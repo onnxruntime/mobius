@@ -641,6 +641,127 @@ def write_audio_codec_pipeline_metadata(
     return path
 
 
+def build_tts_pipeline_metadata(
+    *,
+    num_code_groups: int,
+    max_frames: int = 2000,
+    talker_filename: str = "talker/model.onnx",
+    code_predictor_filename: str = "code_predictor/model.onnx",
+    pre_embedder_filename: str = "talker_step_embedder/model.onnx",
+    tokenizer_filename: str = "tokenizer.json",
+    decoder_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build metadata for a pre-embedder-driven multi-decoder TTS pipeline.
+
+    This is the real Qwen3-TTS shape (DESIGN.md §20.3, ``nested_autoregressive``
+    with the optional ``pre_embedder`` extension): an OUTER ``talker`` AR loop
+    where each frame drives an INNER ``code_predictor`` AR loop of
+    ``num_code_groups`` steps (seeded by the talker's ``last_hidden_state``).
+    Unlike the plain nested shape, the talker is **not** driven by ``input_ids``:
+    each frame its ``inputs_embeds`` is materialized from the previous frame's
+    codes by the ``talker_step_embedder`` pre-embedder (``frame_codes
+    [+ text_embed] -> inputs_embeds``), keeping the engine generic.
+
+    Only the three engine-driven components are emitted (``talker``,
+    ``code_predictor``, ``talker_step_embedder``). The package's ``embedding``
+    and optional ``speaker_encoder`` models feed the trailing-text ``text_embed``
+    and prefill-embeds path, which the runtime does not yet consume (it feeds a
+    zero ``text_embed`` — see DESIGN.md §20.3); emitting them here would declare
+    models the engine cannot place, so they are deliberately omitted until that
+    follow-up lands. There is **no in-package vocoder** — the assembled
+    ``talker.output_codes`` are decoded to a waveform by a separate codec model.
+
+    Args:
+        num_code_groups: Codes collected per outer frame (RVQ residual count).
+        max_frames: Maximum number of outer talker frames to generate.
+        talker_filename: Outer decoder (talker) ONNX filename.
+        code_predictor_filename: Inner decoder ONNX filename.
+        pre_embedder_filename: ``talker_step_embedder`` ONNX filename.
+        tokenizer_filename: Tokenizer filename used by the talker.
+        decoder_metadata: Optional output from
+            :func:`decoder_metadata_from_config`; its decoder capabilities are
+            retained at the document top level.
+
+    Returns:
+        A dict with a top-level ``pipeline`` key and any decoder capabilities.
+    """
+    if num_code_groups < 1:
+        raise ValueError("num_code_groups must be at least 1")
+    if max_frames < 1:
+        raise ValueError("max_frames must be at least 1")
+
+    metadata = dict(decoder_metadata or {})
+    metadata["pipeline"] = {
+        "models": {
+            "talker": {
+                "filename": talker_filename,
+                "type": "decoder",
+                "tokenizer": tokenizer_filename,
+            },
+            "talker_step_embedder": {
+                "filename": pre_embedder_filename,
+                "type": "embedding",
+            },
+            "code_predictor": {
+                "filename": code_predictor_filename,
+                "type": "decoder",
+            },
+        },
+        "dataflow": [
+            {
+                "from": "talker_step_embedder.inputs_embeds",
+                "to": "talker.inputs_embeds",
+                "dtype": "fp32",
+                "device_transfer": False,
+            },
+            {
+                "from": "talker.last_hidden_state",
+                "to": "code_predictor.inputs_embeds",
+                "dtype": "fp32",
+                "device_transfer": False,
+            },
+        ],
+        "strategy": {
+            "kind": "composite",
+            "stages": [
+                {
+                    "name": "generate_codes",
+                    "strategy": {
+                        "kind": "nested_autoregressive",
+                        "outer": "talker",
+                        "inner": "code_predictor",
+                        "pre_embedder": "talker_step_embedder",
+                        "num_code_groups": num_code_groups,
+                        "max_tokens": max_frames,
+                    },
+                    "run_on": "every_step",
+                },
+            ],
+        },
+        "phases": {
+            "talker": {"run_on": "every_step"},
+            "talker_step_embedder": {"run_on": "on_demand"},
+            "code_predictor": {"run_on": "every_step"},
+        },
+    }
+    return metadata
+
+
+def write_tts_pipeline_metadata(
+    directory: str,
+    *,
+    filename: str = "inference_metadata.yaml",
+    **kwargs: Any,
+) -> str:
+    """Build and write pre-embedder-driven TTS metadata into ``directory``."""
+    metadata = build_tts_pipeline_metadata(**kwargs)
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, filename)
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(metadata, handle, sort_keys=False)
+    return path
+
+
 def write_diffusion_pipeline_metadata(
     directory: str,
     *,

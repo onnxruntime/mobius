@@ -360,9 +360,9 @@ def test_dispatch_audio_codec_pipeline(tmp_path):
     ]
 
 
-def test_multi_decoder_tts_raises_precise_not_implemented(tmp_path):
-    # A nested multi-decoder TTS stack (talker + code_predictor) is a designed
-    # but unimplemented shape and must fail with a precise, actionable error.
+def test_multi_decoder_tts_without_pre_embedder_raises_precise_not_implemented(tmp_path):
+    # A nested multi-decoder TTS stack lacking the talker_step_embedder
+    # pre-embedder cannot yet be mapped and must fail with a precise error.
     pkg = _EncoderDecoderPkg(
         {
             "talker": _FakeModel(["inputs_embeds"]),
@@ -372,6 +372,50 @@ def test_multi_decoder_tts_raises_precise_not_implemented(tmp_path):
     )
     with pytest.raises(NotImplementedError, match="nested_autoregressive"):
         write_onnx_genai_config(pkg, str(tmp_path))
+
+
+@dataclasses.dataclass
+class _TTSSubCfg:
+    num_code_groups: int = 16
+
+
+@dataclasses.dataclass
+class _TTSCfg(_Cfg):
+    tts: _TTSSubCfg = dataclasses.field(default_factory=_TTSSubCfg)
+
+
+class _TTSPkg(dict):
+    config = _TTSCfg()
+
+
+def test_dispatch_multi_decoder_tts_with_pre_embedder(tmp_path):
+    # The real Qwen3-TTS shape: talker + code_predictor + talker_step_embedder
+    # emits the pre_embedder-driven nested_autoregressive contract.
+    pkg = _TTSPkg(
+        {
+            "talker": _FakeModel(["inputs_embeds"], ["logits", "last_hidden_state"]),
+            "code_predictor": _FakeModel(["inputs_embeds"], ["logits"]),
+            "talker_step_embedder": _FakeModel(["frame_codes"], ["inputs_embeds"]),
+            "embedding": _FakeModel(["text_ids"]),
+        }
+    )
+    artifacts = write_onnx_genai_config(pkg, str(tmp_path))
+
+    with open(artifacts["inference_metadata"]) as handle:
+        metadata = yaml.safe_load(handle)
+
+    pipeline = metadata["pipeline"]
+    assert set(pipeline["models"]) == {"talker", "talker_step_embedder", "code_predictor"}
+    stage = pipeline["strategy"]["stages"][0]["strategy"]
+    assert stage["kind"] == "nested_autoregressive"
+    assert stage["pre_embedder"] == "talker_step_embedder"
+    assert stage["num_code_groups"] == 16
+    assert {
+        "from": "talker_step_embedder.inputs_embeds",
+        "to": "talker.inputs_embeds",
+        "dtype": "fp32",
+        "device_transfer": False,
+    } in pipeline["dataflow"]
 
 
 def test_unrecognized_multi_component_package_fails_loudly(tmp_path):

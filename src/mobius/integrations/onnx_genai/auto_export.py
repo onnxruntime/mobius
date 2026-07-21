@@ -27,6 +27,7 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     write_diffusion_pipeline_metadata,
     write_multimodal_pipeline_metadata,
     write_speech_to_text_pipeline_metadata,
+    write_tts_pipeline_metadata,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -233,6 +234,41 @@ def _looks_like_multi_decoder_tts(pkg: Any) -> bool:
     return {"talker", "code_predictor"} <= names
 
 
+def _has_tts_pre_embedder(pkg: Any) -> bool:
+    """True when a multi-decoder TTS package carries the pre-embedder component.
+
+    The ``talker_step_embedder`` materializes the talker's per-step
+    ``inputs_embeds`` (``frame_codes [+ text_embed] -> inputs_embeds``); its
+    presence is what makes the package emittable to the ``pre_embedder``-driven
+    ``nested_autoregressive`` contract.
+    """
+    try:
+        names = set(pkg.keys())
+    except AttributeError:
+        return False
+    return "talker_step_embedder" in names
+
+
+def _tts_component_kwargs(pkg: Any, config: Any) -> dict[str, Any]:
+    """Derive pre-embedder-driven TTS metadata kwargs from a package + config.
+
+    Mobius saves each component into ``<component>/model.onnx``. ``num_code_groups``
+    comes from the TTS config (the RVQ residual count per frame).
+    """
+    tts = getattr(config, "tts", None)
+    num_code_groups = getattr(tts, "num_code_groups", None) if tts is not None else None
+    if not num_code_groups:
+        raise ValueError(
+            "TTS metadata requires config.tts.num_code_groups (RVQ codes per frame)"
+        )
+    return {
+        "num_code_groups": num_code_groups,
+        "talker_filename": "talker/model.onnx",
+        "code_predictor_filename": "code_predictor/model.onnx",
+        "pre_embedder_filename": "talker_step_embedder/model.onnx",
+    }
+
+
 def _multimodal_component_kwargs(pkg: Any) -> dict[str, str]:
     """Derive multimodal component filenames from a package's component keys."""
     try:
@@ -399,16 +435,32 @@ def write_onnx_genai_config(
         return artifacts
 
     # A nested multi-decoder TTS stack (talker + code_predictor) uses the
-    # nested_autoregressive strategy, which the onnx-genai runtime now supports;
-    # this emitter does not yet map the Qwen3-TTS component graph, so fail with a
-    # precise, actionable error rather than the generic multi-component message.
+    # nested_autoregressive strategy. When the package also carries the
+    # `talker_step_embedder` pre-embedder (the real Qwen3-TTS shape), emit the
+    # pre-embedder-driven contract the onnx-genai runtime executes; otherwise the
+    # component graph is not yet mappable, so fail with a precise, actionable error.
     if _looks_like_multi_decoder_tts(pkg):
-        raise NotImplementedError(
-            "Multi-decoder TTS packages (talker + code_predictor, e.g. Qwen3-TTS) "
-            "use the nested_autoregressive strategy. The onnx-genai runtime supports "
-            "it, but this emitter does not yet map the multi-decoder TTS component "
-            "graph to it — see onnx-genai docs/DESIGN.md §20.3 'Multi-decoder TTS'."
+        if not _has_tts_pre_embedder(pkg):
+            raise NotImplementedError(
+                "Multi-decoder TTS packages (talker + code_predictor, e.g. Qwen3-TTS) "
+                "use the nested_autoregressive strategy. This package lacks the "
+                "`talker_step_embedder` pre-embedder that materializes the talker "
+                "inputs_embeds, so it cannot yet be mapped to the runtime contract — "
+                "see onnx-genai docs/DESIGN.md §20.3 'Multi-decoder TTS'."
+            )
+        decoder_metadata = decoder_metadata_from_config(
+            resolved_config, kv_native_dtype=kv_native_dtype
         )
+        path = write_tts_pipeline_metadata(
+            output_dir,
+            decoder_metadata=decoder_metadata,
+            **_tts_component_kwargs(pkg, resolved_config),
+        )
+        artifacts = {"inference_metadata": path}
+        tokenizer_path = _write_hf_tokenizer(output_dir, source)
+        if tokenizer_path is not None:
+            artifacts["tokenizer"] = tokenizer_path
+        return artifacts
 
     # Fallback: a single-component decoder language model. A multi-component
     # package that matched none of the composite shapes above would be silently
