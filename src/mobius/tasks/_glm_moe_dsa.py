@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import onnx_ir as ir
 
 from mobius._configs import ArchitectureConfig
@@ -15,7 +17,7 @@ from mobius.tasks._base import ModelTask, _make_graph, _make_model
 class GlmMoeDsaTask(ModelTask):
     """Build the target decoder and optional GLM-5.2 MTP component."""
 
-    model_roles = {"model": "decoder", "mtp": "decoder"}
+    model_roles: ClassVar[dict[str, str]] = {"model": "decoder", "mtp": "decoder"}
 
     @staticmethod
     def _cache_dims(config: ArchitectureConfig, layer_idx: int) -> tuple[int, int]:
@@ -30,7 +32,9 @@ class GlmMoeDsaTask(ModelTask):
 
     def _build_target(self, module, config: ArchitectureConfig):
         graph, builder = _make_graph("glm_moe_dsa")
-        input_ids = builder.input("input_ids", ir.DataType.INT64, ["batch_size", "sequence_length"])
+        input_ids = builder.input(
+            "input_ids", ir.DataType.INT64, ["batch_size", "sequence_length"]
+        )
         attention_mask = builder.input(
             "attention_mask", ir.DataType.INT64, ["batch_size", "total_sequence_length"]
         )
@@ -100,11 +104,9 @@ class GlmMoeDsaTask(ModelTask):
         position_ids = builder.input(
             "position_ids", ir.DataType.INT64, ["batch_size", "sequence_length"]
         )
-        key_dim = (
-            config.num_attention_heads
-            * (int(config.qk_nope_head_dim or 0) + int(config.qk_rope_head_dim or 0))
-            + int(config.index_head_dim or 0)
-        )
+        key_dim = config.num_attention_heads * (
+            int(config.qk_nope_head_dim or 0) + int(config.qk_rope_head_dim or 0)
+        ) + int(config.index_head_dim or 0)
         value_dim = config.num_attention_heads * int(config.v_head_dim or 0)
         past_key = builder.input(
             "past_key_values.0.key",

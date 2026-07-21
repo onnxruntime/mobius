@@ -295,10 +295,7 @@ def is_known_skip(gguf_name: str) -> bool:
     """
     if gguf_name.startswith("tokenizer."):
         return True
-    if (
-        "rope_freqs" in gguf_name
-        or "attn_rot_embd" in gguf_name
-    ):
+    if "rope_freqs" in gguf_name or "attn_rot_embd" in gguf_name:
         return True
     return False
 

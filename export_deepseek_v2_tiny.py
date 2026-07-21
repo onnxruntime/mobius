@@ -9,8 +9,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "tests"))
 
 import numpy as np
 import onnx_ir as ir
-
 from _test_configs import ALL_CAUSAL_LM_CONFIGS, _base_config
+
 from mobius._config_resolver import _default_task_for_model
 from mobius._registry import registry
 from mobius.integrations.onnx_genai import write_inference_metadata
@@ -39,9 +39,7 @@ def _fill_random_weights(model: ir.Model, rng: np.random.Generator) -> None:
 
 
 def main() -> None:
-    overrides = dict(
-        next(ov for mt, ov, _ in ALL_CAUSAL_LM_CONFIGS if mt == "deepseek_v2")
-    )
+    overrides = dict(next(ov for mt, ov, _ in ALL_CAUSAL_LM_CONFIGS if mt == "deepseek_v2"))
     config = _base_config(**overrides)
     config.dtype = ir.DataType.FLOAT
 

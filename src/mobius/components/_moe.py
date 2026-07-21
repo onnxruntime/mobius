@@ -348,9 +348,7 @@ class FusedQuantizedMoE(nn.Module):
         # Dense [rows, E] aggregation weights: combine weight at each selected
         # expert position, 0 elsewhere. QMoE reads these at its own top-k picks.
         zeros = op.Mul(scores_for_choice, 0.0)
-        aggregation = op.ScatterElements(
-            zeros, selected_experts, routing_weights, axis=-1
-        )
+        aggregation = op.ScatterElements(zeros, selected_experts, routing_weights, axis=-1)
 
         moe_out = op.QMoE(
             flat_f32,  # 0: input

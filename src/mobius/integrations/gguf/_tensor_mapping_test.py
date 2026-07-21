@@ -311,9 +311,10 @@ class TestMapGGUFToHFNames:
         assert map_gguf_to_hf_names("blk.78.nextn.eh_proj.weight", "glm-dsa") == (
             "model.layers.78.eh_proj.weight"
         )
-        assert map_gguf_to_hf_names(
-            "blk.78.nextn.shared_head_norm.weight", "glm-dsa"
-        ) == "model.layers.78.shared_head.norm.weight"
+        assert (
+            map_gguf_to_hf_names("blk.78.nextn.shared_head_norm.weight", "glm-dsa")
+            == "model.layers.78.shared_head.norm.weight"
+        )
 
     # ---- Unsupported architecture ----
 

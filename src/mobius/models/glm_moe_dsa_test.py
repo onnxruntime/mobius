@@ -102,7 +102,9 @@ class TestGlmMoeDsaExport:
         assert count_op_type(graph, "Attention") == config.num_hidden_layers
         assert count_op_type(graph, "ScatterElements") >= 1
         assert count_op_type(graph, "Sigmoid") >= config.num_hidden_layers - 1
-        assert any("layers.0.self_attn.indexer.wk.weight" in name for name in graph.initializers)
+        assert any(
+            "layers.0.self_attn.indexer.wk.weight" in name for name in graph.initializers
+        )
         assert not any("layers.1.self_attn.indexer" in name for name in graph.initializers)
         assert {value.name for value in graph.outputs} >= {
             "logits",

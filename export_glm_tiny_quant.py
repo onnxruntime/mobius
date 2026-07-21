@@ -17,20 +17,20 @@ Writes an onnx-genai-loadable artifact directory:
 from __future__ import annotations
 
 import os
-import sys
 import shutil
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "tests"))
 
 import numpy as np
 import onnx_ir as ir
+from _test_configs import ALL_CAUSAL_LM_CONFIGS, _base_config
 
-from _test_configs import _base_config, ALL_CAUSAL_LM_CONFIGS
 from mobius._config_resolver import _default_task_for_model
 from mobius._configs import QuantizationConfig
 from mobius._registry import registry
-from mobius.tasks import get_task
 from mobius.integrations.onnx_genai import write_inference_metadata
+from mobius.tasks import get_task
 
 OUT = "/home/justinchu/glm-e2e-artifacts/glm-5.2-tiny-q4"
 FP32_OUT = "/home/justinchu/glm-e2e-artifacts/glm-5.2-tiny"
@@ -90,10 +90,22 @@ def main() -> None:
     if os.path.exists(tok_src):
         shutil.copy(tok_src, os.path.join(OUT, "tokenizer.json"))
 
-    for attr in ("num_hidden_layers", "num_attention_heads", "num_key_value_heads",
-                 "head_dim", "hidden_size", "vocab_size", "max_position_embeddings",
-                 "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim", "kv_lora_rank",
-                 "q_lora_rank", "num_local_experts", "moe_intermediate_size"):
+    for attr in (
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "head_dim",
+        "hidden_size",
+        "vocab_size",
+        "max_position_embeddings",
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "v_head_dim",
+        "kv_lora_rank",
+        "q_lora_rank",
+        "num_local_experts",
+        "moe_intermediate_size",
+    ):
         print(f"  {attr} =", getattr(config, attr, None))
 
     print("Saved to", OUT)

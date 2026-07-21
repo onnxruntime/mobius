@@ -92,11 +92,23 @@ def main() -> None:
     if os.path.exists(tok_src):
         shutil.copy(tok_src, os.path.join(OUT, "tokenizer.json"))
 
-    for attr in ("num_hidden_layers", "num_attention_heads", "num_key_value_heads",
-                 "head_dim", "hidden_size", "vocab_size", "max_position_embeddings",
-                 "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim", "kv_lora_rank",
-                 "q_lora_rank", "num_local_experts", "num_experts_per_tok",
-                 "moe_intermediate_size"):
+    for attr in (
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "head_dim",
+        "hidden_size",
+        "vocab_size",
+        "max_position_embeddings",
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "v_head_dim",
+        "kv_lora_rank",
+        "q_lora_rank",
+        "num_local_experts",
+        "num_experts_per_tok",
+        "moe_intermediate_size",
+    ):
         print(f"  {attr} =", getattr(config, attr, None))
 
     print("Saved to", OUT)

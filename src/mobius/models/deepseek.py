@@ -323,9 +323,7 @@ class _DeepSeekMoEFFN(nn.Module):
         assert config.moe_intermediate_size is not None
         qc = config.quantization
         use_fused_qmoe = (
-            config.fused_quantized_moe
-            and qc is not None
-            and qc.quant_method != "none"
+            config.fused_quantized_moe and qc is not None and qc.quant_method != "none"
         )
         if use_fused_qmoe:
             self.moe = FusedQuantizedMoE(config, gate=gate)

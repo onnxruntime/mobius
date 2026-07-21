@@ -194,7 +194,9 @@ class GlmMoeDsaAttention(DeepSeekMLA):
         present: tuple,
         index_keys: ir.Value | None,
     ) -> tuple:
-        key = op.Reshape(op.Transpose(present[0], perm=[0, 2, 1, 3]), [0, 0, self.main_key_dim])
+        key = op.Reshape(
+            op.Transpose(present[0], perm=[0, 2, 1, 3]), [0, 0, self.main_key_dim]
+        )
         if index_keys is not None:
             key = op.Concat(key, index_keys, axis=-1)
         value = op.Reshape(
@@ -301,7 +303,9 @@ class GlmMoeDsaAttention(DeepSeekMLA):
                 attention_bias,
             )
         if topk_indices is None:
-            raise ValueError("Shared GLM DSA layers require top-k indices from a preceding full layer")
+            raise ValueError(
+                "Shared GLM DSA layers require top-k indices from a preceding full layer"
+            )
 
         sparse_bias = self._sparse_bias(op, topk_indices, attention_bias)
         attn_output, present_key, present_value = op.Attention(

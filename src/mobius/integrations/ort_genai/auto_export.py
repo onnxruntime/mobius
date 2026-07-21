@@ -720,9 +720,7 @@ def _write_genai_config(
 
     # Derive decoder filename from the actual package key
     decoder_filename = (
-        f"{decoder_key}/model.onnx"
-        if len(pkg) > 1 or decoder_key != "model"
-        else "model.onnx"
+        f"{decoder_key}/model.onnx" if len(pkg) > 1 or decoder_key != "model" else "model.onnx"
     )
 
     # ORT GenAI's ``past_present_share_buffer`` mode requires the decoder
@@ -1010,9 +1008,7 @@ def write_ort_genai_config(
                         "present.0.value",
                         "topk_indices",
                     ],
-                    "num_nextn_predict_layers": getattr(
-                        config, "num_nextn_predict_layers", 0
-                    ),
+                    "num_nextn_predict_layers": getattr(config, "num_nextn_predict_layers", 0),
                     "index_share_for_mtp_iteration": getattr(
                         config, "index_share_for_mtp_iteration", False
                     ),
