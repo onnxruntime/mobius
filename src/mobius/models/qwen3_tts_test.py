@@ -70,9 +70,9 @@ def test_step_embedder_matches_numpy_gather_sum():
     """Gather+Sum in the graph equals the numpy codec_sum + text_embed reference."""
     rng = np.random.default_rng(0)
     codec_table = rng.standard_normal((_CODEC_VOCAB, _HIDDEN)).astype(np.float32)
-    stacked_codec = rng.standard_normal(
-        (_NUM_CODE_GROUPS - 1, _CP_VOCAB, _HIDDEN)
-    ).astype(np.float32)
+    stacked_codec = rng.standard_normal((_NUM_CODE_GROUPS - 1, _CP_VOCAB, _HIDDEN)).astype(
+        np.float32
+    )
 
     session = _build_step_embedder_session(codec_table, stacked_codec)
 
@@ -99,9 +99,9 @@ def test_step_embedder_batched():
     """The component broadcasts correctly over a batch dimension."""
     rng = np.random.default_rng(1)
     codec_table = rng.standard_normal((_CODEC_VOCAB, _HIDDEN)).astype(np.float32)
-    stacked_codec = rng.standard_normal(
-        (_NUM_CODE_GROUPS - 1, _CP_VOCAB, _HIDDEN)
-    ).astype(np.float32)
+    stacked_codec = rng.standard_normal((_NUM_CODE_GROUPS - 1, _CP_VOCAB, _HIDDEN)).astype(
+        np.float32
+    )
     session = _build_step_embedder_session(codec_table, stacked_codec)
 
     batch = 3
@@ -117,9 +117,7 @@ def test_step_embedder_batched():
             codec_sum = codec_sum + stacked_codec[i, rest[b, i], :]
         expected[b, 0] = codec_sum + text_embed[b, 0]
 
-    got = session.run({"frame_codes": frame_codes, "text_embed": text_embed})[
-        "inputs_embeds"
-    ]
+    got = session.run({"frame_codes": frame_codes, "text_embed": text_embed})["inputs_embeds"]
     assert got.shape == (batch, 1, _HIDDEN)
     np.testing.assert_allclose(got, expected, atol=1e-5, rtol=1e-5)
 
@@ -157,6 +155,7 @@ def test_step_embedder_weights_shared_with_existing_tables():
         _CP_VOCAB,
         _HIDDEN,
     )
+
 
 # ---------------------------------------------------------------------------
 # Talker prefill embedder
@@ -221,9 +220,9 @@ def _random_prefill_weights(seed):
         "text_embedding.weight": rng.standard_normal((_TEXT_VOCAB, _TEXT_HIDDEN)).astype(
             np.float32
         ),
-        "text_projection_fc1.weight": rng.standard_normal(
-            (_TEXT_HIDDEN, _TEXT_HIDDEN)
-        ).astype(np.float32),
+        "text_projection_fc1.weight": rng.standard_normal((_TEXT_HIDDEN, _TEXT_HIDDEN)).astype(
+            np.float32
+        ),
         "text_projection_fc1.bias": rng.standard_normal(_TEXT_HIDDEN).astype(np.float32),
         "text_projection_fc2.weight": rng.standard_normal((_HIDDEN, _TEXT_HIDDEN)).astype(
             np.float32

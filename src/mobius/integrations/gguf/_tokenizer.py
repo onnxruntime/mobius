@@ -117,9 +117,7 @@ def _reconstruct_tokenizer_from_ggml(gguf_path: Path, output_dir: str | Path) ->
         vocab = {token: index for index, token in enumerate(tokens)}
         # llama.cpp stores BPE merges as space-joined "left right" pairs.
         merges = [
-            (parts[0], parts[1])
-            for merge in merges_raw
-            if len(parts := merge.split(" ")) == 2
+            (parts[0], parts[1]) for merge in merges_raw if len(parts := merge.split(" ")) == 2
         ]
         unknown_token = tokens[unknown_id] if unknown_id < len(tokens) else None
 

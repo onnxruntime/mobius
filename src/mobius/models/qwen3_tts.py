@@ -551,9 +551,7 @@ class Qwen3TTSTalkerPrefillEmbedder(nn.Module):
             op.Constant(value_ints=[_TTS_BOS_ID, _TTS_EOS_ID, _TTS_PAD_ID]), [0]
         )  # (1, 3)
         special_embeds = self._text_path(op, special_ids)  # (1, 3, H)
-        tts_bos = op.Slice(
-            special_embeds, [0], [1], [1]
-        )  # (1, 1, H)
+        tts_bos = op.Slice(special_embeds, [0], [1], [1])  # (1, 1, H)
         tts_eos = op.Slice(special_embeds, [1], [2], [1])
         tts_pad = op.Slice(special_embeds, [2], [3], [1])
 
@@ -576,9 +574,7 @@ class Qwen3TTSTalkerPrefillEmbedder(nn.Module):
 
         # First text token + last codec token (bos).
         first_text = op.Slice(all_text_embeds, [3], [4], [1])  # (B, 1, H)
-        codec_bos = op.Slice(
-            codec_prefill, [num_prefill - 1], [num_prefill], [1]
-        )  # (1, 1, H)
+        codec_bos = op.Slice(codec_prefill, [num_prefill - 1], [num_prefill], [1])  # (1, 1, H)
         first_text_codec = op.Add(first_text, codec_bos)  # (B, 1, H)
 
         prefill_embeds = op.Concat(

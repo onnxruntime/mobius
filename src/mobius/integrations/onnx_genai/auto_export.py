@@ -281,9 +281,7 @@ def _tts_component_kwargs(pkg: Any, config: Any) -> dict[str, Any]:
     except (AttributeError, TypeError):
         names = set()
     kwargs["prefill_embedder_filename"] = (
-        "talker_prefill_embedder/model.onnx"
-        if "talker_prefill_embedder" in names
-        else None
+        "talker_prefill_embedder/model.onnx" if "talker_prefill_embedder" in names else None
     )
     return kwargs
 
