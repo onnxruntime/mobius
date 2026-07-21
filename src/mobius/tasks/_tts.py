@@ -8,7 +8,8 @@ Builds separate ONNX models:
 2. **code_predictor**: inputs_embeds → hidden_states + KV cache (1D RoPE)
 3. **embedding**: text_ids + codec_ids → text_embeds + codec_embeds
 4. **talker_step_embedder**: frame_codes + text_embed → inputs_embeds
-5. **speaker_encoder**: mel_input → speaker_embedding
+5. **talker_prefill_embedder**: text_ids → prefill_embeds + trailing_text_embeds
+6. **speaker_encoder**: mel_input → speaker_embedding
 
 Used by Qwen3TTSForConditionalGeneration.
 """
@@ -53,6 +54,7 @@ class TTSTask(ModelTask):
         "code_predictor": "decoder",
         "embedding": "embedding",
         "talker_step_embedder": "embedding",
+        "talker_prefill_embedder": "embedding",
         "speaker_encoder": "encoder",
     }
     components: ClassVar[ComponentSpec] = ComponentSpec(
@@ -60,6 +62,7 @@ class TTSTask(ModelTask):
         code_predictor="code_predictor",
         embedding="embedding",
         talker_step_embedder="talker_step_embedder",
+        talker_prefill_embedder="talker_prefill_embedder",
     )
 
     def build(
@@ -75,6 +78,9 @@ class TTSTask(ModelTask):
         models["embedding"] = self._build_embedding(module.embedding, config)
         models["talker_step_embedder"] = self._build_talker_step_embedder(
             module.talker_step_embedder, config
+        )
+        models["talker_prefill_embedder"] = self._build_talker_prefill_embedder(
+            module.talker_prefill_embedder, config
         )
         if module.speaker_encoder is not None:
             models["speaker_encoder"] = self._build_speaker_encoder(
@@ -294,6 +300,45 @@ class TTSTask(ModelTask):
         )
 
         builder.add_output(inputs_embeds, "inputs_embeds")
+        return _make_model(graph)
+
+    def _build_talker_prefill_embedder(
+        self,
+        talker_prefill_embedder: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build talker prefill embedder: text_ids → prefill + trailing embeds.
+
+        Materializes the up-front PREFILL and trailing-text embedding
+        construction in-graph (Auto language, no speaker, no instruct):
+
+        - ``prefill_embeds`` = role(3) + codec_text_pairs(N-1) + first_text_codec(1),
+          length ``3 + 4 + 1 = 8`` (constant, independent of text length).
+        - ``trailing_text_embeds`` = text_embeds[:, 4:-5] ++ tts_eos,
+          length ``text_len - 8``.
+
+        Reuses the embedding model's text + codec tables (shared weights). Lets
+        a generic runtime loop drive the talker without Qwen3-TTS-specific
+        slicing/interleaving logic.
+        """
+        batch = ir.SymbolicDim("batch")
+        text_seq = ir.SymbolicDim("text_sequence_len")
+
+        graph, builder = _make_graph(name="talker_prefill_embedder")
+
+        text_ids = builder.input(
+            "text_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, text_seq],
+        )
+
+        prefill_embeds, trailing_text_embeds = talker_prefill_embedder(
+            builder.op,
+            text_ids=text_ids,
+        )
+
+        builder.add_output(prefill_embeds, "prefill_embeds")
+        builder.add_output(trailing_text_embeds, "trailing_text_embeds")
         return _make_model(graph)
 
     def _build_speaker_encoder(

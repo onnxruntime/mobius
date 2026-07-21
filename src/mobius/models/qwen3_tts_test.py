@@ -13,15 +13,18 @@ from mobius._model_package import ModelPackage
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.models.qwen3_tts import (
     Qwen3TTSForConditionalGeneration,
+    Qwen3TTSTalkerPrefillEmbedder,
     Qwen3TTSTalkerStepEmbedder,
 )
 from mobius.tasks import TTSTask
 
 # Tiny synthetic config — small tables, no 1.7B download.
 _HIDDEN = 8
-_CODEC_VOCAB = 10
+_CODEC_VOCAB = 2160  # > largest codec prefill id (2157)
 _CP_VOCAB = 6
 _NUM_CODE_GROUPS = 4
+_TEXT_HIDDEN = 8
+_TEXT_VOCAB = 151674  # > largest tts special id (151673)
 
 _TINY_CONFIG = ArchitectureConfig(
     model_type="qwen3_tts",
@@ -36,6 +39,8 @@ _TINY_CONFIG = ArchitectureConfig(
     hidden_act="silu",
     tts=TTSConfig(
         num_code_groups=_NUM_CODE_GROUPS,
+        text_hidden_size=_TEXT_HIDDEN,
+        text_vocab_size=_TEXT_VOCAB,
         code_predictor=CodePredictorConfig(
             hidden_size=_HIDDEN,
             vocab_size=_CP_VOCAB,
@@ -152,3 +157,133 @@ def test_step_embedder_weights_shared_with_existing_tables():
         _CP_VOCAB,
         _HIDDEN,
     )
+
+# ---------------------------------------------------------------------------
+# Talker prefill embedder
+# ---------------------------------------------------------------------------
+
+# Special IDs for the Auto/no-speaker/no-instruct path (mirrors the module).
+_TTS_BOS_ID = 151672
+_TTS_EOS_ID = 151673
+_TTS_PAD_ID = 151671
+_AUTO_CODEC_PREFILL_IDS = [2155, 2156, 2157, 2148, 2149]  # N = 5
+
+
+def _build_prefill_embedder_session(weights):
+    """Build the talker_prefill_embedder ONNX graph and load the given tables."""
+    module = Qwen3TTSTalkerPrefillEmbedder(_TINY_CONFIG)
+    module._set_name("talker_prefill_embedder")
+    model = TTSTask()._build_talker_prefill_embedder(module, _TINY_CONFIG)
+    pkg = ModelPackage({"talker_prefill_embedder": model}, config=_TINY_CONFIG)
+    pkg.apply_weights(
+        {f"talker_prefill_embedder.{k}": torch.from_numpy(v) for k, v in weights.items()}
+    )
+    return OnnxModelSession(model)
+
+
+def _numpy_prefill_reference(weights, text_ids):
+    """Reproduce generate_codes's prefill_embeds + trailing_text (Auto path)."""
+    text_emb = weights["text_embedding.weight"]
+    fc1_w = weights["text_projection_fc1.weight"]
+    fc1_b = weights["text_projection_fc1.bias"]
+    fc2_w = weights["text_projection_fc2.weight"]
+    fc2_b = weights["text_projection_fc2.bias"]
+    codec_emb = weights["codec_embedding.weight"]
+
+    def text_path(ids):
+        e = text_emb[ids]  # (B, L, text_hidden)
+        e = e @ fc1_w.T + fc1_b
+        e = e * (1.0 / (1.0 + np.exp(-e)))  # SiLU
+        return e @ fc2_w.T + fc2_b  # (B, L, hidden)
+
+    all_text = text_path(text_ids)  # (B, L, H)
+    special = text_path(np.array([[_TTS_BOS_ID, _TTS_EOS_ID, _TTS_PAD_ID]], dtype=np.int64))
+    tts_bos = special[:, 0:1, :]
+    tts_eos = special[:, 1:2, :]
+    tts_pad = special[:, 2:3, :]
+
+    codec_prefill = codec_emb[np.array([_AUTO_CODEC_PREFILL_IDS], dtype=np.int64)]  # (1,N,H)
+    n = codec_prefill.shape[1]
+
+    role = all_text[:, :3, :]
+    text_side = np.concatenate([np.tile(tts_pad, (1, n - 2, 1)), tts_bos], axis=1)
+    codec_text_pairs = text_side + codec_prefill[:, : n - 1, :]
+    first_text_codec = all_text[:, 3:4, :] + codec_prefill[:, -1:, :]
+    prefill = np.concatenate([role, codec_text_pairs, first_text_codec], axis=1)
+
+    trailing = np.concatenate([all_text[:, 4:-5, :], tts_eos], axis=1)
+    return prefill.astype(np.float32), trailing.astype(np.float32)
+
+
+def _random_prefill_weights(seed):
+    rng = np.random.default_rng(seed)
+    return {
+        "text_embedding.weight": rng.standard_normal((_TEXT_VOCAB, _TEXT_HIDDEN)).astype(
+            np.float32
+        ),
+        "text_projection_fc1.weight": rng.standard_normal(
+            (_TEXT_HIDDEN, _TEXT_HIDDEN)
+        ).astype(np.float32),
+        "text_projection_fc1.bias": rng.standard_normal(_TEXT_HIDDEN).astype(np.float32),
+        "text_projection_fc2.weight": rng.standard_normal((_HIDDEN, _TEXT_HIDDEN)).astype(
+            np.float32
+        ),
+        "text_projection_fc2.bias": rng.standard_normal(_HIDDEN).astype(np.float32),
+        "codec_embedding.weight": rng.standard_normal((_CODEC_VOCAB, _HIDDEN)).astype(
+            np.float32
+        ),
+    }
+
+
+def test_prefill_embedder_matches_numpy_reference():
+    """Graph interleaving equals the numpy prefill/trailing reference."""
+    weights = _random_prefill_weights(7)
+    session = _build_prefill_embedder_session(weights)
+    rng = np.random.default_rng(11)
+
+    for text_len in (10, 14, 20):
+        text_ids = rng.integers(0, 1000, size=(1, text_len)).astype(np.int64)
+        exp_prefill, exp_trailing = _numpy_prefill_reference(weights, text_ids)
+
+        out = session.run({"text_ids": text_ids})
+        got_prefill = out["prefill_embeds"]
+        got_trailing = out["trailing_text_embeds"]
+
+        # prefill_len is constant: 3 (role) + 4 (N-1 pairs) + 1 (first_text_codec)
+        assert got_prefill.shape == (1, 8, _HIDDEN)
+        # trailing_len = (text_len - 9) + 1 = text_len - 8
+        assert got_trailing.shape == (1, text_len - 8, _HIDDEN)
+
+        np.testing.assert_allclose(got_prefill, exp_prefill, atol=1e-4, rtol=1e-4)
+        np.testing.assert_allclose(got_trailing, exp_trailing, atol=1e-4, rtol=1e-4)
+
+
+def test_prefill_embedder_weights_shared_with_embedding():
+    """preprocess_weights routes the embedding tables to the prefill embedder."""
+    model = Qwen3TTSForConditionalGeneration(_TINY_CONFIG)
+
+    state_dict: dict[str, torch.Tensor] = {
+        "talker.model.text_embedding.weight": torch.randn(_TEXT_VOCAB, _TEXT_HIDDEN),
+        "talker.text_projection.linear_fc1.weight": torch.randn(_TEXT_HIDDEN, _TEXT_HIDDEN),
+        "talker.text_projection.linear_fc1.bias": torch.randn(_TEXT_HIDDEN),
+        "talker.text_projection.linear_fc2.weight": torch.randn(_HIDDEN, _TEXT_HIDDEN),
+        "talker.text_projection.linear_fc2.bias": torch.randn(_HIDDEN),
+        "talker.model.codec_embedding.weight": torch.randn(_CODEC_VOCAB, _HIDDEN),
+    }
+
+    cleaned = model.preprocess_weights(state_dict)
+
+    shared = {
+        "text_embedding.weight",
+        "text_projection_fc1.weight",
+        "text_projection_fc1.bias",
+        "text_projection_fc2.weight",
+        "text_projection_fc2.bias",
+        "codec_embedding.weight",
+    }
+    for key in shared:
+        assert f"talker_prefill_embedder.{key}" in cleaned
+        torch.testing.assert_close(
+            cleaned[f"talker_prefill_embedder.{key}"],
+            cleaned[f"embedding.{key}"],
+        )
