@@ -71,6 +71,22 @@ class TestMakeProviderOptions:
         result = make_provider_options("trt-rtx")
         assert result[0]["NvTensorRtRtx"]["enable_cuda_graph"] == "1"
 
+    def test_openvino_defaults_to_npu(self):
+        # The OpenVINO graph is device-independent; mobius emits a default
+        # device_type ("NPU") that can be overridden downstream in genai_config.
+        result = make_provider_options("openvino")
+        assert result == [{"OpenVINO": {"device_type": "NPU"}}]
+
+    def test_openvino_disables_skip_layer_norm_fusion(self):
+        # The OpenVINO ONNX frontend cannot consume the com.microsoft
+        # SkipSimplifiedLayerNormalization op, so the openvino EP must keep the
+        # residual Add + RMSNormalization separate (no skip-norm fusion).
+        from mobius._execution_providers import ep_registry
+
+        caps = ep_registry.get("openvino")
+        assert caps is not None
+        assert caps.supports_skip_layer_norm is False
+
 
 class TestMakeSlidingWindowConfig:
     def test_disabled_when_zero(self):

@@ -439,11 +439,14 @@ class GraniteMoeHybridCausalLMModel(nn.Module):
 
         Handles:
         1. Weight tying (embed_tokens ↔ lm_head)
-        2. MoE gate: block_sparse_moe.router.layer.weight → block_sparse_moe.gate.weight
+        2. MoE gate: block_sparse_moe.router[.layer].weight → block_sparse_moe.gate.weight
+        3. Fused expert weights: HF renamed the routed-expert tensors from
+           ``block_sparse_moe.{input,output}_linear.weight`` to
+           ``block_sparse_moe.experts.{gate_up,down}_proj`` (transformers >=5.x).
+           The layouts are identical, so only the names are remapped.
 
-        Fused expert weights (``input_linear``, ``output_linear``) and shared-MLP
-        weights pass through directly — the ONNX model stores them in the same
-        fused layout as HuggingFace.
+        Shared-MLP weights (``shared_mlp.{input,output}_linear``) pass through
+        directly — the ONNX model stores them in the same fused layout as HF.
         """
         if self.config.tie_word_embeddings:
             if "model.embed_tokens.weight" not in state_dict:
@@ -452,10 +455,24 @@ class GraniteMoeHybridCausalLMModel(nn.Module):
 
         new_state_dict: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
-            # MoE gate: router.layer.weight → gate.weight
-            new_key = key.replace(
+            new_key = key
+            # MoE gate: router.layer.weight (legacy) / router.weight (current) → gate.weight
+            new_key = new_key.replace(
                 ".block_sparse_moe.router.layer.",
                 ".block_sparse_moe.gate.",
+            )
+            new_key = new_key.replace(
+                ".block_sparse_moe.router.weight",
+                ".block_sparse_moe.gate.weight",
+            )
+            # Routed-expert weights: HF renamed the fused 3D tensors.
+            new_key = new_key.replace(
+                ".block_sparse_moe.experts.gate_up_proj",
+                ".block_sparse_moe.input_linear.weight",
+            )
+            new_key = new_key.replace(
+                ".block_sparse_moe.experts.down_proj",
+                ".block_sparse_moe.output_linear.weight",
             )
             new_state_dict[new_key] = value
 

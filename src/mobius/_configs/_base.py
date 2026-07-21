@@ -63,6 +63,8 @@ def _resolve_hidden_act(config, model_type: str) -> str | None:
         or getattr(config, "dense_act_fn", None)
         or getattr(config, "activation", None)
         or getattr(config, "afn", None)
+        # LLaDA/OLMo expose the activation as ``activation_type`` (e.g. "silu").
+        or getattr(config, "activation_type", None)
         or ("silu" if model_type in ("qwen",) else None)
         # gelu_activation is a boolean (XLM) — must be after all string
         # attrs so it cannot override an explicit hidden_act.
@@ -547,16 +549,19 @@ class ArchitectureConfig(BaseModelConfig):
         # instead of scalar ones.  Resolve to a scalar for the base config.
         hidden_size = (
             getattr(config, "hidden_size", None)
+            or getattr(config, "d_model", None)
             or _first(getattr(config, "hidden_sizes", None))
             or 0
         )
         num_attention_heads = (
             getattr(config, "num_attention_heads", None)
+            or getattr(config, "n_heads", None)
             or _first(getattr(config, "num_heads", None))
             or 1
         )
         num_hidden_layers = (
             getattr(config, "num_hidden_layers", None)
+            or getattr(config, "n_layers", None)
             or getattr(config, "num_encoder_blocks", None)
             or 0
         )
@@ -583,13 +588,20 @@ class ArchitectureConfig(BaseModelConfig):
             ),
             num_attention_heads=_as_int(num_attention_heads),
             num_key_value_heads=_as_int(
-                getattr(config, "num_key_value_heads", num_attention_heads)
+                getattr(config, "num_key_value_heads", None)
+                or getattr(config, "n_kv_heads", None)
+                or num_attention_heads
             ),
             num_hidden_layers=_as_int(num_hidden_layers),
-            vocab_size=getattr(config, "vocab_size", None) or 0,
+            vocab_size=(
+                getattr(config, "vocab_size", None)
+                or getattr(config, "embedding_size", None)
+                or 0
+            ),
             hidden_size=_as_int(hidden_size),
             intermediate_size=(
                 getattr(config, "intermediate_size", None)
+                or getattr(config, "mlp_hidden_size", None)
                 or getattr(config, "n_inner", None)
                 or getattr(config, "d_ff", None)
                 or getattr(config, "ffn_dim", None)
@@ -744,10 +756,16 @@ class ArchitectureConfig(BaseModelConfig):
                 rope_config.rope_interleave if rope_config is not None else False
             ),
             **mrope_fields,
-            max_position_embeddings=getattr(config, "max_position_embeddings", 0),
+            max_position_embeddings=(
+                getattr(config, "max_position_embeddings", None)
+                or getattr(config, "max_sequence_length", None)
+                or 0
+            ),
             tie_word_embeddings=(
                 getattr(config, "tie_word_embeddings", None)
                 if getattr(config, "tie_word_embeddings", None) is not None
+                else getattr(config, "weight_tying", None)
+                if getattr(config, "weight_tying", None) is not None
                 else getattr(parent_config, "tie_word_embeddings", False)
             ),
             # MoE
@@ -1487,6 +1505,11 @@ class Gemma4Config(VisionLanguageConfig):
       decoder raises ``NotImplementedError`` rather than silently degrading to
       causal attention (only ``None`` and ``"vision"`` are accepted).
     """
+
+    # Set to True by Gemma4Task.build() when the target EP's max_buffer_size
+    # is too small for the fused [V, L*D] per-layer embedding table, to split
+    # it into L separate [V, D] tables that each fit within the EP's buffer limit.
+    split_per_layer_embedding: bool = False
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Gemma4Config:

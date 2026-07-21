@@ -1478,6 +1478,7 @@ class Gemma4TextModel(nn.Module):
 
     def __init__(self, config: Gemma4Config):
         super().__init__()
+        self.config = config
         self._dtype = config.dtype
 
         embed_scale = math.sqrt(config.hidden_size)
@@ -1559,13 +1560,29 @@ class Gemma4TextModel(nn.Module):
         if self._per_layer_dim:
             self._num_layers = config.num_hidden_layers
             vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
-            # Single fused [V, L*D] table. Requires ORT >= 1.27 for CUDA
-            # Gather int64 index support (onnxruntime#28107).
+            # Fused [V, L*D] table — used when split_per_layer_embedding is False.
+            # Requires ORT >= 1.27 for CUDA Gather int64 index support (onnxruntime#28107).
             self.embed_tokens_per_layer = Gemma3TextScaledWordEmbedding(
                 vocab_per_layer,
                 self._num_layers * self._per_layer_dim,
                 config.pad_token_id,
                 embed_scale=float(self._per_layer_dim**0.5),
+            )
+            # Split [V, D] tables — used when split_per_layer_embedding is True
+            # (i.e. the fused table exceeds the EP's max_buffer_size, e.g. WebGPU's
+            # 256 MiB limit; ~128 MiB each vs ~4.7 GB fused).
+            # Only the table actually called in forward() is realized as an
+            # ONNX initializer, so the unused one adds no graph weight.
+            self.embed_tokens_per_layer_split = nn.ModuleList(
+                [
+                    Gemma3TextScaledWordEmbedding(
+                        vocab_per_layer,
+                        self._per_layer_dim,
+                        config.pad_token_id,
+                        embed_scale=float(self._per_layer_dim**0.5),
+                    )
+                    for _ in range(self._num_layers)
+                ]
             )
             self.per_layer_model_projection = Linear(
                 config.hidden_size,
@@ -1605,17 +1622,26 @@ class Gemma4TextModel(nn.Module):
                 masked_ids,
             )
 
-        fused_emb = self.embed_tokens_per_layer(op, masked_ids)
-        fused_emb = op.Reshape(
-            fused_emb,
-            op.Constant(value_ints=[0, 0, self._num_layers, self._per_layer_dim]),
-        )
+        if self.config.split_per_layer_embedding:
+            # L separate Gathers on [V, D] tables — each fits within the EP's
+            # max_buffer_size (e.g. WebGPU's 256 MiB limit).
+            per_layer_embs = [
+                op.Unsqueeze(self.embed_tokens_per_layer_split[i](op, masked_ids), [2])
+                for i in range(self._num_layers)
+            ]
+            fused_emb = op.Concat(*per_layer_embs, axis=2)  # [B, S, L, D]
+        else:
+            fused_emb = self.embed_tokens_per_layer(op, masked_ids)
+            fused_emb = op.Reshape(
+                fused_emb,
+                op.Constant(value_ints=[0, 0, self._num_layers, self._per_layer_dim]),
+            )
 
         combined = op.Add(proj, fused_emb)
         combined = op.Mul(combined, float(0.5**0.5))
 
         return [
-            op.Squeeze(op.Slice(combined, starts=[i], ends=[i + 1], axes=[2]), [2])
+            op.Gather(combined, op.Constant(value_int=i), axis=2)
             for i in range(self._num_layers)
         ]
 
@@ -1721,17 +1747,25 @@ class Gemma4TextModel(nn.Module):
             # seqlens_k[b] = sum(attention_mask[b]) - 1  (last valid KV idx)
             # total_seq_len = attention_mask.shape[1]     (past + current)
             one_i32 = op.Constant(value_int=1)
+            reduce_sum = op.ReduceSum(attention_mask, [1], keepdims=0)
             seqlens_k = op.Cast(
-                op.Sub(
-                    op.ReduceSum(attention_mask, [1], keepdims=0),
-                    one_i32,
-                ),
+                op.Sub(reduce_sum, one_i32),
                 to=ir.DataType.INT32,
             )
-            total_seq_len = op.Cast(
-                op.Gather(op.Shape(attention_mask), 1),
-                to=ir.DataType.INT32,
-            )
+            if caps.requires_graph_capture_rewrite:
+                # Support graph capture for shared-KV layer models on WebGPU EP.
+                # Derive total_seq_len from reduce_sum (already computed) as a
+                # scalar INT32 via Gather index 0 (valid because graph capture
+                # requires batch=1).
+                total_seq_len = op.Gather(
+                    op.Cast(reduce_sum, to=ir.DataType.INT32),
+                    op.Constant(value_int=0),
+                )
+            else:
+                total_seq_len = op.Cast(
+                    op.Gather(op.Shape(attention_mask), 1),
+                    to=ir.DataType.INT32,
+                )
 
             # Per-layer-type GQA contexts with appropriate cos/sin caches
             # and local_window_size for sliding layers.
@@ -1903,6 +1937,7 @@ class Gemma4CausalLMModel(CausalLMModel):
                 state_dict.pop(key, None)
         # HF's model.embed_tokens_per_layer.weight [V, L*D] maps directly
         # to our fused embedding table — no splitting needed.
+        # (For WebGPU, splitting is handled by _Gemma4DecoderModel.preprocess_weights.)
         # Map HF expert weight names and fold router scale
         _remap_moe_expert_weights(state_dict, self.config)
         return super().preprocess_weights(state_dict)
@@ -1966,7 +2001,23 @@ class _Gemma4DecoderModel(nn.Module):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        return vlm_decoder_weights(state_dict, tie=self.config.tie_word_embeddings)
+        state_dict = vlm_decoder_weights(state_dict, tie=self.config.tie_word_embeddings)
+        # For WebGPU: split the fused [V, L*D] per-layer embedding into L separate [V, D] tables.
+        per_layer_dim = self.config.hidden_size_per_layer_input
+        if per_layer_dim and self.config.split_per_layer_embedding:
+            fused_key = "model.embed_tokens_per_layer.weight"
+            if fused_key in state_dict:
+                num_layers = self.config.num_hidden_layers
+                fused = state_dict.pop(fused_key)
+                assert fused.shape[1] == num_layers * per_layer_dim, (
+                    f"{fused_key} dim 1 expected {num_layers * per_layer_dim} "
+                    f"({num_layers} layers x {per_layer_dim} per_layer_dim), "
+                    f"got {fused.shape[1]}"
+                )
+                chunks = fused.chunk(num_layers, dim=1)
+                for i, chunk in enumerate(chunks):
+                    state_dict[f"model.embed_tokens_per_layer_split.{i}.weight"] = chunk
+        return state_dict
 
 
 class _Gemma4VisionEncoderModel(nn.Module):
@@ -2181,6 +2232,12 @@ class Gemma4EmbeddingModel(nn.Module):
         outputs: dict[str, ir.Value] = {"inputs_embeds": hidden}
 
         if not self._per_layer_dim:
+            return outputs
+
+        # When split_per_layer_embedding is set, the per-layer computation runs
+        # inside the decoder using split [V, D] tables.  The embedding model only
+        # emits inputs_embeds in that case.
+        if self.config.split_per_layer_embedding:
             return outputs
 
         # Compute per-layer input embeddings (moved from the decoder).
@@ -2754,6 +2811,33 @@ class Gemma4Model(nn.Module):
 
         # Map HF expert weight names and fold router scale
         _remap_moe_expert_weights(renamed, self.config)
+
+        # For WebGPU: the fused [V, L*D] embed_tokens_per_layer exceeds the 256 MiB
+        # per-buffer limit.  Split it into L separate [V, D] tables in the decoder.
+        # The per_layer_projection weights also live in the decoder (not embedding).
+        if self.config.split_per_layer_embedding:
+            fused_key = "embedding.embed_tokens_per_layer.weight"
+            if fused_key in renamed:
+                num_layers = self.config.num_hidden_layers
+                per_layer_dim = self.config.hidden_size_per_layer_input
+                fused = renamed.pop(fused_key)
+                assert fused.shape[1] == num_layers * per_layer_dim, (
+                    f"{fused_key} dim 1 expected {num_layers * per_layer_dim} "
+                    f"({num_layers} layers x {per_layer_dim} per_layer_dim), "
+                    f"got {fused.shape[1]}"
+                )
+                chunks = fused.chunk(num_layers, dim=1)
+                for i, chunk in enumerate(chunks):
+                    renamed[f"decoder.model.embed_tokens_per_layer_split.{i}.weight"] = chunk
+            # Re-route the projection weights from embedding.* → decoder.model.*
+            for k in list(renamed.keys()):
+                if k.startswith(
+                    (
+                        "embedding.per_layer_model_projection.",
+                        "embedding.per_layer_projection_norm.",
+                    )
+                ):
+                    renamed[k.replace("embedding.", "decoder.model.", 1)] = renamed.pop(k)
 
         return renamed
 

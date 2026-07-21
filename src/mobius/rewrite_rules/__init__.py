@@ -39,6 +39,7 @@ __all__ = [
     "separate_rope_rules",
     "skip_layer_norm_rules",
     "skip_norm_rules",
+    "static_empty_kv_rules",
     "unpack_qkv_rules",
 ]
 
@@ -56,4 +57,5 @@ from mobius.rewrite_rules._packed_attention import packed_attention_rules
 from mobius.rewrite_rules._separate_rope import separate_rope_rules
 from mobius.rewrite_rules._skip_layer_norm import skip_layer_norm_rules
 from mobius.rewrite_rules._skip_norm import skip_norm_rules
+from mobius.rewrite_rules._static_empty_kv import static_empty_kv_rules
 from mobius.rewrite_rules._unpack_qkv import unpack_qkv_rules

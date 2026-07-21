@@ -17,6 +17,9 @@ import pytest
 from mobius.integrations.gguf._config_mapping import (
     GGUF_ARCH_TO_MODEL_TYPE,
     _extract_config_fields,
+    _infer_attn_o_bias,
+    _infer_attn_qkv_bias,
+    _infer_mlp_bias,
     _infer_tie_embeddings,
     gguf_to_config,
 )
@@ -416,6 +419,48 @@ class TestConfigMapping:
         model = GGUFModel(llama_gguf)
         config = gguf_to_config(model)
         assert config.tie_word_embeddings is False
+
+    def test_infer_projection_biases_from_tensor_names(self):
+        """Q/K/V, output, and MLP biases are inferred from tensor names.
+
+        Regression for the invalid Q4 bug: Qwen2 carries Q/K/V biases in
+        GGUF (``blk.N.attn_{q,k,v}.bias``). If ``attn_qkv_bias`` is not
+        inferred, the graph builder omits the bias Add and the model emits
+        garbage. Attention-output and MLP biases are absent for Qwen2.
+        """
+
+        class _FakeModel:
+            def __init__(self, names):
+                self.tensor_names = names
+
+        qwen_like = _FakeModel(
+            [
+                "blk.0.attn_q.weight",
+                "blk.0.attn_q.bias",
+                "blk.0.attn_k.bias",
+                "blk.0.attn_v.bias",
+                "blk.0.ffn_down.weight",
+            ]
+        )
+        assert _infer_attn_qkv_bias(qwen_like) is True
+        assert _infer_attn_o_bias(qwen_like) is False
+        assert _infer_mlp_bias(qwen_like) is False
+
+        no_bias = _FakeModel(["blk.0.attn_q.weight", "blk.0.ffn_down.weight"])
+        assert _infer_attn_qkv_bias(no_bias) is False
+        assert _infer_attn_o_bias(no_bias) is False
+        assert _infer_mlp_bias(no_bias) is False
+
+        full_bias = _FakeModel(
+            [
+                "blk.0.attn_qkv.bias",
+                "blk.0.attn_output.bias",
+                "blk.0.ffn_up.bias",
+            ]
+        )
+        assert _infer_attn_qkv_bias(full_bias) is True
+        assert _infer_attn_o_bias(full_bias) is True
+        assert _infer_mlp_bias(full_bias) is True
 
     def test_custom_rope_theta(self, tmp_path: Path):
         path = tmp_path / "rope.gguf"

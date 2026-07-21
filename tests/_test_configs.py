@@ -57,6 +57,13 @@ TINY_VOCAB = 256
 
 LONGROPE_FACTORS = [1.0] * (int(TINY_HEAD_DIM * 0.5) // 2)
 
+# NOTE (MLA models): Multi-head Latent Attention models (DeepSeek-V2/V3,
+# LongCat-Flash, ...) reconstruct full-head K/V from a shared latent, so they do
+# not use grouped-query attention.  Their tiny configs must set
+# num_key_value_heads == num_attention_heads; otherwise HuggingFace's repeat_kv()
+# in the SDPA path duplicates the already-full-head K/V tensors, producing a
+# head-count mismatch against the query.
+
 
 def _base_config(config_cls=None, **overrides) -> ArchitectureConfig:
     """Create a tiny ArchitectureConfig for graph-build and parity tests.
@@ -550,6 +557,8 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     (
         "deepseek_v3",
         {
+            # MLA: kv heads must equal attn heads (see MLA note near top of file).
+            "num_key_value_heads": TINY_HEADS,
             "q_lora_rank": 32,
             "kv_lora_rank": 16,
             "qk_nope_head_dim": 16,
@@ -581,6 +590,8 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     (
         "deepseek_v2",
         {
+            # MLA: kv heads must equal attn heads (see MLA note near top of file).
+            "num_key_value_heads": TINY_HEADS,
             "q_lora_rank": 32,
             "kv_lora_rank": 16,
             "qk_nope_head_dim": 16,
@@ -604,6 +615,8 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     (
         "deepseek_v2_moe",
         {
+            # MLA: kv heads must equal attn heads (see MLA note near top of file).
+            "num_key_value_heads": TINY_HEADS,
             "q_lora_rank": 32,
             "kv_lora_rank": 16,
             "qk_nope_head_dim": 16,
@@ -774,6 +787,8 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         "longcat_flash",
         {
             "_config_cls": LongcatFlashConfig,
+            # MLA: kv heads must equal attn heads (see MLA note near top of file).
+            "num_key_value_heads": TINY_HEADS,
             "q_lora_rank": 16,
             "kv_lora_rank": 8,
             "qk_nope_head_dim": 8,
@@ -1085,6 +1100,8 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     (
         "deepseek_v2",
         {
+            # MLA: kv heads must equal attn heads (see MLA note near top of file).
+            "num_key_value_heads": TINY_HEADS,
             "q_lora_rank": 32,
             "kv_lora_rank": 16,
             "qk_nope_head_dim": 16,

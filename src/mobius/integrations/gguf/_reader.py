@@ -226,21 +226,32 @@ class GGUFModel:
         Returns:
             Numpy array in row-major shape order.
         """
-        from gguf import GGMLQuantizationType, dequantize
-
-        data = tensor.data
-        qtype = tensor.tensor_type
         # GGUF stores shape in GGML (column-major) order; reverse
         # to get numpy (row-major) shape.
         np_shape = tuple(reversed(tensor.shape))
+        return self.dequantize_raw_tensor(tensor.data, tensor.tensor_type, np_shape)
 
-        if qtype in (GGMLQuantizationType.F32, GGMLQuantizationType.F16):
-            return data.reshape(np_shape)
+    def dequantize_raw_tensor(
+        self,
+        raw_data: np.ndarray,
+        quant_type: Any,
+        np_shape: tuple[int, ...],
+    ) -> np.ndarray:
+        """Dequantize raw GGUF tensor data into its logical numpy shape.
+
+        K-quant blocks are contiguous over the flattened tensor and may cross
+        logical row boundaries. Delegating the complete raw array to gguf's
+        reference dequantizer before reshaping preserves that layout.
+        """
+        from gguf import GGMLQuantizationType, dequantize
+
+        if quant_type in (GGMLQuantizationType.F32, GGMLQuantizationType.F16):
+            return raw_data.reshape(np_shape)
         # All other types (quantized, BF16) go through dequantize().
         # BF16 is intentionally NOT in the fast path above because
         # numpy has no native bfloat16 dtype — the gguf library's
         # dequantize() converts BF16 bytes to float32.
-        return dequantize(data, qtype).reshape(np_shape)
+        return dequantize(raw_data, quant_type).reshape(np_shape)
 
     def tensor_items(self) -> Iterator[tuple[str, np.ndarray]]:
         """Iterate over ``(name, dequantized_array)`` pairs.
@@ -268,7 +279,9 @@ class GGUFModel:
             Tuples of ``(name, raw_data, quant_type, np_shape)`` where:
 
             - *name*: GGUF tensor name
-            - *raw_data*: Raw bytes as uint8 numpy array (flat)
+            - *raw_data*: Raw tensor storage. Quantized K-blocks are
+              contiguous over the flattened logical tensor and are not
+              independently padded at row boundaries.
             - *quant_type*: :class:`gguf.GGMLQuantizationType` value
             - *np_shape*: Logical shape in numpy (row-major) order
         """

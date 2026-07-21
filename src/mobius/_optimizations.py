@@ -68,6 +68,7 @@ from mobius.rewrite_rules import (
     separate_rope_rules,
     skip_layer_norm_rules,
     skip_norm_rules,
+    static_empty_kv_rules,
     unpack_qkv_rules,
 )
 
@@ -316,6 +317,16 @@ def _get_optimization_passes(
     # Reshape rank-4 RMSNorm (q/k norm) to rank-3 for the QNN HTP, which miscomputes it.
     if not caps.supports_rank4_rmsnorm:
         lower.append(("HtpRank4RMSNorm", list(htp_rank4_rmsnorm_rules())))
+
+    # --- Graph-capture rewrite ---
+    # Supports graph capture for shared-KV layer models on WebGPU EP
+    # (currently Gemma4). Pattern-based: only fires on models that emit the
+    # dynamic Shape → ConstantOfShape → Cast empty-KV pattern. Gated by
+    # requires_graph_capture_rewrite rather than enable_graph_capture because
+    # not all graph-capture EPs need it — e.g. CUDA EP's Shape kernel is
+    # already graph-capture-safe.
+    if caps.requires_graph_capture_rewrite:
+        lower.append(("StaticEmptyKV", list(static_empty_kv_rules())))
 
     return fuse, lower
 

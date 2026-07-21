@@ -68,6 +68,7 @@ __all__ = [
     "JambaCausalLMModel",
     "JetMoeCausalLMModel",
     "Llama4CausalLMModel",
+    "LLaDAModel",
     "LLaVAModel",
     "LayerNormCausalLMModel",
     "LongcatFlashCausalLMModel",
@@ -133,6 +134,8 @@ __all__ = [
     "T2IAdapterModel",
     "T5ForConditionalGeneration",
     "UNet2DConditionModel",
+    "load_unet_lora_safetensors",
+    "remap_diffusers_unet_lora",
     "ViTModel",
     "VideoAutoencoderModel",
     "Wav2Vec2ForCTCModel",
@@ -196,6 +199,7 @@ from mobius.models.internlm import InternLM2CausalLMModel
 from mobius.models.internvl import InternVL2Model
 from mobius.models.jamba import JambaCausalLMModel
 from mobius.models.jetmoe import JetMoeCausalLMModel
+from mobius.models.llada import LLaDAModel
 from mobius.models.llama4 import Llama4CausalLMModel
 from mobius.models.llava import LLaVAModel
 from mobius.models.longcat_flash import LongcatFlashCausalLMModel
@@ -280,7 +284,11 @@ from mobius.models.sensevoice_small import SenseVoiceSmallModel
 from mobius.models.smollm import SmolLM3CausalLMModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5ForConditionalGeneration
-from mobius.models.unet import UNet2DConditionModel
+from mobius.models.unet import (
+    UNet2DConditionModel,
+    load_unet_lora_safetensors,
+    remap_diffusers_unet_lora,
+)
 from mobius.models.vae import AutoencoderKLModel
 from mobius.models.video_vae import VideoAutoencoderModel
 from mobius.models.vit import ViTModel

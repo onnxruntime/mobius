@@ -4865,6 +4865,10 @@ class TestBuildJambaGraph:
 # Model types exercised by non-parametrized test classes above (VLM,
 # whisper, audio, TTS, diffusion, etc.).  Keep sorted for readability.
 _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
+    # LLaDA masked-diffusion LM (co-located src/mobius/models/llada_test.py):
+    # bidirectional Llama backbone with a masked-diffusion task, so it has no
+    # attention_mask / KV cache and does not fit the generic causal-LM harness.
+    "llada",
     # VLM alias tests (test_llava_aliases_build)
     "aya_vision",
     "chameleon",
