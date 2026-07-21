@@ -257,6 +257,32 @@ def test_prefill_embedder_matches_numpy_reference():
         np.testing.assert_allclose(got_trailing, exp_trailing, atol=1e-4, rtol=1e-4)
 
 
+def test_prefill_embedder_batched():
+    """Batched text_ids (B>1) produce per-row output matching the B=1 reference.
+
+    Guards the batch-broadcast of the batch=1 codec/special pieces: a naive
+    Concat of batch=1 pairs with batch=B text would fail the batch dim for B>1.
+    """
+    weights = _random_prefill_weights(13)
+    session = _build_prefill_embedder_session(weights)
+    rng = np.random.default_rng(99)
+    text_len = 16
+    text_ids = rng.integers(0, 1000, size=(3, text_len)).astype(np.int64)
+
+    out = session.run({"text_ids": text_ids})
+    got_prefill = out["prefill_embeds"]
+    got_trailing = out["trailing_text_embeds"]
+
+    assert got_prefill.shape == (3, 8, _HIDDEN)
+    assert got_trailing.shape == (3, text_len - 8, _HIDDEN)
+
+    # Each batch row must equal the single-row reference for that row's ids.
+    for b in range(3):
+        exp_prefill, exp_trailing = _numpy_prefill_reference(weights, text_ids[b : b + 1])
+        np.testing.assert_allclose(got_prefill[b : b + 1], exp_prefill, atol=1e-4, rtol=1e-4)
+        np.testing.assert_allclose(got_trailing[b : b + 1], exp_trailing, atol=1e-4, rtol=1e-4)
+
+
 def test_prefill_embedder_weights_shared_with_embedding():
     """preprocess_weights routes the embedding tables to the prefill embedder."""
     model = Qwen3TTSForConditionalGeneration(_TINY_CONFIG)

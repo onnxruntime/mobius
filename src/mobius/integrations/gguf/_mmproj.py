@@ -445,8 +445,16 @@ def build_gemma4_vlm_from_gguf(
         )
 
     # 2. Build the multimodal graph (decoder + vision + embedding [+ audio]).
+    #    Route through build_from_module so each component gets the EP-aware
+    #    optimize_model passes (GQA fusion, etc.) — the same pipeline the
+    #    text-only build_from_gguf path uses; calling Gemma4Task().build()
+    #    directly would skip those optimizations.
+    from mobius._builder import build_from_module
+
     module = Gemma4Model(config)
-    pkg = Gemma4Task().build(module, config)
+    pkg = build_from_module(
+        module, config, task=Gemma4Task(), execution_provider=execution_provider
+    )
     logger.info("Built Gemma4 VLM graph (%d components: %s)", len(pkg), list(pkg))
 
     # 3. Assemble the combined HF-multimodal state dict from both GGUFs. The

@@ -155,7 +155,14 @@ def _looks_like_multimodal(pkg: Any) -> bool:
         names = set(pkg.keys())
     except AttributeError:
         return False
-    return "decoder" in names and bool(names & {"vision_encoder", "audio_encoder"})
+    # Require the `embedding` fusion component: the multimodal metadata wires
+    # encoder(s) -> embedding -> decoder, so without it we would emit metadata
+    # referencing a non-existent embedding model.
+    return (
+        "decoder" in names
+        and "embedding" in names
+        and bool(names & {"vision_encoder", "audio_encoder"})
+    )
 
 
 def _looks_like_speech_to_text(pkg: Any) -> bool:
@@ -283,7 +290,20 @@ def _tts_component_kwargs(pkg: Any, config: Any) -> dict[str, Any]:
     kwargs["prefill_embedder_filename"] = (
         "talker_prefill_embedder/model.onnx" if "talker_prefill_embedder" in names else None
     )
+    kwargs["activation_dtype"] = _activation_dtype_tag(config)
     return kwargs
+
+
+def _activation_dtype_tag(config: Any) -> str:
+    """Map a model config's activation dtype to the metadata dtype tag.
+
+    The composite dataflow edges (inputs_embeds, encoder_hidden_states, …) carry
+    the model's activation dtype, so metadata must reflect it (fp16/bf16 builds
+    would otherwise be mislabeled fp32).
+    """
+    dtype = getattr(config, "dtype", None)
+    name = getattr(dtype, "name", "") or ""
+    return {"FLOAT16": "fp16", "BFLOAT16": "bf16"}.get(name.upper(), "fp32")
 
 
 def _multimodal_component_kwargs(pkg: Any) -> dict[str, str]:
@@ -428,6 +448,7 @@ def write_onnx_genai_config(
         path = write_multimodal_pipeline_metadata(
             output_dir,
             decoder_metadata=decoder_metadata,
+            activation_dtype=_activation_dtype_tag(resolved_config),
             **kwargs,
         )
         artifacts = {"inference_metadata": path}
@@ -443,6 +464,7 @@ def write_onnx_genai_config(
         path = write_speech_to_text_pipeline_metadata(
             output_dir,
             decoder_metadata=decoder_metadata,
+            activation_dtype=_activation_dtype_tag(resolved_config),
             **kwargs,
         )
         artifacts = {"inference_metadata": path}

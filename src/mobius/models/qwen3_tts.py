@@ -516,6 +516,22 @@ class Qwen3TTSTalkerPrefillEmbedder(nn.Module):
         text_vocab = tts.text_vocab_size if tts else 151936
         hidden = config.hidden_size
 
+        # The fixed TTS special-token ids and codec prefill ids are baked into
+        # the graph as Gather indices, so the embedding tables must be large
+        # enough to contain them, or the build would emit an out-of-bounds Gather.
+        max_text_id = max(_TTS_BOS_ID, _TTS_EOS_ID, _TTS_PAD_ID)
+        if text_vocab <= max_text_id:
+            raise ValueError(
+                f"text_vocab_size ({text_vocab}) must exceed the TTS special-token "
+                f"id {max_text_id}; the prefill embedder gathers those ids."
+            )
+        max_codec_id = max(_AUTO_CODEC_PREFILL_IDS)
+        if config.vocab_size <= max_codec_id:
+            raise ValueError(
+                f"config.vocab_size ({config.vocab_size}) must exceed the codec "
+                f"prefill id {max_codec_id}."
+            )
+
         # Same tables as the embedding model (shared weights, routed in
         # preprocess_weights). Text embedding + ResizeMLP projection.
         self.text_embedding = Embedding(text_vocab, text_hidden)
@@ -546,6 +562,17 @@ class Qwen3TTSTalkerPrefillEmbedder(nn.Module):
         # Projected text embeds for every prompt token.
         all_text_embeds = self._text_path(op, text_ids)  # (B, L, H)
 
+        # The special-token / codec-prefill pieces below are built at batch=1
+        # (they are constant across the batch). Broadcast them to the dynamic
+        # batch B of the text embeds before any Concat with batched tensors,
+        # otherwise Concat(axis=1) fails a batch-dimension mismatch for B > 1.
+        batch_dim = op.Shape(all_text_embeds, start=0, end=1)  # (1,) == [B]
+
+        def _to_batch(x: ir.Value) -> ir.Value:
+            """Expand a ``(1, S, H)`` tensor to ``(B, S, H)`` along the batch."""
+            tail = op.Shape(x, start=1)  # [S, H]
+            return op.Expand(x, op.Concat(batch_dim, tail, axis=0))
+
         # TTS special token embeds (bos, eos, pad) through the text path.
         special_ids = op.Unsqueeze(
             op.Constant(value_ints=[_TTS_BOS_ID, _TTS_EOS_ID, _TTS_PAD_ID]), [0]
@@ -570,9 +597,9 @@ class Qwen3TTSTalkerPrefillEmbedder(nn.Module):
         )  # (1, N-2, H)
         text_side = op.Concat(text_pad_rep, tts_bos, axis=1)  # (1, N-1, H)
         codec_side = op.Slice(codec_prefill, [0], [num_prefill - 1], [1])  # (1, N-1, H)
-        codec_text_pairs = op.Add(text_side, codec_side)  # (1, N-1, H)
+        codec_text_pairs = _to_batch(op.Add(text_side, codec_side))  # (B, N-1, H)
 
-        # First text token + last codec token (bos).
+        # First text token + last codec token (bos). Add broadcasts (1->B).
         first_text = op.Slice(all_text_embeds, [3], [4], [1])  # (B, 1, H)
         codec_bos = op.Slice(codec_prefill, [num_prefill - 1], [num_prefill], [1])  # (1, 1, H)
         first_text_codec = op.Add(first_text, codec_bos)  # (B, 1, H)
@@ -581,9 +608,11 @@ class Qwen3TTSTalkerPrefillEmbedder(nn.Module):
             role, codec_text_pairs, first_text_codec, axis=1
         )  # (B, 8, H)
 
-        # Trailing text: remaining tokens [4:-5] ++ tts_eos.
+        # Trailing text: remaining tokens [4:-5] ++ tts_eos (broadcast to B).
         remaining_text = op.Slice(all_text_embeds, [4], [-5], [1])  # (B, L-9, H)
-        trailing_text_embeds = op.Concat(remaining_text, tts_eos, axis=1)  # (B, L-8, H)
+        trailing_text_embeds = op.Concat(
+            remaining_text, _to_batch(tts_eos), axis=1
+        )  # (B, L-8, H)
 
         return prefill_embeds, trailing_text_embeds
 

@@ -355,6 +355,7 @@ def build_multimodal_pipeline_metadata(
     vision_encoder_filename: str | None = None,
     audio_encoder_filename: str | None = None,
     tokenizer_filename: str = "tokenizer.json",
+    activation_dtype: str = "fp32",
     decoder_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build metadata for an encoder-to-fusion-to-decoder multimodal pipeline.
@@ -396,7 +397,7 @@ def build_multimodal_pipeline_metadata(
             {
                 "from": f"{name}.{output_name}",
                 "to": f"embedding.{output_name}",
-                "dtype": "fp32",
+                "dtype": activation_dtype,
                 "device_transfer": False,
             }
         )
@@ -436,7 +437,7 @@ def build_multimodal_pipeline_metadata(
         {
             "from": "embedding.inputs_embeds",
             "to": "decoder.inputs_embeds",
-            "dtype": "fp32",
+            "dtype": activation_dtype,
             "device_transfer": False,
         }
     )
@@ -487,6 +488,7 @@ def build_speech_to_text_pipeline_metadata(
     encoder_filename: str = "encoder/model.onnx",
     decoder_filename: str = "decoder/model.onnx",
     tokenizer_filename: str = "tokenizer.json",
+    activation_dtype: str = "fp32",
     decoder_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build metadata for a cross-attention encoder-decoder ASR pipeline.
@@ -523,7 +525,7 @@ def build_speech_to_text_pipeline_metadata(
             {
                 "from": "encoder.encoder_hidden_states",
                 "to": "decoder.encoder_hidden_states",
-                "dtype": "fp32",
+                "dtype": activation_dtype,
                 "device_transfer": False,
             }
         ],
@@ -650,6 +652,7 @@ def build_tts_pipeline_metadata(
     pre_embedder_filename: str = "talker_step_embedder/model.onnx",
     prefill_embedder_filename: str | None = "talker_prefill_embedder/model.onnx",
     tokenizer_filename: str = "tokenizer.json",
+    activation_dtype: str = "fp32",
     decoder_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build metadata for a pre-embedder-driven multi-decoder TTS pipeline.
@@ -718,13 +721,13 @@ def build_tts_pipeline_metadata(
         {
             "from": "talker_step_embedder.inputs_embeds",
             "to": "talker.inputs_embeds",
-            "dtype": "fp32",
+            "dtype": activation_dtype,
             "device_transfer": False,
         },
         {
             "from": "talker.last_hidden_state",
             "to": "code_predictor.inputs_embeds",
-            "dtype": "fp32",
+            "dtype": activation_dtype,
             "device_transfer": False,
         },
     ]

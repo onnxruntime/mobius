@@ -160,7 +160,9 @@ def _make_lm_head(config: Gemma4Config) -> nn.Module:
     token-embedding data at load time).
     """
     if _text_lm_head_quantized(config):
-        return _text_linear_class(config)(config.hidden_size, config.vocab_size, bias=False)
+        linear_cls = _text_linear_class(config)
+        if linear_cls is not None:
+            return linear_cls(config.hidden_size, config.vocab_size, bias=False)
     return Linear(config.hidden_size, config.vocab_size, bias=False)
 
 

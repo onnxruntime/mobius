@@ -174,7 +174,11 @@ def _dict_to_pretrained_config(d: dict):
             raw_rope = {k: val[k] for k in rope_keys if k in val}
             nested = _dict_to_pretrained_config(val)
             for k, v in raw_rope.items():
-                if getattr(nested, k, None) is None:
+                # The raw config.json value is authoritative for our extractors.
+                # Restore it whenever HF standardization dropped (None) OR
+                # rewrote it to a different value, so non-standard formats
+                # (e.g. Qwen3-TTS's ``interleaved``/``mrope_section``) survive.
+                if getattr(nested, k, None) != v:
                     setattr(nested, k, v)
             setattr(config, key, nested)
     return config
