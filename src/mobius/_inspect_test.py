@@ -8,7 +8,12 @@ from types import SimpleNamespace
 import pytest
 
 import mobius
-from mobius._inspect import ComponentInfo, _get_hf_component_sources, inspect_components
+from mobius._inspect import (
+    ComponentInfo,
+    _get_hf_component_sources,
+    _resolve_task_model_type_and_config,
+    inspect_components,
+)
 from mobius._registry import registry
 from mobius.tasks import get_task
 
@@ -233,6 +238,22 @@ def test_qwen3_5_moe_vl_detected_from_vision_config(monkeypatch):
     )
     names = {c.name for c in inspect_components("fake/qwen-vl")}
     assert "vision_encoder" in names and "decoder" in names
+
+
+def test_ctc_architecture_uses_mms_registration(monkeypatch):
+    hf_config = SimpleNamespace(
+        model_type="wav2vec2",
+        architectures=["Wav2Vec2ForCTC"],
+    )
+    _patch_autoconfig(monkeypatch, hf_config)
+
+    task, model_type, resolved_config = _resolve_task_model_type_and_config(
+        "fake/wav2vec2-ctc",
+        task=None,
+        trust_remote_code=False,
+    )
+
+    assert (task, model_type, resolved_config) == ("ctc-asr", "mms", hf_config)
 
 
 def test_unresolvable_config_raises(monkeypatch):
