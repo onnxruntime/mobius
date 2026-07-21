@@ -269,8 +269,14 @@ def _extract_mrope_fields(config) -> dict:
     rope_scaling = getattr(config, "rope_scaling", None) or {}
     rope_parameters = getattr(config, "rope_parameters", None) or {}
     result: dict = {}
-    mrope_interleaved = rope_scaling.get("mrope_interleaved", False) or rope_parameters.get(
-        "mrope_interleaved", False
+    # Some models (e.g. Qwen3-TTS talker) spell the interleaved flag as the
+    # bare ``interleaved`` key inside ``rope_scaling`` rather than the
+    # ``mrope_interleaved`` name that Qwen3-VL uses. Accept both spellings.
+    mrope_interleaved = (
+        rope_scaling.get("mrope_interleaved", False)
+        or rope_scaling.get("interleaved", False)
+        or rope_parameters.get("mrope_interleaved", False)
+        or rope_parameters.get("interleaved", False)
     )
     if mrope_interleaved:
         result["mrope_interleaved"] = True

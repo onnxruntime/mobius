@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Emit onnx-genai ``inference_metadata`` for diffusion pipelines.
+"""Emit onnx-genai ``inference_metadata`` for multi-model pipelines.
 
 Mobius builds the neural components of a diffusion model (denoiser transformer,
 VAE, and — externally — a text encoder) as separate ONNX graphs, but does not
@@ -20,12 +20,10 @@ The emitted contract matches onnx-genai's pipeline schema:
 ``denoiser`` / ``num_steps`` / ``timestep_input`` / ``scheduler_config`` /
 ``cfg_conditioning_input`` and denoiser self-edge loop-carried dataflow).
 
-Note:
-    This module covers *diffusion* pipelines only. Autoregressive
-    decoder-only LLM metadata (``model.attention`` + ``kv_cache``) lives in the
-    sibling :mod:`mobius.integrations.onnx_genai.decoder_metadata` module;
-    :func:`mobius.integrations.onnx_genai.write_onnx_genai_config` dispatches to
-    whichever applies for a built package.
+Autoregressive decoder-only LLM metadata (``model.attention`` + ``kv_cache``)
+lives in the sibling :mod:`mobius.integrations.onnx_genai.decoder_metadata`
+module. Composite multimodal pipelines retain those decoder properties while
+declaring their encoder, fusion, and decoder execution stages here.
 """
 
 from __future__ import annotations
@@ -348,6 +346,458 @@ def build_diffusion_pipeline_metadata(
     if phases:
         pipeline["phases"] = phases
     return {"pipeline": pipeline}
+
+
+def build_multimodal_pipeline_metadata(
+    *,
+    decoder_filename: str = "decoder.onnx",
+    embedding_filename: str = "embedding.onnx",
+    vision_encoder_filename: str | None = None,
+    audio_encoder_filename: str | None = None,
+    tokenizer_filename: str = "tokenizer.json",
+    activation_dtype: str = "fp32",
+    decoder_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build metadata for an encoder-to-fusion-to-decoder multimodal pipeline.
+
+    At least one modality encoder is required. Each encoder and the embedding
+    fusion model runs once for the prompt; the decoder then runs
+    autoregressively for every generation step.
+
+    Args:
+        decoder_filename: Decoder ONNX filename relative to the package root.
+        embedding_filename: Embedding fusion ONNX filename.
+        vision_encoder_filename: Optional vision encoder ONNX filename.
+        audio_encoder_filename: Optional audio encoder ONNX filename.
+        tokenizer_filename: Tokenizer filename used by the decoder.
+        decoder_metadata: Optional output from
+            :func:`decoder_metadata_from_config`. Its decoder capabilities are
+            retained at the document top level.
+
+    Returns:
+        A dict with a top-level ``pipeline`` key and any decoder capabilities.
+    """
+    if vision_encoder_filename is None and audio_encoder_filename is None:
+        raise ValueError("a multimodal pipeline requires a vision or audio encoder")
+
+    models: dict[str, Any] = {}
+    dataflow: list[dict[str, Any]] = []
+    stages: list[dict[str, Any]] = []
+    phases: dict[str, Any] = {}
+
+    def add_encoder(
+        name: str,
+        filename: str,
+        model_type: str,
+        output_name: str,
+        stage_name: str,
+    ) -> None:
+        models[name] = {"filename": filename, "type": model_type}
+        dataflow.append(
+            {
+                "from": f"{name}.{output_name}",
+                "to": f"embedding.{output_name}",
+                "dtype": activation_dtype,
+                "device_transfer": False,
+            }
+        )
+        stages.append(
+            {
+                "name": stage_name,
+                "strategy": {"kind": "single_pass", "model": name},
+                "run_on": "prompt_only",
+            }
+        )
+        phases[name] = {"run_on": "prompt_only"}
+
+    if vision_encoder_filename is not None:
+        add_encoder(
+            "vision_encoder",
+            vision_encoder_filename,
+            "vision_encoder",
+            "image_features",
+            "encode_vision",
+        )
+    if audio_encoder_filename is not None:
+        add_encoder(
+            "audio_encoder",
+            audio_encoder_filename,
+            "audio_encoder",
+            "audio_features",
+            "encode_audio",
+        )
+
+    models["embedding"] = {"filename": embedding_filename, "type": "encoder"}
+    models["decoder"] = {
+        "filename": decoder_filename,
+        "type": "decoder",
+        "tokenizer": tokenizer_filename,
+    }
+    dataflow.append(
+        {
+            "from": "embedding.inputs_embeds",
+            "to": "decoder.inputs_embeds",
+            "dtype": activation_dtype,
+            "device_transfer": False,
+        }
+    )
+    stages.extend(
+        [
+            {
+                "name": "fuse_embeddings",
+                "strategy": {"kind": "single_pass", "model": "embedding"},
+                "run_on": "prompt_only",
+            },
+            {
+                "name": "decode",
+                "strategy": {"kind": "autoregressive", "decoder": "decoder"},
+                "run_on": "every_step",
+            },
+        ]
+    )
+    phases["embedding"] = {"run_on": "prompt_only"}
+    phases["decoder"] = {"run_on": "every_step"}
+
+    metadata = dict(decoder_metadata or {})
+    metadata["pipeline"] = {
+        "models": models,
+        "dataflow": dataflow,
+        "strategy": {"kind": "composite", "stages": stages},
+        "phases": phases,
+    }
+    return metadata
+
+
+def write_multimodal_pipeline_metadata(
+    directory: str,
+    *,
+    filename: str = "inference_metadata.yaml",
+    **kwargs: Any,
+) -> str:
+    """Build and write composite multimodal metadata into ``directory``."""
+    metadata = build_multimodal_pipeline_metadata(**kwargs)
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, filename)
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(metadata, handle, sort_keys=False)
+    return path
+
+
+def build_speech_to_text_pipeline_metadata(
+    *,
+    encoder_filename: str = "encoder/model.onnx",
+    decoder_filename: str = "decoder/model.onnx",
+    tokenizer_filename: str = "tokenizer.json",
+    activation_dtype: str = "fp32",
+    decoder_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build metadata for a cross-attention encoder-decoder ASR pipeline.
+
+    This is the Whisper-style speech-to-text shape (DESIGN.md §20): the audio
+    encoder runs once for the prompt and produces ``encoder_hidden_states``,
+    which the autoregressive decoder consumes via cross-attention (distinct from
+    the multimodal ``inputs_embeds`` fusion shape). The decoder then runs for
+    every generation step.
+
+    Args:
+        encoder_filename: Audio encoder ONNX filename relative to the package
+            root.
+        decoder_filename: Decoder ONNX filename relative to the package root.
+        tokenizer_filename: Tokenizer filename used by the decoder.
+        decoder_metadata: Optional output from
+            :func:`decoder_metadata_from_config`; its decoder capabilities are
+            retained at the document top level.
+
+    Returns:
+        A dict with a top-level ``pipeline`` key and any decoder capabilities.
+    """
+    metadata = dict(decoder_metadata or {})
+    metadata["pipeline"] = {
+        "models": {
+            "encoder": {"filename": encoder_filename, "type": "encoder"},
+            "decoder": {
+                "filename": decoder_filename,
+                "type": "decoder",
+                "tokenizer": tokenizer_filename,
+            },
+        },
+        "dataflow": [
+            {
+                "from": "encoder.encoder_hidden_states",
+                "to": "decoder.encoder_hidden_states",
+                "dtype": activation_dtype,
+                "device_transfer": False,
+            }
+        ],
+        "strategy": {
+            "kind": "composite",
+            "stages": [
+                {
+                    "name": "encode_audio",
+                    "strategy": {"kind": "single_pass", "model": "encoder"},
+                    "run_on": "prompt_only",
+                },
+                {
+                    "name": "decode_transcript",
+                    "strategy": {"kind": "autoregressive", "decoder": "decoder"},
+                    "run_on": "every_step",
+                },
+            ],
+        },
+        "phases": {
+            "encoder": {"run_on": "prompt_only"},
+            "decoder": {"run_on": "every_step"},
+        },
+    }
+    return metadata
+
+
+def write_speech_to_text_pipeline_metadata(
+    directory: str,
+    *,
+    filename: str = "inference_metadata.yaml",
+    **kwargs: Any,
+) -> str:
+    """Build and write composite speech-to-text metadata into ``directory``."""
+    metadata = build_speech_to_text_pipeline_metadata(**kwargs)
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, filename)
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(metadata, handle, sort_keys=False)
+    return path
+
+
+def build_audio_codec_pipeline_metadata(
+    *,
+    encoder_filename: str = "encoder/model.onnx",
+    decoder_filename: str = "decoder/model.onnx",
+    codes_dtype: str = "int64",
+) -> dict[str, Any]:
+    """Build metadata for an audio-to-audio neural codec pipeline.
+
+    This is the pure single-pass composite shape (DESIGN.md §20): an audio
+    encoder maps a waveform to ``codes``, and a decoder reconstructs a waveform
+    from those codes. Both stages run once over the shared tensor pool (there is
+    no autoregressive decode and no tokenizer), wired ``encoder.codes ->
+    decoder.codes``.
+
+    Args:
+        encoder_filename: Waveform-to-codes encoder ONNX filename.
+        decoder_filename: Codes-to-waveform decoder ONNX filename.
+        codes_dtype: Metadata dtype of the ``codes`` tensor exchanged between the
+            two stages (neural codecs typically emit ``int64`` code indices).
+
+    Returns:
+        A dict with a top-level ``pipeline`` key. No decoder capabilities are
+        emitted because the pipeline produces tensors, not tokens.
+    """
+    return {
+        "pipeline": {
+            "models": {
+                "encoder": {"filename": encoder_filename, "type": "audio_encoder"},
+                "decoder": {"filename": decoder_filename, "type": "vocoder"},
+            },
+            "dataflow": [
+                {
+                    "from": "encoder.codes",
+                    "to": "decoder.codes",
+                    "dtype": codes_dtype,
+                    "device_transfer": False,
+                }
+            ],
+            "strategy": {
+                "kind": "composite",
+                "stages": [
+                    {
+                        "name": "encode_waveform",
+                        "strategy": {"kind": "single_pass", "model": "encoder"},
+                        "run_on": "prompt_only",
+                    },
+                    {
+                        "name": "decode_waveform",
+                        "strategy": {"kind": "single_pass", "model": "decoder"},
+                        "run_on": "prompt_only",
+                    },
+                ],
+            },
+            "phases": {
+                "encoder": {"run_on": "prompt_only"},
+                "decoder": {"run_on": "prompt_only"},
+            },
+        }
+    }
+
+
+def write_audio_codec_pipeline_metadata(
+    directory: str,
+    *,
+    filename: str = "inference_metadata.yaml",
+    **kwargs: Any,
+) -> str:
+    """Build and write composite audio-codec metadata into ``directory``."""
+    metadata = build_audio_codec_pipeline_metadata(**kwargs)
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, filename)
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(metadata, handle, sort_keys=False)
+    return path
+
+
+def build_tts_pipeline_metadata(
+    *,
+    num_code_groups: int,
+    max_frames: int = 2000,
+    talker_filename: str = "talker/model.onnx",
+    code_predictor_filename: str = "code_predictor/model.onnx",
+    pre_embedder_filename: str = "talker_step_embedder/model.onnx",
+    prefill_embedder_filename: str | None = "talker_prefill_embedder/model.onnx",
+    tokenizer_filename: str = "tokenizer.json",
+    activation_dtype: str = "fp32",
+    decoder_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build metadata for a pre-embedder-driven multi-decoder TTS pipeline.
+
+    This is the real Qwen3-TTS shape (DESIGN.md §20.3, ``nested_autoregressive``
+    with the optional ``pre_embedder`` extension): an OUTER ``talker`` AR loop
+    where each frame drives an INNER ``code_predictor`` AR loop of
+    ``num_code_groups`` steps (seeded by the talker's ``last_hidden_state``).
+    Unlike the plain nested shape, the talker is **not** driven by ``input_ids``:
+    each frame its ``inputs_embeds`` is materialized from the previous frame's
+    codes by the ``talker_step_embedder`` pre-embedder (``frame_codes
+    [+ text_embed] -> inputs_embeds``), keeping the engine generic.
+
+    When ``prefill_embedder_filename`` is set (the default), a
+    ``talker_prefill_embedder`` prompt-phase component is also emitted. It maps
+    the tokenized prompt ``text_ids -> prefill_embeds + trailing_text_embeds``:
+    the runtime feeds ``prefill_embeds`` to the talker on frame 0 and threads
+    ``trailing_text_embeds[:, k-1, :]`` as the pre-embedder's ``text_embed`` on
+    frames k>=1 (see the ``prefill_embedder`` field). Pass ``None`` to emit the
+    prefill-less shape (talker frame 0 + ``text_embed`` fed zeros).
+
+    The engine-driven components are emitted (``talker``, ``code_predictor``,
+    ``talker_step_embedder``, and ``talker_prefill_embedder`` when present). The
+    package's ``embedding`` and optional ``speaker_encoder`` models are internal
+    weight sources already folded into the pre-/prefill-embedders, so they are
+    not declared as pipeline models. There is **no in-package vocoder** — the
+    assembled ``talker.output_codes`` are decoded by a separate codec model.
+
+    Args:
+        num_code_groups: Codes collected per outer frame (RVQ residual count).
+        max_frames: Maximum number of outer talker frames to generate.
+        talker_filename: Outer decoder (talker) ONNX filename.
+        code_predictor_filename: Inner decoder ONNX filename.
+        pre_embedder_filename: ``talker_step_embedder`` ONNX filename.
+        prefill_embedder_filename: ``talker_prefill_embedder`` ONNX filename, or
+            ``None`` to omit the prefill/trailing-text path.
+        tokenizer_filename: Tokenizer filename used by the talker.
+        decoder_metadata: Optional output from
+            :func:`decoder_metadata_from_config`; its decoder capabilities are
+            retained at the document top level.
+
+    Returns:
+        A dict with a top-level ``pipeline`` key and any decoder capabilities.
+    """
+    if num_code_groups < 1:
+        raise ValueError("num_code_groups must be at least 1")
+    if max_frames < 1:
+        raise ValueError("max_frames must be at least 1")
+
+    models: dict[str, Any] = {
+        "talker": {
+            "filename": talker_filename,
+            "type": "decoder",
+            "tokenizer": tokenizer_filename,
+        },
+        "talker_step_embedder": {
+            "filename": pre_embedder_filename,
+            "type": "embedding",
+        },
+        "code_predictor": {
+            "filename": code_predictor_filename,
+            "type": "decoder",
+        },
+    }
+    dataflow: list[dict[str, Any]] = [
+        {
+            "from": "talker_step_embedder.inputs_embeds",
+            "to": "talker.inputs_embeds",
+            "dtype": activation_dtype,
+            "device_transfer": False,
+        },
+        {
+            "from": "talker.last_hidden_state",
+            "to": "code_predictor.inputs_embeds",
+            "dtype": activation_dtype,
+            "device_transfer": False,
+        },
+    ]
+    stage_strategy: dict[str, Any] = {
+        "kind": "nested_autoregressive",
+        "outer": "talker",
+        "inner": "code_predictor",
+        "pre_embedder": {
+            "component": "talker_step_embedder",
+            "frame_codes_input": "frame_codes",
+            "text_embed_input": "text_embed",
+        },
+        "num_code_groups": num_code_groups,
+        "max_tokens": max_frames,
+    }
+    phases: dict[str, Any] = {
+        "talker": {"run_on": "every_step"},
+        "talker_step_embedder": {"run_on": "on_demand"},
+        "code_predictor": {"run_on": "every_step"},
+    }
+
+    if prefill_embedder_filename is not None:
+        models["talker_prefill_embedder"] = {
+            "filename": prefill_embedder_filename,
+            "type": "embedding",
+        }
+        # Runs once in the prompt phase; the runtime seeds the declared
+        # `prompt_input` with the tokenized prompt and reads the two named
+        # outputs from the pool. Every port is declared explicitly (the engine
+        # never guesses tensor names).
+        stage_strategy["prefill_embedder"] = {
+            "component": "talker_prefill_embedder",
+            "prompt_input": "text_ids",
+            "prefill_output": "prefill_embeds",
+            "trailing_output": "trailing_text_embeds",
+        }
+        phases["talker_prefill_embedder"] = {"run_on": "prompt_only"}
+
+    metadata = dict(decoder_metadata or {})
+    metadata["pipeline"] = {
+        "models": models,
+        "dataflow": dataflow,
+        "strategy": {
+            "kind": "composite",
+            "stages": [
+                {
+                    "name": "generate_codes",
+                    "strategy": stage_strategy,
+                    "run_on": "every_step",
+                },
+            ],
+        },
+        "phases": phases,
+    }
+    return metadata
+
+
+def write_tts_pipeline_metadata(
+    directory: str,
+    *,
+    filename: str = "inference_metadata.yaml",
+    **kwargs: Any,
+) -> str:
+    """Build and write pre-embedder-driven TTS metadata into ``directory``."""
+    metadata = build_tts_pipeline_metadata(**kwargs)
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, filename)
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(metadata, handle, sort_keys=False)
+    return path
 
 
 def write_diffusion_pipeline_metadata(

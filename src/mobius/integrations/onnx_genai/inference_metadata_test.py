@@ -14,8 +14,11 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
     build_diffusion_pipeline_metadata,
     build_language_diffusion_pipeline_metadata,
+    build_multimodal_pipeline_metadata,
+    build_tts_pipeline_metadata,
     load_diffusers_scheduler_config,
     write_diffusion_pipeline_metadata,
+    write_tts_pipeline_metadata,
 )
 
 
@@ -270,4 +273,224 @@ class TestLanguageDiffusionMetadata:
             temperature=0.0,
             guidance_scale=2.5,
         )
+        jsonschema.validate(instance=meta, schema=schema)
+
+
+class TestBuildMultimodalPipelineMetadata:
+    def test_vision_only_pipeline(self):
+        metadata = build_multimodal_pipeline_metadata(
+            vision_encoder_filename="vision_encoder.onnx"
+        )
+
+        assert metadata == {
+            "pipeline": {
+                "models": {
+                    "vision_encoder": {
+                        "filename": "vision_encoder.onnx",
+                        "type": "vision_encoder",
+                    },
+                    "embedding": {"filename": "embedding.onnx", "type": "encoder"},
+                    "decoder": {
+                        "filename": "decoder.onnx",
+                        "type": "decoder",
+                        "tokenizer": "tokenizer.json",
+                    },
+                },
+                "dataflow": [
+                    {
+                        "from": "vision_encoder.image_features",
+                        "to": "embedding.image_features",
+                        "dtype": "fp32",
+                        "device_transfer": False,
+                    },
+                    {
+                        "from": "embedding.inputs_embeds",
+                        "to": "decoder.inputs_embeds",
+                        "dtype": "fp32",
+                        "device_transfer": False,
+                    },
+                ],
+                "strategy": {
+                    "kind": "composite",
+                    "stages": [
+                        {
+                            "name": "encode_vision",
+                            "strategy": {
+                                "kind": "single_pass",
+                                "model": "vision_encoder",
+                            },
+                            "run_on": "prompt_only",
+                        },
+                        {
+                            "name": "fuse_embeddings",
+                            "strategy": {
+                                "kind": "single_pass",
+                                "model": "embedding",
+                            },
+                            "run_on": "prompt_only",
+                        },
+                        {
+                            "name": "decode",
+                            "strategy": {
+                                "kind": "autoregressive",
+                                "decoder": "decoder",
+                            },
+                            "run_on": "every_step",
+                        },
+                    ],
+                },
+                "phases": {
+                    "vision_encoder": {"run_on": "prompt_only"},
+                    "embedding": {"run_on": "prompt_only"},
+                    "decoder": {"run_on": "every_step"},
+                },
+            }
+        }
+
+    def test_vision_and_audio_pipeline(self):
+        metadata = build_multimodal_pipeline_metadata(
+            vision_encoder_filename="vision_encoder.onnx",
+            audio_encoder_filename="audio_encoder.onnx",
+        )
+        pipeline = metadata["pipeline"]
+
+        assert pipeline["models"] == {
+            "vision_encoder": {
+                "filename": "vision_encoder.onnx",
+                "type": "vision_encoder",
+            },
+            "audio_encoder": {
+                "filename": "audio_encoder.onnx",
+                "type": "audio_encoder",
+            },
+            "embedding": {"filename": "embedding.onnx", "type": "encoder"},
+            "decoder": {
+                "filename": "decoder.onnx",
+                "type": "decoder",
+                "tokenizer": "tokenizer.json",
+            },
+        }
+        assert pipeline["dataflow"] == [
+            {
+                "from": "vision_encoder.image_features",
+                "to": "embedding.image_features",
+                "dtype": "fp32",
+                "device_transfer": False,
+            },
+            {
+                "from": "audio_encoder.audio_features",
+                "to": "embedding.audio_features",
+                "dtype": "fp32",
+                "device_transfer": False,
+            },
+            {
+                "from": "embedding.inputs_embeds",
+                "to": "decoder.inputs_embeds",
+                "dtype": "fp32",
+                "device_transfer": False,
+            },
+        ]
+        assert pipeline["strategy"]["stages"] == [
+            {
+                "name": "encode_vision",
+                "strategy": {"kind": "single_pass", "model": "vision_encoder"},
+                "run_on": "prompt_only",
+            },
+            {
+                "name": "encode_audio",
+                "strategy": {"kind": "single_pass", "model": "audio_encoder"},
+                "run_on": "prompt_only",
+            },
+            {
+                "name": "fuse_embeddings",
+                "strategy": {"kind": "single_pass", "model": "embedding"},
+                "run_on": "prompt_only",
+            },
+            {
+                "name": "decode",
+                "strategy": {"kind": "autoregressive", "decoder": "decoder"},
+                "run_on": "every_step",
+            },
+        ]
+
+
+class TestBuildTTSPipelineMetadata:
+    """Pre-embedder-driven multi-decoder TTS (Qwen3-TTS) metadata."""
+
+    def test_minimal_nested_autoregressive_with_pre_embedder(self):
+        meta = build_tts_pipeline_metadata(
+            num_code_groups=16, max_frames=1000, prefill_embedder_filename=None
+        )
+        pipe = meta["pipeline"]
+        assert set(pipe["models"]) == {"talker", "talker_step_embedder", "code_predictor"}
+        assert pipe["models"]["talker"]["type"] == "decoder"
+        assert pipe["models"]["talker"]["tokenizer"] == "tokenizer.json"
+        assert pipe["models"]["talker_step_embedder"]["type"] == "embedding"
+
+        stage = pipe["strategy"]["stages"][0]["strategy"]
+        assert stage["kind"] == "nested_autoregressive"
+        assert stage["outer"] == "talker"
+        assert stage["inner"] == "code_predictor"
+        assert stage["pre_embedder"]["component"] == "talker_step_embedder"
+        assert stage["pre_embedder"]["frame_codes_input"] == "frame_codes"
+        assert "prefill_embedder" not in stage
+        assert stage["num_code_groups"] == 16
+        assert stage["max_tokens"] == 1000
+
+        # Required pre-embedder feed edge + inner seed edge.
+        assert {
+            "from": "talker_step_embedder.inputs_embeds",
+            "to": "talker.inputs_embeds",
+            "dtype": "fp32",
+            "device_transfer": False,
+        } in pipe["dataflow"]
+        assert {
+            "from": "talker.last_hidden_state",
+            "to": "code_predictor.inputs_embeds",
+            "dtype": "fp32",
+            "device_transfer": False,
+        } in pipe["dataflow"]
+        # No in-package vocoder.
+        assert "vocoder" not in pipe["models"]
+        # Pre-embedder is a loop-internal on_demand component.
+        assert pipe["phases"]["talker_step_embedder"]["run_on"] == "on_demand"
+
+    def test_with_prefill_embedder(self):
+        # Default emits the prefill/trailing-text component (prompt phase).
+        meta = build_tts_pipeline_metadata(num_code_groups=16)
+        pipe = meta["pipeline"]
+        assert "talker_prefill_embedder" in pipe["models"]
+        assert pipe["models"]["talker_prefill_embedder"]["type"] == "embedding"
+        stage = pipe["strategy"]["stages"][0]["strategy"]
+        assert stage["prefill_embedder"]["component"] == "talker_prefill_embedder"
+        assert stage["prefill_embedder"]["prompt_input"] == "text_ids"
+        assert stage["prefill_embedder"]["prefill_output"] == "prefill_embeds"
+        assert stage["prefill_embedder"]["trailing_output"] == "trailing_text_embeds"
+        assert pipe["phases"]["talker_prefill_embedder"]["run_on"] == "prompt_only"
+
+    def test_rejects_invalid_code_groups(self):
+        with pytest.raises(ValueError, match="num_code_groups"):
+            build_tts_pipeline_metadata(num_code_groups=0)
+
+    def test_write_roundtrip(self, tmp_path):
+        path = write_tts_pipeline_metadata(str(tmp_path), num_code_groups=8)
+        with open(path) as handle:
+            loaded = yaml.safe_load(handle)
+        stage = loaded["pipeline"]["strategy"]["stages"][0]["strategy"]
+        assert stage["pre_embedder"]["component"] == "talker_step_embedder"
+        assert stage["pre_embedder"]["frame_codes_input"] == "frame_codes"
+        assert stage["num_code_groups"] == 8
+
+    def test_matches_onnx_genai_json_schema(self):
+        """Emitted TTS metadata validates against onnx-genai's published schema."""
+        schema_path = _onnx_genai_schema_path()
+        if schema_path is None:
+            pytest.skip("onnx-genai schema not found (set ONNX_GENAI_SCHEMA)")
+        import json
+
+        import jsonschema
+
+        with open(schema_path) as handle:
+            schema = json.load(handle)
+        meta = build_tts_pipeline_metadata(num_code_groups=16, max_frames=2000)
         jsonschema.validate(instance=meta, schema=schema)
