@@ -732,7 +732,11 @@ def build_tts_pipeline_metadata(
         "kind": "nested_autoregressive",
         "outer": "talker",
         "inner": "code_predictor",
-        "pre_embedder": "talker_step_embedder",
+        "pre_embedder": {
+            "component": "talker_step_embedder",
+            "frame_codes_input": "frame_codes",
+            "text_embed_input": "text_embed",
+        },
         "num_code_groups": num_code_groups,
         "max_tokens": max_frames,
     }
@@ -747,10 +751,16 @@ def build_tts_pipeline_metadata(
             "filename": prefill_embedder_filename,
             "type": "embedding",
         }
-        # Runs once in the prompt phase; the runtime auto-seeds its `text_ids`
-        # with the tokenized prompt and reads prefill_embeds/trailing_text_embeds
-        # from the pool (resolved by name — no dataflow edges needed).
-        stage_strategy["prefill_embedder"] = "talker_prefill_embedder"
+        # Runs once in the prompt phase; the runtime seeds the declared
+        # `prompt_input` with the tokenized prompt and reads the two named
+        # outputs from the pool. Every port is declared explicitly (the engine
+        # never guesses tensor names).
+        stage_strategy["prefill_embedder"] = {
+            "component": "talker_prefill_embedder",
+            "prompt_input": "text_ids",
+            "prefill_output": "prefill_embeds",
+            "trailing_output": "trailing_text_embeds",
+        }
         phases["talker_prefill_embedder"] = {"run_on": "prompt_only"}
 
     metadata = dict(decoder_metadata or {})

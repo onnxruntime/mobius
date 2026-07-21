@@ -431,7 +431,8 @@ class TestBuildTTSPipelineMetadata:
         assert stage["kind"] == "nested_autoregressive"
         assert stage["outer"] == "talker"
         assert stage["inner"] == "code_predictor"
-        assert stage["pre_embedder"] == "talker_step_embedder"
+        assert stage["pre_embedder"]["component"] == "talker_step_embedder"
+        assert stage["pre_embedder"]["frame_codes_input"] == "frame_codes"
         assert "prefill_embedder" not in stage
         assert stage["num_code_groups"] == 16
         assert stage["max_tokens"] == 1000
@@ -461,7 +462,10 @@ class TestBuildTTSPipelineMetadata:
         assert "talker_prefill_embedder" in pipe["models"]
         assert pipe["models"]["talker_prefill_embedder"]["type"] == "embedding"
         stage = pipe["strategy"]["stages"][0]["strategy"]
-        assert stage["prefill_embedder"] == "talker_prefill_embedder"
+        assert stage["prefill_embedder"]["component"] == "talker_prefill_embedder"
+        assert stage["prefill_embedder"]["prompt_input"] == "text_ids"
+        assert stage["prefill_embedder"]["prefill_output"] == "prefill_embeds"
+        assert stage["prefill_embedder"]["trailing_output"] == "trailing_text_embeds"
         assert pipe["phases"]["talker_prefill_embedder"]["run_on"] == "prompt_only"
 
     def test_rejects_invalid_code_groups(self):
@@ -473,7 +477,8 @@ class TestBuildTTSPipelineMetadata:
         with open(path) as handle:
             loaded = yaml.safe_load(handle)
         stage = loaded["pipeline"]["strategy"]["stages"][0]["strategy"]
-        assert stage["pre_embedder"] == "talker_step_embedder"
+        assert stage["pre_embedder"]["component"] == "talker_step_embedder"
+        assert stage["pre_embedder"]["frame_codes_input"] == "frame_codes"
         assert stage["num_code_groups"] == 8
 
     def test_matches_onnx_genai_json_schema(self):

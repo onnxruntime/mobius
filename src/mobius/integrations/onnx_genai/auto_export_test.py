@@ -417,8 +417,8 @@ def test_dispatch_multi_decoder_tts_with_pre_embedder(tmp_path):
     }
     stage = pipeline["strategy"]["stages"][0]["strategy"]
     assert stage["kind"] == "nested_autoregressive"
-    assert stage["pre_embedder"] == "talker_step_embedder"
-    assert stage["prefill_embedder"] == "talker_prefill_embedder"
+    assert stage["pre_embedder"]["component"] == "talker_step_embedder"
+    assert stage["prefill_embedder"]["component"] == "talker_prefill_embedder"
     assert stage["num_code_groups"] == 16
     assert pipeline["phases"]["talker_prefill_embedder"]["run_on"] == "prompt_only"
     assert {
