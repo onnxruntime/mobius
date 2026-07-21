@@ -47,6 +47,7 @@ __all__ = [
     "MoshiDepformerTask",
     "MoshiTemporalTask",
     "MultiModalTask",
+    "MultiTalkerRNNTTask",
     "OPSET_VERSION",
     "ObjectDetectionTask",
     "Phi4MMMultiModalTask",
@@ -102,6 +103,7 @@ from mobius.tasks._image_classification import ImageClassificationTask
 from mobius.tasks._masked_diffusion import MaskedDiffusionTask
 from mobius.tasks._moshi import MoshiDepformerTask, MoshiTemporalTask
 from mobius.tasks._multimodal import MultiModalTask
+from mobius.tasks._multitalker_rnnt import MultiTalkerRNNTTask
 from mobius.tasks._object_detection import ObjectDetectionTask
 from mobius.tasks._phi4mm_multimodal import Phi4MMMultiModalTask
 from mobius.tasks._qwen35_mtp import Qwen35MtpTask
@@ -161,6 +163,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "gemma4-assistant": Gemma4AssistantTask,
     "hunyuan-vl-mot": HunYuanVLMoTTask,
     "multimodal": MultiModalTask,
+    "multitalker-rnnt": MultiTalkerRNNTTask,
     "phi4mm-multimodal": Phi4MMMultiModalTask,
     "fun-asr-speech-language": FunASRSpeechLanguageTask,
     "fastconformer-rnnt": RNNTTask,
