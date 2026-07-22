@@ -8,9 +8,11 @@ from __future__ import annotations
 import dataclasses
 import os
 
+import onnx_ir as ir
 import pytest
 import yaml
 
+from mobius._configs import QuantizationConfig
 from mobius.integrations.onnx_genai.decoder_metadata import (
     build_decoder_metadata,
     decoder_metadata_from_config,
@@ -56,17 +58,27 @@ class TestDecoderMetadata:
         )
         assert meta["required_capabilities"] == ["kv_cache", "grouped_query_attention"]
         att = meta["model"]["attention"]
-        assert att["type"] == "grouped_query"
+        assert att["type"] == "grouped_query_attention"
         assert att["num_attention_heads"] == 32
         assert att["num_kv_heads"] == 8
         assert att["head_dim"] == 128
         assert meta["model"]["max_sequence_length"] == 131072
-        assert meta["kv_cache"]["native_dtype"] == "bf16"
+        assert meta["kv_cache"]["native_dtype"] == "bfloat16"
 
     def test_multi_head_when_kv_equals_heads(self):
         meta = build_decoder_metadata(num_attention_heads=16, num_kv_heads=16, head_dim=64)
         assert meta["model"]["attention"]["type"] == "multi_head"
         assert meta["required_capabilities"] == ["kv_cache", "multi_head_attention"]
+
+    def test_gqa_attention_type_override_is_trimmed_and_canonicalized(self):
+        meta = build_decoder_metadata(
+            num_attention_heads=16,
+            num_kv_heads=4,
+            head_dim=64,
+            attention_type=" gqa ",
+        )
+
+        assert meta["model"]["attention"]["type"] == "grouped_query_attention"
 
     def test_sliding_window_and_sink(self):
         meta = build_decoder_metadata(
@@ -83,13 +95,22 @@ class TestDecoderMetadata:
     def test_from_config_reads_mobius_fields(self):
         meta = decoder_metadata_from_config(_FakeConfig(), kv_native_dtype="fp16")
         att = meta["model"]["attention"]
-        assert att["type"] == "grouped_query"
+        assert att["type"] == "grouped_query_attention"
         assert att["num_attention_heads"] == 32
         assert att["num_kv_heads"] == 8
         assert att["head_dim"] == 128
         assert meta["model"]["max_sequence_length"] == 131072
         assert meta["model"]["architecture"] == "llama"
-        assert meta["kv_cache"]["native_dtype"] == "fp16"
+        assert meta["kv_cache"]["native_dtype"] == "float16"
+
+    def test_from_config_infers_fp16_kv_dtype_for_int4_weights(self):
+        cfg = _FakeConfig()
+        cfg.dtype = ir.DataType.FLOAT16
+        cfg.quantization = QuantizationConfig(bits=4, quant_method="rtn")
+
+        meta = decoder_metadata_from_config(cfg)
+
+        assert meta["kv_cache"]["native_dtype"] == "float16"
 
     def test_from_config_derives_head_dim_and_drops_unset(self):
         cfg = _FakeConfig(head_dim=-42, sliding_window=-42)  # DEFAULT_INT sentinel
@@ -97,6 +118,7 @@ class TestDecoderMetadata:
         # head_dim = hidden_size / num_heads = 4096 / 32 = 128
         assert meta["model"]["attention"]["head_dim"] == 128
         assert "sliding_window" not in meta["model"]["attention"]
+        assert "kv_cache" not in meta
 
     def test_write_roundtrips_yaml(self, tmp_path):
         path = write_decoder_metadata(str(tmp_path), config=_FakeConfig())

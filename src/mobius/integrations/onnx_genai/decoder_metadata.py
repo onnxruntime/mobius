@@ -23,6 +23,17 @@ import yaml
 # Mobius' unset-int sentinel.
 _UNSET = -42
 
+_FLOAT_DTYPE_ALIASES = {
+    "float16": "float16",
+    "fp16": "float16",
+    "half": "float16",
+    "bfloat16": "bfloat16",
+    "bf16": "bfloat16",
+    "float32": "float32",
+    "fp32": "float32",
+    "float": "float32",
+}
+
 
 def _clean_int(value: Any) -> int | None:
     if value is None:
@@ -32,6 +43,24 @@ def _clean_int(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return value if value > 0 else None
+
+
+def _canonical_float_dtype(value: Any) -> str | None:
+    """Return the canonical metadata spelling for a floating-point dtype."""
+    if value is None:
+        return None
+    name = getattr(value, "name", None)
+    token = str(name if name is not None else value).strip().lower().rsplit(".", 1)[-1]
+    return _FLOAT_DTYPE_ALIASES.get(token)
+
+
+def _infer_kv_native_dtype(config: Any) -> str | None:
+    """Infer KV storage dtype from the model's activation/compute dtype."""
+    for name in ("activation_dtype", "compute_dtype", "dtype", "torch_dtype"):
+        dtype = _canonical_float_dtype(getattr(config, name, None))
+        if dtype is not None:
+            return dtype
+    return None
 
 
 def build_decoder_metadata(
@@ -54,9 +83,10 @@ def build_decoder_metadata(
         num_kv_heads: Number of key/value heads (defaults to
             ``num_attention_heads`` = multi-head; a smaller value = GQA).
         max_sequence_length: Maximum total sequence length in tokens.
-        kv_native_dtype: KV-cache storage dtype (e.g. ``"fp16"``, ``"bf16"``).
+        kv_native_dtype: KV-cache storage dtype (e.g. ``"float16"``,
+            ``"bfloat16"``).
         attention_type: Override the derived attention type (``multi_head`` /
-            ``grouped_query``).
+            ``grouped_query_attention``).
         sliding_window: Sliding-window length in tokens (None = full context).
         sink_tokens: Attention-sink tokens retained with the sliding window.
         architecture: Optional architecture hint (e.g. ``"llama"``).
@@ -72,12 +102,25 @@ def build_decoder_metadata(
             f"num_kv_heads ({kv}) must divide num_attention_heads ({num_attention_heads})"
         )
     if attention_type is None:
-        attention_type = "grouped_query" if kv < num_attention_heads else "multi_head"
+        attention_type = (
+            "grouped_query_attention" if kv < num_attention_heads else "multi_head"
+        )
+    else:
+        normalized_attention_type = (
+            attention_type.strip().lower().replace("-", "_").replace(" ", "_")
+        )
+        if normalized_attention_type in {
+            "grouped_query",
+            "group_query_attention",
+            "grouped_query_attention",
+            "gqa",
+        }:
+            attention_type = "grouped_query_attention"
 
     capabilities = ["kv_cache"]
     capabilities.append(
         "grouped_query_attention"
-        if attention_type == "grouped_query"
+        if attention_type == "grouped_query_attention"
         else "multi_head_attention"
     )
 
@@ -100,7 +143,9 @@ def build_decoder_metadata(
 
     metadata: dict[str, Any] = {"required_capabilities": capabilities, "model": model}
     if kv_native_dtype:
-        metadata["kv_cache"] = {"native_dtype": kv_native_dtype}
+        metadata["kv_cache"] = {
+            "native_dtype": _canonical_float_dtype(kv_native_dtype) or kv_native_dtype
+        }
     return metadata
 
 
@@ -125,6 +170,9 @@ def decoder_metadata_from_config(
 
     sliding = getattr(config, "sliding_window", None)
     sliding = _clean_int(sliding) if sliding not in (None, _UNSET) else None
+
+    if kv_native_dtype is None:
+        kv_native_dtype = _infer_kv_native_dtype(config)
 
     return build_decoder_metadata(
         num_attention_heads=num_heads,
