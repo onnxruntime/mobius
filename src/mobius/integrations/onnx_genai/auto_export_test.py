@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import dataclasses
 
+import onnx_ir as ir
 import pytest
 import yaml
 
+from mobius._configs import QuantizationConfig
 from mobius.integrations.onnx_genai import write_onnx_genai_config
 
 
@@ -24,6 +26,14 @@ class _Cfg:
     model_type: str = "qwen"
 
 
+@dataclasses.dataclass
+class _Int4Cfg(_Cfg):
+    dtype: ir.DataType = ir.DataType.FLOAT16
+    quantization: QuantizationConfig = dataclasses.field(
+        default_factory=lambda: QuantizationConfig(bits=4, quant_method="rtn")
+    )
+
+
 class _DiffusionPkg(dict):
     pass
 
@@ -33,13 +43,11 @@ class _MultimodalPkg(dict):
 
 
 def test_dispatch_decoder(tmp_path):
-    arts = write_onnx_genai_config(
-        object(), str(tmp_path), config=_Cfg(), kv_native_dtype="bf16"
-    )
+    arts = write_onnx_genai_config(object(), str(tmp_path), config=_Int4Cfg())
     with open(arts["inference_metadata"]) as handle:
         meta = yaml.safe_load(handle)
-    assert meta["model"]["attention"]["type"] == "grouped_query"
-    assert meta["kv_cache"]["native_dtype"] == "bf16"
+    assert meta["model"]["attention"]["type"] == "grouped_query_attention"
+    assert meta["kv_cache"]["native_dtype"] == "float16"
 
 
 def test_dispatch_diffusion(tmp_path):
@@ -149,7 +157,7 @@ def test_dispatch_vision_multimodal_pipeline(tmp_path):
         "kv_cache",
         "grouped_query_attention",
     ]
-    assert metadata["kv_cache"] == {"native_dtype": "bf16"}
+    assert metadata["kv_cache"] == {"native_dtype": "bfloat16"}
     pipeline = metadata["pipeline"]
     assert pipeline["models"] == {
         "vision_encoder": {
@@ -297,7 +305,7 @@ def test_dispatch_speech_to_text_pipeline(tmp_path):
     with open(artifacts["inference_metadata"]) as handle:
         metadata = yaml.safe_load(handle)
 
-    assert metadata["kv_cache"] == {"native_dtype": "bf16"}
+    assert metadata["kv_cache"] == {"native_dtype": "bfloat16"}
     pipeline = metadata["pipeline"]
     assert pipeline["models"] == {
         "encoder": {"filename": "encoder/model.onnx", "type": "encoder"},
