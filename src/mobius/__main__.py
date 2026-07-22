@@ -309,12 +309,15 @@ def _save_package(
         config = getattr(pkg, "config", None)
         source = getattr(args, "config", None) or getattr(args, "model", None)
         if is_native_vlm_package(pkg):
-            artifacts = write_native_vlm_package_metadata(
-                pkg,
-                output_dir,
-                config=config,
-                source=source,
-            )
+            try:
+                artifacts = write_native_vlm_package_metadata(
+                    pkg,
+                    output_dir,
+                    config=config,
+                    source=source,
+                )
+            except ValueError as error:
+                raise SystemExit(f"Error: {error}") from error
         else:
             artifacts = write_onnx_genai_config(pkg, output_dir, config=config, source=source)
         for name, path in artifacts.items():

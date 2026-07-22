@@ -293,6 +293,43 @@ class TestCLIBuildRuntime:
         )
         generic_writer.assert_not_called()
 
+    def test_runtime_onnx_genai_does_not_fallback_for_unsupported_vlm(self):
+        pkg = mock.MagicMock()
+        pkg.items.return_value = []
+        pkg.__iter__.return_value = iter(("vision_encoder", "embedding", "decoder"))
+        pkg.config = object()
+        args = SimpleNamespace(
+            max_shard_size=None,
+            external_data="onnx",
+            execution_provider="cpu",
+            no_weights=True,
+            runtime="onnx-genai",
+            config="/models/unsupported-vlm",
+            model=None,
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.onnx_genai.inference_metadata.is_native_vlm_package",
+                return_value=True,
+            ),
+            mock.patch(
+                "mobius.integrations.onnx_genai.inference_metadata."
+                "write_native_vlm_package_metadata",
+                side_effect=ValueError(
+                    "unsupported VLM signature; regenerate processor assets or register it"
+                ),
+            ) as native_writer,
+            mock.patch(
+                "mobius.integrations.onnx_genai.write_onnx_genai_config"
+            ) as generic_writer,
+            pytest.raises(SystemExit, match=r"regenerate.*register"),
+        ):
+            _save_package(pkg, tmpdir, args, None, None)
+
+        native_writer.assert_called_once()
+        generic_writer.assert_not_called()
+
     def test_no_runtime_does_not_call_write_ort_genai_config(self):
         """Omitting --runtime does NOT call write_ort_genai_config()."""
         with (
