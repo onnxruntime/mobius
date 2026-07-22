@@ -110,6 +110,38 @@ def _port(value: Any) -> _Port:
     )
 
 
+def _shape_metadata(port: _Port) -> list[int | str | None]:
+    """Return a YAML-safe graph shape without losing symbolic dimensions."""
+    shape: list[int | str | None] = []
+    for dim in port.dims:
+        if isinstance(dim, int):
+            shape.append(dim)
+            continue
+        value = getattr(dim, "value", None)
+        shape.append(str(value) if value is not None else None)
+    return shape
+
+
+def _port_metadata(port: _Port) -> dict[str, Any]:
+    """Serialize one exact graph port for the executable component contract."""
+    return {
+        "name": port.name,
+        "dtype": port.dtype,
+        "rank": port.rank,
+        "shape": _shape_metadata(port),
+    }
+
+
+def _same_dim(left: Any, right: Any) -> bool:
+    if isinstance(left, int) or isinstance(right, int):
+        return left == right
+    return getattr(left, "value", None) == getattr(right, "value", None)
+
+
+def _ports_match_for_dataflow(source: _Port, target: _Port) -> bool:
+    return source.dtype == target.dtype and source.rank == target.rank
+
+
 def _is_float(port: _Port) -> bool:
     return port.dtype in {
         "fp32",
@@ -719,14 +751,15 @@ def _decoder_io(
     inputs = [_port(value) for value in decoder.graph.inputs]
     outputs = [_port(value) for value in decoder.graph.outputs]
     io: dict[str, Any] = {
-        "inputs": [port.name for port in inputs],
-        "outputs": [port.name for port in outputs],
+        "inputs": [_port_metadata(port) for port in inputs],
+        "outputs": [_port_metadata(port) for port in outputs],
     }
 
     routed = [port for port in inputs if port.name in routed_inputs]
     embedded = next((port for port in routed if _is_float(port) and port.rank == 3), None)
     if embedded is not None:
         io["inputs_embeds_input"] = embedded.name
+        io["sequence_source"] = "inputs_embeds"
 
     input_by_name = {port.name: port for port in inputs}
     output_by_name = {port.name: port for port in outputs}
@@ -741,6 +774,7 @@ def _decoder_io(
     token = input_by_name.get("input_ids")
     if token is not None:
         io["token_input"] = token.name
+        io.setdefault("sequence_source", "token_ids")
 
     logits = output_by_name.get("logits")
     if logits is None:
@@ -773,6 +807,272 @@ def _decoder_io(
 def _component_filenames(pkg: Any) -> dict[str, str]:
     multiple = len(pkg) > 1
     return {name: f"{name}/model.onnx" if multiple else "model.onnx" for name in pkg}
+
+
+def _sequence_decoder_inputs(decoder_ports: dict[str, list[_Port]]) -> set[str]:
+    """Find decoder inputs whose leading dimensions track the logits sequence."""
+    logits = next(
+        (
+            port
+            for port in decoder_ports["outputs"]
+            if port.name == "logits" and port.rank is not None and port.rank >= 2
+        ),
+        None,
+    )
+    if logits is None:
+        return set()
+    return {
+        port.name
+        for port in decoder_ports["inputs"]
+        if port.rank is not None
+        and port.rank >= 2
+        and _same_dim(port.dims[0], logits.dims[0])
+        and _same_dim(port.dims[1], logits.dims[1])
+        and _is_float(port)
+    }
+
+
+def _component_token_input(component_ports: dict[str, list[_Port]]) -> _Port | None:
+    """Resolve a single structural token stream for an upstream step component."""
+    candidates = [
+        port for port in component_ports["inputs"] if _is_integer(port) and port.rank == 2
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _input_source_map(
+    *,
+    ports: dict[str, dict[str, list[_Port]]],
+    dataflow: list[dict[str, Any]],
+    models: dict[str, Any],
+    decoder_name: str,
+    image_endpoints: set[str],
+) -> dict[str, dict[str, Any]]:
+    incoming = {edge["to"]: edge for edge in dataflow}
+    sources: dict[str, dict[str, Any]] = {}
+    for component, component_ports in ports.items():
+        for port in component_ports["inputs"]:
+            endpoint = f"{component}.{port.name}"
+            edge = incoming.get(endpoint)
+            if edge is not None:
+                sources[endpoint] = {"kind": "dataflow", "from": edge["from"]}
+            elif endpoint in image_endpoints:
+                sources[endpoint] = {
+                    "kind": "generated",
+                    "generator": "image_preprocessing",
+                }
+            else:
+                sources[endpoint] = {"kind": "external", "input": "request"}
+
+    decoder_io = models[decoder_name]["io"]
+    generated_ports = {
+        decoder_io.get("attention_mask_input"): "attention_mask",
+        decoder_io.get("position_ids_input"): "positions",
+    }
+    for port, generator in generated_ports.items():
+        if port is not None:
+            sources[f"{decoder_name}.{port}"] = {
+                "kind": "generated",
+                "generator": generator,
+            }
+
+    for input_name, output_name in zip(
+        decoder_io.get("kv_inputs", []),
+        decoder_io.get("kv_outputs", []),
+    ):
+        sources[f"{decoder_name}.{input_name}"] = {
+            "kind": "stateful",
+            "from": f"{decoder_name}.{output_name}",
+            "update": decoder_io.get("kv_update", "append"),
+        }
+    for pair in decoder_io.get("state_pairs", []):
+        sources[f"{decoder_name}.{pair['input']}"] = {
+            "kind": "stateful",
+            "from": f"{decoder_name}.{pair['output']}",
+            "update": pair["update"],
+        }
+    return sources
+
+
+def _annotate_component_inputs(
+    models: dict[str, Any],
+    sources: dict[str, dict[str, Any]],
+) -> None:
+    for component, model in models.items():
+        for port in model["io"]["inputs"]:
+            port["source"] = sources[f"{component}.{port['name']}"]
+
+
+def _closure_error(endpoint: str, why: str, how: str) -> ValueError:
+    return ValueError(
+        f"What: executable metadata closure is invalid at '{endpoint}'. "
+        f"Why: {why} How to fix: {how}"
+    )
+
+
+def validate_executable_closure(pkg: Any, metadata: dict[str, Any]) -> None:
+    """Reject a native sidecar that cannot bind every real graph input exactly once."""
+    pipeline = metadata.get("pipeline")
+    if not isinstance(pipeline, dict):
+        raise _closure_error(
+            "pipeline.models",
+            "the metadata has no pipeline object.",
+            "emit the native multi-model pipeline contract before packaging.",
+        )
+    declared_models = pipeline.get("models")
+    if not isinstance(declared_models, dict):
+        raise _closure_error(
+            "pipeline.models",
+            "the metadata has no component declarations.",
+            "emit one pipeline.models entry for every ONNX graph.",
+        )
+
+    graph_ports = {
+        component: {
+            "inputs": {_port(value).name: _port(value) for value in model.graph.inputs},
+            "outputs": {_port(value).name: _port(value) for value in model.graph.outputs},
+        }
+        for component, model in pkg.items()
+    }
+    incoming: dict[str, list[dict[str, Any]]] = {}
+    for edge in pipeline.get("dataflow", []):
+        source_endpoint = edge.get("from")
+        target_endpoint = edge.get("to")
+        if not isinstance(source_endpoint, str) or not isinstance(target_endpoint, str):
+            raise _closure_error(
+                "pipeline.dataflow",
+                "a dataflow edge does not declare string from/to endpoints.",
+                "emit every edge as exact component.output and component.input endpoints.",
+            )
+        source_component, separator, source_name = source_endpoint.partition(".")
+        target_component, target_separator, target_name = target_endpoint.partition(".")
+        if not separator or not target_separator:
+            raise _closure_error(
+                target_endpoint,
+                "the edge endpoint is not in component.port form.",
+                "emit exact component.output and component.input endpoints.",
+            )
+        source = graph_ports.get(source_component, {}).get("outputs", {}).get(source_name)
+        target = graph_ports.get(target_component, {}).get("inputs", {}).get(target_name)
+        if source is None:
+            raise _closure_error(
+                source_endpoint,
+                "the declared producer is not an output of its ONNX graph.",
+                "regenerate dataflow from the saved graph outputs.",
+            )
+        if target is None:
+            raise _closure_error(
+                target_endpoint,
+                "the declared consumer is not an input of its ONNX graph.",
+                "regenerate dataflow from the saved graph inputs.",
+            )
+        if source.dtype != target.dtype or source.rank != target.rank:
+            raise _closure_error(
+                target_endpoint,
+                f"edge {source_endpoint} has dtype/rank {source.dtype}/{source.rank}, "
+                f"but the consumer requires {target.dtype}/{target.rank}.",
+                "insert an explicit typed transform or remove the incompatible edge.",
+            )
+        if edge.get("dtype") != source.dtype or edge.get("rank") != source.rank:
+            raise _closure_error(
+                target_endpoint,
+                f"the edge declares dtype/rank {edge.get('dtype')}/{edge.get('rank')}, "
+                f"but the ONNX ports are {source.dtype}/{source.rank}.",
+                "derive edge dtype and rank directly from the matched graph ports.",
+            )
+        incoming.setdefault(target_endpoint, []).append(edge)
+
+    for component, component_ports in graph_ports.items():
+        model = declared_models.get(component)
+        if not isinstance(model, dict) or not isinstance(model.get("io"), dict):
+            first_port = next(iter(component_ports["inputs"]), "<io>")
+            raise _closure_error(
+                f"{component}.{first_port}",
+                "the component has no explicit io contract.",
+                "emit typed inputs and outputs from ONNX graph introspection.",
+            )
+        io = model["io"]
+        input_specs = io.get("inputs")
+        output_specs = io.get("outputs")
+        if not isinstance(input_specs, list) or not isinstance(output_specs, list):
+            first_port = next(iter(component_ports["inputs"]), "<io>")
+            raise _closure_error(
+                f"{component}.{first_port}",
+                "the component io contract does not contain typed input/output lists.",
+                "emit name, dtype, rank, and shape for every real graph port.",
+            )
+        declared_inputs = {
+            spec.get("name"): spec for spec in input_specs if isinstance(spec, dict)
+        }
+        declared_outputs = {
+            spec.get("name"): spec for spec in output_specs if isinstance(spec, dict)
+        }
+        for direction, real_ports, declared in (
+            ("input", component_ports["inputs"], declared_inputs),
+            ("output", component_ports["outputs"], declared_outputs),
+        ):
+            if set(declared) != set(real_ports):
+                missing = sorted(set(real_ports) - set(declared))
+                extra = sorted(set(declared) - set(real_ports))
+                port = (missing or extra or ["<io>"])[0]
+                raise _closure_error(
+                    f"{component}.{port}",
+                    f"declared {direction} ports differ from the ONNX graph "
+                    f"(missing={missing}, extra={extra}).",
+                    "regenerate component io from the packaged ONNX graph.",
+                )
+            for name, real in real_ports.items():
+                spec = declared[name]
+                if (
+                    spec.get("dtype") != real.dtype
+                    or spec.get("rank") != real.rank
+                    or spec.get("shape") != _shape_metadata(real)
+                ):
+                    raise _closure_error(
+                        f"{component}.{name}",
+                        "the declared dtype, rank, or shape does not match the ONNX graph.",
+                        "regenerate the typed port declaration from graph introspection.",
+                    )
+
+        for name in component_ports["inputs"]:
+            endpoint = f"{component}.{name}"
+            spec = declared_inputs[name]
+            edges = incoming.get(endpoint, [])
+            source = spec.get("source")
+            if not isinstance(source, dict):
+                raise _closure_error(
+                    endpoint,
+                    "the required graph input has no declared source classification.",
+                    "classify it as external, generated, stateful, defaulted, or dataflow.",
+                )
+            kind = source.get("kind")
+            if kind == "dataflow":
+                if len(edges) != 1 or source.get("from") != edges[0]["from"]:
+                    raise _closure_error(
+                        endpoint,
+                        f"the input declares dataflow source {source.get('from')!r}, "
+                        f"but {len(edges)} matching edge(s) exist.",
+                        "emit exactly one compatible edge and reference its producer.",
+                    )
+            elif kind in {"external", "generated", "stateful", "defaulted"}:
+                if edges:
+                    raise _closure_error(
+                        endpoint,
+                        f"the input is classified as {kind!r} but also has a dataflow edge.",
+                        "keep exactly one source category for every required graph input.",
+                    )
+                if kind == "defaulted" and "value" not in source:
+                    raise _closure_error(
+                        endpoint,
+                        "a defaulted input does not declare its default value.",
+                        "emit the explicit typed default value or use another source category.",
+                    )
+            else:
+                raise _closure_error(
+                    endpoint,
+                    f"the source category {kind!r} is not executable.",
+                    "use external, generated, stateful, defaulted, or dataflow.",
+                )
 
 
 def _topological_order(
@@ -856,20 +1156,31 @@ def build_native_vlm_package_metadata(
         for name, model in pkg.items()
     }
     dataflow: list[dict[str, Any]] = []
-    for source_name, source_ports in ports.items():
-        output_by_name = {port.name: port for port in source_ports["outputs"]}
-        for target_name, target_ports in ports.items():
-            if source_name == target_name:
-                continue
-            for target_port in target_ports["inputs"]:
-                source_port = output_by_name.get(target_port.name)
-                if source_port is None or source_port.dtype != target_port.dtype:
-                    continue
+    for target_name, target_ports in ports.items():
+        for target_port in target_ports["inputs"]:
+            matches = [
+                (source_name, source_port)
+                for source_name, source_ports in ports.items()
+                if source_name != target_name
+                for source_port in source_ports["outputs"]
+                if source_port.name == target_port.name
+                and _ports_match_for_dataflow(source_port, target_port)
+            ]
+            if len(matches) > 1:
+                producers = [f"{name}.{port.name}" for name, port in matches]
+                raise _closure_error(
+                    f"{target_name}.{target_port.name}",
+                    f"multiple compatible graph outputs could feed this input: {producers}.",
+                    "declare a unique structural producer or rename the ambiguous graph ports.",
+                )
+            if matches:
+                source_name, source_port = matches[0]
                 dataflow.append(
                     {
                         "from": f"{source_name}.{source_port.name}",
                         "to": f"{target_name}.{target_port.name}",
                         "dtype": source_port.dtype,
+                        "rank": source_port.rank,
                         "device_transfer": False,
                     }
                 )
@@ -887,8 +1198,9 @@ def build_native_vlm_package_metadata(
     preprocessing_outputs = []
     processor_summaries = []
     for port, content, pad_value in image_program.bindings:
+        endpoint = f"vision_encoder.{port.name}"
         output: dict[str, Any] = {
-            "name": port.name,
+            "name": endpoint,
             "content": content,
             "dtype": port.dtype,
         }
@@ -896,15 +1208,17 @@ def build_native_vlm_package_metadata(
             output["pad_value"] = pad_value
         preprocessing_outputs.append(output)
         if content in image_program.summary_contents:
-            processor_summaries.append(port.name)
+            processor_summaries.append(endpoint)
 
     if positions is not None and positions["rank"] > 1 and processor_summaries:
         positions["processor_summaries"] = processor_summaries
 
+    sequence_decoder_inputs = _sequence_decoder_inputs(ports[decoder_name])
     downstream_to_decoder = {
         edge["from"].split(".", 1)[0]
         for edge in dataflow
         if edge["to"].startswith(f"{decoder_name}.")
+        and edge["to"].split(".", 1)[1] in sequence_decoder_inputs
     }
     models: dict[str, Any] = {}
     phases: dict[str, Any] = {}
@@ -917,16 +1231,27 @@ def build_native_vlm_package_metadata(
             role = "vision_encoder"
             run_on = "prompt_only"
             io = {
-                "inputs": [port.name for port in ports[name]["inputs"]],
-                "outputs": [port.name for port in ports[name]["outputs"]],
+                "inputs": [_port_metadata(port) for port in ports[name]["inputs"]],
+                "outputs": [_port_metadata(port) for port in ports[name]["outputs"]],
             }
         else:
-            role = "encoder"
+            role = "audio_encoder" if name == "audio_encoder" else "encoder"
             run_on = "every_step" if name in downstream_to_decoder else "prompt_only"
             io = {
-                "inputs": [port.name for port in ports[name]["inputs"]],
-                "outputs": [port.name for port in ports[name]["outputs"]],
+                "inputs": [_port_metadata(port) for port in ports[name]["inputs"]],
+                "outputs": [_port_metadata(port) for port in ports[name]["outputs"]],
             }
+            if run_on == "every_step":
+                token_input = _component_token_input(ports[name])
+                if token_input is None:
+                    raise _closure_error(
+                        f"{name}.<token_input>",
+                        "the sequence-dependent component must run every step, but its "
+                        "graph does not expose one structurally unique rank-2 integer token input.",
+                        "declare a unique token-stream input or add a structural registry entry.",
+                    )
+                io["token_input"] = token_input.name
+                io["sequence_source"] = "token_ids"
         models[name] = {
             "filename": filenames[name],
             "type": role,
@@ -935,6 +1260,18 @@ def build_native_vlm_package_metadata(
         if name == decoder_name:
             models[name]["tokenizer"] = "tokenizer.json"
         phases[name] = {"run_on": run_on}
+
+    image_endpoints = {
+        output["name"] for output in preprocessing_outputs if not output.get("optional", False)
+    }
+    sources = _input_source_map(
+        ports=ports,
+        dataflow=dataflow,
+        models=models,
+        decoder_name=decoder_name,
+        image_endpoints=image_endpoints,
+    )
+    _annotate_component_inputs(models, sources)
 
     stages = []
     for name in _topological_order(pkg.keys(), dataflow):
@@ -994,6 +1331,7 @@ def build_native_vlm_package_metadata(
     }
     if positions is not None:
         metadata["pipeline"]["positions"] = positions
+    validate_executable_closure(pkg, metadata)
     return metadata
 
 

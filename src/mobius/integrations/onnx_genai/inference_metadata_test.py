@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
 import math
@@ -26,6 +27,7 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     build_tts_pipeline_metadata,
     is_native_vlm_package,
     load_diffusers_scheduler_config,
+    validate_executable_closure,
     write_diffusion_pipeline_metadata,
     write_native_vlm_package_metadata,
     write_tts_pipeline_metadata,
@@ -133,6 +135,7 @@ def _decoder_model(
     raw_token_input: bool = False,
     fixed_state: bool = False,
     equal_kv_shape: bool = False,
+    kv_head_dims: list[int] | None = None,
 ) -> ir.Model:
     inputs = [_value(name, dtype, shape) for name, dtype, shape in routed_inputs]
     inputs.extend(
@@ -147,37 +150,35 @@ def _decoder_model(
     )
     if raw_token_input:
         inputs.append(_value("input_ids", ir.DataType.INT64, ["batch", "sequence"]))
-    inputs.extend(
-        [
-            _value(
-                "past_key_values.0.key",
-                ir.DataType.FLOAT,
-                ["batch", 2, "past_sequence", 8],
-            ),
-            _value(
-                "past_key_values.0.value",
-                ir.DataType.FLOAT,
-                ["batch", 2, "past_sequence", 8],
-            ),
-        ]
-    )
-    output_specs = [
-        ("logits", ir.DataType.FLOAT, ["batch", "sequence", 128]),
-        (
-            "present.0.key",
-            ir.DataType.FLOAT,
-            ["batch", 2, "past_sequence", 8]
+    kv_head_dims = kv_head_dims or [8]
+    for layer, head_dim in enumerate(kv_head_dims):
+        inputs.extend(
+            [
+                _value(
+                    f"past_key_values.{layer}.key",
+                    ir.DataType.FLOAT,
+                    ["batch", 2, "past_sequence", head_dim],
+                ),
+                _value(
+                    f"past_key_values.{layer}.value",
+                    ir.DataType.FLOAT,
+                    ["batch", 2, "past_sequence", head_dim],
+                ),
+            ]
+        )
+    output_specs = [("logits", ir.DataType.FLOAT, ["batch", "sequence", 128])]
+    for layer, head_dim in enumerate(kv_head_dims):
+        output_shape = (
+            ["batch", 2, "past_sequence", head_dim]
             if equal_kv_shape
-            else ["batch", 2, "total_sequence", 8],
-        ),
-        (
-            "present.0.value",
-            ir.DataType.FLOAT,
-            ["batch", 2, "past_sequence", 8]
-            if equal_kv_shape
-            else ["batch", 2, "total_sequence", 8],
-        ),
-    ]
+            else ["batch", 2, "total_sequence", head_dim]
+        )
+        output_specs.extend(
+            [
+                (f"present.{layer}.key", ir.DataType.FLOAT, output_shape),
+                (f"present.{layer}.value", ir.DataType.FLOAT, output_shape),
+            ]
+        )
     if fixed_state:
         inputs.extend(
             [
@@ -253,8 +254,26 @@ def _assert_all_graph_ports_declared(
     assert set(models) == set(package)
     for name, model in package.items():
         io = models[name]["io"]
-        assert io["inputs"] == [value.name for value in model.graph.inputs]
-        assert io["outputs"] == [value.name for value in model.graph.outputs]
+        assert [port["name"] for port in io["inputs"]] == [
+            value.name for value in model.graph.inputs
+        ]
+        assert [port["name"] for port in io["outputs"]] == [
+            value.name for value in model.graph.outputs
+        ]
+        for port, value in zip(io["inputs"], model.graph.inputs):
+            assert (
+                port["dtype"]
+                == {
+                    ir.DataType.FLOAT: "fp32",
+                    ir.DataType.FLOAT16: "fp16",
+                    ir.DataType.INT64: "int64",
+                    ir.DataType.BOOL: "bool",
+                }[value.dtype]
+            )
+            assert port["rank"] == len(value.shape)
+            assert "source" in port
+        for port, value in zip(io["outputs"], model.graph.outputs):
+            assert port["rank"] == len(value.shape)
 
 
 class TestNativeVlmPackageMetadata:
@@ -291,6 +310,7 @@ class TestNativeVlmPackageMetadata:
                     ],
                     position_shape=["batch", "sequence"],
                     raw_token_input=True,
+                    kv_head_dims=[8, 16, 8],
                 ),
                 "vision_encoder": _model(
                     "vision_encoder",
@@ -326,7 +346,35 @@ class TestNativeVlmPackageMetadata:
                             ir.DataType.FLOAT,
                             ["batch", "sequence", 128],
                         ),
-                    ]
+                    ],
+                    include_audio=True,
+                ),
+                "audio_encoder": _model(
+                    "audio_encoder",
+                    [
+                        _value(
+                            "input_features",
+                            ir.DataType.FLOAT,
+                            ["batch", "time", 128],
+                        ),
+                        _value(
+                            "input_features_mask",
+                            ir.DataType.BOOL,
+                            ["batch", "time"],
+                        ),
+                    ],
+                    [
+                        (
+                            "audio_features",
+                            ir.DataType.FLOAT,
+                            ["batch", "audio_sequence", 64],
+                        ),
+                        (
+                            "audio_features_mask",
+                            ir.DataType.BOOL,
+                            ["batch", "audio_sequence"],
+                        ),
+                    ],
                 ),
             },
             config=config,
@@ -354,6 +402,7 @@ class TestNativeVlmPackageMetadata:
         metadata = build_native_vlm_package_metadata(
             package, config=config, source=str(source)
         )
+        validate_executable_closure(package, metadata)
         self._validate(metadata)
         _assert_all_graph_ports_declared(package, metadata)
         flow = metadata["pipeline"]["dataflow"]
@@ -361,15 +410,31 @@ class TestNativeVlmPackageMetadata:
             "from": "embedding.inputs_embeds",
             "to": "decoder.inputs_embeds",
             "dtype": "fp32",
+            "rank": 3,
             "device_transfer": False,
         } in flow
         assert {
             "from": "embedding.per_layer_inputs",
             "to": "decoder.per_layer_inputs",
             "dtype": "fp32",
+            "rank": 3,
             "device_transfer": False,
         } in flow
+        assert not any(edge["from"] == "audio_encoder.audio_features" for edge in flow)
+        embedding_audio = next(
+            port
+            for port in metadata["pipeline"]["models"]["embedding"]["io"]["inputs"]
+            if port["name"] == "audio_features"
+        )
+        assert embedding_audio["source"] == {"kind": "external", "input": "request"}
         assert metadata["pipeline"]["phases"]["embedding"] == {"run_on": "every_step"}
+        embedding_stage = next(
+            stage
+            for stage in metadata["pipeline"]["strategy"]["stages"]
+            if stage["strategy"].get("model") == "embedding"
+        )
+        assert embedding_stage["run_on"] == "every_step"
+        assert metadata["pipeline"]["models"]["embedding"]["io"]["token_input"] == "input_ids"
         assert metadata["pipeline"]["vision"]["token_count_source"] == "from_coordinates"
         assert metadata["pipeline"]["vision"]["token_pooling_factor"] == 9
         transforms = metadata["preprocessing"]["image"]["transforms"]
@@ -389,6 +454,46 @@ class TestNativeVlmPackageMetadata:
         )
         assert not any(transform["op"] == "normalize" for transform in transforms)
         assert metadata["model"]["io"]["token_input"] == "input_ids"
+        assert metadata["model"]["io"]["kv_inputs"] == [
+            f"past_key_values.{layer}.{role}"
+            for layer in range(3)
+            for role in ("key", "value")
+        ]
+        assert metadata["model"]["io"]["kv_outputs"] == [
+            f"present.{layer}.{role}" for layer in range(3) for role in ("key", "value")
+        ]
+        kv_inputs = {
+            port["name"]: port
+            for port in metadata["pipeline"]["models"]["decoder"]["io"]["inputs"]
+            if port["name"].startswith("past_key_values.")
+        }
+        assert kv_inputs["past_key_values.1.key"]["shape"][-1] == 16
+        image_outputs = metadata["preprocessing"]["image"]["outputs"]
+        assert image_outputs == [
+            {
+                "name": "vision_encoder.pixel_values",
+                "content": "pixels",
+                "dtype": "fp32",
+            },
+            {
+                "name": "vision_encoder.pixel_position_ids",
+                "content": "patch_coordinates",
+                "dtype": "int64",
+                "pad_value": -1,
+            },
+        ]
+
+        broken = copy.deepcopy(metadata)
+        broken["pipeline"]["dataflow"] = [
+            edge
+            for edge in broken["pipeline"]["dataflow"]
+            if edge["to"] != "decoder.per_layer_inputs"
+        ]
+        with pytest.raises(
+            ValueError,
+            match=r"What:.*decoder\.per_layer_inputs.*Why:.*How to fix:",
+        ):
+            validate_executable_closure(package, broken)
 
     def test_qwen_packed_grid_rank3_positions_sparse_and_fixed_state(self, tmp_path):
         config = _VlmConfig(
@@ -484,7 +589,7 @@ class TestNativeVlmPackageMetadata:
             "continuation": "from_grid",
             "axes": ["temporal", "height", "width"],
             "sections": [16, 24, 24],
-            "processor_summaries": ["image_grid_thw"],
+            "processor_summaries": ["vision_encoder.image_grid_thw"],
         }
         io = metadata["model"]["io"]
         assert io["kv_inputs"] == [
@@ -619,6 +724,7 @@ class TestNativeVlmPackageMetadata:
                 "from": f"embedding.{gate}",
                 "to": f"decoder.{gate}",
                 "dtype": "fp32",
+                "rank": 0,
                 "device_transfer": False,
             } in flow
         outputs = metadata["preprocessing"]["image"]["outputs"]
@@ -982,7 +1088,7 @@ class TestNativeVlmPackageMetadata:
             for output in metadata["preprocessing"]["image"]["outputs"]
             if output["content"] == "transformed_size"
         )
-        assert size_output["name"] == "image_sizes"
+        assert size_output["name"] == "vision_encoder.image_sizes"
         assert float(reference["image_attention_mask"].min()) == pytest.approx(0)
         assert float(reference["image_attention_mask"].max()) == pytest.approx(1)
 
