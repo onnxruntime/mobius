@@ -1255,12 +1255,18 @@ class TestBuildGraphVisionLanguage:
         assert "pixel_values" in vision_input_names
         assert "pixel_position_ids" in vision_input_names
         assert "image_features" in {o.name for o in vision.graph.outputs}
+        assert component_presence(vision.graph) == "image"
         # Embedding: input_ids + image_features (no audio) -> inputs_embeds
         embedding = pkg["embedding"]
         emb_input_names = {i.name for i in embedding.graph.inputs}
         assert "input_ids" in emb_input_names
         assert "image_features" in emb_input_names
         assert "audio_features" not in emb_input_names
+        embedding_image = next(i for i in embedding.graph.inputs if i.name == "image_features")
+        assert optional_input_contract(embedding_image) == {
+            "presence": "image",
+            "absent": {"kind": "zeros", "shape": [0, config.hidden_size]},
+        }
         assert "inputs_embeds" in {o.name for o in embedding.graph.outputs}
 
     def test_gemma4_kv_shared_fallback_attention_is_causal_zero(self):
@@ -1657,6 +1663,7 @@ class TestBuildGraphVisionLanguage:
         assert "pixel_values" in vision_input_names
         assert "pixel_position_ids" in vision_input_names
         assert "image_features" in {o.name for o in vision.graph.outputs}
+        assert component_presence(vision.graph) == "image"
         # Audio encoder
         audio = pkg["audio_encoder"]
         audio_input_names = {i.name for i in audio.graph.inputs}
@@ -1672,6 +1679,11 @@ class TestBuildGraphVisionLanguage:
         assert "input_ids" in emb_input_names
         assert "image_features" in emb_input_names
         assert "audio_features" in emb_input_names
+        embedding_image = next(i for i in embedding.graph.inputs if i.name == "image_features")
+        assert optional_input_contract(embedding_image) == {
+            "presence": "image",
+            "absent": {"kind": "zeros", "shape": [0, config.hidden_size]},
+        }
         embedding_audio = next(i for i in embedding.graph.inputs if i.name == "audio_features")
         assert optional_input_contract(embedding_audio) == {
             "presence": "audio",
@@ -1796,6 +1808,7 @@ class TestBuildGraphVisionLanguage:
         v_inputs = {i.name for i in vision.graph.inputs}
         assert v_inputs == {"pixel_values", "pixel_position_ids"}
         assert "image_features" in {o.name for o in vision.graph.outputs}
+        assert component_presence(vision.graph) == "image"
 
         # Audio embedder: raw frames + mask → audio_features
         audio = pkg["audio_encoder"]
@@ -1809,6 +1822,11 @@ class TestBuildGraphVisionLanguage:
         embedding = pkg["embedding"]
         e_inputs = {i.name for i in embedding.graph.inputs}
         assert {"input_ids", "image_features", "audio_features"} <= e_inputs
+        embedding_image = next(i for i in embedding.graph.inputs if i.name == "image_features")
+        assert optional_input_contract(embedding_image) == {
+            "presence": "image",
+            "absent": {"kind": "zeros", "shape": [0, config.hidden_size]},
+        }
         embedding_audio = next(i for i in embedding.graph.inputs if i.name == "audio_features")
         assert optional_input_contract(embedding_audio) == {
             "presence": "audio",
