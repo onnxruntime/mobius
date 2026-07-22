@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 import tempfile
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -63,9 +64,11 @@ def test_cross_attention_block_matches_diffusers():
     model = _make_model(graph)
     apply_weights(model, _remap_transformer(hf.state_dict()))
 
-    with tempfile.NamedTemporaryFile(suffix=".onnx") as handle:
-        onnx_ir.save(model, handle.name)
-        session = ort.InferenceSession(handle.name)
+    # Windows keeps the ORT model file mapped; ignore cleanup errors so the dir can be removed.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        model_path = Path(temp_dir) / "model.onnx"
+        onnx_ir.save(model, model_path)
+        session = ort.InferenceSession(model_path)
         actual = session.run(None, {"hidden": hidden.numpy(), "context": context.numpy()})[0]
     assert np.abs(actual - expected).max() < 1e-4
 
@@ -115,9 +118,11 @@ def test_unet_matches_diffusers():
     model = DenoisingTask().build(module, config)["model"]
     apply_weights(model, module.preprocess_weights(dict(hf.state_dict())))
 
-    with tempfile.NamedTemporaryFile(suffix=".onnx") as handle:
-        onnx_ir.save(model, handle.name)
-        session = ort.InferenceSession(handle.name)
+    # Windows keeps the ORT model file mapped; ignore cleanup errors so the dir can be removed.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        model_path = Path(temp_dir) / "model.onnx"
+        onnx_ir.save(model, model_path)
+        session = ort.InferenceSession(model_path)
         actual = session.run(
             None,
             {
@@ -185,9 +190,11 @@ def test_unet_sd1x_mixed_block_types_matches_diffusers():
     model = DenoisingTask().build(module, config)["model"]
     apply_weights(model, module.preprocess_weights(dict(hf.state_dict())))
 
-    with tempfile.NamedTemporaryFile(suffix=".onnx") as handle:
-        onnx_ir.save(model, handle.name)
-        session = ort.InferenceSession(handle.name)
+    # Windows keeps the ORT model file mapped; ignore cleanup errors so the dir can be removed.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        model_path = Path(temp_dir) / "model.onnx"
+        onnx_ir.save(model, model_path)
+        session = ort.InferenceSession(model_path)
         actual = session.run(
             None,
             {
@@ -271,9 +278,11 @@ def test_unet_lora_gate_parity():
     weights.update(remap_diffusers_unet_lora(lora_state, "test"))
     apply_weights(model, weights)
 
-    with tempfile.NamedTemporaryFile(suffix=".onnx") as handle:
-        onnx_ir.save(model, handle.name)
-        session = ort.InferenceSession(handle.name)
+    # Windows keeps the ORT model file mapped; ignore cleanup errors so the dir can be removed.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        model_path = Path(temp_dir) / "model.onnx"
+        onnx_ir.save(model, model_path)
+        session = ort.InferenceSession(model_path)
         feed = {
             "sample": sample.numpy(),
             "timestep": timestep.numpy().astype(np.int64),
