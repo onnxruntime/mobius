@@ -769,7 +769,7 @@ class TestNativeVlmPackageMetadata:
                 model_id, local_files_only=True
             ).image_processor
         except Exception as error:
-            pytest.skip(f"cached Qwen processor unavailable: {error}")
+            pytest.fail(f"required cached Qwen processor unavailable: {error}")
 
         image = image_module.fromarray(np.zeros((300, 500, 3), dtype=np.uint8))
         reference = processor(images=[image], return_tensors="np")
@@ -944,7 +944,7 @@ class TestNativeVlmPackageMetadata:
                 local_files_only=True,
             ).image_processor
         except Exception as error:
-            pytest.skip(f"cached Phi4MM processor unavailable: {error}")
+            pytest.fail(f"required cached Phi4MM processor unavailable: {error}")
 
         image = image_module.fromarray(np.zeros((300, 500, 3), dtype=np.uint8))
         reference = processor(images=[image], return_tensors="np")
