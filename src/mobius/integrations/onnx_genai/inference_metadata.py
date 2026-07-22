@@ -33,11 +33,1044 @@ import json
 import logging
 import math
 import os
+import re
+import shutil
+from collections.abc import Callable, Iterable
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import yaml
 
 _LOGGER = logging.getLogger(__name__)
+
+_RUNTIME_ASSET_NAMES = (
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "tokenizer.model",
+    "added_tokens.json",
+    "merges.txt",
+    "vocab.json",
+    "chat_template.jinja",
+    "processor_config.json",
+    "preprocessor_config.json",
+    "image_processor.json",
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Port:
+    """Structural description of one ONNX graph port."""
+
+    value: Any
+    name: str
+    dtype: str
+    rank: int | None
+    dims: tuple[Any, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class _ImageProgram:
+    """Registry result for one declared image processor contract."""
+
+    name: str
+    bindings: tuple[tuple[_Port, str, float | None], ...]
+    transforms: Callable[[Any, dict[str, Any]], list[dict[str, Any]]]
+    token_count_source: str
+    summary_contents: tuple[str, ...] = ()
+    vision_properties: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+
+
+_DTYPE_TAGS = {
+    "FLOAT": "fp32",
+    "FLOAT16": "fp16",
+    "BFLOAT16": "bf16",
+    "FLOAT8E4M3FN": "float8_e4m3fn",
+    "FLOAT8E5M2": "float8_e5m2",
+    "INT64": "int64",
+    "INT32": "int32",
+    "INT8": "int8",
+    "UINT8": "uint8",
+    "BOOL": "bool",
+    "STRING": "string",
+}
+
+
+def _port(value: Any) -> _Port:
+    shape = getattr(value, "shape", None)
+    dims = tuple(shape) if shape is not None else ()
+    dtype = getattr(getattr(value, "dtype", None), "name", "")
+    return _Port(
+        value=value,
+        name=str(value.name),
+        dtype=_DTYPE_TAGS.get(str(dtype).upper(), str(dtype).lower() or "fp32"),
+        rank=len(dims) if shape is not None else None,
+        dims=dims,
+    )
+
+
+def _is_float(port: _Port) -> bool:
+    return port.dtype in {
+        "fp32",
+        "fp16",
+        "bf16",
+        "float8_e4m3fn",
+        "float8_e5m2",
+    }
+
+
+def _is_integer(port: _Port) -> bool:
+    return port.dtype in {"int64", "int32", "int8", "uint8"}
+
+
+def _static_dim(port: _Port, index: int) -> int | None:
+    if port.rank is None or not -port.rank <= index < port.rank:
+        return None
+    dim = port.dims[index]
+    return dim if isinstance(dim, int) else None
+
+
+def _select_one(
+    ports: Iterable[_Port],
+    predicate: Callable[[_Port], bool],
+) -> _Port | None:
+    matches = [port for port in ports if predicate(port)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _resample_name(value: Any) -> str:
+    if isinstance(value, int):
+        return {
+            0: "nearest",
+            1: "lanczos",
+            2: "bilinear",
+            3: "bicubic",
+            4: "box",
+            5: "hamming",
+        }.get(value, str(value))
+    return str(getattr(value, "name", value) or "bicubic").lower()
+
+
+def _enabled(values: dict[str, Any], name: str, default: bool) -> bool:
+    value = values.get(name)
+    return default if value is None else bool(value)
+
+
+def _pixel_value_transforms(
+    values: dict[str, Any],
+    *,
+    default_rescale: bool,
+    default_normalize: bool,
+    default_rescale_factor: float | None = None,
+    default_mean: tuple[float, ...] | None = None,
+    default_std: tuple[float, ...] | None = None,
+) -> list[dict[str, Any]]:
+    transforms: list[dict[str, Any]] = []
+    if _enabled(values, "do_rescale", default_rescale):
+        scale = values.get("rescale_factor", default_rescale_factor)
+        if scale is None:
+            raise ValueError(
+                "Image processor declares do_rescale=true but no rescale_factor. "
+                "Regenerate the processor assets with an explicit factor or add it "
+                "to the structural processor registry entry."
+            )
+        transforms.append({"op": "rescale", "scale": float(scale)})
+    if _enabled(values, "do_normalize", default_normalize):
+        mean = values.get("image_mean", default_mean)
+        std = values.get("image_std", default_std)
+        if mean is None or std is None:
+            raise ValueError(
+                "Image processor declares do_normalize=true but no image_mean/image_std. "
+                "Regenerate the processor assets with explicit normalization values or "
+                "add them to the structural processor registry entry."
+            )
+        transforms.append(
+            {
+                "op": "normalize",
+                "mean": [float(value) for value in mean],
+                "std": [float(value) for value in std],
+            }
+        )
+    return transforms
+
+
+def _area_grid_transforms(config: Any, values: dict[str, Any]) -> list[dict[str, Any]]:
+    del config
+    size = values["size"]
+    patch_size = int(values["patch_size"])
+    merge_size = int(values["merge_size"])
+    transforms: list[dict[str, Any]] = [{"op": "decode_rgb"}]
+    if _enabled(values, "do_resize", True):
+        transforms.append(
+            {
+                "op": "resize",
+                "mode": "pixel_area",
+                "interpolation": _resample_name(values.get("resample", "bicubic")),
+                "min_pixels": int(size["shortest_edge"]),
+                "max_pixels": int(size["longest_edge"]),
+                "size_multiple": patch_size * merge_size,
+            }
+        )
+    transforms.extend(
+        _pixel_value_transforms(
+            values,
+            default_rescale=True,
+            default_normalize=True,
+            default_rescale_factor=1 / 255,
+            default_mean=(0.5, 0.5, 0.5),
+            default_std=(0.5, 0.5, 0.5),
+        )
+    )
+    transforms.append(
+        {
+            "op": "patchify",
+            "patch_size": patch_size,
+            "flatten": True,
+            "temporal_patch_size": int(values["temporal_patch_size"]),
+            "merge_size": merge_size,
+            "channel_order": "channels_first",
+        }
+    )
+    return transforms
+
+
+def _patch_budget_transforms(config: Any, values: dict[str, Any]) -> list[dict[str, Any]]:
+    del config
+    patch_size = int(values["patch_size"])
+    pooling = int(values["pooling_kernel_size"])
+    max_soft_tokens = int(values["max_soft_tokens"])
+    transforms: list[dict[str, Any]] = [{"op": "decode_rgb"}]
+    if _enabled(values, "do_resize", True):
+        transforms.append(
+            {
+                "op": "resize",
+                "mode": "aspect_ratio_patch_budget",
+                "patch_size": patch_size,
+                "max_patches": max_soft_tokens * pooling**2,
+                "pooling_kernel_size": pooling,
+                "interpolation": _resample_name(values.get("resample", "bicubic")),
+            }
+        )
+    transforms.extend(
+        _pixel_value_transforms(
+            values,
+            default_rescale=True,
+            default_normalize=False,
+            default_rescale_factor=1 / 255,
+        )
+    )
+    transforms.append(
+        {
+            "op": "patchify",
+            "patch_size": patch_size,
+            "channel_order": "channels_last",
+            "coordinate_order": "xy",
+            "flatten": True,
+        }
+    )
+    transforms.append(
+        {
+            "op": "pad",
+            "pad_value": 0,
+            "target_length": max_soft_tokens * pooling**2,
+        }
+    )
+    return transforms
+
+
+def _dynamic_hd_transforms(config: Any, values: dict[str, Any]) -> list[dict[str, Any]]:
+    del config
+    transforms: list[dict[str, Any]] = [
+        {"op": "decode_rgb"},
+        {
+            "op": "tile",
+            "mode": "dynamic_hd",
+            "tile_size": int(values["crop_size"]),
+            "max_tiles": int(values["dynamic_hd"]),
+            "include_thumbnail": bool(values["include_thumbnail"]),
+            "thumbnail_order": values["thumbnail_order"],
+            "interpolation": _resample_name(values.get("resample", "bilinear")),
+            "thumbnail_interpolation": _resample_name(
+                values.get("thumbnail_resample", "bicubic")
+            ),
+            "canvas_pad_value": float(values.get("canvas_pad_value", 255)),
+            "mask_patch_size": int(values.get("mask_patch_size", 14)),
+        },
+    ]
+    transforms.extend(
+        _pixel_value_transforms(
+            values,
+            default_rescale=True,
+            default_normalize=True,
+            default_rescale_factor=1 / 255,
+            default_mean=(0.5, 0.5, 0.5),
+            default_std=(0.5, 0.5, 0.5),
+        )
+    )
+    return transforms
+
+
+def _match_packed_coordinates(
+    ports: list[_Port],
+) -> tuple[tuple[_Port, str, float | None], ...] | None:
+    pixels = _select_one(ports, lambda p: _is_float(p) and p.rank == 3)
+    coordinates = _select_one(
+        ports,
+        lambda p: _is_integer(p) and p.rank == 3 and _static_dim(p, -1) == 2,
+    )
+    if pixels is None or coordinates is None:
+        return None
+    return ((pixels, "pixels", None), (coordinates, "patch_coordinates", -1))
+
+
+def _match_packed_grid(
+    ports: list[_Port],
+) -> tuple[tuple[_Port, str, float | None], ...] | None:
+    pixels = _select_one(ports, lambda p: _is_float(p) and p.rank == 2)
+    grid = _select_one(
+        ports,
+        lambda p: _is_integer(p) and p.rank == 2 and _static_dim(p, -1) == 3,
+    )
+    if pixels is None or grid is None:
+        return None
+    return ((pixels, "pixels", None), (grid, "grid_dimensions", None))
+
+
+def _match_crop_mask(
+    ports: list[_Port],
+) -> tuple[tuple[_Port, str, float | None], ...] | None:
+    pixels = _select_one(ports, lambda p: _is_float(p) and p.rank == 4)
+    transformed_size = _select_one(
+        ports,
+        lambda p: _is_integer(p) and p.rank == 2 and _static_dim(p, -1) == 2,
+    )
+    validity_mask = _select_one(ports, lambda p: _is_float(p) and p.rank == 3)
+    if pixels is None or transformed_size is None or validity_mask is None:
+        return None
+    return (
+        (pixels, "pixels", None),
+        (transformed_size, "transformed_size", None),
+        (validity_mask, "validity_mask", 0),
+    )
+
+
+def _match_area_grid(ports: list[_Port], values: dict[str, Any]) -> _ImageProgram | None:
+    bindings = _match_packed_grid(ports)
+    size = values.get("size")
+    if (
+        bindings is None
+        or not isinstance(size, dict)
+        or not isinstance(size.get("shortest_edge"), int)
+        or not isinstance(size.get("longest_edge"), int)
+        or not all(
+            isinstance(values.get(key), int)
+            for key in ("patch_size", "temporal_patch_size", "merge_size")
+        )
+    ):
+        return None
+    return _ImageProgram(
+        name="area_bounded_packed_grid",
+        bindings=bindings,
+        transforms=_area_grid_transforms,
+        token_count_source="from_grid",
+        summary_contents=("grid_dimensions",),
+    )
+
+
+def _match_patch_budget(ports: list[_Port], values: dict[str, Any]) -> _ImageProgram | None:
+    bindings = _match_packed_coordinates(ports)
+    if (
+        bindings is None
+        or values.get("size") is not None
+        or not all(
+            isinstance(values.get(key), int)
+            for key in ("patch_size", "pooling_kernel_size", "max_soft_tokens")
+        )
+    ):
+        return None
+    return _ImageProgram(
+        name="aspect_ratio_patch_budget",
+        bindings=bindings,
+        transforms=_patch_budget_transforms,
+        token_count_source="from_coordinates",
+        summary_contents=("patch_coordinates",),
+        vision_properties=lambda declared: {
+            "token_pooling_factor": int(declared["pooling_kernel_size"]) ** 2,
+            "max_tokens_per_image": int(declared["max_soft_tokens"]),
+        },
+    )
+
+
+def _match_dynamic_hd(ports: list[_Port], values: dict[str, Any]) -> _ImageProgram | None:
+    bindings = _match_crop_mask(ports)
+    if bindings is None or not all(
+        isinstance(values.get(key), int) for key in ("dynamic_hd", "crop_size")
+    ):
+        return None
+    return _ImageProgram(
+        name="dynamic_hd_crop_mask",
+        bindings=bindings,
+        transforms=_dynamic_hd_transforms,
+        token_count_source="from_validity_mask",
+        summary_contents=("transformed_size", "validity_mask"),
+        vision_properties=lambda declared: {
+            "thumbnail_order": declared["thumbnail_order"],
+        },
+    )
+
+
+_IMAGE_PROCESSOR_REGISTRY: tuple[
+    Callable[[list[_Port], dict[str, Any]], _ImageProgram | None], ...
+] = (
+    _match_area_grid,
+    _match_patch_budget,
+    _match_dynamic_hd,
+)
+
+
+def _resolve_image_program(model: Any, values: dict[str, Any]) -> _ImageProgram:
+    ports = [_port(value) for value in model.graph.inputs]
+    for resolve in _IMAGE_PROCESSOR_REGISTRY:
+        program = resolve(ports, values)
+        if program is not None:
+            return program
+    signature = [(port.name, port.dtype, port.rank, port.dims) for port in ports]
+    declared = sorted(key for key, value in values.items() if value is not None)
+    raise ValueError(
+        "Cannot emit native VLM preprocessing metadata: the vision_encoder input "
+        f"signature {signature} and declared processor keys {declared} do not match "
+        "a registered structural processor contract. Generic fallback is unsafe "
+        "because resize/tiling/normalization semantics would be guessed. Regenerate "
+        "the package with complete config.json plus processor_config.json or "
+        "preprocessor_config.json, or register this structural signature in "
+        "_IMAGE_PROCESSOR_REGISTRY."
+    )
+
+
+@lru_cache(maxsize=16)
+def _cached_source_assets(source: str) -> dict[str, str]:
+    """Index all files cached for a Hub model, across cached revisions."""
+    try:
+        from huggingface_hub import scan_cache_dir
+
+        cache = scan_cache_dir()
+    except Exception:
+        return {}
+    repos = [repo for repo in cache.repos if repo.repo_id == source]
+    if not repos:
+        return {}
+    assets: dict[str, str] = {}
+    revisions = sorted(
+        (revision for repo in repos for revision in repo.revisions),
+        key=lambda revision: revision.last_modified,
+        reverse=True,
+    )
+    for revision in revisions:
+        for file in revision.files:
+            assets.setdefault(file.file_name, str(file.file_path))
+    return assets
+
+
+def _source_asset_path(source: str, filename: str) -> str | None:
+    if os.path.isdir(source):
+        path = os.path.join(source, filename)
+        return path if os.path.isfile(path) else None
+    cached = _cached_source_assets(source).get(filename)
+    if cached is not None and os.path.isfile(cached):
+        return cached
+    try:
+        from huggingface_hub import hf_hub_download
+
+        return hf_hub_download(source, filename)
+    except Exception:
+        return None
+
+
+def _processor_values(source: str | None, config: Any) -> dict[str, Any]:
+    """Load plain processor parameters without architecture dispatch."""
+    values: dict[str, Any] = {}
+    if source:
+        for filename in (
+            "config.json",
+            "processor_config.json",
+            "preprocessor_config.json",
+            "image_processor.json",
+        ):
+            path = _source_asset_path(source, filename)
+            if path is not None:
+                try:
+                    with open(path, encoding="utf-8") as handle:
+                        values.update(json.load(handle))
+                except (OSError, ValueError):
+                    _LOGGER.warning("Could not read processor config %s", path)
+    image_processor = values.get("image_processor")
+    if isinstance(image_processor, dict):
+        values.update(image_processor)
+
+    embedding = values.get("embd_layer")
+    if isinstance(embedding, dict):
+        image_embedding = embedding.get("image_embd_layer")
+        if isinstance(image_embedding, dict):
+            values.update(image_embedding)
+
+    vision = getattr(config, "vision", None)
+    for name in (
+        "patch_size",
+        "temporal_patch_size",
+        "spatial_merge_size",
+        "image_crop_size",
+    ):
+        value = getattr(vision, name, None)
+        if value is None:
+            value = getattr(config, name, None)
+        if value is not None:
+            values.setdefault(name, value)
+    values.setdefault("merge_size", values.get("spatial_merge_size"))
+    values.setdefault("crop_size", values.get("image_crop_size"))
+    if "dynamic_hd" in values:
+        if values.get("use_hd_transform") is not True:
+            raise ValueError(
+                "Processor declares dynamic_hd but config.json does not explicitly enable "
+                "use_hd_transform. Regenerate the package with the complete model config "
+                "or register the missing dynamic-HD contract; fixed-resize fallback is unsafe."
+            )
+        values.setdefault("include_thumbnail", True)
+        values.setdefault("thumbnail_order", "prepend")
+        values.setdefault("mask_patch_size", values.get("patch_size", 14))
+        values.setdefault("canvas_pad_value", 255)
+    return values
+
+
+_STATE_INPUT = re.compile(
+    r"^past_key_values\.(?P<layer>\d+)\."
+    r"(?P<role>key|value|conv_state|recurrent_state|ssm_state)$"
+)
+_REPLACE_ROLES = {
+    "lightning_attention": {"recurrent_state"},
+    "linear_attention": {"conv_state", "recurrent_state"},
+    "conv": {"conv_state"},
+    "mamba": {"conv_state", "ssm_state"},
+    "mamba2": {"conv_state", "ssm_state"},
+}
+_STATELESS_LAYER_TYPES = {"mlp", "moe"}
+
+
+def _state_and_kv_pairs(
+    decoder_inputs: list[_Port],
+    decoder_outputs: list[_Port],
+    config: Any,
+) -> tuple[list[str], list[str], list[dict[str, str]]]:
+    """Pair decoder state by declared port role and config layer type."""
+    outputs = {port.name: port for port in decoder_outputs}
+    layer_types = getattr(config, "layer_types", None)
+    kv_inputs: list[str] = []
+    kv_outputs: list[str] = []
+    state_pairs: list[dict[str, str]] = []
+    consumed_outputs: set[str] = set()
+    for input_port in decoder_inputs:
+        match = _STATE_INPUT.fullmatch(input_port.name)
+        if match is None:
+            raise ValueError(
+                "Cannot classify decoder loop state port "
+                f"{input_port.name!r}: it is neither routed data nor a registered "
+                "past_key_values.<layer>.<role> contract. Regenerate the ONNX package "
+                "with declared state port roles or register this decoder signature."
+            )
+        layer = int(match.group("layer"))
+        role = match.group("role")
+        output_name = f"present.{layer}.{role}"
+        output_port = outputs.get(output_name)
+        if output_port is None:
+            raise ValueError(
+                f"Decoder state input {input_port.name!r} declares role {role!r}, but "
+                f"matching output {output_name!r} is absent. Regenerate the package "
+                "with paired state I/O or register an explicit output mapping."
+            )
+        if input_port.dtype != output_port.dtype:
+            raise ValueError(
+                f"Decoder state pair {input_port.name!r} -> {output_name!r} has "
+                f"dtype mismatch {input_port.dtype} vs {output_port.dtype}; regenerate "
+                "the ONNX graph with a stable loop-state dtype."
+            )
+        consumed_outputs.add(output_name)
+
+        layer_type = None
+        if layer_types is not None:
+            if layer >= len(layer_types):
+                raise ValueError(
+                    f"Decoder state port {input_port.name!r} references layer {layer}, "
+                    f"but config.layer_types declares only {len(layer_types)} layers. "
+                    "Regenerate the package from the matching config."
+                )
+            layer_type = str(layer_types[layer])
+
+        if role in {"key", "value"}:
+            if layer_type in _REPLACE_ROLES or layer_type in _STATELESS_LAYER_TYPES:
+                raise ValueError(
+                    f"Decoder port {input_port.name!r} declares KV role {role!r}, but "
+                    f"config.layer_types[{layer}]={layer_type!r} does not declare KV "
+                    "append state. Regenerate the graph/config pair or register the "
+                    "decoder state contract explicitly."
+                )
+            kv_inputs.append(input_port.name)
+            kv_outputs.append(output_name)
+        else:
+            allowed = _REPLACE_ROLES.get(layer_type or "", set())
+            if role not in allowed:
+                why = (
+                    "config.layer_types is absent"
+                    if layer_types is None
+                    else f"config.layer_types[{layer}]={layer_type!r}"
+                )
+                raise ValueError(
+                    f"Decoder port {input_port.name!r} declares recurrent role {role!r}, "
+                    f"but {why} does not register replace-state semantics. Regenerate "
+                    "with explicit layer_types or add a structural decoder-state "
+                    "registry entry; equal tensor shapes are not used to guess."
+                )
+            state_pairs.append(
+                {
+                    "input": input_port.name,
+                    "output": output_name,
+                    "init": "zeros",
+                    "update": "replace",
+                }
+            )
+
+    unpaired = [port.name for port in decoder_outputs if port.name not in consumed_outputs]
+    if unpaired:
+        raise ValueError(
+            "Decoder exposes unpaired loop-state outputs "
+            f"{unpaired}. Regenerate the package with present.<layer>.<role> outputs "
+            "matching declared past_key_values inputs, or register an explicit mapping."
+        )
+    return kv_inputs, kv_outputs, state_pairs
+
+
+@dataclasses.dataclass(frozen=True)
+class _PositionProgram:
+    rank: int
+    axes: tuple[str, ...]
+    continuation: str
+    matches: Callable[[Any], bool]
+    sections_attribute: str | None = None
+
+
+_POSITION_PROGRAM_REGISTRY = (
+    _PositionProgram(
+        rank=1,
+        axes=("sequence",),
+        continuation="linear_increment",
+        matches=lambda config: True,
+    ),
+    _PositionProgram(
+        rank=3,
+        axes=("temporal", "height", "width"),
+        continuation="from_grid",
+        matches=lambda config: (
+            bool(getattr(config, "mrope_interleaved", False))
+            and bool(getattr(config, "mrope_section", None))
+        ),
+        sections_attribute="mrope_section",
+    ),
+)
+
+
+def _positions_from_registry(position: _Port, config: Any) -> dict[str, Any]:
+    if position.rank == 3:
+        semantic_rank = 3
+    elif position.rank == 2:
+        semantic_rank = 1
+    else:
+        raise ValueError(
+            f"Cannot emit position metadata for decoder port {position.name!r}: "
+            f"expected a registered rank-2 or rank-3 tensor, got shape {position.dims}. "
+            "Regenerate the decoder with a declared position contract or register "
+            "the new layout."
+        )
+    for program in _POSITION_PROGRAM_REGISTRY:
+        if program.rank != semantic_rank or not program.matches(config):
+            continue
+        positions: dict[str, Any] = {
+            "input": position.name,
+            "rank": program.rank,
+            "dtype": position.dtype,
+            "continuation": program.continuation,
+            "axes": list(program.axes),
+        }
+        if program.sections_attribute is not None:
+            sections = getattr(config, program.sections_attribute)
+            positions["sections"] = [int(section) for section in sections]
+        return positions
+    raise ValueError(
+        f"Cannot emit position metadata for decoder port {position.name!r} with "
+        f"shape {position.dims}: no position registry entry matches the explicit "
+        "config. Rank-3 axes and continuation are never guessed. Regenerate with "
+        "mrope_interleaved/mrope_section declarations or register this position contract."
+    )
+
+
+def _decoder_io(
+    decoder: Any,
+    routed_inputs: set[str],
+    config: Any,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    inputs = [_port(value) for value in decoder.graph.inputs]
+    outputs = [_port(value) for value in decoder.graph.outputs]
+    io: dict[str, Any] = {
+        "inputs": [port.name for port in inputs],
+        "outputs": [port.name for port in outputs],
+    }
+
+    routed = [port for port in inputs if port.name in routed_inputs]
+    embedded = next((port for port in routed if _is_float(port) and port.rank == 3), None)
+    if embedded is not None:
+        io["inputs_embeds_input"] = embedded.name
+
+    input_by_name = {port.name: port for port in inputs}
+    output_by_name = {port.name: port for port in outputs}
+    attention_mask = input_by_name.get("attention_mask")
+    if attention_mask is not None:
+        io["attention_mask_input"] = attention_mask.name
+
+    position = input_by_name.get("position_ids")
+    if position is not None:
+        io["position_ids_input"] = position.name
+
+    token = input_by_name.get("input_ids")
+    if token is not None:
+        io["token_input"] = token.name
+
+    logits = output_by_name.get("logits")
+    if logits is None:
+        raise ValueError(
+            "Cannot emit native VLM decoder metadata because the graph has no "
+            "'logits' output. Regenerate the Mobius decoder with its declared "
+            "logits role or register an explicit decoder I/O contract."
+        )
+    io["logits_output"] = logits.name
+
+    core_inputs = routed_inputs | {
+        port.name for port in (attention_mask, position, token) if port is not None
+    }
+    state_inputs = [port for port in inputs if port.name not in core_inputs]
+    state_outputs = [port for port in outputs if port.name != logits.name]
+    kv_inputs, kv_outputs, state_pairs = _state_and_kv_pairs(
+        state_inputs, state_outputs, config
+    )
+    if kv_inputs:
+        io["kv_inputs"] = kv_inputs
+        io["kv_outputs"] = kv_outputs
+        io["kv_update"] = "append"
+    if state_pairs:
+        io["state_pairs"] = state_pairs
+
+    positions = _positions_from_registry(position, config) if position is not None else None
+    return io, positions
+
+
+def _component_filenames(pkg: Any) -> dict[str, str]:
+    multiple = len(pkg) > 1
+    return {name: f"{name}/model.onnx" if multiple else "model.onnx" for name in pkg}
+
+
+def _topological_order(
+    names: Iterable[str],
+    edges: list[dict[str, Any]],
+) -> list[str]:
+    names = list(names)
+    incoming = dict.fromkeys(names, 0)
+    outgoing: dict[str, list[str]] = {name: [] for name in names}
+    for edge in edges:
+        source = edge["from"].split(".", 1)[0]
+        target = edge["to"].split(".", 1)[0]
+        if source == target:
+            continue
+        outgoing[source].append(target)
+        incoming[target] += 1
+    ready = [name for name in names if incoming[name] == 0]
+    ordered: list[str] = []
+    while ready:
+        name = ready.pop(0)
+        ordered.append(name)
+        for target in outgoing[name]:
+            incoming[target] -= 1
+            if incoming[target] == 0:
+                ready.append(target)
+    if len(ordered) != len(names):
+        raise ValueError("Component dataflow contains a cycle")
+    return ordered
+
+
+def is_native_vlm_package(pkg: Any) -> bool:
+    """Return whether a package must use native VLM emission.
+
+    Processor support is deliberately not checked here. A VLM-shaped package
+    must enter the native emitter so an unsupported signature fails clearly
+    instead of silently receiving generic decoder metadata.
+    """
+    try:
+        names = set(pkg)
+    except (AttributeError, TypeError):
+        return False
+    return "vision_encoder" in names
+
+
+def build_native_vlm_package_metadata(
+    pkg: Any,
+    *,
+    config: Any,
+    source: str | None = None,
+    decoder_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Emit a native VLM contract by inspecting every component graph.
+
+    Processor selection is registry-driven from graph rank/dtype/shape
+    signatures. No model type, architecture name, or model-name branch
+    participates in dispatch.
+    """
+    try:
+        component_names = set(pkg)
+    except (AttributeError, TypeError):
+        component_names = set()
+    required_components = {"vision_encoder", "embedding", "decoder"}
+    missing_components = sorted(required_components - component_names)
+    if missing_components:
+        raise ValueError(
+            "Cannot emit native VLM metadata: missing required component(s) "
+            f"{missing_components}. Why: executable native VLM metadata requires a "
+            "vision_encoder to produce image features, an embedding component to route "
+            "them into token embeddings, and a decoder to consume those embeddings; "
+            "partial packages cannot define complete graph I/O or dataflow. How to fix: "
+            "regenerate the package with the native multimodal task so all three "
+            "components are present, or use a component-specific non-VLM exporter."
+        )
+
+    filenames = _component_filenames(pkg)
+    ports = {
+        name: {
+            "inputs": [_port(value) for value in model.graph.inputs],
+            "outputs": [_port(value) for value in model.graph.outputs],
+        }
+        for name, model in pkg.items()
+    }
+    dataflow: list[dict[str, Any]] = []
+    for source_name, source_ports in ports.items():
+        output_by_name = {port.name: port for port in source_ports["outputs"]}
+        for target_name, target_ports in ports.items():
+            if source_name == target_name:
+                continue
+            for target_port in target_ports["inputs"]:
+                source_port = output_by_name.get(target_port.name)
+                if source_port is None or source_port.dtype != target_port.dtype:
+                    continue
+                dataflow.append(
+                    {
+                        "from": f"{source_name}.{source_port.name}",
+                        "to": f"{target_name}.{target_port.name}",
+                        "dtype": source_port.dtype,
+                        "device_transfer": False,
+                    }
+                )
+
+    decoder_name = "decoder"
+    routed_decoder_inputs = {
+        edge["to"].split(".", 1)[1]
+        for edge in dataflow
+        if edge["to"].startswith(f"{decoder_name}.")
+    }
+    processor_values = _processor_values(source, config)
+    image_program = _resolve_image_program(pkg["vision_encoder"], processor_values)
+    decoder_io, positions = _decoder_io(pkg[decoder_name], routed_decoder_inputs, config)
+
+    preprocessing_outputs = []
+    processor_summaries = []
+    for port, content, pad_value in image_program.bindings:
+        output: dict[str, Any] = {
+            "name": port.name,
+            "content": content,
+            "dtype": port.dtype,
+        }
+        if pad_value is not None:
+            output["pad_value"] = pad_value
+        preprocessing_outputs.append(output)
+        if content in image_program.summary_contents:
+            processor_summaries.append(port.name)
+
+    if positions is not None and positions["rank"] > 1 and processor_summaries:
+        positions["processor_summaries"] = processor_summaries
+
+    downstream_to_decoder = {
+        edge["from"].split(".", 1)[0]
+        for edge in dataflow
+        if edge["to"].startswith(f"{decoder_name}.")
+    }
+    models: dict[str, Any] = {}
+    phases: dict[str, Any] = {}
+    for name in pkg:
+        if name == decoder_name:
+            role = "decoder"
+            run_on = "every_step"
+            io = decoder_io
+        elif name == "vision_encoder":
+            role = "vision_encoder"
+            run_on = "prompt_only"
+            io = {
+                "inputs": [port.name for port in ports[name]["inputs"]],
+                "outputs": [port.name for port in ports[name]["outputs"]],
+            }
+        else:
+            role = "encoder"
+            run_on = "every_step" if name in downstream_to_decoder else "prompt_only"
+            io = {
+                "inputs": [port.name for port in ports[name]["inputs"]],
+                "outputs": [port.name for port in ports[name]["outputs"]],
+            }
+        models[name] = {
+            "filename": filenames[name],
+            "type": role,
+            "io": io,
+        }
+        if name == decoder_name:
+            models[name]["tokenizer"] = "tokenizer.json"
+        phases[name] = {"run_on": run_on}
+
+    stages = []
+    for name in _topological_order(pkg.keys(), dataflow):
+        strategy = (
+            {"kind": "autoregressive", "decoder": name}
+            if name == decoder_name
+            else {"kind": "single_pass", "model": name}
+        )
+        stages.append(
+            {
+                "name": f"run_{name}",
+                "strategy": strategy,
+                "run_on": phases[name]["run_on"],
+            }
+        )
+
+    vision_config: dict[str, Any] = {
+        "image_placeholder_token_id": getattr(config, "image_token_id", None)
+        or getattr(getattr(config, "vision", None), "image_token_id", None),
+        "image_token_id": getattr(config, "image_token_id", None)
+        or getattr(getattr(config, "vision", None), "image_token_id", None),
+        "placeholder_per_image": True,
+        "token_count_source": image_program.token_count_source,
+    }
+    if processor_summaries:
+        vision_config["processor_summaries"] = processor_summaries
+    if image_program.vision_properties is not None:
+        vision_config.update(image_program.vision_properties(processor_values))
+    vision_config = {key: value for key, value in vision_config.items() if value is not None}
+
+    metadata = dict(decoder_metadata or {})
+    capabilities = list(metadata.get("required_capabilities", []))
+    for capability in (
+        "multimodal_image_preprocessing",
+        "autoregressive_every_step_components",
+    ):
+        if capability not in capabilities:
+            capabilities.append(capability)
+    if positions is not None and positions["rank"] > 1:
+        capabilities.append("multiaxis_positions")
+    if decoder_io.get("state_pairs"):
+        capabilities.append("loop_state")
+    metadata["required_capabilities"] = capabilities
+    metadata.setdefault("model", {})["io"] = decoder_io
+    metadata["preprocessing"] = {
+        "image": {
+            "transforms": image_program.transforms(config, processor_values),
+            "outputs": preprocessing_outputs,
+        }
+    }
+    metadata["pipeline"] = {
+        "models": models,
+        "dataflow": dataflow,
+        "strategy": {"kind": "composite", "stages": stages},
+        "phases": phases,
+        "vision": vision_config,
+    }
+    if positions is not None:
+        metadata["pipeline"]["positions"] = positions
+    return metadata
+
+
+def _copy_runtime_assets(
+    output_dir: str,
+    source: str | None,
+) -> dict[str, str]:
+    if not source:
+        return {}
+    os.makedirs(output_dir, exist_ok=True)
+    for filename in _RUNTIME_ASSET_NAMES:
+        source_path = _source_asset_path(source, filename)
+        if source_path is not None:
+            shutil.copy2(source_path, os.path.join(output_dir, filename))
+
+    template_path = os.path.join(output_dir, "chat_template.jinja")
+    tokenizer_config_path = os.path.join(output_dir, "tokenizer_config.json")
+    if not os.path.isfile(template_path) and os.path.isfile(tokenizer_config_path):
+        try:
+            with open(tokenizer_config_path, encoding="utf-8") as handle:
+                chat_template = json.load(handle).get("chat_template")
+            if chat_template:
+                Path(template_path).write_text(chat_template, encoding="utf-8")
+        except (OSError, ValueError):
+            _LOGGER.warning("Could not extract chat_template from %s", tokenizer_config_path)
+
+    tokenizer_path = os.path.join(output_dir, "tokenizer.json")
+    if not os.path.isfile(tokenizer_path):
+        try:
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(source, use_fast=True)
+            backend = getattr(tokenizer, "backend_tokenizer", None)
+            if backend is not None:
+                backend.save(tokenizer_path)
+            chat_template = getattr(tokenizer, "chat_template", None)
+            if chat_template and not os.path.isfile(template_path):
+                Path(template_path).write_text(chat_template, encoding="utf-8")
+        except Exception as error:
+            _LOGGER.warning(
+                "Could not materialize tokenizer assets from %r: %s", source, error
+            )
+
+    return {
+        Path(filename).stem: os.path.join(output_dir, filename)
+        for filename in _RUNTIME_ASSET_NAMES
+        if os.path.isfile(os.path.join(output_dir, filename))
+    }
+
+
+def write_native_vlm_package_metadata(
+    pkg: Any,
+    directory: str,
+    *,
+    config: Any,
+    source: str | None = None,
+    kv_native_dtype: str | None = None,
+    filename: str = "inference_metadata.yaml",
+) -> dict[str, str]:
+    """Write native VLM metadata and the runtime's tokenizer/processor assets."""
+    from mobius.integrations.onnx_genai.decoder_metadata import (
+        decoder_metadata_from_config,
+    )
+
+    metadata = build_native_vlm_package_metadata(
+        pkg,
+        config=config,
+        source=source,
+        decoder_metadata=decoder_metadata_from_config(config, kv_native_dtype=kv_native_dtype),
+    )
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, filename)
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(metadata, handle, sort_keys=False)
+    artifacts = {"inference_metadata": path}
+    artifacts.update(_copy_runtime_assets(directory, source))
+    return artifacts
 
 
 @dataclasses.dataclass(frozen=True)
