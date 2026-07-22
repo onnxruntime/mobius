@@ -121,12 +121,20 @@ class _VlmConfig:
 def _embedding_model(
     outputs: list[tuple[str, ir.DataType, list[int | str]]],
     *,
+    optional_image: bool = False,
     include_audio: bool = False,
     optional_audio: bool = False,
 ) -> ir.Model:
+    image_features = _value("image_features", ir.DataType.FLOAT, ["image_tokens", 64])
+    if optional_image:
+        declare_optional_input(
+            image_features,
+            presence="image",
+            absent_shape=[0, 64],
+        )
     inputs = [
         _value("input_ids", ir.DataType.INT64, ["batch", "sequence"]),
-        _value("image_features", ir.DataType.FLOAT, ["image_tokens", 64]),
+        image_features,
     ]
     if include_audio:
         audio_features = _value("audio_features", ir.DataType.FLOAT, ["audio_tokens", 64])
@@ -359,6 +367,7 @@ class TestNativeVlmPackageMetadata:
                             ["batch", "sequence", 128],
                         ),
                     ],
+                    optional_image=True,
                     include_audio=True,
                     optional_audio=True,
                 ),
@@ -392,6 +401,7 @@ class TestNativeVlmPackageMetadata:
             },
             config=config,
         )
+        declare_component_presence(package["vision_encoder"].graph, "image")
         declare_component_presence(package["audio_encoder"].graph, "audio")
 
         source = tmp_path / "gemma"
@@ -456,15 +466,29 @@ class TestNativeVlmPackageMetadata:
             "from": "audio_encoder.audio_features",
         }
         assert emitted_yaml["pipeline"]["models"]["embedding"]["io"]["optional_inputs"] == {
+            "image_features": {
+                "presence": "image",
+                "absent": {"kind": "zeros", "shape": [0, 64]},
+            },
             "audio_features": {
                 "presence": "audio",
                 "absent": {"kind": "zeros", "shape": [0, 64]},
-            }
+            },
+        }
+        assert emitted_yaml["pipeline"]["phases"]["vision_encoder"] == {
+            "run_on": "prompt_only",
+            "when_present": "image",
         }
         assert emitted_yaml["pipeline"]["phases"]["audio_encoder"] == {
             "run_on": "prompt_only",
             "when_present": "audio",
         }
+        vision_stage = next(
+            stage
+            for stage in metadata["pipeline"]["strategy"]["stages"]
+            if stage["strategy"].get("model") == "vision_encoder"
+        )
+        assert vision_stage["run_on"] == "prompt_only"
         audio_stage = next(
             stage
             for stage in metadata["pipeline"]["strategy"]["stages"]

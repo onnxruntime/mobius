@@ -362,6 +362,7 @@ class Gemma4Task(ModelTask):
 
         builder.add_output(image_features, "image_features")
 
+        declare_component_presence(graph, "image")
         return _make_model(graph)
 
     def _build_audio(
@@ -455,6 +456,11 @@ class Gemma4Task(ModelTask):
             dtype=config.dtype,
             shape=[num_image_tokens, config.hidden_size],
         )
+        declare_optional_input(
+            image_features,
+            presence="image",
+            absent_shape=[0, config.hidden_size],
+        )
 
         audio_features_val: ir.Value | None = None
 
@@ -547,6 +553,7 @@ class Gemma4UnifiedTask(Gemma4Task):
             pixel_position_ids=pixel_position_ids,
         )
         builder.add_output(image_features, "image_features")
+        declare_component_presence(graph, "image")
         return _make_model(graph)
 
     def _build_audio(
