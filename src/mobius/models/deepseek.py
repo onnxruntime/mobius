@@ -114,10 +114,14 @@ class DeepSeekMoEGate(nn.Module):
 
         # Reshape to groups: (B*S, n_group, experts_per_group)
         scores_grouped = op.Reshape(flat, [0, self.n_group, experts_per_group])
-        # Group score = sum of top-2 within each group
-        k_two = op.Constant(value_ints=[2])
-        group_top2, _ = op.TopK(scores_grouped, k_two, axis=-1, _outputs=2)
-        group_scores = op.ReduceSum(group_top2, [-1], keepdims=False)  # (B*S, n_group)
+        if self.topk_method == "noaux_tc":
+            # Bias-corrected routing scores groups by their two strongest experts.
+            k_two = op.Constant(value_ints=[2])
+            group_top2, _ = op.TopK(scores_grouped, k_two, axis=-1, _outputs=2)
+            group_scores = op.ReduceSum(group_top2, [-1], keepdims=False)
+        else:
+            # Group-limited greedy routing scores each group by its strongest expert.
+            group_scores = op.ReduceMax(scores_grouped, [-1], keepdims=False)
 
         # Select top groups
         k_groups = op.Constant(value_ints=[self.topk_group])
@@ -140,8 +144,12 @@ class DeepSeekMoEGate(nn.Module):
         )
         # Flatten back: (B*S, num_experts)
         expert_mask = op.Reshape(group_mask_expanded, [0, self.num_experts])
-        # Zero out non-selected groups, then reshape back to original (B, S, n_experts)
-        return op.Reshape(op.Mul(flat, expert_mask), orig_shape)
+        # Mask rather than multiply by zero: correction biases may make valid
+        # selected-group scores negative, while zero would let excluded experts win TopK.
+        selected = op.Greater(expert_mask, 0.0)
+        neg_inf = op.CastLike(float("-inf"), flat)
+        masked_scores = op.Where(selected, flat, neg_inf)
+        return op.Reshape(masked_scores, orig_shape)
 
 
 class DeepSeekMLADecoderLayer(nn.Module):

@@ -186,8 +186,10 @@ class MoELayer(nn.Module):
     Routes each token to top-k experts via a gating mechanism, applies
     each expert MLP, and accumulates weighted results.
 
-    Uses loop-over-experts dispatch: each expert processes all tokens,
-    then results are masked and weighted.
+    This is the portable dense fallback representation: it uses only standard
+    ONNX operators, evaluates every expert for every token, then masks and
+    weights each contribution. It is a correctness oracle and compatibility
+    path, not the grouped-expert performance representation.
     """
 
     def __init__(self, config: ArchitectureConfig, gate: nn.Module | None = None):

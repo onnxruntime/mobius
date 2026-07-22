@@ -14,6 +14,7 @@ import yaml
 from mobius.integrations.onnx_genai.decoder_metadata import (
     build_decoder_metadata,
     decoder_metadata_from_config,
+    moe_metadata_from_config,
     write_decoder_metadata,
 )
 
@@ -114,7 +115,69 @@ class TestDecoderMetadata:
 
         with open(schema_path) as handle:
             schema = json.load(handle)
-        meta = decoder_metadata_from_config(
-            _FakeConfig(sliding_window=4096), kv_native_dtype="bf16"
-        )
+        cfg = _FakeConfig(sliding_window=4096)
+        cfg.num_local_experts = 8
+        cfg.num_experts_per_tok = 2
+        cfg.moe_intermediate_size = 256
+        cfg.n_shared_experts = 1
+        cfg.scoring_func = "sigmoid"
+        cfg.topk_method = "noaux_tc"
+        cfg.n_group = 4
+        cfg.topk_group = 2
+        meta = decoder_metadata_from_config(cfg, kv_native_dtype="bf16")
         jsonschema.validate(instance=meta, schema=schema)
+
+    def test_moe_metadata_from_config_is_structural(self):
+        cfg = _FakeConfig()
+        cfg.num_local_experts = 8
+        cfg.num_experts_per_tok = 2
+        cfg.moe_intermediate_size = 256
+        cfg.n_shared_experts = 1
+        cfg.scoring_func = "sigmoid"
+        cfg.topk_method = "noaux_tc"
+        cfg.n_group = 4
+        cfg.topk_group = 2
+        cfg.norm_topk_prob = True
+        cfg.routed_scaling_factor = 2.5
+        cfg.hidden_act = "silu"
+
+        moe = moe_metadata_from_config(cfg)
+
+        assert moe == {
+            "representation": "dense_fallback",
+            "routed_expert_count": 8,
+            "shared_expert_count": 1,
+            "experts_per_token": 2,
+            "expert_intermediate_size": 256,
+            "shared_expert_intermediate_size": 256,
+            "activation": "silu",
+            "router": {
+                "score_function": "sigmoid",
+                "selection_method": "grouped_top_k",
+                "normalize_weights": True,
+                "scaling_factor": 2.5,
+                "group_count": 4,
+                "groups_per_token": 2,
+                "group_score": "top_2_sum",
+            },
+        }
+
+    def test_decoder_metadata_embeds_moe_contract(self):
+        cfg = _FakeConfig()
+        cfg.num_local_experts = 4
+        cfg.num_experts_per_tok = 2
+        cfg.moe_intermediate_size = 128
+
+        meta = decoder_metadata_from_config(cfg)
+
+        assert meta["model"]["mixture_of_experts"]["routed_expert_count"] == 4
+        assert meta["model"]["mixture_of_experts"]["representation"] == "dense_fallback"
+
+    def test_moe_metadata_rejects_incomplete_contract(self):
+        cfg = _FakeConfig()
+        cfg.num_local_experts = 4
+        cfg.num_experts_per_tok = None
+        cfg.moe_intermediate_size = 128
+
+        with pytest.raises(ValueError, match="num_experts_per_tok"):
+            moe_metadata_from_config(cfg)
