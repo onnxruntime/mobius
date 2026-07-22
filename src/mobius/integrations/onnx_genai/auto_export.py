@@ -438,6 +438,8 @@ def write_onnx_genai_config(
             "onnx-genai decoder metadata requires a model config (pass config=... "
             "or a package carrying `.config`)"
         )
+    if kv_native_dtype is None:
+        kv_native_dtype = _activation_dtype_tag(resolved_config)
     if _looks_like_multimodal(pkg):
         derived = _multimodal_component_kwargs(pkg)
         for name, value in derived.items():

@@ -42,6 +42,18 @@ def test_dispatch_decoder(tmp_path):
     assert meta["kv_cache"]["native_dtype"] == "bf16"
 
 
+def test_dispatch_decoder_derives_native_kv_dtype_from_config(tmp_path):
+    class _Float16:
+        name = "FLOAT16"
+
+    cfg = _Cfg()
+    cfg.dtype = _Float16()
+    arts = write_onnx_genai_config(object(), str(tmp_path), config=cfg)
+    with open(arts["inference_metadata"]) as handle:
+        meta = yaml.safe_load(handle)
+    assert meta["kv_cache"]["native_dtype"] == "fp16"
+
+
 def test_dispatch_diffusion(tmp_path):
     pkg = _DiffusionPkg({"denoiser": object(), "vae": object()})
     arts = write_onnx_genai_config(
