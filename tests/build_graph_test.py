@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 
+import ml_dtypes
 import numpy as np
 import onnx_ir as ir
 import pytest
@@ -61,6 +62,7 @@ from mobius._configs import (
     VisionConfig,
 )
 from mobius._optimizations import SymbolicShapeInferencePass
+from mobius._pipeline_contract import component_presence, optional_input_contract
 from mobius._registry import registry
 from mobius.tasks import (
     CausalLMTask,
@@ -1238,7 +1240,7 @@ class TestBuildGraphVisionLanguage:
         module = model_cls(config)
         task_name = _default_task_for_model("gemma4")
         task = get_task(task_name)
-        pkg = task.build(module, config)
+        pkg = build_from_module(module, config, task=task)
 
         assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}, (
             f"Vision-only Gemma4 should produce 3 models, got: {set(pkg.keys())}"
@@ -1660,13 +1662,21 @@ class TestBuildGraphVisionLanguage:
         audio_input_names = {i.name for i in audio.graph.inputs}
         assert "input_features" in audio_input_names
         assert "input_features_mask" in audio_input_names
-        assert "audio_features" in {o.name for o in audio.graph.outputs}
+        audio_features = next(o for o in audio.graph.outputs if o.name == "audio_features")
+        assert len(audio_features.shape) == 2
+        assert audio_features.shape[-1] == config.hidden_size
+        assert component_presence(audio.graph) == "audio"
         # Embedding: all three inputs
         embedding = pkg["embedding"]
         emb_input_names = {i.name for i in embedding.graph.inputs}
         assert "input_ids" in emb_input_names
         assert "image_features" in emb_input_names
         assert "audio_features" in emb_input_names
+        embedding_audio = next(i for i in embedding.graph.inputs if i.name == "audio_features")
+        assert optional_input_contract(embedding_audio) == {
+            "presence": "audio",
+            "absent": {"kind": "zeros", "shape": [0, config.hidden_size]},
+        }
         assert "inputs_embeds" in {o.name for o in embedding.graph.outputs}
         # KV cache outputs: num_kv_layers = num_hidden_layers - num_kv_shared_layers = 1
         decoder_output_names = {o.name for o in decoder.graph.outputs}
@@ -1674,6 +1684,50 @@ class TestBuildGraphVisionLanguage:
         assert "present.0.value" in decoder_output_names
         assert "present.1.key" not in decoder_output_names  # shared layer excluded
         assert "present.1.value" not in decoder_output_names  # shared layer excluded
+
+    @pytest.mark.parametrize(
+        ("dtype", "np_dtype"),
+        [
+            (ir.DataType.FLOAT, np.float32),
+            (ir.DataType.FLOAT16, np.float16),
+            (ir.DataType.BFLOAT16, ml_dtypes.bfloat16),
+        ],
+    )
+    def test_gemma4_audio_encoder_strips_padding_in_graph(self, dtype, np_dtype):
+        """The exported audio graph produces ordered rank-2 valid feature rows."""
+        from onnxscript import nn
+
+        from mobius._configs import Gemma4AudioConfig, Gemma4Config
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        class IdentityAudio(nn.Module):
+            def forward(self, op, input_features, input_features_mask=None):
+                return op.Identity(input_features), op.Identity(input_features_mask)
+
+        config = Gemma4Config(
+            hidden_size=4,
+            dtype=dtype,
+            audio=Gemma4AudioConfig(input_size=4),
+        )
+        model = Gemma4Task()._build_audio(IdentityAudio(), config)
+        features = np.arange(24, dtype=np_dtype).reshape(2, 3, 4)
+        mask = np.array([[True, True, False], [True, False, False]])
+
+        session = OnnxModelSession(model)
+        outputs = session.run(
+            {
+                "input_features": features,
+                "input_features_mask": mask,
+            }
+        )
+        session.close()
+
+        np.testing.assert_array_equal(
+            outputs["audio_features"],
+            np.concatenate([features[0, :2], features[1, :1]], axis=0),
+        )
+        assert outputs["audio_features"].dtype == np.dtype(np_dtype)
 
     def test_gemma4_unified_multimodal_graph(self):
         """Build gemma4_unified (gemma-4-12B) encoder-free multimodal model.
@@ -1728,7 +1782,7 @@ class TestBuildGraphVisionLanguage:
         model_cls = registry.get("gemma4_unified")
         module = model_cls(config)
         task = get_task(_default_task_for_model("gemma4_unified"))
-        pkg = task.build(module, config)
+        pkg = build_from_module(module, config, task=task)
 
         assert set(pkg.keys()) == {
             "decoder",
@@ -1748,12 +1802,18 @@ class TestBuildGraphVisionLanguage:
         a_inputs = {i.name for i in audio.graph.inputs}
         assert a_inputs == {"input_features", "input_features_mask"}
         assert "audio_features" in {o.name for o in audio.graph.outputs}
+        assert component_presence(audio.graph) == "audio"
 
         # Embedding: fuses both modalities → inputs_embeds (no block_sequence_ids;
         # the decoder derives the bidirectional overlay from input_ids itself)
         embedding = pkg["embedding"]
         e_inputs = {i.name for i in embedding.graph.inputs}
         assert {"input_ids", "image_features", "audio_features"} <= e_inputs
+        embedding_audio = next(i for i in embedding.graph.inputs if i.name == "audio_features")
+        assert optional_input_contract(embedding_audio) == {
+            "presence": "audio",
+            "absent": {"kind": "zeros", "shape": [0, config.hidden_size]},
+        }
         e_outputs = {o.name for o in embedding.graph.outputs}
         assert "inputs_embeds" in e_outputs
         assert "block_sequence_ids" not in e_outputs
