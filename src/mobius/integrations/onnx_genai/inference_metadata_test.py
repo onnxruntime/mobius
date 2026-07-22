@@ -372,14 +372,17 @@ class TestNativeVlmPackageMetadata:
         assert metadata["pipeline"]["vision"]["token_count_source"] == "from_coordinates"
         assert metadata["pipeline"]["vision"]["token_pooling_factor"] == 9
         transforms = metadata["preprocessing"]["image"]["transforms"]
-        assert next(transform for transform in transforms if transform["op"] == "tile") == {
-            "op": "tile",
+        assert next(transform for transform in transforms if transform["op"] == "resize") == {
+            "op": "resize",
             "mode": "aspect_ratio_patch_budget",
-            "tile_size": 48,
-            "max_tiles": 280,
-            "include_thumbnail": False,
+            "patch_size": 16,
+            "max_patches": 2520,
+            "pooling_kernel_size": 3,
             "interpolation": "bicubic",
         }
+        assert next(transform for transform in transforms if transform["op"] == "pad")[
+            "target_length"
+        ] == 2520
         assert not any(transform["op"] == "normalize" for transform in transforms)
         assert metadata["model"]["io"]["token_input"] == "input_ids"
 
@@ -617,7 +620,7 @@ class TestNativeVlmPackageMetadata:
         outputs = metadata["preprocessing"]["image"]["outputs"]
         assert {output["content"] for output in outputs} == {
             "pixels",
-            "original_size",
+            "transformed_size",
             "validity_mask",
         }
         tile = next(
@@ -736,6 +739,26 @@ class TestNativeVlmPackageMetadata:
                 package, config=config, source=str(source)
             )
 
+    def test_missing_native_vlm_components_fail_actionably(self):
+        config = _VlmConfig()
+        vision_only = ModelPackage(
+            {
+                "vision_encoder": _model(
+                    "vision_encoder",
+                    [_value("pixel_values", ir.DataType.FLOAT, ["patches", 1536])],
+                    [("image_features", ir.DataType.FLOAT, ["tokens", 64])],
+                )
+            },
+            config=config,
+        )
+
+        assert is_native_vlm_package(vision_only)
+        with pytest.raises(
+            ValueError,
+            match=r"missing required component.*decoder.*embedding.*Why:.*How to fix:",
+        ):
+            build_native_vlm_package_metadata(vision_only, config=config)
+
     def test_cached_qwen_processor_matches_emitted_area_program(self):
         np = pytest.importorskip("numpy")
         image_module = pytest.importorskip("PIL.Image")
@@ -805,32 +828,52 @@ class TestNativeVlmPackageMetadata:
             width // patchify["patch_size"]
         )
         assert emitted_patch_count == reference["pixel_values"].shape[0] == 576
+        emitted_patch_width = (
+            3
+            * patchify["temporal_patch_size"]
+            * patchify["patch_size"]
+            * patchify["patch_size"]
+        )
+        assert emitted_patch_width == reference["pixel_values"].shape[1] == 1536
+        assert patchify["channel_order"] == "channels_first"
         assert np.all(reference["pixel_values"] == -1)
 
     def test_cached_gemma_processor_matches_emitted_patch_budget(self):
         np = pytest.importorskip("numpy")
         image_module = pytest.importorskip("PIL.Image")
         pytest.importorskip("torchvision")
-        from huggingface_hub import scan_cache_dir
+        from huggingface_hub import constants, scan_cache_dir
+        from huggingface_hub.file_download import repo_folder_name
         from transformers.models.gemma4.image_processing_gemma4 import (
             Gemma4ImageProcessor,
         )
 
-        model_id = "google/gemma-4-E2B-it"
-        processor_path = next(
+        model_id = "google/gemma-4-E2B-it-assistant"
+        cached_config = next(
             (
                 str(file.file_path)
                 for repo in scan_cache_dir().repos
                 if repo.repo_id == model_id
                 for revision in repo.revisions
                 for file in revision.files
-                if file.file_name == "processor_config.json"
+                if file.file_name == "config.json"
             ),
             None,
         )
-        if processor_path is None:
-            pytest.skip("cached Gemma4 processor_config.json unavailable")
-        processor_values = json.loads(Path(processor_path).read_text(encoding="utf-8"))[
+        assert cached_config is not None, "cached Gemma4 assistant config.json unavailable"
+        assert json.loads(Path(cached_config).read_text(encoding="utf-8"))["model_type"] == (
+            "gemma4_assistant"
+        )
+        processor_cache = (
+            Path(constants.HF_HUB_CACHE)
+            / repo_folder_name(repo_id="google/gemma-4-E2B-it", repo_type="model")
+            / "snapshots"
+        )
+        processor_path = max(
+            processor_cache.glob("*/processor_config.json"),
+            key=lambda path: path.stat().st_mtime,
+        )
+        processor_values = json.loads(processor_path.read_text(encoding="utf-8"))[
             "image_processor"
         ]
         processor = Gemma4ImageProcessor(
@@ -858,17 +901,27 @@ class TestNativeVlmPackageMetadata:
             [("image_features", ir.DataType.FLOAT, ["image_tokens", 64])],
         )
         metadata = build_native_vlm_package_metadata(
-            _native_package(vision, config), config=config, source=model_id
+            _native_package(vision, config),
+            config=config,
+            source=str(processor_path.parent),
         )
         transforms = metadata["preprocessing"]["image"]["transforms"]
-        tile = next(transform for transform in transforms if transform["op"] == "tile")
+        resize = next(transform for transform in transforms if transform["op"] == "resize")
         patchify = next(
             transform for transform in transforms if transform["op"] == "patchify"
         )
-        emitted_capacity = tile["max_tiles"] * (
-            tile["tile_size"] // patchify["patch_size"]
-        ) ** 2
-        assert emitted_capacity == reference["pixel_values"].shape[1] == 2520
+        pad = next(transform for transform in transforms if transform["op"] == "pad")
+        assert resize == {
+            "op": "resize",
+            "mode": "aspect_ratio_patch_budget",
+            "patch_size": 16,
+            "max_patches": 2520,
+            "pooling_kernel_size": 3,
+            "interpolation": "bicubic",
+        }
+        assert pad["target_length"] == reference["pixel_values"].shape[1] == 2520
+        assert patchify["channel_order"] == "channels_last"
+        assert patchify["coordinate_order"] == "xy"
         assert not any(transform["op"] == "normalize" for transform in transforms)
         coordinate_output = next(
             output
@@ -928,6 +981,9 @@ class TestNativeVlmPackageMetadata:
         assert tile["mode"] == "dynamic_hd"
         assert tile["max_tiles"] == 36
         assert tile["mask_patch_size"] == 14
+        assert tile["thumbnail_order"] == "prepend"
+        assert tile["canvas_pad_value"] == 255
+        assert tile["thumbnail_interpolation"] == "bicubic"
         assert reference["image_attention_mask"].shape[-1] == (
             tile["tile_size"] // tile["mask_patch_size"]
         )
@@ -937,6 +993,12 @@ class TestNativeVlmPackageMetadata:
             if output["content"] == "validity_mask"
         )
         assert mask_output["pad_value"] == 0
+        size_output = next(
+            output
+            for output in metadata["preprocessing"]["image"]["outputs"]
+            if output["content"] == "transformed_size"
+        )
+        assert size_output["name"] == "image_sizes"
         assert float(reference["image_attention_mask"].min()) == pytest.approx(0)
         assert float(reference["image_attention_mask"].max()) == pytest.approx(1)
 

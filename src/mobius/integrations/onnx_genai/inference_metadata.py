@@ -229,6 +229,7 @@ def _area_grid_transforms(config: Any, values: dict[str, Any]) -> list[dict[str,
             "flatten": True,
             "temporal_patch_size": int(values["temporal_patch_size"]),
             "merge_size": merge_size,
+            "channel_order": "channels_first",
         }
     )
     return transforms
@@ -243,11 +244,11 @@ def _patch_budget_transforms(config: Any, values: dict[str, Any]) -> list[dict[s
     if _enabled(values, "do_resize", True):
         transforms.append(
             {
-                "op": "tile",
+                "op": "resize",
                 "mode": "aspect_ratio_patch_budget",
-                "tile_size": patch_size * pooling,
-                "max_tiles": max_soft_tokens,
-                "include_thumbnail": False,
+                "patch_size": patch_size,
+                "max_patches": max_soft_tokens * pooling**2,
+                "pooling_kernel_size": pooling,
                 "interpolation": _resample_name(values.get("resample", "bicubic")),
             }
         )
@@ -259,7 +260,15 @@ def _patch_budget_transforms(config: Any, values: dict[str, Any]) -> list[dict[s
             default_rescale_factor=1 / 255,
         )
     )
-    transforms.append({"op": "patchify", "patch_size": patch_size, "flatten": True})
+    transforms.append(
+        {
+            "op": "patchify",
+            "patch_size": patch_size,
+            "channel_order": "channels_last",
+            "coordinate_order": "xy",
+            "flatten": True,
+        }
+    )
     transforms.append(
         {
             "op": "pad",
@@ -282,7 +291,10 @@ def _dynamic_hd_transforms(config: Any, values: dict[str, Any]) -> list[dict[str
             "include_thumbnail": bool(values["include_thumbnail"]),
             "thumbnail_order": values["thumbnail_order"],
             "interpolation": _resample_name(values.get("resample", "bilinear")),
-            "pad_value": float(values.get("canvas_pad_value", 255)),
+            "thumbnail_interpolation": _resample_name(
+                values.get("thumbnail_resample", "bicubic")
+            ),
+            "canvas_pad_value": float(values.get("canvas_pad_value", 255)),
             "mask_patch_size": int(values.get("mask_patch_size", 14)),
         },
     ]
@@ -329,16 +341,16 @@ def _match_crop_mask(
     ports: list[_Port],
 ) -> tuple[tuple[_Port, str, float | None], ...] | None:
     pixels = _select_one(ports, lambda p: _is_float(p) and p.rank == 4)
-    original_size = _select_one(
+    transformed_size = _select_one(
         ports,
         lambda p: _is_integer(p) and p.rank == 2 and _static_dim(p, -1) == 2,
     )
     validity_mask = _select_one(ports, lambda p: _is_float(p) and p.rank == 3)
-    if pixels is None or original_size is None or validity_mask is None:
+    if pixels is None or transformed_size is None or validity_mask is None:
         return None
     return (
         (pixels, "pixels", None),
-        (original_size, "original_size", None),
+        (transformed_size, "transformed_size", None),
         (validity_mask, "validity_mask", 0),
     )
 
@@ -401,7 +413,7 @@ def _match_dynamic_hd(ports: list[_Port], values: dict[str, Any]) -> _ImageProgr
         bindings=bindings,
         transforms=_dynamic_hd_transforms,
         token_count_source="from_validity_mask",
-        summary_contents=("original_size", "validity_mask"),
+        summary_contents=("transformed_size", "validity_mask"),
         vision_properties=lambda declared: {
             "thumbnail_order": declared["thumbnail_order"],
         },
@@ -816,11 +828,21 @@ def build_native_vlm_package_metadata(
     signatures. No model type, architecture name, or model-name branch
     participates in dispatch.
     """
-    if not is_native_vlm_package(pkg):
+    try:
+        component_names = set(pkg)
+    except (AttributeError, TypeError):
+        component_names = set()
+    required_components = {"vision_encoder", "embedding", "decoder"}
+    missing_components = sorted(required_components - component_names)
+    if missing_components:
         raise ValueError(
-            "Cannot emit native VLM metadata: the package does not contain the "
-            "required vision_encoder, embedding, and decoder components. Regenerate "
-            "the package with the native multimodal task or use the non-VLM emitter."
+            "Cannot emit native VLM metadata: missing required component(s) "
+            f"{missing_components}. Why: executable native VLM metadata requires a "
+            "vision_encoder to produce image features, an embedding component to route "
+            "them into token embeddings, and a decoder to consume those embeddings; "
+            "partial packages cannot define complete graph I/O or dataflow. How to fix: "
+            "regenerate the package with the native multimodal task so all three "
+            "components are present, or use a component-specific non-VLM exporter."
         )
 
     filenames = _component_filenames(pkg)
