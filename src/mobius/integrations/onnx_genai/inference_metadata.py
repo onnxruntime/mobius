@@ -668,8 +668,10 @@ _POSITION_PROGRAM_REGISTRY = (
         rank=3,
         axes=("temporal", "height", "width"),
         continuation="from_grid",
-        matches=lambda config: bool(getattr(config, "mrope_interleaved", False))
-        and bool(getattr(config, "mrope_section", None)),
+        matches=lambda config: (
+            bool(getattr(config, "mrope_interleaved", False))
+            and bool(getattr(config, "mrope_section", None))
+        ),
         sections_attribute="mrope_section",
     ),
 )
