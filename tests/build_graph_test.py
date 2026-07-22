@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 
+import ml_dtypes
 import numpy as np
 import onnx_ir as ir
 import pytest
@@ -1689,6 +1690,7 @@ class TestBuildGraphVisionLanguage:
         [
             (ir.DataType.FLOAT, np.float32),
             (ir.DataType.FLOAT16, np.float16),
+            (ir.DataType.BFLOAT16, ml_dtypes.bfloat16),
         ],
     )
     def test_gemma4_audio_encoder_strips_padding_in_graph(self, dtype, np_dtype):
@@ -1725,6 +1727,7 @@ class TestBuildGraphVisionLanguage:
             outputs["audio_features"],
             np.concatenate([features[0, :2], features[1, :1]], axis=0),
         )
+        assert outputs["audio_features"].dtype == np.dtype(np_dtype)
 
     def test_gemma4_unified_multimodal_graph(self):
         """Build gemma4_unified (gemma-4-12B) encoder-free multimodal model.
