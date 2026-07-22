@@ -70,6 +70,16 @@ class TestDecoderMetadata:
         assert meta["model"]["attention"]["type"] == "multi_head"
         assert meta["required_capabilities"] == ["kv_cache", "multi_head_attention"]
 
+    def test_gqa_attention_type_override_is_trimmed_and_canonicalized(self):
+        meta = build_decoder_metadata(
+            num_attention_heads=16,
+            num_kv_heads=4,
+            head_dim=64,
+            attention_type=" gqa ",
+        )
+
+        assert meta["model"]["attention"]["type"] == "grouped_query_attention"
+
     def test_sliding_window_and_sink(self):
         meta = build_decoder_metadata(
             num_attention_heads=8, head_dim=64, sliding_window=4096, sink_tokens=4

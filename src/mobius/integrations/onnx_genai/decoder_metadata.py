@@ -106,7 +106,9 @@ def build_decoder_metadata(
             "grouped_query_attention" if kv < num_attention_heads else "multi_head"
         )
     else:
-        normalized_attention_type = attention_type.lower().replace("-", "_").replace(" ", "_")
+        normalized_attention_type = (
+            attention_type.strip().lower().replace("-", "_").replace(" ", "_")
+        )
         if normalized_attention_type in {
             "grouped_query",
             "group_query_attention",
