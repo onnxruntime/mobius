@@ -42,6 +42,8 @@ from typing import Any
 
 import yaml
 
+from mobius._pipeline_contract import component_presence, optional_input_contract
+
 _LOGGER = logging.getLogger(__name__)
 
 _RUNTIME_ASSET_NAMES = (
@@ -1257,9 +1259,18 @@ def build_native_vlm_package_metadata(
             "type": role,
             "io": io,
         }
+        optional_inputs = {
+            value.name: contract
+            for value in pkg[name].graph.inputs
+            if (contract := optional_input_contract(value)) is not None
+        }
+        if optional_inputs:
+            io["optional_inputs"] = optional_inputs
         if name == decoder_name:
             models[name]["tokenizer"] = "tokenizer.json"
         phases[name] = {"run_on": run_on}
+        if presence := component_presence(pkg[name].graph):
+            phases[name]["when_present"] = presence
 
     image_endpoints = {
         output["name"] for output in preprocessing_outputs if not output.get("optional", False)

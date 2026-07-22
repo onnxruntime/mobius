@@ -18,6 +18,10 @@ import pytest
 import yaml
 
 from mobius._model_package import ModelPackage
+from mobius._pipeline_contract import (
+    declare_component_presence,
+    declare_optional_input,
+)
 from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
     build_diffusion_pipeline_metadata,
@@ -118,13 +122,21 @@ def _embedding_model(
     outputs: list[tuple[str, ir.DataType, list[int | str]]],
     *,
     include_audio: bool = False,
+    optional_audio: bool = False,
 ) -> ir.Model:
     inputs = [
         _value("input_ids", ir.DataType.INT64, ["batch", "sequence"]),
         _value("image_features", ir.DataType.FLOAT, ["image_tokens", 64]),
     ]
     if include_audio:
-        inputs.append(_value("audio_features", ir.DataType.FLOAT, ["audio_tokens", 64]))
+        audio_features = _value("audio_features", ir.DataType.FLOAT, ["audio_tokens", 64])
+        if optional_audio:
+            declare_optional_input(
+                audio_features,
+                presence="audio",
+                absent_shape=[0, 64],
+            )
+        inputs.append(audio_features)
     return _model("embedding", inputs, outputs)
 
 
@@ -348,6 +360,7 @@ class TestNativeVlmPackageMetadata:
                         ),
                     ],
                     include_audio=True,
+                    optional_audio=True,
                 ),
                 "audio_encoder": _model(
                     "audio_encoder",
@@ -367,7 +380,7 @@ class TestNativeVlmPackageMetadata:
                         (
                             "audio_features",
                             ir.DataType.FLOAT,
-                            ["batch", "audio_sequence", 64],
+                            ["audio_tokens", 64],
                         ),
                         (
                             "audio_features_mask",
@@ -379,6 +392,7 @@ class TestNativeVlmPackageMetadata:
             },
             config=config,
         )
+        declare_component_presence(package["audio_encoder"].graph, "audio")
 
         source = tmp_path / "gemma"
         source.mkdir()
@@ -402,6 +416,7 @@ class TestNativeVlmPackageMetadata:
         metadata = build_native_vlm_package_metadata(
             package, config=config, source=str(source)
         )
+        emitted_yaml = yaml.safe_load(yaml.safe_dump(metadata, sort_keys=False))
         validate_executable_closure(package, metadata)
         self._validate(metadata)
         _assert_all_graph_ports_declared(package, metadata)
@@ -420,13 +435,38 @@ class TestNativeVlmPackageMetadata:
             "rank": 3,
             "device_transfer": False,
         } in flow
-        assert not any(edge["from"] == "audio_encoder.audio_features" for edge in flow)
+        assert {
+            "from": "audio_encoder.audio_features",
+            "to": "embedding.audio_features",
+            "dtype": "fp32",
+            "rank": 2,
+            "device_transfer": False,
+        } in flow
         embedding_audio = next(
             port
             for port in metadata["pipeline"]["models"]["embedding"]["io"]["inputs"]
             if port["name"] == "audio_features"
         )
-        assert embedding_audio["source"] == {"kind": "external", "input": "request"}
+        assert embedding_audio["source"] == {
+            "kind": "dataflow",
+            "from": "audio_encoder.audio_features",
+        }
+        assert emitted_yaml["pipeline"]["models"]["embedding"]["io"]["optional_inputs"] == {
+            "audio_features": {
+                "presence": "audio",
+                "absent": {"kind": "zeros", "shape": [0, 64]},
+            }
+        }
+        assert emitted_yaml["pipeline"]["phases"]["audio_encoder"] == {
+            "run_on": "prompt_only",
+            "when_present": "audio",
+        }
+        audio_stage = next(
+            stage
+            for stage in metadata["pipeline"]["strategy"]["stages"]
+            if stage["strategy"].get("model") == "audio_encoder"
+        )
+        assert audio_stage["run_on"] == "prompt_only"
         assert metadata["pipeline"]["phases"]["embedding"] == {"run_on": "every_step"}
         embedding_stage = next(
             stage
