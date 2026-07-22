@@ -420,26 +420,30 @@ class TestNativeVlmPackageMetadata:
         validate_executable_closure(package, metadata)
         self._validate(metadata)
         _assert_all_graph_ports_declared(package, metadata)
+        assert metadata["schema_version"] == "v1"
+        assert {
+            "image_preprocessing_program",
+            "packed_image_outputs",
+            "position_program",
+            "dual_sequence_inputs",
+        } <= set(metadata["required_capabilities"])
         flow = metadata["pipeline"]["dataflow"]
         assert {
             "from": "embedding.inputs_embeds",
             "to": "decoder.inputs_embeds",
             "dtype": "fp32",
-            "rank": 3,
             "device_transfer": False,
         } in flow
         assert {
             "from": "embedding.per_layer_inputs",
             "to": "decoder.per_layer_inputs",
             "dtype": "fp32",
-            "rank": 3,
             "device_transfer": False,
         } in flow
         assert {
             "from": "audio_encoder.audio_features",
             "to": "embedding.audio_features",
             "dtype": "fp32",
-            "rank": 2,
             "device_transfer": False,
         } in flow
         embedding_audio = next(
@@ -621,12 +625,19 @@ class TestNativeVlmPackageMetadata:
         )
         self._validate(metadata)
         _assert_all_graph_ports_declared(package, metadata)
+        assert {
+            "position_program",
+            "multi_axis_positions",
+            "loop_carried_state",
+        } <= set(metadata["required_capabilities"])
         positions = metadata["pipeline"]["positions"]
         assert positions == {
             "input": "position_ids",
             "rank": 3,
+            "tensor_rank": 3,
             "dtype": "int64",
-            "continuation": "from_grid",
+            "generation": "processor_coordinates",
+            "continuation": "carry_max",
             "axes": ["temporal", "height", "width"],
             "sections": [16, 24, 24],
             "processor_summaries": ["vision_encoder.image_grid_thw"],
@@ -764,7 +775,6 @@ class TestNativeVlmPackageMetadata:
                 "from": f"embedding.{gate}",
                 "to": f"decoder.{gate}",
                 "dtype": "fp32",
-                "rank": 0,
                 "device_transfer": False,
             } in flow
         outputs = metadata["preprocessing"]["image"]["outputs"]

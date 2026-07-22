@@ -686,6 +686,7 @@ def _state_and_kv_pairs(
 class _PositionProgram:
     rank: int
     axes: tuple[str, ...]
+    generation: str
     continuation: str
     matches: Callable[[Any], bool]
     sections_attribute: str | None = None
@@ -695,13 +696,15 @@ _POSITION_PROGRAM_REGISTRY = (
     _PositionProgram(
         rank=1,
         axes=("sequence",),
+        generation="linear",
         continuation="linear_increment",
         matches=lambda config: True,
     ),
     _PositionProgram(
         rank=3,
         axes=("temporal", "height", "width"),
-        continuation="from_grid",
+        generation="processor_coordinates",
+        continuation="carry_max",
         matches=lambda config: (
             bool(getattr(config, "mrope_interleaved", False))
             and bool(getattr(config, "mrope_section", None))
@@ -729,7 +732,9 @@ def _positions_from_registry(position: _Port, config: Any) -> dict[str, Any]:
         positions: dict[str, Any] = {
             "input": position.name,
             "rank": program.rank,
+            "tensor_rank": position.rank,
             "dtype": position.dtype,
+            "generation": program.generation,
             "continuation": program.continuation,
             "axes": list(program.axes),
         }
@@ -975,12 +980,12 @@ def validate_executable_closure(pkg: Any, metadata: dict[str, Any]) -> None:
                 f"but the consumer requires {target.dtype}/{target.rank}.",
                 "insert an explicit typed transform or remove the incompatible edge.",
             )
-        if edge.get("dtype") != source.dtype or edge.get("rank") != source.rank:
+        if edge.get("dtype") != source.dtype:
             raise _closure_error(
                 target_endpoint,
-                f"the edge declares dtype/rank {edge.get('dtype')}/{edge.get('rank')}, "
-                f"but the ONNX ports are {source.dtype}/{source.rank}.",
-                "derive edge dtype and rank directly from the matched graph ports.",
+                f"the edge declares dtype {edge.get('dtype')}, "
+                f"but the ONNX ports use {source.dtype}.",
+                "derive the edge dtype directly from the matched graph ports.",
             )
         incoming.setdefault(target_endpoint, []).append(edge)
 
@@ -1182,7 +1187,6 @@ def build_native_vlm_package_metadata(
                         "from": f"{source_name}.{source_port.name}",
                         "to": f"{target_name}.{target_port.name}",
                         "dtype": source_port.dtype,
-                        "rank": source_port.rank,
                         "device_transfer": False,
                     }
                 )
@@ -1314,17 +1318,24 @@ def build_native_vlm_package_metadata(
     vision_config = {key: value for key, value in vision_config.items() if value is not None}
 
     metadata = dict(decoder_metadata or {})
+    metadata.setdefault("schema_version", "v1")
     capabilities = list(metadata.get("required_capabilities", []))
     for capability in (
-        "multimodal_image_preprocessing",
+        "image_preprocessing_program",
         "autoregressive_every_step_components",
     ):
         if capability not in capabilities:
             capabilities.append(capability)
+    if len(preprocessing_outputs) > 1 and "packed_image_outputs" not in capabilities:
+        capabilities.append("packed_image_outputs")
+    if positions is not None and "position_program" not in capabilities:
+        capabilities.append("position_program")
     if positions is not None and positions["rank"] > 1:
-        capabilities.append("multiaxis_positions")
+        capabilities.append("multi_axis_positions")
     if decoder_io.get("state_pairs"):
-        capabilities.append("loop_state")
+        capabilities.append("loop_carried_state")
+    if decoder_io.get("token_input") and decoder_io.get("inputs_embeds_input"):
+        capabilities.append("dual_sequence_inputs")
     metadata["required_capabilities"] = capabilities
     metadata.setdefault("model", {})["io"] = decoder_io
     metadata["preprocessing"] = {
