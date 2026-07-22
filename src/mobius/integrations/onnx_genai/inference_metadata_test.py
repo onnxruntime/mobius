@@ -5,19 +5,27 @@
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import os
 
+import jsonschema
+import onnx_ir as ir
 import pytest
 import yaml
 
+from mobius._model_package import ModelPackage
 from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
     build_diffusion_pipeline_metadata,
     build_language_diffusion_pipeline_metadata,
     build_multimodal_pipeline_metadata,
+    build_native_vlm_package_metadata,
     build_tts_pipeline_metadata,
+    is_native_vlm_package,
     load_diffusers_scheduler_config,
     write_diffusion_pipeline_metadata,
+    write_native_vlm_package_metadata,
     write_tts_pipeline_metadata,
 )
 
@@ -30,6 +38,7 @@ def _onnx_genai_schema_path() -> str | None:
             os.path.dirname(__file__),
             "../../../../../onnx-genai/schema/inference_metadata.schema.json",
         ),
+        "/home/justinchu/onnx-genai/schema/inference_metadata.schema.json",
         os.path.expanduser(
             "~/Documents/GitHub/onnx-genai/schema/inference_metadata.schema.json"
         ),
@@ -38,6 +47,535 @@ def _onnx_genai_schema_path() -> str | None:
         if candidate and os.path.exists(candidate):
             return candidate
     return None
+
+
+def _value(
+    name: str,
+    dtype: ir.DataType,
+    shape: list[int | str],
+) -> ir.Value:
+    return ir.Value(
+        name=name,
+        type=ir.TensorType(dtype),
+        shape=ir.Shape(shape),
+    )
+
+
+def _model(
+    name: str,
+    inputs: list[ir.Value],
+    output_specs: list[tuple[str, ir.DataType, list[int | str]]],
+) -> ir.Model:
+    outputs = [_value(*spec) for spec in output_specs]
+    nodes = [
+        ir.Node("", "Identity", [inputs[0]], outputs=[output], name=f"emit_{output.name}")
+        for output in outputs
+    ]
+    graph = ir.Graph(
+        inputs=inputs,
+        outputs=outputs,
+        nodes=nodes,
+        name=name,
+        opset_imports={"": 21},
+    )
+    model = ir.Model(graph, ir_version=10)
+    assert ir.to_proto(model).graph.name == name
+    return model
+
+
+@dataclasses.dataclass
+class _VisionConfig:
+    image_size: int = 448
+    patch_size: int = 14
+    temporal_patch_size: int = 2
+    spatial_merge_size: int = 2
+    mm_tokens_per_image: int | None = None
+    image_token_id: int = 200010
+
+
+@dataclasses.dataclass
+class _VlmConfig:
+    num_attention_heads: int = 8
+    num_key_value_heads: int = 2
+    head_dim: int = 8
+    hidden_size: int = 64
+    vocab_size: int = 128
+    max_position_embeddings: int = 4096
+    image_token_id: int = 200010
+    mm_tokens_per_image: int | None = None
+    mrope_section: list[int] | None = None
+    vision: _VisionConfig = dataclasses.field(default_factory=_VisionConfig)
+
+
+def _embedding_model(
+    outputs: list[tuple[str, ir.DataType, list[int | str]]],
+    *,
+    include_audio: bool = False,
+) -> ir.Model:
+    inputs = [
+        _value("input_ids", ir.DataType.INT64, ["batch", "sequence"]),
+        _value("image_features", ir.DataType.FLOAT, ["image_tokens", 64]),
+    ]
+    if include_audio:
+        inputs.append(_value("audio_features", ir.DataType.FLOAT, ["audio_tokens", 64]))
+    return _model("embedding", inputs, outputs)
+
+
+def _decoder_model(
+    routed_inputs: list[tuple[str, ir.DataType, list[int | str]]],
+    *,
+    position_shape: list[int | str],
+    raw_token_input: bool = False,
+    fixed_state: bool = False,
+) -> ir.Model:
+    inputs = [_value(name, dtype, shape) for name, dtype, shape in routed_inputs]
+    inputs.extend(
+        [
+            _value(
+                "attention_mask",
+                ir.DataType.INT64,
+                ["batch", "past_sequence + sequence"],
+            ),
+            _value("position_ids", ir.DataType.INT64, position_shape),
+        ]
+    )
+    if raw_token_input:
+        inputs.append(_value("input_ids", ir.DataType.INT64, ["batch", "sequence"]))
+    inputs.extend(
+        [
+            _value(
+                "past_key_values.0.key",
+                ir.DataType.FLOAT,
+                ["batch", 2, "past_sequence", 8],
+            ),
+            _value(
+                "past_key_values.0.value",
+                ir.DataType.FLOAT,
+                ["batch", 2, "past_sequence", 8],
+            ),
+        ]
+    )
+    output_specs = [
+        ("logits", ir.DataType.FLOAT, ["batch", "sequence", 128]),
+        (
+            "present.0.key",
+            ir.DataType.FLOAT,
+            ["batch", 2, "total_sequence", 8],
+        ),
+        (
+            "present.0.value",
+            ir.DataType.FLOAT,
+            ["batch", 2, "total_sequence", 8],
+        ),
+    ]
+    if fixed_state:
+        inputs.extend(
+            [
+                _value(
+                    "past_key_values.3.conv_state",
+                    ir.DataType.FLOAT,
+                    ["batch", 16, 3],
+                ),
+                _value(
+                    "past_key_values.3.recurrent_state",
+                    ir.DataType.FLOAT,
+                    ["batch", 2, 4, 8],
+                ),
+            ]
+        )
+        output_specs.extend(
+            [
+                (
+                    "present.3.conv_state",
+                    ir.DataType.FLOAT,
+                    ["batch", 16, 3],
+                ),
+                (
+                    "present.3.recurrent_state",
+                    ir.DataType.FLOAT,
+                    ["batch", 2, 4, 8],
+                ),
+            ]
+        )
+    return _model("decoder", inputs, output_specs)
+
+
+def _assert_all_graph_ports_declared(
+    package: ModelPackage,
+    metadata: dict,
+) -> None:
+    models = metadata["pipeline"]["models"]
+    assert set(models) == set(package)
+    for name, model in package.items():
+        io = models[name]["io"]
+        assert io["inputs"] == [value.name for value in model.graph.inputs]
+        assert io["outputs"] == [value.name for value in model.graph.outputs]
+
+
+class TestNativeVlmPackageMetadata:
+    def _validate(self, metadata: dict) -> None:
+        schema_path = _onnx_genai_schema_path()
+        assert schema_path is not None
+        with open(schema_path, encoding="utf-8") as handle:
+            jsonschema.validate(instance=metadata, schema=json.load(handle))
+
+    def test_cached_gemma4_routes_all_embedding_outputs(self):
+        config = _VlmConfig(
+            image_token_id=258880,
+            vision=_VisionConfig(
+                image_size=896,
+                patch_size=16,
+                image_token_id=258880,
+            ),
+        )
+        package = ModelPackage(
+            {
+                "decoder": _decoder_model(
+                    [
+                        (
+                            "inputs_embeds",
+                            ir.DataType.FLOAT,
+                            ["batch", "sequence", 64],
+                        ),
+                        (
+                            "per_layer_inputs",
+                            ir.DataType.FLOAT,
+                            ["batch", "sequence", 128],
+                        ),
+                    ],
+                    position_shape=["batch", "sequence"],
+                    raw_token_input=True,
+                ),
+                "vision_encoder": _model(
+                    "vision_encoder",
+                    [
+                        _value(
+                            "pixel_values",
+                            ir.DataType.FLOAT,
+                            ["images", 280, 768],
+                        ),
+                        _value(
+                            "pixel_position_ids",
+                            ir.DataType.INT64,
+                            ["images", 280, 2],
+                        ),
+                    ],
+                    [
+                        (
+                            "image_features",
+                            ir.DataType.FLOAT,
+                            ["image_tokens", 64],
+                        )
+                    ],
+                ),
+                "embedding": _embedding_model(
+                    [
+                        (
+                            "inputs_embeds",
+                            ir.DataType.FLOAT,
+                            ["batch", "sequence", 64],
+                        ),
+                        (
+                            "per_layer_inputs",
+                            ir.DataType.FLOAT,
+                            ["batch", "sequence", 128],
+                        ),
+                    ]
+                ),
+            },
+            config=config,
+        )
+
+        assert is_native_vlm_package(package)
+        metadata = build_native_vlm_package_metadata(package, config=config)
+        self._validate(metadata)
+        _assert_all_graph_ports_declared(package, metadata)
+        flow = metadata["pipeline"]["dataflow"]
+        assert {
+            "from": "embedding.inputs_embeds",
+            "to": "decoder.inputs_embeds",
+            "dtype": "fp32",
+            "device_transfer": False,
+        } in flow
+        assert {
+            "from": "embedding.per_layer_inputs",
+            "to": "decoder.per_layer_inputs",
+            "dtype": "fp32",
+            "device_transfer": False,
+        } in flow
+        assert metadata["pipeline"]["phases"]["embedding"] == {"run_on": "every_step"}
+        assert metadata["pipeline"]["vision"]["tokens_per_tile"] == 280
+        assert metadata["model"]["io"]["token_input"] == "input_ids"
+
+    def test_qwen_packed_grid_rank3_positions_sparse_and_fixed_state(self):
+        config = _VlmConfig(
+            mrope_section=[16, 24, 24],
+            vision=_VisionConfig(
+                patch_size=14,
+                temporal_patch_size=2,
+                spatial_merge_size=2,
+            ),
+        )
+        package = ModelPackage(
+            {
+                "decoder": _decoder_model(
+                    [
+                        (
+                            "inputs_embeds",
+                            ir.DataType.FLOAT,
+                            ["batch", "sequence", 64],
+                        )
+                    ],
+                    position_shape=[3, "batch", "sequence"],
+                    fixed_state=True,
+                ),
+                "vision_encoder": _model(
+                    "vision_encoder",
+                    [
+                        _value(
+                            "pixel_values",
+                            ir.DataType.FLOAT,
+                            ["total_patches", 1176],
+                        ),
+                        _value(
+                            "image_grid_thw",
+                            ir.DataType.INT64,
+                            ["images", 3],
+                        ),
+                    ],
+                    [
+                        (
+                            "image_features",
+                            ir.DataType.FLOAT,
+                            ["image_tokens", 64],
+                        )
+                    ],
+                ),
+                "embedding": _embedding_model(
+                    [
+                        (
+                            "inputs_embeds",
+                            ir.DataType.FLOAT,
+                            ["batch", "sequence", 64],
+                        )
+                    ]
+                ),
+            },
+            config=config,
+        )
+
+        metadata = build_native_vlm_package_metadata(package, config=config)
+        self._validate(metadata)
+        _assert_all_graph_ports_declared(package, metadata)
+        positions = metadata["pipeline"]["positions"]
+        assert positions == {
+            "input": "position_ids",
+            "rank": 3,
+            "dtype": "int64",
+            "continuation": "from_grid",
+            "axes": ["temporal", "height", "width"],
+            "sections": [16, 24, 24],
+            "processor_summaries": ["image_grid_thw"],
+        }
+        io = metadata["model"]["io"]
+        assert io["kv_inputs"] == [
+            "past_key_values.0.key",
+            "past_key_values.0.value",
+        ]
+        assert io["kv_outputs"] == ["present.0.key", "present.0.value"]
+        assert io["state_pairs"] == [
+            {
+                "input": "past_key_values.3.conv_state",
+                "output": "present.3.conv_state",
+                "init": "zeros",
+                "update": "replace",
+            },
+            {
+                "input": "past_key_values.3.recurrent_state",
+                "output": "present.3.recurrent_state",
+                "init": "zeros",
+                "update": "replace",
+            },
+        ]
+
+    def test_phi_routes_both_modality_gates_and_mask_processor(self):
+        config = _VlmConfig()
+        package = ModelPackage(
+            {
+                "decoder": _decoder_model(
+                    [
+                        (
+                            "inputs_embeds",
+                            ir.DataType.FLOAT,
+                            ["batch", "sequence", 64],
+                        ),
+                        ("vision_gate", ir.DataType.FLOAT, []),
+                        ("speech_gate", ir.DataType.FLOAT, []),
+                    ],
+                    position_shape=["batch", "sequence"],
+                ),
+                "vision_encoder": _model(
+                    "vision_encoder",
+                    [
+                        _value(
+                            "pixel_values",
+                            ir.DataType.FLOAT,
+                            ["crops", 3, 448, 448],
+                        ),
+                        _value(
+                            "image_sizes",
+                            ir.DataType.INT64,
+                            ["images", 2],
+                        ),
+                        _value(
+                            "image_attention_mask",
+                            ir.DataType.FLOAT,
+                            ["crops", 32, 32],
+                        ),
+                    ],
+                    [
+                        (
+                            "image_features",
+                            ir.DataType.FLOAT,
+                            ["image_tokens", 64],
+                        )
+                    ],
+                ),
+                "audio_encoder": _model(
+                    "audio_encoder",
+                    [
+                        _value(
+                            "audio_embeds",
+                            ir.DataType.FLOAT,
+                            ["batch", "audio_sequence", 80],
+                        )
+                    ],
+                    [
+                        (
+                            "audio_features",
+                            ir.DataType.FLOAT,
+                            ["audio_tokens", 64],
+                        )
+                    ],
+                ),
+                "embedding": _embedding_model(
+                    [
+                        (
+                            "inputs_embeds",
+                            ir.DataType.FLOAT,
+                            ["batch", "sequence", 64],
+                        ),
+                        ("vision_gate", ir.DataType.FLOAT, []),
+                        ("speech_gate", ir.DataType.FLOAT, []),
+                    ],
+                    include_audio=True,
+                ),
+            },
+            config=config,
+        )
+
+        metadata = build_native_vlm_package_metadata(package, config=config)
+        self._validate(metadata)
+        _assert_all_graph_ports_declared(package, metadata)
+        flow = metadata["pipeline"]["dataflow"]
+        for gate in ("vision_gate", "speech_gate"):
+            assert {
+                "from": f"embedding.{gate}",
+                "to": f"decoder.{gate}",
+                "dtype": "fp32",
+                "device_transfer": False,
+            } in flow
+        outputs = metadata["preprocessing"]["image"]["outputs"]
+        assert {output["content"] for output in outputs} == {
+            "pixels",
+            "original_size",
+            "validity_mask",
+        }
+
+    def test_writer_copies_local_runtime_assets(self, tmp_path):
+        config = _VlmConfig()
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "tokenizer.json").write_text("{}", encoding="utf-8")
+        (source / "tokenizer_config.json").write_text(
+            json.dumps({"chat_template": "{{ messages }}"}),
+            encoding="utf-8",
+        )
+        (source / "preprocessor_config.json").write_text(
+            json.dumps(
+                {
+                    "image_processor": {
+                        "size": {"height": 448, "width": 448},
+                        "rescale_factor": 1 / 255,
+                        "image_mean": [0.5, 0.5, 0.5],
+                        "image_std": [0.5, 0.5, 0.5],
+                        "image_seq_length": 280,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        package = ModelPackage(
+            {
+                "decoder": _decoder_model(
+                    [
+                        (
+                            "inputs_embeds",
+                            ir.DataType.FLOAT,
+                            ["batch", "sequence", 64],
+                        )
+                    ],
+                    position_shape=["batch", "sequence"],
+                ),
+                "vision_encoder": _model(
+                    "vision_encoder",
+                    [
+                        _value(
+                            "pixel_values",
+                            ir.DataType.FLOAT,
+                            ["images", 280, 588],
+                        ),
+                        _value(
+                            "pixel_position_ids",
+                            ir.DataType.INT64,
+                            ["images", 280, 2],
+                        ),
+                    ],
+                    [
+                        (
+                            "image_features",
+                            ir.DataType.FLOAT,
+                            ["image_tokens", 64],
+                        )
+                    ],
+                ),
+                "embedding": _embedding_model(
+                    [
+                        (
+                            "inputs_embeds",
+                            ir.DataType.FLOAT,
+                            ["batch", "sequence", 64],
+                        )
+                    ]
+                ),
+            },
+            config=config,
+        )
+
+        output = tmp_path / "output"
+        artifacts = write_native_vlm_package_metadata(
+            package,
+            str(output),
+            config=config,
+            source=str(source),
+        )
+        assert os.path.isfile(artifacts["inference_metadata"])
+        assert (output / "tokenizer.json").is_file()
+        assert (output / "tokenizer_config.json").is_file()
+        assert (output / "chat_template.jinja").is_file()
+        assert (output / "preprocessor_config.json").is_file()
+        metadata = yaml.safe_load((output / "inference_metadata.yaml").read_text())
+        assert metadata["pipeline"]["vision"]["tokens_per_tile"] == 280
 
 
 class TestBuildDiffusionPipelineMetadata:
