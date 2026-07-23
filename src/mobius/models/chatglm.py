@@ -5,18 +5,19 @@ from __future__ import annotations
 
 import torch
 
-from mobius._weight_utils import split_fused_qkv
-from mobius.models.base import FusedGateUpCausalLMModel
+from mobius._weight_utils import split_fused_qkv, split_gate_up_proj
+from mobius.models.base import CausalLMModel
 
 
-class ChatGLMCausalLMModel(FusedGateUpCausalLMModel):
+class ChatGLMCausalLMModel(CausalLMModel):
     """ChatGLM model with partial rotary and fused projection imports.
 
     GLM-4's original ChatGLM checkpoint layout nests decoder weights below
     ``transformer.encoder`` and stores QKV and gate/up projections fused.
     Canonicalize those names before generic GPTQ preprocessing, then split the
-    converted QKV tensors along their output dimension. Keeping gate/up fused
-    allows packed tensors to load without dequantization.
+    converted QKV and gate/up tensors along their output dimension. Splitting
+    the repacked gate/up tensors is lossless and avoids a runtime activation
+    Split between captured CUDA graph segments.
     """
 
     def preprocess_weights(
@@ -57,5 +58,15 @@ class ChatGLMCausalLMModel(FusedGateUpCausalLMModel):
             state_dict[key.replace("qkv_proj", "q_proj")] = q
             state_dict[key.replace("qkv_proj", "k_proj")] = k
             state_dict[key.replace("qkv_proj", "v_proj")] = v
+
+        for key in list(state_dict):
+            if ".mlp.gate_up_proj." not in key:
+                continue
+            gate, up = split_gate_up_proj(
+                state_dict.pop(key),
+                self.config.intermediate_size,
+            )
+            state_dict[key.replace("gate_up_proj", "gate_proj")] = gate
+            state_dict[key.replace("gate_up_proj", "up_proj")] = up
 
         return state_dict
