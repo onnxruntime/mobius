@@ -399,7 +399,7 @@ class DeepSeekV3TextModel(nn.Module):
 
         # Detect MLA vs standard attention
         use_mla = config.qk_nope_head_dim is not None and config.qk_nope_head_dim > 0
-        LayerClass = (  # ruff:ignore[non-lowercase-variable-in-function]
+        LayerClass = (  # noqa: N806
             DeepSeekMLADecoderLayer if use_mla else _DeepSeekStandardDecoderLayer
         )
 

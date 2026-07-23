@@ -110,7 +110,7 @@ class SigmoidTopKGate(nn.Module):
             # Renormalize selected weights to sum to 1 (prevents vanishing gradients)
             weight_sum = op.ReduceSum(routing_weights, [-1], keepdims=True)
             routing_weights = op.Div(routing_weights, op.Add(weight_sum, 1e-9))
-        if self.routed_scaling_factor != 1.0:  # ruff:ignore[float-equality-comparison]
+        if self.routed_scaling_factor != 1.0:  # noqa: RUF069
             routing_weights = op.Mul(routing_weights, self.routed_scaling_factor)
         return routing_weights, selected_experts
 
