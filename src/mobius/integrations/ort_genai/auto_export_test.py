@@ -229,6 +229,56 @@ class TestWriteProcessorConfig:
         permute = transforms[5]["operation"]["attrs"]
         assert permute["dims"] == [2, 0, 1]
 
+    def test_gemma3_vision_config(self, tmp_path):
+        """Gemma3 gets a fixed-size resize + Permute3D (not the generic branch).
+
+        Regression guard: gemma3's config unwraps to text_config, so
+        ``config.model_type`` is "gemma3_text" and the branch must fire off the
+        vision sub-config type "siglip_vision_model". The generic-VLM branch
+        would emit smart_resize (variable HxW) with min_pixels/max_pixels and no
+        Permute3D, producing a variable-size HWC tensor that fails the SigLIP
+        encoder's fixed NCHW [batch, 3, 896, 896] input.
+        """
+        vision = mock.MagicMock()
+        vision.image_size = 896
+        vision.model_type = "siglip_vision_model"
+        config = mock.MagicMock()
+        config.vision = vision
+        # Unwrapped text-config model_type — NOT "gemma3".
+        config.model_type = "gemma3_text"
+
+        # No hf_model_id → uses gemma3 defaults (image_size=896, mean/std=0.5).
+        path = _write_vision_processor_config(config, str(tmp_path))
+        assert path is not None
+        assert path.endswith("processor_config.json")
+        with open(path) as f:
+            data = json.load(f)
+
+        proc = data["processor"]
+        transforms = proc["transforms"]
+
+        # 6-step pipeline ending in Permute3D (HWC→CHW).
+        types = [t["operation"]["type"] for t in transforms]
+        assert types == [
+            "DecodeImage",
+            "ConvertRGB",
+            "Resize",
+            "Rescale",
+            "Normalize",
+            "Permute3D",
+        ]
+
+        # Fixed-size resize: smart_resize disabled, no variable-pixel bounds.
+        resize = transforms[2]["operation"]["attrs"]
+        assert resize["smart_resize"] == 0
+        assert resize["height"] == 896
+        assert resize["width"] == 896
+        assert "min_pixels" not in resize
+        assert "max_pixels" not in resize
+
+        # Trailing Permute3D matches the encoder's channels-first contract.
+        assert transforms[5]["operation"]["attrs"]["dims"] == [2, 0, 1]
+
     def test_hf_processor_fallback_to_clip_defaults(self, tmp_path):
         """Falls back to CLIP-standard defaults when HF processor can't be loaded."""
         vision = mock.MagicMock()
