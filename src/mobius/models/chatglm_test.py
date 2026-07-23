@@ -7,7 +7,7 @@ import torch
 
 from mobius._configs import ArchitectureConfig, QuantizationConfig
 from mobius._weight_utils import preprocess_gptq_weights
-from mobius.components._mlp import MLP
+from mobius.components import MLP
 from mobius.models.chatglm import ChatGLMCausalLMModel
 
 
