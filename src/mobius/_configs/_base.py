@@ -51,7 +51,7 @@ def _resolve_hidden_act(config, model_type: str) -> str | None:
       dense_act_fn          — some BERT variants
       activation            — generic fallback
       afn                   — older BERT configs
-      "silu"  (qwen)        — Qwen v1 hardcodes silu; no activation attr
+      "silu"  (qwen, chatglm) — Qwen v1 and ChatGLM hardcode silu; no activation attr
       "gelu"  (XLM)         — gelu_activation=True is a boolean flag
       "relu"  (ctrl)        — CTRL hardcodes relu; no hidden_act attr
     """
@@ -65,7 +65,7 @@ def _resolve_hidden_act(config, model_type: str) -> str | None:
         or getattr(config, "afn", None)
         # LLaDA/OLMo expose the activation as ``activation_type`` (e.g. "silu").
         or getattr(config, "activation_type", None)
-        or ("silu" if model_type in ("qwen",) else None)
+        or ("silu" if model_type in ("qwen", "chatglm") else None)
         # gelu_activation is a boolean (XLM) — must be after all string
         # attrs so it cannot override an explicit hidden_act.
         or ("gelu" if getattr(config, "gelu_activation", False) else None)

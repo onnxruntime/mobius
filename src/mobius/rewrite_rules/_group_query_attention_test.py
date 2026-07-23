@@ -113,6 +113,31 @@ _GEMMA2_CONFIG = Gemma2Config(
 )
 
 
+def _build_tiny_mla_graph(v_head_dim: int):
+    """Build a CPU-only MLA graph with configurable K/V head dimensions."""
+    config = ArchitectureConfig(
+        model_type="deepseek_v2",
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        head_dim=16,
+        num_hidden_layers=1,
+        vocab_size=256,
+        max_position_embeddings=128,
+        hidden_act="silu",
+        rms_norm_eps=1e-6,
+        rope_type="default",
+        rope_theta=10000.0,
+        q_lora_rank=16,
+        kv_lora_rank=8,
+        qk_nope_head_dim=12,
+        qk_rope_head_dim=4,
+        v_head_dim=v_head_dim,
+    )
+    return build_from_module(registry.get("deepseek_v2")(config), config)["model"]
+
+
 class TestGroupQueryAttentionRules:
     def test_rules_returns_rule_set(self):
         rules = group_query_attention_rules()
@@ -208,6 +233,28 @@ class TestGroupQueryAttentionRules:
         vision_counts = count_ops(vision)
         assert vision_counts.get("Attention", 0) == vision_attn_before
         assert vision_counts.get("GroupQueryAttention", 0) == 0
+
+    def test_retains_attention_for_unequal_mla_kv_head_dimensions(self):
+        """MLA's unequal K/V dimensions are incompatible with GQA."""
+        model = _build_tiny_mla_graph(v_head_dim=8)
+        assert count_ops(model).get("Attention", 0) == 1
+
+        rewrite(model, pattern_rewrite_rules=group_query_attention_rules())
+
+        counts = count_ops(model)
+        assert counts.get("Attention", 0) == 1
+        assert counts.get("GroupQueryAttention", 0) == 0
+
+    def test_fuses_attention_for_equal_mla_kv_head_dimensions(self):
+        """The unequal-dimension guard does not reject compatible MLA graphs."""
+        model = _build_tiny_mla_graph(v_head_dim=16)
+        assert count_ops(model).get("Attention", 0) == 1
+
+        rewrite(model, pattern_rewrite_rules=group_query_attention_rules())
+
+        counts = count_ops(model)
+        assert counts.get("Attention", 0) == 0
+        assert counts.get("GroupQueryAttention", 0) == 1
 
     def test_fallback_attention_to_gqa_no_rope(self):
         """AttentionToGQA fallback fires when applied in isolation (do_rotary=0).
