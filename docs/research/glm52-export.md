@@ -42,7 +42,7 @@ weight into `attn_k_b` and `attn_v_b`, while Transformers exposes one
 
 The exporter now preserves the 78-layer backbone, IndexShare DSA, and the
 additional improved-MTP layer. Full indexers are emitted for layers 0, 1, 2,
-6, 10, ... 74; each full layer's INT32 top-k result is reused by the following
+6, 10, ... 74; each full layer's INT64 top-k result is reused by the following
 three shared layers. The indexer implements the checkpoint equations in fp32:
 Q-LoRA residual projection, LayerNorm+interleaved-RoPE key projection, ReLU
 scores, learned signed head weights, causal bias, and dynamic

@@ -253,13 +253,16 @@ class TestCLIBuildRuntime:
         call_kwargs = mock_export.call_args
         assert call_kwargs.kwargs.get("hf_model_id") == "Qwen/Qwen2.5-0.5B"
 
-    def test_runtime_onnx_genai_calls_write_onnx_genai_config(self):
+    def test_runtime_onnx_genai_calls_write_onnx_genai_config(self, capsys):
         """--runtime onnx-genai calls the unified config writer."""
         with (
             tempfile.TemporaryDirectory() as tmpdir,
             mock.patch(
                 "mobius.integrations.onnx_genai.write_onnx_genai_config",
-                return_value={},
+                return_value={
+                    "inference_metadata": "inference_metadata.yaml",
+                    "mtp_config": "mtp_config.json",
+                },
             ) as mock_export,
             mock.patch(
                 "mobius.integrations.ort_genai.write_ort_genai_config",
@@ -281,6 +284,7 @@ class TestCLIBuildRuntime:
 
         mock_export.assert_called_once()
         mock_ort.assert_not_called()
+        assert "mtp_config: mtp_config.json" in capsys.readouterr().out
 
     def test_no_runtime_does_not_call_write_ort_genai_config(self):
         """Omitting --runtime does NOT call write_ort_genai_config()."""

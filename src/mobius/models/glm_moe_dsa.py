@@ -14,14 +14,14 @@ from onnxscript import OpBuilder, nn
 from mobius._configs import ArchitectureConfig
 from mobius.components import (
     MLP,
+    DeepSeekMLA,
     Embedding,
+    LayerNorm,
     Linear,
     RMSNorm,
     create_attention_bias,
     initialize_rope,
 )
-from mobius.components._common import LayerNorm
-from mobius.components._deepseek_mla import DeepSeekMLA
 from mobius.components._rotary_embedding import apply_rotary_pos_emb
 from mobius.models.deepseek import (
     DeepSeekMoEGate,
@@ -41,7 +41,13 @@ _LAYER_RE = re.compile(r"^model\.layers\.(\d+)\.(.+)$")
 def _indexer_types(config: ArchitectureConfig) -> list[str]:
     """Return the authoritative full/shared IndexShare schedule."""
     if config.indexer_types is not None:
-        return list(config.indexer_types)
+        indexer_types = list(config.indexer_types)
+        if len(indexer_types) != config.num_hidden_layers:
+            raise ValueError(
+                "indexer_types must contain exactly one entry per hidden layer "
+                f"(expected {config.num_hidden_layers}, got {len(indexer_types)})"
+            )
+        return indexer_types
     full_layers = {0, 1, 2}
     full_layers.update(
         range(
@@ -120,7 +126,7 @@ class GlmMoeDsaIndexer(nn.Module):
         key_length = op.Shape(scores, start=2, end=3)
         k = op.Min(key_length, op.Constant(value_ints=[self.index_topk]))
         _, indices = op.TopK(scores, k, axis=-1, largest=1, sorted=0, _outputs=2)
-        return op.Cast(indices, to=ir.DataType.INT32)
+        return indices
 
     def forward(
         self,
@@ -212,7 +218,7 @@ class GlmMoeDsaAttention(DeepSeekMLA):
         attention_bias: ir.Value,
     ) -> ir.Value:
         shape = op.Shape(op.Squeeze(attention_bias, [1]))
-        masked = op.Expand(op.Constant(value_float=float(ir.DataType.FLOAT.min)), shape)
+        masked = op.Expand(op.Constant(value_float=float(self.dtype.min)), shape)
         updates = op.Mul(op.Cast(indices, to=ir.DataType.FLOAT), 0.0)
         sparse = op.ScatterElements(masked, indices, updates, axis=-1, reduction="none")
         sparse = op.Cast(op.Unsqueeze(sparse, [1]), to=self.dtype)

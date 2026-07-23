@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 
@@ -11,7 +12,7 @@ from mobius._config_resolver import _default_task_for_model
 from mobius._configs import ArchitectureConfig, QuantizationConfig
 from mobius._registry import registry
 from mobius._testing import count_op_type, make_config
-from mobius.models.glm_moe_dsa import GlmMoeDsaCausalLMModel
+from mobius.models.glm_moe_dsa import GlmMoeDsaCausalLMModel, _indexer_types
 
 
 def _tiny_glm_moe_dsa_config(**overrides):
@@ -89,6 +90,12 @@ class TestGlmMoeDsaExport:
     def test_registry(self):
         assert registry.get("glm_moe_dsa") is GlmMoeDsaCausalLMModel
         assert _default_task_for_model("glm_moe_dsa") == "glm-moe-dsa"
+
+    def test_indexer_types_length_must_match_layers(self):
+        config = _tiny_glm_moe_dsa_config(indexer_types=["full"])
+
+        with pytest.raises(ValueError, match="expected 4, got 1"):
+            _indexer_types(config)
 
     def test_builds_full_attention_mla_moe_graph(self):
         config = _tiny_glm_moe_dsa_config()

@@ -12,6 +12,7 @@ iterative pipeline. This is the onnx-genai analogue of
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any
@@ -33,6 +34,41 @@ from mobius.integrations.onnx_genai.inference_metadata import (
 _LOGGER = logging.getLogger(__name__)
 
 _DENOISER_KEYS = ("denoiser", "transformer", "unet")
+
+
+def _write_mtp_config(output_dir: str, config: Any) -> str:
+    path = os.path.join(output_dir, "mtp_config.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "model": {"filename": "mtp/model.onnx"},
+                "inputs": [
+                    "inputs_embeds",
+                    "hidden_states",
+                    "attention_mask",
+                    "position_ids",
+                    "past_key_values.0.key",
+                    "past_key_values.0.value",
+                ],
+                "outputs": [
+                    "mtp_hidden",
+                    "present.0.key",
+                    "present.0.value",
+                    "topk_indices",
+                ],
+                "num_nextn_predict_layers": getattr(config, "num_nextn_predict_layers", 0),
+                "index_share_for_mtp_iteration": getattr(
+                    config, "index_share_for_mtp_iteration", False
+                ),
+                "shared_embedding": "model.embed_tokens",
+                "shared_lm_head": "lm_head",
+                "runtime_orchestration": "external",
+            },
+            handle,
+            indent=2,
+        )
+        handle.write("\n")
+    return path
 
 
 def _write_clip_tokenizer(output_dir: str, source: str | None) -> str | None:
@@ -501,14 +537,28 @@ def write_onnx_genai_config(
             artifacts["tokenizer"] = tokenizer_path
         return artifacts
 
-    # Fallback: a single-component decoder language model. A multi-component
-    # package that matched none of the composite shapes above would be silently
-    # mis-emitted as a bare decoder — fail loudly instead so an unsupported shape
-    # is obvious rather than producing wrong metadata.
     try:
         component_names = sorted(pkg.keys())
     except (AttributeError, TypeError):
         component_names = []
+
+    if component_names == ["model", "mtp"]:
+        path = write_decoder_metadata(
+            output_dir, config=resolved_config, kv_native_dtype=kv_native_dtype
+        )
+        artifacts = {
+            "inference_metadata": path,
+            "mtp_config": _write_mtp_config(output_dir, resolved_config),
+        }
+        tokenizer_path = _write_hf_tokenizer(output_dir, source)
+        if tokenizer_path is not None:
+            artifacts["tokenizer"] = tokenizer_path
+        return artifacts
+
+    # Fallback: a single-component decoder language model. A multi-component
+    # package that matched none of the composite shapes above would be silently
+    # mis-emitted as a bare decoder — fail loudly instead so an unsupported shape
+    # is obvious rather than producing wrong metadata.
     if len(component_names) > 1:
         raise ValueError(
             "onnx-genai config emission does not recognize this multi-component "
