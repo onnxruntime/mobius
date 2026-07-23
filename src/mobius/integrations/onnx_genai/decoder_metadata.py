@@ -127,8 +127,7 @@ def moe_metadata_from_config(
     ) or _clean_int(getattr(config, "intermediate_size", None))
     if experts_per_token is None:
         raise ValueError(
-            "cannot emit mixture_of_experts metadata: config is missing "
-            "num_experts_per_tok"
+            "cannot emit mixture_of_experts metadata: config is missing num_experts_per_tok"
         )
     if experts_per_token > routed_experts:
         raise ValueError(
@@ -153,9 +152,7 @@ def moe_metadata_from_config(
     group_count = _clean_int(getattr(config, "n_group", None)) or 1
     groups_per_token = _clean_int(getattr(config, "topk_group", None)) or 1
     selection_method = (
-        "grouped_top_k"
-        if group_count > 1 and topk_method != "greedy"
-        else "top_k"
+        "grouped_top_k" if group_count > 1 and topk_method != "greedy" else "top_k"
     )
 
     router: dict[str, Any] = {
@@ -167,9 +164,7 @@ def moe_metadata_from_config(
     if selection_method == "grouped_top_k":
         router["group_count"] = group_count
         router["groups_per_token"] = groups_per_token
-        router["group_score"] = (
-            "top_2_sum" if topk_method == "noaux_tc" else "maximum"
-        )
+        router["group_score"] = "top_2_sum" if topk_method == "noaux_tc" else "maximum"
 
     return {
         "representation": representation,

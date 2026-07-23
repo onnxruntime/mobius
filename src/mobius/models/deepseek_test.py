@@ -17,9 +17,7 @@ def _silu(value: np.ndarray) -> np.ndarray:
     return value / (1.0 + np.exp(-value))
 
 
-def _mlp(
-    hidden_states: np.ndarray, weights: dict[str, np.ndarray], prefix: str
-) -> np.ndarray:
+def _mlp(hidden_states: np.ndarray, weights: dict[str, np.ndarray], prefix: str) -> np.ndarray:
     gate = hidden_states @ weights[f"{prefix}gate_proj.weight"].T
     up = hidden_states @ weights[f"{prefix}up_proj.weight"].T
     return (_silu(gate) * up) @ weights[f"{prefix}down_proj.weight"].T
