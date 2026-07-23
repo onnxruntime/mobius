@@ -39,6 +39,28 @@ _LLAMA_CONFIG = ArchitectureConfig(
     pad_token_id=0,
 )
 
+# Tiny DeepSeek MLA config for structural K/V head-dimension coverage.
+_DEEPSEEK_MLA_CONFIG = ArchitectureConfig(
+    hidden_size=32,
+    intermediate_size=64,
+    num_attention_heads=2,
+    num_key_value_heads=2,
+    head_dim=16,
+    num_hidden_layers=1,
+    vocab_size=64,
+    max_position_embeddings=32,
+    hidden_act="silu",
+    rms_norm_eps=1e-6,
+    rope_type="default",
+    rope_theta=10000.0,
+    dtype=ir.DataType.FLOAT16,
+    q_lora_rank=16,
+    kv_lora_rank=16,
+    qk_nope_head_dim=8,
+    qk_rope_head_dim=8,
+    v_head_dim=8,
+)
+
 # Tiny qwen3 config: has QK norm, weights NOT packable
 _QWEN3_CONFIG = ArchitectureConfig(
     hidden_size=64,
@@ -212,29 +234,26 @@ class TestGroupQueryAttentionRules:
         assert vision_counts.get("Attention", 0) == vision_attn_before
         assert vision_counts.get("GroupQueryAttention", 0) == 0
 
-    @pytest.mark.arch_validation
-    def test_deepseek_v2_lite_unequal_kv_heads_retain_attention(self):
-        """CUDA export must not rewrite unequal-dimension MLA K/V to GQA."""
-        with pytest.warns(UserWarning, match="GQA fusion expected"):
-            pkg = build(
-                "deepseek-ai/DeepSeek-V2-Lite",
-                dtype="f16",
-                execution_provider="cuda",
-                load_weights=False,
-            )
-        model = pkg["model"]
+    @pytest.mark.parametrize(
+        ("v_head_dim", "expected_attention", "expected_gqa"),
+        [(8, 1, 0), (16, 0, 1)],
+    )
+    def test_mla_gqa_fusion_requires_equal_kv_head_dimensions(
+        self, v_head_dim, expected_attention, expected_gqa
+    ):
+        """GQA fusion declines unequal MLA K/V dimensions and accepts equal ones."""
+        config = dataclasses.replace(_DEEPSEEK_MLA_CONFIG, v_head_dim=v_head_dim)
+        model = build_from_module(registry.get("deepseek_v3")(config), config)["model"]
+        attention = next(node for node in model.graph if node.op_type == "Attention")
+        assert attention.inputs[4] is not None
+        assert attention.inputs[4].shape[-1] == 16
+        assert attention.inputs[5] is not None
+        assert attention.inputs[5].shape[-1] == v_head_dim
+
+        rewrite(model, pattern_rewrite_rules=group_query_attention_rules())
         counts = count_ops(model)
-
-        assert counts.get("Attention", 0) == 27
-        assert counts.get("GroupQueryAttention", 0) == 0
-
-        attention_nodes = [node for node in model.graph if node.op_type == "Attention"]
-        assert len(attention_nodes) == 27
-        for node in attention_nodes:
-            past_key = node.inputs[4]
-            past_value = node.inputs[5]
-            assert past_key is not None and past_key.shape[-1] == 192
-            assert past_value is not None and past_value.shape[-1] == 128
+        assert counts.get("Attention", 0) == expected_attention
+        assert counts.get("GroupQueryAttention", 0) == expected_gqa
 
     @pytest.mark.arch_validation
     def test_deepseek_v2_lite_int4_uses_one_qmoe_per_moe_layer(self):
