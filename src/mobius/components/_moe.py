@@ -6,15 +6,13 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING
+import math
 
+import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
-from mobius._configs import ArchitectureConfig
+from mobius._configs import ArchitectureConfig, QuantizationConfig
 from mobius.components._mlp import MLP
-
-if TYPE_CHECKING:
-    import onnx_ir as ir
 
 
 class TopKGate(nn.Module):
@@ -37,6 +35,13 @@ class TopKGate(nn.Module):
         routing_weights, selected_experts = op.TopK(router_logits, k, axis=-1, _outputs=2)
         routing_weights = op.Softmax(routing_weights, axis=-1)
         return routing_weights, selected_experts
+
+    def qmoe_routing(self, op: OpBuilder, hidden_states: ir.Value):
+        """Return selection and aggregation tensors for QMoE."""
+        weight_t = op.Transpose(self.weight, perm=[1, 0])
+        router_logits = op.MatMul(hidden_states, weight_t)
+        router_logits = op.Cast(router_logits, to=ir.DataType.FLOAT.value)
+        return router_logits, None, True, 1.0
 
 
 class SoftmaxTopKGate(nn.Module):
@@ -67,6 +72,14 @@ class SoftmaxTopKGate(nn.Module):
             weight_sum = op.ReduceSum(routing_weights, [-1], keepdims=True)
             routing_weights = op.Div(routing_weights, weight_sum)
         return routing_weights, selected_experts
+
+    def qmoe_routing(self, op: OpBuilder, hidden_states: ir.Value):
+        """Return selection and aggregation tensors for QMoE."""
+        weight_t = op.Transpose(self.weight, perm=[1, 0])
+        router_logits = op.MatMul(hidden_states, weight_t)
+        router_logits = op.Cast(router_logits, to=ir.DataType.FLOAT.value)
+        routing_probs = op.Softmax(router_logits, axis=-1)
+        return routing_probs, routing_probs, self.norm_topk_prob, 1.0
 
 
 class SigmoidTopKGate(nn.Module):
@@ -108,6 +121,19 @@ class SigmoidTopKGate(nn.Module):
         if self.routed_scaling_factor != 1.0:  # noqa: RUF069
             routing_weights = op.Mul(routing_weights, self.routed_scaling_factor)
         return routing_weights, selected_experts
+
+    def qmoe_routing(self, op: OpBuilder, hidden_states: ir.Value):
+        """Return selection and aggregation tensors for QMoE."""
+        weight_t = op.Transpose(self.weight, perm=[1, 0])
+        router_logits = op.MatMul(hidden_states, weight_t)
+        router_logits = op.Cast(router_logits, to=ir.DataType.FLOAT.value)
+        routing_probs = op.Sigmoid(router_logits)
+        return (
+            routing_probs,
+            routing_probs,
+            self.norm_topk_prob,
+            self.routed_scaling_factor,
+        )
 
 
 class SparseMixerGate(nn.Module):
@@ -196,6 +222,7 @@ class MoELayer(nn.Module):
         assert config.num_experts_per_tok is not None
         self.num_experts = config.num_local_experts
         self.top_k = config.num_experts_per_tok
+        self._qmoe_quantization = _supported_qmoe_quantization(config.quantization)
         if gate is not None:
             self.gate = gate
         else:
@@ -206,9 +233,102 @@ class MoELayer(nn.Module):
             if config.moe_intermediate_size is not None
             else config
         )
-        self.experts = nn.ModuleList([MLP(expert_config) for _ in range(self.num_experts)])
+        if self._qmoe_quantization is not None and hasattr(self.gate, "qmoe_routing"):
+            self.experts = None
+            self._init_qmoe_parameters(expert_config)
+        else:
+            self.experts = nn.ModuleList(
+                [MLP(expert_config) for _ in range(self.num_experts)]
+            )
+
+    def _init_qmoe_parameters(self, expert_config: ArchitectureConfig) -> None:
+        quantization = self._qmoe_quantization
+        assert quantization is not None
+        hidden_size = expert_config.hidden_size
+        intermediate_size = expert_config.intermediate_size
+        block_size = quantization.group_size
+        bits = quantization.bits
+        fc1_out = 2 * intermediate_size
+        if hidden_size % block_size or intermediate_size % block_size:
+            raise ValueError(
+                "QMoE dimensions must be divisible by the quantization group size"
+            )
+
+        self.fc1_experts_weights = nn.Parameter(
+            [self.num_experts, fc1_out, hidden_size * bits // 8],
+            dtype=ir.DataType.UINT8,
+        )
+        self.fc1_scales = nn.Parameter(
+            [self.num_experts, fc1_out, hidden_size // block_size]
+        )
+        self.fc1_scales._keep_float32 = True
+        self.fc2_experts_weights = nn.Parameter(
+            [self.num_experts, hidden_size, intermediate_size * bits // 8],
+            dtype=ir.DataType.UINT8,
+        )
+        self.fc2_scales = nn.Parameter(
+            [self.num_experts, hidden_size, intermediate_size // block_size]
+        )
+        self.fc2_scales._keep_float32 = True
+        if quantization.sym:
+            self.fc1_experts_zero_points = None
+            self.fc2_experts_zero_points = None
+        else:
+            self.fc1_experts_zero_points = nn.Parameter(
+                [
+                    self.num_experts,
+                    fc1_out,
+                    math.ceil((hidden_size // block_size) * bits / 8),
+                ],
+                dtype=ir.DataType.UINT8,
+            )
+            self.fc2_experts_zero_points = nn.Parameter(
+                [
+                    self.num_experts,
+                    hidden_size,
+                    math.ceil((intermediate_size // block_size) * bits / 8),
+                ],
+                dtype=ir.DataType.UINT8,
+            )
+
+    def _qmoe_forward(self, op: OpBuilder, hidden_states: ir.Value):
+        quantization = self._qmoe_quantization
+        assert quantization is not None
+        router_probs, router_weights, normalize, output_scale = self.gate.qmoe_routing(
+            op, hidden_states
+        )
+        result = op.QMoE(
+            hidden_states,
+            router_probs,
+            self.fc1_experts_weights,
+            self.fc1_scales,
+            None,
+            self.fc2_experts_weights,
+            self.fc2_scales,
+            None,
+            None,
+            None,
+            None,
+            self.fc1_experts_zero_points,
+            self.fc2_experts_zero_points,
+            None,
+            router_weights,
+            activation_type="swiglu",
+            normalize_routing_weights=int(normalize),
+            k=self.top_k,
+            expert_weight_bits=quantization.bits,
+            block_size=quantization.group_size,
+            swiglu_fusion=2,
+            _domain="com.microsoft",
+        )
+        if output_scale != 1.0:  # noqa: RUF069
+            result = op.Mul(result, op.CastLike(output_scale, result))
+        return result
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
+        if self.experts is None:
+            return self._qmoe_forward(op, hidden_states)
+
         routing_weights, selected_experts = self.gate(op, hidden_states)
 
         result = None
@@ -226,3 +346,17 @@ class MoELayer(nn.Module):
                 result = op.Add(result, contribution)
 
         return result
+
+
+def _supported_qmoe_quantization(
+    quantization: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    """Return quantization settings when they match the native QMoE ABI."""
+    if (
+        quantization is None
+        or quantization.bits != 4
+        or quantization.float_zero_point
+        or quantization.quant_method not in {"gptq", "awq"}
+    ):
+        return None
+    return quantization

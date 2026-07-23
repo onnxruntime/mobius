@@ -3,13 +3,16 @@
 
 from __future__ import annotations
 
+import dataclasses
+
+import onnx_ir as ir
 import pytest
 from onnxscript.rewriter import rewrite
 from onnxscript.rewriter._rewrite_rule import RewriteRuleSet
 
 from mobius import build
 from mobius._builder import build_from_module
-from mobius._configs import ArchitectureConfig, Gemma2Config
+from mobius._configs import ArchitectureConfig, Gemma2Config, QuantizationConfig
 from mobius._registry import registry
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.rewrite_rules import group_query_attention_rules, pack_qkv_for_gqa_rules
@@ -232,6 +235,67 @@ class TestGroupQueryAttentionRules:
             past_value = node.inputs[5]
             assert past_key is not None and past_key.shape[-1] == 192
             assert past_value is not None and past_value.shape[-1] == 128
+
+    @pytest.mark.arch_validation
+    def test_deepseek_v2_lite_int4_uses_one_qmoe_per_moe_layer(self):
+        """The int4 graph keeps shared experts dense and routed experts fused."""
+        from transformers import AutoConfig
+
+        hf_config = AutoConfig.from_pretrained(
+            "deepseek-ai/DeepSeek-V2-Lite", trust_remote_code=True
+        )
+        config = dataclasses.replace(
+            ArchitectureConfig.from_transformers(hf_config),
+            dtype=ir.DataType.FLOAT16,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=128,
+                quant_method="gptq",
+                sym=True,
+            ),
+        )
+        with pytest.warns(UserWarning, match="GQA fusion expected"):
+            model = build_from_module(
+                registry.get("deepseek_v3")(config),
+                config,
+                execution_provider="cuda",
+            )["model"]
+        counts = count_ops(model)
+
+        assert counts.get("QMoE", 0) == 26
+        assert counts.get("GroupQueryAttention", 0) == 0
+        assert counts.get("Attention", 0) == 27
+        for node in (node for node in model.graph if node.op_type == "QMoE"):
+            assert node.inputs[1] is not None
+            assert node.inputs[1].dtype == ir.DataType.FLOAT
+            assert node.inputs[3] is not None
+            assert node.inputs[3].dtype == ir.DataType.FLOAT
+            assert node.inputs[6] is not None
+            assert node.inputs[6].dtype == ir.DataType.FLOAT
+            assert node.inputs[14] is not None
+            assert node.inputs[14].dtype == ir.DataType.FLOAT
+
+        input_names = [
+            value.name
+            for node in model.graph
+            for value in node.inputs
+            if value is not None and value.name is not None
+        ]
+        assert not any(".moe.experts." in name for name in input_names)
+        for layer_idx in range(1, 27):
+            prefix = f"model.layers.{layer_idx}.mlp.shared_experts."
+            shared_matmuls = [
+                node
+                for node in model.graph
+                if node.op_type == "MatMulNBits"
+                and any(
+                    value is not None
+                    and value.name is not None
+                    and prefix in value.name
+                    for value in node.inputs
+                )
+            ]
+            assert len(shared_matmuls) == 3
 
     def test_fallback_attention_to_gqa_no_rope(self):
         """AttentionToGQA fallback fires when applied in isolation (do_rotary=0).

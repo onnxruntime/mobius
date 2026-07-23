@@ -510,6 +510,44 @@ class TestPreprocessGptqWeights:
         result = preprocess_gptq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
         assert result["q_proj.scales"].shape == (self.N, self.N_GROUPS)
 
+    def test_expert_major_tensors_preserve_expert_axis(self):
+        num_experts = 64
+        sd = {
+            "experts.qweight": torch.randint(
+                0,
+                255,
+                (num_experts, self.K_PACKED, self.N),
+                dtype=torch.int32,
+            ),
+            "experts.qzeros": torch.randint(
+                0,
+                255,
+                (num_experts, max(1, self.N_GROUPS_PACKED), self.N),
+                dtype=torch.int32,
+            ),
+            "experts.scales": torch.randn(num_experts, self.N_GROUPS, self.N),
+        }
+        result = preprocess_gptq_weights(
+            sd, bits=self.BITS, group_size=self.GROUP_SIZE
+        )
+
+        assert result["experts.weight"].shape == (
+            num_experts,
+            self.N,
+            self.N_GROUPS,
+            self.BLOB_SIZE,
+        )
+        assert result["experts.zero_points"].shape == (
+            num_experts,
+            self.N,
+            self.N_GROUPS * self.BITS // 8,
+        )
+        assert result["experts.scales"].shape == (
+            num_experts,
+            self.N,
+            self.N_GROUPS,
+        )
+
     def test_non_gptq_keys_pass_through(self):
         t = torch.randn(4, 8)
         sd = {"model.embed_tokens.weight": t, "lm_head.weight": t.clone()}
