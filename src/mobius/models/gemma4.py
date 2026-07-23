@@ -49,6 +49,7 @@ from mobius.components import (
     RMSNorm,
     create_attention_bias,
     initialize_rope,
+    make_clippable_quantized_linear_factory,
     make_quantized_linear_factory,
 )
 from mobius.components._activations import get_activation
@@ -64,13 +65,9 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 # Mixed-precision quantization helpers
 #
-# Gemma4 is a multimodal model whose text decoder + token embeddings may be
-# weight-quantized (MatMulNBits / GatherBlockQuantized) while its vision and
-# audio encoders stay float.  The vision/audio encoder modules deliberately do
-# NOT consult ``config.quantization`` — they always build plain ``Linear``
-# layers — so enabling quantization only affects the text path.  The helpers
-# below are the single place the text components read the quantization config,
-# which keeps that "text quantized, vision/audio float" contract explicit.
+# Gemma4 is a multimodal model whose text decoder, token embeddings, vision,
+# and audio components may be weight-quantized independently. The helpers
+# below centralize checkpoint-level quantization and component exclusions.
 # ---------------------------------------------------------------------------
 
 
@@ -92,10 +89,7 @@ def _text_linear_class(config: Gemma4Config) -> type | None:
     quantization_config = _text_quantization_config(config)
     if quantization_config is None:
         return None
-    if (
-        quantization_config.quant_method == "olive"
-        and quantization_config.quantize_embeddings
-    ):
+    if quantization_config.quant_method == "olive" and quantization_config.quantize_embeddings:
         raise NotImplementedError(
             "Gemma 4 does not yet support Olive-packed quantized token embeddings."
         )
@@ -223,11 +217,58 @@ _PER_LAYER_EMBEDDING_PREFIXES = (
 )
 
 
+def _module_is_excluded(config: Gemma4Config, module_name: str) -> bool:
+    quantization = config.quantization
+    return quantization is not None and any(
+        module_name == name or module_name.startswith(f"{name}.")
+        for name in (quantization.modules_to_not_convert or [])
+    )
+
+
+def _component_is_quantized(config: Gemma4Config, source_prefixes: tuple[str, ...]) -> bool:
+    """Return whether an Olive-packed component is uniformly quantized."""
+    quantization = config.quantization
+    if quantization is None or quantization.quant_method != "olive":
+        return False
+    if quantization.modules_to_not_convert is None:
+        return False
+    return not any(
+        any(name == prefix or name.startswith(f"{prefix}.") for prefix in source_prefixes)
+        for name in (quantization.modules_to_not_convert or [])
+    )
+
+
+def _component_linear_classes(
+    config: Gemma4Config,
+    source_prefixes: tuple[str, ...],
+) -> tuple[type, type]:
+    if not _component_is_quantized(config, source_prefixes):
+        return Linear, ClippableLinear
+    quantization = config.quantization
+    zero_point_dtype = config.dtype if quantization.float_zero_point else ir.DataType.UINT8
+    kwargs = {
+        "bits": quantization.bits,
+        "block_size": quantization.group_size,
+        "has_zero_point": not quantization.sym,
+        "zero_point_dtype": zero_point_dtype,
+    }
+    return (
+        make_quantized_linear_factory(**kwargs),
+        make_clippable_quantized_linear_factory(**kwargs),
+    )
+
+
 def _per_layer_model_projection_class(config: Gemma4Config) -> type:
     """Keep Olive GPTQ's uncalibrated pre-decoder projection in floating point."""
     quantization = config.quantization
     if quantization is not None and quantization.quant_method == "compressed-tensors":
         return _text_linear_class(config) or Linear
+    if quantization is not None and quantization.quant_method == "olive":
+        if quantization.modules_to_not_convert is not None and not _module_is_excluded(
+            config,
+            "model.language_model.per_layer_model_projection",
+        ):
+            return _text_linear_class(config) or Linear
     return Linear
 
 
@@ -394,11 +435,17 @@ class Gemma4VisionSelfAttention(nn.Module):
         rope_theta: float = 100.0,
         max_position: int = 128,
         use_clipped_linears: bool = True,
+        linear_class: type | None = None,
+        clippable_linear_class: type | None = None,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        linear_class = ClippableLinear if use_clipped_linears else Linear
+        linear_class = (
+            clippable_linear_class or ClippableLinear
+            if use_clipped_linears
+            else linear_class or Linear
+        )
         self.q_proj = linear_class(hidden_size, num_heads * self.head_dim, bias=False)
         self.k_proj = linear_class(hidden_size, num_heads * self.head_dim, bias=False)
         self.v_proj = linear_class(hidden_size, num_heads * self.head_dim, bias=False)
@@ -562,6 +609,8 @@ class Gemma4VisionEncoderLayer(nn.Module):
         rope_theta: float = 100.0,
         max_position: int = 128,
         use_clipped_linears: bool = True,
+        linear_class: type | None = None,
+        clippable_linear_class: type | None = None,
     ):
         super().__init__()
         self.self_attn = Gemma4VisionSelfAttention(
@@ -571,6 +620,8 @@ class Gemma4VisionEncoderLayer(nn.Module):
             rope_theta=rope_theta,
             max_position=max_position,
             use_clipped_linears=use_clipped_linears,
+            linear_class=linear_class,
+            clippable_linear_class=clippable_linear_class,
         )
         self.input_layernorm = RMSNorm(hidden_size, eps=norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=norm_eps)
@@ -579,7 +630,11 @@ class Gemma4VisionEncoderLayer(nn.Module):
         # Gated MLP: activation(gate_proj) * up_proj -> down_proj (SwiGLU/GEGLU style)
         # HF uses gelu_pytorch_tanh (GELU with tanh approximation); read from config.
         # Use ClippableLinear only when the checkpoint has clipping weights.
-        linear_class = ClippableLinear if use_clipped_linears else Linear
+        linear_class = (
+            clippable_linear_class or ClippableLinear
+            if use_clipped_linears
+            else linear_class or Linear
+        )
         self.mlp = MLP(
             ArchitectureConfig(
                 hidden_size=hidden_size,
@@ -742,9 +797,15 @@ class _Gemma4VisionPatchEmbedder(nn.Module):
     - ``position_embedding_table`` (Parameter ``[2, pos_emb_size, hidden_size]``)
     """
 
-    def __init__(self, patch_size: int, hidden_size: int, position_embedding_size: int):
+    def __init__(
+        self,
+        patch_size: int,
+        hidden_size: int,
+        position_embedding_size: int,
+        linear_class: type = Linear,
+    ):
         super().__init__()
-        self.input_proj = Linear(3 * patch_size * patch_size, hidden_size, bias=False)
+        self.input_proj = linear_class(3 * patch_size * patch_size, hidden_size, bias=False)
         # Position embedding table: [2, pos_emb_size, hidden] — x and y tables
         self.position_embedding_table = nn.Parameter([2, position_embedding_size, hidden_size])
         self.position_embedding_size = position_embedding_size
@@ -805,10 +866,15 @@ class _Gemma4VisionEncoderCore(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         vc = config.vision  # VisionConfig for the SigLIP encoder
+        linear_class, clippable_linear_class = _component_linear_classes(
+            config,
+            ("model.vision_tower", "model.embed_vision"),
+        )
         self.patch_embedder = _Gemma4VisionPatchEmbedder(
             patch_size=vc.patch_size or 16,
             hidden_size=vc.hidden_size,
             position_embedding_size=vc.position_embedding_size or 128,
+            linear_class=linear_class,
         )
         self.layers = nn.ModuleList(
             [
@@ -821,6 +887,8 @@ class _Gemma4VisionEncoderCore(nn.Module):
                     rope_theta=vc.rope_theta or 100.0,
                     max_position=vc.position_embedding_size or 128,
                     use_clipped_linears=vc.use_clipped_linears,
+                    linear_class=linear_class,
+                    clippable_linear_class=clippable_linear_class,
                 )
                 for _ in range(vc.num_hidden_layers)
             ]
@@ -2305,7 +2373,11 @@ class _Gemma4VisionEncoderModel(nn.Module):
         # Reduces N patches to N/9 before projection.
         self.pooler = Gemma4VisionPooler(vc.hidden_size, vc.pooling_kernel_size or 3)
         self.projector_norm = _Gemma4ScaleFreeRMSNorm(vc.hidden_size, eps=vc.norm_eps)
-        self.projector = Linear(vc.hidden_size, config.hidden_size, bias=False)
+        linear_class, _ = _component_linear_classes(
+            config,
+            ("model.vision_tower", "model.embed_vision"),
+        )
+        self.projector = linear_class(vc.hidden_size, config.hidden_size, bias=False)
 
     def forward(
         self,
@@ -2584,6 +2656,10 @@ class _Gemma4AudioEncoderModel(nn.Module):
     def __init__(self, config: Gemma4Config):
         super().__init__()
         self.config = config
+        linear_class, clippable_linear_class = _component_linear_classes(
+            config,
+            ("model.audio_tower", "model.embed_audio"),
+        )
         ac = config.audio  # Gemma4AudioConfig (guaranteed non-None when used)
         input_size = (ac.input_size if ac else None) or 128
         hidden_size = (ac.hidden_size if ac else None) or 1024
@@ -2605,6 +2681,8 @@ class _Gemma4AudioEncoderModel(nn.Module):
             attention_context_left=13,  # fixed per Gemma4 audio_config
             output_proj_dims=output_proj_dims,
             rms_norm_eps=rms_norm_eps,
+            linear_class=linear_class,
+            clippable_linear_class=clippable_linear_class,
         )
         # Scale-free RMSNorm applied before the projection (HF embed_audio.embedding_pre_projection_norm).
         # with_scale=False in HF → no learnable weight → no checkpoint key, no ONNX initializer.
@@ -2614,7 +2692,7 @@ class _Gemma4AudioEncoderModel(nn.Module):
         self._rms_norm_eps = rms_norm_eps
         # Learned projection from encoder output space → text hidden size.
         # Corresponds to HF's embed_audio.embedding_projection (no bias).
-        self.projector = Linear(output_proj_dims, config.hidden_size, bias=False)
+        self.projector = linear_class(output_proj_dims, config.hidden_size, bias=False)
 
     def forward(
         self,
@@ -2987,7 +3065,10 @@ class Gemma4Model(nn.Module):
 
         renamed: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
-            if key.startswith("language_model."):
+            if key.startswith("lm_head."):
+                renamed["decoder." + key] = value
+
+            elif key.startswith("language_model."):
                 suffix = key[len("language_model.") :]
                 if suffix.startswith("lm_head"):
                     # lm_head lives directly under decoder (not decoder.model)
@@ -3013,9 +3094,9 @@ class Gemma4Model(nn.Module):
                 new_key = new_key.replace(
                     "vision_encoder.encoder.encoder.", "vision_encoder.encoder.", 1
                 )
-                # HF uses Gemma4ClippableLinear which adds a ".linear." infix; strip it
-                new_key = new_key.replace(".linear.weight", ".weight")
-                new_key = new_key.replace(".linear.bias", ".bias")
+                # HF uses Gemma4ClippableLinear which adds a ".linear." infix;
+                # strip it for float and packed qweight/scales/qzeros tensors.
+                new_key = new_key.replace(".linear.", ".")
                 renamed[new_key] = value
 
             elif key.startswith("embed_vision.embedding_projection."):
@@ -3027,9 +3108,9 @@ class Gemma4Model(nn.Module):
 
             elif key.startswith("audio_tower."):
                 new_key = "audio_encoder.encoder." + key[len("audio_tower.") :]
-                # HF Conformer linear layers use a ".linear." infix; strip it
-                new_key = new_key.replace(".linear.weight", ".weight")
-                new_key = new_key.replace(".linear.bias", ".bias")
+                # HF Conformer linears use a ".linear." infix; strip it for
+                # float and packed qweight/scales/qzeros tensors.
+                new_key = new_key.replace(".linear.", ".")
                 # HF subsample_conv_projection uses "layerN.conv" / "layerN.norm" names;
                 # our ONNX module uses "convN" / "normN" directly.
                 new_key = new_key.replace(
