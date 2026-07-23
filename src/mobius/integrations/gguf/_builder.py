@@ -769,13 +769,17 @@ def _load_quantized_state_dict(
                 raw_expert = raw_flat[
                     expert_idx * blocks_per_expert : (expert_idx + 1) * blocks_per_expert
                 ]
+                repacked = None
                 if source_params == (target_bits, target_block_size):
-                    repacked = repack_gguf_tensor(
+                    candidate = repack_gguf_tensor(
                         raw_expert.ravel().view(np.uint8),
                         qtype_val,
                         (n_out, k_in),
                     )
-                else:
+                    target_has_zero_points = not target_symmetric
+                    if (candidate.zero_points is not None) == target_has_zero_points:
+                        repacked = candidate
+                if repacked is None:
                     _require_supported_requantization(
                         bits=target_bits,
                         block_size=target_block_size,

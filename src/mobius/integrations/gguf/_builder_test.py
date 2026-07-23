@@ -496,6 +496,65 @@ def test_load_quantized_glm_experts_repacked_individually(monkeypatch):
     assert "model.layers.0.mlp.experts.1.gate_proj.weight" in result
 
 
+def test_load_quantized_experts_requantizes_when_zero_point_presence_differs(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from gguf import GGMLQuantizationType
+
+    from mobius.integrations.gguf import _repacker, _tencent_q1_0, _tensor_mapping
+    from mobius.integrations.gguf._builder import _load_quantized_state_dict
+
+    requantized = []
+
+    def _repack(*_args, **_kwargs):
+        return SimpleNamespace(
+            weight=np.zeros((2, 1, 16), dtype=np.uint8),
+            scales=np.ones((2, 1), dtype=np.float32),
+            zero_points=None,
+        )
+
+    def _requantize(values, **_kwargs):
+        requantized.append(values)
+        return SimpleNamespace(
+            weight=np.zeros((2, 1, 16), dtype=np.uint8),
+            scales=np.ones((2, 1), dtype=np.float32),
+            zero_points=np.zeros((2, 1), dtype=np.uint8),
+        )
+
+    monkeypatch.setattr(_tencent_q1_0, "is_tencent_q1_0_layout", lambda _model: False)
+    monkeypatch.setattr(
+        _tensor_mapping,
+        "map_gguf_to_hf_names",
+        lambda _name, _arch: "model.layers.0.mlp.experts.gate_proj.weight",
+    )
+    monkeypatch.setattr(_repacker, "repack_quant_params", lambda _qtype: (4, 32))
+    monkeypatch.setattr(_repacker, "repack_gguf_tensor", _repack)
+    monkeypatch.setattr(_repacker, "repack_dequantized_tensor", _requantize)
+
+    raw = np.arange(8, dtype=np.uint8)
+    model = SimpleNamespace(
+        _tensor_index={"experts": object()},
+        tensor_items_raw=lambda: [
+            ("experts", raw, GGMLQuantizationType.Q4_0, (2, 2, 2))
+        ],
+        dequantize_raw_tensor=lambda *_args: np.ones((2, 2), dtype=np.float32),
+    )
+    config = SimpleNamespace(
+        quantization=SimpleNamespace(bits=4, group_size=32, sym=False),
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        model_type="glm_moe_dsa",
+    )
+
+    result = _load_quantized_state_dict(model, "glm-dsa", SimpleNamespace(named_modules=list), config)
+
+    assert len(requantized) == 2
+    assert "model.layers.0.mlp.experts.0.gate_proj.zero_points" in result
+    assert "model.layers.0.mlp.experts.1.gate_proj.zero_points" in result
+
+
 def test_load_quantized_glm_fuses_split_kv_b(monkeypatch):
     from types import SimpleNamespace
 

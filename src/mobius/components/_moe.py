@@ -6,12 +6,16 @@
 from __future__ import annotations
 
 import dataclasses
+import math
+import re
 from typing import TYPE_CHECKING
 
 import onnx_ir as ir
+import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
+from mobius._weight_utils import preprocess_awq_weights, preprocess_gptq_weights
 from mobius.components._mlp import MLP
 
 if TYPE_CHECKING:
@@ -106,7 +110,7 @@ class SigmoidTopKGate(nn.Module):
             # Renormalize selected weights to sum to 1 (prevents vanishing gradients)
             weight_sum = op.ReduceSum(routing_weights, [-1], keepdims=True)
             routing_weights = op.Div(routing_weights, op.Add(weight_sum, 1e-9))
-        if self.routed_scaling_factor != 1.0:  # noqa: RUF069
+        if self.routed_scaling_factor != 1.0:  # ruff:ignore[float-equality-comparison]
             routing_weights = op.Mul(routing_weights, self.routed_scaling_factor)
         return routing_weights, selected_experts
 
@@ -264,8 +268,8 @@ class FusedQuantizedMoE(nn.Module):
     ``normalize_routing_weights=0``, so the fused op reproduces the per-expert
     path's routing bit-for-bit.
 
-    Symmetric int quantization is used (no zero-points): the kernel defaults the
-    per-block zero-point to ``1 << (bits - 1)``.
+    Symmetric quantization omits zero-point inputs and uses the kernel's implicit
+    midpoint. Asymmetric quantization supplies packed per-block zero-points.
     """
 
     _MICROSOFT_DOMAIN = "com.microsoft"
@@ -333,6 +337,26 @@ class FusedQuantizedMoE(nn.Module):
             [e, self._hidden, self._inter // block_size],
             dtype=ir.DataType.FLOAT,
         )
+        if qc.sym:
+            self.fc1_experts_zero_points = None
+            self.fc2_experts_zero_points = None
+        else:
+            self.fc1_experts_zero_points = nn.Parameter(
+                [
+                    e,
+                    fc1_out,
+                    math.ceil((self._hidden // block_size) * bits / 8),
+                ],
+                dtype=ir.DataType.UINT8,
+            )
+            self.fc2_experts_zero_points = nn.Parameter(
+                [
+                    e,
+                    self._hidden,
+                    math.ceil((self._inter // block_size) * bits / 8),
+                ],
+                dtype=ir.DataType.UINT8,
+            )
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
         hidden = self._hidden
@@ -354,16 +378,16 @@ class FusedQuantizedMoE(nn.Module):
             flat_f32,  # 0: input
             scores_for_choice,  # 1: router_probs (selection logits)
             self.fc1_experts_weights,  # 2
-            self.fc1_scales,  # 3
+            op.Cast(self.fc1_scales, to=1),  # 3
             None,  # 4: fc1_experts_bias
             self.fc2_experts_weights,  # 5
-            self.fc2_scales,  # 6
+            op.Cast(self.fc2_scales, to=1),  # 6
             None,  # 7: fc2_experts_bias
             None,  # 8: fc3_experts_weights
             None,  # 9: fc3_scales
             None,  # 10: fc3_experts_bias
-            None,  # 11: fc1_zero_points
-            None,  # 12: fc2_zero_points
+            self.fc1_experts_zero_points,  # 11
+            self.fc2_experts_zero_points,  # 12
             None,  # 13: fc3_zero_points
             aggregation,  # 14: router_weights (explicit combine weights)
             activation_type="swiglu",
@@ -397,3 +421,181 @@ class FusedQuantizedMoE(nn.Module):
             return self.gate.route_for_qmoe(op, hidden_states)
         finally:
             builder.pop_module()
+
+
+_PER_EXPERT_RE = re.compile(
+    r"^(?P<prefix>.*\.mlp)\.experts\.(?P<expert>\d+)\."
+    r"(?P<projection>gate_proj|up_proj|down_proj)\."
+    r"(?P<kind>weight|scales|zero_points)$"
+)
+_FUSED_EXPERT_RE = re.compile(
+    r"^(?P<prefix>.*\.mlp)\.experts\."
+    r"(?P<projection>gate_up_proj|down_proj)\."
+    r"(?P<kind>qweight|qzeros|weight|scales|zero_points)$"
+)
+
+
+def pack_fused_quantized_moe_weights(
+    state_dict: dict[str, torch.Tensor],
+    config: ArchitectureConfig,
+) -> dict[str, torch.Tensor]:
+    """Pack routed expert tensors into the expert-major QMoE initializer ABI.
+
+    Accepts either fused 3-D GPTQ/AWQ checkpoint tensors or already-repacked
+    per-expert GGUF/MatMulNBits tensors. Gate/up rows are interleaved for
+    ``swiglu_fusion=1``; shared-expert tensors are left untouched.
+    """
+    quantization = config.quantization
+    if quantization is None:
+        raise ValueError("Fused QMoE packing requires quantization settings")
+
+    result: dict[str, torch.Tensor] = {}
+    fused: dict[str, dict[str, dict[str, torch.Tensor]]] = {}
+    per_expert: dict[str, dict[int, dict[str, dict[str, torch.Tensor]]]] = {}
+    for key, value in state_dict.items():
+        match = _FUSED_EXPERT_RE.match(key)
+        if match is not None:
+            fused.setdefault(match["prefix"], {}).setdefault(
+                match["projection"], {}
+            )[match["kind"]] = value
+            continue
+        match = _PER_EXPERT_RE.match(key)
+        if match is not None:
+            expert = int(match["expert"])
+            per_expert.setdefault(match["prefix"], {}).setdefault(expert, {}).setdefault(
+                match["projection"], {}
+            )[match["kind"]] = value
+            continue
+        result[key] = value
+
+    prefixes = set(fused) | set(per_expert)
+    for prefix in prefixes:
+        if prefix in fused and prefix in per_expert:
+            raise ValueError(f"Mixed fused and per-expert weights under {prefix}")
+        if prefix in fused:
+            gate_up = _prepare_fused_projection(
+                fused[prefix].get("gate_up_proj"),
+                quantization.quant_method,
+                quantization.bits,
+                quantization.group_size,
+            )
+            down = _prepare_fused_projection(
+                fused[prefix].get("down_proj"),
+                quantization.quant_method,
+                quantization.bits,
+                quantization.group_size,
+            )
+            fc1 = {
+                kind: _interleave_gate_up(value)
+                for kind, value in gate_up.items()
+            }
+            fc2 = down
+        else:
+            experts = per_expert[prefix]
+            expected = set(range(config.num_local_experts or 0))
+            if set(experts) != expected:
+                raise ValueError(
+                    f"{prefix} has expert indices {sorted(experts)}, "
+                    f"expected {sorted(expected)}"
+                )
+            fc1, fc2 = _stack_per_expert_projections(experts)
+
+        _store_qmoe_projection(
+            result,
+            f"{prefix}.moe.fc1",
+            fc1,
+            symmetric=quantization.sym,
+        )
+        _store_qmoe_projection(
+            result,
+            f"{prefix}.moe.fc2",
+            fc2,
+            symmetric=quantization.sym,
+        )
+    return result
+
+
+def _prepare_fused_projection(
+    tensors: dict[str, torch.Tensor] | None,
+    quant_method: str,
+    bits: int,
+    block_size: int,
+) -> dict[str, torch.Tensor]:
+    if tensors is None:
+        raise ValueError("Missing fused routed-expert projection")
+    if "qweight" in tensors:
+        preprocess = (
+            preprocess_gptq_weights if quant_method == "gptq" else preprocess_awq_weights
+        )
+        num_experts = tensors["qweight"].shape[0]
+        processed: dict[str, list[torch.Tensor]] = {}
+        for expert in range(num_experts):
+            expert_state = {
+                f"projection.{kind}": value[expert]
+                for kind, value in tensors.items()
+                if kind in {"qweight", "qzeros", "scales"}
+            }
+            for key, value in preprocess(
+                expert_state, bits=bits, group_size=block_size
+            ).items():
+                processed.setdefault(key.rsplit(".", 1)[-1], []).append(value)
+        return {kind: torch.stack(values) for kind, values in processed.items()}
+    required = {"weight", "scales"}
+    if not required.issubset(tensors):
+        raise ValueError(f"Missing fused projection tensors: {required - tensors.keys()}")
+    return tensors
+
+
+def _stack_per_expert_projections(
+    experts: dict[int, dict[str, dict[str, torch.Tensor]]],
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    fc1: dict[str, list[torch.Tensor]] = {}
+    fc2: dict[str, list[torch.Tensor]] = {}
+    for expert in sorted(experts):
+        projections = experts[expert]
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            if name not in projections:
+                raise ValueError(f"Expert {expert} is missing {name}")
+        kinds = set(projections["gate_proj"]) | set(projections["up_proj"])
+        for kind in kinds:
+            if kind not in projections["gate_proj"] or kind not in projections["up_proj"]:
+                raise ValueError(f"Expert {expert} gate/up {kind} tensors are incomplete")
+            gate = projections["gate_proj"][kind]
+            up = projections["up_proj"][kind]
+            fc1.setdefault(kind, []).append(
+                torch.stack((gate, up), dim=1).flatten(0, 1)
+            )
+        for kind, value in projections["down_proj"].items():
+            fc2.setdefault(kind, []).append(value)
+    return (
+        {kind: torch.stack(values) for kind, values in fc1.items()},
+        {kind: torch.stack(values) for kind, values in fc2.items()},
+    )
+
+
+def _interleave_gate_up(value: torch.Tensor) -> torch.Tensor:
+    if value.shape[1] % 2:
+        raise ValueError(f"gate_up projection has odd output size {value.shape[1]}")
+    intermediate = value.shape[1] // 2
+    return value.reshape(value.shape[0], 2, intermediate, *value.shape[2:]).transpose(
+        1, 2
+    ).flatten(1, 2)
+
+
+def _store_qmoe_projection(
+    result: dict[str, torch.Tensor],
+    stem: str,
+    tensors: dict[str, torch.Tensor],
+    *,
+    symmetric: bool,
+) -> None:
+    weight = tensors["weight"]
+    if weight.ndim == 4:
+        weight = weight.flatten(-2)
+    result[f"{stem}_experts_weights"] = weight
+    result[f"{stem}_scales"] = tensors["scales"].float()
+    zero_points = tensors.get("zero_points")
+    if not symmetric:
+        if zero_points is None:
+            raise ValueError(f"Asymmetric QMoE projection {stem} requires zero-points")
+        result[f"{stem}_experts_zero_points"] = zero_points

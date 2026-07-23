@@ -29,6 +29,7 @@ from mobius.components import (
     make_quantized_linear_factory,
 )
 from mobius.components._deepseek_mla import DeepSeekMLA
+from mobius.components._moe import pack_fused_quantized_moe_weights
 from mobius.models.base import CausalLMModel
 
 if TYPE_CHECKING:
@@ -398,7 +399,9 @@ class DeepSeekV3TextModel(nn.Module):
 
         # Detect MLA vs standard attention
         use_mla = config.qk_nope_head_dim is not None and config.qk_nope_head_dim > 0
-        LayerClass = DeepSeekMLADecoderLayer if use_mla else _DeepSeekStandardDecoderLayer  # noqa: N806
+        LayerClass = (  # ruff:ignore[non-lowercase-variable-in-function]
+            DeepSeekMLADecoderLayer if use_mla else _DeepSeekStandardDecoderLayer
+        )
 
         # Build layers: dense for first k, MoE for rest
         first_k = config.first_k_dense_replace
@@ -490,17 +493,28 @@ class DeepSeekV3CausalLMModel(CausalLMModel):
         - MoE expert weights: HF stores all experts in a single fused tensor
             experts.gate_up_proj: (n_experts, 2*intermediate, hidden)
             experts.down_proj:    (n_experts, hidden, intermediate)
-          These are split into per-expert ONNX weights:
+          Static MoE exports split these into per-expert ONNX weights:
             moe.experts.{i}.gate_proj.weight: (intermediate, hidden)
             moe.experts.{i}.up_proj.weight:   (intermediate, hidden)
             moe.experts.{i}.down_proj.weight: (hidden, intermediate)
+          Fused quantized exports instead pack expert-major FC1/FC2 tensors for QMoE.
         """
         renamed = {}
+        routed_experts = {}
+        qc = self.config.quantization
+        use_fused_qmoe = (
+            self.config.fused_quantized_moe
+            and qc is not None
+            and qc.quant_method != "none"
+        )
         for key, value in state_dict.items():
             new_key = key
 
             # Remap MoE layer names: mlp.gate.* → mlp.moe.gate.*
             new_key = new_key.replace(".mlp.gate.", ".mlp.moe.gate.")
+            if use_fused_qmoe and ".mlp.experts." in new_key:
+                routed_experts[new_key] = value
+                continue
 
             # HF stores all routed experts in fused tensors:
             # layers.N.mlp.experts.gate_up_proj  (n_experts, 2*mid, hidden)
@@ -522,4 +536,7 @@ class DeepSeekV3CausalLMModel(CausalLMModel):
             renamed[new_key] = value
 
         # Handle weight tying
-        return super().preprocess_weights(renamed)
+        processed = super().preprocess_weights(renamed)
+        if use_fused_qmoe:
+            processed.update(pack_fused_quantized_moe_weights(routed_experts, self.config))
+        return processed
