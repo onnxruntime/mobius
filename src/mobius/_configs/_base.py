@@ -65,7 +65,7 @@ def _resolve_hidden_act(config, model_type: str) -> str | None:
         or getattr(config, "afn", None)
         # LLaDA/OLMo expose the activation as ``activation_type`` (e.g. "silu").
         or getattr(config, "activation_type", None)
-        or ("silu" if model_type in ("qwen",) else None)
+        or ("silu" if model_type in ("qwen", "chatglm") else None)
         # gelu_activation is a boolean (XLM) — must be after all string
         # attrs so it cannot override an explicit hidden_act.
         or ("gelu" if getattr(config, "gelu_activation", False) else None)
@@ -549,6 +549,7 @@ class ArchitectureConfig(BaseModelConfig):
             rope_config = RoPEConfig(
                 rope_type="default",
                 rope_theta=_IMPLICIT_ROPE_DEFAULTS[model_type],
+                partial_rotary_factor=0.5 if model_type == "chatglm" else 1.0,
             )
 
         # Some hierarchical models (Segformer, Swin) use plural list attrs
@@ -568,6 +569,7 @@ class ArchitectureConfig(BaseModelConfig):
         num_hidden_layers = (
             getattr(config, "num_hidden_layers", None)
             or getattr(config, "n_layers", None)
+            or getattr(config, "num_layers", None)
             or getattr(config, "num_encoder_blocks", None)
             or 0
         )
@@ -590,12 +592,18 @@ class ArchitectureConfig(BaseModelConfig):
                 config.head_dim
                 if (hasattr(config, "head_dim") and config.head_dim is not None)
                 else getattr(config, "d_kv", None)
+                or getattr(config, "kv_channels", None)
                 or _as_int(hidden_size) // _as_int(num_attention_heads)
             ),
             num_attention_heads=_as_int(num_attention_heads),
             num_key_value_heads=_as_int(
                 getattr(config, "num_key_value_heads", None)
                 or getattr(config, "n_kv_heads", None)
+                or (
+                    getattr(config, "multi_query_group_num", None)
+                    if getattr(config, "multi_query_attention", False)
+                    else None
+                )
                 or num_attention_heads
             ),
             num_hidden_layers=_as_int(num_hidden_layers),
@@ -643,7 +651,9 @@ class ArchitectureConfig(BaseModelConfig):
                 or 1e-6
             ),
             attn_qkv_bias=(
-                getattr(
+                getattr(config, "add_qkv_bias", False)
+                or getattr(config, "add_bias_linear", False)
+                or getattr(
                     config,
                     "attention_bias",
                     getattr(
@@ -677,7 +687,8 @@ class ArchitectureConfig(BaseModelConfig):
                 )
             ),
             attn_o_bias=(
-                getattr(
+                getattr(config, "add_bias_linear", False)
+                or getattr(
                     config,
                     "attention_bias",
                     getattr(
@@ -722,7 +733,8 @@ class ArchitectureConfig(BaseModelConfig):
             ),
             attn_qk_norm_full=(model_type in ("flex_olmo", "olmoe", "olmo2", "olmo3")),
             mlp_bias=(
-                getattr(
+                getattr(config, "add_bias_linear", False)
+                or getattr(
                     config,
                     "use_mlp_bias",
                     getattr(
@@ -765,6 +777,7 @@ class ArchitectureConfig(BaseModelConfig):
             max_position_embeddings=(
                 getattr(config, "max_position_embeddings", None)
                 or getattr(config, "max_sequence_length", None)
+                or getattr(config, "seq_length", None)
                 or 0
             ),
             tie_word_embeddings=(
