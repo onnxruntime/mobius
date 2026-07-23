@@ -495,6 +495,41 @@ def _gemma4_postprocess(
     # --- Per-layer input gating ---
     hidden_size_per_layer_input = metadata.get(f"{arch}.embedding_length_per_layer_input")
 
+    # --- Double-wide MLP (per-layer feed-forward length) ---
+    # Gemma4 E2B/E4B store feed_forward_length as a per-layer array: the base
+    # intermediate size for standalone layers and 2x that for the KV-shared
+    # layers (use_double_wide_mlp).  Gemma4DecoderLayer expects a scalar base
+    # size and re-derives the doubling from use_double_wide_mlp + is_kv_shared,
+    # so collapse the array back to (base, use_double_wide_mlp) here.
+    use_double_wide_mlp = False
+    intermediate_size = config.intermediate_size
+    if isinstance(intermediate_size, (list, np.ndarray)):
+        values = [int(v) for v in intermediate_size]
+        distinct = sorted(set(values))
+        if len(distinct) == 1:
+            intermediate_size = distinct[0]
+        elif len(distinct) == 2 and distinct[1] == 2 * distinct[0]:
+            base, wide = distinct
+            shared = int(num_kv_shared_layers) if num_kv_shared_layers is not None else 0
+            first_shared = config.num_hidden_layers - shared
+            expected = [
+                wide if (shared > 0 and i >= first_shared) else base
+                for i in range(config.num_hidden_layers)
+            ]
+            if values != expected:
+                raise ValueError(
+                    "Gemma4 per-layer feed_forward_length does not match the "
+                    "double-wide-MLP pattern (wide layers must be the last "
+                    f"{shared} KV-shared layers): {values}"
+                )
+            intermediate_size = base
+            use_double_wide_mlp = True
+        else:
+            raise ValueError(
+                f"Unexpected Gemma4 per-layer feed_forward_length array: {values}"
+            )
+        config = dataclasses.replace(config, intermediate_size=intermediate_size)
+
     # --- Per-layer KV heads (num_global_key_value_heads) ---
     # GGUF stores per-layer KV head counts as an array.  When full-attention
     # layers use fewer KV heads than sliding layers, extract the minority
@@ -541,6 +576,7 @@ def _gemma4_postprocess(
         hidden_size_per_layer_input=int(hidden_size_per_layer_input)
         if hidden_size_per_layer_input is not None
         else 0,
+        use_double_wide_mlp=use_double_wide_mlp,
         # Fields without GGUF metadata — use Gemma4Config defaults
         vocab_size_per_layer_input=config.vocab_size
         if (hidden_size_per_layer_input or 0) > 0
@@ -548,10 +584,66 @@ def _gemma4_postprocess(
     )
 
 
+# Gemma3 interleaves sliding-window (local) and full (global) attention. The
+# local RoPE base frequency is a fixed architectural constant that GGUF does not
+# store (only the global ``gemma3.rope.freq_base`` is present), so it must be
+# defaulted. Source: HF Gemma3TextConfig.rope_local_base_freq default value.
+_GEMMA3_DEFAULT_ROPE_LOCAL_BASE_FREQ = 10_000.0
+
+# Gemma3 interleaves sliding-window (local) and full (global) attention on a
+# fixed period: every ``sliding_window_pattern``-th layer is full attention.
+# GGUF stores neither the per-layer types nor the period, so default to the HF
+# Gemma3 value. Source: HF Gemma3TextConfig.sliding_window_pattern default.
+_GEMMA3_DEFAULT_SLIDING_WINDOW_PATTERN = 6
+
+
+def _gemma3_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+) -> ArchitectureConfig:
+    """Populate Gemma3 fields that GGUF omits.
+
+    GGUF carries only the global RoPE base (``gemma3.rope.freq_base``) and the
+    sliding-window size, but not the local RoPE base or the per-layer
+    local/global attention pattern that ``Gemma3TextModel`` requires. Without
+    them the model builds its local rotary embedding from
+    ``rope_local_base_freq = None`` (crash) and iterates ``layer_types = None``
+    (crash). Default both to the known Gemma3 constants when GGUF does not
+    provide them.
+
+    Args:
+        config: The base config extracted from GGUF metadata.
+        metadata: The raw GGUF key-value metadata.
+
+    Returns:
+        The config with ``rope_local_base_freq`` and ``layer_types`` populated.
+    """
+    if getattr(config, "rope_local_base_freq", None) is None:
+        local_freq_base = metadata.get("gemma3.rope.local_freq_base") or metadata.get(
+            "gemma3.rope.freq_base_local"
+        )
+        config.rope_local_base_freq = (
+            float(local_freq_base)
+            if local_freq_base is not None
+            else _GEMMA3_DEFAULT_ROPE_LOCAL_BASE_FREQ
+        )
+    if getattr(config, "layer_types", None) is None:
+        pattern = (
+            metadata.get("gemma3.attention.sliding_window_pattern")
+            or _GEMMA3_DEFAULT_SLIDING_WINDOW_PATTERN
+        )
+        config.layer_types = [
+            "full_attention" if (index + 1) % pattern == 0 else "sliding_attention"
+            for index in range(config.num_hidden_layers)
+        ]
+    return config
+
+
 # Architecture-specific config postprocessors.
 # Each takes a base ArchitectureConfig + raw metadata and returns
 # an architecture-specific config subclass.
 _CONFIG_POSTPROCESSORS: dict[str, Any] = {
+    "gemma3_text": _gemma3_postprocess,
     "gemma4_text": _gemma4_postprocess,
 }
 

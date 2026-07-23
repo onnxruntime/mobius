@@ -76,6 +76,21 @@ def test_qwen3_vl_returns_hf_source_paths(monkeypatch):
     assert components["embedding"].source_paths == ("model.language_model.embed_tokens",)
 
 
+def test_qwen3_tts_embedders_return_shared_hf_source_paths(monkeypatch):
+    _patch_autoconfig(monkeypatch, SimpleNamespace(model_type="qwen3_tts"))
+    components = {c.name: c for c in inspect_components("fake/qwen3-tts")}
+
+    assert components["talker_step_embedder"].source_paths == (
+        "talker.model.codec_embedding",
+        "talker.code_predictor.model.codec_embedding",
+    )
+    assert components["talker_prefill_embedder"].source_paths == (
+        "talker.model.text_embedding",
+        "talker.text_projection",
+        "talker.model.codec_embedding",
+    )
+
+
 def test_qwen2_5_vl_uses_runtime_paths_not_checkpoint_prefixes(monkeypatch):
     # Modern HF Qwen2.5-VL uses the same runtime component roots as Qwen3-VL,
     # despite exposing different checkpoint weight prefixes.

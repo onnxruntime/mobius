@@ -442,6 +442,20 @@ class TestExtractRopeConfig:
         assert result["mrope_interleaved"] is True
         assert result["mrope_section"] == [8, 16, 8]
 
+    def test_mrope_interleaved_alias_from_rope_scaling(self):
+        """Qwen3-TTS talker spells the flag as bare ``interleaved``."""
+
+        class Cfg:
+            rope_scaling: ClassVar[dict] = {
+                "interleaved": True,
+                "mrope_section": [24, 20, 20],
+                "rope_type": "default",
+            }
+
+        result = _extract_mrope_fields(Cfg())
+        assert result["mrope_interleaved"] is True
+        assert result["mrope_section"] == [24, 20, 20]
+
     def test_original_max_position_embeddings(self):
         class Cfg:
             original_max_position_embeddings = 8192

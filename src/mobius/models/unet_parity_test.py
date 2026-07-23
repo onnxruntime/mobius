@@ -24,7 +24,8 @@ def _onnx_session(model):
     import onnx_ir
     import onnxruntime as ort
 
-    with tempfile.TemporaryDirectory() as temp_dir:
+    # Windows keeps the ORT model file mapped; tolerate cleanup until the session is released.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
         model_path = str(Path(temp_dir) / "model.onnx")
         onnx_ir.save(model, model_path)
         yield ort.InferenceSession(model_path)

@@ -29,6 +29,10 @@ from onnxscript import GraphBuilder, nn
 from mobius._build_context import ep_capabilities
 from mobius._configs import Gemma4Config
 from mobius._model_package import ModelPackage
+from mobius._pipeline_contract import (
+    declare_component_presence,
+    declare_optional_input,
+)
 from mobius.tasks._base import (
     ModelTask,
     _make_graph,
@@ -194,9 +198,8 @@ class Gemma4Task(ModelTask):
         (``True``) vs padding (``False``), always contiguous
         (right-padded).  The mask is downsampled through two conv layers
         (stride 2 each → ``T//4``) and used to zero out padding in
-        Conformer attention.  The downsampled mask is returned as
-        ``audio_features_mask [B, T//4]`` so callers can strip padding
-        rows before scattering into text embeddings.
+        Conformer attention. The export strips padding inside the ONNX
+        graph and returns ``audio_features [num_valid, hidden_size]``.
 
     **Decoder** — standard ``attention_mask`` for KV cache padding.
         ``attention_mask [B, past+current]`` is a 1/0 int mask indicating
@@ -370,6 +373,7 @@ class Gemma4Task(ModelTask):
 
         builder.add_output(image_features, "image_features")
 
+        declare_component_presence(graph, "image")
         return _make_model(graph)
 
     def _build_audio(
@@ -391,10 +395,10 @@ class Gemma4Task(ModelTask):
           positions in Conformer attention.
 
         Outputs:
-        - ``audio_features [batch, time//4, text_hidden_size]``: encoded tokens
+        - ``audio_features [num_valid, text_hidden_size]``: encoded tokens with
+          padded rows removed in batch-major order
         - ``audio_features_mask [batch, time//4]``: BOOL downsampled mask
-          indicating which output positions are valid (for stripping
-          padding rows before scattering into text embeddings)
+          retained for diagnostics and backwards compatibility
         """
         batch = ir.SymbolicDim("batch")
         time = ir.SymbolicDim("time")
@@ -419,11 +423,25 @@ class Gemma4Task(ModelTask):
             input_features,
             input_features_mask=input_features_mask,
         )
+        if downsampled_mask is None:
+            raise ValueError("Gemma4 audio encoder must return a downsampled validity mask")
+        flattened_features = op.Reshape(
+            audio_features,
+            op.Constant(value_ints=[-1, config.hidden_size]),
+        )
+        flattened_mask = op.Reshape(
+            downsampled_mask,
+            op.Constant(value_ints=[-1]),
+        )
+        flattened_features_f32 = op.Cast(flattened_features, to=ir.DataType.FLOAT)
+        audio_features = op.CastLike(
+            op.Compress(flattened_features_f32, flattened_mask, axis=0),
+            flattened_features,
+        )
         builder.add_output(audio_features, "audio_features")
+        builder.add_output(downsampled_mask, "audio_features_mask")
 
-        if downsampled_mask is not None:
-            builder.add_output(downsampled_mask, "audio_features_mask")
-
+        declare_component_presence(graph, "audio")
         return _make_model(graph)
 
     def _build_embedding(
@@ -449,6 +467,11 @@ class Gemma4Task(ModelTask):
             dtype=config.dtype,
             shape=[num_image_tokens, config.hidden_size],
         )
+        declare_optional_input(
+            image_features,
+            presence="image",
+            absent_shape=[0, config.hidden_size],
+        )
 
         audio_features_val: ir.Value | None = None
 
@@ -458,6 +481,11 @@ class Gemma4Task(ModelTask):
                 "audio_features",
                 dtype=config.dtype,
                 shape=[num_audio_tokens, config.hidden_size],
+            )
+            declare_optional_input(
+                audio_features_val,
+                presence="audio",
+                absent_shape=[0, config.hidden_size],
             )
 
         result = embedding(
@@ -536,6 +564,7 @@ class Gemma4UnifiedTask(Gemma4Task):
             pixel_position_ids=pixel_position_ids,
         )
         builder.add_output(image_features, "image_features")
+        declare_component_presence(graph, "image")
         return _make_model(graph)
 
     def _build_audio(
@@ -579,4 +608,5 @@ class Gemma4UnifiedTask(Gemma4Task):
             input_features_mask=input_features_mask,
         )
         builder.add_output(audio_features, "audio_features")
+        declare_component_presence(graph, "audio")
         return _make_model(graph)

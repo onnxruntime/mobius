@@ -301,10 +301,25 @@ def _save_package(
             print(f"  {name}: {path}")
     elif runtime == "onnx-genai":
         from mobius.integrations.onnx_genai import write_onnx_genai_config
+        from mobius.integrations.onnx_genai.inference_metadata import (
+            is_native_vlm_package,
+            write_native_vlm_package_metadata,
+        )
 
         config = getattr(pkg, "config", None)
         source = getattr(args, "config", None) or getattr(args, "model", None)
-        artifacts = write_onnx_genai_config(pkg, output_dir, config=config, source=source)
+        if is_native_vlm_package(pkg):
+            try:
+                artifacts = write_native_vlm_package_metadata(
+                    pkg,
+                    output_dir,
+                    config=config,
+                    source=source,
+                )
+            except ValueError as error:
+                raise SystemExit(f"Error: {error}") from error
+        else:
+            artifacts = write_onnx_genai_config(pkg, output_dir, config=config, source=source)
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
 
@@ -364,6 +379,8 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         )
         raise SystemExit(1)
 
+    mmproj_path = getattr(args, "mmproj", None)
+
     if args.keep_quantized:
         print(
             "Quantized mode: preserving GGUF quantization as "
@@ -374,12 +391,22 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
     output_dir = args.output or os.path.splitext(gguf_path)[0] + "_onnx"
     os.makedirs(output_dir, exist_ok=True)
 
-    pkg = build_from_gguf(
-        gguf_path,
-        dtype=args.dtype,
-        keep_quantized=args.keep_quantized,
-        execution_provider=args.execution_provider,
-    )
+    if mmproj_path is not None:
+        print(f"Multimodal mode: fusing vision/audio encoder from mmproj {mmproj_path}...")
+        pkg = build_from_gguf(
+            gguf_path,
+            mmproj=mmproj_path,
+            dtype=args.dtype,
+            execution_provider=args.execution_provider,
+            keep_quantized=args.keep_quantized,
+        )
+    else:
+        pkg = build_from_gguf(
+            gguf_path,
+            dtype=args.dtype,
+            keep_quantized=args.keep_quantized,
+            execution_provider=args.execution_provider,
+        )
 
     pkg.save(
         output_dir,
@@ -392,6 +419,22 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         else:
             path = os.path.join(output_dir, "model.onnx")
         print(f"Saved {name} to {path}")
+
+    if getattr(args, "runtime", None) == "onnx-genai":
+        from mobius.integrations.gguf import write_gguf_tokenizer_json
+        from mobius.integrations.onnx_genai import write_onnx_genai_config
+
+        # A GGUF checkpoint has no Hugging Face source directory, so the
+        # tokenizer is reconstructed from the file's embedded ggml metadata
+        # rather than copied from a `source`.
+        tokenizer_path = write_gguf_tokenizer_json(gguf_path, output_dir)
+        if tokenizer_path is not None:
+            print(f"  tokenizer: {tokenizer_path}")
+        artifacts = write_onnx_genai_config(
+            pkg, output_dir, config=getattr(pkg, "config", None), source=None
+        )
+        for name, path in artifacts.items():
+            print(f"  {name}: {path}")
 
 
 def _cmd_convert_comfyui(args: argparse.Namespace) -> None:
@@ -636,6 +679,17 @@ def main(argv: list[str] | None = None) -> None:
         help="Output directory (default: <gguf_stem>_onnx/).",
     )
     gguf_parser.add_argument(
+        "--mmproj",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to a companion 'clip' mmproj GGUF (vision/audio encoder). "
+            "When set, builds a full multimodal package (decoder + "
+            "vision_encoder + embedding) instead of a text-only model. "
+            "Currently supports Gemma4 vision; audio is experimental."
+        ),
+    )
+    gguf_parser.add_argument(
         "--keep-quantized",
         action="store_true",
         help=(
@@ -665,6 +719,18 @@ def main(argv: list[str] | None = None) -> None:
             "Target execution provider for EP-aware graph optimisations "
             "(e.g. 'cpu' to apply the GroupQueryAttention rewrite). "
             "Defaults to 'default' (portable ONNX, no vendor fusions)."
+        ),
+    )
+    gguf_parser.add_argument(
+        "--runtime",
+        choices=["ort-genai", "onnx-genai"],
+        default=None,
+        help=(
+            "Generate runtime-specific config files after building. "
+            "'onnx-genai' writes inference_metadata.yaml plus a tokenizer.json "
+            "reconstructed from the GGUF's embedded tokenizer metadata; "
+            "'ort-genai' writes genai_config.json + copies tokenizer files. "
+            "Either way the quantized model runs directly in the target runtime."
         ),
     )
     gguf_parser.set_defaults(func=_cmd_build_gguf)

@@ -19,8 +19,8 @@ Two properties are asserted:
 
 from __future__ import annotations
 
-import os
 import tempfile
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -168,11 +168,10 @@ def _build_onnx_session(config: ArchitectureConfig, state: dict[str, torch.Tenso
     model = MaskedDiffusionTask().build(module, config)["model"]
     apply_weights(model, module.preprocess_weights(state))
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        model_path = os.path.join(temp_dir, "model.onnx")
+    # Windows keeps the ORT model file mapped; ignore cleanup errors so the dir can be removed.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        model_path = Path(temp_dir) / "model.onnx"
         onnx_ir.save(model, model_path)
-        # onnxruntime reads the model fully at construction, so the temp file
-        # can be removed as soon as the session exists.
         return ort.InferenceSession(model_path)
 
 
