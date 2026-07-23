@@ -104,7 +104,7 @@ def _default_search_params(
     }
 
 
-def _make_session_options(ep: str) -> dict[str, Any]:
+def _make_session_options(ep: str, *, decoder: bool = False) -> dict[str, Any]:
     """Return session options with EP-specific provider_options.
 
     Args:
@@ -113,10 +113,16 @@ def _make_session_options(ep: str) -> dict[str, Any]:
     """
     from mobius.integrations.ort_genai.ep_config import make_provider_options
 
-    return {
+    options = {
         "log_id": "onnxruntime-genai",
         "provider_options": make_provider_options(ep),
     }
+    if ep == "cuda" and decoder:
+        # ORT's extended CUDA graph optimizer can crash while transforming large
+        # MatMulNBits decoder graphs. BASIC still performs safe constant folding
+        # and matches the session policy used by established quantized packages.
+        options["graph_optimization_level"] = "ORT_ENABLE_BASIC"
+    return options
 
 
 class GenaiConfigGenerator:
@@ -413,7 +419,7 @@ class GenaiConfigGenerator:
             decoder_inputs = _default_decoder_inputs(is_vlm=is_multimodal)
         decoder_filename = "decoder/model.onnx" if is_multimodal else "model.onnx"
         decoder: dict[str, Any] = {
-            "session_options": _make_session_options(self.ep),
+            "session_options": _make_session_options(self.ep, decoder=True),
             "filename": self._decoder_filename or decoder_filename,
             "head_size": self.head_dim,
             "hidden_size": self.hidden_size,
