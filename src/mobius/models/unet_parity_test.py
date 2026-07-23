@@ -10,7 +10,6 @@ by ``tests/integration_test.py`` for the QwenImage VAE. Guarded on diffusers.
 
 from __future__ import annotations
 
-import contextlib
 import re
 import tempfile
 from pathlib import Path
@@ -19,16 +18,19 @@ import numpy as np
 import pytest
 
 
-@contextlib.contextmanager
-def _onnx_session(model):
+def _run_onnx(model, *feeds):
     import onnx_ir
     import onnxruntime as ort
 
-    # Windows keeps the ORT model file mapped; tolerate cleanup until the session is released.
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+    with tempfile.TemporaryDirectory() as temp_dir:
         model_path = str(Path(temp_dir) / "model.onnx")
         onnx_ir.save(model, model_path)
-        yield ort.InferenceSession(model_path)
+        session = ort.InferenceSession(model_path)
+        try:
+            return [session.run(None, feed)[0] for feed in feeds]
+        finally:
+            # Windows keeps the model mapped until the session is released.
+            del session
 
 
 def _remap_transformer(state_dict: dict) -> dict:
@@ -76,8 +78,7 @@ def test_cross_attention_block_matches_diffusers():
     model = _make_model(graph)
     apply_weights(model, _remap_transformer(hf.state_dict()))
 
-    with _onnx_session(model) as session:
-        actual = session.run(None, {"hidden": hidden.numpy(), "context": context.numpy()})[0]
+    (actual,) = _run_onnx(model, {"hidden": hidden.numpy(), "context": context.numpy()})
     assert np.abs(actual - expected).max() < 1e-4
 
 
@@ -124,15 +125,14 @@ def test_unet_matches_diffusers():
     model = DenoisingTask().build(module, config)["model"]
     apply_weights(model, module.preprocess_weights(dict(hf.state_dict())))
 
-    with _onnx_session(model) as session:
-        actual = session.run(
-            None,
-            {
-                "sample": sample.numpy(),
-                "timestep": timestep.numpy().astype(np.int64),
-                "encoder_hidden_states": encoder_hidden_states.numpy(),
-            },
-        )[0]
+    (actual,) = _run_onnx(
+        model,
+        {
+            "sample": sample.numpy(),
+            "timestep": timestep.numpy().astype(np.int64),
+            "encoder_hidden_states": encoder_hidden_states.numpy(),
+        },
+    )
     assert np.abs(actual - expected).max() < 2e-4
 
 
@@ -190,15 +190,14 @@ def test_unet_sd1x_mixed_block_types_matches_diffusers():
     model = DenoisingTask().build(module, config)["model"]
     apply_weights(model, module.preprocess_weights(dict(hf.state_dict())))
 
-    with _onnx_session(model) as session:
-        actual = session.run(
-            None,
-            {
-                "sample": sample.numpy(),
-                "timestep": timestep.numpy().astype(np.int64),
-                "encoder_hidden_states": encoder_hidden_states.numpy(),
-            },
-        )[0]
+    (actual,) = _run_onnx(
+        model,
+        {
+            "sample": sample.numpy(),
+            "timestep": timestep.numpy().astype(np.int64),
+            "encoder_hidden_states": encoder_hidden_states.numpy(),
+        },
+    )
     assert np.abs(actual - expected).max() < 2e-4
 
 
@@ -272,14 +271,16 @@ def test_unet_lora_gate_parity():
     weights.update(remap_diffusers_unet_lora(lora_state, "test"))
     apply_weights(model, weights)
 
-    with _onnx_session(model) as session:
-        feed = {
-            "sample": sample.numpy(),
-            "timestep": timestep.numpy().astype(np.int64),
-            "encoder_hidden_states": encoder_hidden_states.numpy(),
-        }
-        off = session.run(None, {**feed, "lora_gate.test": np.array(0.0, dtype=np.float32)})[0]
-        on = session.run(None, {**feed, "lora_gate.test": np.array(1.0, dtype=np.float32)})[0]
+    feed = {
+        "sample": sample.numpy(),
+        "timestep": timestep.numpy().astype(np.int64),
+        "encoder_hidden_states": encoder_hidden_states.numpy(),
+    }
+    off, on = _run_onnx(
+        model,
+        {**feed, "lora_gate.test": np.array(0.0, dtype=np.float32)},
+        {**feed, "lora_gate.test": np.array(1.0, dtype=np.float32)},
+    )
 
     # gate=0 disables the adapter (base); gate=1 applies it (diffusers+LoRA).
     assert np.abs(off - base_out).max() < 2e-4, np.abs(off - base_out).max()

@@ -2795,11 +2795,11 @@ class Gemma4Model(nn.Module):
 
     Always produced:
     - ``decoder``: Gemma4 text decoder taking ``inputs_embeds``
-    - ``vision``: SigLIP-style encoder + projector
+    - ``vision_encoder``: SigLIP-style encoder + projector
     - ``embedding``: scaled word embedding + multimodal feature fusion
 
     Added when ``config.audio is not None``:
-    - ``speech``: Conformer audio encoder + projection to text hidden size
+    - ``audio_encoder``: Conformer audio encoder + projection to text hidden size
 
     Covers all Gemma4 variants:
     - Vision-language (26B-A4B, 31B): ``audio=None``
