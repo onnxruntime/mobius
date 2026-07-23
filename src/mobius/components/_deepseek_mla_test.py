@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import onnx_ir as ir
 import pytest
 
+from mobius._builder import build_from_module
 from mobius._testing import (
     count_op_type,
     create_test_builder,
@@ -14,6 +16,7 @@ from mobius._testing import (
     make_config,
 )
 from mobius.components._deepseek_mla import DeepSeekMLA
+from mobius.models.deepseek import DeepSeekV3CausalLMModel
 
 # DeepSeek MLA config: uses low-rank KV compression with separate
 # nope (non-positional) and rope (rotary) head dimensions.
@@ -29,6 +32,29 @@ _MLA_DEFAULTS = dict(
     rope_interleave=False,
     rms_norm_eps=1e-6,
 )
+
+
+@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
+def test_low_precision_export_matches_attention_auxiliary_dtypes(dtype):
+    config = _mla_config(
+        dtype=dtype,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_key_value_heads=4,
+        head_dim=8,
+        first_k_dense_replace=1,
+        num_local_experts=None,
+    )
+    graph = build_from_module(DeepSeekV3CausalLMModel(config), config)["model"].graph
+
+    rotary_nodes = [node for node in graph if node.op_type == "RotaryEmbedding"]
+    assert len(rotary_nodes) == 2
+    for node in rotary_nodes:
+        assert [value.dtype for value in node.inputs] == [dtype, dtype, dtype]
+
+    attention = next(node for node in graph if node.op_type == "Attention")
+    assert attention.inputs[3].dtype == dtype
+    assert attention.inputs[3].dtype == attention.inputs[0].dtype
 
 
 def _mla_config(**overrides):

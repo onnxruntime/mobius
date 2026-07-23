@@ -83,12 +83,7 @@ class DeepSeekMoEGate(nn.Module):
             self.e_score_correction_bias = nn.Parameter([self.num_experts])
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
-        # Compute routing logits: hidden @ weight^T
-        weight_t = op.Transpose(self.weight, perm=[1, 0])
-        router_logits = op.MatMul(
-            op.Cast(hidden_states, to=1),
-            weight_t,  # Cast to float32
-        )
+        router_logits = self._router_logits(op, hidden_states)
 
         # Score computation depends on scoring function
         if self.scoring_func == "sigmoid":
@@ -137,8 +132,7 @@ class DeepSeekMoEGate(nn.Module):
         combine weights (normalized sigmoid * routed_scaling_factor) match the
         per-expert path bit-for-bit.
         """
-        weight_t = op.Transpose(self.weight, perm=[1, 0])
-        router_logits = op.MatMul(op.Cast(hidden_states, to=1), weight_t)
+        router_logits = self._router_logits(op, hidden_states)
 
         if self.scoring_func == "sigmoid":
             scores = op.Sigmoid(router_logits)
@@ -161,6 +155,12 @@ class DeepSeekMoEGate(nn.Module):
         routing_weights = op.Mul(routing_weights, float(self.routed_scaling_factor))
 
         return scores_for_choice, routing_weights, selected_experts
+
+    def _router_logits(self, op: OpBuilder, hidden_states: ir.Value):
+        """Compute routing logits in float32 for stable expert selection."""
+        hidden_states = op.Cast(hidden_states, to=1)
+        weight_t = op.Cast(op.Transpose(self.weight, perm=[1, 0]), to=1)
+        return op.MatMul(hidden_states, weight_t)
 
     def _group_topk_selection(self, op, scores_for_choice):
         """Group-based expert selection: pick topk_group groups first."""

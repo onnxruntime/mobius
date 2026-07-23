@@ -77,6 +77,32 @@ class TestSparseMixerGate:
         assert graph.num_nodes() > 0
 
 
+@pytest.mark.parametrize("route_for_qmoe", [False, True])
+def test_deepseek_gate_casts_both_router_matmul_inputs_to_float32(route_for_qmoe):
+    config = make_config(
+        dtype=ir.DataType.FLOAT16,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+    )
+    gate = DeepSeekMoEGate(config)
+    builder, op, graph = create_test_builder()
+    hidden = create_test_input(
+        builder,
+        "hidden",
+        [1, 2, config.hidden_size],
+        dtype=ir.DataType.FLOAT16,
+    )
+
+    outputs = gate.route_for_qmoe(op, hidden) if route_for_qmoe else gate(op, hidden)
+    builder._adapt_outputs(list(outputs), "")
+
+    router_matmul = next(node for node in graph if node.op_type == "MatMul")
+    assert [value.dtype for value in router_matmul.inputs] == [
+        ir.DataType.FLOAT,
+        ir.DataType.FLOAT,
+    ]
+
+
 class TestMoELayer:
     def test_moe_layer_has_gate(self):
         config = make_config(num_local_experts=4, num_experts_per_tok=2)
