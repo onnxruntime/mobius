@@ -1404,13 +1404,13 @@ class Gemma4DecoderLayer(nn.Module):
         intermediate_size = config.intermediate_size * (
             2 if (config.use_double_wide_mlp and is_kv_shared) else 1
         )
-        linear_class = _text_linear_class(config)
+        linear_class = _text_linear_class(config) or Linear
         self.mlp = GatedMLP(
             hidden_size=config.hidden_size,
             intermediate_size=intermediate_size,
             activation=config.hidden_act,
             bias=config.mlp_bias,
-            linear_class=linear_class or Linear,
+            linear_class=linear_class,
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
