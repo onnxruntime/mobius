@@ -40,6 +40,9 @@ class QuantizationConfig:
     # Serialized checkpoint format. This distinguishes formats that share the
     # same quant_method but use different tensor layouts.
     format: str | None = None
+    # Root-relative Hugging Face module names intentionally kept in floating
+    # point by an upstream mixed-precision planner.
+    modules_to_not_convert: list[str] | None = None
 
     @classmethod
     def from_transformers(cls, hf_config) -> QuantizationConfig | None:
@@ -141,4 +144,5 @@ class QuantizationConfig:
             quantize_lm_head=bool(qc.get("lm_head", False)),
             tie_word_embeddings=bool(qc.get("tie_word_embeddings", False)),
             format=qc.get("format"),
+            modules_to_not_convert=qc.get("modules_to_not_convert"),
         )

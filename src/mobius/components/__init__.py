@@ -53,6 +53,7 @@ __all__ = [
     "PatchEmbedding",
     "PostGatedRMSNorm",
     "PostNormDecoderLayer",
+    "ClippableQuantizedLinear",
     "QuantizedEmbedding",
     "QuantizedLinear",
     "RMSNorm",
@@ -80,6 +81,7 @@ __all__ = [
     "create_static_cache_attention_bias",
     "get_activation",
     "initialize_rope",
+    "make_clippable_quantized_linear_factory",
     "make_quantized_linear_factory",
 ]
 
@@ -194,9 +196,11 @@ from mobius.components._qformer import (
 )
 from mobius.components._quantized_linear import (
     BlockQuantizedLinear,
+    ClippableQuantizedLinear,
     QuantizedEmbedding,
     QuantizedLinear,
     TiedQuantizedLMHead,
+    make_clippable_quantized_linear_factory,
     make_quantized_linear_factory,
 )
 from mobius.components._qwen3_asr_audio import (
