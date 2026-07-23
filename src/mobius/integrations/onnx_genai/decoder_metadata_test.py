@@ -106,15 +106,6 @@ class TestDecoderMetadata:
         assert loaded["model"]["attention"]["num_kv_heads"] == 8
 
     def test_matches_onnx_genai_schema(self):
-        schema_path = _schema_path()
-        if schema_path is None:
-            pytest.skip("onnx-genai schema not found")
-        import json
-
-        import jsonschema
-
-        with open(schema_path) as handle:
-            schema = json.load(handle)
         cfg = _FakeConfig(sliding_window=4096)
         cfg.num_local_experts = 8
         cfg.num_experts_per_tok = 2
@@ -125,6 +116,16 @@ class TestDecoderMetadata:
         cfg.n_group = 4
         cfg.topk_group = 2
         meta = decoder_metadata_from_config(cfg, kv_native_dtype="bf16")
+
+        schema_path = _schema_path()
+        if schema_path is None:
+            pytest.skip("onnx-genai schema not found")
+        import json
+
+        import jsonschema
+
+        with open(schema_path) as handle:
+            schema = json.load(handle)
         jsonschema.validate(instance=meta, schema=schema)
 
     def test_moe_metadata_from_config_is_structural(self):
@@ -181,3 +182,44 @@ class TestDecoderMetadata:
 
         with pytest.raises(ValueError, match="num_experts_per_tok"):
             moe_metadata_from_config(cfg)
+
+    def test_moe_metadata_rejects_invalid_expert_dimensions(self):
+        cfg = _FakeConfig()
+        cfg.num_local_experts = 4
+        cfg.num_experts_per_tok = 5
+        cfg.moe_intermediate_size = 128
+
+        with pytest.raises(ValueError, match="exceeds num_local_experts"):
+            moe_metadata_from_config(cfg)
+
+        cfg.num_experts_per_tok = 2
+        cfg.moe_intermediate_size = None
+        cfg.intermediate_size = None
+        with pytest.raises(ValueError, match="lacks both"):
+            moe_metadata_from_config(cfg)
+
+    def test_moe_metadata_handles_dense_and_simple_top_k_configs(self):
+        assert moe_metadata_from_config(_FakeConfig()) is None
+
+        cfg = _FakeConfig()
+        cfg.num_local_experts = 4
+        cfg.num_experts_per_tok = 1
+        cfg.moe_intermediate_size = None
+        cfg.intermediate_size = 512
+        cfg.n_shared_experts = 2
+        cfg.shared_expert_intermediate_size = 768
+        cfg.n_group = 2
+        cfg.topk_method = "greedy"
+
+        moe = moe_metadata_from_config(cfg, representation="native")
+
+        assert moe is not None
+        assert moe["representation"] == "native"
+        assert moe["expert_intermediate_size"] == 512
+        assert moe["shared_expert_intermediate_size"] == 768
+        assert moe["router"] == {
+            "score_function": "softmax",
+            "selection_method": "top_k",
+            "normalize_weights": True,
+            "scaling_factor": 1.0,
+        }
