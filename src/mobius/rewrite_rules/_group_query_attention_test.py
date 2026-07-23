@@ -209,6 +209,30 @@ class TestGroupQueryAttentionRules:
         assert vision_counts.get("Attention", 0) == vision_attn_before
         assert vision_counts.get("GroupQueryAttention", 0) == 0
 
+    @pytest.mark.arch_validation
+    def test_deepseek_v2_lite_unequal_kv_heads_retain_attention(self):
+        """CUDA export must not rewrite unequal-dimension MLA K/V to GQA."""
+        with pytest.warns(UserWarning, match="GQA fusion expected"):
+            pkg = build(
+                "deepseek-ai/DeepSeek-V2-Lite",
+                dtype="f16",
+                execution_provider="cuda",
+                load_weights=False,
+            )
+        model = pkg["model"]
+        counts = count_ops(model)
+
+        assert counts.get("Attention", 0) == 27
+        assert counts.get("GroupQueryAttention", 0) == 0
+
+        attention_nodes = [node for node in model.graph if node.op_type == "Attention"]
+        assert len(attention_nodes) == 27
+        for node in attention_nodes:
+            past_key = node.inputs[4]
+            past_value = node.inputs[5]
+            assert past_key is not None and past_key.shape[-1] == 192
+            assert past_value is not None and past_value.shape[-1] == 128
+
     def test_fallback_attention_to_gqa_no_rope(self):
         """AttentionToGQA fallback fires when applied in isolation (do_rotary=0).
 
