@@ -774,6 +774,15 @@ class TestMakeSessionOptions:
         assert opts["log_id"] == "onnxruntime-genai"
         assert len(opts["provider_options"]) == 1
         assert "cuda" in opts["provider_options"][0]
+        assert "graph_optimization_level" not in opts
+
+    def test_cuda_decoder_uses_basic_graph_optimization(self):
+        """CUDA decoder avoids the unsafe extended MatMulNBits optimization."""
+        from mobius.integrations.ort_genai.genai_config import _make_session_options
+
+        opts = _make_session_options("cuda", decoder=True)
+
+        assert opts["graph_optimization_level"] == "ORT_ENABLE_BASIC"
 
     def test_dml_has_dml_provider_options(self):
         """DML EP produces a provider_options entry for dml."""
