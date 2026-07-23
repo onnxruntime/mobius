@@ -9,7 +9,7 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import tie_word_embeddings
+from mobius._weight_utils import preprocess_olive_weights, tie_word_embeddings
 from mobius.components import (
     InputMixer,
     Qwen2VLVisionModel,
@@ -108,6 +108,18 @@ class Qwen25VLCausalLMModel(nn.Module):
         prefixes (``decoder.``, ``vision_encoder.``, ``embedding.``) because
         onnxscript qualifies parameter names via the parent-child hierarchy.
         """
+        quantization = self.config.quantization
+        if quantization is not None and quantization.quant_method == "olive":
+            state_dict = preprocess_olive_weights(
+                state_dict,
+                bits=quantization.bits,
+                group_size=quantization.group_size,
+                quantize_embeddings=quantization.quantize_embeddings,
+                quantize_lm_head=quantization.quantize_lm_head,
+                tie_word_embeddings=self.config.tie_word_embeddings
+                or quantization.tie_word_embeddings,
+            )
+
         renamed: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             if key.startswith("visual."):
@@ -185,6 +197,18 @@ class Qwen25VLDecoderModel(nn.Module):
         initializers are ``model.layers.*``, ``model.norm.*``,
         ``model.embed_tokens.*``, ``lm_head.*``.  HF keys already match.
         """
+        quantization = self.config.quantization
+        if quantization is not None and quantization.quant_method == "olive":
+            state_dict = preprocess_olive_weights(
+                state_dict,
+                bits=quantization.bits,
+                group_size=quantization.group_size,
+                quantize_embeddings=quantization.quantize_embeddings,
+                quantize_lm_head=quantization.quantize_lm_head,
+                tie_word_embeddings=self.config.tie_word_embeddings
+                or quantization.tie_word_embeddings,
+            )
+
         renamed: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             # Drop vision weights
