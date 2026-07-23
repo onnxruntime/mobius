@@ -8,7 +8,7 @@ from __future__ import annotations
 import onnx_ir as ir
 import torch
 
-from mobius._configs import AudioConfig, Gemma4Config, QuantizationConfig
+from mobius._configs import AudioConfig, Gemma4AudioConfig, Gemma4Config, QuantizationConfig
 from mobius.models.gemma4 import Gemma4CausalLMModel, Gemma4EmbeddingModel, Gemma4Model
 
 
@@ -160,6 +160,8 @@ class TestGemma4OlivePacked:
         quantize_lm_head: bool = False,
         quantize_embeddings: bool = False,
         tie_word_embeddings: bool = False,
+        modules_to_not_convert: list[str] | None = None,
+        audio: Gemma4AudioConfig | None = None,
     ) -> Gemma4Config:
         return _tiny_gemma4_config(
             enable_moe_block=False,
@@ -168,6 +170,7 @@ class TestGemma4OlivePacked:
             hidden_size_per_layer_input=32,
             vocab_size_per_layer_input=256,
             tie_word_embeddings=tie_word_embeddings,
+            audio=audio,
             quantization=QuantizationConfig(
                 bits=4,
                 group_size=32,
@@ -175,6 +178,7 @@ class TestGemma4OlivePacked:
                 sym=False,
                 quantize_embeddings=quantize_embeddings,
                 quantize_lm_head=quantize_lm_head,
+                modules_to_not_convert=modules_to_not_convert,
             ),
         )
 
@@ -223,6 +227,25 @@ class TestGemma4OlivePacked:
 
         assert decoder_ops.count("MatMulNBits") == 2 * 9 + 1
 
+    def test_routes_top_level_olive_packed_lm_head(self):
+        config = self._config(quantize_lm_head=True)
+        model = Gemma4Model(config)
+        qweight = torch.randint(0, 255, (256, 32), dtype=torch.uint8)
+        scales = torch.randn(256, 2)
+        qzeros = torch.randint(0, 255, (256, 1), dtype=torch.uint8)
+
+        result = model.preprocess_weights(
+            {
+                "lm_head.qweight": qweight,
+                "lm_head.scales": scales,
+                "lm_head.qzeros": qzeros,
+            }
+        )
+
+        assert result["decoder.lm_head.weight"].shape == (256, 2, 16)
+        assert result["decoder.lm_head.scales"] is scales
+        assert result["decoder.lm_head.zero_points"] is qzeros
+
     def test_tied_quantized_lm_head_is_not_overwritten_by_float_embedding(self):
         config = self._config(quantize_lm_head=True, tie_word_embeddings=True)
         model = Gemma4Model(config)
@@ -250,6 +273,86 @@ class TestGemma4OlivePacked:
         config = self._config(quantize_embeddings=True)
         with pytest.raises(NotImplementedError, match="quantized token embeddings"):
             Gemma4Model(config)
+
+    def test_uses_matmulnbits_for_all_multimodal_linear_components(self):
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = self._config(
+            quantize_lm_head=True,
+            modules_to_not_convert=[],
+            audio=Gemma4AudioConfig(
+                num_layers=1,
+                hidden_size=32,
+                output_proj_dims=64,
+                subsampling_conv_channels=[8, 4],
+                audio_token_id=240,
+            ),
+        )
+        pkg = Gemma4Task().build(Gemma4Model(config), config)
+
+        assert [node.op_type for node in pkg["decoder"].graph].count("MatMulNBits") == 19
+        assert [node.op_type for node in pkg["embedding"].graph].count("MatMulNBits") == 1
+        assert [node.op_type for node in pkg["vision_encoder"].graph].count("MatMulNBits") == 9
+        assert [node.op_type for node in pkg["audio_encoder"].graph].count("MatMulNBits") == 14
+
+    def test_component_exclusions_keep_multimodal_encoders_float(self):
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = self._config(
+            modules_to_not_convert=[
+                "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear",
+                "model.audio_tower.layers.0.self_attn.q_proj.linear",
+                "model.language_model.per_layer_model_projection",
+            ],
+            audio=Gemma4AudioConfig(
+                num_layers=1,
+                hidden_size=32,
+                output_proj_dims=64,
+                subsampling_conv_channels=[8, 4],
+                audio_token_id=240,
+            ),
+        )
+        pkg = Gemma4Task().build(Gemma4Model(config), config)
+
+        assert [node.op_type for node in pkg["decoder"].graph].count("MatMulNBits") == 18
+        assert [node.op_type for node in pkg["embedding"].graph].count("MatMulNBits") == 0
+        assert [node.op_type for node in pkg["vision_encoder"].graph].count("MatMulNBits") == 0
+        assert [node.op_type for node in pkg["audio_encoder"].graph].count("MatMulNBits") == 0
+
+    def test_converts_and_routes_packed_multimodal_weights(self):
+        config = self._config(
+            modules_to_not_convert=[],
+            audio=Gemma4AudioConfig(
+                num_layers=1,
+                hidden_size=32,
+                output_proj_dims=64,
+                subsampling_conv_channels=[8, 4],
+                audio_token_id=240,
+            ),
+        )
+        model = Gemma4Model(config)
+        qweight = torch.randint(0, 255, (32, 32), dtype=torch.uint8)
+        scales = torch.randn(32, 2)
+        qzeros = torch.randint(0, 255, (32, 1), dtype=torch.uint8)
+
+        result = model.preprocess_weights(
+            {
+                "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.qweight": qweight,
+                "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.scales": scales,
+                "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.qzeros": qzeros,
+                "model.audio_tower.layers.0.self_attn.q_proj.linear.qweight": qweight,
+                "model.audio_tower.layers.0.self_attn.q_proj.linear.scales": scales,
+                "model.audio_tower.layers.0.self_attn.q_proj.linear.qzeros": qzeros,
+            }
+        )
+
+        for prefix in (
+            "vision_encoder.encoder.layers.0.self_attn.q_proj",
+            "audio_encoder.encoder.layers.0.self_attn.q_proj",
+        ):
+            assert result[f"{prefix}.weight"].shape == (32, 2, 16)
+            assert result[f"{prefix}.scales"] is scales
+            assert result[f"{prefix}.zero_points"] is qzeros
 
 
 class TestGemma4EmbeddingModel:
