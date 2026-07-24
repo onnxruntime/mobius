@@ -40,23 +40,19 @@ class TopKGate(nn.Module):
         """Return selection and aggregation tensors for QMoE.
 
         Raw router logits are intentionally passed as ``router_probs`` with
-        ``router_weights=None`` and ``normalize_routing_weights=1``. In this
-        configuration com.microsoft::QMoE reproduces ``TopKGate.forward``
-        exactly: it selects the top-k experts by logit value (softmax is
-        monotonic, so argmax over logits == argmax over softmax) and, because
-        ``router_weights`` is not supplied, computes the aggregation weights as
-        a softmax over the *k selected* logits. That is precisely
-        ``Softmax(TopK(router_logits))``.
+        ``router_weights=None`` and ``normalize_routing_weights=1``. QMoE
+        selects the top-k by raw value (monotonic activations preserve that
+        selection) and, on this path, gives the selected logits softmax
+        weights. This matches ``TopKGate.forward``:
+        ``Softmax(TopK(router_logits))`` on both CPU and CUDA EPs.
 
-        The other gates (Softmax/Sigmoid) must instead pass their already
-        activated probabilities as ``router_weights`` to bypass the op's
-        internal softmax-over-selected (otherwise QMoE would apply softmax on
-        top of an existing softmax/sigmoid). See the QMoE ``router_weights``
-        semantics in ORT (contrib_ops/.../moe_quantization_cpu.cc and
-        ft_moe/moe_kernel.cu): when ``router_weights`` is omitted the kernel's
-        default path is ``softmax(top_k(router_probs))``; when provided it
-        gathers the given weights at the selected experts and (optionally)
-        renormalizes them.
+        ORT's CPU QMoE honors Input 14 (``router_weights``) by gathering it at
+        the selected experts, but CUDA QMoE ignores Input 14 and always uses
+        softmax-top-k on ``router_probs``; see
+        ``contrib_ops/cpu/moe/moe_quantization_cpu.cc`` and
+        ``contrib_ops/cuda/moe/moe_quantization.cc``. Thus ``None`` is correct
+        here on both EPs, while activated probabilities used by Softmax/Sigmoid
+        gates are correct on CPU but double-activated on CUDA.
         """
         weight_t = op.Transpose(self.weight, perm=[1, 0])
         router_logits = op.MatMul(hidden_states, weight_t)
