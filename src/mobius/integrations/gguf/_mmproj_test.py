@@ -119,6 +119,7 @@ class TestReadVisionConfig:
         assert config.num_attention_heads == _VISION_HEADS
         assert config.image_size == _IMAGE_SIZE
         assert config.patch_size == _PATCH_SIZE
+        assert config.pooling_kernel_size == 3
         assert config.position_embedding_size == _POS_EMB_SIZE
         assert config.use_clipped_linears is False
         assert config.norm_eps == pytest.approx(1e-6)
@@ -156,6 +157,63 @@ class TestReadAudioConfig:
         path = tmp_path / "vision_only.gguf"
         _write_clip_mmproj_gguf(path, with_audio=False)
         assert read_mmproj_audio_config(GGUFModel(str(path))) is None
+
+
+def test_special_token_id_uses_exact_token_match():
+    from types import SimpleNamespace
+
+    from mobius.integrations.gguf._mmproj import _special_token_id
+
+    gguf = SimpleNamespace(
+        metadata={
+            "tokenizer.ggml.tokens": [
+                "image",
+                "<|image>",
+                "<|image|>",
+                "<|audio>",
+                "<|audio|>",
+            ]
+        }
+    )
+
+    assert _special_token_id(gguf, "<|image|>") == 2
+    assert _special_token_id(gguf, "<|audio|>") == 4
+
+
+def test_mmproj_audio_expands_depthwise_conv_channel_dimension():
+    from types import SimpleNamespace
+
+    from mobius.integrations.gguf._mmproj import _mmproj_audio_to_hf
+
+    values = np.ones((8, 5), dtype=np.float16)
+    gguf = SimpleNamespace(
+        tensor_names=["a.blk.0.conv_dw.weight"],
+        get_tensor=lambda _name: values,
+    )
+
+    state_dict = _mmproj_audio_to_hf(gguf)
+
+    assert state_dict["audio_tower.layers.0.lconv1d.depthwise_conv1d.weight"].shape == (
+        8,
+        1,
+        5,
+    )
+
+
+def test_mmproj_audio_loads_activation_stats():
+    from types import SimpleNamespace
+
+    from mobius.integrations.gguf._mmproj import _mmproj_audio_to_hf
+
+    values = np.array([-20.375], dtype=np.float32)
+    gguf = SimpleNamespace(
+        tensor_names=["a.blk.0.attn_q.input_min"],
+        get_tensor=lambda _name: values,
+    )
+
+    state_dict = _mmproj_audio_to_hf(gguf)
+
+    assert state_dict["audio_tower.layers.0.self_attn.q_proj.input_min"].shape == ()
 
 
 class TestVisionEncoderBuildAndRun:
@@ -306,6 +364,52 @@ class TestKeepQuantizedMixedPrecision:
         # The mmproj-sourced vision encoder is float — no quantized ops.
         assert "MatMulNBits" not in vision_ops
         assert "GatherBlockQuantized" not in vision_ops
+
+    def test_per_layer_input_projections_are_quantized_targets(self):
+        from mobius.integrations.gguf._mmproj import _QUANTIZED_LINEAR_SUFFIXES
+
+        assert ".per_layer_input_gate.weight" in _QUANTIZED_LINEAR_SUFFIXES
+        assert ".per_layer_projection.weight" in _QUANTIZED_LINEAR_SUFFIXES
+
+    def test_embedding_quantization_flag_controls_graph_layout(self, clip_mmproj_gguf: Path):
+        import dataclasses
+
+        from mobius._configs import Gemma4Config, QuantizationConfig
+        from mobius.integrations.gguf._mmproj import read_mmproj_vision_config
+        from mobius.integrations.gguf._reader import GGUFModel
+        from mobius.models.gemma4 import Gemma4Model
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = Gemma4Config(
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=8,
+            global_head_dim=16,
+            vocab_size=64,
+            layer_types=["full_attention"],
+            intermediate_size=64,
+            hidden_act="gelu_pytorch_tanh",
+            vision=read_mmproj_vision_config(GGUFModel(str(clip_mmproj_gguf))),
+            tie_word_embeddings=True,
+        )
+        config = dataclasses.replace(
+            config,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=32,
+                quant_method="gguf",
+                sym=True,
+                quantize_embeddings=False,
+                quantize_lm_head=False,
+            ),
+        )
+
+        package = Gemma4Task().build(Gemma4Model(config), config)
+
+        assert "GatherBlockQuantized" not in _component_op_types(package["embedding"])
+        assert [node.op_type for node in package["decoder"].graph].count("MatMulNBits") > 0
 
     def test_quantized_decoder_loads_in_onnxruntime(
         self, clip_mmproj_gguf: Path, tmp_path: Path

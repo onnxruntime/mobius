@@ -21,8 +21,9 @@ so the mmproj weights flow through the *same* tested preprocessing path as a
 real HF Gemma4 checkpoint before being applied to the ONNX graph.
 
 Companion activation-range tensors (``.input_max`` / ``.input_min`` /
-``.output_max`` / ``.output_min``) that llama.cpp stores next to each weight are
-**not** model weights and are skipped — see :func:`is_mmproj_stat_tensor`.
+``.output_max`` / ``.output_min``) are mapped for clippable audio linears.
+Vision activation ranges are skipped because the mmproj vision graph uses
+plain linears.
 
 The name derivation was verified against ``unsloth/gemma-4-E2B-it-GGUF``'s
 ``mmproj-F16.gguf`` (``clip.vision.projector_type = gemma4v``,
@@ -104,12 +105,11 @@ _STAT_SUFFIXES = (".input_max", ".input_min", ".output_max", ".output_min")
 
 
 def is_mmproj_stat_tensor(name: str) -> bool:
-    """Return ``True`` for llama.cpp activation-range stats (not weights).
+    """Return ``True`` for llama.cpp activation-range statistics.
 
     Each quantizable linear in the mmproj carries companion
     ``.input_max``/``.input_min``/``.output_max``/``.output_min`` scalar
-    tensors describing the observed activation range. These are calibration
-    statistics, not learnable parameters, and must be skipped.
+    tensors describing the observed activation range.
     """
     return name.endswith(_STAT_SUFFIXES)
 
@@ -156,7 +156,12 @@ def map_mmproj_audio_to_hf(name: str) -> str | None:
     provided and name-tested but treated as experimental by the builder.
     """
     if is_mmproj_stat_tensor(name):
-        return None
+        suffix = next(suffix for suffix in _STAT_SUFFIXES if name.endswith(suffix))
+        weight_name = f"{name[: -len(suffix)]}.weight"
+        weight_hf_name = map_mmproj_audio_to_hf(weight_name)
+        if weight_hf_name is None:
+            return None
+        return f"{weight_hf_name.removesuffix('.weight')}{suffix}"
 
     blk = _AUDIO_BLK.match(name)
     if blk is not None:
@@ -174,6 +179,8 @@ def map_mmproj_audio_to_hf(name: str) -> str | None:
         "a.input_projection.weight": (
             "audio_tower.subsample_conv_projection.input_proj_linear.weight"
         ),
+        "a.pre_encode.out.weight": "audio_tower.output_proj.weight",
+        "a.pre_encode.out.bias": "audio_tower.output_proj.bias",
         "mm.a.input_projection.weight": "embed_audio.embedding_projection.weight",
     }
     return audio_top.get(name)

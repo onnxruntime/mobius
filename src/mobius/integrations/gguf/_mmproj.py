@@ -6,14 +6,17 @@
 Gemma4's text backbone ships in one ``*.gguf`` file while its vision (and
 audio) encoders live in a companion ``mmproj-*.gguf`` whose
 ``general.architecture`` is ``clip``.  :func:`build_gemma4_vlm_from_gguf`
-assembles both into a single onnx-genai-ready :class:`ModelPackage`:
+assembles both into a runtime-ready :class:`ModelPackage`:
 
 - **decoder** — the Gemma4 text decoder (from the text GGUF), taking
   ``inputs_embeds``.
 - **vision_encoder** — the Gemma4 SigLIP vision encoder + projector (from the
   mmproj), taking ``pixel_values`` + ``pixel_position_ids``.
-- **embedding** — scaled token lookup that fuses text + image features (built
-  from the text config, reusing :class:`Gemma4EmbeddingModel`).
+- **audio_encoder** — optional Gemma4 Conformer audio encoder + projector
+  (from the mmproj), enabled with ``include_audio=True``.
+- **embedding** — scaled token lookup that fuses text, image, and optional
+  audio features (built from the text config, reusing
+  :class:`Gemma4EmbeddingModel`).
 
 The mmproj ``clip.vision.*`` metadata is read into a :class:`VisionConfig`
 (:func:`read_mmproj_vision_config`) and merged onto the text
@@ -21,12 +24,9 @@ The mmproj ``clip.vision.*`` metadata is read into a :class:`VisionConfig`
 HF names (:mod:`_mmproj_mapping`) so they flow through the same tested
 ``Gemma4Model.preprocess_weights`` path as a real HF checkpoint.
 
-Audio: :func:`read_mmproj_audio_config` extracts the Conformer
-:class:`Gemma4AudioConfig` and the audio tensor mapping exists
-(:func:`map_mmproj_audio_to_hf`), but the audio encoder is **not** yet wired
-into the assembled package — its Conformer forward-pass weight layout still
-needs validation against llama.cpp's ``clip.cpp`` gemma4a reference.  Pass
-``include_audio=True`` to opt in to the (experimental) audio path.
+Audio remains opt-in while its output quality is validated against the source
+checkpoint. The graph, checkpoint mapping, and ORT-GenAI execution path are
+covered; pass ``include_audio=True`` to include it.
 """
 
 from __future__ import annotations
@@ -51,8 +51,8 @@ logger = logging.getLogger(__name__)
 # it, so use the HF Gemma4VisionAttention default. Source: HF Gemma4 vision.
 _GEMMA4_VISION_ROPE_THETA = 100.0
 # Gemma4 vision pooler spatial average pooling kernel (k x k). Not present in
-# mmproj metadata; the SigLIP encoder pools N patches to N/k^2 soft tokens.
-_DEFAULT_POOLING_KERNEL_SIZE = 4
+# mmproj metadata; Gemma4VisionConfig defaults to 3.
+_DEFAULT_POOLING_KERNEL_SIZE = 3
 
 
 def read_mmproj_vision_config(gguf_model: Any):
@@ -128,6 +128,16 @@ def read_mmproj_audio_config(gguf_model: Any):
     )
 
 
+def _special_token_id(gguf_model: Any, token: str) -> int:
+    tokens = gguf_model.metadata.get("tokenizer.ggml.tokens")
+    if not tokens:
+        raise ValueError("Text GGUF has no tokenizer.ggml.tokens metadata.")
+    try:
+        return tokens.index(token)
+    except ValueError as exc:
+        raise ValueError(f"Text GGUF tokenizer does not contain {token!r}.") from exc
+
+
 def _resolve_local_path(path: str | Path) -> str:
     from mobius.integrations.gguf._builder import _resolve_gguf_path
 
@@ -197,6 +207,8 @@ _QUANTIZED_LINEAR_SUFFIXES = (
     ".mlp.gate_proj.weight",
     ".mlp.up_proj.weight",
     ".mlp.down_proj.weight",
+    ".per_layer_input_gate.weight",
+    ".per_layer_projection.weight",
 )
 
 # HF token-embedding weight names that become GatherBlockQuantized tables.
@@ -255,7 +267,10 @@ def _text_gguf_to_hf_multimodal_quantized(
         is_quant_linear = hf_name.endswith(_QUANTIZED_LINEAR_SUFFIXES) or (
             quantize_lm_head and hf_name == "language_model.lm_head.weight"
         )
-        is_quant_embedding = hf_name in _QUANTIZED_EMBEDDING_NAMES
+        is_quant_embedding = bool(
+            getattr(config.quantization, "quantize_embeddings", False)
+            and hf_name in _QUANTIZED_EMBEDDING_NAMES
+        )
 
         if (is_quant_linear or is_quant_embedding) and len(np_shape) == 2:
             repacked = repack_gguf_weight_to_target(
@@ -384,17 +399,36 @@ def build_gemma4_vlm_from_gguf(
         raise ValueError(
             "mmproj GGUF has no vision encoder (clip.has_vision_encoder is unset)."
         )
-    config = dataclasses.replace(config, vision=vision_config)
+    resolved_image_token_id = (
+        image_token_id
+        if image_token_id is not None
+        else _special_token_id(text_gguf, "<|image|>")
+    )
+    vision_config = dataclasses.replace(vision_config, image_token_id=resolved_image_token_id)
+    config = dataclasses.replace(
+        config,
+        model_type="gemma4",
+        vision=vision_config,
+        image_token_id=resolved_image_token_id,
+    )
 
     if include_audio:
-        config = dataclasses.replace(config, audio=read_mmproj_audio_config(mmproj_gguf))
+        audio_config = read_mmproj_audio_config(mmproj_gguf)
+        if audio_config is None:
+            raise ValueError("Audio was requested but the mmproj GGUF has no audio encoder.")
+        audio_token_id = _special_token_id(text_gguf, "<|audio|>")
+        audio_config = dataclasses.replace(audio_config, audio_token_id=audio_token_id)
+        config = dataclasses.replace(
+            config,
+            audio=audio_config,
+            audio_token_id=audio_token_id,
+            boa_token_id=_special_token_id(text_gguf, "<|audio>"),
+        )
     else:
         # Vision-only VLM: drop any audio sub-config so the package is the
         # 3-component (decoder + vision + embedding) multimodal shape.
         config = dataclasses.replace(config, audio=None)
 
-    if image_token_id is not None:
-        config = dataclasses.replace(config, image_token_id=image_token_id)
     if dtype is not None:
         resolved = resolve_dtype(dtype)
         if resolved is not None:
@@ -497,7 +531,11 @@ def _mmproj_audio_to_hf(mmproj_gguf: Any) -> dict:
         if hf_name is None:
             continue
         values = np.array(mmproj_gguf.get_tensor(name)).astype(np.float32)
-        if hf_name.endswith(".per_dim_scale"):
+        if name.endswith((".input_max", ".input_min", ".output_max", ".output_min")):
+            values = values.reshape(())
+        elif hf_name.endswith(".per_dim_scale"):
             values = values.reshape(-1)
+        elif hf_name.endswith(".depthwise_conv1d.weight") and values.ndim == 2:
+            values = values[:, None, :]
         state_dict[hf_name] = torch.from_numpy(values)
     return state_dict
