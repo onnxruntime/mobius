@@ -97,7 +97,7 @@ class TestGlmMoeDsaExport:
         with pytest.raises(ValueError, match="expected 4, got 1"):
             _indexer_types(config)
 
-    def test_builds_full_attention_mla_moe_graph(self):
+    def test_builds_index_share_mla_moe_graph(self):
         config = _tiny_glm_moe_dsa_config()
         package = build_from_module(
             GlmMoeDsaCausalLMModel(config),
@@ -106,8 +106,9 @@ class TestGlmMoeDsaExport:
         )
         graph = package["model"].graph
 
-        assert count_op_type(graph, "Attention") == config.num_hidden_layers
-        assert count_op_type(graph, "ScatterElements") >= 1
+        assert count_op_type(graph, "IndexShare") == config.num_hidden_layers
+        assert count_op_type(graph, "Attention") == 0
+        assert count_op_type(graph, "ScatterElements") == 0
         assert count_op_type(graph, "Sigmoid") >= config.num_hidden_layers - 1
         assert any(
             "layers.0.self_attn.indexer.wk.weight" in name for name in graph.initializers
@@ -121,8 +122,9 @@ class TestGlmMoeDsaExport:
         assert set(package) == {"model", "mtp"}
 
         mtp_graph = package["mtp"].graph
-        assert count_op_type(mtp_graph, "Attention") == 1
-        assert count_op_type(mtp_graph, "ScatterElements") == 1
+        assert count_op_type(mtp_graph, "IndexShare") == 1
+        assert count_op_type(mtp_graph, "Attention") == 0
+        assert count_op_type(mtp_graph, "ScatterElements") == 0
         assert {value.name for value in mtp_graph.outputs} == {
             "mtp_hidden",
             "present.0.key",
