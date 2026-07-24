@@ -435,6 +435,9 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
     if mmproj_path is not None and args.static_cache:
         raise SystemExit("Error: --static-cache cannot be used with --mmproj.")
 
+    if mmproj_path is not None:
+        print(f"Multimodal mode: fusing vision/audio encoder from mmproj {mmproj_path}...")
+
     pkg = build_from_gguf(
         gguf_path,
         mmproj=mmproj_path,
@@ -443,6 +446,7 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         execution_provider=args.execution_provider,
         static_cache=args.static_cache,
         max_seq_len=args.max_seq_len,
+        include_audio=getattr(args, "include_audio", False),
     )
 
     pkg.save(
@@ -457,9 +461,9 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             path = os.path.join(output_dir, "model.onnx")
         print(f"Saved {name} to {path}")
 
-    if getattr(args, "runtime", None) == "onnx-genai":
+    runtime = getattr(args, "runtime", None)
+    if runtime in {"onnx-genai", "ort-genai"}:
         from mobius.integrations.gguf import write_gguf_tokenizer_json
-        from mobius.integrations.onnx_genai import write_onnx_genai_config
 
         # A GGUF checkpoint has no Hugging Face source directory, so the
         # tokenizer is reconstructed from the file's embedded ggml metadata
@@ -467,9 +471,20 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         tokenizer_path = write_gguf_tokenizer_json(gguf_path, output_dir)
         if tokenizer_path is not None:
             print(f"  tokenizer: {tokenizer_path}")
-        artifacts = write_onnx_genai_config(
-            pkg, output_dir, config=getattr(pkg, "config", None), source=None
-        )
+        if runtime == "onnx-genai":
+            from mobius.integrations.onnx_genai import write_onnx_genai_config
+
+            artifacts = write_onnx_genai_config(
+                pkg, output_dir, config=getattr(pkg, "config", None), source=None
+            )
+        else:
+            from mobius.integrations.ort_genai import write_ort_genai_config
+
+            artifacts = write_ort_genai_config(
+                pkg,
+                output_dir,
+                ep=args.execution_provider,
+            )
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
 
@@ -725,6 +740,11 @@ def main(argv: list[str] | None = None) -> None:
             "vision_encoder + embedding) instead of a text-only model. "
             "Currently supports Gemma4 vision; audio is experimental."
         ),
+    )
+    gguf_parser.add_argument(
+        "--include-audio",
+        action="store_true",
+        help="Also build the experimental audio encoder from --mmproj.",
     )
     gguf_parser.add_argument(
         "--keep-quantized",

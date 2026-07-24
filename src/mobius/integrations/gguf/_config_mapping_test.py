@@ -8,6 +8,27 @@ from __future__ import annotations
 import pytest
 
 
+def test_generation_token_ids_include_gemma4_turn_terminator() -> None:
+    from mobius._configs import ArchitectureConfig
+    from mobius.integrations.gguf._config_mapping import _apply_generation_token_ids
+
+    config = ArchitectureConfig()
+    result = _apply_generation_token_ids(
+        config,
+        {
+            "tokenizer.ggml.tokens": ["<pad>", "<eos>", "<bos>", "<turn|>"],
+            "tokenizer.ggml.bos_token_id": 2,
+            "tokenizer.ggml.eos_token_id": 1,
+            "tokenizer.ggml.padding_token_id": 0,
+        },
+        "gemma4",
+    )
+
+    assert result.bos_token_id == 2
+    assert result.eos_token_id == [1, 3]
+    assert result.pad_token_id == 0
+
+
 class TestGemma3Postprocess:
     """Gemma3 config postprocessing fills fields GGUF omits."""
 

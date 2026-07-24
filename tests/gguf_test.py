@@ -9,6 +9,9 @@ test the full pipeline without network downloads.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest import mock
+
 import numpy as np
 import pytest
 import torch
@@ -508,3 +511,46 @@ class TestCLIBuildGGUF:
         path = _create_tiny_gguf(tmp_path / "test.gguf")
         with pytest.raises((SystemExit, ValueError)):
             main(["build-gguf", path, "--keep-quantized"])
+
+    def test_ort_genai_runtime_writes_config_and_gguf_tokenizer(self, tmp_path):
+        from mobius.__main__ import _cmd_build_gguf
+
+        package = mock.MagicMock()
+        package.__iter__.return_value = iter(["model"])
+        args = SimpleNamespace(
+            gguf_path=str(tmp_path / "model.gguf"),
+            output=str(tmp_path / "output"),
+            mmproj=str(tmp_path / "mmproj.gguf"),
+            include_audio=True,
+            keep_quantized=False,
+            dtype="f16",
+            execution_provider="cuda",
+            external_data="onnx",
+            runtime="ort-genai",
+        )
+
+        with (
+            mock.patch(
+                "mobius.integrations.gguf.build_from_gguf", return_value=package
+            ) as build_from_gguf,
+            mock.patch(
+                "mobius.integrations.gguf.write_gguf_tokenizer_json",
+                return_value=str(tmp_path / "output" / "tokenizer.json"),
+            ) as write_tokenizer,
+            mock.patch(
+                "mobius.integrations.ort_genai.write_ort_genai_config",
+                return_value={"genai_config": str(tmp_path / "output" / "genai_config.json")},
+            ) as write_config,
+        ):
+            _cmd_build_gguf(args)
+
+        build_from_gguf.assert_called_once_with(
+            args.gguf_path,
+            mmproj=args.mmproj,
+            dtype="f16",
+            execution_provider="cuda",
+            keep_quantized=False,
+            include_audio=True,
+        )
+        write_tokenizer.assert_called_once_with(args.gguf_path, args.output)
+        write_config.assert_called_once_with(package, args.output, ep="cuda")

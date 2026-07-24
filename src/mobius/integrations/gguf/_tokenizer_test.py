@@ -55,19 +55,18 @@ class TestWriteGgufTokenizerJson:
         from mobius.integrations.gguf import _tokenizer
 
         gguf_path = tmp_path / "model.gguf"
-        gguf_path.write_bytes(b"GGUF")
+        _write_tokenizerless_gguf(gguf_path)
         out_dir = tmp_path / "out"
         out_dir.mkdir()
 
-        saved_to: dict[str, str] = {}
-
-        class _FakeBackend:
-            def save(self, path: str) -> None:
-                saved_to["path"] = path
-                Path(path).write_text("{}")
-
         fake_tokenizer = mock.Mock()
-        fake_tokenizer.backend_tokenizer = _FakeBackend()
+        fake_tokenizer.backend_tokenizer = mock.Mock()
+
+        def _save_pretrained(path: str) -> None:
+            (Path(path) / "tokenizer.json").write_text("{}")
+            (Path(path) / "tokenizer_config.json").write_text("{}")
+
+        fake_tokenizer.save_pretrained.side_effect = _save_pretrained
 
         fake_transformers = mock.Mock()
         fake_transformers.AutoTokenizer.from_pretrained.return_value = fake_tokenizer
@@ -77,8 +76,8 @@ class TestWriteGgufTokenizerJson:
 
         expected = os.path.join(str(out_dir), "tokenizer.json")
         assert result == expected
-        assert saved_to["path"] == expected
         assert (out_dir / "tokenizer.json").exists()
+        assert (out_dir / "tokenizer_config.json").exists()
         # Loaded from the GGUF file via its embedded metadata, not an HF repo.
         _, kwargs = fake_transformers.AutoTokenizer.from_pretrained.call_args
         assert kwargs["gguf_file"] == "model.gguf"
@@ -126,6 +125,10 @@ def _write_gguf_with_bpe_tokenizer(path):
     writer.add_eos_token_id(1)
     writer.add_unk_token_id(3)
     writer.add_add_bos_token(True)
+    writer.add_chat_template(
+        "{% for message in messages %}{{ message['role'] }}: "
+        "{{ message['content'] }}{% endfor %}"
+    )
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
@@ -153,7 +156,30 @@ class TestReconstructTokenizerFromGgml:
         # Token ids match the ggml ordering (no off-by-one from the reader).
         assert tok.token_to_id("<bos>") == 2
         assert tok.token_to_id("<eos>") == 1
+        tokenizer_config = (out_dir / "tokenizer_config.json").read_text()
+        assert '"tokenizer_class": "LlamaTokenizer"' in tokenizer_config
+        assert (out_dir / "chat_template.jinja").read_text() == (
+            "{% for message in messages %}{{ message['role'] }}: "
+            "{{ message['content'] }}{% endfor %}"
+        )
         # add_bos_token=True prepends <bos>; '▁hi' composes via the two merges.
         enc = tok.encode("hi")
         assert enc.ids[0] == 2  # <bos>
         assert tok.decode(enc.ids) == "hi"
+
+    def test_gemma4_uses_ort_compatible_chat_template(self, tmp_path):
+        from mobius.integrations.gguf._tokenizer import (
+            _GEMMA4_ORT_CHAT_TEMPLATE,
+            _write_chat_template,
+        )
+
+        path = _write_chat_template(
+            {
+                "general.architecture": "gemma4",
+                "tokenizer.chat_template": "{{ raise_exception('unsupported') }}",
+            },
+            tmp_path,
+        )
+
+        assert path == str(tmp_path / "chat_template.jinja")
+        assert (tmp_path / "chat_template.jinja").read_text() == (_GEMMA4_ORT_CHAT_TEMPLATE)

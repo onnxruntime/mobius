@@ -449,6 +449,8 @@ def gguf_to_config(
         config._gguf_model_type = model_type
         config.model_type = model_type
 
+    config = _apply_generation_token_ids(config, metadata, gguf_arch)
+
     logger.info(
         "Extracted config from GGUF: arch=%s, model_type=%s, "
         "hidden=%d, layers=%d, heads=%d, vocab=%d",
@@ -460,6 +462,28 @@ def gguf_to_config(
         config.vocab_size,
     )
 
+    return config
+
+
+def _apply_generation_token_ids(
+    config: ArchitectureConfig, metadata: dict[str, Any], gguf_arch: str
+) -> ArchitectureConfig:
+    bos_token_id = metadata.get("tokenizer.ggml.bos_token_id")
+    eos_token_id = metadata.get("tokenizer.ggml.eos_token_id")
+    pad_token_id = metadata.get("tokenizer.ggml.padding_token_id")
+    if bos_token_id is not None:
+        config.bos_token_id = int(bos_token_id)
+    if eos_token_id is not None:
+        config.eos_token_id = int(eos_token_id)
+    if pad_token_id is not None:
+        config.pad_token_id = int(pad_token_id)
+
+    if gguf_arch == "gemma4" and eos_token_id is not None:
+        tokens = metadata.get("tokenizer.ggml.tokens")
+        if isinstance(tokens, list) and "<turn|>" in tokens:
+            config.eos_token_id = list(
+                dict.fromkeys([int(eos_token_id), tokens.index("<turn|>")])
+            )
     return config
 
 

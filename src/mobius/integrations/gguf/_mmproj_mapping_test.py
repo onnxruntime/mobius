@@ -149,6 +149,14 @@ class TestAudioMapping:
                 "audio_tower.subsample_conv_projection.input_proj_linear.weight",
             ),
             (
+                "a.pre_encode.out.weight",
+                "audio_tower.output_proj.weight",
+            ),
+            (
+                "a.pre_encode.out.bias",
+                "audio_tower.output_proj.bias",
+            ),
+            (
                 "mm.a.input_projection.weight",
                 "embed_audio.embedding_projection.weight",
             ),
@@ -157,5 +165,8 @@ class TestAudioMapping:
     def test_audio_names(self, gguf_name: str, expected: str):
         assert map_mmproj_audio_to_hf(gguf_name) == expected
 
-    def test_stat_tensors_skipped(self):
-        assert map_mmproj_audio_to_hf("a.blk.0.attn_q.weight.output_min") is None
+    def test_audio_activation_stat_names(self):
+        assert (
+            map_mmproj_audio_to_hf("a.blk.0.attn_q.output_min")
+            == "audio_tower.layers.0.self_attn.q_proj.output_min"
+        )

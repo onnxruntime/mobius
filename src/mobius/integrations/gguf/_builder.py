@@ -90,6 +90,7 @@ def build_from_gguf(
     mmproj: str | Path | None = None,
     static_cache: bool = False,
     max_seq_len: int | None = None,
+    include_audio: bool = False,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a GGUF file.
 
@@ -140,6 +141,8 @@ def build_from_gguf(
         max_seq_len: Maximum sequence length for the static cache buffers.
             Only used when ``static_cache=True``. Defaults to the model's
             ``max_position_embeddings``.
+        include_audio: When ``True`` and ``mmproj`` is set, also build the
+            experimental audio encoder.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -166,6 +169,7 @@ def build_from_gguf(
             dtype=dtype,
             execution_provider=execution_provider,
             keep_quantized=keep_quantized,
+            include_audio=include_audio,
         )
 
     from mobius._builder import (
