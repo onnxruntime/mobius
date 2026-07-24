@@ -75,8 +75,17 @@ def _write_clip_mmproj_gguf(path: Path, *, with_audio: bool = True) -> None:
         _f32(prefix + "ffn_gate.weight", (_VISION_FFN, _VISION_HIDDEN))
         _f32(prefix + "ffn_up.weight", (_VISION_FFN, _VISION_HIDDEN))
         _f32(prefix + "ffn_down.weight", (_VISION_HIDDEN, _VISION_FFN))
-        # Stat tensor next to a quantizable linear — must be skipped.
-        _f32(prefix + "attn_q.weight.output_min", (1,))
+        for proj in (
+            "attn_q",
+            "attn_k",
+            "attn_v",
+            "attn_out",
+            "ffn_gate",
+            "ffn_up",
+            "ffn_down",
+        ):
+            for stat in ("input_min", "input_max", "output_min", "output_max"):
+                _f32(prefix + proj + "." + stat, (1,))
 
     # --- audio metadata (best-effort, for config-extraction tests) ---
     if with_audio:
@@ -121,7 +130,7 @@ class TestReadVisionConfig:
         assert config.patch_size == _PATCH_SIZE
         assert config.pooling_kernel_size == 3
         assert config.position_embedding_size == _POS_EMB_SIZE
-        assert config.use_clipped_linears is False
+        assert config.use_clipped_linears is True
         assert config.norm_eps == pytest.approx(1e-6)
 
     def test_returns_none_without_vision_encoder(self, tmp_path: Path):
@@ -216,6 +225,41 @@ def test_mmproj_audio_loads_activation_stats():
     assert state_dict["audio_tower.layers.0.self_attn.q_proj.input_min"].shape == ()
 
 
+def test_mmproj_vision_loads_activation_stats():
+    from types import SimpleNamespace
+
+    from mobius.integrations.gguf._mmproj import _mmproj_vision_to_hf
+
+    values = np.array([20.375], dtype=np.float32)
+    gguf = SimpleNamespace(
+        tensor_names=["v.blk.0.attn_q.output_max"],
+        get_tensor=lambda _name: values,
+    )
+
+    state_dict = _mmproj_vision_to_hf(gguf)
+
+    assert state_dict["vision_tower.encoder.layers.0.self_attn.q_proj.output_max"].shape == ()
+
+
+def test_mmproj_vision_reorders_patch_embedding_to_pixel_layout():
+    from types import SimpleNamespace
+
+    from mobius.integrations.gguf._mmproj import _mmproj_vision_to_hf
+
+    values = np.arange(2 * 3 * 2 * 2, dtype=np.float32).reshape(2, 3, 2, 2)
+    gguf = SimpleNamespace(
+        tensor_names=["v.patch_embd.weight"],
+        get_tensor=lambda _name: values,
+    )
+
+    state_dict = _mmproj_vision_to_hf(gguf)
+
+    np.testing.assert_array_equal(
+        state_dict["vision_tower.patch_embedder.input_proj.weight"].numpy(),
+        values.transpose(0, 2, 3, 1).reshape(2, 12),
+    )
+
+
 class TestVisionEncoderBuildAndRun:
     """Build the Gemma4 vision encoder from the synthetic mmproj and run it."""
 
@@ -255,8 +299,10 @@ class TestVisionEncoderBuildAndRun:
             if hf_name is None:
                 continue
             values = np.array(gguf_model.get_tensor(name)).astype(np.float32)
-            if name == "v.patch_embd.weight":
-                values = values.reshape(values.shape[0], -1)
+            if name.endswith((".input_max", ".input_min", ".output_max", ".output_min")):
+                values = values.reshape(())
+            elif name == "v.patch_embd.weight":
+                values = values.transpose(0, 2, 3, 1).reshape(values.shape[0], -1)
             state_dict[hf_name] = torch.from_numpy(values)
 
         state_dict = module.preprocess_weights(state_dict)

@@ -21,9 +21,8 @@ so the mmproj weights flow through the *same* tested preprocessing path as a
 real HF Gemma4 checkpoint before being applied to the ONNX graph.
 
 Companion activation-range tensors (``.input_max`` / ``.input_min`` /
-``.output_max`` / ``.output_min``) are mapped for clippable audio linears.
-Vision activation ranges are skipped because the mmproj vision graph uses
-plain linears.
+``.output_max`` / ``.output_min``) are mapped for clippable vision and audio
+linears.
 
 The name derivation was verified against ``unsloth/gemma-4-E2B-it-GGUF``'s
 ``mmproj-F16.gguf`` (``clip.vision.projector_type = gemma4v``,
@@ -125,7 +124,12 @@ def map_mmproj_vision_to_hf(name: str) -> str | None:
     The mapping mirrors :mod:`_tensor_mapping` for the text backbone.
     """
     if is_mmproj_stat_tensor(name):
-        return None
+        suffix = next(suffix for suffix in _STAT_SUFFIXES if name.endswith(suffix))
+        weight_name = f"{name[: -len(suffix)]}.weight"
+        weight_hf_name = map_mmproj_vision_to_hf(weight_name)
+        if weight_hf_name is None:
+            return None
+        return f"{weight_hf_name.removesuffix('.weight')}{suffix}"
 
     blk = _VISION_BLK.match(name)
     if blk is not None:

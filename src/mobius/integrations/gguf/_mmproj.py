@@ -83,9 +83,9 @@ def read_mmproj_vision_config(gguf_model: Any):
         image_size=int(md["clip.vision.image_size"]),
         patch_size=int(md["clip.vision.patch_size"]),
         norm_eps=float(md.get("clip.vision.attention.layer_norm_epsilon", 1e-6)),
-        # The mmproj carries activation-range stats, not clipped-linear weights,
-        # so the encoder uses plain (non-clipped) Linear layers.
-        use_clipped_linears=False,
+        # The official mmproj carries activation ranges for every vision
+        # projection; preserve those Clip operations around each linear.
+        use_clipped_linears=True,
         position_embedding_size=pos_emb_size,
         pooling_kernel_size=_DEFAULT_POOLING_KERNEL_SIZE,
         hidden_act="gelu_pytorch_tanh",
@@ -324,11 +324,12 @@ def _mmproj_vision_to_hf(mmproj_gguf: Any) -> dict:
         if hf_name is None:
             continue
         values = np.array(mmproj_gguf.get_tensor(name)).astype(np.float32)
-        if name == "v.patch_embd.weight":
-            # Conv patch embed [out, in_ch, kh, kw] → Linear [out, in_ch*kh*kw].
-            # The flattening order (in_ch, kh, kw) row-major matches the
-            # pre-patchified pixel_values layout consumed by the encoder.
-            values = values.reshape(values.shape[0], -1)
+        if name.endswith((".input_max", ".input_min", ".output_max", ".output_min")):
+            values = values.reshape(())
+        elif name == "v.patch_embd.weight":
+            # GGUF stores Conv weights as [out, channel, height, width], while
+            # Gemma4ImageTransform flattens each patch as [height, width, channel].
+            values = values.transpose(0, 2, 3, 1).reshape(values.shape[0], -1)
         state_dict[hf_name] = torch.from_numpy(values)
     return state_dict
 

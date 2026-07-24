@@ -8,6 +8,16 @@ from __future__ import annotations
 import pytest
 
 
+@pytest.mark.parametrize(
+    "model_type",
+    ["gemma", "gemma2", "gemma3_text", "gemma4_text"],
+)
+def test_default_activation_uses_gemma_geglu(model_type: str) -> None:
+    from mobius.integrations.gguf._config_mapping import _default_activation
+
+    assert _default_activation(model_type) == "gelu_pytorch_tanh"
+
+
 def test_generation_token_ids_include_gemma4_turn_terminator() -> None:
     from mobius._configs import ArchitectureConfig
     from mobius.integrations.gguf._config_mapping import _apply_generation_token_ids
