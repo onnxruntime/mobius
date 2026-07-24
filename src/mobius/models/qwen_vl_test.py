@@ -180,6 +180,42 @@ class TestQwen3VL3ModelCausalLMModelTiedWeights:
         head = result["decoder.lm_head.weight"]
         assert embed.data_ptr() == head.data_ptr()
 
+    def test_olive_packed_decoder_weights_are_converted_before_routing(self):
+        config = dataclasses.replace(
+            _BASE_CONFIG,
+            model_type="qwen3_vl",
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=32,
+                quant_method="olive",
+                sym=False,
+            ),
+        )
+        model = Qwen3VL3ModelCausalLMModel(config)
+        state_dict = {
+            "model.language_model.embed_tokens.weight": torch.randn(100, 64),
+            "model.language_model.layers.0.self_attn.q_proj.qweight": torch.randint(
+                0,
+                255,
+                (64, 32),
+                dtype=torch.uint8,
+            ),
+            "model.language_model.layers.0.self_attn.q_proj.scales": torch.randn(64, 2),
+            "model.language_model.layers.0.self_attn.q_proj.qzeros": torch.randint(
+                0,
+                255,
+                (64, 1),
+                dtype=torch.uint8,
+            ),
+        }
+
+        result = model.preprocess_weights(state_dict)
+
+        prefix = "decoder.model.layers.0.self_attn.q_proj"
+        assert result[f"{prefix}.weight"].shape == (64, 2, 16)
+        assert result[f"{prefix}.scales"].shape == (64, 2)
+        assert result[f"{prefix}.zero_points"].shape == (64, 1)
+
 
 class TestQwen3VLDecoderModelTiedWeights:
     """Standalone Qwen3-VL decoder."""
