@@ -121,11 +121,25 @@ class GlmMoeDsaIndexer(nn.Module):
         weights = op.Cast(weights, to=ir.DataType.FLOAT)
         weights = op.Mul(weights, self.index_n_heads**-0.5)
         scores = op.ReduceSum(op.Mul(scores, op.Unsqueeze(weights, [3])), [2], keepdims=False)
-        scores = op.Add(scores, op.Cast(op.Squeeze(attention_bias, [1]), to=ir.DataType.FLOAT))
-
+        # The additive causal mask is sized to the attention key axis, which the
+        # native decoder exposes at fixed KV capacity while the indexer key cache
+        # grows with the logical prefix. Slice the mask down to the score key
+        # length so the add stays broadcast-compatible under both the logical
+        # (ORT) and fixed-capacity (native single-token decode) exposures.
         key_length = op.Shape(scores, start=2, end=3)
+        causal = op.Squeeze(attention_bias, [1])
+        causal = op.Slice(causal, op.Constant(value_ints=[0]), key_length, op.Constant(value_ints=[2]))
+        scores = op.Add(scores, op.Cast(causal, to=ir.DataType.FLOAT))
+
         k = op.Min(key_length, op.Constant(value_ints=[self.index_topk]))
         _, indices = op.TopK(scores, k, axis=-1, largest=1, sorted=0, _outputs=2)
+        # ``pkg.nxrt::IndexShare`` requires the selected key positions to be
+        # strictly increasing per row. TopK returns them in score order, so sort
+        # the chosen positions ascending. The runtime TopK kernel is f32-only, so
+        # round-trip through float before restoring the Int64 index dtype.
+        indices = op.Cast(indices, to=ir.DataType.FLOAT)
+        indices, _ = op.TopK(indices, k, axis=-1, largest=0, sorted=1, _outputs=2)
+        indices = op.Cast(indices, to=ir.DataType.INT64)
         return indices
 
     def forward(
@@ -211,18 +225,80 @@ class GlmMoeDsaAttention(DeepSeekMLA):
         )
         return op.Unsqueeze(key, [1]), op.Unsqueeze(value, [1])
 
-    def _sparse_bias(
+    def _index_share_attention(
         self,
         op: OpBuilder,
-        indices: ir.Value,
-        attention_bias: ir.Value,
-    ) -> ir.Value:
-        shape = op.Shape(op.Squeeze(attention_bias, [1]))
-        masked = op.Expand(op.Constant(value_float=float(self.dtype.min)), shape)
-        updates = op.Mul(op.Cast(indices, to=ir.DataType.FLOAT), 0.0)
-        sparse = op.ScatterElements(masked, indices, updates, axis=-1, reduction="none")
-        sparse = op.Cast(op.Unsqueeze(sparse, [1]), to=self.dtype)
-        return op.Add(attention_bias, sparse)
+        q: ir.Value,
+        key: ir.Value,
+        value: ir.Value,
+        main_past: tuple | None,
+        topk_indices: ir.Value,
+    ) -> tuple[ir.Value, ir.Value, ir.Value]:
+        """Device-resident selected-token attention via ``pkg.nxrt::IndexShare``.
+
+        Replaces the dense ``ScatterElements`` sparse-mask + ``Attention`` lowering
+        with the frozen ``IndexShare`` op, which gathers only the indexer's
+        selected key positions. Causality is carried entirely by the (already
+        causal) ``topk_indices``, so no dense additive mask island — and thus no
+        logical-length-vs-fixed-capacity broadcast — is emitted here.
+
+        ``IndexShare`` requires a homogeneous head size across query/key/value.
+        MLA's value head (``v_head_dim``) is narrower than the query/key head
+        (``qk_head_dim``), so the value is zero-padded up to ``qk_head_dim`` for
+        the kernel and the padding columns are sliced back off the output. The
+        returned present key/value stay in their native (unpadded) BNSH layout so
+        the packed KV cache is unchanged.
+        """
+        q_bnsh = op.Transpose(
+            op.Reshape(q, [0, 0, self.num_heads, self.qk_head_dim]), perm=[0, 2, 1, 3]
+        )
+        cur_key = op.Transpose(
+            op.Reshape(key, [0, 0, self.num_heads, self.qk_head_dim]), perm=[0, 2, 1, 3]
+        )
+        cur_value = op.Transpose(
+            op.Reshape(value, [0, 0, self.num_heads, self.v_head_dim]), perm=[0, 2, 1, 3]
+        )
+        present_key = cur_key
+        present_value = cur_value
+        if main_past is not None:
+            present_key = op.Concat(main_past[0], cur_key, axis=2)
+            present_value = op.Concat(main_past[1], cur_value, axis=2)
+
+        value_pad = self.qk_head_dim - self.v_head_dim
+        padded_value = present_value
+        if value_pad > 0:
+            # Zero-pad the value head up to ``qk_head_dim`` without ``Pad`` (which
+            # the CUDA EP has no handler for). Build a device-resident zero block
+            # of the value's own dtype and concatenate it onto the head axis.
+            pad_shape = op.Concat(
+                op.Shape(present_value, start=0, end=3),
+                op.Constant(value_ints=[value_pad]),
+                axis=0,
+            )
+            zeros = op.Expand(op.Cast(op.Constant(value_float=0.0), to=self.dtype), pad_shape)
+            padded_value = op.Concat(present_value, zeros, axis=3)
+
+        selected_indices = op.Unsqueeze(topk_indices, [1])
+        attn_output = op.IndexShare(
+            q_bnsh,
+            present_key,
+            padded_value,
+            None,
+            None,
+            selected_indices,
+            num_heads=self.num_heads,
+            kv_num_heads=self.num_heads,
+            scale=self.scaling,
+            _domain="pkg.nxrt",
+            _outputs=1,
+        )
+        if value_pad > 0:
+            attn_output = op.Slice(attn_output, [0], [self.v_head_dim], [3])
+        attn_output = op.Reshape(
+            op.Transpose(attn_output, perm=[0, 2, 1, 3]),
+            [0, 0, self.num_heads * self.v_head_dim],
+        )
+        return attn_output, present_key, present_value
 
     def forward(
         self,
@@ -313,18 +389,13 @@ class GlmMoeDsaAttention(DeepSeekMLA):
                 "Shared GLM DSA layers require top-k indices from a preceding full layer"
             )
 
-        sparse_bias = self._sparse_bias(op, topk_indices, attention_bias)
-        attn_output, present_key, present_value = op.Attention(
+        attn_output, present_key, present_value = self._index_share_attention(
+            op,
             q,
             key,
             value,
-            attn_mask=sparse_bias,
-            past_key=main_past[0] if main_past is not None else None,
-            past_value=main_past[1] if main_past is not None else None,
-            q_num_heads=self.num_heads,
-            kv_num_heads=self.num_heads,
-            scale=self.scaling,
-            _outputs=3,
+            main_past,
+            topk_indices,
         )
         attn_output = self.o_proj(op, attn_output)
         present = self._pack_present(
