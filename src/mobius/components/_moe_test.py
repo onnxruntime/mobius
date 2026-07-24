@@ -299,7 +299,8 @@ def test_expert_major_packing_matches_static_64_expert_top6_reference():
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
-def test_fused_gptq_checkpoint_tensors_pack_to_qmoe_layout():
+@pytest.mark.parametrize("shared_g_idx", [False, True])
+def test_fused_gptq_checkpoint_tensors_pack_to_qmoe_layout(caplog, shared_g_idx):
     experts, hidden_size, intermediate_size, block_size = 4, 32, 16, 16
     gate_up_codes = torch.randint(
         0, 16, (experts, 2 * intermediate_size, hidden_size)
@@ -311,6 +312,12 @@ def test_fused_gptq_checkpoint_tensors_pack_to_qmoe_layout():
     down_scales = torch.rand(
         experts, hidden_size, intermediate_size // block_size
     )
+    gate_up_g_idx = torch.arange(hidden_size, dtype=torch.int32) // block_size
+    gate_up_g_idx[0] = 1
+    down_g_idx = torch.arange(intermediate_size, dtype=torch.int32) // block_size
+    if not shared_g_idx:
+        gate_up_g_idx = gate_up_g_idx.repeat(experts, 1)
+        down_g_idx = down_g_idx.repeat(experts, 1)
     state_dict = {
         "model.layers.0.mlp.experts.gate_up_proj.qweight": _to_gptq_qweight(
             gate_up_codes
@@ -318,10 +325,12 @@ def test_fused_gptq_checkpoint_tensors_pack_to_qmoe_layout():
         "model.layers.0.mlp.experts.gate_up_proj.scales": gate_up_scales.transpose(
             -1, -2
         ),
+        "model.layers.0.mlp.experts.gate_up_proj.g_idx": gate_up_g_idx,
         "model.layers.0.mlp.experts.down_proj.qweight": _to_gptq_qweight(
             down_codes
         ),
         "model.layers.0.mlp.experts.down_proj.scales": down_scales.transpose(-1, -2),
+        "model.layers.0.mlp.experts.down_proj.g_idx": down_g_idx,
     }
     config = make_config(
         hidden_size=hidden_size,
@@ -353,6 +362,8 @@ def test_fused_gptq_checkpoint_tensors_pack_to_qmoe_layout():
         _dequant(fc1, scales, block_size),
         _dequant_codes(expected_codes, expected_scales, block_size),
     )
+    assert "desc_act models with non-trivial g_idx" in caplog.text
+    assert not any(key.endswith(".g_idx") for key in packed)
 
 
 def _pack_matmul_nbits(codes: torch.Tensor, block_size: int) -> torch.Tensor:

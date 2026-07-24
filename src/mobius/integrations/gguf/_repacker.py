@@ -470,20 +470,22 @@ def repack_dequantized_tensor(
         block_max = np.maximum(blocks.max(axis=-1), 0.0)
         if symmetric:
             scales = np.maximum(-block_min / 128.0, block_max / 127.0)
-            zero_points = np.full_like(scales, 128, dtype=np.uint8)
+            zero_points_arr = np.full_like(scales, 128, dtype=np.uint8)
         else:
             scales = (block_max - block_min) / 255.0
             safe_scales = np.where(scales != 0, scales, 1.0)
-            zero_points = np.clip(np.rint(-block_min / safe_scales), 0, 255).astype(np.uint8)
+            zero_points_arr = np.clip(
+                np.rint(-block_min / safe_scales), 0, 255
+            ).astype(np.uint8)
         safe_scales = np.where(scales != 0, scales, 1.0)
         quants = np.rint(blocks / safe_scales[:, :, None])
-        quants += zero_points[:, :, None]
+        quants += zero_points_arr[:, :, None]
         weight = np.clip(quants, 0, 255).astype(np.uint8)
         weight = np.where(scales[:, :, None] != 0, weight, 0).astype(np.uint8)
         return RepackedTensor(
             weight=weight,
             scales=scales.astype(np.float32),
-            zero_points=zero_points,
+            zero_points=None if symmetric else zero_points_arr,
             block_size=block_size,
             bits=bits,
         )

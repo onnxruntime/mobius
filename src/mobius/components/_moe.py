@@ -431,7 +431,7 @@ _PER_EXPERT_RE = re.compile(
 _FUSED_EXPERT_RE = re.compile(
     r"^(?P<prefix>.*\.mlp)\.experts\."
     r"(?P<projection>gate_up_proj|down_proj)\."
-    r"(?P<kind>qweight|qzeros|weight|scales|zero_points)$"
+    r"(?P<kind>qweight|qzeros|g_idx|weight|scales|zero_points)$"
 )
 
 
@@ -530,11 +530,12 @@ def _prepare_fused_projection(
         num_experts = tensors["qweight"].shape[0]
         processed: dict[str, list[torch.Tensor]] = {}
         for expert in range(num_experts):
-            expert_state = {
-                f"projection.{kind}": value[expert]
-                for kind, value in tensors.items()
-                if kind in {"qweight", "qzeros", "scales"}
-            }
+            expert_state = {}
+            for kind in {"qweight", "qzeros", "scales", "g_idx"} & tensors.keys():
+                value = tensors[kind]
+                expert_state[f"projection.{kind}"] = (
+                    value if kind == "g_idx" and value.ndim == 1 else value[expert]
+                )
             for key, value in preprocess(
                 expert_state, bits=bits, group_size=block_size
             ).items():

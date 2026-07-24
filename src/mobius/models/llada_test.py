@@ -173,7 +173,7 @@ def _build_onnx_session(config: ArchitectureConfig, state: dict[str, torch.Tenso
         onnx_ir.save(model, model_path)
         # onnxruntime reads the model fully at construction, so the temp file
         # can be removed as soon as the session exists.
-        return ort.InferenceSession(model_path)
+        return ort.InferenceSession(str(model_path))
 
 
 def test_llada_matches_torch_reference():

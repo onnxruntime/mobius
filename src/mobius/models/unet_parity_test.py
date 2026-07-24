@@ -67,7 +67,7 @@ def test_cross_attention_block_matches_diffusers():
     with tempfile.TemporaryDirectory() as temp_dir:
         model_path = Path(temp_dir) / "model.onnx"
         onnx_ir.save(model, model_path)
-        session = ort.InferenceSession(model_path)
+        session = ort.InferenceSession(str(model_path))
         actual = session.run(None, {"hidden": hidden.numpy(), "context": context.numpy()})[0]
     assert np.abs(actual - expected).max() < 1e-4
 
@@ -120,7 +120,7 @@ def test_unet_matches_diffusers():
     with tempfile.TemporaryDirectory() as temp_dir:
         model_path = Path(temp_dir) / "model.onnx"
         onnx_ir.save(model, model_path)
-        session = ort.InferenceSession(model_path)
+        session = ort.InferenceSession(str(model_path))
         actual = session.run(
             None,
             {
@@ -191,7 +191,7 @@ def test_unet_sd1x_mixed_block_types_matches_diffusers():
     with tempfile.TemporaryDirectory() as temp_dir:
         model_path = Path(temp_dir) / "model.onnx"
         onnx_ir.save(model, model_path)
-        session = ort.InferenceSession(model_path)
+        session = ort.InferenceSession(str(model_path))
         actual = session.run(
             None,
             {
@@ -278,7 +278,7 @@ def test_unet_lora_gate_parity():
     with tempfile.TemporaryDirectory() as temp_dir:
         model_path = Path(temp_dir) / "model.onnx"
         onnx_ir.save(model, model_path)
-        session = ort.InferenceSession(model_path)
+        session = ort.InferenceSession(str(model_path))
         feed = {
             "sample": sample.numpy(),
             "timestep": timestep.numpy().astype(np.int64),
