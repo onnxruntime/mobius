@@ -37,7 +37,27 @@ class TopKGate(nn.Module):
         return routing_weights, selected_experts
 
     def qmoe_routing(self, op: OpBuilder, hidden_states: ir.Value):
-        """Return selection and aggregation tensors for QMoE."""
+        """Return selection and aggregation tensors for QMoE.
+
+        Raw router logits are intentionally passed as ``router_probs`` with
+        ``router_weights=None`` and ``normalize_routing_weights=1``. In this
+        configuration com.microsoft::QMoE reproduces ``TopKGate.forward``
+        exactly: it selects the top-k experts by logit value (softmax is
+        monotonic, so argmax over logits == argmax over softmax) and, because
+        ``router_weights`` is not supplied, computes the aggregation weights as
+        a softmax over the *k selected* logits. That is precisely
+        ``Softmax(TopK(router_logits))``.
+
+        The other gates (Softmax/Sigmoid) must instead pass their already
+        activated probabilities as ``router_weights`` to bypass the op's
+        internal softmax-over-selected (otherwise QMoE would apply softmax on
+        top of an existing softmax/sigmoid). See the QMoE ``router_weights``
+        semantics in ORT (contrib_ops/.../moe_quantization_cpu.cc and
+        ft_moe/moe_kernel.cu): when ``router_weights`` is omitted the kernel's
+        default path is ``softmax(top_k(router_probs))``; when provided it
+        gathers the given weights at the selected experts and (optionally)
+        renormalizes them.
+        """
         weight_t = op.Transpose(self.weight, perm=[1, 0])
         router_logits = op.MatMul(hidden_states, weight_t)
         router_logits = op.Cast(router_logits, to=ir.DataType.FLOAT.value)
