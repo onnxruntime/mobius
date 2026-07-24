@@ -90,10 +90,10 @@ _AUDIO_BLOCK_STEMS: dict[str, str] = {
     "attn_out.weight": "self_attn.post.weight",
     "attn_k_rel.weight": "self_attn.relative_k_proj.weight",
     "per_dim_scale.weight": "self_attn.per_dim_scale",
-    "norm_conv.weight": "lconv1d.pre_layer_norm.weight",
+    "norm_conv.weight": "lconv1d.conv_norm.weight",
     "conv_pw1.weight": "lconv1d.linear_start.weight",
     "conv_dw.weight": "lconv1d.depthwise_conv1d.weight",
-    "conv_norm.weight": "lconv1d.conv_norm.weight",
+    "conv_norm.weight": "lconv1d.pre_layer_norm.weight",
     "conv_pw2.weight": "lconv1d.linear_end.weight",
 }
 

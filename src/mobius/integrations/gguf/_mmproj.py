@@ -535,7 +535,9 @@ def _mmproj_audio_to_hf(mmproj_gguf: Any) -> dict:
         if name.endswith((".input_max", ".input_min", ".output_max", ".output_min")):
             values = values.reshape(())
         elif hf_name.endswith(".per_dim_scale"):
-            values = values.reshape(-1)
+            # llama.cpp stores the effective positive scale, while HF/Mobius
+            # stores the unconstrained parameter and applies Softplus at runtime.
+            values = np.log(np.expm1(values)).reshape(-1)
         elif hf_name.endswith(".depthwise_conv1d.weight") and values.ndim == 2:
             values = values[:, None, :]
         state_dict[hf_name] = torch.from_numpy(values)

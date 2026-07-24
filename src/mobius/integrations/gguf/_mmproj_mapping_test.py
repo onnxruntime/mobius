@@ -147,6 +147,14 @@ class TestAudioMapping:
                 "audio_tower.layers.0.lconv1d.depthwise_conv1d.weight",
             ),
             (
+                "a.blk.0.norm_conv.weight",
+                "audio_tower.layers.0.lconv1d.conv_norm.weight",
+            ),
+            (
+                "a.blk.0.conv_norm.weight",
+                "audio_tower.layers.0.lconv1d.pre_layer_norm.weight",
+            ),
+            (
                 "a.conv1d.0.weight",
                 "audio_tower.subsample_conv_projection.conv0.weight",
             ),
