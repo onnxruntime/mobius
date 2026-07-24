@@ -800,6 +800,18 @@ class Qwen3VL3ModelCausalLMModel(nn.Module):
 
         HF keys: ``model.visual.*``, ``model.language_model.*``.
         """
+        quantization = self.config.quantization
+        if quantization is not None and quantization.quant_method == "olive":
+            state_dict = preprocess_olive_weights(
+                state_dict,
+                bits=quantization.bits,
+                group_size=quantization.group_size,
+                quantize_embeddings=quantization.quantize_embeddings,
+                quantize_lm_head=quantization.quantize_lm_head,
+                tie_word_embeddings=self.config.tie_word_embeddings
+                or quantization.tie_word_embeddings,
+            )
+
         renamed: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             stripped = key
@@ -874,6 +886,18 @@ class Qwen3VLDecoderModel(nn.Module):
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         """Route language_model weights for standalone decoder build."""
+        quantization = self.config.quantization
+        if quantization is not None and quantization.quant_method == "olive":
+            state_dict = preprocess_olive_weights(
+                state_dict,
+                bits=quantization.bits,
+                group_size=quantization.group_size,
+                quantize_embeddings=quantization.quantize_embeddings,
+                quantize_lm_head=quantization.quantize_lm_head,
+                tie_word_embeddings=self.config.tie_word_embeddings
+                or quantization.tie_word_embeddings,
+            )
+
         renamed: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             stripped = key
