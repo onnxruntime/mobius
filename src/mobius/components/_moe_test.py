@@ -167,31 +167,15 @@ class TestMoELayer:
         torch.manual_seed(0)
         num_experts, top_k = 64, 6
         hidden_size, intermediate_size, block_size = 32, 16, 16
-        fc1_codes = torch.randint(
-            0, 16, (num_experts, 2 * intermediate_size, hidden_size)
-        )
-        fc2_codes = torch.randint(
-            0, 16, (num_experts, hidden_size, intermediate_size)
-        )
-        fc1_scales = torch.rand(
-            num_experts, 2 * intermediate_size, hidden_size // block_size
-        )
-        fc2_scales = torch.rand(
-            num_experts, hidden_size, intermediate_size // block_size
-        )
+        fc1_codes = torch.randint(0, 16, (num_experts, 2 * intermediate_size, hidden_size))
+        fc2_codes = torch.randint(0, 16, (num_experts, hidden_size, intermediate_size))
+        fc1_scales = torch.rand(num_experts, 2 * intermediate_size, hidden_size // block_size)
+        fc2_scales = torch.rand(num_experts, hidden_size, intermediate_size // block_size)
         raw = {
-            "model.layers.1.mlp.experts.gate_up_proj.qweight": _to_gptq_qweight(
-                fc1_codes
-            ),
-            "model.layers.1.mlp.experts.gate_up_proj.scales": fc1_scales.transpose(
-                -1, -2
-            ),
-            "model.layers.1.mlp.experts.down_proj.qweight": _to_gptq_qweight(
-                fc2_codes
-            ),
-            "model.layers.1.mlp.experts.down_proj.scales": fc2_scales.transpose(
-                -1, -2
-            ),
+            "model.layers.1.mlp.experts.gate_up_proj.qweight": _to_gptq_qweight(fc1_codes),
+            "model.layers.1.mlp.experts.gate_up_proj.scales": fc1_scales.transpose(-1, -2),
+            "model.layers.1.mlp.experts.down_proj.qweight": _to_gptq_qweight(fc2_codes),
+            "model.layers.1.mlp.experts.down_proj.scales": fc2_scales.transpose(-1, -2),
         }
         packed = pack_qmoe_expert_weights(
             preprocess_gptq_weights(raw, bits=4, group_size=block_size)
@@ -239,17 +223,13 @@ def _to_gptq_qweight(codes: torch.Tensor) -> torch.Tensor:
     return packed.transpose(-1, -2).contiguous()
 
 
-def _dequant_codes(
-    codes: torch.Tensor, scales: torch.Tensor, block_size: int
-) -> torch.Tensor:
+def _dequant_codes(codes: torch.Tensor, scales: torch.Tensor, block_size: int) -> torch.Tensor:
     blocks = codes.shape[-1] // block_size
     values = codes.reshape(*codes.shape[:-1], blocks, block_size).float() - 8.0
     return (values * scales.unsqueeze(-1)).flatten(-2)
 
 
-def _dequant_qmoe(
-    packed: torch.Tensor, scales: torch.Tensor, block_size: int
-) -> torch.Tensor:
+def _dequant_qmoe(packed: torch.Tensor, scales: torch.Tensor, block_size: int) -> torch.Tensor:
     low = packed & 0x0F
     high = packed >> 4
     codes = torch.stack((low, high), dim=-1).flatten(-2)
@@ -271,8 +251,7 @@ def _static_moe(
         activated *= projected[:, intermediate_size:]
         expert_output = activated @ fc2[expert_idx].T
         weight = (
-            routing_weights
-            * (selected_experts == expert_idx).to(routing_weights.dtype)
+            routing_weights * (selected_experts == expert_idx).to(routing_weights.dtype)
         ).sum(dim=-1, keepdim=True)
         result += expert_output * weight
     return result

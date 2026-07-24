@@ -295,7 +295,7 @@ def _extract_vision_config(config, parent_config, model_type: str) -> dict:
     hooks live under :mod:`mobius._configs.per_model` and are
     registered with :mod:`mobius._configs._extractors` at import time.
     """
-    from mobius._configs import per_model  # ruff:ignore[unused-import] - side effect
+    from mobius._configs import per_model  # noqa: F401 - imported for registration side effect
     from mobius._configs._extractors import extract_vision_config as _dispatch
 
     return _dispatch(config, parent_config, model_type)
@@ -308,7 +308,7 @@ def _extract_audio_config(config, parent_config, model_type: str) -> dict:
     hooks live under :mod:`mobius._configs.per_model` and are
     registered with :mod:`mobius._configs._extractors` at import time.
     """
-    from mobius._configs import per_model  # ruff:ignore[unused-import] - side effect
+    from mobius._configs import per_model  # noqa: F401 - imported for registration side effect
     from mobius._configs._extractors import extract_audio_config as _dispatch
 
     return _dispatch(config, parent_config, model_type)

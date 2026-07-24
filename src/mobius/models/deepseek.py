@@ -35,9 +35,7 @@ def _linear_factory(config: ArchitectureConfig):
     quantization = config.quantization
     if quantization is None or quantization.quant_method == "none":
         return None
-    zero_point_dtype = (
-        config.dtype if quantization.float_zero_point else ir.DataType.UINT8
-    )
+    zero_point_dtype = config.dtype if quantization.float_zero_point else ir.DataType.UINT8
     return make_quantized_linear_factory(
         bits=quantization.bits,
         block_size=quantization.group_size,

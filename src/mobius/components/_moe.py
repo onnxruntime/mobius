@@ -90,12 +90,24 @@ class SoftmaxTopKGate(nn.Module):
         return routing_weights, selected_experts
 
     def qmoe_routing(self, op: OpBuilder, hidden_states: ir.Value):
-        """Return selection and aggregation tensors for QMoE."""
+        """Return selection and aggregation tensors for QMoE.
+
+        ``router_probs`` (QMoE input 1) is the raw float32 logits and the
+        pre-softmaxed probabilities are passed as ``router_weights`` (input
+        14). CUDA QMoE ignores ``router_weights`` and applies softmax-top-k on
+        ``router_probs``, so feeding logits reproduces ``forward`` exactly
+        (``Softmax`` then top-k then renormalize); feeding pre-softmaxed probs
+        here would double-softmax on CUDA. CPU QMoE selects the top-k over
+        ``router_probs`` (softmax is monotonic, so logits give the same
+        selection) and gathers ``router_weights`` at the selected experts,
+        renormalizing when ``normalize_routing_weights=1`` -- which equals
+        ``forward``'s renormalized top-k of the full softmax.
+        """
         weight_t = op.Transpose(self.weight, perm=[1, 0])
         router_logits = op.MatMul(hidden_states, weight_t)
         router_logits = op.Cast(router_logits, to=ir.DataType.FLOAT.value)
         routing_probs = op.Softmax(router_logits, axis=-1)
-        return routing_probs, routing_probs, self.norm_topk_prob, 1.0
+        return router_logits, routing_probs, self.norm_topk_prob, 1.0
 
 
 class SigmoidTopKGate(nn.Module):
@@ -139,13 +151,23 @@ class SigmoidTopKGate(nn.Module):
         return routing_weights, selected_experts
 
     def qmoe_routing(self, op: OpBuilder, hidden_states: ir.Value):
-        """Return selection and aggregation tensors for QMoE."""
+        """Return selection and aggregation tensors for QMoE.
+
+        The sigmoid-activated probabilities are passed as ``router_weights``
+        (QMoE input 14) while the raw float32 logits are passed as
+        ``router_probs`` (input 1). CPU QMoE selects the top-k over
+        ``router_probs`` (sigmoid is monotonic, so logits give the same
+        selection) and gathers ``router_weights`` at the selected experts,
+        renormalizing per ``normalize_routing_weights``. Passing logits (rather
+        than the sigmoid probs) as ``router_probs`` avoids a softmax-of-sigmoid
+        on CUDA, which ignores ``router_weights``.
+        """
         weight_t = op.Transpose(self.weight, perm=[1, 0])
         router_logits = op.MatMul(hidden_states, weight_t)
         router_logits = op.Cast(router_logits, to=ir.DataType.FLOAT.value)
         routing_probs = op.Sigmoid(router_logits)
         return (
-            routing_probs,
+            router_logits,
             routing_probs,
             self.norm_topk_prob,
             self.routed_scaling_factor,
@@ -253,9 +275,7 @@ class MoELayer(nn.Module):
             self.experts = None
             self._init_qmoe_parameters(expert_config)
         else:
-            self.experts = nn.ModuleList(
-                [MLP(expert_config) for _ in range(self.num_experts)]
-            )
+            self.experts = nn.ModuleList([MLP(expert_config) for _ in range(self.num_experts)])
 
     def _init_qmoe_parameters(self, expert_config: ArchitectureConfig) -> None:
         quantization = self._qmoe_quantization
@@ -274,9 +294,7 @@ class MoELayer(nn.Module):
             [self.num_experts, fc1_out, hidden_size * bits // 8],
             dtype=ir.DataType.UINT8,
         )
-        self.fc1_scales = nn.Parameter(
-            [self.num_experts, fc1_out, hidden_size // block_size]
-        )
+        self.fc1_scales = nn.Parameter([self.num_experts, fc1_out, hidden_size // block_size])
         self.fc1_scales._keep_float32 = True
         self.fc2_experts_weights = nn.Parameter(
             [self.num_experts, hidden_size, intermediate_size * bits // 8],

@@ -527,9 +527,7 @@ class TestPreprocessGptqWeights:
             ),
             "experts.scales": torch.randn(num_experts, self.N_GROUPS, self.N),
         }
-        result = preprocess_gptq_weights(
-            sd, bits=self.BITS, group_size=self.GROUP_SIZE
-        )
+        result = preprocess_gptq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
 
         assert result["experts.weight"].shape == (
             num_experts,
