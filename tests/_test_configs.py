@@ -2076,6 +2076,9 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
     ("smolvlm", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
     ("video_llava", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
     ("vipllava", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    # --- Microsoft Phi vision-language models ---
+    ("phi3_v", {"vision": _TINY_VISION, "image_token_id": 32044}, True),
+    ("phi4-siglip", {"vision": _TINY_VISION, "image_token_id": -200}, True),
     # --- InternVL family ---
     ("internvl_chat", {"vision": _TINY_VISION, "image_token_id": 32000}, True),
     ("internvl2", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
