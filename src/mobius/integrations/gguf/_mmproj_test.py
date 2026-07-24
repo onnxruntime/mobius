@@ -225,6 +225,28 @@ def test_mmproj_audio_loads_activation_stats():
     assert state_dict["audio_tower.layers.0.self_attn.q_proj.input_min"].shape == ()
 
 
+def test_mmproj_audio_inverts_effective_per_dim_scale():
+    from types import SimpleNamespace
+
+    from mobius.integrations.gguf._mmproj import _mmproj_audio_to_hf
+
+    parameters = np.array([-2.0, -1.0, 0.5], dtype=np.float32)
+    effective_scales = np.log1p(np.exp(parameters))
+    gguf = SimpleNamespace(
+        tensor_names=["a.blk.0.per_dim_scale.weight"],
+        get_tensor=lambda _name: effective_scales,
+    )
+
+    state_dict = _mmproj_audio_to_hf(gguf)
+
+    np.testing.assert_allclose(
+        state_dict["audio_tower.layers.0.self_attn.per_dim_scale"].numpy(),
+        parameters,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
 def test_mmproj_vision_loads_activation_stats():
     from types import SimpleNamespace
 
