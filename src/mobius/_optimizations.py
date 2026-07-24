@@ -69,9 +69,9 @@ from mobius.rewrite_rules import (
     pack_qkv_for_gqa_rules,
     separate_rope_rules,
     skip_layer_norm_rules,
-    tensor_scatter_to_scatternd_rules,
     skip_norm_rules,
     static_empty_kv_rules,
+    tensor_scatter_to_scatternd_rules,
     unpack_qkv_rules,
 )
 
@@ -329,9 +329,7 @@ def _get_optimization_passes(
     # Rewrite the static-cache TensorScatter KV write into ScatterND for EPs
     # without a TensorScatter kernel (QNN HTP), where it falls to CPU.
     if not caps.supports_tensor_scatter:
-        lower.append(
-            ("TensorScatterToScatterND", list(tensor_scatter_to_scatternd_rules()))
-        )
+        lower.append(("TensorScatterToScatterND", list(tensor_scatter_to_scatternd_rules())))
 
     # Decompose the fused opset-24 Attention op into SDPA primitives for EPs
     # without an Attention kernel (QNN HTP), where the fused op falls to CPU.
