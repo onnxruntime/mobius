@@ -13,11 +13,39 @@ from onnxscript import OpBuilder, nn
 from mobius._configs import ArchitectureConfig
 from mobius.components import FCMLP
 from mobius.components._common import Embedding, LayerNorm
-from mobius.components._conv import Conv2d
+from mobius.components._conv import Conv2d, Conv2dNoBias
 from mobius.components._encoder import EncoderAttention
 
 if TYPE_CHECKING:
     import onnx_ir as ir
+
+# Largest int64 value; used as an open-ended ``Slice`` end (ONNX clamps it to
+# the actual dimension size).
+_INT64_MAX = 9223372036854775807
+
+
+class ClipVisionConfigView:
+    """Adapter exposing a :class:`VisionConfig` under CLIP's field names.
+
+    The CLIP vision modules read the encoder geometry from top-level attributes
+    (``hidden_size``, ``num_hidden_layers``, ``num_channels``, ``rms_norm_eps``,
+    ``hidden_act`` ...). In a multimodal checkpoint those live inside the nested
+    :class:`~mobius._configs._sub_configs.VisionConfig` (e.g. Phi-3.5-Vision's
+    ``img_processor`` dict). This view bridges the two so the CLIP tower can be
+    reused without duplicating its module definitions.
+    """
+
+    def __init__(self, vision_config, *, default_hidden_act: str = "quick_gelu"):
+        self._vision_config = vision_config
+        self.hidden_size = vision_config.hidden_size
+        self.intermediate_size = vision_config.intermediate_size
+        self.num_hidden_layers = vision_config.num_hidden_layers
+        self.num_attention_heads = vision_config.num_attention_heads
+        self.image_size = vision_config.image_size
+        self.patch_size = vision_config.patch_size
+        self.num_channels = vision_config.in_channels
+        self.rms_norm_eps = vision_config.norm_eps
+        self.hidden_act = vision_config.hidden_act or default_hidden_act
 
 
 class _CLIPVisionEmbeddings(nn.Module):
@@ -30,11 +58,13 @@ class _CLIPVisionEmbeddings(nn.Module):
         image_size = config.image_size
 
         self.class_embedding = nn.Parameter((hidden_size,))
+        # CLIP's patch-embedding Conv2d has no bias (HuggingFace uses bias=False).
         self.patch_embedding = _Conv2dPatchEmbed(
             config.num_channels,
             hidden_size,
             kernel_size=patch_size,
             stride=patch_size,
+            bias=False,
         )
         num_patches = (image_size // patch_size) ** 2
         self.position_embedding = Embedding(num_patches + 1, hidden_size)
@@ -58,7 +88,10 @@ class _CLIPVisionEmbeddings(nn.Module):
 
 
 class _Conv2dPatchEmbed(nn.Module):
-    """Conv2d-based patch embedding with reshape and transpose."""
+    """Conv2d-based patch embedding with reshape and transpose.
+
+    ``bias`` selects a biased (SigLIP) or bias-free (CLIP) patch convolution.
+    """
 
     def __init__(
         self,
@@ -66,9 +99,11 @@ class _Conv2dPatchEmbed(nn.Module):
         out_channels: int,
         kernel_size: int,
         stride: int,
+        bias: bool = True,
     ):
         super().__init__()
-        self.projection = Conv2d(in_channels, out_channels, kernel_size, stride)
+        conv_cls = Conv2d if bias else Conv2dNoBias
+        self.projection = conv_cls(in_channels, out_channels, kernel_size, stride)
 
     def forward(self, op: OpBuilder, x: ir.Value):
         # Conv2d: [batch, channels, H, W] -> [batch, out_channels, H', W']
@@ -110,23 +145,88 @@ class _CLIPVisionEncoderLayer(nn.Module):
         return hidden_states
 
 
+def resolve_clip_feature_num_layers(num_hidden_layers: int, feature_layer: int) -> int:
+    """Number of encoder layers to run to reach ``hidden_states[feature_layer]``.
+
+    HuggingFace CLIP exposes ``num_hidden_layers + 1`` hidden states: index 0 is
+    the pre-encoder embedding output and index ``k`` is the output after ``k``
+    encoder layers. A model such as Phi-3.5-Vision extracts features from an
+    intermediate layer (``layer_idx = -2``), which corresponds to running one
+    fewer encoder layer and skipping the final ``post_layernorm``.
+
+    Args:
+        num_hidden_layers: Total number of CLIP encoder layers in the checkpoint.
+        feature_layer: The ``hidden_states`` index to extract (may be negative,
+            using Python's from-the-end convention over the ``N + 1`` states).
+
+    Returns:
+        The number of encoder layers to actually instantiate and run.
+
+    Raises:
+        ValueError: If ``feature_layer`` is out of range for the encoder depth.
+    """
+    num_hidden_states = num_hidden_layers + 1
+    index = feature_layer if feature_layer >= 0 else num_hidden_states + feature_layer
+    if not 0 <= index <= num_hidden_layers:
+        raise ValueError(
+            f"feature_layer={feature_layer} is out of range for a CLIP encoder "
+            f"with {num_hidden_layers} layers (valid hidden-state indices span "
+            f"0..{num_hidden_layers})."
+        )
+    return index
+
+
 class CLIPVisionModel(nn.Module):
     """CLIP vision model for standalone image feature extraction.
 
-    Outputs last_hidden_state from the vision encoder.
+    By default this outputs the final ``last_hidden_state`` (all encoder layers
+    followed by ``post_layernorm``).
+
+    Two options support multimodal feature extraction used by models such as
+    Phi-3.5-Vision:
+
+    * ``feature_layer`` selects an intermediate ``hidden_states`` index
+      (HuggingFace convention, e.g. ``-2``). When set, only the encoder layers
+      needed to reach that hidden state are instantiated and run, and the final
+      ``post_layernorm`` is skipped (it is only applied to the last hidden
+      state in HuggingFace).
+    * ``drop_class_token`` removes the leading CLS token from the output so that
+      only the patch features remain (HuggingFace ``img_feature[:, 1:]``).
     """
 
     default_task = "image-classification"
     category = "vision"
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        *,
+        feature_layer: int | None = None,
+        drop_class_token: bool = False,
+    ):
         super().__init__()
+        self.feature_layer = feature_layer
+        self.drop_class_token = drop_class_token
+
+        if feature_layer is None:
+            num_encoder_layers = config.num_hidden_layers
+        else:
+            num_encoder_layers = resolve_clip_feature_num_layers(
+                config.num_hidden_layers, feature_layer
+            )
+
         self.embeddings = _CLIPVisionEmbeddings(config)
         self.encoder = nn.ModuleList(
-            [_CLIPVisionEncoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [_CLIPVisionEncoderLayer(config) for _ in range(num_encoder_layers)]
         )
         self.pre_layrnorm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_layernorm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # post_layernorm is only applied to the final hidden state; when we
+        # extract an intermediate feature layer it is unused (and its weights
+        # are intentionally left unmapped).
+        if feature_layer is None:
+            self.post_layernorm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.post_layernorm = None
 
     def forward(self, op: OpBuilder, pixel_values: ir.Value):
         hidden_states = self.embeddings(op, pixel_values)
@@ -135,7 +235,19 @@ class CLIPVisionModel(nn.Module):
         for layer in self.encoder:
             hidden_states = layer(op, hidden_states)
 
-        hidden_states = self.post_layernorm(op, hidden_states)
+        if self.post_layernorm is not None:
+            hidden_states = self.post_layernorm(op, hidden_states)
+
+        if self.drop_class_token:
+            # Keep patch tokens only, dropping the leading CLS token:
+            # (batch, 1 + num_patches, hidden) -> (batch, num_patches, hidden).
+            hidden_states = op.Slice(
+                hidden_states,
+                [1],  # starts
+                [_INT64_MAX],  # ends (clamped to sequence length)
+                [1],  # axes: sequence dimension
+            )
+
         return hidden_states
 
     def preprocess_weights(
@@ -175,8 +287,12 @@ def _rename_clip_vision_weight(name: str) -> str | None:
     ):
         return None
 
-    # Embeddings
+    # Embeddings — HF stores a flat ``patch_embedding.{weight,bias}`` Conv, but
+    # our ``_Conv2dPatchEmbed`` wraps the Conv in a ``.projection`` sub-module.
     if name.startswith("embeddings."):
+        name = name.replace(
+            "embeddings.patch_embedding.", "embeddings.patch_embedding.projection."
+        )
         return name
 
     # Pre/post layer norm
