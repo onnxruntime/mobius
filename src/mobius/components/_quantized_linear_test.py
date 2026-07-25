@@ -297,8 +297,8 @@ class TestBlockQuantizedLinear:
         b._adapt_outputs([result], "")
 
         node = next(node for node in graph if node.op_type == "BlockQuantizedMatMul")
-        assert node.domain == "com.github.onnxruntime.genai"
-        assert graph.opset_imports["com.github.onnxruntime.genai"] == 1
+        assert node.domain == "pkg.nxrt"
+        assert graph.opset_imports["pkg.nxrt"] == 1
         assert len(node.inputs) == 3
         attrs = {attribute.name: attribute.value for attribute in node.attributes.values()}
         assert attrs == {

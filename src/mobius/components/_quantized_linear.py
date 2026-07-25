@@ -27,7 +27,18 @@ from mobius._build_context import ep_capabilities
 #   zero_points:    [N, ceil(n_blocks*bits/8)] (uint8, optional, bit-packed)
 
 _MICROSOFT_DOMAIN = "com.microsoft"
-_ONNX_GENAI_DOMAIN = "com.github.onnxruntime.genai"
+
+# Domain for BlockQuantizedMatMul, the onnx-genai (nxrt) runtime's custom op for
+# GGUF IQ/MXFP4 block formats. These formats have no standard-op expression the
+# runtime can execute: MXFP4 is E2M1 float4 with E8M0 block scales, and the IQ
+# families use non-linear codebooks / super-block layouts. Neither is
+# representable by affine ``com.microsoft.MatMulNBits`` (int4/uint4 affine block
+# quant) nor by a runtime-supported ``DequantizeLinear`` (the nxrt CPU kernel
+# only dequantizes Int8/Uint8/Int32, not FLOAT4E2M1 or codebooks). This is the
+# only remaining custom op, and it deliberately lives in the runtime's ``pkg``
+# namespace rather than the legacy custom-op namespace — matching the domain the
+# runtime actually registers the kernel under.
+_NXRT_DOMAIN = "pkg.nxrt"
 
 _NATIVE_BLOCK_FORMATS = {
     "mxfp4": (32, 17),
@@ -179,6 +190,13 @@ class BlockQuantizedLinear(nn.Module):
 
     The packed weight retains llama.cpp's serialized block layout, including
     the per-block E8M0/fp16 scale. No dequantization or affine repacking occurs.
+
+    Emits ``pkg.nxrt.BlockQuantizedMatMul`` — the onnx-genai runtime's custom op.
+    This is the only remaining custom op because these formats (MXFP4 E2M1 float4;
+    IQ non-linear codebooks) cannot be expressed with standard ONNX ops the
+    runtime can execute (see ``_NXRT_DOMAIN``). It intentionally avoids the
+    legacy custom-op namespace and uses the runtime's registered
+    ``pkg.nxrt`` domain instead.
     """
 
     def __init__(
@@ -206,7 +224,7 @@ class BlockQuantizedLinear(nn.Module):
         self.bias = nn.Parameter([out_features]) if bias else None
 
     def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
-        op.builder.graph.opset_imports[_ONNX_GENAI_DOMAIN] = 1
+        op.builder.graph.opset_imports[_NXRT_DOMAIN] = 1
         output_dtype = x.dtype
         activation = x if x.dtype == ir.DataType.FLOAT else op.Cast(x, to=ir.DataType.FLOAT)
         inputs: list[ir.Value | None] = [activation, self.weight]
@@ -224,7 +242,7 @@ class BlockQuantizedLinear(nn.Module):
             N=self._n,
             format=self._format,
             block_layout_version=1,
-            _domain=_ONNX_GENAI_DOMAIN,
+            _domain=_NXRT_DOMAIN,
         )
         result.dtype = ir.DataType.FLOAT
         if x.shape is not None:
