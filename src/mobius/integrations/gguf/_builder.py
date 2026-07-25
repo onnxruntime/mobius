@@ -805,7 +805,7 @@ def _load_quantized_state_dict(
     native_block_stems: dict[str, str] = {}
     quantized_embedding_stems = set()
     for mod_name, mod in module.named_modules():
-        if isinstance(mod, QuantizedLinear):
+        if isinstance(mod, QuantizedLinear) or getattr(mod, "_gguf_quantized_linear", False):
             quantized_stems.add(mod_name)
         elif isinstance(mod, BlockQuantizedLinear):
             native_block_stems[mod_name] = mod._format
