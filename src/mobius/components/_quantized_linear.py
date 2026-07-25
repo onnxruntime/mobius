@@ -1,10 +1,11 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Quantized linear and embedding layers (com.microsoft domain).
+"""Quantized linear and embedding layers.
 
 ``QuantizedLinear`` uses ``MatMulNBits``; ``QuantizedEmbedding`` uses
-``GatherBlockQuantized``.
+``GatherBlockQuantized``. ``BlockQuantizedLinear`` preserves runtime-supported
+native GGUF IQ/MXFP4 blocks for onnx-genai's CPU execution provider.
 """
 
 from __future__ import annotations
@@ -26,6 +27,20 @@ from mobius._build_context import ep_capabilities
 #   zero_points:    [N, ceil(n_blocks*bits/8)] (uint8, optional, bit-packed)
 
 _MICROSOFT_DOMAIN = "com.microsoft"
+_ONNX_GENAI_DOMAIN = "com.github.onnxruntime.genai"
+
+_NATIVE_BLOCK_FORMATS = {
+    "mxfp4": (32, 17),
+    "iq4_nl": (32, 18),
+    "iq4_xs": (256, 136),
+    "iq3_s": (256, 110),
+    "iq3_xxs": (256, 98),
+    "iq2_xxs": (256, 66),
+    "iq2_xs": (256, 74),
+    "iq2_s": (256, 82),
+    "iq1_s": (256, 50),
+    "iq1_m": (256, 56),
+}
 
 
 def _accuracy_level_attrs(bits: int) -> dict[str, int]:
@@ -156,6 +171,69 @@ class QuantizedLinear(nn.Module):
         )
         if self.bias is not None:
             result = op.Add(result, self.bias)
+        return result
+
+
+class BlockQuantizedLinear(nn.Module):
+    """Linear layer backed by native GGUF block quantization.
+
+    The packed weight retains llama.cpp's serialized block layout, including
+    the per-block E8M0/fp16 scale. No dequantization or affine repacking occurs.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        format: str,
+        bias: bool = False,
+    ):
+        super().__init__()
+        if format not in _NATIVE_BLOCK_FORMATS:
+            raise ValueError(
+                f"format must be one of {sorted(_NATIVE_BLOCK_FORMATS)}, got {format!r}"
+            )
+
+        self._k = in_features
+        self._n = out_features
+        self._format = format
+        block_elements, block_bytes = _NATIVE_BLOCK_FORMATS[format]
+        self.weight = nn.Parameter(
+            [out_features, math.ceil(in_features / block_elements), block_bytes],
+            dtype=ir.DataType.UINT8,
+        )
+        self.bias = nn.Parameter([out_features]) if bias else None
+
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
+        op.builder.graph.opset_imports[_ONNX_GENAI_DOMAIN] = 1
+        output_dtype = x.dtype
+        activation = x if x.dtype == ir.DataType.FLOAT else op.Cast(x, to=ir.DataType.FLOAT)
+        inputs: list[ir.Value | None] = [activation, self.weight]
+        if self.bias is not None:
+            bias = (
+                self.bias
+                if self.bias.dtype == ir.DataType.FLOAT
+                else op.Cast(self.bias, to=ir.DataType.FLOAT)
+            )
+            inputs.append(bias)
+
+        result = op.BlockQuantizedMatMul(
+            *inputs,
+            K=self._k,
+            N=self._n,
+            format=self._format,
+            block_layout_version=1,
+            _domain=_ONNX_GENAI_DOMAIN,
+        )
+        result.dtype = ir.DataType.FLOAT
+        if x.shape is not None:
+            result.shape = ir.Shape([*x.shape[:-1], self._n])
+        if output_dtype not in (None, ir.DataType.FLOAT):
+            result = op.Cast(result, to=output_dtype)
+            result.dtype = output_dtype
+            if x.shape is not None:
+                result.shape = ir.Shape([*x.shape[:-1], self._n])
         return result
 
 
