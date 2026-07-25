@@ -136,12 +136,13 @@ class DeepSeekV4Gate(nn.Module):
         self.score_func = config.scoring_func
         self.hash_routing = layer_id < config.num_hash_layers
         self.weight = nn.Parameter([self.num_experts, config.hidden_size])
+        # Hash-routed layers do not consume this bias, but DeepSeek V4 GGUF
+        # checkpoints provide it for every layer.
+        self.bias = nn.Parameter([self.num_experts])
         if self.hash_routing:
             self.tid2eid = nn.Parameter(
                 [config.vocab_size, self.top_k], dtype=ir.DataType.INT32
             )
-        else:
-            self.bias = nn.Parameter([self.num_experts])
 
     def forward(
         self,
@@ -161,7 +162,10 @@ class DeepSeekV4Gate(nn.Module):
             scores = op.Sqrt(op.Softplus(logits))
 
         if self.hash_routing:
-            selected_experts = op.Gather(self.tid2eid, input_ids, axis=0)
+            selected_experts = op.Cast(
+                op.Gather(self.tid2eid, input_ids, axis=0),
+                to=ir.DataType.INT64.value,
+            )
         else:
             choice_scores = op.Add(scores, self.bias)
             _, selected_experts = op.TopK(

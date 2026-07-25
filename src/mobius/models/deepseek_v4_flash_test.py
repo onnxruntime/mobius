@@ -219,6 +219,7 @@ def test_parameter_shapes_match_v4_projections():
     assert list(attn.kv_proj.weight.shape) == [16, 32]
     assert list(attn.o_a_proj.weight.shape) == [16, 16]
     assert list(attn.o_b_proj.weight.shape) == [32, 16]
+    assert list(model.model.layers[0].mlp.gate.bias.shape) == [config.num_local_experts]
 
 
 def test_four_and_eight_bit_graphs_use_matmul_nbits():
