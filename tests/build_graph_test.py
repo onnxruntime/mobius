@@ -5214,8 +5214,8 @@ class TestBuildStaticCacheGraph:
         proto = ir.serde.serialize_model(model)
         assert len(proto.SerializeToString()) > 0
 
-    def test_static_cache_attention_uses_noncausal_alignment(self):
-        """Verify external-cache Attention uses non-causal alignment."""
+    def test_static_cache_attention_uses_maskless_causal_alignment(self):
+        """Verify maskless external-cache Attention uses built-in causality."""
         model, config = self._build_static_cache_model()
 
         attention_nodes = [n for n in model.graph if n.op_type == "Attention"]
@@ -5226,8 +5226,8 @@ class TestBuildStaticCacheGraph:
             assert is_causal is not None, (
                 f"Attention node {node.name} missing is_causal attribute"
             )
-            assert is_causal.as_int() == 0, (
-                f"Attention node {node.name} should have is_causal=0"
+            assert is_causal.as_int() == 1, (
+                f"Attention node {node.name} should have is_causal=1"
             )
 
     def test_static_cache_attention_no_attn_mask_input(self):
