@@ -36,7 +36,7 @@ _MICROSOFT_DOMAIN = "com.microsoft"
 # quant) nor by a runtime-supported ``DequantizeLinear`` (the nxrt CPU kernel
 # only dequantizes Int8/Uint8/Int32, not FLOAT4E2M1 or codebooks). This is the
 # only remaining custom op, and it deliberately lives in the runtime's ``pkg``
-# namespace rather than ``com.github.onnxruntime`` — matching the domain the
+# namespace rather than the legacy custom-op namespace — matching the domain the
 # runtime actually registers the kernel under.
 _NXRT_DOMAIN = "pkg.nxrt"
 
@@ -195,7 +195,7 @@ class BlockQuantizedLinear(nn.Module):
     This is the only remaining custom op because these formats (MXFP4 E2M1 float4;
     IQ non-linear codebooks) cannot be expressed with standard ONNX ops the
     runtime can execute (see ``_NXRT_DOMAIN``). It intentionally avoids the
-    ``com.github.onnxruntime`` namespace and uses the runtime's registered
+    legacy custom-op namespace and uses the runtime's registered
     ``pkg.nxrt`` domain instead.
     """
 
