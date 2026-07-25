@@ -16,7 +16,7 @@ from mobius._testing import (
     create_test_builder,
     create_test_input,
 )
-from mobius.components._quantized_linear import QuantizedLinear
+from mobius.components._quantized_linear import BlockQuantizedLinear, QuantizedLinear
 
 # Test dimensions
 IN_FEATURES = 64
@@ -258,6 +258,59 @@ class TestQuantizedLinearForward:
         assert "scales" in names
         assert "zero_points" in names
         assert "bias" in names
+
+
+class TestBlockQuantizedLinear:
+    @pytest.mark.parametrize(
+        ("format_name", "block_elements", "block_bytes"),
+        [
+            ("mxfp4", 32, 17),
+            ("iq4_nl", 32, 18),
+            ("iq4_xs", 256, 136),
+            ("iq3_s", 256, 110),
+            ("iq3_xxs", 256, 98),
+            ("iq2_xxs", 256, 66),
+            ("iq2_xs", 256, 74),
+            ("iq2_s", 256, 82),
+            ("iq1_s", 256, 50),
+            ("iq1_m", 256, 56),
+        ],
+    )
+    def test_emits_native_block_contract(
+        self,
+        format_name: str,
+        block_elements: int,
+        block_bytes: int,
+    ):
+        linear = BlockQuantizedLinear(
+            IN_FEATURES,
+            OUT_FEATURES,
+            format=format_name,
+            bias=True,
+        )
+        expected_blocks = (IN_FEATURES + block_elements - 1) // block_elements
+        assert linear.weight.shape == [OUT_FEATURES, expected_blocks, block_bytes]
+
+        b, op, graph = create_test_builder()
+        x = create_test_input(b, "x", [1, 4, IN_FEATURES])
+        result = linear(op, x)
+        b._adapt_outputs([result], "")
+
+        node = next(node for node in graph if node.op_type == "BlockQuantizedMatMul")
+        assert node.domain == "com.github.onnxruntime.genai"
+        assert graph.opset_imports["com.github.onnxruntime.genai"] == 1
+        assert len(node.inputs) == 3
+        attrs = {attribute.name: attribute.value for attribute in node.attributes.values()}
+        assert attrs == {
+            "K": IN_FEATURES,
+            "N": OUT_FEATURES,
+            "format": format_name,
+            "block_layout_version": 1,
+        }
+
+    def test_rejects_runtime_unsupported_iq_format(self):
+        with pytest.raises(ValueError, match="format must be one of"):
+            BlockQuantizedLinear(IN_FEATURES, OUT_FEATURES, format="q4_k")
 
 
 class TestMakeQuantizedLinearFactory:

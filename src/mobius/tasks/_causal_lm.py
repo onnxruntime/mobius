@@ -419,10 +419,15 @@ def _register_static_cache_outputs(
 def _validate_static_cache_support(module: nn.Module) -> None:
     """Check that the module's decoder layers support StaticCacheState.
 
-    Only :class:`DecoderLayer` and :class:`MoEDecoderLayer` have the
-    ``isinstance(StaticCacheState)`` dispatch in ``forward()``.  Custom
-    decoder layers will silently unpack the NamedTuple as a regular
+    Shared decoder layers have the ``isinstance(StaticCacheState)`` dispatch
+    in ``forward()``. Custom decoder layers must opt in with the
+    ``_supports_static_cache`` marker after implementing equivalent handling;
+    otherwise they may silently unpack the NamedTuple as a regular
     ``(key, value)`` tuple, producing wrong results.
+
+    Also warns when the model uses sliding-window attention, since the
+    static cache path does not enforce window constraints (the Attention
+    op uses ``is_causal=1`` without ``local_window_size``).
 
     NOTE: The following models are NOT yet supported in static cache
     mode and will raise TypeError from this check:
@@ -448,15 +453,16 @@ def _validate_static_cache_support(module: nn.Module) -> None:
     from mobius.components._decoder import DecoderLayer
     from mobius.models.moe import MoEDecoderLayer
 
+    # Whitelist-based validation: only check layers that have self_attn/attn
+    # (decoder-like), and accept shared implementations or explicit opt-ins.
+    # This naturally skips vision/audio encoder layers since they use
+    # different classes (e.g. Gemma4VisionEncoderLayer).
     for name, child in module.named_modules():
         if not isinstance(child, nn.ModuleList):
             continue
         for i, layer in enumerate(child):
             if not isinstance(layer, nn.Module):
                 continue
-            # Check modules that look like decoder layers: they have an
-            # attention sub-module named either "self_attn" (standard) or
-            # "attn" (GPT-2 style).
             if not hasattr(layer, "self_attn") and not hasattr(layer, "attn"):
                 continue
             # A layer qualifies if it inherits the shared DecoderLayer/MoEDecoderLayer
