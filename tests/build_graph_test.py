@@ -2568,13 +2568,13 @@ class TestBuildGraphMultiModal:
         task = get_task(task_name)
         pkg = task.build(module, config)
 
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
 
         decoder = pkg["decoder"]
         assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
         assert "logits" in {o.name for o in decoder.graph.outputs}
 
-        vision = pkg["vision"]
+        vision = pkg["vision_encoder"]
         assert "pixel_values" in {i.name for i in vision.graph.inputs}
         assert "image_features" in {o.name for o in vision.graph.outputs}
 
@@ -2602,13 +2602,13 @@ class TestBuildGraphMultiModal:
         task = get_task(task_name)
         pkg = task.build(module, config)
 
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
 
         decoder = pkg["decoder"]
         assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
         assert "logits" in {o.name for o in decoder.graph.outputs}
 
-        vision = pkg["vision"]
+        vision = pkg["vision_encoder"]
         assert "pixel_values" in {i.name for i in vision.graph.inputs}
         assert "image_features" in {o.name for o in vision.graph.outputs}
 

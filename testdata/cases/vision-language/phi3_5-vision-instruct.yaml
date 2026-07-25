@@ -1,4 +1,5 @@
 model_id: "microsoft/Phi-3.5-vision-instruct"
+model_type: "phi3_v"
 revision: "12b77fb40b63"
 task_type: "image-text-to-text"
 dtype: "float32"

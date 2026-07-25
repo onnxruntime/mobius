@@ -1,4 +1,5 @@
 model_id: "microsoft/Phi-4-reasoning-vision-15B"
+model_type: "phi4-siglip"
 revision: "7df902e2fec3"
 task_type: "image-text-to-text"
 dtype: "float32"
