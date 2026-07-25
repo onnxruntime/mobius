@@ -119,6 +119,24 @@ def _cmd_build(args: argparse.Namespace) -> None:
     )
     from mobius.tasks import CausalLMTask, ModelTask
 
+    def _resolve_static_cache_task(model_type: str) -> ModelTask:
+        """Create the correct static cache task for the given model type."""
+        if model_type == "gemma4":
+            from mobius.tasks._gemma4 import Gemma4Task
+
+            return Gemma4Task(
+                static_cache=True,
+                max_seq_len=args.max_seq_len,
+            )
+        if model_type == "gemma4_text":
+            from mobius.tasks._gemma4 import Gemma4TextCausalLMTask
+
+            return Gemma4TextCausalLMTask(
+                static_cache=True,
+                max_seq_len=args.max_seq_len,
+            )
+        return CausalLMTask(static_cache=True, max_seq_len=args.max_seq_len)
+
     # Validate --max-seq-len requires --static-cache
     if args.max_seq_len is not None and not args.static_cache:
         raise SystemExit("Error: --max-seq-len can only be used with --static-cache.")
@@ -161,7 +179,14 @@ def _cmd_build(args: argparse.Namespace) -> None:
     load_weights = not args.no_weights
     task: str | ModelTask | None = args.task
     if args.static_cache:
-        task = CausalLMTask(static_cache=True, max_seq_len=args.max_seq_len)
+        # Defer task creation — we need to know the model type first.
+        # Store parameters for later resolution.
+        static_cache_params = {
+            "static_cache": True,
+            "max_seq_len": args.max_seq_len,
+        }
+    else:
+        static_cache_params = None
     trust_remote_code = args.trust_remote_code
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
@@ -218,7 +243,9 @@ def _cmd_build(args: argparse.Namespace) -> None:
         config = _config_from_hf(hf_config, parent_config=parent_config)
         if dtype_override is not None:
             config = dataclasses.replace(config, dtype=dtype_override)
-        if task is None:
+        if static_cache_params is not None:
+            task = _resolve_static_cache_task(model_type)
+        elif task is None:
             task = _default_task_for_model(model_type)
         module_class = registry.get(model_type)
         model_module = module_class(config)
@@ -233,8 +260,18 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 state_dict = model_module.preprocess_weights(state_dict)
             pkg.apply_weights(state_dict)
     else:
+        model_id_or_path = args.model
+        if static_cache_params is not None:
+            # Detect model type to resolve the correct static cache task.
+            import transformers
+
+            hf_config = transformers.AutoConfig.from_pretrained(
+                model_id_or_path, trust_remote_code=trust_remote_code
+            )
+            task = _resolve_static_cache_task(getattr(hf_config, "model_type", ""))
+
         pkg = build(
-            args.model,
+            model_id_or_path,
             task=task,
             dtype=dtype_override,
             load_weights=load_weights,
