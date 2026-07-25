@@ -355,10 +355,17 @@ def _replace_child_module(root, path: str, replacement) -> None:
     parts = path.split(".")
     parent = root
     for part in parts[:-1]:
-        parent = parent._modules[part]
+        try:
+            parent = getattr(parent, part)
+        except AttributeError as error:
+            raise AttributeError(f"Module path {path!r} has no child {part!r}") from error
     child_name = parts[-1]
-    old = parent._modules[child_name]
-    replacement._set_name(old.name)
+    try:
+        old = getattr(parent, child_name)
+    except AttributeError as error:
+        raise AttributeError(f"Module path {path!r} has no child {child_name!r}") from error
+    if hasattr(replacement, "_set_name") and hasattr(old, "name"):
+        replacement._set_name(old.name)
     setattr(parent, child_name, replacement)
 
 
