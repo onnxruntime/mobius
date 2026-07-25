@@ -250,8 +250,16 @@ class MoELayer(nn.Module):
     Routes each token to top-k experts via a gating mechanism, applies
     each expert MLP, and accumulates weighted results.
 
-    Uses loop-over-experts dispatch: each expert processes all tokens,
-    then results are masked and weighted.
+    Two dispatch paths are selected at construction time:
+
+    - Loop-over-experts (default): each expert ``MLP`` processes all
+      tokens, then results are masked and weighted. Used when the model
+      is unquantized or the gate has no ``qmoe_routing`` hook.
+    - Fused ``com.microsoft::QMoE`` (``experts=None``): used when the
+      quantization config matches the native QMoE ABI
+      (:func:`_supported_qmoe_quantization`) and the gate implements
+      ``qmoe_routing``. Expert weights are packed into quantized
+      ``fc1``/``fc2`` parameters instead of per-expert ``MLP`` modules.
     """
 
     def __init__(self, config: ArchitectureConfig, gate: nn.Module | None = None):
