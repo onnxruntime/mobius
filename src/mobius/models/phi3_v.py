@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Phi-3-Vision / Phi-3.5-Vision multimodal model (vision + text) — 3-model split.
 
@@ -110,8 +110,10 @@ class _Phi3VDecoderModel(nn.Module):
         prefix = "model."
         renamed: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
+            if key.startswith("model.vision_embed_tokens."):
+                continue
             if key.startswith(prefix):
-                renamed["model." + key[len(prefix) :]] = value
+                renamed[key] = value
             elif key == "lm_head.weight":
                 renamed["lm_head.weight"] = value
 

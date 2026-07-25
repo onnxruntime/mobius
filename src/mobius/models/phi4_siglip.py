@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Phi-4-Reasoning-Vision (phi4-siglip) multimodal model — 3-model split.
 
@@ -148,8 +148,8 @@ class _Phi4SigLIPDecoderModel(nn.Module):
 class _Phi4SigLIPVisionEncoderModel(nn.Module):
     """Phi4-SigLIP vision encoder: SigLIP-2 + mlp2x_gelu projector.
 
-    Input shape:  (1, 3, H, W) — single image, NaFlex or fixed resolution
-    Output shape: (num_patches, text_hidden_size)
+    Input shape:  (batch, 3, H, W) — NaFlex or fixed resolution
+    Output shape: (batch * num_patches, text_hidden_size)
     """
 
     def __init__(self, config: ArchitectureConfig):
@@ -164,10 +164,12 @@ class _Phi4SigLIPVisionEncoderModel(nn.Module):
         # pixel_values: (batch, 3, H, W)
         vision_features = self.vision_tower(op, pixel_values)
         # vision_features: (batch, num_patches, vision_hidden)
-        # For single-image: flatten to (num_patches, vision_hidden)
+        # Flatten images and patches into a single token sequence.
+        batch_size = op.Shape(pixel_values, start=0, end=1)
         num_patches = op.Shape(vision_features, start=1, end=2)
+        total = op.Mul(batch_size, num_patches)
         vision_dim = op.Shape(vision_features, start=2, end=3)
-        flat_shape = op.Concat(num_patches, vision_dim, axis=0)
+        flat_shape = op.Concat(total, vision_dim, axis=0)
         vision_features = op.Reshape(vision_features, flat_shape)
         return self.multi_modal_projector(op, vision_features)
 

@@ -2616,6 +2616,33 @@ class TestBuildGraphMultiModal:
         assert "input_ids" in {i.name for i in embed.graph.inputs}
         assert "inputs_embeds" in {o.name for o in embed.graph.outputs}
 
+    def test_phi3_v_decoder_excludes_vision_weights(self):
+        """Decoder weight preprocessing must not retain vision-only checkpoint tensors."""
+        import torch
+
+        from mobius.models.phi3_v import _Phi3VDecoderModel
+
+        config = _base_config(
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=28,
+                patch_size=14,
+            ),
+            image_token_id=32044,
+        )
+        weights = {
+            "model.layers.0.self_attn.qkv_proj.weight": torch.zeros(128, 64),
+            "model.vision_embed_tokens.img_processor.vision_model.weight": torch.zeros(1),
+            "lm_head.weight": torch.zeros(256, 64),
+        }
+        remapped = _Phi3VDecoderModel(config).preprocess_weights(weights)
+
+        assert "model.vision_embed_tokens.img_processor.vision_model.weight" not in remapped
+        assert "lm_head.weight" in remapped
+
 
 class TestBuildGraphWhisper:
     """Verify Whisper encoder-decoder builds with SpeechToTextTask."""

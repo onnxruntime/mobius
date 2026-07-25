@@ -407,16 +407,21 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
     # Phi-3 Vision exposes its template on the underlying tokenizer rather
     # than on the processor.
     prompt_text = case.prompts[0]
+    template_applied = False
     if getattr(processor, "chat_template", None):
         content: list[dict[str, str]] = []
         for img_path in case.images:
             content.append({"type": "image", "image": str(Path("testdata") / img_path)})
         content.append({"type": "text", "text": prompt_text})
         messages = [{"role": "user", "content": content}]
-        prompt_text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-    else:
+        try:
+            prompt_text = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            template_applied = True
+        except (AttributeError, ValueError):
+            pass
+    if not template_applied:
         tokenizer_inner = getattr(processor, "tokenizer", None)
         img_tokens = getattr(processor, "img_tokens", None)
         if (

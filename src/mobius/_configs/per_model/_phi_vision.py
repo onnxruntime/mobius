@@ -12,17 +12,19 @@ from mobius._configs._extractors import register_vision_hook
 def _phi3_v_vision(config, parent_config, model_type: str, fields: dict):
     """Extract Phi-3 Vision's CLIP encoder fields from ``img_processor``."""
     vision_source = parent_config or config
-    img_processor = getattr(vision_source, "img_processor", None) or {}
-    if isinstance(img_processor, dict):
-        fields.update(
-            hidden_size=img_processor.get("image_dim_out", 1024),
-            intermediate_size=4096,
-            num_hidden_layers=24,
-            num_attention_heads=16,
-            image_size=336,
-            patch_size=14,
-            norm_eps=1e-5,
-        )
+    img_processor = getattr(vision_source, "img_processor", None)
+    image_dim_out = (
+        img_processor.get("image_dim_out", 1024) if isinstance(img_processor, dict) else 1024
+    )
+    fields.update(
+        hidden_size=image_dim_out,
+        intermediate_size=4096,
+        num_hidden_layers=24,
+        num_attention_heads=16,
+        image_size=336,
+        patch_size=14,
+        norm_eps=1e-5,
+    )
     fields.setdefault("image_token_id", 32044)
     return None
 
