@@ -324,7 +324,7 @@ class TestBuildQuantizedGguf:
         model = build_from_gguf(path, keep_quantized=True)["model"]
         nodes = [node for node in model.graph if node.op_type == "BlockQuantizedMatMul"]
         assert len(nodes) == 7
-        assert all(node.domain == "com.github.onnxruntime.genai" for node in nodes)
+        assert all(node.domain == "pkg.nxrt" for node in nodes)
         for node in nodes:
             attrs = {attribute.name: attribute.value for attribute in node.attributes.values()}
             assert attrs["format"] == format_name
@@ -342,10 +342,10 @@ class TestBuildQuantizedGguf:
         np.testing.assert_array_equal(weight.const_value.numpy(), expected)
         assert "model.layers.0.self_attn.o_proj.scales" not in model.graph.initializers
 
-        assert model.graph.opset_imports["com.github.onnxruntime.genai"] == 1
+        assert model.graph.opset_imports["pkg.nxrt"] == 1
         proto = ir.serde.serialize_model(model)
         imports = {opset.domain: opset.version for opset in proto.opset_import}
-        assert imports["com.github.onnxruntime.genai"] == 1
+        assert imports["pkg.nxrt"] == 1
 
     def test_mixed_native_quantization_uses_q4_scaffold(self, mixed_native_q5_q8_gguf: Path):
         """Native IQ tensors force Q5_1 fallback weights onto a Q4 scaffold."""

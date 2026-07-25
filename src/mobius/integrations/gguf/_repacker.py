@@ -8,7 +8,7 @@ quantization types into the (weight, scales, zero_points) tensors
 expected by the ``com.microsoft.MatMulNBits`` operator.
 
 The runtime-native IQ/MXFP4 formats are retained byte-for-byte for
-``com.github.onnxruntime.genai.BlockQuantizedMatMul``.
+``pkg.nxrt.BlockQuantizedMatMul``.
 
 GGUF block layouts:
     Q4_0 (18 bytes, 32 elt):  [fp16 scale][16B packed nibbles]
