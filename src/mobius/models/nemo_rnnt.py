@@ -182,7 +182,7 @@ class _Conv1d(nn.Module):
         new_cache = op.Slice(
             x_cat,
             op.Constant(value_ints=[-self._left_pad]),
-            op.Constant(value_ints=[int(np.iinfo(np.int64).max)]),
+            _dim(op, x_cat, 2),
             op.Constant(value_ints=[2]),
         )
         return out, new_cache
@@ -304,7 +304,7 @@ class RelPositionMultiHeadAttention(nn.Module):
         x = op.Slice(
             x,
             op.Constant(value_ints=[1]),
-            op.Constant(value_ints=[int(np.iinfo(np.int64).max)]),
+            _dim(op, x, 2),
             op.Constant(value_ints=[2]),
         )
         # view back to (B, h, T, L)
@@ -520,7 +520,7 @@ class ConformerLayer(nn.Module):
             new_channel = op.Slice(
                 kv,
                 op.Constant(value_ints=[-cache_len]),
-                op.Constant(value_ints=[int(np.iinfo(np.int64).max)]),
+                _dim(op, kv, 1),
                 op.Constant(value_ints=[1]),
             )  # last cache_len frames of concat(cache, att_in)
         else:
@@ -767,7 +767,6 @@ class FastConformerEncoder(nn.Module):
         """
         de = self._drop_extra
         cache_size = self._cache_size
-        intmax = int(np.iinfo(np.int64).max)
         x = self.pre_encode(op, audio_signal)  # (B, T_sub, d)
         length_sub = self._subsampled_length(op, length)  # (B,)
         # Drop the leading subsampled frames corrupted by chunk-boundary padding
@@ -775,7 +774,7 @@ class FastConformerEncoder(nn.Module):
         x = op.Slice(
             x,
             op.Constant(value_ints=[de]),
-            op.Constant(value_ints=[intmax]),
+            _dim(op, x, 1),
             op.Constant(value_ints=[1]),
         )  # (B, T_out, d)
         length_sub = op.Max(
