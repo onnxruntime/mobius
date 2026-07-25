@@ -71,8 +71,15 @@ from mobius.models.clip import (
 if TYPE_CHECKING:
     import onnx_ir as ir
 
-# Phi-3-Vision: <|image|> token id
+# Phi-3-Vision: <|image|> token id (kept for reference; the HF processor marks
+# image slots with negative placeholder ids, not this positive id — see
+# ``_Phi3VEmbeddingModel.forward``).
 _IMAGE_TOKEN_ID = 32044
+
+# Upper bound (magnitude) for negative image placeholder ids, mirroring
+# ``modeling_phi3_v.MAX_INPUT_ID = int(1e9)``. Image positions satisfy
+# ``-_MAX_INPUT_ID < input_ids < 0``.
+_MAX_INPUT_ID = 1_000_000_000
 
 
 class _Phi3VDecoderModel(nn.Module):
@@ -227,8 +234,10 @@ class _Phi3VVisionEncoderModel(nn.Module):
 class _Phi3VEmbeddingModel(nn.Module):
     """Phi3-V embedding: token lookup + image feature fusion.
 
-    Replaces <|image|> token positions with projected vision features
-    from the vision encoder.
+    Replaces image placeholder positions with projected vision features from
+    the vision encoder. Phi-3/3.5-Vision processors mark those positions with
+    *negative* placeholder ids (-1, -2, ...), matched here the same way HF's
+    ``modeling_phi3_v`` does — see ``forward``.
     """
 
     def __init__(self, config: ArchitectureConfig):
@@ -236,13 +245,23 @@ class _Phi3VEmbeddingModel(nn.Module):
         self.embed_tokens = Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
+        self.hidden_size = config.hidden_size
         self.image_token_id = (
             config.image_token_id if config.image_token_id is not None else _IMAGE_TOKEN_ID
         )
 
     def forward(self, op: builder.OpBuilder, input_ids: ir.Value, image_features: ir.Value):
         # (batch, seq_len, hidden_size)
-        image_mask = op.Equal(input_ids, op.Constant(value_int=self.image_token_id))
+        # Phi-3/3.5-Vision processors mark image placeholder positions with
+        # *negative* token ids (-1 for the first image, -2 for the second, ...),
+        # NOT with a positive ``image_token_id``. Detect them exactly as HF's
+        # ``modeling_phi3_v`` does: ``(input_ids < 0) & (input_ids > -MAX_INPUT_ID)``.
+        # Matching a positive id here would never fire for real processor output,
+        # leaving image features unfused and the decoder running "blind".
+        image_mask = op.And(
+            op.Less(input_ids, op.Constant(value_int=0)),
+            op.Greater(input_ids, op.Constant(value_int=-_MAX_INPUT_ID)),
+        )
         # Replace image token positions with index 0 before the Gather so that
         # negative or out-of-range image token IDs don't cause undefined behavior.
         # These positions will be overwritten by image features via op.Where below.
@@ -256,7 +275,17 @@ class _Phi3VEmbeddingModel(nn.Module):
         indices = op.Sub(cumsum, op.Constant(value_int=1))
         indices = op.Clip(indices, op.Constant(value_int=0))
 
-        gathered = op.Gather(image_features, indices, axis=0)
+        # Pad ``image_features`` with a single trailing zero row so the Gather is
+        # always valid — including at decode time, when there are no image
+        # placeholders and the harness/runtime passes an empty (0-row) tensor.
+        # Without the pad, ``Gather`` would index row 0 of a 0-row tensor and
+        # raise an out-of-bounds error. The gathered padding is discarded by the
+        # ``Where`` below (image_mask is all-false when there are no image rows).
+        zero_row = op.ConstantOfShape(op.Constant(value_ints=[1, self.hidden_size]))
+        zero_row = op.CastLike(zero_row, image_features)
+        padded_features = op.Concat(image_features, zero_row, axis=0)
+
+        gathered = op.Gather(padded_features, indices, axis=0)
         return op.Where(image_mask_3d, gathered, text_embeds)
 
     def preprocess_weights(

@@ -294,24 +294,6 @@ _L5_ONLY_XFAIL_REASONS: dict[str, str] = {
     ),
     # MLA compressed KV cache dimensions not yet handled by OnnxGenerator
     "text-generation/youtu-2b": "Youtu MLA KV cache dims differ from standard attention (v_head_dim != head_dim)",
-    # Phi-3.5-Vision L5 greedy generation drifts from HF after the first few
-    # tokens due to the SAME decoder-side LongRoPE parity gap already xfailed for
-    # the sibling phi4mm case (both share the Phi-3.5 text decoder):
-    #   * L4 prefill PASSES — top-1 argmax matches golden over all 775 tokens, so
-    #     the vision tower + host-side HD-transform/img_projection + embedding
-    #     fusion are correct (the host-side projector matches HF at cos=1.0000,
-    #     max-abs 6.9e-5 vs modeling_phi3_v.hd_feature_transform).
-    #   * The first generated tokens match HF exactly ("The image shows a ...");
-    #     divergence begins mid-generation, deep in the text decoder.
-    #   * Root cause is decoder-side logit drift (LongRoPE short-path freqs,
-    #     rotary_dim=96, attention_scaling), NOT a vision/projector defect —
-    #     identical to phi4mm-multi-image-audio above.
-    "image-text-to-text/phi3_5-vision-instruct": (
-        "Phi-3.5-Vision decode loop drifts from HF after the first few tokens "
-        "(L4 prefill passes; host-side HD-transform/projector match HF at "
-        "cos=1.0; first tokens match). Decoder-side LongRoPE parity gap, same "
-        "as phi4mm-multi-image-audio — not a vision/projector defect."
-    ),
 }
 
 
