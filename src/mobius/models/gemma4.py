@@ -904,11 +904,6 @@ class Gemma4TextAttention(nn.Module):
         if self.is_kv_shared_layer:
             # KV-shared layers borrow K,V from a source layer (no own KV cache).
             src_key, src_value = shared_kv_states[self.kv_shared_layer_index][:2]
-            src_nonpad = (
-                shared_kv_states[self.kv_shared_layer_index][2]
-                if len(shared_kv_states[self.kv_shared_layer_index]) > 2
-                else None
-            )
 
             if use_gqa:
                 # GQA path for shared KV: pass empty K/V tensors and wire the
@@ -1912,7 +1907,7 @@ class Gemma4TextModel(nn.Module):
             # GQA references these caches directly; without the call the
             # parameters are never emitted into the graph.
             _ = self.rotary_emb_local(op, position_ids)
-            _ = self.rotary_emb_global(op, position_ids)
+            global_pos_emb = self.rotary_emb_global(op, position_ids)
 
             # seqlens_k[b] = sum(attention_mask[b]) - 1  (last valid KV idx)
             # total_seq_len = attention_mask.shape[1]     (past + current)
@@ -1978,8 +1973,8 @@ class Gemma4TextModel(nn.Module):
             # All fallback layers use float additive bias masks encoding
             # causal + sliding window + padding constraints. Float bias
             # works with both unfused and MEA kernel paths on CUDA EP.
-            # When attention_mask is None (static cache), the Attention
-            # op uses is_causal=1 + nonpad_kv_seqlen instead.
+            # When attention_mask is None (static cache), the Attention op uses
+            # nonpad_kv_seqlen to bound the externally managed cache.
             fallback_bias_dict = {
                 "sliding_attention": create_attention_bias(
                     op,
