@@ -22,11 +22,15 @@ __all__ = ["build_from_gguf"]
 import logging
 from collections import Counter
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import tqdm
 from huggingface_hub import HfApi, hf_hub_download
 
 from mobius._model_package import ModelPackage
+
+if TYPE_CHECKING:
+    from mobius.tasks import ModelTask
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +88,8 @@ def build_from_gguf(
     keep_quantized: bool = False,
     execution_provider: str = "default",
     mmproj: str | Path | None = None,
+    static_cache: bool = False,
+    max_seq_len: int | None = None,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a GGUF file.
 
@@ -125,6 +131,15 @@ def build_from_gguf(
             mmproj vision/audio encoder are fused into one multimodal
             :class:`ModelPackage` (delegates to
             :func:`build_gemma4_vlm_from_gguf`).
+        static_cache: When ``True``, build with a pre-allocated static KV
+            cache (fixed-width buffers written in place via ``TensorScatter``)
+            instead of the default dynamic concat-grow cache. Produces a
+            fully static-shaped graph, which is required by fixed-shape
+            runtimes such as the QNN HTP backend. Cannot be combined with an
+            explicit *task* override.
+        max_seq_len: Maximum sequence length for the static cache buffers.
+            Only used when ``static_cache=True``. Defaults to the model's
+            ``max_position_embeddings``.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -133,6 +148,7 @@ def build_from_gguf(
         ImportError: If the ``gguf`` package is not installed.
         FileNotFoundError: If the GGUF file does not exist.
         KeyError: If the GGUF architecture is not in the registry.
+        ValueError: If *static_cache* is combined with an explicit *task*.
     """
     import dataclasses
 
@@ -140,6 +156,8 @@ def build_from_gguf(
     # vision/audio encoders are assembled by the dedicated VLM builder. Keep
     # build_from_gguf as the single public entry point (text-only or multimodal).
     if mmproj is not None:
+        if static_cache:
+            raise ValueError("static_cache=True is not supported with a companion mmproj.")
         from mobius.integrations.gguf._mmproj import build_gemma4_vlm_from_gguf
 
         return build_gemma4_vlm_from_gguf(
@@ -166,6 +184,12 @@ def build_from_gguf(
     from mobius.integrations.gguf._tensor_processors import (
         process_tensors,
     )
+
+    if static_cache and task is not None:
+        raise ValueError(
+            "static_cache=True cannot be combined with an explicit task "
+            "override; the static cache is wired through CausalLMTask."
+        )
 
     # 1. Parse GGUF file (auto-download from HF Hub when given "owner/repo[:filename]")
     gguf_path = _resolve_gguf_path(gguf_path)
@@ -230,14 +254,23 @@ def build_from_gguf(
 
     # 4. Look up module class and resolve task
     module_class = registry.get(model_type)
-    if task is None:
-        task = _default_task_for_model(model_type)
+    resolved_task: str | ModelTask
+    if static_cache:
+        from mobius.tasks import CausalLMTask
+
+        resolved_task = CausalLMTask(static_cache=True, max_seq_len=max_seq_len)
+    elif task is None:
+        resolved_task = _default_task_for_model(model_type)
+    else:
+        resolved_task = task
 
     # 5. Build ONNX graph
     module = module_class(config)
     if keep_quantized:
         _replace_native_block_linears(module, gguf_model, gguf_arch)
-    pkg = build_from_module(module, config, task, execution_provider=execution_provider)
+    pkg = build_from_module(
+        module, config, resolved_task, execution_provider=execution_provider
+    )
     logger.info(
         "Built ONNX graph for %s (%d components)",
         model_type,
@@ -460,6 +493,14 @@ def _normalize_gguf_weights(
         # dt_bias.bias → dt_bias (nn.Parameter, not module bias)
         if key.endswith(".dt_bias.bias"):
             result[key[: -len(".bias")]] = value
+            continue
+
+        # layer_scalar.weight → layer_scalar (Gemma4 per-layer output scale is an
+        # nn.Parameter, not a module weight). GGUF stores it as
+        # blk.{i}.layer_output_scale.weight, which the tensor mapping renames to
+        # model.layers.{i}.layer_scalar.weight; strip the artefact .weight suffix.
+        if key.endswith(".layer_scalar.weight"):
+            result[key[: -len(".weight")]] = value
             continue
 
         result[key] = value

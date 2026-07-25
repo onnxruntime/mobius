@@ -224,6 +224,23 @@ class TestMapGGUFToHFNames:
             == "model.layers.1.post_per_layer_input_norm.weight"
         )
 
+    def test_gemma4_top_level_per_layer_input(self) -> None:
+        # Global (non-block) per-layer-input tensors live in the text backbone.
+        # These are required by Gemma 4 E2B/E4B; without them the build fails
+        # with unmapped model.embed_tokens_per_layer / per_layer_model_projection.
+        assert (
+            map_gguf_to_hf_names("per_layer_token_embd.weight", "gemma4")
+            == "model.embed_tokens_per_layer.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("per_layer_model_proj.weight", "gemma4")
+            == "model.per_layer_model_projection.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("per_layer_proj_norm.weight", "gemma4")
+            == "model.per_layer_projection_norm.weight"
+        )
+
     # ---- Phi-3 ----
 
     def test_phi3_fused_qkv(self) -> None:

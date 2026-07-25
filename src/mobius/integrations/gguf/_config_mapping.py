@@ -729,6 +729,12 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
 
 def _default_activation(model_type: str) -> str:
     """Return the default activation function for a model type."""
+    # Gemma models use the approximate-tanh GELU (GeGLU) in every MLP block.
+    # Gemma GGUFs typically omit the activation metadata key, so guard against
+    # the generic SiLU default below (using SiLU here silently degrades Gemma
+    # output to near-garbage).
+    if model_type.startswith("gemma"):
+        return "gelu_pytorch_tanh"
     # Most modern models use SiLU/Swish
     gelu_models = {"gpt2", "bloom", "starcoder2", "t5"}
     if model_type in gelu_models:

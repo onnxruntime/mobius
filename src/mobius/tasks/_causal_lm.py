@@ -123,6 +123,11 @@ class CausalLMTask(ModelTask):
             position_ids = builder.input(
                 "position_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len]
             )
+            # Models may expose per-cache-layer specs (e.g. Gemma4: only
+            # non-KV-shared layers own a cache, and sliding vs full layers use
+            # different head_dim). Uniform models leave this unset.
+            specs_fn = getattr(module, "static_kv_cache_specs", None)
+            cache_specs = specs_fn() if callable(specs_fn) else None
             past_key_values = _make_static_cache_inputs(
                 builder,
                 config.num_hidden_layers,
@@ -131,6 +136,7 @@ class CausalLMTask(ModelTask):
                 config.dtype,
                 batch,
                 max_seq_len,
+                cache_specs=cache_specs,
             )
         else:
             past_seq_len = ir.SymbolicDim("past_sequence_len")
@@ -331,19 +337,32 @@ def _make_static_cache_inputs(
     dtype: ir.DataType,
     batch: ir.SymbolicDim,
     max_seq_len: int,
+    cache_specs: list[tuple[int, int]] | None = None,
 ) -> list[StaticCacheState]:
-    """Create static KV cache inputs for ``num_layers`` layers.
+    """Create static KV cache inputs for the cache-owning layers.
 
     Uses ``builder.input()`` to create and register graph inputs directly.
+
+    Args:
+        cache_specs: Optional per-cache-layer ``(num_key_value_heads, head_dim)``
+            list. When provided (e.g. from a model's ``static_kv_cache_specs()``),
+            one buffer is allocated per entry with its own ``kv_hidden`` — this
+            supports models where only a subset of layers own a cache and/or the
+            head_dim varies per layer (Gemma4: KV-shared layers borrow K,V, and
+            sliding vs full layers use different head_dim). When ``None``, falls
+            back to ``num_layers`` uniform buffers of
+            ``num_key_value_heads * head_dim``.
 
     Returns:
         A list of :class:`StaticCacheState` tuples for passing to the
         module via ``past_key_values``.
     """
-    kv_hidden = num_key_value_heads * head_dim
-    cache_pairs: list[tuple[ir.Value, ir.Value]] = []
+    if cache_specs is None:
+        cache_specs = [(num_key_value_heads, head_dim)] * num_layers
 
-    for i in range(num_layers):
+    cache_pairs: list[tuple[ir.Value, ir.Value]] = []
+    for i, (kv_heads, layer_head_dim) in enumerate(cache_specs):
+        kv_hidden = kv_heads * layer_head_dim
         key_cache = builder.input(
             f"key_cache.{i}",
             dtype=dtype,
@@ -400,11 +419,11 @@ def _register_static_cache_outputs(
 def _validate_static_cache_support(module: nn.Module) -> None:
     """Check that the module's decoder layers support StaticCacheState.
 
-    Only :class:`DecoderLayer`, :class:`MoEDecoderLayer`, and
-    :class:`Gemma4DecoderLayer` have the ``isinstance(StaticCacheState)``
-    dispatch in ``forward()``.  Custom decoder layers will silently
-    unpack the NamedTuple as a regular ``(key, value)`` tuple, producing
-    wrong results.
+    Shared decoder layers have the ``isinstance(StaticCacheState)`` dispatch
+    in ``forward()``. Custom decoder layers must opt in with the
+    ``_supports_static_cache`` marker after implementing equivalent handling;
+    otherwise they may silently unpack the NamedTuple as a regular
+    ``(key, value)`` tuple, producing wrong results.
 
     Also warns when the model uses sliding-window attention, since the
     static cache path does not enforce window constraints (the Attention
@@ -432,13 +451,10 @@ def _validate_static_cache_support(module: nn.Module) -> None:
         TypeError: If any decoder layer is not a supported type.
     """
     from mobius.components._decoder import DecoderLayer
-    from mobius.models.gemma4 import Gemma4DecoderLayer
     from mobius.models.moe import MoEDecoderLayer
 
-    _supported = (DecoderLayer, MoEDecoderLayer, Gemma4DecoderLayer)
-
     # Whitelist-based validation: only check layers that have self_attn/attn
-    # (decoder-like), and accept those that are in the supported tuple.
+    # (decoder-like), and accept shared implementations or explicit opt-ins.
     # This naturally skips vision/audio encoder layers since they use
     # different classes (e.g. Gemma4VisionEncoderLayer).
     for name, child in module.named_modules():
@@ -449,12 +465,19 @@ def _validate_static_cache_support(module: nn.Module) -> None:
                 continue
             if not hasattr(layer, "self_attn") and not hasattr(layer, "attn"):
                 continue
-            if not isinstance(layer, _supported):
-                raise TypeError(
-                    f"Static cache mode requires decoder layers that "
-                    f"inherit from DecoderLayer, MoEDecoderLayer, or "
-                    f"Gemma4DecoderLayer, but {name}[{i}] is "
-                    f"{type(layer).__name__}. Either use a compatible "
-                    f"model or add StaticCacheState dispatch to "
-                    f"{type(layer).__name__}.forward()."
-                )
+            # A layer qualifies if it inherits the shared DecoderLayer/MoEDecoderLayer
+            # static dispatch, or opts in via the ``_supports_static_cache`` class
+            # marker (custom layers that implement StaticCacheState handling
+            # themselves, e.g. Gemma4DecoderLayer with KV-shared + dual head_dim).
+            if isinstance(layer, (DecoderLayer, MoEDecoderLayer)):
+                continue
+            if getattr(type(layer), "_supports_static_cache", False):
+                continue
+            raise TypeError(
+                f"Static cache mode requires decoder layers that "
+                f"inherit from DecoderLayer or MoEDecoderLayer (or set "
+                f"_supports_static_cache=True), but "
+                f"{name}[{i}] is {type(layer).__name__}. Either use a "
+                f"compatible model or add StaticCacheState dispatch to "
+                f"{type(layer).__name__}.forward()."
+            )

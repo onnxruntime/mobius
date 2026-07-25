@@ -875,6 +875,7 @@ class Gemma4TextAttention(nn.Module):
         past_key_value: tuple | None = None,
         is_causal: int = 1,
         static_cache: StaticCacheState | None = None,
+        static_kv_seqlen: ir.Value | None = None,
     ):
         from mobius.components._attention import (
             GQAContext,
@@ -883,6 +884,11 @@ class Gemma4TextAttention(nn.Module):
         )
 
         use_gqa = isinstance(attention_bias, GQAContext)
+        # Static-cache mode: fixed-width pre-allocated KV buffers (TensorScatter
+        # in place). Signalled by static_kv_seqlen being set. Cache-owning layers
+        # additionally receive their own StaticCacheState via static_cache; KV-shared
+        # layers receive static_cache=None and read the source layer's full buffer.
+        is_static = static_kv_seqlen is not None
 
         # Q projection + per-head Q norm
         # For GQA, skip manual RoPE — the op applies it internally.
@@ -904,6 +910,51 @@ class Gemma4TextAttention(nn.Module):
         if self.is_kv_shared_layer:
             # KV-shared layers borrow K,V from a source layer (no own KV cache).
             src_key, src_value = shared_kv_states[self.kv_shared_layer_index][:2]
+
+            if is_static:
+                # Static cache: the source layer scattered its RoPE'd K,V into a
+                # fixed-width buffer and stored the full 3D [B, max_seq, kv_hidden]
+                # present. This layer's query attends over that buffer directly.
+                # attention_bias is the static-cache float bias (causal + sliding +
+                # padding baked in), so is_causal=0. nonpad_kv_seqlen bounds the
+                # valid prefix. No scatter here — this layer produces no cache.
+                attn_output, present_key, present_value = op.Attention(
+                    query_states,
+                    src_key,
+                    src_value,
+                    attention_bias,
+                    None,  # no past_key
+                    None,  # no past_value
+                    static_kv_seqlen,
+                    q_num_heads=self.num_attention_heads,
+                    kv_num_heads=self.num_key_value_heads,
+                    scale=self.scaling,
+                    softcap=self.softcap,
+                    is_causal=0,
+                    _outputs=3,
+                )
+                attn_output = self.o_proj(op, attn_output)
+                return attn_output, (present_key, present_value)
+
+            # The borrowed K,V are the source layer's ``present`` outputs. In the
+            # standard (non-GQA) path those come from the opset-24 ``Attention``
+            # op, whose ``present_key``/``present_value`` outputs have NO shape
+            # inference in ORT — they arrive here rank-unknown. Left unannotated,
+            # the downstream Transpose/Reshape lose the head dimension and this
+            # layer's ``Attention`` infers a zero-width output, which then makes
+            # ``o_proj``'s MatMul fail shape inference at model-load time. The
+            # source shares the same KV-head/head-dim configuration as this
+            # layer, so pin the known 4D BNSH shape to restore inference.
+            for _kv in (src_key, src_value):
+                if _kv.shape is None or len(_kv.shape) != 4:
+                    _kv.shape = ir.Shape(
+                        [
+                            "batch",
+                            self.num_key_value_heads,
+                            "kv_sequence_length",
+                            self.head_dim,
+                        ]
+                    )
 
             if use_gqa:
                 # GQA path for shared KV: pass empty K/V tensors and wire the
@@ -1103,8 +1154,12 @@ class Gemma4TextAttention(nn.Module):
                 key_states,
                 value_states,
                 attention_bias,
-                past_key_value[0] if past_key_value is not None else None,
-                past_key_value[1] if past_key_value is not None else None,
+                None
+                if static_cache is not None
+                else (past_key_value[0] if past_key_value is not None else None),
+                None
+                if static_cache is not None
+                else (past_key_value[1] if past_key_value is not None else None),
                 num_attention_heads=self.num_attention_heads,
                 num_key_value_heads=self.num_key_value_heads,
                 scale=self.scaling,
@@ -1213,6 +1268,12 @@ class Gemma4DecoderLayer(nn.Module):
     Uses standard RMSNorm (not OffsetRMSNorm). KV-shared layers use double-wide
     MLP when config.use_double_wide_mlp=True.
     """
+
+    # Marks this layer as implementing the StaticCacheState dispatch in forward()
+    # so CausalLMTask(static_cache=True) accepts Gemma4 (see
+    # _validate_static_cache_support). Gemma4 has KV-shared + sliding/full layers
+    # with dual head_dim, handled by static_kv_cache_specs() on the text model.
+    _supports_static_cache = True
 
     def __init__(self, config: Gemma4Config, layer_idx: int):
         super().__init__()
@@ -1325,16 +1386,18 @@ class Gemma4DecoderLayer(nn.Module):
         per_layer_input: ir.Value | None,
         past_key_value: tuple | StaticCacheState | None,
         is_causal: int = 1,
+        static_kv_seqlen: ir.Value | None = None,
     ):
-        # Dispatch StaticCacheState: extract it from past_key_value so that
-        # the attention module receives it as a separate parameter.
         from mobius.components._attention import StaticCacheState
 
+        # Static-cache dispatch: a StaticCacheState arrives via past_key_value for
+        # cache-owning layers; unpack it into static_cache and clear past_key_value.
+        # KV-shared layers get past_key_value=None but still run in static mode,
+        # signalled by static_kv_seqlen (shared across all layers).
+        static_cache: StaticCacheState | None = None
         if isinstance(past_key_value, StaticCacheState):
             static_cache = past_key_value
             past_key_value = None
-        else:
-            static_cache = None
 
         # Attention block: pre-norm -> attn -> post-norm -> residual
         residual = hidden_states
@@ -1348,6 +1411,7 @@ class Gemma4DecoderLayer(nn.Module):
             past_key_value=past_key_value,
             static_cache=static_cache,
             is_causal=is_causal,
+            static_kv_seqlen=static_kv_seqlen,
         )
         hidden_states = self.post_attention_layernorm(op, attn_output)
         hidden_states = op.Add(residual, hidden_states)
@@ -1756,6 +1820,38 @@ class Gemma4TextModel(nn.Module):
                 self._per_layer_dim, eps=config.rms_norm_eps
             )
 
+    def static_kv_cache_specs(self) -> list[tuple[int, int]]:
+        """Return ``(num_kv_heads, head_dim)`` for each cache-OWNING layer.
+
+        Consumed by :class:`~mobius.tasks.CausalLMTask` in static-cache mode to
+        allocate the fixed-width KV buffers. Gemma4 needs a per-layer spec (not a
+        single uniform head_dim) because:
+
+        * only the first ``num_hidden_layers - num_kv_shared_layers`` layers own a
+          cache — the trailing KV-shared layers borrow K,V from a source layer;
+        * sliding (local) layers use ``config.head_dim`` while full (global)
+          layers use ``config.global_head_dim`` (E2B: 256 vs 512).
+
+        The order matches the iterator consumption in :meth:`forward`
+        (``next(kv_iter)`` for each non-shared layer), so the i-th spec here maps
+        to the i-th cache-owning layer.
+        """
+        config = self.config
+        first_kv_shared = config.num_hidden_layers - config.num_kv_shared_layers
+        global_head_dim = config.global_head_dim or config.head_dim
+        specs: list[tuple[int, int]] = []
+        for idx, layer_type in enumerate(self.layer_types):
+            if first_kv_shared > 0 and idx >= first_kv_shared:
+                continue  # KV-shared layer: borrows K,V, owns no cache
+            is_full = layer_type == "full_attention"
+            head_dim = global_head_dim if is_full else config.head_dim
+            if is_full and config.num_global_key_value_heads is not None:
+                num_kv_heads = config.num_global_key_value_heads
+            else:
+                num_kv_heads = config.num_key_value_heads
+            specs.append((num_kv_heads, head_dim))
+        return specs
+
     def _compute_per_layer_inputs(
         self,
         op: OpBuilder,
@@ -1966,15 +2062,60 @@ class Gemma4TextModel(nn.Module):
             }
 
         # Fallback attention bias for non-GQA layers (used when use_gqa is False).
+        # Two flavours:
+        #   * static-cache mode (attention_mask is None, StaticCacheState past):
+        #     a fixed-width [B,1,S_q,max_seq] bias keyed on absolute positions;
+        #   * dynamic mode: the growing [B,1,S_q,total] bias from attention_mask.
+        from mobius.components._attention import StaticCacheState
+
         query_input = input_ids if input_ids is not None else hidden_states
         fallback_bias_dict: dict[str, ir.Value | None] = {}
         need_fallback = not use_gqa
-        if need_fallback and attention_mask is not None:
+        is_static = (
+            past_key_values is not None
+            and len(past_key_values) > 0
+            and isinstance(past_key_values[0], StaticCacheState)
+        )
+        static_kv_seqlen: ir.Value | None = None
+        if need_fallback and is_static:
+            from mobius.components import create_static_cache_attention_bias
+
+            first_cache = past_key_values[0]
+            static_kv_seqlen = first_cache.nonpad_kv_seqlen
+            max_seq_len = first_cache.key_cache.shape[1]
+            if not isinstance(max_seq_len, int):
+                raise TypeError(
+                    "Gemma4 static cache requires a concrete key_cache KV "
+                    f"dimension (axis 1), got symbolic {max_seq_len!r}."
+                )
+            # S_q at dim 1 of hidden_states ([B, S_q, hidden]); works for both
+            # input_ids and inputs_embeds entry points.
+            seq_len_t = op.Shape(hidden_states, start=1, end=2)
+            fallback_bias_dict = {
+                "sliding_attention": create_static_cache_attention_bias(
+                    op,
+                    write_indices=first_cache.write_indices,
+                    seq_len=seq_len_t,
+                    nonpad_kv_seqlen=first_cache.nonpad_kv_seqlen,
+                    max_seq_len=max_seq_len,
+                    sliding_window=self.sliding_window,
+                    dtype=self._dtype,
+                ),
+                "full_attention": create_static_cache_attention_bias(
+                    op,
+                    write_indices=first_cache.write_indices,
+                    seq_len=seq_len_t,
+                    nonpad_kv_seqlen=first_cache.nonpad_kv_seqlen,
+                    max_seq_len=max_seq_len,
+                    sliding_window=None,
+                    dtype=self._dtype,
+                ),
+            }
+            fallback_pos_dict = position_embeddings_dict
+        elif need_fallback:
             # All fallback layers use float additive bias masks encoding
             # causal + sliding window + padding constraints. Float bias
             # works with both unfused and MEA kernel paths on CUDA EP.
-            # When attention_mask is None (static cache), the Attention op uses
-            # nonpad_kv_seqlen to bound the externally managed cache.
             fallback_bias_dict = {
                 "sliding_attention": create_attention_bias(
                     op,
@@ -2046,6 +2187,7 @@ class Gemma4TextModel(nn.Module):
                 per_layer_input=per_layer_input,
                 past_key_value=past_kv,
                 is_causal=attn_is_causal,
+                static_kv_seqlen=static_kv_seqlen,
             )
             # KV-shared layers borrow K,V from source layers — exclude from
             # present_key_values so the output has exactly num_kv_layers entries.
@@ -2127,6 +2269,11 @@ class Gemma4CausalLMModel(CausalLMModel):
         # Map HF expert weight names and fold router scale
         _remap_moe_expert_weights(state_dict, self.config)
         return super().preprocess_weights(state_dict)
+
+    def static_kv_cache_specs(self) -> list[tuple[int, int]]:
+        """Per-cache-layer ``(num_kv_heads, head_dim)`` for static-cache mode."""
+        assert isinstance(self.model, Gemma4TextModel)
+        return self.model.static_kv_cache_specs()
 
 
 # ---------------------------------------------------------------------------
