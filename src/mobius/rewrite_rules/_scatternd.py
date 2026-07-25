@@ -64,6 +64,8 @@ class TensorScatterToScatterND(RewriteRuleClassBase):
         # The cache axis being scattered must be a concrete size (static cache).
         if cache.shape is None or len(cache.shape) != 3:
             return result.fail("expected rank-3 cache (B, max, D)")
+        if isinstance(cache.shape[0], int) and cache.shape[0] != 1:
+            return result.fail("only batch=1 static-cache scatter is rewritten")
         if not isinstance(cache.shape[1], int):
             return result.fail("cache axis 1 (max_seq_len) must be a concrete int")
         return result

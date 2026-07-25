@@ -34,12 +34,16 @@ def _run(model: ir.Model, feeds: dict) -> np.ndarray:
     return sess.run(None, feeds)[0]
 
 
-def _build_scatter_model(max_len: int, dim: int) -> ir.Model:
+def _build_scatter_model(max_len: int, dim: int, *, batch: int = 1) -> ir.Model:
     cache = ir.Value(
-        name="cache", shape=ir.Shape([1, max_len, dim]), type=ir.TensorType(ir.DataType.FLOAT)
+        name="cache",
+        shape=ir.Shape([batch, max_len, dim]),
+        type=ir.TensorType(ir.DataType.FLOAT),
     )
     update = ir.Value(
-        name="update", shape=ir.Shape([1, "sq", dim]), type=ir.TensorType(ir.DataType.FLOAT)
+        name="update",
+        shape=ir.Shape([batch, "sq", dim]),
+        type=ir.TensorType(ir.DataType.FLOAT),
     )
     widx = ir.Value(name="widx", shape=ir.Shape([1]), type=ir.TensorType(ir.DataType.INT64))
     y = ir.Value(name="y")
@@ -65,6 +69,12 @@ def _count(model: ir.Model) -> Counter:
 
 
 class TestTensorScatterToScatterND:
+    def test_batch_greater_than_one_is_left_unchanged(self):
+        model = _build_scatter_model(16, 4, batch=2)
+        rewrite(model, pattern_rewrite_rules=tensor_scatter_to_scatternd_rules())
+        assert _count(model).get("TensorScatter", 0) == 1
+        assert _count(model).get("ScatterND", 0) == 0
+
     def _feeds(self, max_len, dim, sq, start):
         rng = np.random.default_rng(sq * 10 + start)
         return {

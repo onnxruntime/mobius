@@ -69,6 +69,14 @@ def _count(model: ir.Model) -> Counter:
 
 
 class TestDecomposeRope:
+    def test_rank2_cos_or_sin_is_left_unchanged(self):
+        for table_index in (1, 2):
+            model = _build_rope_model(1, 4, 2, 8)
+            table = next(iter(model.graph)).inputs[table_index]
+            table.shape = ir.Shape([4, 4])
+            rewrite(model, pattern_rewrite_rules=decompose_rope_rules())
+            assert _count(model).get("RotaryEmbedding", 0) == 1
+
     def test_parity_and_replacement(self):
         b, s, n, h = 1, 4, 3, 8
         rng = np.random.default_rng(0)

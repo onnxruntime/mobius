@@ -76,6 +76,10 @@ class DecomposeRotaryEmbedding(RewriteRuleClassBase):
         # x must be rank-3 (B, S, N*H) as mobius emits.
         if x.shape is None or len(x.shape) != 3:
             return result.fail("expected rank-3 x (B, S, N*H)")
+        if cos.shape is None or len(cos.shape) != 3:
+            return result.fail("expected rank-3 cos (B, S, H/2)")
+        if sin.shape is None or len(sin.shape) != 3:
+            return result.fail("expected rank-3 sin (B, S, H/2)")
         return result
 
     def rewrite(self, op, x, cos, sin, rope_out, **_):

@@ -73,7 +73,7 @@ class EpCapabilities:
             only for the QNN HTP, which miscomputes rank-4 RMSNormalization.
         supports_attention: ``False`` decomposes the fused opset-24
             ``Attention`` op into scaled-dot-product primitives
-            (Reshape/Transpose/MatMul/Softmax/Add, plus Tile for GQA) via
+            (Reshape/Transpose/MatMul/Softmax/Add, plus Expand for GQA) via
             DecomposeAttention.  ``True`` leaves the fused op unchanged.  Set
             ``False`` only for runtimes without an ``Attention`` kernel (QNN
             HTP), where the fused op would otherwise be forced onto CPU.

@@ -49,6 +49,7 @@ def _build_attention_model(
     is_causal: int = 1,
     with_mask: bool = True,
     with_past: bool = True,
+    with_nonpad: bool = False,
 ) -> ir.Model:
     """Single fused Attention node with rank-3 Q/K/V and optional mask/past."""
     q_hidden = q_heads * head_dim
@@ -93,6 +94,16 @@ def _build_attention_model(
         )
         inputs.extend([pk, pv])
         graph_inputs.extend([pk, pv])
+    elif with_nonpad:
+        inputs.extend([None, None])
+    if with_nonpad:
+        nonpad = ir.Value(
+            name="nonpad",
+            shape=ir.Shape([batch]),
+            type=ir.TensorType(ir.DataType.INT64),
+        )
+        inputs.append(nonpad)
+        graph_inputs.append(nonpad)
 
     y = ir.Value(name="y")
     present_k = ir.Value(name="present_k")
@@ -163,6 +174,78 @@ _CASES = [
 
 
 class TestDecomposeAttentionParity:
+    def test_gqa_expand_preserves_runtime_batch_dimension(self):
+        batch, seq_q, q_heads, kv_heads, head_dim = 2, 3, 8, 2, 16
+        feeds = _feeds(
+            batch, seq_q, 0, q_heads, kv_heads, head_dim, with_mask=False, with_past=False
+        )
+        reference = _run(
+            _build_attention_model(
+                batch,
+                seq_q,
+                0,
+                q_heads,
+                kv_heads,
+                head_dim,
+                with_mask=False,
+                with_past=False,
+            ),
+            feeds,
+        )
+        model = _build_attention_model(
+            batch,
+            seq_q,
+            0,
+            q_heads,
+            kv_heads,
+            head_dim,
+            with_mask=False,
+            with_past=False,
+        )
+        decompose_attention_pass()(model)
+        got = _run(model, feeds)
+        np.testing.assert_allclose(got[0], reference[0], rtol=0, atol=0)
+
+    def test_nonpad_kv_seqlen_masks_invalid_cache_slots_without_range(self):
+        batch, seq_q, q_heads, kv_heads, head_dim = 1, 4, 8, 2, 16
+        model = _build_attention_model(
+            batch,
+            seq_q,
+            0,
+            q_heads,
+            kv_heads,
+            head_dim,
+            is_causal=0,
+            with_mask=False,
+            with_past=False,
+            with_nonpad=True,
+        )
+        feeds = _feeds(
+            batch, seq_q, 0, q_heads, kv_heads, head_dim, with_mask=False, with_past=False
+        )
+        feeds["nonpad"] = np.array([2], dtype=np.int64)
+        reference = _run(model, feeds)
+
+        decomposed = _build_attention_model(
+            batch,
+            seq_q,
+            0,
+            q_heads,
+            kv_heads,
+            head_dim,
+            is_causal=0,
+            with_mask=False,
+            with_past=False,
+            with_nonpad=True,
+        )
+        decompose_attention_pass()(decomposed)
+        ops = Counter(n.op_type for n in decomposed.graph)
+        assert ops.get("Attention", 0) == 0
+        assert ops.get("Range", 0) == 0
+        assert ops.get("Less", 0) >= 1
+        got = _run(decomposed, feeds)
+        np.testing.assert_allclose(got[0], reference[0], rtol=0, atol=0)
+
     @pytest.mark.parametrize(
         "seq_q,seq_past,q_heads,kv_heads,softcap,is_causal,with_mask,with_past,atol,tag",
         _CASES,

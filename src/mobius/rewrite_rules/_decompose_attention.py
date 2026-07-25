@@ -7,7 +7,7 @@ The Qualcomm Hexagon HTP (QNN EP) has no kernel for the fused opset-24
 ``Attention`` op, so any decoder that emits it is forced onto the CPU EP.
 This pass rewrites ``Attention`` into the scaled-dot-product primitives HTP
 *does* support (``Reshape``/``Transpose``/``MatMul``/``Softmax``/``Add`` and,
-for group-query attention, ``Tile``), so the attention blocks can be claimed
+for group-query attention, ``Expand``), so the attention blocks can be claimed
 by the QNN partitioner.
 
 **Input op (as mobius emits it for the decoder):**
@@ -28,7 +28,7 @@ standard-Attention path).  ``attn_mask`` is an optional float additive bias,
 1. Reshape/transpose ``Q``/``K``/``V`` to ``(B, N, S, H)``.
 2. Concatenate ``past_key``/``past_value`` along the sequence axis (these
    concatenated tensors are also the ``present_key``/``present_value`` outputs).
-3. Group-query attention: ``Tile`` the KV heads by ``Nq // Nkv``.
+3. Group-query attention: ``Expand`` the KV heads by ``Nq // Nkv``.
 4. ``scores = (Q @ Kᵀ) * scale``; optional ``softcap * tanh(scores/softcap)``;
    add ``attn_mask``; add a bottom-right-aligned causal bias when
    ``is_causal=1``; ``Softmax``; ``@ V``.
@@ -100,6 +100,7 @@ def _build_replacement(node: ir.Node) -> tuple[list[ir.Node], list[ir.Value]]:
     attn_mask = inputs[3] if len(inputs) > 3 else None
     past_key = inputs[4] if len(inputs) > 4 else None
     past_value = inputs[5] if len(inputs) > 5 else None
+    nonpad_kv_seqlen = inputs[6] if len(inputs) > 6 else None
 
     q_heads = node.attributes.get_int("q_num_heads")
     kv_heads = node.attributes.get_int("kv_num_heads")
@@ -141,11 +142,13 @@ def _build_replacement(node: ir.Node) -> tuple[list[ir.Node], list[ir.Value]]:
         if group == 1:
             return x
         x5 = tape.op("Unsqueeze", [x, c_ints([2])])
-        # Broadcast the size-1 group axis to ``group`` via Expand.
-        x5 = tape.op("Expand", [x5, c_ints([1, 1, group, 1, 1])])
         shp = tape.op("Shape", [x])  # (4,) == [B, Nkv, S, H]
         batch = tape.op("Slice", [shp, c_ints([0]), c_ints([1])])
+        n_kv = tape.op("Slice", [shp, c_ints([1]), c_ints([2])])
         s_h = tape.op("Slice", [shp, c_ints([2]), c_ints([4])])
+        expand_shape = tape.op("Concat", [batch, n_kv, c_ints([group]), s_h], {"axis": 0})
+        # Broadcast only the inserted size-1 group axis; preserve B/Nkv/S/H.
+        x5 = tape.op("Expand", [x5, expand_shape])
         target = tape.op("Concat", [batch, c_ints([q_heads]), s_h], {"axis": 0})
         return tape.op("Reshape", [x5, target])
 
@@ -179,11 +182,27 @@ def _build_replacement(node: ir.Node) -> tuple[list[ir.Node], list[ir.Value]]:
     if attn_mask is not None:
         scores = tape.op("Add", [scores, tape.op("CastLike", [attn_mask, scores])])
 
+    static_sk = _static_kv_length(node)
+    if nonpad_kv_seqlen is not None:
+        scores = tape.op(
+            "Add",
+            [
+                scores,
+                _nonpad_bias(
+                    tape, c_ints, c_floats, nonpad_kv_seqlen, k_full, scores, static_sk
+                ),
+            ],
+        )
+
     # Built-in causal masking (bottom-right aligned so a decode step of Sq
     # queries attends to all Sk = Sq + past keys up to its own position).
     if is_causal:
         scores = tape.op(
-            "Add", [scores, _causal_bias(tape, c_ints, c_floats, q_bnsh, k_full, scores)]
+            "Add",
+            [
+                scores,
+                _causal_bias(tape, c_ints, c_floats, q_bnsh, k_full, scores, static_sk),
+            ],
         )
 
     probs = tape.op("Softmax", [scores], {"axis": -1})
@@ -194,13 +213,59 @@ def _build_replacement(node: ir.Node) -> tuple[list[ir.Node], list[ir.Value]]:
     return tape.nodes, [y, present_k, present_v]
 
 
-def _causal_bias(tape, c_ints, c_floats, q_bnsh, k_full, scores):
+def _static_kv_length(node: ir.Node) -> int | None:
+    """Return the statically known full KV length, if available."""
+    key = node.inputs[1]
+    if key is None or key.shape is None or len(key.shape) != 3:
+        return None
+    key_len = key.shape[1]
+    past = node.inputs[4] if len(node.inputs) > 4 else None
+    if past is not None:
+        if past.shape is None or len(past.shape) != 4:
+            return None
+        past_len = past.shape[2]
+        if not isinstance(past_len, int):
+            return None
+    else:
+        past_len = 0
+    return int(key_len) + int(past_len) if isinstance(key_len, int) else None
+
+
+def _indices(tape, c_ints, length, static_length: int | None):
+    """Build ``arange(length)`` without Range when a static upper bound exists."""
+    if static_length is None:
+        zero_s = tape.op("Constant", [], {"value_int": 0})
+        one_s = tape.op("Constant", [], {"value_int": 1})
+        return tape.op("Range", [zero_s, length, one_s])
+    full = c_ints(range(static_length))
+    return tape.op("Slice", [full, c_ints([0]), tape.op("Unsqueeze", [length, c_ints([0])])])
+
+
+def _nonpad_bias(tape, c_ints, c_floats, nonpad, k_full, scores, static_sk):
+    """Mask key slots at or beyond each batch item's valid KV prefix."""
+    sk = tape.op(
+        "Squeeze",
+        [
+            tape.op("Slice", [tape.op("Shape", [k_full]), c_ints([2]), c_ints([3])]),
+            c_ints([0]),
+        ],
+    )
+    cols = _indices(tape, c_ints, sk, static_sk)
+    cols = tape.op("Unsqueeze", [cols, c_ints([0, 1, 2])])
+    limit = tape.op("Unsqueeze", [tape.op("CastLike", [nonpad, cols]), c_ints([1, 2, 3])])
+    allowed = tape.op("Less", [cols, limit])
+    zero_f = tape.op("CastLike", [c_floats([0.0]), scores])
+    neg_f = tape.op("CastLike", [c_floats([_MASK_NEG]), scores])
+    return tape.op("Where", [allowed, zero_f, neg_f])
+
+
+def _causal_bias(tape, c_ints, c_floats, q_bnsh, k_full, scores, static_sk):
     """Bottom-right-aligned ``(1, 1, Sq, Sk)`` causal additive bias.
 
     Query row ``i`` (within the current chunk of ``Sq``) may attend to key
     columns ``j <= i + (Sk - Sq)``; later columns get ``_MASK_NEG``.  Uses
-    ``Range`` over the dynamic Sq/Sk so it is correct for both prefill
-    (Sk == Sq) and decode (Sk == Sq + past).
+    Uses a constant arange sliced to the runtime dimensions when ``Sk`` is
+    statically bounded, avoiding ``Range`` for fixed-size QNN cache graphs.
     """
     sq = tape.op(
         "Squeeze",
@@ -216,10 +281,8 @@ def _causal_bias(tape, c_ints, c_floats, q_bnsh, k_full, scores):
             c_ints([0]),
         ],
     )
-    zero_s = tape.op("Constant", [], {"value_int": 0})
-    one_s = tape.op("Constant", [], {"value_int": 1})
-    rows = tape.op("Range", [zero_s, sq, one_s])  # (Sq,)
-    cols = tape.op("Range", [zero_s, sk, one_s])  # (Sk,)
+    rows = _indices(tape, c_ints, sq, static_sk)  # (Sq,)
+    cols = _indices(tape, c_ints, sk, static_sk)  # (Sk,)
     offset = tape.op("Sub", [sk, sq])  # scalar Sk - Sq
     rows_off = tape.op("Add", [tape.op("Unsqueeze", [rows, c_ints([1])]), offset])  # (Sq, 1)
     cols_2d = tape.op("Unsqueeze", [cols, c_ints([0])])  # (1, Sk)
