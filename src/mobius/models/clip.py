@@ -12,16 +12,12 @@ from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import FCMLP
-from mobius.components._common import Embedding, LayerNorm
+from mobius.components._common import INT64_MAX, Embedding, LayerNorm
 from mobius.components._conv import Conv2d, Conv2dNoBias
 from mobius.components._encoder import EncoderAttention
 
 if TYPE_CHECKING:
     import onnx_ir as ir
-
-# Largest int64 value; used as an open-ended ``Slice`` end (ONNX clamps it to
-# the actual dimension size).
-_INT64_MAX = 9223372036854775807
 
 
 class ClipVisionConfigView:
@@ -244,7 +240,7 @@ class CLIPVisionModel(nn.Module):
             hidden_states = op.Slice(
                 hidden_states,
                 [1],  # starts
-                [_INT64_MAX],  # ends (clamped to sequence length)
+                [INT64_MAX],  # ends (clamped to sequence length)
                 [1],  # axes: sequence dimension
             )
 

@@ -30,6 +30,7 @@ import glob
 import os
 
 import numpy as np
+import torch
 
 # HF checkpoint key prefix for the projector / separators (outside the CLIP
 # ``img_processor`` vision tower, which is exported to ONNX separately).
@@ -221,12 +222,10 @@ def _apply_image_projection(
     Returns:
         ``(num_tokens, hidden_size)``.
     """
-    from math import erf, sqrt
-
     hidden = tokens @ weights.projection_first_weight.T + weights.projection_first_bias
     # Exact GELU (erf form), matching torch.nn.GELU()'s default approximate="none".
-    gelu = np.vectorize(lambda value: 0.5 * value * (1.0 + erf(value / sqrt(2.0))))
-    activated = gelu(hidden).astype(np.float32)
+    hidden_tensor = torch.from_numpy(hidden)
+    activated = (0.5 * hidden_tensor * (1.0 + torch.erf(hidden_tensor / np.sqrt(2.0)))).numpy()
     projected = activated @ weights.projection_second_weight.T + weights.projection_second_bias
     return projected.astype(np.float32)
 
@@ -262,6 +261,12 @@ def phi3_vision_hd_feature_transform(
             "image_features must be (num_images, num_crops+1, 576, image_dim_out); "
             f"got shape {image_features.shape}"
         )
+    num_images, num_crops_including_global, _, _ = image_features.shape
+    if image_sizes.shape != (num_images, 2):
+        raise ValueError(
+            "image_sizes must be (num_images, 2) matching image_features; "
+            f"got shape {image_sizes.shape} for {num_images} images"
+        )
 
     global_separator = weights.global_separator.reshape(1, -1)  # (1, image_dim_out*4)
     sublayer_separator = weights.sublayer_separator  # (1, 1, 1, image_dim_out*4)
@@ -273,9 +278,20 @@ def phi3_vision_hd_feature_transform(
 
     per_image_token_blocks: list[np.ndarray] = []
     for image_index, (height, width) in enumerate(image_sizes):
+        if height <= 0 or width <= 0 or height % _CROP_PIXEL_SIZE or width % _CROP_PIXEL_SIZE:
+            raise ValueError(
+                f"image_sizes[{image_index}] must contain positive multiples of "
+                f"{_CROP_PIXEL_SIZE}; got ({height}, {width})"
+            )
         height_crops = int(height) // _CROP_PIXEL_SIZE
         width_crops = int(width) // _CROP_PIXEL_SIZE
         crop_count = height_crops * width_crops
+        available_sub_crops = num_crops_including_global - 1
+        if crop_count > available_sub_crops:
+            raise ValueError(
+                f"image_sizes[{image_index}] requires {crop_count} HD crops, but "
+                f"image_features provides only {available_sub_crops} sub-crops"
+            )
 
         sub_features = image_features[image_index, 1 : 1 + crop_count]
         sub_merged = _reshape_hd_patches_2x2_merge(sub_features, height_crops, width_crops)

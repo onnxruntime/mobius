@@ -170,6 +170,23 @@ def test_hd_feature_transform_rejects_non_4d_features() -> None:
         )
 
 
+@pytest.mark.parametrize("image_size", [(335, 336), (336, 337), (0, 336)])
+def test_hd_feature_transform_rejects_invalid_image_sizes(
+    image_size: tuple[int, int],
+) -> None:
+    weights = _make_projector_weights(4, 6)
+    image_features = np.zeros((1, 2, _PATCH_COUNT, 4), dtype=np.float32)
+    with pytest.raises(ValueError, match="positive multiples"):
+        phi3_vision_hd_feature_transform(image_features, np.array([image_size]), weights)
+
+
+def test_hd_feature_transform_rejects_insufficient_sub_crops() -> None:
+    weights = _make_projector_weights(4, 6)
+    image_features = np.zeros((1, 4, _PATCH_COUNT, 4), dtype=np.float32)
+    with pytest.raises(ValueError, match="requires 4 HD crops"):
+        phi3_vision_hd_feature_transform(image_features, np.array([[672, 672]]), weights)
+
+
 def test_load_projector_weights_reads_and_validates_safetensors(tmp_path) -> None:
     safetensors_numpy = pytest.importorskip("safetensors.numpy")
     image_dim_out, hidden_size = 8, 16

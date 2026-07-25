@@ -759,7 +759,10 @@ def _run_vl_vision_to_image_features(
             # The HF processor emits pixel_values shaped
             # (num_images, num_crops + 1, 3, 336, 336). The ONNX vision encoder
             # takes 4-D NCHW input, so flatten the leading crop dimension.
-            pixel_values = np.asarray(processed["pixel_values"], dtype=np.float32)
+            pixel_values_dtype = vis_session.get_input_dtype("pixel_values")
+            if pixel_values_dtype is None:
+                raise ValueError("Phi-3.5 vision encoder must have a pixel_values input dtype")
+            pixel_values = np.asarray(processed["pixel_values"], dtype=pixel_values_dtype)
             num_images, num_crops_including_global = pixel_values.shape[:2]
             flat_pixel_values = pixel_values.reshape(
                 num_images * num_crops_including_global, *pixel_values.shape[2:]
