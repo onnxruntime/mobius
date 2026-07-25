@@ -247,13 +247,32 @@ def load_torch_multimodal_model(
     # Some trust_remote_code VLMs (e.g. Phi-3-Vision) are registered as
     # AutoModelForCausalLM, not AutoModelForImageTextToText.  Fall back
     # gracefully so golden generation works for both.
-    model_kwargs = dict(config=config, dtype=dtype, device_map=device, trust_remote_code=True)
+    #
+    # The weight-dtype keyword was renamed from ``torch_dtype`` to ``dtype`` in
+    # transformers 5.x; support both so offline golden generation also works on
+    # the older transformers (e.g. 4.43) required by 4.x-era remote-code models.
+    base_kwargs = dict(config=config, device_map=device, trust_remote_code=True)
+
+    def _load_from_pretrained(auto_cls):
+        try:
+            return auto_cls.from_pretrained(model_id, dtype=dtype, **base_kwargs)
+        except TypeError:
+            return auto_cls.from_pretrained(model_id, torch_dtype=dtype, **base_kwargs)
+
     try:
-        model = transformers.AutoModelForImageTextToText.from_pretrained(
-            model_id, **model_kwargs
-        )
-    except (ValueError, KeyError):
-        model = transformers.AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
+        image_text_to_text_cls = transformers.AutoModelForImageTextToText
+    except AttributeError:
+        # Older transformers (e.g. 4.43, used for offline golden generation of
+        # 4.x-era remote-code checkpoints) predate AutoModelForImageTextToText.
+        image_text_to_text_cls = None
+    model = None
+    if image_text_to_text_cls is not None:
+        try:
+            model = _load_from_pretrained(image_text_to_text_cls)
+        except (ValueError, KeyError):
+            model = None
+    if model is None:
+        model = _load_from_pretrained(transformers.AutoModelForCausalLM)
 
     model.eval()
 
