@@ -90,8 +90,10 @@ __all__ = [
     "Phi3CausalLMModel",
     "Phi3MoECausalLMModel",
     "Phi3SmallCausalLMModel",
+    "Phi3VModel",
     "Phi4MMCausalLMModel",
     "Phi4MMMultiModalModel",
+    "Phi4SigLIPModel",
     "PhiCausalLMModel",
     "Qwen25VLCausalLMModel",
     "Qwen25VLDecoderModel",
@@ -234,6 +236,8 @@ from mobius.models.phi import (
     PhiCausalLMModel,
 )
 from mobius.models.phi3 import Phi3CausalLMModel
+from mobius.models.phi3_v import Phi3VModel
+from mobius.models.phi4_siglip import Phi4SigLIPModel
 from mobius.models.qwen import (
     Qwen3CausalLMModel,
     QwenCausalLMModel,

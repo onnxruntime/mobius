@@ -2548,6 +2548,101 @@ class TestBuildGraphMultiModal:
         assert registry.get("phi4_multimodal") is registry.get("phi4mm")
         assert _default_task_for_model("phi4_multimodal") == "phi4mm-multimodal"
 
+    def test_phi3_v_vision_language_graph(self):
+        """Build Phi-3-Vision with 3-model split and verify all components."""
+        config = _base_config(
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=28,
+                patch_size=14,
+                norm_eps=1e-5,
+            ),
+            image_token_id=32044,
+        )
+        model_cls = registry.get("phi3_v")
+        module = model_cls(config)
+        task_name = _default_task_for_model("phi3_v")
+        task = get_task(task_name)
+        pkg = task.build(module, config)
+
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
+
+        decoder = pkg["decoder"]
+        assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
+        assert "logits" in {o.name for o in decoder.graph.outputs}
+
+        vision = pkg["vision_encoder"]
+        assert "pixel_values" in {i.name for i in vision.graph.inputs}
+        assert "image_features" in {o.name for o in vision.graph.outputs}
+
+        embed = pkg["embedding"]
+        assert "input_ids" in {i.name for i in embed.graph.inputs}
+        assert "inputs_embeds" in {o.name for o in embed.graph.outputs}
+
+    def test_phi4_siglip_vision_language_graph(self):
+        """Build Phi-4-Reasoning-Vision (phi4-siglip) with 3-model split and verify components."""
+        config = _base_config(
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=28,
+                patch_size=14,
+                norm_eps=1e-6,
+            ),
+            image_token_id=-200,
+        )
+        model_cls = registry.get("phi4-siglip")
+        module = model_cls(config)
+        task_name = _default_task_for_model("phi4-siglip")
+        task = get_task(task_name)
+        pkg = task.build(module, config)
+
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
+
+        decoder = pkg["decoder"]
+        assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
+        assert "logits" in {o.name for o in decoder.graph.outputs}
+
+        vision = pkg["vision_encoder"]
+        assert "pixel_values" in {i.name for i in vision.graph.inputs}
+        assert "image_features" in {o.name for o in vision.graph.outputs}
+
+        embed = pkg["embedding"]
+        assert "input_ids" in {i.name for i in embed.graph.inputs}
+        assert "inputs_embeds" in {o.name for o in embed.graph.outputs}
+
+    def test_phi3_v_decoder_excludes_vision_weights(self):
+        """Decoder weight preprocessing must not retain vision-only checkpoint tensors."""
+        import torch
+
+        from mobius.models.phi3_v import _Phi3VDecoderModel
+
+        config = _base_config(
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=28,
+                patch_size=14,
+            ),
+            image_token_id=32044,
+        )
+        weights = {
+            "model.layers.0.self_attn.qkv_proj.weight": torch.zeros(128, 64),
+            "model.vision_embed_tokens.img_processor.vision_model.weight": torch.zeros(1),
+            "lm_head.weight": torch.zeros(256, 64),
+        }
+        remapped = _Phi3VDecoderModel(config).preprocess_weights(weights)
+
+        assert "model.vision_embed_tokens.img_processor.vision_model.weight" not in remapped
+        assert "lm_head.weight" in remapped
+
 
 class TestBuildGraphWhisper:
     """Verify Whisper encoder-decoder builds with SpeechToTextTask."""
@@ -4988,6 +5083,8 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "gemma4_unified_text",
     "llava",
     "mllama",
+    "phi3_v",
+    "phi4-siglip",
     "phi4_multimodal",
     "phi4mm",
     "qwen2_5_vl",
