@@ -948,7 +948,12 @@ class Gemma4TextAttention(nn.Module):
             for _kv in (src_key, src_value):
                 if _kv.shape is None or len(_kv.shape) != 4:
                     _kv.shape = ir.Shape(
-                        ["batch", self.num_key_value_heads, "kv_sequence_length", self.head_dim]
+                        [
+                            "batch",
+                            self.num_key_value_heads,
+                            "kv_sequence_length",
+                            self.head_dim,
+                        ]
                     )
 
             if use_gqa:
