@@ -18,6 +18,7 @@ import onnx
 import pytest
 
 from mobius.__main__ import _save_package, main
+from mobius._configs import ArchitectureConfig
 
 
 class TestCLIList:
@@ -349,8 +350,7 @@ class TestCLIBuildRuntime:
             mock.patch("mobius.__main__.build_from_module", return_value=pkg) as build,
             mock.patch("mobius._model_package.ModelPackage.save"),
         ):
-            from_hf.return_value = SimpleNamespace(
-                dtype=None,
+            from_hf.return_value = ArchitectureConfig(
                 use_dsa=True,
                 num_nextn_predict_layers=1,
             )
