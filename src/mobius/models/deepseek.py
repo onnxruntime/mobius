@@ -35,7 +35,7 @@ from mobius.models.base import CausalLMModel
 def _linear_class(config: ArchitectureConfig):
     quantization = config.quantization
     if quantization is None or quantization.quant_method == "none":
-        return None
+        return Linear
     zero_point_dtype = config.dtype if quantization.float_zero_point else ir.DataType.UINT8
     return make_quantized_linear_factory(
         bits=quantization.bits,
