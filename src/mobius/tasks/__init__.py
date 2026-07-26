@@ -28,6 +28,7 @@ __all__ = [
     "CodecTask",
     "ComponentSpec",
     "ControlNetTask",
+    "DeepSeekV4Task",
     "DFlashDraftTask",
     "Eagle3DraftTask",
     "Qwen35MtpTask",
@@ -87,6 +88,7 @@ from mobius.tasks._causal_lm import (
 from mobius.tasks._codec import CodecTask
 from mobius.tasks._controlnet import ControlNetTask
 from mobius.tasks._ctc_asr import CTCAsrTask
+from mobius.tasks._deepseek_v4 import DeepSeekV4Task
 from mobius.tasks._denoising import DenoisingTask
 from mobius.tasks._dflash import DFlashDraftTask
 from mobius.tasks._eagle3 import Eagle3DraftTask
@@ -145,6 +147,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "moshi-depformer": MoshiDepformerTask,
     "moshi-temporal": MoshiTemporalTask,
     "text-generation": CausalLMTask,
+    "deepseek-v4": DeepSeekV4Task,
     "hybrid-text-generation": HybridCausalLMTask,
     "dflash-draft": DFlashDraftTask,
     "eagle3-draft": Eagle3DraftTask,

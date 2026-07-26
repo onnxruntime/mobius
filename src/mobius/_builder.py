@@ -91,13 +91,14 @@ def _cast_module_dtype(module: nn.Module, dtype: ir.DataType) -> None:
     caches), the underlying data is also cast.
 
     Only recasts parameters that are currently FLOAT (float32). Integer
-    parameters and non-float types are left unchanged.
+    parameters, non-float types, and parameters marked ``_keep_float32`` are
+    left unchanged.
     """
     if dtype == ir.DataType.FLOAT:
         return
     torch_dtype = tensor_adapters.to_torch_dtype(dtype)
     for param in module.parameters():
-        if param.dtype != ir.DataType.FLOAT:
+        if param.dtype != ir.DataType.FLOAT or getattr(param, "_keep_float32", False):
             continue
         param.type = ir.TensorType(dtype)
         if param.const_value is not None:

@@ -7,6 +7,7 @@ __all__ = [
     "Attention",
     "BatchNorm2d",
     "BertEmbeddings",
+    "BlockQuantizedLinear",
     "CausalConv1d",
     "CausalConvNd",
     "CausalDepthwiseConv1d",
@@ -194,6 +195,7 @@ from mobius.components._qformer import (
     QFormerLayer as QFormerLayer,
 )
 from mobius.components._quantized_linear import (
+    BlockQuantizedLinear,
     QuantizedEmbedding,
     QuantizedLinear,
     TiedQuantizedLMHead,

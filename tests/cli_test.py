@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import os
 import tempfile
+from types import SimpleNamespace
 from unittest import mock
 
 import onnx
 import pytest
 
-from mobius.__main__ import main
+from mobius.__main__ import _save_package, main
 
 
 class TestCLIList:
@@ -253,38 +254,120 @@ class TestCLIBuildRuntime:
         call_kwargs = mock_export.call_args
         assert call_kwargs.kwargs.get("hf_model_id") == "Qwen/Qwen2.5-0.5B"
 
-    def test_runtime_onnx_genai_calls_write_onnx_genai_config(self, capsys):
-        """--runtime onnx-genai calls the unified config writer."""
+    def test_runtime_onnx_genai_uses_native_vlm_emitter(self):
+        pkg = mock.MagicMock()
+        pkg.items.return_value = []
+        pkg.__iter__.return_value = iter(())
+        pkg.config = object()
+        args = SimpleNamespace(
+            max_shard_size=None,
+            external_data="onnx",
+            execution_provider="cpu",
+            no_weights=True,
+            runtime="onnx-genai",
+            config="/models/vlm",
+            model=None,
+        )
         with (
             tempfile.TemporaryDirectory() as tmpdir,
             mock.patch(
-                "mobius.integrations.onnx_genai.write_onnx_genai_config",
-                return_value={
-                    "inference_metadata": "inference_metadata.yaml",
-                    "mtp_config": "mtp_config.json",
-                },
-            ) as mock_export,
+                "mobius.integrations.onnx_genai.inference_metadata.is_native_vlm_package",
+                return_value=True,
+            ),
             mock.patch(
-                "mobius.integrations.ort_genai.write_ort_genai_config",
+                "mobius.integrations.onnx_genai.inference_metadata."
+                "write_native_vlm_package_metadata",
                 return_value={},
-            ) as mock_ort,
+            ) as native_writer,
+            mock.patch(
+                "mobius.integrations.onnx_genai.write_onnx_genai_config"
+            ) as generic_writer,
+        ):
+            _save_package(pkg, tmpdir, args, None, None)
+
+        native_writer.assert_called_once_with(
+            pkg,
+            tmpdir,
+            config=pkg.config,
+            source="/models/vlm",
+        )
+        generic_writer.assert_not_called()
+
+    def test_runtime_onnx_genai_does_not_fallback_for_unsupported_vlm(self):
+        pkg = mock.MagicMock()
+        pkg.items.return_value = []
+        pkg.__iter__.return_value = iter(("vision_encoder", "embedding", "decoder"))
+        pkg.config = object()
+        args = SimpleNamespace(
+            max_shard_size=None,
+            external_data="onnx",
+            execution_provider="cpu",
+            no_weights=True,
+            runtime="onnx-genai",
+            config="/models/unsupported-vlm",
+            model=None,
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.onnx_genai.inference_metadata.is_native_vlm_package",
+                return_value=True,
+            ),
+            mock.patch(
+                "mobius.integrations.onnx_genai.inference_metadata."
+                "write_native_vlm_package_metadata",
+                side_effect=ValueError(
+                    "unsupported VLM signature; regenerate processor assets or register it"
+                ),
+            ) as native_writer,
+            mock.patch(
+                "mobius.integrations.onnx_genai.write_onnx_genai_config"
+            ) as generic_writer,
+            pytest.raises(SystemExit, match=r"regenerate.*register"),
+        ):
+            _save_package(pkg, tmpdir, args, None, None)
+
+        native_writer.assert_called_once()
+        generic_writer.assert_not_called()
+
+    def test_glm_full_attention_sets_config_overrides(self):
+        config = SimpleNamespace(
+            model_type="glm_moe_dsa",
+            torch_dtype=None,
+        )
+        module = mock.MagicMock()
+        pkg = mock.MagicMock()
+        pkg.items.return_value = []
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "transformers.AutoConfig.from_pretrained",
+                return_value=config,
+            ),
+            mock.patch("mobius.__main__._config_from_hf") as from_hf,
+            mock.patch("mobius.__main__.registry.get", return_value=module),
+            mock.patch("mobius.__main__.build_from_module", return_value=pkg) as build,
             mock.patch("mobius._model_package.ModelPackage.save"),
         ):
+            from_hf.return_value = SimpleNamespace(
+                dtype=None,
+                use_dsa=True,
+                num_nextn_predict_layers=1,
+            )
             main(
                 [
                     "build",
-                    "--model",
-                    "Qwen/Qwen2.5-0.5B",
+                    "--config",
+                    "glm-config",
                     tmpdir,
                     "--no-weights",
-                    "--runtime",
-                    "onnx-genai",
+                    "--glm-full-attention",
                 ]
             )
 
-        mock_export.assert_called_once()
-        mock_ort.assert_not_called()
-        assert "mtp_config: mtp_config.json" in capsys.readouterr().out
+        config_arg = build.call_args.args[1]
+        assert config_arg.use_dsa is False
+        assert config_arg.num_nextn_predict_layers == 0
 
     def test_no_runtime_does_not_call_write_ort_genai_config(self):
         """Omitting --runtime does NOT call write_ort_genai_config()."""

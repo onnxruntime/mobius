@@ -1,6 +1,6 @@
 """Export a quantized tiny synthetic glm_moe_dsa model for onnx-genai E2E.
 
-Same tiny `glm_moe_dsa` config as ``export_glm_tiny.py`, but with a
+Same tiny ``glm_moe_dsa`` config as ``export_glm_tiny.py``, but with a
 ``QuantizationConfig`` attached so the linear projections (and per-expert
 MoE MLPs) are emitted as ``com.microsoft::MatMulNBits`` (int4, block-32).
 

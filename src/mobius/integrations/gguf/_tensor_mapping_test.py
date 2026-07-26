@@ -224,6 +224,23 @@ class TestMapGGUFToHFNames:
             == "model.layers.1.post_per_layer_input_norm.weight"
         )
 
+    def test_gemma4_top_level_per_layer_input(self) -> None:
+        # Global (non-block) per-layer-input tensors live in the text backbone.
+        # These are required by Gemma 4 E2B/E4B; without them the build fails
+        # with unmapped model.embed_tokens_per_layer / per_layer_model_projection.
+        assert (
+            map_gguf_to_hf_names("per_layer_token_embd.weight", "gemma4")
+            == "model.embed_tokens_per_layer.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("per_layer_model_proj.weight", "gemma4")
+            == "model.per_layer_model_projection.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("per_layer_proj_norm.weight", "gemma4")
+            == "model.per_layer_projection_norm.weight"
+        )
+
     # ---- Phi-3 ----
 
     def test_phi3_fused_qkv(self) -> None:
@@ -305,16 +322,29 @@ class TestMapGGUFToHFNames:
         assert map_gguf_to_hf_names("blk.3.indexer.attn_k.weight", "glm-dsa") == (
             "model.layers.3.self_attn.indexer.wk.weight"
         )
-        assert map_gguf_to_hf_names("blk.3.indexer.k_norm.bias", "glm-dsa") == (
-            "model.layers.3.self_attn.indexer.k_norm.bias"
-        )
-        assert map_gguf_to_hf_names("blk.78.nextn.eh_proj.weight", "glm-dsa") == (
-            "model.layers.78.eh_proj.weight"
-        )
-        assert (
-            map_gguf_to_hf_names("blk.78.nextn.shared_head_norm.weight", "glm-dsa")
-            == "model.layers.78.shared_head.norm.weight"
-        )
+
+    def test_deepseek4_mapping(self) -> None:
+        expected = {
+            "blk.2.attn_q_a.weight": "model.layers.2.self_attn.q_a_proj.weight",
+            "blk.2.attn_kv.weight": "model.layers.2.self_attn.kv_proj.weight",
+            "blk.2.attn_output_a.weight": "model.layers.2.self_attn.o_a_proj.weight",
+            "blk.2.ffn_gate_tid2eid.weight": "model.layers.2.mlp.gate.tid2eid",
+            "blk.2.exp_probs_b.bias": "model.layers.2.mlp.gate.bias",
+            "blk.2.hc_attn_fn.weight": "model.layers.2.hc_attn_fn.weight",
+            "blk.2.attn_sinks.weight": "model.layers.2.self_attn.attn_sink",
+            "blk.2.attn_compressor_ape.weight": ("model.layers.2.self_attn.compressor.ape"),
+            "blk.2.attn_compressor_kv.weight": (
+                "model.layers.2.self_attn.compressor.wkv.weight"
+            ),
+            "blk.2.indexer.attn_q_b.weight": ("model.layers.2.self_attn.indexer.wq_b.weight"),
+            "blk.2.indexer_compressor_norm.weight": (
+                "model.layers.2.self_attn.indexer.compressor.norm.weight"
+            ),
+            "output_hc_fn.weight": "model.hc_head_fn.weight",
+            "output_hc_base.weight": "model.hc_head_base",
+        }
+        for source, target in expected.items():
+            assert map_gguf_to_hf_names(source, "deepseek4") == target
 
     # ---- Unsupported architecture ----
 

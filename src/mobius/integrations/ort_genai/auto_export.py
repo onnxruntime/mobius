@@ -87,6 +87,7 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     # ORT GenAI (see onnxruntime-genai/src/models/model_type.h LLM list).
     "hunyuan_v1_dense": "decoder",
     "glm_moe_dsa": "decoder",
+    "deepseek_v4": "decoder",
     # Qwen VL models all use the same GenAI pipeline as qwen2_5_vl
     "qwen2_vl": "qwen2_5_vl",
     "qwen3_vl": "qwen2_5_vl",
@@ -989,24 +990,21 @@ def write_ort_genai_config(
     result: dict[str, str] = {"genai_config": genai_path}
 
     if "mtp" in pkg:
+        mtp_model = pkg["mtp"]
         mtp_path = os.path.join(directory, "mtp_config.json")
         with open(mtp_path, "w") as f:
             json.dump(
                 {
                     "model": {"filename": "mtp/model.onnx"},
                     "inputs": [
-                        "inputs_embeds",
-                        "hidden_states",
-                        "attention_mask",
-                        "position_ids",
-                        "past_key_values.0.key",
-                        "past_key_values.0.value",
+                        value.name
+                        for value in mtp_model.graph.inputs
+                        if value.name is not None
                     ],
                     "outputs": [
-                        "mtp_hidden",
-                        "present.0.key",
-                        "present.0.value",
-                        "topk_indices",
+                        value.name
+                        for value in mtp_model.graph.outputs
+                        if value.name is not None
                     ],
                     "num_nextn_predict_layers": getattr(config, "num_nextn_predict_layers", 0),
                     "index_share_for_mtp_iteration": getattr(

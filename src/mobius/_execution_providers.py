@@ -71,6 +71,33 @@ class EpCapabilities:
             (query/key norm over the head dimension) to rank-3 and back via
             HtpRank4RMSNorm.  ``True`` leaves it unchanged.  Set ``False``
             only for the QNN HTP, which miscomputes rank-4 RMSNormalization.
+        supports_attention: ``False`` decomposes the fused opset-24
+            ``Attention`` op into scaled-dot-product primitives
+            (Reshape/Transpose/MatMul/Softmax/Add, plus Expand for GQA) via
+            DecomposeAttention.  ``True`` leaves the fused op unchanged.  Set
+            ``False`` only for runtimes without an ``Attention`` kernel (QNN
+            HTP), where the fused op would otherwise be forced onto CPU.
+        supports_rotary_embedding: ``False`` decomposes the opset-24
+            ``RotaryEmbedding`` op into rotate-half primitives (Reshape/Slice/
+            Mul/Sub/Add/Concat) via DecomposeRotaryEmbedding.  ``True`` leaves
+            the fused op unchanged.  Set ``False`` only for runtimes without a
+            ``RotaryEmbedding`` kernel (QNN HTP), where it is forced onto CPU.
+        supports_tensor_scatter: ``False`` rewrites the static-cache
+            ``TensorScatter`` in-place KV write into ``ScatterND`` (batch=1) via
+            TensorScatterToScatterND.  ``True`` leaves ``TensorScatter``
+            unchanged.  Set ``False`` only for runtimes without a
+            ``TensorScatter`` kernel (QNN HTP), where it is forced onto CPU.
+        supports_range: ``False`` replaces the ONNX ``Range`` op in
+            :func:`~mobius.components.create_static_cache_attention_bias` with a
+            precomputed ``Constant(arange)`` + ``Slice``.  ``True`` (the
+            default) leaves ``Range`` unchanged.  Set ``False`` only when
+            static cache is used on runtimes that lack a ``Range`` kernel (QNN
+            HTP), where the ``Range`` node would otherwise be forced onto CPU.
+        supports_matmul_nbits: ``False`` converts ``com.microsoft::MatMulNBits``
+            (blockwise-INT4 weight) into a standard ``DequantizeLinear`` +
+            ``MatMul`` (QDQ) pair via MatMulNBitsToQDQ.  ``True`` leaves the
+            contrib op unchanged.  Set ``False`` only for runtimes that lack a
+            ``MatMulNBits`` kernel but can consume QDQ weights (QNN HTP).
         default_int4_accuracy_level: Default accuracy level for INT4
             quantization (0 = highest accuracy, 4 = fastest).
         provider_options: Default ORT GenAI provider options dict for this EP.
@@ -121,6 +148,11 @@ class EpCapabilities:
     supports_fused_moe: bool = True
     supports_packed_multi_head_attention: bool = False
     supports_rank4_rmsnorm: bool = True
+    supports_attention: bool = True
+    supports_matmul_nbits: bool = True
+    supports_rotary_embedding: bool = True
+    supports_tensor_scatter: bool = True
+    supports_range: bool = True
     default_int4_accuracy_level: int = 0
     provider_options: dict[str, str] = dataclasses.field(default_factory=dict)
     enable_graph_capture: bool = False
@@ -344,6 +376,11 @@ def _register_builtins() -> None:
             },
             supports_past_present_share_buffer=False,  # standard-Attention KV concat
             supports_rank4_rmsnorm=False,  # HTP miscomputes rank-4 RMSNorm (q/k norm)
+            supports_attention=False,  # no HTP Attention kernel — decompose to SDPA
+            supports_matmul_nbits=False,  # no HTP MatMulNBits kernel — convert to QDQ
+            supports_rotary_embedding=False,  # no HTP RotaryEmbedding — rotate-half
+            supports_tensor_scatter=False,  # no HTP TensorScatter — ScatterND (batch=1)
+            supports_range=False,  # no HTP Range — Constant(arange)+Slice in static bias
         ),
         # onnx-standard: ONNX-only runtime — emits zero custom-domain ops.
         # All com.microsoft ops (SkipLayerNorm, PackedMHA) are expanded via
