@@ -554,6 +554,18 @@ class TestExportForOrtGenai:
     def test_mtp_component_writes_sidecar_and_nested_decoder_path(self, tmp_path):
         pkg = self._make_pkg()
         pkg["mtp"] = mock.MagicMock()
+        pkg["mtp"].graph.inputs = [
+            mock.MagicMock(name=name)
+            for name in (
+                "inputs_embeds",
+                "hidden_states",
+                "attention_mask",
+                "position_ids",
+            )
+        ]
+        pkg["mtp"].graph.outputs = [
+            mock.MagicMock(name=name) for name in ("mtp_hidden", "topk_indices")
+        ]
 
         result = write_ort_genai_config(pkg, str(tmp_path))
 
@@ -564,6 +576,7 @@ class TestExportForOrtGenai:
         with open(result["mtp_config"]) as f:
             mtp = json.load(f)
         assert mtp["model"]["filename"] == "mtp/model.onnx"
+        assert mtp["inputs"][0] == "inputs_embeds"
         assert mtp["outputs"][-1] == "topk_indices"
         assert mtp["runtime_orchestration"] == "external"
 
