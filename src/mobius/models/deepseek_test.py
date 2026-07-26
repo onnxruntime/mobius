@@ -100,17 +100,33 @@ def test_deepseek_dense_moe_fallback_matches_numpy_reference():
 def test_noaux_tc_supports_single_expert_groups():
     config = make_config(
         hidden_size=4,
+        intermediate_size=8,
+        moe_intermediate_size=3,
         num_local_experts=4,
         num_experts_per_tok=2,
         n_group=4,
         topk_group=2,
+        n_shared_experts=1,
         scoring_func="sigmoid",
         topk_method="noaux_tc",
     )
+    module = _DeepSeekMoEFFN(config, DeepSeekMoEGate(config))
+    hidden = ir.Value(
+        name="hidden_states",
+        shape=ir.Shape([1, 2, config.hidden_size]),
+        type=ir.TensorType(ir.DataType.FLOAT),
+    )
+    graph = ir.Graph(
+        inputs=[hidden],
+        outputs=[],
+        nodes=[],
+        name="single_expert_groups",
+        opset_imports={"": OPSET_VERSION},
+    )
+    output = module(GraphBuilder(graph).op, hidden)
 
-    gate = DeepSeekMoEGate(config)
-
-    assert gate.num_experts // gate.n_group == 1
+    assert output is not None
+    assert any(node.op_type == "TopK" for node in graph)
 
 
 def test_grouped_routing_rejects_non_divisible_expert_count():
@@ -123,4 +139,18 @@ def test_grouped_routing_rejects_non_divisible_expert_count():
     )
 
     with pytest.raises(ValueError, match="evenly divisible"):
+        DeepSeekMoEGate(config)
+
+
+@pytest.mark.parametrize(("topk_group", "n_group"), [(0, 2), (3, 2)])
+def test_grouped_routing_rejects_invalid_topk_group(topk_group, n_group):
+    config = make_config(
+        hidden_size=4,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        n_group=n_group,
+        topk_group=topk_group,
+    )
+
+    with pytest.raises(ValueError, match="1 <= topk_group <= n_group"):
         DeepSeekMoEGate(config)
