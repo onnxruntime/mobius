@@ -206,11 +206,29 @@ def moe_metadata_from_config(
 
     score_function = str(getattr(config, "scoring_func", "softmax")).lower()
     topk_method = str(getattr(config, "topk_method", "greedy")).lower()
-    group_count = _clean_int(getattr(config, "n_group", None)) or 1
-    groups_per_token = _clean_int(getattr(config, "topk_group", None)) or 1
+    raw_group_count = getattr(config, "n_group", None)
+    raw_groups_per_token = getattr(config, "topk_group", None)
+    group_count = _clean_int(raw_group_count)
+    groups_per_token = _clean_int(raw_groups_per_token)
+    if raw_group_count is not None and group_count is None:
+        raise ValueError("cannot emit mixture_of_experts metadata: n_group must be positive")
+    group_count = group_count or 1
     selection_method = (
         "grouped_top_k" if group_count > 1 and topk_method != "greedy" else "top_k"
     )
+    if selection_method == "grouped_top_k":
+        if routed_experts % group_count:
+            raise ValueError(
+                "cannot emit mixture_of_experts metadata: num_local_experts "
+                f"({routed_experts}) must be divisible by n_group ({group_count})"
+            )
+        if groups_per_token is None or groups_per_token > group_count:
+            raise ValueError(
+                "cannot emit mixture_of_experts metadata: topk_group must satisfy "
+                f"1 <= topk_group <= n_group ({group_count})"
+            )
+    else:
+        groups_per_token = groups_per_token or 1
 
     router: dict[str, Any] = {
         "score_function": score_function,
@@ -230,7 +248,7 @@ def moe_metadata_from_config(
         "experts_per_token": experts_per_token,
         "expert_intermediate_size": expert_intermediate_size,
         "shared_expert_intermediate_size": shared_intermediate_size,
-        "activation": str(getattr(config, "hidden_act", "silu")).lower(),
+        "activation": str(getattr(config, "hidden_act", None) or "silu").lower(),
         "router": router,
     }
 

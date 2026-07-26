@@ -220,6 +220,39 @@ class TestDecoderMetadata:
         with pytest.raises(ValueError, match="lacks both"):
             moe_metadata_from_config(cfg)
 
+    @pytest.mark.parametrize(
+        ("n_group", "topk_group", "message"),
+        [
+            (0, 1, "n_group must be positive"),
+            (3, 1, "must be divisible"),
+            (4, 0, "1 <= topk_group <= n_group"),
+            (4, 5, "1 <= topk_group <= n_group"),
+        ],
+    )
+    def test_moe_metadata_rejects_invalid_grouping(self, n_group, topk_group, message):
+        cfg = _FakeConfig()
+        cfg.num_local_experts = 8
+        cfg.num_experts_per_tok = 2
+        cfg.moe_intermediate_size = 128
+        cfg.n_group = n_group
+        cfg.topk_group = topk_group
+        cfg.topk_method = "noaux_tc"
+
+        with pytest.raises(ValueError, match=message):
+            moe_metadata_from_config(cfg)
+
+    def test_moe_metadata_defaults_none_activation_to_silu(self):
+        cfg = _FakeConfig()
+        cfg.num_local_experts = 4
+        cfg.num_experts_per_tok = 2
+        cfg.moe_intermediate_size = 128
+        cfg.hidden_act = None
+
+        moe = moe_metadata_from_config(cfg)
+
+        assert moe is not None
+        assert moe["activation"] == "silu"
+
     def test_moe_metadata_handles_dense_and_simple_top_k_configs(self):
         assert moe_metadata_from_config(_FakeConfig()) is None
 
