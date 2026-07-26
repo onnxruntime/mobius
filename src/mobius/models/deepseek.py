@@ -32,7 +32,7 @@ from mobius.components._quantized_linear import make_quantized_linear_factory
 from mobius.models.base import CausalLMModel
 
 
-def _linear_factory(config: ArchitectureConfig):
+def _linear_class(config: ArchitectureConfig):
     quantization = config.quantization
     if quantization is None or quantization.quant_method == "none":
         return None
@@ -43,6 +43,9 @@ def _linear_factory(config: ArchitectureConfig):
         has_zero_point=not quantization.sym,
         zero_point_dtype=zero_point_dtype,
     )
+
+
+_linear_factory = _linear_class
 
 
 class DeepSeekMoEGate(nn.Module):
