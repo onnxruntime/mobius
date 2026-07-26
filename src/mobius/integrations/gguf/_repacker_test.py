@@ -731,14 +731,10 @@ class TestRepackDequantizedTensor:
 
     def test_symmetric_q8_omits_zero_points(self):
         values = np.array([[-128.0, 0.0, 127.0] + [0.0] * 29], dtype=np.float32)
-        result = repack_dequantized_tensor(
-            values, bits=8, block_size=32, symmetric=True
-        )
+        result = repack_dequantized_tensor(values, bits=8, block_size=32, symmetric=True)
 
         assert result.zero_points is None
-        dequantized = (
-            result.weight.astype(np.float32) - 128.0
-        ) * result.scales[:, :, None]
+        dequantized = (result.weight.astype(np.float32) - 128.0) * result.scales[:, :, None]
         np.testing.assert_allclose(
             dequantized.reshape(values.shape), values, atol=result.scales.max() * 0.51
         )
