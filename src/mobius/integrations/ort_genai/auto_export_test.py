@@ -555,7 +555,7 @@ class TestExportForOrtGenai:
         pkg = self._make_pkg()
         pkg["mtp"] = mock.MagicMock()
         pkg["mtp"].graph.inputs = [
-            mock.MagicMock(name=name)
+            types.SimpleNamespace(name=name)
             for name in (
                 "inputs_embeds",
                 "hidden_states",
@@ -564,7 +564,7 @@ class TestExportForOrtGenai:
             )
         ]
         pkg["mtp"].graph.outputs = [
-            mock.MagicMock(name=name) for name in ("mtp_hidden", "topk_indices")
+            types.SimpleNamespace(name=name) for name in ("mtp_hidden", "topk_indices")
         ]
 
         result = write_ort_genai_config(pkg, str(tmp_path))
