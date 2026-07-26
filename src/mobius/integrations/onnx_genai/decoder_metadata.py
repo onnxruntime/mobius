@@ -140,7 +140,19 @@ def moe_metadata_from_config(
             "moe_intermediate_size and intermediate_size"
         )
 
-    shared_experts = _clean_int(getattr(config, "n_shared_experts", None)) or 0
+    shared_expert_value = None
+    for name in (
+        "n_shared_experts",
+        "moe_num_shared_experts",
+        "num_shared_expert",
+    ):
+        value = getattr(config, name, None)
+        if isinstance(value, (list, tuple)):
+            value = next((item for item in value if _clean_int(item) is not None), None)
+        if _clean_int(value) is not None:
+            shared_expert_value = value
+            break
+    shared_experts = _clean_int(shared_expert_value) or 0
     shared_intermediate_size = _clean_int(
         getattr(config, "shared_expert_intermediate_size", None)
     )

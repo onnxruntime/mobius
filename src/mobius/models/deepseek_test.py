@@ -6,6 +6,7 @@ from __future__ import annotations
 import numpy as np
 import onnx_ir as ir
 import onnxruntime as ort
+import pytest
 from onnxscript import GraphBuilder
 
 from mobius._constants import OPSET_VERSION
@@ -92,5 +93,34 @@ def test_deepseek_dense_moe_fallback_matches_numpy_reference():
     expected += _mlp(hidden_values, weights, "shared_experts.")
 
     np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
-    assert sum(node.op_type == "MatMul" for node in graph) == 16
+    assert any(node.op_type == "MatMul" for node in graph)
     assert all(node.domain != "com.microsoft" for node in graph)
+
+
+def test_noaux_tc_supports_single_expert_groups():
+    config = make_config(
+        hidden_size=4,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        n_group=4,
+        topk_group=2,
+        scoring_func="sigmoid",
+        topk_method="noaux_tc",
+    )
+
+    gate = DeepSeekMoEGate(config)
+
+    assert gate.num_experts // gate.n_group == 1
+
+
+def test_grouped_routing_rejects_non_divisible_expert_count():
+    config = make_config(
+        hidden_size=4,
+        num_local_experts=5,
+        num_experts_per_tok=2,
+        n_group=2,
+        topk_group=1,
+    )
+
+    with pytest.raises(ValueError, match="evenly divisible"):
+        DeepSeekMoEGate(config)

@@ -57,6 +57,16 @@ class DeepSeekMoEGate(nn.Module):
         self.norm_topk_prob = config.norm_topk_prob
         self.scoring_func = config.scoring_func
         self.topk_method = config.topk_method
+        if self.n_group <= 0 or self.num_experts % self.n_group:
+            raise ValueError(
+                "DeepSeek grouped routing requires num_local_experts to be evenly "
+                f"divisible by n_group, got {self.num_experts} and {self.n_group}"
+            )
+        if self.topk_group <= 0 or self.topk_group > self.n_group:
+            raise ValueError(
+                "DeepSeek grouped routing requires 1 <= topk_group <= n_group, got "
+                f"{self.topk_group} and {self.n_group}"
+            )
 
         self.weight = nn.Parameter([self.num_experts, config.hidden_size])
         # Correction bias only used with sigmoid scoring (V3)
@@ -116,7 +126,7 @@ class DeepSeekMoEGate(nn.Module):
         scores_grouped = op.Reshape(flat, [0, self.n_group, experts_per_group])
         if self.topk_method == "noaux_tc":
             # Bias-corrected routing scores groups by their two strongest experts.
-            k_two = op.Constant(value_ints=[2])
+            k_two = op.Constant(value_ints=[min(2, experts_per_group)])
             group_top2, _ = op.TopK(scores_grouped, k_two, axis=-1, _outputs=2)
             group_scores = op.ReduceSum(group_top2, [-1], keepdims=False)
         else:

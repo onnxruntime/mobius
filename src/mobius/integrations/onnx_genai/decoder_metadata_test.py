@@ -223,3 +223,24 @@ class TestDecoderMetadata:
             "normalize_weights": True,
             "scaling_factor": 1.0,
         }
+
+    @pytest.mark.parametrize(
+        ("field", "value", "expected"),
+        [
+            ("moe_num_shared_experts", 2, 2),
+            ("num_shared_expert", 3, 3),
+            ("moe_num_shared_experts", [0, 4], 4),
+        ],
+    )
+    def test_moe_metadata_reads_shared_expert_aliases(self, field, value, expected):
+        cfg = _FakeConfig()
+        cfg.num_local_experts = 8
+        cfg.num_experts_per_tok = 2
+        cfg.moe_intermediate_size = 256
+        setattr(cfg, field, value)
+
+        moe = moe_metadata_from_config(cfg)
+
+        assert moe is not None
+        assert moe["shared_expert_count"] == expected
+        assert moe["shared_expert_intermediate_size"] == expected * 256
