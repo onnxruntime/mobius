@@ -111,6 +111,7 @@ def test_apply_image_projection_matches_manual_linear_gelu_linear() -> None:
     expected = gelu @ weights.projection_second_weight.T + weights.projection_second_bias
 
     assert result.shape == (5, 16)
+    assert result.dtype == np.float32
     np.testing.assert_allclose(result, expected, rtol=1e-5, atol=1e-5)
 
 

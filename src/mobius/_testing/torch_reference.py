@@ -40,14 +40,14 @@ def _install_dynamic_cache_legacy_shims() -> None:
     if not hasattr(transformers.DynamicCache, "to_legacy_cache"):
 
         def _to_legacy_cache(self):  # type: ignore[misc]
-            legacy_cache: tuple = ()
+            legacy_cache = []
             for layer in getattr(self, "layers", []):
                 keys = getattr(layer, "keys", None)
                 values = getattr(layer, "values", None)
                 if keys is None or values is None:
                     continue
-                legacy_cache += ((keys, values),)
-            return legacy_cache
+                legacy_cache.append((keys, values))
+            return tuple(legacy_cache)
 
         transformers.DynamicCache.to_legacy_cache = _to_legacy_cache  # type: ignore[method-assign]
 

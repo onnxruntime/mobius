@@ -225,7 +225,8 @@ def _apply_image_projection(
     hidden = tokens @ weights.projection_first_weight.T + weights.projection_first_bias
     # Exact GELU (erf form), matching torch.nn.GELU()'s default approximate="none".
     hidden_tensor = torch.from_numpy(hidden)
-    activated = (0.5 * hidden_tensor * (1.0 + torch.erf(hidden_tensor / np.sqrt(2.0)))).numpy()
+    sqrt_two = hidden_tensor.new_tensor(2.0).sqrt()
+    activated = (0.5 * hidden_tensor * (1.0 + torch.erf(hidden_tensor / sqrt_two))).numpy()
     projected = activated @ weights.projection_second_weight.T + weights.projection_second_bias
     return projected.astype(np.float32)
 
