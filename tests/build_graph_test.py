@@ -2548,6 +2548,101 @@ class TestBuildGraphMultiModal:
         assert registry.get("phi4_multimodal") is registry.get("phi4mm")
         assert _default_task_for_model("phi4_multimodal") == "phi4mm-multimodal"
 
+    def test_phi3_v_vision_language_graph(self):
+        """Build Phi-3-Vision with 3-model split and verify all components."""
+        config = _base_config(
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=28,
+                patch_size=14,
+                norm_eps=1e-5,
+            ),
+            image_token_id=32044,
+        )
+        model_cls = registry.get("phi3_v")
+        module = model_cls(config)
+        task_name = _default_task_for_model("phi3_v")
+        task = get_task(task_name)
+        pkg = task.build(module, config)
+
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
+
+        decoder = pkg["decoder"]
+        assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
+        assert "logits" in {o.name for o in decoder.graph.outputs}
+
+        vision = pkg["vision_encoder"]
+        assert "pixel_values" in {i.name for i in vision.graph.inputs}
+        assert "image_features" in {o.name for o in vision.graph.outputs}
+
+        embed = pkg["embedding"]
+        assert "input_ids" in {i.name for i in embed.graph.inputs}
+        assert "inputs_embeds" in {o.name for o in embed.graph.outputs}
+
+    def test_phi4_siglip_vision_language_graph(self):
+        """Build Phi-4-Reasoning-Vision (phi4-siglip) with 3-model split and verify components."""
+        config = _base_config(
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=28,
+                patch_size=14,
+                norm_eps=1e-6,
+            ),
+            image_token_id=-200,
+        )
+        model_cls = registry.get("phi4-siglip")
+        module = model_cls(config)
+        task_name = _default_task_for_model("phi4-siglip")
+        task = get_task(task_name)
+        pkg = task.build(module, config)
+
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
+
+        decoder = pkg["decoder"]
+        assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
+        assert "logits" in {o.name for o in decoder.graph.outputs}
+
+        vision = pkg["vision_encoder"]
+        assert "pixel_values" in {i.name for i in vision.graph.inputs}
+        assert "image_features" in {o.name for o in vision.graph.outputs}
+
+        embed = pkg["embedding"]
+        assert "input_ids" in {i.name for i in embed.graph.inputs}
+        assert "inputs_embeds" in {o.name for o in embed.graph.outputs}
+
+    def test_phi3_v_decoder_excludes_vision_weights(self):
+        """Decoder weight preprocessing must not retain vision-only checkpoint tensors."""
+        import torch
+
+        from mobius.models.phi3_v import _Phi3VDecoderModel
+
+        config = _base_config(
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=28,
+                patch_size=14,
+            ),
+            image_token_id=32044,
+        )
+        weights = {
+            "model.layers.0.self_attn.qkv_proj.weight": torch.zeros(128, 64),
+            "model.vision_embed_tokens.img_processor.vision_model.weight": torch.zeros(1),
+            "lm_head.weight": torch.zeros(256, 64),
+        }
+        remapped = _Phi3VDecoderModel(config).preprocess_weights(weights)
+
+        assert "model.vision_embed_tokens.img_processor.vision_model.weight" not in remapped
+        assert "lm_head.weight" in remapped
+
 
 class TestBuildGraphWhisper:
     """Verify Whisper encoder-decoder builds with SpeechToTextTask."""
@@ -4988,6 +5083,8 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "gemma4_unified_text",
     "llava",
     "mllama",
+    "phi3_v",
+    "phi4-siglip",
     "phi4_multimodal",
     "phi4mm",
     "qwen2_5_vl",
@@ -5214,8 +5311,8 @@ class TestBuildStaticCacheGraph:
         proto = ir.serde.serialize_model(model)
         assert len(proto.SerializeToString()) > 0
 
-    def test_static_cache_attention_is_causal(self):
-        """Verify Attention ops use is_causal=1 in static cache mode."""
+    def test_static_cache_attention_uses_maskless_causal_alignment(self):
+        """Verify maskless external-cache Attention uses built-in causality."""
         model, config = self._build_static_cache_model()
 
         attention_nodes = [n for n in model.graph if n.op_type == "Attention"]
@@ -5273,6 +5370,248 @@ class TestBuildStaticCacheGraph:
         """Verify shape inference populates all output shapes and dtypes."""
         model, _ = self._build_static_cache_model()
         _assert_outputs_have_shapes_and_dtypes({"model": model}, "qwen2-static")
+
+    def _build_gemma4_static(self):
+        """Build gemma4_text with static cache: KV-sharing + dual head_dim."""
+        from mobius._configs import Gemma4Config
+        from mobius.tasks import CausalLMTask
+
+        config = _base_config(
+            _config_cls=Gemma4Config,
+            num_hidden_layers=6,
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            num_kv_shared_layers=2,  # first_kv_shared = 4 -> layers 0..3 own a cache
+            sliding_window=8,
+            global_head_dim=2 * TINY_HEAD_DIM,
+            global_rope_theta=10_000.0,
+            rope_local_base_freq=10_000.0,
+            attn_qk_norm=True,
+            hidden_size_per_layer_input=0,
+        )
+        module = registry.get("gemma4_text")(config)
+        pkg = CausalLMTask(static_cache=True, max_seq_len=self.MAX_SEQ_LEN).build(
+            module, config
+        )
+        return pkg["model"], config
+
+    def test_gemma4_static_cache_only_for_cache_owning_layers(self):
+        """Gemma4 KV-shared layers own no cache: 4 cache buffers, not 6."""
+        model, _ = self._build_gemma4_static()
+        input_names = {inp.name for inp in model.graph.inputs}
+        # first_kv_shared_layer_idx = 6 - 2 = 4 -> cache-owning layers 0..3
+        for i in range(4):
+            assert f"key_cache.{i}" in input_names
+            assert f"value_cache.{i}" in input_names
+        # No cache for the KV-shared layers (indices 4, 5).
+        assert "key_cache.4" not in input_names
+        assert "key_cache.5" not in input_names
+        output_names = {out.name for out in model.graph.outputs}
+        for i in range(4):
+            assert f"updated_key_cache.{i}" in output_names
+        assert "updated_key_cache.4" not in output_names
+
+    def test_gemma4_static_cache_dual_head_dim(self):
+        """Sliding (head_dim) and full (global_head_dim) cache buffers differ."""
+        model, _ = self._build_gemma4_static()
+        by_name = {inp.name: inp for inp in model.graph.inputs}
+        # num_kv_heads=TINY_KV_HEADS; sliding head_dim=TINY_HEAD_DIM,
+        # full head_dim=2*TINY_HEAD_DIM. Cache-owning layer 2 is full_attention.
+        sliding_kv = int(by_name["key_cache.0"].shape[2])  # layer 0 sliding
+        full_kv = int(by_name["key_cache.2"].shape[2])  # layer 2 full
+        assert sliding_kv == TINY_KV_HEADS * TINY_HEAD_DIM
+        assert full_kv == TINY_KV_HEADS * (2 * TINY_HEAD_DIM)
+
+    def test_gemma4_static_cache_has_tensorscatter(self):
+        """Gemma4 static cache uses TensorScatter for in-place KV writes."""
+        model, _ = self._build_gemma4_static()
+        op_types = {n.op_type for n in model.graph}
+        assert "TensorScatter" in op_types
+
+    def test_gemma4_static_qnn_lowering_is_htp_friendly(self):
+        """The qnn build lowers all ops the QNN HTP backend cannot run.
+
+        RotaryEmbedding -> rotate-half, TensorScatter -> ScatterND, Tile ->
+        Expand, Range -> Constant, Attention -> SDPA are all HTP-unsupported and
+        must be gone; their HTP-friendly replacements must appear.
+        """
+        from mobius._builder import build_from_module
+        from mobius._configs import Gemma4Config
+        from mobius.tasks import CausalLMTask
+
+        config = _base_config(
+            _config_cls=Gemma4Config,
+            num_hidden_layers=3,
+            layer_types=["sliding_attention", "full_attention", "sliding_attention"],
+            num_kv_shared_layers=1,
+            sliding_window=8,
+            global_head_dim=2 * TINY_HEAD_DIM,
+            global_rope_theta=10_000.0,
+            rope_local_base_freq=10_000.0,
+            attn_qk_norm=True,
+            hidden_size_per_layer_input=0,
+        )
+        module = registry.get("gemma4_text")(config)
+        model = build_from_module(
+            module,
+            config,
+            CausalLMTask(static_cache=True, max_seq_len=self.MAX_SEQ_LEN),
+            execution_provider="qnn",
+        )["model"]
+        op_types = {n.op_type for n in model.graph}
+        for forbidden in ("RotaryEmbedding", "TensorScatter", "Tile", "Range", "Attention"):
+            assert forbidden not in op_types, f"{forbidden} should be lowered for qnn"
+        assert "ScatterND" in op_types  # TensorScatter replacement
+        assert "Expand" in op_types  # Tile (GQA repeat) replacement
+
+
+class TestBuildGemma4StaticCacheGraph:
+    """Verify Gemma4TextCausalLMTask(static_cache=True) builds a valid graph."""
+
+    MAX_SEQ_LEN = 128
+
+    @staticmethod
+    def _gemma4_config(**overrides):
+        from mobius._configs import Gemma4Config
+
+        defaults = dict(
+            num_hidden_layers=6,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            global_head_dim=32,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="gelu_pytorch_tanh",
+            # Mixed: 5 sliding + 1 full (Gemma4-like hybrid pattern)
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            sliding_window=64,
+            rope_theta=10000.0,
+            global_rope_theta=1000000.0,
+            partial_rotary_factor=0.5,
+            max_position_embeddings=256,
+            hidden_size_per_layer_input=0,
+            num_kv_shared_layers=0,
+        )
+        defaults.update(overrides)
+        return Gemma4Config(**defaults)
+
+    def _build(self, **config_overrides):
+        from mobius.models.gemma4 import Gemma4CausalLMModel
+        from mobius.tasks._gemma4 import Gemma4TextCausalLMTask
+
+        config = self._gemma4_config(**config_overrides)
+        module = Gemma4CausalLMModel(config)
+        task = Gemma4TextCausalLMTask(static_cache=True, max_seq_len=self.MAX_SEQ_LEN)
+        pkg = task.build(module, config)
+        return pkg["model"], config
+
+    def test_gemma4_static_cache_builds(self):
+        """Build Gemma4 with static cache and verify basic graph structure."""
+        model, _config = self._build()
+
+        assert model.graph is not None
+        input_names = {inp.name for inp in model.graph.inputs}
+        assert "input_ids" in input_names
+        assert "position_ids" in input_names
+        # Hybrid mode: attention_mask for sliding GQA + write_indices for static
+        assert "attention_mask" in input_names
+        assert "write_indices" in input_names
+        assert "nonpad_kv_seqlen" in input_names
+
+    def test_gemma4_static_cache_hybrid_inputs(self):
+        """Verify full-attention gets static cache, sliding gets dynamic."""
+        model, _config = self._build()
+
+        input_map = {inp.name: inp for inp in model.graph.inputs}
+
+        # Layer 0-4: sliding → dynamic cache (past_key_values.N.key)
+        assert "past_key_values.0.key" in input_map
+
+        # Layer 5: full_attention → static cache (key_cache.5)
+        assert "key_cache.5" in input_map
+        kv_hidden_full = _config.num_key_value_heads * _config.global_head_dim
+        k5 = input_map["key_cache.5"]
+        assert k5.shape[2] == kv_hidden_full
+
+    def test_gemma4_static_cache_has_tensorscatter(self):
+        """Verify TensorScatter for full-attention layers in hybrid mode."""
+        model, _config = self._build()
+
+        op_counts = {}
+        for n in model.graph:
+            op_counts[n.op_type] = op_counts.get(n.op_type, 0) + 1
+
+        layer_types = _config.layer_types or []
+        num_full = sum(1 for lt in layer_types if lt == "full_attention")
+
+        # TensorScatter: 2 per full-attention layer (key + value)
+        assert op_counts.get("TensorScatter", 0) == 2 * num_full
+        # Sliding layers use either GQA (CUDA EP) or Attention (default EP)
+        # In unit tests without EP context, all use standard Attention.
+        total_attn = op_counts.get("Attention", 0) + op_counts.get("GroupQueryAttention", 0)
+        assert total_attn == _config.num_hidden_layers
+
+    def test_gemma4_static_cache_kv_shared(self):
+        """Verify KV-shared layers are excluded from cache I/O."""
+        model, config = self._build(
+            num_hidden_layers=8,
+            num_kv_shared_layers=2,
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+        )
+
+        input_names = {inp.name for inp in model.graph.inputs}
+        num_kv_layers = config.num_hidden_layers - config.num_kv_shared_layers
+
+        # Non-shared layers 0-5 should have cache entries (type depends on layer)
+        for i in range(num_kv_layers):
+            lt = config.layer_types[i]
+            if lt == "full_attention":
+                assert f"key_cache.{i}" in input_names
+            else:
+                assert f"past_key_values.{i}.key" in input_names
+
+        # Shared layers (6, 7) should NOT have any cache entries
+        assert f"key_cache.{num_kv_layers}" not in input_names
+        assert f"past_key_values.{num_kv_layers}.key" not in input_names
+
+    def test_gemma4_static_cache_input_ordering(self):
+        """Verify write_indices/nonpad_kv_seqlen come after cache inputs."""
+        model, _config = self._build()
+
+        input_names = [inp.name for inp in model.graph.inputs]
+        # write_indices and nonpad_kv_seqlen should come after all cache inputs
+        last_cache_idx = max(i for i, n in enumerate(input_names) if "cache" in n)
+        write_idx = input_names.index("write_indices")
+        nonpad_idx = input_names.index("nonpad_kv_seqlen")
+        assert write_idx > last_cache_idx, "write_indices should come after all cache inputs"
+        assert nonpad_idx > last_cache_idx, (
+            "nonpad_kv_seqlen should come after all cache inputs"
+        )
 
 
 # === Parametrized Vision-Language configs (imported from _test_configs) ===

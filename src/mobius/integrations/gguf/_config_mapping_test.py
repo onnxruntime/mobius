@@ -120,3 +120,28 @@ class TestGemma4DoubleWideMlp:
                 self._base_config([12288, 6144, 6144, 6144]),
                 {"gemma4.attention.shared_kv_layers": 2},
             )
+
+
+class TestDefaultActivation:
+    """Tests for _default_activation()."""
+
+    @pytest.mark.parametrize(
+        "model_type",
+        ["gemma", "gemma2", "gemma3_text", "gemma4_text"],
+    )
+    def test_gemma_uses_gelu_pytorch_tanh(self, model_type: str) -> None:
+        from mobius.integrations.gguf._config_mapping import _default_activation
+
+        assert _default_activation(model_type) == "gelu_pytorch_tanh"
+
+    @pytest.mark.parametrize("model_type", ["gpt2", "bloom", "starcoder2", "t5"])
+    def test_gelu_models(self, model_type: str) -> None:
+        from mobius.integrations.gguf._config_mapping import _default_activation
+
+        assert _default_activation(model_type) == "gelu"
+
+    @pytest.mark.parametrize("model_type", ["llama", "qwen2", "mistral"])
+    def test_silu_default(self, model_type: str) -> None:
+        from mobius.integrations.gguf._config_mapping import _default_activation
+
+        assert _default_activation(model_type) == "silu"

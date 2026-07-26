@@ -58,6 +58,7 @@ GGUF_ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "nemotron": "nemotron",
     "t5": "t5",
     "hunyuan-dense": "hunyuan_v1_dense",
+    "deepseek4": "deepseek_v4",
     "deci": "llama",  # DeciLM uses Llama architecture
 }
 
@@ -87,6 +88,33 @@ _DEFAULT_KEY_MAP: dict[str, str] = {
     "ssm.group_count": "linear_num_key_heads",
     "ssm.time_step_rank": "linear_num_value_heads",
     "ssm.conv_kernel": "linear_conv_kernel_dim",
+}
+
+_ARCH_KEY_MAPS: dict[str, dict[str, str]] = {
+    "deepseek4": {
+        "attention.key_length": "head_dim",
+        "rope.dimension_count": "qk_rope_head_dim",
+        "attention.q_lora_rank": "q_lora_rank",
+        "attention.sliding_window": "sliding_window",
+        "expert_count": "num_local_experts",
+        "expert_used_count": "num_experts_per_tok",
+        "expert_feed_forward_length": "moe_intermediate_size",
+        "expert_shared_count": "n_shared_experts",
+        "expert_weights_scale": "routed_scaling_factor",
+        "expert_weights_norm": "norm_topk_prob",
+        "swiglu_clamp_exp": "swiglu_limit",
+        "attention.indexer.head_count": "index_n_heads",
+        "attention.indexer.key_length": "index_head_dim",
+        "attention.indexer.top_k": "index_topk",
+        "attention.output_group_count": "o_groups",
+        "attention.output_lora_rank": "o_lora_rank",
+        "attention.compress_ratios": "compress_ratios",
+        "attention.compress_rope_freq_base": "compress_rope_theta",
+        "hyper_connection.count": "hc_mult",
+        "hyper_connection.sinkhorn_iterations": "hc_sinkhorn_iters",
+        "hyper_connection.epsilon": "hc_eps",
+        "hash_layer_count": "num_hash_layers",
+    }
 }
 
 
@@ -142,12 +170,18 @@ def _extract_config_fields(
             gguf_arch,
             len(hf_fields),
         )
-    else:
-        # Fallback to standard key names
-        for gguf_suffix, hf_key in _DEFAULT_KEY_MAP.items():
-            full_key = f"{gguf_arch}.{gguf_suffix}"
-            if full_key in metadata:
-                hf_fields[hf_key] = metadata[full_key]
+    # Always apply standard and mobius architecture-specific mappings. This
+    # fills fields omitted by Transformers mappings and supports new GGUF
+    # architectures before they are added upstream.
+    fallback_mapping = {
+        **_DEFAULT_KEY_MAP,
+        **_ARCH_KEY_MAPS.get(gguf_arch, {}),
+    }
+    for gguf_suffix, hf_key in fallback_mapping.items():
+        full_key = f"{gguf_arch}.{gguf_suffix}"
+        if full_key in metadata:
+            hf_fields[hf_key] = metadata[full_key]
+    if hf_mapping is None:
         logger.debug(
             "Used default GGUF key mapping for '%s': %d fields",
             gguf_arch,
@@ -258,7 +292,9 @@ def gguf_to_config(
 
     # Derive rope_interleave from rope.dimension_sections metadata.
     rope_sections = metadata.get(f"{gguf_arch}.rope.dimension_sections")
-    rope_interleave = rope_sections is not None and any(s > 0 for s in rope_sections)
+    rope_interleave = gguf_arch == "deepseek4" or (
+        rope_sections is not None and any(s > 0 for s in rope_sections)
+    )
 
     # Derive rope_type from rope.scaling.type. GGUF stores the scaling
     # variant under ``<arch>.rope.scaling.type`` (or omits the key for the
@@ -285,6 +321,17 @@ def gguf_to_config(
                 rope_scaling_type,
             )
             rope_type = "default"
+
+    if rope_type == "yarn":
+        rope_scaling = {
+            "type": "yarn",
+            "factor": metadata.get(f"{gguf_arch}.rope.scaling.factor", 1.0),
+            "original_max_position_embeddings": metadata.get(
+                f"{gguf_arch}.rope.scaling.original_context_length"
+            ),
+            "beta_fast": metadata.get(f"{gguf_arch}.rope.scaling.yarn_beta_fast", 32.0),
+            "beta_slow": metadata.get(f"{gguf_arch}.rope.scaling.yarn_beta_slow", 1.0),
+        }
 
     # HunYuan-V1-Dense: HF runs dynamic-NTK RoPE with rope_theta=10000 and
     # alpha=1000. The Tencent quantization pipeline bakes those into a
@@ -318,6 +365,10 @@ def gguf_to_config(
 
     # Build config — required fields validated above, optional fields
     # use safe defaults
+    swiglu_limit = hf_fields.get("swiglu_limit", 0.0)
+    if isinstance(swiglu_limit, (list, np.ndarray)):
+        swiglu_limit = swiglu_limit[0] if len(swiglu_limit) else 0.0
+
     config = ArchitectureConfig(
         hidden_size=hidden_size,
         intermediate_size=hf_fields.get("intermediate_size", 4 * hidden_size),
@@ -346,6 +397,34 @@ def gguf_to_config(
         num_experts_per_tok=hf_fields.get("num_experts_per_tok"),
         moe_intermediate_size=hf_fields.get("moe_intermediate_size"),
         shared_expert_intermediate_size=hf_fields.get("shared_expert_intermediate_size"),
+        n_shared_experts=hf_fields.get("n_shared_experts"),
+        norm_topk_prob=hf_fields.get("norm_topk_prob", True),
+        routed_scaling_factor=hf_fields.get("routed_scaling_factor", 1.0),
+        scoring_func=(
+            "sqrtsoftplus"
+            if gguf_arch == "deepseek4"
+            else hf_fields.get("scoring_func", "softmax")
+        ),
+        q_lora_rank=hf_fields.get("q_lora_rank"),
+        qk_rope_head_dim=hf_fields.get("qk_rope_head_dim"),
+        o_groups=hf_fields.get("o_groups", 1),
+        o_lora_rank=hf_fields.get("o_lora_rank"),
+        index_n_heads=hf_fields.get("index_n_heads"),
+        index_head_dim=hf_fields.get("index_head_dim"),
+        index_topk=hf_fields.get("index_topk"),
+        compress_ratios=hf_fields.get("compress_ratios"),
+        compress_rope_theta=hf_fields.get("compress_rope_theta"),
+        hc_mult=hf_fields.get("hc_mult", 1),
+        hc_sinkhorn_iters=hf_fields.get("hc_sinkhorn_iters", 1),
+        hc_eps=hf_fields.get("hc_eps", 1e-6),
+        num_hash_layers=hf_fields.get("num_hash_layers", 0),
+        swiglu_limit=swiglu_limit,
+        sliding_window=hf_fields.get("sliding_window"),
+        original_max_position_embeddings=(
+            rope_scaling.get("original_max_position_embeddings")
+            if rope_scaling is not None
+            else None
+        ),
         # Hybrid architecture fields
         layer_types=layer_types,
         full_attention_interval=full_attention_interval,
@@ -650,6 +729,12 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
 
 def _default_activation(model_type: str) -> str:
     """Return the default activation function for a model type."""
+    # Gemma models use the approximate-tanh GELU (GeGLU) in every MLP block.
+    # Gemma GGUFs typically omit the activation metadata key, so guard against
+    # the generic SiLU default below (using SiLU here silently degrades Gemma
+    # output to near-garbage).
+    if model_type.startswith("gemma"):
+        return "gelu_pytorch_tanh"
     # Most modern models use SiLU/Swish
     gelu_models = {"gpt2", "bloom", "starcoder2", "t5"}
     if model_type in gelu_models:

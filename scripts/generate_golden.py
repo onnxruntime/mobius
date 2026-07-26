@@ -403,24 +403,39 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
     # Load images from testdata/
     images = [Image.open(Path("testdata") / img_path) for img_path in case.images]
 
-    # Build chat-formatted prompt with image placeholders if the processor has a
-    # usable chat template (Qwen-VL, Gemma-3, etc.). Base checkpoints (e.g.
-    # google/gemma-4-12B) ship no chat template, so fall back to manually
-    # prepending one image placeholder token per image — the processor then
-    # expands each into the correct number of soft tokens (mirrors how
-    # examples/gemma4_unified_ort_genai.py formats image prompts).
+    # Build a chat-formatted prompt when a usable template is available.
+    # Phi-3 Vision exposes its template on the underlying tokenizer rather
+    # than on the processor.
     prompt_text = case.prompts[0]
+    template_applied = False
     if getattr(processor, "chat_template", None):
         content: list[dict[str, str]] = []
         for img_path in case.images:
             content.append({"type": "image", "image": str(Path("testdata") / img_path)})
         content.append({"type": "text", "text": prompt_text})
         messages = [{"role": "user", "content": content}]
-        prompt_text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-    elif getattr(processor, "image_token", None):
-        prompt_text = processor.image_token * len(case.images) + prompt_text
+        try:
+            prompt_text = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            template_applied = True
+        except (AttributeError, ValueError):
+            pass
+    if not template_applied:
+        tokenizer_inner = getattr(processor, "tokenizer", None)
+        img_tokens = getattr(processor, "img_tokens", None)
+        if (
+            tokenizer_inner is not None
+            and img_tokens is not None
+            and getattr(tokenizer_inner, "chat_template", None)
+        ):
+            img_prefix = "".join(f"{img_tokens[i]}\n" for i in range(len(images)))
+            messages = [{"role": "user", "content": img_prefix + prompt_text}]
+            prompt_text = tokenizer_inner.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        elif getattr(processor, "image_token", None):
+            prompt_text = processor.image_token * len(case.images) + prompt_text
 
     # Process multimodal inputs through the HF processor
     processed = processor(
