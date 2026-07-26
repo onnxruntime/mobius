@@ -246,9 +246,6 @@ class _Phi3VEmbeddingModel(nn.Module):
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
         self.hidden_size = config.hidden_size
-        self.image_token_id = (
-            config.image_token_id if config.image_token_id is not None else _IMAGE_TOKEN_ID
-        )
 
     def forward(self, op: builder.OpBuilder, input_ids: ir.Value, image_features: ir.Value):
         # (batch, seq_len, hidden_size)

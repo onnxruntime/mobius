@@ -11,7 +11,7 @@ separators, and the ``img_projection`` MLP) is image-size dependent: the crop
 grid, the separator interleaving, and the final token count all vary with the
 input image resolution, so they cannot be expressed as a static ONNX graph.
 
-This module reproduces that host-side tail faithfully in NumPy, mirroring
+This module reproduces that host-side tail faithfully with NumPy and PyTorch, mirroring
 ``modeling_phi3_v.py`` (``hd_feature_transform`` → ``reshape_hd_patches_2x2merge``
 → ``add_image_newline`` → ``img_projection``). The output is the flat sequence
 of projected image embeddings ``(total_image_tokens, hidden_size)`` that the

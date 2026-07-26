@@ -25,6 +25,7 @@ Run::
 from __future__ import annotations
 
 import dataclasses
+import functools
 import os
 import warnings
 from pathlib import Path
@@ -49,6 +50,16 @@ from mobius._testing.golden import (
 )
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius._testing.parity import ParityResult, compare_golden
+
+
+@functools.cache
+def _load_phi3_vision_projector_weights_cached(model_id: str):
+    from mobius.models._phi3_vision_projector import (
+        load_phi3_vision_projector_weights,
+    )
+
+    return load_phi3_vision_projector_weights(model_id)
+
 
 # Root of test data (images, audio, etc.)
 _TESTDATA_DIR = Path(__file__).resolve().parent.parent / "testdata"
@@ -163,6 +174,12 @@ def _build_mm_prompt(
         and numbered_media_tokens is not None
         and getattr(inner_tokenizer, "chat_template", None)
     ):
+        if len(media_paths) > len(numbered_media_tokens):
+            raise ValueError(
+                f"{type(processor).__name__} exposes {len(numbered_media_tokens)} "
+                f"numbered {media_kind} placeholders, but the case requested "
+                f"{len(media_paths)} media items"
+            )
         media_prefix = "".join(
             f"{numbered_media_tokens[index]}\n" for index in range(len(media_paths))
         )
@@ -174,6 +191,25 @@ def _build_mm_prompt(
     if placeholder:
         return placeholder * len(media_paths) + base_prompt
     return base_prompt
+
+
+def test_build_mm_prompt_rejects_more_media_than_numbered_tokens():
+    tokenizer = type(
+        "_Tokenizer",
+        (),
+        {
+            "chat_template": "template",
+            "apply_chat_template": lambda *args, **kwargs: "",
+        },
+    )()
+    processor = type(
+        "_Processor",
+        (),
+        {"tokenizer": tokenizer, "img_tokens": ["<|image_1|>"]},
+    )()
+
+    with pytest.raises(ValueError, match="exposes 1 numbered image placeholders"):
+        _build_mm_prompt(processor, "describe", ["a.png", "b.png"], "image")
 
 
 def _make_empty_kv_cache(
@@ -752,7 +788,6 @@ def _run_vl_vision_to_image_features(
     try:
         if case.model_type == "phi3_v":
             from mobius.models._phi3_vision_projector import (
-                load_phi3_vision_projector_weights,
                 phi3_vision_hd_feature_transform,
             )
 
@@ -773,7 +808,7 @@ def _run_vl_vision_to_image_features(
             image_features_per_crop = raw_patch_features.reshape(
                 num_images, num_crops_including_global, -1, image_dim_out
             )
-            projector_weights = load_phi3_vision_projector_weights(case.model_id)
+            projector_weights = _load_phi3_vision_projector_weights_cached(case.model_id)
             projected = phi3_vision_hd_feature_transform(
                 image_features_per_crop,
                 np.asarray(processed["image_sizes"]),
