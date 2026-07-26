@@ -29,6 +29,7 @@ import functools
 import os
 import warnings
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -210,6 +211,19 @@ def test_build_mm_prompt_rejects_more_media_than_numbered_tokens():
 
     with pytest.raises(ValueError, match="exposes 1 numbered image placeholders"):
         _build_mm_prompt(processor, "describe", ["a.png", "b.png"], "image")
+
+
+def test_phi3_vision_projector_weights_are_cached():
+    _load_phi3_vision_projector_weights_cached.cache_clear()
+    weights = object()
+    with mock.patch(
+        "mobius.models._phi3_vision_projector.load_phi3_vision_projector_weights",
+        return_value=weights,
+    ) as load:
+        assert _load_phi3_vision_projector_weights_cached("model-id") is weights
+        assert _load_phi3_vision_projector_weights_cached("model-id") is weights
+    load.assert_called_once_with("model-id")
+    _load_phi3_vision_projector_weights_cached.cache_clear()
 
 
 def _make_empty_kv_cache(
