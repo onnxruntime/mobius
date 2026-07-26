@@ -49,7 +49,7 @@ Reference: ``microsoft/Phi-3-vision-128k-instruct``,
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 from onnxscript import nn
@@ -201,7 +201,7 @@ class _Phi3VVisionEncoderModel(nn.Module):
         assert config.vision is not None, "Phi3-V requires a vision config"
         clip_config = ClipVisionConfigView(config.vision)
         self.vision_tower = CLIPVisionModel(
-            clip_config,
+            cast(ArchitectureConfig, clip_config),
             feature_layer=config.vision.feature_layer,
             drop_class_token=True,
         )
