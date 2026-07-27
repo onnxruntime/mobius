@@ -260,6 +260,11 @@ class MoELayer(nn.Module):
       (:func:`_supported_qmoe_quantization`) and the gate implements
       ``qmoe_routing``. Expert weights are packed into quantized
       ``fc1``/``fc2`` parameters instead of per-expert ``MLP`` modules.
+
+    The loop-over-experts path is the portable dense fallback representation:
+    it uses only standard ONNX operators, evaluates every expert for every
+    token, then masks and weights each contribution. It is a correctness oracle
+    and compatibility path, not the grouped-expert performance representation.
     """
 
     def __init__(self, config: ArchitectureConfig, gate: nn.Module | None = None):

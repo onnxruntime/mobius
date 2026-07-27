@@ -74,6 +74,7 @@ def build_decoder_metadata(
     sliding_window: int | None = None,
     sink_tokens: int | None = None,
     architecture: str | None = None,
+    mixture_of_experts: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the onnx-genai ``inference_metadata`` dict for a decoder LLM.
 
@@ -90,9 +91,11 @@ def build_decoder_metadata(
         sliding_window: Sliding-window length in tokens (None = full context).
         sink_tokens: Attention-sink tokens retained with the sliding window.
         architecture: Optional architecture hint (e.g. ``"llama"``).
+        mixture_of_experts: Explicit, architecture-neutral MoE graph contract.
 
     Returns:
         A dict ready to serialize to ``inference_metadata.yaml``.
+
     """
     if num_attention_heads < 1 or head_dim < 1:
         raise ValueError("num_attention_heads and head_dim must be >= 1")
@@ -140,6 +143,8 @@ def build_decoder_metadata(
         model["architecture"] = architecture
     if max_sequence_length:
         model["max_sequence_length"] = max_sequence_length
+    if mixture_of_experts is not None:
+        model["mixture_of_experts"] = mixture_of_experts
 
     metadata: dict[str, Any] = {"required_capabilities": capabilities, "model": model}
     if kv_native_dtype:
@@ -147,6 +152,105 @@ def build_decoder_metadata(
             "native_dtype": _canonical_float_dtype(kv_native_dtype) or kv_native_dtype
         }
     return metadata
+
+
+def moe_metadata_from_config(
+    config: Any, *, representation: str = "dense_fallback"
+) -> dict[str, Any] | None:
+    """Build generic MoE metadata from explicit architecture configuration.
+
+    Returns ``None`` for dense models. The emitted contract describes graph
+    structure and router semantics only; it never dispatches on a model name.
+    """
+    routed_experts = _clean_int(getattr(config, "num_local_experts", None))
+    if routed_experts is None or routed_experts <= 1:
+        return None
+
+    experts_per_token = _clean_int(getattr(config, "num_experts_per_tok", None))
+    expert_intermediate_size = _clean_int(
+        getattr(config, "moe_intermediate_size", None)
+    ) or _clean_int(getattr(config, "intermediate_size", None))
+    if experts_per_token is None:
+        raise ValueError(
+            "cannot emit mixture_of_experts metadata: config is missing num_experts_per_tok"
+        )
+    if experts_per_token > routed_experts:
+        raise ValueError(
+            "cannot emit mixture_of_experts metadata: num_experts_per_tok "
+            f"({experts_per_token}) exceeds num_local_experts ({routed_experts})"
+        )
+    if expert_intermediate_size is None:
+        raise ValueError(
+            "cannot emit mixture_of_experts metadata: config lacks both "
+            "moe_intermediate_size and intermediate_size"
+        )
+
+    shared_expert_value = None
+    for name in (
+        "n_shared_experts",
+        "moe_num_shared_experts",
+        "num_shared_expert",
+    ):
+        value = getattr(config, name, None)
+        if isinstance(value, (list, tuple)):
+            value = next((item for item in value if _clean_int(item) is not None), None)
+        if _clean_int(value) is not None:
+            shared_expert_value = value
+            break
+    shared_experts = _clean_int(shared_expert_value) or 0
+    shared_intermediate_size = _clean_int(
+        getattr(config, "shared_expert_intermediate_size", None)
+    )
+    if shared_intermediate_size is None:
+        shared_intermediate_size = shared_experts * expert_intermediate_size
+
+    score_function = str(getattr(config, "scoring_func", "softmax")).lower()
+    topk_method = str(getattr(config, "topk_method", "greedy")).lower()
+    raw_group_count = getattr(config, "n_group", None)
+    raw_groups_per_token = getattr(config, "topk_group", None)
+    group_count = _clean_int(raw_group_count)
+    groups_per_token = _clean_int(raw_groups_per_token)
+    if raw_group_count is not None and group_count is None:
+        raise ValueError("cannot emit mixture_of_experts metadata: n_group must be positive")
+    group_count = group_count or 1
+    selection_method = (
+        "grouped_top_k" if group_count > 1 and topk_method != "greedy" else "top_k"
+    )
+    if selection_method == "grouped_top_k":
+        if routed_experts % group_count:
+            raise ValueError(
+                "cannot emit mixture_of_experts metadata: num_local_experts "
+                f"({routed_experts}) must be divisible by n_group ({group_count})"
+            )
+        if groups_per_token is None or groups_per_token > group_count:
+            raise ValueError(
+                "cannot emit mixture_of_experts metadata: topk_group must satisfy "
+                f"1 <= topk_group <= n_group ({group_count})"
+            )
+    else:
+        groups_per_token = groups_per_token or 1
+
+    router: dict[str, Any] = {
+        "score_function": score_function,
+        "selection_method": selection_method,
+        "normalize_weights": bool(getattr(config, "norm_topk_prob", True)),
+        "scaling_factor": float(getattr(config, "routed_scaling_factor", 1.0)),
+    }
+    if selection_method == "grouped_top_k":
+        router["group_count"] = group_count
+        router["groups_per_token"] = groups_per_token
+        router["group_score"] = "top_2_sum" if topk_method == "noaux_tc" else "maximum"
+
+    return {
+        "representation": representation,
+        "routed_expert_count": routed_experts,
+        "shared_expert_count": shared_experts,
+        "experts_per_token": experts_per_token,
+        "expert_intermediate_size": expert_intermediate_size,
+        "shared_expert_intermediate_size": shared_intermediate_size,
+        "activation": str(getattr(config, "hidden_act", None) or "silu").lower(),
+        "router": router,
+    }
 
 
 def decoder_metadata_from_config(
@@ -183,6 +287,7 @@ def decoder_metadata_from_config(
         kv_native_dtype=kv_native_dtype,
         architecture=getattr(config, "architecture", None)
         or getattr(config, "model_type", None),
+        mixture_of_experts=moe_metadata_from_config(config),
     )
 
 
