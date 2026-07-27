@@ -681,7 +681,7 @@ class ArchitectureConfig(BaseModelConfig):
                 or 0
             ),
             hidden_size=_as_int(hidden_size),
-            intermediate_size=(
+            intermediate_size=_as_int(
                 getattr(config, "intermediate_size", None)
                 or getattr(config, "mlp_hidden_size", None)
                 or getattr(config, "n_inner", None)
