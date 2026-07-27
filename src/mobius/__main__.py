@@ -428,26 +428,34 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
     output_dir = args.output or os.path.splitext(gguf_path)[0] + "_onnx"
     os.makedirs(output_dir, exist_ok=True)
 
-    if args.max_seq_len is not None and not args.static_cache:
+    static_cache = getattr(args, "static_cache", False)
+    max_seq_len = getattr(args, "max_seq_len", None)
+    if max_seq_len is not None and not static_cache:
         raise SystemExit("Error: --max-seq-len can only be used with --static-cache.")
-    if args.max_seq_len is not None and args.max_seq_len <= 0:
+    if max_seq_len is not None and max_seq_len <= 0:
         raise SystemExit("Error: --max-seq-len must be a positive integer.")
-    if mmproj_path is not None and args.static_cache:
+    if mmproj_path is not None and static_cache:
         raise SystemExit("Error: --static-cache cannot be used with --mmproj.")
 
     if mmproj_path is not None:
         print(f"Multimodal mode: fusing vision/audio encoder from mmproj {mmproj_path}...")
-
-    pkg = build_from_gguf(
-        gguf_path,
-        mmproj=mmproj_path,
-        dtype=args.dtype,
-        keep_quantized=args.keep_quantized,
-        execution_provider=args.execution_provider,
-        static_cache=args.static_cache,
-        max_seq_len=args.max_seq_len,
-        include_audio=getattr(args, "include_audio", False),
-    )
+        pkg = build_from_gguf(
+            gguf_path,
+            mmproj=mmproj_path,
+            dtype=args.dtype,
+            execution_provider=args.execution_provider,
+            keep_quantized=args.keep_quantized,
+            include_audio=getattr(args, "include_audio", False),
+        )
+    else:
+        pkg = build_from_gguf(
+            gguf_path,
+            dtype=args.dtype,
+            keep_quantized=args.keep_quantized,
+            execution_provider=args.execution_provider,
+            static_cache=static_cache,
+            max_seq_len=max_seq_len,
+        )
 
     pkg.save(
         output_dir,

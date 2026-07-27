@@ -198,6 +198,7 @@ class BlockQuantizedLinear(nn.Module):
     legacy custom-op namespace and uses the runtime's registered
     ``pkg.nxrt`` domain instead.
     """
+
     def __init__(
         self,
         in_features: int,
