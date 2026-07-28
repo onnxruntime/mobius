@@ -42,6 +42,7 @@ GGUF_ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "qwen2_moe": "qwen2_moe",
     "qwen3": "qwen3",
     "qwen3_moe": "qwen3_moe",
+    "qwen35": "qwen3_5_text",
     "qwen35moe": "qwen3_5_moe",
     "glm-dsa": "glm_moe_dsa",
     "gemma2": "gemma2",
