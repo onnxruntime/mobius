@@ -910,9 +910,7 @@ def _decoder_io(
         cross_kv_inputs,
         cross_kv_outputs,
         state_pairs,
-    ) = _state_and_kv_pairs(
-        state_inputs, state_outputs, config
-    )
+    ) = _state_and_kv_pairs(state_inputs, state_outputs, config)
     if kv_inputs:
         io["kv_inputs"] = kv_inputs
         io["kv_outputs"] = kv_outputs
@@ -1010,15 +1008,19 @@ def _input_source_map(
                 "generator": generator,
             }
 
-    for input_name, output_name in zip(
-        decoder_io.get("kv_inputs", []),
-        decoder_io.get("kv_outputs", []),
+    for input_field, output_field in (
+        ("kv_inputs", "kv_outputs"),
+        ("cross_kv_inputs", "cross_kv_outputs"),
     ):
-        sources[f"{decoder_name}.{input_name}"] = {
-            "kind": "stateful",
-            "from": f"{decoder_name}.{output_name}",
-            "update": decoder_io.get("kv_update", "append"),
-        }
+        for input_name, output_name in zip(
+            decoder_io.get(input_field, []),
+            decoder_io.get(output_field, []),
+        ):
+            sources[f"{decoder_name}.{input_name}"] = {
+                "kind": "stateful",
+                "from": f"{decoder_name}.{output_name}",
+                "update": decoder_io.get("kv_update", "append"),
+            }
     for pair in decoder_io.get("state_pairs", []):
         sources[f"{decoder_name}.{pair['input']}"] = {
             "kind": "stateful",
@@ -1280,7 +1282,9 @@ def add_explicit_package_io(
         component_ios[name] = io
 
     def annotate_strategy(strategy: dict[str, Any]) -> None:
-        if strategy.get("kind") == "nested_autoregressive":
+        if strategy.get("kind") == "nested_autoregressive" and not strategy.get(
+            "inner_embedding_output"
+        ):
             inner_name = strategy.get("inner")
             inner_io = component_ios.get(inner_name, {})
             hidden_output = inner_io.get("hidden_output")

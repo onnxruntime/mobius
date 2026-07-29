@@ -24,6 +24,9 @@ from mobius._pipeline_contract import (
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
+    _decoder_io,
+    _input_source_map,
+    _port,
     add_explicit_package_io,
     build_diffusion_pipeline_metadata,
     build_language_diffusion_pipeline_metadata,
@@ -359,6 +362,155 @@ class TestExplicitPackageIo:
         assert decoder_io["token_input"] == "decoder_tokens"
         assert decoder_io["encoder_hidden_states_input"] == "encoder_hidden_states"
         assert decoder_io["logits_output"] == "logits"
+
+    def test_cross_attention_cache_inputs_are_loop_state(self):
+        inputs = [
+            _value("input_ids", ir.DataType.INT64, ["batch", "sequence"]),
+            _value(
+                "encoder_hidden_states",
+                ir.DataType.FLOAT,
+                ["batch", "encoder_sequence", 64],
+            ),
+            _value(
+                "past_key_values.0.self.key",
+                ir.DataType.FLOAT,
+                ["batch", 2, "past_sequence", 8],
+            ),
+            _value(
+                "past_key_values.0.self.value",
+                ir.DataType.FLOAT,
+                ["batch", 2, "past_sequence", 8],
+            ),
+            _value(
+                "past_key_values.0.cross.key",
+                ir.DataType.FLOAT,
+                ["batch", 2, "encoder_sequence", 8],
+            ),
+            _value(
+                "past_key_values.0.cross.value",
+                ir.DataType.FLOAT,
+                ["batch", 2, "encoder_sequence", 8],
+            ),
+        ]
+        outputs = [
+            ("logits", ir.DataType.FLOAT, ["batch", "sequence", 128]),
+            (
+                "present.0.self.key",
+                ir.DataType.FLOAT,
+                ["batch", 2, "total_sequence", 8],
+            ),
+            (
+                "present.0.self.value",
+                ir.DataType.FLOAT,
+                ["batch", 2, "total_sequence", 8],
+            ),
+            (
+                "present.0.cross.key",
+                ir.DataType.FLOAT,
+                ["batch", 2, "encoder_sequence", 8],
+            ),
+            (
+                "present.0.cross.value",
+                ir.DataType.FLOAT,
+                ["batch", 2, "encoder_sequence", 8],
+            ),
+        ]
+        decoder = _model("decoder", inputs, outputs)
+        decoder_io, _ = _decoder_io(decoder, {"encoder_hidden_states"}, _VlmConfig())
+        ports = {
+            "decoder": {
+                "inputs": [_port(value) for value in decoder.graph.inputs],
+                "outputs": [_port(value) for value in decoder.graph.outputs],
+            }
+        }
+        models = {"decoder": {"io": decoder_io}}
+        sources = _input_source_map(
+            ports=ports,
+            dataflow=[],
+            models=models,
+            decoder_name="decoder",
+            image_endpoints=set(),
+        )
+        assert sources["decoder.past_key_values.0.cross.key"] == {
+            "kind": "stateful",
+            "from": "decoder.present.0.cross.key",
+            "update": "append",
+        }
+        assert sources["decoder.past_key_values.0.cross.value"] == {
+            "kind": "stateful",
+            "from": "decoder.present.0.cross.value",
+            "update": "append",
+        }
+
+    @staticmethod
+    def _nested_package(inner_outputs):
+        talker = _model(
+            "talker",
+            [_value("inputs_embeds", ir.DataType.FLOAT, ["batch", "sequence", 64])],
+            [("logits", ir.DataType.FLOAT, ["batch", "sequence", 128])],
+        )
+        code_predictor = _model(
+            "code_predictor",
+            [_value("inputs_embeds", ir.DataType.FLOAT, ["batch", "sequence", 64])],
+            inner_outputs,
+        )
+        return {"talker": talker, "code_predictor": code_predictor}
+
+    @staticmethod
+    def _nested_metadata(inner_embedding_output=None):
+        strategy = {
+            "kind": "nested_autoregressive",
+            "outer": "talker",
+            "inner": "code_predictor",
+        }
+        if inner_embedding_output is not None:
+            strategy["inner_embedding_output"] = inner_embedding_output
+        return {
+            "pipeline": {
+                "models": {
+                    "talker": {"type": "decoder"},
+                    "code_predictor": {"type": "decoder"},
+                },
+                "dataflow": [],
+                "strategy": strategy,
+            }
+        }
+
+    def test_explicit_inner_embedding_output_is_preserved(self):
+        metadata = self._nested_metadata("declared_embedding")
+        package = self._nested_package(
+            [("logits", ir.DataType.FLOAT, ["batch", "sequence", 128])]
+        )
+        add_explicit_package_io(metadata, package, _VlmConfig())
+        assert (
+            metadata["pipeline"]["strategy"]["inner_embedding_output"] == "declared_embedding"
+        )
+
+    def test_missing_inner_embedding_output_is_derived(self):
+        metadata = self._nested_metadata()
+        package = self._nested_package(
+            [
+                ("logits", ir.DataType.FLOAT, ["batch", "sequence", 128]),
+                ("codec_embeddings", ir.DataType.FLOAT, [16, 64]),
+            ]
+        )
+        add_explicit_package_io(metadata, package, _VlmConfig())
+        assert metadata["pipeline"]["strategy"]["inner_embedding_output"] == "codec_embeddings"
+
+    def test_ambiguous_inner_embedding_output_fails_actionably(self):
+        metadata = self._nested_metadata()
+        package = self._nested_package(
+            [
+                ("logits", ir.DataType.FLOAT, ["batch", "sequence", 128]),
+                ("first_embedding", ir.DataType.FLOAT, [16, 64]),
+                ("second_embedding", ir.DataType.FLOAT, [16, 64]),
+            ]
+        )
+        with pytest.raises(
+            ValueError,
+            match=r"pipeline\.strategy\.inner_embedding_output.*no unique",
+        ):
+            add_explicit_package_io(metadata, package, _VlmConfig())
 
 
 def _native_package(

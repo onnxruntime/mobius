@@ -297,9 +297,7 @@ def test_dispatch_speech_to_text_pipeline(tmp_path):
     pkg = _EncoderDecoderPkg(
         {
             "encoder": _FakeModel(["input_features"], ["encoder_hidden_states"]),
-            "decoder": _FakeModel(
-                ["decoder_input_ids", "encoder_hidden_states"], ["logits"]
-            ),
+            "decoder": _FakeModel(["decoder_input_ids", "encoder_hidden_states"], ["logits"]),
         }
     )
     artifacts = write_onnx_genai_config(pkg, str(tmp_path), kv_native_dtype="bf16")
@@ -405,9 +403,7 @@ def test_dispatch_multi_decoder_tts_with_pre_embedder(tmp_path):
     pkg = _TTSPkg(
         {
             "talker": _FakeModel(["inputs_embeds"], ["logits", "last_hidden_state"]),
-            "code_predictor": _FakeModel(
-                ["inputs_embeds"], ["logits", "codec_embeddings"]
-            ),
+            "code_predictor": _FakeModel(["inputs_embeds"], ["logits", "codec_embeddings"]),
             "talker_step_embedder": _FakeModel(["frame_codes"], ["inputs_embeds"]),
             "talker_prefill_embedder": _FakeModel(
                 ["text_ids"], ["prefill_embeds", "trailing_text_embeds"]
