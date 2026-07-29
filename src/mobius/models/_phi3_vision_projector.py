@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import dataclasses
 import glob
+import json
 import os
 
 import numpy as np
@@ -42,6 +43,8 @@ _PROJECTION_FIRST_WEIGHT_KEY = _PROJECTOR_PREFIX + "img_projection.0.weight"
 _PROJECTION_FIRST_BIAS_KEY = _PROJECTOR_PREFIX + "img_projection.0.bias"
 _PROJECTION_SECOND_WEIGHT_KEY = _PROJECTOR_PREFIX + "img_projection.2.weight"
 _PROJECTION_SECOND_BIAS_KEY = _PROJECTOR_PREFIX + "img_projection.2.bias"
+_WEIGHT_INDEX_NAME = "model.safetensors.index.json"
+_SINGLE_WEIGHT_NAME = "model.safetensors"
 
 # CLIP ViT-L/14-336 produces a 24x24 patch grid (576 patches).
 _PATCH_GRID_SIDE = 24
@@ -75,18 +78,46 @@ class Phi3VisionProjectorWeights:
     projection_second_bias: np.ndarray
 
 
-def _resolve_checkpoint_directory(model_id_or_directory: str) -> str:
-    """Return a local directory that contains the checkpoint safetensors.
+def _resolve_checkpoint_shard_paths(model_id_or_directory: str) -> list[str]:
+    """Return local safetensors shard paths for a checkpoint.
 
     Accepts either a local path or a HuggingFace hub model id (which is
     resolved via the local cache; the weights must already be downloaded).
     """
     if os.path.isdir(model_id_or_directory):
-        return model_id_or_directory
+        return sorted(glob.glob(os.path.join(model_id_or_directory, "*.safetensors")))
 
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
 
-    return snapshot_download(model_id_or_directory, local_files_only=True)
+    try:
+        index_path = hf_hub_download(
+            repo_id=model_id_or_directory,
+            filename=_WEIGHT_INDEX_NAME,
+            local_files_only=True,
+        )
+        with open(index_path, encoding="utf-8") as f:
+            index = json.load(f)
+        filenames = sorted(set(index["weight_map"].values()))
+    except (EntryNotFoundError, LocalEntryNotFoundError):
+        filenames = [_SINGLE_WEIGHT_NAME]
+
+    shard_paths: list[str] = []
+    for filename in filenames:
+        try:
+            shard_paths.append(
+                hf_hub_download(
+                    repo_id=model_id_or_directory,
+                    filename=filename,
+                    local_files_only=True,
+                )
+            )
+        except (EntryNotFoundError, LocalEntryNotFoundError) as exc:
+            raise FileNotFoundError(
+                f"Could not find cached safetensors shard {filename!r} for "
+                f"{model_id_or_directory!r}. Build/load the model weights first."
+            ) from exc
+    return shard_paths
 
 
 def load_phi3_vision_projector_weights(
@@ -111,11 +142,10 @@ def load_phi3_vision_projector_weights(
     """
     from safetensors import safe_open
 
-    directory = _resolve_checkpoint_directory(model_id_or_directory)
-    shard_paths = sorted(glob.glob(os.path.join(directory, "*.safetensors")))
+    shard_paths = _resolve_checkpoint_shard_paths(model_id_or_directory)
     if not shard_paths:
         raise FileNotFoundError(
-            f"No .safetensors shards found in checkpoint directory: {directory}"
+            f"No .safetensors shards found for checkpoint: {model_id_or_directory}"
         )
 
     wanted_keys = {
@@ -136,7 +166,8 @@ def load_phi3_vision_projector_weights(
     missing = wanted_keys - collected.keys()
     if missing:
         raise KeyError(
-            f"Missing Phi-3.5-Vision projector weights in {directory}: {sorted(missing)}"
+            "Missing Phi-3.5-Vision projector weights in "
+            f"{model_id_or_directory}: {sorted(missing)}"
         )
 
     return Phi3VisionProjectorWeights(

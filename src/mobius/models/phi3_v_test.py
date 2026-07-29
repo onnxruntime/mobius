@@ -127,6 +127,8 @@ class TestPhi3VVisionPreprocessWeights:
         assert "vision_tower.embeddings.class_embedding" in renamed
         assert "vision_tower.embeddings.patch_embedding.projection.weight" in renamed
         assert "vision_tower.encoder.0.mlp.up_proj.weight" in renamed
+        assert "vision_tower.encoder.2.mlp.up_proj.weight" not in renamed
+        assert "vision_tower.post_layernorm.weight" not in renamed
         # Projector + separator are host-side.
         assert not any("projection.0" in k or "sub_GN" in k for k in renamed)
         # Only vision_tower.* names are produced.

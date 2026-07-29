@@ -49,7 +49,7 @@ Reference: ``microsoft/Phi-3-vision-128k-instruct``,
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import torch
 from onnxscript import nn
@@ -70,11 +70,6 @@ from mobius.models.clip import (
 
 if TYPE_CHECKING:
     import onnx_ir as ir
-
-# Phi-3-Vision: <|image|> token id (kept for reference; the HF processor marks
-# image slots with negative placeholder ids, not this positive id — see
-# ``_Phi3VEmbeddingModel.forward``).
-_IMAGE_TOKEN_ID = 32044
 
 # Upper bound (magnitude) for negative image placeholder ids, mirroring
 # ``modeling_phi3_v.MAX_INPUT_ID = int(1e9)``. Image positions satisfy
@@ -201,7 +196,7 @@ class _Phi3VVisionEncoderModel(nn.Module):
         assert config.vision is not None, "Phi3-V requires a vision config"
         clip_config = ClipVisionConfigView(config.vision)
         self.vision_tower = CLIPVisionModel(
-            cast(ArchitectureConfig, clip_config),
+            clip_config,
             feature_layer=config.vision.feature_layer,
             drop_class_token=True,
         )
@@ -223,11 +218,14 @@ class _Phi3VVisionEncoderModel(nn.Module):
         The ``img_projection`` and ``sub_GN``/``glb_GN`` tensors are dropped
         (host-side HD transform).
         """
-        renamed: dict[str, torch.Tensor] = {}
+        clip_state_dict: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
-            new_key = _rename_phi3v_vision_weight(key)
-            if new_key is not None:
-                renamed[new_key] = value
+            if key.startswith(_VISION_TOWER_PREFIX):
+                clip_state_dict[key[len(_VISION_TOWER_PREFIX) :]] = value
+        renamed = {
+            "vision_tower." + key: value
+            for key, value in self.vision_tower.preprocess_weights(clip_state_dict).items()
+        }
         return renamed
 
 
@@ -351,11 +349,11 @@ class Phi3VModel(nn.Module):
         """
         renamed: dict[str, torch.Tensor] = {}
 
+        for key, value in self.vision_encoder.preprocess_weights(state_dict).items():
+            renamed["vision_encoder." + key] = value
+
         for key, value in state_dict.items():
-            vision_key = _rename_phi3v_vision_weight(key)
-            if vision_key is not None:
-                renamed["vision_encoder." + vision_key] = value
-            elif key.startswith("model.vision_embed_tokens."):
+            if key.startswith("model.vision_embed_tokens."):
                 # img_projection / sub_GN / glb_GN and any other vision-embed
                 # state is host-side (HD transform) — skip it.
                 pass

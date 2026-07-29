@@ -5,19 +5,36 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius.components import FCMLP
-from mobius.components._common import INT64_MAX, Embedding, LayerNorm
-from mobius.components._conv import Conv2d, Conv2dNoBias
-from mobius.components._encoder import EncoderAttention
+from mobius.components import (
+    FCMLP,
+    INT64_MAX,
+    Conv2d,
+    Conv2dNoBias,
+    Embedding,
+    EncoderAttention,
+    LayerNorm,
+)
 
 if TYPE_CHECKING:
     import onnx_ir as ir
+
+
+class _CLIPVisionConfig(Protocol):
+    hidden_size: int
+    intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    image_size: int
+    patch_size: int
+    num_channels: int
+    rms_norm_eps: float
+    hidden_act: str | None
 
 
 class ClipVisionConfigView:
@@ -47,7 +64,7 @@ class ClipVisionConfigView:
 class _CLIPVisionEmbeddings(nn.Module):
     """CLIP vision embeddings: Conv2d patch + CLS token + position embeddings."""
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(self, config: _CLIPVisionConfig):
         super().__init__()
         hidden_size = config.hidden_size
         patch_size = config.patch_size
@@ -117,7 +134,7 @@ class _Conv2dPatchEmbed(nn.Module):
 class _CLIPVisionEncoderLayer(nn.Module):
     """CLIP vision encoder layer: pre-norm with LayerNorm."""
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(self, config: _CLIPVisionConfig):
         super().__init__()
         self.self_attn = EncoderAttention(config.hidden_size, config.num_attention_heads)
         self.layer_norm1 = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -195,7 +212,7 @@ class CLIPVisionModel(nn.Module):
 
     def __init__(
         self,
-        config: ArchitectureConfig,
+        config: _CLIPVisionConfig,
         *,
         feature_layer: int | None = None,
         drop_class_token: bool = False,
@@ -250,9 +267,17 @@ class CLIPVisionModel(nn.Module):
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         new_state_dict = {}
+        num_encoder_layers = len(self.encoder)
         for name, tensor in state_dict.items():
             new_name = _rename_clip_vision_weight(name)
             if new_name is not None:
+                if self.post_layernorm is None and new_name.startswith("post_layernorm."):
+                    continue
+                if new_name.startswith("encoder."):
+                    parts = new_name.split(".", 2)
+                    if len(parts) >= 3 and parts[1].isdigit():
+                        if int(parts[1]) >= num_encoder_layers:
+                            continue
                 new_state_dict[new_name] = tensor
         return new_state_dict
 
@@ -326,7 +351,7 @@ def _rename_clip_vision_weight(name: str) -> str | None:
 class _SigLIPVisionEmbeddings(nn.Module):
     """SigLIP vision embeddings: Conv2d patch + position embeddings (no CLS token)."""
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(self, config: _CLIPVisionConfig):
         super().__init__()
         hidden_size = config.hidden_size
         patch_size = config.patch_size
