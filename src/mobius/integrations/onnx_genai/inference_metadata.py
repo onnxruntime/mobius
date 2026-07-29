@@ -578,7 +578,11 @@ def _processor_values(source: str | None, config: Any) -> dict[str, Any]:
 
 _STATE_INPUT = re.compile(
     r"^past_key_values\.(?P<layer>\d+)\."
+    r"(?:(?P<scope>self|cross)\.)?"
     r"(?P<role>key|value|conv_state|recurrent_state|ssm_state)$"
+)
+_STATIC_CACHE_PORT = re.compile(
+    r"^(?P<updated>updated_)?(?P<role>key|value)_cache\.(?P<layer>\d+)$"
 )
 _REPLACE_ROLES = {
     "lightning_attention": {"recurrent_state"},
@@ -594,12 +598,14 @@ def _state_and_kv_pairs(
     decoder_inputs: list[_Port],
     decoder_outputs: list[_Port],
     config: Any,
-) -> tuple[list[str], list[str], list[dict[str, str]]]:
+) -> tuple[list[str], list[str], list[str], list[str], list[dict[str, str]]]:
     """Pair decoder state by declared port role and config layer type."""
     outputs = {port.name: port for port in decoder_outputs}
     layer_types = getattr(config, "layer_types", None)
     kv_inputs: list[str] = []
     kv_outputs: list[str] = []
+    cross_kv_inputs: list[str] = []
+    cross_kv_outputs: list[str] = []
     state_pairs: list[dict[str, str]] = []
     consumed_outputs: set[str] = set()
     for input_port in decoder_inputs:
@@ -612,8 +618,9 @@ def _state_and_kv_pairs(
                 "with declared state port roles or register this decoder signature."
             )
         layer = int(match.group("layer"))
+        scope = match.group("scope")
         role = match.group("role")
-        output_name = f"present.{layer}.{role}"
+        output_name = f"present.{layer}.{scope + '.' if scope else ''}{role}"
         output_port = outputs.get(output_name)
         if output_port is None:
             raise ValueError(
@@ -647,8 +654,12 @@ def _state_and_kv_pairs(
                     "append state. Regenerate the graph/config pair or register the "
                     "decoder state contract explicitly."
                 )
-            kv_inputs.append(input_port.name)
-            kv_outputs.append(output_name)
+            if scope == "cross":
+                cross_kv_inputs.append(input_port.name)
+                cross_kv_outputs.append(output_name)
+            else:
+                kv_inputs.append(input_port.name)
+                kv_outputs.append(output_name)
         else:
             allowed = _REPLACE_ROLES.get(layer_type or "", set())
             if role not in allowed:
@@ -679,7 +690,52 @@ def _state_and_kv_pairs(
             f"{unpaired}. Regenerate the package with present.<layer>.<role> outputs "
             "matching declared past_key_values inputs, or register an explicit mapping."
         )
-    return kv_inputs, kv_outputs, state_pairs
+    return kv_inputs, kv_outputs, cross_kv_inputs, cross_kv_outputs, state_pairs
+
+
+def _static_cache_io(
+    decoder_inputs: list[_Port],
+    decoder_outputs: list[_Port],
+) -> dict[str, Any] | None:
+    """Return the explicit TensorScatter static-cache ABI from exported ports."""
+    inputs: dict[tuple[int, str], str] = {}
+    outputs: dict[tuple[int, str], str] = {}
+    for port in decoder_inputs:
+        match = _STATIC_CACHE_PORT.fullmatch(port.name)
+        if match is not None and match.group("updated") is None:
+            inputs[(int(match.group("layer")), match.group("role"))] = port.name
+    for port in decoder_outputs:
+        match = _STATIC_CACHE_PORT.fullmatch(port.name)
+        if match is not None and match.group("updated") is not None:
+            outputs[(int(match.group("layer")), match.group("role"))] = port.name
+    if not inputs and not outputs:
+        return None
+
+    layers = sorted({layer for layer, _ in inputs} | {layer for layer, _ in outputs})
+    missing = [
+        f"{kind}.{layer}.{role}"
+        for layer in layers
+        for role in ("key", "value")
+        for kind, ports in (("input", inputs), ("output", outputs))
+        if (layer, role) not in ports
+    ]
+    input_names = {port.name for port in decoder_inputs}
+    for control in ("write_indices", "nonpad_kv_seqlen"):
+        if control not in input_names:
+            missing.append(f"input.{control}")
+    if missing:
+        raise ValueError(
+            "Cannot emit model.io.static_cache because the exported TensorScatter "
+            f"ABI is incomplete: {missing}"
+        )
+    return {
+        "write_indices_input": "write_indices",
+        "kv_sequence_length_input": "nonpad_kv_seqlen",
+        "key_cache_inputs": [inputs[(layer, "key")] for layer in layers],
+        "value_cache_inputs": [inputs[(layer, "value")] for layer in layers],
+        "key_cache_outputs": [outputs[(layer, "key")] for layer in layers],
+        "value_cache_outputs": [outputs[(layer, "value")] for layer in layers],
+    }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -760,10 +816,21 @@ def _decoder_io(
     io: dict[str, Any] = {
         "inputs": [_port_metadata(port) for port in inputs],
         "outputs": [_port_metadata(port) for port in outputs],
+        "kv_ownership": "owned",
     }
 
     routed = [port for port in inputs if port.name in routed_inputs]
     embedded = next((port for port in routed if _is_float(port) and port.rank == 3), None)
+    if embedded is None:
+        embedded = _select_one(
+            inputs,
+            lambda port: (
+                _is_float(port)
+                and port.rank == 3
+                and port.name != "encoder_hidden_states"
+                and _STATIC_CACHE_PORT.fullmatch(port.name) is None
+            ),
+        )
     if embedded is not None:
         io["inputs_embeds_input"] = embedded.name
         io["sequence_source"] = "inputs_embeds"
@@ -778,7 +845,15 @@ def _decoder_io(
     if position is not None:
         io["position_ids_input"] = position.name
 
-    token = input_by_name.get("input_ids")
+    token = input_by_name.get("input_ids") or _select_one(
+        inputs,
+        lambda port: (
+            _is_integer(port)
+            and port.rank == 2
+            and port.name not in {"attention_mask", "position_ids"}
+            and _STATE_INPUT.fullmatch(port.name) is None
+        ),
+    )
     if token is not None:
         io["token_input"] = token.name
         io.setdefault("sequence_source", "token_ids")
@@ -791,21 +866,73 @@ def _decoder_io(
             "logits role or register an explicit decoder I/O contract."
         )
     io["logits_output"] = logits.name
+    encoder_hidden_states = input_by_name.get("encoder_hidden_states")
+    if encoder_hidden_states is not None:
+        io["encoder_hidden_states_input"] = encoder_hidden_states.name
 
+    static_cache = _static_cache_io(inputs, outputs)
+    if static_cache is not None:
+        io["static_cache"] = static_cache
+    static_names = (
+        {
+            static_cache["write_indices_input"],
+            static_cache["kv_sequence_length_input"],
+            *static_cache["key_cache_inputs"],
+            *static_cache["value_cache_inputs"],
+            *static_cache["key_cache_outputs"],
+            *static_cache["value_cache_outputs"],
+        }
+        if static_cache is not None
+        else set()
+    )
     core_inputs = routed_inputs | {
-        port.name for port in (attention_mask, position, token) if port is not None
+        port.name
+        for port in (attention_mask, position, token, embedded, encoder_hidden_states)
+        if port is not None
     }
-    state_inputs = [port for port in inputs if port.name not in core_inputs]
-    state_outputs = [port for port in outputs if port.name != logits.name]
-    kv_inputs, kv_outputs, state_pairs = _state_and_kv_pairs(
+    state_inputs = [
+        port
+        for port in inputs
+        if port.name not in core_inputs
+        and port.name not in static_names
+        and _STATE_INPUT.fullmatch(port.name) is not None
+    ]
+    state_outputs = [
+        port
+        for port in outputs
+        if port.name != logits.name
+        and port.name not in static_names
+        and port.name.startswith("present.")
+    ]
+    (
+        kv_inputs,
+        kv_outputs,
+        cross_kv_inputs,
+        cross_kv_outputs,
+        state_pairs,
+    ) = _state_and_kv_pairs(
         state_inputs, state_outputs, config
     )
     if kv_inputs:
         io["kv_inputs"] = kv_inputs
         io["kv_outputs"] = kv_outputs
         io["kv_update"] = "append"
+    if cross_kv_inputs:
+        io["cross_kv_inputs"] = cross_kv_inputs
+        io["cross_kv_outputs"] = cross_kv_outputs
     if state_pairs:
         io["state_pairs"] = state_pairs
+    consumed_outputs = set(kv_outputs) | set(cross_kv_outputs)
+    hidden_outputs = [
+        port
+        for port in outputs
+        if port.name != logits.name
+        and port.name not in static_names
+        and port.name not in consumed_outputs
+        and _is_float(port)
+    ]
+    if len(hidden_outputs) == 1:
+        io["hidden_output"] = hidden_outputs[0].name
 
     positions = _positions_from_registry(position, config) if position is not None else None
     return io, positions
@@ -898,6 +1025,25 @@ def _input_source_map(
             "from": f"{decoder_name}.{pair['output']}",
             "update": pair["update"],
         }
+    static_cache = decoder_io.get("static_cache")
+    if static_cache is not None:
+        sources[f"{decoder_name}.{static_cache['write_indices_input']}"] = {
+            "kind": "generated",
+            "generator": "static_cache_write_indices",
+        }
+        sources[f"{decoder_name}.{static_cache['kv_sequence_length_input']}"] = {
+            "kind": "generated",
+            "generator": "kv_sequence_length",
+        }
+        for input_name, output_name in zip(
+            static_cache["key_cache_inputs"] + static_cache["value_cache_inputs"],
+            static_cache["key_cache_outputs"] + static_cache["value_cache_outputs"],
+        ):
+            sources[f"{decoder_name}.{input_name}"] = {
+                "kind": "stateful",
+                "from": f"{decoder_name}.{output_name}",
+                "update": "shared_buffer",
+            }
     return sources
 
 
@@ -1080,6 +1226,85 @@ def validate_executable_closure(pkg: Any, metadata: dict[str, Any]) -> None:
                     f"the source category {kind!r} is not executable.",
                     "use external, generated, stateful, defaulted, or dataflow.",
                 )
+
+
+def add_explicit_package_io(
+    metadata: dict[str, Any],
+    pkg: Any,
+    config: Any,
+) -> dict[str, Any]:
+    """Attach explicit graph-port roles to emitted decoder and encoder models."""
+    pipeline = metadata.get("pipeline")
+    if not isinstance(pipeline, dict):
+        component_names = list(pkg.keys())
+        if len(component_names) != 1:
+            raise ValueError("bare decoder metadata requires exactly one graph component")
+        io, _ = _decoder_io(pkg[component_names[0]], set(), config)
+        metadata.setdefault("model", {})["io"] = io
+        return metadata
+
+    models = pipeline.get("models", {})
+    routed_inputs: dict[str, set[str]] = {}
+    for edge in pipeline.get("dataflow", []):
+        target = edge.get("to", "")
+        component, separator, port = target.partition(".")
+        if separator:
+            routed_inputs.setdefault(component, set()).add(port)
+
+    component_ios: dict[str, dict[str, Any]] = {}
+    for name, model_spec in models.items():
+        if name not in pkg:
+            continue
+        if model_spec.get("type") == "decoder":
+            io, _ = _decoder_io(pkg[name], routed_inputs.get(name, set()), config)
+        else:
+            inputs = [_port(value) for value in pkg[name].graph.inputs]
+            outputs = [_port(value) for value in pkg[name].graph.outputs]
+            io = {
+                "inputs": [_port_metadata(port) for port in inputs],
+                "outputs": [_port_metadata(port) for port in outputs],
+            }
+            if model_spec.get("type") in {"encoder", "audio_encoder"}:
+                audio_prompt = _select_one(
+                    inputs, lambda port: _is_float(port) and port.rank == 3
+                )
+                token_prompt = _select_one(
+                    inputs, lambda port: _is_integer(port) and port.rank == 2
+                )
+                if audio_prompt is not None:
+                    io["audio_features_input"] = audio_prompt.name
+                elif token_prompt is not None:
+                    io["token_input"] = token_prompt.name
+                    io["sequence_source"] = "token_ids"
+        model_spec["io"] = io
+        component_ios[name] = io
+
+    def annotate_strategy(strategy: dict[str, Any]) -> None:
+        if strategy.get("kind") == "nested_autoregressive":
+            inner_name = strategy.get("inner")
+            inner_io = component_ios.get(inner_name, {})
+            hidden_output = inner_io.get("hidden_output")
+            if not hidden_output:
+                raise ValueError(
+                    "Cannot emit pipeline.strategy.inner_embedding_output: the inner "
+                    f"decoder {inner_name!r} has no unique non-logits float output"
+                )
+            strategy["inner_embedding_output"] = hidden_output
+        for stage in strategy.get("stages", []):
+            nested = stage.get("strategy")
+            if isinstance(nested, dict):
+                annotate_strategy(nested)
+
+    strategy = pipeline.get("strategy")
+    if isinstance(strategy, dict):
+        annotate_strategy(strategy)
+    if "model" in metadata:
+        decoder_names = [
+            name for name, model in models.items() if model.get("type") == "decoder"
+        ]
+        if decoder_names:
+            metadata["model"]["io"] = component_ios[decoder_names[0]]
+    return metadata
 
 
 def _topological_order(
@@ -2046,6 +2271,7 @@ def build_tts_pipeline_metadata(
     prefill_embedder_filename: str | None = "talker_prefill_embedder/model.onnx",
     tokenizer_filename: str = "tokenizer.json",
     activation_dtype: str = "fp32",
+    inner_embedding_output: str = "codec_embeddings",
     decoder_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build metadata for a pre-embedder-driven multi-decoder TTS pipeline.
@@ -2128,6 +2354,7 @@ def build_tts_pipeline_metadata(
         "kind": "nested_autoregressive",
         "outer": "talker",
         "inner": "code_predictor",
+        "inner_embedding_output": inner_embedding_output,
         "pre_embedder": {
             "component": "talker_step_embedder",
             "frame_codes_input": "frame_codes",

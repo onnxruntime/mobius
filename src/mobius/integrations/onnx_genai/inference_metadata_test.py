@@ -24,6 +24,7 @@ from mobius._pipeline_contract import (
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
+    add_explicit_package_io,
     build_diffusion_pipeline_metadata,
     build_language_diffusion_pipeline_metadata,
     build_multimodal_pipeline_metadata,
@@ -229,6 +230,135 @@ def _decoder_model(
             ]
         )
     return _model("decoder", inputs, output_specs)
+
+
+def _static_cache_decoder_model() -> ir.Model:
+    inputs = [
+        _value("input_ids", ir.DataType.INT64, ["batch", "sequence"]),
+        _value("attention_mask", ir.DataType.INT64, ["batch", 32]),
+        _value("position_ids", ir.DataType.INT64, ["batch", "sequence"]),
+        _value("key_cache.1", ir.DataType.FLOAT, ["batch", 32, 16]),
+        _value("value_cache.1", ir.DataType.FLOAT, ["batch", 32, 16]),
+        _value("key_cache.3", ir.DataType.FLOAT, ["batch", 32, 16]),
+        _value("value_cache.3", ir.DataType.FLOAT, ["batch", 32, 16]),
+        _value("write_indices", ir.DataType.INT64, ["batch"]),
+        _value("nonpad_kv_seqlen", ir.DataType.INT64, ["batch"]),
+    ]
+    outputs = [
+        ("logits", ir.DataType.FLOAT, ["batch", "sequence", 128]),
+        ("updated_key_cache.1", ir.DataType.FLOAT, ["batch", 32, 16]),
+        ("updated_value_cache.1", ir.DataType.FLOAT, ["batch", 32, 16]),
+        ("updated_key_cache.3", ir.DataType.FLOAT, ["batch", 32, 16]),
+        ("updated_value_cache.3", ir.DataType.FLOAT, ["batch", 32, 16]),
+    ]
+    return _model("decoder", inputs, outputs)
+
+
+class TestExplicitPackageIo:
+    def test_emits_explicit_dynamic_decoder_roles(self):
+        model = _decoder_model(
+            [],
+            position_shape=["batch", "sequence"],
+            raw_token_input=True,
+            kv_head_dims=[8, 16],
+        )
+        metadata = add_explicit_package_io({"model": {}}, {"model": model}, _VlmConfig())
+        io = metadata["model"]["io"]
+        assert io["token_input"] == "input_ids"
+        assert io["sequence_source"] == "token_ids"
+        assert io["logits_output"] == "logits"
+        assert io["kv_ownership"] == "owned"
+        assert io["kv_inputs"] == [
+            "past_key_values.0.key",
+            "past_key_values.0.value",
+            "past_key_values.1.key",
+            "past_key_values.1.value",
+        ]
+        assert io["kv_outputs"] == [
+            "present.0.key",
+            "present.0.value",
+            "present.1.key",
+            "present.1.value",
+        ]
+
+    def test_emits_explicit_static_cache_roles_in_layer_order(self):
+        metadata = add_explicit_package_io(
+            {"model": {}}, {"model": _static_cache_decoder_model()}, _VlmConfig()
+        )
+        io = metadata["model"]["io"]
+        assert io["static_cache"] == {
+            "write_indices_input": "write_indices",
+            "kv_sequence_length_input": "nonpad_kv_seqlen",
+            "key_cache_inputs": ["key_cache.1", "key_cache.3"],
+            "value_cache_inputs": ["value_cache.1", "value_cache.3"],
+            "key_cache_outputs": ["updated_key_cache.1", "updated_key_cache.3"],
+            "value_cache_outputs": [
+                "updated_value_cache.1",
+                "updated_value_cache.3",
+            ],
+        }
+        assert "kv_inputs" not in io
+
+    @pytest.mark.parametrize(
+        ("encoder_input", "role_field"),
+        [
+            (
+                _value(
+                    "mel_prompt",
+                    ir.DataType.FLOAT,
+                    ["batch", 80, "audio_sequence"],
+                ),
+                "audio_features_input",
+            ),
+            (
+                _value("prompt_tokens", ir.DataType.INT64, ["batch", "sequence"]),
+                "token_input",
+            ),
+        ],
+    )
+    def test_emits_explicit_encoder_prompt_role(self, encoder_input, role_field):
+        encoder = _model(
+            "encoder",
+            [encoder_input],
+            [
+                (
+                    "encoder_hidden_states",
+                    ir.DataType.FLOAT,
+                    ["batch", "encoder_sequence", 64],
+                )
+            ],
+        )
+        decoder = _model(
+            "decoder",
+            [
+                _value("decoder_tokens", ir.DataType.INT64, ["batch", "sequence"]),
+                _value(
+                    "encoder_hidden_states",
+                    ir.DataType.FLOAT,
+                    ["batch", "encoder_sequence", 64],
+                ),
+            ],
+            [("logits", ir.DataType.FLOAT, ["batch", "sequence", 128])],
+        )
+        metadata = {
+            "pipeline": {
+                "models": {
+                    "encoder": {"type": "encoder"},
+                    "decoder": {"type": "decoder"},
+                },
+                "dataflow": [],
+                "strategy": {"kind": "autoregressive", "decoder": "decoder"},
+            }
+        }
+        add_explicit_package_io(
+            metadata, {"encoder": encoder, "decoder": decoder}, _VlmConfig()
+        )
+        encoder_io = metadata["pipeline"]["models"]["encoder"]["io"]
+        assert encoder_io[role_field] == encoder_input.name
+        decoder_io = metadata["pipeline"]["models"]["decoder"]["io"]
+        assert decoder_io["token_input"] == "decoder_tokens"
+        assert decoder_io["encoder_hidden_states_input"] == "encoder_hidden_states"
+        assert decoder_io["logits_output"] == "logits"
 
 
 def _native_package(
@@ -1651,6 +1781,7 @@ class TestBuildTTSPipelineMetadata:
         assert stage["kind"] == "nested_autoregressive"
         assert stage["outer"] == "talker"
         assert stage["inner"] == "code_predictor"
+        assert stage["inner_embedding_output"] == "codec_embeddings"
         assert stage["pre_embedder"]["component"] == "talker_step_embedder"
         assert stage["pre_embedder"]["frame_codes_input"] == "frame_codes"
         assert "prefill_embedder" not in stage
