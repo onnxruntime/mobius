@@ -11,6 +11,8 @@ from mobius.integrations.gguf._repacker import (
     RepackedTensor,
     _unpack_q4_k_scales,
     can_repack,
+    native_block_spec,
+    preserve_native_blocks,
     repack_dequantized_tensor,
     repack_gguf_tensor,
 )
@@ -21,6 +23,51 @@ _Q8_0 = 8
 _Q4_K = 12
 _Q1_0 = 41
 _BLOCK_SIZE = 32
+
+
+@pytest.mark.parametrize(
+    ("qtype_name", "qtype_value", "format_name", "block_elements", "block_bytes"),
+    [
+        ("MXFP4", 39, "mxfp4", 32, 17),
+        ("IQ4_NL", 20, "iq4_nl", 32, 18),
+        ("IQ4_XS", 23, "iq4_xs", 256, 136),
+        ("IQ3_S", 21, "iq3_s", 256, 110),
+        ("IQ3_XXS", 18, "iq3_xxs", 256, 98),
+        ("IQ2_XXS", 16, "iq2_xxs", 256, 66),
+        ("IQ2_XS", 17, "iq2_xs", 256, 74),
+        ("IQ2_S", 22, "iq2_s", 256, 82),
+        ("IQ1_S", 19, "iq1_s", 256, 50),
+        ("IQ1_M", 29, "iq1_m", 256, 56),
+    ],
+)
+def test_native_block_specs_match_gguf_and_preserve_bytes(
+    qtype_name: str,
+    qtype_value: int,
+    format_name: str,
+    block_elements: int,
+    block_bytes: int,
+):
+    from gguf import GGMLQuantizationType
+
+    qtype = getattr(GGMLQuantizationType, qtype_name)
+    assert qtype.value == qtype_value
+    spec = native_block_spec(qtype.value)
+    assert spec is not None
+    assert (spec.format, spec.elements, spec.bytes) == (
+        format_name,
+        block_elements,
+        block_bytes,
+    )
+
+    raw = np.arange(2 * block_bytes, dtype=np.uint8)
+    packed = preserve_native_blocks(raw, qtype.value, (2, block_elements))
+    assert packed.shape == (2, 1, block_bytes)
+    np.testing.assert_array_equal(packed.reshape(-1), raw)
+
+
+def test_native_block_size_mismatch_is_rejected():
+    with pytest.raises(ValueError, match="Native iq1_m data size mismatch"):
+        preserve_native_blocks(np.zeros(55, dtype=np.uint8), 29, (1, 256))
 
 
 def _make_q1_0_block(scale: float, bits: list[int]) -> np.ndarray:

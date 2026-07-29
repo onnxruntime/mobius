@@ -9,12 +9,13 @@ Reference: DeepSeek-V3 paper, HuggingFace DeepseekV3ForCausalLM.
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING
 
+import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
+from mobius._weight_utils import pack_qmoe_expert_weights
 from mobius.components import (
     MLP,
     Attention,
@@ -32,8 +33,18 @@ from mobius.components._deepseek_mla import DeepSeekMLA
 from mobius.components._moe import pack_fused_quantized_moe_weights
 from mobius.models.base import CausalLMModel
 
-if TYPE_CHECKING:
-    import onnx_ir as ir
+
+def _linear_factory(config: ArchitectureConfig):
+    quantization = config.quantization
+    if quantization is None or quantization.quant_method == "none":
+        return None
+    zero_point_dtype = config.dtype if quantization.float_zero_point else ir.DataType.UINT8
+    return make_quantized_linear_factory(
+        bits=quantization.bits,
+        block_size=quantization.group_size,
+        has_zero_point=not quantization.sym,
+        zero_point_dtype=zero_point_dtype,
+    )
 
 
 def _linear_class(config: ArchitectureConfig) -> type:
@@ -76,6 +87,16 @@ class DeepSeekMoEGate(nn.Module):
         self.norm_topk_prob = config.norm_topk_prob
         self.scoring_func = config.scoring_func
         self.topk_method = config.topk_method
+        if self.n_group <= 0 or self.num_experts % self.n_group:
+            raise ValueError(
+                "DeepSeek grouped routing requires num_local_experts to be evenly "
+                f"divisible by n_group, got {self.num_experts} and {self.n_group}"
+            )
+        if self.topk_group <= 0 or self.topk_group > self.n_group:
+            raise ValueError(
+                "DeepSeek grouped routing requires 1 <= topk_group <= n_group, got "
+                f"{self.topk_group} and {self.n_group}"
+            )
 
         self.weight = nn.Parameter([self.num_experts, config.hidden_size])
         # Correction bias only used with sigmoid scoring (V3)
@@ -83,56 +104,43 @@ class DeepSeekMoEGate(nn.Module):
             self.e_score_correction_bias = nn.Parameter([self.num_experts])
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
-        router_logits = self._router_logits(op, hidden_states)
+        scores, scores_for_choice = self._routing_scores(op, hidden_states)
+        routing_weights, selected_experts = self._topk_weights(op, scores, scores_for_choice)
+        return routing_weights, selected_experts
 
-        # Score computation depends on scoring function
-        if self.scoring_func == "sigmoid":
-            scores = op.Sigmoid(router_logits)  # (B*S, num_experts)
-            # Add correction bias for expert selection (V3)
-            scores_for_choice = op.Add(scores, self.e_score_correction_bias)
-        else:
-            # Softmax scoring (V2)
-            scores = op.Softmax(router_logits, axis=-1)
-            scores_for_choice = scores
+    def route_for_qmoe(self, op: OpBuilder, hidden_states: ir.Value):
+        """Routing outputs shaped for the fused ``com.microsoft::QMoE`` op."""
+        scores, scores_for_choice = self._routing_scores(op, hidden_states)
+        routing_weights, selected_experts = self._topk_weights(op, scores, scores_for_choice)
+        return scores_for_choice, routing_weights, selected_experts
 
-        # Expert selection: group-based or simple TopK
-        if self.n_group > 1 and self.topk_method != "greedy":
-            scores_for_choice = self._group_topk_selection(op, scores_for_choice)
+    def qmoe_routing(self, op: OpBuilder, hidden_states: ir.Value):
+        """Return distinct expert-selection and aggregation scores for QMoE."""
+        scores, scores_for_choice = self._routing_scores(op, hidden_states)
+        return (
+            scores_for_choice,
+            scores,
+            self.norm_topk_prob,
+            float(self.routed_scaling_factor),
+        )
 
-        # Select top-k experts
+    def _topk_weights(self, op: OpBuilder, scores: ir.Value, scores_for_choice: ir.Value):
         k_val = op.Constant(value_ints=[self.top_k])
         _, selected_experts = op.TopK(scores_for_choice, k_val, axis=-1, _outputs=2)
-
-        # Gather original scores (without bias) for selected experts
         routing_weights = op.GatherElements(scores, selected_experts, axis=-1)
-
-        # Normalize weights (V3 with norm_topk_prob=True)
         if self.norm_topk_prob:
             weight_sum = op.ReduceSum(routing_weights, [-1], keepdims=True)
             eps = 1e-20
             routing_weights = op.Div(routing_weights, op.Add(weight_sum, eps))
-
-        # Apply routing scale
         routing_weights = op.Mul(routing_weights, float(self.routed_scaling_factor))
-
         return routing_weights, selected_experts
 
-    def route_for_qmoe(self, op: OpBuilder, hidden_states: ir.Value):
-        """Routing outputs shaped for the fused ``com.microsoft::QMoE`` op.
-
-        Returns a triple ``(scores_for_choice, routing_weights, selected_experts)``
-        computed identically to :meth:`forward`, but also exposes
-        ``scores_for_choice`` — the per-expert selection scores (sigmoid + bias
-        for V3, softmax for V2, with group masking already applied). The QMoE
-        kernel performs its own top-k over ``scores_for_choice`` (passed as
-        ``router_probs``), so feeding these masked scores reproduces GLM's
-        group-limited / noaux_tc selection exactly. ``routing_weights`` and
-        ``selected_experts`` are scattered into a dense aggregation tensor by the
-        caller and consumed via the optional ``router_weights`` input, so the
-        combine weights (normalized sigmoid * routed_scaling_factor) match the
-        per-expert path bit-for-bit.
-        """
-        router_logits = self._router_logits(op, hidden_states)
+    def _routing_scores(self, op: OpBuilder, hidden_states: ir.Value):
+        weight_t = op.Transpose(self.weight, perm=[1, 0])
+        router_logits = op.MatMul(
+            op.Cast(hidden_states, to=1),
+            op.Cast(weight_t, to=1),
+        )
 
         if self.scoring_func == "sigmoid":
             scores = op.Sigmoid(router_logits)
@@ -143,24 +151,7 @@ class DeepSeekMoEGate(nn.Module):
 
         if self.n_group > 1 and self.topk_method != "greedy":
             scores_for_choice = self._group_topk_selection(op, scores_for_choice)
-
-        k_val = op.Constant(value_ints=[self.top_k])
-        _, selected_experts = op.TopK(scores_for_choice, k_val, axis=-1, _outputs=2)
-
-        routing_weights = op.GatherElements(scores, selected_experts, axis=-1)
-        if self.norm_topk_prob:
-            weight_sum = op.ReduceSum(routing_weights, [-1], keepdims=True)
-            eps = 1e-20
-            routing_weights = op.Div(routing_weights, op.Add(weight_sum, eps))
-        routing_weights = op.Mul(routing_weights, float(self.routed_scaling_factor))
-
-        return scores_for_choice, routing_weights, selected_experts
-
-    def _router_logits(self, op: OpBuilder, hidden_states: ir.Value):
-        """Compute routing logits in float32 for stable expert selection."""
-        hidden_states = op.Cast(hidden_states, to=1)
-        weight_t = op.Cast(op.Transpose(self.weight, perm=[1, 0]), to=1)
-        return op.MatMul(hidden_states, weight_t)
+        return scores, scores_for_choice
 
     def _group_topk_selection(self, op, scores_for_choice):
         """Group-based expert selection: pick topk_group groups first."""
@@ -173,10 +164,14 @@ class DeepSeekMoEGate(nn.Module):
 
         # Reshape to groups: (B*S, n_group, experts_per_group)
         scores_grouped = op.Reshape(flat, [0, self.n_group, experts_per_group])
-        # Group score = sum of top-2 within each group
-        k_two = op.Constant(value_ints=[2])
-        group_top2, _ = op.TopK(scores_grouped, k_two, axis=-1, _outputs=2)
-        group_scores = op.ReduceSum(group_top2, [-1], keepdims=False)  # (B*S, n_group)
+        if self.topk_method == "noaux_tc":
+            # Bias-corrected routing scores groups by their two strongest experts.
+            k_two = op.Constant(value_ints=[min(2, experts_per_group)])
+            group_top2, _ = op.TopK(scores_grouped, k_two, axis=-1, _outputs=2)
+            group_scores = op.ReduceSum(group_top2, [-1], keepdims=False)
+        else:
+            # Group-limited greedy routing scores each group by its strongest expert.
+            group_scores = op.ReduceMax(scores_grouped, [-1], keepdims=False)
 
         # Select top groups
         k_groups = op.Constant(value_ints=[self.topk_group])
@@ -199,8 +194,12 @@ class DeepSeekMoEGate(nn.Module):
         )
         # Flatten back: (B*S, num_experts)
         expert_mask = op.Reshape(group_mask_expanded, [0, self.num_experts])
-        # Zero out non-selected groups, then reshape back to original (B, S, n_experts)
-        return op.Reshape(op.Mul(flat, expert_mask), orig_shape)
+        # Mask rather than multiply by zero: correction biases may make valid
+        # selected-group scores negative, while zero would let excluded experts win TopK.
+        selected = op.Greater(expert_mask, 0.0)
+        neg_inf = op.CastLike(float("-inf"), flat)
+        masked_scores = op.Where(selected, flat, neg_inf)
+        return op.Reshape(masked_scores, orig_shape)
 
 
 class DeepSeekMLADecoderLayer(nn.Module):
@@ -216,6 +215,8 @@ class DeepSeekMLADecoderLayer(nn.Module):
         linear_class: type | None = None,
     ):
         super().__init__()
+        if linear_class is None:
+            linear_class = _linear_factory(config)
         self.self_attn = DeepSeekMLA(config, linear_class=linear_class)
         if is_moe:
             gate = DeepSeekMoEGate(config)
@@ -268,6 +269,8 @@ class _DeepSeekStandardDecoderLayer(nn.Module):
         linear_class: type | None = None,
     ):
         super().__init__()
+        if linear_class is None:
+            linear_class = _linear_factory(config)
         self.self_attn = Attention(config, linear_class=linear_class)
         if is_moe:
             gate = DeepSeekMoEGate(config)
@@ -507,6 +510,13 @@ class DeepSeekV3CausalLMModel(CausalLMModel):
             and qc is not None
             and qc.quant_method != "none"
         )
+        use_qmoe = (
+            not use_fused_qmoe
+            and qc is not None
+            and qc.bits == 4
+            and qc.quant_method in {"gptq", "awq"}
+            and not qc.float_zero_point
+        )
         for key, value in state_dict.items():
             new_key = key
 
@@ -520,14 +530,14 @@ class DeepSeekV3CausalLMModel(CausalLMModel):
             # layers.N.mlp.experts.gate_up_proj  (n_experts, 2*mid, hidden)
             # layers.N.mlp.experts.down_proj      (n_experts, hidden, mid)
             # Split into per-expert weights for our ModuleList.
-            if new_key.endswith(".mlp.experts.gate_up_proj"):
+            if not use_qmoe and new_key.endswith(".mlp.experts.gate_up_proj"):
                 prefix = new_key[: -len(".mlp.experts.gate_up_proj")]
                 mid = value.shape[1] // 2
                 for i in range(value.shape[0]):
                     renamed[f"{prefix}.mlp.moe.experts.{i}.gate_proj.weight"] = value[i, :mid]
                     renamed[f"{prefix}.mlp.moe.experts.{i}.up_proj.weight"] = value[i, mid:]
                 continue
-            if new_key.endswith(".mlp.experts.down_proj"):
+            if not use_qmoe and new_key.endswith(".mlp.experts.down_proj"):
                 prefix = new_key[: -len(".mlp.experts.down_proj")]
                 for i in range(value.shape[0]):
                     renamed[f"{prefix}.mlp.moe.experts.{i}.down_proj.weight"] = value[i]
@@ -535,8 +545,10 @@ class DeepSeekV3CausalLMModel(CausalLMModel):
 
             renamed[new_key] = value
 
-        # Handle weight tying
+        # Handle weight tying and pack routed expert tensors for the selected QMoE path.
         processed = super().preprocess_weights(renamed)
         if use_fused_qmoe:
             processed.update(pack_fused_quantized_moe_weights(routed_experts, self.config))
+        elif use_qmoe:
+            processed = pack_qmoe_expert_weights(processed)
         return processed

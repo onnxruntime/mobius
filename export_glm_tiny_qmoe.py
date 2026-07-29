@@ -1,6 +1,6 @@
 """Export a tiny synthetic glm_moe_dsa model with a FUSED ``com.microsoft::QMoE``.
 
-Same tiny `glm_moe_dsa` config as ``export_glm_tiny_quant.py`, but sets
+Same tiny ``glm_moe_dsa`` config as ``export_glm_tiny_quant.py``, but sets
 ``config.fused_quantized_moe = True`` so the routed MoE experts are emitted as a
 single fused ``com.microsoft::QMoE`` node (int4, block-32, expert-major layout)
 instead of a per-expert unroll of ``com.microsoft::MatMulNBits``.

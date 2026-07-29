@@ -375,6 +375,7 @@ def _pack_matmul_nbits(codes: torch.Tensor, block_size: int) -> torch.Tensor:
 
 
 def _to_gptq_qweight(codes: torch.Tensor) -> torch.Tensor:
+
     shifts = torch.arange(8, dtype=torch.int64) * 4
     packed = torch.sum(
         codes.to(torch.int64).reshape(*codes.shape[:-1], -1, 8) << shifts,
@@ -386,6 +387,7 @@ def _to_gptq_qweight(codes: torch.Tensor) -> torch.Tensor:
 def _dequant_codes(
     codes: torch.Tensor, scales: torch.Tensor, block_size: int
 ) -> torch.Tensor:
+
     blocks = codes.shape[-1] // block_size
     values = codes.reshape(*codes.shape[:-1], blocks, block_size).float() - 8.0
     return (values * scales.unsqueeze(-1)).flatten(-2)
@@ -395,6 +397,7 @@ def _dequant(
     packed: torch.Tensor, scales: torch.Tensor, block_size: int
 ) -> torch.Tensor:
     codes = torch.stack((packed & 0x0F, packed >> 4), dim=-1).flatten(-2)
+
     return _dequant_codes(codes, scales, block_size)
 
 
@@ -416,6 +419,7 @@ def _static_moe(
         weight = (
             routing_weights
             * (selected_experts == expert).to(routing_weights.dtype)
+
         ).sum(dim=-1, keepdim=True)
         result += expert_output * weight
     return result
