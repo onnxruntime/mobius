@@ -109,11 +109,8 @@ _GEMMA4_MODEL_TYPES = frozenset(
 _GEMMA4_UNIFIED_MODEL_TYPES = frozenset({"gemma4_unified", "gemma4_unified_text"})
 # gemma-3 multimodal. build() unwraps the composite HF config to its text
 # sub-config, so at export time ``config.model_type`` is "gemma3_text" (not
-# "gemma3"). The stable discriminator for "this model has a gemma3-style image
-# input" is therefore the vision sub-config type (siglip_vision_model), which we
-# match in addition to the text-config model_type names.
+# "gemma3").
 _GEMMA3_MODEL_TYPES = frozenset({"gemma3", "gemma3_text"})
-_GEMMA3_VISION_MODEL_TYPES = frozenset({"siglip_vision_model"})
 _PIXTRAL_MODEL_TYPES = frozenset({"mistral3"})
 _QWEN_VL_MODEL_TYPES = frozenset(
     {
@@ -438,11 +435,11 @@ def _write_vision_processor_config(
     - **Gemma4 unified** (``gemma4_unified*``): Returns ``None`` — the
       encoder-free model has no matching ort-extensions transform; callers feed
       HF-preprocessed pixel_values via ``Generator.set_inputs``.
-    - **Gemma3** (``gemma3``, ``gemma3_text``, or vision sub-config
-      ``siglip_vision_model``): Writes ``processor_config.json`` with a 6-step
-      pipeline (DecodeImage → ConvertRGB → Resize[fixed] → Rescale → Normalize →
-      Permute3D). Uses a fixed-size resize (no ``smart_resize``) so the SigLIP
-      encoder's fixed NCHW ``pixel_values`` input contract is met.
+    - **Gemma3** (``gemma3`` or ``gemma3_text``): Writes
+      ``processor_config.json`` with a 6-step pipeline (DecodeImage →
+      ConvertRGB → Resize[fixed] → Rescale → Normalize → Permute3D). Uses a
+      fixed-size resize (no ``smart_resize``) so the SigLIP encoder's fixed
+      NCHW ``pixel_values`` input contract is met.
     - **Pixtral / Mistral3**: Writes ``processor_config.json`` with a 7-step
       pipeline (DecodeImage → ConvertRGB → Resize → Rescale → Normalize →
       Permute3D → PixtralImageSizes).
@@ -506,7 +503,7 @@ def _write_vision_processor_config(
             }
         }
         path = os.path.join(output_dir, "image_processor.json")
-    elif model_type in _GEMMA3_MODEL_TYPES or vision_model_type in _GEMMA3_VISION_MODEL_TYPES:
+    elif model_type in _GEMMA3_MODEL_TYPES:
         # Gemma3's SigLIP vision encoder takes a plain NCHW image tensor
         # ([batch, 3, image_size, image_size]). The generic-VLM branch below
         # emits smart_resize (variable HxW) and no Permute3D, leaving a
@@ -1041,7 +1038,12 @@ def write_ort_genai_config(
         # Fall back to fields stored in ArchitectureConfig (set by from_transformers()).
         # This path is taken when hf_model_id is not provided (e.g. --config mode).
         raw_type = getattr(config, "model_type", None) or "unknown"
-        ort_model_type = _resolve_ort_genai_model_type(raw_type)
+        if is_vlm and raw_type == "gemma3_text":
+            # Gemma3 multimodal configs are unwrapped to the text sub-config
+            # during build, but ORT GenAI needs the multimodal parent type.
+            ort_model_type = "gemma3"
+        else:
+            ort_model_type = _resolve_ort_genai_model_type(raw_type)
         if ort_model_type == "unknown":
             logger.warning(
                 "Could not determine ORT-GenAI model type: pkg.config.model_type "
