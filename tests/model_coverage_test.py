@@ -143,6 +143,10 @@ def _all_registered_with_test_id() -> dict[str, str]:
 #   - CausalLM / other models without YAML
 #
 _COVERAGE_SKIP: dict[str, str] = {
+    # --- Specialized-test models (covered by a co-located test class) ---
+    "llada": "Masked-diffusion LM — covered by src/mobius/models/llada_test.py "
+    "(graph build + diffusers-parity + bidirectionality); no small public "
+    "checkpoint and non-standard I/O (no attention_mask/KV cache/golden data)",
     # --- Internal / duplicate aliases ---
     "code_llama": "Alias for llama — covered by llama",
     "command_r": "Alias for cohere — covered by cohere",
@@ -204,6 +208,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "arctic": "Very large MoE (480B) — no small public checkpoint",
     "dbrx": "Large MoE (132B) — no small public checkpoint",
     "deepseek_v3": "Very large MoE (671B) — no small public checkpoint",
+    "deepseek_v4": "Very large MoE (284B) — no small public checkpoint",
     "llama4_text": "Very large MoE (109B) — no small public checkpoint",
     "qwen3_5_moe": "Large MoE (22B) — no small public checkpoint",
     # --- Models without test_model_id ---

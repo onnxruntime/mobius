@@ -3784,7 +3784,10 @@ def test_qwen35_deltanet_single_layer_parity():
             hidden_states=torch.from_numpy(hidden_np).float(),
             cache_params=cache,
         ).numpy()
-    hf_rec = cache.layers[0].recurrent_states.numpy()
+    hf_rec = cache.layers[0].recurrent_states
+    if isinstance(hf_rec, dict):
+        hf_rec = hf_rec[0]
+    hf_rec = hf_rec.numpy()
 
     # ONNX forward
     sess = _make_session(onnx_model)

@@ -557,19 +557,22 @@ def vlm_vision_weights(
 def _reshape_packed_qweight(value: torch.Tensor, blob_size: int) -> torch.Tensor:
     """Transpose and reshape a packed qweight tensor for MatMulNBits.
 
-    Converts ``[K_packed, N]`` int32 → ``[N, n_blocks, blob_size]`` uint8.
+    Converts ``[..., K_packed, N]`` int32 to
+    ``[..., N, n_blocks, blob_size]`` uint8.
     """
-    transposed = value.t().contiguous()
-    n = transposed.shape[0]
+    transposed = value.transpose(-1, -2).contiguous()
+    prefix = transposed.shape[:-2]
+    n = transposed.shape[-2]
     packed = transposed.view(torch.uint8)
-    n_blocks = packed.shape[1] // blob_size
-    return packed.reshape(n, n_blocks, blob_size)
+    n_blocks = packed.shape[-1] // blob_size
+    return packed.reshape(*prefix, n, n_blocks, blob_size)
 
 
 def _reshape_packed_qzeros(value: torch.Tensor, bits: int, n_blocks: int) -> torch.Tensor:
     """Transpose and unpack packed qzeros for MatMulNBits.
 
-    Converts ``[n_groups_packed, N]`` int32 → ``[N, zp_cols]`` uint8
+    Converts ``[..., n_groups_packed, N]`` int32 to
+    ``[..., N, zp_cols]`` uint8
     where ``zp_cols = ceil(n_blocks * bits / 8)``.  For 4-bit this
     packs two zero-point values per byte, matching ORT's expectation.
 
@@ -578,11 +581,56 @@ def _reshape_packed_qzeros(value: torch.Tensor, bits: int, n_blocks: int) -> tor
         bits: Quantization bit-width (4 or 8).
         n_blocks: Actual number of quantization blocks (``ceil(K / block_size)``).
     """
-    transposed = value.t().contiguous()
-    n = transposed.shape[0]
-    flat_uint8 = transposed.flatten().view(torch.uint8).reshape(n, -1)
+    transposed = value.transpose(-1, -2).contiguous()
+    prefix = transposed.shape[:-2]
+    n = transposed.shape[-2]
+    flat_uint8 = transposed.reshape(-1).view(torch.uint8).reshape(*prefix, n, -1)
     zp_cols = math.ceil(n_blocks * bits / 8)
-    return flat_uint8[:, :zp_cols]
+    return flat_uint8[..., :zp_cols]
+
+
+def pack_qmoe_expert_weights(
+    state_dict: dict[str, torch.Tensor],
+    *,
+    target_moe_path: str = ".mlp.moe",
+) -> dict[str, torch.Tensor]:
+    """Map fused expert-major quantized tensors to native QMoE parameters."""
+    packed: dict[str, torch.Tensor] = {}
+    projections = {
+        ".mlp.experts.gate_up_proj.weight": (
+            f"{target_moe_path}.fc1_experts_weights",
+            True,
+        ),
+        ".mlp.experts.gate_up_proj.scales": (
+            f"{target_moe_path}.fc1_scales",
+            False,
+        ),
+        ".mlp.experts.gate_up_proj.zero_points": (
+            f"{target_moe_path}.fc1_experts_zero_points",
+            False,
+        ),
+        ".mlp.experts.down_proj.weight": (
+            f"{target_moe_path}.fc2_experts_weights",
+            True,
+        ),
+        ".mlp.experts.down_proj.scales": (
+            f"{target_moe_path}.fc2_scales",
+            False,
+        ),
+        ".mlp.experts.down_proj.zero_points": (
+            f"{target_moe_path}.fc2_experts_zero_points",
+            False,
+        ),
+    }
+    for key, value in state_dict.items():
+        for source, (target, flatten_blocks) in projections.items():
+            if source in key:
+                key = key.replace(source, target)
+                if flatten_blocks:
+                    value = value.flatten(-2)
+                break
+        packed[key] = value
+    return packed
 
 
 def preprocess_gptq_weights(
@@ -645,12 +693,12 @@ def preprocess_gptq_weights(
                 raise ValueError(
                     f"Missing {qw_key} — qweight must be present alongside qzeros for {key}"
                 )
-            k = state_dict[qw_key].shape[0] * 32 // bits
+            k = state_dict[qw_key].shape[-2] * 32 // bits
             n_blocks = math.ceil(k / group_size)
             result[new_key] = _reshape_packed_qzeros(value, bits, n_blocks)
 
         elif key.endswith(".scales"):
-            result[key] = value.t().contiguous()
+            result[key] = value.transpose(-1, -2).contiguous()
 
         else:
             result[key] = value
@@ -792,7 +840,7 @@ def preprocess_awq_weights(
                 raise ValueError(
                     f"Missing {qw_key} — qweight must be present alongside qzeros for {key}"
                 )
-            k = state_dict[qw_key].shape[0] * 32 // bits
+            k = state_dict[qw_key].shape[-2] * 32 // bits
             n_blocks = math.ceil(k / group_size)
             # AWQ zero points have an implicit +1 offset; subtract it
             # before unpacking so MatMulNBits sees the raw value.
@@ -810,7 +858,7 @@ def preprocess_awq_weights(
                 result[new_key] = zp_int16.clamp(min=0).to(torch.uint8)
 
         elif key.endswith(".scales"):
-            result[key] = value.t().contiguous()
+            result[key] = value.transpose(-1, -2).contiguous()
 
         else:
             result[key] = value

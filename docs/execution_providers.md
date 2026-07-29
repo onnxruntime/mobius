@@ -55,6 +55,7 @@ pkg = build_from_module(
 | **CUDA** | `"cuda"` | ORT CUDA EP. GQA fusion for FP16/BF16. SkipLayerNorm fusion. |
 | **DirectML** | `"dml"` | DirectML (Windows GPU). GQA for FP16. RoPE and packed QKV lowered to separate ops. |
 | **WebGPU** | `"webgpu"` | ORT WebGPU EP. GQA for FP32/FP16. `Shape` eliminated. INT4 accuracy level 4. |
+| **MLX** | `"mlx"` | Apple-silicon MLX plugin EP. GQA for FP32/FP16/BF16 with unpacked Q/K/V and shared KV buffers. |
 | **TRT-RTX** | `"trt-rtx"` | NVIDIA TensorRT-RTX. GQA for FP16/BF16. `SkipLayerNorm`/`SkipSimplifiedLayerNorm` expanded via InlinePass (TRT handles these primitives natively). GPU graph capture enabled. |
 | **ONNX-standard** | `"onnx-standard"` | Strict ONNX. Zero custom-domain ops — all `com.microsoft` ops (FusedMatMul, SkipLayerNorm, PackedMHA) are expanded to standard ONNX via InlinePass. No GQA or QKV packing. Use for non-ORT runtimes that do not support ORT extensions. |
 
@@ -643,4 +644,3 @@ cuda_pkg, dml_pkg = await asyncio.gather(build_cuda(), build_dml())
 
 This is implemented using Python's `contextvars` module, which provides
 copy-on-write isolation for threads and coroutines.
-
