@@ -2939,9 +2939,7 @@ def test_gemma3_embedding_runs_with_empty_image_features():
     embed_sess = _make_session(pkg["embedding"])
     input_ids = np.array([[1]], dtype=np.int64)
     image_features = np.zeros((0, config.hidden_size), dtype=np.float32)
-    embed_out = embed_sess.run(
-        {"input_ids": input_ids, "image_features": image_features}
-    )
+    embed_out = embed_sess.run({"input_ids": input_ids, "image_features": image_features})
     embed_sess.close()
 
     assert "inputs_embeds" in embed_out

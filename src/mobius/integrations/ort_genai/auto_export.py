@@ -506,10 +506,7 @@ def _write_vision_processor_config(
             }
         }
         path = os.path.join(output_dir, "image_processor.json")
-    elif (
-        model_type in _GEMMA3_MODEL_TYPES
-        or vision_model_type in _GEMMA3_VISION_MODEL_TYPES
-    ):
+    elif model_type in _GEMMA3_MODEL_TYPES or vision_model_type in _GEMMA3_VISION_MODEL_TYPES:
         # Gemma3's SigLIP vision encoder takes a plain NCHW image tensor
         # ([batch, 3, image_size, image_size]). The generic-VLM branch below
         # emits smart_resize (variable HxW) and no Permute3D, leaving a
@@ -532,9 +529,7 @@ def _write_vision_processor_config(
                     size = getattr(ip, "size", None)
                     if isinstance(size, dict):
                         image_size = (
-                            size.get("height")
-                            or size.get("longest_edge")
-                            or image_size
+                            size.get("height") or size.get("longest_edge") or image_size
                         )
             except Exception:
                 logger.warning(
@@ -591,9 +586,7 @@ def _write_vision_processor_config(
                 }
             },
         ]
-        processor_config = {
-            "processor": {"name": "image_processor", "transforms": transforms}
-        }
+        processor_config = {"processor": {"name": "image_processor", "transforms": transforms}}
         path = os.path.join(output_dir, "processor_config.json")
     else:
         # Pixtral and generic VLMs share the same base pipeline;
