@@ -35,7 +35,7 @@ jobs:
     runs-on: ${{ inputs.device == 'cuda' && fromJSON(format('["self-hosted", "1ES.Pool=onnxruntime-ep-mobius-github-linux-a10", "JobId=golden-regen-{0}-{1}-{2}"]', github.run_id, github.run_number, github.run_attempt)) || 'ubuntu-latest' }}
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: main
           # NOTE: For production use, replace with a GitHub App or bot
