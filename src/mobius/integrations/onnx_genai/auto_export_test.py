@@ -6,11 +6,12 @@
 from __future__ import annotations
 
 import dataclasses
-import json
 
+import onnx_ir as ir
 import pytest
 import yaml
 
+from mobius._configs import QuantizationConfig
 from mobius.integrations.onnx_genai import write_onnx_genai_config
 
 
@@ -23,8 +24,14 @@ class _Cfg:
     max_position_embeddings: int = 8192
     sliding_window: int | None = None
     model_type: str = "qwen"
-    num_nextn_predict_layers: int = 1
-    index_share_for_mtp_iteration: bool = True
+
+
+@dataclasses.dataclass
+class _Int4Cfg(_Cfg):
+    dtype: ir.DataType = ir.DataType.FLOAT16
+    quantization: QuantizationConfig = dataclasses.field(
+        default_factory=lambda: QuantizationConfig(bits=4, quant_method="rtn")
+    )
 
 
 class _DiffusionPkg(dict):
@@ -36,13 +43,11 @@ class _MultimodalPkg(dict):
 
 
 def test_dispatch_decoder(tmp_path):
-    arts = write_onnx_genai_config(
-        object(), str(tmp_path), config=_Cfg(), kv_native_dtype="bf16"
-    )
+    arts = write_onnx_genai_config(object(), str(tmp_path), config=_Int4Cfg())
     with open(arts["inference_metadata"]) as handle:
         meta = yaml.safe_load(handle)
-    assert meta["model"]["attention"]["type"] == "grouped_query"
-    assert meta["kv_cache"]["native_dtype"] == "bf16"
+    assert meta["model"]["attention"]["type"] == "grouped_query_attention"
+    assert meta["kv_cache"]["native_dtype"] == "float16"
 
 
 def test_dispatch_diffusion(tmp_path):
@@ -152,7 +157,7 @@ def test_dispatch_vision_multimodal_pipeline(tmp_path):
         "kv_cache",
         "grouped_query_attention",
     ]
-    assert metadata["kv_cache"] == {"native_dtype": "bf16"}
+    assert metadata["kv_cache"] == {"native_dtype": "bfloat16"}
     pipeline = metadata["pipeline"]
     assert pipeline["models"] == {
         "vision_encoder": {
@@ -300,7 +305,7 @@ def test_dispatch_speech_to_text_pipeline(tmp_path):
     with open(artifacts["inference_metadata"]) as handle:
         metadata = yaml.safe_load(handle)
 
-    assert metadata["kv_cache"] == {"native_dtype": "bf16"}
+    assert metadata["kv_cache"] == {"native_dtype": "bfloat16"}
     pipeline = metadata["pipeline"]
     assert pipeline["models"] == {
         "encoder": {"filename": "encoder/model.onnx", "type": "encoder"},
@@ -443,20 +448,6 @@ def test_unrecognized_multi_component_package_fails_loudly(tmp_path):
     )
     with pytest.raises(ValueError, match="multi-component"):
         write_onnx_genai_config(pkg, str(tmp_path))
-
-
-def test_mtp_package_emits_decoder_metadata_and_sidecar(tmp_path):
-    pkg = _MultimodalPkg({"model": object(), "mtp": object()})
-
-    artifacts = write_onnx_genai_config(pkg, str(tmp_path))
-
-    assert set(artifacts) == {"inference_metadata", "mtp_config"}
-    with open(artifacts["mtp_config"]) as handle:
-        mtp = json.load(handle)
-    assert mtp["model"]["filename"] == "mtp/model.onnx"
-    assert mtp["num_nextn_predict_layers"] == 1
-    assert mtp["index_share_for_mtp_iteration"] is True
-    assert mtp["runtime_orchestration"] == "external"
 
 
 def test_decoder_emits_tokenizer_from_source(tmp_path):

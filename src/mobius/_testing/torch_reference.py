@@ -156,12 +156,48 @@ def load_torch_multimodal_model(
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     processor = transformers.AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-    model = transformers.AutoModelForImageTextToText.from_pretrained(
-        model_id,
-        dtype=dtype,
-        device_map=device,
-        trust_remote_code=True,
-    )
+
+    # Shim: transformers 5.x removed DynamicCache.from_legacy_cache and
+    # DynamicCache.get_usable_length, but some trust_remote_code models
+    # (e.g. Phi-3.5-vision-instruct) still call them.
+    if not hasattr(transformers.DynamicCache, "from_legacy_cache"):
+
+        @classmethod  # type: ignore[misc]
+        def _from_legacy_cache(cls, past_key_values=None):  # type: ignore[misc]
+            cache = cls()
+            if past_key_values is not None:
+                for i, (k, v) in enumerate(past_key_values):
+                    cache.update(k, v, i)
+            return cache
+
+        transformers.DynamicCache.from_legacy_cache = _from_legacy_cache
+
+    if not hasattr(transformers.DynamicCache, "get_usable_length"):
+
+        def _get_usable_length(self, new_seq_length: int, layer_idx: int = 0) -> int:  # type: ignore[misc]
+            # Without a sliding window, the full cache is usable.
+            return self.get_seq_length(layer_idx) + new_seq_length
+
+        transformers.DynamicCache.get_usable_length = _get_usable_length  # type: ignore[method-assign]
+
+    # Load config and force eager attention so flash_attn is not required.
+    # Some models (e.g. Phi-3.5-vision-instruct) hardcode flash_attention_2
+    # in their config.json, which causes an ImportError when flash_attn is
+    # not installed.
+    config = transformers.AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    config._attn_implementation = "eager"
+
+    # Some trust_remote_code VLMs (e.g. Phi-3-Vision) are registered as
+    # AutoModelForCausalLM, not AutoModelForImageTextToText.  Fall back
+    # gracefully so golden generation works for both.
+    model_kwargs = dict(config=config, dtype=dtype, device_map=device, trust_remote_code=True)
+    try:
+        model = transformers.AutoModelForImageTextToText.from_pretrained(
+            model_id, **model_kwargs
+        )
+    except (ValueError, KeyError):
+        model = transformers.AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
+
     model.eval()
 
     if tokenizer.pad_token is None:

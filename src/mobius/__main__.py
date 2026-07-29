@@ -119,6 +119,24 @@ def _cmd_build(args: argparse.Namespace) -> None:
     )
     from mobius.tasks import CausalLMTask, ModelTask
 
+    def _resolve_static_cache_task(model_type: str) -> ModelTask:
+        """Create the correct static cache task for the given model type."""
+        if model_type == "gemma4":
+            from mobius.tasks._gemma4 import Gemma4Task
+
+            return Gemma4Task(
+                static_cache=True,
+                max_seq_len=args.max_seq_len,
+            )
+        if model_type == "gemma4_text":
+            from mobius.tasks._gemma4 import Gemma4TextCausalLMTask
+
+            return Gemma4TextCausalLMTask(
+                static_cache=True,
+                max_seq_len=args.max_seq_len,
+            )
+        return CausalLMTask(static_cache=True, max_seq_len=args.max_seq_len)
+
     # Validate --max-seq-len requires --static-cache
     if args.max_seq_len is not None and not args.static_cache:
         raise SystemExit("Error: --max-seq-len can only be used with --static-cache.")
@@ -161,7 +179,14 @@ def _cmd_build(args: argparse.Namespace) -> None:
     load_weights = not args.no_weights
     task: str | ModelTask | None = args.task
     if args.static_cache:
-        task = CausalLMTask(static_cache=True, max_seq_len=args.max_seq_len)
+        # Defer task creation — we need to know the model type first.
+        # Store parameters for later resolution.
+        static_cache_params = {
+            "static_cache": True,
+            "max_seq_len": args.max_seq_len,
+        }
+    else:
+        static_cache_params = None
     trust_remote_code = args.trust_remote_code
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
@@ -218,13 +243,9 @@ def _cmd_build(args: argparse.Namespace) -> None:
         config = _config_from_hf(hf_config, parent_config=parent_config)
         if dtype_override is not None:
             config = dataclasses.replace(config, dtype=dtype_override)
-        if args.glm_full_attention:
-            config = dataclasses.replace(
-                config,
-                use_dsa=False,
-                num_nextn_predict_layers=0,
-            )
-        if task is None:
+        if static_cache_params is not None:
+            task = _resolve_static_cache_task(model_type)
+        elif task is None:
             task = _default_task_for_model(model_type)
         module_class = registry.get(model_type)
         model_module = module_class(config)
@@ -239,19 +260,24 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 state_dict = model_module.preprocess_weights(state_dict)
             pkg.apply_weights(state_dict)
     else:
+        model_id_or_path = args.model
+        if static_cache_params is not None:
+            # Detect model type to resolve the correct static cache task.
+            import transformers
+
+            hf_config = transformers.AutoConfig.from_pretrained(
+                model_id_or_path, trust_remote_code=trust_remote_code
+            )
+            task = _resolve_static_cache_task(getattr(hf_config, "model_type", ""))
+
         pkg = build(
-            args.model,
+            model_id_or_path,
             task=task,
             dtype=dtype_override,
             load_weights=load_weights,
             trust_remote_code=trust_remote_code,
             execution_provider=execution_provider,
             text_only=args.text_only,
-            config_overrides=(
-                {"use_dsa": False, "num_nextn_predict_layers": 0}
-                if args.glm_full_attention
-                else None
-            ),
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)
@@ -312,10 +338,25 @@ def _save_package(
             print(f"  {name}: {path}")
     elif runtime == "onnx-genai":
         from mobius.integrations.onnx_genai import write_onnx_genai_config
+        from mobius.integrations.onnx_genai.inference_metadata import (
+            is_native_vlm_package,
+            write_native_vlm_package_metadata,
+        )
 
         config = getattr(pkg, "config", None)
         source = getattr(args, "config", None) or getattr(args, "model", None)
-        artifacts = write_onnx_genai_config(pkg, output_dir, config=config, source=source)
+        if is_native_vlm_package(pkg):
+            try:
+                artifacts = write_native_vlm_package_metadata(
+                    pkg,
+                    output_dir,
+                    config=config,
+                    source=source,
+                )
+            except ValueError as error:
+                raise SystemExit(f"Error: {error}") from error
+        else:
+            artifacts = write_onnx_genai_config(pkg, output_dir, config=config, source=source)
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
 
@@ -387,22 +428,22 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
     output_dir = args.output or os.path.splitext(gguf_path)[0] + "_onnx"
     os.makedirs(output_dir, exist_ok=True)
 
-    if mmproj_path is not None:
-        print(f"Multimodal mode: fusing vision/audio encoder from mmproj {mmproj_path}...")
-        pkg = build_from_gguf(
-            gguf_path,
-            mmproj=mmproj_path,
-            dtype=args.dtype,
-            execution_provider=args.execution_provider,
-            keep_quantized=args.keep_quantized,
-        )
-    else:
-        pkg = build_from_gguf(
-            gguf_path,
-            dtype=args.dtype,
-            keep_quantized=args.keep_quantized,
-            execution_provider=args.execution_provider,
-        )
+    if args.max_seq_len is not None and not args.static_cache:
+        raise SystemExit("Error: --max-seq-len can only be used with --static-cache.")
+    if args.max_seq_len is not None and args.max_seq_len <= 0:
+        raise SystemExit("Error: --max-seq-len must be a positive integer.")
+    if mmproj_path is not None and args.static_cache:
+        raise SystemExit("Error: --static-cache cannot be used with --mmproj.")
+
+    pkg = build_from_gguf(
+        gguf_path,
+        mmproj=mmproj_path,
+        dtype=args.dtype,
+        keep_quantized=args.keep_quantized,
+        execution_provider=args.execution_provider,
+        static_cache=args.static_cache,
+        max_seq_len=args.max_seq_len,
+    )
 
     pkg.save(
         output_dir,
@@ -575,11 +616,6 @@ def main(argv: list[str] | None = None) -> None:
         help="Do not include weights in the output ONNX model.",
     )
     build_parser.add_argument(
-        "--glm-full-attention",
-        action="store_true",
-        help="Disable GLM-5.2 IndexShare DSA and export the dense MLA fallback.",
-    )
-    build_parser.add_argument(
         "--trust-remote-code",
         action="store_true",
         help="Trust remote code when loading the HuggingFace model config.",
@@ -732,6 +768,26 @@ def main(argv: list[str] | None = None) -> None:
             "reconstructed from the GGUF's embedded tokenizer metadata; "
             "'ort-genai' writes genai_config.json + copies tokenizer files. "
             "Either way the quantized model runs directly in the target runtime."
+        ),
+    )
+    gguf_parser.add_argument(
+        "--static-cache",
+        action="store_true",
+        help=(
+            "Use a static KV cache (pre-allocated fixed-width buffers written "
+            "in place via TensorScatter) instead of the dynamic concat-grow "
+            "cache. Produces a fully static-shaped graph as required by "
+            "fixed-shape runtimes such as the QNN HTP backend."
+        ),
+    )
+    gguf_parser.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Maximum sequence length for static cache buffers. Only used with "
+            "--static-cache. Defaults to max_position_embeddings from config."
         ),
     )
     gguf_parser.set_defaults(func=_cmd_build_gguf)

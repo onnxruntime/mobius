@@ -8,11 +8,11 @@ pipeline.  Two modes:
 
 - **Dequantized** (default): All quantized tensors are dequantized to
   float.  Simple, but loses the compression benefit of quantization.
-- **Quantized** (``keep_quantized=True``): Linear-layer weights, including
-  a quantized output head, are repacked into MatMulNBits format and token
-  embeddings into GatherBlockQuantized format. Mixed presets such as
-  Q4_K_M are normalized to one quantization layout. Other tensors are
-  dequantized.
+- **Quantized** (``keep_quantized=True``): Affine linear-layer weights are
+  repacked into MatMulNBits format and token embeddings into
+  GatherBlockQuantized format. Runtime-supported native IQ/MXFP4 projection
+  blocks are preserved for BlockQuantizedMatMul. Mixed presets such as Q4_K_M are
+  normalized to one affine layout. Other tensors are dequantized.
 """
 
 from __future__ import annotations
@@ -22,11 +22,15 @@ __all__ = ["build_from_gguf"]
 import logging
 from collections import Counter
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import tqdm
 from huggingface_hub import HfApi, hf_hub_download
 
 from mobius._model_package import ModelPackage
+
+if TYPE_CHECKING:
+    from mobius.tasks import ModelTask
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +88,8 @@ def build_from_gguf(
     keep_quantized: bool = False,
     execution_provider: str = "default",
     mmproj: str | Path | None = None,
+    static_cache: bool = False,
+    max_seq_len: int | None = None,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a GGUF file.
 
@@ -91,12 +97,14 @@ def build_from_gguf(
     2. Look up the model class and task from the registry
     3. Build the ONNX graph (standard ``build_from_module`` pipeline)
     4. Map GGUF tensor names → HuggingFace names
-    5. Apply architecture-specific tensor processors
-    6. Run ``preprocess_weights()`` (HF → ONNX name mapping)
-    7. Apply weights to the ONNX model
+    5. Replace native-block projection modules when present
+    6. Apply architecture-specific tensor processors
+    7. Run ``preprocess_weights()`` (HF → ONNX name mapping)
+    8. Apply weights to the ONNX model
 
-    When *keep_quantized* is ``True``, supported quantized tensors are
-    repacked into MatMulNBits format instead of dequantized.
+    When *keep_quantized* is ``True``, supported affine tensors are repacked
+    into MatMulNBits format, while runtime-supported native IQ/MXFP4 projection
+    blocks are retained byte-for-byte for BlockQuantizedMatMul.
 
     Args:
         gguf_path: Path to the ``.gguf`` file, *or* a HuggingFace Hub
@@ -123,6 +131,15 @@ def build_from_gguf(
             mmproj vision/audio encoder are fused into one multimodal
             :class:`ModelPackage` (delegates to
             :func:`build_gemma4_vlm_from_gguf`).
+        static_cache: When ``True``, build with a pre-allocated static KV
+            cache (fixed-width buffers written in place via ``TensorScatter``)
+            instead of the default dynamic concat-grow cache. Produces a
+            fully static-shaped graph, which is required by fixed-shape
+            runtimes such as the QNN HTP backend. Cannot be combined with an
+            explicit *task* override.
+        max_seq_len: Maximum sequence length for the static cache buffers.
+            Only used when ``static_cache=True``. Defaults to the model's
+            ``max_position_embeddings``.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -131,6 +148,7 @@ def build_from_gguf(
         ImportError: If the ``gguf`` package is not installed.
         FileNotFoundError: If the GGUF file does not exist.
         KeyError: If the GGUF architecture is not in the registry.
+        ValueError: If *static_cache* is combined with an explicit *task*.
     """
     import dataclasses
 
@@ -138,6 +156,8 @@ def build_from_gguf(
     # vision/audio encoders are assembled by the dedicated VLM builder. Keep
     # build_from_gguf as the single public entry point (text-only or multimodal).
     if mmproj is not None:
+        if static_cache:
+            raise ValueError("static_cache=True is not supported with a companion mmproj.")
         from mobius.integrations.gguf._mmproj import build_gemma4_vlm_from_gguf
 
         return build_gemma4_vlm_from_gguf(
@@ -164,6 +184,12 @@ def build_from_gguf(
     from mobius.integrations.gguf._tensor_processors import (
         process_tensors,
     )
+
+    if static_cache and task is not None:
+        raise ValueError(
+            "static_cache=True cannot be combined with an explicit task "
+            "override; the static cache is wired through CausalLMTask."
+        )
 
     # 1. Parse GGUF file (auto-download from HF Hub when given "owner/repo[:filename]")
     gguf_path = _resolve_gguf_path(gguf_path)
@@ -228,12 +254,23 @@ def build_from_gguf(
 
     # 4. Look up module class and resolve task
     module_class = registry.get(model_type)
-    if task is None:
-        task = _default_task_for_model(model_type)
+    resolved_task: str | ModelTask
+    if static_cache:
+        from mobius.tasks import CausalLMTask
+
+        resolved_task = CausalLMTask(static_cache=True, max_seq_len=max_seq_len)
+    elif task is None:
+        resolved_task = _default_task_for_model(model_type)
+    else:
+        resolved_task = task
 
     # 5. Build ONNX graph
     module = module_class(config)
-    pkg = build_from_module(module, config, task, execution_provider=execution_provider)
+    if keep_quantized:
+        _replace_native_block_linears(module, gguf_model, gguf_arch)
+    pkg = build_from_module(
+        module, config, resolved_task, execution_provider=execution_provider
+    )
     logger.info(
         "Built ONNX graph for %s (%d components)",
         model_type,
@@ -260,7 +297,9 @@ def build_from_gguf(
             k
             for k in state_dict
             if not (
-                k.endswith((".scales", ".zero_points")) or _is_quantized_weight(k, state_dict)
+                k.endswith((".scales", ".zero_points"))
+                or _is_quantized_weight(k, state_dict)
+                or _is_native_block_weight(k, state_dict)
             )
         }
         float_dict = {k: state_dict[k] for k in float_keys}
@@ -295,6 +334,111 @@ def _is_quantized_weight(key: str, state_dict: dict) -> bool:
     return f"{stem}.scales" in state_dict
 
 
+def _is_native_block_weight(key: str, state_dict: dict) -> bool:
+    """Check for a packed runtime-native GGUF weight."""
+    from mobius.integrations.gguf._repacker import NATIVE_BLOCK_BYTE_SIZES
+
+    if not key.endswith(".weight"):
+        return False
+    value = state_dict[key]
+    return (
+        value.dtype.is_floating_point is False
+        and value.dim() == 3
+        and value.shape[-1] in NATIVE_BLOCK_BYTE_SIZES
+    )
+
+
+def _native_block_spec(qtype):
+    """Return the runtime-native layout for a GGUF quantization enum."""
+    from mobius.integrations.gguf._repacker import native_block_spec
+
+    qtype_val = qtype.value if hasattr(qtype, "value") else qtype
+    return native_block_spec(qtype_val)
+
+
+def _native_block_format(qtype) -> str | None:
+    """Return the runtime format string for supported native GGUF blocks."""
+    spec = _native_block_spec(qtype)
+    return spec.format if spec is not None else None
+
+
+def _native_block_target_stems(
+    hf_name: str,
+    np_shape: tuple[int, ...],
+    available_stems: set[str],
+) -> list[str]:
+    """Map a GGUF weight to one or more native-block module stems."""
+    if not hf_name.endswith(".weight"):
+        return []
+    stem = hf_name[: -len(".weight")]
+    if stem in available_stems:
+        return [stem]
+
+    if len(np_shape) == 3 and ".experts." in stem:
+        prefix, projection = stem.rsplit(".experts.", 1)
+        for container in (f"{prefix}.experts", f"{prefix}.moe.experts"):
+            candidates = [f"{container}.{i}.{projection}" for i in range(np_shape[0])]
+            if all(candidate in available_stems for candidate in candidates):
+                return candidates
+    return []
+
+
+def _replace_child_module(root, path: str, replacement) -> None:
+    """Replace a named ONNXScript child module while retaining its graph name."""
+    parts = path.split(".")
+    parent = root
+    for part in parts[:-1]:
+        try:
+            parent = getattr(parent, part)
+        except AttributeError as error:
+            raise AttributeError(f"Module path {path!r} has no child {part!r}") from error
+    child_name = parts[-1]
+    try:
+        old = getattr(parent, child_name)
+    except AttributeError as error:
+        raise AttributeError(f"Module path {path!r} has no child {child_name!r}") from error
+    if hasattr(replacement, "_set_name") and hasattr(old, "name"):
+        replacement._set_name(old.name)
+    setattr(parent, child_name, replacement)
+
+
+def _replace_native_block_linears(module, gguf_model, gguf_arch: str) -> None:
+    """Swap MatMulNBits scaffolding for runtime-supported native linears."""
+    from mobius.components import BlockQuantizedLinear, QuantizedLinear
+    from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
+
+    module_map = dict(module.named_modules())
+    quantized_stems = {
+        name for name, child in module_map.items() if isinstance(child, QuantizedLinear)
+    }
+    replacements: dict[str, str] = {}
+    for gguf_name, _raw, qtype, np_shape in gguf_model.tensor_items_raw():
+        format_name = _native_block_format(qtype)
+        if format_name is None:
+            continue
+        hf_name = map_gguf_to_hf_names(gguf_name, gguf_arch)
+        if hf_name is None:
+            continue
+        for stem in _native_block_target_stems(hf_name, np_shape, quantized_stems):
+            replacements[stem] = format_name
+
+    for stem, format_name in replacements.items():
+        old = module_map[stem]
+        replacement = BlockQuantizedLinear(
+            old._k,
+            old._n,
+            format=format_name,
+            bias=old.bias is not None,
+        )
+        _replace_child_module(module, stem, replacement)
+
+    if replacements:
+        logger.info(
+            "Preserving %d GGUF projection weights as runtime-native IQ/MXFP4 blocks",
+            len(replacements),
+        )
+
+
 def _normalize_gguf_weights(
     state_dict: dict,
 ) -> dict:
@@ -322,19 +466,7 @@ def _normalize_gguf_weights(
     import torch
 
     result: dict[str, torch.Tensor] = {}
-    kv_b_parts: dict[str, dict[str, torch.Tensor]] = {}
     for key, value in state_dict.items():
-        for part in ("k", "v"):
-            suffix = f".self_attn.kv_b_proj.{part}_proj.weight"
-            if key.endswith(suffix):
-                prefix = key[: -len(suffix)]
-                kv_b_parts.setdefault(prefix, {})[part] = value
-                break
-        else:
-            part = None
-        if part is not None:
-            continue
-
         # Stacked expert weights [num_experts, out, in] → per-expert
         unpacked = False
         for proj in ("gate_proj", "up_proj", "down_proj"):
@@ -363,30 +495,15 @@ def _normalize_gguf_weights(
             result[key[: -len(".bias")]] = value
             continue
 
-        if key.endswith(".gate.e_score_correction_bias.bias"):
-            result[key[: -len(".bias")]] = value
+        # layer_scalar.weight → layer_scalar (Gemma4 per-layer output scale is an
+        # nn.Parameter, not a module weight). GGUF stores it as
+        # blk.{i}.layer_output_scale.weight, which the tensor mapping renames to
+        # model.layers.{i}.layer_scalar.weight; strip the artefact .weight suffix.
+        if key.endswith(".layer_scalar.weight"):
+            result[key[: -len(".weight")]] = value
             continue
 
         result[key] = value
-
-    for prefix, parts in kv_b_parts.items():
-        if set(parts) != {"k", "v"}:
-            missing = {"k", "v"} - set(parts)
-            raise ValueError(
-                f"Incomplete split kv_b_proj for {prefix}: missing {sorted(missing)}"
-            )
-        k_proj = parts["k"].transpose(1, 2)
-        v_proj = parts["v"]
-        if k_proj.shape[0] != v_proj.shape[0] or k_proj.shape[2] != v_proj.shape[2]:
-            raise ValueError(
-                f"Incompatible split kv_b_proj shapes for {prefix}: "
-                f"k={tuple(parts['k'].shape)}, v={tuple(v_proj.shape)}"
-            )
-        fused = torch.cat((k_proj, v_proj), dim=1).reshape(
-            -1,
-            k_proj.shape[-1],
-        )
-        result[f"{prefix}.self_attn.kv_b_proj.weight"] = fused
 
     return result
 
@@ -439,6 +556,22 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
             "No mapped weight tensors found in GGUF file. "
             "Use keep_quantized=False for dequantized import."
         )
+
+    native_counts = Counter(
+        {qtype: count for qtype, count in counts.items() if _native_block_format(qtype)}
+    )
+    if native_counts:
+        asymmetric_types = {"Q2_K", "Q4_1", "Q4_K", "Q5_1", "Q5_K"}
+        is_sym = not any(
+            getattr(qtype, "name", None) in asymmetric_types
+            for qtype in counts
+            if qtype not in native_counts
+        )
+        logger.info(
+            "Native GGUF quant types present; using 4-bit/block-32 module "
+            "scaffolding for non-native quantized tensors",
+        )
+        return 4, 32, is_sym
 
     # Q4_K_M is deliberately a mixed preset. Depending on tensor dimensions
     # and importance it may contain mostly Q5_0 plus Q4_K, Q6_K, and Q8_0.
@@ -542,6 +675,16 @@ def _can_quantize_lm_head(gguf_model, gguf_arch: str) -> bool:
         "Q5_K",
         "Q6_K",
         "Q8_0",
+        "MXFP4",
+        "IQ4_NL",
+        "IQ4_XS",
+        "IQ3_S",
+        "IQ3_XXS",
+        "IQ2_XXS",
+        "IQ2_XS",
+        "IQ2_S",
+        "IQ1_S",
+        "IQ1_M",
     }
     for name, _raw, qtype, shape in gguf_model.tensor_items_raw():
         if map_gguf_to_hf_names(name, gguf_arch) != "lm_head.weight":
@@ -556,11 +699,12 @@ def _require_supported_requantization(
     block_size: int,
     tensor_name: str,
 ) -> None:
-    if bits not in (4, 8) or block_size != 32:
+    if bits != 4 or block_size != 32:
         raise ValueError(
             "keep_quantized MatMulNBits requantization currently supports only "
-            f"4-bit or 8-bit block-32 targets; got bits={bits} block={block_size} "
-            f"for tensor {tensor_name}. Use keep_quantized=False or a supported target."
+            f"4-bit/block-32 targets; got bits={bits} block={block_size} "
+            f"for tensor {tensor_name}. Use keep_quantized=False or a "
+            "4-bit/block-32 target."
         )
 
 
@@ -662,7 +806,7 @@ def _load_quantized_state_dict(
     module,
     config,
 ) -> dict:
-    """Load tensors, normalizing quantized projections to MatMulNBits.
+    """Load tensors, preserving native blocks or normalizing to MatMulNBits.
 
     Projection weights (Q/K/V/O, MLP, and a quantized output head) are
     converted to the graph's common MatMulNBits format, and token embeddings
@@ -678,12 +822,12 @@ def _load_quantized_state_dict(
     import torch
     from gguf import GGMLQuantizationType, dequantize
 
-    from mobius.components import QuantizedEmbedding, QuantizedLinear
+    from mobius.components import BlockQuantizedLinear, QuantizedEmbedding, QuantizedLinear
     from mobius.integrations.gguf._repacker import (
         can_repack,
+        preserve_native_blocks,
         repack_dequantized_tensor,
         repack_gguf_tensor,
-        repack_quant_params,
     )
     from mobius.integrations.gguf._tencent_q1_0 import (
         is_tencent_q1_0_layout,
@@ -699,10 +843,13 @@ def _load_quantized_state_dict(
     # Collect module paths that use QuantizedLinear so we know
     # which .weight parameters should receive repacked data.
     quantized_stems = set()
+    native_block_stems: dict[str, str] = {}
     quantized_embedding_stems = set()
     for mod_name, mod in module.named_modules():
-        if isinstance(mod, QuantizedLinear):
+        if isinstance(mod, QuantizedLinear) or getattr(mod, "_gguf_quantized_linear", False):
             quantized_stems.add(mod_name)
+        elif isinstance(mod, BlockQuantizedLinear):
+            native_block_stems[mod_name] = mod._format
         elif isinstance(mod, QuantizedEmbedding):
             quantized_embedding_stems.add(mod_name)
 
@@ -729,7 +876,6 @@ def _load_quantized_state_dict(
     target_bits = config.quantization.bits
     target_block_size = config.quantization.group_size
     target_symmetric = config.quantization.sym
-    split_kv_b: dict[str, dict[str, np.ndarray]] = {}
 
     for gguf_name, raw, qtype, np_shape in tqdm.tqdm(
         gguf_model.tensor_items_raw(),
@@ -744,112 +890,6 @@ def _load_quantized_state_dict(
         # Determine the int value of the quant type for can_repack
         qtype_val = qtype.value if hasattr(qtype, "value") else qtype
 
-        # GGUF stores every routed expert projection in one 3D tensor. Repack
-        # one expert at a time to avoid materializing a multi-gigabyte float
-        # tensor for GLM-5.2's 256 experts.
-        expert_proj = next(
-            (
-                proj
-                for proj in ("gate_proj", "up_proj", "down_proj")
-                if hf_name.endswith(f".mlp.experts.{proj}.weight")
-            ),
-            None,
-        )
-        if expert_proj is not None and len(np_shape) == 3:
-            num_experts, n_out, k_in = (int(dim) for dim in np_shape)
-            raw_flat = raw.reshape(-1)
-            if raw_flat.size % num_experts != 0:
-                raise ValueError(
-                    f"Cannot split GGUF expert tensor {gguf_name}: "
-                    f"{raw_flat.size} blocks across {num_experts} experts"
-                )
-            blocks_per_expert = raw_flat.size // num_experts
-            source_params = repack_quant_params(qtype_val)
-            for expert_idx in range(num_experts):
-                raw_expert = raw_flat[
-                    expert_idx * blocks_per_expert : (expert_idx + 1) * blocks_per_expert
-                ]
-                if source_params == (target_bits, target_block_size):
-                    repacked = repack_gguf_tensor(
-                        raw_expert.ravel().view(np.uint8),
-                        qtype_val,
-                        (n_out, k_in),
-                    )
-                else:
-                    _require_supported_requantization(
-                        bits=target_bits,
-                        block_size=target_block_size,
-                        tensor_name=hf_name,
-                    )
-                    values = gguf_model.dequantize_raw_tensor(
-                        raw_expert,
-                        qtype,
-                        (n_out, k_in),
-                    )
-                    repacked = repack_dequantized_tensor(
-                        values,
-                        bits=target_bits,
-                        block_size=target_block_size,
-                        symmetric=target_symmetric,
-                    )
-                    n_requantized += 1
-
-                expert_name = hf_name.replace(
-                    f".mlp.experts.{expert_proj}.weight",
-                    f".mlp.experts.{expert_idx}.{expert_proj}.weight",
-                )
-                expert_stem = expert_name[: -len(".weight")]
-                state_dict[expert_name] = torch.from_numpy(repacked.weight)
-                state_dict[f"{expert_stem}.scales"] = torch.from_numpy(repacked.scales)
-                if repacked.zero_points is not None:
-                    state_dict[f"{expert_stem}.zero_points"] = torch.from_numpy(
-                        repacked.zero_points
-                    )
-                n_repacked += 1
-            continue
-
-        # GLM-5.2 GGUF splits the MLA kv_b projection into per-head K and V
-        # tensors. Fuse them in float and immediately requantize the resulting
-        # 2D projection so only one layer's temporary arrays are resident.
-        kv_b_part = None
-        for part in ("k", "v"):
-            suffix = f".self_attn.kv_b_proj.{part}_proj.weight"
-            if hf_name.endswith(suffix):
-                kv_b_part = part
-                kv_b_prefix = hf_name[: -len(suffix)]
-                break
-        if kv_b_part is not None:
-            values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
-            parts = split_kv_b.setdefault(kv_b_prefix, {})
-            parts[kv_b_part] = values
-            if set(parts) == {"k", "v"}:
-                k_proj = parts["k"].transpose(0, 2, 1)
-                v_proj = parts["v"]
-                fused = np.concatenate((k_proj, v_proj), axis=1).reshape(
-                    -1,
-                    k_proj.shape[-1],
-                )
-                _require_supported_requantization(
-                    bits=target_bits,
-                    block_size=target_block_size,
-                    tensor_name=f"{kv_b_prefix}.self_attn.kv_b_proj.weight",
-                )
-                repacked = repack_dequantized_tensor(
-                    fused,
-                    bits=target_bits,
-                    block_size=target_block_size,
-                    symmetric=target_symmetric,
-                )
-                stem = f"{kv_b_prefix}.self_attn.kv_b_proj"
-                state_dict[f"{stem}.weight"] = torch.from_numpy(repacked.weight)
-                state_dict[f"{stem}.scales"] = torch.from_numpy(repacked.scales)
-                if repacked.zero_points is not None:
-                    state_dict[f"{stem}.zero_points"] = torch.from_numpy(repacked.zero_points)
-                del split_kv_b[kv_b_prefix]
-                n_repacked += 1
-                n_requantized += 1
-            continue
-
         # Repack every target QuantizedLinear weight. Mixed GGUF presets
         # otherwise leave unsupported source types as full float matrices,
         # which cannot fit the graph's packed MatMulNBits initializer shape.
@@ -860,7 +900,44 @@ def _load_quantized_state_dict(
             stem in quantized_stems or is_quantized_embedding
         )
 
-        if should_repack:
+        native_targets = _native_block_target_stems(
+            hf_name,
+            np_shape,
+            set(native_block_stems),
+        )
+        native_spec = _native_block_spec(qtype)
+        if native_targets and native_spec is not None:
+            n_out = int(np_shape[-2])
+            k_in = int(np_shape[-1])
+            packed = preserve_native_blocks(
+                raw,
+                qtype_val,
+                (len(native_targets) * n_out, k_in),
+            )
+            packed = packed.reshape(
+                len(native_targets),
+                n_out,
+                packed.shape[-2],
+                native_spec.bytes,
+            )
+            for index, native_stem in enumerate(native_targets):
+                w = torch.from_numpy(np.array(packed[index], copy=True))
+                target_name = f"{native_stem}.weight"
+                if _needs_qk_permute(
+                    target_name,
+                    num_heads,
+                    num_kv_heads,
+                    model_type,
+                ):
+                    n_head = (
+                        num_heads
+                        if ".q_proj." in target_name or ".qkv_proj." in target_name
+                        else num_kv_heads
+                    )
+                    w = _reverse_permute(w, n_head)
+                state_dict[target_name] = w
+            n_repacked += len(native_targets)
+        elif should_repack:
             if is_tencent_q1_0_tensor:
                 repacked = parse_tencent_q1_0_tensor(
                     gguf_path,
@@ -942,9 +1019,6 @@ def _load_quantized_state_dict(
             else:
                 arr = dequantize(raw, qtype).reshape(np_shape)
             state_dict[hf_name] = torch.from_numpy(arr)
-
-    if split_kv_b:
-        raise ValueError(f"Incomplete split kv_b_proj tensors: {sorted(split_kv_b)}")
 
     logger.info(
         "Loaded %d state_dict entries (%d GGUF tensors repacked for quantized ops, "

@@ -118,6 +118,12 @@ _GEMMA4_EXTRAS: dict[str, str] = {
     "blk.{bid}.inp_gate": "model.layers.{bid}.per_layer_input_gate",
     "blk.{bid}.proj": "model.layers.{bid}.per_layer_projection",
     "blk.{bid}.post_norm": "model.layers.{bid}.post_per_layer_input_norm",
+    # Top-level per-layer input tensors (E2B/E4B). GGUF stores the per-layer
+    # token embedding table, its projection, and projection norm as global
+    # (non-block) tensors that live inside the text backbone (model.*).
+    "per_layer_token_embd": "model.embed_tokens_per_layer",
+    "per_layer_model_proj": "model.per_layer_model_projection",
+    "per_layer_proj_norm": "model.per_layer_projection_norm",
 }
 
 # Phi-3 uses fused QKV and gate-up projections.
@@ -187,51 +193,10 @@ _MOE_EXTRAS: dict[str, str] = {
     "blk.{bid}.ffn_down_shexp": ("model.layers.{bid}.mlp.shared_expert.down_proj"),
 }
 
-# GLM-5.2 uses MLA with split K/V decompression weights in GGUF.
-# The temporary ``kv_b_proj.{k,v}_proj`` names are fused by
-# ``_normalize_gguf_weights`` before model-specific preprocessing.
-_GLM_DSA_MAPPING: dict[str, str] = {
-    "token_embd": "model.embed_tokens",
-    "output": "lm_head",
-    "output_norm": "model.norm",
-    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
-    "blk.{bid}.attn_q_a": "model.layers.{bid}.self_attn.q_a_proj",
-    "blk.{bid}.attn_q_b": "model.layers.{bid}.self_attn.q_b_proj",
-    "blk.{bid}.attn_kv_a_mqa": "model.layers.{bid}.self_attn.kv_a_proj_with_mqa",
-    "blk.{bid}.attn_k_b": "model.layers.{bid}.self_attn.kv_b_proj.k_proj",
-    "blk.{bid}.attn_v_b": "model.layers.{bid}.self_attn.kv_b_proj.v_proj",
-    "blk.{bid}.attn_q_a_norm": "model.layers.{bid}.self_attn.q_a_layernorm",
-    "blk.{bid}.attn_kv_a_norm": "model.layers.{bid}.self_attn.kv_a_layernorm",
-    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
-    "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
-    "blk.{bid}.ffn_gate": "model.layers.{bid}.mlp.gate_proj",
-    "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.up_proj",
-    "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj",
-    "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.mlp.gate",
-    "blk.{bid}.exp_probs_b": "model.layers.{bid}.mlp.gate.e_score_correction_bias",
-    # GLM-5.2 IndexShare DSA.
-    "blk.{bid}.indexer.attn_k": "model.layers.{bid}.self_attn.indexer.wk",
-    "blk.{bid}.indexer.attn_q_b": "model.layers.{bid}.self_attn.indexer.wq_b",
-    "blk.{bid}.indexer.k_norm": "model.layers.{bid}.self_attn.indexer.k_norm",
-    "blk.{bid}.indexer.proj": "model.layers.{bid}.self_attn.indexer.weights_proj",
-    # GLM-5.2 improved MTP. The shared embedding/head tensors are tied to
-    # token_embd/output and therefore intentionally remain unmapped.
-    "blk.{bid}.nextn.eh_proj": "model.layers.{bid}.eh_proj",
-    "blk.{bid}.nextn.enorm": "model.layers.{bid}.enorm",
-    "blk.{bid}.nextn.hnorm": "model.layers.{bid}.hnorm",
-    "blk.{bid}.nextn.shared_head_norm": "model.layers.{bid}.shared_head.norm",
-    "blk.{bid}.ffn_gate_exps": "model.layers.{bid}.mlp.experts.gate_proj",
-    "blk.{bid}.ffn_up_exps": "model.layers.{bid}.mlp.experts.up_proj",
-    "blk.{bid}.ffn_down_exps": "model.layers.{bid}.mlp.experts.down_proj",
-    "blk.{bid}.ffn_gate_shexp": "model.layers.{bid}.mlp.shared_experts.gate_proj",
-    "blk.{bid}.ffn_up_shexp": "model.layers.{bid}.mlp.shared_experts.up_proj",
-    "blk.{bid}.ffn_down_shexp": "model.layers.{bid}.mlp.shared_experts.down_proj",
-}
-
-# Qwen3.5-MoE hybrid extensions: DeltaNet (SSM) + full-attention + MoE.
+# Qwen3.5 hybrid extensions: DeltaNet (SSM) + full-attention.
 # DeltaNet layers use linear_attn.* naming; full-attention layers add
 # q_norm/k_norm under self_attn; both use post_attention_layernorm.
-_QWEN35_EXTRAS: dict[str, str] = {
+_QWEN35_HYBRID_EXTRAS: dict[str, str] = {
     # DeltaNet (linear attention) layers
     "blk.{bid}.attn_qkv": "model.layers.{bid}.linear_attn.in_proj_qkv",
     "blk.{bid}.attn_gate": "model.layers.{bid}.linear_attn.in_proj_z",
@@ -247,6 +212,56 @@ _QWEN35_EXTRAS: dict[str, str] = {
     "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
     # Both layer types — post-attention layernorm
     "blk.{bid}.post_attention_norm": ("model.layers.{bid}.post_attention_layernorm"),
+}
+
+_DEEPSEEK4_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "output_norm": "model.norm",
+    "output_hc_fn": "model.hc_head_fn",
+    "output_hc_base": "model.hc_head_base@",
+    "output_hc_scale": "model.hc_head_scale@",
+    "blk.{bid}.attn_q_a": "model.layers.{bid}.self_attn.q_a_proj",
+    "blk.{bid}.attn_q_a_norm": "model.layers.{bid}.self_attn.q_a_layernorm",
+    "blk.{bid}.attn_q_b": "model.layers.{bid}.self_attn.q_b_proj",
+    "blk.{bid}.attn_kv": "model.layers.{bid}.self_attn.kv_proj",
+    "blk.{bid}.attn_kv_a_norm": "model.layers.{bid}.self_attn.kv_layernorm",
+    "blk.{bid}.attn_output_a": "model.layers.{bid}.self_attn.o_a_proj",
+    "blk.{bid}.attn_output_b": "model.layers.{bid}.self_attn.o_b_proj",
+    "blk.{bid}.attn_sinks": "model.layers.{bid}.self_attn.attn_sink@",
+    "blk.{bid}.attn_compressor_kv": "model.layers.{bid}.self_attn.compressor.wkv",
+    "blk.{bid}.attn_compressor_gate": "model.layers.{bid}.self_attn.compressor.wgate",
+    "blk.{bid}.attn_compressor_ape": "model.layers.{bid}.self_attn.compressor.ape@",
+    "blk.{bid}.attn_compressor_norm": "model.layers.{bid}.self_attn.compressor.norm",
+    "blk.{bid}.indexer.attn_q_b": "model.layers.{bid}.self_attn.indexer.wq_b",
+    "blk.{bid}.indexer.proj": "model.layers.{bid}.self_attn.indexer.weights_proj",
+    "blk.{bid}.indexer_compressor_kv": ("model.layers.{bid}.self_attn.indexer.compressor.wkv"),
+    "blk.{bid}.indexer_compressor_gate": (
+        "model.layers.{bid}.self_attn.indexer.compressor.wgate"
+    ),
+    "blk.{bid}.indexer_compressor_ape": (
+        "model.layers.{bid}.self_attn.indexer.compressor.ape@"
+    ),
+    "blk.{bid}.indexer_compressor_norm": (
+        "model.layers.{bid}.self_attn.indexer.compressor.norm"
+    ),
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+    "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.mlp.gate",
+    "blk.{bid}.exp_probs_b": "model.layers.{bid}.mlp.gate",
+    "blk.{bid}.ffn_gate_tid2eid": "model.layers.{bid}.mlp.gate.tid2eid@",
+    "blk.{bid}.ffn_gate_exps": "model.layers.{bid}.mlp.experts.gate_proj",
+    "blk.{bid}.ffn_up_exps": "model.layers.{bid}.mlp.experts.up_proj",
+    "blk.{bid}.ffn_down_exps": "model.layers.{bid}.mlp.experts.down_proj",
+    "blk.{bid}.ffn_gate_shexp": "model.layers.{bid}.mlp.shared_experts.gate_proj",
+    "blk.{bid}.ffn_up_shexp": "model.layers.{bid}.mlp.shared_experts.up_proj",
+    "blk.{bid}.ffn_down_shexp": "model.layers.{bid}.mlp.shared_experts.down_proj",
+    "blk.{bid}.hc_attn_fn": "model.layers.{bid}.hc_attn_fn",
+    "blk.{bid}.hc_attn_base": "model.layers.{bid}.hc_attn_base@",
+    "blk.{bid}.hc_attn_scale": "model.layers.{bid}.hc_attn_scale@",
+    "blk.{bid}.hc_ffn_fn": "model.layers.{bid}.hc_ffn_fn",
+    "blk.{bid}.hc_ffn_base": "model.layers.{bid}.hc_ffn_base@",
+    "blk.{bid}.hc_ffn_scale": "model.layers.{bid}.hc_ffn_scale@",
 }
 
 # Architectures sharing the llama HF naming convention.
@@ -315,7 +330,7 @@ def _build_mapping(
     if arch in _LLAMA_FAMILY:
         result = dict(_LLAMA_MAPPING)
         if arch == "qwen35":
-            result.update(_QWEN35_EXTRAS)
+            result.update(_QWEN35_HYBRID_EXTRAS)
     elif arch == "gemma3":
         # Gemma3 uses the llama.cpp Gemma tensor names (ffn_norm as the
         # pre-feedforward norm, plus post_attention/post_ffw norms and Q/K
@@ -348,16 +363,16 @@ def _build_mapping(
         result = dict(_LLAMA_MAPPING)
         result.update(_MOE_EXTRAS)
         if arch == "qwen35moe":
-            result.update(_QWEN35_EXTRAS)
-    elif arch == "glm-dsa":
-        result = dict(_GLM_DSA_MAPPING)
+            result.update(_QWEN35_HYBRID_EXTRAS)
+    elif arch == "deepseek4":
+        result = dict(_DEEPSEEK4_MAPPING)
     else:
         supported = sorted(
             _LLAMA_FAMILY
             | _GEMMA_FAMILY
             | _MOE_FAMILY
             | _HUNYUAN_FAMILY
-            | {"gemma4", "glm-dsa", "phi3", "falcon", "gpt2", "mamba"}
+            | {"deepseek4", "gemma4", "phi3", "falcon", "gpt2", "mamba"}
         )
         raise ValueError(
             f"Unsupported GGUF architecture: {architecture!r}. "
@@ -413,10 +428,15 @@ def map_gguf_to_hf_names(
         lookup = _BLK_PATTERN.sub(_BLK_TEMPLATE, stem)
         hf_pattern = mapping.get(lookup)
         if hf_pattern is not None:
-            return hf_pattern.replace("{bid}", bid) + suffix
+            hf_pattern = hf_pattern.replace("{bid}", bid)
+            if hf_pattern.endswith("@"):
+                return hf_pattern[:-1]
+            return hf_pattern + suffix
     else:
         hf_stem = mapping.get(stem)
         if hf_stem is not None:
+            if hf_stem.endswith("@"):
+                return hf_stem[:-1]
             return hf_stem + suffix
 
     return None

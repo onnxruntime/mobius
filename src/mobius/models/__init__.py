@@ -25,6 +25,7 @@ __all__ = [
     "ControlNetModel",
     "DeepSeekOCR2CausalLMModel",
     "DeepSeekV3CausalLMModel",
+    "DeepSeekV4CausalLMModel",
     "DFlashDraftModel",
     "Eagle3DraftModel",
     "DiTTransformer2DModel",
@@ -55,7 +56,6 @@ __all__ = [
     "Glm4CausalLMModel",
     "Glm4MoECausalLMModel",
     "GlmCausalLMModel",
-    "GlmMoeDsaCausalLMModel",
     "GraniteCausalLMModel",
     "GraniteMoECausalLMModel",
     "GraniteMoeHybridCausalLMModel",
@@ -91,8 +91,10 @@ __all__ = [
     "Phi3CausalLMModel",
     "Phi3MoECausalLMModel",
     "Phi3SmallCausalLMModel",
+    "Phi3VModel",
     "Phi4MMCausalLMModel",
     "Phi4MMMultiModalModel",
+    "Phi4SigLIPModel",
     "PhiCausalLMModel",
     "Qwen25VLCausalLMModel",
     "Qwen25VLDecoderModel",
@@ -165,6 +167,7 @@ from mobius.models.controlnet import ControlNetModel
 from mobius.models.ctrl import CTRLCausalLMModel
 from mobius.models.deepseek import DeepSeekV3CausalLMModel
 from mobius.models.deepseek_ocr2 import DeepSeekOCR2CausalLMModel
+from mobius.models.deepseek_v4 import DeepSeekV4CausalLMModel
 from mobius.models.dflash import DFlashDraftModel
 from mobius.models.diffllama import DiffLlamaCausalLMModel
 from mobius.models.distilbert import DistilBertModel
@@ -187,7 +190,6 @@ from mobius.models.gemma4 import (
 )
 from mobius.models.gemma4_assistant import Gemma4AssistantCausalLMModel
 from mobius.models.glm import Glm4CausalLMModel, GlmCausalLMModel
-from mobius.models.glm_moe_dsa import GlmMoeDsaCausalLMModel
 from mobius.models.gpt2 import GPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
 from mobius.models.gptj_codegen import CodeGenCausalLMModel, GPTJCausalLMModel
@@ -236,6 +238,8 @@ from mobius.models.phi import (
     PhiCausalLMModel,
 )
 from mobius.models.phi3 import Phi3CausalLMModel
+from mobius.models.phi3_v import Phi3VModel
+from mobius.models.phi4_siglip import Phi4SigLIPModel
 from mobius.models.qwen import (
     Qwen3CausalLMModel,
     QwenCausalLMModel,

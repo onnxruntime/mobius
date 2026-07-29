@@ -91,13 +91,14 @@ def _cast_module_dtype(module: nn.Module, dtype: ir.DataType) -> None:
     caches), the underlying data is also cast.
 
     Only recasts parameters that are currently FLOAT (float32). Integer
-    parameters and non-float types are left unchanged.
+    parameters, non-float types, and parameters marked ``_keep_float32`` are
+    left unchanged.
     """
     if dtype == ir.DataType.FLOAT:
         return
     torch_dtype = tensor_adapters.to_torch_dtype(dtype)
     for param in module.parameters():
-        if param.dtype != ir.DataType.FLOAT:
+        if param.dtype != ir.DataType.FLOAT or getattr(param, "_keep_float32", False):
             continue
         param.type = ir.TensorType(dtype)
         if param.const_value is not None:
@@ -354,7 +355,6 @@ def build(
     execution_provider: str = "default",
     trace_optimization: bool = False,
     text_only: bool = False,
-    config_overrides: dict[str, object] | None = None,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a HuggingFace model ID.
 
@@ -418,8 +418,6 @@ def build(
             Raises :class:`ValueError` if the resolved ``model_type`` has no
             text-only sibling. Currently supported for ``gemma4_unified``
             (``google/gemma-4-12B``).
-        config_overrides: Optional dataclass field overrides applied after
-            HuggingFace config extraction and dtype resolution.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -571,8 +569,6 @@ def build(
     if dtype is not None:
         dtype = resolve_dtype(dtype)
         config = dataclasses.replace(config, dtype=dtype)
-    if config_overrides:
-        config = dataclasses.replace(config, **config_overrides)
 
     if output_layer_indices is not None:
         # Opt-in: emit additional `hidden_states.{k}` ONNX outputs for each

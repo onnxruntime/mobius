@@ -36,10 +36,10 @@ jobs:
       - "JobId=gpu-l5-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}"
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -59,8 +59,7 @@ jobs:
           pip install -r requirements/ci/requirements.txt
           pip install soundfile librosa ml_dtypes flatbuffers numpy packaging protobuf sympy coloredlogs
           pip install -e '.[testing,transformers]'
-          # ORT 1.27+ PyPI wheels require CUDA 13; these runners and PyTorch use CUDA 12.8.
-          pip install --pre --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-12-nightly/pypi/simple/ 'onnxruntime-gpu<1.27' onnxruntime-genai-cuda
+          pip install --pre --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-12-nightly/pypi/simple/ onnxruntime-gpu onnxruntime-genai-cuda
 
       - name: Run L5 generation E2E tests
         env:

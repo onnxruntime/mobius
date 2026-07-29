@@ -7,6 +7,7 @@ __all__ = [
     "Attention",
     "BatchNorm2d",
     "BertEmbeddings",
+    "BlockQuantizedLinear",
     "CausalConv1d",
     "CausalConvNd",
     "CausalDepthwiseConv1d",
@@ -47,7 +48,6 @@ __all__ = [
     "MLP",
     "MLPMultiModalProjector",
     "MoELayer",
-    "FusedQuantizedMoE",
     "OffsetRMSNorm",
     "PatchEmbed",
     "PatchEmbedding",
@@ -163,7 +163,6 @@ from mobius.components._mamba_block import Mamba2Block as Mamba2Block
 from mobius.components._mamba_block import MambaBlock as MambaBlock
 from mobius.components._mlp import FCMLP, MLP, FusedGateUpMLP, GatedMLP
 from mobius.components._moe import (
-    FusedQuantizedMoE,
     MoELayer,
     SigmoidTopKGate,
     SoftmaxTopKGate,
@@ -194,6 +193,7 @@ from mobius.components._qformer import (
     QFormerLayer as QFormerLayer,
 )
 from mobius.components._quantized_linear import (
+    BlockQuantizedLinear,
     QuantizedEmbedding,
     QuantizedLinear,
     TiedQuantizedLMHead,

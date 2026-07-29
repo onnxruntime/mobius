@@ -188,6 +188,39 @@ class TestArchitectureConfig:
         config = ArchitectureConfig.from_transformers(FakeQwen3Config())
         assert config.attn_qk_norm is True
 
+    def test_from_transformers_chatglm4_legacy_fields(self):
+        class FakeChatGLMConfig:
+            model_type = "chatglm"
+            num_attention_heads = 32
+            multi_query_attention = True
+            multi_query_group_num = 2
+            num_layers = 40
+            hidden_size = 4096
+            ffn_hidden_size = 13696
+            kv_channels = 128
+            padded_vocab_size = 151552
+            vocab_size = 151552
+            seq_length = 131072
+            layernorm_epsilon = 1.5625e-7
+            add_bias_linear = False
+            add_qkv_bias = True
+            pad_token_id = 151329
+            tie_word_embeddings = False
+
+        config = ArchitectureConfig.from_transformers(FakeChatGLMConfig())
+
+        assert config.num_hidden_layers == 40
+        assert config.num_key_value_heads == 2
+        assert config.head_dim == 128
+        assert config.intermediate_size == 13696
+        assert config.hidden_act == "silu"
+        assert config.max_position_embeddings == 131072
+        assert config.partial_rotary_factor == pytest.approx(0.5)
+        assert config.rope_interleave is True
+        assert config.attn_qkv_bias is True
+        assert config.attn_o_bias is False
+        assert config.mlp_bias is False
+
     def test_from_transformers_rope_scaling(self):
         class FakeConfig:
             model_type = "llama"
@@ -1051,23 +1084,6 @@ class TestGemma4Config:
 
 class TestActivationFallbacks:
     """Tests for hidden_act extraction fallbacks (ff_activation, gelu_activation)."""
-
-    def test_chatglm_silu_fallback(self):
-        """ChatGLM hardcodes SiLU without exposing an activation field."""
-
-        class FakeConfig:
-            model_type = "chatglm"
-            num_attention_heads = 8
-            num_key_value_heads = 8
-            num_hidden_layers = 2
-            vocab_size = 1000
-            hidden_size = 256
-            intermediate_size = 512
-            max_position_embeddings = 1024
-            head_dim = 32
-
-        config = ArchitectureConfig.from_transformers(FakeConfig())
-        assert config.hidden_act == "silu"
 
     def test_ff_activation_fallback(self):
         """ff_activation is used when hidden_act is absent (XLNet pattern)."""

@@ -28,6 +28,7 @@ __all__ = [
     "CodecTask",
     "ComponentSpec",
     "ControlNetTask",
+    "DeepSeekV4Task",
     "DFlashDraftTask",
     "Eagle3DraftTask",
     "Qwen35MtpTask",
@@ -37,7 +38,6 @@ __all__ = [
     "Gemma4AssistantTask",
     "Gemma4Task",
     "Gemma4UnifiedTask",
-    "GlmMoeDsaTask",
     "Gemma4TextCausalLMTask",
     "HybridCausalLMTask",
     "HybridQwenVLTask",
@@ -87,6 +87,7 @@ from mobius.tasks._causal_lm import (
 from mobius.tasks._codec import CodecTask
 from mobius.tasks._controlnet import ControlNetTask
 from mobius.tasks._ctc_asr import CTCAsrTask
+from mobius.tasks._deepseek_v4 import DeepSeekV4Task
 from mobius.tasks._denoising import DenoisingTask
 from mobius.tasks._dflash import DFlashDraftTask
 from mobius.tasks._eagle3 import Eagle3DraftTask
@@ -98,7 +99,6 @@ from mobius.tasks._gemma4 import (
     Gemma4UnifiedTask,
 )
 from mobius.tasks._gemma4_assistant import Gemma4AssistantTask
-from mobius.tasks._glm_moe_dsa import GlmMoeDsaTask
 from mobius.tasks._hunyuan_vl_mot import HunYuanVLMoTTask
 from mobius.tasks._image_classification import ImageClassificationTask
 from mobius.tasks._masked_diffusion import MaskedDiffusionTask
@@ -145,6 +145,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "moshi-depformer": MoshiDepformerTask,
     "moshi-temporal": MoshiTemporalTask,
     "text-generation": CausalLMTask,
+    "deepseek-v4": DeepSeekV4Task,
     "hybrid-text-generation": HybridCausalLMTask,
     "dflash-draft": DFlashDraftTask,
     "eagle3-draft": Eagle3DraftTask,
@@ -161,7 +162,6 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "gemma4-text-generation": Gemma4TextCausalLMTask,
     "gemma4-unified": Gemma4UnifiedTask,
     "gemma4-assistant": Gemma4AssistantTask,
-    "glm-moe-dsa": GlmMoeDsaTask,
     "hunyuan-vl-mot": HunYuanVLMoTTask,
     "multimodal": MultiModalTask,
     "phi4mm-multimodal": Phi4MMMultiModalTask,

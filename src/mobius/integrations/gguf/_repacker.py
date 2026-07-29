@@ -1,11 +1,14 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Repack GGUF quantized blocks into ORT MatMulNBits format.
+"""Preserve or repack GGUF quantized blocks for ORT custom operators.
 
 Converts raw GGUF block data for Q4_0, Q4_1, Q8_0, Q4_K, and Q1_0
 quantization types into the (weight, scales, zero_points) tensors
 expected by the ``com.microsoft.MatMulNBits`` operator.
+
+The runtime-native IQ/MXFP4 formats are retained byte-for-byte for
+``pkg.nxrt.BlockQuantizedMatMul``.
 
 GGUF block layouts:
     Q4_0 (18 bytes, 32 elt):  [fp16 scale][16B packed nibbles]
@@ -35,6 +38,16 @@ _GGUF_Q4_0 = 2
 _GGUF_Q4_1 = 3
 _GGUF_Q8_0 = 8
 _GGUF_Q4_K = 12
+_GGUF_IQ2_XXS = 16
+_GGUF_IQ2_XS = 17
+_GGUF_IQ3_XXS = 18
+_GGUF_IQ1_S = 19
+_GGUF_IQ4_NL = 20
+_GGUF_IQ3_S = 21
+_GGUF_IQ2_S = 22
+_GGUF_IQ4_XS = 23
+_GGUF_IQ1_M = 29
+_GGUF_MXFP4 = 39
 _GGUF_Q1_0 = 41
 
 # Block byte sizes per GGUF type
@@ -69,6 +82,30 @@ _REPACK_PARAMS = {
 }
 
 
+@dataclass(frozen=True)
+class NativeBlockSpec:
+    """Serialized GGUF block layout accepted directly by the runtime."""
+
+    format: str
+    elements: int
+    bytes: int
+
+
+_NATIVE_BLOCK_SPECS = {
+    _GGUF_MXFP4: NativeBlockSpec("mxfp4", 32, 17),
+    _GGUF_IQ4_NL: NativeBlockSpec("iq4_nl", 32, 18),
+    _GGUF_IQ4_XS: NativeBlockSpec("iq4_xs", 256, 136),
+    _GGUF_IQ3_S: NativeBlockSpec("iq3_s", 256, 110),
+    _GGUF_IQ3_XXS: NativeBlockSpec("iq3_xxs", 256, 98),
+    _GGUF_IQ2_XXS: NativeBlockSpec("iq2_xxs", 256, 66),
+    _GGUF_IQ2_XS: NativeBlockSpec("iq2_xs", 256, 74),
+    _GGUF_IQ2_S: NativeBlockSpec("iq2_s", 256, 82),
+    _GGUF_IQ1_S: NativeBlockSpec("iq1_s", 256, 50),
+    _GGUF_IQ1_M: NativeBlockSpec("iq1_m", 256, 56),
+}
+NATIVE_BLOCK_BYTE_SIZES = frozenset(spec.bytes for spec in _NATIVE_BLOCK_SPECS.values())
+
+
 @dataclass
 class RepackedTensor:
     """MatMulNBits-compatible representation of a quantized weight.
@@ -88,6 +125,36 @@ class RepackedTensor:
     zero_points: np.ndarray | None
     block_size: int
     bits: int
+
+
+def native_block_spec(gguf_type: int) -> NativeBlockSpec | None:
+    """Return the runtime-native block layout for a GGUF type, if supported."""
+    return _NATIVE_BLOCK_SPECS.get(gguf_type)
+
+
+def preserve_native_blocks(
+    raw_data: np.ndarray,
+    gguf_type: int,
+    shape: tuple[int, ...],
+) -> np.ndarray:
+    """Validate and reshape raw GGUF blocks without changing any bytes."""
+    spec = native_block_spec(gguf_type)
+    if spec is None:
+        raise ValueError(f"GGUF type {gguf_type} is not runtime-native")
+    if len(shape) != 2:
+        raise ValueError(f"Expected 2D shape (N, K), got {shape}")
+
+    n_out, k_in = shape
+    n_blocks = math.ceil(k_in / spec.elements)
+    expected_bytes = n_out * n_blocks * spec.bytes
+    packed = raw_data.ravel().view(np.uint8)
+    if packed.size != expected_bytes:
+        raise ValueError(
+            f"Native {spec.format} data size mismatch: got {packed.size} bytes, "
+            f"expected {expected_bytes} for shape {shape} "
+            f"with {n_out * n_blocks} blocks x {spec.bytes} bytes"
+        )
+    return packed.reshape(n_out, n_blocks, spec.bytes)
 
 
 def can_repack(gguf_type: int) -> bool:
@@ -451,10 +518,10 @@ def repack_dequantized_tensor(
     """
     if values.ndim != 2:
         raise ValueError(f"Expected 2D values (N, K), got shape {values.shape}")
-    if bits not in (4, 8) or block_size != _BLOCK_SIZE:
+    if bits != 4 or block_size != _BLOCK_SIZE:
         raise ValueError(
             "Float requantization currently supports only "
-            f"bits=4/8, block_size={_BLOCK_SIZE}; got bits={bits}, "
+            f"bits=4, block_size={_BLOCK_SIZE}; got bits={bits}, "
             f"block_size={block_size}"
         )
 
@@ -464,29 +531,6 @@ def repack_dequantized_tensor(
     padded = np.zeros((n_out, padded_k), dtype=np.float32)
     padded[:, :k_in] = values.astype(np.float32, copy=False)
     blocks = padded.reshape(n_out, n_blocks, block_size)
-
-    if bits == 8:
-        block_min = np.minimum(blocks.min(axis=-1), 0.0)
-        block_max = np.maximum(blocks.max(axis=-1), 0.0)
-        if symmetric:
-            scales = np.maximum(-block_min / 128.0, block_max / 127.0)
-            zero_points = np.full_like(scales, 128, dtype=np.uint8)
-        else:
-            scales = (block_max - block_min) / 255.0
-            safe_scales = np.where(scales != 0, scales, 1.0)
-            zero_points = np.clip(np.rint(-block_min / safe_scales), 0, 255).astype(np.uint8)
-        safe_scales = np.where(scales != 0, scales, 1.0)
-        quants = np.rint(blocks / safe_scales[:, :, None])
-        quants += zero_points[:, :, None]
-        weight = np.clip(quants, 0, 255).astype(np.uint8)
-        weight = np.where(scales[:, :, None] != 0, weight, 0).astype(np.uint8)
-        return RepackedTensor(
-            weight=weight,
-            scales=scales.astype(np.float32),
-            zero_points=zero_points,
-            block_size=block_size,
-            bits=bits,
-        )
 
     if symmetric:
         # MatMulNBits' implicit uint4 zero-point is 8. Choose a scale that

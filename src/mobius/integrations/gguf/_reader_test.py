@@ -10,7 +10,6 @@ to avoid requiring model downloads.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import ClassVar
 
 import numpy as np
 import pytest
@@ -409,78 +408,71 @@ class TestConfigMapping:
         assert GGUF_ARCH_TO_MODEL_TYPE["llama"] == "llama"
         assert GGUF_ARCH_TO_MODEL_TYPE["mistral"] == "llama"
         assert GGUF_ARCH_TO_MODEL_TYPE["qwen2"] == "qwen2"
+        assert GGUF_ARCH_TO_MODEL_TYPE["qwen35"] == "qwen3_5_text"
         assert GGUF_ARCH_TO_MODEL_TYPE["phi3"] == "phi3"
-        assert GGUF_ARCH_TO_MODEL_TYPE["glm-dsa"] == "glm_moe_dsa"
+        assert GGUF_ARCH_TO_MODEL_TYPE["deepseek4"] == "deepseek_v4"
 
-    def test_glm_dsa_config_extraction(self):
-        class _FakeGlmDsa:
-            architecture = "glm-dsa"
-            tensor_names: ClassVar[list[str]] = ["token_embd.weight", "output.weight"]
-            metadata: ClassVar[dict] = {
-                "glm-dsa.embedding_length": 6144,
-                "glm-dsa.feed_forward_length": 12288,
-                "glm-dsa.block_count": 79,
-                "glm-dsa.attention.head_count": 64,
-                "glm-dsa.attention.head_count_kv": 1,
-                "glm-dsa.attention.layer_norm_rms_epsilon": 1e-5,
-                "glm-dsa.attention.q_lora_rank": 2048,
-                "glm-dsa.attention.kv_lora_rank": 512,
-                "glm-dsa.attention.key_length_mla": 256,
-                "glm-dsa.attention.value_length_mla": 256,
-                "glm-dsa.attention.indexer.head_count": 32,
-                "glm-dsa.attention.indexer.key_length": 128,
-                "glm-dsa.attention.indexer.top_k": 2048,
-                "glm-dsa.expert_count": 256,
-                "glm-dsa.expert_used_count": 8,
-                "glm-dsa.expert_feed_forward_length": 2048,
-                "glm-dsa.expert_shared_count": 1,
-                "glm-dsa.expert_group_count": 1,
-                "glm-dsa.expert_group_used_count": 1,
-                "glm-dsa.expert_weights_scale": 2.5,
-                "glm-dsa.expert_weights_norm": True,
-                "glm-dsa.expert_gating_func": 2,
-                "glm-dsa.leading_dense_block_count": 3,
-                "glm-dsa.nextn_predict_layers": 1,
-                "glm-dsa.rope.dimension_count": 64,
-                "glm-dsa.rope.freq_base": 8_000_000.0,
-                "glm-dsa.context_length": 1_048_576,
-                "glm-dsa.vocab_size": 154880,
-            }
+    def test_deepseek4_config_extraction(self):
+        metadata = {
+            "general.architecture": "deepseek4",
+            "deepseek4.embedding_length": 4096,
+            "deepseek4.block_count": 43,
+            "deepseek4.attention.head_count": 64,
+            "deepseek4.attention.head_count_kv": 1,
+            "deepseek4.attention.key_length": 512,
+            "deepseek4.context_length": 1048576,
+            "deepseek4.rope.dimension_count": 64,
+            "deepseek4.rope.freq_base": 10000.0,
+            "deepseek4.rope.scaling.type": "yarn",
+            "deepseek4.rope.scaling.factor": 16.0,
+            "deepseek4.rope.scaling.original_context_length": 65536,
+            "deepseek4.rope.scaling.yarn_beta_fast": 32.0,
+            "deepseek4.rope.scaling.yarn_beta_slow": 1.0,
+            "deepseek4.attention.layer_norm_rms_epsilon": 1e-6,
+            "deepseek4.expert_count": 256,
+            "deepseek4.expert_used_count": 6,
+            "deepseek4.expert_feed_forward_length": 2048,
+            "deepseek4.expert_shared_count": 1,
+            "deepseek4.expert_weights_scale": 1.5,
+            "deepseek4.expert_weights_norm": True,
+            "deepseek4.swiglu_clamp_exp": [10.0] * 43,
+            "deepseek4.attention.q_lora_rank": 1024,
+            "deepseek4.attention.sliding_window": 128,
+            "deepseek4.attention.output_group_count": 8,
+            "deepseek4.attention.output_lora_rank": 1024,
+            "deepseek4.attention.indexer.head_count": 64,
+            "deepseek4.attention.indexer.key_length": 128,
+            "deepseek4.attention.indexer.top_k": 512,
+            "deepseek4.attention.compress_ratios": [0, 0, 4, 128],
+            "deepseek4.attention.compress_rope_freq_base": 160000.0,
+            "deepseek4.hyper_connection.count": 4,
+            "deepseek4.hyper_connection.sinkhorn_iterations": 20,
+            "deepseek4.hyper_connection.epsilon": 1e-6,
+            "deepseek4.hash_layer_count": 3,
+        }
+
+        class _FakeModel:
+            architecture = "deepseek4"
+
+            def __init__(self, values):
+                self.metadata = values
+                self.tensor_names = ["token_embd.weight", "output.weight"]
 
             def get_metadata(self, key, default=None):
                 return self.metadata.get(key, default)
 
-        config = gguf_to_config(_FakeGlmDsa())
-
-        assert config.model_type == "glm_moe_dsa"
-        assert config.num_hidden_layers == 78
-        assert config.hidden_size == 6144
-        assert config.num_attention_heads == 64
-        assert config.num_key_value_heads == 64
-        assert config.head_dim == 64
-        assert config.q_lora_rank == 2048
-        assert config.kv_lora_rank == 512
-        assert config.qk_nope_head_dim == 192
+        config = gguf_to_config(_FakeModel(metadata))
+        assert config.model_type == "deepseek_v4"
+        assert config.head_dim == 512
         assert config.qk_rope_head_dim == 64
-        assert config.v_head_dim == 256
         assert config.num_local_experts == 256
-        assert config.num_experts_per_tok == 8
-        assert config.moe_intermediate_size == 2048
-        assert config.shared_expert_intermediate_size == 2048
-        assert config.first_k_dense_replace == 3
-        assert config.routed_scaling_factor == pytest.approx(2.5)
-        assert config.scoring_func == "sigmoid"
+        assert config.scoring_func == "sqrtsoftplus"
+        assert config.hc_mult == 4
+        assert config.num_hash_layers == 3
+        assert config.swiglu_limit == pytest.approx(10.0)
         assert config.rope_interleave is True
-        assert config.max_position_embeddings == 1_048_576
-        assert config.indexer_types[:7] == [
-            "full",
-            "full",
-            "full",
-            "shared",
-            "shared",
-            "shared",
-            "full",
-        ]
+        assert config.rope_type == "yarn"
+        assert config.original_max_position_embeddings == 65536
 
     def test_tie_embeddings_detected(self, tied_gguf: Path):
         model = GGUFModel(tied_gguf)

@@ -6,16 +6,13 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING
+import math
 
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
-from mobius._configs import ArchitectureConfig
+from mobius._configs import ArchitectureConfig, QuantizationConfig
 from mobius.components._mlp import MLP
-
-if TYPE_CHECKING:
-    pass
 
 
 class TopKGate(nn.Module):
@@ -38,6 +35,29 @@ class TopKGate(nn.Module):
         routing_weights, selected_experts = op.TopK(router_logits, k, axis=-1, _outputs=2)
         routing_weights = op.Softmax(routing_weights, axis=-1)
         return routing_weights, selected_experts
+
+    def qmoe_routing(self, op: OpBuilder, hidden_states: ir.Value):
+        """Return selection and aggregation tensors for QMoE.
+
+        Raw router logits are intentionally passed as ``router_probs`` with
+        ``router_weights=None`` and ``normalize_routing_weights=1``. QMoE
+        selects the top-k by raw value (monotonic activations preserve that
+        selection) and, on this path, gives the selected logits softmax
+        weights. This matches ``TopKGate.forward``:
+        ``Softmax(TopK(router_logits))`` on both CPU and CUDA EPs.
+
+        ORT's CPU QMoE honors Input 14 (``router_weights``) by gathering it at
+        the selected experts, but CUDA QMoE ignores Input 14 and always uses
+        softmax-top-k on ``router_probs``; see
+        ``contrib_ops/cpu/moe/moe_quantization_cpu.cc`` and
+        ``contrib_ops/cuda/moe/moe_quantization.cc``. Thus ``None`` is correct
+        here on both EPs, while activated probabilities used by Softmax/Sigmoid
+        gates are correct on CPU but double-activated on CUDA.
+        """
+        weight_t = op.Transpose(self.weight, perm=[1, 0])
+        router_logits = op.MatMul(hidden_states, weight_t)
+        router_logits = op.Cast(router_logits, to=ir.DataType.FLOAT.value)
+        return router_logits, None, True, 1.0
 
 
 class SoftmaxTopKGate(nn.Module):
@@ -68,6 +88,26 @@ class SoftmaxTopKGate(nn.Module):
             weight_sum = op.ReduceSum(routing_weights, [-1], keepdims=True)
             routing_weights = op.Div(routing_weights, weight_sum)
         return routing_weights, selected_experts
+
+    def qmoe_routing(self, op: OpBuilder, hidden_states: ir.Value):
+        """Return selection and aggregation tensors for QMoE.
+
+        ``router_probs`` (QMoE input 1) is the raw float32 logits and the
+        pre-softmaxed probabilities are passed as ``router_weights`` (input
+        14). CUDA QMoE ignores ``router_weights`` and applies softmax-top-k on
+        ``router_probs``, so feeding logits reproduces ``forward`` exactly
+        (``Softmax`` then top-k then renormalize); feeding pre-softmaxed probs
+        here would double-softmax on CUDA. CPU QMoE selects the top-k over
+        ``router_probs`` (softmax is monotonic, so logits give the same
+        selection) and gathers ``router_weights`` at the selected experts,
+        renormalizing when ``normalize_routing_weights=1`` -- which equals
+        ``forward``'s renormalized top-k of the full softmax.
+        """
+        weight_t = op.Transpose(self.weight, perm=[1, 0])
+        router_logits = op.MatMul(hidden_states, weight_t)
+        router_logits = op.Cast(router_logits, to=ir.DataType.FLOAT.value)
+        routing_probs = op.Softmax(router_logits, axis=-1)
+        return router_logits, routing_probs, self.norm_topk_prob, 1.0
 
 
 class SigmoidTopKGate(nn.Module):
@@ -109,6 +149,29 @@ class SigmoidTopKGate(nn.Module):
         if self.routed_scaling_factor != 1.0:  # noqa: RUF069
             routing_weights = op.Mul(routing_weights, self.routed_scaling_factor)
         return routing_weights, selected_experts
+
+    def qmoe_routing(self, op: OpBuilder, hidden_states: ir.Value):
+        """Return selection and aggregation tensors for QMoE.
+
+        The sigmoid-activated probabilities are passed as ``router_weights``
+        (QMoE input 14) while the raw float32 logits are passed as
+        ``router_probs`` (input 1). CPU QMoE selects the top-k over
+        ``router_probs`` (sigmoid is monotonic, so logits give the same
+        selection) and gathers ``router_weights`` at the selected experts,
+        renormalizing per ``normalize_routing_weights``. Passing logits (rather
+        than the sigmoid probs) as ``router_probs`` avoids a softmax-of-sigmoid
+        on CUDA, which ignores ``router_weights``.
+        """
+        weight_t = op.Transpose(self.weight, perm=[1, 0])
+        router_logits = op.MatMul(hidden_states, weight_t)
+        router_logits = op.Cast(router_logits, to=ir.DataType.FLOAT.value)
+        routing_probs = op.Sigmoid(router_logits)
+        return (
+            router_logits,
+            routing_probs,
+            self.norm_topk_prob,
+            self.routed_scaling_factor,
+        )
 
 
 class SparseMixerGate(nn.Module):
@@ -187,21 +250,30 @@ class MoELayer(nn.Module):
     Routes each token to top-k experts via a gating mechanism, applies
     each expert MLP, and accumulates weighted results.
 
-    Uses loop-over-experts dispatch: each expert processes all tokens,
-    then results are masked and weighted.
+    Two dispatch paths are selected at construction time:
+
+    - Loop-over-experts (default): each expert ``MLP`` processes all
+      tokens, then results are masked and weighted. Used when the model
+      is unquantized or the gate has no ``qmoe_routing`` hook.
+    - Fused ``com.microsoft::QMoE`` (``experts=None``): used when the
+      quantization config matches the native QMoE ABI
+      (:func:`_supported_qmoe_quantization`) and the gate implements
+      ``qmoe_routing``. Expert weights are packed into quantized
+      ``fc1``/``fc2`` parameters instead of per-expert ``MLP`` modules.
+
+    The loop-over-experts path is the portable dense fallback representation:
+    it uses only standard ONNX operators, evaluates every expert for every
+    token, then masks and weights each contribution. It is a correctness oracle
+    and compatibility path, not the grouped-expert performance representation.
     """
 
-    def __init__(
-        self,
-        config: ArchitectureConfig,
-        gate: nn.Module | None = None,
-        linear_class: type | None = None,
-    ):
+    def __init__(self, config: ArchitectureConfig, gate: nn.Module | None = None):
         super().__init__()
         assert config.num_local_experts is not None
         assert config.num_experts_per_tok is not None
         self.num_experts = config.num_local_experts
         self.top_k = config.num_experts_per_tok
+        self._qmoe_quantization = _supported_qmoe_quantization(config.quantization)
         if gate is not None:
             self.gate = gate
         else:
@@ -212,11 +284,98 @@ class MoELayer(nn.Module):
             if config.moe_intermediate_size is not None
             else config
         )
-        self.experts = nn.ModuleList(
-            [MLP(expert_config, linear_class=linear_class) for _ in range(self.num_experts)]
+        if self._qmoe_quantization is not None and hasattr(self.gate, "qmoe_routing"):
+            self.experts = None
+            self._init_qmoe_parameters(expert_config)
+        else:
+            self.experts = nn.ModuleList([MLP(expert_config) for _ in range(self.num_experts)])
+
+    def _init_qmoe_parameters(self, expert_config: ArchitectureConfig) -> None:
+        quantization = self._qmoe_quantization
+        assert quantization is not None
+        hidden_size = expert_config.hidden_size
+        intermediate_size = expert_config.intermediate_size
+        block_size = quantization.group_size
+        bits = quantization.bits
+        fc1_out = 2 * intermediate_size
+        if hidden_size % block_size or intermediate_size % block_size:
+            raise ValueError(
+                "QMoE dimensions must be divisible by the quantization group size"
+            )
+
+        self.fc1_experts_weights = nn.Parameter(
+            [self.num_experts, fc1_out, hidden_size * bits // 8],
+            dtype=ir.DataType.UINT8,
         )
+        self.fc1_scales = nn.Parameter([self.num_experts, fc1_out, hidden_size // block_size])
+        self.fc1_scales._keep_float32 = True
+        self.fc2_experts_weights = nn.Parameter(
+            [self.num_experts, hidden_size, intermediate_size * bits // 8],
+            dtype=ir.DataType.UINT8,
+        )
+        self.fc2_scales = nn.Parameter(
+            [self.num_experts, hidden_size, intermediate_size // block_size]
+        )
+        self.fc2_scales._keep_float32 = True
+        if quantization.sym:
+            self.fc1_experts_zero_points = None
+            self.fc2_experts_zero_points = None
+        else:
+            self.fc1_experts_zero_points = nn.Parameter(
+                [
+                    self.num_experts,
+                    fc1_out,
+                    math.ceil((hidden_size // block_size) * bits / 8),
+                ],
+                dtype=ir.DataType.UINT8,
+            )
+            self.fc2_experts_zero_points = nn.Parameter(
+                [
+                    self.num_experts,
+                    hidden_size,
+                    math.ceil((intermediate_size // block_size) * bits / 8),
+                ],
+                dtype=ir.DataType.UINT8,
+            )
+
+    def _qmoe_forward(self, op: OpBuilder, hidden_states: ir.Value):
+        quantization = self._qmoe_quantization
+        assert quantization is not None
+        router_probs, router_weights, normalize, output_scale = self.gate.qmoe_routing(
+            op, hidden_states
+        )
+        result = op.QMoE(
+            hidden_states,
+            router_probs,
+            self.fc1_experts_weights,
+            self.fc1_scales,
+            None,
+            self.fc2_experts_weights,
+            self.fc2_scales,
+            None,
+            None,
+            None,
+            None,
+            self.fc1_experts_zero_points,
+            self.fc2_experts_zero_points,
+            None,
+            router_weights,
+            activation_type="swiglu",
+            normalize_routing_weights=int(normalize),
+            k=self.top_k,
+            expert_weight_bits=quantization.bits,
+            block_size=quantization.group_size,
+            swiglu_fusion=2,
+            _domain="com.microsoft",
+        )
+        if output_scale != 1.0:  # noqa: RUF069
+            result = op.Mul(result, op.CastLike(output_scale, result))
+        return result
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
+        if self.experts is None:
+            return self._qmoe_forward(op, hidden_states)
+
         routing_weights, selected_experts = self.gate(op, hidden_states)
 
         result = None
@@ -236,164 +395,15 @@ class MoELayer(nn.Module):
         return result
 
 
-class FusedQuantizedMoE(nn.Module):
-    """Routed MoE experts emitted as a single fused ``com.microsoft::QMoE`` op.
-
-    Replaces the per-expert ``MatMulNBits`` unroll (:class:`MoELayer`) for
-    weight-only int-quantized MoE. All routed experts are packed into
-    expert-major integer weight tensors laid out exactly as the ORT contrib
-    ``QMoE`` kernel expects::
-
-        fc1_experts_weights: [E, 2*inter, hidden // pack_size]   uint8
-        fc1_scales:          [E, 2*inter, hidden // block_size]  float32
-        fc2_experts_weights: [E, hidden, inter // pack_size]     uint8
-        fc2_scales:          [E, hidden, inter // block_size]    float32
-
-    where ``pack_size = 8 // bits``. ``fc1`` fuses the SwiGLU gate/up
-    projections in the **interleaved** layout ``[g_0, u_0, g_1, u_1, ...]`` and is
-    consumed with ``swiglu_fusion=1`` (the only SwiGLU layout the ORT CPU QMoE
-    kernel supports), so the kernel computes ``silu(gate) * up`` — matching
-    GLM/DeepSeek's SiLU-gated experts (``activation_alpha=1``, ``activation_beta=0``,
-    ``swiglu_limit=inf``, all ORT defaults).
-
-    Routing is delegated to ``gate.route_for_qmoe`` (GLM sigmoid + noaux_tc /
-    DeepSeek softmax group-limited). The kernel re-derives top-k selection from
-    ``router_probs`` (the gate's ``scores_for_choice``); the exact combine
-    weights are scattered into a dense ``[rows, E]`` aggregation tensor and fed
-    through the optional ``router_weights`` input with
-    ``normalize_routing_weights=0``, so the fused op reproduces the per-expert
-    path's routing bit-for-bit.
-
-    Symmetric int quantization is used (no zero-points): the kernel defaults the
-    per-block zero-point to ``1 << (bits - 1)``.
-    """
-
-    _MICROSOFT_DOMAIN = "com.microsoft"
-
-    def __init__(
-        self,
-        config: ArchitectureConfig,
-        gate: nn.Module,
+def _supported_qmoe_quantization(
+    quantization: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    """Return quantization settings when they match the native QMoE ABI."""
+    if (
+        quantization is None
+        or quantization.bits != 4
+        or quantization.float_zero_point
+        or quantization.quant_method not in {"gptq", "awq"}
     ):
-        super().__init__()
-        assert config.num_local_experts is not None
-        assert config.num_experts_per_tok is not None
-        assert config.moe_intermediate_size is not None
-        assert config.quantization is not None
-        if not hasattr(gate, "route_for_qmoe"):
-            raise TypeError(
-                f"gate {type(gate).__name__} does not support the fused QMoE path "
-                "(missing route_for_qmoe); use MoELayer instead"
-            )
-
-        qc = config.quantization
-        bits = qc.bits
-        block_size = qc.group_size
-        if bits not in (1, 2, 4, 8):
-            raise ValueError(f"QMoE expert_weight_bits must be 1/2/4/8, got {bits}")
-        if block_size < 16 or (block_size & (block_size - 1)):
-            raise ValueError(f"QMoE block_size must be a power of 2 >= 16, got {block_size}")
-
-        self.gate = gate
-        self._num_experts = config.num_local_experts
-        self._top_k = config.num_experts_per_tok
-        self._hidden = config.hidden_size
-        self._inter = config.moe_intermediate_size
-        self._bits = bits
-        self._block_size = block_size
-
-        if self._hidden % block_size != 0:
-            raise ValueError(
-                f"hidden_size {self._hidden} must be divisible by block_size {block_size}"
-            )
-        if self._inter % block_size != 0:
-            raise ValueError(
-                f"moe_intermediate_size {self._inter} must be divisible by "
-                f"block_size {block_size}"
-            )
-
-        pack_size = 8 // bits
-        e = self._num_experts
-        fc1_out = 2 * self._inter  # interleaved [g_0, u_0, ...] for swiglu_fusion=1
-        # fc1: [E, 2*inter, hidden] quantized along hidden (K)
-        self.fc1_experts_weights = nn.Parameter(
-            [e, fc1_out, self._hidden // pack_size],
-            dtype=ir.DataType.UINT8,
-        )
-        self.fc1_scales = nn.Parameter(
-            [e, fc1_out, self._hidden // block_size],
-            dtype=ir.DataType.FLOAT,
-        )
-        # fc2: [E, hidden, inter] quantized along inter (K)
-        self.fc2_experts_weights = nn.Parameter(
-            [e, self._hidden, self._inter // pack_size],
-            dtype=ir.DataType.UINT8,
-        )
-        self.fc2_scales = nn.Parameter(
-            [e, self._hidden, self._inter // block_size],
-            dtype=ir.DataType.FLOAT,
-        )
-
-    def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
-        hidden = self._hidden
-
-        # QMoE requires 2-D router_probs, so flatten [B, S, H] -> [rows, H].
-        orig_shape = op.Shape(hidden_states)
-        flat = op.Reshape(hidden_states, op.Constant(value_ints=[-1, hidden]))
-        # QMoE input/router_probs must be float32.
-        flat_f32 = op.Cast(flat, to=1)
-
-        scores_for_choice, routing_weights, selected_experts = self._route(op, flat_f32)
-
-        # Dense [rows, E] aggregation weights: combine weight at each selected
-        # expert position, 0 elsewhere. QMoE reads these at its own top-k picks.
-        zeros = op.Mul(scores_for_choice, 0.0)
-        aggregation = op.ScatterElements(zeros, selected_experts, routing_weights, axis=-1)
-
-        moe_out = op.QMoE(
-            flat_f32,  # 0: input
-            scores_for_choice,  # 1: router_probs (selection logits)
-            self.fc1_experts_weights,  # 2
-            self.fc1_scales,  # 3
-            None,  # 4: fc1_experts_bias
-            self.fc2_experts_weights,  # 5
-            self.fc2_scales,  # 6
-            None,  # 7: fc2_experts_bias
-            None,  # 8: fc3_experts_weights
-            None,  # 9: fc3_scales
-            None,  # 10: fc3_experts_bias
-            None,  # 11: fc1_zero_points
-            None,  # 12: fc2_zero_points
-            None,  # 13: fc3_zero_points
-            aggregation,  # 14: router_weights (explicit combine weights)
-            activation_type="swiglu",
-            k=self._top_k,
-            normalize_routing_weights=0,
-            swiglu_fusion=1,
-            expert_weight_bits=self._bits,
-            block_size=self._block_size,
-            quant_type="int",
-            _domain=self._MICROSOFT_DOMAIN,
-        )
-        moe_out = op.CastLike(moe_out, hidden_states)
-        return op.Reshape(moe_out, orig_shape)
-
-    def _route(self, op: OpBuilder, hidden_states: ir.Value):
-        """Invoke ``gate.route_for_qmoe`` under the gate's module scope.
-
-        ``route_for_qmoe`` is a plain method (not ``forward``), so it never goes
-        through :meth:`nn.Module.__call__`. We replicate the parameter-realization
-        step here so the gate's ``weight`` / ``e_score_correction_bias`` are
-        registered as graph initializers under the ``...moe.gate`` scope (matching
-        the per-expert path) instead of dangling as unqualified names.
-        """
-        builder = op.builder
-        module_name = self.gate._name or "gate"
-        class_name = type(self.gate).__qualname__
-        builder.push_module(module_name, class_name)
-        try:
-            for param in self.gate._parameters.values():
-                param._realize(builder)
-            return self.gate.route_for_qmoe(op, hidden_states)
-        finally:
-            builder.pop_module()
+        return None
+    return quantization
