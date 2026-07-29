@@ -324,7 +324,9 @@ def _extract_vision_config(config, parent_config, model_type: str) -> dict:
     hooks live under :mod:`mobius._configs.per_model` and are
     registered with :mod:`mobius._configs._extractors` at import time.
     """
-    from mobius._configs import per_model  # noqa: F401 - imported for registration side effect
+    from mobius._configs import (
+        per_model,  # ruff: ignore[unused-import] - imported for registration side effect
+    )
     from mobius._configs._extractors import extract_vision_config as _dispatch
 
     return _dispatch(config, parent_config, model_type)
@@ -337,7 +339,9 @@ def _extract_audio_config(config, parent_config, model_type: str) -> dict:
     hooks live under :mod:`mobius._configs.per_model` and are
     registered with :mod:`mobius._configs._extractors` at import time.
     """
-    from mobius._configs import per_model  # noqa: F401 - imported for registration side effect
+    from mobius._configs import (
+        per_model,  # ruff: ignore[unused-import] - imported for registration side effect
+    )
     from mobius._configs._extractors import extract_audio_config as _dispatch
 
     return _dispatch(config, parent_config, model_type)
@@ -1593,6 +1597,12 @@ class Gemma4Config(VisionLanguageConfig):
     # is too small for the fused [V, L*D] per-layer embedding table, to split
     # it into L separate [V, D] tables that each fit within the EP's buffer limit.
     split_per_layer_embedding: bool = False
+    # Dedicated quantization settings for the split per-layer embedding table.
+    # Kept separate from ``quantization`` so embedding_bits does not affect text
+    # token embeddings, LM head, or decoder Linear projection quantization.
+    per_layer_embedding_bits: int | None = None
+    per_layer_embedding_group_size: int = 32
+    per_layer_embedding_sym: bool = False
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Gemma4Config:

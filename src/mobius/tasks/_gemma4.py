@@ -25,7 +25,7 @@ import onnx_ir as ir
 from onnxscript import GraphBuilder, nn
 
 from mobius._build_context import ep_capabilities
-from mobius._configs import Gemma4Config, QuantizationConfig
+from mobius._configs import Gemma4Config
 from mobius._model_package import ModelPackage
 from mobius._pipeline_contract import (
     declare_component_presence,
@@ -444,28 +444,24 @@ class Gemma4Task(ModelTask):
         # in mobius.build() / the MobiusBuilder Olive pass config.
         if config.split_per_layer_embedding:
             qc = config.quantization
-            if qc is not None and qc.quantize_embeddings:
-                # embedding_bits was set by the caller — use its bits value
+            if getattr(config, "per_layer_embedding_bits", None) is not None:
+                if config.per_layer_embedding_bits not in (4, 8):
+                    raise ValueError(
+                        "quantize_embeddings requires bits=4 or bits=8, "
+                        f"got {config.per_layer_embedding_bits}"
+                    )
+            elif qc is not None and qc.quantize_embeddings:
                 if qc.bits not in (4, 8):
                     raise ValueError(
                         f"quantize_embeddings requires bits=4 or bits=8, got {qc.bits}"
                     )
-            elif qc is not None:
-                # Existing quantization config without embedding quantization —
-                # enable it with INT4 (the existing bits may be for MatMul
-                # quantization which is unrelated, so override for embeddings)
-                config.quantization.quantize_embeddings = True
-                config.quantization.bits = 4
-                config.quantization.group_size = 32
-                config.quantization.sym = False
+                config.per_layer_embedding_bits = qc.bits
+                config.per_layer_embedding_group_size = qc.group_size
+                config.per_layer_embedding_sym = qc.sym
             else:
-                config.quantization = QuantizationConfig(
-                    bits=4,
-                    group_size=32,
-                    quant_method="mobius",
-                    sym=False,
-                    quantize_embeddings=True,
-                )
+                config.per_layer_embedding_bits = 4
+                config.per_layer_embedding_group_size = 32
+                config.per_layer_embedding_sym = False
             # The module was already constructed before build() runs, so the
             # per-layer embeddings are plain Embedding (Gather).  Replace them
             # with QuantizedScaledWordEmbedding (GatherBlockQuantized).
@@ -474,13 +470,15 @@ class Gemma4Task(ModelTask):
                 _per_layer_embedding_block_size,
             )
 
-            qc = config.quantization
+            bits = config.per_layer_embedding_bits
+            group_size = config.per_layer_embedding_group_size
+            symmetric = config.per_layer_embedding_sym
             per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
             vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
             import numpy as np
 
             embed_scale = float(np.float16(per_layer_dim**0.5))
-            block_size = _per_layer_embedding_block_size(per_layer_dim, qc.group_size)
+            block_size = _per_layer_embedding_block_size(per_layer_dim, group_size)
             module.decoder.model.embed_tokens_per_layer_split = nn.ModuleList(
                 [
                     QuantizedScaledWordEmbedding(
@@ -488,9 +486,9 @@ class Gemma4Task(ModelTask):
                         per_layer_dim,
                         config.pad_token_id,
                         embed_scale=embed_scale,
-                        bits=qc.bits,
+                        bits=bits,
                         block_size=block_size,
-                        has_zero_point=not qc.sym,
+                        has_zero_point=not symmetric,
                     )
                     for _ in range(config.num_hidden_layers)
                 ]

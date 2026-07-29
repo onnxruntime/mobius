@@ -230,6 +230,26 @@ def _per_layer_embedding_block_size(embedding_dim: int, group_size: int) -> int:
     return group_size
 
 
+def _per_layer_embedding_quantization(config: Gemma4Config) -> tuple[int, int, bool] | None:
+    """Return split per-layer embedding quantization as (bits, group_size, symmetric)."""
+    bits = getattr(config, "per_layer_embedding_bits", None)
+    if bits is None:
+        quantization_config = getattr(config, "quantization", None)
+        if quantization_config is None or not getattr(
+            quantization_config, "quantize_embeddings", False
+        ):
+            return None
+        bits = quantization_config.bits
+        group_size = quantization_config.group_size
+        symmetric = quantization_config.sym
+    else:
+        group_size = getattr(config, "per_layer_embedding_group_size", 32)
+        symmetric = getattr(config, "per_layer_embedding_sym", False)
+    if bits not in (4, 8):
+        raise ValueError(f"quantize_embeddings requires bits=4 or bits=8, got {bits}")
+    return bits, group_size, symmetric
+
+
 def _dtype_safe_compress(
     op: OpBuilder, data: ir.Value, condition: ir.Value, *, axis: int
 ) -> ir.Value:
@@ -1830,15 +1850,10 @@ class Gemma4TextModel(nn.Module):
             # 256 MiB limit; ~128 MiB each vs ~4.7 GB fused).
             # Only the table actually called in forward() is realized as an
             # ONNX initializer, so the unused one adds no graph weight.
-            qc = getattr(config, "quantization", None)
-            if (
-                qc is not None
-                and getattr(qc, "quantize_embeddings", False)
-                and config.split_per_layer_embedding
-            ):
-                block_size = _per_layer_embedding_block_size(
-                    self._per_layer_dim, qc.group_size
-                )
+            per_layer_quant = _per_layer_embedding_quantization(config)
+            if per_layer_quant is not None and config.split_per_layer_embedding:
+                bits, group_size, symmetric = per_layer_quant
+                block_size = _per_layer_embedding_block_size(self._per_layer_dim, group_size)
                 self.embed_tokens_per_layer_split = nn.ModuleList(
                     [
                         QuantizedScaledWordEmbedding(
@@ -1846,9 +1861,9 @@ class Gemma4TextModel(nn.Module):
                             self._per_layer_dim,
                             config.pad_token_id,
                             embed_scale=float(self._per_layer_dim**0.5),
-                            bits=qc.bits,
+                            bits=bits,
                             block_size=block_size,
-                            has_zero_point=not qc.sym,
+                            has_zero_point=not symmetric,
                         )
                         for _ in range(self._num_layers)
                     ]
@@ -2402,24 +2417,18 @@ class _Gemma4DecoderModel(nn.Module):
                     f"got {fused.shape[1]}"
                 )
                 chunks = fused.chunk(num_layers, dim=1)
-                qc = getattr(self.config, "quantization", None)
-                quantize_per_layer = qc is not None and getattr(
-                    qc, "quantize_embeddings", False
-                )
-                if quantize_per_layer:
-                    if qc.bits not in (4, 8):
-                        raise ValueError(
-                            f"quantize_embeddings requires bits=4 or bits=8, got {qc.bits}"
-                        )
+                per_layer_quant = _per_layer_embedding_quantization(self.config)
+                if per_layer_quant is not None:
+                    bits, group_size, symmetric = per_layer_quant
                     from mobius._weight_utils import quantize_embedding_rtn
 
-                    block_size = _per_layer_embedding_block_size(per_layer_dim, qc.group_size)
+                    block_size = _per_layer_embedding_block_size(per_layer_dim, group_size)
                     for i, chunk in enumerate(chunks):
                         qweight, scales, zero_points = quantize_embedding_rtn(
                             chunk.contiguous(),
-                            bits=qc.bits,
+                            bits=bits,
                             block_size=block_size,
-                            symmetric=qc.sym,
+                            symmetric=symmetric,
                         )
                         state_dict[f"model.embed_tokens_per_layer_split.{i}.qweight"] = qweight
                         state_dict[f"model.embed_tokens_per_layer_split.{i}.scales"] = scales
@@ -3229,24 +3238,18 @@ class Gemma4Model(nn.Module):
                     f"got {fused.shape[1]}"
                 )
                 chunks = fused.chunk(num_layers, dim=1)
-                qc = getattr(self.config, "quantization", None)
-                quantize_per_layer = qc is not None and getattr(
-                    qc, "quantize_embeddings", False
-                )
-                if quantize_per_layer:
-                    if qc.bits not in (4, 8):
-                        raise ValueError(
-                            f"quantize_embeddings requires bits=4 or bits=8, got {qc.bits}"
-                        )
+                per_layer_quant = _per_layer_embedding_quantization(self.config)
+                if per_layer_quant is not None:
+                    bits, group_size, symmetric = per_layer_quant
                     from mobius._weight_utils import quantize_embedding_rtn
 
-                    block_size = _per_layer_embedding_block_size(per_layer_dim, qc.group_size)
+                    block_size = _per_layer_embedding_block_size(per_layer_dim, group_size)
                     for i, chunk in enumerate(chunks):
                         qweight, scales, zero_points = quantize_embedding_rtn(
                             chunk.contiguous(),
-                            bits=qc.bits,
+                            bits=bits,
                             block_size=block_size,
-                            symmetric=qc.sym,
+                            symmetric=symmetric,
                         )
                         renamed[f"decoder.model.embed_tokens_per_layer_split.{i}.qweight"] = (
                             qweight

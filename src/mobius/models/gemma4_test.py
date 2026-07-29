@@ -8,7 +8,7 @@ from __future__ import annotations
 import onnx_ir as ir
 import torch
 
-from mobius._configs import AudioConfig, Gemma4Config
+from mobius._configs import AudioConfig, Gemma4Config, QuantizationConfig
 from mobius.models.gemma4 import Gemma4CausalLMModel, Gemma4EmbeddingModel, Gemma4Model
 
 
@@ -118,6 +118,49 @@ class TestGemma4ModelPreprocessWeights:
         key = "decoder.model.layers.0.router.per_expert_scale"
         assert key in result
         assert torch.allclose(result[key], torch.ones(4))
+
+
+class TestGemma4PerLayerEmbeddingQuantization:
+    """Per-layer embedding quantization stays independent from text quantization."""
+
+    def test_split_defaults_do_not_mutate_existing_quantization_config(self, monkeypatch):
+        import dataclasses
+
+        import mobius.tasks._gemma4 as gemma4_task_module
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        class _TinyCaps:
+            max_buffer_size = 1
+
+        monkeypatch.setattr(gemma4_task_module, "ep_capabilities", lambda: _TinyCaps())
+
+        config = _tiny_gemma4_config(
+            enable_moe_block=False,
+            hidden_size_per_layer_input=32,
+            vocab_size_per_layer_input=64,
+        )
+        config = dataclasses.replace(
+            config,
+            quantization=QuantizationConfig(
+                bits=8,
+                group_size=64,
+                quant_method="none",
+                sym=True,
+                quantize_embeddings=False,
+            ),
+        )
+
+        pkg = Gemma4Task().build(Gemma4Model(config), config)
+
+        assert config.quantization is not None
+        assert config.quantization.bits == 8
+        assert config.quantization.group_size == 64
+        assert config.quantization.sym is True
+        assert config.quantization.quantize_embeddings is False
+        assert config.per_layer_embedding_bits == 4
+        assert config.per_layer_embedding_group_size == 32
+        assert config.per_layer_embedding_sym is False
+        assert any(node.op_type == "GatherBlockQuantized" for node in pkg["decoder"].graph)
 
 
 class TestGemma4EmbeddingModel:

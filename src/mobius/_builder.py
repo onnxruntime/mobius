@@ -592,29 +592,17 @@ def build(
         # ``embedding_bits`` is only for Gemma4's per-layer embedding table.  Do not
         # attach a QuantizationConfig to ordinary text models, because that changes
         # their regular token embedding/Linear modules.
-        if getattr(config, "hidden_size_per_layer_input", 0) and getattr(
-            config, "vocab_size_per_layer_input", 0
+        if (
+            hasattr(config, "per_layer_embedding_bits")
+            and getattr(config, "hidden_size_per_layer_input", 0)
+            and getattr(config, "vocab_size_per_layer_input", 0)
         ):
-            from mobius._configs import QuantizationConfig
-
-            if config.quantization is None:
-                config = dataclasses.replace(
-                    config,
-                    quantization=QuantizationConfig(
-                        bits=embedding_bits,
-                        group_size=32,
-                        quant_method="none",
-                        sym=False,
-                        quantize_embeddings=True,
-                    ),
-                )
-            else:
-                qc = dataclasses.replace(
-                    config.quantization,
-                    bits=embedding_bits,
-                    quantize_embeddings=True,
-                )
-                config = dataclasses.replace(config, quantization=qc)
+            config = dataclasses.replace(
+                config,
+                per_layer_embedding_bits=embedding_bits,
+                per_layer_embedding_group_size=32,
+                per_layer_embedding_sym=False,
+            )
 
     if task is None:
         task = _default_task_for_model(model_type)
