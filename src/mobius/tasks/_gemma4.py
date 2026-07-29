@@ -460,13 +460,19 @@ class Gemma4Task(ModelTask):
                 config.quantization.sym = False
             else:
                 config.quantization = QuantizationConfig(
-                    bits=4, group_size=32, quant_method="mobius", sym=False,
+                    bits=4,
+                    group_size=32,
+                    quant_method="mobius",
+                    sym=False,
                     quantize_embeddings=True,
                 )
             # The module was already constructed before build() runs, so the
             # per-layer embeddings are plain Embedding (Gather).  Replace them
             # with QuantizedScaledWordEmbedding (GatherBlockQuantized).
-            from mobius.models.gemma4 import QuantizedScaledWordEmbedding
+            from mobius.models.gemma4 import (
+                QuantizedScaledWordEmbedding,
+                _per_layer_embedding_block_size,
+            )
 
             qc = config.quantization
             per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
@@ -474,6 +480,7 @@ class Gemma4Task(ModelTask):
             import numpy as np
 
             embed_scale = float(np.float16(per_layer_dim**0.5))
+            block_size = _per_layer_embedding_block_size(per_layer_dim, qc.group_size)
             module.decoder.model.embed_tokens_per_layer_split = nn.ModuleList(
                 [
                     QuantizedScaledWordEmbedding(
@@ -482,7 +489,7 @@ class Gemma4Task(ModelTask):
                         config.pad_token_id,
                         embed_scale=embed_scale,
                         bits=qc.bits,
-                        block_size=qc.group_size,
+                        block_size=block_size,
                         has_zero_point=not qc.sym,
                     )
                     for _ in range(config.num_hidden_layers)
