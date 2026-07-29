@@ -45,6 +45,7 @@ from mobius.integrations.onnx_genai.convert import (
 from mobius.integrations.onnx_genai.decoder_metadata import (
     build_decoder_metadata,
     decoder_metadata_from_config,
+    moe_metadata_from_config,
     write_decoder_metadata,
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
@@ -77,6 +78,7 @@ __all__ = [
     "build_tts_pipeline_metadata",
     "convert_comfyui_workflow",
     "decoder_metadata_from_config",
+    "moe_metadata_from_config",
     "load_diffusers_scheduler_config",
     "parse_comfyui_workflow",
     "parse_comfyui_workflow_file",
