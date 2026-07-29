@@ -1,13 +1,15 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""TTS 4-model split task for Qwen3-TTS.
+"""TTS multi-model split task for Qwen3-TTS.
 
-Builds four separate ONNX models:
+Builds separate ONNX models (five required + one optional speaker encoder):
 1. **talker**: inputs_embeds → logits (first code group) + last_hidden_state + KV cache
 2. **code_predictor**: inputs_embeds → hidden_states + KV cache (1D RoPE)
 3. **embedding**: text_ids + codec_ids → text_embeds + codec_embeds
-4. **speaker_encoder**: mel_input → speaker_embedding
+4. **talker_step_embedder**: frame_codes + text_embed → inputs_embeds
+5. **talker_prefill_embedder**: text_ids → prefill_embeds + trailing_text_embeds
+6. **speaker_encoder**: mel_input → speaker_embedding
 
 Used by Qwen3TTSForConditionalGeneration.
 """
@@ -34,13 +36,17 @@ from mobius.tasks._cache_utils import (
 
 
 class TTSTask(ModelTask):
-    """4-model split for Qwen3-TTS.
+    """Multi-model split for Qwen3-TTS.
 
-    The module must provide three required sub-modules and one optional:
+    The module must provide five required sub-modules and one optional:
 
     - ``talker``: Decoder producing logits + last_hidden_state
     - ``code_predictor``: Small decoder for remaining code groups
     - ``embedding``: Text + codec embedding model
+    - ``talker_step_embedder``: Per-frame ``frame_codes [+ text_embed] ->
+      inputs_embeds`` pre-embedder for the talker
+    - ``talker_prefill_embedder``: ``text_ids -> prefill_embeds +
+      trailing_text_embeds`` prefill/trailing-text builder
     - ``speaker_encoder``: ECAPA-TDNN speaker encoder *(optional — omitted
       when the model uses a pre-computed speaker embedding instead)*
 
@@ -51,12 +57,16 @@ class TTSTask(ModelTask):
         "talker": "decoder",
         "code_predictor": "decoder",
         "embedding": "embedding",
+        "talker_step_embedder": "embedding",
+        "talker_prefill_embedder": "embedding",
         "speaker_encoder": "encoder",
     }
     components: ClassVar[ComponentSpec] = ComponentSpec(
         talker="talker",
         code_predictor="code_predictor",
         embedding="embedding",
+        talker_step_embedder="talker_step_embedder",
+        talker_prefill_embedder="talker_prefill_embedder",
     )
 
     def build(
@@ -70,6 +80,12 @@ class TTSTask(ModelTask):
         models["talker"] = self._build_talker(module.talker, config)
         models["code_predictor"] = self._build_code_predictor(module.code_predictor, config)
         models["embedding"] = self._build_embedding(module.embedding, config)
+        models["talker_step_embedder"] = self._build_talker_step_embedder(
+            module.talker_step_embedder, config
+        )
+        models["talker_prefill_embedder"] = self._build_talker_prefill_embedder(
+            module.talker_prefill_embedder, config
+        )
         if module.speaker_encoder is not None:
             models["speaker_encoder"] = self._build_speaker_encoder(
                 module.speaker_encoder, config
@@ -248,6 +264,85 @@ class TTSTask(ModelTask):
 
         builder.add_output(text_embeds, "text_embeds")
         builder.add_output(codec_embeds, "codec_embeds")
+        return _make_model(graph)
+
+    def _build_talker_step_embedder(
+        self,
+        talker_step_embedder: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build talker step embedder: frame_codes + text_embed → inputs_embeds.
+
+        Materializes the per-step talker ``codec_sum`` construction in-graph:
+        ``codec_sum = talker.codec_embed(code_0) + Σ cp_codec_weights[i][code]``
+        and returns ``codec_sum + text_embed``. Lets a generic runtime loop
+        drive the talker from the previous frame's raw integer codes instead
+        of a pre-built ``inputs_embeds``.
+        """
+        tts = config.tts
+        num_code_groups = tts.num_code_groups if tts else 16
+
+        batch = ir.SymbolicDim("batch")
+
+        graph, builder = _make_graph(name="talker_step_embedder")
+
+        frame_codes = builder.input(
+            "frame_codes",
+            dtype=ir.DataType.INT64,
+            shape=[batch, num_code_groups],
+        )
+        text_embed = builder.input(
+            "text_embed",
+            dtype=config.dtype,
+            shape=[batch, 1, config.hidden_size],
+        )
+
+        inputs_embeds = talker_step_embedder(
+            builder.op,
+            frame_codes=frame_codes,
+            text_embed=text_embed,
+        )
+
+        builder.add_output(inputs_embeds, "inputs_embeds")
+        return _make_model(graph)
+
+    def _build_talker_prefill_embedder(
+        self,
+        talker_prefill_embedder: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build talker prefill embedder: text_ids → prefill + trailing embeds.
+
+        Materializes the up-front PREFILL and trailing-text embedding
+        construction in-graph (Auto language, no speaker, no instruct):
+
+        - ``prefill_embeds`` = role(3) + codec_text_pairs(N-1) + first_text_codec(1),
+          length ``3 + 4 + 1 = 8`` (constant, independent of text length).
+        - ``trailing_text_embeds`` = text_embeds[:, 4:-5] ++ tts_eos,
+          length ``text_len - 8``.
+
+        Reuses the embedding model's text + codec tables (shared weights). Lets
+        a generic runtime loop drive the talker without Qwen3-TTS-specific
+        slicing/interleaving logic.
+        """
+        batch = ir.SymbolicDim("batch")
+        text_seq = ir.SymbolicDim("text_sequence_len")
+
+        graph, builder = _make_graph(name="talker_prefill_embedder")
+
+        text_ids = builder.input(
+            "text_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, text_seq],
+        )
+
+        prefill_embeds, trailing_text_embeds = talker_prefill_embedder(
+            builder.op,
+            text_ids=text_ids,
+        )
+
+        builder.add_output(prefill_embeds, "prefill_embeds")
+        builder.add_output(trailing_text_embeds, "trailing_text_embeds")
         return _make_model(graph)
 
     def _build_speaker_encoder(

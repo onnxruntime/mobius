@@ -45,6 +45,7 @@ from mobius.components import (
     RMSNorm,
     create_attention_bias,
     initialize_rope,
+    make_quantized_linear_factory,
 )
 from mobius.components._activations import get_activation
 from mobius.components._gemma4_audio import Gemma4AudioEncoder
@@ -53,7 +54,150 @@ from mobius.models.base import CausalLMModel
 from mobius.models.gemma3_text import Gemma3TextScaledWordEmbedding
 
 if TYPE_CHECKING:
-    from mobius.components._attention import GQAContext
+    from mobius.components._attention import GQAContext, StaticCacheState
+
+
+# ---------------------------------------------------------------------------
+# Mixed-precision quantization helpers
+#
+# Gemma4 is a multimodal model whose text decoder + token embeddings may be
+# weight-quantized (MatMulNBits / GatherBlockQuantized) while its vision and
+# audio encoders stay float.  The vision/audio encoder modules deliberately do
+# NOT consult ``config.quantization`` — they always build plain ``Linear``
+# layers — so enabling quantization only affects the text path.  The helpers
+# below are the single place the text components read the quantization config,
+# which keeps that "text quantized, vision/audio float" contract explicit.
+# ---------------------------------------------------------------------------
+
+
+def _text_quantization_config(config: Gemma4Config):
+    """Return the active weight-quantization config, or ``None`` when off."""
+    quantization_config = getattr(config, "quantization", None)
+    if quantization_config is None or quantization_config.quant_method == "none":
+        return None
+    return quantization_config
+
+
+def _text_linear_class(config: Gemma4Config) -> type | None:
+    """Return a QuantizedLinear factory for text projections, or ``None``.
+
+    ``None`` means "use a plain float :class:`Linear`". Only the text decoder
+    projections (attention Q/K/V/O + MLP + LM head) use this; vision and audio
+    linears are always float.
+    """
+    quantization_config = _text_quantization_config(config)
+    if quantization_config is None:
+        return None
+    zero_point_dtype = (
+        config.dtype
+        if getattr(quantization_config, "float_zero_point", False)
+        else ir.DataType.UINT8
+    )
+    return make_quantized_linear_factory(
+        bits=quantization_config.bits,
+        block_size=quantization_config.group_size,
+        has_zero_point=not quantization_config.sym,
+        zero_point_dtype=zero_point_dtype,
+    )
+
+
+def _text_embeddings_quantized(config: Gemma4Config) -> bool:
+    """Whether the text token-embedding tables use GatherBlockQuantized."""
+    quantization_config = _text_quantization_config(config)
+    return quantization_config is not None and bool(
+        getattr(quantization_config, "quantize_embeddings", False)
+    )
+
+
+def _text_lm_head_quantized(config: Gemma4Config) -> bool:
+    """Whether the text LM head projection uses MatMulNBits."""
+    quantization_config = _text_quantization_config(config)
+    return quantization_config is not None and bool(
+        getattr(quantization_config, "quantize_lm_head", False)
+    )
+
+
+def _make_scaled_word_embedding(
+    config: Gemma4Config,
+    num_embeddings: int,
+    embedding_dim: int,
+    embed_scale: float,
+):
+    """Build a scaled token embedding, quantized when the config requests it.
+
+    Returns a :class:`Gemma4ScaledQuantizedWordEmbedding` (GatherBlockQuantized
+    lookup) when embedding quantization is enabled and the embedding dimension
+    is block-aligned, otherwise a float :class:`Gemma3TextScaledWordEmbedding`.
+    """
+    quantization_config = _text_quantization_config(config)
+    if (
+        _text_embeddings_quantized(config)
+        and embedding_dim % quantization_config.group_size == 0
+    ):
+        return Gemma4ScaledQuantizedWordEmbedding(
+            num_embeddings,
+            embedding_dim,
+            config.pad_token_id,
+            embed_scale=embed_scale,
+            bits=quantization_config.bits,
+            block_size=quantization_config.group_size,
+            has_zero_point=not quantization_config.sym,
+        )
+    return Gemma3TextScaledWordEmbedding(
+        num_embeddings,
+        embedding_dim,
+        config.pad_token_id,
+        embed_scale=embed_scale,
+    )
+
+
+def _make_lm_head(config: Gemma4Config) -> nn.Module:
+    """Build the LM head projection, quantized (MatMulNBits) when requested.
+
+    The multimodal decoder and embedding live in separate ONNX graphs, so a
+    quantized head cannot share the embedding's packed table — it always gets
+    its own independent MatMulNBits weight (populated from the same repacked
+    token-embedding data at load time).
+    """
+    if _text_lm_head_quantized(config):
+        linear_cls = _text_linear_class(config)
+        if linear_cls is not None:
+            return linear_cls(config.hidden_size, config.vocab_size, bias=False)
+    return Linear(config.hidden_size, config.vocab_size, bias=False)
+
+
+class Gemma4ScaledQuantizedWordEmbedding(QuantizedEmbedding):
+    """GatherBlockQuantized token embedding scaled by ``embed_scale``.
+
+    Quantized counterpart of :class:`Gemma3TextScaledWordEmbedding`: the packed
+    embedding rows are gathered and dequantized by ``GatherBlockQuantized`` and
+    then multiplied by the Gemma ``sqrt(hidden_size)`` (or per-layer) scale.
+    """
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        padding_idx: int,
+        embed_scale: float = 1.0,
+        *,
+        bits: int = 4,
+        block_size: int = 32,
+        has_zero_point: bool = True,
+    ):
+        super().__init__(
+            num_embeddings,
+            embedding_dim,
+            bits=bits,
+            block_size=block_size,
+            has_zero_point=has_zero_point,
+            padding_idx=padding_idx,
+        )
+        self.embed_scale = embed_scale
+
+    def forward(self, op: OpBuilder, input_ids: ir.Value) -> ir.Value:
+        embeddings = super().forward(op, input_ids)
+        return op.Mul(embeddings, self.embed_scale)
 
 
 class QuantizedScaledWordEmbedding(QuantizedEmbedding):
@@ -717,23 +861,27 @@ class Gemma4TextAttention(nn.Module):
                 == len(prev_layers) - 1 - prev_layers[::-1].index(layer_types[layer_idx])
             )
 
+        # Text-decoder projections are quantized (MatMulNBits) when the config
+        # requests it; otherwise plain float Linear. Attention norms stay float.
+        linear_class = _text_linear_class(config) or Linear
+
         # All layers have Q projection + Q norm + output projection
-        self.q_proj = Linear(
+        self.q_proj = linear_class(
             config.hidden_size, config.num_attention_heads * head_dim, bias=False
         )
         self.q_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
-        self.o_proj = Linear(
+        self.o_proj = linear_class(
             config.num_attention_heads * head_dim, config.hidden_size, bias=False
         )
 
         # KV-shared layers borrow K,V — no projections needed
         if not self.is_kv_shared_layer:
-            self.k_proj = Linear(
+            self.k_proj = linear_class(
                 config.hidden_size, self.num_key_value_heads * head_dim, bias=False
             )
             # Alternative attention (k_eq_v): V = K, no separate v_proj
             if not self._use_alternative_attention:
-                self.v_proj = Linear(
+                self.v_proj = linear_class(
                     config.hidden_size, self.num_key_value_heads * head_dim, bias=False
                 )
             self.k_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
@@ -747,6 +895,8 @@ class Gemma4TextAttention(nn.Module):
         shared_kv_states: dict | None = None,
         past_key_value: tuple | None = None,
         is_causal: int = 1,
+        static_cache: StaticCacheState | None = None,
+        static_kv_seqlen: ir.Value | None = None,
     ):
         from mobius.components._attention import (
             GQAContext,
@@ -755,6 +905,11 @@ class Gemma4TextAttention(nn.Module):
         )
 
         use_gqa = isinstance(attention_bias, GQAContext)
+        # Static-cache mode: fixed-width pre-allocated KV buffers (TensorScatter
+        # in place). Signalled by static_kv_seqlen being set. Cache-owning layers
+        # additionally receive their own StaticCacheState via static_cache; KV-shared
+        # layers receive static_cache=None and read the source layer's full buffer.
+        is_static = static_kv_seqlen is not None
 
         # Q projection + per-head Q norm
         # For GQA, skip manual RoPE — the op applies it internally.
@@ -775,7 +930,52 @@ class Gemma4TextAttention(nn.Module):
 
         if self.is_kv_shared_layer:
             # KV-shared layers borrow K,V from a source layer (no own KV cache).
-            src_key, src_value = shared_kv_states[self.kv_shared_layer_index]
+            src_key, src_value = shared_kv_states[self.kv_shared_layer_index][:2]
+
+            if is_static:
+                # Static cache: the source layer scattered its RoPE'd K,V into a
+                # fixed-width buffer and stored the full 3D [B, max_seq, kv_hidden]
+                # present. This layer's query attends over that buffer directly.
+                # attention_bias is the static-cache float bias (causal + sliding +
+                # padding baked in), so is_causal=0. nonpad_kv_seqlen bounds the
+                # valid prefix. No scatter here — this layer produces no cache.
+                attn_output, present_key, present_value = op.Attention(
+                    query_states,
+                    src_key,
+                    src_value,
+                    attention_bias,
+                    None,  # no past_key
+                    None,  # no past_value
+                    static_kv_seqlen,
+                    q_num_heads=self.num_attention_heads,
+                    kv_num_heads=self.num_key_value_heads,
+                    scale=self.scaling,
+                    softcap=self.softcap,
+                    is_causal=0,
+                    _outputs=3,
+                )
+                attn_output = self.o_proj(op, attn_output)
+                return attn_output, (present_key, present_value)
+
+            # The borrowed K,V are the source layer's ``present`` outputs. In the
+            # standard (non-GQA) path those come from the opset-24 ``Attention``
+            # op, whose ``present_key``/``present_value`` outputs have NO shape
+            # inference in ORT — they arrive here rank-unknown. Left unannotated,
+            # the downstream Transpose/Reshape lose the head dimension and this
+            # layer's ``Attention`` infers a zero-width output, which then makes
+            # ``o_proj``'s MatMul fail shape inference at model-load time. The
+            # source shares the same KV-head/head-dim configuration as this
+            # layer, so pin the known 4D BNSH shape to restore inference.
+            for _kv in (src_key, src_value):
+                if _kv.shape is None or len(_kv.shape) != 4:
+                    _kv.shape = ir.Shape(
+                        [
+                            "batch",
+                            self.num_key_value_heads,
+                            "kv_sequence_length",
+                            self.head_dim,
+                        ]
+                    )
 
             if use_gqa:
                 # GQA path for shared KV: pass empty K/V tensors and wire the
@@ -824,32 +1024,27 @@ class Gemma4TextAttention(nn.Module):
                     **gqa_attrs,
                 )
             else:
-                # Fallback Attention path (non-GQA / CPU-style graphs).
-                #
-                # The shared K,V buffer is the source layer's present K/V, 4D
-                # BNSH [batch, kv_heads, kv_len, head_dim], and already contains
-                # the FULL sequence (with RoPE applied).  Transpose it to the 3D
-                # layout the Attention op expects:
-                #   [batch, kv_len, kv_heads * head_dim].
-                src_key = op.Transpose(src_key, perm=[0, 2, 1, 3])
-                src_key = op.Reshape(src_key, [0, 0, -1])
-                src_value = op.Transpose(src_value, perm=[0, 2, 1, 3])
-                src_value = op.Reshape(src_value, [0, 0, -1])
+                # Fallback Attention path: transpose shared KV from BNSH to 3D.
+                # Source K/V shape depends on whether the source layer uses
+                # static or dynamic cache:
+                #   Dynamic: [B, kv_heads, total_seq, head_dim] (4D present)
+                #   Static:  [B, max_seq, kv_heads*head_dim]    (3D updated cache)
+                # Static cache sources are already 3D — skip reshape.
+                is_static_source = src_key.shape is not None and len(src_key.shape) == 3
+                if not is_static_source:
+                    shared_kv_hidden = self.num_key_value_heads * self.head_dim
+                    src_key = op.Transpose(src_key, perm=[0, 2, 1, 3])
+                    src_key = op.Reshape(src_key, [0, 0, shared_kv_hidden])
+                    src_value = op.Transpose(src_value, perm=[0, 2, 1, 3])
+                    src_value = op.Reshape(src_value, [0, 0, shared_kv_hidden])
 
-                # IMPORTANT: pass is_causal=0 here, NOT the caller's is_causal.
-                #
-                # We feed the FULL shared sequence as key/value with no past, so
-                # q_len < kv_len during decode.  ``attention_bias`` from
-                # ``create_attention_bias`` already bakes in the complete
-                # bottom-right causal (+ sliding + padding) mask, so causality is
-                # fully handled by the bias.  If we ALSO set is_causal=1 the
-                # Attention op applies its own built-in causal mask on top — and
-                # for q_len < kv_len the two EPs disagree on its alignment (per
-                # the ONNX spec is_causal is UPPER-LEFT aligned: CUDA follows the
-                # spec and a single decode query attends only to kv[0], while the
-                # CPU EP bottom-right aligns).  That double-masking is what made
-                # gemma4 decode diverge on CUDA.  Relying solely on the float
-                # bias (is_causal=0) is correct and identical on CPU and CUDA.
+                # KV-shared layers always use the dynamic Attention path with
+                # mask (attention_bias). Even when the source layer uses static
+                # cache, the KV-shared layer's Attention uses the source's full
+                # cache as K/V with past_key=None (no own KV concat).
+                # The nonpad_kv_seqlen path is NOT used here because ORT's
+                # is_causal=0 + nonpad_kv_seqlen triggers a CUDA kernel issue
+                # for KV-shared decode (S_q=1, S_kv=max_seq).
                 attn_output, present_key, present_value = _apply_attention(
                     op,
                     query_states,
@@ -933,6 +1128,7 @@ class Gemma4TextAttention(nn.Module):
                 shared_kv_states[self.layer_idx] = (
                     present_key,
                     present_value,
+                    None,  # no nonpad_kv_seqlen for GQA path
                 )
         else:
             # K projection + per-head K norm + optional RoPE
@@ -979,20 +1175,29 @@ class Gemma4TextAttention(nn.Module):
                 key_states,
                 value_states,
                 attention_bias,
-                past_key_value[0] if past_key_value is not None else None,
-                past_key_value[1] if past_key_value is not None else None,
+                None
+                if static_cache is not None
+                else (past_key_value[0] if past_key_value is not None else None),
+                None
+                if static_cache is not None
+                else (past_key_value[1] if past_key_value is not None else None),
                 num_attention_heads=self.num_attention_heads,
                 num_key_value_heads=self.num_key_value_heads,
                 scale=self.scaling,
                 softcap=self.softcap,
+                static_cache=static_cache,
                 is_causal=is_causal,
             )
 
             # Source layers store K,V for downstream KV-shared layers.
+            # Include nonpad_kv_seqlen for static cache sources so
+            # KV-shared layers can pass it to the Attention op.
             if self.provides_shared_kv and shared_kv_states is not None:
+                nonpad = static_cache.nonpad_kv_seqlen if static_cache else None
                 shared_kv_states[self.layer_idx] = (
                     present_key,
                     present_value,
+                    nonpad,
                 )
 
         attn_output = self.o_proj(op, attn_output)
@@ -1085,6 +1290,12 @@ class Gemma4DecoderLayer(nn.Module):
     MLP when config.use_double_wide_mlp=True.
     """
 
+    # Marks this layer as implementing the StaticCacheState dispatch in forward()
+    # so CausalLMTask(static_cache=True) accepts Gemma4 (see
+    # _validate_static_cache_support). Gemma4 has KV-shared + sliding/full layers
+    # with dual head_dim, handled by static_kv_cache_specs() on the text model.
+    _supports_static_cache = True
+
     def __init__(self, config: Gemma4Config, layer_idx: int):
         super().__init__()
         layer_types = config.layer_types or ["sliding_attention"] * config.num_hidden_layers
@@ -1122,6 +1333,7 @@ class Gemma4DecoderLayer(nn.Module):
             intermediate_size=intermediate_size,
             activation=config.hidden_act,
             bias=config.mlp_bias,
+            linear_class=_text_linear_class(config),
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1193,9 +1405,21 @@ class Gemma4DecoderLayer(nn.Module):
         position_embeddings: tuple | None,
         shared_kv_states: dict,
         per_layer_input: ir.Value | None,
-        past_key_value: tuple | None,
+        past_key_value: tuple | StaticCacheState | None,
         is_causal: int = 1,
+        static_kv_seqlen: ir.Value | None = None,
     ):
+        from mobius.components._attention import StaticCacheState
+
+        # Static-cache dispatch: a StaticCacheState arrives via past_key_value for
+        # cache-owning layers; unpack it into static_cache and clear past_key_value.
+        # KV-shared layers get past_key_value=None but still run in static mode,
+        # signalled by static_kv_seqlen (shared across all layers).
+        static_cache: StaticCacheState | None = None
+        if isinstance(past_key_value, StaticCacheState):
+            static_cache = past_key_value
+            past_key_value = None
+
         # Attention block: pre-norm -> attn -> post-norm -> residual
         residual = hidden_states
         hidden_states = self.input_layernorm(op, hidden_states)
@@ -1206,7 +1430,9 @@ class Gemma4DecoderLayer(nn.Module):
             position_embeddings=position_embeddings,
             shared_kv_states=shared_kv_states,
             past_key_value=past_key_value,
+            static_cache=static_cache,
             is_causal=is_causal,
+            static_kv_seqlen=static_kv_seqlen,
         )
         hidden_states = self.post_attention_layernorm(op, attn_output)
         hidden_states = op.Add(residual, hidden_states)
@@ -1504,11 +1730,11 @@ class Gemma4TextModel(nn.Module):
         self._dtype = config.dtype
 
         embed_scale = math.sqrt(config.hidden_size)
-        self.embed_tokens = Gemma3TextScaledWordEmbedding(
+        self.embed_tokens = _make_scaled_word_embedding(
+            config,
             config.vocab_size,
             config.hidden_size,
-            config.pad_token_id,
-            embed_scale=embed_scale,
+            embed_scale,
         )
 
         layer_types = config.layer_types or ["sliding_attention"] * config.num_hidden_layers
@@ -1584,11 +1810,11 @@ class Gemma4TextModel(nn.Module):
             vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
             # Fused [V, L*D] table — used when split_per_layer_embedding is False.
             # Requires ORT >= 1.27 for CUDA Gather int64 index support (onnxruntime#28107).
-            self.embed_tokens_per_layer = Gemma3TextScaledWordEmbedding(
+            self.embed_tokens_per_layer = _make_scaled_word_embedding(
+                config,
                 vocab_per_layer,
                 self._num_layers * self._per_layer_dim,
-                config.pad_token_id,
-                embed_scale=float(self._per_layer_dim**0.5),
+                float(self._per_layer_dim**0.5),
             )
             # Split [V, D] tables — used when split_per_layer_embedding is True
             # (i.e. the fused table exceeds the EP's max_buffer_size, e.g. WebGPU's
@@ -1631,6 +1857,38 @@ class Gemma4TextModel(nn.Module):
             self.per_layer_projection_norm = RMSNorm(
                 self._per_layer_dim, eps=config.rms_norm_eps
             )
+
+    def static_kv_cache_specs(self) -> list[tuple[int, int]]:
+        """Return ``(num_kv_heads, head_dim)`` for each cache-OWNING layer.
+
+        Consumed by :class:`~mobius.tasks.CausalLMTask` in static-cache mode to
+        allocate the fixed-width KV buffers. Gemma4 needs a per-layer spec (not a
+        single uniform head_dim) because:
+
+        * only the first ``num_hidden_layers - num_kv_shared_layers`` layers own a
+          cache — the trailing KV-shared layers borrow K,V from a source layer;
+        * sliding (local) layers use ``config.head_dim`` while full (global)
+          layers use ``config.global_head_dim`` (E2B: 256 vs 512).
+
+        The order matches the iterator consumption in :meth:`forward`
+        (``next(kv_iter)`` for each non-shared layer), so the i-th spec here maps
+        to the i-th cache-owning layer.
+        """
+        config = self.config
+        first_kv_shared = config.num_hidden_layers - config.num_kv_shared_layers
+        global_head_dim = config.global_head_dim or config.head_dim
+        specs: list[tuple[int, int]] = []
+        for idx, layer_type in enumerate(self.layer_types):
+            if first_kv_shared > 0 and idx >= first_kv_shared:
+                continue  # KV-shared layer: borrows K,V, owns no cache
+            is_full = layer_type == "full_attention"
+            head_dim = global_head_dim if is_full else config.head_dim
+            if is_full and config.num_global_key_value_heads is not None:
+                num_kv_heads = config.num_global_key_value_heads
+            else:
+                num_kv_heads = config.num_key_value_heads
+            specs.append((num_kv_heads, head_dim))
+        return specs
 
     def _compute_per_layer_inputs(
         self,
@@ -1688,7 +1946,7 @@ class Gemma4TextModel(nn.Module):
         self,
         op: OpBuilder,
         input_ids: ir.Value | None,
-        attention_mask: ir.Value,
+        attention_mask: ir.Value | None,
         position_ids: ir.Value,
         past_key_values: list | None = None,
         inputs_embeds: ir.Value | None = None,
@@ -1724,11 +1982,10 @@ class Gemma4TextModel(nn.Module):
         # KV-shared layers fall back to standard Attention because they
         # borrow K,V from another layer (no own KV cache).
         from mobius._build_context import get_build_dtype
-        from mobius.components._attention import GQAContext
+        from mobius.components._attention import GQAContext, StaticCacheState
 
         caps = ep_capabilities()
         dtype = get_build_dtype()
-
         # Bidirectional vision-block overlay (Gemma4 larger models). When
         # active, contiguous vision-token blocks attend bidirectionally on
         # BOTH full and sliding layers. This cannot be expressed by the
@@ -1764,6 +2021,9 @@ class Gemma4TextModel(nn.Module):
             )
         use_block_overlay = bidirectional and block_sequence_ids is not None
 
+        # GQA is available when attention_mask exists and the EP supports it.
+        # In hybrid mode, sliding layers use GQA while full-attention layers
+        # use the static Attention path with TensorScatter.
         use_gqa = (
             attention_mask is not None
             and dtype in caps.gqa_dtypes
@@ -1781,7 +2041,7 @@ class Gemma4TextModel(nn.Module):
             # GQA references these caches directly; without the call the
             # parameters are never emitted into the graph.
             _ = self.rotary_emb_local(op, position_ids)
-            _ = self.rotary_emb_global(op, position_ids)
+            global_pos_emb = self.rotary_emb_global(op, position_ids)
 
             # seqlens_k[b] = sum(attention_mask[b]) - 1  (last valid KV idx)
             # total_seq_len = attention_mask.shape[1]     (past + current)
@@ -1827,6 +2087,12 @@ class Gemma4TextModel(nn.Module):
                 "sliding_attention": None,
                 "full_attention": None,
             }
+            # In hybrid mode, static-cache full-attention layers need RoPE
+            # embeddings for the standard Attention path (not GQA).
+            if past_key_values is not None and any(
+                isinstance(kv, StaticCacheState) for kv in past_key_values if kv is not None
+            ):
+                position_embeddings_dict["full_attention"] = global_pos_emb
         else:
             position_embeddings_dict = {
                 "sliding_attention": self.rotary_emb_local(op, position_ids),
@@ -1834,10 +2100,60 @@ class Gemma4TextModel(nn.Module):
             }
 
         # Fallback attention bias for non-GQA layers (used when use_gqa is False).
+        # Two flavours:
+        #   * static-cache mode (attention_mask is None, StaticCacheState past):
+        #     a fixed-width [B,1,S_q,max_seq] bias keyed on absolute positions;
+        #   * dynamic mode: the growing [B,1,S_q,total] bias from attention_mask.
+        from mobius.components._attention import StaticCacheState
+
         query_input = input_ids if input_ids is not None else hidden_states
         fallback_bias_dict: dict[str, ir.Value | None] = {}
         need_fallback = not use_gqa
-        if need_fallback:
+        is_static = (
+            past_key_values is not None
+            and len(past_key_values) > 0
+            and isinstance(past_key_values[0], StaticCacheState)
+        )
+        static_kv_seqlen: ir.Value | None = None
+        if need_fallback and is_static:
+            from mobius.components import create_static_cache_attention_bias
+
+            first_cache = past_key_values[0]
+            static_kv_seqlen = first_cache.nonpad_kv_seqlen
+            max_seq_len = first_cache.key_cache.shape[1]
+            if not isinstance(max_seq_len, int):
+                raise TypeError(
+                    "Gemma4 static cache requires a concrete key_cache KV "
+                    f"dimension (axis 1), got symbolic {max_seq_len!r}."
+                )
+            # S_q at dim 1 of hidden_states ([B, S_q, hidden]); works for both
+            # input_ids and inputs_embeds entry points.
+            seq_len_t = op.Shape(hidden_states, start=1, end=2)
+            fallback_bias_dict = {
+                "sliding_attention": create_static_cache_attention_bias(
+                    op,
+                    write_indices=first_cache.write_indices,
+                    seq_len=seq_len_t,
+                    nonpad_kv_seqlen=first_cache.nonpad_kv_seqlen,
+                    max_seq_len=max_seq_len,
+                    sliding_window=self.sliding_window,
+                    dtype=self._dtype,
+                ),
+                "full_attention": create_static_cache_attention_bias(
+                    op,
+                    write_indices=first_cache.write_indices,
+                    seq_len=seq_len_t,
+                    nonpad_kv_seqlen=first_cache.nonpad_kv_seqlen,
+                    max_seq_len=max_seq_len,
+                    sliding_window=None,
+                    dtype=self._dtype,
+                ),
+            }
+            fallback_pos_dict = position_embeddings_dict
+        elif need_fallback:
+            # All fallback layers use float additive bias masks encoding
+            # causal + sliding window + padding constraints. Float bias
+            # works with both unfused and MEA kernel paths on CUDA EP.
             fallback_bias_dict = {
                 "sliding_attention": create_attention_bias(
                     op,
@@ -1881,14 +2197,24 @@ class Gemma4TextModel(nn.Module):
         ):
             per_layer_input = per_layer_list[i] if per_layer_list is not None else None
 
-            # Per-layer decision: use GQA when available. KV-shared layers
-            # also use GQA (with empty K/V and shared past buffer).
-            if use_gqa:
+            # Per-layer cache/attention dispatch:
+            # - StaticCacheState → static path (TensorScatter + Attention)
+            # - Dynamic tuple → GQA path (with local_window_size)
+            # - None (no cache) → fallback Attention path
+            is_layer_static = isinstance(past_kv, StaticCacheState)
+
+            if is_layer_static:
+                attn_bias = None
+                pos_emb = position_embeddings_dict[layer_type]
+            elif use_gqa:
                 attn_bias = gqa_ctx_dict[layer_type]
                 pos_emb = None
-            else:
+            elif fallback_bias_dict:
                 attn_bias = fallback_bias_dict[layer_type]
                 pos_emb = fallback_pos_dict[layer_type]
+            else:
+                attn_bias = None
+                pos_emb = position_embeddings_dict.get(layer_type)
 
             hidden_states, present_kv = layer(
                 op,
@@ -1899,6 +2225,7 @@ class Gemma4TextModel(nn.Module):
                 per_layer_input=per_layer_input,
                 past_key_value=past_kv,
                 is_causal=attn_is_causal,
+                static_kv_seqlen=static_kv_seqlen,
             )
             # KV-shared layers borrow K,V from source layers — exclude from
             # present_key_values so the output has exactly num_kv_layers entries.
@@ -1935,7 +2262,7 @@ class Gemma4CausalLMModel(CausalLMModel):
         nn.Module.__init__(self)
         self.config = config
         self.model = Gemma4TextModel(config)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = _make_lm_head(config)
 
     def forward(
         self,
@@ -1981,6 +2308,11 @@ class Gemma4CausalLMModel(CausalLMModel):
         _remap_moe_expert_weights(state_dict, self.config)
         return super().preprocess_weights(state_dict)
 
+    def static_kv_cache_specs(self) -> list[tuple[int, int]]:
+        """Per-cache-layer ``(num_kv_heads, head_dim)`` for static-cache mode."""
+        assert isinstance(self.model, Gemma4TextModel)
+        return self.model.static_kv_cache_specs()
+
 
 # ---------------------------------------------------------------------------
 # Gemma4 multimodal sub-models
@@ -2000,7 +2332,7 @@ class _Gemma4DecoderModel(nn.Module):
         super().__init__()
         self.config = config
         self.model = Gemma4TextModel(config)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = _make_lm_head(config)
 
     def forward(
         self,
@@ -2184,11 +2516,11 @@ class Gemma4EmbeddingModel(nn.Module):
         super().__init__()
         self.config = config
         embed_scale = math.sqrt(config.hidden_size)
-        self.embed_tokens = Gemma3TextScaledWordEmbedding(
+        self.embed_tokens = _make_scaled_word_embedding(
+            config,
             config.vocab_size,
             config.hidden_size,
-            config.pad_token_id,
-            embed_scale=embed_scale,
+            embed_scale,
         )
         self.image_token_id = config.image_token_id or 0
         # Audio token ID is only set when the model has an audio encoder.
@@ -2203,11 +2535,11 @@ class Gemma4EmbeddingModel(nn.Module):
             # Single fused [V, L*D] embedding table matching HuggingFace's
             # ``embed_tokens_per_layer.weight`` shape.  The ORT CUDA Gather
             # int32 overflow (onnxruntime#28107) is now fixed.
-            self.embed_tokens_per_layer = Gemma3TextScaledWordEmbedding(
+            self.embed_tokens_per_layer = _make_scaled_word_embedding(
+                config,
                 vocab_per_layer,
                 self._num_layers * self._per_layer_dim,
-                config.pad_token_id,
-                embed_scale=float(self._per_layer_dim**0.5),
+                float(self._per_layer_dim**0.5),
             )
             self.per_layer_model_projection = Linear(
                 config.hidden_size,
@@ -2762,7 +3094,10 @@ class Gemma4Model(nn.Module):
             for key, value in state_dict.items()
         }
 
-        # Synthesize lm_head from embed_tokens when weights are tied
+        # Synthesize lm_head from embed_tokens when weights are tied. For a
+        # float checkpoint this copies ``embed_tokens.weight``; for a quantized
+        # checkpoint the tied MatMulNBits head tensors (weight/scales/
+        # zero_points) are emitted directly by the loader, so nothing to do here.
         if self.config.tie_word_embeddings:
             embed_key = "language_model.embed_tokens.weight"
             head_key = "language_model.lm_head.weight"
@@ -2789,9 +3124,13 @@ class Gemma4Model(nn.Module):
                     # All other text weights nest under decoder.model.*
                     onnx_key = "decoder.model." + suffix
                     renamed[onnx_key] = value
-                    if suffix == "embed_tokens.weight":
-                        # Token embedding is shared with the embedding sub-model
-                        renamed["embedding.embed_tokens.weight"] = value
+                    if suffix.startswith("embed_tokens."):
+                        # Token embedding is shared with the embedding sub-model.
+                        # The suffix tail (``weight`` for float, or ``qweight`` /
+                        # ``scales`` / ``zero_points`` for a GatherBlockQuantized
+                        # table) is preserved so both float and quantized
+                        # embeddings route correctly.
+                        renamed["embedding." + suffix] = value
 
             elif key.startswith("vision_tower."):
                 new_key = "vision_encoder.encoder." + key[len("vision_tower.") :]

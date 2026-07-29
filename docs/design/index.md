@@ -7,6 +7,7 @@ Detailed design notes and proposals for `mobius` subsystems.
 
 ../design
 config-redesign
+deepseek-v4-flash-export
 gguf-support-proposal
 golden-infra-design
 multi-tier-testing-strategy

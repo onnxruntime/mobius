@@ -51,7 +51,7 @@ def _resolve_hidden_act(config, model_type: str) -> str | None:
       dense_act_fn          — some BERT variants
       activation            — generic fallback
       afn                   — older BERT configs
-      "silu"  (qwen)        — Qwen v1 hardcodes silu; no activation attr
+      "silu"  (qwen and chatglm) — Qwen v1 and ChatGLM hardcode silu; no activation attr
       "gelu"  (XLM)         — gelu_activation=True is a boolean flag
       "relu"  (ctrl)        — CTRL hardcodes relu; no hidden_act attr
     """
@@ -63,7 +63,9 @@ def _resolve_hidden_act(config, model_type: str) -> str | None:
         or getattr(config, "dense_act_fn", None)
         or getattr(config, "activation", None)
         or getattr(config, "afn", None)
-        or ("silu" if model_type in ("qwen",) else None)
+        # LLaDA/OLMo expose the activation as ``activation_type`` (e.g. "silu").
+        or getattr(config, "activation_type", None)
+        or ("silu" if model_type in ("qwen", "chatglm") else None)
         # gelu_activation is a boolean (XLM) — must be after all string
         # attrs so it cannot override an explicit hidden_act.
         or ("gelu" if getattr(config, "gelu_activation", False) else None)
@@ -130,6 +132,35 @@ def _first_not_none(*values, default=None):
         if v is not None:
             return v
     return default
+
+
+def _leading_layer_type_count(layer_types, target: str) -> int:
+    count = 0
+    for layer_type in layer_types or ():
+        if layer_type != target:
+            break
+        count += 1
+    return count
+
+
+def _deepseek_v4_compress_ratios(config) -> list[int] | None:
+    ratios = getattr(config, "compress_ratios", None)
+    if ratios is not None:
+        return list(ratios)
+    layer_types = getattr(config, "layer_types", None)
+    rates = getattr(config, "compress_rates", None)
+    if not layer_types or not rates:
+        return None
+    return [
+        (
+            rates.get("compressed_sparse_attention", 4)
+            if layer_type == "compressed_sparse_attention"
+            else rates.get("heavily_compressed_attention", 128)
+            if layer_type == "heavily_compressed_attention"
+            else 0
+        )
+        for layer_type in layer_types
+    ]
 
 
 # Models that use RoPE but hardcode rope_theta entirely in model __init__,
@@ -267,8 +298,14 @@ def _extract_mrope_fields(config) -> dict:
     rope_scaling = getattr(config, "rope_scaling", None) or {}
     rope_parameters = getattr(config, "rope_parameters", None) or {}
     result: dict = {}
-    mrope_interleaved = rope_scaling.get("mrope_interleaved", False) or rope_parameters.get(
-        "mrope_interleaved", False
+    # Some models (e.g. Qwen3-TTS talker) spell the interleaved flag as the
+    # bare ``interleaved`` key inside ``rope_scaling`` rather than the
+    # ``mrope_interleaved`` name that Qwen3-VL uses. Accept both spellings.
+    mrope_interleaved = (
+        rope_scaling.get("mrope_interleaved", False)
+        or rope_scaling.get("interleaved", False)
+        or rope_parameters.get("mrope_interleaved", False)
+        or rope_parameters.get("interleaved", False)
     )
     if mrope_interleaved:
         result["mrope_interleaved"] = True
@@ -287,7 +324,7 @@ def _extract_vision_config(config, parent_config, model_type: str) -> dict:
     hooks live under :mod:`mobius._configs.per_model` and are
     registered with :mod:`mobius._configs._extractors` at import time.
     """
-    from mobius._configs import per_model  # noqa: F401  - side-effect import
+    from mobius._configs import per_model  # noqa: F401 - imported for registration side effect
     from mobius._configs._extractors import extract_vision_config as _dispatch
 
     return _dispatch(config, parent_config, model_type)
@@ -300,7 +337,7 @@ def _extract_audio_config(config, parent_config, model_type: str) -> dict:
     hooks live under :mod:`mobius._configs.per_model` and are
     registered with :mod:`mobius._configs._extractors` at import time.
     """
-    from mobius._configs import per_model  # noqa: F401  - side-effect import
+    from mobius._configs import per_model  # noqa: F401 - imported for registration side effect
     from mobius._configs._extractors import extract_audio_config as _dispatch
 
     return _dispatch(config, parent_config, model_type)
@@ -414,6 +451,21 @@ class ArchitectureConfig(BaseModelConfig):
     qk_rope_head_dim: int | None = None
     v_head_dim: int | None = None
     rope_interleave: bool = False
+
+    # DeepSeek-V4 compressed sparse attention / Hyper-Connections.
+    o_groups: int = 1
+    o_lora_rank: int | None = None
+    index_n_heads: int | None = None
+    index_head_dim: int | None = None
+    index_topk: int | None = None
+    compress_ratios: list[int] | None = None
+    compress_rope_theta: float | None = None
+    hc_mult: int = 1
+    hc_sinkhorn_iters: int = 1
+    hc_eps: float = 1e-6
+    num_hash_layers: int = 0
+    swiglu_limit: float = 0.0
+    num_nextn_predict_layers: int = 0
 
     # Vision shared fields (accessed as top-level config.X by tasks)
     mm_tokens_per_image: int | None = None
@@ -541,22 +593,27 @@ class ArchitectureConfig(BaseModelConfig):
             rope_config = RoPEConfig(
                 rope_type="default",
                 rope_theta=_IMPLICIT_ROPE_DEFAULTS[model_type],
+                partial_rotary_factor=0.5 if model_type == "chatglm" else 1.0,
             )
 
         # Some hierarchical models (Segformer, Swin) use plural list attrs
         # instead of scalar ones.  Resolve to a scalar for the base config.
         hidden_size = (
             getattr(config, "hidden_size", None)
+            or getattr(config, "d_model", None)
             or _first(getattr(config, "hidden_sizes", None))
             or 0
         )
         num_attention_heads = (
             getattr(config, "num_attention_heads", None)
+            or getattr(config, "n_heads", None)
             or _first(getattr(config, "num_heads", None))
             or 1
         )
         num_hidden_layers = (
             getattr(config, "num_hidden_layers", None)
+            or getattr(config, "n_layers", None)
+            or getattr(config, "num_layers", None)
             or getattr(config, "num_encoder_blocks", None)
             or 0
         )
@@ -579,17 +636,30 @@ class ArchitectureConfig(BaseModelConfig):
                 config.head_dim
                 if (hasattr(config, "head_dim") and config.head_dim is not None)
                 else getattr(config, "d_kv", None)
+                or getattr(config, "kv_channels", None)
                 or _as_int(hidden_size) // _as_int(num_attention_heads)
             ),
             num_attention_heads=_as_int(num_attention_heads),
             num_key_value_heads=_as_int(
-                getattr(config, "num_key_value_heads", num_attention_heads)
+                getattr(config, "num_key_value_heads", None)
+                or getattr(config, "n_kv_heads", None)
+                or (
+                    getattr(config, "multi_query_group_num", None)
+                    if getattr(config, "multi_query_attention", False)
+                    else None
+                )
+                or num_attention_heads
             ),
             num_hidden_layers=_as_int(num_hidden_layers),
-            vocab_size=getattr(config, "vocab_size", None) or 0,
+            vocab_size=(
+                getattr(config, "vocab_size", None)
+                or getattr(config, "embedding_size", None)
+                or 0
+            ),
             hidden_size=_as_int(hidden_size),
             intermediate_size=(
                 getattr(config, "intermediate_size", None)
+                or getattr(config, "mlp_hidden_size", None)
                 or getattr(config, "n_inner", None)
                 or getattr(config, "d_ff", None)
                 or getattr(config, "ffn_dim", None)
@@ -625,7 +695,9 @@ class ArchitectureConfig(BaseModelConfig):
                 or 1e-6
             ),
             attn_qkv_bias=(
-                getattr(
+                getattr(config, "add_qkv_bias", False)
+                or getattr(config, "add_bias_linear", False)
+                or getattr(
                     config,
                     "attention_bias",
                     getattr(
@@ -659,7 +731,8 @@ class ArchitectureConfig(BaseModelConfig):
                 )
             ),
             attn_o_bias=(
-                getattr(
+                getattr(config, "add_bias_linear", False)
+                or getattr(
                     config,
                     "attention_bias",
                     getattr(
@@ -704,7 +777,8 @@ class ArchitectureConfig(BaseModelConfig):
             ),
             attn_qk_norm_full=(model_type in ("flex_olmo", "olmoe", "olmo2", "olmo3")),
             mlp_bias=(
-                getattr(
+                getattr(config, "add_bias_linear", False)
+                or getattr(
                     config,
                     "use_mlp_bias",
                     getattr(
@@ -744,10 +818,17 @@ class ArchitectureConfig(BaseModelConfig):
                 rope_config.rope_interleave if rope_config is not None else False
             ),
             **mrope_fields,
-            max_position_embeddings=getattr(config, "max_position_embeddings", 0),
+            max_position_embeddings=(
+                getattr(config, "max_position_embeddings", None)
+                or getattr(config, "max_sequence_length", None)
+                or getattr(config, "seq_length", None)
+                or 0
+            ),
             tie_word_embeddings=(
                 getattr(config, "tie_word_embeddings", None)
                 if getattr(config, "tie_word_embeddings", None) is not None
+                else getattr(config, "weight_tying", None)
+                if getattr(config, "weight_tying", None) is not None
                 else getattr(parent_config, "tie_word_embeddings", False)
             ),
             # MoE
@@ -782,6 +863,26 @@ class ArchitectureConfig(BaseModelConfig):
             qk_nope_head_dim=getattr(config, "qk_nope_head_dim", None),
             qk_rope_head_dim=getattr(config, "qk_rope_head_dim", None),
             v_head_dim=getattr(config, "v_head_dim", None),
+            # DeepSeek-V4 compressed sparse attention / Hyper-Connections
+            o_groups=getattr(config, "o_groups", 1),
+            o_lora_rank=getattr(config, "o_lora_rank", None),
+            index_n_heads=getattr(config, "index_n_heads", None),
+            index_head_dim=getattr(config, "index_head_dim", None),
+            index_topk=getattr(config, "index_topk", None),
+            compress_ratios=_deepseek_v4_compress_ratios(config),
+            compress_rope_theta=getattr(config, "compress_rope_theta", None),
+            hc_mult=getattr(config, "hc_mult", 1),
+            hc_sinkhorn_iters=getattr(config, "hc_sinkhorn_iters", 1),
+            hc_eps=getattr(config, "hc_eps", 1e-6),
+            num_hash_layers=(
+                getattr(config, "num_hash_layers", None)
+                or getattr(config, "n_hash_layers", 0)
+                or _leading_layer_type_count(
+                    getattr(config, "mlp_layer_types", None), "hash_moe"
+                )
+            ),
+            swiglu_limit=getattr(config, "swiglu_limit", 0.0),
+            num_nextn_predict_layers=getattr(config, "num_nextn_predict_layers", 0),
             # Encoder-specific
             type_vocab_size=getattr(config, "type_vocab_size", 0),
             # Encoder-decoder
