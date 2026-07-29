@@ -186,6 +186,30 @@ def test_fused_qmoe_wires_asymmetric_zero_points():
     assert layer.fc2_experts_zero_points.shape == ir.Shape([4, 32, 1])
 
 
+def test_fused_qmoe_keeps_activation_input_model_dtype():
+    config = make_config(
+        hidden_size=32,
+        intermediate_size=16,
+        moe_intermediate_size=16,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        quantization=QuantizationConfig(
+            bits=4,
+            group_size=16,
+            quant_method="gptq",
+            sym=True,
+        ),
+    )
+    layer = FusedQuantizedMoE(config, DeepSeekMoEGate(config))
+    builder, op, graph = create_test_builder()
+    hidden = create_test_input(builder, "hidden", [1, 2, 32], dtype=ir.DataType.FLOAT16)
+    builder._adapt_outputs([layer(op, hidden)], "")
+
+    qmoe = next(node for node in graph if node.op_type == "QMoE")
+    assert qmoe.inputs[0].dtype == ir.DataType.FLOAT16
+    assert qmoe.inputs[1].dtype == ir.DataType.FLOAT
+
+
 def test_deepseek_fused_qmoe_graph_has_one_node_per_moe_layer():
     config = make_config(
         hidden_size=32,
@@ -228,6 +252,32 @@ def test_deepseek_fused_qmoe_graph_has_one_node_per_moe_layer():
         )
         == 3
     )
+
+
+def test_deepseek_fused_qmoe_rejects_cuda():
+    config = make_config(
+        hidden_size=32,
+        intermediate_size=32,
+        moe_intermediate_size=16,
+        num_hidden_layers=2,
+        first_k_dense_replace=1,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        n_shared_experts=1,
+        fused_quantized_moe=True,
+        quantization=QuantizationConfig(
+            bits=4,
+            group_size=16,
+            quant_method="gguf",
+            sym=True,
+        ),
+    )
+    with pytest.raises(ValueError, match="CUDA.*ignores router_weights"):
+        build_from_module(
+            DeepSeekV3CausalLMModel(config),
+            config,
+            execution_provider="cuda",
+        )
 
 
 def test_expert_major_packing_matches_static_64_expert_top6_reference():

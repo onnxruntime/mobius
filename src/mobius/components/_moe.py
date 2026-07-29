@@ -14,6 +14,7 @@ import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
+from mobius._build_context import ep_capabilities
 from mobius._configs import ArchitectureConfig, QuantizationConfig
 from mobius._weight_utils import preprocess_awq_weights, preprocess_gptq_weights
 from mobius.components._mlp import MLP
@@ -279,6 +280,7 @@ class MoELayer(nn.Module):
         config: ArchitectureConfig,
         gate: nn.Module | None = None,
         linear_class: type | None = None,
+        enable_qmoe: bool = True,
     ):
         super().__init__()
         assert config.num_local_experts is not None
@@ -296,7 +298,11 @@ class MoELayer(nn.Module):
             if config.moe_intermediate_size is not None
             else config
         )
-        if self._qmoe_quantization is not None and hasattr(self.gate, "qmoe_routing"):
+        if (
+            enable_qmoe
+            and self._qmoe_quantization is not None
+            and hasattr(self.gate, "qmoe_routing")
+        ):
             self.experts = None
             self._init_qmoe_parameters(expert_config)
         else:
@@ -529,12 +535,20 @@ class FusedQuantizedMoE(nn.Module):
             )
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
+        if ep_capabilities().name == "cuda":
+            raise ValueError(
+                "FusedQuantizedMoE is disabled for CUDA because ORT CUDA QMoE "
+                "currently ignores router_weights (input 14), which is required "
+                "for GLM/DeepSeek group-limited routing. Use the decomposed "
+                "MatMulNBits export path for CUDA."
+            )
         hidden = self._hidden
 
         # QMoE requires 2-D router_probs, so flatten [B, S, H] -> [rows, H].
         orig_shape = op.Shape(hidden_states)
         flat = op.Reshape(hidden_states, op.Constant(value_ints=[-1, hidden]))
-        # QMoE input/router_probs must be float32.
+        # Router math must be float32, but QMoE activation input stays in the
+        # model dtype: CUDA QMoE kernels are registered for fp16/bf16 inputs.
         flat_f32 = op.Cast(flat, to=1)
 
         scores_for_choice, routing_weights, selected_experts = self._route(op, flat_f32)
@@ -545,7 +559,7 @@ class FusedQuantizedMoE(nn.Module):
         aggregation = op.ScatterElements(zeros, selected_experts, routing_weights, axis=-1)
 
         moe_out = op.QMoE(
-            flat_f32,  # 0: input
+            flat,  # 0: input
             scores_for_choice,  # 1: router_probs (selection logits)
             self.fc1_experts_weights,  # 2
             op.Cast(self.fc1_scales, to=1),  # 3
