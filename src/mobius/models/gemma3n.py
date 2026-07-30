@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import copy
 import math
+from statistics import NormalDist
 
 import numpy as np
 import onnx_ir as ir
@@ -244,6 +245,75 @@ class Gemma3nAttention(Attention):
         return attn_output, (present_key, present_value)
 
 
+class Gemma3nMLP(MLP):
+    """Gemma3n MLP with optional Gaussian-top-k activation sparsity.
+
+    Where ``config.activation_sparsity_pattern[layer_idx]`` is non-zero, the
+    gate projection is sparsified before the activation: HF's
+    ``_gaussian_topk`` treats each row of ``gate_proj`` as a Gaussian sample,
+    derives the value below which ``sparsity`` of the mass falls, and clamps
+    everything under it to zero::
+
+        cutoff = mean(x) + std(x) * Phi^-1(sparsity)
+        x = relu(x - cutoff)
+
+    The mean and (population, ``unbiased=False``) std are per-row over the
+    intermediate dim.  ``Phi^-1(sparsity)`` — the inverse standard-normal CDF
+    — depends only on the config, so it is folded into a Python float at build
+    time rather than needing an ONNX erfinv.
+
+    E4B applies 0.95 sparsity to layers 0..9, zeroing roughly 95% of each
+    row's gate activations; the remaining layers use the plain MLP path.
+
+    Args:
+        config: Gemma3n configuration.
+        layer_idx: Index of the owning decoder layer, used to look up this
+            layer's entry in ``config.activation_sparsity_pattern``.
+        linear_class: Factory for the projection layers (see :class:`MLP`).
+    """
+
+    def __init__(
+        self,
+        config: Gemma3nConfig,
+        layer_idx: int = 0,
+        linear_class: type | None = None,
+    ):
+        super().__init__(config, linear_class=linear_class)
+        pattern = config.activation_sparsity_pattern
+        if pattern and layer_idx >= len(pattern):
+            raise ValueError(
+                f"activation_sparsity_pattern has {len(pattern)} entries but "
+                f"layer {layer_idx} needs one; it must cover every layer"
+            )
+        sparsity = float(pattern[layer_idx]) if pattern else 0.0
+        if not 0.0 <= sparsity < 1.0:
+            raise ValueError(
+                f"activation_sparsity_pattern[{layer_idx}] must be in [0, 1), got {sparsity}"
+            )
+        self.activation_sparsity = sparsity
+        # Phi^-1(sparsity): HF computes this as
+        # torch.distributions.Normal(0, 1).icdf(sparsity).
+        self._std_multiplier = NormalDist().inv_cdf(sparsity) if sparsity > 0.0 else 0.0
+
+    def forward(self, op: OpBuilder, x: ir.Value):
+        gate = self.gate_proj(op, x)
+        if self.activation_sparsity > 0.0:
+            gate = self._gaussian_topk(op, gate)
+        gate = self.act_fn(op, gate)
+        up = self.up_proj(op, x)
+        return self.down_proj(op, op.Mul(gate, up))
+
+    def _gaussian_topk(self, op: OpBuilder, x: ir.Value) -> ir.Value:
+        """Zero the gate values below the per-row Gaussian sparsity quantile."""
+        mean = op.ReduceMean(x, [-1], keepdims=1)
+        centered = op.Sub(x, mean)
+        # Population variance (unbiased=False), matching HF's torch.std call.
+        variance = op.ReduceMean(op.Mul(centered, centered), [-1], keepdims=1)
+        std = op.Sqrt(variance)
+        cutoff = op.Add(mean, op.Mul(std, self._std_multiplier))
+        return op.Relu(op.Sub(x, cutoff))
+
+
 class Gemma3nScaledWordEmbedding(Embedding):
     """Embedding with scaling by sqrt(hidden_size)."""
 
@@ -412,7 +482,7 @@ class Gemma3nDecoderLayer(nn.Module):
             layer_types=layer_types or config.layer_types,
             first_kv_shared_layer_idx=first_kv_shared_layer_idx,
         )
-        self.mlp = MLP(config)
+        self.mlp = Gemma3nMLP(config, layer_idx=layer_idx)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.pre_feedforward_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

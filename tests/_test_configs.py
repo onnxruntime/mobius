@@ -386,6 +386,9 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             # layer to borrow K,V from; sharing is covered by the
             # all-full-attention gemma3n_text entry below.
             "num_kv_shared_layers": 0,
+            # Layer 0 sparse, layer 1 dense: covers both branches of the
+            # activation-sparsity fork in Gemma3nMLP.
+            "activation_sparsity_pattern": [0.95, 0.0],
         },
         True,
     ),
@@ -404,6 +407,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "hidden_size_per_layer_input": 32,
             "vocab_size_per_layer_input": 256,
             "num_kv_shared_layers": 0,
+            "activation_sparsity_pattern": [0.95, 0.0],
         },
         False,
     ),
