@@ -322,6 +322,7 @@ class TestGGUFArchToModelType:
         assert GGUF_ARCH_TO_MODEL_TYPE["llama"] == "llama"
         assert GGUF_ARCH_TO_MODEL_TYPE["mistral"] == "llama"
         assert GGUF_ARCH_TO_MODEL_TYPE["qwen2"] == "qwen2"
+        assert GGUF_ARCH_TO_MODEL_TYPE["qwen35"] == "qwen3_5_text"
         assert GGUF_ARCH_TO_MODEL_TYPE["gemma2"] == "gemma2"
         assert GGUF_ARCH_TO_MODEL_TYPE["phi3"] == "phi3"
         assert GGUF_ARCH_TO_MODEL_TYPE["falcon"] == "falcon"
@@ -361,6 +362,29 @@ class TestGGUFTensorMapping:
         assert (
             map_gguf_to_hf_names("blk.31.attn_output.weight", "llama")
             == "model.layers.31.self_attn.o_proj.weight"
+        )
+
+    def test_qwen35_hybrid_tensors(self):
+        """Dense Qwen3.5 GGUF maps both DeltaNet and dense MLP tensors."""
+        from mobius.integrations.gguf._tensor_mapping import (
+            map_gguf_to_hf_names,
+        )
+
+        assert (
+            map_gguf_to_hf_names("blk.0.attn_qkv.weight", "qwen35")
+            == "model.layers.0.linear_attn.in_proj_qkv.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("blk.0.ssm_out.weight", "qwen35")
+            == "model.layers.0.linear_attn.out_proj.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("blk.0.post_attention_norm.weight", "qwen35")
+            == "model.layers.0.post_attention_layernorm.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("blk.0.ffn_gate.weight", "qwen35")
+            == "model.layers.0.mlp.gate_proj.weight"
         )
 
     def test_skip_tokenizer_tensors(self):
