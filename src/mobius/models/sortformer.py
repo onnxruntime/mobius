@@ -399,7 +399,10 @@ class _RelPositionMultiHeadAttention(nn.Module):
         matrix_bd = op.MatMul(q_v, op.Transpose(p, perm=[0, 1, 3, 2]))  # [B,H,T,2T-1]
         matrix_bd = self._rel_shift(op, matrix_bd, t_dim)  # [B,H,T,T]
 
-        scale = op.Constant(value=ir.tensor(np.array(self._head_dim**-0.5, dtype=np.float32)))
+        scale = op.CastLike(
+            op.Constant(value=ir.tensor(np.array(self._head_dim**-0.5, dtype=np.float32))),
+            matrix_ac,
+        )
         scores = op.Mul(op.Add(matrix_ac, matrix_bd), scale)
         attn = op.Softmax(scores, axis=-1)
         out = op.MatMul(attn, v)  # [B, H, T, d_k]
