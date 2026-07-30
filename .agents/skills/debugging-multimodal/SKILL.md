@@ -254,9 +254,28 @@ ORT bug: microsoft/onnxruntime#28107
 
 ### Opset 24 kernel registration
 
-ORT ≤1.24.x CUDA/TRT EPs don't register kernels for opset 24.
-**Fix:** Use the `ort_lower_opset_for_ep` feature flag (enabled by
-default). See `src/mobius/_flags.py`.
+ORT ≤1.24.x CUDA/TRT EPs didn't register kernels for opset 24.
+This has been fixed in newer ORT versions.  The `ort_lower_opset_for_ep`
+feature flag is available as a workaround (disabled by default, opt-in
+via `MOBIUS_ORT_LOWER_OPSET_FOR_EP=1`).  See `src/mobius/_flags.py`.
+
+### Encoder input dtype alignment
+
+Encoder task inputs should be declared with `dtype=config.dtype` so
+entry tensors match the model compute dtype (float32/float16/bfloat16).
+In the current codebase, multimodal encoder task builders set encoder
+inputs directly to `config.dtype` (there is no `_cast_encoder_input()`
+helper in `src/mobius/tasks/_base.py`).
+
+### GQA for KV-shared layers
+
+Gemma4 KV-shared layers now emit `GroupQueryAttention` with empty K/V
+inputs (`kv_sequence_length=0`) and borrowed source-layer KV wired via
+`past_key`/`past_value`, avoiding extra Transpose/Reshape cache ops.
+
+Runtime support depends on ORT having KV-shared GQA support (tracked in
+microsoft/onnxruntime#28242; still upstreaming as of this writing). On
+ORT builds without that support, this path can fail at runtime.
 
 ### NaN for large head_dim (> 256)
 

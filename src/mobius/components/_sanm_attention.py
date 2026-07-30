@@ -24,8 +24,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components._common import LayerNorm, Linear
 
@@ -50,7 +49,7 @@ class _FSMNBlock(nn.Module):
         self._n_feat = n_feat
         self._kernel_size = kernel_size
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
         """Apply depthwise Conv1d.
 
         Args:
@@ -111,7 +110,7 @@ class SANMAttention(nn.Module):
         self._n_heads = n_heads
         self._head_dim = out_size // n_heads
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value) -> ir.Value:
+    def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
         # hidden_states: [B, T, in_size]
 
         # Fused QKV → [B, T, 3 * out_size]
@@ -157,7 +156,7 @@ class SANMFFN(nn.Module):
         self.w_1 = Linear(hidden_size, ffn_dim, bias=True)
         self.w_2 = Linear(ffn_dim, hidden_size, bias=True)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
         # x: [B, T, hidden_size]
         return self.w_2(op, op.Relu(self.w_1(op, x)))  # [B, T, hidden_size]
 
@@ -198,7 +197,7 @@ class SANMEncoderLayer(nn.Module):
         # so the residual around the attention block must be skipped.
         self._has_residual = in_size == out_size
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value) -> ir.Value:
+    def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
         # hidden_states: [B, T, in_size]
 
         # Pre-norm attention with optional residual

@@ -7,8 +7,7 @@ import math
 from typing import NamedTuple
 
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._common import Linear
@@ -63,8 +62,8 @@ class StaticCacheState(NamedTuple):
     ``nonpad_kv_seqlen`` to indicate valid token counts.
 
     Fields:
-        key_cache: Pre-allocated key cache [B, max_seq, kv_hidden] 3D.
-        value_cache: Pre-allocated value cache [B, max_seq, kv_hidden] 3D.
+        key_cache: Pre-allocated key cache [B, max_seq_len, kv_hidden] 3D.
+        value_cache: Pre-allocated value cache [B, max_seq_len, kv_hidden] 3D.
         write_indices: Position to write new tokens [B] int64.
         nonpad_kv_seqlen: Valid KV length per batch entry [B] int64.
     """
@@ -76,7 +75,7 @@ class StaticCacheState(NamedTuple):
 
 
 def _apply_attention(
-    op: builder.OpBuilder,
+    op: OpBuilder,
     query: ir.Value,
     key: ir.Value,
     value: ir.Value,
@@ -89,6 +88,7 @@ def _apply_attention(
     scale: float,
     softcap: float = 0.0,
     static_cache: StaticCacheState | None = None,
+    is_causal: int = 1,
 ) -> tuple[ir.Value, ir.Value, ir.Value]:
     """Apply the ONNX Attention op with internal or static KV cache.
 
@@ -101,13 +101,30 @@ def _apply_attention(
     Static cache mode (``static_cache is not None``):
         Scatters new key/value into the static cache via TensorScatter,
         then attends over the full cache using ``nonpad_kv_seqlen``.
-        Also uses ``is_causal=1``.
+        Uses ``is_causal=1`` when ``attn_mask`` is ``None`` (maskless
+        default), or ``is_causal=0`` when ``attn_mask`` is a float additive
+        bias (the bias then carries the full causal + sliding + block +
+        padding mask).  The incoming ``is_causal`` argument is ignored in
+        this mode; causality is derived from ``attn_mask`` presence so the
+        two can never disagree.
         Returns ``(attn_output, updated_key_cache, updated_value_cache)``.
 
+    Args:
+        is_causal: Whether the Attention op applies its built-in causal
+            mask (default ``1``). Set to ``0`` when ``attn_mask`` already
+            bakes the FULL mask (causal + sliding + padding, and any
+            bidirectional unmasking such as Gemma4's vision-block overlay)
+            into a float additive bias. Leaving ``is_causal=1`` in that
+            case would re-apply causality and cancel any future-position
+            unmasking encoded in the bias.
+
     Note:
-        Both paths set ``is_causal=1`` on the Attention op, which enables
-        built-in causal masking. This means ``attn_mask`` should encode
-        only padding information (as a bool mask), not causality.
+        This applies to the DYNAMIC cache path only. There, the Attention op
+        defaults to ``is_causal=1`` for built-in causal masking, so
+        ``attn_mask`` should encode only padding information (as a bool mask),
+        not causality, unless ``is_causal=0`` is passed explicitly. In STATIC
+        cache mode the incoming ``is_causal`` argument is ignored — causality
+        is derived from ``attn_mask`` presence (see above).
 
     Note:
         ``nonpad_kv_seqlen`` (input #6) is only valid in static cache mode
@@ -139,28 +156,45 @@ def _apply_attention(
             axis=1,
         )  # [B, max_seq, kv_hidden]
 
-        # Attend over the full cache.  We pass None for attn_mask and use
-        # is_causal=1 instead — the Attention op handles causal + padding
-        # masking internally via is_causal + nonpad_kv_seqlen.  Using
-        # create_attention_bias() here would produce incorrect causality
-        # during prefill because it cannot represent the relationship
-        # between query positions and the full cache length.
+        # External-cache masking.  Two modes, selected by whether the caller
+        # supplied a float additive bias:
         #
-        # NOTE: The ONNX Attention spec supports attn_mask alongside
-        # nonpad_kv_seqlen for custom masking (e.g., user-defined masks
-        # beyond causal + padding).  Currently we rely on is_causal=1 +
-        # nonpad_kv_seqlen for standard LLM causal + padding masking.
-        # TODO(titaiwang): Support user-provided attn_mask in external
-        # cache mode for advanced use cases (e.g., prefix masking,
-        # document boundaries in batched inference).
-        # TODO(titaiwang): Support sliding window (circular cache mode)
-        # with static cache for long-context models that use local
-        # attention windows.
+        #   * attn_mask is None (default, maskless): pass None and use
+        #     is_causal=1 — the Attention op derives causal + padding masking
+        #     internally from is_causal + nonpad_kv_seqlen.  This is the
+        #     Flash-eligible form (onnx#8068 / onnxruntime#28958).
+        #   * attn_mask is not None (float-bias decoders): pass the bias and
+        #     STRICTLY pair it with is_causal=0.  The bias already bakes in the
+        #     FULL mask (causal + sliding + Gemma4 block overlay + padding), so
+        #     leaving is_causal=1 would double-apply causality and cancel any
+        #     bidirectional unmasking encoded in the bias.  This routes ORT to
+        #     the MEA external-cache path (Flash is precluded by any bias).
+        #
+        # nonpad_kv_seqlen stays as input #6 in BOTH modes: it bounds the valid
+        # KV prefix and, on the CUDA Flash path, drives the fully-masked-row
+        # zero guard (LaunchZeroFullyMaskedRows).  In bias mode the additive
+        # bias already encodes the same ``slot < nonpad`` validity.  The
+        # cross-repo invariant is ``nonpad == write_indices + valid_token_count``
+        # (the count of UNPADDED query tokens), which equals
+        # ``write_indices + S_q`` only when the chunk is unpadded — S_q is the
+        # PADDED chunk width.  When the chunk is unpadded, every query row keeps
+        # its own diagonal slot valid, so a fully-masked (all-``dtype.min``) row
+        # never arises.  With intra-prompt padding plus a sliding window,
+        # however, a pad-token query row CAN fall outside every valid slot and
+        # become fully masked.  In that case the CPU MEA path this bias mode uses
+        # does NOT apply the Flash zero-guard: it returns a finite mean-of-V row
+        # (not NaN, not exactly 0).  This finite-row behavior was empirically
+        # verified on ORT 1.27 CPU MEA; it is an observed ORT-version behavior,
+        # not a permanent op-spec invariant — see test_fully_masked_row_stays_finite.
+        if attn_mask is not None:
+            mask_arg, causal = attn_mask, 0
+        else:
+            mask_arg, causal = None, 1
         attn_output, _, _ = op.Attention(
             query,
             updated_k,
             updated_v,
-            None,  # no attn_mask — is_causal handles masking
+            mask_arg,
             None,  # no past_key (full cache is already provided)
             None,  # no past_value
             static_cache.nonpad_kv_seqlen,
@@ -168,7 +202,7 @@ def _apply_attention(
             kv_num_heads=num_key_value_heads,
             scale=scale,
             softcap=softcap,
-            is_causal=1,
+            is_causal=causal,
             _outputs=3,
         )
         return attn_output, updated_k, updated_v
@@ -192,7 +226,7 @@ def _apply_attention(
         kv_num_heads=num_key_value_heads,
         scale=scale,
         softcap=softcap,
-        is_causal=1,
+        is_causal=is_causal,
         _outputs=3,
     )
     return attn_output, present_key, present_value
@@ -281,7 +315,7 @@ class Attention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | GQAContext | None,
         position_embeddings: tuple | None = None,
@@ -367,7 +401,7 @@ class Attention(nn.Module):
 
     def _forward_gqa(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         query_states: ir.Value,
         key_states: ir.Value,
         value_states: ir.Value,
@@ -478,7 +512,7 @@ class Qwen35Attention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | None,
         position_embeddings: tuple,

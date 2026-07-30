@@ -33,8 +33,7 @@ import re
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import NemotronHConfig
 from mobius._weight_utils import tie_word_embeddings
@@ -90,7 +89,7 @@ class NemotronHMambaLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple,
@@ -132,7 +131,7 @@ class NemotronHAttentionLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple,
@@ -175,7 +174,7 @@ class NemotronHMLPLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple,
@@ -235,7 +234,7 @@ class NemotronHMoEGate(nn.Module):
         # Correction bias for expert selection (loaded from checkpoint)
         self.e_score_correction_bias = nn.Parameter([num_experts])
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # Cast to float32 for numerical stability (eps=1e-20 underflows
         # in fp16/bf16).  HF does the same: hidden_states.type(torch.float32)
         # in NemotronHTopkRouter.forward and never casts back.
@@ -353,7 +352,7 @@ class NemotronHMoEBlock(nn.Module):
                 bias=config.mlp_bias,
             )
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         residual = hidden_states
 
         # Gate routes on original hidden states
@@ -407,7 +406,7 @@ class NemotronHMoELayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple,
@@ -467,7 +466,7 @@ class _NemotronHTextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -523,7 +522,7 @@ class NemotronHCausalLMModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,

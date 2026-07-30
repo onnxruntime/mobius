@@ -227,3 +227,4 @@ docs/feature-flags.md
 *.mp3
 *.m4a
 *.wav
+.olive-cache/

@@ -378,6 +378,50 @@ shared transformer + per-layer Q/K/V/MLP low-rank adapters.
 
 4. **For non-eliminable renames**, keep them in `preprocess_weights`.
 
+## Shared helpers (use instead of hand-writing loops)
+
+`mobius._weight_utils` centralises the renames that *do* have to stay in
+`preprocess_weights`. Prefer these over a hand-written
+`for name, tensor in state_dict.items(): name = name.replace(...)` loop:
+
+| Helper | Use for |
+|--------|---------|
+| `rename_weight_keys(state_dict, [(old, new), ...])` | Pure substring key renames. Applies ordered, cascading `str.replace` to every key and **raises on key collision**. Returns a new dict (values shared). |
+| `rename_mlp_projections(name, old_up, old_down)` | Per-key MLP rename to canonical `up_proj`/`down_proj` (e.g. `fc_in`/`fc_out`, `c_fc`/`c_proj`). |
+| `split_fused_qkv` / `split_interleaved_qkv_weights` / `split_codegen_qkv` | Split fused/interleaved QKV projections. |
+| `split_gate_up_proj` | Split a fused `gate_up_proj` into `gate_proj` + `up_proj`. |
+| `tie_word_embeddings(state_dict)` | Ensure both `embed_tokens.weight` and `lm_head.weight` exist when `tie_word_embeddings=True`. |
+| `strip_prefix(state_dict, prefix)` | Drop a common key prefix. |
+| `vlm_decoder_weights` / `vlm_embedding_weights` / `vlm_vision_weights` | VLM sub-model weight extraction (decoder strip+tie, embedding filter+strip, vision-tower filter + `fc1/fc2`→`up_proj/down_proj`). |
+| `_rename_moe_expert_weights` (in `mobius.models.moe`, not `_weight_utils`) | MoE expert weight remapping across architectures. |
+
+Example — a pure-rename `preprocess_weights`:
+
+```python
+from mobius._weight_utils import rename_weight_keys
+
+def preprocess_weights(self, state_dict):
+    return super().preprocess_weights(
+        rename_weight_keys(
+            state_dict,
+            [
+                (".self_attn.dense.", ".self_attn.o_proj."),
+                (".mlp.fc1.", ".mlp.up_proj."),
+                (".mlp.fc2.", ".mlp.down_proj."),
+            ],
+        )
+    )
+```
+
+For VLM vision sub-models, prefer `vlm_vision_weights`:
+
+```python
+from mobius._weight_utils import vlm_vision_weights
+
+def preprocess_weights(self, state_dict):
+    return vlm_vision_weights(state_dict, ("vision_tower.", "multi_modal_projector."))
+```
+
 ## Non-consecutive index patterns (setattr fallback)
 
 When HF uses `nn.Sequential` with non-consecutive parameter indices AND the

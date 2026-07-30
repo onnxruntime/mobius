@@ -25,10 +25,10 @@ import math
 import numpy as np
 import onnx_ir as ir
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._diffusers_configs import CogVideoXConfig
+from mobius._weight_utils import rename_weight_keys
 from mobius.components import LayerNorm as _LayerNorm
 from mobius.components import Linear as _Linear
 from mobius.components._activations import SiLU as _SiLU
@@ -144,7 +144,7 @@ class _CogVideoXLayerNormZero(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         encoder_hidden_states: ir.Value,
         temb: ir.Value,
@@ -192,7 +192,7 @@ class _CogVideoXOutputNorm(nn.Module):
         self.linear = _Linear(conditioning_dim, output_dim * 2, bias=True)
         self._silu = _SiLU()
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value, temb: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, temb: ir.Value):
         emb = self._silu(op, temb)
         emb = self.linear(op, emb)
         # CogVideoX shift-first order
@@ -227,9 +227,7 @@ class _CogVideoXAttention(nn.Module):
         self._num_heads = num_heads
         self._head_dim = head_dim
 
-    def forward(
-        self, op: builder.OpBuilder, hidden_states: ir.Value, encoder_hidden_states: ir.Value
-    ):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, encoder_hidden_states: ir.Value):
         text_seq_len = op.Shape(encoder_hidden_states, start=1, end=2)
 
         # Concatenate text + video for shared projection
@@ -301,7 +299,7 @@ class _CogVideoXFFN(nn.Module):
         self.gelu_proj = _Linear(hidden_size, intermediate_size)
         self.linear_out = _Linear(intermediate_size, hidden_size)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         hidden_states = self.gelu_proj(op, hidden_states)
         hidden_states = op.Gelu(hidden_states)
         hidden_states = self.linear_out(op, hidden_states)
@@ -337,7 +335,7 @@ class _CogVideoXBlock(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         encoder_hidden_states: ir.Value,
         temb: ir.Value,
@@ -426,7 +424,7 @@ class _CogVideoXPatchEmbed(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         text_embeds: ir.Value,
         video: ir.Value,
     ):
@@ -545,7 +543,7 @@ class CogVideoXTransformer3DModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         sample: ir.Value,
         timestep: ir.Value,
         encoder_hidden_states: ir.Value,
@@ -595,7 +593,7 @@ class CogVideoXTransformer3DModel(nn.Module):
 
         return hidden_states
 
-    def _unpatchify(self, op: builder.OpBuilder, x, batch, num_frames, height, width):
+    def _unpatchify(self, op: OpBuilder, x, batch, num_frames, height, width):
         """Reshape patch tokens back to video: [B, T, C, H, W]."""
         p = self.config.patch_size
         c = self.config.out_channels
@@ -630,7 +628,7 @@ class CogVideoXTransformer3DModel(nn.Module):
         )
         return x
 
-    def _get_timestep_embedding(self, op: builder.OpBuilder, timestep):
+    def _get_timestep_embedding(self, op: OpBuilder, timestep):
         """Sinusoidal timestep embedding (flip_sin_to_cos=True)."""
         half_dim = self._time_proj_dim // 2
         exponent = -math.log(10000.0) / half_dim
@@ -651,9 +649,10 @@ class CogVideoXTransformer3DModel(nn.Module):
         - ``ff.net.0.proj.*`` → ``ff.gelu_proj.*``
         - ``ff.net.2.*`` → ``ff.linear_out.*``
         """
-        new_state_dict: dict[str, torch.Tensor] = {}
-        for name, tensor in state_dict.items():
-            name = name.replace(".ff.net.0.proj.", ".ff.gelu_proj.")
-            name = name.replace(".ff.net.2.", ".ff.linear_out.")
-            new_state_dict[name] = tensor
-        return new_state_dict
+        return rename_weight_keys(
+            state_dict,
+            [
+                (".ff.net.0.proj.", ".ff.gelu_proj."),
+                (".ff.net.2.", ".ff.linear_out."),
+            ],
+        )

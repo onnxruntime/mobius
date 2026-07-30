@@ -190,6 +190,9 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # Gemma4 text: per-layer input embedding + softcapping + QK-norm FP accumulation.
     # Argmax correct, cosine=0.985 — model is functionally correct.
     "gemma4_text": 0.15,
+    # Olmo3: QK-norm + sliding/full attention FP accumulation → ~0.015 max diff.
+    # Argmax near-tie, cosine=0.9999 — model is functionally correct.
+    "olmo3": 0.02,
 }
 
 # Model types with known ONNX-vs-HF divergences, tracked as xfail.
@@ -234,6 +237,12 @@ _PARITY_EXCLUDE: frozenset[str] = frozenset(
         "exaone",  # real HF type is exaone4
         "phi3small",  # real HF type is phi3
         "mistral3",  # our implementation maps to mistral; real mistral3 is different
+        # gemma4_unified_text: mobius-internal alias for the gemma-4-12B text
+        # backbone (reuses Gemma4CausalLMModel). No matching HF model_type is
+        # registered with AutoModelForCausalLM, so a reference model cannot be
+        # constructed here.  Text parity is covered by the real-weight
+        # integration test (test_gemma4_unified_12b_text_prefill).
+        "gemma4_unified_text",
         # falcon_h1: our ONNX uses FalconCausalLMModel (ALiBi attention), not the
         # real HF FalconH1 (Mamba2+SSM hybrid).  Comparing against HF would be apples-to-oranges.
         "falcon_h1",
@@ -388,9 +397,6 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
         "first_k_dense_replace": 0,
         "n_shared_experts": 1,
     },
-    # GraniteMoeHybrid requires layer_types (defaults to None, causing runtime error).
-    # HF accepts 'mamba' and 'attention' (not 'linear_attention'/'full_attention').
-    "granitemoehybrid": {"layer_types": ["mamba", "attention"]},
     # HunYuanMoEV1 requires head_dim (defaults to None, causing pow(None, float) error).
     "hunyuan_v1_moe": {"head_dim": TINY_HEAD_DIM},
     # Llama4Text requires head_dim to match our tiny num_heads x head_dim = hidden_size.
@@ -534,13 +540,14 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             for lt in hf_kwargs["layer_types"]
         ]
 
-    # GraniteMoeHybrid uses layers_block_type (HF field) with "mamba"/"attention" values.
-    # Convert our layer_types (which may use "mamba2"/"full_attention" internal names or
-    # the HF-format values from _HF_EXTRA_CONFIG) to layers_block_type for HF.
+    # GraniteMoeHybrid uses layers_block_type (HF field) with layer-type values.
+    # Convert our internal "mamba2"/"full_attention" names to the current HF values
+    # ("linear_attention"/"full_attention"); the legacy "mamba"/"attention" names
+    # are no longer accepted by HF's layer-type validator.
     if hf_model_type in ("granitemoehybrid",) and "layer_types" in hf_kwargs:
         layer_types = hf_kwargs.pop("layer_types")
         hf_kwargs["layers_block_type"] = [
-            "attention" if lt in ("full_attention", "attention") else "mamba"
+            "full_attention" if lt in ("full_attention", "attention") else "linear_attention"
             for lt in layer_types
         ]
 

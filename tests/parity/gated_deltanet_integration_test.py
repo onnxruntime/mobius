@@ -128,7 +128,9 @@ def parity_outputs():
             position_ids=torch.from_numpy(position_ids),
         )
     hf_logits = hf_out.logits.numpy()
-    hf_rec = hf_out.past_key_values.recurrent_states[0].numpy()
+    # transformers >=5.x stores recurrent state per cache layer
+    # (``cache.layers[idx].recurrent_states``) instead of a top-level list.
+    hf_rec = hf_out.past_key_values.layers[0].recurrent_states.numpy()
 
     # ONNX forward — build zero-valued cache feeds from graph inputs.
     base_feeds: dict[str, np.ndarray] = {

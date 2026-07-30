@@ -43,11 +43,23 @@ class DenoisingTask(ModelTask):
             shape=["batch", "sequence_length", config.cross_attention_dim],
         )
 
+        # Runtime LoRA gates: one scalar `lora_gate.{name}` input per baked
+        # adapter (1.0 = active, 0.0 = inactive, or a blend strength), so a loaded
+        # model can switch/blend LoRAs at run time with no rebuild. Only modules
+        # that declare adapters (`_lora_adapter_names`) receive the gates.
+        lora_gates = {}
+        for name in getattr(module, "_lora_adapter_names", []):
+            lora_gates[name] = builder.input(
+                f"lora_gate.{name}", dtype=ir.DataType.FLOAT, shape=[]
+            )
+
+        extra_kwargs = {"lora_gates": lora_gates} if lora_gates else {}
         noise_pred = module(
             op,
             sample=sample,
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
+            **extra_kwargs,
         )
 
         builder.add_output(noise_pred, "noise_pred")

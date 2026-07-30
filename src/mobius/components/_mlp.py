@@ -5,8 +5,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._activations import get_activation
@@ -43,7 +42,7 @@ class MLP(nn.Module):
         )
         self.act_fn = get_activation(config.hidden_act)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         gate = self.act_fn(op, self.gate_proj(op, x))
         up = self.up_proj(op, x)
         return self.down_proj(op, op.Mul(gate, up))
@@ -93,7 +92,7 @@ class GatedMLP(nn.Module):
         self.down_proj = linear_class(intermediate_size, hidden_size, bias=bias)
         self.act_fn = get_activation(activation)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
         gate = self.act_fn(op, self.gate_proj(op, x))
         return self.down_proj(op, op.Mul(gate, self.up_proj(op, x)))
 
@@ -136,7 +135,7 @@ class FusedGateUpMLP(nn.Module):
         )
         self.act_fn = get_activation(config.hidden_act)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
         # Fused matmul → [*, 2 * intermediate_size]
         gate_up = self.gate_up_proj(op, x)
         # Split activations at intermediate_size boundary
@@ -188,7 +187,7 @@ class FCMLP(nn.Module):
         self.down_proj = linear_class(intermediate_size, hidden_size, bias=bias)
         self.act_fn = get_activation(activation)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
         x = self.up_proj(op, x)
         x = self.act_fn(op, x)
         return self.down_proj(op, x)

@@ -1,0 +1,15 @@
+{
+  "model_id": "google/gemma-4-12B",
+  "prompt": "This image shows",
+  "generated_tokens": [
+    496,
+    34455,
+    9307,
+    528,
+    506,
+    7613,
+    236761,
+    1
+  ],
+  "generated_text": " a bobcat in the snow."
+}

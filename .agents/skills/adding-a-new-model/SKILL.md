@@ -112,6 +112,12 @@ class MyCausalLMModel(CausalLMModel):
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
 ```
 
+> If your text model **subclasses `TextModel`** (rather than `nn.Module`) and
+> overrides `__init__` with `nn.Module.__init__(self)` to swap in a custom
+> decoder layer, you must also set `self.config = config` in that subclass —
+> `TextModel.forward` reads `self.config`. See troubleshooting §7.
+
+
 #### Class metadata attributes
 
 Every registered model class should set two class-level attributes:
@@ -190,9 +196,28 @@ Also export from `src/mobius/models/__init__.py`.
 
 ### 6. Update `ArchitectureConfig.from_transformers` if needed
 
-If the model has unusual config fields, update `from_transformers()` in
-`_configs.py`.  Use safe defaults (1.0 for multipliers, None for optional
-features) so existing models are unaffected.
+If the model has unusual top-level config fields (vocab size, head counts,
+RoPE knobs, etc.), update `from_transformers()` in `src/mobius/_configs/_base.py`.
+Use safe defaults (1.0 for multipliers, None for optional features) so
+existing models are unaffected.
+
+**For audio- or vision-capable models** (i.e. models whose HF config has an
+`audio_config` or `vision_config` sub-object), prefer adding a per-model hook
+under `src/mobius/_configs/per_model/` rather than editing the central file:
+
+```python
+# src/mobius/_configs/per_model/_my_model_vision.py
+from mobius._configs._extractors import register_vision_hook
+
+@register_vision_hook("my_model_type")
+def _my_model_vision(config, parent_config, model_type, fields):
+    fields.update(hidden_size=..., num_attention_heads=..., ...)
+    return None  # contribute fields, defer VisionConfig instantiation
+```
+
+Then add the new module to `src/mobius/_configs/per_model/__init__.py` so its
+side-effect registration runs at import time. The dispatcher filters hooks by
+the declared model_type strings, so unrelated models never see your hook.
 
 ### 7. Write tests
 
@@ -343,9 +368,10 @@ config fields (`embedding_multiplier`, `attention_multiplier`,
 
 ### 4. Config fields not extracted
 
-**Symptom:** Model builds but multipliers default to 1.0.  Add extraction
-to `ArchitectureConfig.from_transformers()` in `_configs.py` with safe
-defaults.
+**Symptom:** Model builds but multipliers default to 1.0. Add extraction
+to `ArchitectureConfig.from_transformers()` in `src/mobius/_configs/_base.py`
+with safe defaults. For audio/vision-specific fields, register a per-model
+hook under `src/mobius/_configs/per_model/` instead — see step 6 above.
 
 ### 5. Debugging workflow for logit mismatches
 
@@ -375,6 +401,25 @@ differs between loads, suspect `_init_weights` corruption. Set
 `torch.manual_seed(42)` before `from_pretrained` — if that makes outputs
 deterministic, `_init_weights` is the culprit. Then compare specific
 parameters between the loaded model and the safetensors checkpoint.
+
+### 7. `AttributeError: '<X>TextModel' object has no attribute 'config'`
+
+**Symptom:** Building (or running build-graph / GQA rewrite-rule tests for)
+a model raises `AttributeError: '…TextModel' object has no attribute
+'config'` from inside `TextModel.forward` (e.g. `_gqa_local_window_size`).
+
+**Root cause:** The base `TextModel.__init__` sets `self.config = config`,
+and `TextModel.forward` relies on it (sliding-window detection, etc.). A
+`TextModel` **subclass** that overrides `__init__` with
+`nn.Module.__init__(self)` — instead of `super().__init__(config)` — to swap
+in a custom decoder layer must re-establish the contract by setting
+`self.config = config` itself. Forgetting it crashes only that model.
+
+**Fix:** Add `self.config = config` right after `nn.Module.__init__(self)`
+in the subclass `__init__`. Real examples: `Glm4TextModel` (`models/glm.py`),
+`_LoRATextModel` (`models/phi.py`). Do **not** paper over it with
+`getattr(self, "config", None)` in the base — that silently disables
+config-driven features for the offending subclass.
 
 > For additional troubleshooting (gated attention split ordering, DeltaNet
 > scaling, identity node folding, fp32 upcast patterns, multi-token prefill,

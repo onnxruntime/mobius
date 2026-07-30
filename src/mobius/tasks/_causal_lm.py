@@ -75,6 +75,16 @@ class CausalLMTask(ModelTask):
         max_seq_len: Maximum sequence length for static cache buffers.
             Only used when ``static_cache=True``.  Defaults to
             ``config.max_position_embeddings``.
+        prune_lm_head: If ``True``, insert ``Gather(axis=1, index=-1)``
+            before the LM head so only the last token's hidden state is
+            projected to logits.  Output logits shape becomes ``[B, 1,
+            vocab]`` instead of ``[B, S, vocab]``, reducing prefill cost
+            for large-vocabulary models.  Set this when the downstream
+            runtime only needs the final token's logits (single-token
+            autoregressive generation).  Breaks workflows that require
+            per-token logits (logprob scoring, speculative decoding,
+            multi-token generation).  Mirrors the ``prune_lm_head`` extra
+            option in onnxruntime-genai's Model Builder.
     """
 
     def __init__(
@@ -82,9 +92,11 @@ class CausalLMTask(ModelTask):
         *,
         static_cache: bool = False,
         max_seq_len: int | None = None,
+        prune_lm_head: bool = False,
     ):
         self._static_cache = static_cache
         self._max_seq_len = max_seq_len
+        self._prune_lm_head = prune_lm_head
 
     def build(
         self,
@@ -123,6 +135,11 @@ class CausalLMTask(ModelTask):
             position_ids = builder.input(
                 "position_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len]
             )
+            # Models may expose per-cache-layer specs (e.g. Gemma4: only
+            # non-KV-shared layers own a cache, and sliding vs full layers use
+            # different head_dim). Uniform models leave this unset.
+            specs_fn = getattr(module, "static_kv_cache_specs", None)
+            cache_specs = specs_fn() if callable(specs_fn) else None
             past_key_values = _make_static_cache_inputs(
                 builder,
                 config.num_hidden_layers,
@@ -131,6 +148,7 @@ class CausalLMTask(ModelTask):
                 config.dtype,
                 batch,
                 max_seq_len,
+                cache_specs=cache_specs,
             )
         else:
             past_seq_len = ir.SymbolicDim("past_sequence_len")
@@ -153,6 +171,10 @@ class CausalLMTask(ModelTask):
             num_kv_cache_heads = (
                 config.num_attention_heads if use_mla else config.num_key_value_heads
             )
+            kv_key_head_dim = (
+                (config.qk_nope_head_dim or 0) + (config.qk_rope_head_dim or 0)
+            ) or config.head_dim
+            kv_value_head_dim = config.v_head_dim or config.head_dim
 
             past_key_values = _make_kv_cache_inputs(
                 builder,
@@ -162,18 +184,35 @@ class CausalLMTask(ModelTask):
                 config.dtype,
                 batch,
                 past_seq_len,
-                key_head_dim=((config.qk_nope_head_dim or 0) + (config.qk_rope_head_dim or 0))
-                or None,
-                value_head_dim=config.v_head_dim or None,
+                key_head_dim=kv_key_head_dim,
+                value_head_dim=kv_value_head_dim,
             )
 
-        logits, present_key_values = module(
+        result = module(
             op,
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
         )
+        intermediate_hidden_states: list | None = None
+        if len(result) == 3:
+            logits, present_key_values, intermediate_hidden_states = result
+        else:
+            logits, present_key_values = result
+
+        if self._prune_lm_head:
+            # Select only the last token's logits: [B, S, vocab] -> [B, 1, vocab].
+            # Use a scalar (rank-0) index so Gather collapses dim 1:
+            #   [B, S, vocab] --Gather(axis=1, idx=-1)--> [B, vocab]
+            #   --Unsqueeze(axis=1)--> [B, 1, vocab]
+            # ONNX Runtime's graph optimizer can push this Gather backward
+            # through the LM head MatMul, avoiding the full [B, S, vocab]
+            # computation during prefill.  Mirrors onnxruntime-genai Model
+            # Builder's prune_lm_head option.
+            last_idx = op.Constant(value_int=-1)  # scalar (rank-0) INT64
+            last_token_logits = op.Gather(logits, last_idx, axis=1)  # [B, vocab]
+            logits = op.Unsqueeze(last_token_logits, op.Constant(value_ints=[1]))  # [B, 1, vocab]
 
         builder.add_output(logits, "logits")
 
@@ -184,9 +223,24 @@ class CausalLMTask(ModelTask):
                 present_key_values,
             )
         else:
+            # Stamp explicit present shapes symmetric to the past inputs so the
+            # com.microsoft::GroupQueryAttention export declares the correct
+            # head_dim (its contrib-op shape inference otherwise mis-derives it
+            # from the packed QKV hidden). total_seq = past + current sequence.
             _register_kv_cache_outputs(
                 builder,
                 present_key_values,
+                batch=batch,
+                num_kv_heads=num_kv_cache_heads,
+                key_head_dim=kv_key_head_dim,
+                value_head_dim=kv_value_head_dim,
+                total_seq_len="past_sequence_len + sequence_len",
+                dtype=config.dtype,
+            )
+
+        if intermediate_hidden_states is not None:
+            _register_intermediate_hidden_states(
+                builder, config.output_layer_indices, intermediate_hidden_states
             )
 
         return ModelPackage({"model": _make_model(graph)}, config=config)
@@ -211,7 +265,15 @@ class HybridCausalLMTask(ModelTask):
     Outputs:
         - logits: FLOAT
         - present.{i}.{key|value|conv_state|recurrent_state}: FLOAT
+
+    Args:
+        prune_lm_head: If ``True``, insert ``Gather(axis=1, index=-1)``
+            after the LM head so only the last token's logits are emitted.
+            See :class:`CausalLMTask` for full documentation.
     """
+
+    def __init__(self, *, prune_lm_head: bool = False):
+        self._prune_lm_head = prune_lm_head
 
     def build(
         self,
@@ -243,13 +305,31 @@ class HybridCausalLMTask(ModelTask):
             past_seq_len,
         )
 
-        logits, present_key_values = module(
+        result = module(
             op,
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
         )
+        intermediate_hidden_states: list | None = None
+        if len(result) == 3:
+            logits, present_key_values, intermediate_hidden_states = result
+        else:
+            logits, present_key_values = result
+
+        if self._prune_lm_head:
+            # Select only the last token's logits: [B, S, vocab] -> [B, 1, vocab].
+            # Use a scalar (rank-0) index so Gather collapses dim 1:
+            #   [B, S, vocab] --Gather(axis=1, idx=-1)--> [B, vocab]
+            #   --Unsqueeze(axis=1)--> [B, 1, vocab]
+            # ONNX Runtime's graph optimizer can push this Gather backward
+            # through the LM head MatMul, avoiding the full [B, S, vocab]
+            # computation during prefill.  Mirrors onnxruntime-genai Model
+            # Builder's prune_lm_head option.
+            last_idx = op.Constant(value_int=-1)  # scalar (rank-0) INT64
+            last_token_logits = op.Gather(logits, last_idx, axis=1)  # [B, vocab]
+            logits = op.Unsqueeze(last_token_logits, op.Constant(value_ints=[1]))  # [B, 1, vocab]
 
         builder.add_output(logits, "logits")
         _register_hybrid_cache_outputs(
@@ -258,9 +338,41 @@ class HybridCausalLMTask(ModelTask):
             config.layer_types or [],
         )
 
+        if intermediate_hidden_states is not None:
+            _register_intermediate_hidden_states(
+                builder, config.output_layer_indices, intermediate_hidden_states
+            )
+
         model = _make_model(graph)
         _register_linear_attention_functions(model, config)
         return ModelPackage({"model": model}, config=config)
+
+
+def _register_intermediate_hidden_states(
+    builder: GraphBuilder,
+    indices: list[int] | None,
+    intermediate_hidden_states: list[ir.Value],
+) -> None:
+    """Register selected per-layer hidden-state tensors as graph outputs.
+
+    Each entry ``intermediate_hidden_states[i]`` is the post-residual
+    output of decoder layer ``indices[i]`` (before the final ``self.norm``).
+    The outputs are named ``hidden_states.{idx}`` so a downstream
+    speculative-decoding draft can address them by layer index.
+
+    See :class:`ArchitectureConfig.output_layer_indices` for the index
+    convention.
+    """
+    if not indices:
+        return
+    if len(indices) != len(intermediate_hidden_states):
+        raise ValueError(
+            f"output_layer_indices has {len(indices)} entries but the model "
+            f"returned {len(intermediate_hidden_states)} intermediate "
+            "hidden-state tensors."
+        )
+    for idx, hs in zip(indices, intermediate_hidden_states):
+        builder.add_output(hs, f"hidden_states.{idx}")
 
 
 def _make_static_cache_inputs(
@@ -271,19 +383,32 @@ def _make_static_cache_inputs(
     dtype: ir.DataType,
     batch: ir.SymbolicDim,
     max_seq_len: int,
+    cache_specs: list[tuple[int, int]] | None = None,
 ) -> list[StaticCacheState]:
-    """Create static KV cache inputs for ``num_layers`` layers.
+    """Create static KV cache inputs for the cache-owning layers.
 
     Uses ``builder.input()`` to create and register graph inputs directly.
+
+    Args:
+        cache_specs: Optional per-cache-layer ``(num_key_value_heads, head_dim)``
+            list. When provided (e.g. from a model's ``static_kv_cache_specs()``),
+            one buffer is allocated per entry with its own ``kv_hidden`` — this
+            supports models where only a subset of layers own a cache and/or the
+            head_dim varies per layer (Gemma4: KV-shared layers borrow K,V, and
+            sliding vs full layers use different head_dim). When ``None``, falls
+            back to ``num_layers`` uniform buffers of
+            ``num_key_value_heads * head_dim``.
 
     Returns:
         A list of :class:`StaticCacheState` tuples for passing to the
         module via ``past_key_values``.
     """
-    kv_hidden = num_key_value_heads * head_dim
-    cache_pairs: list[tuple[ir.Value, ir.Value]] = []
+    if cache_specs is None:
+        cache_specs = [(num_key_value_heads, head_dim)] * num_layers
 
-    for i in range(num_layers):
+    cache_pairs: list[tuple[ir.Value, ir.Value]] = []
+    for i, (kv_heads, layer_head_dim) in enumerate(cache_specs):
+        kv_hidden = kv_heads * layer_head_dim
         key_cache = builder.input(
             f"key_cache.{i}",
             dtype=dtype,
@@ -340,10 +465,15 @@ def _register_static_cache_outputs(
 def _validate_static_cache_support(module: nn.Module) -> None:
     """Check that the module's decoder layers support StaticCacheState.
 
-    Only :class:`DecoderLayer` and :class:`MoEDecoderLayer` have the
-    ``isinstance(StaticCacheState)`` dispatch in ``forward()``.  Custom
-    decoder layers will silently unpack the NamedTuple as a regular
+    Shared decoder layers have the ``isinstance(StaticCacheState)`` dispatch
+    in ``forward()``. Custom decoder layers must opt in with the
+    ``_supports_static_cache`` marker after implementing equivalent handling;
+    otherwise they may silently unpack the NamedTuple as a regular
     ``(key, value)`` tuple, producing wrong results.
+
+    Also warns when the model uses sliding-window attention, since the
+    static cache path does not enforce window constraints (the Attention
+    op uses ``is_causal=1`` without ``local_window_size``).
 
     NOTE: The following models are NOT yet supported in static cache
     mode and will raise TypeError from this check:
@@ -369,22 +499,31 @@ def _validate_static_cache_support(module: nn.Module) -> None:
     from mobius.components._decoder import DecoderLayer
     from mobius.models.moe import MoEDecoderLayer
 
+    # Whitelist-based validation: only check layers that have self_attn/attn
+    # (decoder-like), and accept shared implementations or explicit opt-ins.
+    # This naturally skips vision/audio encoder layers since they use
+    # different classes (e.g. Gemma4VisionEncoderLayer).
     for name, child in module.named_modules():
         if not isinstance(child, nn.ModuleList):
             continue
         for i, layer in enumerate(child):
             if not isinstance(layer, nn.Module):
                 continue
-            # Check modules that look like decoder layers: they have an
-            # attention sub-module named either "self_attn" (standard) or
-            # "attn" (GPT-2 style).
             if not hasattr(layer, "self_attn") and not hasattr(layer, "attn"):
                 continue
-            if not isinstance(layer, (DecoderLayer, MoEDecoderLayer)):
-                raise TypeError(
-                    f"Static cache mode requires decoder layers that "
-                    f"inherit from DecoderLayer or MoEDecoderLayer, but "
-                    f"{name}[{i}] is {type(layer).__name__}. Either use a "
-                    f"compatible model or add StaticCacheState dispatch to "
-                    f"{type(layer).__name__}.forward()."
-                )
+            # A layer qualifies if it inherits the shared DecoderLayer/MoEDecoderLayer
+            # static dispatch, or opts in via the ``_supports_static_cache`` class
+            # marker (custom layers that implement StaticCacheState handling
+            # themselves, e.g. Gemma4DecoderLayer with KV-shared + dual head_dim).
+            if isinstance(layer, (DecoderLayer, MoEDecoderLayer)):
+                continue
+            if getattr(type(layer), "_supports_static_cache", False):
+                continue
+            raise TypeError(
+                f"Static cache mode requires decoder layers that "
+                f"inherit from DecoderLayer or MoEDecoderLayer (or set "
+                f"_supports_static_cache=True), but "
+                f"{name}[{i}] is {type(layer).__name__}. Either use a "
+                f"compatible model or add StaticCacheState dispatch to "
+                f"{type(layer).__name__}.forward()."
+            )

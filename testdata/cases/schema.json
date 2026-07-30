@@ -44,9 +44,12 @@
         "audio-feature-extraction",
         "audio-to-audio",
         "codec",
+        "ctc-asr",
         "depth-estimation",
+        "dflash-draft",
         "feature-extraction",
         "fun-asr-speech-language",
+        "gemma4-assistant",
         "image-classification",
         "image-segmentation",
         "image-text-to-text",
@@ -54,6 +57,7 @@
         "image-to-text",
         "object-detection",
         "phi4mm-multimodal",
+        "qwen35-mtp",
         "seq2seq",
         "speech-language",
         "speech-to-text",
@@ -131,6 +135,14 @@
         "eos_token_id": {
           "type": "integer",
           "description": "End-of-sequence token ID. Overrides the model's default to ensure generation stops correctly."
+        },
+        "lang": {
+          "type": "string",
+          "description": "Target language code for multilingual models (e.g. MMS uses ISO-639-3 codes like 'eng' to pick the per-language adapter)."
+        },
+        "target_model_id": {
+          "type": "string",
+          "description": "Paired target model HF ID for speculative-decoding drafter tasks (e.g. dflash-draft): the target supplies the hidden states / shared KV used to build the drafter's golden inputs at generation time. Only read by generate_golden.py; the e2e test replays stored tensors and never loads the target."
         }
       },
       "additionalProperties": false,
@@ -164,6 +176,10 @@
     "notes": {
       "type": "string",
       "description": "Human-readable description of the test case. Not parsed by the test runner."
+    },
+    "architecture": {
+      "type": "string",
+      "description": "Optional registry architecture key (e.g. Qwen35MtpModel) forcing a specific module class + task at build time. Needed for auxiliary heads (DFlash, MTP) that share a base checkpoint whose architectures field would otherwise auto-route to the base model."
     }
   }
 }

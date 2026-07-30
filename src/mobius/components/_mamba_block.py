@@ -20,8 +20,7 @@ HuggingFace reference: ``MambaMixer``, ``BambaMixer``,
 from __future__ import annotations
 
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components._common import INT64_MAX, Linear
 from mobius.components._rms_norm import GatedRMSNorm
@@ -42,7 +41,7 @@ class _DepthwiseConv1d(nn.Module):
         self._kernel_size = kernel_size
         self._channels = channels
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # x: (batch, channels, seq_len)
         result = op.Conv(
             x,
@@ -101,7 +100,7 @@ class MambaBlock(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         conv_state: ir.Value,
         ssm_state: ir.Value,
@@ -196,7 +195,7 @@ class _Mamba2DepthwiseConv1d(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_val: ir.Value,
         conv_state: ir.Value,
     ):
@@ -332,7 +331,7 @@ class Mamba2Block(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         conv_state: ir.Value,
         ssm_state: ir.Value,
@@ -465,7 +464,7 @@ class Mamba2Block(nn.Module):
 
         return output, new_conv_state, new_ssm_state
 
-    def _expand_groups(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
+    def _expand_groups(self, op: OpBuilder, x: ir.Value) -> ir.Value:
         """Expand grouped B or C from n_groups to num_heads.
 
         Args:

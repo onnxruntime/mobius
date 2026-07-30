@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Text-only export for multimodal Gemma 4 (`--text-only`)
+
+#### Added
+
+- `build(text_only=True)` and the `mobius build --text-only` CLI flag export the
+  **text backbone** of a unified multimodal checkpoint as a standalone
+  decoder-only LLM. For `gemma4_unified` (`google/gemma-4-12B`) this remaps the
+  model type to its text sibling (`gemma4_unified_text`) and strips the
+  vision/audio config so the decoder fuses to `GroupQueryAttention` on
+  GQA-capable execution providers (CUDA/DML) instead of the float-bias
+  `Attention` path forced by the multimodal bidirectional vision-block overlay.
+  `--text-only` is rejected with `--config` / `--component` and now also bypasses
+  diffusers autodetect so `build()` validation runs (a diffusers/unsupported repo
+  raises instead of silently exporting a pipeline).
+
+#### Changed
+
+- `auto_export(..., ep="cuda"|"dml")` now forwards the execution provider to
+  `build()` (`ep` → `build_ep`), so exports build the **EP-fused** graph
+  (GQA / packed-QKV) rather than the portable `"default"` graph. Callers that
+  relied on `auto_export` always producing a portable graph should pass
+  `ep="cpu"` (which maps to the `"default"` build EP).
+
+---
+
+### KV-cache present-shape: fail-closed on partial parameter sets
+
+#### Fixed
+
+- `_register_kv_cache_outputs` now **raises `ValueError`** when given a partial
+  set of present-shape parameters (1–5 of the six `batch`, `num_kv_heads`,
+  `key_head_dim`, `value_head_dim`, `total_seq_len`, `dtype`) instead of logging
+  a warning and proceeding. A partial set is always a wiring slip with no
+  legitimate use; the previous fail-open shipped a structurally-wrong model
+  (mis-derived `GroupQueryAttention` present `head_dim`) with only a log line.
+  Passing all six (stamp) or none (infer) is unaffected. (closes #341)
+
+---
+
+### fp16 GQA Export Fix
+
+#### Fixed
+
+- Native fp16 GroupQueryAttention exports (e.g. `microsoft/Phi-3.5-mini-instruct`
+  with `--dtype f16 --execution-provider cuda`) no longer emit fp32 packed-QKV /
+  transposed weights. Previously the fold passes (`FoldConcatInitializersPass`,
+  `FoldTransposedInitializerPass`) defaulted a folded initializer's dtype to
+  `FLOAT` when the source `Value`'s declared type had been dropped during fp16
+  casting, producing a model onnxruntime rejected at load with a
+  `MatMul` type-parameter error (`tensor(float16)` vs `tensor(float)`) on both
+  CPU and CUDA EPs. A new `mobius._passes._dtype_utils.initializer_dtype()`
+  helper now resolves the effective dtype from `const_value` when the type
+  annotation is missing, so fp16 GQA models load directly with no manual
+  post-cast.
+
+---
+
+### GQA Present KV-Cache Shape Fix
+
+#### Fixed
+
+- GroupQueryAttention exports now declare correct `present.{i}.key` /
+  `present.{i}.value` graph-output shapes and dtype. The GQA contrib op's shape
+  inference mis-derived the present KV `head_dim` (e.g. 32 instead of 96 on
+  `microsoft/Phi-3.5-mini-instruct`), so the present KV-cache outputs declared a
+  `head_dim` inconsistent with the (correct) `past_key_values` inputs. ORT logged
+  `Error merging shape info ... lenient merge` (64 warnings on Phi-3.5) and any
+  consumer that chains `present` → `past` and trusts declared shapes (e.g.
+  `onnxruntime-genai`) saw mismatched past-vs-present KV cache types. This is a
+  metadata / declared-shape correction only — runtime numerics are unchanged
+  (weights byte-identical, next-token parity 20/20). `_register_kv_cache_outputs`
+  now stamps the present KV outputs symmetric to the past inputs. Affects
+  GQA-fusion packed-QKV exports (Phi-3.5, Llama-3.2, Qwen2, Mistral, Phi-3-GQA).
+
+---
+
 ### WebGPU Shape Op Support
 
 #### Changed

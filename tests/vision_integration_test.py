@@ -55,7 +55,7 @@ class _TorchViTAttention(nn.Module):
         self.q_proj = nn.Linear(hidden_size, hidden_size)
         self.k_proj = nn.Linear(hidden_size, hidden_size)
         self.v_proj = nn.Linear(hidden_size, hidden_size)
-        self.o_proj = nn.Linear(hidden_size, hidden_size)
+        self.out_proj = nn.Linear(hidden_size, hidden_size)
 
     def forward(self, x):
         b, n, c = x.shape
@@ -63,7 +63,7 @@ class _TorchViTAttention(nn.Module):
         k = self.k_proj(x).reshape(b, n, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).reshape(b, n, self.num_heads, self.head_dim).transpose(1, 2)
         attn = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-        return self.o_proj(attn.transpose(1, 2).reshape(b, n, c))
+        return self.out_proj(attn.transpose(1, 2).reshape(b, n, c))
 
 
 class _TorchViTEncoderLayer(nn.Module):
@@ -143,7 +143,7 @@ class _TorchCLIPVisionModel(nn.Module):
         post_layernorm.{weight,bias}
     """
 
-    def __init__(self):
+    def __init__(self, num_layers: int = _LAYERS):
         super().__init__()
         num_patches = (_IMAGE_SIZE // _PATCH_SIZE) ** 2
         # Embeddings
@@ -151,16 +151,31 @@ class _TorchCLIPVisionModel(nn.Module):
         self.embeddings.class_embedding = nn.Parameter(torch.zeros(_HIDDEN))
         self.embeddings.patch_embedding = nn.Module()
         self.embeddings.patch_embedding.projection = nn.Conv2d(
-            _CHANNELS, _HIDDEN, kernel_size=_PATCH_SIZE, stride=_PATCH_SIZE
+            _CHANNELS, _HIDDEN, kernel_size=_PATCH_SIZE, stride=_PATCH_SIZE, bias=False
         )
         self.embeddings.position_embedding = nn.Embedding(num_patches + 1, _HIDDEN)
         # Pre/post norms
         self.pre_layrnorm = nn.LayerNorm(_HIDDEN, eps=_NORM_EPS)
         self.post_layernorm = nn.LayerNorm(_HIDDEN, eps=_NORM_EPS)
         # Encoder as indexed ModuleList (keys: encoder.0.*, encoder.1.*, ...)
-        self.encoder = nn.ModuleList([_TorchCLIPEncoderLayer() for _ in range(_LAYERS)])
+        self.encoder = nn.ModuleList([_TorchCLIPEncoderLayer() for _ in range(num_layers)])
 
     def forward(self, pixel_values):
+        return self._encode(pixel_values, feature_layer=None, drop_class_token=False)
+
+    def forward_features(self, pixel_values, feature_layer, drop_class_token):
+        """Match CLIPVisionModel(feature_layer=..., drop_class_token=...).
+
+        Returns ``hidden_states[feature_layer]`` (HuggingFace convention, no
+        ``post_layernorm``), optionally with the leading CLS token dropped.
+        """
+        return self._encode(
+            pixel_values,
+            feature_layer=feature_layer,
+            drop_class_token=drop_class_token,
+        )
+
+    def _encode(self, pixel_values, feature_layer, drop_class_token):
         # Patch embed
         x = self.embeddings.patch_embedding.projection(pixel_values)
         x = x.flatten(2).transpose(1, 2)  # (B, num_patches, hidden)
@@ -174,10 +189,18 @@ class _TorchCLIPVisionModel(nn.Module):
         x = x + self.embeddings.position_embedding(position_ids)
         # Pre-norm
         x = self.pre_layrnorm(x)
-        # Encoder
+        # Encoder — collect HuggingFace-style hidden states (index 0 == input).
+        hidden_states = [x]
         for layer in self.encoder:
             x = layer(x)
-        return self.post_layernorm(x)
+            hidden_states.append(x)
+        if feature_layer is None:
+            out = self.post_layernorm(x)
+        else:
+            out = hidden_states[feature_layer]
+        if drop_class_token:
+            out = out[:, 1:]
+        return out
 
 
 class _TorchCLIPEncoderLayer(nn.Module):
@@ -202,7 +225,7 @@ class _TorchCLIPAttention(nn.Module):
         self.q_proj = nn.Linear(_HIDDEN, _HIDDEN)
         self.k_proj = nn.Linear(_HIDDEN, _HIDDEN)
         self.v_proj = nn.Linear(_HIDDEN, _HIDDEN)
-        self.o_proj = nn.Linear(_HIDDEN, _HIDDEN)
+        self.out_proj = nn.Linear(_HIDDEN, _HIDDEN)
 
     def forward(self, x):
         b, n, c = x.shape
@@ -210,7 +233,7 @@ class _TorchCLIPAttention(nn.Module):
         k = self.k_proj(x).reshape(b, n, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).reshape(b, n, self.num_heads, self.head_dim).transpose(1, 2)
         attn = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-        return self.o_proj(attn.transpose(1, 2).reshape(b, n, c))
+        return self.out_proj(attn.transpose(1, 2).reshape(b, n, c))
 
 
 class _TorchCLIPMLP(nn.Module):
@@ -218,13 +241,13 @@ class _TorchCLIPMLP(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.fc1 = nn.Linear(_HIDDEN, _INTERMEDIATE)
-        self.fc2 = nn.Linear(_INTERMEDIATE, _HIDDEN)
+        self.up_proj = nn.Linear(_HIDDEN, _INTERMEDIATE)
+        self.down_proj = nn.Linear(_INTERMEDIATE, _HIDDEN)
 
     def forward(self, x):
-        x = self.fc1(x)
+        x = self.up_proj(x)
         x = x * torch.sigmoid(1.702 * x)  # quick_gelu
-        return self.fc2(x)
+        return self.down_proj(x)
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +370,80 @@ class TestCLIPVisionEncoderParity:
         onnx_out = session.run({"pixel_values": pixel_values})
         session.close()
 
+        assert_logits_close(
+            onnx_out["last_hidden_state"],
+            ref_out,
+            rtol=1e-3,
+            atol=1e-3,
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.integration_fast
+class TestCLIPVisionFeatureLayerParity:
+    """CLIP feature extraction (Phi-3.5-Vision style): intermediate layer + CLS drop."""
+
+    def test_feature_layer_and_cls_drop_match(self):
+        """hidden_states[-2] with the CLS token dropped matches PyTorch."""
+        import onnx_ir as ir
+
+        num_layers = 3
+        feature_layer = -2
+        config = ArchitectureConfig(
+            hidden_size=_HIDDEN,
+            intermediate_size=_INTERMEDIATE,
+            num_attention_heads=_HEADS,
+            num_key_value_heads=_HEADS,
+            head_dim=_HIDDEN // _HEADS,
+            num_hidden_layers=num_layers,
+            vocab_size=256,
+            max_position_embeddings=128,
+            hidden_act="quick_gelu",
+            rms_norm_eps=_NORM_EPS,
+            rope_type="default",
+            rope_theta=10_000.0,
+            pad_token_id=0,
+            image_size=_IMAGE_SIZE,
+            patch_size=_PATCH_SIZE,
+            num_channels=_CHANNELS,
+        )
+        config.dtype = ir.DataType.FLOAT
+
+        onnx_module = models.CLIPVisionModel(
+            config, feature_layer=feature_layer, drop_class_token=True
+        )
+        pkg = build_from_module(onnx_module, config, task="image-classification")
+
+        # Only the layers needed to reach hidden_states[-2] are instantiated,
+        # and post_layernorm is intentionally absent.
+        init_names = set(pkg["model"].graph.initializers)
+        assert not any("post_layernorm" in n for n in init_names)
+        assert not any("encoder.2." in n for n in init_names)  # last layer skipped
+
+        ref_model = _TorchCLIPVisionModel(num_layers=num_layers).float().eval()
+        # Only the weights that ended up in the graph are applied; extras (the
+        # skipped last layer + post_layernorm) are simply not present.
+        apply_weights(pkg["model"], dict(ref_model.state_dict()))
+
+        rng = np.random.default_rng(7)
+        pixel_values = rng.standard_normal((2, _CHANNELS, _IMAGE_SIZE, _IMAGE_SIZE)).astype(
+            np.float32
+        )
+        with torch.no_grad():
+            ref_out = ref_model.forward_features(
+                torch.from_numpy(pixel_values),
+                feature_layer=feature_layer,
+                drop_class_token=True,
+            ).numpy()
+
+        num_patches = (_IMAGE_SIZE // _PATCH_SIZE) ** 2
+        assert ref_out.shape == (2, num_patches, _HIDDEN)  # CLS dropped
+
+        session = OnnxModelSession(pkg["model"])
+        onnx_out = session.run({"pixel_values": pixel_values})
+        session.close()
+
+        assert onnx_out["last_hidden_state"].shape == (2, num_patches, _HIDDEN)
         assert_logits_close(
             onnx_out["last_hidden_state"],
             ref_out,

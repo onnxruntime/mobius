@@ -99,15 +99,114 @@ class TestProcessTensorsLlama:
             original,
         )
 
+    def test_reverse_matches_hf_reference_head_dim_64(self) -> None:
+        """Reverse permute must match HF's reference for real head dims.
+
+        Regression test for the Q4/Q-K garbage-output bug: the old code
+        reshaped as ``(n_head, 2, dim)`` which only inverts llama.cpp's
+        permute when ``dim == 2`` (head_dim == 4). For head_dim == 64 it
+        scrambled Q/K rows. This asserts the exact inverse of llama.cpp's
+        forward permute is recovered, and cross-checks HF's reference
+        ``_reverse_permute_weights`` formula.
+        """
+        config = self._make_config(num_heads=14, num_kv_heads=14)
+        # Qwen2.5-0.5B geometry: hidden=896, 14 heads, head_dim=64.
+        original_q = torch.randn(896, 896)
+        q_perm = self._forward_permute(original_q, 14)
+
+        state_dict = {"model.layers.0.self_attn.q_proj.weight": q_perm}
+        result = process_tensors(state_dict, config)
+        torch.testing.assert_close(
+            result["model.layers.0.self_attn.q_proj.weight"],
+            original_q,
+        )
+
+        # Cross-check against HF's exact reference formula.
+        dim = q_perm.shape[0] // 14 // 2
+        hf_ref = (
+            q_perm.reshape(14, dim, 2, *q_perm.shape[1:]).swapaxes(2, 1).reshape(q_perm.shape)
+        )
+        torch.testing.assert_close(
+            result["model.layers.0.self_attn.q_proj.weight"],
+            hf_ref,
+        )
+
     @staticmethod
     def _forward_permute(weights: torch.Tensor, n_head: int) -> torch.Tensor:
-        """Simulate llama.cpp's forward permutation.
+        """Simulate llama.cpp's forward permutation (HF -> GGUF).
 
-        Reference: convert_hf_to_gguf.py permute()
+        Reference: ``convert_hf_to_gguf.py`` ``LlamaModel.permute``::
+
+            weights.reshape(n_head, 2, dim, ...).swapaxes(1, 2).reshape(orig)
+
+        The reverse permute in production must exactly invert this for any
+        head dim, not only ``dim == 2``.
         """
         dim = weights.shape[0] // n_head // 2
-        w = weights.reshape(n_head, dim, 2, *weights.shape[1:])
+        w = weights.reshape(n_head, 2, dim, *weights.shape[1:])
         return w.swapaxes(1, 2).reshape(weights.shape)
+
+
+class TestQwenNotPermuted:
+    """Regression: Qwen2/Qwen3 Q/K must NOT be reverse-permuted.
+
+    Qwen uses NEOX-style rope and stores Q/K in plain HF order. Applying
+    the llama interleaved-rope permute scrambles attention heads and
+    produces garbage output (root cause of the invalid Q4 benchmark).
+    """
+
+    def test_needs_llama_qk_permute_helper(self) -> None:
+        from mobius.integrations.gguf._tensor_processors import (
+            needs_llama_qk_permute,
+        )
+
+        assert needs_llama_qk_permute("llama") is True
+        assert needs_llama_qk_permute("mistral") is True
+        assert needs_llama_qk_permute("qwen2") is False
+        assert needs_llama_qk_permute("qwen3") is False
+        assert needs_llama_qk_permute("gemma2") is False
+        assert needs_llama_qk_permute(None) is False
+
+    def test_qwen2_qk_weights_unchanged(self) -> None:
+        config = SimpleNamespace(
+            model_type="qwen2",
+            num_attention_heads=14,
+            num_key_value_heads=2,
+        )
+        q = torch.randn(896, 896)
+        k = torch.randn(128, 896)
+        state_dict = {
+            "model.layers.0.self_attn.q_proj.weight": q.clone(),
+            "model.layers.0.self_attn.k_proj.weight": k.clone(),
+        }
+        result = process_tensors(state_dict, config)
+        # Qwen has no registered processor → weights pass through untouched.
+        torch.testing.assert_close(result["model.layers.0.self_attn.q_proj.weight"], q)
+        torch.testing.assert_close(result["model.layers.0.self_attn.k_proj.weight"], k)
+
+
+class TestBuilderNeedsQkPermute:
+    """Regression: the quantized inline permute gate must honor model_type."""
+
+    def test_qwen2_quantized_not_permuted(self) -> None:
+        from mobius.integrations.gguf._builder import _needs_qk_permute
+
+        name = "model.layers.0.self_attn.q_proj.weight"
+        assert _needs_qk_permute(name, 14, 2, "qwen2") is False
+        assert _needs_qk_permute(name, 14, 2, "qwen3") is False
+
+    def test_llama_quantized_permuted(self) -> None:
+        from mobius.integrations.gguf._builder import _needs_qk_permute
+
+        name = "model.layers.0.self_attn.q_proj.weight"
+        assert _needs_qk_permute(name, 32, 32, "llama") is True
+        assert _needs_qk_permute(name, 32, 32, "mistral") is True
+
+    def test_non_qk_tensor_never_permuted(self) -> None:
+        from mobius.integrations.gguf._builder import _needs_qk_permute
+
+        name = "model.layers.0.self_attn.v_proj.weight"
+        assert _needs_qk_permute(name, 32, 32, "llama") is False
 
 
 class TestProcessTensorsGemma:

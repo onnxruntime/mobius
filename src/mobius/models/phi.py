@@ -13,11 +13,10 @@ from __future__ import annotations
 
 import onnx_ir as ir
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import split_fused_qkv
+from mobius._weight_utils import rename_weight_keys, split_fused_qkv
 from mobius.components import (
     FCMLP,
     ConformerEncoder,
@@ -73,7 +72,7 @@ class _PhiDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | None,
         position_embeddings: tuple,
@@ -117,7 +116,7 @@ class _PhiTextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -169,7 +168,7 @@ class PhiCausalLMModel(CausalLMModel):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -193,12 +192,14 @@ class PhiCausalLMModel(CausalLMModel):
         2. MLP up:   ``mlp.fc1.*`` → ``mlp.up_proj.*``
         3. MLP down: ``mlp.fc2.*`` → ``mlp.down_proj.*``
         """
-        new_state_dict: dict[str, torch.Tensor] = {}
-        for key, value in state_dict.items():
-            key = key.replace(".self_attn.dense.", ".self_attn.o_proj.")
-            key = key.replace(".mlp.fc1.", ".mlp.up_proj.")
-            key = key.replace(".mlp.fc2.", ".mlp.down_proj.")
-            new_state_dict[key] = value
+        new_state_dict: dict[str, torch.Tensor] = rename_weight_keys(
+            state_dict,
+            [
+                (".self_attn.dense.", ".self_attn.o_proj."),
+                (".mlp.fc1.", ".mlp.up_proj."),
+                (".mlp.fc2.", ".mlp.down_proj."),
+            ],
+        )
         return super().preprocess_weights(new_state_dict)
 
 
@@ -220,13 +221,61 @@ def _parse_lora_adapters(
 
 def _make_lora_linear_factory(
     lora_adapters: list[tuple[str, int, float]],
+    gate_holder: dict[str, ir.Value] | None = None,
 ):
-    """Create a LoRALinear factory that captures lora_adapters via closure."""
+    """Create a LoRALinear factory that captures lora_adapters via closure.
+
+    When ``gate_holder`` is provided, every ``LoRALinear`` built by this
+    factory shares the same mapping, so the owning model can populate the
+    per-modality gate values once (in ``forward``) and have them applied
+    across all decoder layers.
+    """
 
     def factory(in_features: int, out_features: int, bias: bool = True) -> LoRALinear:
-        return LoRALinear(in_features, out_features, bias=bias, lora_adapters=lora_adapters)
+        return LoRALinear(
+            in_features,
+            out_features,
+            bias=bias,
+            lora_adapters=lora_adapters,
+            gate_holder=gate_holder,
+        )
 
     return factory
+
+
+# Phi4MM ``InputMode`` (see HF ``processing_phi4mm.InputMode``):
+#   LANGUAGE=0 (no adapter), VISION=1 / VISION_SPEECH=3 (vision adapter),
+#   SPEECH=2 (speech adapter).  HF activates exactly one adapter per forward
+#   via ``set_lora_adapter`` (modeling_phi4mm.py).  We derive the equivalent
+#   per-adapter activation from the special tokens present in ``input_ids``.
+def _compute_phi4mm_lora_gates(
+    op: OpBuilder,
+    input_ids: ir.Value,
+    image_token_id: int,
+    audio_token_id: int,
+    dtype: ir.DataType,
+) -> tuple[ir.Value, ir.Value]:
+    """Derive ``(vision_gate, speech_gate)`` scalars from ``input_ids``.
+
+    - ``vision`` adapter is active when any image token is present
+      (covers ``VISION`` and ``VISION_SPEECH``).
+    - ``speech`` adapter is active when any audio token is present *and*
+      no image token is present (``SPEECH`` only; ``VISION_SPEECH`` uses
+      the vision adapter, matching HF).
+    """
+    img_tok = op.Constant(value_int=image_token_id)
+    aud_tok = op.Constant(value_int=audio_token_id)
+    # Reduce over the whole sequence to a 0/1 float scalar.
+    has_image = op.ReduceMax(
+        op.Cast(op.Equal(input_ids, img_tok), to=ir.DataType.FLOAT), keepdims=False
+    )
+    has_audio = op.ReduceMax(
+        op.Cast(op.Equal(input_ids, aud_tok), to=ir.DataType.FLOAT), keepdims=False
+    )
+    one = op.Constant(value_float=1.0)
+    vision_gate = op.Cast(has_image, to=dtype)
+    speech_gate = op.Cast(op.Mul(has_audio, op.Sub(one, has_image)), to=dtype)
+    return vision_gate, speech_gate
 
 
 class _LoRATextModel(TextModel):
@@ -236,6 +285,7 @@ class _LoRATextModel(TextModel):
         self, config: ArchitectureConfig, lora_adapters: list[tuple[str, int, float]]
     ):
         nn.Module.__init__(self)
+        self.config = config
         lora_factory = _make_lora_linear_factory(lora_adapters)
         self.embed_tokens = Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
@@ -255,15 +305,18 @@ def _preprocess_phi4mm_weights(
 ) -> dict[str, torch.Tensor]:
     """Shared weight preprocessing for Phi4MM models (LoRA + fused weight splitting).
 
-    **LoRA strategy — separate parameters, not merged:**
+    **LoRA strategy — separate parameters, gated per modality:**
     The ONNX model keeps lora_A.{name}.weight and lora_B.{name}.weight as
     separate initializers.  ``LoRALinear.forward()`` applies them at runtime:
-    ``out = base(x) + scale * x @ A.T @ B.T``.  This matches HuggingFace when
-    HF runs with ``merge_and_unload()`` (both vision + speech adapters merged).
+    ``out = base(x) + gate_{name} * scale * x @ A.T @ B.T``.  HuggingFace
+    activates exactly one adapter per forward based on the input modality
+    (``set_lora_adapter``): vision for image / image+audio, speech for
+    audio-only, none for text-only.  In the 4-model split task the embedding
+    model derives ``vision_gate``/``speech_gate`` from ``input_ids`` and the
+    decoder multiplies each adapter by its gate, reproducing HF exactly.
 
-    Do NOT merge LoRA into the base weight here — the separate-parameter
-    approach is intentional and produces correct output (100% token-match
-    parity confirmed in ``examples/phi4mm_parity.py``).
+    Do NOT merge LoRA into the base weight here — keeping adapters separate is
+    what allows the per-modality gating above.
 
     Steps performed:
     1. Strip ``base_layer.`` from LoRA-wrapped weight names so
@@ -361,6 +414,100 @@ class Phi4MMCausalLMModel(Phi3CausalLMModel):
 
 # -----------------------------------------------------------------------
 # Phi4-MM Multimodal Model (Vision + Audio + Text with LoRA)
+class _Phi4MMNaViTPatchEmbedding(PatchEmbedding):
+    """SigLIP NaViT patch embedding with mask-aware position IDs.
+
+    HF's ``SiglipVisionEmbeddings`` (vision_siglip_navit.py:571) assigns
+    position embeddings based on each crop's *valid* patch grid rather than a
+    fixed 0..N-1 sequence.  For a crop with ``nb_h`` valid rows and ``nb_w``
+    valid cols (the top-left block; padding is on the right/bottom), the valid
+    patch at grid (r, c) gets::
+
+        pos_id = floor(r * P / nb_h) * P + floor(c * P / nb_w)
+
+    (``P`` = patches per side).  This is exactly HF's ``bucketize`` of evenly
+    spaced fractional coordinates against ``arange(1/P, 1, 1/P)``.  Padded
+    patches get position id 0.  Without this redistribution, padded HD
+    sub-crops diverge sharply from HF (cos ~0.8) even with attention masking.
+    """
+
+    def __init__(self, image_size: int, patch_size: int, hidden_size: int):
+        super().__init__(image_size=image_size, patch_size=patch_size, hidden_size=hidden_size)
+        self._P = image_size // patch_size  # patches per side
+
+    def forward(
+        self,
+        op: OpBuilder,
+        pixel_values: ir.Value,
+        patch_attention_mask: ir.Value | None = None,
+    ):
+        # Conv patchify → (N, P*P, hidden), mirroring PatchEmbedding.
+        patches = op.Conv(
+            pixel_values,
+            self.patch_embedding,
+            self.patch_embedding_bias,
+            kernel_shape=[self.patch_embedding.shape[2], self.patch_embedding.shape[3]],
+            strides=[self.patch_embedding.shape[2], self.patch_embedding.shape[3]],
+        )
+        batch_size = op.Shape(patches, start=0, end=1)
+        hidden_dim = op.Shape(patches, start=1, end=2)
+        patches = op.Reshape(
+            patches,
+            op.Concat(batch_size, hidden_dim, op.Constant(value_ints=[-1]), axis=0),
+        )
+        patches = op.Transpose(patches, perm=[0, 2, 1])  # (N, P*P, hidden)
+
+        if patch_attention_mask is None:
+            return op.Add(patches, self.position_embedding)
+
+        P = self._P  # noqa: N806
+        # mask: (N, P, P) {0,1} → counts of valid rows/cols (top-left block).
+        mask_i = op.Cast(patch_attention_mask, to=ir.DataType.INT64)
+        # nb_h = sum of column 0 over rows; nb_w = sum of row 0 over cols.
+        col0 = op.Slice(
+            mask_i,
+            op.Constant(value_ints=[0]),
+            op.Constant(value_ints=[1]),
+            op.Constant(value_ints=[2]),
+        )  # (N, P, 1)
+        nb_h = op.ReduceSum(col0, op.Constant(value_ints=[1]), keepdims=1)  # (N,1,1)
+        row0 = op.Slice(
+            mask_i,
+            op.Constant(value_ints=[0]),
+            op.Constant(value_ints=[1]),
+            op.Constant(value_ints=[1]),
+        )  # (N, 1, P)
+        nb_w = op.ReduceSum(row0, op.Constant(value_ints=[2]), keepdims=1)  # (N,1,1)
+        # Guard against a fully-padded crop (nb_h or nb_w == 0): clamp the
+        # divisor to >=1 to avoid a division by zero.  Such crops have no valid
+        # patches, so every position is masked to id 0 by ``valid`` below and
+        # the clamped quotient is never used.
+        one_i = op.Constant(value_int=1)
+        nb_h_div = op.Max(nb_h, one_i)
+        nb_w_div = op.Max(nb_w, one_i)
+
+        # r: (1, P, 1), c: (1, 1, P)
+        idx = op.Constant(value_ints=list(range(P)))
+        r = op.Reshape(idx, op.Constant(value_ints=[1, P, 1]))
+        c = op.Reshape(idx, op.Constant(value_ints=[1, 1, P]))
+        p_const = op.Constant(value_int=P)  # scalar int64
+        # pos_h = floor(r * P / nb_h); pos_w = floor(c * P / nb_w)
+        pos_h = op.Div(op.Mul(r, p_const), nb_h_div)  # (N, P, 1)
+        pos_w = op.Div(op.Mul(c, p_const), nb_w_div)  # (N, 1, P)
+        # pos_id(r,c) = pos_h * P + pos_w → (N, P, P)
+        pos_id = op.Add(op.Mul(pos_h, p_const), pos_w)
+        # Valid patches are the top-left nb_h x nb_w block; others -> id 0.
+        valid = op.And(op.Less(r, nb_h), op.Less(c, nb_w))  # (N, P, P)
+        zero = op.Constant(value_int=0)
+        pos_id = op.Where(valid, pos_id, zero)
+        pos_id_flat = op.Reshape(
+            pos_id, op.Concat(batch_size, op.Constant(value_ints=[-1]), axis=0)
+        )  # (N, P*P)
+        # Gather per-crop position embeddings: (N, P*P, hidden)
+        pos_emb = op.Gather(self.position_embedding, pos_id_flat, axis=0)
+        return op.Add(patches, pos_emb)
+
+
 # -----------------------------------------------------------------------
 
 
@@ -383,7 +530,8 @@ class _Phi4MMSigLIPEncoder(nn.Module):
         num_heads = vc.num_attention_heads or 4 if vc else 4
         num_layers = vc.num_hidden_layers or 2 if vc else 2
         norm_eps = vc.norm_eps if vc else 1e-6
-        self.embeddings = PatchEmbedding(
+        self._dtype = config.dtype
+        self.embeddings = _Phi4MMNaViTPatchEmbedding(
             image_size=image_size,
             patch_size=patch_size,
             hidden_size=hidden_size,
@@ -399,15 +547,47 @@ class _Phi4MMSigLIPEncoder(nn.Module):
             norm_eps=norm_eps,
         )
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
-        hidden_states = self.embeddings(op, pixel_values)
-        return self.encoder(op, hidden_states)
+    def forward(
+        self,
+        op: OpBuilder,
+        pixel_values: ir.Value,
+        image_attention_mask: ir.Value | None = None,
+    ):
+        hidden_states = self.embeddings(
+            op, pixel_values, patch_attention_mask=image_attention_mask
+        )
+        attn_bias = None
+        if image_attention_mask is not None:
+            # image_attention_mask: (N_crops, H, H) of {0, 1} → flatten to the
+            # patch sequence (N_crops, 1, 1, H*H) and build an additive
+            # attention bias: 0 for valid patches, large-negative for padding.
+            # This replicates HF's ``patch_attention_mask`` so padded patches
+            # do not leak into valid patches via self-attention.  ORT's
+            # Attention requires the bias' query dim to equal the Q seq length,
+            # so broadcast (Expand) the key-padding bias across all queries:
+            # (N_crops, 1, 1, S) → (N_crops, 1, S, S).
+            n_crops = op.Shape(image_attention_mask, start=0, end=1)  # (1,)
+            seq = op.Shape(hidden_states, start=1, end=2)  # (1,) = H*H
+            flat_shape = op.Concat(
+                n_crops,
+                op.Constant(value_ints=[1, 1, -1]),
+                axis=0,
+            )
+            mask_flat = op.Reshape(image_attention_mask, flat_shape)
+            mask_flat = op.Cast(mask_flat, to=self._dtype)
+            one = op.Cast(op.Constant(value_floats=[1.0]), to=self._dtype)
+            neg = op.Cast(op.Constant(value_floats=[-50000.0]), to=self._dtype)
+            # (1 - mask) * -50000 → 0 where valid, -50000 where padded.
+            attn_bias = op.Mul(op.Sub(one, mask_flat), neg)
+            target_shape = op.Concat(n_crops, op.Constant(value_ints=[1]), seq, seq, axis=0)
+            attn_bias = op.Expand(attn_bias, target_shape)
+        return self.encoder(op, hidden_states, attn_bias)
 
 
 class _GELUModule(nn.Module):
     """GELU activation as an nn.Module (no parameters)."""
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return op.Gelu(x)
 
 
@@ -431,7 +611,7 @@ class _Phi4MMProjectionMLP(nn.Module):
             setattr(self, str(i), layer)
         self._layers = layers
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         for layer in self._layers:
             x = layer(op, x)
         return x
@@ -451,7 +631,7 @@ class _Phi4MMImageEmbedding(nn.Module):
         self.glb_GN = nn.Parameter([1, 1, vision_hidden_size])
         self.sub_GN = nn.Parameter([1, 1, 1, vision_hidden_size])
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         vision_features = self.img_processor(op, pixel_values)
         return self.img_projection(op, vision_features)
 
@@ -482,7 +662,7 @@ class _Phi4MMAudioEmbedding(nn.Module):
         self.speech = _Phi4MMProjectionMLP(audio_dim, text_hidden_size)
         self.vision = _Phi4MMProjectionMLP(audio_dim, text_hidden_size)
 
-    def forward(self, op: builder.OpBuilder, audio_features: ir.Value):
+    def forward(self, op: OpBuilder, audio_features: ir.Value):
         audio_hidden = self.encoder(op, audio_features)
         return self.speech(op, audio_hidden)
 
@@ -497,7 +677,7 @@ class _Phi4MMImageAudioEmbedding(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         pixel_values: ir.Value | None = None,
         audio_features: ir.Value | None = None,
     ):
@@ -540,7 +720,7 @@ class _Phi4MMMultiModalTextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -641,9 +821,10 @@ class _Phi4MMVisionModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         pixel_values: ir.Value,
         image_sizes: ir.Value,
+        image_attention_mask: ir.Value | None = None,
     ):
         """Encode crops through SigLIP + HD spatial reassembly.
 
@@ -654,9 +835,18 @@ class _Phi4MMVisionModel(nn.Module):
           4. Global crop (index 0): reshape to (1, Hp, Hp, C) and append
              sub_GN row separators → (1, Hp*(Hp+1), C)
           5. Sub crops (indices 1..h*w): arrange in (h, w) grid →
-             (1, h*Hp, w*Hp, C) and append sub_GN row separators
+             (1, h*Hp, w*Hp, C), optionally crop padded rows/cols using
+             ``image_attention_mask``, then append sub_GN row separators
           6. Assemble sub-first: [sub | glb_GN | global]
           7. Project flat sequence through img_projection MLP
+
+        When ``image_attention_mask`` (N_crops, H, H) is provided, padded
+        sub-crops are cropped to their useful height/width before the row
+        separators are added — replicating HuggingFace's masked HD transform
+        (``modeling_phi4mm.py`` lines 376-387).  Without it, the full
+        (h*Hp, w*Hp) grid is emitted, which only matches HF when no sub-crop
+        is padded.  Phi4MM's processor always emits the mask, so for parity
+        (and correct multi-image token alignment) it must be passed.
         """
         H = self._H  # noqa: N806  # 32 patches per side from SigLIP
         Hp = self._Hp  # noqa: N806  # 16 patches per side after AvgPool
@@ -665,7 +855,11 @@ class _Phi4MMVisionModel(nn.Module):
         # ── Step 1: SigLIP encode all crops ────────────────────────────
         # pixel_values: (N_crops, 3, 448, 448)
         # vision_features: (N_crops, H*H, C) = (N_crops, 1024, 1152)
-        vision_features = self.img_processor(op, pixel_values)
+        # The patch mask excludes padded patches from self-attention so the
+        # valid patches' features match HF (which passes patch_attention_mask).
+        vision_features = self.img_processor(
+            op, pixel_values, image_attention_mask=image_attention_mask
+        )
 
         # ── Step 2: AvgPool2d — compress 32x32 patches to 16x16 ───────
         # Reshape: (N_crops, H*H, C) -> (N_crops, H, H, C)
@@ -763,18 +957,101 @@ class _Phi4MMVisionModel(nn.Module):
         )
         sub_grid = op.Reshape(sub_6d_t, sub_flat_shape)  # (1, h*16, w*16, 1152)
 
-        # Row separators: sub_GN (1, 1, 1, C) tiled to (1, h*Hp, 1, C)
-        sub_sep_tile = op.Concat(
-            op.Constant(value_ints=[1]),
-            op.Unsqueeze(h_hp, [0]),
-            op.Constant(value_ints=[1, 1]),
-            axis=0,
-        )
-        temp_sub_gn = op.Tile(self.sub_GN, sub_sep_tile)  # (1, h*16, 1, 1152)
-        # Append one separator per row: (1, h*Hp, w*Hp+1, C)
-        sub_rows = op.Concat(sub_grid, temp_sub_gn, axis=2)
-        # Flatten rows: (1, h*Hp*(w*Hp+1), C)
-        sub_img = op.Reshape(sub_rows, op.Constant(value_ints=[1, -1, C]))
+        # ── Optional mask crop: drop padded sub-crop rows/cols ────────
+        # HF (modeling_phi4mm.py:376-382) uses image_attention_mask to crop
+        # the assembled grid to its useful height/width before adding the
+        # row separators.  The mask is at the pre-AvgPool resolution (HxH);
+        # HF samples it stride-2 (``[..., 0::2, 0::2]``) so each value maps
+        # to one post-AvgPool position (HpxHp per crop).
+        if image_attention_mask is not None:
+            # Sub-crop masks: crops 1..B_ → (h*w, H, H)
+            sub_mask = op.Slice(
+                image_attention_mask,
+                op.Constant(value_ints=[1]),
+                B_plus_1,
+                op.Constant(value_ints=[0]),
+            )  # (h*w, 32, 32)
+            # Stride-2 downsample to match AvgPool: (h*w, Hp, Hp)
+            sub_mask = op.Slice(
+                sub_mask,
+                op.Constant(value_ints=[0, 0]),
+                op.Constant(value_ints=[H, H]),
+                op.Constant(value_ints=[1, 2]),
+                op.Constant(value_ints=[2, 2]),
+            )  # (h*w, 16, 16)
+            # Arrange in spatial grid mirroring the feature layout:
+            # (1, h, w, Hp, Hp) -> (1, h, Hp, w, Hp) -> (1, h*Hp, w*Hp)
+            mask_5d_shape = op.Concat(
+                op.Constant(value_ints=[1]),
+                op.Unsqueeze(h, [0]),
+                op.Unsqueeze(w, [0]),
+                op.Constant(value_ints=[Hp, Hp]),
+                axis=0,
+            )
+            mask_6d = op.Reshape(sub_mask, mask_5d_shape)
+            mask_6d_t = op.Transpose(mask_6d, perm=[0, 1, 3, 2, 4])
+            mask_grid = op.Reshape(
+                mask_6d_t,
+                op.Concat(
+                    op.Constant(value_ints=[1]),
+                    op.Unsqueeze(h_hp, [0]),
+                    op.Unsqueeze(w_hp, [0]),
+                    axis=0,
+                ),
+            )  # (1, h*Hp, w*Hp)
+            # useful_height = sum of column 0; useful_width = sum of row 0
+            col0 = op.Slice(
+                mask_grid,
+                op.Constant(value_ints=[0]),
+                op.Constant(value_ints=[1]),
+                op.Constant(value_ints=[2]),
+            )  # (1, h*Hp, 1)
+            row0 = op.Slice(
+                mask_grid,
+                op.Constant(value_ints=[0]),
+                op.Constant(value_ints=[1]),
+                op.Constant(value_ints=[1]),
+            )  # (1, 1, w*Hp)
+            useful_h = op.Cast(
+                op.ReduceSum(col0, op.Constant(value_ints=[0, 1, 2]), keepdims=0),
+                to=ir.DataType.INT64,
+            )  # scalar
+            useful_w = op.Cast(
+                op.ReduceSum(row0, op.Constant(value_ints=[0, 1, 2]), keepdims=0),
+                to=ir.DataType.INT64,
+            )  # scalar
+            uh = op.Unsqueeze(useful_h, [0])  # (1,)
+            uw = op.Unsqueeze(useful_w, [0])  # (1,)
+            # Crop grid: (1, useful_h, useful_w, C)
+            sub_grid = op.Slice(
+                sub_grid,
+                op.Constant(value_ints=[0, 0]),
+                op.Concat(uh, uw, axis=0),
+                op.Constant(value_ints=[1, 2]),
+            )
+            # Row separators tiled to useful_height instead of h*Hp.
+            sub_sep_tile = op.Concat(
+                op.Constant(value_ints=[1]),
+                uh,
+                op.Constant(value_ints=[1, 1]),
+                axis=0,
+            )
+            temp_sub_gn = op.Tile(self.sub_GN, sub_sep_tile)  # (1, useful_h, 1, C)
+            sub_rows = op.Concat(sub_grid, temp_sub_gn, axis=2)
+            sub_img = op.Reshape(sub_rows, op.Constant(value_ints=[1, -1, C]))
+        else:
+            # Row separators: sub_GN (1, 1, 1, C) tiled to (1, h*Hp, 1, C)
+            sub_sep_tile = op.Concat(
+                op.Constant(value_ints=[1]),
+                op.Unsqueeze(h_hp, [0]),
+                op.Constant(value_ints=[1, 1]),
+                axis=0,
+            )
+            temp_sub_gn = op.Tile(self.sub_GN, sub_sep_tile)  # (1, h*16, 1, 1152)
+            # Append one separator per row: (1, h*Hp, w*Hp+1, C)
+            sub_rows = op.Concat(sub_grid, temp_sub_gn, axis=2)
+            # Flatten rows: (1, h*Hp*(w*Hp+1), C)
+            sub_img = op.Reshape(sub_rows, op.Constant(value_ints=[1, -1, C]))
 
         # ── Step 7: Assemble sub-first and project ────────────────────
         # HF hd_transform_order = "sub_glb": [sub | glb_GN | global]
@@ -828,7 +1105,7 @@ class _Phi4MMSpeechModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         audio_embeds: ir.Value,
         audio_sizes: ir.Value,
         audio_projection_mode: ir.Value,
@@ -859,10 +1136,15 @@ class _Phi4MMEmbeddingModel(nn.Module):
         audio_features: [num_speech_tokens, hidden_size]
     Outputs:
         inputs_embeds: [batch, seq_len, hidden_size]
+        vision_gate: scalar — 1.0 if any image token present else 0.0
+        speech_gate: scalar — 1.0 if audio present and no image else 0.0
     """
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
+        self._dtype = config.dtype
+        self._image_token_id = config.image_token_id or 200010
+        self._audio_token_id = (config.audio.token_id if config.audio else None) or 200011
         self.embed_tokens = Embedding(
             config.vocab_size,
             config.hidden_size,
@@ -875,7 +1157,7 @@ class _Phi4MMEmbeddingModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         image_features: ir.Value,
         audio_features: ir.Value,
@@ -887,7 +1169,12 @@ class _Phi4MMEmbeddingModel(nn.Module):
         audio_features_3d = op.Unsqueeze(audio_features, [0])
         hidden_states = self._image_mixer(op, hidden_states, image_features_3d, input_ids)
         hidden_states = self._audio_mixer(op, hidden_states, audio_features_3d, input_ids)
-        return hidden_states
+        # Derive per-modality LoRA gates here (the decoder only sees
+        # ``inputs_embeds`` and cannot recover the modality from input_ids).
+        vision_gate, speech_gate = _compute_phi4mm_lora_gates(
+            op, input_ids, self._image_token_id, self._audio_token_id, self._dtype
+        )
+        return hidden_states, vision_gate, speech_gate
 
 
 class _Phi4MMDecoderModel(nn.Module):
@@ -902,6 +1189,8 @@ class _Phi4MMDecoderModel(nn.Module):
         attention_mask: [batch, past_seq_len + seq_len]
         position_ids: [batch, seq_len]
         past_key_values: list of (key, value) tuples
+        vision_gate: scalar LoRA gate for the vision adapter (optional)
+        speech_gate: scalar LoRA gate for the speech adapter (optional)
     Outputs:
         logits: [batch, seq_len, vocab_size]
         present_key_values: list of (key, value) tuples
@@ -911,7 +1200,10 @@ class _Phi4MMDecoderModel(nn.Module):
         super().__init__()
         self._dtype = config.dtype
         lora_adapters = _parse_lora_adapters(config)
-        lora_factory = _make_lora_linear_factory(lora_adapters)
+        # Shared mapping {adapter_name: gate ir.Value}, populated in forward()
+        # so every LoRALinear gates its adapter by the active input modality.
+        self._lora_gates: dict[str, ir.Value] = {}
+        lora_factory = _make_lora_linear_factory(lora_adapters, self._lora_gates)
 
         self.layers = nn.ModuleList(
             [
@@ -925,12 +1217,24 @@ class _Phi4MMDecoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
         past_key_values: list | None = None,
+        vision_gate: ir.Value | None = None,
+        speech_gate: ir.Value | None = None,
     ):
+        # Publish the per-modality LoRA gates (computed in the embedding model
+        # from input_ids) so every LoRALinear in the decoder applies only the
+        # adapter active for the current modality.  Clear any gates from a
+        # previous forward so a stale gate cannot leak across calls.
+        self._lora_gates.clear()
+        if vision_gate is not None:
+            self._lora_gates["vision"] = vision_gate
+        if speech_gate is not None:
+            self._lora_gates["speech"] = speech_gate
+
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(op, position_ids)
         # Use inputs_embeds for query_length since decoder has no input_ids
@@ -982,7 +1286,7 @@ class Phi4MMMultiModalModel(nn.Module):
         self.embedding = _Phi4MMEmbeddingModel(config)
         self.decoder = _Phi4MMDecoderModel(config)
 
-    def forward(self, op: builder.OpBuilder, **kwargs):
+    def forward(self, op: OpBuilder, **kwargs):
         raise NotImplementedError(
             "Phi4MMMultiModalModel uses Phi4MMMultiModalTask "
             "which calls each sub-module (vision_encoder, "

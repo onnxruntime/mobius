@@ -14,8 +14,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components._common import LayerNorm, Linear
 
@@ -41,7 +40,7 @@ class Conv1d(nn.Module):
         self._strides = [stride]
         self._pads = [padding, padding]
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # x: [batch, in_channels, seq_len]
         return op.Conv(
             x,
@@ -77,7 +76,7 @@ class WhisperAttention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         key_value_states: ir.Value | None = None,
         past_key_value: tuple | None = None,
@@ -141,7 +140,7 @@ class WhisperEncoderLayer(nn.Module):
         self.final_layer_norm = LayerNorm(d_model, eps=eps)
         self._activation = activation
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(op, hidden_states)
         hidden_states, _ = self.self_attn(op, hidden_states)
@@ -186,7 +185,7 @@ class WhisperDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         encoder_hidden_states: ir.Value,
         past_key_value: tuple | None = None,

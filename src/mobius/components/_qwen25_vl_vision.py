@@ -24,11 +24,10 @@ import math
 
 import numpy as np
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
-from mobius._build_context import ep_capabilities
-from mobius.components._common import LayerNorm, Linear
+from mobius._build_context import ep_capabilities, get_build_dtype
+from mobius.components._common import LayerNorm, Linear, build_packed_token_offset
 from mobius.components._mlp import FCMLP, GatedMLP
 from mobius.components._rms_norm import RMSNorm
 from mobius.components._scan_utils import (
@@ -66,7 +65,7 @@ class Qwen25VLPatchEmbed(nn.Module):
             name="proj.weight",
         )
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         x = op.Reshape(
             hidden_states,
             [-1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size],
@@ -103,7 +102,7 @@ class Qwen25VLVisionRotaryEmbedding(nn.Module):
             data=ir.tensor(freqs),
         )
 
-    def forward(self, op: builder.OpBuilder, rotary_pos_ids: ir.Value):
+    def forward(self, op: OpBuilder, rotary_pos_ids: ir.Value):
         """Compute cos/sin position embeddings.
 
         Args:
@@ -145,7 +144,7 @@ class Qwen25VLVisionAttention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         cu_seqlens: ir.Value,
         cos: ir.Value,
@@ -190,10 +189,13 @@ class Qwen25VLVisionAttention(nn.Module):
         """Emit com.microsoft.PackedMultiHeadAttention.
 
         Uses cu_seqlens natively, avoiding the O(N^2) block-diagonal bias.
+        The block-diagonal masking is expressed through the packed varlen
+        contract: each sub-sequence delimited by ``cu_seqlens`` (a window or
+        a frame) is one batch element, and attention is computed within it.
 
         Args:
             q, k, v: (N, num_heads, head_dim) after rotary embedding
-            cu_seqlens: (num_sub_seqs + 1,) INT32
+            cu_seqlens: (num_sub_seqs + 1,) cumulative sequence lengths
             seq_len_val: (1,) shape tensor with N
         """
         hidden_size = self.num_heads * self.head_dim
@@ -202,26 +204,32 @@ class Qwen25VLVisionAttention(nn.Module):
         key = op.Reshape(k, op.Concat(seq_len_val, [hidden_size], axis=0))
         value = op.Reshape(v, op.Concat(seq_len_val, [hidden_size], axis=0))
 
-        # token_offset: identity mapping for packed (no-padding) input.
-        # Shape: (1, token_count) — single batch, positions [0..N-1].
-        token_count_scalar = op.Squeeze(seq_len_val, [0])
-        token_offset = op.Unsqueeze(
-            op.Range(
-                op.Constant(value_int=0),
-                token_count_scalar,
-                op.Constant(value_int=1),
-            ),
-            [0],
-        )
-        token_offset = op.Cast(token_offset, to=6)  # INT32
+        # token_offset: (num_sub_seqs, max_seq_len) mapping the packed tokens to
+        # their padded (batch, seq) layout. ORT derives batch_size from
+        # token_offset.shape[0] and requires cumulative_sequence_length to have
+        # length batch_size + 1, so this MUST encode every sub-sequence (window
+        # or frame), not a single (1, N) batch — otherwise the kernel rejects
+        # windowed cu_seqlens and computes full instead of block-diagonal
+        # attention.
+        token_offset = build_packed_token_offset(op, cu_seqlens)
 
         cu_seqlens_int32 = op.Cast(cu_seqlens, to=6)  # INT32
 
+        # PackedMHA supports float32 and float16 only; cast bfloat16 builds to
+        # float16 and leave float32/float16 native to preserve precision.
+        if get_build_dtype() == ir.DataType.BFLOAT16:
+            query_mha = op.Cast(query, to=ir.DataType.FLOAT16)
+            key_mha = op.Cast(key, to=ir.DataType.FLOAT16)
+            value_mha = op.Cast(value, to=ir.DataType.FLOAT16)
+        else:
+            query_mha, key_mha, value_mha = query, key, value
+
         # Emit PackedMultiHeadAttention
         attn_out = op.PackedMultiHeadAttention(
-            query,
-            key,
-            value,
+            query_mha,
+            key_mha,
+            value_mha,
+            None,  # bias (optional, not used)
             token_offset,
             cu_seqlens_int32,
             num_heads=self.num_heads,
@@ -230,7 +238,8 @@ class Qwen25VLVisionAttention(nn.Module):
             _outputs=["packed_attn_out"],
         )  # (token_count, hidden_size)
 
-        return attn_out
+        # Cast back to original dtype
+        return op.CastLike(attn_out, query)
 
     def _emit_standard_attention(self, op, q, k, v, cu_seqlens, seq_len_val):
         """Emit standard Attention with block-diagonal bias from cu_seqlens.
@@ -280,6 +289,10 @@ class Qwen25VLVisionAttention(nn.Module):
         half = self.head_dim // 2
         x1 = op.Slice(x, [0], [half], [2])
         x2 = op.Slice(x, [half], [self.head_dim], [2])
+
+        # Cast cos/sin to match x dtype (tables are float32, model may be f16/bf16)
+        cos = op.CastLike(cos, x)
+        sin = op.CastLike(sin, x)
 
         # cos/sin: (N, 2*head_dim) → need (N, head_dim) for each half
         cos_half = op.Slice(cos, [0], [self.head_dim], [1])  # (N, head_dim)
@@ -362,7 +375,7 @@ class Qwen25VLVisionBlock(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         cu_seqlens: ir.Value,
         cos: ir.Value,
@@ -403,7 +416,7 @@ class Qwen2VLVisionBlock(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         cu_seqlens: ir.Value,
         cos: ir.Value,
@@ -449,7 +462,7 @@ class Qwen25VLPatchMerger(nn.Module):
         self.mlp_0 = Linear(merged_dim, merged_dim, bias=True)
         self.mlp_2 = Linear(merged_dim, out_hidden_size, bias=True)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # hidden_states: (N, hidden_size) where N = total_patches after blocks
         # Apply RMSNorm per-token
         hidden_states = self.ln_q(op, hidden_states)
@@ -1020,7 +1033,7 @@ class Qwen25VLVisionModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         pixel_values: ir.Value,
         image_grid_thw: ir.Value,
     ):
@@ -1176,7 +1189,7 @@ class Qwen2VLVisionModel(Qwen25VLVisionModel):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         pixel_values: ir.Value,
         image_grid_thw: ir.Value,
     ) -> ir.Value:

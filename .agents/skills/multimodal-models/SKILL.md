@@ -167,6 +167,11 @@ Multimodal HF models often prefix text weights differently. Implement
 | `language_model.model.layers.0.…` | `layers.0.…` |
 | `vision_tower.vision_model.encoder.…` | `vision_tower.encoder.…` |
 
+Prefer the shared helpers in `mobius._weight_utils` over hand-written loops:
+`vlm_decoder_weights` (strip + tie), `vlm_embedding_weights` (filter + strip),
+and `vlm_vision_weights` (vision-tower filter + `fc1/fc2`→`up_proj/down_proj`).
+See the `weight-name-alignment` skill for the full helper table.
+
 > Read `references/weight-mappings.md` when you need full weight mapping
 > tables, shape mismatch fixes, ClippableLinear weight conventions, or
 > per-layer embedding splitting details.
@@ -280,6 +285,34 @@ Type Error: Type parameter (T) bound to different types
 If you're adding a new multimodal model, you don't need to handle this
 manually — mobius inserts the Cast automatically for all encoder graphs.
 If the model dtype is already f32, no Cast is needed.
+
+## GQA for KV-shared layers (Gemma4)
+
+Models with KV-shared layers (e.g. Gemma4) borrow key/value from
+earlier source layers instead of projecting their own. With GQA
+(`onnxruntime/mobius#279`), shared layers use `GroupQueryAttention` with:
+
+- `key=None` (empty current K, i.e. `new_kv_length=0`)
+- `value=None` (empty)
+- `past_key=source_layer_present_key` (borrowed from source)
+- `past_value=source_layer_present_value` (borrowed from source)
+- `do_rotary=1` (RoPE applied to queries; borrowed source K is already RoPE-rotated)
+
+This eliminates ~40 Transpose/Reshape ops per shared layer that
+were previously needed to convert the source KV from BNSH
+`[B, kv_heads, seq, head_dim]` to 3D `[B, seq, kv_hidden]` format.
+
+This relies on ORT GQA support for empty current K/V (`new_kv_length=0`,
+represented in graph wiring as empty key/value tensors with
+`kv_sequence_length=0`).
+
+## Vision preprocessing: float-domain bicubic resize
+
+For HF parity in vision preprocessing, `microsoft/onnxruntime-extensions#1056`
+provides a float-domain bicubic resize that avoids uint8 clamping
+artifacts. This eliminates 0.03-0.13 pixel differences that can
+cause token divergence in vision encoders. The utility operates in
+packed RGB with fused uint8→float rescale.
 
 ## Cross-references
 

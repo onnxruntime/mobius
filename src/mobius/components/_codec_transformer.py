@@ -16,8 +16,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components._codec_conv import LayerScale
 from mobius.components._common import (
@@ -83,7 +82,7 @@ class CodecDecoderTransformerLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         position_embeddings: tuple,
         attention_mask: ir.Value | None = None,
@@ -149,7 +148,7 @@ class _CodecDecoderAttention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         position_embeddings: tuple,
         attention_mask: ir.Value | None = None,
@@ -259,7 +258,7 @@ class CodecDecoderTransformerModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         position_ids: ir.Value,
         attention_mask: ir.Value | None = None,
@@ -319,20 +318,21 @@ class CodecEncoderTransformerLayer(nn.Module):
         num_kv_heads: int,
         head_dim: int,
         intermediate_size: int,
+        layer_norm_eps: float = 1e-6,
     ):
         super().__init__()
-        self.input_layernorm = LayerNorm(hidden_size)
+        self.input_layernorm = LayerNorm(hidden_size, eps=layer_norm_eps)
         self.self_attn = _CodecDecoderAttention(hidden_size, num_heads, num_kv_heads, head_dim)
         self.self_attn_layer_scale = LayerScale(hidden_size)
 
-        self.post_attention_layernorm = LayerNorm(hidden_size)
+        self.post_attention_layernorm = LayerNorm(hidden_size, eps=layer_norm_eps)
         # GELU fc1/fc2 MLP (no bias, matches Mimi encoder)
         self.mlp = FCMLP(hidden_size, intermediate_size, activation="gelu", bias=False)
         self.mlp_layer_scale = LayerScale(hidden_size)
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         position_embeddings: tuple,
         attention_mask: ir.Value | None = None,
@@ -392,6 +392,7 @@ class CodecEncoderTransformerModel(nn.Module):
         head_dim: int = 64,
         rope_theta: float = 10000.0,
         max_position_embeddings: int = 4096,
+        layer_norm_eps: float = 1e-6,
     ):
         super().__init__()
         self.layers = nn.ModuleList(
@@ -402,6 +403,7 @@ class CodecEncoderTransformerModel(nn.Module):
                     num_kv_heads=num_key_value_heads,
                     head_dim=head_dim,
                     intermediate_size=intermediate_size,
+                    layer_norm_eps=layer_norm_eps,
                 )
                 for _ in range(num_hidden_layers)
             ]
@@ -416,7 +418,7 @@ class CodecEncoderTransformerModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         position_ids: ir.Value,
         attention_mask: ir.Value | None = None,

@@ -24,8 +24,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._attention import StaticCacheState
@@ -83,7 +82,7 @@ class Glm4DecoderLayer(DecoderLayer):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | None,
         position_embeddings: tuple,
@@ -150,6 +149,7 @@ class Glm4TextModel(TextModel):
         nn.Module.__init__(self)
         from mobius.components import Embedding, initialize_rope
 
+        self.config = config
         self._dtype = config.dtype
         self.embed_tokens = Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id

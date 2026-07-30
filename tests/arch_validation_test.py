@@ -40,9 +40,20 @@ from mobius.tasks import get_task
 
 logger = logging.getLogger(__name__)
 
-# Build parametrized test cases from registry entries that have a test_model_id
-_KNOWN_XFAILS: dict[str, str] = {
-    "phi3small": "gegelu activation not implemented (gated GELU variant)",
+# Build parametrized test cases from registry entries that have a test_model_id.
+#
+# We split known failures by which subset of tests they apply to:
+#
+# * ``_PARSE_AND_GRAPH_XFAILS`` — config loads successfully *and* would build
+#   a graph successfully if not for a known limitation. xfail all three
+#   sub-tests (currently empty; phi3small previously lived here but starts
+#   passing once gegelu is implemented and was XPASS-ing across all three).
+# * ``_GRAPH_ONLY_XFAILS`` — config parses fine; only the full-graph build
+#   and shape-consistency tests fail. This is the common case for VL models
+#   whose vision sub-config requires ``trust_remote_code=True``.
+_PARSE_AND_GRAPH_XFAILS: dict[str, str] = {}
+
+_GRAPH_ONLY_XFAILS: dict[str, str] = {
     # VL models with missing/incomplete vision_config when loaded without
     # trust_remote_code — the HF config JSON doesn't expose vision fields.
     "deepseek_vl": "VisionConfig.hidden_size missing without trust_remote_code",
@@ -55,18 +66,32 @@ _KNOWN_XFAILS: dict[str, str] = {
     "ovis2": "VisionConfig missing without trust_remote_code",
 }
 
-_ARCH_PARAMS = [
-    pytest.param(
-        model_type,
-        registration.test_model_id,
-        id=model_type,
-        marks=[pytest.mark.xfail(reason=_KNOWN_XFAILS[model_type], strict=False)]
-        if model_type in _KNOWN_XFAILS
-        else [],
-    )
-    for model_type in sorted(registry.architectures())
-    if (registration := registry.get_registration(model_type)).test_model_id is not None
-]
+
+def _build_arch_params(extra_xfails: dict[str, str]):
+    """Build the pytest.param list, applying xfail marks from both dicts."""
+    params = []
+    for model_type in sorted(registry.architectures()):
+        registration = registry.get_registration(model_type)
+        if registration.test_model_id is None:
+            continue
+        reason = _PARSE_AND_GRAPH_XFAILS.get(model_type) or extra_xfails.get(model_type)
+        marks = [pytest.mark.xfail(reason=reason, strict=True)] if reason is not None else []
+        params.append(
+            pytest.param(
+                model_type,
+                registration.test_model_id,
+                id=model_type,
+                marks=marks,
+            )
+        )
+    return params
+
+
+# Parse test sees only the always-failing models; VL graph-only failures are
+# expected to PARSE cleanly.
+_PARSE_PARAMS = _build_arch_params({})
+# Graph tests see both always-failing and graph-only failures.
+_GRAPH_PARAMS = _build_arch_params(_GRAPH_ONLY_XFAILS)
 
 
 def _load_hf_config(model_id: str):
@@ -151,7 +176,7 @@ class TestArchValidation:
     that the graph has a reasonable structure.
     """
 
-    @pytest.mark.parametrize("model_type,model_id", _ARCH_PARAMS)
+    @pytest.mark.parametrize("model_type,model_id", _PARSE_PARAMS)
     def test_config_downloads_and_parses(self, model_type: str, model_id: str):
         """Verify config.json can be downloaded and parsed."""
         hf_config = _load_hf_config(model_id)
@@ -162,7 +187,7 @@ class TestArchValidation:
         # The config must have a model_type
         assert hasattr(hf_config, "model_type"), f"Config for {model_id} missing model_type"
 
-    @pytest.mark.parametrize("model_type,model_id", _ARCH_PARAMS)
+    @pytest.mark.parametrize("model_type,model_id", _GRAPH_PARAMS)
     def test_full_graph_builds(self, model_type: str, model_id: str):
         """Build full-size ONNX graph from real HF config (no weights).
 
@@ -183,7 +208,7 @@ class TestArchValidation:
 
         del pkg
 
-    @pytest.mark.parametrize("model_type,model_id", _ARCH_PARAMS)
+    @pytest.mark.parametrize("model_type,model_id", _GRAPH_PARAMS)
     def test_graph_shapes_consistent(self, model_type: str, model_id: str):
         """Validate structural consistency in the full-size graph.
 

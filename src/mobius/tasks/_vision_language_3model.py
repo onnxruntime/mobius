@@ -21,7 +21,6 @@ from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
     ComponentSpec,
     ModelTask,
-    _cast_encoder_input,
     _make_graph,
     _make_model,
     build_decoder_from_embeds,
@@ -87,10 +86,9 @@ class VisionLanguageTask(ModelTask):
         op = builder.op
         pixel_values = builder.input(
             "pixel_values",
-            dtype=ir.DataType.FLOAT,
+            dtype=config.dtype,
             shape=[batch, 3, image_size, image_size],
         )
-        pixel_values = _cast_encoder_input(op, pixel_values, config)
         image_features = vision(op, pixel_values=pixel_values)
 
         builder.add_output(image_features, "image_features")
@@ -140,10 +138,9 @@ class QwenVLTask(VisionLanguageTask):
         op = builder.op
         pixel_values = builder.input(
             "pixel_values",
-            dtype=ir.DataType.FLOAT,
+            dtype=config.dtype,
             shape=[total_patches, pixel_dim],
         )
-        pixel_values = _cast_encoder_input(op, pixel_values, config)
         image_grid_thw = builder.input(
             "image_grid_thw",
             dtype=ir.DataType.INT64,
@@ -217,10 +214,9 @@ class PixtralVLTask(VisionLanguageTask):
         op = builder.op
         pixel_values = builder.input(
             "pixel_values",
-            dtype=ir.DataType.FLOAT,
+            dtype=config.dtype,
             shape=[batch, 3, height, width],
         )
-        pixel_values = _cast_encoder_input(op, pixel_values, config)
 
         image_features = vision(
             op,

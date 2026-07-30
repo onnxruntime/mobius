@@ -85,8 +85,9 @@ class AddGeluToBiasGelu(RewriteRuleClassBase):
 
         return op.op(
             "BiasGelu",
-            inputs=[input_a, input_b],
-            domain="com.microsoft",
+            input_a,
+            input_b,
+            _domain="com.microsoft",
         )
 
 

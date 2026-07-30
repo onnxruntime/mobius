@@ -35,7 +35,12 @@ class ObjectDetectionTask(ModelTask):
     ) -> ModelPackage:
         batch = ir.SymbolicDim("batch")
 
-        image_size = getattr(config, "image_size", 224)
+        image_height = getattr(config, "image_height", None) or getattr(
+            config, "image_size", 224
+        )
+        image_width = getattr(config, "image_width", None) or getattr(
+            config, "image_size", 224
+        )
         num_channels = getattr(config, "num_channels", 3)
 
         graph, builder = _make_graph()
@@ -44,7 +49,7 @@ class ObjectDetectionTask(ModelTask):
         pixel_values = builder.input(
             "pixel_values",
             dtype=ir.DataType.FLOAT,
-            shape=[batch, num_channels, image_size, image_size],
+            shape=[batch, num_channels, image_height, image_width],
         )
 
         logits, pred_boxes = module(op, pixel_values=pixel_values)

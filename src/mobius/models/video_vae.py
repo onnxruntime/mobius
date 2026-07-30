@@ -18,8 +18,7 @@ import dataclasses
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components import GroupNorm as _GroupNorm
 from mobius.components import SiLU as _SiLU
@@ -79,7 +78,7 @@ class _Conv3d(nn.Module):
         self._stride = list(stride)
         self._padding = list(padding)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         pads = [
             p for p in self._padding for _ in range(2)
         ]  # [d_begin, h_begin, w_begin, d_end, h_end, w_end]
@@ -115,7 +114,7 @@ class _ResNetBlock3D(nn.Module):
         else:
             self.conv_shortcut = None
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         residual = hidden_states
         hidden_states = self.norm1(op, hidden_states)
         hidden_states = self._silu(op, hidden_states)
@@ -162,7 +161,7 @@ class _DownBlock3D(nn.Module):
                 )
             )
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         for resnet in self.resnets:
             hidden_states = resnet(op, hidden_states)
         if self.downsamplers is not None:
@@ -195,7 +194,7 @@ class _UpBlock3D(nn.Module):
                 _Conv3d(out_channels, out_channels, kernel_size=(1, 3, 3), padding=(0, 1, 1))
             )
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         for resnet in self.resnets:
             hidden_states = resnet(op, hidden_states)
         if self.upsamplers is not None:
@@ -221,7 +220,7 @@ class _MidBlock3D(nn.Module):
         self.resnets.append(_ResNetBlock3D(channels, channels, norm_num_groups))
         self.resnets.append(_ResNetBlock3D(channels, channels, norm_num_groups))
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         for resnet in self.resnets:
             hidden_states = resnet(op, hidden_states)
         return hidden_states
@@ -267,7 +266,7 @@ class _VideoEncoder(nn.Module):
         )
         self._silu = _SiLU()
 
-    def forward(self, op: builder.OpBuilder, sample: ir.Value):
+    def forward(self, op: OpBuilder, sample: ir.Value):
         hidden_states = self.conv_in(op, sample)
         for down_block in self.down_blocks:
             hidden_states = down_block(op, hidden_states)
@@ -315,7 +314,7 @@ class _VideoDecoder(nn.Module):
         )
         self._silu = _SiLU()
 
-    def forward(self, op: builder.OpBuilder, latent_sample: ir.Value):
+    def forward(self, op: OpBuilder, latent_sample: ir.Value):
         hidden_states = self.conv_in(op, latent_sample)
         hidden_states = self.mid_block(op, hidden_states)
         for up_block in self.up_blocks:
@@ -349,7 +348,7 @@ class VideoAutoencoderModel(nn.Module):
         self.quant_conv = None
         self.post_quant_conv = None
 
-    def forward(self, op: builder.OpBuilder, latent_sample: ir.Value):
+    def forward(self, op: OpBuilder, latent_sample: ir.Value):
         """Decoder forward pass."""
         return self.decoder(op, latent_sample)
 

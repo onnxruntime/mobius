@@ -20,7 +20,7 @@ Naming convention:
 from __future__ import annotations
 
 import onnx_ir as ir
-from onnxscript._internal import builder
+from onnxscript._internal.builder import build_function
 
 from mobius._constants import OPSET_VERSION
 
@@ -68,7 +68,7 @@ def skip_layer_normalization() -> ir.Function:
         add_out.name = "add_out"
         return norm_out, mean_out, inv_std_out, add_out
 
-    return builder.build_function(
+    return build_function(
         body,
         [
             ir.Value(name="input"),
@@ -94,8 +94,20 @@ def skip_simplified_layer_normalization() -> ir.Function:
         norm_out = RMSNormalization(add_out, weight, epsilon=<forwarded>)
 
     Inputs:  ``[input, skip, weight]``
-    Outputs: ``[norm_out, add_out]``
+    Outputs: ``[norm_out, mean, inv_std_var, add_out]``
     Attr:    ``epsilon`` (float)
+
+    The ``com.microsoft::SkipSimplifiedLayerNormalization`` op declares four
+    positional outputs — ``output`` (0), ``mean`` (1), ``inv_std_var`` (2) and
+    ``input_skip_bias_sum`` (3). The residual sum lives at **index 3**, so the
+    function body must expose it there for InlinePass to reconnect downstream
+    consumers correctly (see :mod:`mobius.rewrite_rules._skip_norm`, which reads
+    ``outputs[3]``). ``mean`` and ``inv_std_var`` are training-only outputs that
+    the simplified (RMS) variant does not compute and that ``RMSNormalization``
+    (single-output) cannot supply; they are emitted as unused ``Constant``
+    placeholders purely to keep the output arity aligned. Because the fusion
+    rule never wires indices 1-2 to any consumer, ``RemoveUnusedNodesPass``
+    prunes these placeholders right after the function is inlined.
     """
 
     def body(op, v_input, v_skip, v_weight):
@@ -110,11 +122,18 @@ def skip_simplified_layer_normalization() -> ir.Function:
         )
         norm_out = op.RMSNormalization(add_out, v_weight, epsilon=epsilon_attr)
 
-        norm_out.name = "norm_out"
-        add_out.name = "add_out"
-        return norm_out, add_out
+        # Optional mean (1) / inv_std_var (2): not produced by RMS. Emit unused
+        # placeholders so input_skip_bias_sum stays at index 3; pruned by DCE.
+        mean = op.Constant(value_floats=[0.0])
+        inv_std_var = op.Constant(value_floats=[0.0])
 
-    return builder.build_function(
+        norm_out.name = "norm_out"
+        mean.name = "mean"
+        inv_std_var.name = "inv_std_var"
+        add_out.name = "add_out"
+        return norm_out, mean, inv_std_var, add_out
+
+    return build_function(
         body,
         [
             ir.Value(name="input"),

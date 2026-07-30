@@ -22,6 +22,7 @@ __all__ = [
     "ModelRegistration",
     "ModelRegistry",
     "ModelTask",
+    "MMSConfig",
     "OPSET_VERSION",
     "Sam2Config",
     "SegformerConfig",
@@ -33,7 +34,9 @@ __all__ = [
     "build",
     "build_context",
     "build_diffusers_pipeline",
+    "build_from_gguf",
     "build_from_module",
+    "build_from_nemo",
     "components",
     "ep_capabilities",
     "ep_registry",
@@ -67,6 +70,7 @@ from mobius._configs import (
     Gemma4Config,
     MambaConfig,
     MllamaConfig,
+    MMSConfig,
     Sam2Config,
     SegformerConfig,
     VisionConfig,
@@ -85,4 +89,6 @@ from mobius._registry import (
     registry,
 )
 from mobius._weight_loading import apply_weights
+from mobius.integrations.gguf import build_from_gguf
+from mobius.integrations.nemo import build_from_nemo
 from mobius.tasks import CausalLMTask, ModelTask

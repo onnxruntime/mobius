@@ -15,12 +15,82 @@ from pathlib import Path
 
 import numpy as np
 import onnx_ir as ir
+import onnxruntime as ort
 import onnxruntime_easy as ort_easy
 
+from mobius._builder import _graph_requires_opset24
 from mobius._flags import flags
 from mobius._model_package import ModelPackage
 
 logger = logging.getLogger(__name__)
+
+
+# Map ORT element type strings to ml_dtypes numpy dtypes.  These are types
+# that ``onnxruntime.OrtValue.numpy()`` cannot return natively because NumPy
+# has no built-in dtype, but ``ml_dtypes`` extends NumPy with them.
+_ML_DTYPE_OUTPUT_MAP: dict[str, str] = {
+    "tensor(bfloat16)": "bfloat16",
+    "tensor(float8e4m3fn)": "float8_e4m3fn",
+    "tensor(float8e4m3fnuz)": "float8_e4m3fnuz",
+    "tensor(float8e5m2)": "float8_e5m2",
+    "tensor(float8e5m2fnuz)": "float8_e5m2fnuz",
+    "tensor(uint4)": "uint4",
+    "tensor(int4)": "int4",
+    "tensor(float4e2m1)": "float4_e2m1fn",
+}
+
+
+def _ort_value_to_numpy(value: ort.OrtValue) -> np.ndarray:
+    """Convert an OrtValue to numpy, with bf16 / ml_dtypes fallback.
+
+    ``OrtValue.numpy()`` raises for dtypes that are not in core NumPy
+    (e.g. bfloat16).  For those types we copy the raw bytes via DLPack
+    + torch and reinterpret as the matching ``ml_dtypes`` scalar.
+    """
+    elem_type = value.data_type()
+    ml_name = _ML_DTYPE_OUTPUT_MAP.get(elem_type)
+    if ml_name is None:
+        return value.numpy()
+    import ml_dtypes
+    import torch
+
+    target_dtype = np.dtype(getattr(ml_dtypes, ml_name))
+    bytes_per_elem = target_dtype.itemsize
+    tensor = torch.utils.dlpack.from_dlpack(value._ortvalue.to_dlpack())
+    raw = tensor.contiguous().view(torch.uint8).cpu().numpy()
+    arr = raw.view(target_dtype)
+    shape = tuple(value.shape())
+    if bytes_per_elem * int(np.prod(shape) or 1) != raw.size:
+        # 4-bit types pack 2 elements per byte — keep packed view.
+        return arr
+    return arr.reshape(shape)
+
+
+def _numpy_to_ort_value(value: np.ndarray) -> ort.OrtValue:
+    """Convert a NumPy array to an OrtValue, supporting ml_dtypes and bool.
+
+    ``onnxruntime_easy.ort_value`` prefers the DLPack path, which is broken
+    for ml_dtypes scalars (NumPy's __dlpack__ rejects non-standard dtypes)
+    and for bool (DLPack has no native bool type code). Route those arrays
+    through the explicit numpy-to-OrtValue APIs instead.
+    """
+    if isinstance(value, np.ndarray):
+        if value.dtype == np.bool_:
+            # ORT supports tensor(bool) natively but DLPack does not, so
+            # bypass ort_easy's DLPack-first path.
+            return ort.OrtValue.ortvalue_from_numpy(np.ascontiguousarray(value))
+        try:
+            import ml_dtypes
+        except ImportError:  # pragma: no cover
+            ml_dtypes = None
+        if ml_dtypes is not None:
+            onnx_type = ort_easy._ml_dtypes_to_onnx_type(value.dtype)
+            if onnx_type is not None:
+                return ort.OrtValue.ortvalue_from_numpy_with_onnx_type(
+                    np.ascontiguousarray(value), onnx_element_type=onnx_type
+                )
+    return ort_easy.ort_value(value)
+
 
 # Maximum default-domain ONNX opset that ORT ≤1.24.x CUDA/TRT EPs
 # register kernels for.  Models built with a higher opset can be
@@ -37,10 +107,13 @@ def _should_lower_opset(model: ir.Model, device: str) -> bool:
     target device is non-CPU with a default-domain opset exceeding
     ``_MAX_EP_OPSET``.
 
-    Lowering is *not* safe when the graph contains ops that were first
-    introduced in a post-23 opset (e.g. ``TensorScatter``).  In that
-    case the model requires genuine opset 24+ support and lowering
-    would produce an invalid model.
+    Lowering is *not* safe when the graph uses opset-24-only semantics that
+    have no opset 23 equivalent — a ``TensorScatter`` node, or an ``Attention``
+    node consuming a non-empty ``nonpad_kv_seqlen`` input (the static-cache
+    Flash path).  In that case the model genuinely requires opset 24+ and
+    lowering would produce an invalid model.  Detection is delegated to
+    :func:`mobius._builder._graph_requires_opset24`, which scans recursively
+    (including control-flow subgraphs) so both opset-24 gates agree.
     """
     if not flags.ort_lower_opset_for_ep:
         return False
@@ -50,12 +123,8 @@ def _should_lower_opset(model: ir.Model, device: str) -> bool:
     if current_opset <= _MAX_EP_OPSET:
         return False
 
-    # Ops that were *introduced* in opset 24 and have no opset 23
-    # equivalent.  If any appear in the graph, lowering is unsafe.
-    opset_24_only_ops = {"TensorScatter"}
-    for node in model.graph:
-        if node.domain == "" and node.op_type in opset_24_only_ops:
-            return False
+    if _graph_requires_opset24(model.graph):
+        return False
     return True
 
 
@@ -130,6 +199,35 @@ class OnnxModelSession:
                 return list(inp.shape)
         return None
 
+    def get_input_dtype(self, name: str) -> np.dtype | None:
+        """Return the numpy dtype for an input, or ``None`` if not found.
+
+        For non-NumPy native dtypes (e.g. bfloat16), returns the matching
+        ``ml_dtypes`` dtype.
+        """
+        for inp in self._session.get_inputs():
+            if inp.name == name:
+                t = inp.type
+                ml_name = _ML_DTYPE_OUTPUT_MAP.get(t)
+                if ml_name is not None:
+                    import ml_dtypes
+
+                    return np.dtype(getattr(ml_dtypes, ml_name))
+                # Map common ORT type strings to numpy
+                mapping = {
+                    "tensor(float)": np.float32,
+                    "tensor(float16)": np.float16,
+                    "tensor(double)": np.float64,
+                    "tensor(int32)": np.int32,
+                    "tensor(int64)": np.int64,
+                    "tensor(uint8)": np.uint8,
+                    "tensor(int8)": np.int8,
+                    "tensor(bool)": np.bool_,
+                }
+                np_t = mapping.get(t)
+                return np.dtype(np_t) if np_t is not None else None
+        return None
+
     @property
     def output_names(self) -> list[str]:
         return self._output_names
@@ -153,9 +251,9 @@ class OnnxModelSession:
             # because np.ascontiguousarray promotes them to 1-d.
             if v.ndim > 0:
                 v = np.ascontiguousarray(v)
-            ort_feeds[k] = ort_easy.ort_value(v)
+            ort_feeds[k] = _numpy_to_ort_value(v)
         raw_outputs = self._session(**ort_feeds)
-        return dict(zip(self._output_names, (o.numpy() for o in raw_outputs)))
+        return dict(zip(self._output_names, (_ort_value_to_numpy(o) for o in raw_outputs)))
 
     def close(self) -> None:
         self._tmpdir.cleanup()

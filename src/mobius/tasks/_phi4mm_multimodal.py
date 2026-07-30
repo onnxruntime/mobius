@@ -15,6 +15,16 @@ This is the Phi-4-multimodal-specific task. Unlike the generic
 ``MultiModalTask`` (single unified model), this splits each component
 into its own ONNX graph for independent optimization and runtime
 flexibility.
+
+.. note::
+    **Batch size is assumed to be 1.** Although the embedding and decoder
+    graphs declare a symbolic ``batch`` dimension, the per-modality LoRA
+    gates (``vision_gate``/``speech_gate``) are scalars derived from the
+    whole input — a single modality decision is applied to the entire
+    batch. Image/audio features are also a single flattened stream. True
+    ``batch > 1`` (with per-row modalities and ragged feature counts) is
+    unsupported and tracked separately; callers must run one sequence at a
+    time (matching the onnxruntime-genai MultiModal pipeline contract).
 """
 
 from __future__ import annotations
@@ -29,10 +39,8 @@ from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
     ComponentSpec,
     ModelTask,
-    _cast_encoder_input,
     _make_graph,
     _make_model,
-    build_decoder_from_embeds,
 )
 
 
@@ -72,7 +80,7 @@ class Phi4MMMultiModalTask(ModelTask):
         models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
         models["audio_encoder"] = self._build_speech(module.speech_encoder, config)
         models["embedding"] = self._build_embedding(module.embedding, config)
-        models["decoder"] = build_decoder_from_embeds(module.decoder, config)
+        models["decoder"] = self._build_decoder(module.decoder, config)
         return ModelPackage(models, config=config)
 
     def _build_vision(
@@ -84,23 +92,38 @@ class Phi4MMMultiModalTask(ModelTask):
         batch = ir.SymbolicDim("batch")
         num_images = ir.SymbolicDim("num_images")
         image_size = (config.vision.image_size if config.vision else None) or 448
+        patch_size = (config.vision.patch_size if config.vision else None) or 14
+        # Mask spatial dim = patches per side from the vision tower (e.g. 32).
+        mask_dim = image_size // patch_size
 
         graph, builder = _make_graph(name="vision_encoder")
         op = builder.op
 
         pixel_values = builder.input(
             "pixel_values",
-            dtype=ir.DataType.FLOAT,
+            dtype=config.dtype,
             shape=[batch, 3, image_size, image_size],
         )
-        pixel_values = _cast_encoder_input(op, pixel_values, config)
         image_sizes = builder.input(
             "image_sizes",
             dtype=ir.DataType.INT64,
             shape=[num_images, 2],
         )
+        # Per-crop validity mask (1 = real patch, 0 = padding).  Phi4MM's
+        # processor emits this for the HD transform; the encoder crops padded
+        # sub-crops so the emitted token count matches HuggingFace.
+        image_attention_mask = builder.input(
+            "image_attention_mask",
+            dtype=config.dtype,
+            shape=[batch, mask_dim, mask_dim],
+        )
 
-        image_features = vision(op, pixel_values, image_sizes=image_sizes)
+        image_features = vision(
+            op,
+            pixel_values,
+            image_sizes=image_sizes,
+            image_attention_mask=image_attention_mask,
+        )
 
         builder.add_output(image_features, "image_features")
         return _make_model(graph)
@@ -125,10 +148,9 @@ class Phi4MMMultiModalTask(ModelTask):
 
         audio_embeds = builder.input(
             "audio_embeds",
-            dtype=ir.DataType.FLOAT,
+            dtype=config.dtype,
             shape=[batch, audio_seq_len, input_size],
         )
-        audio_embeds = _cast_encoder_input(op, audio_embeds, config)
         audio_sizes = builder.input(
             "audio_sizes",
             dtype=ir.DataType.INT64,
@@ -186,5 +208,78 @@ class Phi4MMMultiModalTask(ModelTask):
             audio_features=audio_features,
         )
 
-        builder.add_output(inputs_embeds, "inputs_embeds")
+        # The embedding model also emits the per-modality LoRA gates derived
+        # from input_ids (see ``_Phi4MMEmbeddingModel``).  These are wired to
+        # the decoder so it activates only the adapter HF would select.
+        if isinstance(inputs_embeds, tuple):
+            inputs_embeds, vision_gate, speech_gate = inputs_embeds
+            builder.add_output(inputs_embeds, "inputs_embeds")
+            builder.add_output(vision_gate, "vision_gate")
+            builder.add_output(speech_gate, "speech_gate")
+        else:
+            builder.add_output(inputs_embeds, "inputs_embeds")
+        return _make_model(graph)
+
+    def _build_decoder(
+        self,
+        decoder: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build decoder: inputs_embeds + KV cache + LoRA gates → logits.
+
+        Mirrors :func:`build_decoder_from_embeds` but adds two scalar inputs,
+        ``vision_gate`` and ``speech_gate``, which select the active LoRA
+        adapter per input modality (produced by the embedding model).
+        """
+        from mobius.tasks._cache_utils import (
+            _make_kv_cache_inputs,
+            _register_kv_cache_outputs,
+        )
+
+        batch = ir.SymbolicDim("batch")
+        seq_len = ir.SymbolicDim("sequence_len")
+        past_seq_len = ir.SymbolicDim("past_sequence_len")
+
+        graph, builder = _make_graph(name="decoder")
+        inputs_embeds = builder.input(
+            "inputs_embeds",
+            dtype=config.dtype,
+            shape=[batch, seq_len, config.hidden_size],
+        )
+        attention_mask = builder.input(
+            "attention_mask",
+            dtype=ir.DataType.INT64,
+            shape=[batch, "past_seq_len + seq_len"],
+        )
+        position_ids = builder.input(
+            "position_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, seq_len],
+        )
+        # Scalar per-modality LoRA gates (1.0 = active, 0.0 = inactive).
+        vision_gate = builder.input("vision_gate", dtype=config.dtype, shape=[])
+        speech_gate = builder.input("speech_gate", dtype=config.dtype, shape=[])
+
+        past_key_values = _make_kv_cache_inputs(
+            builder,
+            config.num_hidden_layers,
+            config.num_key_value_heads,
+            config.head_dim,
+            config.dtype,
+            batch,
+            past_seq_len,
+        )
+
+        logits, present_key_values = decoder(
+            builder.op,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            vision_gate=vision_gate,
+            speech_gate=speech_gate,
+        )
+
+        builder.add_output(logits, "logits")
+        _register_kv_cache_outputs(builder, present_key_values)
         return _make_model(graph)

@@ -137,26 +137,67 @@ class TestBuildFromModule:
         assert isinstance(model, ir.Model)
         assert model.graph.num_nodes() > 0
 
+    def test_build_with_output_layer_indices(self):
+        config = make_config(num_hidden_layers=4, output_layer_indices=[1, 2])
+        module = CausalLMModel(config)
+        model = build_from_module(module, config)["model"]
+        output_names = [v.name for v in model.graph.outputs]
+        assert "logits" in output_names
+        assert "hidden_states.1" in output_names
+        assert "hidden_states.2" in output_names
+        assert "hidden_states.0" not in output_names
+        assert "hidden_states.3" not in output_names
+
+    def test_build_without_output_layer_indices_unchanged(self):
+        # Default (None) must preserve the legacy 2-tuple output set:
+        # logits + present.{i}.key/value only, no hidden_states.* outputs.
+        config = make_config(num_hidden_layers=2)
+        module = CausalLMModel(config)
+        model = build_from_module(module, config)["model"]
+        output_names = [v.name for v in model.graph.outputs]
+        assert not any(n.startswith("hidden_states.") for n in output_names)
+
+    def test_build_output_layer_indices_preserves_order(self):
+        # Caller-supplied order is preserved in the graph outputs, so a
+        # downstream draft model can zip(indices, outputs) without sorting.
+        config = make_config(num_hidden_layers=5, output_layer_indices=[3, 0, 2])
+        module = CausalLMModel(config)
+        model = build_from_module(module, config)["model"]
+        hs_outputs = [
+            v.name for v in model.graph.outputs if v.name.startswith("hidden_states.")
+        ]
+        assert hs_outputs == ["hidden_states.3", "hidden_states.0", "hidden_states.2"]
+
+
+class TestTextModelOutputHiddenStates:
+    def test_textmodel_output_layer_indices_default_none(self):
+        config = make_config()
+        model = TextModel(config)
+        assert model.output_layer_indices is None
+
+    def test_textmodel_output_layer_indices_set(self):
+        config = make_config(num_hidden_layers=4, output_layer_indices=[0, 3])
+        model = TextModel(config)
+        assert model.output_layer_indices == [0, 3]
+
 
 class TestPruneLmHead:
-    """Tests for the ``prune_lm_head`` flag in CausalLMModel.
+    """Tests for the ``prune_lm_head`` option in :class:`CausalLMTask`.
 
-    When ``True``, a ``Gather + Unsqueeze`` is inserted before the LM head
-    MatMul so logits are produced for only the last sequence position.
+    When ``True``, a ``Gather + Unsqueeze`` is inserted after the LM head
+    so logits are produced for only the last sequence position.
     Mirrors onnxruntime-genai Model Builder's ``prune_lm_head`` opt-in.
     """
 
-    def _build(self) -> ir.Model:
+    def _build(self, prune_lm_head: bool = False) -> ir.Model:
         config = make_config()
         module = CausalLMModel(config)
-        return build_from_module(module, config)["model"]
+        task = CausalLMTask(prune_lm_head=prune_lm_head)
+        return build_from_module(module, config, task=task)["model"]
 
     def test_default_emits_no_lm_head_pruning(self):
-        """Default flag: graph emits full [B, S, vocab] logits."""
-        from mobius._flags import override_flags
-
-        with override_flags(prune_lm_head=False):
-            model = self._build()
+        """Default (prune_lm_head=False): graph emits full [B, S, vocab] logits."""
+        model = self._build(prune_lm_head=False)
 
         logits = next(v for v in model.graph.outputs if v.name == "logits")
         # Logits must remain rank-3 [B, S, vocab]
@@ -173,12 +214,9 @@ class TestPruneLmHead:
         config = make_config()
         assert logits.shape[2] == config.vocab_size
 
-    def test_prune_emits_gather_before_lm_head(self):
+    def test_prune_emits_gather_on_logits(self):
         """With prune_lm_head=True, logits dim 1 collapses to 1 (still rank-3)."""
-        from mobius._flags import override_flags
-
-        with override_flags(prune_lm_head=True):
-            model = self._build()
+        model = self._build(prune_lm_head=True)
 
         logits = next(v for v in model.graph.outputs if v.name == "logits")
         # Logits must still be rank-3 [B, 1, vocab] (NOT rank-4 [B, 1, 1, V])
@@ -194,13 +232,10 @@ class TestPruneLmHead:
         assert logits.shape[2] == config.vocab_size
 
     def test_prune_does_not_change_input_shapes(self):
-        """Pruning only affects output; input_ids / attention_mask still
-        have dynamic sequence_length so the model accepts arbitrary prompts.
+        """Pruning only affects output; input_ids still has dynamic sequence_length
+        so the model accepts arbitrary prompts.
         """
-        from mobius._flags import override_flags
-
-        with override_flags(prune_lm_head=True):
-            model = self._build()
+        model = self._build(prune_lm_head=True)
 
         input_ids = next(v for v in model.graph.inputs if v.name == "input_ids")
         # input dim 1 (sequence_length) should still be dynamic, not 1

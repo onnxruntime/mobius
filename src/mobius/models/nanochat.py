@@ -28,7 +28,7 @@ import dataclasses
 
 import onnx_ir as ir
 import torch
-from onnxscript._internal import builder
+from onnxscript import OpBuilder
 
 from mobius._configs import NanoChatConfig
 from mobius._weight_utils import rename_mlp_projections
@@ -52,7 +52,7 @@ class NanoChatAttention(Attention):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | None,
         position_embeddings: tuple | None = None,
@@ -119,7 +119,7 @@ class NanoChatTextModel(TextModel):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value | None,
         position_ids: ir.Value,
@@ -203,7 +203,7 @@ class NanoChatCausalLMModel(CausalLMModel):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,

@@ -24,11 +24,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import vlm_decoder_weights, vlm_embedding_weights
+from mobius._weight_utils import (
+    vlm_decoder_weights,
+    vlm_embedding_weights,
+    vlm_vision_weights,
+)
 from mobius.components import (
     Embedding,
     Linear,
@@ -52,7 +55,7 @@ class _LLaVADecoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -86,22 +89,14 @@ class _LLaVAVisionEncoderModel(nn.Module):
             text_hidden_size=config.hidden_size,
         )
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         vision_features = self.vision_tower(op, pixel_values)
         return self.multi_modal_projector(op, vision_features)
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        renamed: dict[str, torch.Tensor] = {}
-        for key, value in state_dict.items():
-            if not key.startswith(("vision_tower.", "multi_modal_projector.")):
-                continue
-            # VisionModel MLP uses up_proj/down_proj; HF uses fc1/fc2
-            key = key.replace(".mlp.fc1.", ".mlp.up_proj.")
-            key = key.replace(".mlp.fc2.", ".mlp.down_proj.")
-            renamed[key] = value
-        return renamed
+        return vlm_vision_weights(state_dict, ("vision_tower.", "multi_modal_projector."))
 
 
 class _LLaVAEmbeddingModel(nn.Module):
@@ -115,7 +110,7 @@ class _LLaVAEmbeddingModel(nn.Module):
         )
         self.image_token_id = config.image_token_id or 0
 
-    def forward(self, op: builder.OpBuilder, input_ids: ir.Value, image_features: ir.Value):
+    def forward(self, op: OpBuilder, input_ids: ir.Value, image_features: ir.Value):
         text_embeds = self.embed_tokens(op, input_ids)
 
         image_mask = op.Equal(
@@ -173,7 +168,7 @@ class _PixtralVisionEncoderModel(nn.Module):
             norm_eps=config.rms_norm_eps,
         )
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         hidden_states, grid_h, grid_w = self.vision_tower(op, pixel_values)
         return self.multi_modal_projector(op, hidden_states, grid_h, grid_w)
 
@@ -214,7 +209,7 @@ class LLaVAModel(nn.Module):
             self.vision_encoder = _LLaVAVisionEncoderModel(config)
         self.embedding = _LLaVAEmbeddingModel(config)
 
-    def forward(self, op: builder.OpBuilder, **kwargs):
+    def forward(self, op: OpBuilder, **kwargs):
         raise NotImplementedError(
             "LLaVAModel uses VisionLanguageTask which calls "
             "each sub-module (decoder, vision_encoder, embedding) separately."

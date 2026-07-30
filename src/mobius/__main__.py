@@ -119,6 +119,24 @@ def _cmd_build(args: argparse.Namespace) -> None:
     )
     from mobius.tasks import CausalLMTask, ModelTask
 
+    def _resolve_static_cache_task(model_type: str) -> ModelTask:
+        """Create the correct static cache task for the given model type."""
+        if model_type == "gemma4":
+            from mobius.tasks._gemma4 import Gemma4Task
+
+            return Gemma4Task(
+                static_cache=True,
+                max_seq_len=args.max_seq_len,
+            )
+        if model_type == "gemma4_text":
+            from mobius.tasks._gemma4 import Gemma4TextCausalLMTask
+
+            return Gemma4TextCausalLMTask(
+                static_cache=True,
+                max_seq_len=args.max_seq_len,
+            )
+        return CausalLMTask(static_cache=True, max_seq_len=args.max_seq_len)
+
     # Validate --max-seq-len requires --static-cache
     if args.max_seq_len is not None and not args.static_cache:
         raise SystemExit("Error: --max-seq-len can only be used with --static-cache.")
@@ -127,6 +145,12 @@ def _cmd_build(args: argparse.Namespace) -> None:
     if args.max_seq_len is not None and args.max_seq_len <= 0:
         raise SystemExit("Error: --max-seq-len must be a positive integer.")
 
+    max_length = getattr(args, "max_length", None)
+    if max_length is not None and args.runtime != "onnx-genai":
+        raise SystemExit("Error: --max-length can only be used with --runtime onnx-genai.")
+    if max_length is not None and max_length <= 0:
+        raise SystemExit("Error: --max-length must be a positive integer.")
+
     # Validate --static-cache + --task compatibility
     if args.static_cache and args.task is not None:
         raise SystemExit(
@@ -134,10 +158,35 @@ def _cmd_build(args: argparse.Namespace) -> None:
             "Remove --task to use --static-cache."
         )
 
+    # --text-only resolution lives in build() (model_type remap + config
+    # stripping), which is only reached on the HuggingFace model-ID path.
+    if args.text_only and args.config:
+        raise SystemExit(
+            "Error: --text-only is not supported with --config (local "
+            "directory). Use --model <hf-id> --text-only instead."
+        )
+
+    # --component selects one component of a diffusers pipeline; --text-only
+    # produces a single decoder-only model. Combining them would silently
+    # filter that model away unless --component happens to be 'model'.
+    if args.text_only and args.component:
+        raise SystemExit(
+            "Error: --text-only is not supported with --component. "
+            "--text-only produces a single decoder-only model, while "
+            "--component selects a component of a diffusers pipeline."
+        )
+
     load_weights = not args.no_weights
     task: str | ModelTask | None = args.task
     if args.static_cache:
-        task = CausalLMTask(static_cache=True, max_seq_len=args.max_seq_len)
+        # Defer task creation — we need to know the model type first.
+        # Store parameters for later resolution.
+        static_cache_params = {
+            "static_cache": True,
+            "max_seq_len": args.max_seq_len,
+        }
+    else:
+        static_cache_params = None
     trust_remote_code = args.trust_remote_code
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
@@ -146,8 +195,11 @@ def _cmd_build(args: argparse.Namespace) -> None:
     component_filter = args.component
     execution_provider = args.execution_provider
 
-    # Auto-detect diffusers pipelines
-    if args.model and not args.config:
+    # Auto-detect diffusers pipelines.  Skipped when --text-only is set:
+    # that flag only applies to transformers decoder exports, so we let the
+    # central build() validation reject a diffusers/unsupported repo rather
+    # than silently exporting a diffusion pipeline and ignoring the flag.
+    if args.model and not args.config and not args.text_only:
         pipeline_index = _load_diffusers_pipeline_index(args.model)
         if pipeline_index is not None:
             print(
@@ -160,6 +212,21 @@ def _cmd_build(args: argparse.Namespace) -> None:
             )
             _save_package(pkg, output_dir, args, optimize, component_filter)
             return
+
+    # Auto-detect NeMo .nemo archives (local file or HF ref like
+    # 'owner/repo:model.nemo'). Routes to the NeMo import path; reuses the
+    # standard build args (--dtype, --ep, --external-data) and save logic.
+    if args.model and args.model.endswith(".nemo"):
+        from mobius.integrations.nemo import build_from_nemo
+
+        print(f"Detected NeMo archive: {args.model}")
+        pkg = build_from_nemo(
+            args.model,
+            dtype=dtype_override,
+            execution_provider=execution_provider,
+        )
+        _save_package(pkg, output_dir, args, optimize, component_filter)
+        return
 
     # Build from HuggingFace model ID or local config
     if args.config:
@@ -176,7 +243,9 @@ def _cmd_build(args: argparse.Namespace) -> None:
         config = _config_from_hf(hf_config, parent_config=parent_config)
         if dtype_override is not None:
             config = dataclasses.replace(config, dtype=dtype_override)
-        if task is None:
+        if static_cache_params is not None:
+            task = _resolve_static_cache_task(model_type)
+        elif task is None:
             task = _default_task_for_model(model_type)
         module_class = registry.get(model_type)
         model_module = module_class(config)
@@ -191,13 +260,24 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 state_dict = model_module.preprocess_weights(state_dict)
             pkg.apply_weights(state_dict)
     else:
+        model_id_or_path = args.model
+        if static_cache_params is not None:
+            # Detect model type to resolve the correct static cache task.
+            import transformers
+
+            hf_config = transformers.AutoConfig.from_pretrained(
+                model_id_or_path, trust_remote_code=trust_remote_code
+            )
+            task = _resolve_static_cache_task(getattr(hf_config, "model_type", ""))
+
         pkg = build(
-            args.model,
+            model_id_or_path,
             task=task,
             dtype=dtype_override,
             load_weights=load_weights,
             trust_remote_code=trust_remote_code,
             execution_provider=execution_provider,
+            text_only=args.text_only,
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)
@@ -215,7 +295,7 @@ def _save_package(
 
     max_shard_size_bytes = _parse_size(args.max_shard_size) if args.max_shard_size else None
 
-    if args.external_data == "safetensors" and getattr(args, "ep", "default") == "cuda":
+    if args.external_data == "safetensors" and args.execution_provider == "cuda":
         logging.getLogger(__name__).warning(
             "Safetensors external data does not guarantee 256-byte offset "
             "alignment, which can cause CUBLAS misaligned address errors on "
@@ -254,6 +334,29 @@ def _save_package(
             ep=ep,
             local_config_dir=local_config_dir,
         )
+        for name, path in artifacts.items():
+            print(f"  {name}: {path}")
+    elif runtime == "onnx-genai":
+        from mobius.integrations.onnx_genai import write_onnx_genai_config
+        from mobius.integrations.onnx_genai.inference_metadata import (
+            is_native_vlm_package,
+            write_native_vlm_package_metadata,
+        )
+
+        config = getattr(pkg, "config", None)
+        source = getattr(args, "config", None) or getattr(args, "model", None)
+        if is_native_vlm_package(pkg):
+            try:
+                artifacts = write_native_vlm_package_metadata(
+                    pkg,
+                    output_dir,
+                    config=config,
+                    source=source,
+                )
+            except ValueError as error:
+                raise SystemExit(f"Error: {error}") from error
+        else:
+            artifacts = write_onnx_genai_config(pkg, output_dir, config=config, source=source)
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
 
@@ -313,17 +416,33 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         )
         raise SystemExit(1)
 
+    mmproj_path = getattr(args, "mmproj", None)
+
     if args.keep_quantized:
-        print("Quantized mode: preserving GGUF quantization as MatMulNBits...")
+        print(
+            "Quantized mode: preserving GGUF quantization as "
+            "MatMulNBits/GatherBlockQuantized..."
+        )
 
     gguf_path = args.gguf_path
     output_dir = args.output or os.path.splitext(gguf_path)[0] + "_onnx"
     os.makedirs(output_dir, exist_ok=True)
 
+    if args.max_seq_len is not None and not args.static_cache:
+        raise SystemExit("Error: --max-seq-len can only be used with --static-cache.")
+    if args.max_seq_len is not None and args.max_seq_len <= 0:
+        raise SystemExit("Error: --max-seq-len must be a positive integer.")
+    if mmproj_path is not None and args.static_cache:
+        raise SystemExit("Error: --static-cache cannot be used with --mmproj.")
+
     pkg = build_from_gguf(
         gguf_path,
+        mmproj=mmproj_path,
         dtype=args.dtype,
         keep_quantized=args.keep_quantized,
+        execution_provider=args.execution_provider,
+        static_cache=args.static_cache,
+        max_seq_len=args.max_seq_len,
     )
 
     pkg.save(
@@ -337,6 +456,48 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         else:
             path = os.path.join(output_dir, "model.onnx")
         print(f"Saved {name} to {path}")
+
+    if getattr(args, "runtime", None) == "onnx-genai":
+        from mobius.integrations.gguf import write_gguf_tokenizer_json
+        from mobius.integrations.onnx_genai import write_onnx_genai_config
+
+        # A GGUF checkpoint has no Hugging Face source directory, so the
+        # tokenizer is reconstructed from the file's embedded ggml metadata
+        # rather than copied from a `source`.
+        tokenizer_path = write_gguf_tokenizer_json(gguf_path, output_dir)
+        if tokenizer_path is not None:
+            print(f"  tokenizer: {tokenizer_path}")
+        artifacts = write_onnx_genai_config(
+            pkg, output_dir, config=getattr(pkg, "config", None), source=None
+        )
+        for name, path in artifacts.items():
+            print(f"  {name}: {path}")
+
+
+def _cmd_convert_comfyui(args: argparse.Namespace) -> None:
+    """Execute the 'convert-comfyui' subcommand."""
+    from mobius.integrations.onnx_genai import convert_comfyui_workflow
+
+    with open(args.workflow, encoding="utf-8") as handle:
+        workflow = json.load(handle)
+    result = convert_comfyui_workflow(
+        workflow,
+        args.checkpoint,
+        args.output,
+        sdxl=getattr(args, "sdxl", False),
+    )
+    wf = result.workflow
+    print(f"Converted ComfyUI workflow -> {result.output_dir}")
+    print(f"  metadata: {result.metadata_path}")
+    print(f"  run params: {result.run_params_path}")
+    print(
+        f"  {wf.steps} steps, cfg {wf.cfg}, sampler {wf.sampler_name} "
+        f"(scheduler {wf.scheduler_kind}), {wf.width}x{wf.height}"
+    )
+    if wf.loras:
+        print(f"  loras: {', '.join(f'{n}@{s}' for n, s in wf.loras)}")
+    if wf.prompt is not None:
+        print(f"  prompt: {wf.prompt!r}")
 
 
 def _cmd_info(args: argparse.Namespace) -> None:
@@ -514,14 +675,27 @@ def main(argv: list[str] | None = None) -> None:
     build_parser.add_argument(
         "--runtime",
         default=None,
-        choices=["ort-genai"],
+        choices=["ort-genai", "onnx-genai"],
         metavar="RUNTIME",
         help=(
-            "Generate runtime-specific config files after building. "
-            "Currently supports: 'ort-genai' (writes genai_config.json and "
-            "copies tokenizer files). When used with --model, tokenizer files "
-            "are downloaded from HuggingFace. When used with --config (local "
-            "directory), tokenizer files are copied from that directory."
+            "Generate runtime-specific config files after building. Supports: "
+            "'ort-genai' (writes genai_config.json + copies tokenizer files) and "
+            "'onnx-genai' (writes inference_metadata.yaml — a decoder attention/KV "
+            "document for LLMs, or an iterative pipeline document for diffusion). "
+            "When used with --model, tokenizer files are downloaded from HuggingFace; "
+            "with --config (local directory), they are copied from that directory."
+        ),
+    )
+    build_parser.add_argument(
+        "--text-only",
+        dest="text_only",
+        action="store_true",
+        help=(
+            "Export the text backbone of a multimodal checkpoint as a "
+            "standalone decoder-only LLM. Strips vision/audio routing so the "
+            "decoder uses GroupQueryAttention on GQA-capable EPs. Currently "
+            "supported for gemma4_unified (google/gemma-4-12B). Not compatible "
+            "with --config or --component (use --model <hf-id>)."
         ),
     )
     build_parser.set_defaults(func=_cmd_build)
@@ -542,9 +716,23 @@ def main(argv: list[str] | None = None) -> None:
         help="Output directory (default: <gguf_stem>_onnx/).",
     )
     gguf_parser.add_argument(
+        "--mmproj",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to a companion 'clip' mmproj GGUF (vision/audio encoder). "
+            "When set, builds a full multimodal package (decoder + "
+            "vision_encoder + embedding) instead of a text-only model. "
+            "Currently supports Gemma4 vision; audio is experimental."
+        ),
+    )
+    gguf_parser.add_argument(
         "--keep-quantized",
         action="store_true",
-        help="Preserve quantization via MatMulNBits (Q4_0/Q4_1/Q8_0).",
+        help=(
+            "Preserve supported projection, output-head, and embedding "
+            "quantization via MatMulNBits/GatherBlockQuantized."
+        ),
     )
     gguf_parser.add_argument(
         "--dtype",
@@ -557,6 +745,50 @@ def main(argv: list[str] | None = None) -> None:
         choices=["onnx", "safetensors"],
         default="onnx",
         help="External data format (default: onnx).",
+    )
+    gguf_parser.add_argument(
+        "--ep",
+        "--execution-provider",
+        dest="execution_provider",
+        default="default",
+        metavar="EP",
+        help=(
+            "Target execution provider for EP-aware graph optimisations "
+            "(e.g. 'cpu' to apply the GroupQueryAttention rewrite). "
+            "Defaults to 'default' (portable ONNX, no vendor fusions)."
+        ),
+    )
+    gguf_parser.add_argument(
+        "--runtime",
+        choices=["ort-genai", "onnx-genai"],
+        default=None,
+        help=(
+            "Generate runtime-specific config files after building. "
+            "'onnx-genai' writes inference_metadata.yaml plus a tokenizer.json "
+            "reconstructed from the GGUF's embedded tokenizer metadata; "
+            "'ort-genai' writes genai_config.json + copies tokenizer files. "
+            "Either way the quantized model runs directly in the target runtime."
+        ),
+    )
+    gguf_parser.add_argument(
+        "--static-cache",
+        action="store_true",
+        help=(
+            "Use a static KV cache (pre-allocated fixed-width buffers written "
+            "in place via TensorScatter) instead of the dynamic concat-grow "
+            "cache. Produces a fully static-shaped graph as required by "
+            "fixed-shape runtimes such as the QNN HTP backend."
+        ),
+    )
+    gguf_parser.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Maximum sequence length for static cache buffers. Only used with "
+            "--static-cache. Defaults to max_position_embeddings from config."
+        ),
     )
     gguf_parser.set_defaults(func=_cmd_build_gguf)
 
@@ -583,6 +815,31 @@ def main(argv: list[str] | None = None) -> None:
         help="Trust remote code when loading the HuggingFace model config.",
     )
     info_parser.set_defaults(func=_cmd_info)
+
+    # --- convert-comfyui ---
+    comfy_parser = subparsers.add_parser(
+        "convert-comfyui",
+        help="Translate a ComfyUI API-format workflow JSON into an onnx-genai "
+        "pipeline metadata directory (inference_metadata.yaml + run.json). The "
+        "ONNX component graphs are built separately by Mobius's diffusers builder.",
+    )
+    comfy_parser.add_argument("workflow", help="Path to the ComfyUI API-format workflow JSON.")
+    comfy_parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Optional diffusers directory or Hugging Face model id whose "
+        "scheduler config supplies the noise-schedule betas (Stable Diffusion "
+        "defaults are used when omitted).",
+    )
+    comfy_parser.add_argument(
+        "--output", "-o", required=True, help="Output directory for the pipeline metadata."
+    )
+    comfy_parser.add_argument(
+        "--sdxl",
+        action="store_true",
+        help="Target an SDXL pipeline (routes the dual text-encoder conditioning edges).",
+    )
+    comfy_parser.set_defaults(func=_cmd_convert_comfyui)
 
     args = parser.parse_args(argv)
     args.func(args)

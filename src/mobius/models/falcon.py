@@ -38,7 +38,7 @@ from mobius.components._common import Embedding, LayerNorm, Linear
 
 if TYPE_CHECKING:
     import onnx_ir as ir
-    from onnxscript._internal import builder
+    from onnxscript import OpBuilder
 
 
 class _ALiBiAttention(nn.Module):
@@ -72,7 +72,7 @@ class _ALiBiAttention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         past_key_value: tuple | None = None,
@@ -124,13 +124,13 @@ class _ALiBiDecoderLayer(nn.Module):
         self.mlp = FCMLP(
             config.hidden_size,
             config.intermediate_size,
-            activation="gelu",
+            activation=config.hidden_act or "gelu",
             bias=config.mlp_bias,
         )
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         past_key_value: tuple | None = None,
@@ -189,13 +189,13 @@ class _FalconDecoderLayer(nn.Module):
         self.mlp = FCMLP(
             config.hidden_size,
             config.intermediate_size,
-            activation="gelu",
+            activation=config.hidden_act or "gelu",
             bias=config.mlp_bias,
         )
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple,
@@ -333,7 +333,7 @@ class _FalconTextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -401,7 +401,7 @@ class _BloomTextModel(_FalconTextModel):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -521,7 +521,7 @@ class FalconCausalLMModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -614,7 +614,12 @@ class BloomCausalLMModel(FalconCausalLMModel):
         # Bloom always uses ALiBi positional encoding — enforce it regardless
         # of whether the caller set alibi=True in the config, since HF's
         # BloomConfig has no alibi field and ArchitectureConfig defaults to False.
-        config = dataclasses.replace(config, alibi=True)
+        # Bloom's MLP uses ``BloomGelu`` — the tanh GELU approximation
+        # (x * 0.5 * (1 + tanh(0.79788456 * x * (1 + 0.044715 * x^2)))) — not
+        # the exact erf GELU. BloomConfig has no ``hidden_act`` field, so set it
+        # explicitly; otherwise the layer defaults to exact GELU, producing a
+        # small per-layer error that compounds over all blocks.
+        config = dataclasses.replace(config, alibi=True, hidden_act="gelu_pytorch_tanh")
         super().__init__(config)
         self.transformer = _BloomTextModel(config)
         # Re-tie lm_head after overriding self.transformer; the parent's

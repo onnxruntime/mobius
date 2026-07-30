@@ -1,0 +1,27 @@
+{
+  "model_id": "google/gemma-4-12B",
+  "prompt": "Here is my poem:",
+  "generated_tokens": [
+    108,
+    198,
+    199,
+    818,
+    4109,
+    208,
+    207,
+    108,
+    199,
+    818,
+    1902,
+    563,
+    496,
+    4148,
+    1977,
+    236764,
+    208,
+    108,
+    199,
+    4573
+  ],
+  "generated_text": "\n\n<strong><em>The World</em></strong>\n\n<em>The world is a beautiful place,</em>\n\n<em>But"
+}

@@ -98,8 +98,9 @@ and wrapper modules for nesting. See the `weight-name-alignment` skill.
 - Ruff for linting/formatting (line-length=95, Python 3.10+)
 - MyPy strict mode (excludes `*_test.py`)
 - Use `op.Shape(x, start=i, end=i+1)` for single dimension extraction
-- Use ONNX opset 23 `op.Attention` with `q_num_heads`/`kv_num_heads`
-  attributes (not `num_heads`)
+- Use the ONNX opset-24 `op.Attention` (introduced in opset 23) with
+  `q_num_heads`/`kv_num_heads` attributes (not `num_heads`). The codebase
+  emits opset 24 graphs (`OPSET_VERSION` in `src/mobius/_constants.py`).
 
 ### Protobuf prohibition
 

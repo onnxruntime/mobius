@@ -10,8 +10,7 @@ import re
 import numpy as np
 import onnx_ir as ir
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import (
@@ -47,7 +46,7 @@ class ViTModel(nn.Module):
         self.encoder = _ViTEncoder(config)
         self.layernorm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         hidden_states = self.embeddings(op, pixel_values)
         hidden_states = self.encoder(op, hidden_states)
         hidden_states = self.layernorm(op, hidden_states)
@@ -82,7 +81,7 @@ class _ViTEmbeddings(nn.Module):
             ),
         )
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         patch_embeds = self.patch_embeddings(op, pixel_values)
         batch_size = op.Shape(patch_embeds, start=0, end=1)
 
@@ -105,7 +104,7 @@ class _Conv2dPatchEmbed(nn.Module):
         super().__init__()
         self.projection = _Conv2d(in_channels, hidden_size, patch_size, patch_size)
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         # Conv2d: [batch, channels, H, W] -> [batch, hidden, H/patch, W/patch]
         x = self.projection(op, pixel_values)
         # Flatten spatial dims and transpose: [batch, hidden, num_patches] -> [batch, num_patches, hidden]
@@ -125,7 +124,7 @@ class _ViTEncoder(nn.Module):
             [_ViTEncoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         for layer in self.layer:
             hidden_states = layer(op, hidden_states)
         return hidden_states
@@ -149,7 +148,7 @@ class _ViTEncoderLayer(nn.Module):
             activation=config.hidden_act,
         )
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         residual = hidden_states
         hidden_states = self.layernorm_before(op, hidden_states)
         hidden_states = self.self_attn(op, hidden_states)
@@ -175,6 +174,19 @@ _VIT_LAYER_RENAMES = {
 
 _LAYER_PATTERN = re.compile(r"^encoder\.layer\.(\d+)\.(.+)$")
 
+# transformers >=5.x flattened the ViT state dict: encoder layers are
+# ``layers.N.<sub>`` (no ``encoder.`` prefix) with consolidated attention
+# (``attention.{q,k,v,o}_proj``) and MLP (``mlp.fc1``/``mlp.fc2``) names.
+_LAYER_PATTERN_NEW = re.compile(r"^layers\.(\d+)\.(.+)$")
+_VIT_NEW_LAYER_RENAMES = {
+    "attention.q_proj": "self_attn.q_proj",
+    "attention.k_proj": "self_attn.k_proj",
+    "attention.v_proj": "self_attn.v_proj",
+    "attention.o_proj": "self_attn.out_proj",
+    "mlp.fc1": "mlp.up_proj",
+    "mlp.fc2": "mlp.down_proj",
+}
+
 
 def _rename_vit_weight(name: str) -> str | None:
     """Rename HF ViT weight to our naming convention."""
@@ -184,7 +196,7 @@ def _rename_vit_weight(name: str) -> str | None:
     if first_dot > 0:
         after = name[first_dot + 1 :]
         if after.startswith(
-            ("embeddings.", "encoder.", "layernorm.", "pooler.", "classifier.")
+            ("embeddings.", "encoder.", "layers.", "layernorm.", "pooler.", "classifier.")
         ):
             name = after
 
@@ -211,6 +223,18 @@ def _rename_vit_weight(name: str) -> str | None:
     # Final layernorm
     if name.startswith("layernorm."):
         return name  # Already correct
+
+    # transformers >=5.x flattened encoder layers: ``layers.N.<sub>``.
+    m_new = _LAYER_PATTERN_NEW.match(name)
+    if m_new:
+        layer_idx, suffix = m_new.group(1), m_new.group(2)
+        if suffix.startswith("layernorm_"):
+            return f"encoder.layer.{layer_idx}.{suffix}"
+        for old, new in _VIT_NEW_LAYER_RENAMES.items():
+            if suffix.startswith(old):
+                remainder = suffix[len(old) :]
+                return f"encoder.layer.{layer_idx}.{new}{remainder}"
+        return None
 
     # Encoder layers
     m = _LAYER_PATTERN.match(name)

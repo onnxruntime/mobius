@@ -15,8 +15,7 @@ import dataclasses
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig, LongcatFlashConfig
 from mobius.components import (
@@ -88,7 +87,7 @@ class _LongcatFlashMLA(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple,
@@ -197,7 +196,7 @@ class _LongcatFlashRouter(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.routed_scaling_factor = config.routed_scaling_factor
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # Compute routing logits: (B*S, total_experts)
         router_logits = self.classifier(op, hidden_states)
         # Softmax over all experts
@@ -244,7 +243,7 @@ class _LongcatFlashMoE(nn.Module):
             [MLP(expert_config) for _ in range(self.n_routed_experts)]
         )
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         routing_weights, selected_experts = self.router(op, hidden_states)
         # routing_weights: (B*S, top_k), selected_experts: (B*S, top_k)
 
@@ -305,7 +304,7 @@ class LongcatFlashDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple,
@@ -385,7 +384,7 @@ class LongcatFlashTextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,

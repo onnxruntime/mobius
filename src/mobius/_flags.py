@@ -83,14 +83,20 @@ class _Flags:
          - ``MOBIUS_ORT_LOWER_OPSET_FOR_EP``
          - ``False``
          - Lower the ONNX opset declaration to 23 for non-CPU EPs
-           (ORT ≤1.24.x workaround). Disabled by default.
-       * - ``prune_lm_head``
-         - ``MOBIUS_PRUNE_LM_HEAD``
+           (ORT <=1.24.x workaround). Disabled by default.
+       * - ``tencent_q1_0_use_native_2bit``
+         - ``MOBIUS_TENCENT_Q1_0_USE_NATIVE_2BIT``
          - ``False``
-         - Insert ``Gather(axis=1, indices=[-1])`` before the LM head MatMul
-           so logits are only computed for the last token. Speeds up prefill
-           for chat-only workloads but breaks logprob scoring and
-           speculative decoding.
+         - Use native ``MatMulNBits bits=2`` for Tencent SEQ Q1_0
+           (smaller, semantically faithful, but ~20x slower on CPU EP
+           pending an MLAS fast path).
+       * - ``static_cache_bias``
+         - ``MOBIUS_STATIC_CACHE_BIAS``
+         - ``False``
+         - Emit a float additive attention bias (causal + sliding window +
+           block overlay + padding) on the external-KV static-cache
+           ``Attention`` path (``is_causal=0``) for float-bias decoders,
+           instead of the maskless ``is_causal=1`` default.
     """
 
     suppress_dedup_warning: bool = dataclasses.field(
@@ -106,7 +112,7 @@ class _Flags:
         default_factory=lambda: _env_bool("MOBIUS_ORT_CUDA_GROUPED_RMSNORM_WORKAROUND", False)
     )
     """Decompose grouped RMSNormalization into basic ops to work around an
-    ORT ≤1.24.4 CUDA kernel bug that produces wrong results when scale is 2D.
+    ORT <=1.24.4 CUDA kernel bug that produces wrong results when scale is 2D.
     Set ``MOBIUS_ORT_CUDA_GROUPED_RMSNORM_WORKAROUND=1`` when targeting CUDA.
     """
 
@@ -116,43 +122,60 @@ class _Flags:
     """Lower the ONNX default-domain opset declaration to 23 when creating
     ORT sessions on non-CPU execution providers (CUDA, TRT, etc.).
 
-    ORT ≤1.24.x EPs didn't register kernels for opset 24 standard ops
+    ORT <=1.24.x EPs didn't register kernels for opset 24 standard ops
     (Squeeze, Reshape, etc.) even though the semantics are unchanged.
     Lowering the import declaration lets the EP find its existing kernels.
     Set ``MOBIUS_ORT_LOWER_OPSET_FOR_EP=1`` to re-enable if running on
     an older ORT build without opset 24 kernel registration.
     """
 
-    prune_lm_head: bool = dataclasses.field(
-        default_factory=lambda: _env_bool("MOBIUS_PRUNE_LM_HEAD", False)
+    tencent_q1_0_use_native_2bit: bool = dataclasses.field(
+        default_factory=lambda: _env_bool("MOBIUS_TENCENT_Q1_0_USE_NATIVE_2BIT", False)
     )
-    """Insert ``Gather(axis=1, indices=[-1])`` before the LM head MatMul to
-    select only the last token's hidden state.
+    """Emit Tencent custom Q1_0 (2-bit SEQ) tensors using native
+    ``MatMulNBits bits=2`` + float ``zero_point = 1.5`` instead of the
+    ``bits=4`` inflation that defaults today.
 
-    When ``False`` (default), the LM head computes logits for every token
-    in the sequence (output shape ``[B, S, vocab]``). This preserves all
-    use cases including logprob scoring, perplexity evaluation,
-    speculative-decoding verification, and multi-token-at-a-time generation.
+    Pros (when set to ``True``):
+        Halves the on-disk weight bytes (2 bpw vs 4 bpw inflated).
+        Semantically faithful to the source quantization layout.
 
-    When ``True``, only the last token's logits are computed (output shape
-    ``[B, 1, vocab]``), avoiding the full ``[B, S, vocab]`` MatMul during
-    prefill.  This is a meaningful prefill speedup for chat / single-token
-    generation workloads on models with large vocabularies (e.g. Qwen at
-    151936 tokens), but **breaks** any workflow that needs per-token logits.
+    Cons (default ``False``):
+        ORT's CPU ``bits=2`` + float-zp dequant path is currently a
+        naive scalar fallback (~20x slower than the ``bits=4`` packed
+        path on the same weights). See
+        `microsoft/onnxruntime#28552
+        <https://github.com/microsoft/onnxruntime/issues/28552>`_.
+        Also requires ORT >=1.27 (the float-zp path was added in
+        `microsoft/onnxruntime#28354
+        <https://github.com/microsoft/onnxruntime/pull/28354>`_).
 
-    Mirrors the ``prune_lm_head`` extra option in onnxruntime-genai's
-    Model Builder.  Set ``MOBIUS_PRUNE_LM_HEAD=1`` to enable for chat-only
-    deployments.
+    The ``bits=4`` default inflates each 2-bit code ``c in {0..3}`` to
+    a 4-bit slot ``2c in {0,2,4,6}`` paired with integer ``zero_point=3``;
+    dequant gives the same SEQ codebook values, just at twice the
+    weight storage. Set ``MOBIUS_TENCENT_Q1_0_USE_NATIVE_2BIT=1`` to
+    opt in to the smaller native form once kernel performance lands.
+    """
 
-    .. note::
-        **Compatibility:** This flag only takes effect for models that use
-        the base :class:`~mobius.models.base.CausalLMModel.forward`
-        implementation — Llama, Mistral, Qwen2 / 2.5 / 3, and other
-        standard decoder-only architectures.  Models that override
-        ``forward()`` (GPT-J, CodeGen, Phi, NanoChat, DOGE, Gemma3n,
-        Apertus, GPT-2 family, Mamba, InternLM2, Qwen3.5, etc.) **silently
-        ignore this flag** because they assemble logits via their own code
-        paths.  Coverage will be extended in follow-up work as needed.
+    static_cache_bias: bool = dataclasses.field(
+        default_factory=lambda: _env_bool("MOBIUS_STATIC_CACHE_BIAS", False)
+    )
+    """Emit a float additive attention bias on the external-KV static-cache
+    ``Attention`` path instead of the maskless ``is_causal=1`` default.
+
+    When ``True`` (and the model declares a bias need, e.g. a sliding window
+    or a block-overlay hook), :class:`~mobius.models.base.TextModel` builds a
+    ``(B, 1, S_q, max_seq)`` additive bias via
+    :func:`~mobius.components.create_static_cache_attention_bias` (causal +
+    sliding window + block overlay + padding, keyed on absolute query
+    positions with KV validity ``slot < nonpad_kv_seqlen``) and threads it
+    into the static-cache ``Attention`` op with ``is_causal=0``. This lets a
+    single standard-``Attention`` graph carry an arbitrary additive bias that
+    ``com.microsoft.GroupQueryAttention`` cannot express, while still using the
+    opset-24 external KV cache (``TensorScatter`` + ``nonpad_kv_seqlen``).
+
+    Default ``False``: the maskless ``is_causal=1`` static-cache emission is
+    unchanged, so no shipped model's graph changes unless this flag is set.
     """
 
 

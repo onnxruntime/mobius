@@ -23,19 +23,30 @@ __all__ = [
     "AudioCTCTask",
     "AudioFeatureExtractionTask",
     "CausalLMTask",
+    "CTCAsrTask",
+    "RNNTTask",
     "CodecTask",
     "ComponentSpec",
     "ControlNetTask",
+    "DeepSeekV4Task",
+    "DFlashDraftTask",
+    "Eagle3DraftTask",
+    "Qwen35MtpTask",
     "DenoisingTask",
     "FeatureExtractionTask",
     "FunASRSpeechLanguageTask",
+    "Gemma4AssistantTask",
     "Gemma4Task",
+    "Gemma4UnifiedTask",
     "Gemma4TextCausalLMTask",
     "HybridCausalLMTask",
     "HybridQwenVLTask",
     "ImageClassificationTask",
     "ModelTask",
     "MllamaVisionLanguageTask",
+    "MaskedDiffusionTask",
+    "MoshiDepformerTask",
+    "MoshiTemporalTask",
     "MultiModalTask",
     "OPSET_VERSION",
     "ObjectDetectionTask",
@@ -75,18 +86,29 @@ from mobius.tasks._causal_lm import (
 )
 from mobius.tasks._codec import CodecTask
 from mobius.tasks._controlnet import ControlNetTask
+from mobius.tasks._ctc_asr import CTCAsrTask
+from mobius.tasks._deepseek_v4 import DeepSeekV4Task
 from mobius.tasks._denoising import DenoisingTask
+from mobius.tasks._dflash import DFlashDraftTask
+from mobius.tasks._eagle3 import Eagle3DraftTask
 from mobius.tasks._feature_extraction import FeatureExtractionTask
 from mobius.tasks._fun_asr_speech_language import FunASRSpeechLanguageTask
 from mobius.tasks._gemma4 import (
     Gemma4Task,
     Gemma4TextCausalLMTask,
+    Gemma4UnifiedTask,
 )
+from mobius.tasks._gemma4_assistant import Gemma4AssistantTask
+from mobius.tasks._hunyuan_vl_mot import HunYuanVLMoTTask
 from mobius.tasks._image_classification import ImageClassificationTask
+from mobius.tasks._masked_diffusion import MaskedDiffusionTask
+from mobius.tasks._moshi import MoshiDepformerTask, MoshiTemporalTask
 from mobius.tasks._multimodal import MultiModalTask
 from mobius.tasks._object_detection import ObjectDetectionTask
 from mobius.tasks._phi4mm_multimodal import Phi4MMMultiModalTask
+from mobius.tasks._qwen35_mtp import Qwen35MtpTask
 from mobius.tasks._qwen_image_vae import QwenImageVAETask
+from mobius.tasks._rnnt import RNNTTask
 from mobius.tasks._seq2seq import Seq2SeqTask
 from mobius.tasks._speech_language import SpeechLanguageTask
 from mobius.tasks._speech_to_text import SpeechToTextTask
@@ -111,15 +133,23 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "adapter": AdapterTask,
     "audio-ctc": AudioCTCTask,
     "audio-feature-extraction": AudioFeatureExtractionTask,
+    "ctc-asr": CTCAsrTask,
     "codec": CodecTask,
     "controlnet": ControlNetTask,
     "denoising": DenoisingTask,
     "feature-extraction": FeatureExtractionTask,
+    "masked-diffusion": MaskedDiffusionTask,
     "image-classification": ImageClassificationTask,
     "object-detection": ObjectDetectionTask,
     "seq2seq": Seq2SeqTask,
+    "moshi-depformer": MoshiDepformerTask,
+    "moshi-temporal": MoshiTemporalTask,
     "text-generation": CausalLMTask,
+    "deepseek-v4": DeepSeekV4Task,
     "hybrid-text-generation": HybridCausalLMTask,
+    "dflash-draft": DFlashDraftTask,
+    "eagle3-draft": Eagle3DraftTask,
+    "qwen35-mtp": Qwen35MtpTask,
     "vae": VAETask,
     "qwen-image-vae": QwenImageVAETask,
     "vision-language": VisionLanguageTask,
@@ -130,9 +160,13 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "qwen3-vl-vision-language": Qwen3VLVisionLanguageTask,
     "gemma4": Gemma4Task,
     "gemma4-text-generation": Gemma4TextCausalLMTask,
+    "gemma4-unified": Gemma4UnifiedTask,
+    "gemma4-assistant": Gemma4AssistantTask,
+    "hunyuan-vl-mot": HunYuanVLMoTTask,
     "multimodal": MultiModalTask,
     "phi4mm-multimodal": Phi4MMMultiModalTask,
     "fun-asr-speech-language": FunASRSpeechLanguageTask,
+    "fastconformer-rnnt": RNNTTask,
     "speech-language": SpeechLanguageTask,
     "speech-to-text": SpeechToTextTask,
     "ssm-text-generation": SSMCausalLMTask,

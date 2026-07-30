@@ -17,7 +17,7 @@ dependencies = [
     "numpy>=1.24.0",
     "onnx_ir>=0.1.0",
     "onnx-shape-inference>=0.1.9",
-    "onnxscript>=0.7.0",
+    "onnxscript>=0.7.1",
     "safetensors",
     "torch>=2.1.0",
     "tqdm",
@@ -34,6 +34,11 @@ testing = [
     "accelerate",
     "diffusers",
     "onnxruntime-easy>=0.1.1",
+    # onnxruntime>=1.28 is required for the fused Attention kernel to apply
+    # attention-logit soft-capping *before* the mask/bias (ONNX spec order).
+    # Older kernels (<=1.26) applied softcap after the mask, which diverges from
+    # the DecomposeAttentionPass output and fails its softcap parity tests.
+    "onnxruntime>=1.28.0",
     "torch",
     "transformers>=5.0",
     "safetensors",
@@ -45,7 +50,7 @@ testing = [
     "librosa",
     "jsonschema>=4.0",
 ]
-ort-genai = ["onnxruntime-genai"]
+ort-genai = ["onnxruntime-genai", "Pillow"]
 docs = ["furo", "myst-parser", "sphinx", "sphinx_copybutton"]
 
 [tool.setuptools.packages.find]

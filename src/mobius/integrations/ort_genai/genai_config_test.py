@@ -197,6 +197,41 @@ class TestGenaiConfigGeneratorLLM:
         # CUDA: full context_length, NOT capped at 4096
         assert config["search"]["max_length"] == 131072
 
+    def test_search_params_mlx_shares_buffer(self):
+        gen = GenaiConfigGenerator(
+            "qwen2",
+            vocab_size=151936,
+            hidden_size=896,
+            num_hidden_layers=24,
+            num_attention_heads=14,
+            num_key_value_heads=2,
+            head_dim=64,
+            ep="mlx",
+            context_length=32768,
+        )
+        config = gen.generate()
+        assert config["search"]["past_present_share_buffer"] is True
+        assert config["search"]["max_length"] == 32768
+
+    def test_webgpu_graph_capture_propagates_to_session_options(self):
+        """WebGPU's graph-capture capability flag reaches genai_config (PR #357)."""
+        gen = GenaiConfigGenerator(
+            "qwen2",
+            vocab_size=151936,
+            hidden_size=896,
+            num_hidden_layers=24,
+            num_attention_heads=14,
+            num_key_value_heads=2,
+            head_dim=64,
+            ep="webgpu",
+            context_length=2048,
+        )
+        config = gen.generate()
+        provider_options = config["model"]["decoder"]["session_options"]["provider_options"]
+        webgpu = next(opts["webgpu"] for opts in provider_options if "webgpu" in opts)
+        assert webgpu["enableGraphCapture"] == "1"
+        assert webgpu["validationMode"] == "disabled"
+
     def test_search_params_custom_ep_with_share_buffer(self):
         """A custom EP registered with supports_past_present_share_buffer=True gets the flag set.
 

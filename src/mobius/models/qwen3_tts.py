@@ -25,11 +25,11 @@ HuggingFace class: Qwen3TTSForConditionalGeneration
 from __future__ import annotations
 
 import dataclasses
+import logging
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import (
@@ -44,6 +44,8 @@ from mobius.components._ecapa_tdnn import SpeakerEncoder
 
 if TYPE_CHECKING:
     import onnx_ir as ir
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Talker decoder model (model 1 of 4)
@@ -74,7 +76,7 @@ class Qwen3TTSTalkerDecoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -214,7 +216,7 @@ class Qwen3TTSCodePredictorModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         inputs_embeds: ir.Value,
         step_index: ir.Value,
         attention_mask: ir.Value,
@@ -330,7 +332,7 @@ class Qwen3TTSEmbeddingModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         text_ids: ir.Value,
         codec_ids: ir.Value,
     ):
@@ -354,6 +356,275 @@ class Qwen3TTSEmbeddingModel(nn.Module):
         codec_embeds = self.codec_embedding(op, codec_ids)
 
         return text_embeds, codec_embeds
+
+
+# ---------------------------------------------------------------------------
+# Talker step embedder (pre-embedding component)
+# ---------------------------------------------------------------------------
+
+
+class Qwen3TTSTalkerStepEmbedder(nn.Module):
+    r"""Materializes the per-step talker ``codec_sum`` construction in ONNX.
+
+    In the reference generation loop the talker's per-step ``inputs_embeds``
+    is built in Python as::
+
+        codec_sum = talker.codec_embed(code_0)
+                    + Σ_{i=0..14} cp_codec_weights[i][codes[i + 1]]
+        inputs_embeds = codec_sum + text_embed
+
+    where ``talker.codec_embed`` is the talker codec-embedding table (the
+    embedding model's ``codec_embedding.weight``) and ``cp_codec_weights`` is
+    the code predictor's stacked codec-embedding table
+    (``[num_code_groups - 1, cp_vocab, hidden]``).
+
+    This module folds that construction into a graph so a generic runtime loop
+    can drive the talker by feeding the previous frame's raw integer codes
+    (plus the already-embedded trailing-text vector) instead of a pre-built
+    ``inputs_embeds``. The text projection stays on the embedding model; this
+    component only holds the two codec-embedding tables (shared weights, not
+    re-quantized) and does the Gather + Add.
+
+    Inputs:
+      - ``frame_codes``: (batch, num_code_groups) int64 — the previous frame's
+        codes (``code_0`` followed by ``codes[1..num_code_groups - 1]``).
+      - ``text_embed``: (batch, 1, hidden) float — the trailing-text (or pad)
+        embedding for this step, produced by the embedding model.
+
+    Output:
+      - ``inputs_embeds``: (batch, 1, hidden) float — exactly
+        ``codec_sum + text_embed``.
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        tts = config.tts
+        hidden = config.hidden_size
+        # Talker codec-embedding table (audio codes → hidden). Same weights as
+        # the embedding model's ``codec_embedding``; shared, not re-quantized.
+        self.codec_embedding = nn.Parameter([config.vocab_size, hidden])
+
+        # Code predictor stacked codec-embedding table, stored in talker_hidden
+        # space: (num_code_groups - 1, cp_vocab, hidden). Same weights as the
+        # code predictor's ``stacked_codec_embedding`` (exposed as its
+        # ``codec_embeddings`` graph output).
+        num_extra_groups = (tts.num_code_groups if tts else 16) - 1
+        cp = tts.code_predictor if tts else None
+        cp_vocab = cp.vocab_size if cp else 2048
+        self.stacked_codec_embedding = nn.Parameter([num_extra_groups, cp_vocab, hidden])
+        self._num_extra_groups = num_extra_groups
+
+    def forward(
+        self,
+        op: OpBuilder,
+        frame_codes: ir.Value,
+        text_embed: ir.Value,
+    ):
+        """Compute ``codec_sum + text_embed`` from raw frame codes.
+
+        Args:
+            frame_codes: (batch, num_code_groups) int64 previous-frame codes.
+            text_embed: (batch, 1, hidden) float trailing-text/pad embedding.
+
+        Returns:
+            inputs_embeds: (batch, 1, hidden) float.
+        """
+        # code_0 → talker codec embedding. Keep the length-1 group axis so the
+        # result is (batch, 1, hidden) and broadcasts cleanly against text.
+        code_0 = op.Gather(frame_codes, [0], axis=1)  # (batch, 1)
+        codec_sum = op.Gather(self.codec_embedding, code_0, axis=0)  # (batch, 1, hidden)
+
+        # codes[1..num_extra_groups] → per-group code predictor codec embedding.
+        for i in range(self._num_extra_groups):
+            code_i = op.Gather(frame_codes, [i + 1], axis=1)  # (batch, 1)
+            table_i = op.Gather(self.stacked_codec_embedding, [i], axis=0)
+            table_i = op.Squeeze(table_i, [0])  # (cp_vocab, hidden)
+            emb_i = op.Gather(table_i, code_i, axis=0)  # (batch, 1, hidden)
+            codec_sum = op.Add(codec_sum, emb_i)
+
+        return op.Add(codec_sum, text_embed)
+
+
+# ---------------------------------------------------------------------------
+# Talker prefill embedder (pre-embedding component)
+# ---------------------------------------------------------------------------
+
+# Text-side special token IDs (shared text vocab).
+_TTS_BOS_ID = 151672
+_TTS_EOS_ID = 151673
+_TTS_PAD_ID = 151671
+# Codec prefill token IDs for the DEFAULT path (language="Auto", no speaker,
+# no instruct). N = 5: [nothink, think_bos, think_eos, pad, bos].
+_CODEC_NOTHINK_ID = 2155
+_CODEC_THINK_BOS_ID = 2156
+_CODEC_THINK_EOS_ID = 2157
+_CODEC_PAD_ID = 2148
+_CODEC_BOS_ID = 2149
+_AUTO_CODEC_PREFILL_IDS = [
+    _CODEC_NOTHINK_ID,
+    _CODEC_THINK_BOS_ID,
+    _CODEC_THINK_EOS_ID,
+    _CODEC_PAD_ID,
+    _CODEC_BOS_ID,
+]
+
+
+class Qwen3TTSTalkerPrefillEmbedder(nn.Module):
+    r"""Materializes the talker PREFILL + trailing-text construction in ONNX.
+
+    In the reference generation loop (see
+    ``examples/qwen3_tts.py::generate_codes``) two embedding sequences are built
+    once, up front, from the already-tokenized prompt ids. This component folds
+    that construction into a single graph so a generic runtime loop can drive
+    the talker without any Qwen3-TTS-specific slicing/interleaving logic.
+
+    Scope: the DEFAULT path only — ``language="Auto"`` (codec prefill ids
+    ``[nothink, think_bos, think_eos, pad, bos]``, so ``N = 5``), NO instruct
+    and NO speaker embedding. Speaker/language/instruct branches are a
+    documented follow-up and are intentionally not implemented here.
+
+    The prompt is tokenized (by the runtime) as::
+
+        <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
+
+    giving ``text_ids`` with layout: ``[0:3]`` role prefix, ``[3]`` first text
+    token, ``[4:-5]`` remaining text, ``[-5:]`` end role (discarded).
+
+    Two sequences are produced (matching ``generate_codes`` exactly):
+
+    - ``prefill_embeds`` = ``role(3) + codec_text_pairs(N-1) + first_text_codec(1)``
+      where ``codec_text_pairs = (tts_pad*(N-2) ++ tts_bos) + codec_prefill[:-1]``
+      and ``first_text_codec = text_embeds[:, 3:4] + codec_prefill[:, -1:]``.
+      Length is constant: ``3 + (N-1) + 1 = 3 + 4 + 1 = 8``.
+    - ``trailing_text_embeds`` = ``text_embeds[:, 4:-5] ++ tts_eos``.
+      Length is ``(text_len - 9) + 1 = text_len - 8``.
+
+    Weights are the SAME tables as the ``embedding`` model (text embedding +
+    projection, codec embedding); they are shared, not re-quantized. Only the
+    Slice/Concat/Add/Tile interleaving lives here; the codec prefill ids and the
+    tts special ids are graph constants.
+
+    Inputs:
+      - ``text_ids``: (batch, text_len) int64 — already-tokenized prompt ids.
+
+    Outputs:
+      - ``prefill_embeds``: (batch, 8, hidden) float.
+      - ``trailing_text_embeds``: (batch, text_len - 8, hidden) float.
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        tts = config.tts
+        text_hidden = tts.text_hidden_size if tts else 2048
+        text_vocab = tts.text_vocab_size if tts else 151936
+        hidden = config.hidden_size
+
+        # The fixed TTS special-token ids and codec prefill ids are baked into
+        # the graph as Gather indices, so the embedding tables must be large
+        # enough to contain them or the gathers are out of bounds at runtime.
+        # Real Qwen3-TTS configs always satisfy this; tiny structural-test
+        # configs may not (the graph still builds — the OOB only matters at
+        # run time), so warn rather than fail the build.
+        max_text_id = max(_TTS_BOS_ID, _TTS_EOS_ID, _TTS_PAD_ID)
+        if text_vocab <= max_text_id:
+            logger.warning(
+                "text_vocab_size (%d) does not exceed the TTS special-token id %d; "
+                "the prefill embedder's baked-in gathers would be out of bounds at "
+                "run time for this config.",
+                text_vocab,
+                max_text_id,
+            )
+        max_codec_id = max(_AUTO_CODEC_PREFILL_IDS)
+        if config.vocab_size <= max_codec_id:
+            logger.warning(
+                "config.vocab_size (%d) does not exceed the codec prefill id %d.",
+                config.vocab_size,
+                max_codec_id,
+            )
+
+        # Same tables as the embedding model (shared weights, routed in
+        # preprocess_weights). Text embedding + ResizeMLP projection.
+        self.text_embedding = Embedding(text_vocab, text_hidden)
+        self.text_projection_fc1 = Linear(text_hidden, text_hidden, bias=True)
+        self.text_projection_fc2 = Linear(text_hidden, hidden, bias=True)
+        # Codec embedding (audio codes → hidden).
+        self.codec_embedding = Embedding(config.vocab_size, hidden)
+
+    def _text_path(self, op: OpBuilder, ids: ir.Value) -> ir.Value:
+        """Embed *ids* through the text embedding + projection (fc1 → SiLU → fc2)."""
+        embeds = self.text_embedding(op, ids)
+        embeds = self.text_projection_fc1(op, embeds)
+        embeds = op.Mul(embeds, op.Sigmoid(embeds))  # SiLU
+        return self.text_projection_fc2(op, embeds)
+
+    def forward(self, op: OpBuilder, text_ids: ir.Value):
+        """Build ``prefill_embeds`` and ``trailing_text_embeds`` from ``text_ids``.
+
+        Args:
+            text_ids: (batch, text_len) int64 already-tokenized prompt ids.
+
+        Returns:
+            Tuple ``(prefill_embeds, trailing_text_embeds)``, both
+            (batch, seq, hidden) float.
+        """
+        num_prefill = len(_AUTO_CODEC_PREFILL_IDS)  # N = 5
+
+        # Projected text embeds for every prompt token.
+        all_text_embeds = self._text_path(op, text_ids)  # (B, L, H)
+
+        # The special-token / codec-prefill pieces below are built at batch=1
+        # (they are constant across the batch). Broadcast them to the dynamic
+        # batch B of the text embeds before any Concat with batched tensors,
+        # otherwise Concat(axis=1) fails a batch-dimension mismatch for B > 1.
+        batch_dim = op.Shape(all_text_embeds, start=0, end=1)  # (1,) == [B]
+
+        def _to_batch(x: ir.Value) -> ir.Value:
+            """Expand a ``(1, S, H)`` tensor to ``(B, S, H)`` along the batch."""
+            tail = op.Shape(x, start=1)  # [S, H]
+            return op.Expand(x, op.Concat(batch_dim, tail, axis=0))
+
+        # TTS special token embeds (bos, eos, pad) through the text path.
+        special_ids = op.Unsqueeze(
+            op.Constant(value_ints=[_TTS_BOS_ID, _TTS_EOS_ID, _TTS_PAD_ID]), [0]
+        )  # (1, 3)
+        special_embeds = self._text_path(op, special_ids)  # (1, 3, H)
+        tts_bos = op.Slice(special_embeds, [0], [1], [1])  # (1, 1, H)
+        tts_eos = op.Slice(special_embeds, [1], [2], [1])
+        tts_pad = op.Slice(special_embeds, [2], [3], [1])
+
+        # Codec prefill embeds over the constant Auto-path ids.
+        codec_ids = op.Unsqueeze(
+            op.Constant(value_ints=_AUTO_CODEC_PREFILL_IDS), [0]
+        )  # (1, N)
+        codec_prefill = self.codec_embedding(op, codec_ids)  # (1, N, H)
+
+        # Role prefix: first 3 text tokens (pure text, no codec overlay).
+        role = op.Slice(all_text_embeds, [0], [3], [1])  # (B, 3, H)
+
+        # Text side of codec prefill: tts_pad * (N-2) ++ tts_bos.
+        text_pad_rep = op.Tile(
+            tts_pad, op.Constant(value_ints=[1, num_prefill - 2, 1])
+        )  # (1, N-2, H)
+        text_side = op.Concat(text_pad_rep, tts_bos, axis=1)  # (1, N-1, H)
+        codec_side = op.Slice(codec_prefill, [0], [num_prefill - 1], [1])  # (1, N-1, H)
+        codec_text_pairs = _to_batch(op.Add(text_side, codec_side))  # (B, N-1, H)
+
+        # First text token + last codec token (bos). Add broadcasts (1->B).
+        first_text = op.Slice(all_text_embeds, [3], [4], [1])  # (B, 1, H)
+        codec_bos = op.Slice(codec_prefill, [num_prefill - 1], [num_prefill], [1])  # (1, 1, H)
+        first_text_codec = op.Add(first_text, codec_bos)  # (B, 1, H)
+
+        prefill_embeds = op.Concat(
+            role, codec_text_pairs, first_text_codec, axis=1
+        )  # (B, 8, H)
+
+        # Trailing text: remaining tokens [4:-5] ++ tts_eos (broadcast to B).
+        remaining_text = op.Slice(all_text_embeds, [4], [-5], [1])  # (B, L-9, H)
+        trailing_text_embeds = op.Concat(
+            remaining_text, _to_batch(tts_eos), axis=1
+        )  # (B, L-8, H)
+
+        return prefill_embeds, trailing_text_embeds
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +657,7 @@ class Qwen3TTSSpeakerEncoderModel(nn.Module):
             enc_se_channels=se.enc_se_channels if se else 128,
         )
 
-    def forward(self, op: builder.OpBuilder, mel_input: ir.Value):
+    def forward(self, op: OpBuilder, mel_input: ir.Value):
         """Extract speaker embedding from mel spectrogram.
 
         Args:
@@ -425,6 +696,8 @@ class Qwen3TTSForConditionalGeneration(nn.Module):
         self.talker = Qwen3TTSTalkerDecoderModel(config)
         self.code_predictor = Qwen3TTSCodePredictorModel(config)
         self.embedding = Qwen3TTSEmbeddingModel(config)
+        self.talker_step_embedder = Qwen3TTSTalkerStepEmbedder(config)
+        self.talker_prefill_embedder = Qwen3TTSTalkerPrefillEmbedder(config)
         # Speaker encoder is optional — not all TTS models include it
         tts = config.tts
         if tts and tts.speaker_encoder:
@@ -434,7 +707,7 @@ class Qwen3TTSForConditionalGeneration(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -476,25 +749,33 @@ class Qwen3TTSForConditionalGeneration(nn.Module):
                 self._route_code_predictor_weight(cleaned, cp_key, value)
                 continue
 
-            # Text embedding → embedding model
+            # Text embedding → embedding model (+ shared with prefill embedder)
             if inner.startswith("model.text_embedding."):
                 emb_key = inner[len("model.") :]  # text_embedding.*
                 cleaned[f"embedding.{emb_key}"] = value
+                cleaned[f"talker_prefill_embedder.{emb_key}"] = value
                 continue
 
-            # Text projection → embedding model
+            # Text projection → embedding model (+ shared with prefill embedder)
             if inner.startswith("text_projection."):
                 proj_key = inner[len("text_projection.") :]
                 # linear_fc1.weight → text_projection_fc1.weight
                 proj_key = proj_key.replace("linear_fc1.", "text_projection_fc1.")
                 proj_key = proj_key.replace("linear_fc2.", "text_projection_fc2.")
                 cleaned[f"embedding.{proj_key}"] = value
+                cleaned[f"talker_prefill_embedder.{proj_key}"] = value
                 continue
 
             # Codec embedding: talker.model.codec_embedding.weight
             if inner.startswith("model.codec_embedding."):
                 emb_key = inner.replace("model.codec_embedding.", "codec_embedding.")
                 cleaned[f"embedding.{emb_key}"] = value
+                # Share the same table with the talker step embedder so it can
+                # materialize codec_sum in-graph (talker.codec_embed(code_0)).
+                if emb_key == "codec_embedding.weight":
+                    cleaned["talker_step_embedder.codec_embedding"] = value
+                    # Also share with the prefill embedder's codec table.
+                    cleaned[f"talker_prefill_embedder.{emb_key}"] = value
                 continue
 
             # Codec head → talker lm_head
@@ -591,11 +872,23 @@ class Qwen3TTSForConditionalGeneration(nn.Module):
             else:
                 remaining[key] = value
 
-        # Stack codec embeddings: (num_groups-1, cp_vocab, cp_hidden)
+        # Stack codec embeddings: (num_groups-1, cp_vocab, talker_hidden).
+        # The code predictor exposes this table via `op.Identity(stacked_codec_embedding)`
+        # as its `codec_embeddings` graph output. onnx-ir normally folds the Identity so
+        # the sole initializer takes the OUTPUT name `codec_embeddings` (unprefixed) —
+        # unlike every other code_predictor initializer. To avoid depending on that IR
+        # rewrite, key the stacked weight under BOTH names: whichever initializer the
+        # build actually emits (`codec_embeddings` when folded, else
+        # `code_predictor.stacked_codec_embedding`) is populated, and the other key is
+        # harmlessly logged as unmapped (apply_weights does not error on extra keys).
         if codec_emb_weights:
             num_groups = max(codec_emb_weights.keys()) + 1
             stacked = torch.stack([codec_emb_weights[i] for i in range(num_groups)])
+            remaining["codec_embeddings"] = stacked
             remaining["code_predictor.stacked_codec_embedding"] = stacked
+            # Share the same stacked table with the talker step embedder so it
+            # can materialize codec_sum in-graph (Σ cp_codec_weights[i][code]).
+            remaining["talker_step_embedder.stacked_codec_embedding"] = stacked
 
         # Stack lm_heads: (num_groups-1, cp_vocab, cp_hidden)
         if lm_head_weights:

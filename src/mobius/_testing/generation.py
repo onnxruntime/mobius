@@ -61,7 +61,12 @@ class OnnxGenerator:
         head_dim = self.config.head_dim
         layer_types = self.config.layer_types or []
 
-        # Initialize empty past KV / recurrent state per layer
+        # Initialize empty past KV / recurrent state per layer.
+        # Resolve each input's dtype from the session so f16/bf16 exports get
+        # matching cache buffers (the graph type-checks even zero-length KV).
+        def _kv_dtype(name: str) -> np.dtype:
+            return self.session.get_input_dtype(name) or np.dtype(np.float32)
+
         past_kv: dict[str, np.ndarray] = {}
         for i in range(num_layers):
             ltype = layer_types[i] if i < len(layer_types) else "full_attention"
@@ -75,25 +80,31 @@ class OnnxGenerator:
                     name = f"past_key_values.{i}.{suffix}"
                     shape = self.session.get_input_shape(name) or []
                     static = [d if isinstance(d, int) and d > 0 else batch_size for d in shape]
-                    past_kv[name] = np.zeros(static, dtype=np.float32)
+                    past_kv[name] = np.zeros(static, dtype=_kv_dtype(name))
             elif ltype == "lightning_attention":
                 # Single recurrent state only (no conv_state)
                 name = f"past_key_values.{i}.recurrent_state"
                 shape = self.session.get_input_shape(name) or []
                 static = [d if isinstance(d, int) and d > 0 else batch_size for d in shape]
-                past_kv[name] = np.zeros(static, dtype=np.float32)
+                past_kv[name] = np.zeros(static, dtype=_kv_dtype(name))
             elif ltype == "conv":
                 # ShortConv conv_state only (no SSM state)
                 name = f"past_key_values.{i}.conv_state"
                 shape = self.session.get_input_shape(name) or []
                 static = [d if isinstance(d, int) and d > 0 else batch_size for d in shape]
-                past_kv[name] = np.zeros(static, dtype=np.float32)
+                past_kv[name] = np.zeros(static, dtype=_kv_dtype(name))
+            elif ltype in ("mlp", "moe"):
+                # Pure feed-forward layers (e.g. NemotronH hybrid) carry no
+                # attention KV and no recurrent state — nothing to initialize.
+                continue
             else:
-                past_kv[f"past_key_values.{i}.key"] = np.zeros(
-                    (batch_size, num_kv_heads, 0, head_dim), dtype=np.float32
+                key_name = f"past_key_values.{i}.key"
+                value_name = f"past_key_values.{i}.value"
+                past_kv[key_name] = np.zeros(
+                    (batch_size, num_kv_heads, 0, head_dim), dtype=_kv_dtype(key_name)
                 )
-                past_kv[f"past_key_values.{i}.value"] = np.zeros(
-                    (batch_size, num_kv_heads, 0, head_dim), dtype=np.float32
+                past_kv[value_name] = np.zeros(
+                    (batch_size, num_kv_heads, 0, head_dim), dtype=_kv_dtype(value_name)
                 )
 
         all_ids = input_ids.copy()
@@ -154,6 +165,9 @@ class OnnxGenerator:
                     dst = f"past_key_values.{i}.conv_state"
                     if src in outputs:
                         past_kv[dst] = outputs[src]
+                elif ltype in ("mlp", "moe"):
+                    # Pure feed-forward layers have no cache state to carry.
+                    continue
                 else:
                     past_kv[f"past_key_values.{i}.key"] = outputs[f"present.{i}.key"]
                     past_kv[f"past_key_values.{i}.value"] = outputs[f"present.{i}.value"]

@@ -3,12 +3,10 @@
 
 from __future__ import annotations
 
-import dataclasses
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._attention import Qwen35Attention
@@ -19,10 +17,10 @@ from mobius.components._common import (
 )
 from mobius.components._gated_deltanet import GatedDeltaNet
 from mobius.components._mlp import MLP
-from mobius.components._moe import TopKGate
 from mobius.components._rms_norm import OffsetRMSNorm
 from mobius.components._rotary_embedding import initialize_rope
 from mobius.models.base import CausalLMModel
+from mobius.models.moe import Qwen2MoELayer
 from mobius.models.qwen_vl import (
     Qwen3VLEmbeddingModel,
     Qwen3VLVisionEncoderModel,
@@ -68,7 +66,7 @@ class Qwen35DecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple[ir.Value, ir.Value],
@@ -128,7 +126,7 @@ class Qwen35TextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value | None,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -219,65 +217,21 @@ class Qwen35CausalLMModel(CausalLMModel):
         return super().preprocess_weights(cleaned)
 
 
-class Qwen35MoEBlock(nn.Module):
-    """Qwen3.5-MoE sparse MoE block with shared expert.
+class Qwen35MoEBlock(Qwen2MoELayer):
+    """Qwen3.5-MoE sparse MoE block: top-k routing + sigmoid-gated shared expert.
 
-    Combines top-k expert routing with a shared expert gated by sigmoid.
-    Weight names are aligned to the HuggingFace naming convention::
+    Structurally identical to Qwen2-MoE's shared-expert block
+    (:class:`~mobius.models.moe.Qwen2MoELayer`): top-k expert routing whose
+    weighted sum is added to a shared expert scaled by a sigmoid gate. Weight
+    names match the HuggingFace convention::
 
-        gate.weight            → router logits
+        gate.weight                  → router logits
         experts.N.{gate,up,down}_proj.weight
         shared_expert.{gate,up,down}_proj.weight
-        shared_expert_gate.weight   → sigmoid gate for shared expert
+        shared_expert_gate.weight    → sigmoid gate for shared expert
+
+    Retained as a named subclass for readability within the Qwen3.5 hybrid stack.
     """
-
-    def __init__(self, config: ArchitectureConfig):
-        super().__init__()
-        assert config.num_local_experts is not None
-        assert config.num_experts_per_tok is not None
-        num_experts = config.num_local_experts
-        top_k = config.num_experts_per_tok
-
-        self.gate = TopKGate(config.hidden_size, num_experts, top_k)
-
-        expert_config = dataclasses.replace(
-            config, intermediate_size=config.moe_intermediate_size
-        )
-        self.experts = nn.ModuleList([MLP(expert_config) for _ in range(num_experts)])
-
-        shared_config = dataclasses.replace(
-            config,
-            intermediate_size=config.shared_expert_intermediate_size,
-        )
-        self.shared_expert = MLP(shared_config)
-        self.shared_expert_gate = Linear(config.hidden_size, 1, bias=False)
-
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
-        routing_weights, selected_experts = self.gate(op, hidden_states)
-
-        # Loop-over-experts dispatch (same pattern as MoELayer)
-        result = None
-        for expert_idx, expert in enumerate(self.experts):
-            expert_output = expert(op, hidden_states)
-            expert_id = op.Constant(value_int=expert_idx)
-            match = op.Equal(selected_experts, expert_id)
-            match_float = op.Cast(match, to=1)  # FLOAT
-            weighted = op.Mul(routing_weights, match_float)
-            weight = op.ReduceSum(weighted, [-1], keepdims=True)
-            contribution = op.Mul(expert_output, weight)
-            if result is None:
-                result = contribution
-            else:
-                result = op.Add(result, contribution)
-
-        # Shared expert with sigmoid gating
-        shared_output = self.shared_expert(op, hidden_states)
-        shared_gate = self.shared_expert_gate(op, hidden_states)
-        shared_gate = op.Sigmoid(shared_gate)
-        shared_output = op.Mul(shared_output, shared_gate)
-
-        result = op.Add(result, shared_output)
-        return result
 
 
 class Qwen35MoEDecoderLayer(Qwen35DecoderLayer):
@@ -320,18 +274,25 @@ class Qwen35MoETextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
-        input_ids: ir.Value,
+        op: OpBuilder,
+        input_ids: ir.Value | None,
         attention_mask: ir.Value,
         position_ids: ir.Value,
         past_key_values: list | None = None,
+        inputs_embeds: ir.Value | None = None,
     ):
-        hidden_states = self.embed_tokens(op, input_ids)
+        # Embed tokens unless caller already provided fused inputs_embeds
+        # (e.g. the VL decoder, which interleaves vision features before
+        # entering the text backbone).
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = self.embed_tokens(op, input_ids)
         position_embeddings = self.rotary_emb(op, position_ids)
 
         attention_bias = create_attention_bias(
             op,
-            input_ids=input_ids,
+            input_ids=hidden_states if input_ids is None else input_ids,
             attention_mask=attention_mask,
             dtype=self._dtype,
         )
@@ -467,7 +428,7 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
         self.vision_encoder = Qwen3VLVisionEncoderModel(config)
         self.embedding = Qwen3VLEmbeddingModel(config)
 
-    def forward(self, op: builder.OpBuilder, **kwargs):
+    def forward(self, op: OpBuilder, **kwargs):
         raise NotImplementedError(
             "Qwen35VL3ModelCausalLMModel uses QwenVLTask "
             "which calls each sub-module separately."
@@ -531,7 +492,7 @@ class Qwen35VLDecoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -569,4 +530,147 @@ class Qwen35VLDecoderModel(nn.Module):
         if self.config.tie_word_embeddings:
             if "lm_head.weight" not in renamed and "model.embed_tokens.weight" in renamed:
                 renamed["lm_head.weight"] = renamed["model.embed_tokens.weight"]
+        return renamed
+
+
+# ---------------------------------------------------------------------------
+# Qwen3.5-MoE-VL (Qwen3.6-35B-A3B and friends)
+# ---------------------------------------------------------------------------
+
+
+class Qwen35MoEVLDecoderModel(nn.Module):
+    """Qwen3.5-MoE-VL text decoder taking ``inputs_embeds`` (3-model split).
+
+    Same wiring as :class:`Qwen35VLDecoderModel` but the text backbone is the
+    MoE variant :class:`Qwen35MoETextModel` (hybrid linear/full attention +
+    sparse Mixture-of-Experts FFN with a sigmoid-gated shared expert).
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        self.config = config
+        self.model = Qwen35MoETextModel(config)
+        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        inputs_embeds: ir.Value,
+        attention_mask: ir.Value,
+        position_ids: ir.Value,
+        past_key_values: list | None = None,
+    ):
+        hidden_states, present_key_values = self.model(
+            op,
+            input_ids=None,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+        )
+        logits = self.lm_head(op, hidden_states)
+        return logits, present_key_values
+
+    # No preprocess_weights here: this class is an internal sub-module of
+    # Qwen35MoEVL3ModelCausalLMModel (constructed at line ~667 below) and is
+    # never registered standalone. The wrapper's preprocess_weights handles
+    # all HF weight routing for the 3-model package, including the fused
+    # MoE expert unpack and the tied lm_head/embeddings hookup. Adding a
+    # standalone preprocess_weights here would be dead code at best and
+    # confusingly out-of-sync with the wrapper at worst.
+
+
+class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
+    """Qwen3.5-MoE-VL vision-language model (3-model split for ORT GenAI).
+
+    Builds three separate ONNX models:
+
+    - ``decoder``: text decoder over hybrid linear/full attention with MoE
+      FFN; consumes ``inputs_embeds`` so the embedding model can splice in
+      vision features.
+    - ``vision_encoder``: shared Qwen3-VL ViT (identical to the dense
+      Qwen3.5-VL counterpart).
+    - ``embedding``: token embedding + image-feature fusion.
+
+    HuggingFace class: ``Qwen3_5MoeForConditionalGeneration``. The HF
+    model_type string is ``qwen3_5_moe`` for both the text-only checkpoints
+    and these VL checkpoints; the registry dispatches to this class when the
+    HF config carries a ``vision_config`` sub-object and to
+    :class:`Qwen35MoECausalLMModel` otherwise.
+    """
+
+    default_task: str = "hybrid-qwen-vl"
+    category: str = "Multimodal"
+    config_class: type = ArchitectureConfig
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        self.config = config
+        self.decoder = Qwen35MoEVLDecoderModel(config)
+        self.vision_encoder = Qwen3VLVisionEncoderModel(config)
+        self.embedding = Qwen3VLEmbeddingModel(config)
+
+    def forward(self, op, **kwargs):
+        raise NotImplementedError(
+            "Qwen35MoEVL3ModelCausalLMModel uses HybridQwenVLTask which "
+            "drives each sub-module independently."
+        )
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Route HF weights to the three sub-model ONNX initializer names.
+
+        HF key prefixes: ``model.visual.*`` (vision encoder),
+        ``model.language_model.*`` (MoE text backbone + embeddings),
+        ``lm_head.*`` (final projection — tied or untied to embeddings).
+        Mirrors :meth:`Qwen35VL3ModelCausalLMModel.preprocess_weights` but
+        the decoder uses the MoE-flavoured text model and HF stores experts
+        as fused tensors that must be unpacked.
+        """
+        renamed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if key.startswith(("mtp_", "mtp.")):
+                continue
+            stripped = key
+            if stripped.startswith("model."):
+                stripped = stripped[len("model.") :]
+
+            if stripped.startswith("visual."):
+                stripped = stripped.replace(".mlp.linear_fc1.", ".mlp.up_proj.")
+                stripped = stripped.replace(".mlp.linear_fc2.", ".mlp.down_proj.")
+                renamed[f"vision_encoder.{stripped}"] = value
+            elif stripped.startswith("language_model.embed_tokens."):
+                suffix = stripped[len("language_model.") :]
+                renamed[f"decoder.model.{suffix}"] = value
+                renamed[f"embedding.{suffix}"] = value
+                if (
+                    self.config.tie_word_embeddings
+                    and stripped == "language_model.embed_tokens.weight"
+                ):
+                    renamed["decoder.lm_head.weight"] = value
+            elif stripped.startswith("language_model.lm_head."):
+                renamed[f"decoder.{stripped[len('language_model.') :]}"] = value
+            elif stripped.startswith("lm_head."):
+                renamed[f"decoder.{stripped}"] = value
+            elif stripped.startswith("language_model."):
+                suffix = stripped[len("language_model.") :]
+                target = f"decoder.model.{suffix}"
+                # Unpack fused expert tensors into per-expert ONNX initializer
+                # names. HF stores ``experts.gate_up_proj`` as
+                # ``[num_experts, 2*inter, hidden]`` (gate + up concatenated
+                # along dim 1) and ``experts.down_proj`` as
+                # ``[num_experts, hidden, inter]``.
+                if suffix.endswith(".mlp.experts.gate_up_proj"):
+                    prefix = target[: -len("experts.gate_up_proj")]
+                    half = value.shape[1] // 2
+                    for i in range(value.shape[0]):
+                        renamed[f"{prefix}experts.{i}.gate_proj.weight"] = value[i, :half]
+                        renamed[f"{prefix}experts.{i}.up_proj.weight"] = value[i, half:]
+                elif suffix.endswith(".mlp.experts.down_proj"):
+                    prefix = target[: -len("experts.down_proj")]
+                    for i in range(value.shape[0]):
+                        renamed[f"{prefix}experts.{i}.down_proj.weight"] = value[i]
+                else:
+                    renamed[target] = value
         return renamed

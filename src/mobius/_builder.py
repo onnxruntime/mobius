@@ -26,6 +26,7 @@ __all__ = [
 
 import dataclasses
 import logging
+from typing import Any
 
 import onnx_ir as ir
 import torch
@@ -90,13 +91,14 @@ def _cast_module_dtype(module: nn.Module, dtype: ir.DataType) -> None:
     caches), the underlying data is also cast.
 
     Only recasts parameters that are currently FLOAT (float32). Integer
-    parameters and non-float types are left unchanged.
+    parameters, non-float types, and parameters marked ``_keep_float32`` are
+    left unchanged.
     """
     if dtype == ir.DataType.FLOAT:
         return
     torch_dtype = tensor_adapters.to_torch_dtype(dtype)
     for param in module.parameters():
-        if param.dtype != ir.DataType.FLOAT:
+        if param.dtype != ir.DataType.FLOAT or getattr(param, "_keep_float32", False):
             continue
         param.type = ir.TensorType(dtype)
         if param.const_value is not None:
@@ -213,27 +215,132 @@ def build_from_module(
             trace=trace_optimization,
         )
 
-    # Lower default-domain opset from 24 to 23 when the target EP doesn't
-    # register opset 24 kernels for standard ops (Reshape, RMSNormalization,
-    # etc.). Without this, those ops fall to CPU and produce ~280 memcpy
-    # nodes that destroy performance. The flag defaults to True; set
-    # MOBIUS_ORT_LOWER_OPSET_FOR_EP=0 to disable for EPs that support
-    # opset 24 natively.
-    if flags.ort_lower_opset_for_ep and execution_provider != "default":
-        for name, model in pkg.items():
-            if "" in model.graph.opset_imports:
-                original = model.graph.opset_imports[""]
-                model.graph.opset_imports[""] = 23
-                logger.warning(
-                    "Lowered opset %d→23 for '%s' (EP=%s). "
-                    "ORT does not yet register opset %d kernels for this EP. "
-                    "Track https://github.com/microsoft/onnxruntime/issues/27729",
-                    original,
-                    name,
-                    execution_provider,
-                    original,
-                )
+    _maybe_apply_opset_lowering(pkg, execution_provider)
     return pkg
+
+
+def _strip_to_text_only(config: Any, model_type: str) -> Any:
+    """Return a copy of *config* reduced to a pure text-only decoder.
+
+    Used by :func:`build` when ``text_only=True``. Overrides ``model_type``
+    to the text-only registry sibling and nulls multimodal fields so the text
+    backbone builds as a plain causal LM (no vision-block bidirectional
+    overlay, no image/audio token routing). This lets the decoder use
+    ``GroupQueryAttention`` on GQA-capable execution providers instead of the
+    multimodal float-bias ``Attention`` path.
+
+    Only fields that exist on the config dataclass are overridden, so the helper is
+    safe across different config dataclasses. Raises :class:`TypeError` if *config*
+    is not a dataclass instance.
+    """
+    if not dataclasses.is_dataclass(config):
+        raise TypeError(
+            f"_strip_to_text_only expects a dataclass config instance, got {type(config)!r}"
+        )
+    field_names = {f.name for f in dataclasses.fields(config)}
+    # model_type drives downstream ORT-GenAI type selection and task defaults.
+    overrides: dict[str, Any] = {"model_type": model_type}
+    # Vision/audio routing fields: nulling them removes the bidirectional
+    # image-block overlay and the per-layer image/audio token masking, leaving
+    # a pure causal decoder. ``None`` is the "absent" value for each of these.
+    for name in (
+        "image_token_id",
+        "use_bidirectional_attention",
+        "audio_token_id",
+        "boa_token_id",
+        "vision",
+        "audio",
+    ):
+        if name in field_names:
+            overrides[name] = None
+    return dataclasses.replace(
+        config, **{k: v for k, v in overrides.items() if k in field_names}
+    )
+
+
+# Attention input index for the optional ``nonpad_kv_seqlen`` operand. This
+# operand (external/static KV cache length) and the TensorScatter op are
+# defined only in opset 24, so a graph using either must not declare opset 23.
+_ATTENTION_NONPAD_KV_SEQLEN_INPUT_INDEX = 6
+
+
+def _maybe_apply_opset_lowering(pkg: ModelPackage, execution_provider: str) -> None:
+    """Lower the default-domain opset from 24 to 23 where it is safe to do so.
+
+    Some EPs (older ORT builds) don't register opset 24 kernels for standard
+    ops (Reshape, RMSNormalization, etc.). Without lowering, those ops fall to
+    CPU and produce ~280 memcpy nodes that destroy performance. The
+    ``MOBIUS_ORT_LOWER_OPSET_FOR_EP`` flag (default False) opts a deployment
+    into the lowering; it is a no-op for the ``"default"`` and ``"cpu"`` EPs
+    (the CPU EP already has opset-24 kernels), matching the inference-side gate
+    ``ort_inference._should_lower_opset``.
+
+    Any sub-model that uses opset-24-only semantics (TensorScatter, or
+    Attention with a non-empty input #6 ``nonpad_kv_seqlen``) is left at opset
+    24: declaring opset 23 on such a graph is invalid and would strip the
+    static-cache Flash path. See :func:`_graph_requires_opset24`. The decision
+    is made per sub-model, so a mixed package lowers its standard sub-models
+    while preserving its static-cache sub-models.
+    """
+    if not flags.ort_lower_opset_for_ep:
+        return
+    # Mirror ort_inference._should_lower_opset: the "default" EP is a no-op, and
+    # the CPU EP already registers opset-24 kernels, so lowering there is both
+    # unnecessary and inconsistent with the inference-side gate.
+    if execution_provider in ("default", "cpu"):
+        return
+    for name, model in pkg.items():
+        if "" not in model.graph.opset_imports:
+            continue
+        if _graph_requires_opset24(model.graph):
+            logger.info(
+                "Skipped opset→23 lowering for '%s' (EP=%s): graph uses "
+                "opset-24-only ops (TensorScatter / Attention nonpad_kv_seqlen). "
+                "Preserving opset 24 to keep the static-cache Flash path valid.",
+                name,
+                execution_provider,
+            )
+            continue
+        original = model.graph.opset_imports[""]
+        model.graph.opset_imports[""] = 23
+        logger.warning(
+            "Lowered opset %d→23 for '%s' (EP=%s). "
+            "ORT does not yet register opset %d kernels for this EP. "
+            "Track https://github.com/microsoft/onnxruntime/issues/27729",
+            original,
+            name,
+            execution_provider,
+            original,
+        )
+
+
+def _graph_requires_opset24(graph: ir.Graph) -> bool:
+    """Return True if the graph uses opset-24-only default-domain semantics.
+
+    Lowering the default-domain opset import to 23 on such a graph is invalid
+    and would silently break the static-cache Flash-attention path. A graph
+    requires opset 24 when it contains:
+
+    - a ``TensorScatter`` node (default domain), or
+    - an ``Attention`` node consuming a non-empty input #6 (``nonpad_kv_seqlen``).
+
+    The scan is recursive: nodes nested inside ``If``/``Loop``/``Scan``
+    subgraphs are inspected too, so a future graph that buries one of these ops
+    in a control-flow body is still detected.
+    """
+    for node in ir.traversal.RecursiveGraphIterator(graph):
+        if node.domain not in ("", "ai.onnx"):
+            continue
+        if node.op_type == "TensorScatter":
+            return True
+        if node.op_type == "Attention":
+            inputs = node.inputs
+            if (
+                len(inputs) > _ATTENTION_NONPAD_KV_SEQLEN_INPUT_INDEX
+                and inputs[_ATTENTION_NONPAD_KV_SEQLEN_INPUT_INDEX] is not None
+            ):
+                return True
+    return False
 
 
 def build(
@@ -242,10 +349,12 @@ def build(
     *,
     module_class: type[nn.Module] | None = None,
     dtype: str | ir.DataType | None = None,
+    output_layer_indices: list[int] | None = None,
     load_weights: bool = True,
     trust_remote_code: bool = False,
     execution_provider: str = "default",
     trace_optimization: bool = False,
+    text_only: bool = False,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a HuggingFace model ID.
 
@@ -275,6 +384,16 @@ def build(
             ``"f16"``, ``"bf16"``) or :class:`ir.DataType` values.
             When ``None``, the dtype is auto-detected from the HuggingFace
             config.
+        output_layer_indices: Optional list of decoder layer indices for
+            which to emit additional ``hidden_states.{k}`` ONNX outputs
+            alongside the standard ``logits`` / ``present.*`` outputs.
+            Each ``k`` follows the HF ``output_hidden_states`` convention
+            and refers to the post-residual output of decoder layer ``k``
+            (equivalent to ``model(...).hidden_states[k + 1]`` in
+            transformers).  Used by speculative-decoding draft models
+            such as DFlash that condition on intermediate target hidden
+            states.  See
+            :class:`mobius.ArchitectureConfig.output_layer_indices`.
         load_weights: Whether to download and apply weights from HuggingFace.
         trust_remote_code: Whether to trust remote code when loading the
             HuggingFace config.
@@ -289,6 +408,16 @@ def build(
         trace_optimization: When ``True``, log step-by-step diagnostic
             output at INFO level for each optimization stage. See
             :func:`build_from_module` for details.
+        text_only: When ``True``, export the text backbone of a multimodal
+            checkpoint as a standalone decoder-only LLM. The resolved
+            ``model_type`` is remapped to its text-only registry sibling (see
+            ``_TEXT_ONLY_MODEL_TYPE``) and vision/audio config fields
+            (``image_token_id``, ``use_bidirectional_attention``, ``vision``,
+            ``audio``, ...) are stripped, yielding a pure-causal decoder that
+            can use ``GroupQueryAttention`` on GQA-capable execution providers.
+            Raises :class:`ValueError` if the resolved ``model_type`` has no
+            text-only sibling. Currently supported for ``gemma4_unified``
+            (``google/gemma-4-12B``).
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -332,6 +461,12 @@ def build(
         # Try loading config.json directly if the model is in our registry.
         hf_config = _try_load_config_json(model_id)
         if hf_config is None or hf_config.model_type not in registry:
+            if text_only:
+                raise ValueError(
+                    f"text_only=True is not supported for '{model_id}': it does "
+                    "not resolve to a registered text-capable model_type (it "
+                    "looks like a diffusers pipeline or an unsupported config)."
+                )
             # Not a model we support — try diffusers pipeline
             return build_diffusers_pipeline(
                 model_id,
@@ -357,7 +492,54 @@ def build(
             dc.model_type = model_type
         hf_config = dc
     elif hasattr(hf_config, "text_config"):
+        # Qwen3.5-MoE-VL (Qwen3.6-35B-A3B etc.) ships ``model_type=qwen3_5_moe``
+        # for *both* text-only and VL checkpoints. When the composite carries
+        # a ``vision_config`` sub-object, override model_type so the registry
+        # picks the 3-model VL class. The text backbone's per-layer fields
+        # still live under ``text_config``, so we always unwrap; the original
+        # composite stays available via ``parent_config`` for vision extraction.
+        if (
+            model_type == "qwen3_5_moe"
+            and getattr(hf_config, "vision_config", None) is not None
+        ):
+            model_type = "qwen3_5_moe_vl"
         hf_config = hf_config.text_config
+
+    # Wav2Vec2 / HuBERT / WavLM ship ``model_type="wav2vec2"`` (etc.) for both
+    # feature-extraction and CTC checkpoints. Switch to the ``mms`` registration
+    # (Wav2Vec2ForCTCModel + ctc-asr task) when the architecture indicates a
+    # CTC head — this covers both MMS and vanilla Wav2Vec2ForCTC fine-tunes.
+    if model_type in ("wav2vec2", "hubert", "wavlm"):
+        architectures = getattr(parent_config, "architectures", None) or []
+        if any("ForCTC" in arch for arch in architectures):
+            model_type = "mms"
+
+    if text_only:
+        from mobius._registry import _TEXT_ONLY_MODEL_TYPE
+
+        text_type = _TEXT_ONLY_MODEL_TYPE.get(model_type)
+        if text_type is None:
+            raise ValueError(
+                f"text_only=True is not supported for model_type '{model_type}'. "
+                "It is only available for multimodal checkpoints with a text-only "
+                f"registry sibling: {sorted(_TEXT_ONLY_MODEL_TYPE)}."
+            )
+        model_type = text_type
+
+    # DFlash speculative-decoding drafters ship ``model_type="qwen3"`` (the
+    # base Qwen3 family) but declare ``architectures=["DFlashDraftModel"]``.
+    # Re-route via the architectures field so build() picks the cross-
+    # attending drafter class + dflash-draft task instead of the standard
+    # CausalLMModel + text-generation task.
+    architectures = getattr(parent_config, "architectures", None) or []
+    if architectures and architectures[0] in registry:
+        arch_key = architectures[0]
+        # Only override when the architecture-keyed registration is *more
+        # specific* than the model_type-keyed one (i.e. different class).
+        model_type_class = registry.get(model_type) if model_type in registry else None
+        arch_class = registry.get(arch_key)
+        if model_type_class is not arch_class:
+            model_type = arch_key
 
     if module_class is None:
         if model_type in registry:
@@ -381,9 +563,19 @@ def build(
 
     config = _config_from_hf(hf_config, parent_config=parent_config, module_class=module_class)
 
+    if text_only:
+        config = _strip_to_text_only(config, model_type)
+
     if dtype is not None:
         dtype = resolve_dtype(dtype)
         config = dataclasses.replace(config, dtype=dtype)
+
+    if output_layer_indices is not None:
+        # Opt-in: emit additional `hidden_states.{k}` ONNX outputs for each
+        # listed decoder layer index.  Used by speculative-decoding draft
+        # models (e.g. DFlash) that condition on intermediate target hidden
+        # states.  See ``ArchitectureConfig.output_layer_indices``.
+        config = dataclasses.replace(config, output_layer_indices=list(output_layer_indices))
 
     if task is None:
         task = _default_task_for_model(model_type)

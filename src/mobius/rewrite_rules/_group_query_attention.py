@@ -49,24 +49,22 @@ from onnxscript.rewriter._rewrite_rule import (
     RewriteRuleSet,
 )
 
-# CUDA EP's GroupQueryAttention kernel historically enforced MAX_HEAD_SIZE = 256.
-# Keep the rewrite-rule limit conservative until GQA fusion is gated on a
-# runtime/EP capability check. This avoids emitting GroupQueryAttention nodes
-# with head_dim=512 that can still fail on released ORT builds.
-_MAX_GQA_HEAD_DIM = 256
 
+def _has_unequal_kv_head_dimensions(k, v, past_key, past_value) -> bool:
+    """Return whether static K/V shapes prove incompatible GQA head dimensions."""
 
-def _head_dim_exceeds_gqa_limit(past_key) -> int | None:
-    """Return the head_dim if it exceeds the GQA kernel limit, else None.
+    def _static_last_dim(value):
+        if value is None or value.shape is None or len(value.shape) == 0:
+            return None
+        dim = value.shape[-1]
+        return dim if isinstance(dim, int) else None
 
-    ``past_key`` is expected to have shape ``(batch, kv_heads, seq, head_dim)``.
-    """
-    if past_key is None or past_key.shape is None or len(past_key.shape) < 4:
-        return None
-    hd = past_key.shape[3]
-    if isinstance(hd, int) and hd > _MAX_GQA_HEAD_DIM:
-        return hd
-    return None
+    for key, value in ((k, v), (past_key, past_value)):
+        key_dim = _static_last_dim(key)
+        value_dim = _static_last_dim(value)
+        if key_dim is not None and value_dim is not None and key_dim != value_dim:
+            return True
+    return False
 
 
 class RotaryAttentionToGQA(RewriteRuleClassBase):
@@ -138,7 +136,7 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
 
     # ------------------------------------------------------------------ check
 
-    def check(self, context, attn_out, cos, sin, past_key, past_value, **_):
+    def check(self, context, attn_out, k_pre, v, cos, sin, past_key, past_value, **_):
         result = MatchResult()
 
         attn = attn_out.producer()
@@ -166,10 +164,8 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
         if past_value.producer() is not None:
             return result.fail("past_value is not a graph input")
 
-        # Skip when head_dim exceeds CUDA GQA MAX_HEAD_SIZE (256).
-        hd = _head_dim_exceeds_gqa_limit(past_key)
-        if hd is not None:
-            return result.fail(f"head_dim={hd} exceeds GQA MAX_HEAD_SIZE={_MAX_GQA_HEAD_DIM}")
+        if _has_unequal_kv_head_dimensions(k_pre, v, past_key, past_value):
+            return result.fail("K and V head dimensions differ; retain standard Attention")
 
         return result
 
@@ -244,22 +240,19 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
         }
         if softcap:
             gqa_attrs["softcap"] = softcap
-        outputs = op.op_multi_out(
-            "GroupQueryAttention",
-            inputs=[
-                q_pre,
-                k_pre,
-                v,
-                past_key,
-                past_value,
-                self._seqlens_k,
-                self._total_seq_len,
-                self._cos_cache,
-                self._sin_cache,
-            ],
-            domain="com.microsoft",
-            attributes=gqa_attrs,
-            num_outputs=3,
+        outputs = op.GroupQueryAttention(
+            q_pre,
+            k_pre,
+            v,
+            past_key,
+            past_value,
+            self._seqlens_k,
+            self._total_seq_len,
+            self._cos_cache,
+            self._sin_cache,
+            _domain="com.microsoft",
+            _outputs=3,
+            **gqa_attrs,
         )
 
         return outputs[0], outputs[1], outputs[2]
@@ -377,17 +370,14 @@ class PackQKVForGQA(RewriteRuleClassBase):
         gqa_node = gqa_out.producer()
         attrs = {key: gqa_node.attributes[key].value for key in gqa_node.attributes}
 
-        outputs = op.op_multi_out(
-            "GroupQueryAttention",
-            inputs=[
-                packed_qkv,
-                None,
-                None,
-                *gqa_node.inputs[3:],
-            ],
-            domain="com.microsoft",
-            attributes=attrs,
-            num_outputs=3,
+        outputs = op.GroupQueryAttention(
+            packed_qkv,
+            None,
+            None,
+            *gqa_node.inputs[3:],
+            _domain="com.microsoft",
+            _outputs=3,
+            **attrs,
         )
 
         return outputs[0], outputs[1], outputs[2]
@@ -507,17 +497,14 @@ class PackQKVWithBiasForGQA(RewriteRuleClassBase):
         gqa_node = gqa_out.producer()
         attrs = {key: gqa_node.attributes[key].value for key in gqa_node.attributes}
 
-        outputs = op.op_multi_out(
-            "GroupQueryAttention",
-            inputs=[
-                packed_qkv,
-                None,
-                None,
-                *gqa_node.inputs[3:],
-            ],
-            domain="com.microsoft",
-            attributes=attrs,
-            num_outputs=3,
+        outputs = op.GroupQueryAttention(
+            packed_qkv,
+            None,
+            None,
+            *gqa_node.inputs[3:],
+            _domain="com.microsoft",
+            _outputs=3,
+            **attrs,
         )
 
         return outputs[0], outputs[1], outputs[2]
@@ -580,7 +567,7 @@ class AttentionToGQA(RewriteRuleClassBase):
 
     # ------------------------------------------------------------------ check
 
-    def check(self, context, attn_out, past_key, past_value, **_):
+    def check(self, context, attn_out, k, v, past_key, past_value, **_):
         result = MatchResult()
         attn = attn_out.producer()
 
@@ -604,10 +591,8 @@ class AttentionToGQA(RewriteRuleClassBase):
         if not any(gi.name == "attention_mask" for gi in graph.inputs):
             return result.fail("No attention_mask graph input — cannot build seqlens_k")
 
-        # Skip when head_dim exceeds CUDA GQA MAX_HEAD_SIZE (256).
-        hd = _head_dim_exceeds_gqa_limit(past_key)
-        if hd is not None:
-            return result.fail(f"head_dim={hd} exceeds GQA MAX_HEAD_SIZE={_MAX_GQA_HEAD_DIM}")
+        if _has_unequal_kv_head_dimensions(k, v, past_key, past_value):
+            return result.fail("K and V head dimensions differ; retain standard Attention")
 
         return result
 
@@ -655,12 +640,17 @@ class AttentionToGQA(RewriteRuleClassBase):
         if softcap:
             gqa_attrs["softcap"] = softcap
 
-        outputs = op.op_multi_out(
-            "GroupQueryAttention",
-            inputs=[q, k, v, past_key, past_value, self._seqlens_k, self._total_seq_len],
-            domain="com.microsoft",
-            attributes=gqa_attrs,
-            num_outputs=3,
+        outputs = op.GroupQueryAttention(
+            q,
+            k,
+            v,
+            past_key,
+            past_value,
+            self._seqlens_k,
+            self._total_seq_len,
+            _domain="com.microsoft",
+            _outputs=3,
+            **gqa_attrs,
         )
         return outputs[0], outputs[1], outputs[2]
 
@@ -679,13 +669,23 @@ def group_query_attention_rules() -> RewriteRuleSet:
        position embeddings are not expressed as standard ``RotaryEmbedding``
        ops (e.g. Qwen3.5 3D mRoPE via ``Where`` nodes).
 
+    GQA fusion is applied uniformly to every decoder ``Attention`` node
+    regardless of ``head_dim`` — there is no head-dim cap.  Whether a given
+    runtime's GQA kernel supports a particular ``head_dim`` is a separate EP
+    concern, gated by :attr:`~mobius._execution_providers.EpCapabilities.gqa_dtypes`.
+
     QKV packing is a separate optional pass; use
     :func:`pack_qkv_for_gqa_rules` for that.
 
     Returns:
         :class:`RewriteRuleSet` containing the GQA fusion rules.
     """
-    return RewriteRuleSet([RotaryAttentionToGQA().rule(), AttentionToGQA().rule()])
+    return RewriteRuleSet(
+        [
+            RotaryAttentionToGQA.rule(),
+            AttentionToGQA.rule(),
+        ]
+    )
 
 
 def pack_qkv_for_gqa_rules() -> RewriteRuleSet:
