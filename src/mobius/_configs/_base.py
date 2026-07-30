@@ -2226,10 +2226,25 @@ class GraniteMoeHybridConfig(BambaConfig):
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> GraniteMoeHybridConfig:
-        # Reuse BambaConfig.from_transformers for mamba fields + layer_types conversion
-        # (converts HF "mamba"→"mamba2" and "attention"→"full_attention")
+        # Reuse BambaConfig.from_transformers for mamba fields, MoE/RoPE/multiplier
+        # extraction, then rebuild layer_types from GraniteMoeHybrid's own naming.
         bamba = BambaConfig.from_transformers(config, parent_config)
         bamba_fields = _shallow_fields(bamba)
+
+        # GraniteMoeHybrid names layers "full_attention" / "linear_attention"
+        # (linear_attention == Mamba2/SSD), unlike Bamba's "attention" / "mamba".
+        raw_layer_types = (
+            getattr(config, "layer_types", None)
+            or getattr(config, "layers_block_type", None)
+            or []
+        )
+        layer_types = [
+            "full_attention" if ltype == "full_attention" else "mamba2"
+            for ltype in raw_layer_types
+        ]
+        if layer_types:
+            bamba_fields["layer_types"] = layer_types
+
         return cls(
             **bamba_fields,
             shared_intermediate_size=getattr(config, "shared_intermediate_size", 1024),
