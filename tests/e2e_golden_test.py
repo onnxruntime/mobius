@@ -25,9 +25,11 @@ Run::
 from __future__ import annotations
 
 import dataclasses
+import functools
 import os
 import warnings
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -49,6 +51,16 @@ from mobius._testing.golden import (
 )
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius._testing.parity import ParityResult, compare_golden
+
+
+@functools.cache
+def _load_phi3_vision_projector_weights_cached(model_id: str):
+    from mobius.models._phi3_vision_projector import (
+        load_phi3_vision_projector_weights,
+    )
+
+    return load_phi3_vision_projector_weights(model_id)
+
 
 # Root of test data (images, audio, etc.)
 _TESTDATA_DIR = Path(__file__).resolve().parent.parent / "testdata"
@@ -148,10 +160,70 @@ def _build_mm_prompt(
         return processor.apply_chat_template(  # type: ignore[attr-defined]
             messages, tokenize=False, add_generation_prompt=True
         )
+    # Some processors (e.g. Phi-3.5-Vision's ``Phi3VProcessor``) expose the chat
+    # template on the *inner tokenizer* rather than the processor, and use
+    # numbered placeholders (``<|image_1|>``) enumerated in ``img_tokens``.
+    inner_tokenizer = getattr(processor, "tokenizer", None)
+    numbered_token_attribute = {"image": "img_tokens", "audio": "audio_tokens"}.get(media_kind)
+    numbered_media_tokens = (
+        getattr(processor, numbered_token_attribute, None)
+        if numbered_token_attribute is not None
+        else None
+    )
+    if (
+        inner_tokenizer is not None
+        and numbered_media_tokens is not None
+        and getattr(inner_tokenizer, "chat_template", None)
+    ):
+        if len(media_paths) > len(numbered_media_tokens):
+            raise ValueError(
+                f"{type(processor).__name__} exposes {len(numbered_media_tokens)} "
+                f"numbered {media_kind} placeholders, but the case requested "
+                f"{len(media_paths)} media items"
+            )
+        media_prefix = "".join(
+            f"{numbered_media_tokens[index]}\n" for index in range(len(media_paths))
+        )
+        messages = [{"role": "user", "content": media_prefix + base_prompt}]
+        return inner_tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
     placeholder = getattr(processor, f"{media_kind}_token", None)
     if placeholder:
         return placeholder * len(media_paths) + base_prompt
     return base_prompt
+
+
+def test_build_mm_prompt_rejects_more_media_than_numbered_tokens():
+    tokenizer = type(
+        "_Tokenizer",
+        (),
+        {
+            "chat_template": "template",
+            "apply_chat_template": lambda *args, **kwargs: "",
+        },
+    )()
+    processor = type(
+        "_Processor",
+        (),
+        {"tokenizer": tokenizer, "img_tokens": ["<|image_1|>"]},
+    )()
+
+    with pytest.raises(ValueError, match="exposes 1 numbered image placeholders"):
+        _build_mm_prompt(processor, "describe", ["a.png", "b.png"], "image")
+
+
+def test_phi3_vision_projector_weights_are_cached():
+    _load_phi3_vision_projector_weights_cached.cache_clear()
+    weights = object()
+    with mock.patch(
+        "mobius.models._phi3_vision_projector.load_phi3_vision_projector_weights",
+        return_value=weights,
+    ) as load:
+        assert _load_phi3_vision_projector_weights_cached("model-id") is weights
+        assert _load_phi3_vision_projector_weights_cached("model-id") is weights
+    load.assert_called_once_with("model-id")
+    _load_phi3_vision_projector_weights_cached.cache_clear()
 
 
 def _make_empty_kv_cache(
@@ -709,6 +781,73 @@ def _compute_mrope_position_ids(
     return position_ids
 
 
+def _run_vl_vision_to_image_features(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+    processed: dict[str, np.ndarray],
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """Run the ONNX vision encoder and return the embedding model's image features.
+
+    Returns ``(vision_outputs, image_features)`` where ``image_features`` is the
+    tensor to feed into the embedding model's ``image_features`` input.
+
+    For most vision-language models the vision encoder output is used directly.
+    Phi-3.5-Vision (``model_type == "phi3_v"``) additionally requires the
+    host-side HD feature transform + ``img_projection`` MLP — an image-size
+    dependent step that cannot be a static ONNX graph — to map the raw CLIP
+    patch features ``(num_crops, 576, image_dim_out)`` into projected image
+    embeddings ``(total_image_tokens, hidden_size)``.
+    """
+    vis_session = OnnxModelSession(pkg["vision_encoder"], **_get_test_device_kwargs())
+    try:
+        if case.model_type == "phi3_v":
+            from mobius.models._phi3_vision_projector import (
+                phi3_vision_hd_feature_transform,
+            )
+
+            # The HF processor emits pixel_values shaped
+            # (num_images, num_crops + 1, 3, 336, 336). The ONNX vision encoder
+            # takes 4-D NCHW input, so flatten the leading crop dimension.
+            pixel_values_dtype = vis_session.get_input_dtype("pixel_values")
+            if pixel_values_dtype is None:
+                raise ValueError("Phi-3.5 vision encoder must have a pixel_values input dtype")
+            pixel_values = np.asarray(processed["pixel_values"], dtype=pixel_values_dtype)
+            num_images, num_crops_including_global = pixel_values.shape[:2]
+            flat_pixel_values = pixel_values.reshape(
+                num_images * num_crops_including_global, *pixel_values.shape[2:]
+            )
+            vis_out = vis_session.run({"pixel_values": flat_pixel_values})
+            raw_patch_features = vis_out[next(iter(vis_out))]
+            image_dim_out = raw_patch_features.shape[-1]
+            image_features_per_crop = raw_patch_features.reshape(
+                num_images, num_crops_including_global, -1, image_dim_out
+            )
+            projector_weights = _load_phi3_vision_projector_weights_cached(case.model_id)
+            projected = phi3_vision_hd_feature_transform(
+                image_features_per_crop,
+                np.asarray(processed["image_sizes"]),
+                projector_weights,
+            )
+            return vis_out, projected
+
+        vis_feeds: dict[str, np.ndarray] = {}
+        for name in vis_session.input_names:
+            if name in processed:
+                val = processed[name]
+                vis_feeds[name] = val if isinstance(val, np.ndarray) else np.array(val)
+            else:
+                # Handle HF↔ONNX name mismatches (e.g. HF "image_position_ids"
+                # vs ONNX "pixel_position_ids").
+                for hf_key, val in processed.items():
+                    if hf_key.replace("image_", "pixel_") == name:
+                        vis_feeds[name] = val if isinstance(val, np.ndarray) else np.array(val)
+                        break
+        vis_out = vis_session.run(vis_feeds)
+        return vis_out, vis_out[next(iter(vis_out))]
+    finally:
+        vis_session.close()
+
+
 def _run_vision_language_prefill(
     pkg: ModelPackage,
     case: GoldenTestCase,
@@ -742,28 +881,8 @@ def _run_vision_language_prefill(
         k: v.numpy() if hasattr(v, "numpy") else np.array(v) for k, v in processed_pt.items()
     }
 
-    # --- Step 1: Run vision encoder ---
-    vis_session = OnnxModelSession(pkg["vision_encoder"], **_get_test_device_kwargs())
-    try:
-        vis_feeds: dict[str, np.ndarray] = {}
-        for name in vis_session.input_names:
-            if name in processed:
-                val = processed[name]
-                vis_feeds[name] = val if isinstance(val, np.ndarray) else np.array(val)
-            else:
-                # Handle HF↔ONNX name mismatches (e.g. HF "image_position_ids"
-                # vs ONNX "pixel_position_ids").
-                for hf_key, val in processed.items():
-                    if hf_key.replace("image_", "pixel_") == name:
-                        vis_feeds[name] = val if isinstance(val, np.ndarray) else np.array(val)
-                        break
-        vis_out = vis_session.run(vis_feeds)
-    finally:
-        vis_session.close()
-
-    # Extract the image hidden states (first output)
-    vis_hidden_key = next(iter(vis_out))
-    vis_hidden = vis_out[vis_hidden_key]
+    # --- Step 1: Run vision encoder (+ host-side projector where required) ---
+    vis_out, image_features = _run_vl_vision_to_image_features(pkg, case, processed)
 
     # --- Step 2: Run embedding model ---
     emb_session = OnnxModelSession(pkg["embedding"], **_get_test_device_kwargs())
@@ -773,10 +892,10 @@ def _run_vision_language_prefill(
         }
         # Pass vision hidden states
         for name in emb_session.input_names:
-            if name not in emb_feeds and name in vis_out:
+            if name == "image_features":
+                emb_feeds[name] = image_features
+            elif name not in emb_feeds and name in vis_out:
                 emb_feeds[name] = vis_out[name]
-            elif name == "image_features":
-                emb_feeds[name] = vis_hidden
             elif name not in emb_feeds:
                 # Provide empty tensor for unused modalities (e.g. audio_features)
                 shape = emb_session.get_input_shape(name) or []
@@ -926,24 +1045,8 @@ def _run_vl_generation(
         k: v.numpy() if hasattr(v, "numpy") else np.array(v) for k, v in processed_pt.items()
     }
 
-    # --- Step 1: vision encoder ---
-    vis_session = OnnxModelSession(pkg["vision_encoder"], **_get_test_device_kwargs())
-    try:
-        vis_feeds: dict[str, np.ndarray] = {}
-        for name in vis_session.input_names:
-            if name in processed:
-                vis_feeds[name] = processed[name]
-            else:
-                # HF↔ONNX name mismatch (e.g. image_position_ids → pixel_position_ids)
-                for hf_key, val in processed.items():
-                    if hf_key.replace("image_", "pixel_") == name:
-                        vis_feeds[name] = val if isinstance(val, np.ndarray) else np.array(val)
-                        break
-        vis_out = vis_session.run(vis_feeds)
-    finally:
-        vis_session.close()
-
-    vis_hidden = vis_out[next(iter(vis_out))]  # image feature tensor
+    # --- Step 1: vision encoder (+ host-side projector where required) ---
+    _vis_out, image_features = _run_vl_vision_to_image_features(pkg, case, processed)
 
     # --- Step 2: embedding (prefill) ---
     # VL packages use "decoder" as the decoder key
@@ -962,7 +1065,7 @@ def _run_vl_generation(
             "input_ids": processed["input_ids"].astype(np.int64),
         }
         if image_feat_input is not None:
-            emb_feeds[image_feat_input] = vis_hidden
+            emb_feeds[image_feat_input] = image_features
         # Provide empty tensors for unused modalities (e.g. audio_features)
         for name in emb_session.input_names:
             if name not in emb_feeds:

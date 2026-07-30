@@ -11,19 +11,22 @@ Builds three ONNX models:
 
 Architecture:
     pixel_values (num_crops, 3, 336, 336)
-        → CLIP ViT-L/14-336 → (num_crops, 576, 1024)
-        → MLP projector    → (num_crops, 576, 3072)
+        → CLIP ViT-L/14-336 (hidden_states[-2], CLS dropped) → (num_crops, 576, 1024)
+        → [host-side HD transform: 2x2 merge + sub_GN/glb_GN + MLP projector]
         → concat + insert into input sequence
         → Phi3 text decoder
 
 The vision encoder uses CLIP ViT-L/14-336 (patch_size=14, image_size=336),
-which produces 576 patches per crop. The MLP projector maps from the vision
-hidden size (1024) to the text hidden size (3072).
+which produces 576 patches per crop (after dropping the CLS token). Features
+are taken from ``hidden_states[layer_idx]`` (default ``-2``): the last encoder
+layer and ``post_layernorm`` are skipped, matching HuggingFace's
+``get_img_features``.
 
 HD transform note: the HuggingFace phi3_v model supports high-definition
-tiling (sub_glb ordering with learnable separators). This ONNX implementation
-processes a batch of pre-tiled crops uniformly — the HD tiling and separator
-insertion is expected to happen in the preprocessing step outside ONNX.
+tiling (sub_glb ordering with learnable separators) and the ``img_projection``
+MLP whose input width is ``image_dim_out * 4``. Both are image-size dependent
+and are expected to run host-side, outside ONNX — the ONNX vision encoder
+emits the raw per-crop CLIP patch features that feed into them.
 
 HuggingFace weight name prefixes::
 
@@ -35,11 +38,10 @@ HuggingFace weight name prefixes::
     model.norm.* / lm_head.*
         → decoder.model.norm.* / decoder.lm_head.*
     model.vision_embed_tokens.img_processor.vision_model.*
-        → vision_encoder.vision_tower.vision_model.*
-    model.vision_embed_tokens.img_projection.0.*  (fc1)
-        → vision_encoder.multi_modal_projector.fc1.*
-    model.vision_embed_tokens.img_projection.2.*  (fc2)
-        → vision_encoder.multi_modal_projector.fc2.*
+        → vision_encoder.vision_tower.*  (CLIP tower only)
+
+    (model.vision_embed_tokens.img_projection.* and sub_GN/glb_GN are
+     host-side and intentionally not exported.)
 
 Reference: ``microsoft/Phi-3-vision-128k-instruct``,
 ``microsoft/Phi-3.5-vision-instruct``.
@@ -58,16 +60,21 @@ from mobius._weight_utils import split_fused_qkv, split_gate_up_proj
 from mobius.components import (
     Embedding,
     Linear,
-    MLPMultiModalProjector,
-    VisionModel,
 )
 from mobius.models.base import TextModel
+from mobius.models.clip import (
+    ClipVisionConfigView,
+    CLIPVisionModel,
+    _rename_clip_vision_weight,
+)
 
 if TYPE_CHECKING:
     import onnx_ir as ir
 
-# Phi-3-Vision: <|image|> token id
-_IMAGE_TOKEN_ID = 32044
+# Upper bound (magnitude) for negative image placeholder ids, mirroring
+# ``modeling_phi3_v.MAX_INPUT_ID = int(1e9)``. Image positions satisfy
+# ``-_MAX_INPUT_ID < input_ids < 0``.
+_MAX_INPUT_ID = 1_000_000_000
 
 
 class _Phi3VDecoderModel(nn.Module):
@@ -140,74 +147,95 @@ class _Phi3VDecoderModel(nn.Module):
         return renamed
 
 
+# Prefix under which the CLIP ViT weights live in a Phi-3-V checkpoint.
+_VISION_TOWER_PREFIX = "model.vision_embed_tokens.img_processor."
+
+
+def _rename_phi3v_vision_weight(name: str) -> str | None:
+    """Map a Phi-3-V ``img_processor`` CLIP weight to ``vision_tower.*``.
+
+    Strips the ``model.vision_embed_tokens.img_processor.`` prefix, then reuses
+    the shared CLIP vision renamer (which handles the ``vision_model.`` prefix,
+    the ``patch_embedding`` → ``patch_embedding.projection`` Conv wrapping, the
+    ``mlp.fc1/fc2`` → ``mlp.up_proj/down_proj`` naming, and the per-layer
+    ``encoder.layers.N`` → ``encoder.N`` flattening).
+
+    Returns ``None`` for weights that are not part of the CLIP tower (e.g. the
+    ``img_projection`` MLP and the learnable ``sub_GN``/``glb_GN`` separators,
+    which are applied host-side as part of the HD feature transform).
+    """
+    if not name.startswith(_VISION_TOWER_PREFIX):
+        return None
+    clip_name = _rename_clip_vision_weight(name[len(_VISION_TOWER_PREFIX) :])
+    if clip_name is None:
+        return None
+    return "vision_tower." + clip_name
+
+
 class _Phi3VVisionEncoderModel(nn.Module):
-    """Phi3-V vision encoder: CLIP ViT-L/14-336 + MLP projector.
+    """Phi3-V vision encoder: CLIP ViT-L/14-336 patch-feature extractor.
 
-    Accepts a batch of image crops (pre-tiled), applies the CLIP encoder to
-    each, and projects from the vision hidden size to the text hidden size.
+    Faithfully reproduces HuggingFace ``Phi3ImageEmbedding.get_img_features``:
+    run the CLIP tower to ``hidden_states[layer_idx]`` (default ``-2``, i.e. all
+    but the last encoder layer and no ``post_layernorm``) and keep only the
+    patch tokens, dropping the leading CLS token.
 
-    Input shape:  (num_crops, 3, 336, 336)  — NCHW
-    Output shape: (num_crops * num_patches, text_hidden_size)
+    The ``img_projection`` MLP and the HD 2x2 patch-merge with learnable
+    ``sub_GN``/``glb_GN`` separators are intentionally *not* part of this ONNX
+    graph: the projector's input width (``image_dim_out * 4``) only exists after
+    the host-side HD feature transform, which is image-size dependent and cannot
+    be expressed as a static graph. They run host-side alongside the pre-tiling
+    of crops, consistent with the model's HD-transform design.
+
+    Input shape:  (num_crops, 3, image_size, image_size)  — NCHW
+    Output shape: (num_crops, num_patches, image_dim_out)  — raw patch features
     """
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
-        self.vision_tower = VisionModel(config)
-        self.multi_modal_projector = MLPMultiModalProjector(
-            vision_hidden_size=config.vision.hidden_size,
-            text_hidden_size=config.hidden_size,
+        assert config.vision is not None, "Phi3-V requires a vision config"
+        clip_config = ClipVisionConfigView(config.vision)
+        self.vision_tower = CLIPVisionModel(
+            clip_config,
+            feature_layer=config.vision.feature_layer,
+            drop_class_token=True,
         )
 
     def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
-        # pixel_values: (num_crops, 3, H, W)
-        vision_features = self.vision_tower(op, pixel_values)
-        # vision_features: (num_crops, num_patches, vision_hidden)
-        # Flatten crops and patches into a single token sequence
-        num_crops = op.Shape(pixel_values, start=0, end=1)  # scalar
-        num_patches = op.Shape(vision_features, start=1, end=2)
-        total = op.Mul(num_crops, num_patches)
-        vision_dim = op.Shape(vision_features, start=2, end=3)
-        flat_shape = op.Concat(total, vision_dim, axis=0)
-        vision_features = op.Reshape(vision_features, flat_shape)
-        # vision_features: (num_crops * num_patches, vision_hidden)
-        return self.multi_modal_projector(op, vision_features)
+        # pixel_values: (num_crops, 3, H, W) -> (num_crops, num_patches, image_dim_out)
+        return self.vision_tower(op, pixel_values)
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        """Extract vision encoder and projector weights from the full checkpoint.
+        """Extract CLIP vision-tower weights from the full checkpoint.
 
         HF path → ONNX path::
 
             model.vision_embed_tokens.img_processor.vision_model.*
-                → vision_tower.vision_model.*
-            model.vision_embed_tokens.img_projection.0.*
-                → multi_modal_projector.fc1.*
-            model.vision_embed_tokens.img_projection.2.*
-                → multi_modal_projector.fc2.*
+                → vision_tower.*  (via the shared CLIP renamer)
+
+        The ``img_projection`` and ``sub_GN``/``glb_GN`` tensors are dropped
+        (host-side HD transform).
         """
-        renamed: dict[str, torch.Tensor] = {}
-
-        vision_pfx = "model.vision_embed_tokens.img_processor."
-        proj_0_pfx = "model.vision_embed_tokens.img_projection.0."
-        proj_2_pfx = "model.vision_embed_tokens.img_projection.2."
-
+        clip_state_dict: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
-            if key.startswith(vision_pfx):
-                renamed["vision_tower." + key[len(vision_pfx) :]] = value
-            elif key.startswith(proj_0_pfx):
-                renamed["multi_modal_projector.fc1." + key[len(proj_0_pfx) :]] = value
-            elif key.startswith(proj_2_pfx):
-                renamed["multi_modal_projector.fc2." + key[len(proj_2_pfx) :]] = value
-
+            if key.startswith(_VISION_TOWER_PREFIX):
+                clip_state_dict[key[len(_VISION_TOWER_PREFIX) :]] = value
+        renamed = {
+            "vision_tower." + key: value
+            for key, value in self.vision_tower.preprocess_weights(clip_state_dict).items()
+        }
         return renamed
 
 
 class _Phi3VEmbeddingModel(nn.Module):
     """Phi3-V embedding: token lookup + image feature fusion.
 
-    Replaces <|image|> token positions with projected vision features
-    from the vision encoder.
+    Replaces image placeholder positions with projected vision features from
+    the vision encoder. Phi-3/3.5-Vision processors mark those positions with
+    *negative* placeholder ids (-1, -2, ...), matched here the same way HF's
+    ``modeling_phi3_v`` does — see ``forward``.
     """
 
     def __init__(self, config: ArchitectureConfig):
@@ -215,13 +243,20 @@ class _Phi3VEmbeddingModel(nn.Module):
         self.embed_tokens = Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
-        self.image_token_id = (
-            config.image_token_id if config.image_token_id is not None else _IMAGE_TOKEN_ID
-        )
+        self.hidden_size = config.hidden_size
 
     def forward(self, op: builder.OpBuilder, input_ids: ir.Value, image_features: ir.Value):
         # (batch, seq_len, hidden_size)
-        image_mask = op.Equal(input_ids, op.Constant(value_int=self.image_token_id))
+        # Phi-3/3.5-Vision processors mark image placeholder positions with
+        # *negative* token ids (-1 for the first image, -2 for the second, ...),
+        # NOT with a positive ``image_token_id``. Detect them exactly as HF's
+        # ``modeling_phi3_v`` does: ``(input_ids < 0) & (input_ids > -MAX_INPUT_ID)``.
+        # Matching a positive id here would never fire for real processor output,
+        # leaving image features unfused and the decoder running "blind".
+        image_mask = op.And(
+            op.Less(input_ids, op.Constant(value_int=0)),
+            op.Greater(input_ids, op.Constant(value_int=-_MAX_INPUT_ID)),
+        )
         # Replace image token positions with index 0 before the Gather so that
         # negative or out-of-range image token IDs don't cause undefined behavior.
         # These positions will be overwritten by image features via op.Where below.
@@ -235,7 +270,17 @@ class _Phi3VEmbeddingModel(nn.Module):
         indices = op.Sub(cumsum, op.Constant(value_int=1))
         indices = op.Clip(indices, op.Constant(value_int=0))
 
-        gathered = op.Gather(image_features, indices, axis=0)
+        # Pad ``image_features`` with a single trailing zero row so the Gather is
+        # always valid — including at decode time, when there are no image
+        # placeholders and the harness/runtime passes an empty (0-row) tensor.
+        # Without the pad, ``Gather`` would index row 0 of a 0-row tensor and
+        # raise an out-of-bounds error. The gathered padding is discarded by the
+        # ``Where`` below (image_mask is all-false when there are no image rows).
+        zero_row = op.ConstantOfShape(op.Constant(value_ints=[1, self.hidden_size]))
+        zero_row = op.CastLike(zero_row, image_features)
+        padded_features = op.Concat(image_features, zero_row, axis=0)
+
+        gathered = op.Gather(padded_features, indices, axis=0)
         return op.Where(image_mask_3d, gathered, text_embeds)
 
     def preprocess_weights(
@@ -295,32 +340,22 @@ class Phi3VModel(nn.Module):
                 → decoder.model.layers.N.*       (split)
             model.norm.* / lm_head.*
                 → decoder.model.norm.* / decoder.lm_head.*
-            model.vision_embed_tokens.img_processor.*
-                → vision_encoder.vision_tower.*
-            model.vision_embed_tokens.img_projection.0.*
-                → vision_encoder.multi_modal_projector.fc1.*
-            model.vision_embed_tokens.img_projection.2.*
-                → vision_encoder.multi_modal_projector.fc2.*
+            model.vision_embed_tokens.img_processor.vision_model.*
+                → vision_encoder.vision_tower.*  (CLIP tower only)
+
+        The ``img_projection`` MLP and the learnable ``sub_GN``/``glb_GN``
+        separators are dropped — they are applied host-side as part of the HD
+        feature transform (see :class:`_Phi3VVisionEncoderModel`).
         """
         renamed: dict[str, torch.Tensor] = {}
 
-        vision_pfx = "model.vision_embed_tokens.img_processor."
-        proj_0_pfx = "model.vision_embed_tokens.img_projection.0."
-        proj_2_pfx = "model.vision_embed_tokens.img_projection.2."
+        for key, value in self.vision_encoder.preprocess_weights(state_dict).items():
+            renamed["vision_encoder." + key] = value
 
         for key, value in state_dict.items():
-            if key.startswith(vision_pfx):
-                new_key = "vision_encoder.vision_tower." + key[len(vision_pfx) :]
-                renamed[new_key] = value
-            elif key.startswith(proj_0_pfx):
-                sfx = key[len(proj_0_pfx) :]
-                renamed[f"vision_encoder.multi_modal_projector.fc1.{sfx}"] = value
-            elif key.startswith(proj_2_pfx):
-                sfx = key[len(proj_2_pfx) :]
-                renamed[f"vision_encoder.multi_modal_projector.fc2.{sfx}"] = value
-            elif key.startswith("model.vision_embed_tokens."):
-                # Learnable separators (sub_GN, glb_GN) and other VE state
-                # are not used in the ONNX decoder sub-model — skip them.
+            if key.startswith("model.vision_embed_tokens."):
+                # img_projection / sub_GN / glb_GN and any other vision-embed
+                # state is host-side (HD transform) — skip it.
                 pass
             elif key == "model.embed_tokens.weight":
                 renamed["decoder.model.embed_tokens.weight"] = value

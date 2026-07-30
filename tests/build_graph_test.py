@@ -5997,3 +5997,148 @@ class TestResolveSlidingWindow:
             self._cfg(model_type="mistral", sliding_window=4096), "mistral"
         )
         assert cfg.sliding_window == 4096
+
+
+class TestLongRopeAliasExtraction:
+    """``rope_type`` alias handling for Phi LongRoPE.
+
+    Phi-3/Phi-3.5 checkpoints label LongRoPE as ``"su"`` (short/long-factor
+    scaled rotary embeddings); newer HuggingFace configs spell the identical
+    algorithm ``"longrope"``. ``_extract_rope_config`` must canonicalize the
+    legacy ``"su"`` alias to ``"longrope"`` so both configs resolve to the
+    same ``LongRope`` code path.
+    """
+
+    _SHORT_FACTOR = [1.0] * (TINY_HEAD_DIM // 2)
+    _LONG_FACTOR = [2.0] * (TINY_HEAD_DIM // 2)
+
+    @staticmethod
+    def _cfg(rope_scaling, **attrs):
+        from types import SimpleNamespace
+
+        defaults = dict(
+            model_type="phi3",
+            hidden_size=TINY_HIDDEN,
+            intermediate_size=TINY_INTERMEDIATE,
+            num_attention_heads=TINY_HEADS,
+            num_key_value_heads=TINY_KV_HEADS,
+            head_dim=TINY_HEAD_DIM,
+            num_hidden_layers=TINY_LAYERS,
+            vocab_size=TINY_VOCAB,
+            max_position_embeddings=1024,
+            original_max_position_embeddings=128,
+            hidden_act="silu",
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            rope_scaling=rope_scaling,
+        )
+        defaults.update(attrs)
+        return SimpleNamespace(**defaults)
+
+    def _scaling(self, rope_type_key, rope_type_value):
+        return {
+            rope_type_key: rope_type_value,
+            "short_factor": self._SHORT_FACTOR,
+            "long_factor": self._LONG_FACTOR,
+        }
+
+    def test_su_and_longrope_produce_identical_rope_config(self):
+        """``type="su"`` and ``rope_type="longrope"`` extract identically."""
+        from mobius._configs._base import _extract_rope_config
+
+        su_config = _extract_rope_config(self._cfg(self._scaling("type", "su")))
+        longrope_config = _extract_rope_config(
+            self._cfg(self._scaling("rope_type", "longrope"))
+        )
+
+        assert su_config is not None
+        assert su_config.rope_type == "longrope"
+        assert longrope_config.rope_type == "longrope"
+        assert su_config.original_max_position_embeddings == 128
+        assert su_config.rope_type == longrope_config.rope_type
+        assert (
+            su_config.rope_scaling["short_factor"]
+            == longrope_config.rope_scaling["short_factor"]
+        )
+        assert (
+            su_config.rope_scaling["long_factor"]
+            == longrope_config.rope_scaling["long_factor"]
+        )
+        assert (
+            su_config.original_max_position_embeddings
+            == longrope_config.original_max_position_embeddings
+        )
+
+    def test_su_alias_dispatches_to_longrope_module(self):
+        """A ``"su"`` config resolves to the ``LongRope`` runtime module."""
+        from mobius.components._rotary_embedding import LongRope, initialize_rope
+
+        config = ArchitectureConfig.from_transformers(self._cfg(self._scaling("type", "su")))
+        assert config.rope_type == "longrope"
+        rope = initialize_rope(config)
+        assert isinstance(rope, LongRope)
+
+    def test_su_graph_builds_end_to_end(self):
+        """A phi3 ``"su"`` config builds a valid ONNX graph without weights."""
+        config = ArchitectureConfig.from_transformers(self._cfg(self._scaling("type", "su")))
+        module = registry.get("phi3")(config)
+        task = get_task(_default_task_for_model("phi3"))
+        pkg = task.build(module, config)
+        model = pkg["model"]
+
+        assert model.graph is not None
+        input_names = {inp.name for inp in model.graph.inputs}
+        assert "input_ids" in input_names
+        assert "position_ids" in input_names
+        output_names = {out.name for out in model.graph.outputs}
+        assert "logits" in output_names
+
+    def test_missing_original_max_position_embeddings_still_maps_to_longrope(self):
+        """A ``"su"`` config without ``original_max_position_embeddings``.
+
+        The alias must still resolve to ``longrope`` and ``LongRope`` falls
+        back to ``max_position_embeddings`` for the short cache length rather
+        than crashing.
+        """
+        from mobius._configs._base import _extract_rope_config
+        from mobius.components._rotary_embedding import LongRope, initialize_rope
+
+        config_source = self._cfg(
+            self._scaling("type", "su"), original_max_position_embeddings=None
+        )
+        rope_config = _extract_rope_config(config_source)
+        assert rope_config.rope_type == "longrope"
+        assert rope_config.original_max_position_embeddings is None
+
+        arch_config = ArchitectureConfig.from_transformers(config_source)
+        rope = initialize_rope(arch_config)
+        assert isinstance(rope, LongRope)
+
+    def test_factor_length_mismatch_is_rejected(self):
+        """Short/long factor arrays must match the rotary dimension.
+
+        A factor list whose length does not equal ``head_dim / 2`` cannot be
+        broadcast against the inverse-frequency vector, so ``LongRope``
+        construction raises rather than silently producing a wrong cache.
+        """
+        from mobius.components._rotary_embedding import initialize_rope
+
+        bad_scaling = {
+            "type": "su",
+            "short_factor": [1.0] * (TINY_HEAD_DIM // 2 + 1),
+            "long_factor": [2.0] * (TINY_HEAD_DIM // 2 + 1),
+        }
+        config = ArchitectureConfig.from_transformers(self._cfg(bad_scaling))
+        assert config.rope_type == "longrope"
+        with pytest.raises(ValueError, match="broadcast"):
+            initialize_rope(config)
+
+    def test_non_alias_rope_types_are_unchanged(self):
+        """Canonicalization only rewrites known aliases, not other types."""
+        from mobius._configs._base import _canonical_rope_type
+
+        assert _canonical_rope_type("su") == "longrope"
+        assert _canonical_rope_type("longrope") == "longrope"
+        assert _canonical_rope_type("yarn") == "yarn"
+        assert _canonical_rope_type("default") == "default"
+        assert _canonical_rope_type(None) is None
