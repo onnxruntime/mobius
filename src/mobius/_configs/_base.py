@@ -1508,6 +1508,12 @@ class Gemma3nConfig(CausalLMConfig):
     last N decoder layers borrow K,V from the last non-shared layer of the
     same attention type instead of projecting their own, so they own no KV
     cache entry.  E4B ships 15 (of 35 layers), i.e. layers 20..34 are shared.
+
+    ``activation_sparsity_pattern`` holds a per-layer target sparsity for the
+    MLP gate branch.  Where it is non-zero the gate activations below a
+    Gaussian quantile cutoff are zeroed (see
+    :class:`~mobius.models.gemma3n.Gemma3nMLP`).  E4B ships 0.95 for layers
+    0..9 and 0.0 for the rest; ``None`` disables sparsity everywhere.
     """
 
     altup_num_inputs: int = 4
@@ -1517,10 +1523,12 @@ class Gemma3nConfig(CausalLMConfig):
     hidden_size_per_layer_input: int = 256
     vocab_size_per_layer_input: int = 262_144
     num_kv_shared_layers: int = 0
+    activation_sparsity_pattern: list[float] | None = None
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Gemma3nConfig:
         base = ArchitectureConfig.from_transformers(config, parent_config)
+        sparsity = getattr(config, "activation_sparsity_pattern", None)
         return cls(
             **_shallow_fields(base),
             altup_num_inputs=getattr(config, "altup_num_inputs", 4),
@@ -1530,6 +1538,9 @@ class Gemma3nConfig(CausalLMConfig):
             hidden_size_per_layer_input=getattr(config, "hidden_size_per_layer_input", 256),
             vocab_size_per_layer_input=getattr(config, "vocab_size_per_layer_input", 262_144),
             num_kv_shared_layers=getattr(config, "num_kv_shared_layers", 0) or 0,
+            activation_sparsity_pattern=(
+                [float(s) for s in sparsity] if sparsity is not None else None
+            ),
         )
 
 
