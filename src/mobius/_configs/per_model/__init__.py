@@ -24,6 +24,8 @@ from __future__ import annotations
 # may freely re-sort this block.
 from mobius._configs.per_model import (  # noqa: F401
     _cosmos3_edge_vision,
+    _gemma3n_audio,
+    _gemma3n_vision,
     _gemma4_audio,
     _gemma4_unified_audio,
     _gemma4_unified_vision,
