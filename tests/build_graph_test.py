@@ -257,8 +257,12 @@ class TestBuildGraph:
         output_names = {out.name for out in model.graph.outputs}
         assert "logits" in output_names
 
-        # Check KV cache / hybrid cache outputs
-        num_layers = config.num_hidden_layers
+        # Check KV cache / hybrid cache outputs.  Models whose trailing layers
+        # borrow K,V from an earlier layer (Gemma 3n's num_kv_shared_layers)
+        # expose fewer cache entries than they have layers; the non-shared
+        # layers are the leading ones, so truncating the range is enough.
+        count_fn = getattr(module, "kv_cache_layer_count", None)
+        num_layers = count_fn() if callable(count_fn) else config.num_hidden_layers
         layer_types = config.layer_types or []
         for i in range(num_layers):
             ltype = layer_types[i] if i < len(layer_types) else "full_attention"
@@ -5471,6 +5475,133 @@ class TestBuildStaticCacheGraph:
             assert forbidden not in op_types, f"{forbidden} should be lowered for qnn"
         assert "ScatterND" in op_types  # TensorScatter replacement
         assert "Expand" in op_types  # Tile (GQA repeat) replacement
+
+
+class TestBuildGemma3nKvSharing:
+    """Gemma 3n's trailing layers borrow K,V instead of projecting their own.
+
+    Layers at or after ``num_hidden_layers - num_kv_shared_layers`` reuse the
+    K,V of the last preceding layer of the *same* attention type, so they own
+    no KV cache entry and carry no ``k_proj``/``v_proj``/``k_norm`` weights.
+    """
+
+    @staticmethod
+    def _build(num_kv_shared_layers, layer_types):
+        from mobius._configs import Gemma3nConfig
+
+        config = Gemma3nConfig(
+            num_hidden_layers=len(layer_types),
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            vocab_size=256,
+            max_position_embeddings=128,
+            rms_norm_eps=1e-6,
+            hidden_act="gelu_pytorch_tanh",
+            rope_type="default",
+            rope_theta=10_000.0,
+            rope_local_base_freq=10_000.0,
+            attn_qk_norm=True,
+            layer_types=layer_types,
+            sliding_window=8,
+            altup_num_inputs=2,
+            altup_active_idx=0,
+            altup_correct_scale=True,
+            laurel_rank=16,
+            hidden_size_per_layer_input=32,
+            vocab_size_per_layer_input=256,
+            num_kv_shared_layers=num_kv_shared_layers,
+            pad_token_id=0,
+        )
+        module = registry.get("gemma3n_text")(config)
+        pkg = get_task(_default_task_for_model("gemma3n_text")).build(module, config)
+        return module, pkg["model"], config
+
+    def test_cache_io_excludes_shared_layers(self):
+        """Only non-shared layers get past/present KV entries."""
+        module, model, _config = self._build(2, ["full_attention"] * 4)
+
+        assert module.kv_cache_layer_count() == 2
+        input_names = {i.name for i in model.graph.inputs}
+        output_names = {o.name for o in model.graph.outputs}
+        for i in range(2):
+            assert f"past_key_values.{i}.key" in input_names
+            assert f"past_key_values.{i}.value" in input_names
+            assert f"present.{i}.key" in output_names
+            assert f"present.{i}.value" in output_names
+        for i in (2, 3):
+            assert f"past_key_values.{i}.key" not in input_names
+            assert f"present.{i}.key" not in output_names
+
+    def test_shared_layers_have_no_kv_weights(self):
+        """KV-shared layers must not request k_proj/v_proj/k_norm initializers.
+
+        The checkpoint ships these tensors for every layer, but HF only builds
+        them for the non-shared layers — emitting them here would create
+        initializers with no consumer.
+        """
+        _module, model, _config = self._build(2, ["full_attention"] * 4)
+
+        names = set(model.graph.initializers)
+        for i in (0, 1):
+            assert f"model.layers.{i}.self_attn.k_proj.weight" in names
+            assert f"model.layers.{i}.self_attn.v_proj.weight" in names
+        for i in (2, 3):
+            assert f"model.layers.{i}.self_attn.k_proj.weight" not in names
+            assert f"model.layers.{i}.self_attn.v_proj.weight" not in names
+            assert f"model.layers.{i}.self_attn.k_norm.weight" not in names
+
+    def test_source_layer_matches_attention_type(self):
+        """Sliding and full layers borrow from different source layers.
+
+        HF indexes the *pre-cutoff* slice of ``layer_types`` for the matching
+        type, so a shared sliding layer never borrows a full layer's K,V.
+        """
+        layer_types = [
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+        ]
+        module, _model, _config = self._build(2, layer_types)
+
+        attns = [layer.self_attn for layer in module.model.layers]
+        assert [a.is_kv_shared_layer for a in attns] == [False, False, False, True, True]
+        # Last non-shared layer of each type publishes its K,V for reuse.
+        assert [a.provides_shared_kv for a in attns] == [False, True, True, False, False]
+        # Shared sliding layer 3 -> layer 1; shared full layer 4 -> layer 2.
+        assert attns[3].kv_shared_layer_index == 1
+        assert attns[4].kv_shared_layer_index == 2
+
+    def test_drops_shared_layer_weights_from_state_dict(self):
+        """preprocess_weights discards the K/V tensors HF never constructs."""
+        import torch
+
+        module, _model, config = self._build(2, ["full_attention"] * 4)
+        state_dict = {
+            f"model.layers.{i}.self_attn.{name}.weight": torch.zeros(1)
+            for i in range(config.num_hidden_layers)
+            for name in ("q_proj", "k_proj", "v_proj", "k_norm")
+        }
+
+        result = module.preprocess_weights(state_dict)
+
+        for i in range(config.num_hidden_layers):
+            assert f"model.layers.{i}.self_attn.q_proj.weight" in result
+        for i in (0, 1):
+            assert f"model.layers.{i}.self_attn.k_proj.weight" in result
+        for i in (2, 3):
+            assert f"model.layers.{i}.self_attn.k_proj.weight" not in result
+            assert f"model.layers.{i}.self_attn.v_proj.weight" not in result
+            assert f"model.layers.{i}.self_attn.k_norm.weight" not in result
+
+    def test_rejects_sharing_every_layer(self):
+        """A layer cannot borrow K,V when no earlier layer computes any."""
+        with pytest.raises(ValueError, match="num_kv_shared_layers"):
+            self._build(4, ["full_attention"] * 4)
 
 
 class TestBuildGemma4StaticCacheGraph:

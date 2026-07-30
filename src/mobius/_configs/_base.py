@@ -1503,6 +1503,11 @@ class Gemma3nConfig(CausalLMConfig):
 
     Adds AltUp prediction/correction parameters and per-layer input
     dimension fields used exclusively by :mod:`models.gemma3n`.
+
+    ``num_kv_shared_layers`` mirrors the Gemma4 field of the same name: the
+    last N decoder layers borrow K,V from the last non-shared layer of the
+    same attention type instead of projecting their own, so they own no KV
+    cache entry.  E4B ships 15 (of 35 layers), i.e. layers 20..34 are shared.
     """
 
     altup_num_inputs: int = 4
@@ -1511,6 +1516,7 @@ class Gemma3nConfig(CausalLMConfig):
     laurel_rank: int = 64
     hidden_size_per_layer_input: int = 256
     vocab_size_per_layer_input: int = 262_144
+    num_kv_shared_layers: int = 0
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Gemma3nConfig:
@@ -1523,6 +1529,7 @@ class Gemma3nConfig(CausalLMConfig):
             laurel_rank=getattr(config, "laurel_rank", 64),
             hidden_size_per_layer_input=getattr(config, "hidden_size_per_layer_input", 256),
             vocab_size_per_layer_input=getattr(config, "vocab_size_per_layer_input", 262_144),
+            num_kv_shared_layers=getattr(config, "num_kv_shared_layers", 0) or 0,
         )
 
 

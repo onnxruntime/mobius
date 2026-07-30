@@ -19,9 +19,9 @@ from __future__ import annotations
 
 import copy
 import math
-from typing import TYPE_CHECKING
 
 import numpy as np
+import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
@@ -39,23 +39,95 @@ from mobius.components._activations import get_activation
 from mobius.components._attention import _apply_attention, apply_rotary_pos_emb
 from mobius.models.base import CausalLMModel
 
-if TYPE_CHECKING:
-    import onnx_ir as ir
+
+def _drop_kv_shared_layer_weights(
+    state_dict: dict[str, torch.Tensor],
+    text_model: Gemma3nTextModel,
+    prefix: str = "model.layers.",
+) -> dict[str, torch.Tensor]:
+    """Drop the K/V weights of KV-shared layers from *state_dict*.
+
+    The Gemma 3n checkpoint ships ``k_proj``/``v_proj``/``k_norm`` for **every**
+    layer, but HF only constructs them for the non-shared layers and discards
+    the rest.  mobius likewise builds no such projections for KV-shared layers,
+    so leaving these keys in place would only emit "weight not found in the
+    model" warnings for tensors that are correctly unused.
+
+    Args:
+        state_dict: Weights keyed relative to the decoder root.
+        text_model: The :class:`Gemma3nTextModel` whose layers declare which
+            indices are KV-shared.
+        prefix: Layer-key prefix, e.g. ``"model.layers."``.
+    """
+    for idx, layer in enumerate(text_model.layers):
+        if not layer.self_attn.is_kv_shared_layer:
+            continue
+        for suffix in ("k_proj.weight", "v_proj.weight", "k_norm.weight"):
+            state_dict.pop(f"{prefix}{idx}.self_attn.{suffix}", None)
+    return state_dict
 
 
 class Gemma3nAttention(Attention):
-    """Gemma3n attention with per-head Q/K/V normalization.
+    """Gemma3n attention with per-head Q/K/V normalization and KV sharing.
 
     Extends the base Attention by adding a parameterless V normalization
     (``v_norm`` with ``with_scale=False`` in HF) applied after ``v_proj``.
     Q and K use standard OffsetRMSNorm from the parent; V is divided by its
     per-head RMS without any learnable scale parameter.
+
+    Layers at or after ``first_kv_shared_layer_idx`` are *KV-shared*: they
+    borrow the already-RoPE'd K,V of the last non-shared layer of the same
+    attention type instead of running their own ``k_proj``/``v_proj``.  Such
+    layers own no KV cache entry and hold no K/V weights — matching HF
+    ``Gemma3nTextAttention``, which does not even construct them.
+
+    Args:
+        config: Gemma3n configuration.
+        layer_idx: Index of this layer (0-based).
+        layer_types: Attention type per layer for all layers.
+        first_kv_shared_layer_idx: First layer index that borrows K,V.
+            ``0`` disables sharing entirely.
     """
 
-    def __init__(self, config: Gemma3nConfig):
+    def __init__(
+        self,
+        config: Gemma3nConfig,
+        layer_idx: int = 0,
+        layer_types: list[str] | None = None,
+        first_kv_shared_layer_idx: int = 0,
+    ):
         # HF Gemma3nTextAttention hardcodes self.scaling = 1.0 (not head_dim**-0.5)
         super().__init__(config, rms_norm_class=RMSNorm, scale=1.0)
         self._v_norm_eps = config.rms_norm_eps
+        self.layer_idx = layer_idx
+
+        layer_types = layer_types or ["full_attention"] * config.num_hidden_layers
+        # Mirrors HF modeling_gemma3n.py: shared layers reuse the K,V of the
+        # LAST pre-cutoff layer whose attention type matches theirs, so sliding
+        # and full-attention layers borrow from different sources.
+        self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
+        prev_layers = layer_types[:first_kv_shared_layer_idx]
+        if self.is_kv_shared_layer:
+            self.kv_shared_layer_index = (
+                len(prev_layers) - 1 - prev_layers[::-1].index(layer_types[layer_idx])
+            )
+            self.provides_shared_kv = False
+        else:
+            self.kv_shared_layer_index = None
+            # The last non-shared layer of each type must publish its K,V.
+            self.provides_shared_kv = first_kv_shared_layer_idx > 0 and (
+                layer_idx
+                == len(prev_layers) - 1 - prev_layers[::-1].index(layer_types[layer_idx])
+            )
+
+        if self.is_kv_shared_layer:
+            # Drop the K/V projections and K norm the parent built: these layers
+            # borrow K,V, and the weights are absent from what HF constructs.
+            # Deleting the registered submodules keeps them out of the graph's
+            # initializers and out of the expected state_dict.
+            for name in ("k_proj", "v_proj", "k_norm"):
+                self._modules.pop(name, None)
+                object.__setattr__(self, name, None)
 
     def forward(
         self,
@@ -65,33 +137,17 @@ class Gemma3nAttention(Attention):
         position_embeddings=None,
         past_key_value=None,
         static_cache=None,
+        shared_kv_states=None,
     ):
         query_states = self.q_proj(op, hidden_states)
-        key_states = self.k_proj(op, hidden_states)
-        value_states = self.v_proj(op, hidden_states)
 
-        # Per-head Q/K normalization (same order as parent Attention)
-        if self.q_norm is not None and self.k_norm is not None:
+        # Per-head Q normalization (same order as parent Attention)
+        if self.q_norm is not None:
             query_states = op.Reshape(query_states, [0, 0, -1, self.head_dim])
-            key_states = op.Reshape(key_states, [0, 0, -1, self.head_dim])
             query_states = self.q_norm(op, query_states)
-            key_states = self.k_norm(op, key_states)
             query_states = op.Reshape(query_states, [0, 0, -1])
-            key_states = op.Reshape(key_states, [0, 0, -1])
 
-        # V normalization: parameterless RMS norm per head (with_scale=False in HF)
-        # Reshape to (B, T, num_kv_heads, head_dim), normalize over last dim, reshape back
-        value_states = op.Reshape(
-            value_states,
-            op.Constant(value_ints=[0, 0, self.num_key_value_heads, self.head_dim]),
-        )
-        sq = op.Mul(value_states, value_states)
-        mean_sq = op.ReduceMean(sq, [-1], keepdims=1)
-        rms = op.Sqrt(op.Add(mean_sq, self._v_norm_eps))
-        value_states = op.Div(value_states, rms)
-        value_states = op.Reshape(value_states, [0, 0, -1])
-
-        # Apply RoPE to Q and K (same as parent)
+        # Apply RoPE to Q (same as parent)
         if position_embeddings is not None:
             query_states = apply_rotary_pos_emb(
                 op,
@@ -101,14 +157,70 @@ class Gemma3nAttention(Attention):
                 rotary_embedding_dim=self.rotary_embedding_dim,
                 interleaved=self._rope_interleave,
             )
-            key_states = apply_rotary_pos_emb(
-                op,
-                x=key_states,
-                position_embeddings=position_embeddings,
-                num_heads=self.num_key_value_heads,
-                rotary_embedding_dim=self.rotary_embedding_dim,
-                interleaved=self._rope_interleave,
+
+        if self.is_kv_shared_layer:
+            # Borrow the source layer's ``present`` K,V — already normalized and
+            # RoPE'd, and already spanning past + current positions, so this
+            # layer passes no past_key/past_value of its own.
+            src_key, src_value = shared_kv_states[self.kv_shared_layer_index]
+
+            # The opset-24 ``Attention`` op's present_key/present_value outputs
+            # have no shape inference in ORT, so they arrive rank-unknown; the
+            # Transpose/Reshape below would then lose the head dim and make this
+            # layer's o_proj MatMul fail shape inference at load time. The source
+            # shares this layer's KV geometry, so pin the known BNSH shape.
+            for _kv in (src_key, src_value):
+                if _kv.shape is None or len(_kv.shape) != 4:
+                    _kv.shape = ir.Shape(
+                        [
+                            "batch",
+                            self.num_key_value_heads,
+                            "kv_sequence_length",
+                            self.head_dim,
+                        ]
+                    )
+
+            kv_hidden = self.num_key_value_heads * self.head_dim
+            key_states = op.Reshape(
+                op.Transpose(src_key, perm=[0, 2, 1, 3]), [0, 0, kv_hidden]
             )
+            value_states = op.Reshape(
+                op.Transpose(src_value, perm=[0, 2, 1, 3]), [0, 0, kv_hidden]
+            )
+            past_key = past_value = None
+        else:
+            key_states = self.k_proj(op, hidden_states)
+            value_states = self.v_proj(op, hidden_states)
+
+            if self.k_norm is not None:
+                key_states = op.Reshape(key_states, [0, 0, -1, self.head_dim])
+                key_states = self.k_norm(op, key_states)
+                key_states = op.Reshape(key_states, [0, 0, -1])
+
+            # V normalization: parameterless RMS norm per head (with_scale=False
+            # in HF). Reshape to (B, T, num_kv_heads, head_dim), normalize over
+            # the last dim, reshape back.
+            value_states = op.Reshape(
+                value_states,
+                op.Constant(value_ints=[0, 0, self.num_key_value_heads, self.head_dim]),
+            )
+            sq = op.Mul(value_states, value_states)
+            mean_sq = op.ReduceMean(sq, [-1], keepdims=1)
+            rms = op.Sqrt(op.Add(mean_sq, self._v_norm_eps))
+            value_states = op.Div(value_states, rms)
+            value_states = op.Reshape(value_states, [0, 0, -1])
+
+            if position_embeddings is not None:
+                key_states = apply_rotary_pos_emb(
+                    op,
+                    x=key_states,
+                    position_embeddings=position_embeddings,
+                    num_heads=self.num_key_value_heads,
+                    rotary_embedding_dim=self.rotary_embedding_dim,
+                    interleaved=self._rope_interleave,
+                )
+            past_key = past_key_value[0] if past_key_value is not None else None
+            past_value = past_key_value[1] if past_key_value is not None else None
 
         attn_output, present_key, present_value = _apply_attention(
             op,
@@ -116,13 +228,17 @@ class Gemma3nAttention(Attention):
             key_states,
             value_states,
             attention_bias,
-            past_key_value[0] if past_key_value is not None else None,
-            past_key_value[1] if past_key_value is not None else None,
+            past_key,
+            past_value,
             num_attention_heads=self.num_attention_heads,
             num_key_value_heads=self.num_key_value_heads,
             scale=self.scaling,
             static_cache=static_cache,
         )
+
+        # Source layers publish their K,V for the downstream shared layers.
+        if self.provides_shared_kv and shared_kv_states is not None:
+            shared_kv_states[self.layer_idx] = (present_key, present_value)
 
         attn_output = self.o_proj(op, attn_output)
         return attn_output, (present_key, present_value)
@@ -271,11 +387,31 @@ class Gemma3nAltUp(nn.Module):
 
 
 class Gemma3nDecoderLayer(nn.Module):
-    """Gemma3n decoder layer with AltUp, Laurel, and per-layer input gating."""
+    """Gemma3n decoder layer with AltUp, Laurel, and per-layer input gating.
 
-    def __init__(self, config: Gemma3nConfig, layer_idx: int):
+    Args:
+        config: Gemma3n configuration.
+        layer_idx: Index of this layer (0-based).
+        layer_types: Attention type per layer for all layers. Defaults to
+            ``config.layer_types``.
+        first_kv_shared_layer_idx: First layer index that borrows K,V from an
+            earlier layer (``0`` disables KV sharing).
+    """
+
+    def __init__(
+        self,
+        config: Gemma3nConfig,
+        layer_idx: int,
+        layer_types: list[str] | None = None,
+        first_kv_shared_layer_idx: int = 0,
+    ):
         super().__init__()
-        self.self_attn = Gemma3nAttention(config)
+        self.self_attn = Gemma3nAttention(
+            config,
+            layer_idx=layer_idx,
+            layer_types=layer_types or config.layer_types,
+            first_kv_shared_layer_idx=first_kv_shared_layer_idx,
+        )
         self.mlp = MLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -311,6 +447,7 @@ class Gemma3nDecoderLayer(nn.Module):
         position_embeddings: tuple,
         per_layer_input: ir.Value,
         past_key_value: tuple | None,
+        shared_kv_states: dict | None = None,
     ):
         # AltUp predict
         predictions = self.altup.predict(op, hidden_states_list)
@@ -327,6 +464,7 @@ class Gemma3nDecoderLayer(nn.Module):
             attention_bias=attention_bias,
             position_embeddings=position_embeddings,
             past_key_value=past_key_value,
+            shared_kv_states=shared_kv_states,
         )
         attn_output = self.post_attention_layernorm(op, attn_output)
 
@@ -378,10 +516,38 @@ class Gemma3nTextModel(nn.Module):
             config.pad_token_id,
             embed_scale=embed_scale,
         )
-        self.layers = nn.ModuleList(
-            [Gemma3nDecoderLayer(config, i) for i in range(config.num_hidden_layers)]
+        self.layer_types = config.layer_types or (
+            ["full_attention"] * config.num_hidden_layers
         )
-        self.layer_types = config.layer_types
+        if len(self.layer_types) != config.num_hidden_layers:
+            raise ValueError(
+                f"Gemma3nConfig.layer_types length ({len(self.layer_types)}) must match "
+                f"num_hidden_layers ({config.num_hidden_layers})"
+            )
+        # Layers at/after this index borrow K,V from an earlier layer of the
+        # same attention type and own no KV cache entry.
+        self.first_kv_shared_layer_idx = config.num_hidden_layers - (
+            config.num_kv_shared_layers or 0
+        )
+        if self.first_kv_shared_layer_idx <= 0:
+            # All layers "shared" would leave no source to borrow from.
+            raise ValueError(
+                f"num_kv_shared_layers ({config.num_kv_shared_layers}) must be less "
+                f"than num_hidden_layers ({config.num_hidden_layers}); every layer "
+                "cannot borrow K,V."
+            )
+        self.layers = nn.ModuleList(
+            [
+                Gemma3nDecoderLayer(
+                    config,
+                    i,
+                    layer_types=self.layer_types,
+                    first_kv_shared_layer_idx=self.first_kv_shared_layer_idx,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
+        self.num_kv_layers = self.first_kv_shared_layer_idx
         self.sliding_window = config.sliding_window
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -491,9 +657,22 @@ class Gemma3nTextModel(nn.Module):
             altup_proj = op.Mul(altup_proj, op.Div(target_mag, new_mag))
             hidden_states_list.append(altup_proj)
 
-        # Decoder layers
+        # Decoder layers.  ``shared_kv_states`` is populated by the source
+        # layers and consumed by the KV-shared layers that follow them.
+        shared_kv_states: dict = {}
         present_key_values = []
-        past_kvs = past_key_values or [None] * len(self.layers)
+        # ``past_key_values`` carries only ``num_kv_layers`` entries (KV-shared
+        # layers own no cache), so expand it to a full per-layer list to zip
+        # over every layer without truncating the tail.
+        if past_key_values is not None:
+            kv_iter = iter(past_key_values)
+            past_kvs: list = [
+                None if layer.self_attn.is_kv_shared_layer else next(kv_iter)
+                for layer in self.layers
+            ]
+        else:
+            past_kvs = [None] * len(self.layers)
+
         for i, (layer, layer_type, past_kv) in enumerate(
             zip(self.layers, self.layer_types, past_kvs)
         ):
@@ -507,8 +686,12 @@ class Gemma3nTextModel(nn.Module):
                 position_embeddings=position_embeddings_dict[layer_type],
                 per_layer_input=per_layer_input,
                 past_key_value=past_kv,
+                shared_kv_states=shared_kv_states,
             )
-            present_key_values.append(present_kv)
+            # KV-shared layers reuse a source layer's K,V — exclude them so the
+            # cache output has exactly ``num_kv_layers`` entries.
+            if not layer.self_attn.is_kv_shared_layer:
+                present_key_values.append(present_kv)
 
         # Collapse AltUp outputs back to single hidden state with magnitude normalization.
         # HF normalizes each unembed projection's magnitude to match hidden_states_list[0]'s
@@ -593,6 +776,10 @@ class Gemma3nCausalLMModel(CausalLMModel):
         super().__init__(config)
         self.model = Gemma3nTextModel(config)
 
+    def kv_cache_layer_count(self) -> int:
+        """Number of layers owning a KV cache entry (excludes KV-shared layers)."""
+        return self.model.num_kv_layers
+
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
@@ -615,4 +802,5 @@ class Gemma3nCausalLMModel(CausalLMModel):
                 new_key = key.replace(".altup.", ".")
                 state_dict[new_key] = state_dict.pop(key)
 
+        state_dict = _drop_kv_shared_layer_weights(state_dict, self.model)
         return super().preprocess_weights(state_dict)
