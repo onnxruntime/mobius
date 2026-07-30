@@ -820,7 +820,17 @@ def _decoder_io(
     }
 
     routed = [port for port in inputs if port.name in routed_inputs]
-    embedded = next((port for port in routed if _is_float(port) and port.rank == 3), None)
+    embedded = next(
+        (
+            port
+            for port in routed
+            if _is_float(port)
+            and port.rank == 3
+            and port.name != "encoder_hidden_states"
+            and _STATIC_CACHE_PORT.fullmatch(port.name) is None
+        ),
+        None,
+    )
     if embedded is None:
         embedded = _select_one(
             inputs,
