@@ -49,6 +49,24 @@ def linear_attention_dims(config: BaseModelConfig) -> LinearAttentionDims:
     head_k_dim = config.linear_key_head_dim
     head_v_dim = config.linear_value_head_dim
     conv_kernel = config.linear_conv_kernel_dim
+    missing = [
+        name
+        for name, value in (
+            ("linear_num_key_heads", num_k_heads),
+            ("linear_num_value_heads", num_v_heads),
+            ("linear_key_head_dim", head_k_dim),
+            ("linear_value_head_dim", head_v_dim),
+            ("linear_conv_kernel_dim", conv_kernel),
+        )
+        if value is None
+    ]
+    if missing:
+        raise ValueError(
+            "Linear-attention cache inputs requested but the following config "
+            f"fields are unset: {', '.join(missing)}. This usually means the "
+            "architecture's layer_types were mis-detected as 'linear_attention' "
+            "(e.g. a hybrid model built without trust_remote_code)."
+        )
     key_dim = head_k_dim * num_k_heads
     value_dim = head_v_dim * num_v_heads
     conv_dim = key_dim * 2 + value_dim

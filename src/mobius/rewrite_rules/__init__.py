@@ -30,6 +30,8 @@ Example::
 
 __all__ = [
     "bias_gelu_rules",
+    "decompose_attention_pass",
+    "decompose_rope_rules",
     "gelu_fusion_rules",
     "group_query_attention_rules",
     "htp_rank4_rmsnorm_rules",
@@ -40,10 +42,13 @@ __all__ = [
     "skip_layer_norm_rules",
     "skip_norm_rules",
     "static_empty_kv_rules",
+    "tensor_scatter_to_scatternd_rules",
     "unpack_qkv_rules",
 ]
 
 from mobius.rewrite_rules._bias_gelu import bias_gelu_rules
+from mobius.rewrite_rules._decompose_attention import decompose_attention_pass
+from mobius.rewrite_rules._decompose_rope import decompose_rope_rules
 from mobius.rewrite_rules._gelu_fusion import gelu_fusion_rules
 from mobius.rewrite_rules._group_query_attention import (
     group_query_attention_rules,
@@ -54,6 +59,7 @@ from mobius.rewrite_rules._layer_norm_fusion import (
     layer_norm_fusion_rules,
 )
 from mobius.rewrite_rules._packed_attention import packed_attention_rules
+from mobius.rewrite_rules._scatternd import tensor_scatter_to_scatternd_rules
 from mobius.rewrite_rules._separate_rope import separate_rope_rules
 from mobius.rewrite_rules._skip_layer_norm import skip_layer_norm_rules
 from mobius.rewrite_rules._skip_norm import skip_norm_rules

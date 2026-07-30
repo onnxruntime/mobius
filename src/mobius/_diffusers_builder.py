@@ -43,11 +43,14 @@ def _init_diffusers_class_map() -> None:
         return
 
     from mobius._diffusers_configs import (
+        CLIPTextConfig,
         CogVideoXConfig,
         QwenImageConfig,
         QwenImageVAEConfig,
+        UNet2DConfig,
         VAEConfig,
     )
+    from mobius.models.clip import CLIPTextModel
     from mobius.models.cogvideox import (
         CogVideoXTransformer3DModel,
     )
@@ -61,6 +64,7 @@ def _init_diffusers_class_map() -> None:
     from mobius.models.hunyuan_dit import HunyuanDiT2DModel, HunyuanDiTConfig
     from mobius.models.qwen_image import QwenImageTransformer2DModel
     from mobius.models.qwen_image_vae import AutoencoderKLQwenImageModel
+    from mobius.models.unet import UNet2DConditionModel
     from mobius.models.vae import AutoencoderKLModel
     from mobius.models.video_vae import VideoAutoencoderModel, VideoVAEConfig
 
@@ -71,6 +75,14 @@ def _init_diffusers_class_map() -> None:
             "PixArtTransformer2DModel": (DiTTransformer2DModel, DiTConfig, "denoising"),
             "FluxTransformer2DModel": (FluxTransformer2DModel, FluxConfig, "denoising"),
             "SD3Transformer2DModel": (SD3Transformer2DModel, SD3Config, "denoising"),
+            # Classic Stable Diffusion 1.x/2.x: cross-attention UNet denoiser plus
+            # a CLIP text prompt encoder, both built from scratch by Mobius.
+            "UNet2DConditionModel": (
+                UNet2DConditionModel,
+                UNet2DConfig,
+                "denoising",
+            ),
+            "CLIPTextModel": (CLIPTextModel, CLIPTextConfig, "feature-extraction"),
             "QwenImageTransformer2DModel": (
                 QwenImageTransformer2DModel,
                 QwenImageConfig,
@@ -128,41 +140,43 @@ def _download_diffusers_component_weights(
     from huggingface_hub.utils import EntryNotFoundError
 
     prefix = f"{component_name}/"
-    # Diffusers uses two naming conventions for weight files
-    weight_basenames = ["diffusion_pytorch_model", "model"]
+    # Diffusers uses two naming conventions for the weight basename, and either
+    # safetensors (preferred) or PyTorch .bin serialization. Some real repos
+    # (e.g. OFA-Sys/small-stable-diffusion-v0) ship only .bin.
+    weight_basenames = ["diffusion_pytorch_model", "pytorch_model", "model"]
 
     all_files = None
-    for basename in weight_basenames:
-        try:
-            index_path = hf_hub_download(
-                repo_id=model_id,
-                filename=f"{prefix}{basename}.safetensors.index.json",
-            )
-            with open(index_path) as f:
-                index = json.load(f)
-            all_files = sorted(set(index["weight_map"].values()))
-            break
-        except EntryNotFoundError:
-            continue
-
-    if all_files is None:
-        # No index file found — try single-file weights
+    for ext in ("safetensors", "bin"):
+        # Sharded weights: <basename>.<ext>.index.json maps params -> shard files.
         for basename in weight_basenames:
             try:
-                hf_hub_download(
+                index_path = hf_hub_download(
                     repo_id=model_id,
-                    filename=f"{prefix}{basename}.safetensors",
+                    filename=f"{prefix}{basename}.{ext}.index.json",
                 )
-                all_files = [f"{basename}.safetensors"]
+                with open(index_path) as f:
+                    index = json.load(f)
+                all_files = sorted(set(index["weight_map"].values()))
                 break
             except EntryNotFoundError:
                 continue
+        if all_files is not None:
+            break
+        # Single-file weights.
+        for basename in weight_basenames:
+            try:
+                hf_hub_download(repo_id=model_id, filename=f"{prefix}{basename}.{ext}")
+                all_files = [f"{basename}.{ext}"]
+                break
+            except EntryNotFoundError:
+                continue
+        if all_files is not None:
+            break
 
     if all_files is None:
         raise FileNotFoundError(
             f"Could not find weight files for component '{component_name}' "
-            f"in '{model_id}'. Tried diffusion_pytorch_model.safetensors "
-            f"and model.safetensors."
+            f"in '{model_id}'. Tried {weight_basenames} with .safetensors and .bin."
         )
 
     paths = _parallel_download(
@@ -173,7 +187,10 @@ def _download_diffusers_component_weights(
 
     state_dict: dict[str, torch.Tensor] = {}
     for path in tqdm.tqdm(paths, desc=f"Loading {component_name} weights"):
-        state_dict.update(safetensors.torch.load_file(path))
+        if path.endswith(".safetensors"):
+            state_dict.update(safetensors.torch.load_file(path))
+        else:
+            state_dict.update(torch.load(path, map_location="cpu", weights_only=True))
     return state_dict
 
 
@@ -186,11 +203,39 @@ def _load_diffusers_component_config(model_id: str, component_name: str) -> dict
         return json.load(f)
 
 
+def _prepare_unet_loras(unet_loras: dict) -> tuple[tuple, dict]:
+    """Load each UNet LoRA ``.safetensors``; return baked-adapter specs + merged weights.
+
+    ``unet_loras`` maps ``adapter_name -> safetensors path``. The rank is inferred
+    from each adapter's ``lora_A`` factor (``[rank, in]``); the baked scale is
+    ``1.0`` because the runtime ``lora_gate.{name}`` input supplies the effective
+    strength (0 = off, 1 = on, or a blend). Returns
+    ``(((name, rank, 1.0), ...), merged_state_dict)``.
+    """
+    from mobius.models.unet import load_unet_lora_safetensors
+
+    adapters = []
+    merged: dict = {}
+    for name, path in unet_loras.items():
+        remapped = load_unet_lora_safetensors(path, name)
+        rank = None
+        for key, value in remapped.items():
+            if f".lora_A.{name}.weight" in key:
+                rank = int(value.shape[0])
+                break
+        if rank is None:
+            raise ValueError(f"no lora_A weights found for adapter {name!r} in {path}")
+        adapters.append((name, rank, 1.0))
+        merged.update(remapped)
+    return tuple(adapters), merged
+
+
 def build_diffusers_pipeline(
     model_id: str,
     *,
     dtype: str | ir.DataType | None = None,
     load_weights: bool = True,
+    unet_loras: dict | None = None,
 ) -> ModelPackage:
     """Build ONNX models for all supported components in a diffusers pipeline.
 
@@ -205,6 +250,11 @@ def build_diffusers_pipeline(
         model_id: HuggingFace model repository ID for a diffusers pipeline.
         dtype: Override the model dtype.
         load_weights: Whether to download and apply weights.
+        unet_loras: Optional ``{adapter_name: lora.safetensors}`` map. Each LoRA
+            is baked into the UNet denoiser as a runtime-gated adapter (rank
+            inferred from the file); at inference a ``lora_gate.{name}`` scalar
+            input switches/blends it. Requires ``load_weights=True`` to apply the
+            adapter weights.
 
     Returns:
         A :class:`ModelPackage` containing the built component model(s).
@@ -257,6 +307,15 @@ def build_diffusers_pipeline(
 
             config = dataclasses.replace(config, dtype=dtype)
 
+        # Runtime LoRA: bake the requested adapters into the UNet denoiser and
+        # merge their (remapped) weights alongside the base weights.
+        lora_weights: dict = {}
+        if unet_loras and task_name == "denoising" and hasattr(config, "lora_adapters"):
+            import dataclasses
+
+            adapters, lora_weights = _prepare_unet_loras(unet_loras)
+            config = dataclasses.replace(config, lora_adapters=adapters)
+
         model_module = module_class(config)
 
         sub_pkg = build_from_module(model_module, config, task_name)
@@ -274,6 +333,8 @@ def build_diffusers_pipeline(
             state_dict = _download_diffusers_component_weights(model_id, component_name)
             if hasattr(model_module, "preprocess_weights"):
                 state_dict = model_module.preprocess_weights(state_dict)
+            if lora_weights:
+                state_dict = {**state_dict, **lora_weights}
             for model in sub_pkg.values():
                 apply_weights(model, state_dict)
 

@@ -50,6 +50,23 @@ from onnxscript.rewriter._rewrite_rule import (
 )
 
 
+def _has_unequal_kv_head_dimensions(k, v, past_key, past_value) -> bool:
+    """Return whether static K/V shapes prove incompatible GQA head dimensions."""
+
+    def _static_last_dim(value):
+        if value is None or value.shape is None or len(value.shape) == 0:
+            return None
+        dim = value.shape[-1]
+        return dim if isinstance(dim, int) else None
+
+    for key, value in ((k, v), (past_key, past_value)):
+        key_dim = _static_last_dim(key)
+        value_dim = _static_last_dim(value)
+        if key_dim is not None and value_dim is not None and key_dim != value_dim:
+            return True
+    return False
+
+
 class RotaryAttentionToGQA(RewriteRuleClassBase):
     """Replace RotaryEmbedding + Attention with GroupQueryAttention.
 
@@ -119,7 +136,7 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
 
     # ------------------------------------------------------------------ check
 
-    def check(self, context, attn_out, cos, sin, past_key, past_value, **_):
+    def check(self, context, attn_out, k_pre, v, cos, sin, past_key, past_value, **_):
         result = MatchResult()
 
         attn = attn_out.producer()
@@ -146,6 +163,9 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
             return result.fail("past_key is not a graph input")
         if past_value.producer() is not None:
             return result.fail("past_value is not a graph input")
+
+        if _has_unequal_kv_head_dimensions(k_pre, v, past_key, past_value):
+            return result.fail("K and V head dimensions differ; retain standard Attention")
 
         return result
 
@@ -547,7 +567,7 @@ class AttentionToGQA(RewriteRuleClassBase):
 
     # ------------------------------------------------------------------ check
 
-    def check(self, context, attn_out, past_key, past_value, **_):
+    def check(self, context, attn_out, k, v, past_key, past_value, **_):
         result = MatchResult()
         attn = attn_out.producer()
 
@@ -570,6 +590,9 @@ class AttentionToGQA(RewriteRuleClassBase):
         graph = attn.graph
         if not any(gi.name == "attention_mask" for gi in graph.inputs):
             return result.fail("No attention_mask graph input — cannot build seqlens_k")
+
+        if _has_unequal_kv_head_dimensions(k, v, past_key, past_value):
+            return result.fail("K and V head dimensions differ; retain standard Attention")
 
         return result
 

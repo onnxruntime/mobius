@@ -18,7 +18,7 @@ Architecture:
 
 Prerequisites::
 
-    pip install mobius-ai[transformers] sounddevice soundfile
+    pip install mobius-onnx[transformers] sounddevice soundfile
 
 Usage::
 
