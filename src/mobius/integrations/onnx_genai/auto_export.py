@@ -16,12 +16,15 @@ import logging
 import os
 from typing import Any
 
+import yaml
+
 from mobius.integrations.onnx_genai.decoder_metadata import (
     decoder_metadata_from_config,
     write_decoder_metadata,
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
+    add_explicit_package_io,
     load_diffusers_scheduler_config,
     write_audio_codec_pipeline_metadata,
     write_diffusion_pipeline_metadata,
@@ -33,6 +36,21 @@ from mobius.integrations.onnx_genai.inference_metadata import (
 _LOGGER = logging.getLogger(__name__)
 
 _DENOISER_KEYS = ("denoiser", "transformer", "unet")
+
+
+def _add_explicit_io_to_file(path: str, pkg: Any, config: Any) -> None:
+    """Augment an emitted sidecar with roles derived from the actual ONNX ports."""
+    try:
+        models = list(pkg.values())
+    except AttributeError:
+        return
+    if not models or any(not hasattr(model, "graph") for model in models):
+        return
+    with open(path, encoding="utf-8") as handle:
+        metadata = yaml.safe_load(handle)
+    add_explicit_package_io(metadata, pkg, config)
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(metadata, handle, sort_keys=False)
 
 
 def _write_clip_tokenizer(output_dir: str, source: str | None) -> str | None:
@@ -451,6 +469,7 @@ def write_onnx_genai_config(
             activation_dtype=_activation_dtype_tag(resolved_config),
             **kwargs,
         )
+        _add_explicit_io_to_file(path, pkg, resolved_config)
         artifacts = {"inference_metadata": path}
         tokenizer_path = _write_hf_tokenizer(output_dir, source)
         if tokenizer_path is not None:
@@ -467,6 +486,7 @@ def write_onnx_genai_config(
             activation_dtype=_activation_dtype_tag(resolved_config),
             **kwargs,
         )
+        _add_explicit_io_to_file(path, pkg, resolved_config)
         artifacts = {"inference_metadata": path}
         tokenizer_path = _write_hf_tokenizer(output_dir, source)
         if tokenizer_path is not None:
@@ -495,6 +515,7 @@ def write_onnx_genai_config(
             decoder_metadata=decoder_metadata,
             **_tts_component_kwargs(pkg, resolved_config),
         )
+        _add_explicit_io_to_file(path, pkg, resolved_config)
         artifacts = {"inference_metadata": path}
         tokenizer_path = _write_hf_tokenizer(output_dir, source)
         if tokenizer_path is not None:
@@ -520,6 +541,7 @@ def write_onnx_genai_config(
     path = write_decoder_metadata(
         output_dir, config=resolved_config, kv_native_dtype=kv_native_dtype
     )
+    _add_explicit_io_to_file(path, pkg, resolved_config)
     artifacts = {"inference_metadata": path}
     tokenizer_path = _write_hf_tokenizer(output_dir, source)
     if tokenizer_path is not None:

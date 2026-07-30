@@ -40,7 +40,7 @@ Japan is" -> " Tokyo.").
 
 Requirements::
 
-    pip install mobius-ai[ort-genai] transformers
+    pip install mobius-onnx[ort-genai] transformers
     # plus a per-layer-KV-aware onnxruntime-genai build
 
 Usage::

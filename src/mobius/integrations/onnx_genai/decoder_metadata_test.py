@@ -16,6 +16,7 @@ from mobius._configs import QuantizationConfig
 from mobius.integrations.onnx_genai.decoder_metadata import (
     build_decoder_metadata,
     decoder_metadata_from_config,
+    moe_metadata_from_config,
     write_decoder_metadata,
 )
 
@@ -127,6 +128,17 @@ class TestDecoderMetadata:
         assert loaded["model"]["attention"]["num_kv_heads"] == 8
 
     def test_matches_onnx_genai_schema(self):
+        cfg = _FakeConfig(sliding_window=4096)
+        cfg.num_local_experts = 8
+        cfg.num_experts_per_tok = 2
+        cfg.moe_intermediate_size = 256
+        cfg.n_shared_experts = 1
+        cfg.scoring_func = "sigmoid"
+        cfg.topk_method = "noaux_tc"
+        cfg.n_group = 4
+        cfg.topk_group = 2
+        meta = decoder_metadata_from_config(cfg, kv_native_dtype="bf16")
+
         schema_path = _schema_path()
         if schema_path is None:
             pytest.skip("onnx-genai schema not found")
@@ -136,7 +148,154 @@ class TestDecoderMetadata:
 
         with open(schema_path) as handle:
             schema = json.load(handle)
-        meta = decoder_metadata_from_config(
-            _FakeConfig(sliding_window=4096), kv_native_dtype="bf16"
-        )
         jsonschema.validate(instance=meta, schema=schema)
+
+    def test_moe_metadata_from_config_is_structural(self):
+        cfg = _FakeConfig()
+        cfg.num_local_experts = 8
+        cfg.num_experts_per_tok = 2
+        cfg.moe_intermediate_size = 256
+        cfg.n_shared_experts = 1
+        cfg.scoring_func = "sigmoid"
+        cfg.topk_method = "noaux_tc"
+        cfg.n_group = 4
+        cfg.topk_group = 2
+        cfg.norm_topk_prob = True
+        cfg.routed_scaling_factor = 2.5
+        cfg.hidden_act = "silu"
+
+        moe = moe_metadata_from_config(cfg)
+
+        assert moe == {
+            "representation": "dense_fallback",
+            "routed_expert_count": 8,
+            "shared_expert_count": 1,
+            "experts_per_token": 2,
+            "expert_intermediate_size": 256,
+            "shared_expert_intermediate_size": 256,
+            "activation": "silu",
+            "router": {
+                "score_function": "sigmoid",
+                "selection_method": "grouped_top_k",
+                "normalize_weights": True,
+                "scaling_factor": 2.5,
+                "group_count": 4,
+                "groups_per_token": 2,
+                "group_score": "top_2_sum",
+            },
+        }
+
+    def test_decoder_metadata_embeds_moe_contract(self):
+        cfg = _FakeConfig()
+        cfg.num_local_experts = 4
+        cfg.num_experts_per_tok = 2
+        cfg.moe_intermediate_size = 128
+
+        meta = decoder_metadata_from_config(cfg)
+
+        assert meta["model"]["mixture_of_experts"]["routed_expert_count"] == 4
+        assert meta["model"]["mixture_of_experts"]["representation"] == "dense_fallback"
+
+    def test_moe_metadata_rejects_incomplete_contract(self):
+        cfg = _FakeConfig()
+        cfg.num_local_experts = 4
+        cfg.num_experts_per_tok = None
+        cfg.moe_intermediate_size = 128
+
+        with pytest.raises(ValueError, match="num_experts_per_tok"):
+            moe_metadata_from_config(cfg)
+
+    def test_moe_metadata_rejects_invalid_expert_dimensions(self):
+        cfg = _FakeConfig()
+        cfg.num_local_experts = 4
+        cfg.num_experts_per_tok = 5
+        cfg.moe_intermediate_size = 128
+
+        with pytest.raises(ValueError, match="exceeds num_local_experts"):
+            moe_metadata_from_config(cfg)
+
+        cfg.num_experts_per_tok = 2
+        cfg.moe_intermediate_size = None
+        cfg.intermediate_size = None
+        with pytest.raises(ValueError, match="lacks both"):
+            moe_metadata_from_config(cfg)
+
+    @pytest.mark.parametrize(
+        ("n_group", "topk_group", "message"),
+        [
+            (0, 1, "n_group must be positive"),
+            (3, 1, "must be divisible"),
+            (4, 0, "1 <= topk_group <= n_group"),
+            (4, 5, "1 <= topk_group <= n_group"),
+        ],
+    )
+    def test_moe_metadata_rejects_invalid_grouping(self, n_group, topk_group, message):
+        cfg = _FakeConfig()
+        cfg.num_local_experts = 8
+        cfg.num_experts_per_tok = 2
+        cfg.moe_intermediate_size = 128
+        cfg.n_group = n_group
+        cfg.topk_group = topk_group
+        cfg.topk_method = "noaux_tc"
+
+        with pytest.raises(ValueError, match=message):
+            moe_metadata_from_config(cfg)
+
+    def test_moe_metadata_defaults_none_activation_to_silu(self):
+        cfg = _FakeConfig()
+        cfg.num_local_experts = 4
+        cfg.num_experts_per_tok = 2
+        cfg.moe_intermediate_size = 128
+        cfg.hidden_act = None
+
+        moe = moe_metadata_from_config(cfg)
+
+        assert moe is not None
+        assert moe["activation"] == "silu"
+
+    def test_moe_metadata_handles_dense_and_simple_top_k_configs(self):
+        assert moe_metadata_from_config(_FakeConfig()) is None
+
+        cfg = _FakeConfig()
+        cfg.num_local_experts = 4
+        cfg.num_experts_per_tok = 1
+        cfg.moe_intermediate_size = None
+        cfg.intermediate_size = 512
+        cfg.n_shared_experts = 2
+        cfg.shared_expert_intermediate_size = 768
+        cfg.n_group = 2
+        cfg.topk_method = "greedy"
+
+        moe = moe_metadata_from_config(cfg, representation="native")
+
+        assert moe is not None
+        assert moe["representation"] == "native"
+        assert moe["expert_intermediate_size"] == 512
+        assert moe["shared_expert_intermediate_size"] == 768
+        assert moe["router"] == {
+            "score_function": "softmax",
+            "selection_method": "top_k",
+            "normalize_weights": True,
+            "scaling_factor": 1.0,
+        }
+
+    @pytest.mark.parametrize(
+        ("field", "value", "expected"),
+        [
+            ("moe_num_shared_experts", 2, 2),
+            ("num_shared_expert", 3, 3),
+            ("moe_num_shared_experts", [0, 4], 4),
+        ],
+    )
+    def test_moe_metadata_reads_shared_expert_aliases(self, field, value, expected):
+        cfg = _FakeConfig()
+        cfg.num_local_experts = 8
+        cfg.num_experts_per_tok = 2
+        cfg.moe_intermediate_size = 256
+        setattr(cfg, field, value)
+
+        moe = moe_metadata_from_config(cfg)
+
+        assert moe is not None
+        assert moe["shared_expert_count"] == expected
+        assert moe["shared_expert_intermediate_size"] == expected * 256

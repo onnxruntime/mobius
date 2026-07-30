@@ -86,6 +86,7 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     # HunYuan-V1 dense / Hy-MT1.5 — generic decoder LLM type accepted by
     # ORT GenAI (see onnxruntime-genai/src/models/model_type.h LLM list).
     "hunyuan_v1_dense": "decoder",
+    "deepseek_v4": "decoder",
     # Qwen VL models all use the same GenAI pipeline as qwen2_5_vl
     "qwen2_vl": "qwen2_5_vl",
     "qwen3_vl": "qwen2_5_vl",
@@ -106,6 +107,10 @@ _GEMMA4_MODEL_TYPES = frozenset(
 # must preprocess with the HuggingFace processor and feed tensors via
 # ``Generator.set_inputs`` (see examples/gemma4_unified_ort_genai.py).
 _GEMMA4_UNIFIED_MODEL_TYPES = frozenset({"gemma4_unified", "gemma4_unified_text"})
+# gemma-3 multimodal. build() unwraps the composite HF config to its text
+# sub-config, so at export time ``config.model_type`` is "gemma3_text" (not
+# "gemma3").
+_GEMMA3_MODEL_TYPES = frozenset({"gemma3", "gemma3_text"})
 _PIXTRAL_MODEL_TYPES = frozenset({"mistral3"})
 _QWEN_VL_MODEL_TYPES = frozenset(
     {
@@ -430,6 +435,11 @@ def _write_vision_processor_config(
     - **Gemma4 unified** (``gemma4_unified*``): Returns ``None`` — the
       encoder-free model has no matching ort-extensions transform; callers feed
       HF-preprocessed pixel_values via ``Generator.set_inputs``.
+    - **Gemma3** (``gemma3`` or ``gemma3_text``): Writes
+      ``processor_config.json`` with a 6-step pipeline (DecodeImage →
+      ConvertRGB → Resize[fixed] → Rescale → Normalize → Permute3D). Uses a
+      fixed-size resize (no ``smart_resize``) so the SigLIP encoder's fixed
+      NCHW ``pixel_values`` input contract is met.
     - **Pixtral / Mistral3**: Writes ``processor_config.json`` with a 7-step
       pipeline (DecodeImage → ConvertRGB → Resize → Rescale → Normalize →
       Permute3D → PixtralImageSizes).
@@ -493,6 +503,88 @@ def _write_vision_processor_config(
             }
         }
         path = os.path.join(output_dir, "image_processor.json")
+    elif model_type in _GEMMA3_MODEL_TYPES:
+        # Gemma3's SigLIP vision encoder takes a plain NCHW image tensor
+        # ([batch, 3, image_size, image_size]). The generic-VLM branch below
+        # emits smart_resize (variable HxW) and no Permute3D, leaving a
+        # variable-size HWC tensor that fails the encoder's fixed input.
+        # Emit a fixed-size resize (no smart_resize) + trailing Permute3D.
+        image_size = getattr(vision, "image_size", None) or 896
+        image_mean = [0.5, 0.5, 0.5]
+        image_std = [0.5, 0.5, 0.5]
+        rescale_factor = 1.0 / 255.0
+        if hf_model_id is not None:
+            try:
+                from transformers import AutoProcessor
+
+                hf_proc = AutoProcessor.from_pretrained(hf_model_id)
+                ip = getattr(hf_proc, "image_processor", None)
+                if ip is not None:
+                    image_mean = list(getattr(ip, "image_mean", image_mean))
+                    image_std = list(getattr(ip, "image_std", image_std))
+                    rescale_factor = getattr(ip, "rescale_factor", rescale_factor)
+                    size = getattr(ip, "size", None)
+                    if isinstance(size, dict):
+                        image_size = (
+                            size.get("height") or size.get("longest_edge") or image_size
+                        )
+            except Exception:
+                logger.warning(
+                    "Could not load HF processor for %s; using gemma3 defaults "
+                    "(image_size=%s, mean/std=0.5)",
+                    hf_model_id,
+                    image_size,
+                    exc_info=True,
+                )
+        transforms = [
+            {
+                "operation": {
+                    "name": "decode_image",
+                    "type": "DecodeImage",
+                    "attrs": {"color_space": "RGB"},
+                }
+            },
+            {
+                "operation": {
+                    "name": "convert_to_rgb",
+                    "type": "ConvertRGB",
+                }
+            },
+            {
+                "operation": {
+                    "name": "resize",
+                    "type": "Resize",
+                    "attrs": {
+                        "height": image_size,
+                        "width": image_size,
+                        "smart_resize": 0,
+                    },
+                }
+            },
+            {
+                "operation": {
+                    "name": "rescale",
+                    "type": "Rescale",
+                    "attrs": {"rescale_factor": rescale_factor},
+                }
+            },
+            {
+                "operation": {
+                    "name": "normalize",
+                    "type": "Normalize",
+                    "attrs": {"mean": image_mean, "std": image_std},
+                }
+            },
+            {
+                "operation": {
+                    "name": "permute",
+                    "type": "Permute3D",
+                    "attrs": {"dims": [2, 0, 1]},
+                }
+            },
+        ]
+        processor_config = {"processor": {"name": "image_processor", "transforms": transforms}}
+        path = os.path.join(output_dir, "processor_config.json")
     else:
         # Pixtral and generic VLMs share the same base pipeline;
         # Pixtral adds Permute3D + PixtralImageSizes at the end.
@@ -718,7 +810,9 @@ def _write_genai_config(
         decoder_inputs["past_value_names"] = "past_key_values.%d.value"
 
     # Derive decoder filename from the actual package key
-    decoder_filename = f"{decoder_key}/model.onnx" if decoder_key != "model" else "model.onnx"
+    decoder_filename = (
+        f"{decoder_key}/model.onnx" if len(pkg) > 1 or decoder_key != "model" else "model.onnx"
+    )
 
     # ORT GenAI's ``past_present_share_buffer`` mode requires the decoder
     # graph to write the KV cache in place. Only ``com.microsoft.
@@ -944,7 +1038,12 @@ def write_ort_genai_config(
         # Fall back to fields stored in ArchitectureConfig (set by from_transformers()).
         # This path is taken when hf_model_id is not provided (e.g. --config mode).
         raw_type = getattr(config, "model_type", None) or "unknown"
-        ort_model_type = _resolve_ort_genai_model_type(raw_type)
+        if is_vlm and raw_type == "gemma3_text":
+            # Gemma3 multimodal configs are unwrapped to the text sub-config
+            # during build, but ORT GenAI needs the multimodal parent type.
+            ort_model_type = "gemma3"
+        else:
+            ort_model_type = _resolve_ort_genai_model_type(raw_type)
         if ort_model_type == "unknown":
             logger.warning(
                 "Could not determine ORT-GenAI model type: pkg.config.model_type "
@@ -984,6 +1083,34 @@ def write_ort_genai_config(
     )
 
     result: dict[str, str] = {"genai_config": genai_path}
+
+    if "mtp" in pkg:
+        mtp_model = pkg["mtp"]
+        mtp_path = os.path.join(directory, "mtp_config.json")
+        with open(mtp_path, "w") as f:
+            json.dump(
+                {
+                    "model": {"filename": "mtp/model.onnx"},
+                    "inputs": [
+                        value.name
+                        for value in mtp_model.graph.inputs
+                        if value.name is not None
+                    ],
+                    "outputs": [
+                        value.name
+                        for value in mtp_model.graph.outputs
+                        if value.name is not None
+                    ],
+                    "num_nextn_predict_layers": getattr(config, "num_nextn_predict_layers", 0),
+                    "shared_embedding": "model.embed_tokens",
+                    "shared_lm_head": "lm_head",
+                    "runtime_orchestration": "external",
+                },
+                f,
+                indent=2,
+            )
+            f.write("\n")
+        result["mtp_config"] = mtp_path
 
     # Copy tokenizer files — HF Hub takes precedence; local dir is the fallback
     # for --config mode where no HF model ID is available.

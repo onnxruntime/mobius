@@ -297,7 +297,7 @@ def test_dispatch_speech_to_text_pipeline(tmp_path):
     pkg = _EncoderDecoderPkg(
         {
             "encoder": _FakeModel(["input_features"], ["encoder_hidden_states"]),
-            "decoder": _FakeModel(["decoder_input_ids", "encoder_hidden_states"]),
+            "decoder": _FakeModel(["decoder_input_ids", "encoder_hidden_states"], ["logits"]),
         }
     )
     artifacts = write_onnx_genai_config(pkg, str(tmp_path), kv_native_dtype="bf16")
@@ -307,14 +307,14 @@ def test_dispatch_speech_to_text_pipeline(tmp_path):
 
     assert metadata["kv_cache"] == {"native_dtype": "bfloat16"}
     pipeline = metadata["pipeline"]
-    assert pipeline["models"] == {
-        "encoder": {"filename": "encoder/model.onnx", "type": "encoder"},
-        "decoder": {
-            "filename": "decoder/model.onnx",
-            "type": "decoder",
-            "tokenizer": "tokenizer.json",
-        },
-    }
+    assert pipeline["models"]["encoder"]["filename"] == "encoder/model.onnx"
+    assert pipeline["models"]["encoder"]["type"] == "encoder"
+    decoder_model = pipeline["models"]["decoder"]
+    assert decoder_model["filename"] == "decoder/model.onnx"
+    assert decoder_model["type"] == "decoder"
+    assert decoder_model["tokenizer"] == "tokenizer.json"
+    assert decoder_model["io"]["logits_output"] == "logits"
+    assert decoder_model["io"]["kv_ownership"] == "owned"
     assert pipeline["dataflow"] == [
         {
             "from": "encoder.encoder_hidden_states",
@@ -403,7 +403,7 @@ def test_dispatch_multi_decoder_tts_with_pre_embedder(tmp_path):
     pkg = _TTSPkg(
         {
             "talker": _FakeModel(["inputs_embeds"], ["logits", "last_hidden_state"]),
-            "code_predictor": _FakeModel(["inputs_embeds"], ["logits"]),
+            "code_predictor": _FakeModel(["inputs_embeds"], ["logits", "codec_embeddings"]),
             "talker_step_embedder": _FakeModel(["frame_codes"], ["inputs_embeds"]),
             "talker_prefill_embedder": _FakeModel(
                 ["text_ids"], ["prefill_embeds", "trailing_text_embeds"]
@@ -425,6 +425,7 @@ def test_dispatch_multi_decoder_tts_with_pre_embedder(tmp_path):
     }
     stage = pipeline["strategy"]["stages"][0]["strategy"]
     assert stage["kind"] == "nested_autoregressive"
+    assert stage["inner_embedding_output"] == "codec_embeddings"
     assert stage["pre_embedder"]["component"] == "talker_step_embedder"
     assert stage["prefill_embedder"]["component"] == "talker_prefill_embedder"
     assert stage["num_code_groups"] == 16

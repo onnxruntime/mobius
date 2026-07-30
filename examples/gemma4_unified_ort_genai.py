@@ -65,7 +65,7 @@ artifacts).
 
 Requirements::
 
-    pip install mobius-ai[ort-genai] transformers pillow librosa
+    pip install mobius-onnx[ort-genai] transformers pillow librosa
     # plus a per-layer-KV-aware onnxruntime-genai build (see caveat 1)
 
 Usage::
