@@ -272,7 +272,7 @@ def test_deepseek_fused_qmoe_rejects_cuda():
             sym=True,
         ),
     )
-    with pytest.raises(ValueError, match="CUDA.*ignores router_weights"):
+    with pytest.raises(ValueError, match=r"CUDA.*ignores router_weights"):
         build_from_module(
             DeepSeekV3CausalLMModel(config),
             config,

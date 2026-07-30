@@ -128,7 +128,9 @@ class GlmMoeDsaIndexer(nn.Module):
         # (ORT) and fixed-capacity (native single-token decode) exposures.
         key_length = op.Shape(scores, start=2, end=3)
         causal = op.Squeeze(attention_bias, [1])
-        causal = op.Slice(causal, op.Constant(value_ints=[0]), key_length, op.Constant(value_ints=[2]))
+        causal = op.Slice(
+            causal, op.Constant(value_ints=[0]), key_length, op.Constant(value_ints=[2])
+        )
         scores = op.Add(scores, op.Cast(causal, to=ir.DataType.FLOAT))
 
         k = op.Min(key_length, op.Constant(value_ints=[self.index_topk]))
