@@ -2238,12 +2238,26 @@ class GraniteMoeHybridConfig(BambaConfig):
             or getattr(config, "layers_block_type", None)
             or []
         )
-        layer_types = [
-            "full_attention" if ltype == "full_attention" else "mamba2"
-            for ltype in raw_layer_types
-        ]
+        _attn = {"full_attention", "attention"}
+        _mamba = {"linear_attention", "mamba", "mamba2"}
+        layer_types: list[str] = []
+        for ltype in raw_layer_types:
+            if ltype in _attn:
+                layer_types.append("full_attention")
+            elif ltype in _mamba:
+                layer_types.append("mamba2")
+            else:
+                raise ValueError(f"Unknown GraniteMoeHybrid layer type: {ltype!r}")
         if layer_types:
             bamba_fields["layer_types"] = layer_types
+
+        # Respect position_embedding_type: GraniteMoeHybrid checkpoints ship
+        # default ``rope_parameters`` even for the NoPE variant
+        # (granite-4.0-tiny-preview: position_embedding_type='nope'). Only apply
+        # RoPE when explicitly requested; otherwise disable it so
+        # ``initialize_rope`` returns None and attention runs NoPE.
+        if getattr(config, "position_embedding_type", "rope") != "rope":
+            bamba_fields["rope_type"] = None
 
         return cls(
             **bamba_fields,

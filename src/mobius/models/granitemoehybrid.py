@@ -252,7 +252,7 @@ class _GraniteMoeHybridMambaDecoderLayer(nn.Module):
         op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
-        position_embeddings: tuple,
+        position_embeddings: tuple | None,
         past_key_value: tuple | None,
     ):
         """Forward pass. Returns (hidden_states, (conv_state, ssm_state)).
@@ -318,7 +318,7 @@ class _GraniteMoeHybridAttentionDecoderLayer(nn.Module):
         op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
-        position_embeddings: tuple,
+        position_embeddings: tuple | None,
         past_key_value: tuple | None,
     ):
         """Forward pass. Returns (hidden_states, (key, value)).
