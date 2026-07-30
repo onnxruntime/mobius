@@ -219,6 +219,7 @@ class GenaiConfigGenerator:
         decoder_inputs: dict[str, str] | None = None,
         decoder_filename: str | None = None,
         supports_in_place_kv_cache: bool | None = None,
+        num_kv_cache_layers: int | None = None,
     ) -> GenaiConfigGenerator:
         """Create a generator from a BaseModelConfig-like dataclass.
 
@@ -226,6 +227,18 @@ class GenaiConfigGenerator:
         ``num_attention_heads``, ``num_key_value_heads``, and ``head_dim``
         from the config object. Token IDs and context_length can be
         overridden since they are often not on the model config.
+
+        Args:
+            num_kv_cache_layers: Number of KV cache entries the exported
+                decoder graph actually has. Overrides
+                ``config.num_hidden_layers`` for the ``num_hidden_layers``
+                field written to ``genai_config.json`` — ORT-GenAI uses that
+                field to decide how many ``past_key_values.%d.{key,value}``
+                bindings to create, so it must match the graph, not the
+                architecture. They differ for KV-layer-sharing models
+                (Gemma 3n / Gemma 4), where the last
+                ``num_kv_shared_layers`` layers borrow K,V from an earlier
+                layer and own no cache entry. ``None`` uses the config value.
         """
         pad = pad_token_id
         if pad is None:
@@ -241,7 +254,11 @@ class GenaiConfigGenerator:
             model_type,
             vocab_size=config.vocab_size,
             hidden_size=config.hidden_size,
-            num_hidden_layers=config.num_hidden_layers,
+            num_hidden_layers=(
+                num_kv_cache_layers
+                if num_kv_cache_layers is not None
+                else config.num_hidden_layers
+            ),
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
             head_dim=config.head_dim,

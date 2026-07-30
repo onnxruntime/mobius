@@ -184,6 +184,30 @@ def _graph_input_names(model: ir.Model) -> list[str]:
     ]
 
 
+def _count_kv_cache_layers(model: ir.Model | None) -> int | None:
+    """Return the number of ``past_key_values.{i}.key`` inputs in *model*.
+
+    ORT-GenAI binds ``num_hidden_layers`` KV cache pairs by name, so that
+    field must reflect the graph rather than the architecture. The two differ
+    for KV-layer-sharing models (Gemma 3n / Gemma 4), whose trailing layers
+    borrow K,V from an earlier layer and therefore own no cache entry.
+
+    Returns ``None`` when *model* is absent or has no such inputs (e.g. a
+    static-cache export, which uses ``key_cache.{i}`` instead), letting
+    callers fall back to the config value.
+    """
+    if model is None:
+        return None
+    count = sum(
+        1
+        for inp in model.graph.inputs
+        if inp.name is not None
+        and inp.name.startswith("past_key_values.")
+        and inp.name.endswith(".key")
+    )
+    return count or None
+
+
 def _introspect_inputs(pkg: ModelPackage, key: str) -> dict[str, str] | None:
     """Return ``{name: name}`` identity mapping for a sub-model's inputs.
 
@@ -841,6 +865,7 @@ def _write_genai_config(
         decoder_inputs=decoder_inputs,
         decoder_filename=decoder_filename,
         supports_in_place_kv_cache=supports_in_place_kv_cache,
+        num_kv_cache_layers=_count_kv_cache_layers(decoder_model),
     )
 
     if is_vlm:
