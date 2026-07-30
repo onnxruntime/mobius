@@ -19,7 +19,7 @@ import onnx_ir as ir
 import pytest
 
 from mobius._flags import flags
-from mobius._testing.ort_inference import OnnxModelSession, _MAX_EP_OPSET, _should_lower_opset
+from mobius._testing.ort_inference import _MAX_EP_OPSET, OnnxModelSession, _should_lower_opset
 
 
 def _make_value(name: str) -> ir.Value:
