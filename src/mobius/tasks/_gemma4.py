@@ -413,7 +413,6 @@ class Gemma4Task(ModelTask):
         pre-allocated cache (static mode).
     """
 
-<<<<<<< HEAD
     #: decoder + vision + embedding, plus audio when ``config.audio`` is set.
     #: ``audio_encoder`` is declared statically (it is config-gated at build time).
     model_roles: ClassVar[dict[str, str]] = {
@@ -422,7 +421,7 @@ class Gemma4Task(ModelTask):
         "audio_encoder": "encoder",
         "embedding": "embedding",
     }
-=======
+
     def __init__(
         self,
         *,
@@ -431,7 +430,6 @@ class Gemma4Task(ModelTask):
     ):
         self._static_cache = static_cache
         self._max_seq_len = max_seq_len
->>>>>>> origin/main
 
     def build(
         self,
