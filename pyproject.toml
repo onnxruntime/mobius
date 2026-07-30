@@ -34,6 +34,11 @@ testing = [
     "accelerate",
     "diffusers",
     "onnxruntime-easy>=0.1.1",
+    # onnxruntime>=1.28 is required for the fused Attention kernel to apply
+    # attention-logit soft-capping *before* the mask/bias (ONNX spec order).
+    # Older kernels (<=1.26) applied softcap after the mask, which diverges from
+    # the DecomposeAttentionPass output and fails its softcap parity tests.
+    "onnxruntime>=1.28.0",
     "torch",
     "transformers>=5.0",
     "safetensors",

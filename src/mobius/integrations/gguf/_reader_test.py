@@ -409,6 +409,7 @@ class TestConfigMapping:
         assert GGUF_ARCH_TO_MODEL_TYPE["llama"] == "llama"
         assert GGUF_ARCH_TO_MODEL_TYPE["mistral"] == "llama"
         assert GGUF_ARCH_TO_MODEL_TYPE["qwen2"] == "qwen2"
+        assert GGUF_ARCH_TO_MODEL_TYPE["qwen35"] == "qwen3_5_text"
         assert GGUF_ARCH_TO_MODEL_TYPE["phi3"] == "phi3"
         assert GGUF_ARCH_TO_MODEL_TYPE["deepseek4"] == "deepseek_v4"
         assert GGUF_ARCH_TO_MODEL_TYPE["glm-dsa"] == "glm_moe_dsa"

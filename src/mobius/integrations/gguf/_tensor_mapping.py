@@ -237,7 +237,7 @@ _GLM_DSA_MAPPING: dict[str, str] = {
 # Qwen3.5-MoE hybrid extensions: DeltaNet (SSM) + full-attention + MoE.
 # DeltaNet layers use linear_attn.* naming; full-attention layers add
 # q_norm/k_norm under self_attn; both use post_attention_layernorm.
-_QWEN35MOE_EXTRAS: dict[str, str] = {
+_QWEN35_HYBRID_EXTRAS: dict[str, str] = {
     # DeltaNet (linear attention) layers
     "blk.{bid}.attn_qkv": "model.layers.{bid}.linear_attn.in_proj_qkv",
     "blk.{bid}.attn_gate": "model.layers.{bid}.linear_attn.in_proj_z",
@@ -312,6 +312,7 @@ _LLAMA_FAMILY = frozenset(
         "mistral",
         "qwen2",
         "qwen3",
+        "qwen35",
         "starcoder2",
         "internlm2",
         "nemotron",
@@ -369,6 +370,8 @@ def _build_mapping(
 
     if arch in _LLAMA_FAMILY:
         result = dict(_LLAMA_MAPPING)
+        if arch == "qwen35":
+            result.update(_QWEN35_HYBRID_EXTRAS)
     elif arch == "gemma3":
         # Gemma3 uses the llama.cpp Gemma tensor names (ffn_norm as the
         # pre-feedforward norm, plus post_attention/post_ffw norms and Q/K
@@ -401,7 +404,7 @@ def _build_mapping(
         result = dict(_LLAMA_MAPPING)
         result.update(_MOE_EXTRAS)
         if arch == "qwen35moe":
-            result.update(_QWEN35MOE_EXTRAS)
+            result.update(_QWEN35_HYBRID_EXTRAS)
     elif arch == "deepseek4":
         result = dict(_DEEPSEEK4_MAPPING)
     elif arch == "glm-dsa":

@@ -214,7 +214,9 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
         torch_forward,
     )
 
-    model, tokenizer = load_torch_model(case.model_id, device=device)
+    model, tokenizer = load_torch_model(
+        case.model_id, device=device, trust_remote_code=case.trust_remote_code
+    )
 
     encoded = tokenizer(case.prompts[0], return_tensors="np", padding=False)
     input_ids = encoded["input_ids"]

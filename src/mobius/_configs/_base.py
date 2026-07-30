@@ -134,6 +134,28 @@ def _first_not_none(*values, default=None):
     return default
 
 
+# Legacy rope_type spellings that name the same algorithm as a canonical
+# rope_type understood by ``initialize_rope``. Phi-3/Phi-3.5 checkpoints
+# label LongRoPE as ``"su"`` (short/long-factor scaled rotary embeddings);
+# newer HuggingFace configs call the identical algorithm ``"longrope"``.
+# Both must resolve to the same code path, so we canonicalize the alias at
+# extraction time rather than special-casing ``"su"`` downstream.
+_ROPE_TYPE_ALIASES: dict[str, str] = {
+    "su": "longrope",
+}
+
+
+def _canonical_rope_type(rope_type: str | None) -> str | None:
+    """Map legacy rope_type aliases to their canonical spelling.
+
+    Returns the input unchanged when it is not a known alias (including
+    ``None`` and ``"default"``).
+    """
+    if rope_type is None:
+        return None
+    return _ROPE_TYPE_ALIASES.get(rope_type, rope_type)
+
+
 def _leading_layer_type_count(layer_types, target: str) -> int:
     count = 0
     for layer_type in layer_types or ():
@@ -247,12 +269,14 @@ def _extract_rope_config(config) -> RoPEConfig | None:
     rope_parameters = raw_rope_parameters or {}
 
     return RoPEConfig(
-        rope_type=_first_not_none(
-            rope_scaling.get("rope_type", None),
-            rope_scaling.get("type", None),
-            rope_parameters.get("rope_type", None),
-            _nested_rope_type(rope_scaling, "full_attention"),
-            default="default",
+        rope_type=_canonical_rope_type(
+            _first_not_none(
+                rope_scaling.get("rope_type", None),
+                rope_scaling.get("type", None),
+                rope_parameters.get("rope_type", None),
+                _nested_rope_type(rope_scaling, "full_attention"),
+                default="default",
+            )
         ),
         rope_theta=_first_not_none(
             getattr(config, "rope_theta", None),
