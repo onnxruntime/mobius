@@ -36,7 +36,7 @@ are used (vision and audio encoders run once per generation).
 
 Prerequisites::
 
-    pip install mobius-ai[transformers]
+    pip install mobius-onnx[transformers]
     pip install torchaudio pillow  # for audio and image loading
 
 Usage::
