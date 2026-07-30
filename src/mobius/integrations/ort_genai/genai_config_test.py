@@ -501,6 +501,31 @@ class TestGenaiConfigFromConfig:
         config = gen.generate()
         assert config["model"]["context_length"] == 4096
 
+    def test_num_kv_cache_layers_overrides_num_hidden_layers(self):
+        """KV-sharing models report the graph's cache count, not the layer count.
+
+        Gemma 3n / Gemma 4 trailing layers borrow K,V from an earlier layer and
+        own no cache entry, so ORT-GenAI must bind fewer
+        ``past_key_values.%d.*`` pairs than the architecture has layers.
+        """
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            vocab_size: int = 32000
+            hidden_size: int = 4096
+            num_hidden_layers: int = 35
+            num_attention_heads: int = 32
+            num_key_value_heads: int = 8
+            head_dim: int = 128
+
+        cfg = FakeConfig()
+        gen = GenaiConfigGenerator.from_config(cfg, "gemma3n", num_kv_cache_layers=20)
+        assert gen.generate()["model"]["decoder"]["num_hidden_layers"] == 20
+
+        # None falls back to the config value.
+        gen = GenaiConfigGenerator.from_config(cfg, "gemma3n")
+        assert gen.generate()["model"]["decoder"]["num_hidden_layers"] == 35
+
 
 class TestGenaiConfigWrite:
     """Test writing genai_config.json to disk."""

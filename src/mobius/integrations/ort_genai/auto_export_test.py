@@ -16,6 +16,7 @@ import pytest
 from mobius.integrations.ort_genai.auto_export import (
     _copy_tokenizer_files,
     _copy_tokenizer_files_from_local,
+    _count_kv_cache_layers,
     _fix_chat_template,
     _fix_tokenizer_config,
     _graph_input_names,
@@ -1469,6 +1470,32 @@ class TestGraphInputNames:
             "attention_mask",
             "position_ids",
         ]
+
+
+class TestCountKvCacheLayers:
+    """Tests for _count_kv_cache_layers() helper."""
+
+    def test_counts_key_inputs(self):
+        """Counts past_key_values.{i}.key inputs, not the value pairs."""
+        model = _mock_model_with_inputs(
+            [
+                "input_ids",
+                "attention_mask",
+                "past_key_values.0.key",
+                "past_key_values.0.value",
+                "past_key_values.1.key",
+                "past_key_values.1.value",
+            ]
+        )
+        assert _count_kv_cache_layers(model) == 2
+
+    def test_returns_none_without_kv_cache(self):
+        """A static-cache export (key_cache.{i}) falls back to the config."""
+        model = _mock_model_with_inputs(["input_ids", "key_cache.0", "value_cache.0"])
+        assert _count_kv_cache_layers(model) is None
+
+    def test_returns_none_for_missing_model(self):
+        assert _count_kv_cache_layers(None) is None
 
 
 class TestGemma4RealModel:
