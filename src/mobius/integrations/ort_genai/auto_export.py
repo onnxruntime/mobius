@@ -54,6 +54,10 @@ import os
 import shutil
 from typing import TYPE_CHECKING, Any
 
+from mobius.integrations.ort_genai.chat_template import (
+    synchronize_chat_template_for_ort,
+)
+
 if TYPE_CHECKING:
     import onnx_ir as ir
 
@@ -112,20 +116,47 @@ _GEMMA4_UNIFIED_MODEL_TYPES = frozenset({"gemma4_unified", "gemma4_unified_text"
 # "gemma3").
 _GEMMA3_MODEL_TYPES = frozenset({"gemma3", "gemma3_text"})
 _PIXTRAL_MODEL_TYPES = frozenset({"mistral3"})
-_QWEN_VL_MODEL_TYPES = frozenset(
+_QWEN2_VL_MODEL_TYPES = frozenset(
+    {"qwen2_vl", "qwen2_vl_text", "qwen2_5_vl", "qwen2_5_vl_text"}
+)
+_QWEN3_VL_MODEL_TYPES = frozenset(
     {
-        "qwen2_vl",
-        "qwen2_vl_text",
-        "qwen2_5_vl",
-        "qwen2_5_vl_text",
         "qwen3_vl",
+        "qwen3_vl_single",
         "qwen3_vl_text",
         "qwen3_5",
         "qwen3_5_vl",
+        "qwen3_5_vl_text",
+        "qwen3_5_text",
         "qwen3_5_moe",
-        "videochat_flash_qwen",
+        "qwen3_5_moe_vl",
+        "qwen3_5_moe_text",
     }
 )
+_QWEN_VL_MODEL_TYPES = frozenset(
+    _QWEN2_VL_MODEL_TYPES | _QWEN3_VL_MODEL_TYPES | {"videochat_flash_qwen"}
+)
+
+_QWEN_VISION_DEFAULTS: dict[str, dict[str, Any]] = {
+    "qwen2": {
+        "patch_size": 14,
+        "temporal_patch_size": 2,
+        "merge_size": 2,
+        "image_mean": [0.48145466, 0.4578275, 0.40821073],
+        "image_std": [0.26862954, 0.26130258, 0.27577711],
+        "min_pixels": 3136,
+        "max_pixels": 12845056,
+    },
+    "qwen3": {
+        "patch_size": 16,
+        "temporal_patch_size": 2,
+        "merge_size": 2,
+        "image_mean": [0.5, 0.5, 0.5],
+        "image_std": [0.5, 0.5, 0.5],
+        "min_pixels": 65536,
+        "max_pixels": 16777216,
+    },
+}
 
 _TOKENIZER_FILES = [
     "tokenizer.json",
@@ -417,18 +448,68 @@ def _build_vision_transform_pipeline(
     ]
 
 
+def _image_processor_settings(source: str) -> dict[str, Any]:
+    """Load image-processor fields from a local config or Hugging Face processor."""
+    if os.path.isdir(source):
+        preprocessor_path = os.path.join(source, "preprocessor_config.json")
+        if os.path.isfile(preprocessor_path):
+            with open(preprocessor_path, encoding="utf-8") as f:
+                return json.load(f)
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
+
+            preprocessor_path = hf_hub_download(source, "preprocessor_config.json")
+            with open(preprocessor_path, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            logger.debug(
+                "Could not read raw preprocessor_config.json for %s; "
+                "falling back to AutoProcessor",
+                source,
+                exc_info=True,
+            )
+
+    from transformers import AutoProcessor
+
+    processor = AutoProcessor.from_pretrained(source)
+    image_processor = getattr(processor, "image_processor", None)
+    if image_processor is None:
+        raise ValueError(f"Processor source {source!r} has no image_processor")
+    return {
+        "patch_size": getattr(image_processor, "patch_size", None),
+        "temporal_patch_size": getattr(image_processor, "temporal_patch_size", None),
+        "merge_size": getattr(image_processor, "merge_size", None),
+        "image_mean": getattr(image_processor, "image_mean", None),
+        "image_std": getattr(image_processor, "image_std", None),
+        "rescale_factor": getattr(image_processor, "rescale_factor", None),
+        "size": getattr(image_processor, "size", None),
+        "min_pixels": getattr(image_processor, "min_pixels", None),
+        "max_pixels": getattr(image_processor, "max_pixels", None),
+    }
+
+
+def _size_value(size: Any, key: str) -> int | None:
+    """Read a resize bound from dict-like or attribute-based HF size objects."""
+    if isinstance(size, dict):
+        return size.get(key)
+    return getattr(size, key, None)
+
+
 def _write_vision_processor_config(
     config: Any,
     output_dir: str,
     *,
     hf_model_id: str | None = None,
+    local_config_dir: str | None = None,
 ) -> str | None:
     """Write the vision processor config file for VLM models.
 
     Generates the ORT-extensions image transform pipeline derived from the
-    HuggingFace image processor config. When ``hf_model_id`` is provided,
-    loads the HF processor to extract normalization values and resize
-    parameters. Otherwise falls back to CLIP-standard defaults.
+    HuggingFace image processor config. ``hf_model_id`` and
+    ``local_config_dir`` are searched for source processor settings. Qwen
+    exports fail when an explicitly supplied source cannot be loaded, rather
+    than silently emitting another Qwen generation's defaults.
 
     The output format depends on the model type:
 
@@ -605,32 +686,69 @@ def _write_vision_processor_config(
         max_pixels = 2371600
         image_size = getattr(vision, "image_size", None)
 
-        if hf_model_id is not None:
-            try:
-                from transformers import AutoProcessor
+        qwen_family = None
+        if model_type in _QWEN2_VL_MODEL_TYPES:
+            qwen_family = "qwen2"
+        elif model_type in _QWEN3_VL_MODEL_TYPES:
+            qwen_family = "qwen3"
 
-                hf_proc = AutoProcessor.from_pretrained(hf_model_id)
-                ip = getattr(hf_proc, "image_processor", None)
-                if ip is not None:
-                    image_mean = list(getattr(ip, "image_mean", image_mean))
-                    image_std = list(getattr(ip, "image_std", image_std))
-                    rescale_factor = getattr(ip, "rescale_factor", rescale_factor)
-                    if hasattr(ip, "size"):
-                        size = ip.size
-                        if isinstance(size, dict):
-                            if "longest_edge" in size:
-                                image_size = size["longest_edge"]
-                            min_pixels = size.get("shortest_edge", min_pixels)
-                            max_pixels = size.get("longest_edge", max_pixels)
-                        elif isinstance(size, int):
-                            image_size = size
-            except Exception:
-                logger.warning(
-                    "Could not load HF processor for %s; "
-                    "using CLIP-standard normalization defaults",
-                    hf_model_id,
-                    exc_info=True,
-                )
+        if qwen_family is not None:
+            qwen_defaults = _QWEN_VISION_DEFAULTS[qwen_family]
+            patch_size = qwen_defaults["patch_size"]
+            merge_size = qwen_defaults["merge_size"]
+            image_mean = list(qwen_defaults["image_mean"])
+            image_std = list(qwen_defaults["image_std"])
+            min_pixels = qwen_defaults["min_pixels"]
+            max_pixels = qwen_defaults["max_pixels"]
+
+        processor_settings = None
+        processor_source = hf_model_id if hf_model_id is not None else local_config_dir
+        processor_error = None
+        if processor_source is not None:
+            try:
+                processor_settings = _image_processor_settings(processor_source)
+            except Exception as error:
+                processor_error = error
+
+        if processor_settings is None and processor_error is not None:
+            if qwen_family is not None:
+                raise ValueError(
+                    f"Could not load required {model_type} image processor config "
+                    f"from {processor_source!r}"
+                ) from processor_error
+            logger.warning(
+                "Could not load HF processor for %s (%s); "
+                "using CLIP-standard normalization defaults",
+                processor_source,
+                processor_error,
+            )
+
+        if processor_settings is not None:
+            patch_size = processor_settings.get("patch_size") or patch_size
+            merge_size = processor_settings.get("merge_size") or merge_size
+            source_mean = processor_settings.get("image_mean")
+            source_std = processor_settings.get("image_std")
+            if source_mean is not None:
+                image_mean = list(source_mean)
+            if source_std is not None:
+                image_std = list(source_std)
+            rescale_factor = processor_settings.get("rescale_factor") or rescale_factor
+            size = processor_settings.get("size")
+            source_min_pixels = processor_settings.get("min_pixels") or _size_value(
+                size, "shortest_edge"
+            )
+            source_max_pixels = processor_settings.get("max_pixels") or _size_value(
+                size, "longest_edge"
+            )
+            if source_min_pixels is not None:
+                min_pixels = source_min_pixels
+            if source_max_pixels is not None:
+                max_pixels = source_max_pixels
+            if qwen_family is None:
+                if isinstance(size, int):
+                    image_size = size
+                else:
+                    image_size = _size_value(size, "longest_edge") or image_size
 
         if image_size is None:
             image_size = 1540 if is_pixtral else 448
@@ -668,14 +786,30 @@ def _write_vision_processor_config(
             )
         elif model_type in _QWEN_VL_MODEL_TYPES:
             # Qwen-VL models need the PatchImage transform to extract
-            # temporal+spatial patches, and qwen2_5_vl/qwen3_vl flag
-            # on Normalize for correct interleaving.
-            temporal_patch_size = config.temporal_patch_size
-            # Add qwen3_vl flag to the Normalize step
+            # temporal+spatial patches and an architecture-specific Normalize
+            # flag for correct interleaving.
+            temporal_patch_size = (
+                processor_settings.get("temporal_patch_size")
+                if processor_settings is not None
+                else None
+            )
+            temporal_patch_size = (
+                temporal_patch_size
+                or (
+                    _QWEN_VISION_DEFAULTS[qwen_family]["temporal_patch_size"]
+                    if qwen_family is not None
+                    else getattr(vision, "temporal_patch_size", None)
+                )
+                or getattr(config, "temporal_patch_size", 2)
+                or 2
+            )
+            normalize_flag = (
+                "qwen3_vl" if model_type in _QWEN3_VL_MODEL_TYPES else "qwen2_5_vl"
+            )
             for t in transforms:
                 op = t.get("operation", {})
                 if op.get("type") == "Normalize":
-                    op.setdefault("attrs", {})["qwen2_5_vl"] = 1
+                    op.setdefault("attrs", {})[normalize_flag] = 1
             transforms.append(
                 {
                     "operation": {
@@ -693,6 +827,8 @@ def _write_vision_processor_config(
         processor_name = (
             "pixtral_image_processor"
             if is_pixtral
+            else "qwen3_vl_image_processor"
+            if model_type in _QWEN3_VL_MODEL_TYPES
             else "qwen2_5_image_processor"
             if model_type in _QWEN_VL_MODEL_TYPES
             else "image_processor"
@@ -1155,7 +1291,12 @@ def write_ort_genai_config(
             result[tf] = os.path.join(directory, tf)
 
     # Write processor config for VLMs
-    processor_path = _write_vision_processor_config(config, directory, hf_model_id=hf_model_id)
+    processor_path = _write_vision_processor_config(
+        config,
+        directory,
+        hf_model_id=hf_model_id,
+        local_config_dir=local_config_dir,
+    )
     if processor_path:
         result["processor_config"] = processor_path
 
@@ -1169,6 +1310,16 @@ def write_ort_genai_config(
 
     # Ensure chat_template is in tokenizer_config.json
     _fix_chat_template(directory, hf_model_id)
+
+    # Keep ORT's standalone and tokenizer-config templates identical. Gemma-4
+    # QAT checkpoints can carry structured-media branches that use Python
+    # ``.get`` calls unsupported by ORT's Jinja implementation.
+    chat_template_path = synchronize_chat_template_for_ort(directory, ort_model_type)
+    if chat_template_path:
+        result["chat_template.jinja"] = chat_template_path
+        tokenizer_config_path = os.path.join(directory, "tokenizer_config.json")
+        if os.path.exists(tokenizer_config_path):
+            result["tokenizer_config.json"] = tokenizer_config_path
 
     logger.info("ORT-GenAI artifacts written: %d files", len(result))
     return result

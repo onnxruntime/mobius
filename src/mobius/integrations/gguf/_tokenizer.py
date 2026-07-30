@@ -23,32 +23,12 @@ import logging
 import os
 from pathlib import Path
 
-_LOGGER = logging.getLogger(__name__)
+from mobius.integrations.ort_genai.chat_template import (
+    GEMMA4_ORT_CHAT_TEMPLATE,
+    write_chat_template_artifacts,
+)
 
-_GEMMA4_ORT_CHAT_TEMPLATE = """{{- bos_token -}}
-{%- for message in messages -%}
-{{- '<|turn>' + ('model' if message['role'] == 'assistant' else message['role']) + '\\n' -}}
-{%- if message['content'] is string -%}
-{{- message['content'] | trim -}}
-{%- else -%}
-{%- for item in message['content'] -%}
-{%- if item['type'] == 'text' -%}
-{{- item['text'] | trim -}}
-{%- elif item['type'] == 'image' -%}
-{{- '<|image|>' -}}
-{%- elif item['type'] == 'audio' -%}
-{{- '<|audio|>' -}}
-{%- elif item['type'] == 'video' -%}
-{{- '<|video|>' -}}
-{%- endif -%}
-{%- endfor -%}
-{%- endif -%}
-{{- '<turn|>\\n' -}}
-{%- endfor -%}
-{%- if add_generation_prompt -%}
-{{- '<|turn>model\\n' -}}
-{%- endif -%}
-"""
+_LOGGER = logging.getLogger(__name__)
 
 
 def write_gguf_tokenizer_json(gguf_path: str | Path, output_dir: str | Path) -> str | None:
@@ -270,13 +250,10 @@ def _write_tokenizer_config(metadata: dict, tokens: list[str], output_dir: str |
 def _write_chat_template(metadata: dict, output_dir: str | Path) -> str | None:
     architecture = str(metadata.get("general.architecture", ""))
     chat_template = (
-        _GEMMA4_ORT_CHAT_TEMPLATE
+        GEMMA4_ORT_CHAT_TEMPLATE
         if architecture == "gemma4"
         else metadata.get("tokenizer.chat_template")
     )
     if not isinstance(chat_template, str) or not chat_template:
         return None
-    path = os.path.join(str(output_dir), "chat_template.jinja")
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(chat_template)
-    return path
+    return write_chat_template_artifacts(output_dir, chat_template)

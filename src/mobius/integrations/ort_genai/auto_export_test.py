@@ -27,6 +27,11 @@ from mobius.integrations.ort_genai.auto_export import (
     auto_export,
     write_ort_genai_config,
 )
+from mobius.integrations.ort_genai.chat_template import (
+    GEMMA4_ORT_CHAT_TEMPLATE,
+    gemma4_template_needs_ort_normalization,
+    synchronize_chat_template_for_ort,
+)
 
 
 def _mock_model_with_inputs(names):
@@ -136,6 +141,30 @@ class TestSelectOrtModelType:
 
 
 class TestWriteProcessorConfig:
+    @staticmethod
+    def _qwen_config(model_type, *, patch_size, temporal_patch_size, merge_size):
+        vision = types.SimpleNamespace(
+            image_size=None,
+            model_type=model_type,
+            patch_size=patch_size,
+            spatial_merge_size=merge_size,
+            temporal_patch_size=temporal_patch_size,
+        )
+        return types.SimpleNamespace(
+            model_type=model_type,
+            vision=vision,
+            spatial_merge_size=merge_size,
+            temporal_patch_size=temporal_patch_size,
+        )
+
+    @staticmethod
+    def _transform_attrs(processor_config, operation_type):
+        for transform in processor_config["processor"]["transforms"]:
+            operation = transform["operation"]
+            if operation["type"] == operation_type:
+                return operation.get("attrs", {})
+        raise AssertionError(f"Missing {operation_type} transform")
+
     def test_no_vision_returns_none(self, tmp_path):
         config = mock.MagicMock(spec=[])
         del config.vision  # ensure no vision attribute
@@ -333,6 +362,320 @@ class TestWriteProcessorConfig:
         assert normalize["mean"] == pytest.approx([0.48145466, 0.4578275, 0.40821073])
         assert normalize["std"] == pytest.approx([0.26862954, 0.26130258, 0.27577711])
 
+    @pytest.mark.parametrize(
+        (
+            "model_type",
+            "source_config",
+            "expected_processor_name",
+            "expected_normalize_flag",
+        ),
+        [
+            (
+                "qwen2_5_vl",
+                {
+                    "patch_size": 14,
+                    "temporal_patch_size": 2,
+                    "merge_size": 2,
+                    "image_mean": [0.48145466, 0.4578275, 0.40821073],
+                    "image_std": [0.26862954, 0.26130258, 0.27577711],
+                    "min_pixels": 3136,
+                    "max_pixels": 12845056,
+                },
+                "qwen2_5_image_processor",
+                "qwen2_5_vl",
+            ),
+            (
+                "qwen3_vl",
+                {
+                    "patch_size": 16,
+                    "temporal_patch_size": 2,
+                    "merge_size": 2,
+                    "image_mean": [0.5, 0.5, 0.5],
+                    "image_std": [0.5, 0.5, 0.5],
+                    "size": {
+                        "shortest_edge": 65536,
+                        "longest_edge": 16777216,
+                    },
+                },
+                "qwen3_vl_image_processor",
+                "qwen3_vl",
+            ),
+        ],
+    )
+    def test_qwen_uses_local_source_processor_config(
+        self,
+        tmp_path,
+        model_type,
+        source_config,
+        expected_processor_name,
+        expected_normalize_flag,
+    ):
+        """Local HF processor settings override stale or swapped architecture values."""
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "preprocessor_config.json").write_text(json.dumps(source_config))
+        config = self._qwen_config(
+            model_type,
+            patch_size=99,
+            temporal_patch_size=7,
+            merge_size=5,
+        )
+
+        path = _write_vision_processor_config(
+            config,
+            str(tmp_path),
+            local_config_dir=str(source),
+        )
+
+        assert path == str(tmp_path / "processor_config.json")
+        processor_config = json.loads((tmp_path / "processor_config.json").read_text())
+        assert processor_config["processor"]["name"] == expected_processor_name
+        resize = self._transform_attrs(processor_config, "Resize")
+        patch = self._transform_attrs(processor_config, "PatchImage")
+        normalize = self._transform_attrs(processor_config, "Normalize")
+        assert resize["patch_size"] == source_config["patch_size"]
+        assert resize["merge_size"] == source_config["merge_size"]
+        assert resize["min_pixels"] == (
+            source_config.get("min_pixels") or source_config["size"]["shortest_edge"]
+        )
+        assert resize["max_pixels"] == (
+            source_config.get("max_pixels") or source_config["size"]["longest_edge"]
+        )
+        assert patch == {
+            "patch_size": source_config["patch_size"],
+            "temporal_patch_size": source_config["temporal_patch_size"],
+            "merge_size": source_config["merge_size"],
+        }
+        assert normalize["mean"] == pytest.approx(source_config["image_mean"])
+        assert normalize["std"] == pytest.approx(source_config["image_std"])
+        assert normalize[expected_normalize_flag] == 1
+
+    @pytest.mark.parametrize(
+        (
+            "model_type",
+            "patch_size",
+            "image_mean",
+            "image_std",
+            "min_pixels",
+            "max_pixels",
+        ),
+        [
+            (
+                "qwen2_5_vl",
+                14,
+                [0.48145466, 0.4578275, 0.40821073],
+                [0.26862954, 0.26130258, 0.27577711],
+                3136,
+                12845056,
+            ),
+            ("qwen3_vl", 16, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], 65536, 16777216),
+        ],
+    )
+    def test_qwen_without_source_uses_architecture_defaults(
+        self,
+        tmp_path,
+        model_type,
+        patch_size,
+        image_mean,
+        image_std,
+        min_pixels,
+        max_pixels,
+    ):
+        config = self._qwen_config(
+            model_type,
+            patch_size=99,
+            temporal_patch_size=7,
+            merge_size=5,
+        )
+
+        _write_vision_processor_config(config, str(tmp_path))
+
+        processor_config = json.loads((tmp_path / "processor_config.json").read_text())
+        resize = self._transform_attrs(processor_config, "Resize")
+        patch = self._transform_attrs(processor_config, "PatchImage")
+        normalize = self._transform_attrs(processor_config, "Normalize")
+        assert resize["patch_size"] == patch_size
+        assert resize["min_pixels"] == min_pixels
+        assert resize["max_pixels"] == max_pixels
+        assert resize["merge_size"] == 2
+        assert patch["patch_size"] == patch_size
+        assert patch["temporal_patch_size"] == 2
+        assert patch["merge_size"] == 2
+        assert normalize["mean"] == pytest.approx(image_mean)
+        assert normalize["std"] == pytest.approx(image_std)
+
+    @pytest.mark.parametrize(
+        "model_type",
+        [
+            "qwen3_vl_single",
+            "qwen3_5",
+            "qwen3_5_vl",
+            "qwen3_5_moe",
+            "qwen3_5_moe_vl",
+        ],
+    )
+    def test_qwen35_outer_aliases_use_qwen3_processor(self, tmp_path, model_type):
+        config = self._qwen_config(
+            model_type,
+            patch_size=99,
+            temporal_patch_size=7,
+            merge_size=5,
+        )
+
+        _write_vision_processor_config(config, str(tmp_path))
+
+        processor_config = json.loads((tmp_path / "processor_config.json").read_text())
+        assert processor_config["processor"]["name"] == "qwen3_vl_image_processor"
+        resize = self._transform_attrs(processor_config, "Resize")
+        patch = self._transform_attrs(processor_config, "PatchImage")
+        normalize = self._transform_attrs(processor_config, "Normalize")
+        assert resize["patch_size"] == 16
+        assert resize["min_pixels"] == 65536
+        assert resize["max_pixels"] == 16777216
+        assert patch == {
+            "patch_size": 16,
+            "temporal_patch_size": 2,
+            "merge_size": 2,
+        }
+        assert normalize["mean"] == [0.5, 0.5, 0.5]
+        assert normalize["std"] == [0.5, 0.5, 0.5]
+        assert normalize["qwen3_vl"] == 1
+        assert "qwen2_5_vl" not in normalize
+
+    @pytest.mark.parametrize(
+        "model_type",
+        ["qwen3_5_text", "qwen3_5_vl_text", "qwen3_5_moe_text"],
+    )
+    def test_qwen35_text_aliases_use_qwen3_processor(self, tmp_path, model_type):
+        config = self._qwen_config(
+            model_type,
+            patch_size=99,
+            temporal_patch_size=7,
+            merge_size=5,
+        )
+
+        _write_vision_processor_config(config, str(tmp_path))
+
+        processor_config = json.loads((tmp_path / "processor_config.json").read_text())
+        assert processor_config["processor"]["name"] == "qwen3_vl_image_processor"
+        patch = self._transform_attrs(processor_config, "PatchImage")
+        normalize = self._transform_attrs(processor_config, "Normalize")
+        assert patch == {
+            "patch_size": 16,
+            "temporal_patch_size": 2,
+            "merge_size": 2,
+        }
+        assert normalize["mean"] == [0.5, 0.5, 0.5]
+        assert normalize["std"] == [0.5, 0.5, 0.5]
+        assert normalize["qwen3_vl"] == 1
+
+    def test_qwen_with_unreadable_explicit_source_fails(self, tmp_path):
+        config = self._qwen_config(
+            "qwen3_vl",
+            patch_size=16,
+            temporal_patch_size=2,
+            merge_size=2,
+        )
+        local_source = tmp_path / "local"
+        local_source.mkdir()
+
+        with (
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._image_processor_settings",
+                side_effect=OSError("missing processor config"),
+            ) as load_processor,
+            pytest.raises(ValueError, match="required qwen3_vl image processor"),
+        ):
+            _write_vision_processor_config(
+                config,
+                str(tmp_path),
+                hf_model_id="Qwen/Qwen3-VL-2B-Instruct",
+                local_config_dir=str(local_source),
+            )
+        load_processor.assert_called_once_with("Qwen/Qwen3-VL-2B-Instruct")
+
+    def test_qwen_hf_processor_takes_precedence_over_local(self, tmp_path):
+        hf_settings = {
+            "patch_size": 16,
+            "temporal_patch_size": 2,
+            "merge_size": 2,
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_std": [0.5, 0.5, 0.5],
+            "size": {
+                "shortest_edge": 65536,
+                "longest_edge": 16777216,
+            },
+        }
+        config = self._qwen_config(
+            "qwen3_5_vl",
+            patch_size=99,
+            temporal_patch_size=7,
+            merge_size=5,
+        )
+        local_source = tmp_path / "local"
+        local_source.mkdir()
+
+        with mock.patch(
+            "mobius.integrations.ort_genai.auto_export._image_processor_settings",
+            return_value=hf_settings,
+        ) as load_processor:
+            _write_vision_processor_config(
+                config,
+                str(tmp_path),
+                hf_model_id="Qwen/Qwen3.5-VL",
+                local_config_dir=str(local_source),
+            )
+
+        load_processor.assert_called_once_with("Qwen/Qwen3.5-VL")
+        processor_config = json.loads((tmp_path / "processor_config.json").read_text())
+        resize = self._transform_attrs(processor_config, "Resize")
+        assert resize["patch_size"] == 16
+        assert resize["min_pixels"] == 65536
+        assert resize["max_pixels"] == 16777216
+
+    def test_qwen_hf_model_id_reads_raw_preprocessor_config(self, tmp_path):
+        source_config = {
+            "patch_size": 14,
+            "temporal_patch_size": 2,
+            "merge_size": 2,
+            "image_mean": [0.48145466, 0.4578275, 0.40821073],
+            "image_std": [0.26862954, 0.26130258, 0.27577711],
+            "min_pixels": 3136,
+            "max_pixels": 12845056,
+        }
+        source_path = tmp_path / "preprocessor_config.json"
+        source_path.write_text(json.dumps(source_config))
+        config = self._qwen_config(
+            "qwen2_5_vl",
+            patch_size=99,
+            temporal_patch_size=7,
+            merge_size=5,
+        )
+
+        with (
+            mock.patch(
+                "huggingface_hub.hf_hub_download",
+                return_value=str(source_path),
+            ) as download,
+            mock.patch("transformers.AutoProcessor.from_pretrained") as auto_processor,
+        ):
+            _write_vision_processor_config(
+                config,
+                str(tmp_path),
+                hf_model_id="Qwen/Qwen2.5-VL-3B-Instruct",
+            )
+
+        download.assert_called_once_with(
+            "Qwen/Qwen2.5-VL-3B-Instruct",
+            "preprocessor_config.json",
+        )
+        auto_processor.assert_not_called()
+        processor_config = json.loads((tmp_path / "processor_config.json").read_text())
+        resize = self._transform_attrs(processor_config, "Resize")
+        assert resize["patch_size"] == 14
+        assert resize["min_pixels"] == 3136
+        assert resize["max_pixels"] == 12845056
+
 
 class TestFixTokenizerConfig:
     def test_remaps_tokenizers_backend(self, tmp_path):
@@ -448,6 +791,153 @@ class TestFixChatTemplate:
         assert "chat_template" not in fixed
 
 
+class TestGemma4ChatTemplateCompatibility:
+    _QAT_STYLE_TEMPLATE = """{{- bos_token -}}
+{%- for message in messages -%}
+{%- if message.get('content') is string -%}
+{{- message['content'] -}}
+{%- else -%}
+{%- for item in message['content'] -%}
+{%- if item.get('type') == 'image' -%}{{- '<|image|>' -}}
+{%- elif item.get('type') == 'audio' -%}{{- '<|audio|>' -}}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{%- endfor -%}
+"""
+    _COMPATIBLE_CUSTOM_TEMPLATE = """{{- bos_token -}}{{- 'custom:' -}}
+{%- for message in messages -%}
+{%- if message['content'] is string -%}
+{{- message['content'] -}}
+{%- else -%}
+{%- for item in message['content'] -%}
+{%- if item['type'] == 'text' -%}{{- item['text'] -}}
+{%- elif item['type'] == 'image' -%}{{- '<|image|>' -}}
+{%- elif item['type'] == 'audio' -%}{{- '<|audio|>' -}}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{%- endfor -%}
+"""
+
+    def _write_templates(self, tmp_path, template):
+        (tmp_path / "chat_template.jinja").write_text(template)
+        (tmp_path / "tokenizer_config.json").write_text(
+            json.dumps({"chat_template": template})
+        )
+
+    def test_normalizes_qat_get_structured_media_template(self, tmp_path):
+        self._write_templates(tmp_path, self._QAT_STYLE_TEMPLATE)
+
+        path = synchronize_chat_template_for_ort(tmp_path, "gemma4")
+
+        assert path == str(tmp_path / "chat_template.jinja")
+        assert gemma4_template_needs_ort_normalization(self._QAT_STYLE_TEMPLATE)
+        assert (tmp_path / "chat_template.jinja").read_text() == (GEMMA4_ORT_CHAT_TEMPLATE)
+        tokenizer_config = json.loads((tmp_path / "tokenizer_config.json").read_text())
+        assert tokenizer_config["chat_template"] == GEMMA4_ORT_CHAT_TEMPLATE
+
+    def test_preserves_compatible_custom_gemma_template(self, tmp_path):
+        self._write_templates(tmp_path, self._COMPATIBLE_CUSTOM_TEMPLATE)
+
+        synchronize_chat_template_for_ort(tmp_path, "gemma4")
+
+        assert not gemma4_template_needs_ort_normalization(self._COMPATIBLE_CUSTOM_TEMPLATE)
+        assert (tmp_path / "chat_template.jinja").read_text() == (
+            self._COMPATIBLE_CUSTOM_TEMPLATE
+        )
+        tokenizer_config = json.loads((tmp_path / "tokenizer_config.json").read_text())
+        assert tokenizer_config["chat_template"] == self._COMPATIBLE_CUSTOM_TEMPLATE
+
+    def test_normalizes_template_that_stringifies_structured_content(self, tmp_path):
+        stringifying_template = (
+            "{{ bos_token }}{% for message in messages %}{{ message['content'] }}{% endfor %}"
+        )
+        self._write_templates(tmp_path, stringifying_template)
+
+        synchronize_chat_template_for_ort(tmp_path, "gemma4")
+
+        assert gemma4_template_needs_ort_normalization(stringifying_template)
+        assert (tmp_path / "chat_template.jinja").read_text() == (GEMMA4_ORT_CHAT_TEMPLATE)
+
+    def test_text_only_gemma_does_not_require_media_rendering(self, tmp_path):
+        text_template = (
+            "{{ bos_token }}{% for message in messages %}{{ message['content'] }}{% endfor %}"
+        )
+        self._write_templates(tmp_path, text_template)
+
+        synchronize_chat_template_for_ort(tmp_path, "gemma4_text")
+
+        assert (tmp_path / "chat_template.jinja").read_text() == text_template
+
+    def test_preserves_non_gemma_template(self, tmp_path):
+        non_gemma_template = (
+            "{% for message in messages %}{{ message.get('content') }}{% endfor %}"
+        )
+        self._write_templates(tmp_path, non_gemma_template)
+
+        synchronize_chat_template_for_ort(tmp_path, "qwen2_5_vl")
+
+        assert (tmp_path / "chat_template.jinja").read_text() == non_gemma_template
+        tokenizer_config = json.loads((tmp_path / "tokenizer_config.json").read_text())
+        assert tokenizer_config["chat_template"] == non_gemma_template
+
+    @pytest.mark.parametrize(
+        ("content", "expected_content"),
+        [
+            ("Hello", "Hello"),
+            ([{"type": "image"}, {"type": "text", "text": "Describe"}], "<|image|>Describe"),
+            (
+                [{"type": "audio"}, {"type": "text", "text": "Transcribe"}],
+                "<|audio|>Transcribe",
+            ),
+        ],
+    )
+    def test_template_renders_text_image_and_audio_content(self, content, expected_content):
+        jinja2 = pytest.importorskip("jinja2")
+        template = jinja2.Environment().from_string(GEMMA4_ORT_CHAT_TEMPLATE)
+
+        rendered = template.render(
+            bos_token="<bos>",
+            messages=[{"role": "user", "content": content}],
+            add_generation_prompt=True,
+        )
+
+        assert rendered == (f"<bos><|turn>user\n{expected_content}<turn|>\n<|turn>model\n")
+
+    def test_template_renders_with_ort_genai_when_test_model_is_available(self):
+        """Exercise ORT Jinja with an opt-in tiny local model; no model is downloaded."""
+        model_path = os.environ.get("MOBIUS_ORT_GENAI_TEST_MODEL")
+        if not model_path:
+            pytest.skip("set MOBIUS_ORT_GENAI_TEST_MODEL to a local ORT-GenAI test model")
+        og = pytest.importorskip("onnxruntime_genai")
+        model = og.Model(model_path)
+        tokenizer = og.Tokenizer(model)
+        messages = json.dumps(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "audio"},
+                        {"type": "text", "text": "Explain"},
+                    ],
+                }
+            ]
+        )
+
+        for template in (
+            GEMMA4_ORT_CHAT_TEMPLATE,
+            self._COMPATIBLE_CUSTOM_TEMPLATE,
+        ):
+            rendered = tokenizer.apply_chat_template(
+                messages=messages,
+                template_str=template,
+                add_generation_prompt=True,
+            )
+            assert "<|image|><|audio|>Explain" in rendered
+
+
 class TestCopyTokenizerFiles:
     def test_copies_available_files(self, tmp_path):
         # Create a fake tokenizer file to "download"
@@ -561,6 +1051,68 @@ class TestWriteOrtGenaiConfigLocalDir:
         assert "tokenizer.json" in result
         assert (out / "tokenizer.json").read_text() == '{"local": true}'
         assert "tokenizer_config.json" in result
+
+    def test_local_gemma4_qat_template_is_normalized_and_synchronized(self, tmp_path):
+        """The package-writing path fixes incompatible Gemma-4 structured media access."""
+        src = tmp_path / "local_model"
+        src.mkdir()
+        template = TestGemma4ChatTemplateCompatibility._QAT_STYLE_TEMPLATE
+        (src / "tokenizer.json").write_text("{}")
+        (src / "tokenizer_config.json").write_text(json.dumps({"chat_template": template}))
+        (src / "chat_template.jinja").write_text(template)
+
+        out = tmp_path / "output"
+        pkg = _make_fake_llm_pkg("gemma4")
+
+        result = write_ort_genai_config(pkg, str(out), local_config_dir=str(src))
+
+        assert result["chat_template.jinja"] == str(out / "chat_template.jinja")
+        assert (out / "chat_template.jinja").read_text() == GEMMA4_ORT_CHAT_TEMPLATE
+        tokenizer_config = json.loads((out / "tokenizer_config.json").read_text())
+        assert tokenizer_config["chat_template"] == GEMMA4_ORT_CHAT_TEMPLATE
+
+    def test_local_config_dir_is_used_for_qwen_processor(self, tmp_path):
+        source = tmp_path / "local_model"
+        source.mkdir()
+        (source / "preprocessor_config.json").write_text(
+            json.dumps(
+                {
+                    "patch_size": 16,
+                    "temporal_patch_size": 2,
+                    "merge_size": 2,
+                    "image_mean": [0.5, 0.5, 0.5],
+                    "image_std": [0.5, 0.5, 0.5],
+                    "size": {
+                        "shortest_edge": 65536,
+                        "longest_edge": 16777216,
+                    },
+                }
+            )
+        )
+        pkg = _make_fake_llm_pkg("qwen3_vl")
+        pkg.config.vision = types.SimpleNamespace(
+            image_size=None,
+            model_type="qwen3_vl",
+            patch_size=99,
+            spatial_merge_size=5,
+            temporal_patch_size=7,
+        )
+        pkg.config.spatial_merge_size = 5
+        pkg.config.temporal_patch_size = 7
+        out = tmp_path / "output"
+
+        result = write_ort_genai_config(
+            pkg,
+            str(out),
+            local_config_dir=str(source),
+        )
+
+        assert result["processor_config"] == str(out / "processor_config.json")
+        processor_config = json.loads((out / "processor_config.json").read_text())
+        resize = TestWriteProcessorConfig._transform_attrs(processor_config, "Resize")
+        assert resize["patch_size"] == 16
+        assert resize["min_pixels"] == 65536
+        assert resize["max_pixels"] == 16777216
 
     def test_hf_model_id_takes_precedence_over_local_dir(self, tmp_path):
         """When both hf_model_id and local_config_dir are set, HF takes precedence."""

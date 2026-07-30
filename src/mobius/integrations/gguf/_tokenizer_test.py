@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from unittest import mock
@@ -168,10 +169,13 @@ class TestReconstructTokenizerFromGgml:
         assert tok.decode(enc.ids) == "hi"
 
     def test_gemma4_uses_ort_compatible_chat_template(self, tmp_path):
-        from mobius.integrations.gguf._tokenizer import (
-            _GEMMA4_ORT_CHAT_TEMPLATE,
-            _write_chat_template,
+        from mobius.integrations.gguf._tokenizer import _write_chat_template
+        from mobius.integrations.ort_genai.chat_template import (
+            GEMMA4_ORT_CHAT_TEMPLATE,
         )
+
+        tokenizer_config_path = tmp_path / "tokenizer_config.json"
+        tokenizer_config_path.write_text("{}")
 
         path = _write_chat_template(
             {
@@ -182,4 +186,6 @@ class TestReconstructTokenizerFromGgml:
         )
 
         assert path == str(tmp_path / "chat_template.jinja")
-        assert (tmp_path / "chat_template.jinja").read_text() == (_GEMMA4_ORT_CHAT_TEMPLATE)
+        assert (tmp_path / "chat_template.jinja").read_text() == GEMMA4_ORT_CHAT_TEMPLATE
+        tokenizer_config = json.loads(tokenizer_config_path.read_text())
+        assert tokenizer_config["chat_template"] == GEMMA4_ORT_CHAT_TEMPLATE
