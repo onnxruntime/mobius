@@ -3782,17 +3782,10 @@ def test_qwen35_deltanet_single_layer_parity():
             hidden_states=torch.from_numpy(hidden_np).float(),
             cache_params=cache,
         ).numpy()
-<<<<<<< HEAD
     # transformers >=5.14 changed recurrent_states from a tensor to a dict
     # keyed by layer index; extract the tensor for either version.
     _rec_states = cache.layers[0].recurrent_states
     hf_rec = (_rec_states[0] if isinstance(_rec_states, dict) else _rec_states).numpy()
-=======
-    hf_rec = cache.layers[0].recurrent_states
-    if isinstance(hf_rec, dict):
-        hf_rec = hf_rec[0]
-    hf_rec = hf_rec.numpy()
->>>>>>> origin/main
 
     # ONNX forward
     sess = _make_session(onnx_model)

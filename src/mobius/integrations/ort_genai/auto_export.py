@@ -86,12 +86,8 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     # HunYuan-V1 dense / Hy-MT1.5 — generic decoder LLM type accepted by
     # ORT GenAI (see onnxruntime-genai/src/models/model_type.h LLM list).
     "hunyuan_v1_dense": "decoder",
-<<<<<<< HEAD
-    # Qwen VL model families have separate ORT GenAI model types.
-=======
     "deepseek_v4": "decoder",
-    # Qwen VL models all use the same GenAI pipeline as qwen2_5_vl
->>>>>>> origin/main
+    # Qwen VL model families have separate ORT GenAI model types.
     "qwen2_vl": "qwen2_5_vl",
     "qwen3_vl": "qwen3_vl",
     "qwen3_vl_text": "qwen3_vl",
@@ -1104,10 +1100,6 @@ def write_ort_genai_config(
 
     result: dict[str, str] = {"genai_config": genai_path}
 
-<<<<<<< HEAD
-    # Copy tokenizer files. A local hf_model_id is a local model directory, not a
-    # Hub repo id; copy directly instead of calling hf_hub_download.
-=======
     if "mtp" in pkg:
         mtp_model = pkg["mtp"]
         mtp_path = os.path.join(directory, "mtp_config.json")
@@ -1136,9 +1128,8 @@ def write_ort_genai_config(
             f.write("\n")
         result["mtp_config"] = mtp_path
 
-    # Copy tokenizer files — HF Hub takes precedence; local dir is the fallback
-    # for --config mode where no HF model ID is available.
->>>>>>> origin/main
+    # Copy tokenizer files. A local hf_model_id is a local model directory, not a
+    # Hub repo id; copy directly instead of calling hf_hub_download.
     if hf_model_id is not None:
         if os.path.isdir(hf_model_id):
             logger.info("Copying tokenizer files from local model directory %s", hf_model_id)
