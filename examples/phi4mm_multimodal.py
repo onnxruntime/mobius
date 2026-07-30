@@ -32,7 +32,7 @@ only the embedding and decoder sessions are used (no vision/speech).
 
 Prerequisites::
 
-    pip install mobius-ai[transformers] torchaudio
+    pip install mobius-onnx[transformers] torchaudio
 
 Usage::
 

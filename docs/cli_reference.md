@@ -257,7 +257,7 @@ mobius build --model Qwen/Qwen2.5-0.5B output_dir/ \
 
 Build an ONNX model from a GGUF file (e.g. from llama.cpp).
 
-> **Note**: Requires the optional `gguf` package: `pip install mobius-ai[gguf]`
+> **Note**: Requires the optional `gguf` package: `pip install mobius-onnx[gguf]`
 
 ### Synopsis
 

@@ -211,7 +211,10 @@ class Gemma4ConvSubsampling(nn.Module):
         # Broadcast mask [B, T] → [B, 1, T, 1] over C and F dims
         mask_4d = op.Unsqueeze(mask, [1, 3])  # [B, 1, T, 1]
         x = op.Mul(x, op.CastLike(mask_4d, x))
-        # Downsample mask by conv stride (2): mask[:, ::2]
+        # Downsample mask by conv stride (2): mask[:, ::2]. The INT64_MAX
+        # ``ends`` sentinel means "to the end"; onnx-shape-inference (>=0.3.1)
+        # normalizes it to the axis length for strided slices, yielding a
+        # ceil(T/2) extent instead of a 2^62 sentinel.
         mask = op.Slice(
             mask,
             [0],  # starts
@@ -477,7 +480,10 @@ class Gemma4Attention(nn.Module):
         """Build [1, 1, T, T] causal sliding-window attention bias."""
         zero = op.Constant(value_int=0)
         one = op.Constant(value_int=1)
-        positions = op.Range(zero, seq_len, one)  # [T] int64
+        # ``seq_len`` is a 1-D [1] tensor from op.Shape; Range requires a
+        # scalar limit, so squeeze the singleton axis.
+        seq_len_scalar = op.Squeeze(seq_len, [0])
+        positions = op.Range(zero, seq_len_scalar, one)  # [T] int64
         q_pos = op.Unsqueeze(positions, [1])  # [T, 1]
         k_pos = op.Unsqueeze(positions, [0])  # [1, T]
         diff = op.Sub(q_pos, k_pos)  # [T, T]: i - j
@@ -570,7 +576,9 @@ class Gemma4Attention(nn.Module):
         # pos_embed is ordered [ctx_left-1, ..., 0], so distance d maps to index ctx_left-1-d
         zero_i = op.Constant(value_int=0)
         one_i = op.Constant(value_int=1)
-        positions = op.Range(zero_i, seq_len, one_i)  # [T]
+        # Range requires a scalar limit; ``seq_len`` is a 1-D [1] shape tensor.
+        seq_len_scalar = op.Squeeze(seq_len, [0])
+        positions = op.Range(zero_i, seq_len_scalar, one_i)  # [T]
         q_pos_i = op.Unsqueeze(positions, [1])  # [T, 1]
         k_pos_i = op.Unsqueeze(positions, [0])  # [1, T]
         diff_i = op.Sub(q_pos_i, k_pos_i)  # [T, T]: i-j

@@ -20,7 +20,7 @@ onnxruntime-genai providing the tokenizer.
 
 Requirements::
 
-    pip install mobius-ai[ort-genai]
+    pip install mobius-onnx[ort-genai]
 
 Usage::
 

@@ -43,8 +43,11 @@ class DeepSeekMLA(nn.Module):
         self,
         config: ArchitectureConfig,
         scale: float | None = None,
+        linear_class: type | None = None,
     ):
         super().__init__()
+        if linear_class is None:
+            linear_class = Linear
         self.num_heads = config.num_attention_heads
         self.q_lora_rank = config.q_lora_rank
         self.kv_lora_rank = config.kv_lora_rank
@@ -55,16 +58,16 @@ class DeepSeekMLA(nn.Module):
 
         # Q path: LoRA compression → norm → decompression
         if self.q_lora_rank is not None and self.q_lora_rank > 0:
-            self.q_a_proj = Linear(config.hidden_size, self.q_lora_rank, bias=False)
+            self.q_a_proj = linear_class(config.hidden_size, self.q_lora_rank, bias=False)
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
-            self.q_b_proj = Linear(
+            self.q_b_proj = linear_class(
                 self.q_lora_rank,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
             )
         else:
             # No LoRA — direct projection
-            self.q_proj = Linear(
+            self.q_proj = linear_class(
                 config.hidden_size,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
@@ -72,20 +75,20 @@ class DeepSeekMLA(nn.Module):
 
         # KV path: joint projection for latent KV + RoPE key
         # Output: (kv_lora_rank) for latent KV + (qk_rope_head_dim) for k_rope
-        self.kv_a_proj_with_mqa = Linear(
+        self.kv_a_proj_with_mqa = linear_class(
             config.hidden_size,
             self.kv_lora_rank + self.qk_rope_head_dim,
             bias=False,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         # Decompresses latent KV into per-head k_nope + v
-        self.kv_b_proj = Linear(
+        self.kv_b_proj = linear_class(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
         )
 
-        self.o_proj = Linear(
+        self.o_proj = linear_class(
             self.num_heads * self.v_head_dim,
             config.hidden_size,
             bias=False,
