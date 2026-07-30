@@ -1545,6 +1545,61 @@ class Gemma3nConfig(CausalLMConfig):
 
 
 @dataclasses.dataclass
+class Gemma3nMultiModalConfig(Gemma3nConfig):
+    """Configuration for the full Gemma 3n image + audio + text model.
+
+    Carries the same text-decoder fields as :class:`Gemma3nConfig` (from which
+    it inherits, since the decoder is unchanged) plus the multimodal wiring.
+    The towers live in the inherited ``vision`` (:class:`VisionConfig`, a
+    MobileNet-V5 encoder rather than SigLIP) and ``audio``
+    (:class:`Gemma3nAudioConfig`, a USM Conformer) sub-configs, populated by
+    the ``gemma3n`` extractor hooks.
+
+    Both modalities are projected into the decoder's embedding space and
+    spliced in at their placeholder token positions, so each needs its token
+    id and its fixed soft-token count.  The token ids come from the inherited
+    ``image_token_id`` / ``audio_token_id`` (262145 and 262273 for E4B, also
+    mirrored on the sub-configs per the Gemma4 convention); the per-image
+    counts are fixed because both towers emit a fixed-size feature map:
+
+    - ``vision_soft_tokens_per_image``: 256 — a 768x768 image becomes a 16x16
+      grid.
+    - ``audio_soft_tokens_per_image``: 188.
+
+    Audio is optional: checkpoints without an ``audio_config`` leave ``audio``
+    as ``None`` and the exported package omits the audio encoder.
+    """
+
+    vision_soft_tokens_per_image: int = 256
+    audio_soft_tokens_per_image: int = 188
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Gemma3nMultiModalConfig:
+        # The HF Gemma3nConfig wraps a text_config while the multimodal token
+        # ids and soft-token counts live on the outer config.  build() may hand
+        # us either one, so resolve in both directions.
+        text_config = getattr(config, "text_config", None) or config
+        composite = parent_config if parent_config is not None else config
+        base = Gemma3nConfig.from_transformers(text_config, composite)
+        # audio_token_id is an ArchitectureConfig field that no generic
+        # extractor populates for gemma3n (the audio hook puts it on the
+        # sub-config); lift it so tasks can read it at the top level.
+        if base.audio_token_id is None:
+            base = dataclasses.replace(
+                base, audio_token_id=getattr(composite, "audio_token_id", None)
+            )
+        return cls(
+            **_shallow_fields(base),
+            vision_soft_tokens_per_image=int(
+                getattr(composite, "vision_soft_tokens_per_image", 256) or 256
+            ),
+            audio_soft_tokens_per_image=int(
+                getattr(composite, "audio_soft_tokens_per_image", 188) or 188
+            ),
+        )
+
+
+@dataclasses.dataclass
 class MllamaConfig(VisionLanguageConfig):
     """Configuration for Mllama (Llama 3.2 Vision) cross-attention models.
 
