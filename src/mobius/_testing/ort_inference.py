@@ -256,6 +256,10 @@ class OnnxModelSession:
         return dict(zip(self._output_names, (_ort_value_to_numpy(o) for o in raw_outputs)))
 
     def close(self) -> None:
+        # Release ORT resources eagerly (not only at Python GC time) so
+        # long-running GPU test suites do not accumulate session memory.
+        if hasattr(self, "_session"):
+            del self._session
         self._tmpdir.cleanup()
 
     def __del__(self) -> None:
