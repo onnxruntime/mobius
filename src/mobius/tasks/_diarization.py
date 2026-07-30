@@ -38,7 +38,7 @@ class DiarizationTask(ModelTask):
         input_features = builder.input(
             "input_features",
             dtype=config.dtype,
-            shape=["batch", feat_in if feat_in else "feat", "time"],
+            shape=["batch", feat_in if feat_in is not None else "feat", "time"],
         )
 
         speaker_probs = module(builder.op, input_features=input_features)
