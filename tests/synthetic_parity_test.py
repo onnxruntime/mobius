@@ -260,18 +260,18 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     "gemma": {"head_dim": TINY_HEAD_DIM},
     # Gemma3/Gemma3n: head_dim is an explicit param in HF (default 256); pass tiny value.
     "gemma3_text": {"head_dim": TINY_HEAD_DIM, "query_pre_attn_scalar": TINY_HEAD_DIM},
-    # num_kv_shared_layers default is 15; with TINY_LAYERS=2 this makes all layers
-    # "shared", causing prev_layers[:-13]=[] and a ValueError on index lookup. Set to 0.
+    # num_kv_shared_layers is threaded through from the tiny config (HF defaults
+    # to 15, which with TINY_LAYERS=2 would make every layer "shared" and leave
+    # no source layer to borrow K,V from), so it is set explicitly per entry in
+    # _test_configs.py rather than pinned to 0 here.
     "gemma3n_text": {
         "query_pre_attn_scalar": TINY_HEAD_DIM,
         "head_dim": TINY_HEAD_DIM,
-        "num_kv_shared_layers": 0,
         "hidden_activation": "gelu_pytorch_tanh",
     },
     "gemma3n": {
         "query_pre_attn_scalar": TINY_HEAD_DIM,
         "head_dim": TINY_HEAD_DIM,
-        "num_kv_shared_layers": 0,
         "hidden_activation": "gelu_pytorch_tanh",
     },
     "gemma3": {"query_pre_attn_scalar": TINY_HEAD_DIM, "head_dim": TINY_HEAD_DIM},

@@ -164,9 +164,17 @@ class CausalLMTask(ModelTask):
             ) or config.head_dim
             kv_value_head_dim = config.v_head_dim or config.head_dim
 
+            # Models whose trailing layers borrow K,V from an earlier layer
+            # (Gemma 3n's ``num_kv_shared_layers``) own fewer cache entries
+            # than they have layers; they report the count via this hook.
+            count_fn = getattr(module, "kv_cache_layer_count", None)
+            num_cache_layers = (
+                count_fn() if callable(count_fn) else config.num_hidden_layers
+            )
+
             past_key_values = _make_kv_cache_inputs(
                 builder,
-                config.num_hidden_layers,
+                num_cache_layers,
                 num_kv_cache_heads,
                 config.head_dim,
                 config.dtype,

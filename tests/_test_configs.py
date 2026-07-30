@@ -382,6 +382,10 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "laurel_rank": 16,
             "hidden_size_per_layer_input": 32,
             "vocab_size_per_layer_input": 256,
+            # Mixed layer_types with TINY_LAYERS=2 leaves no same-type source
+            # layer to borrow K,V from; sharing is covered by the
+            # all-full-attention gemma3n_text entry below.
+            "num_kv_shared_layers": 0,
         },
         True,
     ),
@@ -399,6 +403,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "laurel_rank": 16,
             "hidden_size_per_layer_input": 32,
             "vocab_size_per_layer_input": 256,
+            "num_kv_shared_layers": 0,
         },
         False,
     ),
@@ -1286,7 +1291,10 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         True,
     ),
-    # gemma3n_text: all full attention (no sliding window)
+    # gemma3n_text: all full attention (no sliding window) + KV layer sharing.
+    # With num_kv_shared_layers=1 the last layer borrows K,V from layer 0, so
+    # the graph owns TINY_LAYERS - 1 cache entries and layer 1 has no
+    # k_proj/v_proj/k_norm weights.
     (
         "gemma3n_text",
         {
@@ -1301,6 +1309,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "laurel_rank": 16,
             "hidden_size_per_layer_input": 32,
             "vocab_size_per_layer_input": 256,
+            "num_kv_shared_layers": 1,
         },
         False,
     ),
