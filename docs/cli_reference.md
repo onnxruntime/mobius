@@ -206,6 +206,18 @@ mobius build --model meta-llama/Llama-3.2-1B output/ --static-cache --max-seq-le
 | `--max-shard-size SIZE` | Maximum shard size for safetensors external data (e.g. `5GB`). Only used with `--external-data safetensors`. |
 | `--trust-remote-code` | Trust remote code when loading the HuggingFace model config. |
 | `--component NAME` | Build only one component from a diffusers pipeline (e.g. `--component vae_decoder`). |
+| `--text-only` | Export the text backbone of a multimodal checkpoint as a standalone decoder-only LLM. Strips vision/audio routing so the decoder uses `GroupQueryAttention` on GQA-capable EPs (build with `--ep cuda`/`dml`). Currently supported for `gemma4_unified` (`google/gemma-4-12B`). Not compatible with `--config` or `--component`. |
+
+#### Text-only example
+
+```bash
+# Export gemma-4-12B's text backbone as a GQA decoder-only LLM
+mobius build --model google/gemma-4-12B output/ --text-only --ep cuda --dtype f16
+```
+
+For a full ORT-GenAI text-only package (with `genai_config.json`), use
+`auto_export(..., text_only=True)` — see
+`examples/gemma4_12b_text_ort_genai.py`.
 
 ### More Examples
 
@@ -245,7 +257,7 @@ mobius build --model Qwen/Qwen2.5-0.5B output_dir/ \
 
 Build an ONNX model from a GGUF file (e.g. from llama.cpp).
 
-> **Note**: Requires the optional `gguf` package: `pip install mobius-ai[gguf]`
+> **Note**: Requires the optional `gguf` package: `pip install mobius-onnx[gguf]`
 
 ### Synopsis
 

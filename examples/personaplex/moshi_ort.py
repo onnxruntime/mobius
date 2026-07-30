@@ -29,7 +29,7 @@ audio stream is fed as the 8 "other" codebooks (``k = 9..16``); the assistant
 
 Prerequisites::
 
-    pip install mobius-ai onnxruntime numpy soundfile
+    pip install mobius-onnx onnxruntime numpy soundfile
 
 CUDA note: on H200 / Ampere+ GPUs ORT defaults to TF32 for fp32 matmul, which
 can flip greedy sampling. ``--device cuda`` sets ``use_tf32=0`` for fp32
@@ -248,6 +248,16 @@ class MoshiORT:
         self._senc = StreamingMimiEncoder(self.enc)
         self._sdec = StreamingMimiDecoder(self.dec)
         self._reset_lm_state()
+
+    def set_seed(self, seed: int | None) -> None:
+        """Reseed the sampling RNG so a conversation's voice is reproducible.
+
+        The assistant's voice/accent is determined entirely by the temperature
+        + top-k sampling trajectory (the ONNX models are deterministic), so a
+        fixed ``seed`` yields the same voice every session; ``None`` reseeds
+        from entropy for a fresh random voice.
+        """
+        self._rng = np.random.default_rng(seed)
 
     def process_frame(self, frame: np.ndarray) -> np.ndarray | None:
         """Process one 12.5Hz user frame, return the assistant frame.

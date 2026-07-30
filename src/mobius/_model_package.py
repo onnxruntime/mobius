@@ -77,8 +77,10 @@ class ModelPackage(UserDict[str, ir.Model]):
             This method writes ONNX files only.  If you need a directory that
             ``onnxruntime-genai`` can load (i.e. with ``genai_config.json`` and
             tokenizer files), use
-            :func:`mobius.integrations.ort_genai.export_package` instead — it
-            wraps :meth:`save` with the ORT-GenAI config-generation step.
+            :func:`mobius.integrations.ort_genai.export_package` instead. For
+            onnx-genai, call
+            :func:`mobius.integrations.onnx_genai.write_onnx_genai_config`
+            after saving, or use ``mobius build --runtime onnx-genai``.
 
         Args:
             directory: Path to the output directory (created if needed).

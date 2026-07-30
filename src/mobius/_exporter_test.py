@@ -177,6 +177,14 @@ class TestResolveDtype:
         with pytest.raises(ValueError, match="Unknown dtype"):
             resolve_dtype("int8")
 
+    def test_mlx_supports_bf16_gqa_shared_kv(self):
+        from mobius._execution_providers import ep_registry
+
+        caps = ep_registry.require("mlx")
+        assert ir.DataType.BFLOAT16 in caps.gqa_dtypes
+        assert caps.qkv_pack_dtypes == frozenset()
+        assert caps.supports_past_present_share_buffer
+
 
 class TestCastModuleDtype:
     def test_float_is_noop(self):

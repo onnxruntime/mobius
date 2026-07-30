@@ -2867,6 +2867,85 @@ def test_gemma3_3model_builds_and_runs():
     )
 
 
+@pytest.mark.integration
+@pytest.mark.integration_fast
+def test_gemma3_embedding_runs_with_empty_image_features():
+    """Gemma3 embedding graph survives a decode step (empty image_features).
+
+    Regression guard for the decode-step Gather crash: ORT-GenAI re-runs the
+    embedding model per generated token, and a decode token is text-only, so
+    ``image_features`` is ``[0, hidden]`` and the image mask is all-False. The
+    Where would discard the gathered value, but ORT executes the Gather first
+    and indexing an empty tensor at the Clip-clamped index 0 fails with
+    "indices element out of data bounds, range [0,-1]".
+
+    ``_Gemma3EmbeddingModel.forward`` pads ``image_features`` with a single zero
+    row so index 0 always references a valid row that Where never selects. This
+    test runs the embedding graph with empty features + text-only input_ids and
+    asserts it returns pure text embeddings without error. It fails (Gather
+    out-of-bounds) if the zero-row pad is removed.
+    """
+    import onnx_ir as ir
+
+    from mobius._registry import registry
+    from mobius.tasks import get_task
+
+    config = ArchitectureConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        num_hidden_layers=2,
+        vocab_size=256,
+        max_position_embeddings=128,
+        hidden_act="gelu_pytorch_tanh",
+        rms_norm_eps=1e-6,
+        rope_type="default",
+        rope_theta=10000.0,
+        attn_qk_norm=True,
+        rope_local_base_freq=10_000.0,
+        layer_types=["full_attention", "sliding_attention"],
+        vision=VisionConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            image_size=28,
+            patch_size=14,
+            norm_eps=1e-6,
+            mm_tokens_per_image=4,
+        ),
+        image_token_id=255999,
+        dtype=ir.DataType.FLOAT,
+    )
+
+    model_cls = registry.get("gemma3")
+    module = model_cls(config)
+    task = get_task("vision-language")
+    pkg = task.build(module, config)
+
+    # Fill initializers with random weights so the graph can execute.
+    rng = np.random.default_rng(42)
+    for model in pkg.values():
+        for init in model.graph.initializers.values():
+            if init.const_value is None:
+                shape = [d if isinstance(d, int) else 1 for d in init.shape]
+                init.const_value = ir.Tensor(rng.standard_normal(shape).astype(np.float32))
+
+    # Decode step: a single text-only token, no image_token_id present, and an
+    # empty image_features tensor ([0, hidden]).  This is the exact condition
+    # that crashed the unpadded Gather.
+    embed_sess = _make_session(pkg["embedding"])
+    input_ids = np.array([[1]], dtype=np.int64)
+    image_features = np.zeros((0, config.hidden_size), dtype=np.float32)
+    embed_out = embed_sess.run({"input_ids": input_ids, "image_features": image_features})
+    embed_sess.close()
+
+    assert "inputs_embeds" in embed_out
+    assert embed_out["inputs_embeds"].shape == (1, 1, config.hidden_size)
+
+
 # ---------------------------------------------------------------------------
 # Qwen3.5-VL (hybrid DeltaNet + attention, 3-model split) integration tests
 #
@@ -3703,10 +3782,17 @@ def test_qwen35_deltanet_single_layer_parity():
             hidden_states=torch.from_numpy(hidden_np).float(),
             cache_params=cache,
         ).numpy()
+<<<<<<< HEAD
     # transformers >=5.14 changed recurrent_states from a tensor to a dict
     # keyed by layer index; extract the tensor for either version.
     _rec_states = cache.layers[0].recurrent_states
     hf_rec = (_rec_states[0] if isinstance(_rec_states, dict) else _rec_states).numpy()
+=======
+    hf_rec = cache.layers[0].recurrent_states
+    if isinstance(hf_rec, dict):
+        hf_rec = hf_rec[0]
+    hf_rec = hf_rec.numpy()
+>>>>>>> origin/main
 
     # ONNX forward
     sess = _make_session(onnx_model)

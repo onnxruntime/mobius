@@ -143,6 +143,10 @@ def _all_registered_with_test_id() -> dict[str, str]:
 #   - CausalLM / other models without YAML
 #
 _COVERAGE_SKIP: dict[str, str] = {
+    # --- Specialized-test models (covered by a co-located test class) ---
+    "llada": "Masked-diffusion LM — covered by src/mobius/models/llada_test.py "
+    "(graph build + diffusers-parity + bidirectionality); no small public "
+    "checkpoint and non-standard I/O (no attention_mask/KV cache/golden data)",
     # --- Internal / duplicate aliases ---
     "code_llama": "Alias for llama — covered by llama",
     "command_r": "Alias for cohere — covered by cohere",
@@ -204,6 +208,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "arctic": "Very large MoE (480B) — no small public checkpoint",
     "dbrx": "Large MoE (132B) — no small public checkpoint",
     "deepseek_v3": "Very large MoE (671B) — no small public checkpoint",
+    "deepseek_v4": "Very large MoE (284B) — no small public checkpoint",
     "llama4_text": "Very large MoE (109B) — no small public checkpoint",
     "qwen3_5_moe": "Large MoE (22B) — no small public checkpoint",
     # --- Models without test_model_id ---
@@ -270,6 +275,19 @@ _COVERAGE_SKIP: dict[str, str] = {
     "youtu": "CausalLM — YAML not yet created",
     "zamba": "CausalLM — YAML not yet created",
     "zamba2": "HybridCausalLM — YAML not yet created",
+    # --- Speculative-decoding drafters (bespoke IO; generic L1-L3/L2 matrix
+    # cannot drive them — they consume target hidden states / shared KV rather
+    # than input_ids). Covered by dedicated specialized tests + golden. ---
+    "DFlashDraftModel": "Drafter (noise_embedding + target_hidden IO) — covered by src/mobius/models/_dflash_test.py + L4 golden (dflash-draft)",
+    "gemma4_assistant": "Drafter (target shared KV + hidden state) — covered by _gemma4_assistant_test.py + L4/L5 golden (gemma4-assistant)",
+    "Gemma4AssistantForCausalLM": "Drafter alias of gemma4_assistant — covered by _gemma4_assistant_test.py + L4/L5 golden",
+    "gemma4_unified_assistant": "Drafter (unified variant) — covered by _gemma4_assistant_test.py + L4/L5 golden",
+    "Gemma4UnifiedAssistantForCausalLM": "Drafter alias of gemma4_unified_assistant — covered by _gemma4_assistant_test.py + L4/L5 golden",
+    "Qwen35MtpModel": "Drafter (inputs_embeds + target hidden_states IO; borrows target embed/lm_head) — covered by src/mobius/models/_qwen35_mtp_test.py + L4 golden (qwen35-mtp)",
+    "Eagle3LlamaForCausalLM": "Drafter (inputs_embeds + fused/recycled hidden IO; own draft-vocab lm_head) — covered by src/mobius/models/_eagle3_test.py",
+    "LlamaForCausalLMEagle3": "Drafter (EAGLE-3 arch alias used by the Qwen3-8B checkpoint) — covered by src/mobius/models/_eagle3_test.py",
+    "Eagle3Speculator": "Drafter (speculators-format EAGLE-3, RedHat Qwen3) — covered by src/mobius/models/_eagle3_test.py",
+    "Eagle3DraftModel": "Drafter (speculators-format EAGLE-3, RedHat Gemma4) — covered by src/mobius/models/_eagle3_test.py",
 }
 
 

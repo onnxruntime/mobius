@@ -557,19 +557,22 @@ def vlm_vision_weights(
 def _reshape_packed_qweight(value: torch.Tensor, blob_size: int) -> torch.Tensor:
     """Transpose and reshape a packed qweight tensor for MatMulNBits.
 
-    Converts ``[K_packed, N]`` int32 → ``[N, n_blocks, blob_size]`` uint8.
+    Converts ``[..., K_packed, N]`` int32 to
+    ``[..., N, n_blocks, blob_size]`` uint8.
     """
-    transposed = value.t().contiguous()
-    n = transposed.shape[0]
+    transposed = value.transpose(-1, -2).contiguous()
+    prefix = transposed.shape[:-2]
+    n = transposed.shape[-2]
     packed = transposed.view(torch.uint8)
-    n_blocks = packed.shape[1] // blob_size
-    return packed.reshape(n, n_blocks, blob_size)
+    n_blocks = packed.shape[-1] // blob_size
+    return packed.reshape(*prefix, n, n_blocks, blob_size)
 
 
 def _reshape_packed_qzeros(value: torch.Tensor, bits: int, n_blocks: int) -> torch.Tensor:
     """Transpose and unpack packed qzeros for MatMulNBits.
 
-    Converts ``[n_groups_packed, N]`` int32 → ``[N, zp_cols]`` uint8
+    Converts ``[..., n_groups_packed, N]`` int32 to
+    ``[..., N, zp_cols]`` uint8
     where ``zp_cols = ceil(n_blocks * bits / 8)``.  For 4-bit this
     packs two zero-point values per byte, matching ORT's expectation.
 
@@ -578,11 +581,56 @@ def _reshape_packed_qzeros(value: torch.Tensor, bits: int, n_blocks: int) -> tor
         bits: Quantization bit-width (4 or 8).
         n_blocks: Actual number of quantization blocks (``ceil(K / block_size)``).
     """
-    transposed = value.t().contiguous()
-    n = transposed.shape[0]
-    flat_uint8 = transposed.flatten().view(torch.uint8).reshape(n, -1)
+    transposed = value.transpose(-1, -2).contiguous()
+    prefix = transposed.shape[:-2]
+    n = transposed.shape[-2]
+    flat_uint8 = transposed.reshape(-1).view(torch.uint8).reshape(*prefix, n, -1)
     zp_cols = math.ceil(n_blocks * bits / 8)
-    return flat_uint8[:, :zp_cols]
+    return flat_uint8[..., :zp_cols]
+
+
+def pack_qmoe_expert_weights(
+    state_dict: dict[str, torch.Tensor],
+    *,
+    target_moe_path: str = ".mlp.moe",
+) -> dict[str, torch.Tensor]:
+    """Map fused expert-major quantized tensors to native QMoE parameters."""
+    packed: dict[str, torch.Tensor] = {}
+    projections = {
+        ".mlp.experts.gate_up_proj.weight": (
+            f"{target_moe_path}.fc1_experts_weights",
+            True,
+        ),
+        ".mlp.experts.gate_up_proj.scales": (
+            f"{target_moe_path}.fc1_scales",
+            False,
+        ),
+        ".mlp.experts.gate_up_proj.zero_points": (
+            f"{target_moe_path}.fc1_experts_zero_points",
+            False,
+        ),
+        ".mlp.experts.down_proj.weight": (
+            f"{target_moe_path}.fc2_experts_weights",
+            True,
+        ),
+        ".mlp.experts.down_proj.scales": (
+            f"{target_moe_path}.fc2_scales",
+            False,
+        ),
+        ".mlp.experts.down_proj.zero_points": (
+            f"{target_moe_path}.fc2_experts_zero_points",
+            False,
+        ),
+    }
+    for key, value in state_dict.items():
+        for source, (target, flatten_blocks) in projections.items():
+            if source in key:
+                key = key.replace(source, target)
+                if flatten_blocks:
+                    value = value.flatten(-2)
+                break
+        packed[key] = value
+    return packed
 
 
 def preprocess_gptq_weights(
@@ -645,15 +693,113 @@ def preprocess_gptq_weights(
                 raise ValueError(
                     f"Missing {qw_key} — qweight must be present alongside qzeros for {key}"
                 )
-            k = state_dict[qw_key].shape[0] * 32 // bits
+            k = state_dict[qw_key].shape[-2] * 32 // bits
             n_blocks = math.ceil(k / group_size)
             result[new_key] = _reshape_packed_qzeros(value, bits, n_blocks)
 
         elif key.endswith(".scales"):
-            result[key] = value.t().contiguous()
+            result[key] = value.transpose(-1, -2).contiguous()
 
         else:
             result[key] = value
+
+    return result
+
+
+def preprocess_olive_weights(
+    state_dict: dict[str, torch.Tensor],
+    bits: int = 4,
+    group_size: int = 128,
+    quantize_embeddings: bool = False,
+    quantize_lm_head: bool = False,
+    tie_word_embeddings: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Rename and reshape Olive-packed quantized weights.
+
+    Olive stores quantized weights with uint8 packing:
+      - ``*.qweight``: [N, packed_K] uint8
+      - ``*.scales``: [N, n_blocks]
+      - ``*.qzeros``: [N, ceil(n_blocks * bits / 8)] uint8, asymmetric only
+
+    Linear projections target ``MatMulNBits``, which expects ``weight`` as
+    [N, n_blocks, blob_size]; scales and zero-points already match the
+    expected orientation, so they are renamed but not transposed.
+
+    The input embedding table (``*.embed_tokens.qweight``) instead targets
+    ``GatherBlockQuantized``, which consumes the **2-D** uint8 ``qweight``
+    directly — so it is kept as-is (only ``qzeros`` is renamed to
+    ``zero_points``).
+
+    Tied LM head: Olive RTN drops ``lm_head.*`` when the head is tied. When the
+    head is **quantized**, no ``lm_head`` weights are produced here — the model
+    shares the embedding's packed table via :class:`TiedQuantizedLMHead` (one
+    initializer). When the head stays **float** (unquantized embedding), the
+    standard float tie is applied so ``lm_head.weight`` aliases the embedding.
+
+    Args:
+        state_dict: Model state dict with Olive quantization keys.
+        bits: Quantization bit-width (typically 4).
+        group_size: Number of elements per quantization group.
+        quantize_embeddings: Whether the embedding table is quantized.
+        quantize_lm_head: Whether the LM head is quantized.
+        tie_word_embeddings: Whether embedding and LM head share weights.
+
+    Returns:
+        State dict with renamed and reshaped weights (and, for a float tied
+        head, the aliased ``lm_head.weight``).
+    """
+    blob_size = group_size * bits // 8
+    result: dict[str, torch.Tensor] = {}
+
+    for key, value in state_dict.items():
+        if key.endswith("embed_tokens.qweight"):
+            # GatherBlockQuantized consumes the 2-D uint8 table directly.
+            if value.dtype != torch.uint8:
+                raise ValueError(
+                    f"Olive embedding qweight must be uint8 for {key}, got {value.dtype}"
+                )
+            if value.shape[-1] % blob_size != 0:
+                raise ValueError(
+                    f"Olive embedding qweight packed dimension for {key} "
+                    f"({value.shape[-1]}) must be divisible by blob_size ({blob_size})"
+                )
+            result[key] = value.contiguous()
+        elif key.endswith("embed_tokens.qzeros"):
+            if value.dtype != torch.uint8:
+                raise ValueError(
+                    f"Olive embedding qzeros must be uint8 for {key}, got {value.dtype}"
+                )
+            result[key.replace(".qzeros", ".zero_points")] = value.contiguous()
+        elif key.endswith("embed_tokens.scales"):
+            result[key] = value
+        elif key.endswith(".qweight"):
+            if value.dtype != torch.uint8:
+                raise ValueError(f"Olive qweight must be uint8 for {key}, got {value.dtype}")
+            if value.shape[-1] % blob_size != 0:
+                raise ValueError(
+                    f"Olive qweight packed dimension for {key} ({value.shape[-1]}) "
+                    f"must be divisible by blob_size ({blob_size})"
+                )
+            new_key = key.replace(".qweight", ".weight")
+            result[new_key] = value.reshape(value.shape[0], -1, blob_size).contiguous()
+        elif key.endswith(".qzeros"):
+            if value.dtype != torch.uint8:
+                raise ValueError(f"Olive qzeros must be uint8 for {key}, got {value.dtype}")
+            new_key = key.replace(".qzeros", ".zero_points")
+            result[new_key] = value.contiguous()
+        else:
+            result[key] = value
+
+    # A tied quantized head shares the embedding's Parameters in the module
+    # (TiedQuantizedLMHead), so no lm_head initializers exist to fill here.
+    # Only a tied *float* head needs an explicit weight alias.
+    if (
+        tie_word_embeddings
+        and not quantize_lm_head
+        and "lm_head.weight" not in result
+        and "model.embed_tokens.weight" in result
+    ):
+        result["lm_head.weight"] = result["model.embed_tokens.weight"]
 
     return result
 
@@ -694,7 +840,7 @@ def preprocess_awq_weights(
                 raise ValueError(
                     f"Missing {qw_key} — qweight must be present alongside qzeros for {key}"
                 )
-            k = state_dict[qw_key].shape[0] * 32 // bits
+            k = state_dict[qw_key].shape[-2] * 32 // bits
             n_blocks = math.ceil(k / group_size)
             # AWQ zero points have an implicit +1 offset; subtract it
             # before unpacking so MatMulNBits sees the raw value.
@@ -712,7 +858,7 @@ def preprocess_awq_weights(
                 result[new_key] = zp_int16.clamp(min=0).to(torch.uint8)
 
         elif key.endswith(".scales"):
-            result[key] = value.t().contiguous()
+            result[key] = value.transpose(-1, -2).contiguous()
 
         else:
             result[key] = value

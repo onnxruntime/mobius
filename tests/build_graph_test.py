@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 
+import ml_dtypes
 import numpy as np
 import onnx_ir as ir
 import pytest
@@ -61,6 +62,7 @@ from mobius._configs import (
     VisionConfig,
 )
 from mobius._optimizations import SymbolicShapeInferencePass
+from mobius._pipeline_contract import component_presence, optional_input_contract
 from mobius._registry import registry
 from mobius.tasks import (
     CausalLMTask,
@@ -1238,7 +1240,7 @@ class TestBuildGraphVisionLanguage:
         module = model_cls(config)
         task_name = _default_task_for_model("gemma4")
         task = get_task(task_name)
-        pkg = task.build(module, config)
+        pkg = build_from_module(module, config, task=task)
 
         assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}, (
             f"Vision-only Gemma4 should produce 3 models, got: {set(pkg.keys())}"
@@ -1253,12 +1255,18 @@ class TestBuildGraphVisionLanguage:
         assert "pixel_values" in vision_input_names
         assert "pixel_position_ids" in vision_input_names
         assert "image_features" in {o.name for o in vision.graph.outputs}
+        assert component_presence(vision.graph) == "image"
         # Embedding: input_ids + image_features (no audio) -> inputs_embeds
         embedding = pkg["embedding"]
         emb_input_names = {i.name for i in embedding.graph.inputs}
         assert "input_ids" in emb_input_names
         assert "image_features" in emb_input_names
         assert "audio_features" not in emb_input_names
+        embedding_image = next(i for i in embedding.graph.inputs if i.name == "image_features")
+        assert optional_input_contract(embedding_image) == {
+            "presence": "image",
+            "absent": {"kind": "zeros", "shape": [0, config.hidden_size]},
+        }
         assert "inputs_embeds" in {o.name for o in embedding.graph.outputs}
 
     def test_gemma4_kv_shared_fallback_attention_is_causal_zero(self):
@@ -1414,6 +1422,174 @@ class TestBuildGraphVisionLanguage:
         assert "past_key_values.0.key" in input_names
         assert "past_key_values.1.key" in input_names
 
+    def test_gemma4_unified_text_only_emits_gqa(self):
+        """text_only build of gemma-4-12B emits GroupQueryAttention on CUDA.
+
+        The multimodal ``gemma4_unified`` decoder uses the bidirectional
+        vision-block overlay (float-bias ``Attention``), but the text-only
+        export strips ``image_token_id`` / ``use_bidirectional_attention`` so
+        the decoder is pure causal and fuses to ``GroupQueryAttention`` on a
+        GQA-capable execution provider. This mirrors what
+        ``build(text_only=True)`` produces, without network access.
+        """
+        from collections import Counter
+
+        from mobius._builder import _strip_to_text_only
+        from mobius._configs import Gemma4Config
+        from mobius.tasks import get_task
+
+        config = Gemma4Config(
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="gelu_pytorch_tanh",
+            attn_qk_norm=True,
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=8,
+            global_head_dim=32,
+            global_rope_theta=1_000_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=30.0,
+            hidden_size_per_layer_input=0,
+            num_global_key_value_heads=1,
+            attention_k_eq_v=True,
+            use_bidirectional_attention="vision",
+            image_token_id=258880,
+            pad_token_id=0,
+            tie_word_embeddings=True,
+        )
+        config = _strip_to_text_only(config, "gemma4_unified_text")
+        config.dtype = DTYPE_MAP["f16"]
+        assert config.image_token_id is None
+        assert config.use_bidirectional_attention is None
+
+        model_cls = registry.get("gemma4_unified_text")
+        module = model_cls(config)
+        task = get_task(_default_task_for_model("gemma4_unified_text"))
+        pkg = build_from_module(module, config, task=task, execution_provider="cuda")
+
+        counts = Counter(n.op_type for n in pkg["model"].graph)
+        assert counts.get("GroupQueryAttention", 0) == 2, dict(counts)
+        assert counts.get("Attention", 0) == 0, dict(counts)
+
+    def test_strip_to_text_only(self):
+        """``_strip_to_text_only`` nulls multimodal fields and sets model_type."""
+        from mobius._builder import _strip_to_text_only
+        from mobius._configs import Gemma4AudioConfig, Gemma4Config
+
+        config = Gemma4Config(
+            model_type="gemma4_unified",
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            vocab_size=256,
+            hidden_act="gelu_pytorch_tanh",
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=8,
+            global_head_dim=32,
+            use_bidirectional_attention="vision",
+            image_token_id=258880,
+            boa_token_id=256000,
+            audio=Gemma4AudioConfig(),
+            pad_token_id=0,
+        )
+        out = _strip_to_text_only(config, "gemma4_unified_text")
+
+        assert out.model_type == "gemma4_unified_text"
+        assert out.image_token_id is None
+        assert out.use_bidirectional_attention is None
+        assert out.boa_token_id is None
+        assert out.audio is None
+        assert out.vision is None
+        # Original config is untouched (dataclasses.replace returns a copy).
+        assert config.image_token_id == 258880
+
+    def test_build_text_only_unsupported_model_type_raises(self):
+        """``build(text_only=True)`` rejects model types with no text sibling."""
+        from unittest import mock
+
+        from mobius._builder import build
+
+        fake_hf = type("HF", (), {"model_type": "llama"})()
+        with (
+            mock.patch("transformers.AutoConfig.from_pretrained", return_value=fake_hf),
+            pytest.raises(ValueError, match="text_only=True is not supported"),
+        ):
+            build("meta-llama/Llama-3.2-1B", load_weights=False, text_only=True)
+
+    def test_build_text_only_remaps_and_strips(self):
+        """``build(text_only=True)`` remaps to the text sibling and strips config.
+
+        Happy path: the model_type is remapped to its text-only registry
+        sibling and the multimodal config is stripped before building.
+        """
+        from unittest import mock
+
+        from mobius import _builder
+
+        fake_hf = type("HF", (), {"model_type": "gemma4_unified"})()
+        raw_config = mock.MagicMock(name="raw_config")
+        stripped_config = mock.MagicMock(name="stripped_config")
+        fake_pkg = mock.MagicMock()
+        fake_pkg.items.return_value = []
+        fake_module_cls = mock.MagicMock(name="Gemma4CausalLMModel")
+
+        with (
+            mock.patch("transformers.AutoConfig.from_pretrained", return_value=fake_hf),
+            mock.patch.object(
+                _builder.registry, "get", return_value=fake_module_cls
+            ) as mock_get,
+            mock.patch("mobius._config_resolver._config_from_hf", return_value=raw_config),
+            mock.patch(
+                "mobius._builder._strip_to_text_only", return_value=stripped_config
+            ) as mock_strip,
+            mock.patch(
+                "mobius._config_resolver._default_task_for_model",
+                return_value="text-generation",
+            ),
+            mock.patch(
+                "mobius._builder.build_from_module", return_value=fake_pkg
+            ) as mock_build_mod,
+        ):
+            pkg = _builder.build("google/gemma-4-12B", load_weights=False, text_only=True)
+
+        # model_type was remapped to the text sibling before module lookup
+        mock_get.assert_called_once_with("gemma4_unified_text")
+        # config stripping invoked with the remapped (text) model_type
+        mock_strip.assert_called_once_with(raw_config, "gemma4_unified_text")
+        # the stripped config (not the raw multimodal one) is what gets built
+        assert mock_build_mod.call_args.args[1] is stripped_config
+        assert pkg is fake_pkg
+
+    def test_build_text_only_diffusers_path_raises(self):
+        """``build(text_only=True)`` errors on the diffusers/unsupported path.
+
+        When AutoConfig fails and the model is not in the registry, ``build``
+        normally falls through to ``build_diffusers_pipeline``. With
+        ``text_only=True`` it must raise instead of silently ignoring the flag.
+        """
+        from unittest import mock
+
+        from mobius._builder import build
+
+        with (
+            mock.patch(
+                "transformers.AutoConfig.from_pretrained",
+                side_effect=ValueError("no such model_type"),
+            ),
+            mock.patch("mobius._config_resolver._try_load_config_json", return_value=None),
+            pytest.raises(ValueError, match="does not resolve to a registered"),
+        ):
+            build("some/diffusion-pipeline", load_weights=False, text_only=True)
+
     def test_gemma4_any_to_any_graph(self):
         """Build Gemma4 Any-to-Any model (4-model split: decoder+vision+speech+embedding).
 
@@ -1487,18 +1663,32 @@ class TestBuildGraphVisionLanguage:
         assert "pixel_values" in vision_input_names
         assert "pixel_position_ids" in vision_input_names
         assert "image_features" in {o.name for o in vision.graph.outputs}
+        assert component_presence(vision.graph) == "image"
         # Audio encoder
         audio = pkg["audio_encoder"]
         audio_input_names = {i.name for i in audio.graph.inputs}
         assert "input_features" in audio_input_names
         assert "input_features_mask" in audio_input_names
-        assert "audio_features" in {o.name for o in audio.graph.outputs}
+        audio_features = next(o for o in audio.graph.outputs if o.name == "audio_features")
+        assert len(audio_features.shape) == 2
+        assert audio_features.shape[-1] == config.hidden_size
+        assert component_presence(audio.graph) == "audio"
         # Embedding: all three inputs
         embedding = pkg["embedding"]
         emb_input_names = {i.name for i in embedding.graph.inputs}
         assert "input_ids" in emb_input_names
         assert "image_features" in emb_input_names
         assert "audio_features" in emb_input_names
+        embedding_image = next(i for i in embedding.graph.inputs if i.name == "image_features")
+        assert optional_input_contract(embedding_image) == {
+            "presence": "image",
+            "absent": {"kind": "zeros", "shape": [0, config.hidden_size]},
+        }
+        embedding_audio = next(i for i in embedding.graph.inputs if i.name == "audio_features")
+        assert optional_input_contract(embedding_audio) == {
+            "presence": "audio",
+            "absent": {"kind": "zeros", "shape": [0, config.hidden_size]},
+        }
         assert "inputs_embeds" in {o.name for o in embedding.graph.outputs}
         # KV cache outputs: num_kv_layers = num_hidden_layers - num_kv_shared_layers = 1
         decoder_output_names = {o.name for o in decoder.graph.outputs}
@@ -1506,6 +1696,50 @@ class TestBuildGraphVisionLanguage:
         assert "present.0.value" in decoder_output_names
         assert "present.1.key" not in decoder_output_names  # shared layer excluded
         assert "present.1.value" not in decoder_output_names  # shared layer excluded
+
+    @pytest.mark.parametrize(
+        ("dtype", "np_dtype"),
+        [
+            (ir.DataType.FLOAT, np.float32),
+            (ir.DataType.FLOAT16, np.float16),
+            (ir.DataType.BFLOAT16, ml_dtypes.bfloat16),
+        ],
+    )
+    def test_gemma4_audio_encoder_strips_padding_in_graph(self, dtype, np_dtype):
+        """The exported audio graph produces ordered rank-2 valid feature rows."""
+        from onnxscript import nn
+
+        from mobius._configs import Gemma4AudioConfig, Gemma4Config
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        class IdentityAudio(nn.Module):
+            def forward(self, op, input_features, input_features_mask=None):
+                return op.Identity(input_features), op.Identity(input_features_mask)
+
+        config = Gemma4Config(
+            hidden_size=4,
+            dtype=dtype,
+            audio=Gemma4AudioConfig(input_size=4),
+        )
+        model = Gemma4Task()._build_audio(IdentityAudio(), config)
+        features = np.arange(24, dtype=np_dtype).reshape(2, 3, 4)
+        mask = np.array([[True, True, False], [True, False, False]])
+
+        session = OnnxModelSession(model)
+        outputs = session.run(
+            {
+                "input_features": features,
+                "input_features_mask": mask,
+            }
+        )
+        session.close()
+
+        np.testing.assert_array_equal(
+            outputs["audio_features"],
+            np.concatenate([features[0, :2], features[1, :1]], axis=0),
+        )
+        assert outputs["audio_features"].dtype == np.dtype(np_dtype)
 
     def test_gemma4_unified_multimodal_graph(self):
         """Build gemma4_unified (gemma-4-12B) encoder-free multimodal model.
@@ -1560,7 +1794,7 @@ class TestBuildGraphVisionLanguage:
         model_cls = registry.get("gemma4_unified")
         module = model_cls(config)
         task = get_task(_default_task_for_model("gemma4_unified"))
-        pkg = task.build(module, config)
+        pkg = build_from_module(module, config, task=task)
 
         assert set(pkg.keys()) == {
             "decoder",
@@ -1574,18 +1808,30 @@ class TestBuildGraphVisionLanguage:
         v_inputs = {i.name for i in vision.graph.inputs}
         assert v_inputs == {"pixel_values", "pixel_position_ids"}
         assert "image_features" in {o.name for o in vision.graph.outputs}
+        assert component_presence(vision.graph) == "image"
 
         # Audio embedder: raw frames + mask → audio_features
         audio = pkg["audio_encoder"]
         a_inputs = {i.name for i in audio.graph.inputs}
         assert a_inputs == {"input_features", "input_features_mask"}
         assert "audio_features" in {o.name for o in audio.graph.outputs}
+        assert component_presence(audio.graph) == "audio"
 
         # Embedding: fuses both modalities → inputs_embeds (no block_sequence_ids;
         # the decoder derives the bidirectional overlay from input_ids itself)
         embedding = pkg["embedding"]
         e_inputs = {i.name for i in embedding.graph.inputs}
         assert {"input_ids", "image_features", "audio_features"} <= e_inputs
+        embedding_image = next(i for i in embedding.graph.inputs if i.name == "image_features")
+        assert optional_input_contract(embedding_image) == {
+            "presence": "image",
+            "absent": {"kind": "zeros", "shape": [0, config.hidden_size]},
+        }
+        embedding_audio = next(i for i in embedding.graph.inputs if i.name == "audio_features")
+        assert optional_input_contract(embedding_audio) == {
+            "presence": "audio",
+            "absent": {"kind": "zeros", "shape": [0, config.hidden_size]},
+        }
         e_outputs = {o.name for o in embedding.graph.outputs}
         assert "inputs_embeds" in e_outputs
         assert "block_sequence_ids" not in e_outputs
@@ -2301,6 +2547,101 @@ class TestBuildGraphMultiModal:
         assert registry.get("phi4_multimodal") is Phi4MMMultiModalModel
         assert registry.get("phi4_multimodal") is registry.get("phi4mm")
         assert _default_task_for_model("phi4_multimodal") == "phi4mm-multimodal"
+
+    def test_phi3_v_vision_language_graph(self):
+        """Build Phi-3-Vision with 3-model split and verify all components."""
+        config = _base_config(
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=28,
+                patch_size=14,
+                norm_eps=1e-5,
+            ),
+            image_token_id=32044,
+        )
+        model_cls = registry.get("phi3_v")
+        module = model_cls(config)
+        task_name = _default_task_for_model("phi3_v")
+        task = get_task(task_name)
+        pkg = task.build(module, config)
+
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
+
+        decoder = pkg["decoder"]
+        assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
+        assert "logits" in {o.name for o in decoder.graph.outputs}
+
+        vision = pkg["vision_encoder"]
+        assert "pixel_values" in {i.name for i in vision.graph.inputs}
+        assert "image_features" in {o.name for o in vision.graph.outputs}
+
+        embed = pkg["embedding"]
+        assert "input_ids" in {i.name for i in embed.graph.inputs}
+        assert "inputs_embeds" in {o.name for o in embed.graph.outputs}
+
+    def test_phi4_siglip_vision_language_graph(self):
+        """Build Phi-4-Reasoning-Vision (phi4-siglip) with 3-model split and verify components."""
+        config = _base_config(
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=28,
+                patch_size=14,
+                norm_eps=1e-6,
+            ),
+            image_token_id=-200,
+        )
+        model_cls = registry.get("phi4-siglip")
+        module = model_cls(config)
+        task_name = _default_task_for_model("phi4-siglip")
+        task = get_task(task_name)
+        pkg = task.build(module, config)
+
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
+
+        decoder = pkg["decoder"]
+        assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
+        assert "logits" in {o.name for o in decoder.graph.outputs}
+
+        vision = pkg["vision_encoder"]
+        assert "pixel_values" in {i.name for i in vision.graph.inputs}
+        assert "image_features" in {o.name for o in vision.graph.outputs}
+
+        embed = pkg["embedding"]
+        assert "input_ids" in {i.name for i in embed.graph.inputs}
+        assert "inputs_embeds" in {o.name for o in embed.graph.outputs}
+
+    def test_phi3_v_decoder_excludes_vision_weights(self):
+        """Decoder weight preprocessing must not retain vision-only checkpoint tensors."""
+        import torch
+
+        from mobius.models.phi3_v import _Phi3VDecoderModel
+
+        config = _base_config(
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=28,
+                patch_size=14,
+            ),
+            image_token_id=32044,
+        )
+        weights = {
+            "model.layers.0.self_attn.qkv_proj.weight": torch.zeros(128, 64),
+            "model.vision_embed_tokens.img_processor.vision_model.weight": torch.zeros(1),
+            "lm_head.weight": torch.zeros(256, 64),
+        }
+        remapped = _Phi3VDecoderModel(config).preprocess_weights(weights)
+
+        assert "model.vision_embed_tokens.img_processor.vision_model.weight" not in remapped
+        assert "lm_head.weight" in remapped
 
 
 class TestBuildGraphWhisper:
@@ -3765,6 +4106,36 @@ class TestBuildMoshiLM:
         assert "text_logits" in outputs
         assert "present.0.key" in outputs
 
+    def test_temporal_gqa_emits_sliding_window(self):
+        """Temporal GQA nodes carry Moshi's sliding window as local_window_size.
+
+        On the GQA (fp16/cuda) path, the temporal transformer's uniform sliding
+        window (Moshi ``context``) must reach every GroupQueryAttention node as
+        ``local_window_size``.  PersonaPlex deploys this fp16 path, so without it
+        long streams would silently run full causal attention.
+        """
+        import dataclasses
+
+        import onnx_ir as ir
+
+        from mobius.models.moshi import MoshiTemporalModel, moshi_temporal_config
+        from mobius.tasks import MoshiTemporalTask
+
+        full_window = moshi_temporal_config().sliding_window
+        assert full_window and full_window > 0, "Moshi temporal must be sliding"
+
+        config = dataclasses.replace(self._temporal_tiny_config(), dtype=ir.DataType.FLOAT16)
+        pkg = build_from_module(
+            MoshiTemporalModel(config),
+            config,
+            task=MoshiTemporalTask(),
+            execution_provider="cuda",
+        )
+        gqa_nodes = [n for n in pkg["model"].graph if n.op_type == "GroupQueryAttention"]
+        assert len(gqa_nodes) == config.num_hidden_layers
+        for node in gqa_nodes:
+            assert node.attributes["local_window_size"].value == full_window
+
     def test_depformer_io(self):
         """Depformer model I/O: hidden + prev_token + substep_index -> logits."""
         from mobius.models.moshi import MoshiDepformerModel, moshi_depformer_config
@@ -4667,6 +5038,10 @@ class TestBuildJambaGraph:
 # Model types exercised by non-parametrized test classes above (VLM,
 # whisper, audio, TTS, diffusion, etc.).  Keep sorted for readability.
 _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
+    # LLaDA masked-diffusion LM (co-located src/mobius/models/llada_test.py):
+    # bidirectional Llama backbone with a masked-diffusion task, so it has no
+    # attention_mask / KV cache and does not fit the generic causal-LM harness.
+    "llada",
     # VLM alias tests (test_llava_aliases_build)
     "aya_vision",
     "chameleon",
@@ -4708,6 +5083,8 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "gemma4_unified_text",
     "llava",
     "mllama",
+    "phi3_v",
+    "phi4-siglip",
     "phi4_multimodal",
     "phi4mm",
     "qwen2_5_vl",
@@ -4750,6 +5127,31 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     # Hybrid SSM+Attention dedicated tests
     "bamba",
     "jamba",
+    # Speculative-decoding draft models with bespoke IO contracts
+    # (DFlash drafter takes noise_embedding + target_hidden instead of
+    # input_ids; the generic ALL_CAUSAL_LM_CONFIGS matrix can't drive it).
+    # Covered by src/mobius/models/_dflash_test.py.
+    "DFlashDraftModel",
+    # Gemma4-Assistant: bespoke IO contract (consumes inputs_embeds +
+    # the target's shared KV instead of input_ids), so the generic
+    # ALL_CAUSAL_LM_CONFIGS matrix can't drive it. Covered by
+    # src/mobius/models/_gemma4_assistant_test.py.
+    "gemma4_assistant",
+    "Gemma4AssistantForCausalLM",
+    "gemma4_unified_assistant",
+    "Gemma4UnifiedAssistantForCausalLM",
+    # Qwen3.6 MTP self-speculative head: bespoke IO contract (consumes
+    # inputs_embeds + the target's hidden_states instead of input_ids;
+    # borrows the target's embed/lm_head), so the generic
+    # ALL_CAUSAL_LM_CONFIGS matrix can't drive it. Covered by
+    # src/mobius/models/_qwen35_mtp_test.py.
+    "Qwen35MtpModel",
+    # EAGLE-3 drafter: bespoke IO contract (inputs_embeds, fused_hidden,
+    # recycled_hidden and draft-vocab logits). Covered by _eagle3_test.py.
+    "Eagle3LlamaForCausalLM",
+    "LlamaForCausalLMEagle3",
+    "Eagle3Speculator",
+    "Eagle3DraftModel",
 }
 
 # Registered model types that truly have no test coverage yet.
@@ -4909,8 +5311,8 @@ class TestBuildStaticCacheGraph:
         proto = ir.serde.serialize_model(model)
         assert len(proto.SerializeToString()) > 0
 
-    def test_static_cache_attention_is_causal(self):
-        """Verify Attention ops use is_causal=1 in static cache mode."""
+    def test_static_cache_attention_uses_maskless_causal_alignment(self):
+        """Verify maskless external-cache Attention uses built-in causality."""
         model, config = self._build_static_cache_model()
 
         attention_nodes = [n for n in model.graph if n.op_type == "Attention"]
@@ -4968,6 +5370,248 @@ class TestBuildStaticCacheGraph:
         """Verify shape inference populates all output shapes and dtypes."""
         model, _ = self._build_static_cache_model()
         _assert_outputs_have_shapes_and_dtypes({"model": model}, "qwen2-static")
+
+    def _build_gemma4_static(self):
+        """Build gemma4_text with static cache: KV-sharing + dual head_dim."""
+        from mobius._configs import Gemma4Config
+        from mobius.tasks import CausalLMTask
+
+        config = _base_config(
+            _config_cls=Gemma4Config,
+            num_hidden_layers=6,
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            num_kv_shared_layers=2,  # first_kv_shared = 4 -> layers 0..3 own a cache
+            sliding_window=8,
+            global_head_dim=2 * TINY_HEAD_DIM,
+            global_rope_theta=10_000.0,
+            rope_local_base_freq=10_000.0,
+            attn_qk_norm=True,
+            hidden_size_per_layer_input=0,
+        )
+        module = registry.get("gemma4_text")(config)
+        pkg = CausalLMTask(static_cache=True, max_seq_len=self.MAX_SEQ_LEN).build(
+            module, config
+        )
+        return pkg["model"], config
+
+    def test_gemma4_static_cache_only_for_cache_owning_layers(self):
+        """Gemma4 KV-shared layers own no cache: 4 cache buffers, not 6."""
+        model, _ = self._build_gemma4_static()
+        input_names = {inp.name for inp in model.graph.inputs}
+        # first_kv_shared_layer_idx = 6 - 2 = 4 -> cache-owning layers 0..3
+        for i in range(4):
+            assert f"key_cache.{i}" in input_names
+            assert f"value_cache.{i}" in input_names
+        # No cache for the KV-shared layers (indices 4, 5).
+        assert "key_cache.4" not in input_names
+        assert "key_cache.5" not in input_names
+        output_names = {out.name for out in model.graph.outputs}
+        for i in range(4):
+            assert f"updated_key_cache.{i}" in output_names
+        assert "updated_key_cache.4" not in output_names
+
+    def test_gemma4_static_cache_dual_head_dim(self):
+        """Sliding (head_dim) and full (global_head_dim) cache buffers differ."""
+        model, _ = self._build_gemma4_static()
+        by_name = {inp.name: inp for inp in model.graph.inputs}
+        # num_kv_heads=TINY_KV_HEADS; sliding head_dim=TINY_HEAD_DIM,
+        # full head_dim=2*TINY_HEAD_DIM. Cache-owning layer 2 is full_attention.
+        sliding_kv = int(by_name["key_cache.0"].shape[2])  # layer 0 sliding
+        full_kv = int(by_name["key_cache.2"].shape[2])  # layer 2 full
+        assert sliding_kv == TINY_KV_HEADS * TINY_HEAD_DIM
+        assert full_kv == TINY_KV_HEADS * (2 * TINY_HEAD_DIM)
+
+    def test_gemma4_static_cache_has_tensorscatter(self):
+        """Gemma4 static cache uses TensorScatter for in-place KV writes."""
+        model, _ = self._build_gemma4_static()
+        op_types = {n.op_type for n in model.graph}
+        assert "TensorScatter" in op_types
+
+    def test_gemma4_static_qnn_lowering_is_htp_friendly(self):
+        """The qnn build lowers all ops the QNN HTP backend cannot run.
+
+        RotaryEmbedding -> rotate-half, TensorScatter -> ScatterND, Tile ->
+        Expand, Range -> Constant, Attention -> SDPA are all HTP-unsupported and
+        must be gone; their HTP-friendly replacements must appear.
+        """
+        from mobius._builder import build_from_module
+        from mobius._configs import Gemma4Config
+        from mobius.tasks import CausalLMTask
+
+        config = _base_config(
+            _config_cls=Gemma4Config,
+            num_hidden_layers=3,
+            layer_types=["sliding_attention", "full_attention", "sliding_attention"],
+            num_kv_shared_layers=1,
+            sliding_window=8,
+            global_head_dim=2 * TINY_HEAD_DIM,
+            global_rope_theta=10_000.0,
+            rope_local_base_freq=10_000.0,
+            attn_qk_norm=True,
+            hidden_size_per_layer_input=0,
+        )
+        module = registry.get("gemma4_text")(config)
+        model = build_from_module(
+            module,
+            config,
+            CausalLMTask(static_cache=True, max_seq_len=self.MAX_SEQ_LEN),
+            execution_provider="qnn",
+        )["model"]
+        op_types = {n.op_type for n in model.graph}
+        for forbidden in ("RotaryEmbedding", "TensorScatter", "Tile", "Range", "Attention"):
+            assert forbidden not in op_types, f"{forbidden} should be lowered for qnn"
+        assert "ScatterND" in op_types  # TensorScatter replacement
+        assert "Expand" in op_types  # Tile (GQA repeat) replacement
+
+
+class TestBuildGemma4StaticCacheGraph:
+    """Verify Gemma4TextCausalLMTask(static_cache=True) builds a valid graph."""
+
+    MAX_SEQ_LEN = 128
+
+    @staticmethod
+    def _gemma4_config(**overrides):
+        from mobius._configs import Gemma4Config
+
+        defaults = dict(
+            num_hidden_layers=6,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            global_head_dim=32,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="gelu_pytorch_tanh",
+            # Mixed: 5 sliding + 1 full (Gemma4-like hybrid pattern)
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            sliding_window=64,
+            rope_theta=10000.0,
+            global_rope_theta=1000000.0,
+            partial_rotary_factor=0.5,
+            max_position_embeddings=256,
+            hidden_size_per_layer_input=0,
+            num_kv_shared_layers=0,
+        )
+        defaults.update(overrides)
+        return Gemma4Config(**defaults)
+
+    def _build(self, **config_overrides):
+        from mobius.models.gemma4 import Gemma4CausalLMModel
+        from mobius.tasks._gemma4 import Gemma4TextCausalLMTask
+
+        config = self._gemma4_config(**config_overrides)
+        module = Gemma4CausalLMModel(config)
+        task = Gemma4TextCausalLMTask(static_cache=True, max_seq_len=self.MAX_SEQ_LEN)
+        pkg = task.build(module, config)
+        return pkg["model"], config
+
+    def test_gemma4_static_cache_builds(self):
+        """Build Gemma4 with static cache and verify basic graph structure."""
+        model, _config = self._build()
+
+        assert model.graph is not None
+        input_names = {inp.name for inp in model.graph.inputs}
+        assert "input_ids" in input_names
+        assert "position_ids" in input_names
+        # Hybrid mode: attention_mask for sliding GQA + write_indices for static
+        assert "attention_mask" in input_names
+        assert "write_indices" in input_names
+        assert "nonpad_kv_seqlen" in input_names
+
+    def test_gemma4_static_cache_hybrid_inputs(self):
+        """Verify full-attention gets static cache, sliding gets dynamic."""
+        model, _config = self._build()
+
+        input_map = {inp.name: inp for inp in model.graph.inputs}
+
+        # Layer 0-4: sliding → dynamic cache (past_key_values.N.key)
+        assert "past_key_values.0.key" in input_map
+
+        # Layer 5: full_attention → static cache (key_cache.5)
+        assert "key_cache.5" in input_map
+        kv_hidden_full = _config.num_key_value_heads * _config.global_head_dim
+        k5 = input_map["key_cache.5"]
+        assert k5.shape[2] == kv_hidden_full
+
+    def test_gemma4_static_cache_has_tensorscatter(self):
+        """Verify TensorScatter for full-attention layers in hybrid mode."""
+        model, _config = self._build()
+
+        op_counts = {}
+        for n in model.graph:
+            op_counts[n.op_type] = op_counts.get(n.op_type, 0) + 1
+
+        layer_types = _config.layer_types or []
+        num_full = sum(1 for lt in layer_types if lt == "full_attention")
+
+        # TensorScatter: 2 per full-attention layer (key + value)
+        assert op_counts.get("TensorScatter", 0) == 2 * num_full
+        # Sliding layers use either GQA (CUDA EP) or Attention (default EP)
+        # In unit tests without EP context, all use standard Attention.
+        total_attn = op_counts.get("Attention", 0) + op_counts.get("GroupQueryAttention", 0)
+        assert total_attn == _config.num_hidden_layers
+
+    def test_gemma4_static_cache_kv_shared(self):
+        """Verify KV-shared layers are excluded from cache I/O."""
+        model, config = self._build(
+            num_hidden_layers=8,
+            num_kv_shared_layers=2,
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+        )
+
+        input_names = {inp.name for inp in model.graph.inputs}
+        num_kv_layers = config.num_hidden_layers - config.num_kv_shared_layers
+
+        # Non-shared layers 0-5 should have cache entries (type depends on layer)
+        for i in range(num_kv_layers):
+            lt = config.layer_types[i]
+            if lt == "full_attention":
+                assert f"key_cache.{i}" in input_names
+            else:
+                assert f"past_key_values.{i}.key" in input_names
+
+        # Shared layers (6, 7) should NOT have any cache entries
+        assert f"key_cache.{num_kv_layers}" not in input_names
+        assert f"past_key_values.{num_kv_layers}.key" not in input_names
+
+    def test_gemma4_static_cache_input_ordering(self):
+        """Verify write_indices/nonpad_kv_seqlen come after cache inputs."""
+        model, _config = self._build()
+
+        input_names = [inp.name for inp in model.graph.inputs]
+        # write_indices and nonpad_kv_seqlen should come after all cache inputs
+        last_cache_idx = max(i for i, n in enumerate(input_names) if "cache" in n)
+        write_idx = input_names.index("write_indices")
+        nonpad_idx = input_names.index("nonpad_kv_seqlen")
+        assert write_idx > last_cache_idx, "write_indices should come after all cache inputs"
+        assert nonpad_idx > last_cache_idx, (
+            "nonpad_kv_seqlen should come after all cache inputs"
+        )
 
 
 # === Parametrized Vision-Language configs (imported from _test_configs) ===
@@ -5105,3 +5749,396 @@ class TestBuildSpeechGraph:
         task = get_task(_default_task_for_model(model_type))
         pkg = task.build(module, config)
         _assert_outputs_have_shapes_and_dtypes(pkg, model_type)
+
+
+class TestGQASlidingWindow:
+    """Wire ``config.sliding_window`` into GQA's ``local_window_size``.
+
+    On the direct GQA path (``TextModel.forward``), GQA
+    ``local_window_size=W`` masks each query to the most recent ``W`` keys
+    (positions ``[i-W+1, i]``), matching HuggingFace ``sliding_window=W``.
+    Because the global GQAContext is shared by every layer, the window is only
+    emitted for models with a *uniform* sliding window across all layers.
+    """
+
+    @staticmethod
+    def _build_gqa_model(**overrides):
+        from mobius.models.base import CausalLMModel
+
+        overrides.setdefault("num_hidden_layers", 2)
+        config = ArchitectureConfig(
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            vocab_size=256,
+            max_position_embeddings=128,
+            hidden_act="silu",
+            rms_norm_eps=1e-6,
+            rope_type="default",
+            rope_theta=10000.0,
+            pad_token_id=0,
+            dtype=ir.DataType.FLOAT16,
+            **overrides,
+        )
+        module = CausalLMModel(config)
+        # execution_provider="cuda" + fp16 activates the direct GQA path.
+        return build_from_module(module, config, execution_provider="cuda")["model"]
+
+    @classmethod
+    def _build_gqa_decoder(cls, **overrides):
+        model = cls._build_gqa_model(**overrides)
+        gqa_nodes = [n for n in model.graph if n.op_type == "GroupQueryAttention"]
+        assert gqa_nodes, "expected GroupQueryAttention nodes on the cuda/fp16 path"
+        return gqa_nodes
+
+    @staticmethod
+    def _fill_fp16_weights(model, seed):
+        """Deterministically fill uninitialised params, honouring fp16 dtype."""
+        rng = np.random.default_rng(seed)
+        npdt = {ir.DataType.FLOAT16: np.float16, ir.DataType.FLOAT: np.float32}
+        for init in model.graph.initializers.values():
+            if init.const_value is None:
+                shape = [int(d) for d in init.shape]
+                arr = (rng.standard_normal(shape) * 0.1).astype(
+                    npdt.get(init.dtype, np.float32)
+                )
+                init.const_value = ir.Tensor(arr)
+
+    def test_uniform_sliding_window_sets_local_window_size(self):
+        """A uniform sliding window is forwarded to every GQA node verbatim."""
+        gqa_nodes = self._build_gqa_decoder(sliding_window=3000)
+        for node in gqa_nodes:
+            assert node.attributes["local_window_size"].value == 3000
+
+    def test_no_sliding_window_omits_local_window_size(self):
+        """Full-attention models must not carry a local_window_size attribute."""
+        gqa_nodes = self._build_gqa_decoder(sliding_window=None)
+        for node in gqa_nodes:
+            assert "local_window_size" not in node.attributes
+
+    def test_mixed_layer_types_omits_local_window_size(self):
+        """A per-layer schedule cannot be expressed by one global window."""
+        gqa_nodes = self._build_gqa_decoder(
+            sliding_window=8,
+            layer_types=["sliding_attention", "full_attention"],
+        )
+        for node in gqa_nodes:
+            assert "local_window_size" not in node.attributes
+
+    def test_all_sliding_layer_types_sets_local_window_size(self):
+        """An explicit all-sliding schedule is uniform, so window is emitted."""
+        gqa_nodes = self._build_gqa_decoder(
+            sliding_window=8,
+            layer_types=["sliding_attention", "sliding_attention"],
+        )
+        for node in gqa_nodes:
+            assert node.attributes["local_window_size"].value == 8
+
+    def test_window_confines_receptive_field(self):
+        """The sliding window must actually bound each query's receptive field.
+
+        Property test (no golden, weight-agnostic): with window ``W`` over
+        ``L`` layers, the last position can only be influenced by inputs within
+        ``L*(W-1)`` steps. Perturbing an out-of-window token must leave the
+        windowed model's last-position logits unchanged, while the same
+        perturbation *does* change the full-attention twin's logits — proving
+        the window is genuinely applied (and exercising seq > window, unlike
+        the short-sequence Moshi parity golden). Runs the fp16 GQA op on CPU.
+        """
+        from mobius._testing.ort_inference import OnnxModelSession
+
+        window, seq, layers = 4, 24, 2
+        # Pos 0 is well outside the last position's receptive field
+        # (layers*(window-1) = 6 << seq-1 = 23).
+        windowed = self._build_gqa_model(sliding_window=window, num_hidden_layers=layers)
+        full = self._build_gqa_model(sliding_window=None, num_hidden_layers=layers)
+        # Same seed + identical structure (only the GQA attr differs) => same weights.
+        self._fill_fp16_weights(windowed, seed=1234)
+        self._fill_fp16_weights(full, seed=1234)
+
+        def feeds(first_token):
+            ids = np.arange(1, seq + 1, dtype=np.int64).reshape(1, seq)
+            ids[0, 0] = first_token
+            f = {"input_ids": ids, "attention_mask": np.ones((1, seq), np.int64)}
+            for i in range(layers):
+                f[f"past_key_values.{i}.key"] = np.zeros((1, 2, 0, 16), np.float16)
+                f[f"past_key_values.{i}.value"] = np.zeros((1, 2, 0, 16), np.float16)
+            return f
+
+        def last_logits(model, first_token):
+            sess = OnnxModelSession(model)
+            out = sess.run(feeds(first_token))
+            return out["logits"][0, -1].astype(np.float32)
+
+        # Windowed: perturbing the out-of-window first token leaves the last
+        # position's logits unchanged.
+        w_a = last_logits(windowed, first_token=5)
+        w_b = last_logits(windowed, first_token=200)
+        np.testing.assert_allclose(w_a, w_b, atol=1e-3)
+
+        # Full attention: the same perturbation DOES reach the last position.
+        f_a = last_logits(full, first_token=5)
+        f_b = last_logits(full, first_token=200)
+        assert np.abs(f_a - f_b).max() > 1e-2, (
+            "full-attention twin should be sensitive to the first token"
+        )
+
+    def test_empty_layer_types_omits_local_window_size(self):
+        """An empty ``layer_types`` is not a valid uniform schedule.
+
+        ``all(... for t in [])`` is vacuously True, so an unhardened guard
+        would wrongly treat ``[]`` as uniform-sliding. The length check against
+        ``num_hidden_layers`` rejects it, leaving the window disabled.
+        """
+        gqa_nodes = self._build_gqa_decoder(
+            sliding_window=8,
+            layer_types=[],
+            num_hidden_layers=2,
+        )
+        for node in gqa_nodes:
+            assert "local_window_size" not in node.attributes
+
+    def test_non_gqa_path_warns_on_uniform_window(self, caplog):
+        """Non-GQA (static-cache) export of a uniform-sliding model warns.
+
+        That path cannot represent the window, so the warning flags the
+        divergence from HuggingFace for sequences longer than the window.
+        """
+        import logging
+
+        from mobius.models.base import CausalLMModel
+
+        config = ArchitectureConfig(
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            vocab_size=256,
+            max_position_embeddings=128,
+            hidden_act="silu",
+            rms_norm_eps=1e-6,
+            rope_type="default",
+            rope_theta=10000.0,
+            pad_token_id=0,
+            num_hidden_layers=2,
+            sliding_window=8,
+            dtype=ir.DataType.FLOAT,
+        )
+        module = CausalLMModel(config)
+        # Static cache feeds attention_mask=None, taking the non-GQA else
+        # branch that cannot express the window.
+        from mobius.tasks import CausalLMTask
+
+        task = CausalLMTask(static_cache=True, max_seq_len=128)
+        with caplog.at_level(logging.WARNING, logger="mobius.models.base"):
+            build_from_module(module, config, task=task, execution_provider="cpu")
+        assert "sliding window" in caplog.text
+
+    def test_partial_layer_types_omits_local_window_size(self):
+        """A ``layer_types`` shorter than the layer count is not uniform."""
+        gqa_nodes = self._build_gqa_decoder(
+            sliding_window=8,
+            layer_types=["sliding_attention"],
+            num_hidden_layers=2,
+        )
+        for node in gqa_nodes:
+            assert "local_window_size" not in node.attributes
+
+
+class TestResolveSlidingWindow:
+    """``from_transformers`` must honor HF's ``use_sliding_window`` gate.
+
+    Qwen2/Qwen3 keep a non-null ``sliding_window`` in the config even when the
+    window is disabled and signal activation via ``use_sliding_window``. A raw
+    ``config.json`` fallback bypasses HF's ``__post_init__`` (which would null
+    the field), so the gate is re-applied in ``_resolve_sliding_window``.
+    """
+
+    @staticmethod
+    def _cfg(**attrs):
+        from types import SimpleNamespace
+
+        defaults = dict(
+            model_type="qwen2",
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_hidden_layers=2,
+            vocab_size=256,
+            max_position_embeddings=128,
+            hidden_act="silu",
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+        )
+        defaults.update(attrs)
+        return SimpleNamespace(**defaults)
+
+    def test_disabled_window_is_nulled(self):
+        """``use_sliding_window=False`` drops a non-null ``sliding_window``."""
+        cfg = ArchitectureConfig.from_transformers(
+            self._cfg(sliding_window=4096, use_sliding_window=False), "qwen2"
+        )
+        assert cfg.sliding_window is None
+
+    def test_enabled_window_is_kept(self):
+        """``use_sliding_window=True`` keeps the window."""
+        cfg = ArchitectureConfig.from_transformers(
+            self._cfg(sliding_window=4096, use_sliding_window=True), "qwen2"
+        )
+        assert cfg.sliding_window == 4096
+
+    def test_window_without_flag_is_kept(self):
+        """Models without ``use_sliding_window`` (e.g. Mistral) are unaffected."""
+        cfg = ArchitectureConfig.from_transformers(
+            self._cfg(model_type="mistral", sliding_window=4096), "mistral"
+        )
+        assert cfg.sliding_window == 4096
+
+
+class TestLongRopeAliasExtraction:
+    """``rope_type`` alias handling for Phi LongRoPE.
+
+    Phi-3/Phi-3.5 checkpoints label LongRoPE as ``"su"`` (short/long-factor
+    scaled rotary embeddings); newer HuggingFace configs spell the identical
+    algorithm ``"longrope"``. ``_extract_rope_config`` must canonicalize the
+    legacy ``"su"`` alias to ``"longrope"`` so both configs resolve to the
+    same ``LongRope`` code path.
+    """
+
+    _SHORT_FACTOR = [1.0] * (TINY_HEAD_DIM // 2)
+    _LONG_FACTOR = [2.0] * (TINY_HEAD_DIM // 2)
+
+    @staticmethod
+    def _cfg(rope_scaling, **attrs):
+        from types import SimpleNamespace
+
+        defaults = dict(
+            model_type="phi3",
+            hidden_size=TINY_HIDDEN,
+            intermediate_size=TINY_INTERMEDIATE,
+            num_attention_heads=TINY_HEADS,
+            num_key_value_heads=TINY_KV_HEADS,
+            head_dim=TINY_HEAD_DIM,
+            num_hidden_layers=TINY_LAYERS,
+            vocab_size=TINY_VOCAB,
+            max_position_embeddings=1024,
+            original_max_position_embeddings=128,
+            hidden_act="silu",
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            rope_scaling=rope_scaling,
+        )
+        defaults.update(attrs)
+        return SimpleNamespace(**defaults)
+
+    def _scaling(self, rope_type_key, rope_type_value):
+        return {
+            rope_type_key: rope_type_value,
+            "short_factor": self._SHORT_FACTOR,
+            "long_factor": self._LONG_FACTOR,
+        }
+
+    def test_su_and_longrope_produce_identical_rope_config(self):
+        """``type="su"`` and ``rope_type="longrope"`` extract identically."""
+        from mobius._configs._base import _extract_rope_config
+
+        su_config = _extract_rope_config(self._cfg(self._scaling("type", "su")))
+        longrope_config = _extract_rope_config(
+            self._cfg(self._scaling("rope_type", "longrope"))
+        )
+
+        assert su_config is not None
+        assert su_config.rope_type == "longrope"
+        assert longrope_config.rope_type == "longrope"
+        assert su_config.original_max_position_embeddings == 128
+        assert su_config.rope_type == longrope_config.rope_type
+        assert (
+            su_config.rope_scaling["short_factor"]
+            == longrope_config.rope_scaling["short_factor"]
+        )
+        assert (
+            su_config.rope_scaling["long_factor"]
+            == longrope_config.rope_scaling["long_factor"]
+        )
+        assert (
+            su_config.original_max_position_embeddings
+            == longrope_config.original_max_position_embeddings
+        )
+
+    def test_su_alias_dispatches_to_longrope_module(self):
+        """A ``"su"`` config resolves to the ``LongRope`` runtime module."""
+        from mobius.components._rotary_embedding import LongRope, initialize_rope
+
+        config = ArchitectureConfig.from_transformers(self._cfg(self._scaling("type", "su")))
+        assert config.rope_type == "longrope"
+        rope = initialize_rope(config)
+        assert isinstance(rope, LongRope)
+
+    def test_su_graph_builds_end_to_end(self):
+        """A phi3 ``"su"`` config builds a valid ONNX graph without weights."""
+        config = ArchitectureConfig.from_transformers(self._cfg(self._scaling("type", "su")))
+        module = registry.get("phi3")(config)
+        task = get_task(_default_task_for_model("phi3"))
+        pkg = task.build(module, config)
+        model = pkg["model"]
+
+        assert model.graph is not None
+        input_names = {inp.name for inp in model.graph.inputs}
+        assert "input_ids" in input_names
+        assert "position_ids" in input_names
+        output_names = {out.name for out in model.graph.outputs}
+        assert "logits" in output_names
+
+    def test_missing_original_max_position_embeddings_still_maps_to_longrope(self):
+        """A ``"su"`` config without ``original_max_position_embeddings``.
+
+        The alias must still resolve to ``longrope`` and ``LongRope`` falls
+        back to ``max_position_embeddings`` for the short cache length rather
+        than crashing.
+        """
+        from mobius._configs._base import _extract_rope_config
+        from mobius.components._rotary_embedding import LongRope, initialize_rope
+
+        config_source = self._cfg(
+            self._scaling("type", "su"), original_max_position_embeddings=None
+        )
+        rope_config = _extract_rope_config(config_source)
+        assert rope_config.rope_type == "longrope"
+        assert rope_config.original_max_position_embeddings is None
+
+        arch_config = ArchitectureConfig.from_transformers(config_source)
+        rope = initialize_rope(arch_config)
+        assert isinstance(rope, LongRope)
+
+    def test_factor_length_mismatch_is_rejected(self):
+        """Short/long factor arrays must match the rotary dimension.
+
+        A factor list whose length does not equal ``head_dim / 2`` cannot be
+        broadcast against the inverse-frequency vector, so ``LongRope``
+        construction raises rather than silently producing a wrong cache.
+        """
+        from mobius.components._rotary_embedding import initialize_rope
+
+        bad_scaling = {
+            "type": "su",
+            "short_factor": [1.0] * (TINY_HEAD_DIM // 2 + 1),
+            "long_factor": [2.0] * (TINY_HEAD_DIM // 2 + 1),
+        }
+        config = ArchitectureConfig.from_transformers(self._cfg(bad_scaling))
+        assert config.rope_type == "longrope"
+        with pytest.raises(ValueError, match="broadcast"):
+            initialize_rope(config)
+
+    def test_non_alias_rope_types_are_unchanged(self):
+        """Canonicalization only rewrites known aliases, not other types."""
+        from mobius._configs._base import _canonical_rope_type
+
+        assert _canonical_rope_type("su") == "longrope"
+        assert _canonical_rope_type("longrope") == "longrope"
+        assert _canonical_rope_type("yarn") == "yarn"
+        assert _canonical_rope_type("default") == "default"
+        assert _canonical_rope_type(None) is None

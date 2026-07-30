@@ -25,9 +25,11 @@ Run::
 from __future__ import annotations
 
 import dataclasses
+import functools
 import os
 import warnings
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -42,12 +44,23 @@ from mobius._testing.golden import (
     generation_json_path_for_case,
     golden_path_for_case,
     has_golden,
+    load_drafter_inputs,
     load_generation_golden,
     load_golden_ref,
     load_tolerances,
 )
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius._testing.parity import ParityResult, compare_golden
+
+
+@functools.cache
+def _load_phi3_vision_projector_weights_cached(model_id: str):
+    from mobius.models._phi3_vision_projector import (
+        load_phi3_vision_projector_weights,
+    )
+
+    return load_phi3_vision_projector_weights(model_id)
+
 
 # Root of test data (images, audio, etc.)
 _TESTDATA_DIR = Path(__file__).resolve().parent.parent / "testdata"
@@ -147,10 +160,70 @@ def _build_mm_prompt(
         return processor.apply_chat_template(  # type: ignore[attr-defined]
             messages, tokenize=False, add_generation_prompt=True
         )
+    # Some processors (e.g. Phi-3.5-Vision's ``Phi3VProcessor``) expose the chat
+    # template on the *inner tokenizer* rather than the processor, and use
+    # numbered placeholders (``<|image_1|>``) enumerated in ``img_tokens``.
+    inner_tokenizer = getattr(processor, "tokenizer", None)
+    numbered_token_attribute = {"image": "img_tokens", "audio": "audio_tokens"}.get(media_kind)
+    numbered_media_tokens = (
+        getattr(processor, numbered_token_attribute, None)
+        if numbered_token_attribute is not None
+        else None
+    )
+    if (
+        inner_tokenizer is not None
+        and numbered_media_tokens is not None
+        and getattr(inner_tokenizer, "chat_template", None)
+    ):
+        if len(media_paths) > len(numbered_media_tokens):
+            raise ValueError(
+                f"{type(processor).__name__} exposes {len(numbered_media_tokens)} "
+                f"numbered {media_kind} placeholders, but the case requested "
+                f"{len(media_paths)} media items"
+            )
+        media_prefix = "".join(
+            f"{numbered_media_tokens[index]}\n" for index in range(len(media_paths))
+        )
+        messages = [{"role": "user", "content": media_prefix + base_prompt}]
+        return inner_tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
     placeholder = getattr(processor, f"{media_kind}_token", None)
     if placeholder:
         return placeholder * len(media_paths) + base_prompt
     return base_prompt
+
+
+def test_build_mm_prompt_rejects_more_media_than_numbered_tokens():
+    tokenizer = type(
+        "_Tokenizer",
+        (),
+        {
+            "chat_template": "template",
+            "apply_chat_template": lambda *args, **kwargs: "",
+        },
+    )()
+    processor = type(
+        "_Processor",
+        (),
+        {"tokenizer": tokenizer, "img_tokens": ["<|image_1|>"]},
+    )()
+
+    with pytest.raises(ValueError, match="exposes 1 numbered image placeholders"):
+        _build_mm_prompt(processor, "describe", ["a.png", "b.png"], "image")
+
+
+def test_phi3_vision_projector_weights_are_cached():
+    _load_phi3_vision_projector_weights_cached.cache_clear()
+    weights = object()
+    with mock.patch(
+        "mobius.models._phi3_vision_projector.load_phi3_vision_projector_weights",
+        return_value=weights,
+    ) as load:
+        assert _load_phi3_vision_projector_weights_cached("model-id") is weights
+        assert _load_phi3_vision_projector_weights_cached("model-id") is weights
+    load.assert_called_once_with("model-id")
+    _load_phi3_vision_projector_weights_cached.cache_clear()
 
 
 def _make_empty_kv_cache(
@@ -322,8 +395,21 @@ _L5_CASES = _discover_cases("L5", xfails=_L5_ONLY_XFAIL_REASONS)
 
 def _build_model_package(case: GoldenTestCase) -> ModelPackage:
     """Build an ONNX ModelPackage with real weights from HuggingFace."""
+    module_class = None
+    task = None
+    if case.architecture:
+        # Force a specific module class + task (auxiliary heads such as the
+        # Qwen3.6 MTP head that share a base checkpoint whose ``architectures``
+        # field would otherwise auto-route to the base model).
+        from mobius._registry import registry
+
+        reg = registry.get_registration(case.architecture)
+        module_class = reg.module_class
+        task = reg.task or getattr(module_class, "default_task", None)
     return build(
         case.model_id,
+        task=task,
+        module_class=module_class,
         dtype=case.dtype,
         load_weights=True,
         trust_remote_code=case.trust_remote_code,
@@ -498,6 +584,14 @@ def _extract_logits(
     """
     if "logits" in outputs:
         return outputs["logits"]
+    if task_type == "dflash-draft" and "draft_hidden" in outputs:
+        # DFlash outputs draft_hidden (pre-lm_head). Treat it as the logit
+        # vector for the argmax gate (mirrors the hidden-state task handling).
+        return outputs["draft_hidden"]
+    if task_type == "qwen35-mtp" and "mtp_hidden" in outputs:
+        # The Qwen3.6 MTP head outputs mtp_hidden (pre-lm_head, the head borrows
+        # the target's lm_head). Treat it as the logit vector for the argmax gate.
+        return outputs["mtp_hidden"]
     if task_type in _HIDDEN_STATE_TASKS and "last_hidden_state" in outputs:
         return outputs["last_hidden_state"]
     raise KeyError(
@@ -687,6 +781,73 @@ def _compute_mrope_position_ids(
     return position_ids
 
 
+def _run_vl_vision_to_image_features(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+    processed: dict[str, np.ndarray],
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """Run the ONNX vision encoder and return the embedding model's image features.
+
+    Returns ``(vision_outputs, image_features)`` where ``image_features`` is the
+    tensor to feed into the embedding model's ``image_features`` input.
+
+    For most vision-language models the vision encoder output is used directly.
+    Phi-3.5-Vision (``model_type == "phi3_v"``) additionally requires the
+    host-side HD feature transform + ``img_projection`` MLP — an image-size
+    dependent step that cannot be a static ONNX graph — to map the raw CLIP
+    patch features ``(num_crops, 576, image_dim_out)`` into projected image
+    embeddings ``(total_image_tokens, hidden_size)``.
+    """
+    vis_session = OnnxModelSession(pkg["vision_encoder"], **_get_test_device_kwargs())
+    try:
+        if case.model_type == "phi3_v":
+            from mobius.models._phi3_vision_projector import (
+                phi3_vision_hd_feature_transform,
+            )
+
+            # The HF processor emits pixel_values shaped
+            # (num_images, num_crops + 1, 3, 336, 336). The ONNX vision encoder
+            # takes 4-D NCHW input, so flatten the leading crop dimension.
+            pixel_values_dtype = vis_session.get_input_dtype("pixel_values")
+            if pixel_values_dtype is None:
+                raise ValueError("Phi-3.5 vision encoder must have a pixel_values input dtype")
+            pixel_values = np.asarray(processed["pixel_values"], dtype=pixel_values_dtype)
+            num_images, num_crops_including_global = pixel_values.shape[:2]
+            flat_pixel_values = pixel_values.reshape(
+                num_images * num_crops_including_global, *pixel_values.shape[2:]
+            )
+            vis_out = vis_session.run({"pixel_values": flat_pixel_values})
+            raw_patch_features = vis_out[next(iter(vis_out))]
+            image_dim_out = raw_patch_features.shape[-1]
+            image_features_per_crop = raw_patch_features.reshape(
+                num_images, num_crops_including_global, -1, image_dim_out
+            )
+            projector_weights = _load_phi3_vision_projector_weights_cached(case.model_id)
+            projected = phi3_vision_hd_feature_transform(
+                image_features_per_crop,
+                np.asarray(processed["image_sizes"]),
+                projector_weights,
+            )
+            return vis_out, projected
+
+        vis_feeds: dict[str, np.ndarray] = {}
+        for name in vis_session.input_names:
+            if name in processed:
+                val = processed[name]
+                vis_feeds[name] = val if isinstance(val, np.ndarray) else np.array(val)
+            else:
+                # Handle HF↔ONNX name mismatches (e.g. HF "image_position_ids"
+                # vs ONNX "pixel_position_ids").
+                for hf_key, val in processed.items():
+                    if hf_key.replace("image_", "pixel_") == name:
+                        vis_feeds[name] = val if isinstance(val, np.ndarray) else np.array(val)
+                        break
+        vis_out = vis_session.run(vis_feeds)
+        return vis_out, vis_out[next(iter(vis_out))]
+    finally:
+        vis_session.close()
+
+
 def _run_vision_language_prefill(
     pkg: ModelPackage,
     case: GoldenTestCase,
@@ -720,28 +881,8 @@ def _run_vision_language_prefill(
         k: v.numpy() if hasattr(v, "numpy") else np.array(v) for k, v in processed_pt.items()
     }
 
-    # --- Step 1: Run vision encoder ---
-    vis_session = OnnxModelSession(pkg["vision_encoder"], **_get_test_device_kwargs())
-    try:
-        vis_feeds: dict[str, np.ndarray] = {}
-        for name in vis_session.input_names:
-            if name in processed:
-                val = processed[name]
-                vis_feeds[name] = val if isinstance(val, np.ndarray) else np.array(val)
-            else:
-                # Handle HF↔ONNX name mismatches (e.g. HF "image_position_ids"
-                # vs ONNX "pixel_position_ids").
-                for hf_key, val in processed.items():
-                    if hf_key.replace("image_", "pixel_") == name:
-                        vis_feeds[name] = val if isinstance(val, np.ndarray) else np.array(val)
-                        break
-        vis_out = vis_session.run(vis_feeds)
-    finally:
-        vis_session.close()
-
-    # Extract the image hidden states (first output)
-    vis_hidden_key = next(iter(vis_out))
-    vis_hidden = vis_out[vis_hidden_key]
+    # --- Step 1: Run vision encoder (+ host-side projector where required) ---
+    vis_out, image_features = _run_vl_vision_to_image_features(pkg, case, processed)
 
     # --- Step 2: Run embedding model ---
     emb_session = OnnxModelSession(pkg["embedding"], **_get_test_device_kwargs())
@@ -751,10 +892,10 @@ def _run_vision_language_prefill(
         }
         # Pass vision hidden states
         for name in emb_session.input_names:
-            if name not in emb_feeds and name in vis_out:
+            if name == "image_features":
+                emb_feeds[name] = image_features
+            elif name not in emb_feeds and name in vis_out:
                 emb_feeds[name] = vis_out[name]
-            elif name == "image_features":
-                emb_feeds[name] = vis_hidden
             elif name not in emb_feeds:
                 # Provide empty tensor for unused modalities (e.g. audio_features)
                 shape = emb_session.get_input_shape(name) or []
@@ -904,24 +1045,8 @@ def _run_vl_generation(
         k: v.numpy() if hasattr(v, "numpy") else np.array(v) for k, v in processed_pt.items()
     }
 
-    # --- Step 1: vision encoder ---
-    vis_session = OnnxModelSession(pkg["vision_encoder"], **_get_test_device_kwargs())
-    try:
-        vis_feeds: dict[str, np.ndarray] = {}
-        for name in vis_session.input_names:
-            if name in processed:
-                vis_feeds[name] = processed[name]
-            else:
-                # HF↔ONNX name mismatch (e.g. image_position_ids → pixel_position_ids)
-                for hf_key, val in processed.items():
-                    if hf_key.replace("image_", "pixel_") == name:
-                        vis_feeds[name] = val if isinstance(val, np.ndarray) else np.array(val)
-                        break
-        vis_out = vis_session.run(vis_feeds)
-    finally:
-        vis_session.close()
-
-    vis_hidden = vis_out[next(iter(vis_out))]  # image feature tensor
+    # --- Step 1: vision encoder (+ host-side projector where required) ---
+    _vis_out, image_features = _run_vl_vision_to_image_features(pkg, case, processed)
 
     # --- Step 2: embedding (prefill) ---
     # VL packages use "decoder" as the decoder key
@@ -940,7 +1065,7 @@ def _run_vl_generation(
             "input_ids": processed["input_ids"].astype(np.int64),
         }
         if image_feat_input is not None:
-            emb_feeds[image_feat_input] = vis_hidden
+            emb_feeds[image_feat_input] = image_features
         # Provide empty tensors for unused modalities (e.g. audio_features)
         for name in emb_session.input_names:
             if name not in emb_feeds:
@@ -1556,6 +1681,148 @@ def _run_speech_language_prefill(
 
 
 # ---------------------------------------------------------------------------
+# Gemma4-Assistant drafter helpers (multi-model: replay target-derived tensors)
+# ---------------------------------------------------------------------------
+
+
+def _assistant_feeds_for_step(
+    inputs: dict[str, np.ndarray],
+    input_names: list[str],
+    step: int,
+) -> dict[str, np.ndarray]:
+    """Build the assistant ONNX feeds for one draft step from replay tensors.
+
+    ``inputs`` is the ``*_inputs.npz`` payload: ``inputs_embeds`` is
+    ``[num_steps, 1, 2*backbone_hidden]``; ``position_ids`` / shared KV are
+    fixed across the round (SinglePositionMultiToken). Only inputs present in
+    the ONNX graph are fed (an fp32/CPU build prunes ``attention_mask``).
+    """
+    feeds: dict[str, np.ndarray] = {
+        "inputs_embeds": inputs["inputs_embeds"][step : step + 1].astype(np.float32),
+        "position_ids": inputs["position_ids"].astype(np.int64),
+        "attention_mask": inputs["attention_mask"].astype(np.int64),
+    }
+    for lt in inputs["layer_types"].tolist():
+        feeds[f"shared_kv.{lt}.key"] = inputs[f"skv_key_{lt}"].astype(np.float32)
+        feeds[f"shared_kv.{lt}.value"] = inputs[f"skv_val_{lt}"].astype(np.float32)
+    return {k: v for k, v in feeds.items() if k in input_names}
+
+
+def _run_gemma4_assistant_prefill(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+) -> dict[str, np.ndarray]:
+    """Run the assistant ONNX on the first draft step and return its outputs."""
+    inputs = load_drafter_inputs(case)
+    if inputs is None:
+        pytest.skip(f"Assistant replay inputs missing for {case.case_id}")
+    session = _open_decoder_session(pkg)
+    try:
+        feeds = _assistant_feeds_for_step(inputs, session.input_names, step=0)
+        return session.run(feeds)
+    finally:
+        session.close()
+
+
+def _run_gemma4_assistant_generation(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+) -> np.ndarray:
+    """Replay the first draft round through the assistant ONNX (teacher-forced).
+
+    Feeds each captured step's ``inputs_embeds`` (with the fixed shared KV and
+    position) and collects the per-step argmax — the drafted token sequence.
+    """
+    inputs = load_drafter_inputs(case)
+    if inputs is None:
+        pytest.skip(f"Assistant replay inputs missing for {case.case_id}")
+    num_steps = inputs["inputs_embeds"].shape[0]
+    session = _open_decoder_session(pkg)
+    try:
+        tokens: list[int] = []
+        for step in range(num_steps):
+            feeds = _assistant_feeds_for_step(inputs, session.input_names, step=step)
+            out = session.run(feeds)
+            tokens.append(int(np.asarray(out["logits"])[0, -1].argmax()))
+    finally:
+        session.close()
+    return np.array(tokens, dtype=np.int64)
+
+
+def _run_dflash_draft_prefill(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+) -> dict[str, np.ndarray]:
+    """Run the DFlash drafter ONNX on the first block and return its outputs.
+
+    Replay tensors (noise_embedding, target_hidden, position_ids, q_position_ids)
+    are captured from the reference spec_generate loop; the first block starts
+    from an empty draft KV cache (zero-length past tensors sized from the config).
+    """
+    inputs = load_drafter_inputs(case)
+    if inputs is None:
+        pytest.skip(f"Drafter replay inputs missing for {case.case_id}")
+    config = pkg.config
+    batch = int(inputs["noise_embedding"].shape[0])
+    session = _open_decoder_session(pkg)
+    try:
+        feeds: dict[str, np.ndarray] = {
+            "noise_embedding": inputs["noise_embedding"].astype(np.float32),
+            "target_hidden": inputs["target_hidden"].astype(np.float32),
+            "position_ids": inputs["position_ids"].astype(np.int64),
+            "q_position_ids": inputs["q_position_ids"].astype(np.int64),
+        }
+        empty_kv = np.zeros(
+            (batch, config.num_key_value_heads, 0, config.head_dim), dtype=np.float32
+        )
+        for i in range(config.num_hidden_layers):
+            feeds[f"past_key_values.{i}.key"] = empty_kv
+            feeds[f"past_key_values.{i}.value"] = empty_kv
+        feeds = {k: v for k, v in feeds.items() if k in session.input_names}
+        return session.run(feeds)
+    finally:
+        session.close()
+
+
+def _run_qwen35_mtp_prefill(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+) -> dict[str, np.ndarray]:
+    """Run the Qwen3.6 MTP head ONNX on the replay block and return its outputs.
+
+    Replay tensors (``inputs_embeds``, ``hidden_states``, ``attention_mask``,
+    ``position_ids``) are the target's shared embedding of the just-emitted
+    tokens plus the target's last hidden state — captured from the reference
+    forward. The MTP head borrows the target's embed / lm_head, so it has a
+    single GQA layer whose KV cache starts empty (zero-length past tensors).
+    """
+    inputs = load_drafter_inputs(case)
+    if inputs is None:
+        pytest.skip(f"Drafter replay inputs missing for {case.case_id}")
+    config = pkg.config
+    batch = int(inputs["inputs_embeds"].shape[0])
+    np_dt = np.float16 if case.dtype == "float16" else np.float32
+    session = _open_decoder_session(pkg)
+    try:
+        feeds: dict[str, np.ndarray] = {
+            "inputs_embeds": inputs["inputs_embeds"].astype(np_dt),
+            "hidden_states": inputs["hidden_states"].astype(np_dt),
+            "attention_mask": inputs["attention_mask"].astype(np.int64),
+            "position_ids": inputs["position_ids"].astype(np.int64),
+        }
+        empty_kv = np.zeros(
+            (batch, config.num_key_value_heads, 0, config.head_dim), dtype=np_dt
+        )
+        for i in range(config.num_hidden_layers):
+            feeds[f"past_key_values.{i}.key"] = empty_kv
+            feeds[f"past_key_values.{i}.value"] = empty_kv
+        feeds = {k: v for k, v in feeds.items() if k in session.input_names}
+        return session.run(feeds)
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
 # L4 Tests: Checkpoint Verified
 # ---------------------------------------------------------------------------
 
@@ -1595,6 +1862,12 @@ class TestL4CheckpointVerified:
             outputs = _run_vision_language_prefill(pkg, case, config)
         elif case.task_type == "phi4mm-multimodal":
             outputs = _run_phi4mm_multimodal_prefill(pkg, case, golden, config)
+        elif case.task_type == "gemma4-assistant":
+            outputs = _run_gemma4_assistant_prefill(pkg, case)
+        elif case.task_type == "dflash-draft":
+            outputs = _run_dflash_draft_prefill(pkg, case)
+        elif case.task_type == "qwen35-mtp":
+            outputs = _run_qwen35_mtp_prefill(pkg, case)
         elif case.task_type == "image-classification":
             session = _open_decoder_session(pkg)
             try:
@@ -1677,6 +1950,7 @@ _GENERATION_SUPPORTED_TASKS = frozenset(
         "seq2seq",
         "speech-to-text",
         "speech-language",
+        "gemma4-assistant",
     }
 )
 
@@ -2291,6 +2565,8 @@ class TestL5GenerationE2E:
                 max_new_tokens=case.generation_params.get("max_new_tokens", 30),
                 eos_token_id=case.generation_params.get("eos_token_id"),
             )
+        elif case.task_type == "gemma4-assistant":
+            new_tokens = _run_gemma4_assistant_generation(pkg, case)
         elif case.task_type == "seq2seq":
             new_tokens = _run_seq2seq_generation(pkg, case, golden, expected_token_ids)
         elif case.task_type == "speech-to-text":

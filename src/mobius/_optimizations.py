@@ -61,12 +61,17 @@ from mobius._passes import (
 )
 from mobius.functions import register_function_bodies
 from mobius.rewrite_rules import (
+    decompose_attention_pass,
+    decompose_rope_rules,
     gelu_fusion_rules,
     group_query_attention_rules,
+    htp_rank4_rmsnorm_rules,
     pack_qkv_for_gqa_rules,
     separate_rope_rules,
     skip_layer_norm_rules,
     skip_norm_rules,
+    static_empty_kv_rules,
+    tensor_scatter_to_scatternd_rules,
     unpack_qkv_rules,
 )
 
@@ -312,6 +317,43 @@ def _get_optimization_passes(
         lower.append(("SeparateRoPE", list(separate_rope_rules())))
         lower.append(("UnpackQKV", list(unpack_qkv_rules())))
 
+    # Reshape rank-4 RMSNorm (q/k norm) to rank-3 for the QNN HTP, which miscomputes it.
+    if not caps.supports_rank4_rmsnorm:
+        lower.append(("HtpRank4RMSNorm", list(htp_rank4_rmsnorm_rules())))
+
+    # Decompose the opset-24 RotaryEmbedding op into rotate-half primitives for
+    # EPs without a RotaryEmbedding kernel (QNN HTP), where the op falls to CPU.
+    if not caps.supports_rotary_embedding:
+        lower.append(("DecomposeRotaryEmbedding", list(decompose_rope_rules())))
+
+    # Rewrite the static-cache TensorScatter KV write into ScatterND for EPs
+    # without a TensorScatter kernel (QNN HTP), where it falls to CPU.
+    if not caps.supports_tensor_scatter:
+        lower.append(("TensorScatterToScatterND", list(tensor_scatter_to_scatternd_rules())))
+
+    # Decompose the fused opset-24 Attention op into SDPA primitives for EPs
+    # without an Attention kernel (QNN HTP), where the fused op falls to CPU.
+    # An IR pass (not a rewrite rule) so it can rewire the op's 3 outputs, whose
+    # KV-cache present tensors are graph outputs on some layers and dead on
+    # shared-KV layers. Runs after the batched rewrite rules (lower_ir_passes).
+    if not caps.supports_attention:
+        lower.append(("DecomposeAttention", decompose_attention_pass()))
+
+    # NOTE: MatMulNBits → QDQ lowering is handled by the InlinePass mechanism
+    # (a registered com.microsoft::MatMulNBits function body), not a rewrite
+    # rule — see optimize_model()'s _should_inline and mobius.functions. It is
+    # gated by ``supports_matmul_nbits`` there.
+
+    # --- Graph-capture rewrite ---
+    # Supports graph capture for shared-KV layer models on WebGPU EP
+    # (currently Gemma4). Pattern-based: only fires on models that emit the
+    # dynamic Shape → ConstantOfShape → Cast empty-KV pattern. Gated by
+    # requires_graph_capture_rewrite rather than enable_graph_capture because
+    # not all graph-capture EPs need it — e.g. CUDA EP's Shape kernel is
+    # already graph-capture-safe.
+    if caps.requires_graph_capture_rewrite:
+        lower.append(("StaticEmptyKV", list(static_empty_kv_rules())))
+
     return fuse, lower
 
 
@@ -403,6 +445,12 @@ def optimize_model(
             return not caps.supports_skip_layer_norm
         if func.domain == "com.microsoft" and func.name == "PackedMultiHeadAttention":
             return not caps.supports_packed_multi_head_attention
+        # MatMulNBits (blockwise-INT4) → QDQ (DequantizeLinear + MatMul) for EPs
+        # without a MatMulNBits kernel (QNN HTP). Supported EPs (CPU/CUDA/…) keep
+        # the compact contrib op and its native kernel; the function body stays
+        # registered but uninlined (kernels take precedence over local functions).
+        if func.domain == "com.microsoft" and func.name == "MatMulNBits":
+            return not caps.supports_matmul_nbits
         return False
 
     inline_pass = common_passes.InlinePass(criteria=_should_inline)

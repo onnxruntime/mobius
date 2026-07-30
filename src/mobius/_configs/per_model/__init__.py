@@ -30,6 +30,7 @@ from mobius._configs.per_model import (  # noqa: F401
     _internvl_vision,
     _phi4mm_audio,
     _phi4mm_vision,
+    _phi_vision,
     _qwen3_asr_audio,
     _sensevoice_audio,
 )

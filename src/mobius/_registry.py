@@ -24,6 +24,8 @@ from onnxscript import nn
 
 from mobius._configs import (
     BaseModelConfig,
+    Eagle3Config,
+    Gemma4AssistantConfig,
     Gemma4Config,
     MMSConfig,
     WhisperConfig,
@@ -35,8 +37,11 @@ from mobius.models import (
     ChatGLMCausalLMModel,
     DeepSeekOCR2CausalLMModel,
     DeepSeekV3CausalLMModel,
+    DeepSeekV4CausalLMModel,
+    DFlashDraftModel,
     DiffLlamaCausalLMModel,
     DogeCausalLMModel,
+    Eagle3DraftModel,
     EncDecRNNTModel,
     Ernie45MoECausalLMModel,
     ErnieCausalLMModel,
@@ -44,6 +49,7 @@ from mobius.models import (
     Gemma2CausalLMModel,
     Gemma3CausalLMModel,
     Gemma3MultiModalModel,
+    Gemma4AssistantCausalLMModel,
     Gemma4CausalLMModel,
     Gemma4Model,
     Gemma4UnifiedModel,
@@ -59,6 +65,7 @@ from mobius.models import (
     HunYuanVLMoTModel,
     InternLM2CausalLMModel,
     LayerNormCausalLMModel,
+    LLaDAModel,
     Llama4CausalLMModel,
     MoECausalLMModel,
     NanoChatCausalLMModel,
@@ -68,7 +75,9 @@ from mobius.models import (
     Phi3CausalLMModel,
     Phi3MoECausalLMModel,
     Phi3SmallCausalLMModel,
+    Phi3VModel,
     Phi4MMMultiModalModel,
+    Phi4SigLIPModel,
     PhiCausalLMModel,
     Qwen2MoECausalLMModel,
     Qwen2VLCausalLMModel,
@@ -82,6 +91,7 @@ from mobius.models import (
     Qwen35CausalLMModel,
     Qwen35MoECausalLMModel,
     Qwen35MoEVL3ModelCausalLMModel,
+    Qwen35MtpModel,
     Qwen35VL3ModelCausalLMModel,
     Qwen35VLTextModel,
     QwenCausalLMModel,
@@ -401,6 +411,39 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "gemma3n_text": ModelRegistration(Gemma3nCausalLMModel),
     "gemma4_text": ModelRegistration(Gemma4CausalLMModel, config_class=Gemma4Config),
     "gemma4_unified_text": ModelRegistration(Gemma4CausalLMModel, config_class=Gemma4Config),
+    # Gemma4-Assistant ships ``model_type="gemma4_assistant"`` plus
+    # ``architectures=["Gemma4AssistantForCausalLM"]``.  Both keys point
+    # at the assistant drafter so build() can dispatch via either.  The
+    # ``gemma4_unified_assistant`` family is structurally identical (same
+    # 4-layer Gemma4 decoder, KV-shared with target, optional ordered-
+    # embeddings head) but ships under a different ``model_type``;
+    # register all four keys at the same class.
+    "gemma4_assistant": ModelRegistration(
+        Gemma4AssistantCausalLMModel,
+        task="gemma4-assistant",
+        config_class=Gemma4AssistantConfig,
+        family="gemma4_assistant",
+    ),
+    "Gemma4AssistantForCausalLM": ModelRegistration(
+        Gemma4AssistantCausalLMModel,
+        task="gemma4-assistant",
+        config_class=Gemma4AssistantConfig,
+        family="gemma4_assistant",
+    ),
+    "gemma4_unified_assistant": ModelRegistration(
+        Gemma4AssistantCausalLMModel,
+        task="gemma4-assistant",
+        config_class=Gemma4AssistantConfig,
+        family="gemma4_assistant",
+        variant="unified",
+    ),
+    "Gemma4UnifiedAssistantForCausalLM": ModelRegistration(
+        Gemma4AssistantCausalLMModel,
+        task="gemma4-assistant",
+        config_class=Gemma4AssistantConfig,
+        family="gemma4_assistant",
+        variant="unified",
+    ),
     "glm": ModelRegistration(GlmCausalLMModel),
     "glm4": ModelRegistration(Glm4CausalLMModel),
     "gpt_neox": ModelRegistration(GPTNeoXCausalLMModel),
@@ -411,6 +454,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "hunyuan_v1_dense": ModelRegistration(HunYuanV1DenseCausalLMModel),
     "internlm2": ModelRegistration(InternLM2CausalLMModel),
     "llama4_text": ModelRegistration(Llama4CausalLMModel),
+    "llada": ModelRegistration(LLaDAModel, task="masked-diffusion"),
     "modernbert-decoder": ModelRegistration(ModernBertDecoderModel),
     "mpt": ModelRegistration(MPTCausalLMModel),
     "nanochat": ModelRegistration(NanoChatCausalLMModel),
@@ -425,6 +469,53 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "qwen": ModelRegistration(QwenCausalLMModel),
     "qwen3": ModelRegistration(Qwen3CausalLMModel),
     "qwen3_5_text": ModelRegistration(Qwen35CausalLMModel),
+    # DFlash drafters share ``model_type=qwen3`` with the base Qwen3 family;
+    # build() routes to DFlashDraftModel by the ``architectures`` field in the
+    # checkpoint config.  The registry entry below allows direct lookup by
+    # architecture name and exposes the task.
+    "DFlashDraftModel": ModelRegistration(
+        DFlashDraftModel, task="dflash-draft", family="dflash", variant="qwen3"
+    ),
+    # Qwen3.6 MTP self-speculative head.  Like DFlash, it is an auxiliary
+    # drafter that is NOT auto-routed by ``model_type`` (the main checkpoint
+    # maps to the qwen3_5 VL / text model); it is looked up directly by
+    # architecture name and exposes the ``qwen35-mtp`` task.
+    "Qwen35MtpModel": ModelRegistration(
+        Qwen35MtpModel, task="qwen35-mtp", family="qwen", variant="mtp"
+    ),
+    "Eagle3LlamaForCausalLM": ModelRegistration(
+        Eagle3DraftModel,
+        task="eagle3-draft",
+        config_class=Eagle3Config,
+        family="eagle3",
+        variant="qwen3",
+    ),
+    # AngelSlim ships two equivalent EAGLE-3 architecture strings: Qwen3-4B uses
+    # "Eagle3LlamaForCausalLM", Qwen3-8B uses "LlamaForCausalLMEagle3".
+    "LlamaForCausalLMEagle3": ModelRegistration(
+        Eagle3DraftModel,
+        task="eagle3-draft",
+        config_class=Eagle3Config,
+        family="eagle3",
+        variant="qwen3",
+    ),
+    # speculators-format EAGLE-3 checkpoints (RedHat): the Qwen3 checkpoint
+    # declares "Eagle3Speculator", the Gemma4 one "Eagle3DraftModel". Both nest
+    # the arch config under transformer_layer_config and set norm_before_residual.
+    "Eagle3Speculator": ModelRegistration(
+        Eagle3DraftModel,
+        task="eagle3-draft",
+        config_class=Eagle3Config,
+        family="eagle3",
+        variant="speculators",
+    ),
+    "Eagle3DraftModel": ModelRegistration(
+        Eagle3DraftModel,
+        task="eagle3-draft",
+        config_class=Eagle3Config,
+        family="eagle3",
+        variant="speculators",
+    ),
     "shieldgemma2": ModelRegistration(Gemma2CausalLMModel),
     "smollm3": ModelRegistration(SmolLM3CausalLMModel),
     "stablelm": ModelRegistration(LayerNormCausalLMModel),
@@ -454,6 +545,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "deepseek_v2": ModelRegistration(DeepSeekV3CausalLMModel),
     "deepseek_v2_moe": ModelRegistration(DeepSeekV3CausalLMModel),
     "deepseek_v3": ModelRegistration(DeepSeekV3CausalLMModel),
+    "deepseek_v4": ModelRegistration(DeepSeekV4CausalLMModel, task="deepseek-v4"),
     "deepseek_vl_v2": ModelRegistration(DeepSeekOCR2CausalLMModel),
     # --- SSM (Mamba / Mamba2) ---
     "falcon_mamba": ModelRegistration(MambaCausalLMModel),
@@ -503,6 +595,8 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "paligemma": ModelRegistration(LLaVAModel, task="vision-language"),
     "phi4_multimodal": ModelRegistration(Phi4MMMultiModalModel, task="phi4mm-multimodal"),
     "phi4mm": ModelRegistration(Phi4MMMultiModalModel, task="phi4mm-multimodal"),
+    "phi3_v": ModelRegistration(Phi3VModel, task="vision-language"),
+    "phi4-siglip": ModelRegistration(Phi4SigLIPModel, task="vision-language"),
     "pixtral": ModelRegistration(LLaVAModel, task="pixtral-vl"),
     "qwen2_5_vl": ModelRegistration(Qwen25VLCausalLMModel, task="qwen-vl"),
     "qwen2_5_vl_text": ModelRegistration(Qwen25VLTextModel),
@@ -686,6 +780,20 @@ def _create_default_registry() -> ModelRegistry:
     return reg
 
 
+# -- Text-only export overrides --
+# Maps a multimodal ``model_type`` to its text-only registry sibling, used by
+# ``build(..., text_only=True)`` to export the text backbone of a multimodal
+# checkpoint as a standalone decoder-only LLM (e.g. so it can use
+# GroupQueryAttention instead of the multimodal bidirectional float-bias path).
+# Entries must point at a registered text-only model_type. The mapping is
+# idempotent: a text-only model_type maps to itself so ``text_only=True`` is a
+# no-op when the resolved type is already text-only.
+_TEXT_ONLY_MODEL_TYPE: dict[str, str] = {
+    "gemma4_unified": "gemma4_unified_text",
+    "gemma4_unified_text": "gemma4_unified_text",
+}
+
+
 # fmt: off
 # -- Test model IDs for L2 architecture validation --
 # Each maps a registered model_type to a public HuggingFace model.
@@ -756,6 +864,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "qwen": "Qwen/Qwen-1_8B-Chat",
     "qwen3": "Qwen/Qwen3-0.6B",
     "qwen3_5_text": "Qwen/Qwen3.5-2B",
+    "Eagle3LlamaForCausalLM": "AngelSlim/Qwen3-4B_eagle3",
+    "LlamaForCausalLMEagle3": "AngelSlim/Qwen3-8B_eagle3",
     "smollm3": "HuggingFaceTB/SmolLM3-3B",
     "gpt2": "openai-community/gpt2",
     "opt": "facebook/opt-125m",
@@ -804,6 +914,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "deepseek_v2": "deepseek-ai/DeepSeek-V2-Lite",
     "deepseek_v2_moe": "deepseek-ai/DeepSeek-V2-Lite",
     "deepseek_v3": "deepseek-ai/DeepSeek-V3",
+    "deepseek_v4": "deepseek-ai/DeepSeek-V4-Flash",
 
     # --- SSM (Mamba) ---
     "mamba": "state-spaces/mamba-130m-hf",
@@ -831,6 +942,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "internvl2": "OpenGVLab/InternVL2-1B",
     "phi4mm": "microsoft/Phi-4-multimodal-instruct",
     "phi4_multimodal": "microsoft/Phi-4-multimodal-instruct",
+    "phi3_v": "microsoft/Phi-3.5-vision-instruct",
+    "phi4-siglip": "microsoft/Phi-4-reasoning-vision-15B",
     "blip-2": "Salesforce/blip2-opt-2.7b",
     "florence2": "microsoft/Florence-2-base",
     "idefics2": "HuggingFaceM4/idefics2-8b",
@@ -1008,6 +1121,8 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "phimoe": "phi",
     "phi4mm": "phi",
     "phi4_multimodal": "phi",
+    "phi3_v": "phi",
+    "phi4-siglip": "phi",
     "gemma": "gemma",
     "gemma2": "gemma",
     "shieldgemma2": "gemma",
@@ -1047,6 +1162,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "deepseek_v2": "deepseek",
     "deepseek_v2_moe": "deepseek",
     "deepseek_v3": "deepseek",
+    "deepseek_v4": "deepseek",
     "deepseek_vl_v2": "deepseek",
     "olmo": "olmo",
     "olmo2": "olmo",
@@ -1118,6 +1234,7 @@ _VARIANT_LABELS: dict[str, str] = {
     "deepseek_v2": "mla",
     "deepseek_v2_moe": "mla+moe",
     "deepseek_v3": "mla+moe",
+    "deepseek_v4": "dense-csa-fallback+mtp+moe+hc",
     "phi3small": "blocksparse",
     "falcon_h1": "hybrid-ssm",
     "mamba": "ssm",

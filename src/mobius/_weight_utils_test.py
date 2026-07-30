@@ -12,6 +12,7 @@ from mobius._weight_utils import (
     merge_lora_weights,
     preprocess_awq_weights,
     preprocess_gptq_weights,
+    preprocess_olive_weights,
     rename_weight_keys,
     split_codegen_qkv,
     split_fused_qkv,
@@ -509,6 +510,42 @@ class TestPreprocessGptqWeights:
         result = preprocess_gptq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
         assert result["q_proj.scales"].shape == (self.N, self.N_GROUPS)
 
+    def test_expert_major_tensors_preserve_expert_axis(self):
+        num_experts = 64
+        sd = {
+            "experts.qweight": torch.randint(
+                0,
+                255,
+                (num_experts, self.K_PACKED, self.N),
+                dtype=torch.int32,
+            ),
+            "experts.qzeros": torch.randint(
+                0,
+                255,
+                (num_experts, max(1, self.N_GROUPS_PACKED), self.N),
+                dtype=torch.int32,
+            ),
+            "experts.scales": torch.randn(num_experts, self.N_GROUPS, self.N),
+        }
+        result = preprocess_gptq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+
+        assert result["experts.weight"].shape == (
+            num_experts,
+            self.N,
+            self.N_GROUPS,
+            self.BLOB_SIZE,
+        )
+        assert result["experts.zero_points"].shape == (
+            num_experts,
+            self.N,
+            self.N_GROUPS * self.BITS // 8,
+        )
+        assert result["experts.scales"].shape == (
+            num_experts,
+            self.N,
+            self.N_GROUPS,
+        )
+
     def test_non_gptq_keys_pass_through(self):
         t = torch.randn(4, 8)
         sd = {"model.embed_tokens.weight": t, "lm_head.weight": t.clone()}
@@ -522,6 +559,179 @@ class TestPreprocessGptqWeights:
         sd = {"q_proj.qzeros": torch.zeros(1, self.N, dtype=torch.int32)}
         with pytest.raises(ValueError, match=r"Missing q_proj\.qweight"):
             preprocess_gptq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+
+
+class TestPreprocessOliveWeights:
+    """Tests for Olive uint8-packed weight preprocessing."""
+
+    K = 256
+    N = 128
+    BITS = 4
+    GROUP_SIZE = 32
+    PACKED_K = K * BITS // 8
+    N_BLOCKS = K // GROUP_SIZE
+    BLOB_SIZE = GROUP_SIZE * BITS // 8
+
+    def test_qweight_renamed_and_reshaped_to_matmulnbits_weight(self):
+        sd = {
+            "q_proj.qweight": torch.randint(0, 255, (self.N, self.PACKED_K), dtype=torch.uint8)
+        }
+
+        result = preprocess_olive_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+
+        assert "q_proj.weight" in result
+        assert "q_proj.qweight" not in result
+        assert result["q_proj.weight"].shape == (self.N, self.N_BLOCKS, self.BLOB_SIZE)
+        assert result["q_proj.weight"].dtype == torch.uint8
+
+    def test_scales_orientation_is_preserved(self):
+        scales = torch.randn(self.N, self.N_BLOCKS)
+
+        result = preprocess_olive_weights(
+            {"q_proj.scales": scales}, bits=self.BITS, group_size=self.GROUP_SIZE
+        )
+
+        assert result["q_proj.scales"] is scales
+
+    def test_qzeros_renamed_to_zero_points_without_reshape(self):
+        qzeros = torch.randint(0, 255, (self.N, self.N_BLOCKS // 2), dtype=torch.uint8)
+
+        result = preprocess_olive_weights(
+            {"q_proj.qzeros": qzeros}, bits=self.BITS, group_size=self.GROUP_SIZE
+        )
+
+        assert "q_proj.zero_points" in result
+        assert "q_proj.qzeros" not in result
+        assert torch.equal(result["q_proj.zero_points"], qzeros)
+
+    def test_non_quantized_keys_pass_through(self):
+        weight = torch.randn(4, 8)
+
+        result = preprocess_olive_weights(
+            {"model.embed_tokens.weight": weight}, bits=self.BITS, group_size=self.GROUP_SIZE
+        )
+
+        assert result["model.embed_tokens.weight"] is weight
+
+    def test_non_uint8_qweight_raises(self):
+        sd = {
+            "q_proj.qweight": torch.randint(0, 255, (self.N, self.PACKED_K), dtype=torch.int32)
+        }
+
+        with pytest.raises(ValueError, match="Olive qweight must be uint8"):
+            preprocess_olive_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+
+    def test_non_uint8_qzeros_raises(self):
+        sd = {
+            "q_proj.qzeros": torch.randint(
+                0, 255, (self.N, self.N_BLOCKS // 2), dtype=torch.int32
+            )
+        }
+        with pytest.raises(ValueError, match="Olive qzeros must be uint8"):
+            preprocess_olive_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+
+    # --- Quantized embedding (GatherBlockQuantized) ---
+
+    V = 64  # vocab size for embedding tests
+
+    def test_embed_qweight_kept_2d(self):
+        """embed_tokens.qweight targets GatherBlockQuantized: keep 2-D uint8."""
+        qweight = torch.randint(0, 255, (self.V, self.PACKED_K), dtype=torch.uint8)
+        result = preprocess_olive_weights(
+            {"model.embed_tokens.qweight": qweight},
+            bits=self.BITS,
+            group_size=self.GROUP_SIZE,
+            quantize_embeddings=True,
+        )
+        out = result["model.embed_tokens.qweight"]
+        assert out.shape == (self.V, self.PACKED_K)
+        assert out.dtype == torch.uint8
+
+    def test_embed_qzeros_renamed_to_zero_points(self):
+        qzeros = torch.randint(0, 255, (self.V, self.N_BLOCKS // 2), dtype=torch.uint8)
+        result = preprocess_olive_weights(
+            {"model.embed_tokens.qzeros": qzeros},
+            bits=self.BITS,
+            group_size=self.GROUP_SIZE,
+            quantize_embeddings=True,
+        )
+        assert "model.embed_tokens.zero_points" in result
+        assert "model.embed_tokens.qzeros" not in result
+
+    def test_embed_non_uint8_qweight_raises(self):
+        sd = {
+            "model.embed_tokens.qweight": torch.randint(
+                0, 255, (self.V, self.PACKED_K), dtype=torch.int32
+            )
+        }
+        with pytest.raises(ValueError, match="Olive embedding qweight must be uint8"):
+            preprocess_olive_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+
+    def test_embed_non_uint8_qzeros_raises(self):
+        sd = {
+            "model.embed_tokens.qzeros": torch.randint(
+                0, 255, (self.V, self.N_BLOCKS // 2), dtype=torch.int32
+            )
+        }
+        with pytest.raises(ValueError, match="Olive embedding qzeros must be uint8"):
+            preprocess_olive_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+
+    # --- Tied LM head synthesis ---
+
+    def test_tied_quantized_head_produces_no_lm_head_keys(self):
+        """A tied *quantized* head shares the embed Parameters in the module.
+
+        So preprocessing must NOT emit duplicate lm_head.* initializers.
+        """
+        qweight = torch.randint(0, 255, (self.V, self.PACKED_K), dtype=torch.uint8)
+        scales = torch.randn(self.V, self.N_BLOCKS)
+        qzeros = torch.randint(0, 255, (self.V, self.N_BLOCKS // 2), dtype=torch.uint8)
+        result = preprocess_olive_weights(
+            {
+                "model.embed_tokens.qweight": qweight,
+                "model.embed_tokens.scales": scales,
+                "model.embed_tokens.qzeros": qzeros,
+            },
+            bits=self.BITS,
+            group_size=self.GROUP_SIZE,
+            quantize_embeddings=True,
+            quantize_lm_head=True,
+            tie_word_embeddings=True,
+        )
+        assert not any(k.startswith("lm_head.") for k in result)
+        assert "model.embed_tokens.qweight" in result
+        assert "model.embed_tokens.zero_points" in result
+
+    def test_float_tie_fallback(self):
+        """Unquantized embed + tie -> lm_head shares the float embedding table."""
+        embed = torch.randn(self.V, self.K)
+        result = preprocess_olive_weights(
+            {"model.embed_tokens.weight": embed},
+            bits=self.BITS,
+            group_size=self.GROUP_SIZE,
+            tie_word_embeddings=True,
+        )
+        assert result["lm_head.weight"] is embed
+
+    def test_untied_quantized_lm_head_not_overwritten(self):
+        """A present lm_head.qweight must not be replaced by embed synthesis."""
+        lm_head = torch.randint(0, 255, (self.V, self.PACKED_K), dtype=torch.uint8)
+        embed = torch.randint(0, 255, (self.V, self.PACKED_K), dtype=torch.uint8)
+        result = preprocess_olive_weights(
+            {
+                "lm_head.qweight": lm_head,
+                "model.embed_tokens.qweight": embed,
+            },
+            bits=self.BITS,
+            group_size=self.GROUP_SIZE,
+            quantize_embeddings=True,
+            quantize_lm_head=True,
+            tie_word_embeddings=False,
+        )
+        assert torch.equal(
+            result["lm_head.weight"],
+            lm_head.reshape(self.V, -1, self.BLOB_SIZE),
+        )
 
 
 class TestPreprocessAwqWeights:

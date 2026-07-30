@@ -40,7 +40,7 @@ class TestQFormerAttention:
         b, op, graph = create_test_builder()
         hidden = create_test_input(b, "hidden", [1, NUM_QUERIES, HIDDEN])
         result = attn(op, hidden)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
 
     def test_self_attention_uses_attention_op(self):
@@ -48,7 +48,7 @@ class TestQFormerAttention:
         b, op, graph = create_test_builder()
         hidden = create_test_input(b, "hidden", [1, NUM_QUERIES, HIDDEN])
         result = attn(op, hidden)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert count_op_type(graph, "Attention") == 1
 
     def test_cross_attention_forward(self):
@@ -62,7 +62,7 @@ class TestQFormerAttention:
         queries = create_test_input(b, "queries", [1, NUM_QUERIES, HIDDEN])
         visual = create_test_input(b, "visual", [1, NUM_PATCHES, ENCODER_HIDDEN])
         result = attn(op, queries, key_value_states=visual)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert count_op_type(graph, "Attention") == 1
 
     def test_cross_attention_same_hidden_size(self):
@@ -72,7 +72,7 @@ class TestQFormerAttention:
         queries = create_test_input(b, "queries", [1, NUM_QUERIES, HIDDEN])
         visual = create_test_input(b, "visual", [1, NUM_PATCHES, HIDDEN])
         result = attn(op, queries, key_value_states=visual)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
 
 
@@ -101,7 +101,7 @@ class TestQFormerLayer:
         queries = create_test_input(b, "queries", [1, NUM_QUERIES, HIDDEN])
         visual = create_test_input(b, "visual", [1, NUM_PATCHES, HIDDEN])
         result = layer(op, queries, visual)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
 
     def test_forward_different_encoder_hidden_size(self):
@@ -116,7 +116,7 @@ class TestQFormerLayer:
         queries = create_test_input(b, "queries", [1, NUM_QUERIES, HIDDEN])
         visual = create_test_input(b, "visual", [1, NUM_PATCHES, ENCODER_HIDDEN])
         result = layer(op, queries, visual)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         # Self-attention + cross-attention = 2 Attention ops
         assert count_op_type(graph, "Attention") == 2
 
@@ -158,7 +158,7 @@ class TestQFormer:
         b, op, graph = create_test_builder()
         visual = create_test_input(b, "visual", [1, NUM_PATCHES, HIDDEN])
         result = qformer(op, visual)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
 
     def test_forward_with_different_encoder_hidden_size(self):
@@ -173,7 +173,7 @@ class TestQFormer:
         b, op, graph = create_test_builder()
         visual = create_test_input(b, "visual", [1, NUM_PATCHES, ENCODER_HIDDEN])
         result = qformer(op, visual)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         # 2 layers x 2 attn ops each = 4 Attention ops
         assert count_op_type(graph, "Attention") == NUM_LAYERS * 2
 
@@ -189,5 +189,5 @@ class TestQFormer:
         b, op, graph = create_test_builder()
         visual = create_test_input(b, "visual", [1, NUM_PATCHES, HIDDEN])
         result = qformer(op, visual)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert count_op_type(graph, "Attention") == 6  # 3 layers x 2

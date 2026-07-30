@@ -7,12 +7,12 @@ audio, and diffusion) built directly as ONNX graphs using
 automatic weight downloading and conversion, including bfloat16 models via
 `ir.LazyTensor`-based dtype casting.
 
-📦 [GitHub Repository](https://github.com/microsoft/mobius)
+📦 [GitHub Repository](https://github.com/onnxruntime/mobius)
 
 ## Installation
 
 ```bash
-pip install mobius-ai
+pip install mobius-onnx
 ```
 
 For development and testing:
@@ -112,7 +112,7 @@ mobius build-gguf path/to/model.gguf --output output/model/
 ```
 
 > **Note**: GGUF support requires the optional `gguf` package:
-> `pip install mobius-ai[gguf]`
+> `pip install mobius-onnx[gguf]`
 
 ### Build quantized models (GPTQ/AWQ)
 

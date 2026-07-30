@@ -188,6 +188,39 @@ class TestArchitectureConfig:
         config = ArchitectureConfig.from_transformers(FakeQwen3Config())
         assert config.attn_qk_norm is True
 
+    def test_from_transformers_chatglm4_legacy_fields(self):
+        class FakeChatGLMConfig:
+            model_type = "chatglm"
+            num_attention_heads = 32
+            multi_query_attention = True
+            multi_query_group_num = 2
+            num_layers = 40
+            hidden_size = 4096
+            ffn_hidden_size = 13696
+            kv_channels = 128
+            padded_vocab_size = 151552
+            vocab_size = 151552
+            seq_length = 131072
+            layernorm_epsilon = 1.5625e-7
+            add_bias_linear = False
+            add_qkv_bias = True
+            pad_token_id = 151329
+            tie_word_embeddings = False
+
+        config = ArchitectureConfig.from_transformers(FakeChatGLMConfig())
+
+        assert config.num_hidden_layers == 40
+        assert config.num_key_value_heads == 2
+        assert config.head_dim == 128
+        assert config.intermediate_size == 13696
+        assert config.hidden_act == "silu"
+        assert config.max_position_embeddings == 131072
+        assert config.partial_rotary_factor == pytest.approx(0.5)
+        assert config.rope_interleave is True
+        assert config.attn_qkv_bias is True
+        assert config.attn_o_bias is False
+        assert config.mlp_bias is False
+
     def test_from_transformers_rope_scaling(self):
         class FakeConfig:
             model_type = "llama"
@@ -441,6 +474,20 @@ class TestExtractRopeConfig:
         result = _extract_mrope_fields(Cfg())
         assert result["mrope_interleaved"] is True
         assert result["mrope_section"] == [8, 16, 8]
+
+    def test_mrope_interleaved_alias_from_rope_scaling(self):
+        """Qwen3-TTS talker spells the flag as bare ``interleaved``."""
+
+        class Cfg:
+            rope_scaling: ClassVar[dict] = {
+                "interleaved": True,
+                "mrope_section": [24, 20, 20],
+                "rope_type": "default",
+            }
+
+        result = _extract_mrope_fields(Cfg())
+        assert result["mrope_interleaved"] is True
+        assert result["mrope_section"] == [24, 20, 20]
 
     def test_original_max_position_embeddings(self):
         class Cfg:
@@ -809,6 +856,49 @@ class TestQuantizationConfig:
         assert qc is not None
         assert qc.bits == 8
         assert qc.group_size == 32
+
+    def test_from_transformers_symmetric_key_fallback(self):
+        """Olive uses ``symmetric`` rather than GPTQ's ``sym`` key."""
+        hf = type(
+            "HFConfig",
+            (),
+            {
+                "quantization_config": {
+                    "quant_method": "olive",
+                    "bits": 4,
+                    "group_size": 32,
+                    "symmetric": False,
+                }
+            },
+        )()
+        qc = QuantizationConfig.from_transformers(hf)
+        assert qc is not None
+        assert qc.sym is False
+
+    def test_from_transformers_olive_embeds_and_lm_head(self):
+        """Olive RTN exports flag quantized embeddings and LM head."""
+        hf = type(
+            "HFConfig",
+            (),
+            {
+                "quantization_config": {
+                    "quant_method": "olive",
+                    "bits": 4,
+                    "group_size": 32,
+                    "embeds": True,
+                    "lm_head": True,
+                }
+            },
+        )()
+        qc = QuantizationConfig.from_transformers(hf)
+        assert qc is not None
+        assert qc.quantize_embeddings is True
+        assert qc.quantize_lm_head is True
+
+    def test_quantize_embed_lm_head_default_false(self):
+        qc = QuantizationConfig()
+        assert qc.quantize_embeddings is False
+        assert qc.quantize_lm_head is False
 
     def test_architecture_config_has_quantization_field(self):
         config = ArchitectureConfig()

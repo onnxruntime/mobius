@@ -51,7 +51,7 @@ def _resolve_hidden_act(config, model_type: str) -> str | None:
       dense_act_fn          — some BERT variants
       activation            — generic fallback
       afn                   — older BERT configs
-      "silu"  (qwen)        — Qwen v1 hardcodes silu; no activation attr
+      "silu"  (qwen and chatglm) — Qwen v1 and ChatGLM hardcode silu; no activation attr
       "gelu"  (XLM)         — gelu_activation=True is a boolean flag
       "relu"  (ctrl)        — CTRL hardcodes relu; no hidden_act attr
     """
@@ -63,12 +63,33 @@ def _resolve_hidden_act(config, model_type: str) -> str | None:
         or getattr(config, "dense_act_fn", None)
         or getattr(config, "activation", None)
         or getattr(config, "afn", None)
-        or ("silu" if model_type in ("qwen",) else None)
+        # LLaDA/OLMo expose the activation as ``activation_type`` (e.g. "silu").
+        or getattr(config, "activation_type", None)
+        or ("silu" if model_type in ("qwen", "chatglm") else None)
         # gelu_activation is a boolean (XLM) — must be after all string
         # attrs so it cannot override an explicit hidden_act.
         or ("gelu" if getattr(config, "gelu_activation", False) else None)
         or ("relu" if model_type in ("ctrl",) else None)
     )
+
+
+def _resolve_sliding_window(config) -> int | None:
+    """Resolve the effective sliding-window size, honoring HF's enable gate.
+
+    Qwen2/Qwen3 keep a non-null ``sliding_window`` in the config even when the
+    window is disabled, signalling activation through the separate
+    ``use_sliding_window`` flag (HF's ``__post_init__`` nulls ``sliding_window``
+    when it is ``False``). A raw ``config.json`` fallback that bypasses
+    ``__post_init__`` would otherwise leak a window onto a model that does not
+    use one, so the gate must be re-applied here. ``use_sliding_window`` defaults
+    to ``True`` so models without the flag (e.g. Mistral) are unaffected.
+    """
+    window = getattr(config, "sliding_window", None) or getattr(config, "window_size", None)
+    if window is None:
+        return None
+    if getattr(config, "use_sliding_window", True) is False:
+        return None
+    return window
 
 
 def _nested_rope_theta(rope_scaling: dict, key: str) -> float | None:
@@ -111,6 +132,57 @@ def _first_not_none(*values, default=None):
         if v is not None:
             return v
     return default
+
+
+# Legacy rope_type spellings that name the same algorithm as a canonical
+# rope_type understood by ``initialize_rope``. Phi-3/Phi-3.5 checkpoints
+# label LongRoPE as ``"su"`` (short/long-factor scaled rotary embeddings);
+# newer HuggingFace configs call the identical algorithm ``"longrope"``.
+# Both must resolve to the same code path, so we canonicalize the alias at
+# extraction time rather than special-casing ``"su"`` downstream.
+_ROPE_TYPE_ALIASES: dict[str, str] = {
+    "su": "longrope",
+}
+
+
+def _canonical_rope_type(rope_type: str | None) -> str | None:
+    """Map legacy rope_type aliases to their canonical spelling.
+
+    Returns the input unchanged when it is not a known alias (including
+    ``None`` and ``"default"``).
+    """
+    if rope_type is None:
+        return None
+    return _ROPE_TYPE_ALIASES.get(rope_type, rope_type)
+
+
+def _leading_layer_type_count(layer_types, target: str) -> int:
+    count = 0
+    for layer_type in layer_types or ():
+        if layer_type != target:
+            break
+        count += 1
+    return count
+
+
+def _deepseek_v4_compress_ratios(config) -> list[int] | None:
+    ratios = getattr(config, "compress_ratios", None)
+    if ratios is not None:
+        return list(ratios)
+    layer_types = getattr(config, "layer_types", None)
+    rates = getattr(config, "compress_rates", None)
+    if not layer_types or not rates:
+        return None
+    return [
+        (
+            rates.get("compressed_sparse_attention", 4)
+            if layer_type == "compressed_sparse_attention"
+            else rates.get("heavily_compressed_attention", 128)
+            if layer_type == "heavily_compressed_attention"
+            else 0
+        )
+        for layer_type in layer_types
+    ]
 
 
 # Models that use RoPE but hardcode rope_theta entirely in model __init__,
@@ -197,12 +269,14 @@ def _extract_rope_config(config) -> RoPEConfig | None:
     rope_parameters = raw_rope_parameters or {}
 
     return RoPEConfig(
-        rope_type=_first_not_none(
-            rope_scaling.get("rope_type", None),
-            rope_scaling.get("type", None),
-            rope_parameters.get("rope_type", None),
-            _nested_rope_type(rope_scaling, "full_attention"),
-            default="default",
+        rope_type=_canonical_rope_type(
+            _first_not_none(
+                rope_scaling.get("rope_type", None),
+                rope_scaling.get("type", None),
+                rope_parameters.get("rope_type", None),
+                _nested_rope_type(rope_scaling, "full_attention"),
+                default="default",
+            )
         ),
         rope_theta=_first_not_none(
             getattr(config, "rope_theta", None),
@@ -248,8 +322,14 @@ def _extract_mrope_fields(config) -> dict:
     rope_scaling = getattr(config, "rope_scaling", None) or {}
     rope_parameters = getattr(config, "rope_parameters", None) or {}
     result: dict = {}
-    mrope_interleaved = rope_scaling.get("mrope_interleaved", False) or rope_parameters.get(
-        "mrope_interleaved", False
+    # Some models (e.g. Qwen3-TTS talker) spell the interleaved flag as the
+    # bare ``interleaved`` key inside ``rope_scaling`` rather than the
+    # ``mrope_interleaved`` name that Qwen3-VL uses. Accept both spellings.
+    mrope_interleaved = (
+        rope_scaling.get("mrope_interleaved", False)
+        or rope_scaling.get("interleaved", False)
+        or rope_parameters.get("mrope_interleaved", False)
+        or rope_parameters.get("interleaved", False)
     )
     if mrope_interleaved:
         result["mrope_interleaved"] = True
@@ -268,7 +348,7 @@ def _extract_vision_config(config, parent_config, model_type: str) -> dict:
     hooks live under :mod:`mobius._configs.per_model` and are
     registered with :mod:`mobius._configs._extractors` at import time.
     """
-    from mobius._configs import per_model  # noqa: F401  - side-effect import
+    from mobius._configs import per_model  # noqa: F401 - imported for registration side effect
     from mobius._configs._extractors import extract_vision_config as _dispatch
 
     return _dispatch(config, parent_config, model_type)
@@ -281,7 +361,7 @@ def _extract_audio_config(config, parent_config, model_type: str) -> dict:
     hooks live under :mod:`mobius._configs.per_model` and are
     registered with :mod:`mobius._configs._extractors` at import time.
     """
-    from mobius._configs import per_model  # noqa: F401  - side-effect import
+    from mobius._configs import per_model  # noqa: F401 - imported for registration side effect
     from mobius._configs._extractors import extract_audio_config as _dispatch
 
     return _dispatch(config, parent_config, model_type)
@@ -396,6 +476,21 @@ class ArchitectureConfig(BaseModelConfig):
     v_head_dim: int | None = None
     rope_interleave: bool = False
 
+    # DeepSeek-V4 compressed sparse attention / Hyper-Connections.
+    o_groups: int = 1
+    o_lora_rank: int | None = None
+    index_n_heads: int | None = None
+    index_head_dim: int | None = None
+    index_topk: int | None = None
+    compress_ratios: list[int] | None = None
+    compress_rope_theta: float | None = None
+    hc_mult: int = 1
+    hc_sinkhorn_iters: int = 1
+    hc_eps: float = 1e-6
+    num_hash_layers: int = 0
+    swiglu_limit: float = 0.0
+    num_nextn_predict_layers: int = 0
+
     # Vision shared fields (accessed as top-level config.X by tasks)
     mm_tokens_per_image: int | None = None
     image_token_id: int | None = None
@@ -498,6 +593,17 @@ class ArchitectureConfig(BaseModelConfig):
     bos_token_id: int | None = None
     eos_token_id: int | list[int] | None = None
 
+    # Speculative-decoding draft-target support.
+    # When set to a non-empty list, ``TextModel`` captures the post-residual
+    # output of ``self.layers[k]`` for each ``k`` in the list (before the
+    # final norm), and ``CausalLMTask`` registers them as additional ONNX
+    # outputs named ``hidden_states.{k}``.  Indices follow the HF
+    # convention used by drafters such as DFlash: ``k`` refers to the
+    # 0-based decoder layer whose output you want — equivalent to
+    # ``model(..., output_hidden_states=True).hidden_states[k + 1]`` in
+    # transformers (where index 0 is the embedding output).
+    output_layer_indices: list[int] | None = None
+
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> ArchitectureConfig:
         model_type = config.model_type
@@ -511,22 +617,27 @@ class ArchitectureConfig(BaseModelConfig):
             rope_config = RoPEConfig(
                 rope_type="default",
                 rope_theta=_IMPLICIT_ROPE_DEFAULTS[model_type],
+                partial_rotary_factor=0.5 if model_type == "chatglm" else 1.0,
             )
 
         # Some hierarchical models (Segformer, Swin) use plural list attrs
         # instead of scalar ones.  Resolve to a scalar for the base config.
         hidden_size = (
             getattr(config, "hidden_size", None)
+            or getattr(config, "d_model", None)
             or _first(getattr(config, "hidden_sizes", None))
             or 0
         )
         num_attention_heads = (
             getattr(config, "num_attention_heads", None)
+            or getattr(config, "n_heads", None)
             or _first(getattr(config, "num_heads", None))
             or 1
         )
         num_hidden_layers = (
             getattr(config, "num_hidden_layers", None)
+            or getattr(config, "n_layers", None)
+            or getattr(config, "num_layers", None)
             or getattr(config, "num_encoder_blocks", None)
             or 0
         )
@@ -549,17 +660,30 @@ class ArchitectureConfig(BaseModelConfig):
                 config.head_dim
                 if (hasattr(config, "head_dim") and config.head_dim is not None)
                 else getattr(config, "d_kv", None)
+                or getattr(config, "kv_channels", None)
                 or _as_int(hidden_size) // _as_int(num_attention_heads)
             ),
             num_attention_heads=_as_int(num_attention_heads),
             num_key_value_heads=_as_int(
-                getattr(config, "num_key_value_heads", num_attention_heads)
+                getattr(config, "num_key_value_heads", None)
+                or getattr(config, "n_kv_heads", None)
+                or (
+                    getattr(config, "multi_query_group_num", None)
+                    if getattr(config, "multi_query_attention", False)
+                    else None
+                )
+                or num_attention_heads
             ),
             num_hidden_layers=_as_int(num_hidden_layers),
-            vocab_size=getattr(config, "vocab_size", None) or 0,
+            vocab_size=(
+                getattr(config, "vocab_size", None)
+                or getattr(config, "embedding_size", None)
+                or 0
+            ),
             hidden_size=_as_int(hidden_size),
             intermediate_size=(
                 getattr(config, "intermediate_size", None)
+                or getattr(config, "mlp_hidden_size", None)
                 or getattr(config, "n_inner", None)
                 or getattr(config, "d_ff", None)
                 or getattr(config, "ffn_dim", None)
@@ -575,9 +699,7 @@ class ArchitectureConfig(BaseModelConfig):
             ),
             no_rope_layers=getattr(config, "no_rope_layers", None),
             full_attention_interval=(getattr(config, "full_attention_interval", None)),
-            sliding_window=(
-                getattr(config, "sliding_window", None) or getattr(config, "window_size", None)
-            ),
+            sliding_window=_resolve_sliding_window(config),
             # Linear attention (DeltaNet) parameters
             linear_conv_kernel_dim=(getattr(config, "linear_conv_kernel_dim", 4)),
             linear_key_head_dim=(getattr(config, "linear_key_head_dim", None)),
@@ -597,7 +719,9 @@ class ArchitectureConfig(BaseModelConfig):
                 or 1e-6
             ),
             attn_qkv_bias=(
-                getattr(
+                getattr(config, "add_qkv_bias", False)
+                or getattr(config, "add_bias_linear", False)
+                or getattr(
                     config,
                     "attention_bias",
                     getattr(
@@ -631,7 +755,8 @@ class ArchitectureConfig(BaseModelConfig):
                 )
             ),
             attn_o_bias=(
-                getattr(
+                getattr(config, "add_bias_linear", False)
+                or getattr(
                     config,
                     "attention_bias",
                     getattr(
@@ -676,7 +801,8 @@ class ArchitectureConfig(BaseModelConfig):
             ),
             attn_qk_norm_full=(model_type in ("flex_olmo", "olmoe", "olmo2", "olmo3")),
             mlp_bias=(
-                getattr(
+                getattr(config, "add_bias_linear", False)
+                or getattr(
                     config,
                     "use_mlp_bias",
                     getattr(
@@ -716,10 +842,17 @@ class ArchitectureConfig(BaseModelConfig):
                 rope_config.rope_interleave if rope_config is not None else False
             ),
             **mrope_fields,
-            max_position_embeddings=getattr(config, "max_position_embeddings", 0),
+            max_position_embeddings=(
+                getattr(config, "max_position_embeddings", None)
+                or getattr(config, "max_sequence_length", None)
+                or getattr(config, "seq_length", None)
+                or 0
+            ),
             tie_word_embeddings=(
                 getattr(config, "tie_word_embeddings", None)
                 if getattr(config, "tie_word_embeddings", None) is not None
+                else getattr(config, "weight_tying", None)
+                if getattr(config, "weight_tying", None) is not None
                 else getattr(parent_config, "tie_word_embeddings", False)
             ),
             # MoE
@@ -754,6 +887,26 @@ class ArchitectureConfig(BaseModelConfig):
             qk_nope_head_dim=getattr(config, "qk_nope_head_dim", None),
             qk_rope_head_dim=getattr(config, "qk_rope_head_dim", None),
             v_head_dim=getattr(config, "v_head_dim", None),
+            # DeepSeek-V4 compressed sparse attention / Hyper-Connections
+            o_groups=getattr(config, "o_groups", 1),
+            o_lora_rank=getattr(config, "o_lora_rank", None),
+            index_n_heads=getattr(config, "index_n_heads", None),
+            index_head_dim=getattr(config, "index_head_dim", None),
+            index_topk=getattr(config, "index_topk", None),
+            compress_ratios=_deepseek_v4_compress_ratios(config),
+            compress_rope_theta=getattr(config, "compress_rope_theta", None),
+            hc_mult=getattr(config, "hc_mult", 1),
+            hc_sinkhorn_iters=getattr(config, "hc_sinkhorn_iters", 1),
+            hc_eps=getattr(config, "hc_eps", 1e-6),
+            num_hash_layers=(
+                getattr(config, "num_hash_layers", None)
+                or getattr(config, "n_hash_layers", 0)
+                or _leading_layer_type_count(
+                    getattr(config, "mlp_layer_types", None), "hash_moe"
+                )
+            ),
+            swiglu_limit=getattr(config, "swiglu_limit", 0.0),
+            num_nextn_predict_layers=getattr(config, "num_nextn_predict_layers", 0),
             # Encoder-specific
             type_vocab_size=getattr(config, "type_vocab_size", 0),
             # Encoder-decoder
@@ -1120,6 +1273,158 @@ class VisionLanguageConfig(CausalLMConfig):
 
 
 @dataclasses.dataclass
+class DFlashConfig(CausalLMConfig):
+    """Configuration for the DFlash speculative-decoding draft model.
+
+    DFlash drafters (z-lab/dflash) condition on intermediate target hidden
+    states fused into every draft layer.  The HuggingFace ``config.json``
+    of a DFlash checkpoint stores DFlash-specific fields under a nested
+    ``dflash_config`` dict; we lift them onto the top-level mobius config
+    so the rest of the build pipeline (component init, task graph wiring,
+    weight loading) can read them through standard attribute access.
+
+    Fields:
+        target_layer_ids: 0-based decoder layer indices on the *target*
+            model whose post-residual hidden states feed each draft layer.
+            Same convention as
+            :class:`ArchitectureConfig.output_layer_indices`.
+        block_size: Number of mask/draft tokens the drafter consumes per
+            speculative step (``b16`` in checkpoint names means 16).
+        mask_token_id: Token id used to embed the masked draft positions
+            via the target's ``embed_tokens``; ``None`` is allowed and
+            indicates a pure noise embedding.
+        num_target_layers: Total number of decoder layers on the target
+            model.  Used together with ``target_layer_ids`` for runtime
+            consistency checks.
+    """
+
+    target_layer_ids: list[int] | None = None
+    block_size: int | None = None
+    mask_token_id: int | None = None
+    num_target_layers: int | None = None
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> DFlashConfig:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        dflash_cfg = getattr(config, "dflash_config", None) or {}
+        if not isinstance(dflash_cfg, dict):
+            # Some checkpoints expose ``dflash_config`` as a nested config object.
+            dflash_cfg = {
+                "target_layer_ids": getattr(dflash_cfg, "target_layer_ids", None),
+                "mask_token_id": getattr(dflash_cfg, "mask_token_id", None),
+            }
+        return cls(
+            **_shallow_fields(base),
+            target_layer_ids=dflash_cfg.get("target_layer_ids"),
+            block_size=getattr(config, "block_size", None),
+            mask_token_id=dflash_cfg.get("mask_token_id"),
+            num_target_layers=getattr(config, "num_target_layers", None),
+        )
+
+
+@dataclasses.dataclass
+class Qwen35MtpConfig(CausalLMConfig):
+    """Configuration for the Qwen3.6 multi-token-prediction (MTP) head.
+
+    The MTP head is a self-speculative drafter shipped inside the dense
+    ``Qwen/Qwen3.6-27B`` checkpoint under the ``mtp.*`` weight prefix
+    (HuggingFace ``transformers`` discards these on ``from_pretrained``).
+    Architecturally it is a single ``full_attention`` Qwen3.5 decoder layer
+    preceded by an input projection that fuses the just-emitted token
+    embedding with the target model's last hidden state::
+
+        h' = fc(concat[ pre_fc_norm_embedding(embed(input_ids)),
+                        pre_fc_norm_hidden(hidden_states) ])
+
+    All standard transformer fields (hidden_size, head_dim, mrope_section,
+    partial_rotary_factor, attn_output_gate, …) are read from the parent
+    model's ``text_config`` so the reused :class:`Qwen35DecoderLayer`,
+    :class:`Qwen35Attention` and mRoPE machinery stay bit-compatible with
+    the target.  ``num_hidden_layers`` is forced to ``1`` and
+    ``layer_types`` to ``["full_attention"]`` regardless of the parent's
+    (64-layer, hybrid) stack — the MTP head has exactly one layer.
+    """
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Qwen35MtpConfig:
+        hf_config = config
+        if hasattr(config, "text_config"):
+            hf_config = config.text_config
+        base = ArchitectureConfig.from_transformers(
+            hf_config, parent_config=parent_config or config
+        )
+        fields = _shallow_fields(base)
+        # The MTP head is a single full-attention layer no matter how deep /
+        # hybrid the parent decoder stack is.
+        fields["num_hidden_layers"] = 1
+        fields["layer_types"] = ["full_attention"]
+        return cls(**fields)
+
+
+def _speculators_layer_namespace(layer_cfg: dict):
+    """Build a config-like namespace from a speculators ``transformer_layer_config``.
+
+    Normalizes the rope fields: speculators checkpoints store either a flat
+    ``rope_theta`` (Qwen3) or a nested ``rope_parameters = {rope_theta, ...}``
+    (Gemma4), so flatten the latter to ``rope_theta`` for ArchitectureConfig.
+    """
+    import types
+
+    cfg = dict(layer_cfg)
+    if "rope_theta" not in cfg:
+        rope = cfg.get("rope_parameters") or cfg.get("rope_scaling")
+        if isinstance(rope, dict) and rope.get("rope_theta") is not None:
+            cfg["rope_theta"] = rope["rope_theta"]
+    return types.SimpleNamespace(**cfg)
+
+
+@dataclasses.dataclass
+class Eagle3Config(CausalLMConfig):
+    """Configuration for EAGLE-3 draft checkpoints.
+
+    Two on-disk formats are supported:
+      * AngelSlim: a flat llama config with ``draft_vocab_size`` at top level
+        (Qwen3-4B/8B); ``norm_before_residual`` absent -> False.
+      * speculators (RedHat): the architecture config is nested under
+        ``transformer_layer_config``; eagle fields (``draft_vocab_size``,
+        ``norm_before_residual``, ``norm_before_fc``, ``target_hidden_size``,
+        ``eagle_aux_hidden_state_layer_ids``) sit at the top level.
+    """
+
+    draft_vocab_size: int | None = None
+    norm_before_residual: bool = False
+    norm_before_fc: bool = False
+    fc_norm: bool = False
+    target_hidden_size: int | None = None
+    eagle_aux_hidden_state_layer_ids: list[int] | None = None
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Eagle3Config:
+        layer_cfg = getattr(config, "transformer_layer_config", None)
+        if layer_cfg is not None:
+            # speculators format: arch config nested under transformer_layer_config.
+            if isinstance(layer_cfg, dict):
+                layer_cfg = _speculators_layer_namespace(layer_cfg)
+            base = ArchitectureConfig.from_transformers(layer_cfg, parent_config=config)
+        else:
+            base = ArchitectureConfig.from_transformers(config, parent_config)
+        fields = _shallow_fields(base)
+        fields["num_hidden_layers"] = 1
+        fields["layer_types"] = ["full_attention"]
+        return cls(
+            **fields,
+            draft_vocab_size=getattr(config, "draft_vocab_size", None),
+            norm_before_residual=bool(getattr(config, "norm_before_residual", False)),
+            norm_before_fc=bool(getattr(config, "norm_before_fc", False)),
+            fc_norm=bool(getattr(config, "fc_norm", False)),
+            target_hidden_size=getattr(config, "target_hidden_size", None),
+            eagle_aux_hidden_state_layer_ids=getattr(
+                config, "eagle_aux_hidden_state_layer_ids", None
+            ),
+        )
+
+
+@dataclasses.dataclass
 class Gemma2Config(CausalLMConfig):
     """Configuration for Gemma2 models with attention soft-capping.
 
@@ -1308,6 +1613,11 @@ class Gemma4Config(VisionLanguageConfig):
       causal attention (only ``None`` and ``"vision"`` are accepted).
     """
 
+    # Set to True by Gemma4Task.build() when the target EP's max_buffer_size
+    # is too small for the fused [V, L*D] per-layer embedding table, to split
+    # it into L separate [V, D] tables that each fit within the EP's buffer limit.
+    split_per_layer_embedding: bool = False
+
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Gemma4Config:
         base = ArchitectureConfig.from_transformers(config, parent_config)
@@ -1382,6 +1692,124 @@ class Gemma4Config(VisionLanguageConfig):
             boa_token_id=getattr(parent_config, "boa_token_id", None),
             use_bidirectional_attention=getattr(config, "use_bidirectional_attention", None),
         )
+
+
+@dataclasses.dataclass
+class Gemma4AssistantConfig(Gemma4Config):
+    """Configuration for the Gemma4-Assistant MTP draft model.
+
+    The HuggingFace Gemma4-Assistant checkpoint
+    (``google/gemma-4-{E2B,E4B,12B,26B,31B}-it-assistant``) is a small
+    Gemma4-style decoder that is hooked up to a target Gemma4 model for
+    speculative decoding.  Its HF config layout is::
+
+        Gemma4AssistantConfig
+        ├── text_config: Gemma4TextConfig   ← all the standard Gemma4 fields
+        ├── backbone_hidden_size: int        ← target model's hidden size
+        ├── use_ordered_embeddings: bool
+        ├── num_centroids: int
+        └── centroid_intermediate_top_k: int
+
+    We flatten this into a single mobius dataclass by extracting the
+    nested ``text_config`` fields onto the top level (via
+    :meth:`Gemma4Config.from_transformers`) and adding the assistant-
+    specific fields below.
+
+    Constraints enforced by the HF config (mirrored here):
+    - All draft layers must be KV-shared with the target — i.e.
+      ``num_kv_shared_layers == num_hidden_layers``.  The drafter has no
+      KV cache of its own; per-layer K/V is fed in from the target's
+      shared K/V buffers at inference time.
+    - ``hidden_size_per_layer_input == 0`` (no per-layer input gating).
+    - ``enable_moe_block == False`` (no MoE).
+    - ``use_double_wide_mlp == False``.
+    - ``vocab_size_per_layer_input == 0``.
+
+    Fields (assistant-specific):
+        backbone_hidden_size: Hidden size of the target model the
+            assistant was trained against (so the assistant's
+            ``pre_projection`` and ``post_projection`` know the right
+            input/output dims for the shared hidden state).
+        use_ordered_embeddings: When True, the assistant routes its
+            output through a centroid-based ordered-embedding LM head
+            (``Gemma4AssistantMaskedEmbedder``), built by
+            ``Gemma4AssistantCausalLMModel``.
+        num_centroids: Number of centroids used by the ordered-embedding
+            head when ``use_ordered_embeddings`` is True.
+        centroid_intermediate_top_k: Top-K centroid count for the
+            ordered-embedding head.
+    """
+
+    backbone_hidden_size: int = 1536
+    use_ordered_embeddings: bool = False
+    num_centroids: int = 2048
+    centroid_intermediate_top_k: int = 32
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Gemma4AssistantConfig:
+        # The HF Gemma4AssistantConfig nests the Gemma4 text config under
+        # ``text_config``.  Drive Gemma4Config.from_transformers on that
+        # nested config to lift all the standard text-decoder fields onto
+        # the top level, then layer on the assistant-specific knobs.
+        #
+        # NOTE: ``build()`` unwraps ``config.text_config`` BEFORE calling
+        # us when the wrapper has a ``text_config`` attribute (see
+        # _builder.py:370-382).  In that case ``config`` is the unwrapped
+        # Gemma4TextConfig and the assistant-specific fields
+        # (use_ordered_embeddings, backbone_hidden_size, num_centroids,
+        # centroid_intermediate_top_k) live on ``parent_config`` instead.
+        # Resolve from whichever object has them.
+        text_cfg = getattr(config, "text_config", None) or config
+        base = Gemma4Config.from_transformers(text_cfg, parent_config=parent_config)
+
+        def _resolve(name, default):
+            for src in (config, parent_config):
+                if src is not None and hasattr(src, name):
+                    val = getattr(src, name)
+                    if val is not None:
+                        return val
+            return default
+
+        return cls(
+            **_shallow_fields(base),
+            backbone_hidden_size=int(_resolve("backbone_hidden_size", 1536)),
+            use_ordered_embeddings=bool(_resolve("use_ordered_embeddings", False)),
+            num_centroids=int(_resolve("num_centroids", 2048)),
+            centroid_intermediate_top_k=int(_resolve("centroid_intermediate_top_k", 32)),
+        )
+
+    def validate(self) -> None:
+        super().validate()
+        errors: list[str] = []
+        if self.num_kv_shared_layers != self.num_hidden_layers:
+            errors.append(
+                "Gemma4-Assistant requires every layer to be KV-shared with the "
+                f"target: num_kv_shared_layers ({self.num_kv_shared_layers}) "
+                f"must equal num_hidden_layers ({self.num_hidden_layers})."
+            )
+        if self.hidden_size_per_layer_input:
+            errors.append(
+                "Gemma4-Assistant does not support per-layer input gating; "
+                f"hidden_size_per_layer_input must be 0, got {self.hidden_size_per_layer_input}."
+            )
+        if self.enable_moe_block:
+            errors.append(
+                "Gemma4-Assistant does not support MoE layers; enable_moe_block must be False."
+            )
+        if self.use_double_wide_mlp:
+            errors.append(
+                "Gemma4-Assistant does not support double-wide MLP; "
+                "use_double_wide_mlp must be False."
+            )
+        if self.vocab_size_per_layer_input:
+            errors.append(
+                "Gemma4-Assistant does not support per-layer vocab; "
+                f"vocab_size_per_layer_input must be 0, got {self.vocab_size_per_layer_input}."
+            )
+        if errors:
+            raise ValueError(
+                "Invalid Gemma4AssistantConfig:\n" + "\n".join(f"  - {e}" for e in errors)
+            )
 
 
 @dataclasses.dataclass

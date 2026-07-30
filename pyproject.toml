@@ -3,7 +3,7 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mobius-ai"
+name = "mobius-onnx"
 dynamic = ["version"]
 description = "ONNX model definitions for GenAI using onnxscript.nn"
 authors = [
@@ -16,8 +16,8 @@ dependencies = [
     "huggingface_hub",
     "numpy>=1.24.0",
     "onnx_ir>=0.1.0",
-    "onnx-shape-inference>=0.1.9",
-    "onnxscript>=0.7.0",
+    "onnx-shape-inference>=0.3.1",
+    "onnxscript>=0.7.1",
     "safetensors",
     "torch>=2.1.0",
     "tqdm",
@@ -34,6 +34,11 @@ testing = [
     "accelerate",
     "diffusers",
     "onnxruntime-easy>=0.1.1",
+    # onnxruntime>=1.28 is required for the fused Attention kernel to apply
+    # attention-logit soft-capping *before* the mask/bias (ONNX spec order).
+    # Older kernels (<=1.26) applied softcap after the mask, which diverges from
+    # the DecomposeAttentionPass output and fails its softcap parity tests.
+    "onnxruntime>=1.28.0",
     "torch",
     "transformers>=5.0",
     "safetensors",

@@ -26,6 +26,17 @@ class QuantizationConfig:
     # bit-packed uint8. Required for codebooks with non-integer offsets
     # (e.g. Tencent SEQ uses 1.5).
     float_zero_point: bool = False
+    # When True, the input embedding table is block-wise quantized and is
+    # looked up with GatherBlockQuantized instead of a plain Gather. Used by
+    # Olive RTN exports and quantized GGUF imports.
+    quantize_embeddings: bool = False
+    # When True, the LM head projection is block-wise quantized (MatMulNBits).
+    # Used by Olive RTN exports and quantized GGUF imports.
+    quantize_lm_head: bool = False
+    # When True, the input embedding and LM head share one weight table. Olive
+    # RTN records this in its own config (``tie_word_embeddings``) and may clear
+    # the model's top-level flag, so it is tracked here independently.
+    tie_word_embeddings: bool = False
 
     @classmethod
     def from_transformers(cls, hf_config) -> QuantizationConfig | None:
@@ -53,5 +64,8 @@ class QuantizationConfig:
             bits=qc.get("bits", 4),
             group_size=qc.get("group_size", 128),
             quant_method=method,
-            sym=qc.get("sym", True),
+            sym=qc.get("sym", qc.get("symmetric", True)),
+            quantize_embeddings=bool(qc.get("embeds", False)),
+            quantize_lm_head=bool(qc.get("lm_head", False)),
+            tie_word_embeddings=bool(qc.get("tie_word_embeddings", False)),
         )

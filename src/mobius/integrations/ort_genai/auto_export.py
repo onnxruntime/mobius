@@ -86,7 +86,12 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     # HunYuan-V1 dense / Hy-MT1.5 — generic decoder LLM type accepted by
     # ORT GenAI (see onnxruntime-genai/src/models/model_type.h LLM list).
     "hunyuan_v1_dense": "decoder",
+<<<<<<< HEAD
     # Qwen VL model families have separate ORT GenAI model types.
+=======
+    "deepseek_v4": "decoder",
+    # Qwen VL models all use the same GenAI pipeline as qwen2_5_vl
+>>>>>>> origin/main
     "qwen2_vl": "qwen2_5_vl",
     "qwen3_vl": "qwen3_vl",
     "qwen3_vl_text": "qwen3_vl",
@@ -106,6 +111,10 @@ _GEMMA4_MODEL_TYPES = frozenset(
 # must preprocess with the HuggingFace processor and feed tensors via
 # ``Generator.set_inputs`` (see examples/gemma4_unified_ort_genai.py).
 _GEMMA4_UNIFIED_MODEL_TYPES = frozenset({"gemma4_unified", "gemma4_unified_text"})
+# gemma-3 multimodal. build() unwraps the composite HF config to its text
+# sub-config, so at export time ``config.model_type`` is "gemma3_text" (not
+# "gemma3").
+_GEMMA3_MODEL_TYPES = frozenset({"gemma3", "gemma3_text"})
 _PIXTRAL_MODEL_TYPES = frozenset({"mistral3"})
 _QWEN_VL_MODEL_TYPES = frozenset(
     {
@@ -135,6 +144,32 @@ _TOKENIZER_FILES = [
 def _resolve_ort_genai_model_type(model_type: str) -> str:
     """Map HuggingFace model_type to ORT-GenAI model type string."""
     return _ORT_GENAI_MODEL_TYPE.get(model_type, model_type)
+
+
+def _select_ort_model_type(
+    config_model_type: str | None,
+    hf_model_type: str | None,
+    *,
+    is_decoder_only: bool,
+) -> str:
+    """Choose the ORT-GenAI model type for an exported package.
+
+    Decoder-only packages prefer the built package's ``config.model_type`` so
+    text-only / overridden builds (e.g. ``gemma4_unified -> gemma4_unified_text``)
+    resolve to the decoder-only ORT type. Multimodal packages keep the HF
+    parent ``model_type``: ``build()`` unwraps composite configs to their text
+    sub-config, so ``config.model_type`` would otherwise be the text type even
+    for a full multimodal export.
+
+    The ``config.model_type`` preference only applies when it resolves to a
+    *known* ORT-GenAI type (a key in :data:`_ORT_GENAI_MODEL_TYPE`). An
+    unrecognised ``config.model_type`` would otherwise pass straight through as
+    an invalid ORT type and mask a valid HF-derived mapping, so in that case we
+    fall back to ``hf_model_type``.
+    """
+    if is_decoder_only and config_model_type in _ORT_GENAI_MODEL_TYPE:
+        return _ORT_GENAI_MODEL_TYPE[config_model_type]
+    return _resolve_ort_genai_model_type(hf_model_type or "unknown")
 
 
 def _graph_input_names(model: ir.Model) -> list[str]:
@@ -404,6 +439,11 @@ def _write_vision_processor_config(
     - **Gemma4 unified** (``gemma4_unified*``): Returns ``None`` — the
       encoder-free model has no matching ort-extensions transform; callers feed
       HF-preprocessed pixel_values via ``Generator.set_inputs``.
+    - **Gemma3** (``gemma3`` or ``gemma3_text``): Writes
+      ``processor_config.json`` with a 6-step pipeline (DecodeImage →
+      ConvertRGB → Resize[fixed] → Rescale → Normalize → Permute3D). Uses a
+      fixed-size resize (no ``smart_resize``) so the SigLIP encoder's fixed
+      NCHW ``pixel_values`` input contract is met.
     - **Pixtral / Mistral3**: Writes ``processor_config.json`` with a 7-step
       pipeline (DecodeImage → ConvertRGB → Resize → Rescale → Normalize →
       Permute3D → PixtralImageSizes).
@@ -467,6 +507,88 @@ def _write_vision_processor_config(
             }
         }
         path = os.path.join(output_dir, "image_processor.json")
+    elif model_type in _GEMMA3_MODEL_TYPES:
+        # Gemma3's SigLIP vision encoder takes a plain NCHW image tensor
+        # ([batch, 3, image_size, image_size]). The generic-VLM branch below
+        # emits smart_resize (variable HxW) and no Permute3D, leaving a
+        # variable-size HWC tensor that fails the encoder's fixed input.
+        # Emit a fixed-size resize (no smart_resize) + trailing Permute3D.
+        image_size = getattr(vision, "image_size", None) or 896
+        image_mean = [0.5, 0.5, 0.5]
+        image_std = [0.5, 0.5, 0.5]
+        rescale_factor = 1.0 / 255.0
+        if hf_model_id is not None:
+            try:
+                from transformers import AutoProcessor
+
+                hf_proc = AutoProcessor.from_pretrained(hf_model_id)
+                ip = getattr(hf_proc, "image_processor", None)
+                if ip is not None:
+                    image_mean = list(getattr(ip, "image_mean", image_mean))
+                    image_std = list(getattr(ip, "image_std", image_std))
+                    rescale_factor = getattr(ip, "rescale_factor", rescale_factor)
+                    size = getattr(ip, "size", None)
+                    if isinstance(size, dict):
+                        image_size = (
+                            size.get("height") or size.get("longest_edge") or image_size
+                        )
+            except Exception:
+                logger.warning(
+                    "Could not load HF processor for %s; using gemma3 defaults "
+                    "(image_size=%s, mean/std=0.5)",
+                    hf_model_id,
+                    image_size,
+                    exc_info=True,
+                )
+        transforms = [
+            {
+                "operation": {
+                    "name": "decode_image",
+                    "type": "DecodeImage",
+                    "attrs": {"color_space": "RGB"},
+                }
+            },
+            {
+                "operation": {
+                    "name": "convert_to_rgb",
+                    "type": "ConvertRGB",
+                }
+            },
+            {
+                "operation": {
+                    "name": "resize",
+                    "type": "Resize",
+                    "attrs": {
+                        "height": image_size,
+                        "width": image_size,
+                        "smart_resize": 0,
+                    },
+                }
+            },
+            {
+                "operation": {
+                    "name": "rescale",
+                    "type": "Rescale",
+                    "attrs": {"rescale_factor": rescale_factor},
+                }
+            },
+            {
+                "operation": {
+                    "name": "normalize",
+                    "type": "Normalize",
+                    "attrs": {"mean": image_mean, "std": image_std},
+                }
+            },
+            {
+                "operation": {
+                    "name": "permute",
+                    "type": "Permute3D",
+                    "attrs": {"dims": [2, 0, 1]},
+                }
+            },
+        ]
+        processor_config = {"processor": {"name": "image_processor", "transforms": transforms}}
+        path = os.path.join(output_dir, "processor_config.json")
     else:
         # Pixtral and generic VLMs share the same base pipeline;
         # Pixtral adds Permute3D + PixtralImageSizes at the end.
@@ -692,7 +814,9 @@ def _write_genai_config(
         decoder_inputs["past_value_names"] = "past_key_values.%d.value"
 
     # Derive decoder filename from the actual package key
-    decoder_filename = f"{decoder_key}/model.onnx" if decoder_key != "model" else "model.onnx"
+    decoder_filename = (
+        f"{decoder_key}/model.onnx" if len(pkg) > 1 or decoder_key != "model" else "model.onnx"
+    )
 
     # ORT GenAI's ``past_present_share_buffer`` mode requires the decoder
     # graph to write the KV cache in place. Only ``com.microsoft.
@@ -894,12 +1018,24 @@ def write_ort_genai_config(
     pad_token_id: int | None = None
     ort_model_type: str
 
+    # Detect multimodal capabilities from the package keys. Needed before
+    # resolving the ORT model type so decoder-only (text-only) packages can
+    # prefer their own config.model_type (see below).
+    is_vlm = "vision_encoder" in pkg and "embedding" in pkg
+    has_speech = "audio_encoder" in pkg
+    is_decoder_only = not is_vlm and not has_speech
+
     if hf_model_id is not None:
         import transformers
 
         hf_config = transformers.AutoConfig.from_pretrained(hf_model_id)
         model_type = hf_config.model_type
-        ort_model_type = _resolve_ort_genai_model_type(model_type)
+        cfg_model_type = getattr(config, "model_type", None)
+        # See _select_ort_model_type: decoder-only packages prefer the package's
+        # own config.model_type; multimodal packages keep the HF parent type.
+        ort_model_type = _select_ort_model_type(
+            cfg_model_type, model_type, is_decoder_only=is_decoder_only
+        )
         # Token IDs may live on the parent config or the text sub-config
         # (e.g. Gemma4Config has text_config with bos_token_id=2).
         _tok_cfg = getattr(hf_config, "text_config", hf_config)
@@ -922,7 +1058,12 @@ def write_ort_genai_config(
         # Fall back to fields stored in ArchitectureConfig (set by from_transformers()).
         # This path is taken when hf_model_id is not provided (e.g. --config mode).
         raw_type = getattr(config, "model_type", None) or "unknown"
-        ort_model_type = _resolve_ort_genai_model_type(raw_type)
+        if is_vlm and raw_type == "gemma3_text":
+            # Gemma3 multimodal configs are unwrapped to the text sub-config
+            # during build, but ORT GenAI needs the multimodal parent type.
+            ort_model_type = "gemma3"
+        else:
+            ort_model_type = _resolve_ort_genai_model_type(raw_type)
         if ort_model_type == "unknown":
             logger.warning(
                 "Could not determine ORT-GenAI model type: pkg.config.model_type "
@@ -939,10 +1080,6 @@ def write_ort_genai_config(
         # "not set" sentinel (negative IDs are never valid token positions).
         _pad = getattr(config, "pad_token_id", None)
         pad_token_id = None if (_pad is None or _pad < 0) else _pad
-
-    # Detect multimodal capabilities from the package keys
-    is_vlm = "vision_encoder" in pkg and "embedding" in pkg
-    has_speech = "audio_encoder" in pkg
 
     # Phi4MM quirk: HF reports model_type='phi' but the model package
     # includes an 'audio_encoder' component that distinguishes it from plain Phi.
@@ -967,8 +1104,41 @@ def write_ort_genai_config(
 
     result: dict[str, str] = {"genai_config": genai_path}
 
+<<<<<<< HEAD
     # Copy tokenizer files. A local hf_model_id is a local model directory, not a
     # Hub repo id; copy directly instead of calling hf_hub_download.
+=======
+    if "mtp" in pkg:
+        mtp_model = pkg["mtp"]
+        mtp_path = os.path.join(directory, "mtp_config.json")
+        with open(mtp_path, "w") as f:
+            json.dump(
+                {
+                    "model": {"filename": "mtp/model.onnx"},
+                    "inputs": [
+                        value.name
+                        for value in mtp_model.graph.inputs
+                        if value.name is not None
+                    ],
+                    "outputs": [
+                        value.name
+                        for value in mtp_model.graph.outputs
+                        if value.name is not None
+                    ],
+                    "num_nextn_predict_layers": getattr(config, "num_nextn_predict_layers", 0),
+                    "shared_embedding": "model.embed_tokens",
+                    "shared_lm_head": "lm_head",
+                    "runtime_orchestration": "external",
+                },
+                f,
+                indent=2,
+            )
+            f.write("\n")
+        result["mtp_config"] = mtp_path
+
+    # Copy tokenizer files — HF Hub takes precedence; local dir is the fallback
+    # for --config mode where no HF model ID is available.
+>>>>>>> origin/main
     if hf_model_id is not None:
         if os.path.isdir(hf_model_id):
             logger.info("Copying tokenizer files from local model directory %s", hf_model_id)
@@ -1135,6 +1305,7 @@ def auto_export(
     context_length: int = 4096,
     ep: str = "cpu",
     progress_bar: bool = True,
+    text_only: bool = False,
 ) -> dict[str, str]:
     """Build and export a model for onnxruntime-genai.
 
@@ -1157,8 +1328,19 @@ def auto_export(
         trust_remote_code: Trust remote code for HuggingFace config.
         context_length: Minimum context length for genai_config.json.
         ep: Execution provider for ``session_options`` in
-            ``genai_config.json``. Defaults to ``"cpu"``.
+            ``genai_config.json``. Defaults to ``"cpu"``. For non-CPU providers
+            this value also drives build-time ``execution_provider`` so the
+            exported ONNX graph is fused for the same provider the runtime will
+            use (e.g. ``"cuda"`` enables ``GroupQueryAttention`` fusion).
+            ``"cpu"`` builds the portable ``"default"`` graph (unchanged
+            behavior).
         progress_bar: Show progress bar during save.
+        text_only: When ``True``, export the text backbone of a multimodal
+            checkpoint as a standalone decoder-only LLM (see
+            :func:`~mobius._builder.build`). Produces a single ``model.onnx``
+            with a decoder-only ``genai_config.json`` (no vision/audio
+            sections). Currently supported for ``gemma4_unified``
+            (``google/gemma-4-12B``).
 
     Returns:
         Dict mapping output artifact names to file paths, e.g.::
@@ -1173,14 +1355,21 @@ def auto_export(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # Build ONNX graph(s) with weights
-    logger.info("Building ONNX model for %s", model_id)
+    # Build ONNX graph(s) with weights. The runtime EP (``ep``) also drives
+    # EP-aware graph construction so fused ops (e.g. GroupQueryAttention on
+    # CUDA) match the provider declared in genai_config.json. ``cpu`` maps to
+    # the portable ``default`` build to preserve historical CPU/f32 output
+    # (the CPU EP would otherwise fuse f32 GroupQueryAttention).
+    build_ep = "default" if ep == "cpu" else ep
+    logger.info("Building ONNX model for %s (build ep=%s)", model_id, build_ep)
     pkg = build(
         model_id,
         task=task,
         dtype=dtype,
         load_weights=True,
         trust_remote_code=trust_remote_code,
+        execution_provider=build_ep,
+        text_only=text_only,
     )
 
     if getattr(pkg, "config", None) is None:

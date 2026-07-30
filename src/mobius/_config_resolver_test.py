@@ -118,7 +118,9 @@ class TestConfigFromHfPhi:
         )
         result = _config_from_hf(hf)
         assert isinstance(result, ArchitectureConfig)
-        assert result.rope_type == "su"
+        # The legacy Phi-3 ``"su"`` rope_type is canonicalized to ``"longrope"``
+        # (they name the same LongRoPE algorithm); see _canonical_rope_type.
+        assert result.rope_type == "longrope"
 
     def test_phi3_partial_rotary(self):
         hf = _fake_hf_config("phi3", partial_rotary_factor=0.5)

@@ -25,6 +25,9 @@ __all__ = [
     "ControlNetModel",
     "DeepSeekOCR2CausalLMModel",
     "DeepSeekV3CausalLMModel",
+    "DeepSeekV4CausalLMModel",
+    "DFlashDraftModel",
+    "Eagle3DraftModel",
     "DiTTransformer2DModel",
     "DiffLlamaCausalLMModel",
     "DistilBertModel",
@@ -45,6 +48,7 @@ __all__ = [
     "Gemma3CausalLMModel",
     "Gemma3MultiModalModel",
     "Gemma3nCausalLMModel",
+    "Gemma4AssistantCausalLMModel",
     "Gemma4CausalLMModel",
     "Gemma4Model",
     "Gemma4UnifiedModel",
@@ -65,6 +69,7 @@ __all__ = [
     "JambaCausalLMModel",
     "JetMoeCausalLMModel",
     "Llama4CausalLMModel",
+    "LLaDAModel",
     "LLaVAModel",
     "LayerNormCausalLMModel",
     "LongcatFlashCausalLMModel",
@@ -86,8 +91,10 @@ __all__ = [
     "Phi3CausalLMModel",
     "Phi3MoECausalLMModel",
     "Phi3SmallCausalLMModel",
+    "Phi3VModel",
     "Phi4MMCausalLMModel",
     "Phi4MMMultiModalModel",
+    "Phi4SigLIPModel",
     "PhiCausalLMModel",
     "Qwen25VLCausalLMModel",
     "Qwen25VLDecoderModel",
@@ -99,6 +106,7 @@ __all__ = [
     "Qwen2VLVisionEncoderModel",
     "Qwen35CausalLMModel",
     "Qwen35MoECausalLMModel",
+    "Qwen35MtpModel",
     "Qwen35MoEVL3ModelCausalLMModel",
     "Qwen35VL3ModelCausalLMModel",
     "Qwen35VLDecoderModel",
@@ -129,6 +137,8 @@ __all__ = [
     "T2IAdapterModel",
     "T5ForConditionalGeneration",
     "UNet2DConditionModel",
+    "load_unet_lora_safetensors",
+    "remap_diffusers_unet_lora",
     "ViTModel",
     "VideoAutoencoderModel",
     "Wav2Vec2ForCTCModel",
@@ -157,10 +167,13 @@ from mobius.models.controlnet import ControlNetModel
 from mobius.models.ctrl import CTRLCausalLMModel
 from mobius.models.deepseek import DeepSeekV3CausalLMModel
 from mobius.models.deepseek_ocr2 import DeepSeekOCR2CausalLMModel
+from mobius.models.deepseek_v4 import DeepSeekV4CausalLMModel
+from mobius.models.dflash import DFlashDraftModel
 from mobius.models.diffllama import DiffLlamaCausalLMModel
 from mobius.models.distilbert import DistilBertModel
 from mobius.models.dit import DiTTransformer2DModel
 from mobius.models.doge import DogeCausalLMModel
+from mobius.models.eagle3 import Eagle3DraftModel
 from mobius.models.ernie import ErnieCausalLMModel
 from mobius.models.exaone4 import ExaOne4CausalLMModel
 from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel, MPTCausalLMModel
@@ -175,6 +188,7 @@ from mobius.models.gemma4 import (
     Gemma4Model,
     Gemma4UnifiedModel,
 )
+from mobius.models.gemma4_assistant import Gemma4AssistantCausalLMModel
 from mobius.models.glm import Glm4CausalLMModel, GlmCausalLMModel
 from mobius.models.gpt2 import GPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
@@ -189,6 +203,7 @@ from mobius.models.internlm import InternLM2CausalLMModel
 from mobius.models.internvl import InternVL2Model
 from mobius.models.jamba import JambaCausalLMModel
 from mobius.models.jetmoe import JetMoeCausalLMModel
+from mobius.models.llada import LLaDAModel
 from mobius.models.llama4 import Llama4CausalLMModel
 from mobius.models.llava import LLaVAModel
 from mobius.models.longcat_flash import LongcatFlashCausalLMModel
@@ -223,6 +238,8 @@ from mobius.models.phi import (
     PhiCausalLMModel,
 )
 from mobius.models.phi3 import Phi3CausalLMModel
+from mobius.models.phi3_v import Phi3VModel
+from mobius.models.phi4_siglip import Phi4SigLIPModel
 from mobius.models.qwen import (
     Qwen3CausalLMModel,
     QwenCausalLMModel,
@@ -251,6 +268,7 @@ from mobius.models.qwen35 import (
     Qwen35VLDecoderModel,
     Qwen35VLTextModel,
 )
+from mobius.models.qwen35_mtp import Qwen35MtpModel
 from mobius.models.qwen_image import QwenImageTransformer2DModel
 from mobius.models.qwen_image_vae import AutoencoderKLQwenImageModel
 from mobius.models.qwen_vl import (
@@ -272,7 +290,11 @@ from mobius.models.sensevoice_small import SenseVoiceSmallModel
 from mobius.models.smollm import SmolLM3CausalLMModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5ForConditionalGeneration
-from mobius.models.unet import UNet2DConditionModel
+from mobius.models.unet import (
+    UNet2DConditionModel,
+    load_unet_lora_safetensors,
+    remap_diffusers_unet_lora,
+)
 from mobius.models.vae import AutoencoderKLModel
 from mobius.models.video_vae import VideoAutoencoderModel
 from mobius.models.vit import ViTModel
