@@ -48,6 +48,7 @@ __all__ = [
     "MLP",
     "MLPMultiModalProjector",
     "Cosmos3EdgeMultiModalProjector",
+    "MobileNetV5Encoder",
     "MoELayer",
     "OffsetRMSNorm",
     "PatchEmbed",
@@ -57,6 +58,7 @@ __all__ = [
     "QuantizedEmbedding",
     "QuantizedLinear",
     "RMSNorm",
+    "RmsNorm2d",
     "SelectiveScan",
     "SiLU",
     "SigmoidTopKGate",
@@ -131,6 +133,7 @@ from mobius.components._conv import (
     Conv2d,
     Conv2dNoBias,
     ConvTranspose2d,
+    RmsNorm2d,
 )
 from mobius.components._decoder import (
     DecoderLayer,
@@ -163,6 +166,7 @@ from mobius.components._lora import LoRALinear
 from mobius.components._mamba_block import Mamba2Block as Mamba2Block
 from mobius.components._mamba_block import MambaBlock as MambaBlock
 from mobius.components._mlp import FCMLP, MLP, FusedGateUpMLP, GatedMLP
+from mobius.components._mobilenetv5 import MobileNetV5Encoder
 from mobius.components._moe import (
     MoELayer,
     SigmoidTopKGate,
