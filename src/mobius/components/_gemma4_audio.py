@@ -285,6 +285,8 @@ class Gemma4FeedForward(nn.Module):
         rms_norm_eps: Epsilon for RMSNorm.
         residual_weight: Scale applied to FF output before adding residual (0.5).
         gradient_clipping: Clamp value for numerical stability (1e9).
+        linear_cls: Projection class. Gemma 3n reuses this block with plain
+            :class:`Linear`, since its checkpoint ships no clipping bounds.
     """
 
     def __init__(
@@ -293,14 +295,15 @@ class Gemma4FeedForward(nn.Module):
         rms_norm_eps: float = 1e-6,
         residual_weight: float = 0.5,
         gradient_clipping: float = 1e9,
+        linear_cls: type[nn.Module] = ClippableLinear,
     ):
         super().__init__()
         self._residual_weight = residual_weight
         self._gradient_clipping = gradient_clipping
 
         self.pre_layer_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.ffw_layer_1 = ClippableLinear(hidden_size, hidden_size * 4, bias=False)
-        self.ffw_layer_2 = ClippableLinear(hidden_size * 4, hidden_size, bias=False)
+        self.ffw_layer_1 = linear_cls(hidden_size, hidden_size * 4, bias=False)
+        self.ffw_layer_2 = linear_cls(hidden_size * 4, hidden_size, bias=False)
         self.post_layer_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
     def forward(self, op: OpBuilder, x: ir.Value):
@@ -337,6 +340,8 @@ class Gemma4LightConv1d(nn.Module):
         conv_kernel_size: Depthwise conv kernel size (Gemma4 default: 5).
         rms_norm_eps: Epsilon for RMSNorm.
         gradient_clipping: Clamp value for numerical stability.
+        linear_cls: Projection class. Gemma 3n reuses this block with plain
+            :class:`Linear`, since its checkpoint ships no clipping bounds.
     """
 
     def __init__(
@@ -345,15 +350,16 @@ class Gemma4LightConv1d(nn.Module):
         conv_kernel_size: int = 5,
         rms_norm_eps: float = 1e-6,
         gradient_clipping: float = 1e9,
+        linear_cls: type[nn.Module] = ClippableLinear,
     ):
         super().__init__()
         self._gradient_clipping = gradient_clipping
 
         self.pre_layer_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.linear_start = ClippableLinear(hidden_size, hidden_size * 2, bias=False)
+        self.linear_start = linear_cls(hidden_size, hidden_size * 2, bias=False)
         self.depthwise_conv1d = CausalDepthwiseConv1d(hidden_size, conv_kernel_size)
         self.conv_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.linear_end = ClippableLinear(hidden_size, hidden_size, bias=False)
+        self.linear_end = linear_cls(hidden_size, hidden_size, bias=False)
 
     def forward(self, op: OpBuilder, x: ir.Value):
         residual = x
