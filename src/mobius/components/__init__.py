@@ -32,6 +32,7 @@ __all__ = [
     "GatedDeltaNet",
     "GatedMLP",
     "GatedRMSNorm",
+    "Gemma3nAudioEncoder",
     "Gemma3nMultimodalEmbedder",
     "ClippableLinear",
     "GroupNorm",
@@ -161,6 +162,7 @@ from mobius.components._encoder_decoder_attention import (
     EncoderDecoderAttention,
 )
 from mobius.components._gated_deltanet import GatedDeltaNet
+from mobius.components._gemma3n_audio import Gemma3nAudioEncoder
 from mobius.components._gemma3n_embedder import Gemma3nMultimodalEmbedder
 from mobius.components._gemma4_audio import ClippableLinear
 from mobius.components._gemma4_audio import Gemma4AudioEncoder as Gemma4AudioEncoder
