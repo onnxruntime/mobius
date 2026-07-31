@@ -139,7 +139,7 @@ ignore = [
     "incorrectly-parenthesized-tuple-in-subscript",
     "used-dummy-variable",
     "non-empty-init-module",
-    "noqa-comments",
+    "noqa-comments",  # Keep legacy # noqa selectors; Ruff 0.16 prefers ruff: ignore
     "collapsible-if",
     "if-else-block-instead-of-if-exp",
     "if-with-same-arms",
