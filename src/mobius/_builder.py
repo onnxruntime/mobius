@@ -417,7 +417,8 @@ def build(
             can use ``GroupQueryAttention`` on GQA-capable execution providers.
             Raises :class:`ValueError` if the resolved ``model_type`` has no
             text-only sibling. Currently supported for ``gemma4_unified``
-            (``google/gemma-4-12B``).
+            (``google/gemma-4-12B``) and ``qwen3_5_moe_vl``
+            (``Qwen/Qwen3.6-35B-A3B``).
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
