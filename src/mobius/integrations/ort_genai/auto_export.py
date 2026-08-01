@@ -111,6 +111,13 @@ _GEMMA4_UNIFIED_MODEL_TYPES = frozenset({"gemma4_unified", "gemma4_unified_text"
 # sub-config, so at export time ``config.model_type`` is "gemma3_text" (not
 # "gemma3").
 _GEMMA3_MODEL_TYPES = frozenset({"gemma3", "gemma3_text"})
+# gemma-3n multimodal. Like gemma-3, build() unwraps the composite config, so
+# ``config.model_type`` is "gemma3n_text" at export time. Its MobileNet-V5
+# tower takes the same fixed NCHW ``pixel_values`` as gemma-3's SigLIP (at
+# 768x768), so it shares that fixed-resize branch — but the checkpoint's
+# ``SiglipImageProcessorFast`` sets ``do_normalize=False``, i.e. pixels stay in
+# [0, 1] rather than being mapped to [-1, 1].
+_GEMMA3N_MODEL_TYPES = frozenset({"gemma3n", "gemma3n_text"})
 _PIXTRAL_MODEL_TYPES = frozenset({"mistral3"})
 _QWEN_VL_MODEL_TYPES = frozenset(
     {
@@ -464,6 +471,10 @@ def _write_vision_processor_config(
       ConvertRGB → Resize[fixed] → Rescale → Normalize → Permute3D). Uses a
       fixed-size resize (no ``smart_resize``) so the SigLIP encoder's fixed
       NCHW ``pixel_values`` input contract is met.
+    - **Gemma3n** (``gemma3n`` or ``gemma3n_text``): Same fixed-resize pipeline
+      at 768x768 for the MobileNet-V5 tower, but with the ``Normalize`` step
+      *omitted* — the checkpoint's processor sets ``do_normalize=False``, so
+      pixels stay in [0, 1] (5 steps).
     - **Pixtral / Mistral3**: Writes ``processor_config.json`` with a 7-step
       pipeline (DecodeImage → ConvertRGB → Resize → Rescale → Normalize →
       Permute3D → PixtralImageSizes).
@@ -527,16 +538,23 @@ def _write_vision_processor_config(
             }
         }
         path = os.path.join(output_dir, "image_processor.json")
-    elif model_type in _GEMMA3_MODEL_TYPES:
-        # Gemma3's SigLIP vision encoder takes a plain NCHW image tensor
-        # ([batch, 3, image_size, image_size]). The generic-VLM branch below
-        # emits smart_resize (variable HxW) and no Permute3D, leaving a
-        # variable-size HWC tensor that fails the encoder's fixed input.
-        # Emit a fixed-size resize (no smart_resize) + trailing Permute3D.
-        image_size = getattr(vision, "image_size", None) or 896
+    elif model_type in _GEMMA3_MODEL_TYPES or model_type in _GEMMA3N_MODEL_TYPES:
+        # Gemma3's SigLIP encoder and Gemma3n's MobileNet-V5 tower both take a
+        # plain NCHW image tensor ([batch, 3, image_size, image_size]). The
+        # generic-VLM branch below emits smart_resize (variable HxW) and no
+        # Permute3D, leaving a variable-size HWC tensor that fails either
+        # encoder's fixed input. Emit a fixed-size resize (no smart_resize) +
+        # trailing Permute3D.
+        is_gemma3n = model_type in _GEMMA3N_MODEL_TYPES
+        family = "gemma3n" if is_gemma3n else "gemma3"
+        image_size = getattr(vision, "image_size", None) or (768 if is_gemma3n else 896)
         image_mean = [0.5, 0.5, 0.5]
         image_std = [0.5, 0.5, 0.5]
         rescale_factor = 1.0 / 255.0
+        # Gemma3n's SiglipImageProcessorFast sets do_normalize=False: the tower
+        # is trained on [0, 1] pixels, so a mean/std-0.5 Normalize would shift
+        # them to [-1, 1] and silently degrade every caption.
+        do_normalize = not is_gemma3n
         if hf_model_id is not None:
             try:
                 from transformers import AutoProcessor
@@ -547,6 +565,9 @@ def _write_vision_processor_config(
                     image_mean = list(getattr(ip, "image_mean", image_mean))
                     image_std = list(getattr(ip, "image_std", image_std))
                     rescale_factor = getattr(ip, "rescale_factor", rescale_factor)
+                    hf_do_normalize = getattr(ip, "do_normalize", None)
+                    if hf_do_normalize is not None:
+                        do_normalize = bool(hf_do_normalize)
                     size = getattr(ip, "size", None)
                     if isinstance(size, dict):
                         image_size = (
@@ -554,10 +575,12 @@ def _write_vision_processor_config(
                         )
             except Exception:
                 logger.warning(
-                    "Could not load HF processor for %s; using gemma3 defaults "
-                    "(image_size=%s, mean/std=0.5)",
+                    "Could not load HF processor for %s; using %s defaults "
+                    "(image_size=%s, mean/std=0.5, do_normalize=%s)",
                     hf_model_id,
+                    family,
                     image_size,
+                    do_normalize,
                     exc_info=True,
                 )
         transforms = [
@@ -592,21 +615,26 @@ def _write_vision_processor_config(
                     "attrs": {"rescale_factor": rescale_factor},
                 }
             },
-            {
-                "operation": {
-                    "name": "normalize",
-                    "type": "Normalize",
-                    "attrs": {"mean": image_mean, "std": image_std},
+        ]
+        if do_normalize:
+            transforms.append(
+                {
+                    "operation": {
+                        "name": "normalize",
+                        "type": "Normalize",
+                        "attrs": {"mean": image_mean, "std": image_std},
+                    }
                 }
-            },
+            )
+        transforms.append(
             {
                 "operation": {
                     "name": "permute",
                     "type": "Permute3D",
                     "attrs": {"dims": [2, 0, 1]},
                 }
-            },
-        ]
+            }
+        )
         processor_config = {"processor": {"name": "image_processor", "transforms": transforms}}
         path = os.path.join(output_dir, "processor_config.json")
     else:
@@ -1090,6 +1118,12 @@ def write_ort_genai_config(
             # Gemma3 multimodal configs are unwrapped to the text sub-config
             # during build, but ORT GenAI needs the multimodal parent type.
             ort_model_type = "gemma3"
+        elif is_vlm and raw_type == "gemma3n_text":
+            # Same unwrapping for Gemma3n, whose parent type is "gemma3n".
+            # Deliberately *not* aliased to "gemma3": the package threads
+            # per_layer_inputs (and optional audio) that gemma3's ORT pipeline
+            # does not bind, so borrowing that type would mis-wire the graph.
+            ort_model_type = "gemma3n"
         else:
             ort_model_type = _resolve_ort_genai_model_type(raw_type)
         if ort_model_type == "unknown":

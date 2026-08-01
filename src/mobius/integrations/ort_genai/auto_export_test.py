@@ -292,6 +292,102 @@ class TestWriteProcessorConfig:
         # Trailing Permute3D matches the encoder's channels-first contract.
         assert transforms[5]["operation"]["attrs"]["dims"] == [2, 0, 1]
 
+    def test_gemma3n_vision_config_omits_normalize(self, tmp_path):
+        """Gemma3n shares gemma3's fixed resize but skips Normalize.
+
+        Its ``SiglipImageProcessorFast`` sets ``do_normalize=False``, so the
+        MobileNet-V5 tower is trained on [0, 1] pixels.  Emitting a mean/std-0.5
+        Normalize would map them to [-1, 1] and silently degrade every caption.
+        """
+        vision = mock.MagicMock()
+        vision.image_size = 768
+        vision.model_type = "gemma3n_vision"
+        config = mock.MagicMock()
+        config.vision = vision
+        # Unwrapped text-config model_type — NOT "gemma3n".
+        config.model_type = "gemma3n_text"
+
+        path = _write_vision_processor_config(config, str(tmp_path))
+        assert path is not None
+        assert path.endswith("processor_config.json")
+        with open(path) as f:
+            data = json.load(f)
+
+        transforms = data["processor"]["transforms"]
+        types = [t["operation"]["type"] for t in transforms]
+        assert types == [
+            "DecodeImage",
+            "ConvertRGB",
+            "Resize",
+            "Rescale",
+            "Permute3D",
+        ]
+
+        # Fixed 768x768 resize (MobileNet-V5 has no dynamic-resolution path).
+        resize = transforms[2]["operation"]["attrs"]
+        assert resize["smart_resize"] == 0
+        assert resize["height"] == 768
+        assert resize["width"] == 768
+        assert transforms[3]["operation"]["attrs"]["rescale_factor"] == pytest.approx(
+            1.0 / 255.0
+        )
+        assert transforms[-1]["operation"]["attrs"]["dims"] == [2, 0, 1]
+
+    def test_gemma3n_vision_config_honours_hf_do_normalize(self, tmp_path):
+        """A checkpoint that *does* normalize gets the Normalize step back."""
+        vision = mock.MagicMock()
+        vision.image_size = 768
+        config = mock.MagicMock()
+        config.vision = vision
+        config.model_type = "gemma3n_text"
+
+        image_processor = mock.MagicMock()
+        image_processor.image_mean = [0.5, 0.5, 0.5]
+        image_processor.image_std = [0.5, 0.5, 0.5]
+        image_processor.rescale_factor = 1.0 / 255.0
+        image_processor.do_normalize = True
+        image_processor.size = {"height": 768, "width": 768}
+        hf_proc = mock.MagicMock()
+        hf_proc.image_processor = image_processor
+
+        with mock.patch(
+            "transformers.AutoProcessor.from_pretrained", return_value=hf_proc
+        ):
+            path = _write_vision_processor_config(
+                config, str(tmp_path), hf_model_id="google/gemma-3n-E4B-it"
+            )
+
+        with open(path) as f:
+            transforms = json.load(f)["processor"]["transforms"]
+        types = [t["operation"]["type"] for t in transforms]
+        assert types == [
+            "DecodeImage",
+            "ConvertRGB",
+            "Resize",
+            "Rescale",
+            "Normalize",
+            "Permute3D",
+        ]
+
+    def test_gemma3_vision_config_keeps_normalize(self, tmp_path):
+        """Sharing the branch with gemma3n must not drop gemma3's Normalize."""
+        vision = mock.MagicMock()
+        vision.image_size = 896
+        vision.model_type = "siglip_vision_model"
+        config = mock.MagicMock()
+        config.vision = vision
+        config.model_type = "gemma3_text"
+
+        path = _write_vision_processor_config(config, str(tmp_path))
+
+        with open(path) as f:
+            transforms = json.load(f)["processor"]["transforms"]
+        normalize = next(
+            t["operation"] for t in transforms if t["operation"]["type"] == "Normalize"
+        )
+        assert normalize["attrs"]["mean"] == [0.5, 0.5, 0.5]
+        assert normalize["attrs"]["std"] == [0.5, 0.5, 0.5]
+
     def test_siglip_vision_config_non_gemma3_uses_generic_branch(self, tmp_path):
         """A SigLIP vision tower alone is not enough to select Gemma3 preprocessing."""
         vision = mock.MagicMock()
@@ -1131,6 +1227,53 @@ class TestExportForOrtGenai:
         with open(result["genai_config"]) as f:
             data = json.load(f)
         assert data["model"]["type"] == "gemma3"
+
+    def test_config_mode_gemma3n_text_vlm_uses_multimodal_model_type(self, tmp_path):
+        """Gemma3n unwraps to "gemma3n_text" too, and must not alias to gemma3.
+
+        Its package threads ``per_layer_inputs`` (and optional audio) that
+        gemma3's ORT pipeline does not bind, so borrowing that type would
+        mis-wire the graph.
+        """
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 768
+            model_type: str = "gemma3n_vision"
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            # build() stores the unwrapped text sub-config type on Gemma3n VLMs.
+            model_type: str = "gemma3n_text"
+            vocab_size: int = 262400
+            hidden_size: int = 64
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 4
+            num_key_value_heads: int = 2
+            head_dim: int = 16
+            max_position_embeddings: int = 128
+            image_token_id: int = 262145
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+
+        pkg = ModelPackage(
+            {
+                "decoder": _mock_model_with_inputs(
+                    ["inputs_embeds", "attention_mask", "per_layer_inputs"]
+                ),
+                "vision_encoder": _mock_model_with_inputs(["pixel_values"]),
+                "embedding": _mock_model_with_inputs(["input_ids", "image_features"]),
+            },
+            config=FakeConfig(),
+        )
+        result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+        assert data["model"]["type"] == "gemma3n"
 
     def test_config_mode_token_ids_propagated(self, tmp_path):
         """bos/eos token IDs in genai_config.json come from config fields in --config mode."""
