@@ -53,6 +53,27 @@ class QuantizationConfig:
         if not isinstance(qc, dict):
             return None
         method = qc.get("quant_method", "none")
+        # NVIDIA ModelOpt NVFP4/FP8 checkpoints (e.g. quantized Qwen3.6) encode
+        # weights as packed E2M1 (fp4) / float8 with block + global scales — a
+        # layout the INT4 ``QuantizedLinear``/``MatMulNBits`` path below would
+        # silently mis-dequantize. Checked before the ``quant_method == "none"``
+        # early-return because ModelOpt may name its scheme only via
+        # ``quant_algo``/``quant_cfg`` (no ``quant_method``). Fail loudly: the
+        # reconstruction math is available in :mod:`mobius.integrations.modelopt`,
+        # but the full weight-load integration + native routed-expert NVFP4 QMoE
+        # emission (CUDA/Blackwell, ``onnxruntime_USE_FP4_QMOE=ON``) are not wired.
+        from mobius.integrations.modelopt import is_modelopt_quant_config
+
+        if is_modelopt_quant_config(qc):
+            raise NotImplementedError(
+                "NVIDIA ModelOpt NVFP4/FP8 checkpoints are not yet fully "
+                "supported for export. The weight-reconstruction core lives in "
+                "mobius.integrations.modelopt (dequantize_nvfp4 / dequantize_fp8); "
+                "remaining work is checkpoint weight-loading and native "
+                "routed-expert NVFP4 QMoE emission (CUDA/Blackwell, "
+                "onnxruntime_USE_FP4_QMOE=ON). Export the unquantized (bf16) "
+                "checkpoint instead, or quantize the bf16 export via Olive."
+            )
         if method == "none":
             return None
         # FP8 per-tensor quantization (float8_e4m3fn + scalar scale)
