@@ -1046,7 +1046,7 @@ def _run_vl_generation(
     }
 
     # --- Step 1: vision encoder (+ host-side projector where required) ---
-    _vis_out, image_features = _run_vl_vision_to_image_features(pkg, case, processed)
+    vis_out, image_features = _run_vl_vision_to_image_features(pkg, case, processed)
 
     # --- Step 2: embedding (prefill) ---
     # VL packages use "decoder" as the decoder key
@@ -1066,6 +1066,11 @@ def _run_vl_generation(
         }
         if image_feat_input is not None:
             emb_feeds[image_feat_input] = image_features
+        # Some architectures expose additional named vision tensors consumed
+        # by the embedding graph (for example Qwen3-VL DeepStack features).
+        for name in emb_session.input_names:
+            if name not in emb_feeds and name in vis_out:
+                emb_feeds[name] = vis_out[name]
         # Provide empty tensors for unused modalities (e.g. audio_features)
         for name in emb_session.input_names:
             if name not in emb_feeds:
