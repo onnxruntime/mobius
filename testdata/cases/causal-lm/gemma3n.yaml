@@ -1,5 +1,5 @@
 model_id: "google/gemma-3n-E2B-pt"
-model_type: "gemma3n"
+model_type: "gemma3n_text"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"

@@ -42,6 +42,7 @@ from _test_configs import (
     VISION_CONFIGS,
     VL_CONFIGS,
     _base_config,
+    vl_overrides,
 )
 
 # --- ONNX Checker infrastructure (merged from onnx_checker_test.py) --------
@@ -1992,6 +1993,123 @@ class TestBuildGraphVisionLanguage:
             f"Full layer 1 should have 2 KV heads "
             f"(num_global_key_value_heads), got {layer1_key_shape[1]}"
         )
+
+    def test_gemma3n_multimodal_graph(self):
+        """Build Gemma 3n via the registry (4-model split, audio configured).
+
+        The tiny config is taken from ``VL_CONFIGS`` so this test and the
+        parametrized suite can never drift apart.
+        """
+        config = _base_config(**vl_overrides("gemma3n"))
+        module = registry.get("gemma3n")(config)
+        task_name = _default_task_for_model("gemma3n")
+        assert task_name == "gemma3n"
+        pkg = get_task(task_name).build(module, config)
+
+        assert set(pkg.keys()) == {
+            "decoder",
+            "vision_encoder",
+            "audio_encoder",
+            "embedding",
+        }, f"Gemma3n with audio should produce 4 models, got: {set(pkg.keys())}"
+
+        # --- decoder: inputs_embeds + per_layer_inputs -> logits + KV cache.
+        # The per-layer embedding tables live in the embedding sub-model, so
+        # the decoder takes their combined output as a graph input and never
+        # sees input_ids.
+        decoder = pkg["decoder"]
+        decoder_inputs = {i.name: i for i in decoder.graph.inputs}
+        assert "input_ids" not in decoder_inputs
+        assert "inputs_embeds" in decoder_inputs
+        assert "per_layer_inputs" in decoder_inputs
+        assert list(decoder_inputs["per_layer_inputs"].shape)[-1] == (
+            config.num_hidden_layers * config.hidden_size_per_layer_input
+        )
+        decoder_outputs = {o.name for o in decoder.graph.outputs}
+        assert "logits" in decoder_outputs
+        # num_kv_shared_layers=0 here, so every layer owns a cache entry.
+        assert module.decoder.kv_cache_layer_count() == config.num_hidden_layers
+        for i in range(config.num_hidden_layers):
+            assert f"past_key_values.{i}.key" in decoder_inputs
+            assert f"present.{i}.key" in decoder_outputs
+
+        # --- vision: fixed-size pixels -> [B*256, hidden], no mask.
+        vision = pkg["vision_encoder"]
+        vision_inputs = {i.name: i for i in vision.graph.inputs}
+        assert set(vision_inputs) == {"pixel_values"}
+        image_size = config.vision.image_size
+        assert list(vision_inputs["pixel_values"].shape)[1:] == [3, image_size, image_size]
+        image_features = next(o for o in vision.graph.outputs if o.name == "image_features")
+        assert len(image_features.shape) == 2
+        assert image_features.shape[-1] == config.hidden_size
+        assert component_presence(vision.graph) == "image"
+
+        # --- audio: mel frames + bool mask -> fixed-count [B*188, hidden].
+        # Unlike Gemma 4, padded rows are not stripped, so there is no
+        # companion audio_features_mask output.
+        audio = pkg["audio_encoder"]
+        audio_inputs = {i.name: i for i in audio.graph.inputs}
+        assert set(audio_inputs) == {"input_features", "input_features_mask"}
+        assert list(audio_inputs["input_features"].shape)[-1] == (
+            config.audio.input_feat_size
+        )
+        assert audio_inputs["input_features_mask"].dtype == ir.DataType.BOOL
+        assert {o.name for o in audio.graph.outputs} == {"audio_features"}
+        audio_features = next(o for o in audio.graph.outputs if o.name == "audio_features")
+        assert len(audio_features.shape) == 2
+        assert audio_features.shape[-1] == config.hidden_size
+        assert component_presence(audio.graph) == "audio"
+
+        # --- embedding: ids + both feature sets -> inputs_embeds + per_layer.
+        embedding = pkg["embedding"]
+        emb_inputs = {i.name: i for i in embedding.graph.inputs}
+        assert set(emb_inputs) == {"input_ids", "image_features", "audio_features"}
+        for name, presence in (("image_features", "image"), ("audio_features", "audio")):
+            assert optional_input_contract(emb_inputs[name]) == {
+                "presence": presence,
+                "absent": {"kind": "zeros", "shape": [0, config.hidden_size]},
+            }, name
+        assert {o.name for o in embedding.graph.outputs} == {
+            "inputs_embeds",
+            "per_layer_inputs",
+        }
+        # The embedding's per_layer_inputs must match what the decoder expects.
+        emb_per_layer = next(
+            o for o in embedding.graph.outputs if o.name == "per_layer_inputs"
+        )
+        assert list(emb_per_layer.shape)[-1] == (
+            list(decoder_inputs["per_layer_inputs"].shape)[-1]
+        )
+        # The 4.7 GB per-layer table belongs to the embedding model only.
+        assert "embedding.embed_tokens_per_layer.weight" in embedding.graph.initializers
+        assert not any("embed_tokens_per_layer" in n for n in decoder.graph.initializers)
+        # Only the *hard* embedder path is built here, so the soft-path norm
+        # (which the towers own) must not add a dangling initializer.
+        assert "embedding.embed_vision.hard_embedding_norm.weight" in (
+            embedding.graph.initializers
+        )
+        assert not any("soft_embedding_norm" in n for n in embedding.graph.initializers)
+
+    def test_gemma3n_multimodal_graph_without_audio(self):
+        """With ``config.audio=None`` the package drops the audio encoder.
+
+        The embedding model must then also drop its ``audio_features`` input,
+        or the runtime would be asked for a tensor no component produces.
+        """
+        overrides = vl_overrides("gemma3n")
+        overrides["audio"] = None
+        overrides["audio_token_id"] = None
+        config = _base_config(**overrides)
+        module = registry.get("gemma3n")(config)
+        pkg = get_task("gemma3n").build(module, config)
+
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
+        assert module.audio_encoder is None
+        emb_input_names = {i.name for i in pkg["embedding"].graph.inputs}
+        assert "image_features" in emb_input_names
+        assert "audio_features" not in emb_input_names
+        # No audio embedder weights should be built either.
+        assert not any("embed_audio" in n for n in pkg["embedding"].graph.initializers)
 
     def test_blip2_vision_language_graph(self):
         """Build BLIP-2 with ViT + Q-Former + LLM 3-model split."""

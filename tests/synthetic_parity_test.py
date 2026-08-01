@@ -150,8 +150,9 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # Gemma3n: AltUp magnitude normalization (target_mag/new_mag ratio) amplifies
     # FP differences between ORT and PyTorch, especially with random weight init.
     # Argmax correct (near-tie), cosine≥0.995, top10_jaccard=1.0 — functionally correct.
+    # Only the text entry appears here: the "gemma3n" key builds the multimodal
+    # model, which this causal-LM suite does not cover.
     "gemma3n_text": 0.1,  # ~0.094 max diff worst-case (AltUp magnitude ratio)
-    "gemma3n": 0.1,  # same architecture
     # Gemma3 VL: same QK-norm FP accumulation as gemma3_text (~0.045 max diff).
     # argmax_match=True (near-tie), cosine=0.996 — functionally correct.
     "gemma3": 0.05,
@@ -265,11 +266,6 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     # no source layer to borrow K,V from), so it is set explicitly per entry in
     # _test_configs.py rather than pinned to 0 here.
     "gemma3n_text": {
-        "query_pre_attn_scalar": TINY_HEAD_DIM,
-        "head_dim": TINY_HEAD_DIM,
-        "hidden_activation": "gelu_pytorch_tanh",
-    },
-    "gemma3n": {
         "query_pre_attn_scalar": TINY_HEAD_DIM,
         "head_dim": TINY_HEAD_DIM,
         "hidden_activation": "gelu_pytorch_tanh",
@@ -453,8 +449,6 @@ _HF_MODEL_TYPE_OVERRIDES: dict[str, str] = {
     # Gemma3Config wraps Gemma3TextConfig; tiny kwargs go to the outer config
     # but the actual model is built from text_config which retains HF defaults.
     "gemma3": "gemma3_text",
-    # Gemma3nConfig is the multimodal wrapper; text-only parity uses Gemma3nTextConfig.
-    "gemma3n": "gemma3n_text",
     # Qwen3.5-MoE outer config wraps text_config; use the text-only model type
     # so tiny kwargs (num_experts, moe_intermediate_size, etc.) apply directly.
     "qwen3_5_moe": "qwen3_5_moe_text",
