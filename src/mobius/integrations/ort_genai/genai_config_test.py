@@ -440,6 +440,62 @@ class TestGenaiConfigGeneratorVLM:
         assert emb["inputs"]["custom_input"] == "custom_input"
         assert emb["inputs"]["input_ids"] == "input_ids"
 
+    def test_deepstack_features_vector_in_vision_outputs_and_embedding_inputs(self):
+        """with_vision() accepts a ``deepstack_features`` list value.
+
+        Both ``output_names`` (vision) and ``embedding_input_names``
+        (embedding) may carry it, matching the agreed Qwen3-VL DeepStack
+        config schema. ``embedding_output_names``/decoder-side
+        ``per_layer_inputs`` stays a plain scalar name (handled generically,
+        no change needed there).
+        """
+        gen = GenaiConfigGenerator(
+            "qwen3_vl",
+            vocab_size=151936,
+            hidden_size=2048,
+            num_hidden_layers=2,
+            num_attention_heads=16,
+            num_key_value_heads=8,
+            head_dim=128,
+        ).with_vision(
+            image_token_id=151655,
+            output_names={
+                "image_features": "image_features",
+                "deepstack_features": [
+                    "deepstack_features_0",
+                    "deepstack_features_1",
+                    "deepstack_features_2",
+                ],
+            },
+            embedding_input_names={
+                "input_ids": "input_ids",
+                "image_features": "image_features",
+                "deepstack_features": [
+                    "deepstack_features_0",
+                    "deepstack_features_1",
+                    "deepstack_features_2",
+                ],
+            },
+            embedding_output_names={
+                "inputs_embeds": "inputs_embeds",
+                "per_layer_inputs": "per_layer_inputs",
+            },
+        )
+        config = gen.generate()
+        vision = config["model"]["vision"]
+        emb = config["model"]["embedding"]
+        assert vision["outputs"]["deepstack_features"] == [
+            "deepstack_features_0",
+            "deepstack_features_1",
+            "deepstack_features_2",
+        ]
+        assert emb["inputs"]["deepstack_features"] == [
+            "deepstack_features_0",
+            "deepstack_features_1",
+            "deepstack_features_2",
+        ]
+        assert emb["outputs"]["per_layer_inputs"] == "per_layer_inputs"
+
 
 class TestGenaiConfigFromConfig:
     """Test from_config() factory method."""

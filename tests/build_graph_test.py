@@ -1076,6 +1076,9 @@ class TestBuildGraphVisionLanguage:
         model_cls = registry.get("qwen3_vl")
         module = model_cls(config)
         task_name = _default_task_for_model("qwen3_vl")
+        assert task_name == "qwen3-vl-deepstack", (
+            "qwen3_vl must auto-select the DeepStack-aware task"
+        )
         task = get_task(task_name)
         pkg = task.build(module, config)
 
@@ -1088,6 +1091,68 @@ class TestBuildGraphVisionLanguage:
         decoder = pkg["decoder"]
         assert "logits" in {out.name for out in decoder.graph.outputs}
         assert "inputs_embeds" in {inp.name for inp in decoder.graph.inputs}
+
+        # DeepStack ports: D == len(deepstack_visual_indexes) == 1 here.
+        vision = pkg["vision_encoder"]
+        vision_outputs = [o.name for o in vision.graph.outputs]
+        assert vision_outputs == ["image_features", "deepstack_features_0"]
+
+        embed = pkg["embedding"]
+        embed_inputs = [i.name for i in embed.graph.inputs]
+        embed_outputs = [o.name for o in embed.graph.outputs]
+        assert embed_inputs == ["input_ids", "image_features", "deepstack_features_0"]
+        assert embed_outputs == ["inputs_embeds", "per_layer_inputs"]
+
+        decoder_inputs = {inp.name for inp in decoder.graph.inputs}
+        assert "per_layer_inputs" in decoder_inputs
+        per_layer_input = next(
+            inp for inp in decoder.graph.inputs if inp.name == "per_layer_inputs"
+        )
+        # D * hidden_size == 1 * config.hidden_size
+        assert per_layer_input.shape[-1] == config.hidden_size
+
+        # Every vision output must feed a matching embedding input (by name),
+        # and every embedding output must feed a matching decoder input.
+        assert set(vision_outputs).issubset(set(embed_inputs))
+        assert set(embed_outputs).issubset(decoder_inputs | {"inputs_embeds"})
+
+    def test_qwen3_vl_no_deepstack_graph(self):
+        """D == 0 must degrade to the plain (non-DeepStack) I/O contract.
+
+        No ``deepstack_features_i``/``per_layer_inputs`` ports.
+        """
+        config = _base_config(
+            attn_qk_norm=True,
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                patch_size=16,
+                in_channels=3,
+                out_hidden_size=64,
+                num_position_embeddings=16,
+            ),
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+            image_token_id=151655,
+            mrope_section=[8, 12, 12],
+        )
+        model_cls = registry.get("qwen3_vl")
+        module = model_cls(config)
+        task = get_task(_default_task_for_model("qwen3_vl"))
+        pkg = task.build(module, config)
+
+        vision_outputs = [o.name for o in pkg["vision_encoder"].graph.outputs]
+        assert vision_outputs == ["image_features"]
+
+        embed_inputs = [i.name for i in pkg["embedding"].graph.inputs]
+        embed_outputs = [o.name for o in pkg["embedding"].graph.outputs]
+        assert embed_inputs == ["input_ids", "image_features"]
+        assert embed_outputs == ["inputs_embeds"]
+
+        decoder_inputs = {inp.name for inp in pkg["decoder"].graph.inputs}
+        assert "per_layer_inputs" not in decoder_inputs
 
     def test_qwen35_vl_graph(self):
         """Build Qwen3.5-VL with its auto-detected 3-model task."""
@@ -1119,6 +1184,10 @@ class TestBuildGraphVisionLanguage:
         model_cls = registry.get("qwen3_5_vl")
         module = model_cls(config)
         task_name = _default_task_for_model("qwen3_5_vl")
+        assert task_name != "qwen3-vl-deepstack", (
+            "Qwen3.5-VL must keep using its own (non-DeepStack) task; the new "
+            "Qwen3-VL DeepStack task must not be reused here"
+        )
         task = get_task(task_name)
         pkg = task.build(module, config)
 
@@ -1139,6 +1208,53 @@ class TestBuildGraphVisionLanguage:
         assert "present.0.recurrent_state" in output_names
         assert "present.1.key" in output_names
         assert "present.1.value" in output_names
+
+        # Regression: even though this config sets deepstack_visual_indexes=[0]
+        # (same as the Qwen3-VL DeepStack test above), Qwen3.5-VL's task/model
+        # classes are untouched by this work, so no deepstack_features_i or
+        # per_layer_inputs ports should appear anywhere in the 3-model split.
+        vision_outputs = {o.name for o in pkg["vision_encoder"].graph.outputs}
+        embed_inputs = {i.name for i in pkg["embedding"].graph.inputs}
+        embed_outputs = {o.name for o in pkg["embedding"].graph.outputs}
+        assert vision_outputs == {"image_features"}
+        assert embed_inputs == {"input_ids", "image_features"}
+        assert embed_outputs == {"inputs_embeds"}
+        assert "per_layer_inputs" not in {inp.name for inp in decoder.graph.inputs}
+
+    def test_qwen2_5_vl_graph_has_no_deepstack_ports(self):
+        """Regression: Qwen2.5-VL's 3-model split gets no DeepStack ports."""
+        config = _base_config(
+            attn_qkv_bias=True,
+            mrope_section=[8, 12, 12],
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                patch_size=14,
+                in_channels=3,
+                out_hidden_size=64,
+            ),
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+            fullatt_block_indexes=[1],
+            image_token_id=151655,
+        )
+        model_cls = registry.get("qwen2_5_vl")
+        module = model_cls(config)
+        task_name = _default_task_for_model("qwen2_5_vl")
+        assert task_name != "qwen3-vl-deepstack"
+        task = get_task(task_name)
+        pkg = task.build(module, config)
+
+        vision_outputs = {o.name for o in pkg["vision_encoder"].graph.outputs}
+        embed_inputs = {i.name for i in pkg["embedding"].graph.inputs}
+        embed_outputs = {o.name for o in pkg["embedding"].graph.outputs}
+        decoder_inputs = {inp.name for inp in pkg["decoder"].graph.inputs}
+        assert vision_outputs == {"image_features"}
+        assert embed_inputs == {"input_ids", "image_features"}
+        assert embed_outputs == {"inputs_embeds"}
+        assert "per_layer_inputs" not in decoder_inputs
 
     def test_qwen3_vl_single_model_graph(self):
         """Build Qwen3-VL with single-model Qwen3VLVisionLanguageTask."""

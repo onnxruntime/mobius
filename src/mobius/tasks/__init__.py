@@ -52,6 +52,7 @@ __all__ = [
     "ObjectDetectionTask",
     "Phi4MMMultiModalTask",
     "PixtralVLTask",
+    "Qwen3VLDeepStackTask",
     "Qwen3VLVisionLanguageTask",
     "QwenImageVAETask",
     "QwenVLTask",
@@ -106,6 +107,7 @@ from mobius.tasks._moshi import MoshiDepformerTask, MoshiTemporalTask
 from mobius.tasks._multimodal import MultiModalTask
 from mobius.tasks._object_detection import ObjectDetectionTask
 from mobius.tasks._phi4mm_multimodal import Phi4MMMultiModalTask
+from mobius.tasks._qwen3_vl_deepstack import Qwen3VLDeepStackTask
 from mobius.tasks._qwen35_mtp import Qwen35MtpTask
 from mobius.tasks._qwen_image_vae import QwenImageVAETask
 from mobius.tasks._rnnt import RNNTTask
@@ -157,6 +159,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "mllama-vision-language": MllamaVisionLanguageTask,
     "qwen-vl": QwenVLTask,
     "hybrid-qwen-vl": HybridQwenVLTask,
+    "qwen3-vl-deepstack": Qwen3VLDeepStackTask,
     "qwen3-vl-vision-language": Qwen3VLVisionLanguageTask,
     "gemma4": Gemma4Task,
     "gemma4-text-generation": Gemma4TextCausalLMTask,

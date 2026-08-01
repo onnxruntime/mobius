@@ -606,7 +606,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "qwen3_5_moe_vl": ModelRegistration(Qwen35MoEVL3ModelCausalLMModel, task="hybrid-qwen-vl"),
     "qwen3_5_vl": ModelRegistration(Qwen35VL3ModelCausalLMModel, task="hybrid-qwen-vl"),
     "qwen3_5_vl_text": ModelRegistration(Qwen35VLTextModel),
-    "qwen3_vl": ModelRegistration(Qwen3VL3ModelCausalLMModel, task="qwen-vl"),
+    "qwen3_vl": ModelRegistration(Qwen3VL3ModelCausalLMModel, task="qwen3-vl-deepstack"),
     "qwen3_vl_single": ModelRegistration(
         Qwen3VLCausalLMModel, task="qwen3-vl-vision-language"
     ),

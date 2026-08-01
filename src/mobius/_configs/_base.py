@@ -494,6 +494,10 @@ class ArchitectureConfig(BaseModelConfig):
     # Vision shared fields (accessed as top-level config.X by tasks)
     mm_tokens_per_image: int | None = None
     image_token_id: int | None = None
+    # Video placeholder token ID (Qwen3-VL DeepStack: images and video frames
+    # share one flat visual-feature stream, so the embedding scatter mask is
+    # ``(input_ids == image_token_id) | (input_ids == video_token_id)``).
+    video_token_id: int | None = None
     spatial_merge_size: int = 2
     temporal_patch_size: int = 2
     deepstack_visual_indexes: list[int] | None = None

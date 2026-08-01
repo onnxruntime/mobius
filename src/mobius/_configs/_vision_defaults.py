@@ -101,6 +101,7 @@ def apply_vision_defaults(config, parent_config, model_type: str, fields: dict) 
     # per-model hook may overwrite later via fields.update(...).
     fields["mm_tokens_per_image"] = getattr(vision_source, "mm_tokens_per_image", None)
     fields["image_token_id"] = getattr(vision_source, "image_token_id", None)
+    fields["video_token_id"] = getattr(vision_source, "video_token_id", None)
 
     # MRoPE section — only for composite VL models (parent_config != config).
     if parent_config is not None and parent_config is not config:

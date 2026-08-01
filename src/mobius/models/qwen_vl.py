@@ -759,21 +759,24 @@ class Qwen3VLCausalLMModel(nn.Module):
 
 
 class Qwen3VL3ModelCausalLMModel(nn.Module):
-    """Qwen3-VL vision-language model (3-model split).
+    """Qwen3-VL vision-language model (3-model split), with DeepStack.
 
     Builds three separate ONNX models for onnxruntime-genai:
 
     - ``decoder``: text decoder taking ``inputs_embeds`` (interleaved MRoPE)
+      plus an optional packed ``per_layer_inputs`` DeepStack tensor
     - ``vision_encoder``: packed-attention ViT outputting merged features
-    - ``embedding``: token embedding + image feature fusion
+      plus ``D`` DeepStack intermediate features
+    - ``embedding``: token/image/video feature fusion, producing
+      ``inputs_embeds`` and the packed ``per_layer_inputs`` DeepStack tensor
 
-    .. note::
-       DeepStack intermediate feature injection is not used in the
-       3-model split; only the final merged vision features are passed
-       to the embedding model.
+    ``D`` (the number of DeepStack features) is derived from
+    ``len(config.deepstack_visual_indexes)`` and is 0 for configs that don't
+    set it, in which case this behaves exactly like the pre-DeepStack
+    3-model split. Built via :class:`~mobius.tasks.Qwen3VLDeepStackTask`.
     """
 
-    default_task: str = "qwen-vl"
+    default_task: str = "qwen3-vl-deepstack"
     category: str = "Multimodal"
     config_class: type = ArchitectureConfig
 
@@ -781,8 +784,8 @@ class Qwen3VL3ModelCausalLMModel(nn.Module):
         super().__init__()
         self.config = config
         self.decoder = Qwen3VLDecoderModel(config)
-        self.vision_encoder = Qwen3VLVisionEncoderModel(config)
-        self.embedding = Qwen3VLEmbeddingModel(config)
+        self.vision_encoder = Qwen3VLDeepStackVisionEncoderModel(config)
+        self.embedding = Qwen3VLDeepStackEmbeddingModel(config)
 
     def forward(self, op: OpBuilder, **kwargs):
         raise NotImplementedError(
@@ -853,6 +856,15 @@ class Qwen3VLDecoderModel(nn.Module):
 
     Uses interleaved MRoPE with 3D ``position_ids`` of shape
     ``(3, batch, seq_len)``. QK normalization is enabled.
+
+    When ``config.deepstack_visual_indexes`` is non-empty, also accepts an
+    optional ``per_layer_inputs [B, S, D*H]`` tensor (produced by
+    :class:`Qwen3VLDeepStackEmbeddingModel`) that is unpacked into ``D``
+    ``[B, S, H]`` slices and added to the hidden state after each of the
+    first ``D`` decoder layers — equivalent to HF's
+    ``hidden_states[visual_pos_masks] += deepstack_visual_embeds[layer_idx]``.
+    ``D`` is derived from ``len(config.deepstack_visual_indexes)``, never
+    hardcoded.
     """
 
     def __init__(self, config: ArchitectureConfig):
@@ -862,6 +874,7 @@ class Qwen3VLDecoderModel(nn.Module):
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
+        self._num_deepstack_layers = len(config.deepstack_visual_indexes or [])
 
     def forward(
         self,
@@ -870,7 +883,22 @@ class Qwen3VLDecoderModel(nn.Module):
         attention_mask: ir.Value,
         position_ids: ir.Value,
         past_key_values: list | None = None,
+        per_layer_inputs: ir.Value | None = None,
     ):
+        deepstack_inputs: list[ir.Value] | None = None
+        if self._num_deepstack_layers and per_layer_inputs is not None:
+            num_layers = self._num_deepstack_layers
+            hidden_size = self.config.hidden_size
+            # [B, S, D*H] → [B, S, D, H]
+            per_layer_4d = op.Reshape(
+                per_layer_inputs,
+                op.Constant(value_ints=[0, 0, num_layers, hidden_size]),
+            )
+            deepstack_inputs = [
+                op.Squeeze(op.Slice(per_layer_4d, starts=[i], ends=[i + 1], axes=[2]), [2])
+                for i in range(num_layers)
+            ]
+
         hidden_states, present_key_values = self.model(
             op,
             input_ids=None,
@@ -878,6 +906,7 @@ class Qwen3VLDecoderModel(nn.Module):
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
+            deepstack_inputs=deepstack_inputs,
         )
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
@@ -1010,3 +1039,150 @@ class Qwen3VLEmbeddingModel(Qwen25VLEmbeddingModel):
                         new_key = new_key[len(prefix) :]
                 renamed[new_key] = value
         return renamed
+
+
+# ---------------------------------------------------------------------------
+# Qwen3-VL DeepStack 3-model split (separate from the plain Qwen3-VL /
+# Qwen3.5-VL 3-model classes above, which stay untouched so their exported
+# contract does not change).
+# ---------------------------------------------------------------------------
+
+
+class Qwen3VLDeepStackVisionEncoderModel(Qwen3VLVisionEncoderModel):
+    """Qwen3-VL vision encoder for the 3-model split, with DeepStack outputs.
+
+    Identical to :class:`Qwen3VLVisionEncoderModel` except ``forward`` keeps
+    (rather than drops) the ``D`` intermediate DeepStack features, so the
+    ONNX graph exposes ``image_features`` plus ``D`` ``deepstack_features_i``
+    outputs (``D == len(config.deepstack_visual_indexes)``, never hardcoded).
+
+    Weight preprocessing is unchanged (inherited): the ``deepstack_merger_list``
+    weights are already covered by the parent's blanket ``visual.*`` copy,
+    since :class:`~mobius.components._qwen3_vl_vision.Qwen3VLPatchMerger`
+    (used for both the final merger and each ``deepstack_merger_list[i]``)
+    already uses HF-native ``linear_fc1``/``linear_fc2`` attribute names.
+    """
+
+    def forward(
+        self,
+        op: OpBuilder,
+        pixel_values: ir.Value,
+        image_grid_thw: ir.Value,
+    ):
+        outputs = self.visual(
+            op,
+            hidden_states=pixel_values,
+            grid_thw=image_grid_thw,
+        )
+        # Keep the merged features plus every DeepStack feature (in
+        # deepstack_visual_indexes order); the vision component already
+        # returns them as (merged, *deepstack_features).
+        if isinstance(outputs, tuple):
+            return outputs
+        return (outputs,)
+
+
+class Qwen3VLDeepStackEmbeddingModel(Qwen3VLEmbeddingModel):
+    """Qwen3-VL embedding model for the 3-model split, with DeepStack support.
+
+    In addition to the inherited image/video-feature fusion into
+    ``inputs_embeds``, this variant accepts ``D`` ``deepstack_features_i``
+    inputs and scatters each of them (using the same visual-token positions
+    and ordering as ``image_features``) into a packed, zero-elsewhere
+    ``per_layer_inputs [B, S, D*H]`` output consumed by
+    :class:`Qwen3VLDecoderModel`. ``D`` is derived from
+    ``len(config.deepstack_visual_indexes)``, never hardcoded.
+
+    The visual-token mask combines image AND video placeholder tokens
+    (``input_ids == image_token_id) | (input_ids == video_token_id)``),
+    matching HF's ``image_mask | video_mask`` since Mobius's 3-model split
+    already merges all visual patches (image and video frames alike) into a
+    single flat ``image_features``/``deepstack_features_i`` stream.
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__(config)
+        self.video_token_id: int | None = config.video_token_id
+        self._num_deepstack_layers = len(config.deepstack_visual_indexes or [])
+
+    def _visual_mask_and_indices(
+        self, op: OpBuilder, input_ids: ir.Value
+    ) -> tuple[ir.Value, ir.Value]:
+        """Combined image-or-video mask (3D) and per-token gather indices.
+
+        Both ``image_features`` and every ``deepstack_features_i`` share the
+        same flat visual-token ordering, so the mask and cumsum-derived
+        indices computed here are reused for all of them.
+        """
+        visual_mask = op.Equal(input_ids, op.Constant(value_int=self.image_token_id))
+        if self.video_token_id is not None:
+            video_mask = op.Equal(input_ids, op.Constant(value_int=self.video_token_id))
+            visual_mask = op.Or(visual_mask, video_mask)
+        visual_mask_3d = op.Unsqueeze(visual_mask, [-1])
+
+        mask_int = op.Cast(visual_mask, to=7)  # INT64
+        cumsum = op.CumSum(mask_int, op.Constant(value_int=1))
+        indices = op.Sub(cumsum, op.Constant(value_int=1))
+        indices = op.Clip(indices, op.Constant(value_int=0))
+        return visual_mask_3d, indices
+
+    def _scatter(
+        self,
+        op: OpBuilder,
+        mask_3d: ir.Value,
+        indices: ir.Value,
+        features: ir.Value,
+        fallback: ir.Value,
+    ) -> ir.Value:
+        """Gather ``features`` at ``indices`` and select via ``mask_3d``.
+
+        Pads ``features`` with one zero row before ``Gather`` so the op is
+        safe even when ``features`` is empty (text-only input, N == 0); the
+        ``Where`` mask guarantees the padding row is never selected.
+        """
+        pad_row = op.Expand(
+            op.CastLike(0.0, features),
+            op.Concat(
+                op.Constant(value_ints=[1]),
+                op.Shape(features, start=1, end=2),
+                axis=0,
+            ),
+        )
+        padded = op.Concat(features, pad_row, axis=0)
+        gathered = op.Gather(padded, indices, axis=0)
+        return op.Where(mask_3d, gathered, fallback)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        input_ids: ir.Value,
+        image_features: ir.Value,
+        deepstack_features: list[ir.Value] | None = None,
+    ):
+        if deepstack_features:
+            assert len(deepstack_features) == self._num_deepstack_layers, (
+                f"Expected {self._num_deepstack_layers} deepstack_features "
+                f"(len(config.deepstack_visual_indexes)), got "
+                f"{len(deepstack_features)}"
+            )
+        text_embeds = self.embed_tokens(op, input_ids)
+        mask_3d, indices = self._visual_mask_and_indices(op, input_ids)
+
+        inputs_embeds = self._scatter(op, mask_3d, indices, image_features, text_embeds)
+        outputs: dict[str, ir.Value] = {"inputs_embeds": inputs_embeds}
+
+        if deepstack_features:
+            zero = op.CastLike(0.0, inputs_embeds)
+            per_layer_slices = [
+                op.Unsqueeze(
+                    self._scatter(op, mask_3d, indices, feature, zero),
+                    [2],
+                )
+                for feature in deepstack_features
+            ]
+            # [B, S, 1, H] * D → [B, S, D, H] → [B, S, D*H]
+            stacked = op.Concat(*per_layer_slices, axis=2)
+            per_layer_inputs = op.Reshape(stacked, op.Constant(value_ints=[0, 0, -1]))
+            outputs["per_layer_inputs"] = per_layer_inputs
+
+        return outputs

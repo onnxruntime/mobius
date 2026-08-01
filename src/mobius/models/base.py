@@ -174,6 +174,7 @@ class TextModel(nn.Module):
         position_ids: ir.Value,
         past_key_values: list | None = None,
         inputs_embeds: ir.Value | None = None,
+        deepstack_inputs: list[ir.Value] | None = None,
     ):
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
@@ -306,6 +307,16 @@ class TextModel(nn.Module):
                 past_key_value=past_kv,
             )
             present_key_values.append(present_kv)
+
+            # DeepStack-style intermediate feature injection (Qwen3-VL): add
+            # a pre-scattered, zero-elsewhere per-layer feature tensor after
+            # each of the first ``len(deepstack_inputs)`` layers. Generic and
+            # architecture-agnostic (opt-in via ``deepstack_inputs=None``
+            # default), matching HF's ``hidden_states[mask] += visual_embeds``
+            # semantics since the caller already zeroed non-visual positions.
+            if deepstack_inputs is not None and layer_idx < len(deepstack_inputs):
+                hidden_states = op.Add(hidden_states, deepstack_inputs[layer_idx])
+
             if layer_idx in capture_set:
                 captured_by_index[layer_idx] = hidden_states
 

@@ -675,6 +675,95 @@ class TestWriteProcessorConfig:
         assert resize["patch_size"] == 14
         assert resize["min_pixels"] == 3136
         assert resize["max_pixels"] == 12845056
+    def _qwen_vl_config(self, model_type):
+        """Build a mock config for the Qwen-VL processor-config branch."""
+        vision = mock.MagicMock()
+        vision.image_size = None
+        vision.patch_size = 14
+        vision.spatial_merge_size = 2
+        vision.model_type = None
+        config = mock.MagicMock()
+        config.vision = vision
+        config.model_type = model_type
+        config.spatial_merge_size = 2
+        config.temporal_patch_size = 2
+        return config
+
+    def _qwen_vl_processor_and_normalize(self, tmp_path, model_type):
+        """Write processor_config.json for ``model_type`` and return (proc, normalize_attrs)."""
+        config = self._qwen_vl_config(model_type)
+        path = _write_vision_processor_config(config, str(tmp_path))
+        assert path is not None
+        with open(path) as f:
+            data = json.load(f)
+        proc = data["processor"]
+        transforms = proc["transforms"]
+        normalize = next(
+            t["operation"]["attrs"]
+            for t in transforms
+            if t["operation"]["type"] == "Normalize"
+        )
+        return proc, normalize, transforms
+
+    def test_qwen3_vl_processor_config_uses_native_defaults(self, tmp_path):
+        """Qwen3-VL-native processor_config uses SigLIP defaults, correct name/flag.
+
+        Regression target for the previously-hardcoded ``qwen2_5_image_processor``
+        name, CLIP mean/std, and ``qwen2_5_vl`` Normalize flag that were being
+        emitted for Qwen3-VL (should have been Qwen3-VL-native values).
+        """
+        proc, normalize, transforms = self._qwen_vl_processor_and_normalize(
+            tmp_path, "qwen3_vl"
+        )
+
+        assert proc["name"] == "qwen3_vl_image_processor"
+        assert normalize["mean"] == pytest.approx([0.5, 0.5, 0.5])
+        assert normalize["std"] == pytest.approx([0.5, 0.5, 0.5])
+        assert normalize["qwen3_vl"] == 1
+        assert "qwen2_5_vl" not in normalize
+
+        resize = next(
+            t["operation"]["attrs"] for t in transforms if t["operation"]["type"] == "Resize"
+        )
+        assert resize["min_pixels"] == 65536
+        assert resize["max_pixels"] == 16777216
+
+        types = [t["operation"]["type"] for t in transforms]
+        assert types == [
+            "DecodeImage",
+            "ConvertRGB",
+            "Resize",
+            "Rescale",
+            "Normalize",
+            "PatchImage",
+        ]
+
+    def test_qwen3_vl_text_processor_config_uses_native_defaults(self, tmp_path):
+        """``qwen3_vl_text`` (decoder-only variant) gets the same native defaults as ``qwen3_vl``."""
+        proc, normalize, _ = self._qwen_vl_processor_and_normalize(tmp_path, "qwen3_vl_text")
+
+        assert proc["name"] == "qwen3_vl_image_processor"
+        assert normalize["qwen3_vl"] == 1
+
+    def test_qwen2_5_vl_processor_config_unaffected_by_qwen3_vl_defaults(self, tmp_path):
+        """Regression: Qwen2.5-VL keeps its pre-existing CLIP/qwen2_5_vl contract."""
+        proc, normalize, _ = self._qwen_vl_processor_and_normalize(tmp_path, "qwen2_5_vl")
+
+        assert proc["name"] == "qwen2_5_image_processor"
+        assert normalize["mean"] == pytest.approx([0.48145466, 0.4578275, 0.40821073])
+        assert normalize["std"] == pytest.approx([0.26862954, 0.26130258, 0.27577711])
+        assert normalize["qwen2_5_vl"] == 1
+        assert "qwen3_vl" not in normalize
+
+    def test_qwen3_5_vl_processor_config_uses_qwen3_defaults(self, tmp_path):
+        """Qwen3.5-VL uses the source-validated Qwen3 processor contract."""
+        proc, normalize, _ = self._qwen_vl_processor_and_normalize(tmp_path, "qwen3_5_vl")
+
+        assert proc["name"] == "qwen3_vl_image_processor"
+        assert normalize["mean"] == pytest.approx([0.5, 0.5, 0.5])
+        assert normalize["std"] == pytest.approx([0.5, 0.5, 0.5])
+        assert normalize["qwen3_vl"] == 1
+        assert "qwen2_5_vl" not in normalize
 
 
 class TestFixTokenizerConfig:
@@ -2104,6 +2193,54 @@ class TestGraphInputNames:
         ]
 
 
+class TestGroupDeepstackNames:
+    """Tests for _group_deepstack_names().
+
+    Flat ``deepstack_features_i`` names (from generic graph introspection)
+    are collapsed into a single ordered ``deepstack_features`` vector,
+    matching the agreed Qwen3-VL DeepStack ORT-GenAI config schema.
+    """
+
+    def test_none_passthrough(self):
+        from mobius.integrations.ort_genai.auto_export import _group_deepstack_names
+
+        assert _group_deepstack_names(None) is None
+
+    def test_no_deepstack_names_unchanged(self):
+        from mobius.integrations.ort_genai.auto_export import _group_deepstack_names
+
+        mapping = {"input_ids": "input_ids", "image_features": "image_features"}
+        assert _group_deepstack_names(mapping) == mapping
+
+    def test_groups_in_numeric_order_regardless_of_dict_order(self):
+        from mobius.integrations.ort_genai.auto_export import _group_deepstack_names
+
+        mapping = {
+            "image_features": "image_features",
+            "deepstack_features_2": "deepstack_features_2",
+            "deepstack_features_0": "deepstack_features_0",
+            "deepstack_features_1": "deepstack_features_1",
+            "input_ids": "input_ids",
+        }
+        result = _group_deepstack_names(mapping)
+        assert result["deepstack_features"] == [
+            "deepstack_features_0",
+            "deepstack_features_1",
+            "deepstack_features_2",
+        ]
+        assert result["image_features"] == "image_features"
+        assert result["input_ids"] == "input_ids"
+        assert "deepstack_features_0" not in result
+        assert "deepstack_features_1" not in result
+        assert "deepstack_features_2" not in result
+
+    def test_single_deepstack_name(self):
+        from mobius.integrations.ort_genai.auto_export import _group_deepstack_names
+
+        result = _group_deepstack_names({"deepstack_features_0": "deepstack_features_0"})
+        assert result == {"deepstack_features": ["deepstack_features_0"]}
+
+
 class TestGemma4RealModel:
     """Build a real tiny Gemma4 model and verify genai config inputs."""
 
@@ -2521,3 +2658,110 @@ class TestGemma4RealModel:
             saved = json.load(f)
         assert saved["model"]["type"] == "phi4mm"
         assert "speech" in saved["model"]
+
+
+class TestQwen3VLDeepStackGenaiConfig:
+    """Build a real tiny Qwen3-VL DeepStack model and verify the config.
+
+    Checks that the ORT-GenAI config emits vector-valued
+    ``deepstack_features`` mappings plus scalar ``per_layer_inputs``
+    mappings, per the agreed contract.
+
+    NOTE: the released onnxruntime-genai runtime does not yet parse
+    list-valued vision/embedding fields — see
+    ``mobius.integrations.ort_genai.auto_export._group_deepstack_names``.
+    """
+
+    def _build_pkg(self, num_deepstack: int):
+        from mobius._builder import build_from_module
+        from mobius._config_resolver import _default_task_for_model
+        from mobius._configs import ArchitectureConfig, VisionConfig
+        from mobius._registry import registry
+        from mobius.tasks import get_task
+
+        config = ArchitectureConfig(
+            model_type="qwen3_vl",
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="silu",
+            pad_token_id=0,
+            image_token_id=151655,
+            video_token_id=151656,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+            attn_qk_norm=True,
+            mrope_section=[2, 3, 3],
+            deepstack_visual_indexes=list(range(num_deepstack)),
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=max(num_deepstack, 2),
+                num_attention_heads=4,
+                patch_size=16,
+                in_channels=3,
+                out_hidden_size=32,
+                num_position_embeddings=16,
+            ),
+        )
+        model_cls = registry.get("qwen3_vl")
+        module = model_cls(config)
+        task_name = _default_task_for_model("qwen3_vl")
+        assert task_name == "qwen3-vl-deepstack"
+        task = get_task(task_name)
+        pkg = build_from_module(module, config, task=task)
+        pkg.config = config
+        return pkg
+
+    def test_deepstack_features_emitted_as_vectors(self, tmp_path):
+        pkg = self._build_pkg(num_deepstack=3)
+        result = write_ort_genai_config(pkg, str(tmp_path))
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+
+        model = data["model"]
+        vision_outputs = model["vision"]["outputs"]
+        embedding_inputs = model["embedding"]["inputs"]
+        embedding_outputs = model["embedding"]["outputs"]
+        decoder_inputs = model["decoder"]["inputs"]
+
+        # vision.outputs.deepstack_features: vector of ONNX graph names, in
+        # deepstack_visual_indexes order.
+        assert vision_outputs["image_features"] == "image_features"
+        assert vision_outputs["deepstack_features"] == [
+            "deepstack_features_0",
+            "deepstack_features_1",
+            "deepstack_features_2",
+        ]
+
+        # embedding.inputs.deepstack_features: same vector.
+        assert embedding_inputs["image_features"] == "image_features"
+        assert embedding_inputs["deepstack_features"] == [
+            "deepstack_features_0",
+            "deepstack_features_1",
+            "deepstack_features_2",
+        ]
+
+        # embedding.outputs.per_layer_inputs / decoder.inputs.per_layer_inputs:
+        # scalar names (already-supported ORT-GenAI field, Gemma4 precedent).
+        assert embedding_outputs["per_layer_inputs"] == "per_layer_inputs"
+        assert decoder_inputs["per_layer_inputs"] == "per_layer_inputs"
+
+    def test_no_deepstack_omits_vector_fields(self, tmp_path):
+        """D == 0: no deepstack_features/per_layer_inputs fields anywhere."""
+        pkg = self._build_pkg(num_deepstack=0)
+        result = write_ort_genai_config(pkg, str(tmp_path))
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+
+        model = data["model"]
+        assert "deepstack_features" not in model["vision"]["outputs"]
+        assert "deepstack_features" not in model["embedding"]["inputs"]
+        assert "per_layer_inputs" not in model["embedding"]["outputs"]
+        assert "per_layer_inputs" not in model["decoder"]["inputs"]
+        assert model["vision"]["outputs"]["image_features"] == "image_features"

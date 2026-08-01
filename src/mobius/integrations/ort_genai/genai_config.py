@@ -270,8 +270,8 @@ class GenaiConfigGenerator:
         spatial_merge_size: int | None = 2,
         config_filename: str = "image_processor.json",
         input_names: dict[str, str] | None = None,
-        output_names: dict[str, str] | None = None,
-        embedding_input_names: dict[str, str] | None = None,
+        output_names: dict[str, str | list[str]] | None = None,
+        embedding_input_names: dict[str, str | list[str]] | None = None,
         embedding_output_names: dict[str, str] | None = None,
         vision_start_token_id: int | None = None,
         video_token_id: int | None = None,
@@ -293,13 +293,22 @@ class GenaiConfigGenerator:
             input_names: Override vision model input name mapping.
                 Defaults to pixel_values + image_grid_thw.
             output_names: Override vision model output name mapping.
-                Defaults to image_features.
+                Defaults to image_features. A ``"deepstack_features"`` key
+                may hold a ``list[str]`` of ONNX graph output names (Qwen3-VL
+                DeepStack, ``deepstack_visual_indexes`` order) — see
+                ``auto_export._group_deepstack_names``. NOTE: the released
+                onnxruntime-genai runtime does not yet support list-valued
+                fields here; see that helper's docstring.
             embedding_input_names: Override embedding model input name
                 mapping.  When provided (e.g. from ONNX graph
                 introspection), used directly.  Defaults to
-                input_ids + image_features.
+                input_ids + image_features. May likewise carry a
+                ``"deepstack_features"`` list entry (same caveat as above).
             embedding_output_names: Override embedding model output name
-                mapping. Defaults to inputs_embeds.
+                mapping. Defaults to inputs_embeds. May include a scalar
+                ``per_layer_inputs`` entry (Qwen3-VL DeepStack /
+                Gemma4-style per-layer packed features) — this is already a
+                supported scalar field in onnxruntime-genai.
             vision_start_token_id: Token ID for ``<|vision_start|>``.
             video_token_id: Token ID for video placeholders.
             tokens_per_second: Video/image timestamp rate for Qwen3-VL.

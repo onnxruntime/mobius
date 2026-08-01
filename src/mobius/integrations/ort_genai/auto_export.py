@@ -51,6 +51,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 from typing import TYPE_CHECKING, Any
 
@@ -136,6 +137,7 @@ _QWEN3_VL_MODEL_TYPES = frozenset(
 _QWEN_VL_MODEL_TYPES = frozenset(
     _QWEN2_VL_MODEL_TYPES | _QWEN3_VL_MODEL_TYPES | {"videochat_flash_qwen"}
 )
+_QWEN3_VL_NATIVE_MODEL_TYPES = frozenset({"qwen3_vl", "qwen3_vl_text"})
 
 _QWEN_VISION_DEFAULTS: dict[str, dict[str, Any]] = {
     "qwen2": {
@@ -238,6 +240,49 @@ def _introspect_outputs(pkg: ModelPackage, key: str) -> dict[str, str] | None:
     if model is None:
         return None
     return {out.name: out.name for out in model.graph.outputs if out.name is not None}
+
+
+_DEEPSTACK_FEATURE_NAME_RE = re.compile(r"^deepstack_features_(\d+)$")
+
+
+def _group_deepstack_names(
+    mapping: dict[str, str] | None,
+) -> dict[str, str | list[str]] | None:
+    """Collapse flat deepstack_features_i entries into a vector.
+
+    Groups ``deepstack_features_0``, ``deepstack_features_1``, ... entries
+    (produced by generic graph introspection) into a single ordered
+    ``deepstack_features`` vector entry, matching the agreed Qwen3-VL
+    DeepStack ORT-GenAI config schema (``vision.outputs.deepstack_features``
+    / ``embedding.inputs.deepstack_features`` as a list of ONNX graph names,
+    in ``deepstack_visual_indexes`` order). All other entries pass through
+    unchanged. Returns ``None`` unchanged (no deepstack ports to group).
+
+    IMPORTANT: as of this writing the released ``onnxruntime-genai`` C++
+    config parser (``src/config.cpp``/``config.h``) only supports scalar
+    string values for ``Vision::Outputs``/``Embedding::Inputs`` fields — a
+    list value here will raise ``JSON::unknown_value_error`` when loaded by
+    that runtime. This grouping is written now so Mobius emits the agreed
+    forward-looking contract shape; do NOT point a production ORT-GenAI
+    deployment at a config produced this way until upstream lands vector
+    support (see the Mobius DeepStack export report for the specific fields
+    that need to change).
+    """
+    if mapping is None:
+        return None
+    deepstack_by_index: dict[int, str] = {}
+    rest: dict[str, str | list[str]] = {}
+    for key, value in mapping.items():
+        match = _DEEPSTACK_FEATURE_NAME_RE.match(key)
+        if match is not None:
+            deepstack_by_index[int(match.group(1))] = value
+        else:
+            rest[key] = value
+    if deepstack_by_index:
+        rest["deepstack_features"] = [
+            deepstack_by_index[i] for i in sorted(deepstack_by_index)
+        ]
+    return rest
 
 
 def _copy_tokenizer_files(
@@ -526,6 +571,19 @@ def _write_vision_processor_config(
     - **Pixtral / Mistral3**: Writes ``processor_config.json`` with a 7-step
       pipeline (DecodeImage → ConvertRGB → Resize → Rescale → Normalize →
       Permute3D → PixtralImageSizes).
+    - **Qwen-VL family** (``qwen2_vl``, ``qwen2_5_vl``, ``qwen3_vl``,
+      ``qwen3_vl_text``, ``qwen3_5``, ``qwen3_5_vl``, ``qwen3_5_moe``,
+      ``videochat_flash_qwen``): Writes ``processor_config.json`` with a
+      6-step pipeline (DecodeImage → ConvertRGB → Resize → Rescale →
+      Normalize → PatchImage). Qwen3-VL-native types (``qwen3_vl``,
+      ``qwen3_vl_text``) use processor name ``qwen3_vl_image_processor``,
+      SigLIP-style ``[0.5, 0.5, 0.5]`` mean/std, ``min_pixels=65536``/
+      ``max_pixels=16777216`` defaults, and a ``qwen3_vl`` Normalize flag;
+      all other Qwen-VL types (including Qwen3.5-VL) keep the existing
+      ``qwen2_5_image_processor`` name, CLIP-standard mean/std, and
+      ``qwen2_5_vl`` Normalize flag. HF processor lookup (when
+      ``hf_model_id`` is provided) still takes precedence over either
+      default set.
     - **Other VLMs**: Writes ``processor_config.json`` with a 5-step pipeline
       (DecodeImage → ConvertRGB → Resize → Rescale → Normalize).
 
@@ -678,12 +736,20 @@ def _write_vision_processor_config(
             or 2
         )
 
-        # CLIP-standard normalization defaults
-        image_mean = [0.48145466, 0.4578275, 0.40821073]
-        image_std = [0.26862954, 0.26130258, 0.27577711]
+        if model_type in _QWEN3_VL_NATIVE_MODEL_TYPES:
+            # Qwen3-VL uses SigLIP-style centered normalization, not CLIP.
+            image_mean = [0.5, 0.5, 0.5]
+            image_std = [0.5, 0.5, 0.5]
+            min_pixels = 65536  # 256 * 256
+            max_pixels = 16777216  # 4096 * 4096
+        else:
+            # CLIP-standard normalization defaults (Qwen2-VL/Qwen2.5-VL/
+            # Qwen3.5-VL and other generic VLMs).
+            image_mean = [0.48145466, 0.4578275, 0.40821073]
+            image_std = [0.26862954, 0.26130258, 0.27577711]
+            min_pixels = 784
+            max_pixels = 2371600
         rescale_factor = 1.0 / 255.0
-        min_pixels = 784
-        max_pixels = 2371600
         image_size = getattr(vision, "image_size", None)
 
         qwen_family = None
@@ -1032,7 +1098,13 @@ def _write_genai_config(
             if vision_input_mapping is not None:
                 vision_kwargs["input_names"] = vision_input_mapping
             if embedding_input_mapping is not None:
-                vision_kwargs["embedding_input_names"] = embedding_input_mapping
+                vision_kwargs["embedding_input_names"] = _group_deepstack_names(
+                    embedding_input_mapping
+                )
+
+            vision_output_mapping = _introspect_outputs(pkg, "vision_encoder")
+            if vision_output_mapping is not None:
+                vision_kwargs["output_names"] = _group_deepstack_names(vision_output_mapping)
 
             embedding_output_mapping = _introspect_outputs(pkg, "embedding")
             if embedding_output_mapping is not None:
