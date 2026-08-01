@@ -48,6 +48,7 @@ __all__ = [
     "Gemma3CausalLMModel",
     "Gemma3MultiModalModel",
     "Gemma3nCausalLMModel",
+    "Gemma3nMultiModalModel",
     "Gemma4AssistantCausalLMModel",
     "Gemma4CausalLMModel",
     "Gemma4Model",
@@ -182,7 +183,7 @@ from mobius.models.fun_asr import FunASRForConditionalGeneration
 from mobius.models.gemma import Gemma2CausalLMModel, GemmaCausalLMModel
 from mobius.models.gemma3 import Gemma3MultiModalModel
 from mobius.models.gemma3_text import Gemma3CausalLMModel
-from mobius.models.gemma3n import Gemma3nCausalLMModel
+from mobius.models.gemma3n import Gemma3nCausalLMModel, Gemma3nMultiModalModel
 from mobius.models.gemma4 import (
     Gemma4CausalLMModel,
     Gemma4Model,
