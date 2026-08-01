@@ -284,6 +284,86 @@ class TestGemma4BlockSequenceIds:
         assert "input_ids" not in dec_inputs
 
 
+def _tiny_gemma4_audio_config(**overrides) -> Gemma4Config:
+    """Minimal gemma4 config with a Conformer audio encoder (E2B-style)."""
+    from mobius._configs import Gemma4AudioConfig
+
+    base = dict(
+        image_token_id=255,
+        audio=Gemma4AudioConfig(
+            input_size=32,
+            hidden_size=16,
+            num_layers=1,
+            subsampling_conv_channels=[8, 8],
+            output_proj_dims=16,
+            audio_token_id=254,
+        ),
+    )
+    base.update(overrides)
+    return _tiny_gemma4_config(**base)
+
+
+class TestGemma4AudioEncoderRank:
+    """Lock the audio dataflow-edge rank contract (regression for #570).
+
+    The exported ``audio_encoder`` must emit ``audio_features`` at the SAME rank
+    the ``embedding`` sub-model consumes it (rank-2
+    ``[num_valid_frames, text_hidden_size]``), mirroring HF's
+    ``audio_features[audio_mask]`` selection.  A rank-3 producer against a
+    rank-2 consumer is rejected at onnx-genai pipeline admission.
+    """
+
+    def test_audio_features_producer_consumer_ranks_match(self):
+        from mobius.models.gemma4 import Gemma4Model
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = _tiny_gemma4_audio_config()
+        pkg = Gemma4Task().build(Gemma4Model(config), config)
+
+        audio_out = {o.name: o for o in pkg["audio_encoder"].graph.outputs}
+        emb_in = {i.name: i for i in pkg["embedding"].graph.inputs}
+
+        producer = audio_out["audio_features"]
+        consumer = emb_in["audio_features"]
+        assert producer.shape is not None
+        assert consumer.shape is not None
+        producer_rank = len(producer.shape)
+        consumer_rank = len(consumer.shape)
+
+        # Non-vacuous: assert the concrete rank-2 contract on BOTH ends and that
+        # they agree, not merely that export ran.
+        assert producer_rank == 2, (
+            f"audio_encoder audio_features must be rank-2 "
+            f"[num_valid_frames, hidden]; got rank {producer_rank} {producer.shape}"
+        )
+        assert consumer_rank == 2, (
+            f"embedding audio_features input must be rank-2; "
+            f"got rank {consumer_rank} {consumer.shape}"
+        )
+        assert producer_rank == consumer_rank
+        # Trailing dim must be the text hidden size on both ends.
+        assert producer.shape[1] == config.hidden_size
+        assert consumer.shape[1] == config.hidden_size
+
+    def test_audio_encoder_selects_valid_frames_with_compress(self):
+        """The rank reduction is a real mask-select (HF ``audio_features[audio_mask]``).
+
+        Guards against a "fix" that reshapes B*T//4 into rank-2 without dropping
+        padding frames, which would misalign rows with placeholder tokens.
+        """
+        from mobius.models.gemma4 import Gemma4Model
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = _tiny_gemma4_audio_config()
+        pkg = Gemma4Task().build(Gemma4Model(config), config)
+
+        audio_graph = pkg["audio_encoder"].graph
+        assert any(n.op_type == "Compress" for n in audio_graph), (
+            "audio_encoder must Compress by the downsampled validity mask so "
+            "output rows align 1:1 with audio placeholder tokens"
+        )
+
+
 def _tiny_gemma4_unified_config(**overrides) -> Gemma4Config:
     """Minimal gemma4_unified config (dense decoder + encoder-free embedders)."""
     from mobius._configs import Gemma4AudioConfig, VisionConfig

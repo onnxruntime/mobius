@@ -2639,9 +2639,19 @@ class _Gemma4AudioEncoderModel(nn.Module):
 
     Inputs:
     - ``input_features [B, T, input_size]``: mel-spectrogram features
+    - ``input_features_mask [B, T]``: BOOL mask, ``True`` for valid frames
 
     Output:
-    - ``audio_features [B, T//4, text_hidden_size]``: projected audio tokens
+    - ``audio_features [num_valid_frames, text_hidden_size]``: projected audio
+      tokens with padding frames stripped so output rows align 1:1 with audio
+      placeholder tokens.  This mirrors HF, which selects
+      ``audio_features[audio_mask]`` (a rank-2 gather) before scattering the
+      rows into the language-model embeddings.  Emitting rank-2 here keeps the
+      producer rank aligned with the ``embedding`` sub-model's rank-2
+      ``audio_features`` consumer.
+    - ``downsampled_mask [B, T//4]``: BOOL mask over the subsampled time axis,
+      returned for the ``audio_features_mask`` diagnostic output.  ``None`` when
+      no ``input_features_mask`` was supplied.
     """
 
     def __init__(self, config: Gemma4Config):
@@ -2701,7 +2711,23 @@ class _Gemma4AudioEncoderModel(nn.Module):
         rms = op.Sqrt(op.Add(mean_sq, eps))
         audio_features = op.CastLike(op.Div(x_f32, rms), audio_features)
         # → projector → [B, T//4, text_hidden_size]
-        return self.projector(op, audio_features), downsampled_mask
+        audio_features = self.projector(op, audio_features)
+        if downsampled_mask is None:
+            # No validity mask (e.g. eager unit call): emit the rank-3 tensor
+            # unchanged.  Export always supplies a mask, so the rank-2 path below
+            # is the one that reaches the ``embedding`` consumer.
+            return audio_features, None
+        # Select valid frames so the output rows align 1:1 with audio placeholder
+        # tokens, matching HF's ``audio_features[audio_mask]``.  Flatten the batch
+        # and subsampled-time axes, then compress by the downsampled mask to get
+        # rank-2 ``[num_valid_frames, text_hidden_size]`` — the rank the
+        # ``embedding`` sub-model consumes.
+        flat_features = op.Reshape(
+            audio_features, op.Constant(value_ints=[-1, self.config.hidden_size])
+        )
+        flat_mask = op.Reshape(downsampled_mask, op.Constant(value_ints=[-1]))
+        selected = _dtype_safe_compress(op, flat_features, flat_mask, axis=0)
+        return selected, downsampled_mask
 
 
 # ---------------------------------------------------------------------------

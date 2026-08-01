@@ -666,19 +666,9 @@ class Gemma4Task(ModelTask):
         )
         if downsampled_mask is None:
             raise ValueError("Gemma4 audio encoder must return a downsampled validity mask")
-        flattened_features = op.Reshape(
-            audio_features,
-            op.Constant(value_ints=[-1, config.hidden_size]),
-        )
-        flattened_mask = op.Reshape(
-            downsampled_mask,
-            op.Constant(value_ints=[-1]),
-        )
-        flattened_features_f32 = op.Cast(flattened_features, to=ir.DataType.FLOAT)
-        audio_features = op.CastLike(
-            op.Compress(flattened_features_f32, flattened_mask, axis=0),
-            flattened_features,
-        )
+        # The audio encoder module already strips padding frames and flattens the
+        # batch axis, so ``audio_features`` is rank-2 ``[num_valid, hidden_size]``
+        # here — the rank the ``embedding`` sub-model consumes.
         builder.add_output(audio_features, "audio_features")
         builder.add_output(downsampled_mask, "audio_features_mask")
 
