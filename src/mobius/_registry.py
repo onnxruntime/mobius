@@ -25,6 +25,7 @@ from onnxscript import nn
 from mobius._configs import (
     BaseModelConfig,
     Eagle3Config,
+    Gemma3nMultiModalConfig,
     Gemma4AssistantConfig,
     Gemma4Config,
     MMSConfig,
@@ -110,7 +111,7 @@ from mobius.models.depth_anything import DepthAnythingForDepthEstimation
 from mobius.models.distilbert import DistilBertModel
 from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel, MPTCausalLMModel
 from mobius.models.fun_asr import FunASRForConditionalGeneration
-from mobius.models.gemma3n import Gemma3nCausalLMModel
+from mobius.models.gemma3n import Gemma3nCausalLMModel, Gemma3nMultiModalModel
 from mobius.models.gpt2 import GPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
 from mobius.models.gptj_codegen import CodeGenCausalLMModel, GPTJCausalLMModel
@@ -407,7 +408,6 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "gemma2": ModelRegistration(Gemma2CausalLMModel),
     "gemma3": ModelRegistration(Gemma3MultiModalModel, task="vision-language"),
     "gemma3_text": ModelRegistration(Gemma3CausalLMModel),
-    "gemma3n": ModelRegistration(Gemma3nCausalLMModel),
     "gemma3n_text": ModelRegistration(Gemma3nCausalLMModel),
     "gemma4_text": ModelRegistration(Gemma4CausalLMModel, config_class=Gemma4Config),
     "gemma4_unified_text": ModelRegistration(Gemma4CausalLMModel, config_class=Gemma4Config),
@@ -566,6 +566,9 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "deepseek_vl_hybrid": ModelRegistration(LLaVAModel, task="vision-language"),
     "florence2": ModelRegistration(LLaVAModel, task="vision-language"),
     "fuyu": ModelRegistration(LLaVAModel, task="vision-language"),
+    "gemma3n": ModelRegistration(
+        Gemma3nMultiModalModel, task="gemma3n", config_class=Gemma3nMultiModalConfig
+    ),
     "gemma4": ModelRegistration(Gemma4Model, task="gemma4", config_class=Gemma4Config),
     "gemma4_unified": ModelRegistration(
         Gemma4UnifiedModel, task="gemma4-unified", config_class=Gemma4Config
@@ -789,6 +792,8 @@ def _create_default_registry() -> ModelRegistry:
 # idempotent: a text-only model_type maps to itself so ``text_only=True`` is a
 # no-op when the resolved type is already text-only.
 _TEXT_ONLY_MODEL_TYPE: dict[str, str] = {
+    "gemma3n": "gemma3n_text",
+    "gemma3n_text": "gemma3n_text",
     "gemma4_unified": "gemma4_unified_text",
     "gemma4_unified_text": "gemma4_unified_text",
 }

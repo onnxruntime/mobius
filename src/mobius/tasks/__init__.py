@@ -35,6 +35,7 @@ __all__ = [
     "DenoisingTask",
     "FeatureExtractionTask",
     "FunASRSpeechLanguageTask",
+    "Gemma3nTask",
     "Gemma4AssistantTask",
     "Gemma4Task",
     "Gemma4UnifiedTask",
@@ -93,6 +94,7 @@ from mobius.tasks._dflash import DFlashDraftTask
 from mobius.tasks._eagle3 import Eagle3DraftTask
 from mobius.tasks._feature_extraction import FeatureExtractionTask
 from mobius.tasks._fun_asr_speech_language import FunASRSpeechLanguageTask
+from mobius.tasks._gemma3n import Gemma3nTask
 from mobius.tasks._gemma4 import (
     Gemma4Task,
     Gemma4TextCausalLMTask,
@@ -158,6 +160,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "qwen-vl": QwenVLTask,
     "hybrid-qwen-vl": HybridQwenVLTask,
     "qwen3-vl-vision-language": Qwen3VLVisionLanguageTask,
+    "gemma3n": Gemma3nTask,
     "gemma4": Gemma4Task,
     "gemma4-text-generation": Gemma4TextCausalLMTask,
     "gemma4-unified": Gemma4UnifiedTask,
