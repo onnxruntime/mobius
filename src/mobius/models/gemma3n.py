@@ -26,12 +26,15 @@ import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
-from mobius._configs import Gemma3nConfig
+from mobius._configs import Gemma3nConfig, Gemma3nMultiModalConfig
 from mobius.components import (
     MLP,
     Attention,
     Embedding,
+    Gemma3nAudioEncoder,
+    Gemma3nMultimodalEmbedder,
     Linear,
+    MobileNetV5Encoder,
     RMSNorm,
     create_attention_bias,
     initialize_rope,
@@ -39,6 +42,35 @@ from mobius.components import (
 from mobius.components._activations import get_activation
 from mobius.components._attention import _apply_attention, apply_rotary_pos_emb
 from mobius.models.base import CausalLMModel
+
+
+def _apply_logit_softcapping(op: OpBuilder, logits: ir.Value, cap: float) -> ir.Value:
+    """Tanh-cap *logits* at +-*cap* as Gemma2/Gemma3n's LM head does.
+
+    ``cap * tanh(logits / cap)``.  A non-positive *cap* disables the capping and
+    returns *logits* unchanged, so no nodes are emitted for configs that ship
+    ``final_logit_softcapping: null``.
+    """
+    if not cap or cap <= 0.0:
+        return logits
+    cap_value = op.CastLike(op.Constant(value_float=float(cap)), logits)
+    return op.Mul(op.Tanh(op.Div(logits, cap_value)), cap_value)
+
+
+def _strip_altup_prefix(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Drop the ``.altup.`` level from every key that carries it.
+
+    The AltUp submodules (``correction_coefs``, ``prediction_coefs``,
+    ``modality_router``, ``router_norm``, ``correct_output_scale``) are invoked
+    through plain methods rather than ``__call__``, so onnxscript registers them
+    on the parent :class:`Gemma3nDecoderLayer` without the ``.altup.`` level.
+    """
+    for key in list(state_dict.keys()):
+        if ".altup." in key:
+            state_dict[key.replace(".altup.", ".")] = state_dict.pop(key)
+    return state_dict
 
 
 def _drop_kv_shared_layer_weights(
@@ -679,14 +711,30 @@ class Gemma3nTextModel(nn.Module):
         position_ids: ir.Value,
         past_key_values: list | None = None,
         inputs_embeds: ir.Value | None = None,
+        per_layer_inputs: ir.Value | None = None,
     ):
         if inputs_embeds is not None:
             hidden_states_0 = inputs_embeds
         else:
             hidden_states_0 = self.embed_tokens(op, input_ids)
 
-        # Compute per-layer inputs
-        per_layer_inputs = self._compute_per_layer_inputs(op, input_ids, hidden_states_0)
+        # Per-layer inputs.  In the multimodal split the embedding sub-model owns
+        # the per-layer tables and hands the combined ``[B, S, L*D]`` tensor in
+        # as a graph input; the text-only path derives it here from ``input_ids``.
+        if per_layer_inputs is not None:
+            per_layer_inputs = op.Reshape(
+                per_layer_inputs,
+                op.Constant(
+                    value_ints=[
+                        0,
+                        0,
+                        self.num_hidden_layers,
+                        self.hidden_size_per_layer_input,
+                    ]
+                ),
+            )
+        else:
+            per_layer_inputs = self._compute_per_layer_inputs(op, input_ids, hidden_states_0)
 
         position_embeddings_dict = {
             "full_attention": self.rotary_emb(op, position_ids),
@@ -789,12 +837,21 @@ class Gemma3nTextModel(nn.Module):
         return hidden_states, present_key_values
 
     def _compute_per_layer_inputs(self, op, input_ids, inputs_embeds):
-        """Compute per-layer input embeddings from input_ids and model projection."""
-        # Per-layer token embeddings
-        if input_ids is not None:
-            per_layer_token_embed = self.embed_tokens_per_layer(op, input_ids)
-        else:
-            per_layer_token_embed = None
+        """Compute per-layer input embeddings from input_ids and model projection.
+
+        Requires ``input_ids``: the token-embedding term is not optional in HF,
+        so dropping it (as an ``inputs_embeds``-only decoder would have to)
+        would silently skip both the add and the ``1/sqrt(2)`` scale.  Callers
+        without ``input_ids`` must pass ``per_layer_inputs`` to
+        :meth:`forward` instead.
+        """
+        if input_ids is None:
+            raise ValueError(
+                "Gemma3nTextModel needs either input_ids (to look up the per-layer "
+                "token embeddings) or a precomputed per_layer_inputs tensor; got "
+                "neither."
+            )
+        per_layer_token_embed = self.embed_tokens_per_layer(op, input_ids)
 
         # Per-layer projection from hidden states
         per_layer_proj = self.per_layer_model_projection(op, inputs_embeds)
@@ -809,19 +866,14 @@ class Gemma3nTextModel(nn.Module):
         )
         per_layer_proj = self.per_layer_projection_norm(op, per_layer_proj)
 
-        if per_layer_token_embed is not None:
-            per_layer_token_embed = op.Reshape(
-                per_layer_token_embed,
-                op.Constant(
-                    value_ints=[0, 0, self.num_hidden_layers, self.hidden_size_per_layer_input]
-                ),
-            )
-            per_layer_inputs = op.Add(per_layer_proj, per_layer_token_embed)
-            per_layer_inputs = op.Mul(per_layer_inputs, self.per_layer_input_scale)
-        else:
-            per_layer_inputs = per_layer_proj
-
-        return per_layer_inputs
+        per_layer_token_embed = op.Reshape(
+            per_layer_token_embed,
+            op.Constant(
+                value_ints=[0, 0, self.num_hidden_layers, self.hidden_size_per_layer_input]
+            ),
+        )
+        per_layer_inputs = op.Add(per_layer_proj, per_layer_token_embed)
+        return op.Mul(per_layer_inputs, self.per_layer_input_scale)
 
     def _get_per_layer_input(self, op, per_layer_inputs, layer_idx: int):
         """Extract the per-layer input for a specific layer."""
@@ -845,10 +897,31 @@ class Gemma3nCausalLMModel(CausalLMModel):
     def __init__(self, config: Gemma3nConfig):
         super().__init__(config)
         self.model = Gemma3nTextModel(config)
+        self._final_logit_softcapping = config.final_logit_softcapping
 
     def kv_cache_layer_count(self) -> int:
         """Number of layers owning a KV cache entry (excludes KV-shared layers)."""
         return self.model.num_kv_layers
+
+    def forward(
+        self,
+        op: OpBuilder,
+        input_ids: ir.Value,
+        attention_mask: ir.Value | None,
+        position_ids: ir.Value,
+        past_key_values: list | None = None,
+    ):
+        hidden_states, present_key_values = self.model(
+            op,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+        )
+        logits = self.lm_head(op, hidden_states)
+        return _apply_logit_softcapping(op, logits, self._final_logit_softcapping), (
+            present_key_values
+        )
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
@@ -863,14 +936,604 @@ class Gemma3nCausalLMModel(CausalLMModel):
             elif "audio_tower" in key:
                 state_dict.pop(key)
 
-        # AltUp submodules (correction_coefs, prediction_coefs, modality_router,
-        # router_norm, correct_output_scale) are called via plain methods rather than
-        # __call__, so onnxscript registers them on the parent DecoderLayer without the
-        # ".altup." prefix.  Strip ".altup." from all keys that contain it.
-        for key in list(state_dict.keys()):
-            if ".altup." in key:
-                new_key = key.replace(".altup.", ".")
-                state_dict[new_key] = state_dict.pop(key)
-
+        state_dict = _strip_altup_prefix(state_dict)
         state_dict = _drop_kv_shared_layer_weights(state_dict, self.model)
         return super().preprocess_weights(state_dict)
+
+
+# ---------------------------------------------------------------------------
+# Gemma 3n multimodal sub-models
+# ---------------------------------------------------------------------------
+
+
+class _Gemma3nDecoderModel(nn.Module):
+    """Gemma 3n text decoder sub-model consuming ``inputs_embeds``.
+
+    The embedding sub-model owns both the token embedding and the per-layer
+    embedding tables, so this graph takes the combined ``per_layer_inputs``
+    ``[B, S, L*D]`` as an input and never needs ``input_ids``.  That keeps the
+    4.7 GB ``embed_tokens_per_layer`` table out of the decoder and — unlike
+    deriving the per-layer inputs from ``inputs_embeds`` alone — preserves the
+    token-embedding term that HF's ``project_per_layer_inputs`` adds.
+    """
+
+    def __init__(self, config: Gemma3nMultiModalConfig):
+        super().__init__()
+        self.config = config
+        self.model = Gemma3nTextModel(config)
+        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def kv_cache_layer_count(self) -> int:
+        """Number of layers owning a KV cache entry (excludes KV-shared layers)."""
+        return self.model.num_kv_layers
+
+    def forward(
+        self,
+        op: OpBuilder,
+        inputs_embeds: ir.Value,
+        attention_mask: ir.Value,
+        position_ids: ir.Value,
+        per_layer_inputs: ir.Value | None = None,
+        past_key_values: list | None = None,
+    ):
+        hidden_states, present_key_values = self.model(
+            op,
+            input_ids=None,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            per_layer_inputs=per_layer_inputs,
+        )
+        logits = self.lm_head(op, hidden_states)
+        logits = _apply_logit_softcapping(op, logits, self.config.final_logit_softcapping)
+        return logits, present_key_values
+
+
+class _Gemma3nVisionEncoderModel(nn.Module):
+    """Gemma 3n vision tower sub-model: pixels -> text-space soft tokens.
+
+    Mirrors HF ``Gemma3nModel.get_image_features``::
+
+        pixel_values [B, 3, 768, 768]
+        -> encoder                  [B, vision_hidden, 16, 16]
+        -> reshape + transpose      [B, 256, vision_hidden]
+        -> * sqrt(vision_hidden)
+        -> embed_vision (soft)      [B, 256, text_hidden]
+        -> reshape                  [B*256, text_hidden]
+
+    Only the embedder's *soft* path is built here, so this graph carries
+    ``soft_embedding_norm`` but not the 128-row hard lookup table (which the
+    embedding sub-model owns and uses for the placeholder ids).
+    """
+
+    def __init__(self, config: Gemma3nMultiModalConfig):
+        super().__init__()
+        vision = config.vision
+        if vision is None:
+            raise ValueError(
+                "Gemma3n vision encoder requires config.vision; got None. The "
+                "gemma3n vision extractor hook populates it from vision_config."
+            )
+        vision_hidden = vision.hidden_size or 2048
+        eps = vision.rms_norm_eps or vision.norm_eps or config.rms_norm_eps
+        self.encoder = MobileNetV5Encoder(
+            hidden_size=vision_hidden,
+            image_size=vision.image_size or 768,
+            norm_eps=eps,
+        )
+        self.embed_vision = Gemma3nMultimodalEmbedder(
+            vision_hidden,
+            config.hidden_size,
+            vocab_size=vision.vocab_size or 128,
+            vocab_offset=vision.vocab_offset or 0,
+            eps=eps,
+        )
+        self._vision_hidden = vision_hidden
+        self._soft_tokens = config.vision_soft_tokens_per_image
+        self._text_hidden_size = config.hidden_size
+
+    def forward(self, op: OpBuilder, pixel_values: ir.Value) -> ir.Value:
+        # [B, 3, S, S] -> [B, vision_hidden, 16, 16]
+        features = self.encoder(op, pixel_values)
+        # Flatten the spatial grid into soft tokens, then move channels last.
+        # Both extents are compile-time constants, so no Shape op is needed.
+        features = op.Reshape(
+            features,
+            op.Constant(value_ints=[0, self._vision_hidden, self._soft_tokens]),
+        )
+        features = op.Transpose(features, perm=[0, 2, 1])
+        features = op.Mul(features, float(self._vision_hidden**0.5))
+        features = self.embed_vision(op, inputs_embeds=features)
+        # [B, 256, text_hidden] -> [B*256, text_hidden] so the rows line up 1:1
+        # with the image placeholder tokens the processor spliced into the
+        # prompt, matching the 2-D ``image_features`` contract of the
+        # embedding sub-model (which Gathers along axis 0).
+        return op.Reshape(features, op.Constant(value_ints=[-1, self._text_hidden_size]))
+
+
+class _Gemma3nAudioEncoderModel(nn.Module):
+    """Gemma 3n USM audio tower sub-model: mel frames -> text-space soft tokens.
+
+    Mirrors HF ``Gemma3nModel.get_audio_features`` plus the padding step
+    ``Gemma3nModel.forward`` applies right after it.  The processor always
+    splices exactly ``audio_soft_tokens_per_image`` placeholders into the
+    prompt, while the encoder produces *at most* that many frames, so both
+    padded and missing frames are filled with the embedding of the last id in
+    the audio vocabulary.  The output therefore always has a fixed row count
+    per clip and needs no companion validity mask.
+
+    This is the one place a single embedder is used through *both* of its
+    paths: soft for the encoder features, hard for that padding token.
+    """
+
+    def __init__(self, config: Gemma3nMultiModalConfig):
+        super().__init__()
+        audio = config.audio
+        if audio is None:
+            raise ValueError(
+                "Gemma3n audio encoder requires config.audio; got None. Build "
+                "the package without an audio_encoder component instead."
+            )
+        audio_hidden = audio.hidden_size or 1536
+        eps = audio.rms_norm_eps or config.rms_norm_eps
+        self.encoder = Gemma3nAudioEncoder(
+            input_feat_size=audio.input_feat_size,
+            hidden_size=audio_hidden,
+            num_heads=audio.conf_num_attention_heads,
+            num_layers=audio.conf_num_hidden_layers,
+            conv_kernel_size=audio.conf_conv_kernel_size,
+            conv_channel_size=audio.sscp_conv_channel_size,
+            conv_kernel_size_2d=audio.sscp_conv_kernel_size,
+            conv_stride_size=audio.sscp_conv_stride_size,
+            conv_group_norm_eps=audio.sscp_conv_group_norm_eps,
+            attention_chunk_size=audio.conf_attention_chunk_size,
+            attention_context_left=audio.conf_attention_context_left,
+            attention_context_right=audio.conf_attention_context_right,
+            attention_logit_cap=audio.conf_attention_logit_cap,
+            reduction_factor=audio.conf_reduction_factor,
+            rms_norm_eps=eps,
+            residual_weight=audio.conf_residual_weight,
+            gradient_clipping=audio.gradient_clipping,
+        )
+        vocab_size = audio.vocab_size or 128
+        vocab_offset = audio.vocab_offset or 0
+        self.embed_audio = Gemma3nMultimodalEmbedder(
+            audio_hidden,
+            config.hidden_size,
+            vocab_size=vocab_size,
+            vocab_offset=vocab_offset,
+            eps=eps,
+        )
+        # HF pads with ``self.vocab_size - 1``, the last id of the *audio*
+        # table; the embedder rebases by ``vocab_offset`` internally, so the
+        # absolute id is what gets passed in.
+        self._padding_token_id = vocab_offset + vocab_size - 1
+        self._soft_tokens = config.audio_soft_tokens_per_image
+        self._text_hidden_size = config.hidden_size
+
+    def forward(
+        self,
+        op: OpBuilder,
+        input_features: ir.Value,
+        input_features_mask: ir.Value,
+    ) -> ir.Value:
+        # [B, T, mel] -> [B, T', audio_hidden] plus the downsampled valid mask.
+        # ``Gemma3nAudioEncoder`` takes True = valid, which is already the
+        # polarity of the task's graph input (HF negates because its
+        # ``audio_mel_mask`` marks padding).
+        encodings, mask = self.encoder(op, input_features, input_features_mask)
+        features = self.embed_audio(op, inputs_embeds=encodings)
+
+        # Embedding of the audio padding token, [1, 1, text_hidden].  The id
+        # tensor is rank 2 so the hard lookup broadcasts against the
+        # [B, T', text_hidden] features below.
+        padding_id = op.Constant(
+            value=ir.tensor(np.array([[self._padding_token_id]], dtype=np.int64))
+        )
+        padding_embed = self.embed_audio(op, input_ids=padding_id)
+        padding_embed = op.CastLike(padding_embed, features)
+
+        # Replace padded frames, then extend to the fixed placeholder count.
+        features = op.Where(op.Unsqueeze(mask, [-1]), features, padding_embed)
+        features = self._pad_to_soft_tokens(op, features, padding_embed)
+        # [B, soft_tokens, text_hidden] -> [B*soft_tokens, text_hidden], the
+        # 2-D contract the embedding sub-model Gathers from.
+        return op.Reshape(features, op.Constant(value_ints=[-1, self._text_hidden_size]))
+
+    def _pad_to_soft_tokens(
+        self, op: OpBuilder, features: ir.Value, padding_embed: ir.Value
+    ) -> ir.Value:
+        """Force the token axis of *features* to ``audio_soft_tokens_per_image``.
+
+        Shorter clips are extended with *padding_embed* (HF's
+        ``extra_padding_features``).  Longer ones are truncated: HF cannot hit
+        that case because its encoder is fed 30 s of audio, but a longer clip
+        would otherwise emit more rows than there are placeholders and
+        misalign every subsequent token.
+        """
+        soft_tokens = op.Constant(value_ints=[self._soft_tokens])
+        batch = op.Shape(features, start=0, end=1)
+        length = op.Shape(features, start=1, end=2)
+        # Clamp at zero so an over-long clip does not ask Expand for a
+        # negative extent; the Slice below trims it instead.
+        extra = op.Max(op.Sub(soft_tokens, length), op.Constant(value_ints=[0]))
+        pad_shape = op.Concat(
+            batch, extra, op.Constant(value_ints=[self._text_hidden_size]), axis=0
+        )
+        padded = op.Concat(features, op.Expand(padding_embed, pad_shape), axis=1)
+        return op.Slice(
+            padded,
+            op.Constant(value_ints=[0]),
+            soft_tokens,
+            op.Constant(value_ints=[1]),
+        )
+
+
+class _Gemma3nEmbeddingModel(nn.Module):
+    """Gemma 3n embedding sub-model: token lookup + multimodal fusion.
+
+    Reproduces the embedding half of HF ``Gemma3nModel.forward``:
+
+    1. scaled token embedding;
+    2. **hard** placeholder embeddings — the reserved vision/audio token ids
+       are embedded through their modality's 128-row lookup table and
+       overwrite those positions;
+    3. **soft** feature scatter — encoder output rows replace the
+       ``image_token_id`` / ``audio_token_id`` positions;
+    4. per-layer inputs, projected from the *fused* embeddings and added to
+       the per-layer token embedding.
+
+    Steps 2 and 3 are distinct on purpose: the ``boi``/``eoi`` style markers in
+    the reserved id range get the hard embedding, while the soft tokens
+    standing in for the actual image and audio content get the encoder
+    features.
+
+    Inputs are ``input_ids [B, S]`` INT64, ``image_features
+    [num_image_tokens, hidden]`` and — with audio configured — ``audio_features
+    [num_audio_tokens, hidden]``.  Outputs are ``inputs_embeds [B, S, hidden]``
+    and ``per_layer_inputs [B, S, L*D]``.
+    """
+
+    def __init__(self, config: Gemma3nMultiModalConfig):
+        super().__init__()
+        self.config = config
+        vision = config.vision
+        if vision is None:
+            raise ValueError(
+                "Gemma3n embedding model requires config.vision; got None. The "
+                "gemma3n vision extractor hook populates it from vision_config."
+            )
+        self.embed_tokens = Gemma3nScaledWordEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            config.pad_token_id,
+            embed_scale=float(np.float16(config.hidden_size**0.5)),
+        )
+
+        self._num_layers = config.num_hidden_layers
+        self._per_layer_dim = config.hidden_size_per_layer_input
+        self.embed_tokens_per_layer = Gemma3nScaledWordEmbedding(
+            config.vocab_size_per_layer_input,
+            self._num_layers * self._per_layer_dim,
+            config.pad_token_id,
+            embed_scale=float(self._per_layer_dim**0.5),
+        )
+        self.per_layer_model_projection = Linear(
+            config.hidden_size,
+            self._num_layers * self._per_layer_dim,
+            bias=False,
+        )
+        self.per_layer_projection_norm = RMSNorm(
+            self._per_layer_dim, eps=config.rms_norm_eps
+        )
+
+        vision_eps = vision.rms_norm_eps or vision.norm_eps or config.rms_norm_eps
+        self._vision_vocab_offset = vision.vocab_offset or 0
+        self._vision_vocab_size = vision.vocab_size or 128
+        self.embed_vision = Gemma3nMultimodalEmbedder(
+            vision.hidden_size or 2048,
+            config.hidden_size,
+            vocab_size=self._vision_vocab_size,
+            vocab_offset=self._vision_vocab_offset,
+            eps=vision_eps,
+        )
+        self.image_token_id = vision.image_token_id or config.image_token_id
+
+        audio = config.audio
+        self.audio_token_id: int | None = None
+        self._audio_vocab_offset: int | None = None
+        if audio is not None:
+            self._audio_vocab_offset = audio.vocab_offset or 0
+            self.embed_audio = Gemma3nMultimodalEmbedder(
+                audio.hidden_size or 1536,
+                config.hidden_size,
+                vocab_size=audio.vocab_size or 128,
+                vocab_offset=self._audio_vocab_offset,
+                eps=audio.rms_norm_eps or config.rms_norm_eps,
+            )
+            self.audio_token_id = audio.audio_token_id or config.audio_token_id
+
+    def _embed_placeholder_ids(
+        self,
+        op: OpBuilder,
+        hidden: ir.Value,
+        input_ids: ir.Value,
+        embedder: Gemma3nMultimodalEmbedder,
+        lower: int,
+        upper: int | None,
+    ) -> ir.Value:
+        """Overwrite ids in ``[lower, upper)`` with their hard-path embedding.
+
+        Out-of-range positions are rewritten to the *last* id of the
+        modality's table before the lookup, exactly as HF does: ONNX
+        ``Gather`` does not bounds-check, so feeding an ordinary text id
+        straight into a 128-row table would read out of bounds.
+        """
+        in_range = op.GreaterOrEqual(input_ids, op.CastLike(lower, input_ids))
+        if upper is not None:
+            in_range = op.And(in_range, op.Less(input_ids, op.CastLike(upper, input_ids)))
+        dummy_id = op.CastLike(
+            embedder.vocab_offset + embedder.vocab_size - 1, input_ids
+        )
+        safe_ids = op.Where(in_range, input_ids, dummy_id)
+        embeds = op.CastLike(embedder(op, input_ids=safe_ids), hidden)
+        return op.Where(op.Unsqueeze(in_range, [-1]), embeds, hidden)
+
+    def _scatter_features(
+        self,
+        op: OpBuilder,
+        hidden: ir.Value,
+        input_ids: ir.Value,
+        token_id: int,
+        features: ir.Value,
+    ) -> ir.Value:
+        """Scatter ``features`` rows into ``hidden`` at ``token_id`` positions.
+
+        A dummy zero row is appended before the Gather so that a text-only or
+        decode step, which passes a ``[0, hidden]`` feature tensor, cannot
+        fault on an empty-tensor Gather even though ``Where`` discards the
+        result.  ``Constant`` + ``Unsqueeze`` rather than
+        ``Expand``/``ConstantOfShape``: a dynamic shape input there blocks
+        ONNX shape inference.
+        """
+        mask = op.Equal(input_ids, op.CastLike(token_id, input_ids))
+        # CumSum -> sub-1 -> clip gives each matching position its 0-based row
+        # index into ``features``.
+        mask_int = op.Cast(mask, to=ir.DataType.INT64)
+        cumsum = op.CumSum(mask_int, op.Constant(value_int=1))
+        indices = op.Clip(op.Sub(cumsum, op.Constant(value_int=1)), op.Constant(value_int=0))
+        dummy_row = op.Unsqueeze(
+            op.CastLike(op.Constant(value_floats=[0.0] * self.config.hidden_size), features),
+            [0],
+        )
+        features_safe = op.Concat(features, dummy_row, axis=0)
+        gathered = op.CastLike(op.Gather(features_safe, indices, axis=0), hidden)
+        return op.Where(op.Unsqueeze(mask, [-1]), gathered, hidden)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        input_ids: ir.Value,
+        image_features: ir.Value,
+        audio_features: ir.Value | None = None,
+    ) -> dict[str, ir.Value]:
+        hidden = self.embed_tokens(op, input_ids)
+
+        # Hard placeholder embeddings.  The vision id range ends where the
+        # audio range begins (HF reads ``embed_audio.vocab_offset``); with no
+        # audio tower it ends after the vision table.
+        vision_upper = self._audio_vocab_offset
+        if vision_upper is None:
+            vision_upper = self._vision_vocab_offset + self._vision_vocab_size
+        hidden = self._embed_placeholder_ids(
+            op,
+            hidden,
+            input_ids,
+            self.embed_vision,
+            self._vision_vocab_offset,
+            vision_upper,
+        )
+        if self._audio_vocab_offset is not None:
+            hidden = self._embed_placeholder_ids(
+                op, hidden, input_ids, self.embed_audio, self._audio_vocab_offset, None
+            )
+
+        # Soft encoder features replace their placeholder positions.
+        if self.image_token_id is None:
+            raise ValueError(
+                "Gemma3n embedding model needs image_token_id to place image "
+                "features; got None."
+            )
+        hidden = self._scatter_features(
+            op, hidden, input_ids, self.image_token_id, image_features
+        )
+        if audio_features is not None:
+            if self.audio_token_id is None:
+                raise ValueError(
+                    "Gemma3n embedding model received audio_features but no "
+                    "audio_token_id is configured."
+                )
+            hidden = self._scatter_features(
+                op, hidden, input_ids, self.audio_token_id, audio_features
+            )
+
+        return {
+            "inputs_embeds": hidden,
+            "per_layer_inputs": self._per_layer_inputs(op, input_ids, hidden),
+        }
+
+    def _per_layer_inputs(
+        self, op: OpBuilder, input_ids: ir.Value, hidden: ir.Value
+    ) -> ir.Value:
+        """Build the combined ``[B, S, L*D]`` per-layer input tensor.
+
+        Matches HF ``get_per_layer_inputs`` + ``project_per_layer_inputs``.
+        The projection reads the *fused* embeddings, so the multimodal
+        features feed the per-layer gates exactly as they do in HF, where
+        ``project_per_layer_inputs`` runs inside the language model on the
+        already-merged ``inputs_embeds``.
+        """
+        proj = self.per_layer_model_projection(op, hidden)
+        proj = op.Mul(proj, float(self.config.hidden_size**-0.5))
+        proj = op.Reshape(
+            proj, op.Constant(value_ints=[0, 0, self._num_layers, self._per_layer_dim])
+        )
+        proj = self.per_layer_projection_norm(op, proj)
+
+        # HF masks every id outside the per-layer vocab to 0 before the
+        # lookup, which covers both modalities' reserved ranges (they sit
+        # above ``vocab_size_per_layer_input``) as well as any negative id.
+        in_vocab = op.And(
+            op.GreaterOrEqual(input_ids, op.CastLike(0, input_ids)),
+            op.Less(
+                input_ids, op.CastLike(self.config.vocab_size_per_layer_input, input_ids)
+            ),
+        )
+        masked_ids = op.Where(in_vocab, input_ids, op.CastLike(0, input_ids))
+        token_embed = op.Reshape(
+            self.embed_tokens_per_layer(op, masked_ids),
+            op.Constant(value_ints=[0, 0, self._num_layers, self._per_layer_dim]),
+        )
+
+        combined = op.Mul(op.Add(proj, token_embed), float(1.0 / math.sqrt(2.0)))
+        # Flatten L*D into a single graph output; the decoder reshapes back.
+        return op.Reshape(
+            combined,
+            op.Constant(value_ints=[0, 0, self._num_layers * self._per_layer_dim]),
+        )
+
+
+class Gemma3nMultiModalModel(nn.Module):
+    """Gemma 3n image + audio + text model (3- or 4-model split).
+
+    Always produced:
+
+    - ``decoder`` — text decoder on ``inputs_embeds`` + ``per_layer_inputs``
+    - ``vision_encoder`` — MobileNet-V5 tower + ``embed_vision`` soft path
+    - ``embedding`` — token embedding, hard placeholder embedding, feature
+      fusion, and the per-layer input tables
+
+    Added when ``config.audio is not None``:
+
+    - ``audio_encoder`` — USM Conformer tower + ``embed_audio``
+
+    Registered as ``gemma3n``; the text-only ``gemma3n_text`` key keeps
+    mapping to :class:`Gemma3nCausalLMModel`.
+    """
+
+    default_task: str = "gemma3n"
+    category: str = "Multimodal"
+    config_class: type = Gemma3nMultiModalConfig
+
+    def __init__(self, config: Gemma3nMultiModalConfig):
+        super().__init__()
+        self.config = config
+        self.decoder = _Gemma3nDecoderModel(config)
+        self.vision_encoder = _Gemma3nVisionEncoderModel(config)
+        self.embedding = _Gemma3nEmbeddingModel(config)
+        self.audio_encoder: _Gemma3nAudioEncoderModel | None = (
+            _Gemma3nAudioEncoderModel(config) if config.audio is not None else None
+        )
+
+    def forward(self, op: OpBuilder, **kwargs):
+        raise NotImplementedError(
+            "Gemma3nMultiModalModel is a multi-model split; Gemma3nTask builds each "
+            "sub-module (decoder, vision_encoder, embedding, and optionally "
+            "audio_encoder) separately."
+        )
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Rename HuggingFace weight keys to ONNX initializer names.
+
+        HF multimodal checkpoints prefix every key with ``model.``; after
+        stripping it:
+
+        - ``language_model.lm_head.*`` -> ``decoder.lm_head.*``
+        - ``language_model.{embed_tokens_per_layer,per_layer_model_projection,
+          per_layer_projection_norm}.*`` -> ``embedding.*``
+        - ``language_model.*`` -> ``decoder.model.*``, with ``embed_tokens.*``
+          *also* copied to ``embedding.embed_tokens.*``
+        - ``vision_tower.timm_model.*`` -> ``vision_encoder.encoder.*``
+        - ``audio_tower.*`` -> ``audio_encoder.encoder.*``
+
+        Both tower maps are pure prefix swaps: unlike Gemma 4, every learned
+        tensor of :class:`~mobius.components.MobileNetV5Encoder` and
+        :class:`~mobius.components.Gemma3nAudioEncoder` already carries its
+        checkpoint name verbatim.
+
+        ``embed_vision.*`` goes to *both* ``vision_encoder.embed_vision.*``
+        and ``embedding.embed_vision.*`` (likewise ``embed_audio.*``): each
+        embedder is used through its soft path in its tower's graph and its
+        hard path in the embedding graph, so both graphs need all four
+        tensors.  ``embedding.weight``, the hard lookup table, is kept —
+        Gemma 3n uses the hard path, unlike Gemma 4.
+
+        Unused keys are dropped rather than passed through: the KV-shared
+        layers' K/V projections (shipped by the checkpoint but built by no
+        layer) and, for an audio-less config, the whole audio tower.
+        """
+        state_dict = {
+            (key[len("model.") :] if key.startswith("model.") else key): value
+            for key, value in state_dict.items()
+        }
+
+        # A tied checkpoint ships no lm_head; synthesize it from the token
+        # embedding so the decoder's head initializer gets data.
+        if self.config.tie_word_embeddings:
+            embed_key = "language_model.embed_tokens.weight"
+            head_key = "language_model.lm_head.weight"
+            if head_key not in state_dict and embed_key in state_dict:
+                state_dict[head_key] = state_dict[embed_key]
+
+        per_layer_prefixes = (
+            "embed_tokens_per_layer.",
+            "per_layer_model_projection.",
+            "per_layer_projection_norm.",
+        )
+        renamed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if key.startswith("language_model."):
+                suffix = key[len("language_model.") :]
+                if suffix.startswith("lm_head"):
+                    # lm_head lives directly under decoder (not decoder.model)
+                    renamed["decoder." + suffix] = value
+                elif suffix.startswith(per_layer_prefixes):
+                    # Per-layer embedding tables → embedding sub-model
+                    renamed["embedding." + suffix] = value
+                else:
+                    renamed["decoder.model." + suffix] = value
+                    if suffix.startswith("embed_tokens."):
+                        # Token embedding is shared with the embedding sub-model.
+                        renamed["embedding." + suffix] = value
+
+            elif key.startswith("vision_tower.timm_model."):
+                # HF wraps the timm encoder in a TimmWrapperModel, adding one
+                # name level our encoder does not have.
+                suffix = key[len("vision_tower.timm_model.") :]
+                renamed["vision_encoder.encoder." + suffix] = value
+
+            elif key.startswith("embed_vision."):
+                suffix = key[len("embed_vision.") :]
+                renamed["vision_encoder.embed_vision." + suffix] = value
+                renamed["embedding.embed_vision." + suffix] = value
+
+            elif key.startswith("audio_tower."):
+                if self.audio_encoder is not None:
+                    renamed["audio_encoder.encoder." + key[len("audio_tower.") :]] = value
+
+            elif key.startswith("embed_audio."):
+                if self.audio_encoder is not None:
+                    suffix = key[len("embed_audio.") :]
+                    renamed["audio_encoder.embed_audio." + suffix] = value
+                    renamed["embedding.embed_audio." + suffix] = value
+
+            else:
+                renamed[key] = value
+
+        renamed = _strip_altup_prefix(renamed)
+        return _drop_kv_shared_layer_weights(
+            renamed, self.decoder.model, prefix="decoder.model.layers."
+        )

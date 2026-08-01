@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Tests for Gemma3n activation sparsity (``_gaussian_topk``)."""
+"""Tests for Gemma3n activation sparsity and multimodal weight renaming."""
 
 from __future__ import annotations
 
@@ -11,9 +11,14 @@ import onnxruntime as ort
 import pytest
 import torch
 
-from mobius._configs import Gemma3nConfig
+from mobius._configs import (
+    Gemma3nAudioConfig,
+    Gemma3nConfig,
+    Gemma3nMultiModalConfig,
+    VisionConfig,
+)
 from mobius._constants import OPSET_VERSION
-from mobius.models.gemma3n import Gemma3nMLP
+from mobius.models.gemma3n import Gemma3nMLP, Gemma3nMultiModalModel
 
 
 def _tiny_gemma3n_config(**overrides) -> Gemma3nConfig:
@@ -175,3 +180,398 @@ class TestGemma3nActivationSparsity:
 
         with pytest.raises(ValueError, match="must cover every layer"):
             Gemma3nMLP(config, layer_idx=1)
+
+
+# ---------------------------------------------------------------------------
+# Multimodal weight renaming
+# ---------------------------------------------------------------------------
+#: HF ships every Gemma 3n multimodal key under this prefix.
+_HF = "model."
+
+
+def _tiny_multimodal_config(**overrides) -> Gemma3nMultiModalConfig:
+    """Create a minimal Gemma3nMultiModalConfig for renaming tests.
+
+    Only ``preprocess_weights`` is exercised here, so the towers' sizes are
+    irrelevant — but they must be *present*, since which sub-models exist
+    decides where keys are routed.  Kept independent of the graph-level
+    ``VL_CONFIGS`` entry, which has to satisfy MobileNet-V5's ``image_size``
+    constraints that no rename depends on.
+    """
+    defaults = dict(
+        model_type="gemma3n",
+        vocab_size=256,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        intermediate_size=128,
+        head_dim=16,
+        hidden_act="gelu_pytorch_tanh",
+        max_position_embeddings=128,
+        rms_norm_eps=1e-6,
+        rope_type="default",
+        rope_theta=10_000.0,
+        rope_local_base_freq=10_000.0,
+        layer_types=["full_attention", "sliding_attention"],
+        attn_qk_norm=True,
+        altup_num_inputs=2,
+        laurel_rank=16,
+        hidden_size_per_layer_input=32,
+        vocab_size_per_layer_input=256,
+        image_token_id=216,
+        audio_token_id=217,
+        vision_soft_tokens_per_image=256,
+        audio_soft_tokens_per_image=8,
+        vision=VisionConfig(
+            hidden_size=32,
+            image_size=256,
+            rms_norm_eps=1e-6,
+            vocab_offset=200,
+            vocab_size=8,
+            architecture="mobilenetv5_300m_enc",
+            do_pooling=False,
+        ),
+        audio=Gemma3nAudioConfig(
+            hidden_size=32,
+            conf_num_attention_heads=4,
+            conf_num_hidden_layers=1,
+            conf_attention_chunk_size=4,
+            conf_attention_context_left=5,
+            conf_attention_context_right=0,
+            conf_reduction_factor=2,
+            input_feat_size=16,
+            sscp_conv_channel_size=[8, 4],
+            vocab_offset=208,
+            vocab_size=8,
+        ),
+    )
+    defaults.update(overrides)
+    return Gemma3nMultiModalConfig(**defaults)
+
+
+class TestGemma3nMultiModalPreprocessWeights:
+    """``Gemma3nMultiModalModel.preprocess_weights`` HF -> ONNX renaming.
+
+    The original gemma3n export was silently vision-blind because the
+    causal-LM ``preprocess_weights`` *deleted* every ``vision_tower.`` and
+    ``audio_tower.`` key.  These tests pin the routing table so no key can go
+    missing again without failing here.
+    """
+
+    def test_language_model_routes_to_decoder(self):
+        model = Gemma3nMultiModalModel(_tiny_multimodal_config())
+
+        result = model.preprocess_weights(
+            {
+                f"{_HF}language_model.layers.0.mlp.gate_proj.weight": torch.zeros(1),
+                f"{_HF}language_model.norm.weight": torch.zeros(1),
+            }
+        )
+
+        assert "decoder.model.layers.0.mlp.gate_proj.weight" in result
+        assert "decoder.model.norm.weight" in result
+
+    def test_lm_head_skips_the_model_level(self):
+        """``lm_head`` hangs off the decoder root, not ``decoder.model``."""
+        model = Gemma3nMultiModalModel(_tiny_multimodal_config())
+
+        result = model.preprocess_weights(
+            {f"{_HF}language_model.lm_head.weight": torch.zeros(1)}
+        )
+
+        assert "decoder.lm_head.weight" in result
+        assert "decoder.model.lm_head.weight" not in result
+
+    def test_tied_checkpoint_synthesizes_lm_head(self):
+        """E4B ships no ``lm_head``; it is tied to the token embedding."""
+        embed = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+        model = Gemma3nMultiModalModel(_tiny_multimodal_config(tie_word_embeddings=True))
+
+        result = model.preprocess_weights(
+            {f"{_HF}language_model.embed_tokens.weight": embed.clone()}
+        )
+
+        assert torch.equal(result["decoder.lm_head.weight"], embed)
+
+    def test_untied_checkpoint_keeps_its_own_lm_head(self):
+        """An explicit head must not be overwritten by the tying fallback."""
+        head = torch.ones(3, 2)
+        model = Gemma3nMultiModalModel(_tiny_multimodal_config(tie_word_embeddings=True))
+
+        result = model.preprocess_weights(
+            {
+                f"{_HF}language_model.embed_tokens.weight": torch.zeros(3, 2),
+                f"{_HF}language_model.lm_head.weight": head.clone(),
+            }
+        )
+
+        assert torch.equal(result["decoder.lm_head.weight"], head)
+
+    def test_no_lm_head_when_untied(self):
+        """Without tying, a headless state dict stays headless (a load error
+        downstream is better than silently reusing the embedding)."""
+        model = Gemma3nMultiModalModel(_tiny_multimodal_config(tie_word_embeddings=False))
+
+        result = model.preprocess_weights(
+            {f"{_HF}language_model.embed_tokens.weight": torch.zeros(3, 2)}
+        )
+
+        assert "decoder.lm_head.weight" not in result
+
+    def test_embed_tokens_goes_to_both_decoder_and_embedding(self):
+        model = Gemma3nMultiModalModel(_tiny_multimodal_config())
+
+        result = model.preprocess_weights(
+            {f"{_HF}language_model.embed_tokens.weight": torch.zeros(3, 2)}
+        )
+
+        assert "embedding.embed_tokens.weight" in result
+        assert "decoder.model.embed_tokens.weight" in result
+
+    @pytest.mark.parametrize(
+        "suffix",
+        [
+            "embed_tokens_per_layer.weight",
+            "per_layer_model_projection.weight",
+            "per_layer_projection_norm.weight",
+        ],
+    )
+    def test_per_layer_tables_go_only_to_embedding(self, suffix):
+        """The 4.7 GB per-layer table must not be duplicated into the decoder."""
+        model = Gemma3nMultiModalModel(_tiny_multimodal_config())
+
+        result = model.preprocess_weights({f"{_HF}language_model.{suffix}": torch.zeros(1)})
+
+        assert f"embedding.{suffix}" in result
+        assert not any(key.startswith("decoder.") for key in result)
+
+    def test_altup_level_is_stripped(self):
+        """AltUp submodules register on the parent layer, without the level."""
+        model = Gemma3nMultiModalModel(_tiny_multimodal_config())
+
+        result = model.preprocess_weights(
+            {
+                f"{_HF}language_model.layers.0.altup.correction_coefs.weight": torch.zeros(1),
+                f"{_HF}language_model.layers.0.altup.correct_output_scale": torch.zeros(1),
+            }
+        )
+
+        assert "decoder.model.layers.0.correction_coefs.weight" in result
+        assert "decoder.model.layers.0.correct_output_scale" in result
+        assert not any(".altup." in key for key in result)
+
+    def test_vision_tower_drops_the_timm_wrapper_level(self):
+        model = Gemma3nMultiModalModel(_tiny_multimodal_config())
+
+        result = model.preprocess_weights(
+            {f"{_HF}vision_tower.timm_model.blocks.0.0.conv_exp.weight": torch.zeros(1)}
+        )
+
+        assert "vision_encoder.encoder.blocks.0.0.conv_exp.weight" in result
+        assert not any("timm_model" in key for key in result)
+
+    def test_audio_tower_routes_to_audio_encoder(self):
+        model = Gemma3nMultiModalModel(_tiny_multimodal_config())
+
+        result = model.preprocess_weights(
+            {f"{_HF}audio_tower.conformer.0.attention.post.weight": torch.zeros(1)}
+        )
+
+        assert "audio_encoder.encoder.conformer.0.attention.post.weight" in result
+
+    @pytest.mark.parametrize("modality", ["vision", "audio"])
+    def test_embedder_weights_are_duplicated_into_two_components(self, modality):
+        """Each embedder is used soft-path in its tower and hard-path in the
+        embedding graph, so both graphs need all four tensors."""
+        component = "vision_encoder" if modality == "vision" else "audio_encoder"
+        model = Gemma3nMultiModalModel(_tiny_multimodal_config())
+
+        result = model.preprocess_weights(
+            {
+                f"{_HF}embed_{modality}.{name}": torch.zeros(1)
+                for name in (
+                    "embedding.weight",
+                    "embedding_projection.weight",
+                    "hard_embedding_norm.weight",
+                    "soft_embedding_norm.weight",
+                )
+            }
+        )
+
+        for prefix in (f"{component}.embed_{modality}.", f"embedding.embed_{modality}."):
+            assert f"{prefix}embedding.weight" in result, prefix
+            assert f"{prefix}embedding_projection.weight" in result, prefix
+            assert f"{prefix}hard_embedding_norm.weight" in result, prefix
+            assert f"{prefix}soft_embedding_norm.weight" in result, prefix
+
+    def test_audio_keys_dropped_when_config_has_no_audio(self):
+        """An audio-less package must not be handed audio weights: they would
+        only produce "not applied" warnings for a component that is absent."""
+        config = _tiny_multimodal_config(audio=None, audio_token_id=None)
+        model = Gemma3nMultiModalModel(config)
+        assert model.audio_encoder is None
+
+        result = model.preprocess_weights(
+            {
+                f"{_HF}audio_tower.conformer.0.norm.weight": torch.zeros(1),
+                f"{_HF}embed_audio.embedding.weight": torch.zeros(1),
+                f"{_HF}vision_tower.timm_model.msfa.norm.weight": torch.zeros(1),
+            }
+        )
+
+        assert not any("audio" in key for key in result)
+        assert "vision_encoder.encoder.msfa.norm.weight" in result
+
+    def test_kv_shared_layer_weights_are_dropped(self):
+        """The checkpoint ships K/V for all layers; shared layers build none."""
+        config = _tiny_multimodal_config(
+            layer_types=["full_attention", "full_attention"],
+            num_kv_shared_layers=1,
+        )
+        model = Gemma3nMultiModalModel(config)
+        assert model.decoder.model.layers[1].self_attn.is_kv_shared_layer
+
+        suffixes = ("q_proj.weight", "k_proj.weight", "v_proj.weight", "k_norm.weight")
+        result = model.preprocess_weights(
+            {
+                f"{_HF}language_model.layers.{idx}.self_attn.{suffix}": torch.zeros(1)
+                for idx in (0, 1)
+                for suffix in suffixes
+            }
+        )
+
+        for suffix in ("k_proj.weight", "v_proj.weight", "k_norm.weight"):
+            assert f"decoder.model.layers.0.self_attn.{suffix}" in result, suffix
+            assert f"decoder.model.layers.1.self_attn.{suffix}" not in result, suffix
+        # Q is per-layer and is never shared.
+        assert "decoder.model.layers.1.self_attn.q_proj.weight" in result
+
+    def test_unprefixed_keys_pass_through(self):
+        """Keys already in ONNX form (e.g. a re-loaded package) survive."""
+        model = Gemma3nMultiModalModel(_tiny_multimodal_config())
+
+        result = model.preprocess_weights({"decoder.model.norm.weight": torch.zeros(1)})
+
+        assert "decoder.model.norm.weight" in result
+
+
+def _hf_key_for(initializer_name: str) -> str:
+    """Invert ``preprocess_weights`` for one ONNX initializer name.
+
+    Written independently of the implementation (from the E4B checkpoint's
+    ``model.safetensors.index.json`` key layout) so a wrong rename shows up as
+    a missing initializer rather than cancelling out.
+    """
+    tower_prefixes = (
+        ("vision_encoder.encoder.", "vision_tower.timm_model."),
+        ("audio_encoder.encoder.", "audio_tower."),
+        ("vision_encoder.embed_vision.", "embed_vision."),
+        ("embedding.embed_vision.", "embed_vision."),
+        ("audio_encoder.embed_audio.", "embed_audio."),
+        ("embedding.embed_audio.", "embed_audio."),
+        ("embedding.", "language_model."),
+        ("decoder.lm_head.", "language_model.lm_head."),
+    )
+    for onnx_prefix, hf_suffix in tower_prefixes:
+        if initializer_name.startswith(onnx_prefix):
+            return _HF + hf_suffix + initializer_name[len(onnx_prefix) :]
+
+    assert initializer_name.startswith("decoder.model."), initializer_name
+    suffix = initializer_name[len("decoder.model.") :]
+    parts = suffix.split(".")
+    altup_members = {
+        "correct_output_scale",
+        "correction_coefs",
+        "prediction_coefs",
+        "modality_router",
+        "router_norm",
+    }
+    if parts[0] == "layers" and parts[2] in altup_members:
+        # preprocess_weights strips the ``.altup.`` level; put it back.
+        suffix = ".".join([*parts[:2], "altup", *parts[2:]])
+    return f"{_HF}language_model.{suffix}"
+
+
+class TestGemma3nMultiModalWeightCoverage:
+    """Every initializer needing data must be filled by a real checkpoint.
+
+    ``ModelPackage.save`` raises when any initializer still has
+    ``const_value is None``, so a rename that misses even one tensor turns a
+    working export into a hard failure — or, as with the original vision-blind
+    gemma3n export, into a package whose towers were never populated.  This
+    walks the *built* package and checks the full HF -> ONNX round-trip.
+    """
+
+    @staticmethod
+    def _unfilled_initializers(pkg) -> dict[str, list[str]]:
+        """Map component name -> initializer names still awaiting weights."""
+        return {
+            name: [
+                init_name
+                for init_name, init in model.graph.initializers.items()
+                if init.const_value is None
+            ]
+            for name, model in pkg.items()
+        }
+
+    def _assert_full_coverage(self, config) -> None:
+        from mobius._registry import registry
+        from mobius.tasks import get_task
+
+        module = registry.get("gemma3n")(config)
+        pkg = get_task("gemma3n").build(module, config)
+        unfilled = self._unfilled_initializers(pkg)
+
+        # Synthesize the checkpoint the way HF ships it, then rename.
+        state_dict = {}
+        for component, names in unfilled.items():
+            for name in names:
+                shape = list(pkg[component].graph.initializers[name].shape)
+                state_dict[_hf_key_for(name)] = torch.ones(shape)
+        renamed = module.preprocess_weights(state_dict)
+
+        missing = {
+            component: sorted(set(names) - set(renamed))
+            for component, names in unfilled.items()
+            if set(names) - set(renamed)
+        }
+        assert not missing, f"preprocess_weights left initializers unfilled: {missing}"
+
+    def test_all_initializers_covered_with_audio(self):
+        self._assert_full_coverage(_tiny_multimodal_config())
+
+    def test_all_initializers_covered_without_audio(self):
+        self._assert_full_coverage(
+            _tiny_multimodal_config(audio=None, audio_token_id=None)
+        )
+
+    def test_all_initializers_covered_with_kv_sharing(self):
+        """KV sharing removes initializers; it must not remove needed ones."""
+        self._assert_full_coverage(
+            _tiny_multimodal_config(
+                layer_types=["full_attention", "full_attention"],
+                num_kv_shared_layers=1,
+            )
+        )
+
+    def test_vision_tower_weights_actually_reach_the_graph(self):
+        """The regression guard: the MobileNet-V5 tower must be populated.
+
+        The causal-LM ``preprocess_weights`` deleted ``vision_tower.`` keys,
+        which produced an 8 GB "multimodal" package that could not see images.
+        """
+        config = _tiny_multimodal_config()
+        from mobius._registry import registry
+        from mobius.tasks import get_task
+
+        module = registry.get("gemma3n")(config)
+        pkg = get_task("gemma3n").build(module, config)
+        vision_names = self._unfilled_initializers(pkg)["vision_encoder"]
+        assert len(vision_names) > 500, "MobileNet-V5 tower should be large"
+
+        renamed = module.preprocess_weights(
+            {_hf_key_for(name): torch.ones(1) for name in vision_names}
+        )
+
+        assert set(vision_names) <= set(renamed)

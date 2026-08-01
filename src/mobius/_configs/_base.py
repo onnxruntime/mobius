@@ -1514,6 +1514,10 @@ class Gemma3nConfig(CausalLMConfig):
     Gaussian quantile cutoff are zeroed (see
     :class:`~mobius.models.gemma3n.Gemma3nMLP`).  E4B ships 0.95 for layers
     0..9 and 0.0 for the rest; ``None`` disables sparsity everywhere.
+
+    ``final_logit_softcapping`` tanh-caps the LM head output as in Gemma2
+    (``cap * tanh(logits / cap)``).  Every published Gemma 3n config ships
+    30.0; ``0.0`` disables it.
     """
 
     altup_num_inputs: int = 4
@@ -1524,6 +1528,7 @@ class Gemma3nConfig(CausalLMConfig):
     vocab_size_per_layer_input: int = 262_144
     num_kv_shared_layers: int = 0
     activation_sparsity_pattern: list[float] | None = None
+    final_logit_softcapping: float = 0.0
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Gemma3nConfig:
@@ -1541,6 +1546,7 @@ class Gemma3nConfig(CausalLMConfig):
             activation_sparsity_pattern=(
                 [float(s) for s in sparsity] if sparsity is not None else None
             ),
+            final_logit_softcapping=(getattr(config, "final_logit_softcapping", 0.0) or 0.0),
         )
 
 
