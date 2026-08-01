@@ -16,6 +16,7 @@ from mobius._testing.ort_inference import OnnxModelSession
 from mobius._weight_loading import apply_weights
 from mobius.models.qwen_vl import (
     Qwen3VL3ModelCausalLMModel,
+    Qwen3VLCausalLMModel,
     Qwen3VLDecoderModel,
     Qwen3VLDeepStackEmbeddingModel,
     Qwen3VLDeepStackVisionEncoderModel,
@@ -70,10 +71,31 @@ def _fake_state_dict_qwen3vl() -> dict[str, torch.Tensor]:
     embed = torch.randn(100, 64)
     return {
         "model.visual.patch_embed.proj.weight": torch.randn(64, 3, 14, 14),
+        "model.visual.blocks.0.mlp.linear_fc1.weight": torch.randn(128, 64),
+        "model.visual.blocks.0.mlp.linear_fc2.weight": torch.randn(64, 128),
+        "model.visual.merger.linear_fc1.weight": torch.randn(64, 64),
+        "model.visual.deepstack_merger_list.0.linear_fc2.weight": torch.randn(64, 64),
         "model.language_model.embed_tokens.weight": embed,
         "model.language_model.layers.0.self_attn.q_proj.weight": torch.randn(64, 64),
         "model.language_model.model.norm.weight": torch.randn(64),
     }
+
+
+class TestQwen3VLSingleModelWeights:
+    """Single-graph Qwen3-VL vision weights align with graph initializers."""
+
+    def test_vision_block_mlp_names_are_remapped_without_touching_mergers(self):
+        config = dataclasses.replace(_BASE_CONFIG, model_type="qwen3_vl")
+        model = Qwen3VLCausalLMModel(config)
+
+        result = model.preprocess_weights(_fake_state_dict_qwen3vl())
+
+        assert "visual.blocks.0.mlp.up_proj.weight" in result
+        assert "visual.blocks.0.mlp.down_proj.weight" in result
+        assert "visual.blocks.0.mlp.linear_fc1.weight" not in result
+        assert "visual.blocks.0.mlp.linear_fc2.weight" not in result
+        assert "visual.merger.linear_fc1.weight" in result
+        assert "visual.deepstack_merger_list.0.linear_fc2.weight" in result
 
 
 class TestQwen25VLCausalLMModelTiedWeights:

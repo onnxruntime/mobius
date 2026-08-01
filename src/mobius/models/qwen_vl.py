@@ -737,6 +737,13 @@ class Qwen3VLCausalLMModel(nn.Module):
             # Strip outer ``model.`` prefix
             if new_key.startswith("model."):
                 new_key = new_key[len("model.") :]
+            # Vision transformer blocks expose Qwen3's ``linear_fc1/fc2``
+            # weights through the generic MLP's ``up_proj/down_proj`` names.
+            # Merger modules deliberately keep their native ``linear_fc*``
+            # names and do not contain the ``.mlp.`` segment.
+            if new_key.startswith("visual."):
+                new_key = new_key.replace(".mlp.linear_fc1.", ".mlp.up_proj.")
+                new_key = new_key.replace(".mlp.linear_fc2.", ".mlp.down_proj.")
             # HF flattens language_model.model → language_model; restore it
             if new_key.startswith("language_model.") and not new_key.startswith(
                 "language_model.lm_head"
