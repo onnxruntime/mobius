@@ -135,6 +135,28 @@ class QuantizationConfig:
                 format=checkpoint_format,
             )
 
+        if method == "quark":
+            global_config = qc.get("global_quant_config")
+            weights = global_config.get("weight") if isinstance(global_config, dict) else None
+            if not isinstance(weights, dict):
+                raise ValueError(
+                    "Quark quantization_config must define global_quant_config.weight."
+                )
+            dtype = weights.get("dtype")
+            bits_by_dtype = {"int4": 4, "uint4": 4, "int8": 8, "uint8": 8}
+            if dtype not in bits_by_dtype:
+                raise ValueError(f"Unsupported Quark weight dtype {dtype!r}.")
+            group_size = weights.get("group_size")
+            if not isinstance(group_size, int) or group_size <= 0:
+                raise ValueError(f"Invalid Quark group_size {group_size!r}.")
+            return cls(
+                bits=bits_by_dtype[dtype],
+                group_size=group_size,
+                quant_method=method,
+                sym=bool(weights.get("symmetric", dtype.startswith("int"))),
+                modules_to_not_convert=qc.get("exclude"),
+            )
+
         return cls(
             bits=qc.get("bits", 4),
             group_size=qc.get("group_size", 128),

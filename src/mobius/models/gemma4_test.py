@@ -222,6 +222,60 @@ class TestGemma4Awq:
         assert result["decoder.lm_head.weight"] is embedding
 
 
+class TestGemma4QuarkAwq:
+    @staticmethod
+    def _config() -> Gemma4Config:
+        return _tiny_gemma4_config(
+            enable_moe_block=False,
+            attention_k_eq_v=False,
+            num_kv_shared_layers=0,
+            hidden_size_per_layer_input=32,
+            vocab_size_per_layer_input=256,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=32,
+                quant_method="quark",
+                sym=False,
+            ),
+        )
+
+    def test_uses_matmulnbits_for_decoder_only(self):
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = self._config()
+        pkg = Gemma4Task().build(Gemma4Model(config), config)
+
+        assert [node.op_type for node in pkg["decoder"].graph].count("MatMulNBits") == 2 * 9
+        assert [node.op_type for node in pkg["embedding"].graph].count("MatMulNBits") == 0
+        assert [node.op_type for node in pkg["vision_encoder"].graph].count("MatMulNBits") == 0
+
+    def test_converts_quark_native_decoder_weights(self):
+        config = self._config()
+        model = Gemma4Model(config)
+        qweight = torch.zeros(64, 8, dtype=torch.int32)
+        scales = torch.randn(2, 64)
+        qzeros = torch.zeros(2, 8, dtype=torch.int32)
+        vision_weight = torch.randn(32, 32)
+
+        result = model.preprocess_weights(
+            {
+                "model.language_model.layers.0.self_attn.q_proj.weight": qweight,
+                "model.language_model.layers.0.self_attn.q_proj.weight_scale": scales,
+                "model.language_model.layers.0.self_attn.q_proj.weight_zero_point": qzeros,
+                "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight": vision_weight,
+            }
+        )
+
+        prefix = "decoder.model.layers.0.self_attn.q_proj"
+        assert result[f"{prefix}.weight"].shape == (64, 2, 16)
+        assert result[f"{prefix}.weight"].dtype == torch.uint8
+        assert result[f"{prefix}.scales"].shape == (64, 2)
+        assert result[f"{prefix}.zero_points"].shape == (64, 1)
+        assert (
+            result["vision_encoder.encoder.layers.0.self_attn.q_proj.weight"] is vision_weight
+        )
+
+
 class TestGemma4OlivePacked:
     """Olive-native GPTQ checkpoints use ORT-oriented uint8 packed tensors."""
 

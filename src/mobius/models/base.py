@@ -26,6 +26,7 @@ from mobius._weight_utils import (
     preprocess_awq_weights,
     preprocess_gptq_weights,
     preprocess_olive_weights,
+    preprocess_quark_weights,
     tie_word_embeddings,
 )
 from mobius.components import (
@@ -442,6 +443,10 @@ class CausalLMModel(nn.Module):
             )
         elif qc is not None and qc.quant_method == "awq":
             state_dict = preprocess_awq_weights(
+                state_dict, bits=qc.bits, group_size=qc.group_size
+            )
+        elif qc is not None and qc.quant_method == "quark":
+            state_dict = preprocess_quark_weights(
                 state_dict, bits=qc.bits, group_size=qc.group_size
             )
         elif qc is not None and qc.quant_method == "olive":

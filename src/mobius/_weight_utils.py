@@ -1110,3 +1110,80 @@ def preprocess_awq_weights(
             result[key] = value
 
     return result
+
+
+def _unpack_quark_int32(value: torch.Tensor, bits: int, value_count: int) -> torch.Tensor:
+    """Unpack Quark values packed along the final dimension of an int32 tensor."""
+    shifts = torch.arange(0, 32, bits, dtype=torch.int32, device=value.device)
+    unpacked = torch.bitwise_right_shift(value.unsqueeze(-1), shifts)
+    unpacked = torch.bitwise_and(unpacked, (1 << bits) - 1)
+    return unpacked.reshape(*value.shape[:-1], -1)[..., :value_count].to(torch.uint8)
+
+
+def _pack_ort_uint8(value: torch.Tensor, bits: int) -> torch.Tensor:
+    """Pack values along the final dimension into ORT's uint8 representation."""
+    values_per_byte = 8 // bits
+    padding = (-value.shape[-1]) % values_per_byte
+    if padding:
+        value = torch.nn.functional.pad(value, (0, padding))
+    packed = torch.zeros(
+        *value.shape[:-1],
+        value.shape[-1] // values_per_byte,
+        dtype=torch.uint8,
+        device=value.device,
+    )
+    for index in range(values_per_byte):
+        packed |= value[..., index::values_per_byte] << (index * bits)
+    return packed
+
+
+def preprocess_quark_weights(
+    state_dict: dict[str, torch.Tensor],
+    bits: int = 4,
+    group_size: int = 128,
+) -> dict[str, torch.Tensor]:
+    """Convert Quark-native packed tensors to MatMulNBits initializer layouts.
+
+    Quark packs INT weights and zero points along the output-channel dimension:
+    ``weight`` is ``[K, ceil(N * bits / 32)]`` and ``weight_zero_point`` is
+    ``[groups, ceil(N * bits / 32)]``. MatMulNBits instead packs weights along
+    K into ``[N, groups, group_size * bits / 8]`` and zero points along groups.
+    Floating-point weights excluded from quantization retain the ordinary
+    ``weight`` key and pass through unchanged.
+    """
+    if bits not in (2, 4, 8):
+        raise ValueError(f"Quark MatMulNBits import requires 2, 4, or 8 bits, got {bits}.")
+
+    blob_size = group_size * bits // 8
+    result: dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        if key.endswith(".weight") and value.dtype == torch.int32:
+            scale_key = key.replace(".weight", ".weight_scale")
+            if scale_key not in state_dict:
+                raise ValueError(f"Missing {scale_key} for quantized Quark weight {key}.")
+            output_channels = state_dict[scale_key].shape[-1]
+            codes = _unpack_quark_int32(value, bits, output_channels)
+            packed = _pack_ort_uint8(codes.transpose(-1, -2).contiguous(), bits)
+            if packed.shape[-1] % blob_size:
+                raise ValueError(
+                    f"Packed Quark weight {key} has {packed.shape[-1]} bytes per output channel; "
+                    f"expected a multiple of blob_size {blob_size}."
+                )
+            result[key] = packed.reshape(*packed.shape[:-1], -1, blob_size).contiguous()
+        elif key.endswith(".weight_scale"):
+            result[key.replace(".weight_scale", ".scales")] = value.transpose(
+                -1, -2
+            ).contiguous()
+        elif key.endswith(".weight_zero_point"):
+            scale_key = key.replace(".weight_zero_point", ".weight_scale")
+            if scale_key not in state_dict:
+                raise ValueError(f"Missing {scale_key} for Quark zero points {key}.")
+            output_channels = state_dict[scale_key].shape[-1]
+            zeros = _unpack_quark_int32(value, bits, output_channels)
+            zeros = zeros.transpose(-1, -2).contiguous()
+            result[key.replace(".weight_zero_point", ".zero_points")] = _pack_ort_uint8(
+                zeros, bits
+            )
+        else:
+            result[key] = value
+    return result

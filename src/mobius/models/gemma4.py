@@ -37,6 +37,7 @@ from mobius._configs import ArchitectureConfig, Gemma4Config
 from mobius._weight_utils import (
     preprocess_awq_weights,
     preprocess_olive_weights,
+    preprocess_quark_weights,
     vlm_decoder_weights,
     vlm_embedding_weights,
 )
@@ -283,6 +284,12 @@ def _preprocess_quantized_checkpoint(
         return state_dict
     if quantization.quant_method == "awq":
         return preprocess_awq_weights(
+            state_dict,
+            bits=quantization.bits,
+            group_size=quantization.group_size,
+        )
+    if quantization.quant_method == "quark":
+        return preprocess_quark_weights(
             state_dict,
             bits=quantization.bits,
             group_size=quantization.group_size,

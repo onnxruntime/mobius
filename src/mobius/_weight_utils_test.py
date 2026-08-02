@@ -16,6 +16,7 @@ from mobius._weight_utils import (
     preprocess_gptq_weights,
     unwrap_gptq_observer_modules,
     preprocess_olive_weights,
+    preprocess_quark_weights,
     rename_weight_keys,
     split_codegen_qkv,
     split_fused_qkv,
@@ -1064,6 +1065,49 @@ class TestPreprocessAwqWeights:
         sd = {"q_proj.qzeros": torch.zeros(1, self.N, dtype=torch.int32)}
         with pytest.raises(ValueError, match=r"Missing q_proj\.qweight"):
             preprocess_awq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+
+
+class TestPreprocessQuarkWeights:
+    BITS = 4
+    GROUP_SIZE = 32
+    K = 64
+    N = 32
+    GROUPS = K // GROUP_SIZE
+
+    @staticmethod
+    def _pack_int32_last(values: torch.Tensor) -> torch.Tensor:
+        packed = torch.zeros(*values.shape[:-1], values.shape[-1] // 8, dtype=torch.int32)
+        for index in range(8):
+            packed |= values[..., index::8].to(torch.int32) << (index * 4)
+        return packed
+
+    def test_converts_quark_native_layout(self):
+        codes = torch.arange(self.K * self.N, dtype=torch.uint8).reshape(self.K, self.N) % 16
+        zero_codes = torch.tensor([[1, 2], [3, 4]], dtype=torch.uint8).repeat(1, self.N // 2)
+        scales = torch.randn(self.GROUPS, self.N)
+        media_weight = torch.randn(8, 8)
+        state_dict = {
+            "q_proj.weight": self._pack_int32_last(codes),
+            "q_proj.weight_scale": scales,
+            "q_proj.weight_zero_point": self._pack_int32_last(zero_codes),
+            "vision.weight": media_weight,
+        }
+
+        result = preprocess_quark_weights(
+            state_dict,
+            bits=self.BITS,
+            group_size=self.GROUP_SIZE,
+        )
+
+        expected_weight = codes.T[:, 0::2] | (codes.T[:, 1::2] << 4)
+        expected_weight = expected_weight.reshape(self.N, self.GROUPS, 16)
+        expected_zeros = zero_codes.T[:, 0::2] | (zero_codes.T[:, 1::2] << 4)
+        assert torch.equal(result["q_proj.weight"], expected_weight)
+        assert torch.equal(result["q_proj.scales"], scales.T)
+        assert torch.equal(result["q_proj.zero_points"], expected_zeros)
+        assert result["vision.weight"] is media_weight
+        assert "q_proj.weight_scale" not in result
+        assert "q_proj.weight_zero_point" not in result
 
 
 class TestMergeLoraWeights:

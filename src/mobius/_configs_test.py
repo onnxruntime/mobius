@@ -816,6 +816,34 @@ class TestQuantizationConfig:
         assert qc.group_size == 64
         assert qc.sym is False
 
+    def test_from_transformers_quark(self):
+        hf = type(
+            "HFConfig",
+            (),
+            {
+                "quantization_config": {
+                    "quant_method": "quark",
+                    "global_quant_config": {
+                        "weight": {
+                            "dtype": "uint4",
+                            "group_size": 32,
+                            "symmetric": False,
+                        }
+                    },
+                    "exclude": ["lm_head", "model.vision_tower*"],
+                }
+            },
+        )()
+
+        qc = QuantizationConfig.from_transformers(hf)
+
+        assert qc is not None
+        assert qc.quant_method == "quark"
+        assert qc.bits == 4
+        assert qc.group_size == 32
+        assert qc.sym is False
+        assert qc.modules_to_not_convert == ["lm_head", "model.vision_tower*"]
+
     def test_from_transformers_no_quant_config(self):
         hf = type("HFConfig", (), {})()
         assert QuantizationConfig.from_transformers(hf) is None
