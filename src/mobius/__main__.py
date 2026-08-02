@@ -178,6 +178,19 @@ def _cmd_build(args: argparse.Namespace) -> None:
 
     load_weights = not args.no_weights
     task: str | ModelTask | None = args.task
+
+    # FP8 KV cache: resolve the optional per-layer scale file up front so both
+    # the --config and --model build paths can pass the same scales.
+    fp8_kv_cache = getattr(args, "fp8_kv_cache", False)
+    kv_cache_scales: dict[int, tuple[float, float]] | None = None
+    scale_file = getattr(args, "kv_cache_scale_file", None)
+    if scale_file is not None and not fp8_kv_cache:
+        raise SystemExit("Error: --kv-cache-scale-file can only be used with --fp8-kv-cache.")
+    if fp8_kv_cache and scale_file is not None:
+        from mobius._passes._fp8_kv_cache import load_kv_cache_scale_file
+
+        kv_cache_scales = load_kv_cache_scale_file(scale_file)
+
     if args.static_cache:
         # Defer task creation — we need to know the model type first.
         # Store parameters for later resolution.
@@ -250,7 +263,12 @@ def _cmd_build(args: argparse.Namespace) -> None:
         module_class = registry.get(model_type)
         model_module = module_class(config)
         pkg = build_from_module(
-            model_module, config, task=task, execution_provider=execution_provider
+            model_module,
+            config,
+            task=task,
+            execution_provider=execution_provider,
+            fp8_kv_cache=fp8_kv_cache,
+            kv_cache_scales=kv_cache_scales,
         )
         for name, model in pkg.items():
             model.graph.name = f"{config_path}/{name}"
@@ -278,6 +296,8 @@ def _cmd_build(args: argparse.Namespace) -> None:
             trust_remote_code=trust_remote_code,
             execution_provider=execution_provider,
             text_only=args.text_only,
+            fp8_kv_cache=fp8_kv_cache,
+            kv_cache_scales=kv_cache_scales,
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)
@@ -696,6 +716,29 @@ def main(argv: list[str] | None = None) -> None:
             "decoder uses GroupQueryAttention on GQA-capable EPs. Currently "
             "supported for gemma4_unified (google/gemma-4-12B). Not compatible "
             "with --config or --component (use --model <hf-id>)."
+        ),
+    )
+    build_parser.add_argument(
+        "--fp8-kv-cache",
+        dest="fp8_kv_cache",
+        action="store_true",
+        help=(
+            "Store the GroupQueryAttention KV cache as FLOAT8E4M3FN (per-tensor "
+            "E4M3), halving KV-cache memory at long context. Requires a "
+            "GQA-capable build (e.g. --execution-provider cuda with --dtype "
+            "f16/bf16) and an ORT runtime with the FP8 KV-cache kernel (SM89+)."
+        ),
+    )
+    build_parser.add_argument(
+        "--kv-cache-scale-file",
+        dest="kv_cache_scale_file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Optional JSON file of calibrated per-layer FP8 KV-cache scales "
+            "(onnxruntime-genai format: {'scales': {'k_scales': [...], "
+            "'v_scales': [...]}}). Only used with --fp8-kv-cache; without it "
+            "all layers use a unit scale of 1.0."
         ),
     )
     build_parser.set_defaults(func=_cmd_build)
