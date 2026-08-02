@@ -46,6 +46,7 @@ import json
 import logging
 import math
 import re
+import warnings
 
 import numpy as np
 import onnx_ir as ir
@@ -79,6 +80,19 @@ def _retype_fp8(value: ir.Value | None) -> None:
     value.type = ir.TensorType(_FP8)
 
 
+def _is_retypable_cache(value: ir.Value) -> bool:
+    """Whether *value* may be safely retyped to FP8.
+
+    A KV cache is retypable when it is a graph input (no ``const_value``) or an
+    empty placeholder initializer. A non-empty FLOAT/FLOAT16 initializer must
+    NOT be retyped: declaring FP8 over FLOAT bytes would corrupt the graph.
+    """
+    const = value.const_value
+    if const is None:
+        return True
+    return const.size == 0
+
+
 class Fp8KvCachePass(ir.passes.InPlacePass):
     """Convert decoder ``GroupQueryAttention`` KV caches to FP8-E4M3.
 
@@ -109,6 +123,19 @@ class Fp8KvCachePass(ir.passes.InPlacePass):
                 # Prompt-processing GQA without a KV cache — nothing to convert.
                 continue
 
+            # Contract: only KV caches that are graph inputs (or empty
+            # placeholders) may be retyped. Retyping a non-empty FLOAT/FLOAT16
+            # initializer would declare FP8 over FLOAT bytes and corrupt the
+            # graph, so skip such nodes loudly rather than emit an invalid model.
+            if not _is_retypable_cache(past_key) or not _is_retypable_cache(past_value):
+                warnings.warn(
+                    f"Fp8KvCachePass: skipping {node.name!r} — its KV cache is a "
+                    f"non-empty initializer, not a graph input. Only graph-input "
+                    f"KV caches can be converted to FP8.",
+                    stacklevel=2,
+                )
+                continue
+
             # No early skip when past_key is already FP8: every step below is
             # idempotent (retype is a no-op, scale initializers dedup by name,
             # attributes overwrite, inputs only grow when < 14), so a re-run
@@ -120,17 +147,22 @@ class Fp8KvCachePass(ir.passes.InPlacePass):
             )
 
             # (1) Retype the cache graph I/O: past inputs + present outputs.
+            # Guard each present output on its own index so a hypothetical
+            # 2-output GQA variant cannot leave present_key (index 1) as a
+            # different dtype from past_key.
             _retype_fp8(past_key)
             _retype_fp8(past_value)
-            present_key = node.outputs[1] if len(node.outputs) > 2 else None
+            present_key = node.outputs[1] if len(node.outputs) > 1 else None
             present_value = node.outputs[2] if len(node.outputs) > 2 else None
             _retype_fp8(present_key)
             _retype_fp8(present_value)
 
-            # (2) Per-layer scale initializers (unit 1.0 unless calibrated).
-            suffix = f"{layer_id}" if layer_id is not None else node.name
-            k_scale = self._scale_initializer(graph, f"kv_cache.{suffix}.k_scale", k_val)
-            v_scale = self._scale_initializer(graph, f"kv_cache.{suffix}.v_scale", v_val)
+            # (2) Scale initializers (unit 1.0 unless calibrated). Names are
+            # derived from the cache tensor names — not just the numeric layer
+            # id — so distinct caches at the same layer index (e.g. seq2seq
+            # self- vs cross-attention) never share a scale initializer.
+            k_scale = self._scale_initializer(graph, f"{past_key.name}.fp8_scale", k_val)
+            v_scale = self._scale_initializer(graph, f"{past_value.name}.fp8_scale", v_val)
 
             if len(node.inputs) < _MIN_INPUTS:
                 node.resize_inputs(_MIN_INPUTS)

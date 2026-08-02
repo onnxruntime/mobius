@@ -42,6 +42,26 @@ _CUDA = "CUDAExecutionProvider"
 _HAS_CUDA = _CUDA in ort.get_available_providers()
 
 
+def _cuda_supports_fp8() -> bool:
+    """Best-effort check that the CUDA device has an FP8 GQA kernel (SM89+).
+
+    Conservative: returns ``False`` when the compute capability cannot be
+    determined (e.g. torch unavailable), so the runtime test is skipped rather
+    than run on hardware without the FP8 kernel (e.g. T4 / SM75).
+    """
+    if not _HAS_CUDA:
+        return False
+    try:
+        import torch
+
+        return torch.cuda.get_device_capability() >= (8, 9)
+    except Exception:
+        return False
+
+
+_FP8_CUDA = _cuda_supports_fp8()
+
+
 def _build_fp8_decoder(fp8_kv_cache=True, kv_cache_scales=None):
     """Build a tiny fp16 qwen2 decoder on the CUDA EP with the FP8 KV pass."""
     config = _base_config(dtype=ir.DataType.FLOAT16)
@@ -78,8 +98,12 @@ class TestFp8KvCacheGraph:
         assert gqa_nodes, "expected GroupQueryAttention nodes"
         for node in gqa_nodes:
             assert len(node.inputs) == 14
-            assert node.inputs[12] is not None and node.inputs[12].name.endswith("k_scale")
-            assert node.inputs[13] is not None and node.inputs[13].name.endswith("v_scale")
+            assert node.inputs[12] is not None and node.inputs[12].name.endswith(
+                "key.fp8_scale"
+            )
+            assert node.inputs[13] is not None and node.inputs[13].name.endswith(
+                "value.fp8_scale"
+            )
             assert node.attributes.get_string("k_quant_type") == "PER_TENSOR"
             assert node.attributes.get_string("v_quant_type") == "PER_TENSOR"
             assert node.attributes.get_int("kv_cache_bit_width") == 8
@@ -87,8 +111,8 @@ class TestFp8KvCacheGraph:
     def test_default_unit_scales(self):
         model, config = _build_fp8_decoder()
         for i in range(config.num_hidden_layers):
-            k = model.graph.initializers[f"kv_cache.{i}.k_scale"]
-            v = model.graph.initializers[f"kv_cache.{i}.v_scale"]
+            k = model.graph.initializers[f"past_key_values.{i}.key.fp8_scale"]
+            v = model.graph.initializers[f"past_key_values.{i}.value.fp8_scale"]
             np.testing.assert_array_equal(k.const_value.numpy(), np.array([1.0], np.float32))
             np.testing.assert_array_equal(v.const_value.numpy(), np.array([1.0], np.float32))
 
@@ -96,8 +120,8 @@ class TestFp8KvCacheGraph:
         scales = {0: (0.25, 0.5), 1: (2.0, 4.0)}
         model, _config = _build_fp8_decoder(kv_cache_scales=scales)
         for i, (kv_k, kv_v) in scales.items():
-            k = model.graph.initializers[f"kv_cache.{i}.k_scale"]
-            v = model.graph.initializers[f"kv_cache.{i}.v_scale"]
+            k = model.graph.initializers[f"past_key_values.{i}.key.fp8_scale"]
+            v = model.graph.initializers[f"past_key_values.{i}.value.fp8_scale"]
             np.testing.assert_array_equal(k.const_value.numpy(), np.array([kv_k], np.float32))
             np.testing.assert_array_equal(v.const_value.numpy(), np.array([kv_v], np.float32))
 
@@ -128,6 +152,53 @@ class TestFp8KvCacheGraph:
         for node in model.graph:
             if node.op_type == "GroupQueryAttention":
                 assert len(node.inputs) == 14
+
+    def test_skips_nonempty_initializer_cache(self):
+        """A non-empty FLOAT initializer-backed cache is left untouched (warns)."""
+        f16, i32 = ir.DataType.FLOAT16, ir.DataType.INT32
+
+        def val(name, dt, shape):
+            return ir.Value(name=name, type=ir.TensorType(dt), shape=ir.Shape(shape))
+
+        query = val("query", f16, [1, 1, 32])
+        seqlens_k = val("seqlens_k", i32, [1])
+        total_seq = val("total_seq", i32, [1])
+        # Non-empty fp16 past initializers (NOT graph inputs).
+        past_key = val("past_key_values.0.key", f16, [1, 1, 1, 16])
+        past_key.const_value = ir.tensor(
+            np.ones((1, 1, 1, 16), np.float16), name="past_key_values.0.key"
+        )
+        past_value = val("past_key_values.0.value", f16, [1, 1, 1, 16])
+        past_value.const_value = ir.tensor(
+            np.ones((1, 1, 1, 16), np.float16), name="past_key_values.0.value"
+        )
+        out = val("out", f16, [1, 1, 32])
+        pk = val("present.0.key", f16, [1, 1, 1, 16])
+        pv = val("present.0.value", f16, [1, 1, 1, 16])
+        node = ir.Node(
+            "com.microsoft",
+            "GroupQueryAttention",
+            [query, None, None, past_key, past_value, seqlens_k, total_seq],
+            attributes={
+                "num_heads": ir.AttrInt64("num_heads", 2),
+                "kv_num_heads": ir.AttrInt64("kv_num_heads", 1),
+            },
+            outputs=[out, pk, pv],
+            num_outputs=3,
+        )
+        graph = ir.Graph(
+            [query, seqlens_k, total_seq],
+            [out, pk, pv],
+            nodes=[node],
+            initializers=[past_key, past_value],
+            name="g",
+            opset_imports={"": 24, "com.microsoft": 1},
+        )
+        model = ir.Model(graph, ir_version=10)
+        with pytest.warns(UserWarning, match="non-empty initializer"):
+            Fp8KvCachePass()(model)
+        assert past_key.dtype == f16
+        assert len(node.inputs) == 7  # unchanged: no scale inputs added
 
 
 class TestLoadScaleFile:
@@ -166,7 +237,7 @@ class TestLoadScaleFile:
             load_kv_cache_scale_file(str(path))
 
 
-@pytest.mark.skipif(not _HAS_CUDA, reason="requires CUDAExecutionProvider (SM89+)")
+@pytest.mark.skipif(not _FP8_CUDA, reason="requires CUDA FP8 GQA kernel (SM89+)")
 def test_fp8_kv_gqa_runs_on_cuda(tmp_path):
     """The emitted FP8 GQA op signature is accepted and computes on CUDA.
 
