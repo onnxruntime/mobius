@@ -158,6 +158,10 @@ _COVERAGE_SKIP: dict[str, str] = {
     "shieldgemma2": "Alias for gemma2 — covered by gemma2",
     "yi": "Alias for llama — covered by llama",
     # --- VL text-decoder submodels (tested via their parent VL model) ---
+    "cosmos3_edge": "Cosmos3-Edge text reasoner backbone — L1 graph-build only; "
+    "L4/L5 parity needs NVIDIA's custom edge modeling code (not in transformers)",
+    "cosmos3_edge_text": "Alias for cosmos3_edge text reasoner — L1 graph-build only; "
+    "L4/L5 parity needs NVIDIA's custom edge modeling code (not in transformers)",
     "glm4v_moe_text": "VL text decoder — tested via glm4v_moe",
     "glm4v_text": "VL text decoder — tested via glm4v",
     "qwen2_5_vl_text": "VL text decoder — tested via qwen2_5_vl",

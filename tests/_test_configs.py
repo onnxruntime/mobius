@@ -111,6 +111,11 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ("qwen2", {}, True),
     ("cohere", {"tie_word_embeddings": True, "logit_scale": 0.0625}, True),
     ("cohere2", {"tie_word_embeddings": True, "logit_scale": 0.0625}, False),
+    (
+        "cosmos3_edge",
+        {"hidden_act": "relu2", "mlp_bias": False, "mrope_section": [24, 20, 20]},
+        True,
+    ),
     ("diffllama", {}, False),
     ("doge", {}, False),
     (

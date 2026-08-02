@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### NVIDIA Cosmos 3 Edge text reasoner (`cosmos3_edge`)
+
+#### Added
+
+- Support for the **text reasoner backbone** of the `cosmos3_edge`
+  vision-language checkpoint (`nvidia/Cosmos3-Edge`). The language tower is a
+  grouped-query-attention decoder with a **non-gated squared-ReLU FFN**
+  (`hidden_act="relu2"`, `up_proj → relu2 → down_proj`) and 3D multimodal RoPE
+  (`mrope_section=[24, 20, 20]`, equivalent to 1D RoPE for text-only). Mapped
+  onto the standard `CausalLMModel` backbone + `FCMLP`; `preprocess_weights`
+  renames the `self_attn.to_{q,k,v,out}` projections, nests the top-level text
+  tower under `model.`, and drops the vision encoder, projector, and the
+  generator-tower `k_norm_und_for_gen` key-norm. Registered as `cosmos3_edge`
+  / `cosmos3_edge_text`; L1 graph-build tested. The `cosmos3_omni` variants
+  (`Cosmos3-Nano`/`-Super`) are two-tower diffusion world models and remain out
+  of scope for this decoder-only path.
+
 ### Cargo-style `--features` build option
 
 #### Added
