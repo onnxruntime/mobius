@@ -168,20 +168,50 @@ mobius build --model Qwen/Qwen2.5-0.5B output/ \
     --ep cuda --dtype f16 --runtime ort-genai
 ```
 
-### Static Cache (`--static-cache`)
+### Build Features (`--features`)
+
+Build-mode toggles are collected under a single cargo-style `--features`
+option. Pass a comma-separated list (and/or repeat the flag):
 
 ```
---static-cache
+--features fp8-kv-cache,static-cache
+--features text-only
+```
+
+Available features:
+
+| Feature | Effect |
+|---------|--------|
+| `static-cache` | Pre-allocate fixed-size KV cache buffers using `TensorScatter` (pair with `--max-seq-len N`). Requires `DecoderLayer` / `MoEDecoderLayer` models. Cannot combine with `--task`. |
+| `fp8-kv-cache` | Store the `GroupQueryAttention` KV cache as `FLOAT8E4M3FN` (per-tensor E4M3), halving KV-cache memory. Requires a GQA build (e.g. `--ep cuda --dtype f16`) and an ORT runtime with the FP8 KV-cache kernel (SM89+). Pair with `--kv-cache-scale-file` for calibrated scales. |
+| `text-only` | Export the text backbone of a multimodal checkpoint as a standalone decoder-only LLM (see below). |
+
+The legacy boolean flags `--static-cache`, `--fp8-kv-cache`, and
+`--text-only` still work but are **deprecated** aliases for the matching
+feature and print a warning. Prefer `--features`.
+
+```bash
+mobius build --model meta-llama/Llama-3.2-1B output/ \
+    --features static-cache --max-seq-len 2048
+
+mobius build --model Qwen/Qwen2.5-0.5B output/ \
+    --ep cuda --dtype f16 --features fp8-kv-cache
+```
+
+### Static Cache (`--features static-cache`)
+
+```
+--features static-cache
 --max-seq-len N
 ```
 
 Pre-allocate fixed-size KV cache buffers using TensorScatter. Useful when
 the maximum sequence length is known up front.
 
-- `--static-cache` enables static cache mode. Requires models using
+- `--features static-cache` enables static cache mode. Requires models using
   `DecoderLayer` or `MoEDecoderLayer`.
 - `--max-seq-len N` sets the maximum sequence length for static cache
-  buffers. Only valid with `--static-cache`. Defaults to
+  buffers. Only valid with static cache. Defaults to
   `max_position_embeddings` from the model config.
 
 Cannot be combined with `--task`.
@@ -189,10 +219,11 @@ Cannot be combined with `--task`.
 #### Example
 
 ```bash
-mobius build --model meta-llama/Llama-3.2-1B output/ --static-cache
+mobius build --model meta-llama/Llama-3.2-1B output/ --features static-cache
 
 # With explicit max sequence length
-mobius build --model meta-llama/Llama-3.2-1B output/ --static-cache --max-seq-len 2048
+mobius build --model meta-llama/Llama-3.2-1B output/ \
+    --features static-cache --max-seq-len 2048
 ```
 
 ### Other Flags
@@ -206,13 +237,14 @@ mobius build --model meta-llama/Llama-3.2-1B output/ --static-cache --max-seq-le
 | `--max-shard-size SIZE` | Maximum shard size for safetensors external data (e.g. `5GB`). Only used with `--external-data safetensors`. |
 | `--trust-remote-code` | Trust remote code when loading the HuggingFace model config. |
 | `--component NAME` | Build only one component from a diffusers pipeline (e.g. `--component vae_decoder`). |
-| `--text-only` | Export the text backbone of a multimodal checkpoint as a standalone decoder-only LLM. Strips vision/audio routing so the decoder uses `GroupQueryAttention` on GQA-capable EPs (build with `--ep cuda`/`dml`). Currently supported for `gemma4_unified` (`google/gemma-4-12B`). Not compatible with `--config` or `--component`. |
+| `--text-only` | **Deprecated** alias for `--features text-only`. Export the text backbone of a multimodal checkpoint as a standalone decoder-only LLM. Strips vision/audio routing so the decoder uses `GroupQueryAttention` on GQA-capable EPs (build with `--ep cuda`/`dml`). Currently supported for `gemma4_unified` (`google/gemma-4-12B`). Not compatible with `--config` or `--component`. |
+| `--kv-cache-scale-file PATH` | Optional JSON file of calibrated per-layer FP8 KV-cache scales (onnxruntime-genai format). Only used with the `fp8-kv-cache` feature; without it all layers use a unit scale of 1.0. |
 
 #### Text-only example
 
 ```bash
 # Export gemma-4-12B's text backbone as a GQA decoder-only LLM
-mobius build --model google/gemma-4-12B output/ --text-only --ep cuda --dtype f16
+mobius build --model google/gemma-4-12B output/ --features text-only --ep cuda --dtype f16
 ```
 
 For a full ORT-GenAI text-only package (with `genai_config.json`), use

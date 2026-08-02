@@ -10,6 +10,7 @@ import glob
 import json
 import logging
 import os
+import sys
 from typing import TYPE_CHECKING
 
 import tqdm
@@ -31,6 +32,51 @@ from mobius._config_resolver import (
 from mobius._registry import registry
 
 logger = logging.getLogger(__name__)
+
+
+# Rust/cargo-style build features. Each feature name (kebab-case) maps to the
+# boolean attribute on the parsed args that it enables. `--features a,b` (or a
+# repeated `--features`) is the canonical way to toggle these build modes; the
+# legacy per-feature boolean flags remain as deprecated aliases that set the
+# same attributes.
+_BUILD_FEATURES: dict[str, str] = {
+    "static-cache": "static_cache",
+    "fp8-kv-cache": "fp8_kv_cache",
+    "text-only": "text_only",
+}
+
+
+def _resolve_build_features(args: argparse.Namespace) -> None:
+    """Fold ``--features`` values into the boolean build-mode attributes.
+
+    ``--features`` accepts a comma-separated list and may be repeated (cargo
+    style), e.g. ``--features fp8-kv-cache,static-cache`` or
+    ``--features fp8-kv-cache --features static-cache``. Each recognised feature
+    sets its corresponding attribute (``fp8-kv-cache`` -> ``args.fp8_kv_cache``).
+
+    The legacy boolean flags (``--static-cache``, ``--text-only``,
+    ``--fp8-kv-cache``) still work but are deprecated: using one prints a notice
+    and sets the same attribute. Unknown feature names raise ``SystemExit``.
+    """
+    # Warn when a caller uses a deprecated boolean alias directly.
+    for feature, dest in _BUILD_FEATURES.items():
+        if getattr(args, dest, False):
+            print(
+                f"Warning: --{feature} is deprecated; use --features {feature} instead.",
+                file=sys.stderr,
+            )
+
+    raw = getattr(args, "features", None) or []
+    requested: list[str] = []
+    for chunk in raw:
+        requested.extend(f.strip() for f in chunk.split(",") if f.strip())
+
+    for feature in requested:
+        dest = _BUILD_FEATURES.get(feature)
+        if dest is None:
+            valid = ", ".join(sorted(_BUILD_FEATURES))
+            raise SystemExit(f"Error: unknown feature '{feature}'. Valid features: {valid}.")
+        setattr(args, dest, True)
 
 
 def _parse_size(size_str: str) -> int:
@@ -136,6 +182,10 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 max_seq_len=args.max_seq_len,
             )
         return CausalLMTask(static_cache=True, max_seq_len=args.max_seq_len)
+
+    # Fold --features into the boolean build-mode attributes before any
+    # validation reads them (and warn on deprecated boolean aliases).
+    _resolve_build_features(args)
 
     # Validate --max-seq-len requires --static-cache
     if args.max_seq_len is not None and not args.static_cache:
@@ -666,9 +716,24 @@ def main(argv: list[str] | None = None) -> None:
         help="Build only this component from a diffusers pipeline (e.g. --component vae_decoder).",
     )
     build_parser.add_argument(
+        "--features",
+        action="append",
+        default=None,
+        metavar="FEATURES",
+        help=(
+            "Comma-separated list of build features to enable (cargo-style; "
+            "may be repeated). Available: "
+            + ", ".join(sorted(_BUILD_FEATURES))
+            + ". Example: --features fp8-kv-cache,static-cache. This is the "
+            "canonical replacement for the individual --static-cache / "
+            "--text-only / --fp8-kv-cache flags."
+        ),
+    )
+    build_parser.add_argument(
         "--static-cache",
         action="store_true",
-        help="Use static KV cache (pre-allocated buffers with TensorScatter). "
+        help="[deprecated: use --features static-cache] "
+        "Use static KV cache (pre-allocated buffers with TensorScatter). "
         "Requires models using DecoderLayer or MoEDecoderLayer.",
     )
     build_parser.add_argument(
@@ -711,6 +776,7 @@ def main(argv: list[str] | None = None) -> None:
         dest="text_only",
         action="store_true",
         help=(
+            "[deprecated: use --features text-only] "
             "Export the text backbone of a multimodal checkpoint as a "
             "standalone decoder-only LLM. Strips vision/audio routing so the "
             "decoder uses GroupQueryAttention on GQA-capable EPs. Currently "
@@ -723,6 +789,7 @@ def main(argv: list[str] | None = None) -> None:
         dest="fp8_kv_cache",
         action="store_true",
         help=(
+            "[deprecated: use --features fp8-kv-cache] "
             "Store the GroupQueryAttention KV cache as FLOAT8E4M3FN (per-tensor "
             "E4M3), halving KV-cache memory at long context. Requires a "
             "GQA-capable build (e.g. --execution-provider cuda with --dtype "
