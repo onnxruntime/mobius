@@ -568,25 +568,56 @@ def _reshape_packed_qweight(value: torch.Tensor, blob_size: int) -> torch.Tensor
     return packed.reshape(*prefix, n, n_blocks, blob_size)
 
 
-def _reshape_packed_qzeros(value: torch.Tensor, bits: int, n_blocks: int) -> torch.Tensor:
-    """Transpose and unpack packed qzeros for MatMulNBits.
+def _reshape_packed_qzeros(
+    value: torch.Tensor, bits: int, n_blocks: int, offset: int = 0
+) -> torch.Tensor:
+    """Unpack GPTQ qzeros along N and repack along blocks for MatMulNBits.
 
-    Converts ``[..., n_groups_packed, N]`` int32 to
-    ``[..., N, zp_cols]`` uint8
-    where ``zp_cols = ceil(n_blocks * bits / 8)``.  For 4-bit this
-    packs two zero-point values per byte, matching ORT's expectation.
+    GPTQ stores zero points as ``[..., n_groups, N / pack_factor]`` int32,
+    packing ``pack_factor = 32 // bits`` *output channels* into each int32.
+    GPTQModel's packer writes
+    ``qzeros[:, col] |= zeros[:, col * pack_factor + j] << (bits * j)``,
+    so the packed axis is N while the group axis stays unpacked.
+
+    MatMulNBits expects ``[..., N, ceil(n_blocks * bits / 8)]`` uint8 packed
+    along the *block* axis instead. Because the two formats pack different
+    axes, reinterpreting the buffer as bytes is not sufficient: the values
+    must be unpacked, transposed, and repacked.
 
     Args:
-        value: Packed qzeros tensor ``[n_groups_packed, N]`` int32.
+        value: Packed qzeros tensor ``[..., n_groups, N / pack_factor]`` int32.
         bits: Quantization bit-width (4 or 8).
         n_blocks: Actual number of quantization blocks (``ceil(K / block_size)``).
+        offset: Added to every zero point after unpacking, for checkpoint
+            formats that store a biased value. Results are clamped to the
+            representable range.
     """
-    transposed = value.transpose(-1, -2).contiguous()
-    prefix = transposed.shape[:-2]
-    n = transposed.shape[-2]
-    flat_uint8 = transposed.reshape(-1).view(torch.uint8).reshape(*prefix, n, -1)
+    pack_factor = 32 // bits
+    mask = (1 << bits) - 1
+    prefix = value.shape[:-2]
+    n_groups = value.shape[-2]
+
+    # Unpack along N: [..., n_groups, N/pack_factor, pack_factor] -> [..., n_groups, N]
+    shifts = torch.arange(pack_factor, device=value.device, dtype=torch.int32) * bits
+    unpacked = (value.unsqueeze(-1) >> shifts) & mask
+    unpacked = unpacked.reshape(*prefix, n_groups, -1)
+
+    if offset:
+        unpacked = (unpacked + offset).clamp(0, mask)
+
+    # [..., N, n_groups], trimmed to the real block count
+    transposed = unpacked.transpose(-1, -2).contiguous()[..., :n_blocks]
+
+    # Repack along blocks: 8 // bits zero points per byte
+    per_byte = 8 // bits
     zp_cols = math.ceil(n_blocks * bits / 8)
-    return flat_uint8[..., :zp_cols]
+    padded = zp_cols * per_byte
+    if transposed.shape[-1] < padded:
+        transposed = torch.nn.functional.pad(transposed, (0, padded - transposed.shape[-1]))
+    grouped = transposed.reshape(*transposed.shape[:-1], zp_cols, per_byte)
+    byte_shifts = torch.arange(per_byte, device=value.device, dtype=torch.int32) * bits
+    packed = (grouped << byte_shifts).sum(dim=-1)
+    return packed.to(torch.uint8)
 
 
 def pack_qmoe_expert_weights(
@@ -818,6 +849,26 @@ def preprocess_compressed_tensors_weights(
     return result
 
 
+def unwrap_gptq_observer_modules(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Strip the observer-wrapper infix GPTQModel adds to unquantized layers.
+
+    GPTQModel wraps every targeted ``nn.Linear`` in an observer module. Layers
+    it chose to quantize are replaced outright, so their packed tensors keep
+    the original path, but layers left in floating point end up one level
+    deeper as ``<path>.linear.weight`` alongside scalar activation observers.
+
+    The wrapped name does not exist in the built graph, so unless the infix is
+    removed those weights never bind and the affected component silently runs
+    on uninitialized values. This must run *before* a model's
+    ``preprocess_weights`` so that its renames and transposes see canonical
+    names. The activation observers are left untouched: the built graph
+    declares matching initializers for them.
+    """
+    return {key.replace(".linear.", "."): value for key, value in state_dict.items()}
+
+
 def preprocess_gptq_weights(
     state_dict: dict[str, torch.Tensor],
     bits: int = 4,
@@ -854,6 +905,9 @@ def preprocess_gptq_weights(
     result: dict[str, torch.Tensor] = {}
 
     for key, value in state_dict.items():
+        # GPTQModel's observer wrapper is unwrapped earlier, before the
+        # model's own preprocess_weights runs, so keys arriving here are
+        # already canonical.
         if key.endswith(".g_idx"):
             # g_idx maps element i to its quantization group.  For
             # non-desc_act models this is simply i // group_size.
@@ -880,7 +934,14 @@ def preprocess_gptq_weights(
                 )
             k = state_dict[qw_key].shape[-2] * 32 // bits
             n_blocks = math.ceil(k / group_size)
-            result[new_key] = _reshape_packed_qzeros(value, bits, n_blocks)
+            # GPTQ stores ``zero - 1``, so dequantization is
+            # ``scale * (q - (z + 1))``. MatMulNBits applies
+            # ``scale * (q - zero_point)`` with no bias of its own, so the
+            # +1 has to be folded in here. Omitting it leaves the weights
+            # highly correlated with the original but with roughly 3x the
+            # reconstruction error, which is enough to reduce generation to
+            # noise while still looking plausible in a shape check.
+            result[new_key] = _reshape_packed_qzeros(value, bits, n_blocks, offset=1)
 
         elif key.endswith(".scales"):
             result[key] = value.transpose(-1, -2).contiguous()

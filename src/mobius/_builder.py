@@ -46,6 +46,8 @@ from mobius._weight_loading import _download_weights
 from mobius._weight_utils import (
     infer_compressed_tensors_group_size,
     preprocess_compressed_tensors_weights,
+    preprocess_gptq_weights,
+    unwrap_gptq_observer_modules,
 )
 from mobius.tasks import ModelTask, get_task
 
@@ -634,21 +636,50 @@ def build(
     for name, model in pkg.items():
         model.graph.name = f"{model_id}/{name}"
 
-    if state_dict is not None:
+    def _preprocess_state_dict(
+        state_dict: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Apply module and quantization-format weight preprocessing.
+
+        Quantized checkpoints store packed tensors in the exporting
+        framework's layout, which differs from the output-channel-major
+        layout MatMulNBits expects. This must run for both caller-supplied
+        and downloaded weights, otherwise a checkpoint that loads fine when
+        a state dict is passed explicitly fails with a shape mismatch when
+        ``load_weights=True`` drives the download path.
+        """
+        if quantization is not None and quantization.quant_method == "gptq":
+            # GPTQModel wraps targeted ``nn.Linear`` modules in an observer.
+            # Layers it left in floating point keep their weight one level
+            # deeper as ``<path>.linear.weight``. Unwrap before the module
+            # preprocessor runs so its renames and transposes see the
+            # canonical names; otherwise those weights never bind.
+            state_dict = unwrap_gptq_observer_modules(state_dict)
         if hasattr(model_module, "preprocess_weights"):
             state_dict = model_module.preprocess_weights(state_dict)
-        if quantization is not None and quantization.quant_method == "compressed-tensors":
-            state_dict = preprocess_compressed_tensors_weights(
+        if quantization is None:
+            return state_dict
+        if quantization.quant_method == "compressed-tensors":
+            return preprocess_compressed_tensors_weights(
                 state_dict,
                 bits=quantization.bits,
                 group_size=quantization.group_size,
             )
+        if quantization.quant_method == "gptq":
+            return preprocess_gptq_weights(
+                state_dict,
+                bits=quantization.bits,
+                group_size=quantization.group_size,
+            )
+        return state_dict
+
+    if state_dict is not None:
+        state_dict = _preprocess_state_dict(state_dict)
         prefix_map = getattr(model_module, "weight_prefix_map", None)
         pkg.apply_weights(state_dict, prefix_map=prefix_map)
     elif load_weights:
         state_dict = _download_weights(model_id)
-        if hasattr(model_module, "preprocess_weights"):
-            state_dict = model_module.preprocess_weights(state_dict)
+        state_dict = _preprocess_state_dict(state_dict)
         prefix_map = getattr(model_module, "weight_prefix_map", None)
         pkg.apply_weights(state_dict, prefix_map=prefix_map)
 

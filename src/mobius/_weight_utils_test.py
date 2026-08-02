@@ -14,6 +14,7 @@ from mobius._weight_utils import (
     preprocess_awq_weights,
     preprocess_compressed_tensors_weights,
     preprocess_gptq_weights,
+    unwrap_gptq_observer_modules,
     preprocess_olive_weights,
     rename_weight_keys,
     split_codegen_qkv,
@@ -559,8 +560,9 @@ class TestPreprocessGptqWeights:
     K_PACKED = K * BITS // 32  # 32
     N_GROUPS = K // GROUP_SIZE  # 8
     BLOB_SIZE = GROUP_SIZE * BITS // 8  # 16
-    # qzeros packs (32 // BITS)=8 zero points per int32
-    N_GROUPS_PACKED = N_GROUPS * BITS // 32  # 1
+    # qzeros packs (32 // BITS)=8 *output channels* per int32, so the
+    # packed axis is N and the group axis stays unpacked.
+    N_PACKED = N * BITS // 32  # 16
 
     def test_qweight_renamed_to_weight(self):
         sd = {
@@ -586,7 +588,7 @@ class TestPreprocessGptqWeights:
                 0, 255, (self.K_PACKED, self.N), dtype=torch.int32
             ),
             "q_proj.qzeros": torch.randint(
-                0, 255, (max(1, self.N_GROUPS_PACKED), self.N), dtype=torch.int32
+                0, 255, (self.N_GROUPS, self.N_PACKED), dtype=torch.int32
             ),
         }
         result = preprocess_gptq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
@@ -619,6 +621,79 @@ class TestPreprocessGptqWeights:
         result = preprocess_gptq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
         assert result["q_proj.scales"].shape == (self.N, self.N_GROUPS)
 
+    def test_observer_wrapped_linear_weights_are_unwrapped(self):
+        """Unquantized layers keep a `.linear.` infix that must be stripped.
+
+        GPTQModel wraps targeted `nn.Linear` modules in an observer. Layers
+        it leaves in floating point end up as `<path>.linear.weight`. That
+        name does not exist in the built graph, so without unwrapping they
+        never bind and the component silently runs on uninitialized weights.
+        """
+        weight = torch.randn(8, 8)
+        sd = {
+            "vision_tower.layers.0.mlp.down_proj.linear.weight": weight,
+            "vision_tower.layers.0.mlp.down_proj.linear.bias": torch.randn(8),
+            "vision_tower.layers.0.mlp.down_proj.input_min": torch.tensor(0.0),
+        }
+        result = unwrap_gptq_observer_modules(sd)
+
+        # Infix stripped; activation observers preserved because the built
+        # graph declares initializers for them.
+        assert set(result) == {
+            "vision_tower.layers.0.mlp.down_proj.weight",
+            "vision_tower.layers.0.mlp.down_proj.bias",
+            "vision_tower.layers.0.mlp.down_proj.input_min",
+        }
+        torch.testing.assert_close(
+            result["vision_tower.layers.0.mlp.down_proj.weight"], weight
+        )
+
+    def test_qzeros_round_trip_applies_gptq_plus_one_offset(self):
+        """Zero points must be transposed, repacked, and biased by +1.
+
+        GPTQ packs zero points along N while MatMulNBits packs them along
+        the block axis, so the conversion has to unpack, transpose and
+        repack rather than reinterpret the int32 buffer as bytes.
+
+        GPTQ also stores ``zero - 1``: its dequantization is
+        ``scale * (q - (z + 1))``. MatMulNBits applies
+        ``scale * (q - zero_point)`` with no bias of its own, so the +1 must
+        be folded into the stored zero point here.
+        """
+        pack_factor = 32 // self.BITS
+        maxq = (1 << self.BITS) - 1
+        torch.manual_seed(0)
+        zeros = torch.randint(0, 2**self.BITS, (self.N_GROUPS, self.N), dtype=torch.int32)
+
+        # Pack along N exactly as GPTQModel's packer does.
+        qzeros = torch.zeros((self.N_GROUPS, self.N_PACKED), dtype=torch.int32)
+        for col in range(self.N_PACKED):
+            for j in range(pack_factor):
+                qzeros[:, col] |= zeros[:, col * pack_factor + j] << (self.BITS * j)
+
+        sd = {
+            "q_proj.qweight": torch.randint(
+                0, 255, (self.K_PACKED, self.N), dtype=torch.int32
+            ),
+            "q_proj.qzeros": qzeros,
+        }
+        result = preprocess_gptq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+        packed = result["q_proj.zero_points"]
+
+        zp_cols = self.N_GROUPS * self.BITS // 8
+        assert packed.shape == (self.N, zp_cols)
+        assert packed.dtype == torch.uint8
+
+        per_byte = 8 // self.BITS
+        recovered = torch.zeros((self.N, self.N_GROUPS), dtype=torch.int32)
+        for n in range(self.N):
+            for g in range(self.N_GROUPS):
+                byte = int(packed[n, g // per_byte])
+                recovered[n, g] = (byte >> (self.BITS * (g % per_byte))) & maxq
+
+        expected = (zeros + 1).clamp(0, maxq).transpose(0, 1).contiguous()
+        torch.testing.assert_close(recovered, expected)
+
     def test_expert_major_tensors_preserve_expert_axis(self):
         num_experts = 64
         sd = {
@@ -631,7 +706,7 @@ class TestPreprocessGptqWeights:
             "experts.qzeros": torch.randint(
                 0,
                 255,
-                (num_experts, max(1, self.N_GROUPS_PACKED), self.N),
+                (num_experts, self.N_GROUPS, self.N_PACKED),
                 dtype=torch.int32,
             ),
             "experts.scales": torch.randn(num_experts, self.N_GROUPS, self.N),
@@ -857,7 +932,9 @@ class TestPreprocessAwqWeights:
     K_PACKED = K * BITS // 32  # 32
     N_GROUPS = K // GROUP_SIZE  # 8
     BLOB_SIZE = GROUP_SIZE * BITS // 8  # 16
-    N_GROUPS_PACKED = N_GROUPS * BITS // 32  # 1
+    # AWQ uses the same int32 packing as GPTQ: qzeros packs output
+    # channels, so the packed axis is N.
+    N_PACKED = N * BITS // 32  # 16
 
     def test_qweight_renamed_to_weight(self):
         sd = {
@@ -885,7 +962,7 @@ class TestPreprocessAwqWeights:
             "q_proj.qzeros": torch.randint(
                 0,
                 255,
-                (max(1, self.N_GROUPS_PACKED), self.N),
+                (self.N_GROUPS, self.N_PACKED),
                 dtype=torch.int32,
             ),
         }
@@ -895,22 +972,25 @@ class TestPreprocessAwqWeights:
 
     def test_zero_point_offset_subtracted(self):
         """AWQ zero points have +1 offset that must be subtracted."""
-        # Create qzeros where every byte is 0x05 (all nibbles = 5).
-        # After unpacking to uint8 we get 5 per element, after -1 → 4.
+        # 0x55555555 sets every 4-bit nibble to 5. (0x05050505 would only
+        # set alternating nibbles, since one byte holds two zero points.)
         sd = {
             "q_proj.qweight": torch.randint(
                 0, 255, (self.K_PACKED, self.N), dtype=torch.int32
             ),
             "q_proj.qzeros": torch.full(
-                (max(1, self.N_GROUPS_PACKED), self.N),
-                0x05050505,
+                (self.N_GROUPS, self.N_PACKED),
+                0x55555555,
                 dtype=torch.int32,
             ),
         }
         result = preprocess_awq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
         zp = result["q_proj.zero_points"]
-        # Each byte was 0x05=5, after -1 → 4
-        assert (zp == 4).all()
+        # Every zero point was 5; after the -1 offset each nibble is 4, so
+        # each output byte packs two 4s as 0x44.
+        assert (zp == 0x44).all()
+        assert ((zp & 0x0F) == 4).all()
+        assert (((zp >> 4) & 0x0F) == 4).all()
 
     def test_no_g_idx_handling(self):
         """AWQ does not have g_idx — unknown keys should pass through."""
@@ -948,7 +1028,7 @@ class TestPreprocessAwqWeights:
                 0, 255, (self.K_PACKED, self.N), dtype=torch.int32
             ),
             "q_proj.qzeros": torch.zeros(
-                max(1, self.N_GROUPS_PACKED), self.N, dtype=torch.int32
+                self.N_GROUPS, self.N_PACKED, dtype=torch.int32
             ),
         }
         result = preprocess_awq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
@@ -969,7 +1049,7 @@ class TestPreprocessAwqWeights:
                 0, 255, (self.K_PACKED, self.N), dtype=torch.int32
             ),
             "q_proj.qzeros": torch.full(
-                (max(1, self.N_GROUPS_PACKED), self.N),
+                (self.N_GROUPS, self.N_PACKED),
                 -2004318072,  # 0x88888888 as signed int32
                 dtype=torch.int32,
             ),
