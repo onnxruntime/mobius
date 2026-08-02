@@ -154,6 +154,7 @@ class QuantizationConfig:
                 group_size=group_size,
                 quant_method=method,
                 sym=bool(weights.get("symmetric", dtype.startswith("int"))),
+                format=(qc.get("export") or {}).get("pack_method"),
                 modules_to_not_convert=qc.get("exclude"),
             )
 

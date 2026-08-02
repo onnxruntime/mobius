@@ -447,7 +447,10 @@ class CausalLMModel(nn.Module):
             )
         elif qc is not None and qc.quant_method == "quark":
             state_dict = preprocess_quark_weights(
-                state_dict, bits=qc.bits, group_size=qc.group_size
+                state_dict,
+                bits=qc.bits,
+                group_size=qc.group_size,
+                reorder=qc.format != "order",
             )
         elif qc is not None and qc.quant_method == "olive":
             # Olive-packed weights: also handles quantized embed/lm_head and

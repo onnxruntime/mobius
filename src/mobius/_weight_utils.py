@@ -1112,12 +1112,29 @@ def preprocess_awq_weights(
     return result
 
 
-def _unpack_quark_int32(value: torch.Tensor, bits: int, value_count: int) -> torch.Tensor:
+def _unpack_quark_int32(
+    value: torch.Tensor,
+    bits: int,
+    value_count: int,
+    reorder: bool,
+) -> torch.Tensor:
     """Unpack Quark values packed along the final dimension of an int32 tensor."""
     shifts = torch.arange(0, 32, bits, dtype=torch.int32, device=value.device)
     unpacked = torch.bitwise_right_shift(value.unsqueeze(-1), shifts)
     unpacked = torch.bitwise_and(unpacked, (1 << bits) - 1)
-    return unpacked.reshape(*value.shape[:-1], -1)[..., :value_count].to(torch.uint8)
+    unpacked = unpacked.reshape(*value.shape[:-1], -1)
+    if reorder:
+        if bits != 4:
+            raise NotImplementedError(
+                "Quark reordered import currently supports only 4-bit weights."
+            )
+        inverse_order = torch.tensor(
+            [0, 4, 1, 5, 2, 6, 3, 7],
+            device=value.device,
+        )
+        unpacked = unpacked.reshape(*unpacked.shape[:-1], -1, 8)[..., inverse_order]
+        unpacked = unpacked.flatten(-2)
+    return unpacked[..., :value_count].to(torch.uint8)
 
 
 def _pack_ort_uint8(value: torch.Tensor, bits: int) -> torch.Tensor:
@@ -1141,6 +1158,7 @@ def preprocess_quark_weights(
     state_dict: dict[str, torch.Tensor],
     bits: int = 4,
     group_size: int = 128,
+    reorder: bool = True,
 ) -> dict[str, torch.Tensor]:
     """Convert Quark-native packed tensors to MatMulNBits initializer layouts.
 
@@ -1162,7 +1180,7 @@ def preprocess_quark_weights(
             if scale_key not in state_dict:
                 raise ValueError(f"Missing {scale_key} for quantized Quark weight {key}.")
             output_channels = state_dict[scale_key].shape[-1]
-            codes = _unpack_quark_int32(value, bits, output_channels)
+            codes = _unpack_quark_int32(value, bits, output_channels, reorder)
             packed = _pack_ort_uint8(codes.transpose(-1, -2).contiguous(), bits)
             if packed.shape[-1] % blob_size:
                 raise ValueError(
@@ -1179,7 +1197,7 @@ def preprocess_quark_weights(
             if scale_key not in state_dict:
                 raise ValueError(f"Missing {scale_key} for Quark zero points {key}.")
             output_channels = state_dict[scale_key].shape[-1]
-            zeros = _unpack_quark_int32(value, bits, output_channels)
+            zeros = _unpack_quark_int32(value, bits, output_channels, reorder)
             zeros = zeros.transpose(-1, -2).contiguous()
             result[key.replace(".weight_zero_point", ".zero_points")] = _pack_ort_uint8(
                 zeros, bits

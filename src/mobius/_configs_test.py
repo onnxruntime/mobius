@@ -830,6 +830,7 @@ class TestQuantizationConfig:
                             "symmetric": False,
                         }
                     },
+                    "export": {"pack_method": "reorder"},
                     "exclude": ["lm_head", "model.vision_tower*"],
                 }
             },
@@ -842,6 +843,7 @@ class TestQuantizationConfig:
         assert qc.bits == 4
         assert qc.group_size == 32
         assert qc.sym is False
+        assert qc.format == "reorder"
         assert qc.modules_to_not_convert == ["lm_head", "model.vision_tower*"]
 
     def test_from_transformers_no_quant_config(self):

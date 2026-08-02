@@ -1076,6 +1076,8 @@ class TestPreprocessQuarkWeights:
 
     @staticmethod
     def _pack_int32_last(values: torch.Tensor) -> torch.Tensor:
+        order = [0, 2, 4, 6, 1, 3, 5, 7]
+        values = values.reshape(*values.shape[:-1], -1, 8)[..., order].flatten(-2)
         packed = torch.zeros(*values.shape[:-1], values.shape[-1] // 8, dtype=torch.int32)
         for index in range(8):
             packed |= values[..., index::8].to(torch.int32) << (index * 4)

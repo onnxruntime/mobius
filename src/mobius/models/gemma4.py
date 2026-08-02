@@ -293,6 +293,7 @@ def _preprocess_quantized_checkpoint(
             state_dict,
             bits=quantization.bits,
             group_size=quantization.group_size,
+            reorder=quantization.format != "order",
         )
     if quantization.quant_method != "olive":
         return state_dict
