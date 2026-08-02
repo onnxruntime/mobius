@@ -398,9 +398,10 @@ def optimize_model(
         fp8_kv_cache: When ``True``, convert decoder
             ``GroupQueryAttention`` KV caches to ``FLOAT8E4M3FN`` (per-tensor
             E4M3) via :class:`~mobius._passes.Fp8KvCachePass`. Only applied
-            when GQA fusion is active for ``(ep, dtype)`` and
-            ``model_role == "decoder"``; otherwise a warning is emitted and the
-            request is ignored (no GQA nodes to convert).
+            when GQA fusion is active for ``(ep, dtype)``,
+            ``model_role == "decoder"``, and the EP ships the FP8 GQA kernel
+            (``caps.supports_fp8_kv_cache`` — currently CUDA only); otherwise a
+            warning is emitted and the request is ignored.
         kv_cache_scales: Optional ``layer_id -> (k_scale, v_scale)`` map of
             per-tensor FP8 scales (from offline calibration). Only used when
             ``fp8_kv_cache`` is ``True``; layers absent from the map use a unit
@@ -572,12 +573,13 @@ def optimize_model(
     # GQA-capable EP/dtype); otherwise there is no KV-cache op to convert.
     if fp8_kv_cache:
         gqa_active = model_role == "decoder" and dtype in caps.gqa_dtypes
-        if not gqa_active:
+        if not gqa_active or not caps.supports_fp8_kv_cache:
             warnings.warn(
-                f"fp8_kv_cache=True was requested but GQA fusion is not active "
-                f"for ep={ep!r}/dtype={dtype}/role={model_role!r}. FP8 KV cache "
-                f"requires a GroupQueryAttention decoder (e.g. --execution-provider "
-                f"cuda with an fp16/bf16 dtype). Ignoring the request.",
+                f"fp8_kv_cache=True was requested but the FP8 GQA KV-cache kernel "
+                f"is not available for ep={ep!r}/dtype={dtype}/role={model_role!r}. "
+                f"FP8 KV cache requires a GroupQueryAttention decoder on an EP with "
+                f"the FP8 kernel (currently only --execution-provider cuda with an "
+                f"fp16/bf16 dtype). Ignoring the request.",
                 stacklevel=4,
             )
         else:

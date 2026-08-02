@@ -145,6 +145,26 @@ class TestFp8KvCacheGraph:
         ins = {v.name: v for v in pkg["model"].graph.inputs}
         assert ins["past_key_values.0.key"].dtype == ir.DataType.FLOAT
 
+    def test_ignored_and_warns_on_non_fp8_ep_with_gqa(self):
+        """GQA-active but non-FP8 EP (CPU/float32) must NOT emit FP8 KV I/O.
+
+        Regression: fp8_kv_cache was previously applied whenever GQA fusion was
+        active, which includes CPU (gqa_dtypes={FLOAT}) — an EP without the FP8
+        GQA kernel — producing models that can't load/run.
+        """
+        config = _base_config(dtype=ir.DataType.FLOAT)
+        module = registry.get("qwen2")(config)
+        with pytest.warns(UserWarning, match="fp8_kv_cache=True"):
+            pkg = build_from_module(
+                module,
+                config,
+                "text-generation",
+                execution_provider="cpu",
+                fp8_kv_cache=True,
+            )
+        ins = {v.name: v for v in pkg["model"].graph.inputs}
+        assert ins["past_key_values.0.key"].dtype == ir.DataType.FLOAT
+
     def test_pass_is_idempotent(self):
         model, _config = _build_fp8_decoder()
         # Re-running the pass must not add extra inputs or re-type anything.
