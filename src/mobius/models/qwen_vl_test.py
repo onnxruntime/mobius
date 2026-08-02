@@ -245,6 +245,30 @@ class TestQwen3VL3ModelCausalLMModelTiedWeights:
         assert result[f"{prefix}.scales"].shape == (64, 2)
         assert result[f"{prefix}.zero_points"].shape == (64, 1)
 
+    def test_olive_tie_flag_restores_float_lm_head_when_top_level_flag_is_clear(self):
+        config = dataclasses.replace(
+            _BASE_CONFIG,
+            model_type="qwen3_vl",
+            tie_word_embeddings=False,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=32,
+                quant_method="olive",
+                sym=False,
+                tie_word_embeddings=True,
+            ),
+        )
+        model = Qwen3VL3ModelCausalLMModel(config)
+        state_dict = {
+            "model.language_model.embed_tokens.weight": torch.randn(100, 64),
+        }
+
+        result = model.preprocess_weights(state_dict)
+
+        embed = result["decoder.model.embed_tokens.weight"]
+        head = result["decoder.lm_head.weight"]
+        assert embed.data_ptr() == head.data_ptr()
+
 
 class TestQwen3VLDecoderModelTiedWeights:
     """Standalone Qwen3-VL decoder."""

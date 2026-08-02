@@ -811,6 +811,9 @@ class Qwen3VL3ModelCausalLMModel(nn.Module):
         HF keys: ``model.visual.*``, ``model.language_model.*``.
         """
         quantization = self.config.quantization
+        tie = self.config.tie_word_embeddings or (
+            quantization is not None and quantization.tie_word_embeddings
+        )
         if quantization is not None and quantization.quant_method == "olive":
             state_dict = preprocess_olive_weights(
                 state_dict,
@@ -818,8 +821,7 @@ class Qwen3VL3ModelCausalLMModel(nn.Module):
                 group_size=quantization.group_size,
                 quantize_embeddings=quantization.quantize_embeddings,
                 quantize_lm_head=quantization.quantize_lm_head,
-                tie_word_embeddings=self.config.tie_word_embeddings
-                or quantization.tie_word_embeddings,
+                tie_word_embeddings=tie,
             )
 
         renamed: dict[str, torch.Tensor] = {}
@@ -839,13 +841,13 @@ class Qwen3VL3ModelCausalLMModel(nn.Module):
                 renamed[f"decoder.model.{suffix}"] = value
                 renamed[f"embedding.{suffix}"] = value
             elif stripped.startswith("language_model.lm_head."):
-                if not self.config.tie_word_embeddings:
+                if not tie:
                     renamed[f"decoder.{stripped[len('language_model.') :]}"] = value
             elif stripped.startswith("language_model."):
                 # language_model.layers.* → decoder.model.layers.*
                 suffix = stripped[len("language_model.") :]
                 renamed[f"decoder.model.{suffix}"] = value
-        if self.config.tie_word_embeddings:
+        if tie:
             # onnxscript qualifies params by module path, so the in-tree
             # alias set in __init__ does not cross composite module
             # boundaries.  Establish tensor identity here so apply_weights
@@ -923,6 +925,9 @@ class Qwen3VLDecoderModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Route language_model weights for standalone decoder build."""
         quantization = self.config.quantization
+        tie = self.config.tie_word_embeddings or (
+            quantization is not None and quantization.tie_word_embeddings
+        )
         if quantization is not None and quantization.quant_method == "olive":
             state_dict = preprocess_olive_weights(
                 state_dict,
@@ -930,8 +935,7 @@ class Qwen3VLDecoderModel(nn.Module):
                 group_size=quantization.group_size,
                 quantize_embeddings=quantization.quantize_embeddings,
                 quantize_lm_head=quantization.quantize_lm_head,
-                tie_word_embeddings=self.config.tie_word_embeddings
-                or quantization.tie_word_embeddings,
+                tie_word_embeddings=tie,
             )
 
         renamed: dict[str, torch.Tensor] = {}
@@ -946,7 +950,7 @@ class Qwen3VLDecoderModel(nn.Module):
                 stripped = stripped[len("language_model.") :]
             renamed[stripped] = value
 
-        if self.config.tie_word_embeddings:
+        if tie:
             # After stripping language_model., keys are embed_tokens.weight
             # and lm_head.weight (no model. prefix).
             tie_word_embeddings(
