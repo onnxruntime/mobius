@@ -46,7 +46,16 @@ def unpack_nvfp4_codes(packed_nk2: np.ndarray) -> np.ndarray:
     K-axis E2M1 codes for the same output row ``N`` (low nibble = even ``K``,
     high nibble = odd ``K``) — the layout ModelOpt writes. Returns uint8 codes
     ``[N, K]`` in ``0..15``.
+
+    Raises:
+        ValueError: if ``packed_nk2`` is not a 2D ``[N, K/2]`` array. Loader
+            code should surface an upstream shape/dtype mistake (e.g. passing
+            already-unpacked codes) rather than silently reinterpreting it.
     """
+    if packed_nk2.ndim != 2:
+        raise ValueError(
+            f"NVFP4 packed codes must be 2D [N, K/2], got shape {packed_nk2.shape}."
+        )
     packed = np.ascontiguousarray(packed_nk2).astype(np.uint8)
     low = packed & 0x0F
     high = packed >> 4
@@ -81,9 +90,17 @@ def dequantize_nvfp4(
     block_scale = _to_float32(block_scale_e4m3)  # [N, K/16]
     k = codes.shape[1]
     n_blocks = block_scale.shape[1]
-    if k % n_blocks != 0:
+    if n_blocks == 0 or k % n_blocks != 0:
         raise ValueError(f"NVFP4 K={k} is not divisible by the block count {n_blocks}.")
-    block_scale = np.repeat(block_scale, k // n_blocks, axis=1)  # [N, K]
+    block_size = k // n_blocks
+    if block_size != NVFP4_BLOCK_SIZE:
+        # NVFP4 pins the block size to 16; a different derived size means the
+        # weight/scale shapes are mismatched (silently-wrong reconstruction).
+        raise ValueError(
+            f"NVFP4 block size must be {NVFP4_BLOCK_SIZE}, got {block_size} "
+            f"(K={k}, block scales={n_blocks})."
+        )
+    block_scale = np.repeat(block_scale, block_size, axis=1)  # [N, K]
 
     dequant = val * block_scale * np.float32(global_scale)
     return dequant.astype(ml_dtypes.bfloat16)
