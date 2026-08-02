@@ -151,6 +151,20 @@ class TestLoadScaleFile:
         with pytest.raises(ValueError, match="equal length"):
             load_kv_cache_scale_file(str(path))
 
+    def test_rejects_non_positive_scale(self, tmp_path):
+        path = tmp_path / "bad.json"
+        path.write_text(
+            json.dumps({"scales": {"k_scales": [0.1, 0.0], "v_scales": [0.3, 0.4]}})
+        )
+        with pytest.raises(ValueError, match="non-finite"):
+            load_kv_cache_scale_file(str(path))
+
+    def test_rejects_non_array(self, tmp_path):
+        path = tmp_path / "bad.json"
+        path.write_text(json.dumps({"scales": {"k_scales": "0.1", "v_scales": "0.3"}}))
+        with pytest.raises(ValueError, match="must be JSON arrays"):
+            load_kv_cache_scale_file(str(path))
+
 
 @pytest.mark.skipif(not _HAS_CUDA, reason="requires CUDAExecutionProvider (SM89+)")
 def test_fp8_kv_gqa_runs_on_cuda(tmp_path):

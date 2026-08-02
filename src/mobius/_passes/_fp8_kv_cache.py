@@ -42,7 +42,9 @@ Hopper / Blackwell). The FP8 KV cache is IO-bound at runtime as device
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 import re
 
 import numpy as np
@@ -106,9 +108,11 @@ class Fp8KvCachePass(ir.passes.InPlacePass):
             if past_key is None or past_value is None:
                 # Prompt-processing GQA without a KV cache — nothing to convert.
                 continue
-            if past_key.dtype == _FP8:
-                # Already converted (idempotent re-run).
-                continue
+
+            # No early skip when past_key is already FP8: every step below is
+            # idempotent (retype is a no-op, scale initializers dedup by name,
+            # attributes overwrite, inputs only grow when < 14), so a re-run
+            # cannot leave a node in a half-converted state.
 
             layer_id = _layer_id_from_name(past_key.name)
             k_val, v_val = self._scales.get(
@@ -182,8 +186,6 @@ def load_kv_cache_scale_file(path: str) -> dict[int, tuple[float, float]]:
         ValueError: If the file lacks ``scales.k_scales`` / ``scales.v_scales``
             or the two lists differ in length.
     """
-    import json
-
     with open(path, encoding="utf-8") as handle:
         data = json.load(handle)
     try:
@@ -193,9 +195,22 @@ def load_kv_cache_scale_file(path: str) -> dict[int, tuple[float, float]]:
         raise ValueError(
             f"{path!r} must contain scales.k_scales and scales.v_scales."
         ) from error
+    if not isinstance(k_scales, list) or not isinstance(v_scales, list):
+        raise ValueError(  # noqa: TRY004 — malformed calibration file is a value error, not a type error
+            f"{path!r}: scales.k_scales and scales.v_scales must be JSON arrays."
+        )
     if len(k_scales) != len(v_scales):
         raise ValueError(
             f"{path!r}: k_scales and v_scales must have equal length "
             f"(got k={len(k_scales)}, v={len(v_scales)})."
         )
-    return {i: (float(k), float(v)) for i, (k, v) in enumerate(zip(k_scales, v_scales))}
+    scales: dict[int, tuple[float, float]] = {}
+    for i, (k, v) in enumerate(zip(k_scales, v_scales)):
+        k_f, v_f = float(k), float(v)
+        if not (math.isfinite(k_f) and k_f > 0.0 and math.isfinite(v_f) and v_f > 0.0):
+            raise ValueError(
+                f"{path!r}: layer {i} has a non-positive or non-finite scale "
+                f"(k={k}, v={v}); FP8 KV-cache scales must be finite and > 0."
+            )
+        scales[i] = (k_f, v_f)
+    return scales
