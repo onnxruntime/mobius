@@ -35,6 +35,7 @@ from onnxscript import OpBuilder, nn
 from mobius._build_context import ep_capabilities
 from mobius._configs import ArchitectureConfig, Gemma4Config
 from mobius._weight_utils import (
+    preprocess_awq_weights,
     preprocess_olive_weights,
     vlm_decoder_weights,
     vlm_embedding_weights,
@@ -272,13 +273,21 @@ def _per_layer_model_projection_class(config: Gemma4Config) -> type:
     return Linear
 
 
-def _preprocess_olive_checkpoint(
+def _preprocess_quantized_checkpoint(
     state_dict: dict[str, torch.Tensor],
     config: Gemma4Config,
 ) -> dict[str, torch.Tensor]:
-    """Convert renamed Olive-packed tensors to Gemma 4 ONNX initializer layouts."""
+    """Convert renamed packed tensors to Gemma 4 ONNX initializer layouts."""
     quantization = config.quantization
-    if quantization is None or quantization.quant_method != "olive":
+    if quantization is None:
+        return state_dict
+    if quantization.quant_method == "awq":
+        return preprocess_awq_weights(
+            state_dict,
+            bits=quantization.bits,
+            group_size=quantization.group_size,
+        )
+    if quantization.quant_method != "olive":
         return state_dict
     return preprocess_olive_weights(
         state_dict,
@@ -3325,7 +3334,7 @@ class Gemma4Model(nn.Module):
         # into the decoder, which owns the split tables in that configuration.
         _route_split_per_layer_weights(renamed, self.config)
 
-        return _preprocess_olive_checkpoint(renamed, self.config)
+        return _preprocess_quantized_checkpoint(renamed, self.config)
 
 
 # ---------------------------------------------------------------------------
@@ -3447,4 +3456,4 @@ class Gemma4UnifiedModel(nn.Module):
                 renamed[key] = value
 
         _route_split_per_layer_weights(renamed, self.config)
-        return _preprocess_olive_checkpoint(renamed, self.config)
+        return _preprocess_quantized_checkpoint(renamed, self.config)

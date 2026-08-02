@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import onnx_ir as ir
 import torch
 
@@ -149,6 +151,75 @@ class TestGemma4CompressedTensors:
         assert embedding_ops.count("MatMulNBits") == 1
         assert vision_ops.count("MatMulNBits") == 0
         assert "Compress" not in vision_ops
+
+
+class TestGemma4Awq:
+    @staticmethod
+    def _config() -> Gemma4Config:
+        return _tiny_gemma4_config(
+            enable_moe_block=False,
+            attention_k_eq_v=False,
+            num_kv_shared_layers=0,
+            hidden_size_per_layer_input=32,
+            vocab_size_per_layer_input=256,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=32,
+                quant_method="awq",
+                sym=False,
+            ),
+        )
+
+    def test_uses_matmulnbits_for_decoder_only(self):
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = self._config()
+        pkg = Gemma4Task().build(Gemma4Model(config), config)
+
+        assert [node.op_type for node in pkg["decoder"].graph].count("MatMulNBits") == 2 * 9
+        assert [node.op_type for node in pkg["embedding"].graph].count("MatMulNBits") == 0
+        assert [node.op_type for node in pkg["vision_encoder"].graph].count("MatMulNBits") == 0
+
+    def test_converts_and_routes_awq_decoder_weights(self):
+        config = self._config()
+        model = Gemma4Model(config)
+        qweight = torch.randint(0, 255, (8, 64), dtype=torch.int32)
+        scales = torch.randn(2, 64)
+        qzeros = torch.full((1, 64), 0x05050505, dtype=torch.int32)
+        vision_weight = torch.randn(32, 32)
+
+        result = model.preprocess_weights(
+            {
+                "model.language_model.layers.0.self_attn.q_proj.qweight": qweight,
+                "model.language_model.layers.0.self_attn.q_proj.scales": scales,
+                "model.language_model.layers.0.self_attn.q_proj.qzeros": qzeros,
+                "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight": vision_weight,
+            }
+        )
+
+        prefix = "decoder.model.layers.0.self_attn.q_proj"
+        assert result[f"{prefix}.weight"].shape == (64, 2, 16)
+        assert result[f"{prefix}.weight"].dtype == torch.uint8
+        assert result[f"{prefix}.scales"].shape == (64, 2)
+        assert result[f"{prefix}.zero_points"].shape == (64, 1)
+        assert (result[f"{prefix}.zero_points"] == 4).all()
+        assert (
+            result["vision_encoder.encoder.layers.0.self_attn.q_proj.weight"] is vision_weight
+        )
+        assert not any(key.endswith((".qweight", ".qzeros")) for key in result)
+
+    def test_preserves_tied_float_embedding_and_lm_head(self):
+        config = dataclasses.replace(self._config(), tie_word_embeddings=True)
+        model = Gemma4Model(config)
+        embedding = torch.randn(256, 64)
+
+        result = model.preprocess_weights(
+            {"model.language_model.embed_tokens.weight": embedding}
+        )
+
+        assert result["embedding.embed_tokens.weight"] is embedding
+        assert result["decoder.model.embed_tokens.weight"] is embedding
+        assert result["decoder.lm_head.weight"] is embedding
 
 
 class TestGemma4OlivePacked:
