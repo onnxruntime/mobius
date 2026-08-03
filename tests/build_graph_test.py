@@ -80,6 +80,7 @@ _CHECKER_SKIP_MODELS: set[str] = {
     "minimax",
     "qwen3_5_text",
     "qwen3_5_moe",
+    "qwen3_5_moe_text",
     "qwen3_next",
     # Models using LinearAttention / CausalConvWithState custom ops
     # prevent full shape/type propagation through com.microsoft domain.

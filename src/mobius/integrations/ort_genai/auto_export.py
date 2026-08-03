@@ -87,10 +87,10 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     # ORT GenAI (see onnxruntime-genai/src/models/model_type.h LLM list).
     "hunyuan_v1_dense": "decoder",
     "deepseek_v4": "decoder",
-    # Qwen VL models all use the same GenAI pipeline as qwen2_5_vl
+    # Qwen VL model families have separate ORT GenAI model types.
     "qwen2_vl": "qwen2_5_vl",
-    "qwen3_vl": "qwen2_5_vl",
-    "qwen3_vl_text": "qwen2_5_vl",
+    "qwen3_vl": "qwen3_vl",
+    "qwen3_vl_text": "qwen3_vl",
     "qwen3_5": "qwen2_5_vl",
     "qwen3_5_vl": "qwen2_5_vl",
 }
@@ -880,6 +880,16 @@ def _write_genai_config(
                 if sms is not None:
                     vision_kwargs["spatial_merge_size"] = sms
                 vision_kwargs["config_filename"] = "processor_config.json"
+                if model_type in {"qwen3_vl", "qwen3_vl_text"}:
+                    patch_size = getattr(vision_cfg, "patch_size", None)
+                    window_size = getattr(vision_cfg, "window_size", None)
+                    if patch_size is not None:
+                        vision_kwargs["patch_size"] = patch_size
+                    if window_size is not None:
+                        vision_kwargs["window_size"] = window_size
+                    vision_kwargs["tokens_per_second"] = float(
+                        getattr(config, "tokens_per_second", 2.0)
+                    )
 
             if vision_input_mapping is not None:
                 vision_kwargs["input_names"] = vision_input_mapping
@@ -889,6 +899,12 @@ def _write_genai_config(
             embedding_output_mapping = _introspect_outputs(pkg, "embedding")
             if embedding_output_mapping is not None:
                 vision_kwargs["embedding_output_names"] = embedding_output_mapping
+            vision_start_token_id = getattr(config, "vision_start_token_id", None)
+            video_token_id = getattr(config, "video_token_id", None)
+            if vision_start_token_id is not None:
+                vision_kwargs["vision_start_token_id"] = vision_start_token_id
+            if video_token_id is not None:
+                vision_kwargs["video_token_id"] = video_token_id
 
             generator.with_vision(image_token_id=image_token_id, **vision_kwargs)
 
@@ -946,8 +962,8 @@ def write_ort_genai_config(
         pkg: Already-built :class:`~mobius._model_package.ModelPackage` with
             weights applied and ``config`` set.
         directory: Output directory (created if needed).
-        hf_model_id: HuggingFace model ID. When provided, used to fetch token
-            IDs (``bos``/``eos``/``pad``) and download tokenizer files.
+        hf_model_id: HuggingFace model ID or local model directory. When provided,
+            used to fetch token IDs (``bos``/``eos``/``pad``) and copy tokenizer files.
             When ``None``, token IDs are read from ``pkg.config`` fields
             (``bos_token_id``, ``eos_token_id``, ``pad_token_id``) populated
             by :meth:`~mobius._configs.ArchitectureConfig.from_transformers`,
@@ -1112,11 +1128,15 @@ def write_ort_genai_config(
             f.write("\n")
         result["mtp_config"] = mtp_path
 
-    # Copy tokenizer files — HF Hub takes precedence; local dir is the fallback
-    # for --config mode where no HF model ID is available.
+    # Copy tokenizer files. A local hf_model_id is a local model directory, not a
+    # Hub repo id; copy directly instead of calling hf_hub_download.
     if hf_model_id is not None:
-        logger.info("Copying tokenizer files from %s", hf_model_id)
-        tokenizer_files = _copy_tokenizer_files(hf_model_id, directory)
+        if os.path.isdir(hf_model_id):
+            logger.info("Copying tokenizer files from local model directory %s", hf_model_id)
+            tokenizer_files = _copy_tokenizer_files_from_local(hf_model_id, directory)
+        else:
+            logger.info("Copying tokenizer files from %s", hf_model_id)
+            tokenizer_files = _copy_tokenizer_files(hf_model_id, directory)
         for tf in tokenizer_files:
             result[tf] = os.path.join(directory, tf)
     elif local_config_dir is not None:
