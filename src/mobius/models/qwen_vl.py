@@ -952,8 +952,11 @@ class Qwen3VLVisionEncoderModel(nn.Module):
             hidden_states=pixel_values,
             grid_thw=image_grid_thw,
         )
-        # ``Qwen3VLVisionModel`` returns ``(merged, *deepstack_features)``.
-        # Without DeepStack layers it returns a bare tensor.
+        # ``Qwen3VLVisionModel`` always returns a tuple ``(merged,
+        # *deepstack_features)``: a 1-tuple ``(merged,)`` when no DeepStack
+        # layers are configured, otherwise ``(merged, ds_0, ds_1, ...)``.  The
+        # ``isinstance`` guard is a defensive fallback for a future vision
+        # backbone that might return a bare tensor.
         if not isinstance(outputs, tuple):
             return outputs
         merged = outputs[0]
