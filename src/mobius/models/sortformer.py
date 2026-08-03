@@ -479,14 +479,9 @@ class _FastConformerEncoder(nn.Module):
         one = op.Constant(value_int=1)
         start = op.Sub(t_scalar, one)  # T - 1
         limit = op.Neg(t_scalar)  # -T (exclusive) -> last value -(T-1)
-        positions = op.Range(start, limit, op.Constant(value_int=-1))  # [2T-1]
-        pos_f = op.Unsqueeze(op.Cast(positions, to=ir.DataType.FLOAT), [-1])  # [2T-1,1]
-        div_term = op.Constant(value=ir.tensor(self._div_term))  # [d/2]
-        angles = op.Mul(pos_f, div_term)  # [2T-1, d/2]
-        sin = op.Unsqueeze(op.Sin(angles), [-1])
-        cos = op.Unsqueeze(op.Cos(angles), [-1])
         interleaved = op.Concat(sin, cos, axis=-1)  # [2T-1, d/2, 2]
         pe = op.Reshape(interleaved, [0, -1])  # [2T-1, d]
+        pe = op.CastLike(pe, x)
         return op.Unsqueeze(pe, [0])  # [1, 2T-1, d]
 
     def forward(self, op: OpBuilder, input_features: ir.Value) -> ir.Value:
