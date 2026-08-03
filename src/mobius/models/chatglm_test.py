@@ -14,7 +14,7 @@ from mobius.models.chatglm import ChatGLMCausalLMModel
 def _gptq_tensor_shapes(k: int, n: int, group_size: int = 16):
     return {
         "qweight": torch.zeros(k // 8, n, dtype=torch.int32),
-        "qzeros": torch.zeros(1, n, dtype=torch.int32),
+        "qzeros": torch.zeros(k // group_size, n // 8, dtype=torch.int32),
         "scales": torch.ones(k // group_size, n, dtype=torch.float16),
         "g_idx": torch.arange(k, dtype=torch.int32) // group_size,
     }
@@ -133,7 +133,8 @@ def test_glm4_gptq_gate_up_split_preserves_packed_tensors():
     _add_gptq(source, stem, 32, 32)
     source[f"{stem}.qweight"][:, 16:] = 0x12345678
     source[f"{stem}.scales"][:, 16:] = 2
-    source[f"{stem}.qzeros"][:, 16:] = 0x11111111
+    qzeros = source[f"{stem}.qzeros"]
+    qzeros[:, qzeros.shape[1] // 2 :] = 0x11111111
 
     expected = preprocess_gptq_weights(
         {
