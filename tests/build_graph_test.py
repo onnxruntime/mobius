@@ -5104,6 +5104,7 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "seamless_m4t_v2",
     "sew",
     "sew-d",
+    "sortformer",
     "speecht5",
     "unispeech",
     "unispeech-sat",
@@ -5998,6 +5999,7 @@ class TestResolveSlidingWindow:
         )
         assert cfg.sliding_window == 4096
 
+
 class TestLongRopeAliasExtraction:
     """``rope_type`` alias handling for Phi LongRoPE.
 
@@ -6141,6 +6143,7 @@ class TestLongRopeAliasExtraction:
         assert _canonical_rope_type("yarn") == "yarn"
         assert _canonical_rope_type("default") == "default"
         assert _canonical_rope_type(None) is None
+
 
 class TestBuildGraphSortformer:
     """Verify Sortformer diarization builds with DiarizationTask."""
