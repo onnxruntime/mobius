@@ -200,6 +200,56 @@ class Gemma4ScaledQuantizedWordEmbedding(QuantizedEmbedding):
         return op.Mul(embeddings, self.embed_scale)
 
 
+class QuantizedScaledWordEmbedding(QuantizedEmbedding):
+    """Quantized embedding with scaling — INT4 GatherBlockQuantized + scale multiply."""
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        padding_idx: int,
+        embed_scale: float = 1.0,
+        bits: int = 4,
+        block_size: int = 32,
+        has_zero_point: bool = True,
+    ):
+        super().__init__(
+            num_embeddings, embedding_dim, bits, block_size, has_zero_point, padding_idx
+        )
+        self.embed_scale = embed_scale
+
+    def forward(self, op: OpBuilder, input_ids: ir.Value):
+        embeddings = super().forward(op, input_ids)
+        return op.Mul(embeddings, self.embed_scale)
+
+
+def _per_layer_embedding_block_size(embedding_dim: int, group_size: int) -> int:
+    """Use one valid block for small test embeddings whose dim is below the real group."""
+    if group_size > embedding_dim >= 16 and embedding_dim & (embedding_dim - 1) == 0:
+        return embedding_dim
+    return group_size
+
+
+def _per_layer_embedding_quantization(config: Gemma4Config) -> tuple[int, int, bool] | None:
+    """Return split per-layer embedding quantization as (bits, group_size, symmetric)."""
+    bits = getattr(config, "per_layer_embedding_bits", None)
+    if bits is None:
+        quantization_config = getattr(config, "quantization", None)
+        if quantization_config is None or not getattr(
+            quantization_config, "quantize_embeddings", False
+        ):
+            return None
+        bits = quantization_config.bits
+        group_size = quantization_config.group_size
+        symmetric = quantization_config.sym
+    else:
+        group_size = getattr(config, "per_layer_embedding_group_size", 32)
+        symmetric = getattr(config, "per_layer_embedding_sym", False)
+    if bits not in (4, 8):
+        raise ValueError(f"quantize_embeddings requires bits=4 or bits=8, got {bits}")
+    return bits, group_size, symmetric
+
+
 def _dtype_safe_compress(
     op: OpBuilder, data: ir.Value, condition: ir.Value, *, axis: int
 ) -> ir.Value:
@@ -1800,17 +1850,36 @@ class Gemma4TextModel(nn.Module):
             # 256 MiB limit; ~128 MiB each vs ~4.7 GB fused).
             # Only the table actually called in forward() is realized as an
             # ONNX initializer, so the unused one adds no graph weight.
-            self.embed_tokens_per_layer_split = nn.ModuleList(
-                [
-                    Gemma3TextScaledWordEmbedding(
-                        vocab_per_layer,
-                        self._per_layer_dim,
-                        config.pad_token_id,
-                        embed_scale=float(self._per_layer_dim**0.5),
-                    )
-                    for _ in range(self._num_layers)
-                ]
-            )
+            per_layer_quant = _per_layer_embedding_quantization(config)
+            if per_layer_quant is not None and config.split_per_layer_embedding:
+                bits, group_size, symmetric = per_layer_quant
+                block_size = _per_layer_embedding_block_size(self._per_layer_dim, group_size)
+                self.embed_tokens_per_layer_split = nn.ModuleList(
+                    [
+                        QuantizedScaledWordEmbedding(
+                            vocab_per_layer,
+                            self._per_layer_dim,
+                            config.pad_token_id,
+                            embed_scale=float(self._per_layer_dim**0.5),
+                            bits=bits,
+                            block_size=block_size,
+                            has_zero_point=not symmetric,
+                        )
+                        for _ in range(self._num_layers)
+                    ]
+                )
+            else:
+                self.embed_tokens_per_layer_split = nn.ModuleList(
+                    [
+                        Gemma3TextScaledWordEmbedding(
+                            vocab_per_layer,
+                            self._per_layer_dim,
+                            config.pad_token_id,
+                            embed_scale=float(self._per_layer_dim**0.5),
+                        )
+                        for _ in range(self._num_layers)
+                    ]
+                )
             self.per_layer_model_projection = Linear(
                 config.hidden_size,
                 config.num_hidden_layers * self._per_layer_dim,
@@ -2348,8 +2417,28 @@ class _Gemma4DecoderModel(nn.Module):
                     f"got {fused.shape[1]}"
                 )
                 chunks = fused.chunk(num_layers, dim=1)
-                for i, chunk in enumerate(chunks):
-                    state_dict[f"model.embed_tokens_per_layer_split.{i}.weight"] = chunk
+                per_layer_quant = _per_layer_embedding_quantization(self.config)
+                if per_layer_quant is not None:
+                    bits, group_size, symmetric = per_layer_quant
+                    from mobius._weight_utils import quantize_embedding_rtn
+
+                    block_size = _per_layer_embedding_block_size(per_layer_dim, group_size)
+                    for i, chunk in enumerate(chunks):
+                        qweight, scales, zero_points = quantize_embedding_rtn(
+                            chunk.contiguous(),
+                            bits=bits,
+                            block_size=block_size,
+                            symmetric=symmetric,
+                        )
+                        state_dict[f"model.embed_tokens_per_layer_split.{i}.qweight"] = qweight
+                        state_dict[f"model.embed_tokens_per_layer_split.{i}.scales"] = scales
+                        if zero_points is not None:
+                            state_dict[
+                                f"model.embed_tokens_per_layer_split.{i}.zero_points"
+                            ] = zero_points
+                else:
+                    for i, chunk in enumerate(chunks):
+                        state_dict[f"model.embed_tokens_per_layer_split.{i}.weight"] = chunk
         return state_dict
 
 
@@ -3149,8 +3238,34 @@ class Gemma4Model(nn.Module):
                     f"got {fused.shape[1]}"
                 )
                 chunks = fused.chunk(num_layers, dim=1)
-                for i, chunk in enumerate(chunks):
-                    renamed[f"decoder.model.embed_tokens_per_layer_split.{i}.weight"] = chunk
+                per_layer_quant = _per_layer_embedding_quantization(self.config)
+                if per_layer_quant is not None:
+                    bits, group_size, symmetric = per_layer_quant
+                    from mobius._weight_utils import quantize_embedding_rtn
+
+                    block_size = _per_layer_embedding_block_size(per_layer_dim, group_size)
+                    for i, chunk in enumerate(chunks):
+                        qweight, scales, zero_points = quantize_embedding_rtn(
+                            chunk.contiguous(),
+                            bits=bits,
+                            block_size=block_size,
+                            symmetric=symmetric,
+                        )
+                        renamed[f"decoder.model.embed_tokens_per_layer_split.{i}.qweight"] = (
+                            qweight
+                        )
+                        renamed[f"decoder.model.embed_tokens_per_layer_split.{i}.scales"] = (
+                            scales
+                        )
+                        if zero_points is not None:
+                            renamed[
+                                f"decoder.model.embed_tokens_per_layer_split.{i}.zero_points"
+                            ] = zero_points
+                else:
+                    for i, chunk in enumerate(chunks):
+                        renamed[f"decoder.model.embed_tokens_per_layer_split.{i}.weight"] = (
+                            chunk
+                        )
             # Re-route the projection weights from embedding.* → decoder.model.*
             for k in list(renamed.keys()):
                 if k.startswith(

@@ -706,6 +706,111 @@ def preprocess_gptq_weights(
     return result
 
 
+def quantize_embedding_rtn(
+    weight: torch.Tensor,
+    bits: int = 4,
+    block_size: int = 32,
+    symmetric: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Block-wise RTN quantization of a 2D embedding table.
+
+    Produces the packed uint8 format expected by GatherBlockQuantized /
+    QuantizedEmbedding: quantize along axis=1 (embedding dim), gather along
+    axis=0 (vocabulary).
+
+    Args:
+        weight: [num_embeddings, embedding_dim] float tensor.
+        bits: Quantization bit-width (4 or 8).
+        block_size: Number of elements per quantization group.
+        symmetric: If True, use symmetric quantization (no zero_points).
+
+    Returns:
+        (qweight, scales, zero_points) where:
+        - qweight: [num_embeddings, embedding_dim * bits // 8] uint8
+        - scales: [num_embeddings, n_blocks] same dtype as input
+        - zero_points: [num_embeddings, ceil(n_blocks * bits / 8)] uint8,
+          or None if symmetric.
+    """
+    if bits not in (4, 8):
+        raise ValueError(f"bits must be 4 or 8, got {bits}")
+    if weight.ndim != 2:
+        raise ValueError(f"weight must be 2D, got {weight.ndim}D")
+    num_embeddings, embedding_dim = weight.shape
+    if embedding_dim % block_size != 0:
+        raise ValueError(
+            f"embedding_dim ({embedding_dim}) must be divisible by block_size ({block_size})"
+        )
+
+    n_blocks = embedding_dim // block_size
+    w = weight.detach().cpu().float().numpy()
+
+    import numpy as np
+
+    # Reshape to [num_embeddings, n_blocks, block_size] for per-block quantization
+    blocks = w.reshape(num_embeddings, n_blocks, block_size)
+
+    if symmetric:
+        qmax = (1 << (bits - 1)) - 1  # 7 for 4-bit
+        qmin = -(1 << (bits - 1))     # -8 for 4-bit
+        abs_max = np.maximum(np.abs(blocks.max(axis=2, keepdims=True)),
+                             np.abs(blocks.min(axis=2, keepdims=True)))
+        scales_np = abs_max / float(qmax)
+        scales_np = np.where(scales_np == 0, 1.0, scales_np)
+        quantized = np.clip(np.round(blocks / scales_np), qmin, qmax).astype(np.int8)
+        # Convert signed to unsigned for packing: [-8,7] -> [0,15]
+        quantized_unsigned = (quantized.astype(np.int16) + (1 << (bits - 1))).astype(np.uint8)
+        scales_np = scales_np.squeeze(2)  # [num_embeddings, n_blocks]
+        zero_points_np = None
+    else:
+        qmax = (1 << bits) - 1  # 15 for 4-bit
+        block_min = blocks.min(axis=2, keepdims=True)
+        block_max = blocks.max(axis=2, keepdims=True)
+        # Ensure range includes zero
+        block_min = np.minimum(block_min, 0.0)
+        block_max = np.maximum(block_max, 0.0)
+        scales_np = (block_max - block_min) / float(qmax)
+        scales_np = np.where(scales_np == 0, 1.0, scales_np)
+        zp = np.clip(np.round(-block_min / scales_np), 0, qmax).astype(np.uint8)
+        quantized_unsigned = np.clip(
+            np.round(blocks / scales_np + zp), 0, qmax
+        ).astype(np.uint8)
+        scales_np = scales_np.squeeze(2)  # [num_embeddings, n_blocks]
+        zero_points_np = zp.squeeze(2)     # [num_embeddings, n_blocks]
+
+    # Pack into uint8
+    if bits == 4:
+        # Flatten quantized to [num_embeddings, embedding_dim]
+        flat = quantized_unsigned.reshape(num_embeddings, embedding_dim)
+        # Pack pairs of 4-bit values into uint8 (low nibble first)
+        packed = (flat[:, 0::2] & 0x0F) | ((flat[:, 1::2] & 0x0F) << 4)
+        qweight = packed.astype(np.uint8)  # [num_embeddings, embedding_dim // 2]
+
+        if zero_points_np is not None:
+            # Pack zero_points the same way
+            if n_blocks % 2 == 0:
+                zp_packed = (zero_points_np[:, 0::2] & 0x0F) | ((zero_points_np[:, 1::2] & 0x0F) << 4)
+            else:
+                # Pad to even count
+                padded = np.pad(zero_points_np, ((0, 0), (0, 1)), constant_values=0)
+                zp_packed = (padded[:, 0::2] & 0x0F) | ((padded[:, 1::2] & 0x0F) << 4)
+            zero_points_out = torch.from_numpy(zp_packed.astype(np.uint8))
+        else:
+            zero_points_out = None
+    else:
+        # 8-bit: no packing
+        qweight = quantized_unsigned.reshape(num_embeddings, embedding_dim)
+        if zero_points_np is not None:
+            zero_points_out = torch.from_numpy(zero_points_np.astype(np.uint8))
+        else:
+            zero_points_out = None
+
+    return (
+        torch.from_numpy(qweight),
+        torch.from_numpy(scales_np).to(weight.dtype),
+        zero_points_out,
+    )
+
+
 def preprocess_olive_weights(
     state_dict: dict[str, torch.Tensor],
     bits: int = 4,

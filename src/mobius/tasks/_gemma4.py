@@ -439,6 +439,64 @@ class Gemma4Task(ModelTask):
             config.split_per_layer_embedding = fused_bytes > caps.max_buffer_size
         else:
             config.split_per_layer_embedding = False
+        # When splitting per-layer embeddings, quantize them to reduce size.
+        # Bits default to 4 (INT4) but can be overridden via embedding_bits
+        # in mobius.build() / the MobiusBuilder Olive pass config.
+        if config.split_per_layer_embedding:
+            qc = config.quantization
+            if getattr(config, "per_layer_embedding_bits", None) is not None:
+                if config.per_layer_embedding_bits not in (4, 8):
+                    raise ValueError(
+                        "quantize_embeddings requires bits=4 or bits=8, "
+                        f"got {config.per_layer_embedding_bits}"
+                    )
+            elif qc is not None and qc.quantize_embeddings:
+                if qc.bits not in (4, 8):
+                    raise ValueError(
+                        f"quantize_embeddings requires bits=4 or bits=8, got {qc.bits}"
+                    )
+                config.per_layer_embedding_bits = qc.bits
+                config.per_layer_embedding_group_size = qc.group_size
+                config.per_layer_embedding_sym = qc.sym
+            else:
+                config.per_layer_embedding_bits = 4
+                config.per_layer_embedding_group_size = 32
+                config.per_layer_embedding_sym = False
+            # The module was already constructed before build() runs, so the
+            # per-layer embeddings are plain Embedding (Gather).  Replace them
+            # with QuantizedScaledWordEmbedding (GatherBlockQuantized).
+            from mobius.models.gemma4 import (
+                QuantizedScaledWordEmbedding,
+                _per_layer_embedding_block_size,
+            )
+
+            bits = config.per_layer_embedding_bits
+            group_size = config.per_layer_embedding_group_size
+            symmetric = config.per_layer_embedding_sym
+            per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
+            vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
+            import numpy as np
+
+            embed_scale = float(np.float16(per_layer_dim**0.5))
+            block_size = _per_layer_embedding_block_size(per_layer_dim, group_size)
+            module.decoder.model.embed_tokens_per_layer_split = nn.ModuleList(
+                [
+                    QuantizedScaledWordEmbedding(
+                        vocab_per_layer,
+                        per_layer_dim,
+                        config.pad_token_id,
+                        embed_scale=embed_scale,
+                        bits=bits,
+                        block_size=block_size,
+                        has_zero_point=not symmetric,
+                    )
+                    for _ in range(config.num_hidden_layers)
+                ]
+            )
+            # Cast scales to model dtype (modules created after _cast_module_dtype)
+            from mobius._builder import _cast_module_dtype
+
+            _cast_module_dtype(module.decoder.model.embed_tokens_per_layer_split, config.dtype)
         models: dict[str, ir.Model] = {}
         models["decoder"] = self._build_decoder(module.decoder, config)
         models["vision_encoder"] = self._build_vision(module.vision_encoder, config)

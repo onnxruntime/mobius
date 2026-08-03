@@ -375,3 +375,32 @@ class TestBuildOrchestration:
         )
         pkg = build("fake/model-id", load_weights=False)
         assert pkg["model"].graph.name == "fake/model-id/model"
+
+    def test_embedding_bits_ignored_for_regular_text_models(self, monkeypatch):
+        """embedding_bits must not opt ordinary text models into quantized modules."""
+        import transformers
+
+        fake_config = self._mock_hf_config()
+        monkeypatch.setattr(
+            transformers.AutoConfig,
+            "from_pretrained",
+            lambda *a, **kw: fake_config,
+        )
+        pkg = build("fake/model-id", embedding_bits=4, load_weights=False)
+        op_types = {node.op_type for node in pkg["model"].graph}
+        assert "MatMulNBits" not in op_types
+        assert "GatherBlockQuantized" not in op_types
+        assert pkg.config.quantization is None
+
+    def test_embedding_bits_validates_bit_width(self, monkeypatch):
+        """embedding_bits only accepts the bit-widths supported by GatherBlockQuantized."""
+        import transformers
+
+        fake_config = self._mock_hf_config()
+        monkeypatch.setattr(
+            transformers.AutoConfig,
+            "from_pretrained",
+            lambda *a, **kw: fake_config,
+        )
+        with pytest.raises(ValueError, match="embedding_bits must be 4 or 8"):
+            build("fake/model-id", embedding_bits=3, load_weights=False)

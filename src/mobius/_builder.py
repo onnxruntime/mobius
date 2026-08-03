@@ -355,6 +355,7 @@ def build(
     execution_provider: str = "default",
     trace_optimization: bool = False,
     text_only: bool = False,
+    embedding_bits: int | None = None,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a HuggingFace model ID.
 
@@ -418,6 +419,14 @@ def build(
             Raises :class:`ValueError` if the resolved ``model_type`` has no
             text-only sibling. Currently supported for ``gemma4_unified``
             (``google/gemma-4-12B``).
+        embedding_bits: Quantization bit-width for per-layer embedding tables
+            (4 or 8). When set, large embedding tables that exceed the EP's
+            buffer limit are block-quantized with ``GatherBlockQuantized``
+            instead of stored at full precision. Only affects models that
+            split per-layer embeddings (e.g. Gemma4 on WebGPU). When ``None``
+            (default), the model task decides — currently defaults to INT4
+            when splitting is required. Ignored by models without per-layer
+            embedding tables.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -583,6 +592,24 @@ def build(
         # models (e.g. DFlash) that condition on intermediate target hidden
         # states.  See ``ArchitectureConfig.output_layer_indices``.
         config = dataclasses.replace(config, output_layer_indices=list(output_layer_indices))
+
+    if embedding_bits is not None:
+        if embedding_bits not in (4, 8):
+            raise ValueError(f"embedding_bits must be 4 or 8, got {embedding_bits}")
+        # ``embedding_bits`` is only for Gemma4's per-layer embedding table.  Do not
+        # attach a QuantizationConfig to ordinary text models, because that changes
+        # their regular token embedding/Linear modules.
+        if (
+            hasattr(config, "per_layer_embedding_bits")
+            and getattr(config, "hidden_size_per_layer_input", 0)
+            and getattr(config, "vocab_size_per_layer_input", 0)
+        ):
+            config = dataclasses.replace(
+                config,
+                per_layer_embedding_bits=embedding_bits,
+                per_layer_embedding_group_size=32,
+                per_layer_embedding_sym=False,
+            )
 
     if task is None:
         task = _default_task_for_model(model_type)
