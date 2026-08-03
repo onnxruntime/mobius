@@ -17,16 +17,17 @@ The function body rebuilds the block-diagonal attention bias from
 
     # Build block-diagonal bias (0 for same segment, -inf for different)
     same = Equal(segment_ids[:, None], segment_ids[None, :])
-    bias = Where(same, 0.0, -10000.0)
+    attn_bias = Where(same, 0.0, -10000.0)
 
     # Standard Attention
-    output = Attention(query, key, value, bias,
+    output = Attention(query, key, value, attn_bias,
                        q_num_heads=<num_heads>, kv_num_heads=<num_heads>,
                        scale=<scale>)
 
 The optional ``bias`` (slot 4) and ``token_offset`` inputs are consumed by
-the native kernel but are unused by the fallback body (segment boundaries
-from ``cumulative_sequence_length`` are sufficient).  They are still declared
+the native kernel but are unused by the fallback body (the ``attn_bias``
+computed above from ``cumulative_sequence_length`` is sufficient, and is
+unrelated to the formal ``bias`` input).  They are still declared
 as formal inputs to preserve the positional slot alignment expected by the
 ORT ``PackedMultiHeadAttention`` signature.
 
