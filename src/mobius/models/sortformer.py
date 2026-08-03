@@ -494,7 +494,11 @@ class _FastConformerEncoder(nn.Module):
         x = op.Transpose(input_features, perm=[0, 2, 1])
         x = self.pre_encode(op, x)  # [B, T, d_model]
         # Scale inputs to the attention layers by sqrt(d_model) (xscaling).
-        x = op.Mul(x, op.Constant(value=ir.tensor(np.array(self._xscale, np.float32))))
+        xscale = op.CastLike(
+            op.Constant(value=ir.tensor(np.array(self._xscale, np.float32))),
+            x,
+        )
+        x = op.Mul(x, xscale)
         pos_emb = self._build_pos_emb(op, x)
         t_dim = op.Shape(x, start=1, end=2)  # [T]
         for layer in self.layers:
