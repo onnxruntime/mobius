@@ -480,6 +480,18 @@ class _FastConformerEncoder(nn.Module):
         one = op.Constant(value_int=1)
         start = op.Sub(t_scalar, one)  # T - 1
         limit = op.Neg(t_scalar)  # -T (exclusive) -> last value -(T-1)
+
+        # Positions: [T-1, T-2, ..., -(T-1)] -> shape [2T-1]
+        positions = op.Range(start, limit, op.Constant(value_int=-1))
+
+        # Sin/Cos are float32-only on some EPs; keep them in f32 and cast later.
+        f32 = op.Constant(value_float=0.0)
+        pos_f = op.CastLike(op.Unsqueeze(positions, [1]), f32)  # [2T-1, 1]
+        div_term = op.Constant(value=ir.tensor(self._div_term))  # [d/2]
+        angles = op.Mul(pos_f, div_term)  # [2T-1, d/2]
+        sin = op.Unsqueeze(op.Sin(angles), [2])  # [2T-1, d/2, 1]
+        cos = op.Unsqueeze(op.Cos(angles), [2])  # [2T-1, d/2, 1]
+
         interleaved = op.Concat(sin, cos, axis=-1)  # [2T-1, d/2, 2]
         pe = op.Reshape(interleaved, [0, -1])  # [2T-1, d]
         pe = op.CastLike(pe, x)
