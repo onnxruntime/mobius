@@ -620,6 +620,25 @@ def _reshape_packed_qzeros(
     return packed.to(torch.uint8)
 
 
+def _reshape_awq_qzeros(
+    value: torch.Tensor, bits: int, n_blocks: int
+) -> torch.Tensor:
+    """Transpose AWQ block-packed qzeros for MatMulNBits.
+
+    AWQ stores ``[..., ceil(n_blocks / pack_factor), N]`` int32 tensors,
+    packing quantization groups along the penultimate axis. After transposing
+    output channels first, each int32 can be reinterpreted as four packed bytes
+    and trimmed to ORT's actual zero-point column count.
+    """
+    transposed = value.transpose(-1, -2).contiguous()
+    prefix = transposed.shape[:-2]
+    output_channels = transposed.shape[-2]
+    packed = transposed.reshape(-1).view(torch.uint8)
+    packed = packed.reshape(*prefix, output_channels, -1)
+    zero_point_columns = math.ceil(n_blocks * bits / 8)
+    return packed[..., :zero_point_columns]
+
+
 def pack_qmoe_expert_weights(
     state_dict: dict[str, torch.Tensor],
     *,
@@ -1057,9 +1076,9 @@ def preprocess_awq_weights(
 ) -> dict[str, torch.Tensor]:
     """Rename, transpose and reshape AWQ weights for MatMulNBits.
 
-    AWQ uses the same int32 packing as GPTQ for qweight/qzeros/scales
-    but does **not** include ``g_idx``.  The key difference is that AWQ
-    zero points are stored with an implicit ``+1`` offset that must be
+    AWQ uses the same int32 packing as GPTQ for qweight and does **not**
+    include ``g_idx``. Its qzeros instead pack quantization groups along
+    the K/group axis, and include an implicit ``+1`` offset that must be
     subtracted so MatMulNBits receives the correct raw values.
 
     Args:
@@ -1092,7 +1111,7 @@ def preprocess_awq_weights(
             # before unpacking so MatMulNBits sees the raw value.
             # For 4-bit, each byte packs TWO nibbles — subtract per-nibble
             # to avoid cross-nibble borrow (e.g. 0x80 - 1 = 0x7F is wrong).
-            zp = _reshape_packed_qzeros(value, bits, n_blocks)
+            zp = _reshape_awq_qzeros(value, bits, n_blocks)
             if bits == 4:
                 low = (zp & 0x0F).to(torch.int16) - 1
                 high = ((zp >> 4) & 0x0F).to(torch.int16) - 1

@@ -933,9 +933,8 @@ class TestPreprocessAwqWeights:
     K_PACKED = K * BITS // 32  # 32
     N_GROUPS = K // GROUP_SIZE  # 8
     BLOB_SIZE = GROUP_SIZE * BITS // 8  # 16
-    # AWQ uses the same int32 packing as GPTQ: qzeros packs output
-    # channels, so the packed axis is N.
-    N_PACKED = N * BITS // 32  # 16
+    N_GROUPS_PACKED = N_GROUPS * BITS // 32  # 1
+    ZERO_POINT_COLUMNS = (N_GROUPS * BITS + 7) // 8  # 4
 
     def test_qweight_renamed_to_weight(self):
         sd = {
@@ -963,13 +962,17 @@ class TestPreprocessAwqWeights:
             "q_proj.qzeros": torch.randint(
                 0,
                 255,
-                (self.N_GROUPS, self.N_PACKED),
+                (self.N_GROUPS_PACKED, self.N),
                 dtype=torch.int32,
             ),
         }
         result = preprocess_awq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
         assert "q_proj.zero_points" in result
         assert "q_proj.qzeros" not in result
+        assert result["q_proj.zero_points"].shape == (
+            self.N,
+            self.ZERO_POINT_COLUMNS,
+        )
 
     def test_zero_point_offset_subtracted(self):
         """AWQ zero points have +1 offset that must be subtracted."""
@@ -980,7 +983,7 @@ class TestPreprocessAwqWeights:
                 0, 255, (self.K_PACKED, self.N), dtype=torch.int32
             ),
             "q_proj.qzeros": torch.full(
-                (self.N_GROUPS, self.N_PACKED),
+                (self.N_GROUPS_PACKED, self.N),
                 0x55555555,
                 dtype=torch.int32,
             ),
@@ -1029,7 +1032,7 @@ class TestPreprocessAwqWeights:
                 0, 255, (self.K_PACKED, self.N), dtype=torch.int32
             ),
             "q_proj.qzeros": torch.zeros(
-                self.N_GROUPS, self.N_PACKED, dtype=torch.int32
+                self.N_GROUPS_PACKED, self.N, dtype=torch.int32
             ),
         }
         result = preprocess_awq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
@@ -1050,7 +1053,7 @@ class TestPreprocessAwqWeights:
                 0, 255, (self.K_PACKED, self.N), dtype=torch.int32
             ),
             "q_proj.qzeros": torch.full(
-                (self.N_GROUPS, self.N_PACKED),
+                (self.N_GROUPS_PACKED, self.N),
                 -2004318072,  # 0x88888888 as signed int32
                 dtype=torch.int32,
             ),
