@@ -27,6 +27,7 @@ from mobius.components import (
     initialize_rope,
 )
 from mobius.components._deepseek_mla import DeepSeekMLA
+from mobius.components._moe import _supported_qmoe_quantization
 from mobius.components._quantized_linear import make_quantized_linear_factory
 from mobius.models.base import CausalLMModel
 
@@ -445,12 +446,9 @@ class DeepSeekV3CausalLMModel(CausalLMModel):
             moe.experts.{i}.down_proj.weight: (hidden, intermediate)
         """
         renamed = {}
-        use_qmoe = (
-            self.config.quantization is not None
-            and self.config.quantization.bits == 4
-            and self.config.quantization.quant_method in {"gptq", "awq"}
-            and not self.config.quantization.float_zero_point
-        )
+        # Same predicate as MoELayer/_supported_qmoe_quantization so the
+        # repacked weights and the emitted graph never disagree.
+        use_qmoe = _supported_qmoe_quantization(self.config.quantization) is not None
         for key, value in state_dict.items():
             new_key = key
 
