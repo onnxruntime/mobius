@@ -173,6 +173,7 @@ class TextModel(nn.Module):
         position_ids: ir.Value,
         past_key_values: list | None = None,
         inputs_embeds: ir.Value | None = None,
+        deepstack_embeds: list | None = None,
     ):
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
@@ -307,6 +308,16 @@ class TextModel(nn.Module):
             present_key_values.append(present_kv)
             if layer_idx in capture_set:
                 captured_by_index[layer_idx] = hidden_states
+
+            # DeepStack (Qwen3-VL family): add pre-scattered intermediate
+            # vision features to the hidden states of the first ``D`` decoder
+            # layers, where ``D = len(deepstack_embeds)``.  Each entry is a
+            # full-length ``[batch, seq, hidden]`` tensor that is zero at
+            # non-image positions, so a plain Add reproduces HuggingFace's
+            # "inject at visual token positions" semantics.  ``deepstack_embeds``
+            # is ``None`` for every non-DeepStack model, making this inert.
+            if deepstack_embeds is not None and layer_idx < len(deepstack_embeds):
+                hidden_states = op.Add(hidden_states, deepstack_embeds[layer_idx])
 
         hidden_states = self.norm(op, hidden_states)
         if output_layer_indices is not None:
