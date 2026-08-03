@@ -629,7 +629,11 @@ def main(argv: list[str] | None = None) -> None:
     build_parser.add_argument(
         "--glm-full-attention",
         action="store_true",
-        help="Disable GLM-5.2 IndexShare DSA and export the dense MLA fallback.",
+        help=(
+            "Disable GLM-5.2 IndexShare DSA and export the dense MLA fallback. "
+            "Also forces num_nextn_predict_layers=0, dropping the DSA-dependent "
+            "MTP component."
+        ),
     )
     build_parser.add_argument(
         "--trust-remote-code",

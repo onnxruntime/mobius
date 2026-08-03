@@ -766,9 +766,7 @@ def test_load_quantized_experts_requantizes_when_zero_point_presence_differs(
     raw = np.arange(8, dtype=np.uint8)
     model = SimpleNamespace(
         _tensor_index={"experts": object()},
-        tensor_items_raw=lambda: [
-            ("experts", raw, GGMLQuantizationType.Q4_0, (2, 2, 2))
-        ],
+        tensor_items_raw=lambda: [("experts", raw, GGMLQuantizationType.Q4_0, (2, 2, 2))],
         dequantize_raw_tensor=lambda *_args: np.ones((2, 2), dtype=np.float32),
     )
     config = SimpleNamespace(
@@ -778,7 +776,9 @@ def test_load_quantized_experts_requantizes_when_zero_point_presence_differs(
         model_type="glm_moe_dsa",
     )
 
-    result = _load_quantized_state_dict(model, "glm-dsa", SimpleNamespace(named_modules=list), config)
+    result = _load_quantized_state_dict(
+        model, "glm-dsa", SimpleNamespace(named_modules=list), config
+    )
 
     assert len(requantized) == 2
     assert "model.layers.0.mlp.experts.0.gate_proj.zero_points" in result

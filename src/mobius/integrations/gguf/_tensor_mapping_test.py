@@ -356,7 +356,6 @@ class TestMapGGUFToHFNames:
         for source, target in expected.items():
             assert map_gguf_to_hf_names(source, "deepseek4") == target
 
-
     # ---- Unsupported architecture ----
 
     def test_unsupported_raises(self) -> None:

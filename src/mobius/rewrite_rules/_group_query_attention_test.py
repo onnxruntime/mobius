@@ -375,7 +375,6 @@ class TestGroupQueryAttentionRules:
             ]
             assert len(shared_matmuls) == 3
 
-
     def test_fallback_attention_to_gqa_no_rope(self):
         """AttentionToGQA fallback fires when applied in isolation (do_rotary=0).
 

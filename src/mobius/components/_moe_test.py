@@ -232,9 +232,7 @@ def test_deepseek_fused_qmoe_graph_has_one_node_per_moe_layer():
 
     assert count_op_type(graph, "QMoE") == 1
     assert not any(
-        value is not None
-        and value.name is not None
-        and ".moe.experts." in value.name
+        value is not None and value.name is not None and ".moe.experts." in value.name
         for node in graph
         for value in node.inputs
     )
@@ -243,9 +241,7 @@ def test_deepseek_fused_qmoe_graph_has_one_node_per_moe_layer():
         sum(
             node.op_type == "MatMulNBits"
             and any(
-                value is not None
-                and value.name is not None
-                and shared_prefix in value.name
+                value is not None and value.name is not None and shared_prefix in value.name
                 for value in node.inputs
             )
             for node in graph
@@ -343,25 +339,17 @@ def test_expert_major_packing_matches_static_64_expert_top6_reference():
     expected = _static_moe(
         hidden, weights, selected, static_fc1, static_fc2, intermediate_size
     )
-    actual = _static_moe(
-        hidden, weights, selected, packed_fc1, packed_fc2, intermediate_size
-    )
+    actual = _static_moe(hidden, weights, selected, packed_fc1, packed_fc2, intermediate_size)
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize("shared_g_idx", [False, True])
 def test_fused_gptq_checkpoint_tensors_pack_to_qmoe_layout(caplog, shared_g_idx):
     experts, hidden_size, intermediate_size, block_size = 4, 32, 16, 16
-    gate_up_codes = torch.randint(
-        0, 16, (experts, 2 * intermediate_size, hidden_size)
-    )
+    gate_up_codes = torch.randint(0, 16, (experts, 2 * intermediate_size, hidden_size))
     down_codes = torch.randint(0, 16, (experts, hidden_size, intermediate_size))
-    gate_up_scales = torch.rand(
-        experts, 2 * intermediate_size, hidden_size // block_size
-    )
-    down_scales = torch.rand(
-        experts, hidden_size, intermediate_size // block_size
-    )
+    gate_up_scales = torch.rand(experts, 2 * intermediate_size, hidden_size // block_size)
+    down_scales = torch.rand(experts, hidden_size, intermediate_size // block_size)
     gate_up_g_idx = torch.arange(hidden_size, dtype=torch.int32) // block_size
     gate_up_g_idx[0] = 1
     down_g_idx = torch.arange(intermediate_size, dtype=torch.int32) // block_size
@@ -369,16 +357,10 @@ def test_fused_gptq_checkpoint_tensors_pack_to_qmoe_layout(caplog, shared_g_idx)
         gate_up_g_idx = gate_up_g_idx.repeat(experts, 1)
         down_g_idx = down_g_idx.repeat(experts, 1)
     state_dict = {
-        "model.layers.0.mlp.experts.gate_up_proj.qweight": _to_gptq_qweight(
-            gate_up_codes
-        ),
-        "model.layers.0.mlp.experts.gate_up_proj.scales": gate_up_scales.transpose(
-            -1, -2
-        ),
+        "model.layers.0.mlp.experts.gate_up_proj.qweight": _to_gptq_qweight(gate_up_codes),
+        "model.layers.0.mlp.experts.gate_up_proj.scales": gate_up_scales.transpose(-1, -2),
         "model.layers.0.mlp.experts.gate_up_proj.g_idx": gate_up_g_idx,
-        "model.layers.0.mlp.experts.down_proj.qweight": _to_gptq_qweight(
-            down_codes
-        ),
+        "model.layers.0.mlp.experts.down_proj.qweight": _to_gptq_qweight(down_codes),
         "model.layers.0.mlp.experts.down_proj.scales": down_scales.transpose(-1, -2),
         "model.layers.0.mlp.experts.down_proj.g_idx": down_g_idx,
     }
@@ -400,12 +382,16 @@ def test_fused_gptq_checkpoint_tensors_pack_to_qmoe_layout(caplog, shared_g_idx)
     packed = pack_fused_quantized_moe_weights(state_dict, config)
     fc1 = packed["model.layers.0.mlp.moe.fc1_experts_weights"]
     scales = packed["model.layers.0.mlp.moe.fc1_scales"]
-    expected_codes = gate_up_codes.reshape(
-        experts, 2, intermediate_size, hidden_size
-    ).transpose(1, 2).flatten(1, 2)
-    expected_scales = gate_up_scales.reshape(
-        experts, 2, intermediate_size, hidden_size // block_size
-    ).transpose(1, 2).flatten(1, 2)
+    expected_codes = (
+        gate_up_codes.reshape(experts, 2, intermediate_size, hidden_size)
+        .transpose(1, 2)
+        .flatten(1, 2)
+    )
+    expected_scales = (
+        gate_up_scales.reshape(experts, 2, intermediate_size, hidden_size // block_size)
+        .transpose(1, 2)
+        .flatten(1, 2)
+    )
 
     assert fc1.shape == (experts, 2 * intermediate_size, hidden_size // 2)
     torch.testing.assert_close(
@@ -434,18 +420,14 @@ def _to_gptq_qweight(codes: torch.Tensor) -> torch.Tensor:
     return packed.transpose(-1, -2).contiguous()
 
 
-def _dequant_codes(
-    codes: torch.Tensor, scales: torch.Tensor, block_size: int
-) -> torch.Tensor:
+def _dequant_codes(codes: torch.Tensor, scales: torch.Tensor, block_size: int) -> torch.Tensor:
 
     blocks = codes.shape[-1] // block_size
     values = codes.reshape(*codes.shape[:-1], blocks, block_size).float() - 8.0
     return (values * scales.unsqueeze(-1)).flatten(-2)
 
 
-def _dequant(
-    packed: torch.Tensor, scales: torch.Tensor, block_size: int
-) -> torch.Tensor:
+def _dequant(packed: torch.Tensor, scales: torch.Tensor, block_size: int) -> torch.Tensor:
     codes = torch.stack((packed & 0x0F, packed >> 4), dim=-1).flatten(-2)
 
     return _dequant_codes(codes, scales, block_size)
@@ -467,9 +449,7 @@ def _static_moe(
         assert activated.shape[-1] == intermediate_size
         expert_output = activated @ fc2[expert].T
         weight = (
-            routing_weights
-            * (selected_experts == expert).to(routing_weights.dtype)
-
+            routing_weights * (selected_experts == expert).to(routing_weights.dtype)
         ).sum(dim=-1, keepdim=True)
         result += expert_output * weight
     return result

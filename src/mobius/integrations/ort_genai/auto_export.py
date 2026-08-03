@@ -1103,9 +1103,7 @@ def write_ort_genai_config(
 
     if "mtp" in pkg:
         mtp_model = pkg["mtp"]
-        mtp_inputs = [
-            value.name for value in mtp_model.graph.inputs if value.name is not None
-        ]
+        mtp_inputs = [value.name for value in mtp_model.graph.inputs if value.name is not None]
         if not mtp_inputs:
             mtp_inputs = [
                 "inputs_embeds",

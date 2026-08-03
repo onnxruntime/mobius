@@ -307,7 +307,10 @@ class MoELayer(nn.Module):
             self._init_qmoe_parameters(expert_config)
         else:
             self.experts = nn.ModuleList(
-                [MLP(expert_config, linear_class=linear_class) for _ in range(self.num_experts)]
+                [
+                    MLP(expert_config, linear_class=linear_class)
+                    for _ in range(self.num_experts)
+                ]
             )
 
     def _init_qmoe_parameters(self, expert_config: ArchitectureConfig) -> None:
@@ -391,7 +394,6 @@ class MoELayer(nn.Module):
         if output_scale != 1.0:  # noqa: RUF069
             result = op.Mul(result, op.CastLike(output_scale, result))
         return result
-
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
         if self.experts is None:
@@ -639,9 +641,9 @@ def pack_fused_quantized_moe_weights(
     for key, value in state_dict.items():
         match = _FUSED_EXPERT_RE.match(key)
         if match is not None:
-            fused.setdefault(match["prefix"], {}).setdefault(
-                match["projection"], {}
-            )[match["kind"]] = value
+            fused.setdefault(match["prefix"], {}).setdefault(match["projection"], {})[
+                match["kind"]
+            ] = value
             continue
         match = _PER_EXPERT_RE.match(key)
         if match is not None:
@@ -669,10 +671,7 @@ def pack_fused_quantized_moe_weights(
                 quantization.bits,
                 quantization.group_size,
             )
-            fc1 = {
-                kind: _interleave_gate_up(value)
-                for kind, value in gate_up.items()
-            }
+            fc1 = {kind: _interleave_gate_up(value) for kind, value in gate_up.items()}
             fc2 = down
         else:
             experts = per_expert[prefix]
@@ -747,9 +746,7 @@ def _stack_per_expert_projections(
                 raise ValueError(f"Expert {expert} gate/up {kind} tensors are incomplete")
             gate = projections["gate_proj"][kind]
             up = projections["up_proj"][kind]
-            fc1.setdefault(kind, []).append(
-                torch.stack((gate, up), dim=1).flatten(0, 1)
-            )
+            fc1.setdefault(kind, []).append(torch.stack((gate, up), dim=1).flatten(0, 1))
         for kind, value in projections["down_proj"].items():
             fc2.setdefault(kind, []).append(value)
     return (
@@ -762,9 +759,11 @@ def _interleave_gate_up(value: torch.Tensor) -> torch.Tensor:
     if value.shape[1] % 2:
         raise ValueError(f"gate_up projection has odd output size {value.shape[1]}")
     intermediate = value.shape[1] // 2
-    return value.reshape(value.shape[0], 2, intermediate, *value.shape[2:]).transpose(
-        1, 2
-    ).flatten(1, 2)
+    return (
+        value.reshape(value.shape[0], 2, intermediate, *value.shape[2:])
+        .transpose(1, 2)
+        .flatten(1, 2)
+    )
 
 
 def _store_qmoe_projection(

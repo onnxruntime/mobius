@@ -176,7 +176,6 @@ def _build_onnx_session(config: ArchitectureConfig, state: dict[str, torch.Tenso
         return ort.InferenceSession(str(model_path))
 
 
-
 def test_llada_matches_torch_reference():
     """ONNX logits match the self-contained torch reference to < 1e-4."""
     pytest.importorskip("onnxruntime")

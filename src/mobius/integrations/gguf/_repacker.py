@@ -541,9 +541,9 @@ def repack_dequantized_tensor(
         else:
             scales = (block_max - block_min) / 255.0
             safe_scales = np.where(scales != 0, scales, 1.0)
-            zero_points_arr = np.clip(
-                np.rint(-block_min / safe_scales), 0, 255
-            ).astype(np.uint8)
+            zero_points_arr = np.clip(np.rint(-block_min / safe_scales), 0, 255).astype(
+                np.uint8
+            )
         safe_scales = np.where(scales != 0, scales, 1.0)
         quants = np.rint(blocks / safe_scales[:, :, None])
         quants += zero_points_arr[:, :, None]

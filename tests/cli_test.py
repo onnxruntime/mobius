@@ -387,7 +387,6 @@ class TestCLIBuildRuntime:
         native_writer.assert_called_once()
         generic_writer.assert_not_called()
 
-
     def test_no_runtime_does_not_call_write_ort_genai_config(self):
         """Omitting --runtime does NOT call write_ort_genai_config()."""
         with (

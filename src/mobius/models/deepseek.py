@@ -506,9 +506,7 @@ class DeepSeekV3CausalLMModel(CausalLMModel):
         routed_experts = {}
         qc = self.config.quantization
         use_fused_qmoe = (
-            self.config.fused_quantized_moe
-            and qc is not None
-            and qc.quant_method != "none"
+            self.config.fused_quantized_moe and qc is not None and qc.quant_method != "none"
         )
         use_qmoe = (
             not use_fused_qmoe
