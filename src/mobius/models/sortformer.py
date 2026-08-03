@@ -431,7 +431,8 @@ class _ConformerLayer(nn.Module):
     ) -> ir.Value:
         # Macaron feed-forward (half-step residual)
         ff = self.feed_forward1(op, self.norm_feed_forward1(op, x))
-        x = op.Add(x, op.Mul(ff, op.Constant(value_float=0.5)))
+        half = op.CastLike(op.Constant(value_float=0.5), x)
+        x = op.Add(x, op.Mul(ff, half))
         # Relative-position self-attention
         att = self.self_attn(op, self.norm_self_att(op, x), pos_emb, t_dim)
         x = op.Add(x, att)
