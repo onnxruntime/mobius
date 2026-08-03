@@ -620,9 +620,7 @@ def _reshape_packed_qzeros(
     return packed.to(torch.uint8)
 
 
-def _reshape_awq_qzeros(
-    value: torch.Tensor, bits: int, n_blocks: int
-) -> torch.Tensor:
+def _reshape_awq_qzeros(value: torch.Tensor, bits: int, n_blocks: int) -> torch.Tensor:
     """Transpose AWQ block-packed qzeros for MatMulNBits.
 
     AWQ stores ``[..., ceil(n_blocks / pack_factor), N]`` int32 tensors,

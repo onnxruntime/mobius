@@ -14,7 +14,6 @@ from mobius._weight_utils import (
     preprocess_awq_weights,
     preprocess_compressed_tensors_weights,
     preprocess_gptq_weights,
-    unwrap_gptq_observer_modules,
     preprocess_olive_weights,
     preprocess_quark_weights,
     rename_weight_keys,
@@ -24,6 +23,7 @@ from mobius._weight_utils import (
     split_interleaved_qkv,
     strip_prefix,
     tie_word_embeddings,
+    unwrap_gptq_observer_modules,
     vlm_decoder_weights,
     vlm_embedding_weights,
     vlm_vision_weights,
@@ -1031,9 +1031,7 @@ class TestPreprocessAwqWeights:
             "q_proj.qweight": torch.randint(
                 0, 255, (self.K_PACKED, self.N), dtype=torch.int32
             ),
-            "q_proj.qzeros": torch.zeros(
-                self.N_GROUPS_PACKED, self.N, dtype=torch.int32
-            ),
+            "q_proj.qzeros": torch.zeros(self.N_GROUPS_PACKED, self.N, dtype=torch.int32),
         }
         result = preprocess_awq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
         zp = result["q_proj.zero_points"]

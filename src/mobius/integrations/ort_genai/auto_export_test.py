@@ -675,6 +675,7 @@ class TestWriteProcessorConfig:
         assert resize["patch_size"] == 14
         assert resize["min_pixels"] == 3136
         assert resize["max_pixels"] == 12845056
+
     def _qwen_vl_config(self, model_type):
         """Build a mock config for the Qwen-VL processor-config branch."""
         vision = mock.MagicMock()
