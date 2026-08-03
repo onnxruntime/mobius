@@ -24,9 +24,11 @@ The function body rebuilds the block-diagonal attention bias from
                        q_num_heads=<num_heads>, kv_num_heads=<num_heads>,
                        scale=<scale>)
 
-The ``token_offset`` input is consumed by the native kernel but is
-unused by the fallback body (segment boundaries from
-``cumulative_sequence_length`` are sufficient).
+The optional ``bias`` (slot 4) and ``token_offset`` inputs are consumed by
+the native kernel but are unused by the fallback body (segment boundaries
+from ``cumulative_sequence_length`` are sufficient).  They are still declared
+as formal inputs to preserve the positional slot alignment expected by the
+ORT ``PackedMultiHeadAttention`` signature.
 
 Attributes:
     num_heads (int): Number of attention heads.
@@ -53,6 +55,7 @@ def packed_multi_head_attention() -> ir.Function:
         query:  (token_count, hidden_size)
         key:    (token_count, hidden_size)
         value:  (token_count, v_hidden_size)
+        bias:   (optional) — unused in fallback
         token_offset: (batch_size, sequence_length) — unused in fallback
         cumulative_sequence_length: (batch_size + 1,) INT32
 
@@ -69,9 +72,14 @@ def packed_multi_head_attention() -> ir.Function:
         query_input,
         key_input,
         value_input,
+        bias_input,
         token_offset_input,
         cumulative_sequence_length_input,
     ):
+        # bias_input is the optional slot-4 input of the ORT
+        # PackedMultiHeadAttention signature.  It is unused by this fallback
+        # (the block-diagonal bias is reconstructed from cu_seqlens below) but
+        # must exist as a formal input to keep the positional slots aligned.
         # --- Compute sequence length from query shape ---
         # query: (token_count, hidden_size)
         token_count = op.Shape(query_input, start=0, end=1)
@@ -159,6 +167,7 @@ def packed_multi_head_attention() -> ir.Function:
             ir.Value(name="query"),
             ir.Value(name="key"),
             ir.Value(name="value"),
+            ir.Value(name="bias"),
             ir.Value(name="token_offset"),
             ir.Value(name="cumulative_sequence_length"),
         ],
