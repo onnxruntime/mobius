@@ -417,7 +417,8 @@ def build(
             can use ``GroupQueryAttention`` on GQA-capable execution providers.
             Raises :class:`ValueError` if the resolved ``model_type`` has no
             text-only sibling. Currently supported for ``gemma4_unified``
-            (``google/gemma-4-12B``).
+            (``google/gemma-4-12B``) and ``qwen3_5_moe_vl``
+            (``Qwen/Qwen3.6-35B-A3B``).
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -447,6 +448,7 @@ def build(
     from mobius._config_resolver import (
         _config_from_hf,
         _default_task_for_model,
+        _dict_to_pretrained_config,
         _try_load_config_json,
     )
     from mobius._diffusers_builder import build_diffusers_pipeline
@@ -481,7 +483,13 @@ def build(
         hf_config = hf_config.talker_config
     elif hasattr(hf_config, "thinker_config"):
         thinker = hf_config.thinker_config
-        if hasattr(thinker, "text_config"):
+        # Some checkpoints (e.g. Qwen3-ASR) ship ``thinker_config`` as a plain
+        # dict rather than a nested ``PretrainedConfig``. Convert it so the
+        # decoder ``text_config`` (and its scalar fields such as hidden_size)
+        # is reachable via attribute access.
+        if isinstance(thinker, dict):
+            thinker = _dict_to_pretrained_config(thinker)
+        if getattr(thinker, "text_config", None) is not None:
             hf_config = thinker.text_config
     elif hasattr(hf_config, "decoder_config") and model_type == "qwen3_tts_tokenizer_12hz":
         # Codec tokenizer: use decoder_config as the primary config source

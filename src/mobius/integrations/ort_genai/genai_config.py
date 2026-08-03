@@ -269,6 +269,9 @@ class GenaiConfigGenerator:
         embedding_output_names: dict[str, str] | None = None,
         vision_start_token_id: int | None = None,
         video_token_id: int | None = None,
+        tokens_per_second: float | None = None,
+        patch_size: int | None = None,
+        window_size: int | None = None,
     ) -> GenaiConfigGenerator:
         """Add VLM vision + embedding sections.
 
@@ -293,6 +296,9 @@ class GenaiConfigGenerator:
                 mapping. Defaults to inputs_embeds.
             vision_start_token_id: Token ID for ``<|vision_start|>``.
             video_token_id: Token ID for video placeholders.
+            tokens_per_second: Video/image timestamp rate for Qwen3-VL.
+            patch_size: Vision patch size.
+            window_size: Vision window size.
 
         Returns self for chaining.
         """
@@ -320,6 +326,12 @@ class GenaiConfigGenerator:
         }
         if spatial_merge_size is not None:
             self._vision["spatial_merge_size"] = spatial_merge_size
+        if tokens_per_second is not None:
+            self._vision["tokens_per_second"] = tokens_per_second
+        if patch_size is not None:
+            self._vision["patch_size"] = patch_size
+        if window_size is not None:
+            self._vision["window_size"] = window_size
 
         self._embedding = {
             "filename": embedding_filename,

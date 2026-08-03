@@ -14,7 +14,7 @@ automatically wraps prompts in the Gemma chat template.
 
 Requirements::
 
-    pip install mobius-ai[transformers] onnxruntime-genai
+    pip install mobius-onnx[transformers] onnxruntime-genai
 
 Usage::
 

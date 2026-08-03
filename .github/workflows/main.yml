@@ -85,7 +85,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Cache pip packages
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/pip
           key: pip-smoke-${{ hashFiles('pyproject.toml', 'requirements/ci/requirements.txt') }}
@@ -132,7 +132,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Cache pip packages
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/pip
           key: pip-parity-${{ hashFiles('pyproject.toml', 'requirements/ci/requirements.txt') }}
@@ -227,7 +227,7 @@ jobs:
         with:
           python-version: ${{ matrix.python_version }}
       - name: Cache pip packages
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/pip
           key: pip-${{ runner.os }}-${{ matrix.python_version }}-${{ hashFiles('pyproject.toml', 'requirements/ci/requirements.txt') }}
@@ -270,7 +270,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Cache HuggingFace models
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface
           key: hf-integration-fast-${{ hashFiles('tests/integration_test.py') }}
@@ -324,27 +324,3 @@ jobs:
       - name: Build wheels
         run: |
           python -m build
-      - name: Upload wheels
-        uses: actions/upload-artifact@v7
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        with:
-          name: dist
-          path: dist
-
-  release:
-    name: Release
-    environment: release
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [test, build]
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: dist
-          path: dist
-      - name: Publish package
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          attestations: true
