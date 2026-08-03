@@ -36,6 +36,7 @@ from mobius.models import (
     CausalLMModel,
     ChatGLMCausalLMModel,
     Cosmos3EdgeTextModel,
+    Cosmos3EdgeVLModel,
     Cosmos3OmniReasonerModel,
     DeepSeekOCR2CausalLMModel,
     DeepSeekV3CausalLMModel,
@@ -400,7 +401,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "codegen": ModelRegistration(CodeGenCausalLMModel),
     "cohere": ModelRegistration(CohereCausalLMModel),
     "cohere2": ModelRegistration(CohereCausalLMModel),
-    "cosmos3_edge": ModelRegistration(Cosmos3EdgeTextModel),
+    "cosmos3_edge": ModelRegistration(Cosmos3EdgeVLModel),
     "cosmos3_edge_text": ModelRegistration(Cosmos3EdgeTextModel),
     "cosmos3_omni": ModelRegistration(
         Cosmos3OmniReasonerModel, task="qwen-vl", family="cosmos", variant="reasoner"

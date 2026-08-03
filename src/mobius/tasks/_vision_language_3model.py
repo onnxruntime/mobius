@@ -95,6 +95,35 @@ class VisionLanguageTask(ModelTask):
         return _make_model(graph)
 
 
+class Cosmos3EdgeVLTask(VisionLanguageTask):
+    """NVIDIA Cosmos3-Edge VL 3-model split.
+
+    Identical to the base :class:`VisionLanguageTask` (SigLIP vision encoder
+    with a dense ``pixel_values [B, 3, H, W]`` input, pixel-shuffle merger
+    projector) but builds the text decoder with 3D multimodal RoPE
+    (``mrope_section=[24, 20, 20]``), so ``position_ids`` has shape
+    ``[3, batch, seq]``. The vision tower keeps the standard SigLIP contract,
+    so only ``build`` is overridden.
+    """
+
+    def build(
+        self,
+        module: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ModelPackage:
+        self._validate_components(module)
+        models: dict[str, ir.Model] = {}
+        models["decoder"] = build_decoder_from_embeds(module.decoder, config, mrope=True)
+        models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
+        models["embedding"] = build_embedding_from_features(
+            module.embedding,
+            config,
+            feature_name="image_features",
+            feature_dim=config.hidden_size,
+        )
+        return ModelPackage(models, config=config)
+
+
 class QwenVLTask(VisionLanguageTask):
     """Qwen-family VL 3-model split with packed-attention vision and MRoPE.
 

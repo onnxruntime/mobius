@@ -7,22 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### NVIDIA Cosmos 3 Edge text reasoner (`cosmos3_edge`)
+### NVIDIA Cosmos 3 Edge vision-language model (`cosmos3_edge`)
 
 #### Added
 
-- Support for the **text reasoner backbone** of the `cosmos3_edge`
-  vision-language checkpoint (`nvidia/Cosmos3-Edge`). The language tower is a
-  grouped-query-attention decoder with a **non-gated squared-ReLU FFN**
-  (`hidden_act="relu2"`, `up_proj → relu2 → down_proj`) and 3D multimodal RoPE
-  (`mrope_section=[24, 20, 20]`, equivalent to 1D RoPE for text-only). Mapped
-  onto the standard `CausalLMModel` backbone + `FCMLP`; `preprocess_weights`
-  renames the `self_attn.to_{q,k,v,out}` projections, nests the top-level text
-  tower under `model.`, and drops the vision encoder, projector, and the
-  generator-tower `k_norm_und_for_gen` key-norm. Registered as `cosmos3_edge`
-  / `cosmos3_edge_text`; L1 graph-build tested. The `cosmos3_omni` variants
-  (`Cosmos3-Nano`/`-Super`) are two-tower diffusion world models and remain out
-  of scope for this decoder-only path.
+- Support for the **full `cosmos3_edge` vision-language model**
+  (`nvidia/Cosmos3-Edge`, `Cosmos3EdgeForConditionalGeneration`) as a 3-model
+  onnxruntime-genai split (`decoder` + `vision_encoder` + `embedding`):
+  - **decoder**: grouped-query-attention text reasoner with a **non-gated
+    squared-ReLU FFN** (`hidden_act="relu2"`, `up_proj → relu2 → down_proj`)
+    and 3D multimodal RoPE (`mrope_section=[24, 20, 20]`); takes
+    `inputs_embeds`.
+  - **vision_encoder**: SigLIP vision tower + a new
+    `Cosmos3EdgeMultiModalProjector` (pre-shuffle `LayerNorm` → 2×2
+    pixel-shuffle → `linear_fc1` → GELU → `linear_fc2`).
+  - **embedding**: token embedding + image-feature fusion at
+    `image_token_id=19`.
+  `preprocess_weights` routes the single HF checkpoint to the three
+  sub-models: `model.visual.*` / `model.projector.*` → vision (with SigLIP
+  `mlp.fc1/fc2` → `up_proj/down_proj`), `embed_tokens` → embedding, the
+  top-level text tower (`layers.*` / `norm` / `lm_head`) → decoder (renaming
+  `self_attn.to_{q,k,v,out}` → `{q,k,v,o}_proj`), and drops the
+  generator-tower `k_norm_und_for_gen` key-norm. Built via a new
+  `Cosmos3EdgeVLTask` (`cosmos3-edge-vl`). The decoder-only text reasoner
+  remains available as `cosmos3_edge_text`.
+- **L1 graph-build tested only.** NVIDIA does not publish modeling code for
+  `cosmos3_edge` (not in `transformers`, no remote-code module), so the exact
+  pixel-shuffle ordering and numerical parity are unverifiable; L4/L5 parity
+  is deferred. The `cosmos3_omni` variants (`Cosmos3-Nano`/`-Super`) are
+  two-tower diffusion world models tracked separately.
 
 ### Cargo-style `--features` build option
 
