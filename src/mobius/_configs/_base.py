@@ -2249,10 +2249,39 @@ class GraniteMoeHybridConfig(BambaConfig):
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> GraniteMoeHybridConfig:
-        # Reuse BambaConfig.from_transformers for mamba fields + layer_types conversion
-        # (converts HF "mamba"→"mamba2" and "attention"→"full_attention")
+        # Reuse BambaConfig.from_transformers for mamba fields, MoE/RoPE/multiplier
+        # extraction, then rebuild layer_types from GraniteMoeHybrid's own naming.
         bamba = BambaConfig.from_transformers(config, parent_config)
         bamba_fields = _shallow_fields(bamba)
+
+        # GraniteMoeHybrid names layers "full_attention" / "linear_attention"
+        # (linear_attention == Mamba2/SSD), unlike Bamba's "attention" / "mamba".
+        raw_layer_types = (
+            getattr(config, "layer_types", None)
+            or getattr(config, "layers_block_type", None)
+            or []
+        )
+        _attn = {"full_attention", "attention"}
+        _mamba = {"linear_attention", "mamba", "mamba2"}
+        layer_types: list[str] = []
+        for ltype in raw_layer_types:
+            if ltype in _attn:
+                layer_types.append("full_attention")
+            elif ltype in _mamba:
+                layer_types.append("mamba2")
+            else:
+                raise ValueError(f"Unknown GraniteMoeHybrid layer type: {ltype!r}")
+        if layer_types:
+            bamba_fields["layer_types"] = layer_types
+
+        # Respect position_embedding_type: GraniteMoeHybrid checkpoints ship
+        # default ``rope_parameters`` even for the NoPE variant
+        # (granite-4.0-tiny-preview: position_embedding_type='nope'). Only apply
+        # RoPE when explicitly requested; otherwise disable it so
+        # ``initialize_rope`` returns None and attention runs NoPE.
+        if getattr(config, "position_embedding_type", "rope") != "rope":
+            bamba_fields["rope_type"] = None
+
         return cls(
             **bamba_fields,
             shared_intermediate_size=getattr(config, "shared_intermediate_size", 1024),

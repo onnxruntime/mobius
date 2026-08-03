@@ -29,7 +29,7 @@ audio stream is fed as the 8 "other" codebooks (``k = 9..16``); the assistant
 
 Prerequisites::
 
-    pip install mobius-ai onnxruntime numpy soundfile
+    pip install mobius-onnx onnxruntime numpy soundfile
 
 CUDA note: on H200 / Ampere+ GPUs ORT defaults to TF32 for fp32 matmul, which
 can flip greedy sampling. ``--device cuda`` sets ``use_tf32=0`` for fp32

@@ -16,7 +16,7 @@ build of ORT GenAI that supports the ``gemma4`` type.
 
 Requirements::
 
-    pip install mobius-ai[ort-genai]
+    pip install mobius-onnx[ort-genai]
 
 Usage::
 

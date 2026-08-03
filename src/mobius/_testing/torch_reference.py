@@ -334,7 +334,18 @@ def torch_forward(
             )
         kwargs["past_key_values"] = cache
 
-    outputs = model(**kwargs)
+    try:
+        outputs = model(**kwargs)
+    except ValueError as e:
+        # All-attention hybrid models (e.g. GraniteMoeHybrid granite-4.0-1b)
+        # trip transformers' recurrent-mask builder, which assumes the hybrid
+        # cache contains a linear-attention (Mamba) layer: "`has_previous_state`
+        # can only be called on LinearAttention layers". A single-pass forward's
+        # logits don't depend on caching, so retry without a cache.
+        if "has_previous_state" not in str(e) or "past_key_values" in kwargs:
+            raise
+        kwargs["use_cache"] = False
+        outputs = model(**kwargs)
     logits = outputs.logits.cpu().numpy()
 
     # Extract KV cache if available (Mamba models don't have it)
