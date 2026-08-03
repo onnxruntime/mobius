@@ -440,7 +440,8 @@ class _ConformerLayer(nn.Module):
         x = op.Add(x, self.conv(op, self.norm_conv(op, x)))
         # Macaron feed-forward (half-step residual)
         ff = self.feed_forward2(op, self.norm_feed_forward2(op, x))
-        x = op.Add(x, op.Mul(ff, op.Constant(value_float=0.5)))
+        half = op.CastLike(op.Constant(value_float=0.5), x)
+        x = op.Add(x, op.Mul(ff, half))
         return self.norm_out(op, x)
 
 
