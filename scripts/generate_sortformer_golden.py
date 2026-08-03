@@ -35,7 +35,6 @@ import torch
 # Deterministic mel-feature fixture (also recorded in metadata).
 _SEED = 0
 _T = 400  # mel frames; with 8x subsampling -> 50 output diarization frames.
-_FEAT_DIM = 128
 
 
 def main() -> None:
