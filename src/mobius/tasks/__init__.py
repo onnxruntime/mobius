@@ -41,6 +41,7 @@ __all__ = [
     "Gemma4UnifiedTask",
     "Gemma4TextCausalLMTask",
     "HybridCausalLMTask",
+    "Cosmos3EdgeVLTask",
     "HybridQwenVLTask",
     "ImageClassificationTask",
     "ModelTask",
@@ -120,6 +121,7 @@ from mobius.tasks._vae import VAETask
 from mobius.tasks._video_denoising import VideoDenoisingTask
 from mobius.tasks._vision_language import Qwen3VLVisionLanguageTask
 from mobius.tasks._vision_language_3model import (
+    Cosmos3EdgeVLTask,
     HybridQwenVLTask,
     MllamaVisionLanguageTask,
     PixtralVLTask,
@@ -156,6 +158,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "vae": VAETask,
     "qwen-image-vae": QwenImageVAETask,
     "vision-language": VisionLanguageTask,
+    "cosmos3-edge-vl": Cosmos3EdgeVLTask,
     "pixtral-vl": PixtralVLTask,
     "mllama-vision-language": MllamaVisionLanguageTask,
     "qwen-vl": QwenVLTask,

@@ -23,6 +23,8 @@ __all__ = [
     "CogVideoXTransformer3DModel",
     "CohereCausalLMModel",
     "ControlNetModel",
+    "Cosmos3EdgeTextModel",
+    "Cosmos3EdgeVLModel",
     "Cosmos3OmniReasonerModel",
     "DeepSeekOCR2CausalLMModel",
     "DeepSeekV3CausalLMModel",
@@ -167,6 +169,7 @@ from mobius.models.clip import CLIPVisionModel, SigLIPVisionModel
 from mobius.models.cogvideox import CogVideoXTransformer3DModel
 from mobius.models.cohere import CohereCausalLMModel
 from mobius.models.controlnet import ControlNetModel
+from mobius.models.cosmos import Cosmos3EdgeTextModel, Cosmos3EdgeVLModel
 from mobius.models.cosmos3_omni import Cosmos3OmniReasonerModel
 from mobius.models.ctrl import CTRLCausalLMModel
 from mobius.models.deepseek import DeepSeekV3CausalLMModel
