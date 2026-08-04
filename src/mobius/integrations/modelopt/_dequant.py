@@ -48,20 +48,25 @@ def unpack_nvfp4_codes(packed_nk2: np.ndarray) -> np.ndarray:
     ``[N, K]`` in ``0..15``.
 
     Raises:
-        ValueError: if ``packed_nk2`` is not a 2D ``[N, K/2]`` array. Loader
-            code should surface an upstream shape/dtype mistake (e.g. passing
-            already-unpacked codes) rather than silently reinterpreting it.
+        ValueError: if ``packed_nk2`` is not a 2D uint8 ``[N, K/2]`` array.
+            Loader code should surface an upstream shape/dtype mistake rather than
+            silently reinterpreting it.
     """
-    if packed_nk2.ndim != 2:
+    packed = np.asarray(packed_nk2)
+    if packed.ndim != 2:
         raise ValueError(
-            f"NVFP4 packed codes must be 2D [N, K/2], got shape {packed_nk2.shape}."
+            f"NVFP4 packed codes must be 2D [N, K/2], got shape {packed.shape}."
         )
-    packed = np.ascontiguousarray(packed_nk2).astype(np.uint8)
+    if packed.dtype != np.uint8:
+        raise ValueError(f"NVFP4 packed codes must be uint8, got dtype {packed.dtype}.")
+    packed = np.ascontiguousarray(packed)
     low = packed & 0x0F
     high = packed >> 4
-    n = packed.shape[0]
-    # Interleave (low, high) along a new trailing axis, then flatten to [N, K].
-    codes = np.stack((low, high), axis=-1).reshape(n, -1)
+    n, k2 = packed.shape
+    # Interleave low/high nibbles (even-K / odd-K) to produce [N, K].
+    codes = np.empty((n, k2 * 2), dtype=np.uint8)
+    codes[:, 0::2] = low
+    codes[:, 1::2] = high
     return np.ascontiguousarray(codes)
 
 
