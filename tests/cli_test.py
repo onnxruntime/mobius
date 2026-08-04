@@ -78,7 +78,17 @@ class TestCLIBuild:
     def test_text_only_with_config_errors(self):
         """--text-only is rejected on the --config (local dir) path."""
         with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit):
-            main(["build", "--config", tmpdir, tmpdir, "--text-only", "--no-weights"])
+            main(
+                [
+                    "build",
+                    "--config",
+                    tmpdir,
+                    tmpdir,
+                    "--features",
+                    "text-only",
+                    "--no-weights",
+                ]
+            )
 
     def test_text_only_with_component_errors(self):
         """--text-only is rejected when combined with --component."""
@@ -89,7 +99,8 @@ class TestCLIBuild:
                     "--model",
                     "google/gemma-4-12B",
                     tmpdir,
-                    "--text-only",
+                    "--features",
+                    "text-only",
                     "--component",
                     "vision_encoder",
                     "--no-weights",
@@ -116,7 +127,8 @@ class TestCLIBuild:
                     "--model",
                     "some/diffusion-repo",
                     tmpdir,
-                    "--text-only",
+                    "--features",
+                    "text-only",
                     "--no-weights",
                 ]
             )
@@ -134,7 +146,8 @@ class TestCLIBuild:
                     "Qwen/Qwen2.5-0.5B",
                     tmpdir,
                     "--no-weights",
-                    "--static-cache",
+                    "--features",
+                    "static-cache",
                 ]
             )
             assert os.path.isfile(os.path.join(tmpdir, "model.onnx"))
@@ -269,21 +282,6 @@ class TestCLIBuild:
                 ]
             )
 
-    def test_deprecated_static_cache_flag_warns(self, capsys):
-        """The legacy --static-cache flag still works but warns."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            main(
-                [
-                    "build",
-                    "--model",
-                    "Qwen/Qwen2.5-0.5B",
-                    tmpdir,
-                    "--no-weights",
-                    "--static-cache",
-                ]
-            )
-        assert "--static-cache is deprecated" in capsys.readouterr().err
-
     def test_max_seq_len_without_static_cache_errors(self):
         with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit):
             main(
@@ -308,7 +306,8 @@ class TestCLIBuild:
                     "Qwen/Qwen2.5-0.5B",
                     tmpdir,
                     "--no-weights",
-                    "--static-cache",
+                    "--features",
+                    "static-cache",
                     "--task",
                     "text-generation",
                 ]
@@ -323,7 +322,8 @@ class TestCLIBuild:
                     "Qwen/Qwen2.5-0.5B",
                     tmpdir,
                     "--no-weights",
-                    "--static-cache",
+                    "--features",
+                    "static-cache",
                     "--max-seq-len",
                     "0",
                 ]
@@ -340,7 +340,8 @@ class TestCLIBuild:
                     "Qwen/Qwen2.5-0.5B",
                     tmpdir,
                     "--no-weights",
-                    "--static-cache",
+                    "--features",
+                    "static-cache",
                     "--max-seq-len",
                     str(max_seq_len),
                 ]

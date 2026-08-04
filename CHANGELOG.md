@@ -20,9 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Changed
 
-- The boolean flags `--static-cache`, `--fp8-kv-cache`, and `--text-only` are now
-  **deprecated aliases** for the matching `--features` value. They still work and
-  set the same behaviour, but print a deprecation notice on stderr. Companion
+- The boolean flags `--static-cache`, `--fp8-kv-cache`, and `--text-only` have
+  been **removed** in favor of the equivalent `--features` value. Companion
   value args (`--max-seq-len`, `--kv-cache-scale-file`) are unchanged.
 
 ### FP8 (E4M3) KV-cache export (`--features fp8-kv-cache`)

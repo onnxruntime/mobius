@@ -187,8 +187,7 @@ Available features:
 | `text-only` | Export the text backbone of a multimodal checkpoint as a standalone decoder-only LLM (see below). |
 
 The legacy boolean flags `--static-cache`, `--fp8-kv-cache`, and
-`--text-only` still work but are **deprecated** aliases for the matching
-feature and print a warning. Prefer `--features`.
+`--text-only` have been removed in favor of `--features`.
 
 ```bash
 mobius build --model meta-llama/Llama-3.2-1B output/ \
@@ -237,7 +236,7 @@ mobius build --model meta-llama/Llama-3.2-1B output/ \
 | `--max-shard-size SIZE` | Maximum shard size for safetensors external data (e.g. `5GB`). Only used with `--external-data safetensors`. |
 | `--trust-remote-code` | Trust remote code when loading the HuggingFace model config. |
 | `--component NAME` | Build only one component from a diffusers pipeline (e.g. `--component vae_decoder`). |
-| `--text-only` | **Deprecated** alias for `--features text-only`. Export the text backbone of a multimodal checkpoint as a standalone decoder-only LLM. Strips vision/audio routing so the decoder uses `GroupQueryAttention` on GQA-capable EPs (build with `--ep cuda`/`dml`). Currently supported for `gemma4_unified` (`google/gemma-4-12B`). Not compatible with `--config` or `--component`. |
+| `--kv-cache-scale-file PATH` | Optional JSON file of calibrated per-layer FP8 KV-cache scales (onnxruntime-genai format). Only used with the `fp8-kv-cache` feature; without it all layers use a unit scale of 1.0. |
 | `--kv-cache-scale-file PATH` | Optional JSON file of calibrated per-layer FP8 KV-cache scales (onnxruntime-genai format). Only used with the `fp8-kv-cache` feature; without it all layers use a unit scale of 1.0. |
 
 #### Text-only example
