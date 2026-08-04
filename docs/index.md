@@ -11,6 +11,7 @@ Build ONNX models directly from HuggingFace model IDs with automatic weight down
 :caption: User Guide
 
 getting-started
+world_models
 cli_reference
 module-architecture
 model-catalog

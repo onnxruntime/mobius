@@ -36,6 +36,7 @@ multi-component export for pipelines.
 | **Audio** | Wav2Vec2, HuBERT, WavLM, SpeechT5 |
 | **Vision** | ViT, BEiT, DeiT, DINOv2, Swin, CLIP, SigLIP |
 | **Diffusion** | Stable Diffusion (UNet + VAE + ControlNet), Flux, SD3, DiT, QwenImage, HunyuanDiT, CogVideoX |
+| **World Models** | Directly declared state-transition graphs with stateful ONNX Runtime rollout |
 | **Adapters** | T2I-Adapter, IP-Adapter |
 
 Supports **290+ Transformers model types** and **10 Diffusers component types**
@@ -96,6 +97,23 @@ pkg = build("meta-llama/Llama-3.2-1B",
 
 See the [EP quickstart](docs/ep_quickstart.md) and
 [full EP reference](docs/execution_providers.md) for all supported EPs and options.
+
+**World models** use a directly declared single-step state-transition graph
+and a stateful ONNX Runtime runner:
+
+```python
+from mobius import MLPWorldModel, WorldModelConfig, build_from_module
+
+config = WorldModelConfig(
+    observation_shape=(64,),
+    action_shape=(6,),
+    state_shape=(128,),
+)
+pkg = build_from_module(MLPWorldModel(config), config, task="world-model")
+```
+
+See the [world-model guide](docs/world_models.md) for weight loading and
+ONNX Runtime rollout.
 
 ### CLI
 
