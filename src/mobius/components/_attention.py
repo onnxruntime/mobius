@@ -516,6 +516,17 @@ class Attention(nn.Module):
             )
 
         if paged_cache is not None:
+            # Paged attention attends over gathered pages with a causal mask
+            # only; it has no path for an additive/float attention_bias. Models
+            # that need bias masking (ALiBi, sliding-window/block overlays)
+            # would be silently miscomputed, so reject the combination up front.
+            if attention_bias is not None:
+                raise ValueError(
+                    "paged_cache is incompatible with a non-None attention_bias "
+                    "(e.g. ALiBi or sliding-window additive masks); the paged "
+                    "attention path applies causal masking only and cannot honor "
+                    "an additive bias."
+                )
             # Paged (block-table) KV cache: scatter new K/V into the physical
             # page pool, gather this sequence's pages contiguously, then attend.
             # present_* here are the UPDATED page pools (registered as outputs).

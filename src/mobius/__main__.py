@@ -691,7 +691,7 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Use a paged / block-table KV cache (vLLM PagedAttention / SGLang "
         "RadixAttention layout): a page pool + block_table + slot_mapping, with "
-        "GatherElements-style page assembly and ScatterND writes (onnx-genai "
+        "Gather-based page assembly and ScatterND writes (onnx-genai "
         "DESIGN §39.4 Option C). Requires DecoderLayer or MoEDecoderLayer models.",
     )
     build_parser.add_argument(

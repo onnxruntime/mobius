@@ -160,7 +160,7 @@ class CausalLMTask(ModelTask):
                 raise ValueError("num_pages must be a positive integer when provided.")
             # Paged cache reuses the same DecoderLayer/MoEDecoderLayer dispatch
             # as the static cache (both flow their state through past_key_value).
-            _validate_static_cache_support(module)
+            _validate_static_cache_support(module, mode="Paged cache")
 
         # --- Graph input dims ---
         batch = ir.SymbolicDim("batch")
@@ -581,8 +581,13 @@ def _register_paged_cache_outputs(
         builder.add_output(updated_value_pool, f"updated_value_pool.{i}")
 
 
-def _validate_static_cache_support(module: nn.Module) -> None:
+def _validate_static_cache_support(module: nn.Module, mode: str = "Static cache") -> None:
     """Check that the module's decoder layers support StaticCacheState.
+
+    The same layer dispatch backs both the static and paged KV caches (both
+    flow their state through ``past_key_value``), so this helper serves both;
+    pass ``mode`` (e.g. ``"Paged cache"``) so the raised message names the
+    layout the caller actually enabled.
 
     Shared decoder layers have the ``isinstance(StaticCacheState)`` dispatch
     in ``forward()``. Custom decoder layers must opt in with the
@@ -639,7 +644,7 @@ def _validate_static_cache_support(module: nn.Module) -> None:
             if getattr(type(layer), "_supports_static_cache", False):
                 continue
             raise TypeError(
-                f"Static cache mode requires decoder layers that "
+                f"{mode} mode requires decoder layers that "
                 f"inherit from DecoderLayer or MoEDecoderLayer (or set "
                 f"_supports_static_cache=True), but "
                 f"{name}[{i}] is {type(layer).__name__}. Either use a "

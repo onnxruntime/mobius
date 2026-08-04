@@ -204,10 +204,6 @@ class TestPagedPagingOpsCpuParity:
 
 def test_paged_cache_task_builds_valid_onnx():
     """End-to-end: CausalLMTask(paged_cache=True) builds a checker-valid graph."""
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).parent))
     from _test_configs import _base_config
     from onnx_ir.passes.common import CheckerPass
 
@@ -236,3 +232,62 @@ def test_paged_cache_task_builds_valid_onnx():
     for i in range(config.num_hidden_layers):
         assert out_shapes[f"updated_key_pool.{i}"] == [16, 8, kv_hidden]
         assert out_shapes[f"updated_value_pool.{i}"] == [16, 8, kv_hidden]
+
+
+def test_paged_validation_message_names_paged_mode():
+    """An unsupported decoder layer reports the *paged* mode in the error."""
+    import pytest
+    from onnxscript import nn
+
+    from mobius.tasks._causal_lm import _validate_static_cache_support
+
+    class _BadLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = nn.Module()
+
+    class _BadModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([_BadLayer()])
+
+    with pytest.raises(TypeError, match="Paged cache mode"):
+        _validate_static_cache_support(_BadModel(), mode="Paged cache")
+
+
+def test_paged_cache_rejects_attention_bias():
+    """Paged attention has no additive-bias path, so it must fail fast."""
+    import pytest
+    from _test_configs import _base_config
+
+    from mobius._registry import registry
+    from mobius.components._attention import PagedCacheState
+    from mobius.tasks._base import _make_graph
+
+    config = _base_config()
+    module = registry.get("qwen2")(config)
+    attn = module.model.layers[0].self_attn
+
+    _graph, builder = _make_graph()
+    op = builder.op
+    hidden = builder.input("hidden", dtype=config.dtype, shape=[1, 1, config.hidden_size])
+    bt = builder.input("block_table", dtype=ir.DataType.INT64, shape=[1, 4])
+    sm = builder.input("slot_mapping", dtype=ir.DataType.INT64, shape=[1])
+    kp = builder.input("kpool", dtype=config.dtype, shape=[16, 8, config.head_dim])
+    vp = builder.input("vpool", dtype=config.dtype, shape=[16, 8, config.head_dim])
+    seqlen = builder.input("nonpad_kv_seqlen", dtype=ir.DataType.INT64, shape=[1])
+    paged = PagedCacheState(
+        key_pool=kp,
+        value_pool=vp,
+        block_table=bt,
+        slot_mapping=sm,
+        nonpad_kv_seqlen=seqlen,
+    )
+
+    with pytest.raises(ValueError, match="attention_bias"):
+        attn(
+            op,
+            hidden,
+            attention_bias=op.Identity(hidden),
+            paged_cache=paged,
+        )
