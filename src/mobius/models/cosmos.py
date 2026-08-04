@@ -73,12 +73,15 @@ if TYPE_CHECKING:
 
 
 def _rename_cosmos_text_key(key: str) -> str:
-    """Rename a Cosmos3-Edge attention projection key to mobius conventions."""
+    """Rename Cosmos3-Edge attention and QK-norm keys to mobius conventions."""
     return (
-        key.replace("self_attn.to_q.", "self_attn.q_proj.")
+        key.replace("self_attn.to_out.0.", "self_attn.o_proj.")
+        .replace("self_attn.to_q.", "self_attn.q_proj.")
         .replace("self_attn.to_k.", "self_attn.k_proj.")
         .replace("self_attn.to_v.", "self_attn.v_proj.")
         .replace("self_attn.to_out.", "self_attn.o_proj.")
+        .replace("self_attn.norm_q.", "self_attn.q_norm.")
+        .replace("self_attn.norm_k.", "self_attn.k_norm.")
     )
 
 
@@ -210,6 +213,11 @@ class _Cosmos3EdgeVisionEncoderModel(nn.Module):
         assert vc.projector_intermediate_size is not None, (
             "Cosmos3-Edge projector requires projector_intermediate_size"
         )
+        if vc.out_hidden_size is not None:
+            assert vc.out_hidden_size == config.hidden_size, (
+                "Cosmos3-Edge projector output must match the text hidden size, "
+                f"got {vc.out_hidden_size} != {config.hidden_size}"
+            )
         self.vision_tower = VisionModel(config)
         # Fixed square patch grid (image_size // patch_size), e.g. 256 -> 16.
         grid_size = vc.image_size // vc.patch_size
@@ -218,7 +226,7 @@ class _Cosmos3EdgeVisionEncoderModel(nn.Module):
             text_hidden_size=config.hidden_size,
             intermediate_size=vc.projector_intermediate_size,
             grid_size=grid_size,
-            spatial_merge_size=vc.spatial_merge_size,
+            spatial_merge_size=vc.spatial_merge_size or 2,
             norm_eps=vc.norm_eps,
         )
 
@@ -364,6 +372,14 @@ class Cosmos3EdgeVLModel(nn.Module):
                 embedding_sd[key] = value
             else:
                 decoder_sd[key] = value
+
+        if self.config.tie_word_embeddings:
+            embed_weight = next(iter(embedding_sd.values()), None)
+            head_weight = decoder_sd.get("lm_head.weight")
+            if embed_weight is None and head_weight is not None:
+                embedding_sd["embed_tokens.weight"] = head_weight
+            elif head_weight is None and embed_weight is not None:
+                decoder_sd["lm_head.weight"] = embed_weight
 
         result: dict[str, torch.Tensor] = {}
         for k, v in self.vision_encoder.preprocess_weights(vision_sd).items():
