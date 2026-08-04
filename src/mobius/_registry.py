@@ -97,6 +97,7 @@ from mobius.models import (
     Qwen35VLTextModel,
     QwenCausalLMModel,
     SmolLM3CausalLMModel,
+    SortformerDiarizationModel,
     WhisperForConditionalGeneration,
 )
 from mobius.models.bamba import BambaCausalLMModel
@@ -776,6 +777,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "wavlm": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
     "mms": ModelRegistration(Wav2Vec2ForCTCModel, task="ctc-asr", config_class=MMSConfig),
     "fastconformer_rnnt": ModelRegistration(EncDecRNNTModel, task="fastconformer-rnnt"),
+    "sortformer": ModelRegistration(SortformerDiarizationModel, task="diarization"),
 }
 
 

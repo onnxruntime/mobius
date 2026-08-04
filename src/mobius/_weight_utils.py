@@ -781,7 +781,11 @@ def preprocess_olive_weights(
                     f"must be divisible by blob_size ({blob_size})"
                 )
             new_key = key.replace(".qweight", ".weight")
-            result[new_key] = value.reshape(value.shape[0], -1, blob_size).contiguous()
+            # Preserve all leading dims so fused expert-major tensors
+            # ``[E, N, packed_K]`` reshape to ``[E, N, n_blocks, blob_size]``
+            # for the QMoE repacker; 2-D linears ``[N, packed_K]`` are
+            # unchanged (``[N, n_blocks, blob_size]``).
+            result[new_key] = value.reshape(*value.shape[:-1], -1, blob_size).contiguous()
         elif key.endswith(".qzeros"):
             if value.dtype != torch.uint8:
                 raise ValueError(f"Olive qzeros must be uint8 for {key}, got {value.dtype}")
