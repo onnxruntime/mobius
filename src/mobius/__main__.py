@@ -33,6 +33,42 @@ from mobius._registry import registry
 logger = logging.getLogger(__name__)
 
 
+# Rust/cargo-style build features. Each feature name (kebab-case) maps to the
+# boolean attribute on the parsed args that it enables. `--features a,b` (or a
+# repeated `--features`) is the canonical way to toggle these build modes.
+_BUILD_FEATURES: dict[str, str] = {
+    "static-cache": "static_cache",
+    "fp8-kv-cache": "fp8_kv_cache",
+    "text-only": "text_only",
+}
+
+
+def _resolve_build_features(args: argparse.Namespace) -> None:
+    """Fold ``--features`` values into the boolean build-mode attributes.
+
+    ``--features`` accepts a comma-separated list and may be repeated (cargo
+    style), e.g. ``--features fp8-kv-cache,static-cache`` or
+    ``--features fp8-kv-cache --features static-cache``. Each recognised feature
+    sets its corresponding attribute (``fp8-kv-cache`` -> ``args.fp8_kv_cache``).
+    Unknown feature names raise ``SystemExit``.
+    """
+    for dest in _BUILD_FEATURES.values():
+        if not hasattr(args, dest):
+            setattr(args, dest, False)
+
+    raw = getattr(args, "features", None) or []
+    requested: list[str] = []
+    for chunk in raw:
+        requested.extend(f.strip() for f in chunk.split(",") if f.strip())
+
+    for feature in requested:
+        dest = _BUILD_FEATURES.get(feature)
+        if dest is None:
+            valid = ", ".join(sorted(_BUILD_FEATURES))
+            raise SystemExit(f"Error: unknown feature '{feature}'. Valid features: {valid}.")
+        setattr(args, dest, True)
+
+
 def _parse_size(size_str: str) -> int:
     """Parse a human-readable size string (e.g. '5GB') to bytes."""
     size_str = size_str.strip().upper()
@@ -137,6 +173,10 @@ def _cmd_build(args: argparse.Namespace) -> None:
             )
         return CausalLMTask(static_cache=True, max_seq_len=args.max_seq_len)
 
+    # Fold --features into the boolean build-mode attributes before any
+    # validation reads them.
+    _resolve_build_features(args)
+
     # Validate --max-seq-len requires --static-cache
     if args.max_seq_len is not None and not args.static_cache:
         raise SystemExit("Error: --max-seq-len can only be used with --static-cache.")
@@ -178,6 +218,19 @@ def _cmd_build(args: argparse.Namespace) -> None:
 
     load_weights = not args.no_weights
     task: str | ModelTask | None = args.task
+
+    # FP8 KV cache: resolve the optional per-layer scale file up front so both
+    # the --config and --model build paths can pass the same scales.
+    fp8_kv_cache = getattr(args, "fp8_kv_cache", False)
+    kv_cache_scales: dict[int, tuple[float, float]] | None = None
+    scale_file = getattr(args, "kv_cache_scale_file", None)
+    if scale_file is not None and not fp8_kv_cache:
+        raise SystemExit("Error: --kv-cache-scale-file can only be used with --fp8-kv-cache.")
+    if fp8_kv_cache and scale_file is not None:
+        from mobius._passes._fp8_kv_cache import load_kv_cache_scale_file
+
+        kv_cache_scales = load_kv_cache_scale_file(scale_file)
+
     if args.static_cache:
         # Defer task creation — we need to know the model type first.
         # Store parameters for later resolution.
@@ -250,7 +303,12 @@ def _cmd_build(args: argparse.Namespace) -> None:
         module_class = registry.get(model_type)
         model_module = module_class(config)
         pkg = build_from_module(
-            model_module, config, task=task, execution_provider=execution_provider
+            model_module,
+            config,
+            task=task,
+            execution_provider=execution_provider,
+            fp8_kv_cache=fp8_kv_cache,
+            kv_cache_scales=kv_cache_scales,
         )
         for name, model in pkg.items():
             model.graph.name = f"{config_path}/{name}"
@@ -278,6 +336,8 @@ def _cmd_build(args: argparse.Namespace) -> None:
             trust_remote_code=trust_remote_code,
             execution_provider=execution_provider,
             text_only=args.text_only,
+            fp8_kv_cache=fp8_kv_cache,
+            kv_cache_scales=kv_cache_scales,
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)
@@ -646,10 +706,17 @@ def main(argv: list[str] | None = None) -> None:
         help="Build only this component from a diffusers pipeline (e.g. --component vae_decoder).",
     )
     build_parser.add_argument(
-        "--static-cache",
-        action="store_true",
-        help="Use static KV cache (pre-allocated buffers with TensorScatter). "
-        "Requires models using DecoderLayer or MoEDecoderLayer.",
+        "--features",
+        action="append",
+        default=None,
+        metavar="FEATURES",
+        help=(
+            "Comma-separated list of build features to enable (cargo-style; "
+            "may be repeated). Available: "
+            + ", ".join(sorted(_BUILD_FEATURES))
+            + ". Example: --features fp8-kv-cache,static-cache. This is the "
+            "canonical way to enable these build modes."
+        ),
     )
     build_parser.add_argument(
         "--max-seq-len",
@@ -687,15 +754,15 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     build_parser.add_argument(
-        "--text-only",
-        dest="text_only",
-        action="store_true",
+        "--kv-cache-scale-file",
+        dest="kv_cache_scale_file",
+        default=None,
+        metavar="PATH",
         help=(
-            "Export the text backbone of a multimodal checkpoint as a "
-            "standalone decoder-only LLM. Strips vision/audio routing so the "
-            "decoder uses GroupQueryAttention on GQA-capable EPs. Currently "
-            "supported for gemma4_unified (google/gemma-4-12B). Not compatible "
-            "with --config or --component (use --model <hf-id>)."
+            "Optional JSON file of calibrated per-layer FP8 KV-cache scales "
+            "(onnxruntime-genai format: {'scales': {'k_scales': [...], "
+            "'v_scales': [...]}}). Only used with --fp8-kv-cache; without it "
+            "all layers use a unit scale of 1.0."
         ),
     )
     build_parser.set_defaults(func=_cmd_build)

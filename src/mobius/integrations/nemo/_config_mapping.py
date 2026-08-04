@@ -20,11 +20,13 @@ from __future__ import annotations
 from typing import Any
 
 from mobius._configs import ArchitectureConfig
+from mobius._configs._base import BaseModelConfig
 
 # NeMo ``target`` class path → mobius registry model_type.
 NEMO_TARGET_TO_MODEL_TYPE: dict[str, str] = {
     "nemo.collections.asr.models.rnnt_bpe_models.EncDecRNNTBPEModel": "fastconformer_rnnt",
     "nemo.collections.asr.models.rnnt_models.EncDecRNNTModel": "fastconformer_rnnt",
+    "nemo.collections.asr.models.sortformer_diar_models.SortformerEncLabelModel": "sortformer",
 }
 
 
@@ -85,10 +87,21 @@ def _validate_encoder(enc: dict[str, Any]) -> None:
         )
 
 
-def nemo_to_config(nemo_config: dict[str, Any]) -> ArchitectureConfig:
-    """Build an :class:`ArchitectureConfig` from a NeMo ``model_config.yaml`` dict."""
+def nemo_to_config(nemo_config: dict[str, Any]) -> BaseModelConfig:
+    """Build a mobius config from a NeMo ``model_config.yaml`` dict.
+
+    Dispatches on the NeMo ``target`` class path: FastConformer-RNNT models
+    produce an :class:`ArchitectureConfig`; Sortformer diarization models
+    produce a :class:`SortformerConfig`.
+    """
     target = str(nemo_config.get("target", ""))
     model_type = nemo_model_type(target)
+
+    if model_type == "sortformer":
+        # Imported lazily to avoid a models→integrations import cycle.
+        from mobius.models.sortformer import SortformerConfig
+
+        return SortformerConfig.from_nemo_yaml(nemo_config)
 
     enc = nemo_config["encoder"]
     dec = nemo_config["decoder"]

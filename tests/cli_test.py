@@ -78,7 +78,17 @@ class TestCLIBuild:
     def test_text_only_with_config_errors(self):
         """--text-only is rejected on the --config (local dir) path."""
         with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit):
-            main(["build", "--config", tmpdir, tmpdir, "--text-only", "--no-weights"])
+            main(
+                [
+                    "build",
+                    "--config",
+                    tmpdir,
+                    tmpdir,
+                    "--features",
+                    "text-only",
+                    "--no-weights",
+                ]
+            )
 
     def test_text_only_with_component_errors(self):
         """--text-only is rejected when combined with --component."""
@@ -89,7 +99,8 @@ class TestCLIBuild:
                     "--model",
                     "google/gemma-4-12B",
                     tmpdir,
-                    "--text-only",
+                    "--features",
+                    "text-only",
                     "--component",
                     "vision_encoder",
                     "--no-weights",
@@ -116,7 +127,8 @@ class TestCLIBuild:
                     "--model",
                     "some/diffusion-repo",
                     tmpdir,
-                    "--text-only",
+                    "--features",
+                    "text-only",
                     "--no-weights",
                 ]
             )
@@ -134,10 +146,141 @@ class TestCLIBuild:
                     "Qwen/Qwen2.5-0.5B",
                     tmpdir,
                     "--no-weights",
-                    "--static-cache",
+                    "--features",
+                    "static-cache",
                 ]
             )
             assert os.path.isfile(os.path.join(tmpdir, "model.onnx"))
+
+    def test_features_static_cache_equivalent(self):
+        """--features static-cache builds the same static-cache model."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main(
+                [
+                    "build",
+                    "--model",
+                    "Qwen/Qwen2.5-0.5B",
+                    tmpdir,
+                    "--no-weights",
+                    "--features",
+                    "static-cache",
+                ]
+            )
+            model = onnx.load(os.path.join(tmpdir, "model.onnx"))
+            cache_inputs = [
+                inp for inp in model.graph.input if inp.name.startswith("key_cache.")
+            ]
+            assert len(cache_inputs) > 0, "static cache not applied via --features"
+
+    def test_features_max_seq_len_pairs_with_static_cache(self):
+        """--max-seq-len works when static-cache is enabled via --features."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main(
+                [
+                    "build",
+                    "--model",
+                    "Qwen/Qwen2.5-0.5B",
+                    tmpdir,
+                    "--no-weights",
+                    "--features",
+                    "static-cache",
+                    "--max-seq-len",
+                    "128",
+                ]
+            )
+            assert os.path.isfile(os.path.join(tmpdir, "model.onnx"))
+
+    def test_features_text_only_passed_through(self):
+        """--features text-only sets text_only on the build() call."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius._diffusers_builder._load_diffusers_pipeline_index",
+                return_value=None,
+            ),
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "some/model",
+                    tmpdir,
+                    "--no-weights",
+                    "--features",
+                    "text-only",
+                ]
+            )
+        assert mock_build.call_args.kwargs.get("text_only") is True
+
+    def test_features_fp8_kv_cache_passed_through(self):
+        """--features fp8-kv-cache sets fp8_kv_cache on the build() call."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius._diffusers_builder._load_diffusers_pipeline_index",
+                return_value=None,
+            ),
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "some/model",
+                    tmpdir,
+                    "--no-weights",
+                    "--features",
+                    "fp8-kv-cache",
+                ]
+            )
+        assert mock_build.call_args.kwargs.get("fp8_kv_cache") is True
+
+    def test_features_comma_separated_multiple(self):
+        """A single --features accepts a comma-separated list."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius._diffusers_builder._load_diffusers_pipeline_index",
+                return_value=None,
+            ),
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "some/model",
+                    tmpdir,
+                    "--no-weights",
+                    "--features",
+                    "text-only,fp8-kv-cache",
+                ]
+            )
+        kwargs = mock_build.call_args.kwargs
+        assert kwargs.get("text_only") is True
+        assert kwargs.get("fp8_kv_cache") is True
+
+    def test_features_unknown_errors(self):
+        """An unrecognised feature name is rejected with a clear error."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(SystemExit, match=r"unknown feature 'bogus'"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "some/model",
+                    tmpdir,
+                    "--no-weights",
+                    "--features",
+                    "bogus",
+                ]
+            )
 
     def test_max_seq_len_without_static_cache_errors(self):
         with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit):
@@ -163,7 +306,8 @@ class TestCLIBuild:
                     "Qwen/Qwen2.5-0.5B",
                     tmpdir,
                     "--no-weights",
-                    "--static-cache",
+                    "--features",
+                    "static-cache",
                     "--task",
                     "text-generation",
                 ]
@@ -178,7 +322,8 @@ class TestCLIBuild:
                     "Qwen/Qwen2.5-0.5B",
                     tmpdir,
                     "--no-weights",
-                    "--static-cache",
+                    "--features",
+                    "static-cache",
                     "--max-seq-len",
                     "0",
                 ]
@@ -195,7 +340,8 @@ class TestCLIBuild:
                     "Qwen/Qwen2.5-0.5B",
                     tmpdir,
                     "--no-weights",
-                    "--static-cache",
+                    "--features",
+                    "static-cache",
                     "--max-seq-len",
                     str(max_seq_len),
                 ]

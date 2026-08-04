@@ -56,7 +56,7 @@ Usage::
 
 The equivalent raw-ONNX (no genai_config) build is::
 
-    mobius build --model google/gemma-4-12B --text-only --ep cuda --dtype f16 \
+    mobius build --model google/gemma-4-12B --features text-only --ep cuda --dtype f16 \
         out/gemma4_12b_text_onnx/
 """
 
