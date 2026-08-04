@@ -35,6 +35,8 @@ __all__ = [
     "build_context",
     "ep_capabilities",
     "get_build_dtype",
+    "is_lm_head_pruning_enabled",
+    "lm_head_pruning",
 ]
 
 _DEFAULT_CAPABILITIES = EpCapabilities(name="default")
@@ -44,6 +46,9 @@ _current_ep: contextvars.ContextVar[EpCapabilities] = contextvars.ContextVar(
 )
 _current_dtype: contextvars.ContextVar[ir.DataType] = contextvars.ContextVar(
     "mobius_build_dtype", default=ir.DataType.FLOAT
+)
+_prune_lm_head: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "mobius_prune_lm_head", default=False
 )
 
 
@@ -113,3 +118,18 @@ def get_build_dtype() -> ir.DataType:
             ...
     """
     return _current_dtype.get()
+
+
+@contextmanager
+def lm_head_pruning(enabled: bool) -> Iterator[None]:
+    """Enable or disable pre-projection LM-head pruning during graph construction."""
+    token = _prune_lm_head.set(enabled)
+    try:
+        yield
+    finally:
+        _prune_lm_head.reset(token)
+
+
+def is_lm_head_pruning_enabled() -> bool:
+    """Return whether the active causal-LM task requests final-token logits only."""
+    return _prune_lm_head.get()
