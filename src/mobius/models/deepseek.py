@@ -20,14 +20,17 @@ from mobius.components import (
     MLP,
     Attention,
     Embedding,
+    FusedQuantizedMoE,
     Linear,
     MoELayer,
+    QuantizedEmbedding,
     RMSNorm,
     create_attention_bias,
     initialize_rope,
+    make_quantized_linear_factory,
 )
 from mobius.components._deepseek_mla import DeepSeekMLA
-from mobius.components._quantized_linear import make_quantized_linear_factory
+from mobius.components._moe import pack_fused_quantized_moe_weights
 from mobius.models.base import CausalLMModel
 
 
@@ -40,6 +43,21 @@ def _linear_factory(config: ArchitectureConfig):
         bits=quantization.bits,
         block_size=quantization.group_size,
         has_zero_point=not quantization.sym,
+        zero_point_dtype=zero_point_dtype,
+    )
+
+
+def _linear_class(config: ArchitectureConfig) -> type:
+    qc = config.quantization
+    if qc is None or qc.quant_method == "none":
+        return Linear
+    import onnx_ir as ir
+
+    zero_point_dtype = config.dtype if qc.float_zero_point else ir.DataType.UINT8
+    return make_quantized_linear_factory(
+        bits=qc.bits,
+        block_size=qc.group_size,
+        has_zero_point=not qc.sym,
         zero_point_dtype=zero_point_dtype,
     )
 
@@ -87,24 +105,14 @@ class DeepSeekMoEGate(nn.Module):
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
         scores, scores_for_choice = self._routing_scores(op, hidden_states)
-
-        # Select top-k experts
-        k_val = op.Constant(value_ints=[self.top_k])
-        _, selected_experts = op.TopK(scores_for_choice, k_val, axis=-1, _outputs=2)
-
-        # Gather original scores (without bias) for selected experts
-        routing_weights = op.GatherElements(scores, selected_experts, axis=-1)
-
-        # Normalize weights (V3 with norm_topk_prob=True)
-        if self.norm_topk_prob:
-            weight_sum = op.ReduceSum(routing_weights, [-1], keepdims=True)
-            eps = 1e-20
-            routing_weights = op.Div(routing_weights, op.Add(weight_sum, eps))
-
-        # Apply routing scale
-        routing_weights = op.Mul(routing_weights, float(self.routed_scaling_factor))
-
+        routing_weights, selected_experts = self._topk_weights(op, scores, scores_for_choice)
         return routing_weights, selected_experts
+
+    def route_for_qmoe(self, op: OpBuilder, hidden_states: ir.Value):
+        """Routing outputs shaped for the fused ``com.microsoft::QMoE`` op."""
+        scores, scores_for_choice = self._routing_scores(op, hidden_states)
+        routing_weights, selected_experts = self._topk_weights(op, scores, scores_for_choice)
+        return scores_for_choice, routing_weights, selected_experts
 
     def qmoe_routing(self, op: OpBuilder, hidden_states: ir.Value):
         """Return distinct expert-selection and aggregation scores for QMoE."""
@@ -116,6 +124,17 @@ class DeepSeekMoEGate(nn.Module):
             float(self.routed_scaling_factor),
         )
 
+    def _topk_weights(self, op: OpBuilder, scores: ir.Value, scores_for_choice: ir.Value):
+        k_val = op.Constant(value_ints=[self.top_k])
+        _, selected_experts = op.TopK(scores_for_choice, k_val, axis=-1, _outputs=2)
+        routing_weights = op.GatherElements(scores, selected_experts, axis=-1)
+        if self.norm_topk_prob:
+            weight_sum = op.ReduceSum(routing_weights, [-1], keepdims=True)
+            eps = 1e-20
+            routing_weights = op.Div(routing_weights, op.Add(weight_sum, eps))
+        routing_weights = op.Mul(routing_weights, float(self.routed_scaling_factor))
+        return routing_weights, selected_experts
+
     def _routing_scores(self, op: OpBuilder, hidden_states: ir.Value):
         weight_t = op.Transpose(self.weight, perm=[1, 0])
         router_logits = op.MatMul(
@@ -123,17 +142,13 @@ class DeepSeekMoEGate(nn.Module):
             op.Cast(weight_t, to=1),
         )
 
-        # Score computation depends on scoring function
         if self.scoring_func == "sigmoid":
-            scores = op.Sigmoid(router_logits)  # (B*S, num_experts)
-            # Add correction bias for expert selection (V3)
+            scores = op.Sigmoid(router_logits)
             scores_for_choice = op.Add(scores, self.e_score_correction_bias)
         else:
-            # Softmax scoring (V2)
             scores = op.Softmax(router_logits, axis=-1)
             scores_for_choice = scores
 
-        # Expert selection: group-based or simple TopK
         if self.n_group > 1 and self.topk_method != "greedy":
             scores_for_choice = self._group_topk_selection(op, scores_for_choice)
         return scores, scores_for_choice
@@ -193,9 +208,15 @@ class DeepSeekMLADecoderLayer(nn.Module):
     Forward signature matches DecoderLayer for compatibility with TextModel.
     """
 
-    def __init__(self, config: ArchitectureConfig, is_moe: bool = False):
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        is_moe: bool = False,
+        linear_class: type | None = None,
+    ):
         super().__init__()
-        linear_class = _linear_factory(config)
+        if linear_class is None:
+            linear_class = _linear_factory(config)
         self.self_attn = DeepSeekMLA(config, linear_class=linear_class)
         if is_moe:
             gate = DeepSeekMoEGate(config)
@@ -241,9 +262,15 @@ class _DeepSeekStandardDecoderLayer(nn.Module):
     Forward signature matches DeepSeekMLADecoderLayer for compatibility.
     """
 
-    def __init__(self, config: ArchitectureConfig, is_moe: bool = False):
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        is_moe: bool = False,
+        linear_class: type | None = None,
+    ):
         super().__init__()
-        linear_class = _linear_factory(config)
+        if linear_class is None:
+            linear_class = _linear_factory(config)
         self.self_attn = Attention(config, linear_class=linear_class)
         if is_moe:
             gate = DeepSeekMoEGate(config)
@@ -290,17 +317,29 @@ class _DeepSeekMoEFFN(nn.Module):
     """
 
     def __init__(
-        self, config: ArchitectureConfig, gate: nn.Module, linear_class: type | None = None
+        self,
+        config: ArchitectureConfig,
+        gate: nn.Module,
+        linear_class: type | None = None,
     ):
         super().__init__()
         assert config.num_local_experts is not None
         assert config.moe_intermediate_size is not None
-        self.moe = MoELayer(config, gate=gate)
+        qc = config.quantization
+        use_fused_qmoe = (
+            config.fused_quantized_moe and qc is not None and qc.quant_method != "none"
+        )
+        if use_fused_qmoe:
+            self.moe = FusedQuantizedMoE(config, gate=gate)
+        else:
+            self.moe = MoELayer(config, gate=gate, linear_class=linear_class)
         # Shared expert uses moe_intermediate_size * n_shared_experts
         n_shared = config.n_shared_experts or 1
         shared_intermediate = config.moe_intermediate_size * n_shared
         self.shared_experts = _SharedExpertMLP(
-            config, shared_intermediate, linear_class=linear_class
+            config,
+            shared_intermediate,
+            linear_class=linear_class,
         )
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
@@ -346,12 +385,26 @@ class DeepSeekV3TextModel(nn.Module):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
-        self.embed_tokens = Embedding(config.vocab_size, config.hidden_size)
+        linear_class = _linear_class(config)
+        qc = config.quantization
+        if qc is not None and qc.quantize_embeddings:
+            self.embed_tokens = QuantizedEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                bits=qc.bits,
+                block_size=qc.group_size,
+                has_zero_point=not qc.sym,
+                padding_idx=config.pad_token_id,
+            )
+        else:
+            self.embed_tokens = Embedding(config.vocab_size, config.hidden_size)
         self._dtype = config.dtype
 
         # Detect MLA vs standard attention
         use_mla = config.qk_nope_head_dim is not None and config.qk_nope_head_dim > 0
-        LayerClass = DeepSeekMLADecoderLayer if use_mla else _DeepSeekStandardDecoderLayer  # noqa: N806
+        LayerClass = (  # noqa: N806
+            DeepSeekMLADecoderLayer if use_mla else _DeepSeekStandardDecoderLayer
+        )
 
         # Build layers: dense for first k, MoE for rest
         first_k = config.first_k_dense_replace
@@ -360,7 +413,7 @@ class DeepSeekV3TextModel(nn.Module):
             first_k = config.num_hidden_layers
         self.layers = nn.ModuleList(
             [
-                LayerClass(config, is_moe=(i >= first_k))
+                LayerClass(config, is_moe=(i >= first_k), linear_class=linear_class)
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -425,7 +478,11 @@ class DeepSeekV3CausalLMModel(CausalLMModel):
         nn.Module.__init__(self)
         self.config = config
         self.model = DeepSeekV3TextModel(config)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        qc = config.quantization
+        lm_head_class = (
+            _linear_class(config) if qc is not None and qc.quantize_lm_head else Linear
+        )
+        self.lm_head = lm_head_class(config.hidden_size, config.vocab_size, bias=False)
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
@@ -439,23 +496,33 @@ class DeepSeekV3CausalLMModel(CausalLMModel):
         - MoE expert weights: HF stores all experts in a single fused tensor
             experts.gate_up_proj: (n_experts, 2*intermediate, hidden)
             experts.down_proj:    (n_experts, hidden, intermediate)
-          These are split into per-expert ONNX weights:
+          Static MoE exports split these into per-expert ONNX weights:
             moe.experts.{i}.gate_proj.weight: (intermediate, hidden)
             moe.experts.{i}.up_proj.weight:   (intermediate, hidden)
             moe.experts.{i}.down_proj.weight: (hidden, intermediate)
+          Fused quantized exports instead pack expert-major FC1/FC2 tensors for QMoE.
         """
         renamed = {}
+        routed_experts = {}
+        qc = self.config.quantization
+        use_fused_qmoe = (
+            self.config.fused_quantized_moe and qc is not None and qc.quant_method != "none"
+        )
         use_qmoe = (
-            self.config.quantization is not None
-            and self.config.quantization.bits == 4
-            and self.config.quantization.quant_method in {"gptq", "awq"}
-            and not self.config.quantization.float_zero_point
+            not use_fused_qmoe
+            and qc is not None
+            and qc.bits == 4
+            and qc.quant_method in {"gptq", "awq"}
+            and not qc.float_zero_point
         )
         for key, value in state_dict.items():
             new_key = key
 
             # Remap MoE layer names: mlp.gate.* → mlp.moe.gate.*
             new_key = new_key.replace(".mlp.gate.", ".mlp.moe.gate.")
+            if use_fused_qmoe and ".mlp.experts." in new_key:
+                routed_experts[new_key] = value
+                continue
 
             # HF stores all routed experts in fused tensors:
             # layers.N.mlp.experts.gate_up_proj  (n_experts, 2*mid, hidden)
@@ -476,9 +543,10 @@ class DeepSeekV3CausalLMModel(CausalLMModel):
 
             renamed[new_key] = value
 
-        # Handle weight tying and GPTQ/AWQ conversion before flattening the
-        # expert-major MatMulNBits blobs into the QMoE ABI.
+        # Handle weight tying and pack routed expert tensors for the selected QMoE path.
         processed = super().preprocess_weights(renamed)
-        if use_qmoe:
+        if use_fused_qmoe:
+            processed.update(pack_fused_quantized_moe_weights(routed_experts, self.config))
+        elif use_qmoe:
             processed = pack_qmoe_expert_weights(processed)
         return processed

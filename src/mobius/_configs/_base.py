@@ -467,6 +467,11 @@ class ArchitectureConfig(BaseModelConfig):
     topk_method: str = "greedy"
     first_k_dense_replace: int = 0
     n_shared_experts: int | None = None
+    mlp_layer_types: list[str] | None = None
+    # When True (and quantization is active), routed MoE experts are emitted as a
+    # single fused ``com.microsoft::QMoE`` op instead of a per-expert unroll of
+    # ``MatMulNBits``. Only wired for the GLM/DeepSeek MoE path today.
+    fused_quantized_moe: bool = False
 
     # Multi-head Latent Attention (MLA) config — DeepSeek-V2/V3
     q_lora_rank: int | None = None
@@ -476,12 +481,20 @@ class ArchitectureConfig(BaseModelConfig):
     v_head_dim: int | None = None
     rope_interleave: bool = False
 
+    # Deep Sparse Attention / IndexShare config — GLM-5.2 and DeepSeek-V4 CSA.
+    use_dsa: bool = True
+    index_topk: int | None = None
+    index_head_dim: int | None = None
+    index_n_heads: int | None = None
+    index_topk_freq: int = 4
+    index_skip_topk_offset: int = 3
+    indexer_rope_interleave: bool = True
+    indexer_types: list[str] | None = None
+    index_share_for_mtp_iteration: bool = False
+
     # DeepSeek-V4 compressed sparse attention / Hyper-Connections.
     o_groups: int = 1
     o_lora_rank: int | None = None
-    index_n_heads: int | None = None
-    index_head_dim: int | None = None
-    index_topk: int | None = None
     compress_ratios: list[int] | None = None
     compress_rope_theta: float | None = None
     hc_mult: int = 1
@@ -650,7 +663,7 @@ class ArchitectureConfig(BaseModelConfig):
             config,
             "rope_interleave",
             (getattr(config, "qk_rope_head_dim", None) or 0) > 0
-            or model_type in ("glm", "glm4", "glm4_moe", "chatglm"),
+            or model_type in ("glm", "glm4", "glm4_moe", "glm_moe_dsa", "chatglm"),
         )
         if rope_config is not None:
             rope_config = dataclasses.replace(rope_config, rope_interleave=rope_interleave)
@@ -881,18 +894,28 @@ class ArchitectureConfig(BaseModelConfig):
             topk_method=getattr(config, "topk_method", "greedy"),
             first_k_dense_replace=getattr(config, "first_k_dense_replace", 0),
             n_shared_experts=getattr(config, "n_shared_experts", None),
+            mlp_layer_types=getattr(config, "mlp_layer_types", None),
             # Multi-head Latent Attention (MLA)
             q_lora_rank=getattr(config, "q_lora_rank", None),
             kv_lora_rank=getattr(config, "kv_lora_rank", None),
             qk_nope_head_dim=getattr(config, "qk_nope_head_dim", None),
             qk_rope_head_dim=getattr(config, "qk_rope_head_dim", None),
             v_head_dim=getattr(config, "v_head_dim", None),
+            # Deep Sparse Attention / IndexShare
+            use_dsa=getattr(config, "use_dsa", True),
+            index_topk=getattr(config, "index_topk", None),
+            index_head_dim=getattr(config, "index_head_dim", None),
+            index_n_heads=getattr(config, "index_n_heads", None),
+            index_topk_freq=getattr(config, "index_topk_freq", 4),
+            index_skip_topk_offset=getattr(config, "index_skip_topk_offset", 3),
+            indexer_rope_interleave=getattr(config, "indexer_rope_interleave", True),
+            indexer_types=getattr(config, "indexer_types", None),
+            index_share_for_mtp_iteration=getattr(
+                config, "index_share_for_mtp_iteration", False
+            ),
             # DeepSeek-V4 compressed sparse attention / Hyper-Connections
             o_groups=getattr(config, "o_groups", 1),
             o_lora_rank=getattr(config, "o_lora_rank", None),
-            index_n_heads=getattr(config, "index_n_heads", None),
-            index_head_dim=getattr(config, "index_head_dim", None),
-            index_topk=getattr(config, "index_topk", None),
             compress_ratios=_deepseek_v4_compress_ratios(config),
             compress_rope_theta=getattr(config, "compress_rope_theta", None),
             hc_mult=getattr(config, "hc_mult", 1),

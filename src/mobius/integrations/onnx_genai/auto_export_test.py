@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 
 import onnx_ir as ir
 import pytest
@@ -24,6 +25,8 @@ class _Cfg:
     max_position_embeddings: int = 8192
     sliding_window: int | None = None
     model_type: str = "qwen"
+    num_nextn_predict_layers: int = 1
+    index_share_for_mtp_iteration: bool = True
 
 
 @dataclasses.dataclass
@@ -449,6 +452,20 @@ def test_unrecognized_multi_component_package_fails_loudly(tmp_path):
     )
     with pytest.raises(ValueError, match="multi-component"):
         write_onnx_genai_config(pkg, str(tmp_path))
+
+
+def test_mtp_package_emits_decoder_metadata_and_sidecar(tmp_path):
+    pkg = _MultimodalPkg({"model": object(), "mtp": object()})
+
+    artifacts = write_onnx_genai_config(pkg, str(tmp_path))
+
+    assert set(artifacts) == {"inference_metadata", "mtp_config"}
+    with open(artifacts["mtp_config"]) as handle:
+        mtp = json.load(handle)
+    assert mtp["model"]["filename"] == "mtp/model.onnx"
+    assert mtp["num_nextn_predict_layers"] == 1
+    assert mtp["index_share_for_mtp_iteration"] is True
+    assert mtp["runtime_orchestration"] == "external"
 
 
 def test_decoder_emits_tokenizer_from_source(tmp_path):

@@ -75,6 +75,9 @@ class TestResolveOrtGenaiModelType:
         # decoder-only causal LM not in its built-in registry.
         assert _resolve_ort_genai_model_type("hunyuan_v1_dense") == "decoder"
 
+    def test_glm_moe_dsa_maps_to_decoder(self):
+        assert _resolve_ort_genai_model_type("glm_moe_dsa") == "decoder"
+
     def test_unknown_model_type_passthrough(self):
         assert _resolve_ort_genai_model_type("my_custom") == "my_custom"
 
@@ -651,6 +654,22 @@ class TestExportForOrtGenai:
             data = json.load(f)
         assert "model" in data
         assert data["model"]["type"] == "qwen2"
+
+    def test_mtp_component_writes_sidecar_and_nested_decoder_path(self, tmp_path):
+        pkg = self._make_pkg()
+        pkg["mtp"] = mock.MagicMock()
+
+        result = write_ort_genai_config(pkg, str(tmp_path))
+
+        assert "mtp_config" in result
+        with open(result["genai_config"]) as f:
+            genai = json.load(f)
+        assert genai["model"]["decoder"]["filename"] == "model/model.onnx"
+        with open(result["mtp_config"]) as f:
+            mtp = json.load(f)
+        assert mtp["model"]["filename"] == "mtp/model.onnx"
+        assert mtp["outputs"][-1] == "topk_indices"
+        assert mtp["runtime_orchestration"] == "external"
 
     def test_processor_config_written_with_vision(self, tmp_path):
         """image_processor.json is written when pkg.config.vision is set."""

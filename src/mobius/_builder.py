@@ -355,6 +355,7 @@ def build(
     execution_provider: str = "default",
     trace_optimization: bool = False,
     text_only: bool = False,
+    config_overrides: dict[str, object] | None = None,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a HuggingFace model ID.
 
@@ -419,6 +420,8 @@ def build(
             text-only sibling. Currently supported for ``gemma4_unified``
             (``google/gemma-4-12B``) and ``qwen3_5_moe_vl``
             (``Qwen/Qwen3.6-35B-A3B``).
+        config_overrides: Optional dataclass field overrides applied after
+            HuggingFace config extraction and dtype resolution.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -577,6 +580,8 @@ def build(
     if dtype is not None:
         dtype = resolve_dtype(dtype)
         config = dataclasses.replace(config, dtype=dtype)
+    if config_overrides:
+        config = dataclasses.replace(config, **config_overrides)
 
     if output_layer_indices is not None:
         # Opt-in: emit additional `hidden_states.{k}` ONNX outputs for each

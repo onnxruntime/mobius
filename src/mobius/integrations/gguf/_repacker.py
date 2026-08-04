@@ -518,10 +518,10 @@ def repack_dequantized_tensor(
     """
     if values.ndim != 2:
         raise ValueError(f"Expected 2D values (N, K), got shape {values.shape}")
-    if bits != 4 or block_size != _BLOCK_SIZE:
+    if bits not in (4, 8) or block_size != _BLOCK_SIZE:
         raise ValueError(
             "Float requantization currently supports only "
-            f"bits=4, block_size={_BLOCK_SIZE}; got bits={bits}, "
+            f"bits=4/8, block_size={_BLOCK_SIZE}; got bits={bits}, "
             f"block_size={block_size}"
         )
 
@@ -531,6 +531,31 @@ def repack_dequantized_tensor(
     padded = np.zeros((n_out, padded_k), dtype=np.float32)
     padded[:, :k_in] = values.astype(np.float32, copy=False)
     blocks = padded.reshape(n_out, n_blocks, block_size)
+
+    if bits == 8:
+        block_min = np.minimum(blocks.min(axis=-1), 0.0)
+        block_max = np.maximum(blocks.max(axis=-1), 0.0)
+        if symmetric:
+            scales = np.maximum(-block_min / 128.0, block_max / 127.0)
+            zero_points_arr = np.full_like(scales, 128, dtype=np.uint8)
+        else:
+            scales = (block_max - block_min) / 255.0
+            safe_scales = np.where(scales != 0, scales, 1.0)
+            zero_points_arr = np.clip(np.rint(-block_min / safe_scales), 0, 255).astype(
+                np.uint8
+            )
+        safe_scales = np.where(scales != 0, scales, 1.0)
+        quants = np.rint(blocks / safe_scales[:, :, None])
+        quants += zero_points_arr[:, :, None]
+        weight = np.clip(quants, 0, 255).astype(np.uint8)
+        weight = np.where(scales[:, :, None] != 0, weight, 0).astype(np.uint8)
+        return RepackedTensor(
+            weight=weight,
+            scales=scales.astype(np.float32),
+            zero_points=None if symmetric else zero_points_arr,
+            block_size=block_size,
+            bits=bits,
+        )
 
     if symmetric:
         # MatMulNBits' implicit uint4 zero-point is 8. Choose a scale that

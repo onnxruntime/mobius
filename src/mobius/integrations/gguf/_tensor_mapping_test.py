@@ -306,6 +306,33 @@ class TestMapGGUFToHFNames:
             "model.layers.0.mlp.experts.gate_proj.weight"
         )
 
+    def test_glm_dsa_mapping(self) -> None:
+        assert map_gguf_to_hf_names("blk.3.attn_q_a.weight", "glm-dsa") == (
+            "model.layers.3.self_attn.q_a_proj.weight"
+        )
+        assert map_gguf_to_hf_names("blk.3.attn_k_b.weight", "glm-dsa") == (
+            "model.layers.3.self_attn.kv_b_proj.k_proj.weight"
+        )
+        assert map_gguf_to_hf_names("blk.3.ffn_gate_exps.weight", "glm-dsa") == (
+            "model.layers.3.mlp.experts.gate_proj.weight"
+        )
+        assert map_gguf_to_hf_names("blk.3.exp_probs_b.bias", "glm-dsa") == (
+            "model.layers.3.mlp.gate.e_score_correction_bias.bias"
+        )
+        assert map_gguf_to_hf_names("blk.3.indexer.attn_k.weight", "glm-dsa") == (
+            "model.layers.3.self_attn.indexer.wk.weight"
+        )
+        assert map_gguf_to_hf_names("blk.3.indexer.k_norm.bias", "glm-dsa") == (
+            "model.layers.3.self_attn.indexer.k_norm.bias"
+        )
+        assert map_gguf_to_hf_names("blk.78.nextn.eh_proj.weight", "glm-dsa") == (
+            "model.layers.78.eh_proj.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("blk.78.nextn.shared_head_norm.weight", "glm-dsa")
+            == "model.layers.78.shared_head.norm.weight"
+        )
+
     def test_deepseek4_mapping(self) -> None:
         expected = {
             "blk.2.attn_q_a.weight": "model.layers.2.self_attn.q_a_proj.weight",

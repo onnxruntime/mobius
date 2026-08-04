@@ -1085,6 +1085,23 @@ class TestGemma4Config:
 class TestActivationFallbacks:
     """Tests for hidden_act extraction fallbacks (ff_activation, gelu_activation)."""
 
+    def test_chatglm_silu_fallback(self):
+        """ChatGLM hardcodes SiLU without exposing an activation field."""
+
+        class FakeConfig:
+            model_type = "chatglm"
+            num_attention_heads = 8
+            num_key_value_heads = 8
+            num_hidden_layers = 2
+            vocab_size = 1000
+            hidden_size = 256
+            intermediate_size = 512
+            max_position_embeddings = 1024
+            head_dim = 32
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        assert config.hidden_act == "silu"
+
     def test_ff_activation_fallback(self):
         """ff_activation is used when hidden_act is absent (XLNet pattern)."""
 

@@ -87,6 +87,7 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     # ORT GenAI (see onnxruntime-genai/src/models/model_type.h LLM list).
     "hunyuan_v1_dense": "decoder",
     "deepseek_v4": "decoder",
+    "glm_moe_dsa": "decoder",
     # Qwen VL model families have separate ORT GenAI model types.
     "qwen2_vl": "qwen2_5_vl",
     "qwen3_vl": "qwen3_vl",
@@ -1102,22 +1103,37 @@ def write_ort_genai_config(
 
     if "mtp" in pkg:
         mtp_model = pkg["mtp"]
+        mtp_inputs = [value.name for value in mtp_model.graph.inputs if value.name is not None]
+        if not mtp_inputs:
+            mtp_inputs = [
+                "inputs_embeds",
+                "hidden_states",
+                "attention_mask",
+                "position_ids",
+                "past_key_values.0.key",
+                "past_key_values.0.value",
+            ]
+        mtp_outputs = [
+            value.name for value in mtp_model.graph.outputs if value.name is not None
+        ]
+        if not mtp_outputs:
+            mtp_outputs = [
+                "mtp_hidden",
+                "present.0.key",
+                "present.0.value",
+                "topk_indices",
+            ]
         mtp_path = os.path.join(directory, "mtp_config.json")
         with open(mtp_path, "w") as f:
             json.dump(
                 {
                     "model": {"filename": "mtp/model.onnx"},
-                    "inputs": [
-                        value.name
-                        for value in mtp_model.graph.inputs
-                        if value.name is not None
-                    ],
-                    "outputs": [
-                        value.name
-                        for value in mtp_model.graph.outputs
-                        if value.name is not None
-                    ],
+                    "inputs": mtp_inputs,
+                    "outputs": mtp_outputs,
                     "num_nextn_predict_layers": getattr(config, "num_nextn_predict_layers", 0),
+                    "index_share_for_mtp_iteration": getattr(
+                        config, "index_share_for_mtp_iteration", False
+                    ),
                     "shared_embedding": "model.embed_tokens",
                     "shared_lm_head": "lm_head",
                     "runtime_orchestration": "external",

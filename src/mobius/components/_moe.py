@@ -7,12 +7,20 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import re
+from typing import TYPE_CHECKING
 
 import onnx_ir as ir
+import torch
 from onnxscript import OpBuilder, nn
 
+from mobius._build_context import ep_capabilities
 from mobius._configs import ArchitectureConfig, QuantizationConfig
+from mobius._weight_utils import preprocess_awq_weights, preprocess_gptq_weights
 from mobius.components._mlp import MLP
+
+if TYPE_CHECKING:
+    pass
 
 
 class TopKGate(nn.Module):
@@ -267,7 +275,13 @@ class MoELayer(nn.Module):
     and compatibility path, not the grouped-expert performance representation.
     """
 
-    def __init__(self, config: ArchitectureConfig, gate: nn.Module | None = None):
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        gate: nn.Module | None = None,
+        linear_class: type | None = None,
+        enable_qmoe: bool = True,
+    ):
         super().__init__()
         assert config.num_local_experts is not None
         assert config.num_experts_per_tok is not None
@@ -284,11 +298,20 @@ class MoELayer(nn.Module):
             if config.moe_intermediate_size is not None
             else config
         )
-        if self._qmoe_quantization is not None and hasattr(self.gate, "qmoe_routing"):
+        if (
+            enable_qmoe
+            and self._qmoe_quantization is not None
+            and hasattr(self.gate, "qmoe_routing")
+        ):
             self.experts = None
             self._init_qmoe_parameters(expert_config)
         else:
-            self.experts = nn.ModuleList([MLP(expert_config) for _ in range(self.num_experts)])
+            self.experts = nn.ModuleList(
+                [
+                    MLP(expert_config, linear_class=linear_class)
+                    for _ in range(self.num_experts)
+                ]
+            )
 
     def _init_qmoe_parameters(self, expert_config: ArchitectureConfig) -> None:
         quantization = self._qmoe_quantization
@@ -393,6 +416,373 @@ class MoELayer(nn.Module):
                 result = op.Add(result, contribution)
 
         return result
+
+
+class FusedQuantizedMoE(nn.Module):
+    """Routed MoE experts emitted as a single fused ``com.microsoft::QMoE`` op.
+
+    Replaces the per-expert ``MatMulNBits`` unroll (:class:`MoELayer`) for
+    weight-only int-quantized MoE. All routed experts are packed into
+    expert-major integer weight tensors laid out exactly as the ORT contrib
+    ``QMoE`` kernel expects::
+
+        fc1_experts_weights: [E, 2*inter, hidden // pack_size]   uint8
+        fc1_scales:          [E, 2*inter, hidden // block_size]  float32
+        fc2_experts_weights: [E, hidden, inter // pack_size]     uint8
+        fc2_scales:          [E, hidden, inter // block_size]    float32
+
+    where ``pack_size = 8 // bits``. ``fc1`` fuses the SwiGLU gate/up
+    projections in the **interleaved** layout ``[g_0, u_0, g_1, u_1, ...]`` and is
+    consumed with ``swiglu_fusion=1`` (the only SwiGLU layout the ORT CPU QMoE
+    kernel supports), so the kernel computes ``silu(gate) * up`` — matching
+    GLM/DeepSeek's SiLU-gated experts (``activation_alpha=1``, ``activation_beta=0``,
+    ``swiglu_limit=inf``, all ORT defaults).
+
+    Routing is delegated to ``gate.route_for_qmoe`` (GLM sigmoid + noaux_tc /
+    DeepSeek softmax group-limited). The kernel re-derives top-k selection from
+    ``router_probs`` (the gate's ``scores_for_choice``); the exact combine
+    weights are scattered into a dense ``[rows, E]`` aggregation tensor and fed
+    through the optional ``router_weights`` input with
+    ``normalize_routing_weights=0``, so the fused op reproduces the per-expert
+    path's routing bit-for-bit.
+
+    Symmetric quantization omits zero-point inputs and uses the kernel's implicit
+    midpoint. Asymmetric quantization supplies packed per-block zero-points.
+    """
+
+    _MICROSOFT_DOMAIN = "com.microsoft"
+
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        gate: nn.Module,
+    ):
+        super().__init__()
+        assert config.num_local_experts is not None
+        assert config.num_experts_per_tok is not None
+        assert config.moe_intermediate_size is not None
+        assert config.quantization is not None
+        if not hasattr(gate, "route_for_qmoe"):
+            raise TypeError(
+                f"gate {type(gate).__name__} does not support the fused QMoE path "
+                "(missing route_for_qmoe); use MoELayer instead"
+            )
+
+        qc = config.quantization
+        bits = qc.bits
+        block_size = qc.group_size
+        if bits not in (1, 2, 4, 8):
+            raise ValueError(f"QMoE expert_weight_bits must be 1/2/4/8, got {bits}")
+        if block_size < 16 or (block_size & (block_size - 1)):
+            raise ValueError(f"QMoE block_size must be a power of 2 >= 16, got {block_size}")
+
+        self.gate = gate
+        self._num_experts = config.num_local_experts
+        self._top_k = config.num_experts_per_tok
+        self._hidden = config.hidden_size
+        self._inter = config.moe_intermediate_size
+        self._bits = bits
+        self._block_size = block_size
+
+        if self._hidden % block_size != 0:
+            raise ValueError(
+                f"hidden_size {self._hidden} must be divisible by block_size {block_size}"
+            )
+        if self._inter % block_size != 0:
+            raise ValueError(
+                f"moe_intermediate_size {self._inter} must be divisible by "
+                f"block_size {block_size}"
+            )
+
+        pack_size = 8 // bits
+        e = self._num_experts
+        fc1_out = 2 * self._inter  # interleaved [g_0, u_0, ...] for swiglu_fusion=1
+        # fc1: [E, 2*inter, hidden] quantized along hidden (K)
+        self.fc1_experts_weights = nn.Parameter(
+            [e, fc1_out, self._hidden // pack_size],
+            dtype=ir.DataType.UINT8,
+        )
+        self.fc1_scales = nn.Parameter(
+            [e, fc1_out, self._hidden // block_size],
+            dtype=ir.DataType.FLOAT,
+        )
+        # fc2: [E, hidden, inter] quantized along inter (K)
+        self.fc2_experts_weights = nn.Parameter(
+            [e, self._hidden, self._inter // pack_size],
+            dtype=ir.DataType.UINT8,
+        )
+        self.fc2_scales = nn.Parameter(
+            [e, self._hidden, self._inter // block_size],
+            dtype=ir.DataType.FLOAT,
+        )
+        if qc.sym:
+            self.fc1_experts_zero_points = None
+            self.fc2_experts_zero_points = None
+        else:
+            self.fc1_experts_zero_points = nn.Parameter(
+                [
+                    e,
+                    fc1_out,
+                    math.ceil((self._hidden // block_size) * bits / 8),
+                ],
+                dtype=ir.DataType.UINT8,
+            )
+            self.fc2_experts_zero_points = nn.Parameter(
+                [
+                    e,
+                    self._hidden,
+                    math.ceil((self._inter // block_size) * bits / 8),
+                ],
+                dtype=ir.DataType.UINT8,
+            )
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
+        if ep_capabilities().name == "cuda":
+            raise ValueError(
+                "FusedQuantizedMoE is disabled for CUDA because ORT CUDA QMoE "
+                "currently ignores router_weights (input 14), which is required "
+                "for GLM/DeepSeek group-limited routing. Use the decomposed "
+                "MatMulNBits export path for CUDA."
+            )
+        hidden = self._hidden
+
+        # QMoE requires 2-D router_probs, so flatten [B, S, H] -> [rows, H].
+        orig_shape = op.Shape(hidden_states)
+        flat = op.Reshape(hidden_states, op.Constant(value_ints=[-1, hidden]))
+        # Router math must be float32, but QMoE activation input stays in the
+        # model dtype: CUDA QMoE kernels are registered for fp16/bf16 inputs.
+        flat_f32 = op.Cast(flat, to=1)
+
+        scores_for_choice, routing_weights, selected_experts = self._route(op, flat_f32)
+
+        # Dense [rows, E] aggregation weights: combine weight at each selected
+        # expert position, 0 elsewhere. QMoE reads these at its own top-k picks.
+        zeros = op.Mul(scores_for_choice, 0.0)
+        aggregation = op.ScatterElements(zeros, selected_experts, routing_weights, axis=-1)
+
+        moe_out = op.QMoE(
+            flat,  # 0: input
+            scores_for_choice,  # 1: router_probs (selection logits)
+            self.fc1_experts_weights,  # 2
+            op.Cast(self.fc1_scales, to=1),  # 3
+            None,  # 4: fc1_experts_bias
+            self.fc2_experts_weights,  # 5
+            op.Cast(self.fc2_scales, to=1),  # 6
+            None,  # 7: fc2_experts_bias
+            None,  # 8: fc3_experts_weights
+            None,  # 9: fc3_scales
+            None,  # 10: fc3_experts_bias
+            self.fc1_experts_zero_points,  # 11
+            self.fc2_experts_zero_points,  # 12
+            None,  # 13: fc3_zero_points
+            aggregation,  # 14: router_weights (explicit combine weights)
+            activation_type="swiglu",
+            k=self._top_k,
+            normalize_routing_weights=0,
+            swiglu_fusion=1,
+            expert_weight_bits=self._bits,
+            block_size=self._block_size,
+            quant_type="int",
+            _domain=self._MICROSOFT_DOMAIN,
+        )
+        moe_out = op.CastLike(moe_out, hidden_states)
+        return op.Reshape(moe_out, orig_shape)
+
+    def _route(self, op: OpBuilder, hidden_states: ir.Value):
+        """Invoke ``gate.route_for_qmoe`` under the gate's module scope.
+
+        ``route_for_qmoe`` is a plain method (not ``forward``), so it never goes
+        through :meth:`nn.Module.__call__`. We replicate the parameter-realization
+        step here so the gate's ``weight`` / ``e_score_correction_bias`` are
+        registered as graph initializers under the ``...moe.gate`` scope (matching
+        the per-expert path) instead of dangling as unqualified names.
+        """
+        builder = op.builder
+        module_name = self.gate._name or "gate"
+        class_name = type(self.gate).__qualname__
+        builder.push_module(module_name, class_name)
+        try:
+            for param in self.gate._parameters.values():
+                param._realize(builder)
+            return self.gate.route_for_qmoe(op, hidden_states)
+        finally:
+            builder.pop_module()
+
+
+_PER_EXPERT_RE = re.compile(
+    r"^(?P<prefix>.*\.mlp)\.experts\.(?P<expert>\d+)\."
+    r"(?P<projection>gate_proj|up_proj|down_proj)\."
+    r"(?P<kind>weight|scales|zero_points)$"
+)
+_FUSED_EXPERT_RE = re.compile(
+    r"^(?P<prefix>.*\.mlp)\.experts\."
+    r"(?P<projection>gate_up_proj|down_proj)\."
+    r"(?P<kind>qweight|qzeros|g_idx|weight|scales|zero_points)$"
+)
+
+
+def pack_fused_quantized_moe_weights(
+    state_dict: dict[str, torch.Tensor],
+    config: ArchitectureConfig,
+) -> dict[str, torch.Tensor]:
+    """Pack routed expert tensors into the expert-major QMoE initializer ABI.
+
+    Accepts either fused 3-D GPTQ/AWQ checkpoint tensors or already-repacked
+    per-expert GGUF/MatMulNBits tensors. Gate/up rows are interleaved for
+    ``swiglu_fusion=1``; shared-expert tensors are left untouched.
+    """
+    quantization = config.quantization
+    if quantization is None:
+        raise ValueError("Fused QMoE packing requires quantization settings")
+
+    result: dict[str, torch.Tensor] = {}
+    fused: dict[str, dict[str, dict[str, torch.Tensor]]] = {}
+    per_expert: dict[str, dict[int, dict[str, dict[str, torch.Tensor]]]] = {}
+    for key, value in state_dict.items():
+        match = _FUSED_EXPERT_RE.match(key)
+        if match is not None:
+            fused.setdefault(match["prefix"], {}).setdefault(match["projection"], {})[
+                match["kind"]
+            ] = value
+            continue
+        match = _PER_EXPERT_RE.match(key)
+        if match is not None:
+            expert = int(match["expert"])
+            per_expert.setdefault(match["prefix"], {}).setdefault(expert, {}).setdefault(
+                match["projection"], {}
+            )[match["kind"]] = value
+            continue
+        result[key] = value
+
+    prefixes = set(fused) | set(per_expert)
+    for prefix in prefixes:
+        if prefix in fused and prefix in per_expert:
+            raise ValueError(f"Mixed fused and per-expert weights under {prefix}")
+        if prefix in fused:
+            gate_up = _prepare_fused_projection(
+                fused[prefix].get("gate_up_proj"),
+                quantization.quant_method,
+                quantization.bits,
+                quantization.group_size,
+            )
+            down = _prepare_fused_projection(
+                fused[prefix].get("down_proj"),
+                quantization.quant_method,
+                quantization.bits,
+                quantization.group_size,
+            )
+            fc1 = {kind: _interleave_gate_up(value) for kind, value in gate_up.items()}
+            fc2 = down
+        else:
+            experts = per_expert[prefix]
+            expected = set(range(config.num_local_experts or 0))
+            if set(experts) != expected:
+                raise ValueError(
+                    f"{prefix} has expert indices {sorted(experts)}, "
+                    f"expected {sorted(expected)}"
+                )
+            fc1, fc2 = _stack_per_expert_projections(experts)
+
+        _store_qmoe_projection(
+            result,
+            f"{prefix}.moe.fc1",
+            fc1,
+            symmetric=quantization.sym,
+        )
+        _store_qmoe_projection(
+            result,
+            f"{prefix}.moe.fc2",
+            fc2,
+            symmetric=quantization.sym,
+        )
+    return result
+
+
+def _prepare_fused_projection(
+    tensors: dict[str, torch.Tensor] | None,
+    quant_method: str,
+    bits: int,
+    block_size: int,
+) -> dict[str, torch.Tensor]:
+    if tensors is None:
+        raise ValueError("Missing fused routed-expert projection")
+    if "qweight" in tensors:
+        preprocess = (
+            preprocess_gptq_weights if quant_method == "gptq" else preprocess_awq_weights
+        )
+        num_experts = tensors["qweight"].shape[0]
+        processed: dict[str, list[torch.Tensor]] = {}
+        for expert in range(num_experts):
+            expert_state = {}
+            for kind in {"qweight", "qzeros", "scales", "g_idx"} & tensors.keys():
+                value = tensors[kind]
+                expert_state[f"projection.{kind}"] = (
+                    value if kind == "g_idx" and value.ndim == 1 else value[expert]
+                )
+            for key, value in preprocess(
+                expert_state, bits=bits, group_size=block_size
+            ).items():
+                processed.setdefault(key.rsplit(".", 1)[-1], []).append(value)
+        return {kind: torch.stack(values) for kind, values in processed.items()}
+    required = {"weight", "scales"}
+    if not required.issubset(tensors):
+        raise ValueError(f"Missing fused projection tensors: {required - tensors.keys()}")
+    return tensors
+
+
+def _stack_per_expert_projections(
+    experts: dict[int, dict[str, dict[str, torch.Tensor]]],
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    fc1: dict[str, list[torch.Tensor]] = {}
+    fc2: dict[str, list[torch.Tensor]] = {}
+    for expert in sorted(experts):
+        projections = experts[expert]
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            if name not in projections:
+                raise ValueError(f"Expert {expert} is missing {name}")
+        kinds = set(projections["gate_proj"]) | set(projections["up_proj"])
+        for kind in kinds:
+            if kind not in projections["gate_proj"] or kind not in projections["up_proj"]:
+                raise ValueError(f"Expert {expert} gate/up {kind} tensors are incomplete")
+            gate = projections["gate_proj"][kind]
+            up = projections["up_proj"][kind]
+            fc1.setdefault(kind, []).append(torch.stack((gate, up), dim=1).flatten(0, 1))
+        for kind, value in projections["down_proj"].items():
+            fc2.setdefault(kind, []).append(value)
+    return (
+        {kind: torch.stack(values) for kind, values in fc1.items()},
+        {kind: torch.stack(values) for kind, values in fc2.items()},
+    )
+
+
+def _interleave_gate_up(value: torch.Tensor) -> torch.Tensor:
+    if value.shape[1] % 2:
+        raise ValueError(f"gate_up projection has odd output size {value.shape[1]}")
+    intermediate = value.shape[1] // 2
+    return (
+        value.reshape(value.shape[0], 2, intermediate, *value.shape[2:])
+        .transpose(1, 2)
+        .flatten(1, 2)
+    )
+
+
+def _store_qmoe_projection(
+    result: dict[str, torch.Tensor],
+    stem: str,
+    tensors: dict[str, torch.Tensor],
+    *,
+    symmetric: bool,
+) -> None:
+    weight = tensors["weight"]
+    if weight.ndim == 4:
+        weight = weight.flatten(-2)
+    result[f"{stem}_experts_weights"] = weight
+    result[f"{stem}_scales"] = tensors["scales"].float()
+    zero_points = tensors.get("zero_points")
+    if not symmetric:
+        if zero_points is None:
+            raise ValueError(f"Asymmetric QMoE projection {stem} requires zero-points")
+        result[f"{stem}_experts_zero_points"] = zero_points
 
 
 def _supported_qmoe_quantization(

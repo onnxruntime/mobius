@@ -44,6 +44,7 @@ GGUF_ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "qwen3_moe": "qwen3_moe",
     "qwen35": "qwen3_5_text",
     "qwen35moe": "qwen3_5_moe",
+    "glm-dsa": "glm_moe_dsa",
     "gemma2": "gemma2",
     "gemma3": "gemma3_text",
     # Gemma 4 GGUF contains the text backbone only — no vision or audio encoder.
@@ -115,7 +116,24 @@ _ARCH_KEY_MAPS: dict[str, dict[str, str]] = {
         "hyper_connection.sinkhorn_iterations": "hc_sinkhorn_iters",
         "hyper_connection.epsilon": "hc_eps",
         "hash_layer_count": "num_hash_layers",
-    }
+    },
+    "glm-dsa": {
+        "leading_dense_block_count": "first_k_dense_replace",
+        "expert_shared_count": "n_shared_experts",
+        "expert_group_count": "n_group",
+        "expert_group_used_count": "topk_group",
+        "expert_weights_scale": "routed_scaling_factor",
+        "expert_weights_norm": "norm_topk_prob",
+        "expert_gating_func": "expert_gating_func",
+        "attention.q_lora_rank": "q_lora_rank",
+        "attention.kv_lora_rank": "kv_lora_rank",
+        "attention.key_length_mla": "qk_head_dim",
+        "attention.value_length_mla": "v_head_dim",
+        "attention.indexer.head_count": "index_n_heads",
+        "attention.indexer.key_length": "index_head_dim",
+        "attention.indexer.top_k": "index_topk",
+        "nextn_predict_layers": "num_nextn_predict_layers",
+    },
 }
 
 
@@ -188,6 +206,11 @@ def _extract_config_fields(
             gguf_arch,
             len(hf_fields),
         )
+
+    for gguf_suffix, hf_key in _ARCH_KEY_MAPS.get(gguf_arch, {}).items():
+        full_key = f"{gguf_arch}.{gguf_suffix}"
+        if full_key in metadata:
+            hf_fields[hf_key] = metadata[full_key]
 
     # Extract vocab_size from tokenizer token list if not in metadata
     if "vocab_size" not in hf_fields:
@@ -400,19 +423,29 @@ def gguf_to_config(
         shared_expert_intermediate_size=hf_fields.get("shared_expert_intermediate_size"),
         n_shared_experts=hf_fields.get("n_shared_experts"),
         norm_topk_prob=hf_fields.get("norm_topk_prob", True),
+        n_group=hf_fields.get("n_group", 1),
+        topk_group=hf_fields.get("topk_group", 1),
         routed_scaling_factor=hf_fields.get("routed_scaling_factor", 1.0),
         scoring_func=(
             "sqrtsoftplus"
             if gguf_arch == "deepseek4"
             else hf_fields.get("scoring_func", "softmax")
         ),
+        topk_method=hf_fields.get("topk_method", "greedy"),
+        first_k_dense_replace=hf_fields.get("first_k_dense_replace", 0),
+        # Multi-head Latent Attention fields
         q_lora_rank=hf_fields.get("q_lora_rank"),
+        kv_lora_rank=hf_fields.get("kv_lora_rank"),
+        qk_nope_head_dim=hf_fields.get("qk_nope_head_dim"),
         qk_rope_head_dim=hf_fields.get("qk_rope_head_dim"),
+        v_head_dim=hf_fields.get("v_head_dim"),
+        # DSA / MTP metadata
+        index_topk=hf_fields.get("index_topk"),
+        index_head_dim=hf_fields.get("index_head_dim"),
+        index_n_heads=hf_fields.get("index_n_heads"),
+        num_nextn_predict_layers=hf_fields.get("num_nextn_predict_layers", 0),
         o_groups=hf_fields.get("o_groups", 1),
         o_lora_rank=hf_fields.get("o_lora_rank"),
-        index_n_heads=hf_fields.get("index_n_heads"),
-        index_head_dim=hf_fields.get("index_head_dim"),
-        index_topk=hf_fields.get("index_topk"),
         compress_ratios=hf_fields.get("compress_ratios"),
         compress_rope_theta=hf_fields.get("compress_rope_theta"),
         hc_mult=hf_fields.get("hc_mult", 1),
@@ -719,12 +752,70 @@ def _gemma3_postprocess(
     return config
 
 
+def _glm_moe_dsa_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+) -> ArchitectureConfig:
+    """Restore GLM-5.2 fields that GGUF represents with MLA-specific keys."""
+    arch = "glm-dsa"
+    n_mtp = int(metadata.get(f"{arch}.nextn_predict_layers", 0))
+    num_hidden_layers = config.num_hidden_layers - n_mtp
+    qk_head_dim = int(metadata[f"{arch}.attention.key_length_mla"])
+    qk_rope_head_dim = int(metadata[f"{arch}.rope.dimension_count"])
+    qk_nope_head_dim = qk_head_dim - qk_rope_head_dim
+    n_shared_experts = int(metadata.get(f"{arch}.expert_shared_count", 0))
+    first_k_dense_replace = int(metadata.get(f"{arch}.leading_dense_block_count", 0))
+
+    # Official GLM-5.2 schedule: full indexers in layers 0, 1, 2, then
+    # 6, 10, ...; each later full layer shares its selection with the next
+    # three layers.
+    indexer_types = [
+        "full" if i <= 2 or (i >= 6 and (i - 6) % 4 == 0) else "shared"
+        for i in range(num_hidden_layers)
+    ]
+    mlp_layer_types = [
+        "dense" if i < first_k_dense_replace else "sparse" for i in range(num_hidden_layers)
+    ]
+
+    return dataclasses.replace(
+        config,
+        num_hidden_layers=num_hidden_layers,
+        num_key_value_heads=config.num_attention_heads,
+        head_dim=qk_rope_head_dim,
+        partial_rotary_factor=1.0,
+        rope_interleave=True,
+        qk_nope_head_dim=qk_nope_head_dim,
+        qk_rope_head_dim=qk_rope_head_dim,
+        v_head_dim=int(metadata[f"{arch}.attention.value_length_mla"]),
+        q_lora_rank=int(metadata[f"{arch}.attention.q_lora_rank"]),
+        kv_lora_rank=int(metadata[f"{arch}.attention.kv_lora_rank"]),
+        n_shared_experts=n_shared_experts,
+        shared_expert_intermediate_size=(
+            config.moe_intermediate_size * n_shared_experts
+            if config.moe_intermediate_size is not None
+            else None
+        ),
+        first_k_dense_replace=first_k_dense_replace,
+        mlp_layer_types=mlp_layer_types,
+        scoring_func="sigmoid",
+        topk_method="noaux_tc",
+        use_dsa=True,
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+        indexer_rope_interleave=True,
+        indexer_types=indexer_types,
+        index_share_for_mtp_iteration=n_mtp > 0,
+        num_nextn_predict_layers=n_mtp,
+    )
+
+
 # Architecture-specific config postprocessors.
 # Each takes a base ArchitectureConfig + raw metadata and returns
 # an architecture-specific config subclass.
 _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "gemma3_text": _gemma3_postprocess,
     "gemma4_text": _gemma4_postprocess,
+    "glm_moe_dsa": _glm_moe_dsa_postprocess,
 }
 
 

@@ -48,6 +48,7 @@ __all__ = [
     "MLP",
     "MLPMultiModalProjector",
     "MoELayer",
+    "FusedQuantizedMoE",
     "OffsetRMSNorm",
     "PatchEmbed",
     "PatchEmbedding",
@@ -163,6 +164,7 @@ from mobius.components._mamba_block import Mamba2Block as Mamba2Block
 from mobius.components._mamba_block import MambaBlock as MambaBlock
 from mobius.components._mlp import FCMLP, MLP, FusedGateUpMLP, GatedMLP
 from mobius.components._moe import (
+    FusedQuantizedMoE,
     MoELayer,
     SigmoidTopKGate,
     SoftmaxTopKGate,

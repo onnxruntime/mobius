@@ -125,6 +125,30 @@ class TestCLIBuild:
         mock_build.assert_called_once()
         assert mock_build.call_args.kwargs.get("text_only") is True
 
+    def test_glm_full_attention_passes_config_overrides(self):
+        """--glm-full-attention disables DSA and MTP for registry builds."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "THUDM/GLM-5.2-Air",
+                    tmpdir,
+                    "--no-weights",
+                    "--glm-full-attention",
+                ]
+            )
+
+        mock_build.assert_called_once()
+        assert mock_build.call_args.kwargs.get("config_overrides") == {
+            "use_dsa": False,
+            "num_nextn_predict_layers": 0,
+        }
+
     def test_build_static_cache(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             main(
@@ -253,6 +277,39 @@ class TestCLIBuildRuntime:
         mock_export.assert_called_once()
         call_kwargs = mock_export.call_args
         assert call_kwargs.kwargs.get("hf_model_id") == "Qwen/Qwen2.5-0.5B"
+
+    def test_runtime_onnx_genai_calls_write_onnx_genai_config(self, capsys):
+        """--runtime onnx-genai calls the unified config writer."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.onnx_genai.write_onnx_genai_config",
+                return_value={
+                    "inference_metadata": "inference_metadata.yaml",
+                    "mtp_config": "mtp_config.json",
+                },
+            ) as mock_export,
+            mock.patch(
+                "mobius.integrations.ort_genai.write_ort_genai_config",
+                return_value={},
+            ) as mock_ort,
+            mock.patch("mobius._model_package.ModelPackage.save"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "Qwen/Qwen2.5-0.5B",
+                    tmpdir,
+                    "--no-weights",
+                    "--runtime",
+                    "onnx-genai",
+                ]
+            )
+
+        mock_export.assert_called_once()
+        mock_ort.assert_not_called()
+        assert "mtp_config: mtp_config.json" in capsys.readouterr().out
 
     def test_runtime_onnx_genai_uses_native_vlm_emitter(self):
         pkg = mock.MagicMock()

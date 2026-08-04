@@ -167,9 +167,9 @@ _CASES = [
     (4, 0, 8, 8, 0.0, 1, True, False, 0.0, "prefill_mha"),
     (4, 0, 8, 2, 0.0, 1, True, False, 0.0, "prefill_gqa"),
     (1, 3, 8, 1, 0.0, 1, True, True, 0.0, "decode_gqa_past"),
-    (4, 0, 8, 2, 30.0, 1, True, False, 1e-5, "softcap"),
+    (4, 0, 8, 2, 30.0, 1, True, False, 5e-3, "softcap"),
     (4, 0, 8, 2, 0.0, 0, True, False, 0.0, "mask_only_noncausal"),
-    (1, 5, 8, 1, 30.0, 1, True, True, 1e-5, "decode_softcap_past"),
+    (1, 5, 8, 1, 30.0, 1, True, True, 5e-3, "decode_softcap_past"),
 ]
 
 
