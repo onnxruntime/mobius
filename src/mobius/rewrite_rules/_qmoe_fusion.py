@@ -281,6 +281,21 @@ def _expert_geometry(down: ir.Node) -> tuple[int, int, int]:
     return bits, block_size, has_zp
 
 
+def _qmoe_abi_supported(bits: int, block_size: int) -> bool:
+    """Whether ``(bits, block_size)`` is runnable by ``com.microsoft::QMoE``.
+
+    The fusion reuses the packed ``MatMulNBits`` bytes *byte-for-byte*, which is
+    only valid for int4 (two values per byte); an 8-bit layout would need a
+    different packing. The CUDA/CPU QMoE kernel additionally requires a
+    power-of-two ``block_size >= 16``. When either constraint is unmet the dense
+    fallback graph is still runnable, so we must keep it rather than emit an
+    unrunnable ``QMoE`` node.
+    """
+    if bits != 4:
+        return False
+    return block_size >= 16 and (block_size & (block_size - 1)) == 0
+
+
 def _pack_projection(nodes: list[ir.Node], slot: int) -> np.ndarray:
     """Stack ``flatten(-2)`` of one ``MatMulNBits`` weight input across experts."""
     stacked = [
@@ -448,6 +463,17 @@ def fuse_dense_moe_to_qmoe(model: ir.Model) -> int:
             logger.warning(
                 "skipping MoE layer at %s: unrecognised dense-fallback structure",
                 layer.topk.name,
+            )
+            continue
+        down = layer.experts[sorted(layer.experts)[0]].down
+        bits, block_size, _ = _expert_geometry(down)
+        if not _qmoe_abi_supported(bits, block_size):
+            logger.warning(
+                "skipping MoE layer at %s: QMoE ABI unsupported "
+                "(bits=%d, block_size=%d); keeping dense fallback",
+                layer.topk.name,
+                bits,
+                block_size,
             )
             continue
         _fuse_layer(graph, layer, index)

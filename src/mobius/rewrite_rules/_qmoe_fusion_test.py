@@ -10,6 +10,7 @@ import onnx_ir as ir
 import pytest
 
 from mobius.rewrite_rules import fuse_dense_moe_to_qmoe
+from mobius.rewrite_rules._qmoe_fusion import _qmoe_abi_supported
 
 # Tiny Qwen35-MoE-shaped geometry (mirrors the real 35B topology at 1/64 scale).
 H = 32  # hidden size
@@ -477,6 +478,39 @@ def test_attributes_match_qmoe_abi() -> None:
     assert attrs["swiglu_fusion"].value == 2
     assert attrs["normalize_routing_weights"].value == 1
     assert attrs["activation_type"].value == "swiglu"
+
+
+@pytest.mark.parametrize(
+    ("bits", "block_size", "expected"),
+    [
+        (4, 16, True),
+        (4, 32, True),
+        (4, 128, True),
+        (4, 8, False),  # block_size < 16
+        (4, 24, False),  # not a power of two
+        (8, 32, False),  # 8-bit packing not byte-compatible with the reuse
+        (2, 16, False),
+    ],
+)
+def test_qmoe_abi_supported(bits: int, block_size: int, expected: bool) -> None:
+    assert _qmoe_abi_supported(bits, block_size) is expected
+
+
+def test_unsupported_geometry_keeps_dense_fallback() -> None:
+    """A non-power-of-two block_size must not emit an unrunnable QMoE node."""
+    model, _, _ = _build_dense_graph()
+    graph = model.graph
+    # Force every expert down_proj into an ABI-invalid geometry.
+    for node in graph:
+        if node.op_type == "MatMulNBits" and ".down_proj" in (node.name or ""):
+            node.attributes["block_size"] = ir.AttrInt64("block_size", 24)
+
+    fused = fuse_dense_moe_to_qmoe(model)
+
+    assert fused == 0
+    assert _count(graph, "QMoE") == 0
+    # Dense routing machinery is preserved (still runnable).
+    assert _count(graph, "TopK") == 1
 
 
 if __name__ == "__main__":

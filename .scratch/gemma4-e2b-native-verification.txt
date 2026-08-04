@@ -1,0 +1,40 @@
+commit=640c1cb
+package=/home/justinchu/mobius/.scratch/gemma4-e2b-native
+metadata_bytes=19625 metadata_lines=948
+edge=embedding.inputs_embeds->decoder.inputs_embeds {'from': 'embedding.inputs_embeds', 'to': 'decoder.inputs_embeds', 'dtype': 'fp16', 'rank': 3, 'device_transfer': False}
+edge=embedding.per_layer_inputs->decoder.per_layer_inputs {'from': 'embedding.per_layer_inputs', 'to': 'decoder.per_layer_inputs', 'dtype': 'fp16', 'rank': 3, 'device_transfer': False}
+embedding_phase=every_step
+embedding_stage=every_step
+kv_input_tensors=30 kv_output_tensors=30 kv_layers=15 layers=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+kv_layer_0=key(fp16,rank4,head_dim=256) value(fp16,rank4,head_dim=256)
+kv_layer_1=key(fp16,rank4,head_dim=256) value(fp16,rank4,head_dim=256)
+kv_layer_2=key(fp16,rank4,head_dim=256) value(fp16,rank4,head_dim=256)
+kv_layer_3=key(fp16,rank4,head_dim=256) value(fp16,rank4,head_dim=256)
+kv_layer_4=key(fp16,rank4,head_dim=512) value(fp16,rank4,head_dim=512)
+kv_layer_5=key(fp16,rank4,head_dim=256) value(fp16,rank4,head_dim=256)
+kv_layer_6=key(fp16,rank4,head_dim=256) value(fp16,rank4,head_dim=256)
+kv_layer_7=key(fp16,rank4,head_dim=256) value(fp16,rank4,head_dim=256)
+kv_layer_8=key(fp16,rank4,head_dim=256) value(fp16,rank4,head_dim=256)
+kv_layer_9=key(fp16,rank4,head_dim=512) value(fp16,rank4,head_dim=512)
+kv_layer_10=key(fp16,rank4,head_dim=256) value(fp16,rank4,head_dim=256)
+kv_layer_11=key(fp16,rank4,head_dim=256) value(fp16,rank4,head_dim=256)
+kv_layer_12=key(fp16,rank4,head_dim=256) value(fp16,rank4,head_dim=256)
+kv_layer_13=key(fp16,rank4,head_dim=256) value(fp16,rank4,head_dim=256)
+kv_layer_14=key(fp16,rank4,head_dim=512) value(fp16,rank4,head_dim=512)
+kv_head_dims=[256, 512]
+vision_pixel_values=dtype:fp16 rank:3 shape:['batch', 'num_patches', 768] source:{'kind': 'generated', 'generator': 'image_preprocessing'}
+vision_pixel_position_ids=dtype:int64 rank:3 shape:['batch', 'num_patches', 2] source:{'kind': 'generated', 'generator': 'image_preprocessing'}
+preprocess_output={'name': 'vision_encoder.pixel_values', 'content': 'pixels', 'dtype': 'fp16'}
+preprocess_output={'name': 'vision_encoder.pixel_position_ids', 'content': 'patch_coordinates', 'dtype': 'int64', 'pad_value': -1}
+grep_model_name_or_type_keys=[]
+grep_checkpoint_identity=[]
+grep_gemma_token=[(13, '  architecture: gemma4_text')]
+closure_decoder=inputs_match:True outputs_match:True graph_inputs:34 declared_inputs:34 graph_outputs:31 declared_outputs:31
+closure_vision_encoder=inputs_match:True outputs_match:True graph_inputs:2 declared_inputs:2 graph_outputs:1 declared_outputs:1
+closure_audio_encoder=inputs_match:True outputs_match:True graph_inputs:2 declared_inputs:2 graph_outputs:2 declared_outputs:2
+closure_embedding=inputs_match:True outputs_match:True graph_inputs:3 declared_inputs:3 graph_outputs:2 declared_outputs:2
+CHECK decoder_edges_every_step=PASS
+CHECK embedding_every_step=PASS
+CHECK kv_15_pairs_typed_ranked_mixed=PASS
+CHECK vision_typed_shapes=PASS
+CHECK no_model_name_or_type_hardcoding=PASS
