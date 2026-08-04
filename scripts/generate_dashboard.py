@@ -145,7 +145,7 @@ class ModelInfo:
 
     @property
     def confidence_level(self) -> int:
-        """Return the highest confidence level achieved (0-5)."""
+        """The highest confidence level achieved (0-5)."""
         if self.l5_passes:
             return 5
         if self.l4_passes:
