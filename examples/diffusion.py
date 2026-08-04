@@ -1,6 +1,6 @@
 #!/usr/bin/env python
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Diffusion model example — build and save ONNX image generation models.
 
@@ -85,7 +85,7 @@ def main():
     except ImportError:
         print(
             "Error: mobius is not installed.\n"
-            "Install with: pip install mobius-ai[transformers]",
+            "Install with: pip install mobius-onnx[transformers]",
             file=sys.stderr,
         )
         sys.exit(1)

@@ -1,17 +1,18 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
+from mobius._weight_utils import tie_word_embeddings
 from mobius.components import (
     InputMixer,
+    Qwen2VLVisionModel,
     Qwen3VLVisionModel,
     Qwen25VLVisionModel,
 )
@@ -92,7 +93,7 @@ class Qwen25VLCausalLMModel(nn.Module):
         self.vision_encoder = Qwen25VLVisionEncoderModel(config)
         self.embedding = Qwen25VLEmbeddingModel(config)
 
-    def forward(self, op: builder.OpBuilder, **kwargs):
+    def forward(self, op: OpBuilder, **kwargs):
         raise NotImplementedError(
             "Qwen25VLCausalLMModel uses Qwen25VL3ModelTask which calls "
             "each sub-module (decoder, vision_encoder, embedding) separately."
@@ -120,13 +121,21 @@ class Qwen25VLCausalLMModel(nn.Module):
                 renamed[f"decoder.{key}"] = value
                 stripped = key[len("model.") :]
                 renamed[f"embedding.{stripped}"] = value
-                # Weight tying: also use as lm_head
-                if self.config.tie_word_embeddings and key == "model.embed_tokens.weight":
-                    renamed["decoder.lm_head.weight"] = value
             elif key.startswith("model."):
                 renamed[f"decoder.{key}"] = value
             elif key.startswith("lm_head."):
-                renamed[f"decoder.{key}"] = value
+                if not self.config.tie_word_embeddings:
+                    renamed[f"decoder.{key}"] = value
+        if self.config.tie_word_embeddings:
+            # onnxscript qualifies params by module path, so the in-tree
+            # alias set in __init__ does not cross composite module
+            # boundaries.  Establish tensor identity here so apply_weights
+            # sees a single data_ptr() across both initializers.
+            tie_word_embeddings(
+                renamed,
+                embed_key="decoder.model.embed_tokens.weight",
+                head_key="decoder.lm_head.weight",
+            )
         return renamed
 
 
@@ -145,10 +154,12 @@ class Qwen25VLDecoderModel(nn.Module):
         self.config = config
         self.model = TextModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -181,10 +192,10 @@ class Qwen25VLDecoderModel(nn.Module):
                 continue
             renamed[key] = value
 
-        # Handle weight tying
+        # Establish tensor identity for tied weights so apply_weights
+        # detects shared data_ptr() and emits a single ONNX initializer.
         if self.config.tie_word_embeddings:
-            if "lm_head.weight" not in renamed and "model.embed_tokens.weight" in renamed:
-                renamed["lm_head.weight"] = renamed["model.embed_tokens.weight"]
+            tie_word_embeddings(renamed)
         return renamed
 
 
@@ -225,7 +236,7 @@ class Qwen25VLVisionEncoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         pixel_values: ir.Value,
         image_grid_thw: ir.Value,
     ):
@@ -274,7 +285,7 @@ class Qwen25VLEmbeddingModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         image_features: ir.Value,
     ):
@@ -301,7 +312,7 @@ class Qwen25VLEmbeddingModel(nn.Module):
         # image_features is empty (text-only input: num_image_tokens == 0).
         # The Where mask ensures the padding row is never used in the output.
         pad_row = op.Expand(
-            op.CastLike(op.Constant(value_float=0.0), image_features),
+            op.CastLike(0.0, image_features),
             op.Concat(
                 op.Constant(value_ints=[1]),
                 op.Shape(image_features, start=1, end=2),
@@ -337,6 +348,103 @@ class Qwen25VLEmbeddingModel(nn.Module):
         return renamed
 
 
+class Qwen2VLVisionEncoderModel(Qwen25VLVisionEncoderModel):
+    """Qwen2-VL vision encoder for the 3-model split.
+
+    Uses Qwen2VLVisionModel (LayerNorm + FCMLP) instead of Qwen2.5-VL's
+    RMSNorm + GatedMLP.  All attention blocks are full (no windowing).
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        # Skip Qwen25VLVisionEncoderModel.__init__ to use our own model
+        nn.Module.__init__(self)
+        vc = config.vision
+        assert vc is not None and vc.hidden_size is not None
+        assert vc.num_hidden_layers is not None
+        assert vc.num_attention_heads is not None
+        self.visual = Qwen2VLVisionModel(
+            depth=vc.num_hidden_layers,
+            hidden_size=vc.hidden_size,
+            intermediate_size=vc.intermediate_size or vc.hidden_size * 4,
+            num_heads=vc.num_attention_heads,
+            patch_size=vc.patch_size or 14,
+            temporal_patch_size=config.temporal_patch_size,
+            in_channels=vc.in_channels,
+            out_hidden_size=vc.out_hidden_size or config.hidden_size,
+            spatial_merge_size=config.spatial_merge_size,
+        )
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Keep only visual.* weights and rename fc1/fc2 → up_proj/down_proj."""
+        renamed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if key.startswith("visual."):
+                new_key = key
+                new_key = new_key.replace(".mlp.fc1.", ".mlp.up_proj.")
+                new_key = new_key.replace(".mlp.fc2.", ".mlp.down_proj.")
+                new_key = new_key.replace(".merger.mlp.0.", ".merger.mlp_0.")
+                new_key = new_key.replace(".merger.mlp.2.", ".merger.mlp_2.")
+                renamed[new_key] = value
+        return renamed
+
+
+class Qwen2VLCausalLMModel(nn.Module):
+    """Qwen2-VL vision-language model (3-model split).
+
+    Same 3-model architecture as Qwen2.5-VL but with:
+    - Qwen2VLVisionModel (LayerNorm + FCMLP, no windowed attention)
+    - Same text decoder and embedding model
+    """
+
+    default_task: str = "qwen-vl"
+    category: str = "Multimodal"
+    config_class: type = ArchitectureConfig
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        self.config = config
+        self.decoder = Qwen25VLDecoderModel(config)
+        self.vision_encoder = Qwen2VLVisionEncoderModel(config)
+        self.embedding = Qwen25VLEmbeddingModel(config)
+
+    def forward(self, op: OpBuilder, **kwargs):
+        raise NotImplementedError(
+            "Qwen2VLCausalLMModel uses Qwen25VL3ModelTask which calls "
+            "each sub-module (decoder, vision_encoder, embedding) "
+            "separately."
+        )
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Route HF weights to the correct sub-model ONNX initializer names.
+
+        Vision weights get fc1→up_proj, fc2→down_proj renames for FCMLP.
+        """
+        renamed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if key.startswith("visual."):
+                new_key = f"vision_encoder.{key}"
+                new_key = new_key.replace(".mlp.fc1.", ".mlp.up_proj.")
+                new_key = new_key.replace(".mlp.fc2.", ".mlp.down_proj.")
+                new_key = new_key.replace(".merger.mlp.0.", ".merger.mlp_0.")
+                new_key = new_key.replace(".merger.mlp.2.", ".merger.mlp_2.")
+                renamed[new_key] = value
+            elif key.startswith("model.embed_tokens."):
+                renamed[f"decoder.{key}"] = value
+                stripped = key[len("model.") :]
+                renamed[f"embedding.{stripped}"] = value
+                if self.config.tie_word_embeddings and key == "model.embed_tokens.weight":
+                    renamed["decoder.lm_head.weight"] = value
+            elif key.startswith("model."):
+                renamed[f"decoder.{key}"] = value
+            elif key.startswith("lm_head."):
+                renamed[f"decoder.{key}"] = value
+        return renamed
+
+
 class _Qwen3VLTextModel(nn.Module):
     """Qwen3-VL text model with DeepStack injection and MRoPE.
 
@@ -362,7 +470,7 @@ class _Qwen3VLTextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -443,7 +551,7 @@ class _Qwen3VLTextModel(nn.Module):
                     op.Where(
                         visual_mask_3d,
                         scattered_ds,
-                        op.CastLike(op.Constant(value_float=0.0), hidden_states),
+                        op.CastLike(0.0, hidden_states),
                     ),
                 )
 
@@ -463,10 +571,12 @@ class _Qwen3VLForMultimodalLM(nn.Module):
         self.config = config
         self.model = _Qwen3VLTextModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -534,7 +644,7 @@ class Qwen3VLCausalLMModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -610,15 +720,12 @@ class Qwen3VLCausalLMModel(nn.Module):
                 new_key = new_key.replace("language_model.", "language_model.model.", 1)
             renamed[new_key] = value
 
-        # Handle weight tying
+        # Single-model composite: lm_head shares the embed_tokens initializer
+        # at graph level (onnxscript ties them in __init__). Discard the
+        # checkpoint's separate lm_head entry to avoid a duplicate.
         config = self.config
         if config.tie_word_embeddings:
-            embed_key = "language_model.model.embed_tokens.weight"
-            head_key = "language_model.lm_head.weight"
-            if head_key not in renamed and embed_key in renamed:
-                renamed[head_key] = renamed[embed_key]
-            elif embed_key not in renamed and head_key in renamed:
-                renamed[embed_key] = renamed[head_key]
+            renamed.pop("language_model.lm_head.weight", None)
         return renamed
 
 
@@ -653,7 +760,7 @@ class Qwen3VL3ModelCausalLMModel(nn.Module):
         self.vision_encoder = Qwen3VLVisionEncoderModel(config)
         self.embedding = Qwen3VLEmbeddingModel(config)
 
-    def forward(self, op: builder.OpBuilder, **kwargs):
+    def forward(self, op: OpBuilder, **kwargs):
         raise NotImplementedError(
             "Qwen3VL3ModelCausalLMModel uses QwenVLTask "
             "which calls each sub-module separately."
@@ -676,24 +783,32 @@ class Qwen3VL3ModelCausalLMModel(nn.Module):
                 stripped = stripped[len("model.") :]
 
             if stripped.startswith("visual."):
+                # Qwen3-VL uses linear_fc1/fc2; ONNX uses up_proj/down_proj
+                stripped = stripped.replace(".mlp.linear_fc1.", ".mlp.up_proj.")
+                stripped = stripped.replace(".mlp.linear_fc2.", ".mlp.down_proj.")
                 renamed[f"vision_encoder.{stripped}"] = value
             elif stripped.startswith("language_model.embed_tokens."):
                 # Shared embedding → both decoder and embedding model
                 suffix = stripped[len("language_model.") :]
                 renamed[f"decoder.model.{suffix}"] = value
                 renamed[f"embedding.{suffix}"] = value
-                # Weight tying
-                if (
-                    self.config.tie_word_embeddings
-                    and stripped == "language_model.embed_tokens.weight"
-                ):
-                    renamed["decoder.lm_head.weight"] = value
             elif stripped.startswith("language_model.lm_head."):
-                renamed[f"decoder.{stripped[len('language_model.') :]}"] = value
+                if not self.config.tie_word_embeddings:
+                    renamed[f"decoder.{stripped[len('language_model.') :]}"] = value
             elif stripped.startswith("language_model."):
                 # language_model.layers.* → decoder.model.layers.*
                 suffix = stripped[len("language_model.") :]
                 renamed[f"decoder.model.{suffix}"] = value
+        if self.config.tie_word_embeddings:
+            # onnxscript qualifies params by module path, so the in-tree
+            # alias set in __init__ does not cross composite module
+            # boundaries.  Establish tensor identity here so apply_weights
+            # sees a single data_ptr() across both initializers.
+            tie_word_embeddings(
+                renamed,
+                embed_key="decoder.model.embed_tokens.weight",
+                head_key="decoder.lm_head.weight",
+            )
         return renamed
 
 
@@ -709,10 +824,12 @@ class Qwen3VLDecoderModel(nn.Module):
         self.config = config
         self.model = TextModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -746,8 +863,13 @@ class Qwen3VLDecoderModel(nn.Module):
             renamed[stripped] = value
 
         if self.config.tie_word_embeddings:
-            if "lm_head.weight" not in renamed and "model.embed_tokens.weight" in renamed:
-                renamed["lm_head.weight"] = renamed["model.embed_tokens.weight"]
+            # After stripping language_model., keys are embed_tokens.weight
+            # and lm_head.weight (no model. prefix).
+            tie_word_embeddings(
+                renamed,
+                embed_key="embed_tokens.weight",
+                head_key="lm_head.weight",
+            )
         return renamed
 
 
@@ -786,7 +908,7 @@ class Qwen3VLVisionEncoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         pixel_values: ir.Value,
         image_grid_thw: ir.Value,
     ):
@@ -810,6 +932,9 @@ class Qwen3VLVisionEncoderModel(nn.Module):
             if stripped.startswith("model."):
                 stripped = stripped[len("model.") :]
             if stripped.startswith("visual."):
+                # Qwen3-VL uses linear_fc1/fc2; ONNX uses up_proj/down_proj
+                stripped = stripped.replace(".mlp.linear_fc1.", ".mlp.up_proj.")
+                stripped = stripped.replace(".mlp.linear_fc2.", ".mlp.down_proj.")
                 renamed[stripped] = value
         return renamed
 

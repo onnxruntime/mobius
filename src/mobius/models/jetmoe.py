@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """JetMoE causal language model with Mixture-of-Attention (MoA).
 
@@ -20,11 +20,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import tie_word_embeddings
 from mobius.components import (
     Embedding,
     Linear,
@@ -57,7 +55,7 @@ class _JetMoARouter(nn.Module):
         self.top_k = top_k
         self.weight = nn.Parameter([num_experts, hidden_size])
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # routing logits: [bsz, seq, n_experts]
         weight_t = op.Transpose(self.weight, perm=[1, 0])
         logits = op.MatMul(hidden_states, weight_t)
@@ -127,7 +125,7 @@ class _JetMoeAttention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | None,
         position_embeddings: tuple,
@@ -283,7 +281,7 @@ class _JetMoeMLP(nn.Module):
         # Additive output bias: [hidden]
         self.bias = nn.Parameter([config.hidden_size])
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         return op.Add(self.moe(op, hidden_states), self.bias)
 
 
@@ -313,7 +311,7 @@ class JetMoeDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | None,
         position_embeddings: tuple,
@@ -366,7 +364,7 @@ class _JetMoeTextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value | None,
         position_ids: ir.Value,
@@ -485,5 +483,5 @@ class JetMoeCausalLMModel(CausalLMModel):
             renamed[key] = value
 
         if self.config.tie_word_embeddings:
-            tie_word_embeddings(renamed)
+            renamed.pop("lm_head.weight", None)
         return renamed

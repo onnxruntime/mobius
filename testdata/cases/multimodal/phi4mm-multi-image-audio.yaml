@@ -1,0 +1,23 @@
+model_id: "microsoft/Phi-4-multimodal-instruct"
+model_type: "phi4mm"
+revision: "main"
+task_type: "phi4mm-multimodal"
+dtype: "float32"
+trust_remote_code: true
+
+inputs:
+  prompts:
+    - "Compare these images and explain what you hear."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+    - "pipeline-cat-chonk.jpeg"
+  audio:
+    - "652-129742-0006.flac"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 40
+  do_sample: false
+
+notes: "Phi-4-MM text + multiple images + short audio. Tests multi-image vision processing combined with audio. Ensures InputMixer handles multiple image feature blocks and audio features simultaneously."

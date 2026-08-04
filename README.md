@@ -1,5 +1,12 @@
 # mobius
 
+[![PyPI](https://img.shields.io/pypi/v/mobius-onnx)](https://pypi.org/project/mobius-onnx/)
+[![CI](https://github.com/onnxruntime/mobius/actions/workflows/main.yml/badge.svg)](https://github.com/onnxruntime/mobius/actions/workflows/main.yml)
+[![L4: Golden Checkpoint Parity (GPU)](https://github.com/onnxruntime/mobius/actions/workflows/gpu_l4_golden_parity.yml/badge.svg)](https://github.com/onnxruntime/mobius/actions/workflows/gpu_l4_golden_parity.yml)
+[![L5: End-to-End Generation (GPU)](https://github.com/onnxruntime/mobius/actions/workflows/gpu_l5_generation_e2e.yml/badge.svg)](https://github.com/onnxruntime/mobius/actions/workflows/gpu_l5_generation_e2e.yml)
+[![Nightly L2 Architecture Validation](https://github.com/onnxruntime/mobius/actions/workflows/nightly_l2.yml/badge.svg)](https://github.com/onnxruntime/mobius/actions/workflows/nightly_l2.yml)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+
 ONNX model definitions for GenAI using the `onnxscript.nn` API.
 
 ## Overview
@@ -20,19 +27,19 @@ multi-component export for pipelines.
 
 | Category | Examples |
 |---|---|
-| **Text Generation** | Llama 2/3/4, Mistral, Qwen 2/2.5/3, Phi-3/3.5, Gemma 1/2/3, Granite, GPT-2, OPT, OLMo, SmolLM3, and many more |
-| **Mixture of Experts** | PhiMoE, GPTOSS, Mixtral, OLMoE, DeepSeek-V2/V3, Qwen2-MoE, Qwen3-MoE, Arctic, DBRX, Jamba |
-| **Multimodal** | Gemma 3, Phi-3V, Phi-4MM (vision + audio + LoRA), LLaVA, InternVL2, Qwen2.5-VL, Qwen3-VL, Pixtral |
+| **Text Generation** | Llama 2/3/4, Mistral, Qwen 2/2.5/3/3.5/3.6, Phi-3/3.5, Gemma 1/2/3/4, Granite, GPT-2, OPT, OLMo, SmolLM3, and many more |
+| **Mixture of Experts** | PhiMoE, GPTOSS, Mixtral, OLMoE, DeepSeek-V2/V3, Qwen2-MoE, Qwen3-MoE, Qwen3-Next, GLM-4-MoE, Arctic, DBRX, Jamba |
+| **Multimodal** | Gemma 3/4, Phi-4MM (vision + audio + LoRA), LLaVA, InternVL2, Qwen2.5-VL, Qwen3-VL, Qwen3.5/3.6-VL, Pixtral |
 | **Encoder-only** | BERT, RoBERTa, ALBERT, DeBERTa, DistilBERT, ELECTRA, XLNet |
 | **Encoder-Decoder** | BART, T5/mT5, Marian, M2M-100, Pegasus, BigBird-Pegasus |
-| **Speech-to-Text** | Whisper |
+| **Speech-to-Text** | Whisper, FastConformer-RNNT, FunASR, Qwen3-ASR, SenseVoice |
 | **Audio** | Wav2Vec2, HuBERT, WavLM, SpeechT5 |
 | **Vision** | ViT, BEiT, DeiT, DINOv2, Swin, CLIP, SigLIP |
-| **Diffusion** | Stable Diffusion (UNet + VAE + ControlNet), Flux, SD3, DiT, QwenImage |
+| **Diffusion** | Stable Diffusion (UNet + VAE + ControlNet), Flux, SD3, DiT, QwenImage, HunyuanDiT, CogVideoX |
 | **Adapters** | T2I-Adapter, IP-Adapter |
 
-Supports **130 Transformers model types** and **5 Diffusers component types**
-across **14 task types** and **56+ reusable components**.
+Supports **290+ Transformers model types** and **10 Diffusers component types**
+across **40+ task types** and **100+ reusable components**.
 
 See the [model documentation](https://onnxruntime.github.io/mobius/models/index.html) for the complete list.
 
@@ -71,32 +78,41 @@ pkg = build("meta-llama/Llama-3.2-1B", task=task)
 pkg.save("output/llama-3.2-1b-static/")
 ```
 
+**EP-aware optimization** generates graphs tuned for a specific runtime execution
+provider. Pass `execution_provider` to target CUDA, DirectML, WebGPU, and more —
+each with the right set of fused kernels and lowering passes applied automatically:
+
+```python
+from mobius import build
+
+# CUDA: GQA fusion, SkipLayerNorm, PackQKV
+pkg = build("meta-llama/Llama-3.2-1B",
+            execution_provider="cuda", dtype="f16")
+
+# WebGPU: GQA fusion, Shape ops replaced with portable alternatives
+pkg = build("meta-llama/Llama-3.2-1B",
+            execution_provider="webgpu", dtype="f16")
+```
+
+See the [EP quickstart](docs/ep_quickstart.md) and
+[full EP reference](docs/execution_providers.md) for all supported EPs and options.
+
 ### CLI
 
-```bash
-# Build from a HuggingFace model ID
+```sh
 mobius build --model Qwen/Qwen2.5-0.5B output_dir/
 
-# Build without weights (graph skeleton only)
-mobius build --model meta-llama/Llama-3.2-1B output_dir/ --no-weights
+# Build for CUDA with f16
+mobius build --model meta-llama/Llama-3.2-1B output_dir/ --ep cuda --dtype f16
 
 # Build a diffusers pipeline (all components)
 mobius build --model Qwen/Qwen-Image-2512 output_dir/
 
 # Build encoder-decoder model (produces encoder/model.onnx + decoder/model.onnx)
 mobius build --model openai/whisper-tiny output_dir/
-
-# Specify dtype
-mobius build --model meta-llama/Llama-3.2-1B output_dir/ --dtype f16
-
-# Build with static KV cache (pre-allocated buffers, uses TensorScatter)
-mobius build --model meta-llama/Llama-3.2-1B output_dir/ --static-cache
-
-# Static cache with explicit max sequence length
-mobius build --model meta-llama/Llama-3.2-1B output_dir/ --static-cache --max-seq-len 2048
 ```
 
-See the [CLI reference](https://onnxruntime.github.io/mobius/cli.html) for all options.
+See the [CLI Reference](https://onnxruntime.github.io/mobius/cli_reference.html) for all subcommands and flags.
 
 ### Examples
 
@@ -152,7 +168,7 @@ lintrunner f --all-files
 ### Adding a new model
 
 See the [AI-assisted model support strategy](https://onnxruntime.github.io/mobius/ai-model-support-strategy.html)
-and the developer skills in `.github/skills/`:
+and the developer skills in `.agents/skills/`:
 
 | Skill | Use when |
 |-------|----------|

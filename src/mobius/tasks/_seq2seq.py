@@ -1,9 +1,11 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Seq2Seq task for encoder-decoder models (T5, BART, etc.)."""
 
 from __future__ import annotations
+
+from typing import ClassVar
 
 import onnx_ir as ir
 from onnxscript import nn
@@ -11,9 +13,9 @@ from onnxscript import nn
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
+    ComponentSpec,
     ModelTask,
     _make_graph,
-    _make_kv_cache_inputs,
     _make_model,
 )
 
@@ -29,11 +31,15 @@ class Seq2SeqTask(ModelTask):
     The module must have ``encoder`` and ``decoder`` attributes.
     """
 
+    model_roles: ClassVar[dict[str, str]] = {"encoder": "encoder", "decoder": "decoder"}
+    components: ClassVar[ComponentSpec] = ComponentSpec(encoder="encoder", decoder="decoder")
+
     def build(
         self,
         module: nn.Module,
         config: ArchitectureConfig,
     ) -> ModelPackage:
+        self._validate_components(module)
         encoder_model = self._build_encoder_graph(module, config)
         decoder_model = self._build_decoder_graph(module, config)
         return ModelPackage(
@@ -49,26 +55,19 @@ class Seq2SeqTask(ModelTask):
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
 
-        input_ids = ir.Value(
-            name="input_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
-        attention_mask = ir.Value(
-            name="attention_mask",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
-
-        graph, builder = _make_graph([input_ids, attention_mask], name="encoder")
+        graph, builder = _make_graph(name="encoder")
         op = builder.op
+
+        input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
+        attention_mask = builder.input(
+            "attention_mask", dtype=ir.DataType.INT64, shape=[batch, seq_len]
+        )
 
         encoder_hidden_states = module.encoder(
             op, input_ids=input_ids, attention_mask=attention_mask
         )
 
-        encoder_hidden_states.name = "last_hidden_state"
-        graph.outputs.append(encoder_hidden_states)
+        builder.add_output(encoder_hidden_states, "last_hidden_state")
 
         return _make_model(graph)
 
@@ -82,63 +81,58 @@ class Seq2SeqTask(ModelTask):
         enc_seq_len = ir.SymbolicDim("encoder_sequence_len")
         past_seq_len = ir.SymbolicDim("past_sequence_len")
 
-        input_ids = ir.Value(
-            name="input_ids",
-            shape=ir.Shape([batch, dec_seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
-        encoder_hidden_states = ir.Value(
-            name="encoder_hidden_states",
-            shape=ir.Shape([batch, enc_seq_len, config.hidden_size]),
-            type=ir.TensorType(config.dtype),
-        )
-        attention_mask = ir.Value(
-            name="attention_mask",
-            shape=ir.Shape([batch, "past_seq_len + dec_seq_len"]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
+        graph, builder = _make_graph()
+        op = builder.op
 
-        graph_inputs = [input_ids, encoder_hidden_states, attention_mask]
+        input_ids = builder.input(
+            "input_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, dec_seq_len],
+        )
+        encoder_hidden_states = builder.input(
+            "encoder_hidden_states",
+            dtype=config.dtype,
+            shape=[batch, enc_seq_len, config.hidden_size],
+        )
+        attention_mask = builder.input(
+            "attention_mask",
+            dtype=ir.DataType.INT64,
+            shape=[batch, "past_seq_len + dec_seq_len"],
+        )
 
         num_heads = config.num_attention_heads
         head_dim = config.head_dim
         num_decoder_layers = getattr(config, "num_decoder_layers", config.num_hidden_layers)
 
-        # Self-attention KV cache
-        self_kv_inputs, past_self_kvs = _make_kv_cache_inputs(
-            num_decoder_layers,
-            num_heads,
-            head_dim,
-            config.dtype,
-            batch,
-            past_seq_len,
-            prefix="past_key_values",
-        )
-        # Use .self. naming for seq2seq self-attention KVs
-        for v in self_kv_inputs:
-            idx = v.name.split(".")[1]
-            kv_type = v.name.rsplit(".", 1)[-1]
-            v.name = f"past_key_values.{idx}.self.{kv_type}"
-        graph_inputs.extend(self_kv_inputs)
+        # Self-attention KV cache (named past_key_values.{i}.self.key/value)
+        past_self_kvs: list[tuple[ir.Value, ir.Value]] = []
+        for i in range(num_decoder_layers):
+            past_key = builder.input(
+                f"past_key_values.{i}.self.key",
+                dtype=config.dtype,
+                shape=[batch, num_heads, past_seq_len, head_dim],
+            )
+            past_value = builder.input(
+                f"past_key_values.{i}.self.value",
+                dtype=config.dtype,
+                shape=[batch, num_heads, past_seq_len, head_dim],
+            )
+            past_self_kvs.append((past_key, past_value))
 
-        # Cross-attention KV cache
-        cross_kv_inputs, cross_past_kvs = _make_kv_cache_inputs(
-            num_decoder_layers,
-            num_heads,
-            head_dim,
-            config.dtype,
-            batch,
-            enc_seq_len,
-            prefix="past_key_values",
-        )
-        for v in cross_kv_inputs:
-            idx = v.name.split(".")[1]
-            kv_type = v.name.rsplit(".", 1)[-1]
-            v.name = f"past_key_values.{idx}.cross.{kv_type}"
-        graph_inputs.extend(cross_kv_inputs)
-
-        graph, builder = _make_graph(graph_inputs, name="decoder")
-        op = builder.op
+        # Cross-attention KV cache (named past_key_values.{i}.cross.key/value)
+        cross_past_kvs: list[tuple[ir.Value, ir.Value]] = []
+        for i in range(num_decoder_layers):
+            past_key = builder.input(
+                f"past_key_values.{i}.cross.key",
+                dtype=config.dtype,
+                shape=[batch, num_heads, enc_seq_len, head_dim],
+            )
+            past_value = builder.input(
+                f"past_key_values.{i}.cross.value",
+                dtype=config.dtype,
+                shape=[batch, num_heads, enc_seq_len, head_dim],
+            )
+            cross_past_kvs.append((past_key, past_value))
 
         logits, present_self_kvs, present_cross_kvs = module.decoder(
             op,
@@ -149,17 +143,14 @@ class Seq2SeqTask(ModelTask):
             cross_past_key_values=cross_past_kvs,
         )
 
-        logits.name = "logits"
-        graph.outputs.append(logits)
+        builder.add_output(logits, "logits")
 
         for i, (k, v) in enumerate(present_self_kvs):
-            k.name = f"present.{i}.self.key"
-            v.name = f"present.{i}.self.value"
-            graph.outputs.extend([k, v])
+            builder.add_output(k, f"present.{i}.self.key")
+            builder.add_output(v, f"present.{i}.self.value")
 
         for i, (k, v) in enumerate(present_cross_kvs):
-            k.name = f"present.{i}.cross.key"
-            v.name = f"present.{i}.cross.value"
-            graph.outputs.extend([k, v])
+            builder.add_output(k, f"present.{i}.cross.key")
+            builder.add_output(v, f"present.{i}.cross.value")
 
         return _make_model(graph)

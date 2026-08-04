@@ -223,3 +223,8 @@ cache_dir/**
 .worktrees/
 dashboard_preview.html
 docs/feature-flags.md
+.copilot/
+*.mp3
+*.m4a
+*.wav
+.olive-cache/

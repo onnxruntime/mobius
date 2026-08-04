@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Tests for encoder components (EncoderAttention, EncoderLayer, BertEmbeddings)."""
 
@@ -50,7 +50,7 @@ class TestEncoderAttention:
         hidden = create_test_input(builder, "hidden", [1, 8, 64])
 
         result = attn(op, hidden)
-        builder._adapt_outputs([result])
+        builder._adapt_outputs([result], "")
         assert count_op_type(graph, "Attention") >= 1
 
     def test_forward_with_attention_mask(self):
@@ -60,7 +60,7 @@ class TestEncoderAttention:
         mask = create_test_input(builder, "mask", [1, 1, 8, 8])
 
         result = attn(op, hidden, attention_mask=mask)
-        builder._adapt_outputs([result])
+        builder._adapt_outputs([result], "")
         assert count_op_type(graph, "Attention") >= 1
 
     def test_head_dim_computed(self):
@@ -92,7 +92,7 @@ class TestEncoderLayer:
         hidden = create_test_input(builder, "hidden", [1, 8, 64])
 
         result = layer(op, hidden)
-        builder._adapt_outputs([result])
+        builder._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
         assert count_op_type(graph, "Attention") >= 1
         # Post-norm: two LayerNormalization ops
@@ -109,7 +109,7 @@ class TestEncoderLayer:
         mask = create_test_input(builder, "mask", [1, 1, 8, 8])
 
         result = layer(op, hidden, attention_mask=mask)
-        builder._adapt_outputs([result])
+        builder._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
 
     def test_residual_connections(self):
@@ -177,7 +177,7 @@ class TestBertEmbeddings:
         )
 
         result = emb(op, input_ids, token_type_ids)
-        builder._adapt_outputs([result])
+        builder._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
         # Three Gather ops (word + position + token_type)
         assert count_op_type(graph, "Gather") >= 3

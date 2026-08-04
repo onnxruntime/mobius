@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Numerical comparison utilities for integration testing."""
 
@@ -25,14 +25,12 @@ def assert_logits_close(
     Raises:
         AssertionError: If shapes differ or values are not close.
     """
-    assert actual.shape == expected.shape, (
-        f"Shape mismatch: ONNX {actual.shape} vs reference {expected.shape}"
-    )
     np.testing.assert_allclose(
         actual,
         expected,
         rtol=rtol,
         atol=atol,
+        strict=True,
         err_msg="Logits differ between ONNX and reference model",
     )
 

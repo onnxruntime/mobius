@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Schema validation tests for YAML test case files in testdata/cases/.
 
@@ -28,7 +28,7 @@ _SCHEMA_PATH = _CASES_DIR / "schema.json"
 
 
 def _load_schema() -> dict[str, Any]:
-    with open(_SCHEMA_PATH) as f:
+    with open(_SCHEMA_PATH, encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -53,7 +53,7 @@ _VALIDATOR = jsonschema.Draft202012Validator(_SCHEMA)
 )
 def test_yaml_validates_against_schema(yaml_path: Path) -> None:
     """Each YAML test case must conform to testdata/cases/schema.json."""
-    with open(yaml_path) as f:
+    with open(yaml_path, encoding="utf-8") as f:
         data = yaml.safe_load(f)
 
     errors = sorted(_VALIDATOR.iter_errors(data), key=lambda e: e.json_path)
@@ -97,7 +97,7 @@ def test_all_yaml_task_types_are_in_schema() -> None:
     schema_task_types: set[str] = set(_SCHEMA["properties"]["task_type"]["enum"])
     missing: list[str] = []
     for yaml_path in _YAML_FILES:
-        with open(yaml_path) as f:
+        with open(yaml_path, encoding="utf-8") as f:
             data = yaml.safe_load(f)
         task_type = data.get("task_type") if isinstance(data, dict) else None
         if task_type and task_type not in schema_task_types:

@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Gemma and Gemma2 causal language models.
 
@@ -15,8 +15,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig, Gemma2Config
 from mobius.components import (
@@ -48,7 +47,7 @@ class GemmaScaledWordEmbedding(Embedding):
         super().__init__(num_embeddings, embedding_dim, padding_idx)
         self.embed_scale = embed_scale
 
-    def forward(self, op: builder.OpBuilder, input_ids: ir.Value):
+    def forward(self, op: OpBuilder, input_ids: ir.Value):
         embeddings = super().forward(op, input_ids)
         return op.Mul(embeddings, self.embed_scale)
 
@@ -77,7 +76,7 @@ class GemmaTextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -127,7 +126,7 @@ class Gemma2Attention(Attention):
 
     This bounds attention weights to [-softcap, softcap], preventing
     extreme attention concentrations. Uses the ONNX Attention op's
-    native ``softcap`` attribute (opset 23).
+    native ``softcap`` attribute (opset 24).
 
     Also uses ``query_pre_attn_scalar`` for attention scaling instead
     of the default ``1/sqrt(head_dim)``.
@@ -145,7 +144,7 @@ class Gemma2Attention(Attention):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple | None = None,
@@ -185,7 +184,7 @@ class Gemma2Attention(Attention):
                 interleaved=self._rope_interleave,
             )
 
-        # ONNX Attention op (opset 23) with native softcap support
+        # ONNX Attention op (opset 24) with native softcap support
         attn_output, present_key, present_value = op.Attention(
             query_states,
             key_states,
@@ -224,7 +223,7 @@ class Gemma2DecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple,
@@ -278,7 +277,7 @@ class Gemma2TextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -336,7 +335,7 @@ class Gemma2CausalLMModel(CausalLMModel):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,

@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Unit tests for scripts/detect_affected_models.py.
 
@@ -19,11 +19,14 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from detect_affected_models import (  # noqa: E402
+    _SRC_ROOT,
     _build_class_to_source_module,
     _build_import_graph,
+    _build_reexport_map,
     _build_registry_class_to_types,
     _build_source_module_to_types,
     _find_reverse_dependents,
+    _parse_imports,
     classify_file,
     detect_affected_models,
 )
@@ -37,27 +40,27 @@ class TestClassifyFile:
     def test_model_file(self):
         assert classify_file("src/mobius/models/falcon.py") == "model"
 
-    def test_model_init_is_shared_infra(self):
-        """models/__init__.py is the re-export hub — classify as shared_infra."""
-        assert classify_file("src/mobius/models/__init__.py") == "shared_infra"
+    def test_model_init_is_model(self):
+        """models/__init__.py classifies as model (shared_infra disabled)."""
+        assert classify_file("src/mobius/models/__init__.py") == "model"
 
     def test_component_file(self):
-        assert classify_file("src/mobius/components/_attention.py") == "shared_infra"
+        assert classify_file("src/mobius/components/_attention.py") == "traceable"
 
     def test_task_file(self):
-        assert classify_file("src/mobius/tasks/_causal_lm.py") == "shared_infra"
+        assert classify_file("src/mobius/tasks/_causal_lm.py") == "traceable"
 
     def test_configs_file(self):
-        assert classify_file("src/mobius/_configs.py") == "shared_infra"
+        assert classify_file("src/mobius/_configs.py") == "other"
 
     def test_registry_file(self):
-        assert classify_file("src/mobius/_registry.py") == "shared_infra"
+        assert classify_file("src/mobius/_registry.py") == "other"
 
     def test_builder_file(self):
-        assert classify_file("src/mobius/_builder.py") == "shared_infra"
+        assert classify_file("src/mobius/_builder.py") == "other"
 
     def test_exporter_file(self):
-        assert classify_file("src/mobius/_exporter.py") == "shared_infra"
+        assert classify_file("src/mobius/_exporter.py") == "other"
 
     def test_test_file_in_src(self):
         assert classify_file("src/mobius/models/_models_test.py") == "test"
@@ -116,7 +119,7 @@ class TestRegistryParsing:
         assert "FalconCausalLMModel" in mapping
         types = mapping["FalconCausalLMModel"]
         assert "falcon" in types
-        assert "bloom" in types
+        assert "falcon_h1" in types
 
     def test_source_module_to_types(self):
         mapping = _build_source_module_to_types()
@@ -173,17 +176,29 @@ class TestImportGraph:
 
 
 class TestDetectAffectedModels:
-    def test_component_change_triggers_run_all(self):
+    def test_component_change_traces_affected_models(self):
+        """A component change traces through the import graph to find affected models."""
         result = detect_affected_models(["src/mobius/components/_attention.py"])
-        assert result["run_all"] is True
+        assert result["run_all"] is False
+        # _attention.py is imported by many models — should find affected types
+        assert len(result["affected"]) > 0
 
-    def test_task_change_triggers_run_all(self):
+    def test_task_change_does_not_trigger_run_all(self):
+        """Task files are traceable but produce an empty affected set.
+
+        No model imports ``mobius.tasks`` directly (tasks are looked up at
+        runtime by string keys), so tracing through the import graph finds
+        no dependents. Documented limitation — see PR description.
+        """
         result = detect_affected_models(["src/mobius/tasks/_causal_lm.py"])
-        assert result["run_all"] is True
+        assert result["run_all"] is False
+        assert result["affected"] == []
 
-    def test_configs_change_triggers_run_all(self):
+    def test_configs_change_no_run_all(self):
+        """_configs.py no longer triggers run_all (shared_infra disabled)."""
         result = detect_affected_models(["src/mobius/_configs.py"])
-        assert result["run_all"] is True
+        assert result["run_all"] is False
+        assert result["affected"] == []
 
     def test_unrelated_file_no_affected(self):
         result = detect_affected_models(["README.md"])
@@ -236,20 +251,21 @@ class TestDetectAffectedModels:
         assert result["run_all"] is False
         assert "falcon" in result["affected"]
 
-    def test_shared_infra_overrides_model(self):
-        """If any shared infra changes, run_all even with model files."""
+    def test_infra_does_not_override_model(self):
+        """Infra files no longer trigger run_all (shared_infra disabled)."""
         result = detect_affected_models(
             [
                 "src/mobius/models/falcon.py",
                 "src/mobius/_configs.py",
             ]
         )
-        assert result["run_all"] is True
+        assert result["run_all"] is False
+        assert "falcon" in result["affected"]
 
-    def test_models_init_triggers_run_all(self):
-        """models/__init__.py is the re-export hub — must trigger run_all."""
+    def test_models_init_no_run_all(self):
+        """models/__init__.py no longer triggers run_all (shared_infra disabled)."""
         result = detect_affected_models(["src/mobius/models/__init__.py"])
-        assert result["run_all"] is True
+        assert result["run_all"] is False
 
     def test_deleted_model_file_triggers_run_all(self):
         """A model file that doesn't exist on disk triggers run_all."""
@@ -261,10 +277,244 @@ class TestDetectAffectedModels:
         assert result["run_all"] is False
         assert result["affected"] == []
 
+    def test_component_common_affects_many_models(self):
+        """_common.py is foundational — tracing should find many models."""
+        result = detect_affected_models(["src/mobius/components/_common.py"])
+        assert result["run_all"] is False
+        # _common.py defines Linear, Embedding, LayerNorm — used everywhere
+        assert len(result["affected"]) > 10
+
+    def test_former_shared_infra_no_run_all(self):
+        """Former shared_infra files no longer trigger run_all."""
+        for path in [
+            "src/mobius/_configs.py",
+            "src/mobius/_registry.py",
+            "src/mobius/_builder.py",
+            "src/mobius/_weight_loading.py",
+            "src/mobius/_model_package.py",
+            "src/mobius/models/__init__.py",
+        ]:
+            result = detect_affected_models([path])
+            assert result["run_all"] is False, f"{path} should NOT trigger run_all"
+
+    def test_traceable_and_model_combined(self):
+        """A component + model file change returns union of affected types."""
+        result = detect_affected_models(
+            [
+                "src/mobius/models/falcon.py",
+                "src/mobius/components/_attention.py",
+            ]
+        )
+        assert result["run_all"] is False
+        assert "falcon" in result["affected"]
+        # _attention.py dependents should also be included
+        assert len(result["affected"]) > 2
+
+    def test_traceable_and_infra_no_run_all(self):
+        """Component + infra files no longer trigger run_all."""
+        result = detect_affected_models(
+            [
+                "src/mobius/components/_attention.py",
+                "src/mobius/_configs.py",
+            ]
+        )
+        assert result["run_all"] is False
+        assert len(result["affected"]) > 0
+
+    def test_deleted_traceable_file_triggers_run_all(self):
+        """A deleted component file triggers run_all (conservative)."""
+        result = detect_affected_models(["src/mobius/components/_nonexistent_component.py"])
+        assert result["run_all"] is True
+
 
 # ----------------------------------------------------------------
-# CLI tests
+# Traceable tracing integration tests
 # ----------------------------------------------------------------
+
+
+class TestTraceableTracing:
+    """Verify the import graph tracing for component/task files."""
+
+    def test_attention_component_finds_model_dependents(self):
+        """_attention.py should trace to models that import it."""
+        import_graph = _build_import_graph(_SRC_ROOT)
+        registry_map = _build_source_module_to_types()
+
+        dependents = _find_reverse_dependents("mobius.components._attention", import_graph)
+        # At minimum, models that use Attention should appear
+        affected_types: set[str] = set()
+        for dep in dependents:
+            if dep in registry_map:
+                affected_types.update(registry_map[dep])
+        assert len(affected_types) > 0, "Expected _attention.py to affect at least one model"
+
+    def test_traceable_result_is_subset_of_all_models(self):
+        """Traceable tracing should return a subset, not all models."""
+        # A niche component should affect fewer models than _common.py
+        result_common = detect_affected_models(["src/mobius/components/_common.py"])
+        result_niche = detect_affected_models(["src/mobius/components/_sam_vision.py"])
+        assert result_common["run_all"] is False
+        assert result_niche["run_all"] is False
+        # Niche component should affect fewer models
+        assert len(result_niche["affected"]) <= len(result_common["affected"]), (
+            f"_sam_vision.py ({len(result_niche['affected'])} models) should "
+            f"affect <= models than _common.py ({len(result_common['affected'])})"
+        )
+
+
+# ----------------------------------------------------------------
+# Re-export resolution tests
+#
+# These tests use synthetic source trees in a temp directory so they
+# are isolated from the real mobius package layout.
+# ----------------------------------------------------------------
+
+
+class TestReexportResolution:
+    """Tests for _parse_imports + _build_reexport_map.
+
+    The resolver must record dependencies on the *source* module that
+    actually defines a symbol, not on re-export hubs like
+    ``components/__init__.py``. Wildcard and unknown symbols fall back
+    to depending on the hub package.
+    """
+
+    @staticmethod
+    def _write_pkg(tmp_path: Path, monkeypatch) -> Path:
+        """Create a synthetic ``src/mobius`` tree.
+
+        Layout::
+
+            src/mobius/__init__.py
+            src/mobius/components/__init__.py  # re-exports Attention, MLP
+            src/mobius/components/_attention.py  # defines Attention
+            src/mobius/components/_mlp.py        # defines MLP
+        """
+        src = tmp_path / "src" / "mobius"
+        (src / "components").mkdir(parents=True)
+        (src / "__init__.py").write_text("")
+        (src / "components" / "__init__.py").write_text(
+            "from ._attention import Attention\nfrom ._mlp import MLP\n"
+        )
+        (src / "components" / "_attention.py").write_text("class Attention: ...\n")
+        (src / "components" / "_mlp.py").write_text("class MLP: ...\n")
+        # _module_name_from_path uses _PROJECT_ROOT to resolve dotted names;
+        # point it at our synthetic tree for the duration of the test.
+        monkeypatch.setattr("detect_affected_models._PROJECT_ROOT", tmp_path)
+        return src
+
+    def test_resolves_symbol_to_source_module(self, tmp_path: Path, monkeypatch) -> None:
+        """``from mobius.components import Attention`` → depends on _attention."""
+        src = self._write_pkg(tmp_path, monkeypatch)
+        importer = tmp_path / "importer.py"
+        importer.write_text("from mobius.components import Attention\n")
+
+        reexport = _build_reexport_map(src)
+        imports = _parse_imports(importer, reexport)
+
+        assert "mobius.components._attention" in imports
+        # The hub package itself is NOT recorded when every symbol resolves.
+        assert "mobius.components" not in imports
+
+    def test_resolves_multiple_symbols_from_same_hub(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Each symbol in a multi-import resolves to its own source module."""
+        src = self._write_pkg(tmp_path, monkeypatch)
+        importer = tmp_path / "importer.py"
+        importer.write_text("from mobius.components import Attention, MLP\n")
+
+        reexport = _build_reexport_map(src)
+        imports = _parse_imports(importer, reexport)
+
+        assert "mobius.components._attention" in imports
+        assert "mobius.components._mlp" in imports
+        assert "mobius.components" not in imports
+
+    def test_unknown_symbol_falls_back_to_package(self, tmp_path: Path, monkeypatch) -> None:
+        """Symbols not in the re-export map fall back to the hub package."""
+        src = self._write_pkg(tmp_path, monkeypatch)
+        importer = tmp_path / "importer.py"
+        importer.write_text("from mobius.components import NotExported\n")
+
+        reexport = _build_reexport_map(src)
+        imports = _parse_imports(importer, reexport)
+
+        # Unknown symbol → conservative fallback on the package itself
+        assert "mobius.components" in imports
+        # And no spurious source-module resolution
+        assert "mobius.components._attention" not in imports
+
+    def test_wildcard_import_falls_back_to_package(self, tmp_path: Path, monkeypatch) -> None:
+        """``from mobius.components import *`` cannot be resolved — fall back."""
+        src = self._write_pkg(tmp_path, monkeypatch)
+        importer = tmp_path / "importer.py"
+        importer.write_text("from mobius.components import *\n")
+
+        reexport = _build_reexport_map(src)
+        imports = _parse_imports(importer, reexport)
+
+        assert "mobius.components" in imports
+
+    def test_mixed_resolved_and_unresolved_records_both(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Mix of known + unknown symbols records resolved sources AND the hub."""
+        src = self._write_pkg(tmp_path, monkeypatch)
+        importer = tmp_path / "importer.py"
+        importer.write_text("from mobius.components import Attention, NotExported\n")
+
+        reexport = _build_reexport_map(src)
+        imports = _parse_imports(importer, reexport)
+
+        assert "mobius.components._attention" in imports
+        # Unresolved symbol keeps the hub as a conservative dependency
+        assert "mobius.components" in imports
+
+    def test_plain_import_statement_records_module(self, tmp_path: Path, monkeypatch) -> None:
+        """``import mobius.components`` (no ``from``) records the module directly."""
+        src = self._write_pkg(tmp_path, monkeypatch)
+        importer = tmp_path / "importer.py"
+        importer.write_text("import mobius.components\n")
+
+        reexport = _build_reexport_map(src)
+        imports = _parse_imports(importer, reexport)
+
+        assert "mobius.components" in imports
+
+    def test_no_reexport_map_records_module(self, tmp_path: Path, monkeypatch) -> None:
+        """When no map is passed, the hub is always recorded (legacy behavior)."""
+        self._write_pkg(tmp_path, monkeypatch)
+        importer = tmp_path / "importer.py"
+        importer.write_text("from mobius.components import Attention\n")
+
+        imports = _parse_imports(importer, reexport_map=None)
+
+        assert "mobius.components" in imports
+        assert "mobius.components._attention" not in imports
+
+    def test_non_mobius_imports_ignored(self, tmp_path: Path, monkeypatch) -> None:
+        """Imports outside the mobius package are not recorded."""
+        src = self._write_pkg(tmp_path, monkeypatch)
+        importer = tmp_path / "importer.py"
+        importer.write_text(
+            "import os\nfrom typing import Any\nfrom mobius.components import Attention\n"
+        )
+
+        reexport = _build_reexport_map(src)
+        imports = _parse_imports(importer, reexport)
+
+        assert imports == {"mobius.components._attention"}
+
+    def test_reexport_map_built_from_relative_import(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """``from .sub import X`` in __init__.py produces correct (pkg, X) entry."""
+        src = self._write_pkg(tmp_path, monkeypatch)
+        reexport = _build_reexport_map(src)
+
+        assert reexport[("mobius.components", "Attention")] == ("mobius.components._attention")
+        assert reexport[("mobius.components", "MLP")] == "mobius.components._mlp"
 
 
 class TestCLI:

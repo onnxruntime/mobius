@@ -1,0 +1,20 @@
+model_id: "google/gemma-4-26B-A4B-it"
+model_type: "gemma4"
+revision: "main"
+task_type: "image-text-to-text"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Describe this image in detail."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 30
+  do_sample: false
+
+skip_reason: "Gated repo (google/gemma-4-26B-A4B-it requires authentication). Model is 26B — too large for CI."
+notes: "Gemma 4 26B-A4B Image-Text-to-Text. 3-model split: decoder + vision + embedding. MoE layers, KV sharing (num_kv_shared_layers=20). No audio encoder."

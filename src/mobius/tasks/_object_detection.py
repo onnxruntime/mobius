@@ -1,9 +1,11 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Object detection task for models like YOLOS and DETR."""
 
 from __future__ import annotations
+
+from typing import ClassVar
 
 import onnx_ir as ir
 from onnxscript import nn
@@ -24,6 +26,8 @@ class ObjectDetectionTask(ModelTask):
         - pred_boxes: [batch, num_queries, 4] FLOAT
     """
 
+    model_roles: ClassVar[dict[str, str]] = {"model": "encoder"}
+
     def build(
         self,
         module: nn.Module,
@@ -31,23 +35,26 @@ class ObjectDetectionTask(ModelTask):
     ) -> ModelPackage:
         batch = ir.SymbolicDim("batch")
 
-        image_size = getattr(config, "image_size", 224)
+        image_height = getattr(config, "image_height", None) or getattr(
+            config, "image_size", 224
+        )
+        image_width = getattr(config, "image_width", None) or getattr(
+            config, "image_size", 224
+        )
         num_channels = getattr(config, "num_channels", 3)
 
-        pixel_values = ir.Value(
-            name="pixel_values",
-            shape=ir.Shape([batch, num_channels, image_size, image_size]),
-            type=ir.TensorType(ir.DataType.FLOAT),
-        )
-
-        graph, builder = _make_graph([pixel_values])
+        graph, builder = _make_graph()
         op = builder.op
+
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=ir.DataType.FLOAT,
+            shape=[batch, num_channels, image_height, image_width],
+        )
 
         logits, pred_boxes = module(op, pixel_values=pixel_values)
 
-        logits.name = "logits"
-        pred_boxes.name = "pred_boxes"
-        graph.outputs.append(logits)
-        graph.outputs.append(pred_boxes)
+        builder.add_output(logits, "logits")
+        builder.add_output(pred_boxes, "pred_boxes")
 
         return ModelPackage({"model": _make_model(graph)}, config=config)

@@ -1,0 +1,20 @@
+model_id: "microsoft/Phi-4-multimodal-instruct"
+model_type: "phi4mm"
+revision: "main"
+task_type: "phi4mm-multimodal"
+dtype: "float32"
+trust_remote_code: true
+
+inputs:
+  prompts:
+    - "Describe this image in detail."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 30
+  do_sample: false
+
+notes: "Phi-4-MM text + single image. Exercises vision encoder (SigLIP + HD transform) + projection + embedding mixer + decoder."

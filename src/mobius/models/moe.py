@@ -1,15 +1,15 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import (
@@ -40,6 +40,10 @@ class MoEDecoderLayer(nn.Module):
     - Post-norm (config.post_feedforward_norm=True): norms applied to sub-layer outputs.
       Adds post_feedforward_layernorm after MLP, no input_layernorm. Used by FlexOLMo.
 
+    Supports Granite-style scaling multipliers when present in config:
+    - ``attention_multiplier``: replaces the default 1/sqrt(head_dim) attention scale.
+    - ``residual_multiplier``: scales attention and MLP outputs before residual add.
+
     PhiMoE overrides norm_class with LayerNorm via the norm_class parameter.
     """
 
@@ -51,8 +55,11 @@ class MoEDecoderLayer(nn.Module):
     ):
         super().__init__()
         self._post_feedforward_norm = config.post_feedforward_norm
-        self.self_attn = Attention(config)
+        attention_scale = getattr(config, "attention_multiplier", None)
+        self.self_attn = Attention(config, scale=attention_scale)
         self.mlp = MoELayer(config, gate=gate)
+        residual_multiplier = getattr(config, "residual_multiplier", None)
+        self._residual_multiplier = 1.0 if residual_multiplier is None else residual_multiplier
         if not self._post_feedforward_norm:
             # Pre-norm style: norm before attention input and before MLP input
             self.input_layernorm = norm_class(config.hidden_size, eps=config.rms_norm_eps)
@@ -65,7 +72,7 @@ class MoEDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | None,
         position_embeddings: tuple,
@@ -92,11 +99,15 @@ class MoEDecoderLayer(nn.Module):
                 static_cache=static_cache,
             )
             attn_output = self.post_attention_layernorm(op, attn_output)
+            if not math.isclose(self._residual_multiplier, 1.0):
+                attn_output = op.Mul(attn_output, self._residual_multiplier)
             hidden_states = op.Add(residual, attn_output)
 
             residual = hidden_states
             mlp_output = self.mlp(op, hidden_states)
             mlp_output = self.post_feedforward_layernorm(op, mlp_output)
+            if not math.isclose(self._residual_multiplier, 1.0):
+                mlp_output = op.Mul(mlp_output, self._residual_multiplier)
             hidden_states = op.Add(residual, mlp_output)
         else:
             # Pre-norm style (standard): norm before each sub-layer input.
@@ -111,11 +122,15 @@ class MoEDecoderLayer(nn.Module):
                 past_key_value=past_key_value,
                 static_cache=static_cache,
             )
+            if not math.isclose(self._residual_multiplier, 1.0):
+                attn_output = op.Mul(attn_output, self._residual_multiplier)
             hidden_states = op.Add(residual, attn_output)
 
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(op, hidden_states)
             hidden_states = self.mlp(op, hidden_states)
+            if not math.isclose(self._residual_multiplier, 1.0):
+                hidden_states = op.Mul(hidden_states, self._residual_multiplier)
             hidden_states = op.Add(residual, hidden_states)
 
         return hidden_states, present_key_value
@@ -169,7 +184,7 @@ class MoETextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value | None,
         position_ids: ir.Value,
@@ -274,7 +289,7 @@ class Qwen2MoELayer(MoELayer):
         self.shared_expert = MLP(shared_config)
         self.shared_expert_gate = Linear(config.hidden_size, 1, bias=False)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # Routing expert output: top-k weighted sum  [B, S, H]
         expert_output = super().forward(op, hidden_states)
         # Shared expert always runs on every token
@@ -344,7 +359,7 @@ class UngatedSharedMoELayer(MoELayer):
         )
         self.shared_expert = MLP(shared_config)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # Routed expert output: top-k weighted sum  [B, S, H]
         routing_output = super().forward(op, hidden_states)
         # Shared expert always runs on every token, no gate scaling

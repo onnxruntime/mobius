@@ -1,0 +1,24 @@
+{
+  "model_id": "facebook/mbart-large-cc25",
+  "prompt": "translate English to German: The house is wonderful.",
+  "generated_tokens": [
+    0,
+    0,
+    3900,
+    3900,
+    3900,
+    3900,
+    19309,
+    14941,
+    47,
+    30839,
+    12,
+    581,
+    18276,
+    83,
+    58867,
+    5,
+    2
+  ],
+  "generated_text": "trans trans trans translate English to German: The house is wonderful."
+}

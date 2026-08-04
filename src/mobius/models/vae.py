@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """AutoencoderKL (VAE) model for diffusers.
 
@@ -11,8 +11,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._diffusers_configs import VAEConfig
 from mobius.components import Conv2d as _Conv2d
@@ -50,7 +49,7 @@ class _ResNetBlock2D(nn.Module):
         else:
             self.conv_shortcut = None
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         residual = hidden_states
 
         hidden_states = self.norm1(op, hidden_states)
@@ -85,7 +84,7 @@ class _AttentionBlock(nn.Module):
         self._channels = channels
         self._num_heads = max(1, channels // num_head_channels) if num_head_channels > 0 else 1
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         residual = hidden_states
         batch = op.Shape(hidden_states, start=0, end=1)
         channels = op.Shape(hidden_states, start=1, end=2)
@@ -104,7 +103,7 @@ class _AttentionBlock(nn.Module):
         value = self.to_v(op, hidden_states)
 
         # Simple scaled dot-product attention
-        scale = op.Constant(value_float=float(self._channels**-0.5))
+        scale = float(self._channels**-0.5)
         query = op.Mul(query, scale)
         attn_weights = op.MatMul(query, op.Transpose(key, perm=[0, 2, 1]))
         attn_weights = op.Softmax(attn_weights, axis=-1)
@@ -148,7 +147,7 @@ class _DownEncoderBlock2D(nn.Module):
         else:
             self.downsamplers = None
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         for resnet in self.resnets:
             hidden_states = resnet(op, hidden_states)
 
@@ -166,7 +165,7 @@ class _Downsample2D(nn.Module):
         super().__init__()
         self.conv = _Conv2d(channels, channels, kernel_size=3, stride=2, padding=1)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         return self.conv(op, hidden_states)
 
 
@@ -197,7 +196,7 @@ class _UpDecoderBlock2D(nn.Module):
         else:
             self.upsamplers = None
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         for resnet in self.resnets:
             hidden_states = resnet(op, hidden_states)
 
@@ -215,7 +214,7 @@ class _Upsample2D(nn.Module):
         super().__init__()
         self.conv = _Conv2d(channels, channels, kernel_size=3, padding=1)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         hidden_states = op.Resize(
             hidden_states,
             None,
@@ -249,7 +248,7 @@ class _MidBlock2D(nn.Module):
         else:
             self.attentions = None
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         hidden_states = self.resnets[0](op, hidden_states)
 
         if self.attentions is not None:
@@ -302,7 +301,7 @@ class _VAEEncoder(nn.Module):
         )
         self._silu = _SiLU()
 
-    def forward(self, op: builder.OpBuilder, sample: ir.Value):
+    def forward(self, op: OpBuilder, sample: ir.Value):
         hidden_states = self.conv_in(op, sample)
 
         for down_block in self.down_blocks:
@@ -356,7 +355,7 @@ class _VAEDecoder(nn.Module):
         )
         self._silu = _SiLU()
 
-    def forward(self, op: builder.OpBuilder, latent_sample: ir.Value):
+    def forward(self, op: OpBuilder, latent_sample: ir.Value):
         hidden_states = self.conv_in(op, latent_sample)
 
         hidden_states = self.mid_block(op, hidden_states)
@@ -415,5 +414,36 @@ class AutoencoderKLModel(nn.Module):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        """No renaming needed — parameter names match diffusers directly."""
-        return state_dict
+        """Map legacy diffusers VAE attention names to the current convention.
+
+        Older Stable-Diffusion VAE checkpoints (e.g. OFA-Sys/small-stable-diffusion-v0)
+        name the mid-block self-attention projections ``query``/``key``/``value``/
+        ``proj_attn``; current diffusers (and this builder) use ``to_q``/``to_k``/
+        ``to_v``/``to_out.0``. The projections are plain Linears in both, so this is
+        a pure rename. Newer checkpoints already match and pass through unchanged.
+        Legacy checkpoints sometimes store the projections as 1x1 convolutions
+        (rank-4 ``[C, C, 1, 1]``); squeeze those to the ``[C, C]`` Linear form.
+        """
+        rename = {
+            ".query.": ".to_q.",
+            ".key.": ".to_k.",
+            ".value.": ".to_v.",
+            ".proj_attn.": ".to_out.0.",
+        }
+        out: dict[str, torch.Tensor] = {}
+        for key, tensor in state_dict.items():
+            new_key = key
+            if ".attentions." in key:
+                for old, new in rename.items():
+                    if old in new_key:
+                        new_key = new_key.replace(old, new)
+                        break
+                # Legacy 1x1-conv projections -> Linear weight matrices.
+                if (
+                    new_key.endswith(".weight")
+                    and tensor.dim() == 4
+                    and tensor.shape[2:] == (1, 1)
+                ):
+                    tensor = tensor.squeeze(-1).squeeze(-1)
+            out[new_key] = tensor
+        return out

@@ -1,4 +1,5 @@
 model_id: "google/bigbird-pegasus-large-bigpatent"
+model_type: "bigbird_pegasus"
 revision: "main"
 task_type: "seq2seq"
 dtype: "float32"
@@ -8,7 +9,7 @@ inputs:
     - "summarize: The tower is 324 metres tall and is the tallest structure in Paris."
   decoder_prompt: ""
 
-level: "L4"
+level: "L4+L5"
 
-skip_reason: "BigBird-Pegasus large is too large (484M) for CI golden generation."
+skip_reason: "Model only has .bin weights (no safetensors); weight loader requires safetensors."
 notes: "BigBird-Pegasus large. Long-range document summarization."

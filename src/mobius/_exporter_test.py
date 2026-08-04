@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Tests for the build API (build, build_from_module, registry)."""
 
@@ -176,6 +176,14 @@ class TestResolveDtype:
     def test_unknown_dtype_raises(self):
         with pytest.raises(ValueError, match="Unknown dtype"):
             resolve_dtype("int8")
+
+    def test_mlx_supports_bf16_gqa_shared_kv(self):
+        from mobius._execution_providers import ep_registry
+
+        caps = ep_registry.require("mlx")
+        assert ir.DataType.BFLOAT16 in caps.gqa_dtypes
+        assert caps.qkv_pack_dtypes == frozenset()
+        assert caps.supports_past_present_share_buffer
 
 
 class TestCastModuleDtype:

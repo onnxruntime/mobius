@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Golden file loading, saving, and test case discovery for L4/L5 tests.
 
@@ -70,6 +70,9 @@ class GoldenTestCase:
     model_id: str
     """HuggingFace model ID (e.g. ``Qwen/Qwen2.5-0.5B``)."""
 
+    model_type: str
+    """Registry model_type key (e.g. ``qwen2``, ``llama``)."""
+
     revision: str
     """HF model revision / commit SHA."""
 
@@ -100,11 +103,22 @@ class GoldenTestCase:
     skip_reason: str | None
     """If set, the test runner should skip with this message."""
 
+    ci_skip_reason: str | None
+    """If set, the test is skipped in CI (GITHUB_ACTIONS=true) but runs
+    locally.  Used for models that are too large for CI hardware but can
+    be tested on a local GPU.  Does NOT block golden data generation."""
+
     min_token_match_ratio: float | None
     """Per-case override for the L5 token match tolerance (0-1).
     When ``None``, the global tolerance from ``default_tolerances.yaml`` is used.
     Use when a model has known float32 precision divergence vs HF (e.g.
     VL 3-model pipeline)."""
+
+    architecture: str | None
+    """Optional registry architecture key (e.g. ``Qwen35MtpModel``) forcing a
+    specific module class + task at build time.  Needed for auxiliary heads
+    (DFlash, MTP) that share a base checkpoint whose ``architectures`` field
+    would otherwise auto-route to the base model.  ``None`` = auto-detect."""
 
     yaml_path: Path
     """Absolute path to the source YAML file."""
@@ -143,10 +157,10 @@ class GoldenRef:
 
     # Multi-model diagnostics — empty dicts for single-model tasks
     component_norms: dict[str, float]
-    """L2 norms of component outputs, e.g. ``{"vision": 42.5}``."""
+    """L2 norms of component outputs, e.g. ``{"vision_encoder": 42.5}``."""
 
     component_shapes: dict[str, list[int]]
-    """Output shapes for components, e.g. ``{"vision": [1, 577, 1024]}``."""
+    """Output shapes for components, e.g. ``{"vision_encoder": [1, 577, 1024]}``."""
 
     # Metadata
     json_path: Path
@@ -199,7 +213,7 @@ def load_test_case(yaml_path: Path) -> GoldenTestCase:
         raise TypeError(f"Expected a YAML mapping in {yaml_path}, got {type(data)}")
 
     # Validate required top-level fields
-    _required = ("model_id", "revision", "task_type", "dtype", "level")
+    _required = ("model_id", "model_type", "revision", "task_type", "dtype", "level")
     missing = [k for k in _required if k not in data]
     if missing:
         raise ValueError(f"Missing required fields in {yaml_path}: {missing}")
@@ -215,6 +229,7 @@ def load_test_case(yaml_path: Path) -> GoldenTestCase:
         case_id=case_id,
         task_type=data["task_type"],
         model_id=data["model_id"],
+        model_type=data["model_type"],
         revision=data["revision"],
         dtype=data["dtype"],
         level=data["level"],
@@ -225,7 +240,9 @@ def load_test_case(yaml_path: Path) -> GoldenTestCase:
         generation_params=generation,
         trust_remote_code=data.get("trust_remote_code", False),
         skip_reason=data.get("skip_reason"),
+        ci_skip_reason=data.get("ci_skip_reason"),
         min_token_match_ratio=data.get("min_token_match_ratio"),
+        architecture=data.get("architecture"),
         yaml_path=yaml_path,
     )
 
@@ -424,6 +441,43 @@ def load_generation_golden(
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
     return [int(t) for t in data["generated_tokens"]]
+
+
+def drafter_inputs_path_for_case(
+    case: GoldenTestCase,
+    golden_dir: Path = GOLDEN_DIR,
+) -> Path:
+    """Return the companion ``*_inputs.npz`` path for a drafter test case.
+
+    Multi-model drafter tasks (e.g. ``gemma4-assistant``) consume tensors
+    derived from a target model's forward pass (shared KV + hidden state)
+    rather than a tokenized prompt, so the exact input tensors are stored
+    alongside the golden JSON for the test to replay.
+
+    Maps ``testdata/cases/<task>/<name>.yaml``
+    to  ``testdata/golden/<task>/<name>_inputs.npz``.
+    """
+    task_dir = case.yaml_path.parent.name
+    return golden_dir / task_dir / f"{case.case_id}_inputs.npz"
+
+
+def save_drafter_inputs(path: Path, arrays: dict[str, np.ndarray]) -> None:
+    """Save a drafter test case's input tensors to a ``.npz`` archive."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(path, **arrays)
+
+
+def load_drafter_inputs(
+    case: GoldenTestCase,
+    golden_dir: Path = GOLDEN_DIR,
+) -> dict[str, np.ndarray] | None:
+    """Load a drafter test case's input tensors, or ``None`` if missing."""
+    path = drafter_inputs_path_for_case(case, golden_dir)
+    if not path.exists():
+        return None
+    with np.load(path, allow_pickle=False) as data:
+        return {k: data[k] for k in data.files}
 
 
 def discover_test_cases(

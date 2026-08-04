@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Tests for DeepSeek Multi-head Latent Attention (MLA) component."""
 
@@ -135,7 +135,7 @@ class TestDeepSeekMLAForward:
             attention_bias=bias,
             position_embeddings=(cos, sin),
         )
-        builder._adapt_outputs([output, present_key, present_value])
+        builder._adapt_outputs([output, present_key, present_value], "")
 
         assert graph.num_nodes() > 0
         assert count_op_type(graph, "Attention") >= 1
@@ -157,7 +157,7 @@ class TestDeepSeekMLAForward:
             attention_bias=bias,
             position_embeddings=(cos, sin),
         )
-        builder._adapt_outputs([output, pk, pv])
+        builder._adapt_outputs([output, pk, pv], "")
 
         assert graph.num_nodes() > 0
         assert count_op_type(graph, "Attention") >= 1
@@ -186,7 +186,7 @@ class TestDeepSeekMLAForward:
             position_embeddings=(cos, sin),
             past_key_value=(past_key, past_value),
         )
-        builder._adapt_outputs([output, pk, pv])
+        builder._adapt_outputs([output, pk, pv], "")
 
         assert count_op_type(graph, "Attention") >= 1
 
@@ -217,7 +217,7 @@ class TestDeepSeekMLAForward:
             attention_bias=bias,
             position_embeddings=(cos, sin),
         )
-        builder._adapt_outputs([output, pk, pv])
+        builder._adapt_outputs([output, pk, pv], "")
 
         # MLA splits: q_nope/q_rope, k_pass/k_rope, k_nope/v
         assert count_op_type(graph, "Split") >= 3
@@ -239,7 +239,7 @@ class TestDeepSeekMLAForward:
             attention_bias=bias,
             position_embeddings=(cos, sin),
         )
-        builder._adapt_outputs([output, pk, pv])
+        builder._adapt_outputs([output, pk, pv], "")
 
         # Q = concat(q_nope, q_rope), K = concat(k_nope, k_rope_expanded)
         assert count_op_type(graph, "Concat") >= 2
@@ -261,7 +261,7 @@ class TestDeepSeekMLAForward:
             attention_bias=bias,
             position_embeddings=(cos, sin),
         )
-        builder._adapt_outputs([output, pk, pv])
+        builder._adapt_outputs([output, pk, pv], "")
 
         # q_a_layernorm + kv_a_layernorm = 2
         assert count_op_type(graph, "RMSNormalization") >= 2
@@ -320,6 +320,6 @@ class TestDeepSeekMLADimensions:
             attention_bias=bias,
             position_embeddings=(cos, sin),
         )
-        builder._adapt_outputs([output, pk, pv])
+        builder._adapt_outputs([output, pk, pv], "")
 
         assert count_op_type(graph, "Attention") >= 1

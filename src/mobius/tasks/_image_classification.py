@@ -1,9 +1,11 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Image classification task for ViT-like models."""
 
 from __future__ import annotations
+
+from typing import ClassVar
 
 import onnx_ir as ir
 from onnxscript import nn
@@ -23,6 +25,8 @@ class ImageClassificationTask(ModelTask):
         - last_hidden_state: [batch, sequence_len, hidden_size] FLOAT
     """
 
+    model_roles: ClassVar[dict[str, str]] = {"model": "encoder"}
+
     def build(
         self,
         module: nn.Module,
@@ -33,18 +37,17 @@ class ImageClassificationTask(ModelTask):
         image_size = getattr(config, "image_size", 224)
         num_channels = getattr(config, "num_channels", 3)
 
-        pixel_values = ir.Value(
-            name="pixel_values",
-            shape=ir.Shape([batch, num_channels, image_size, image_size]),
-            type=ir.TensorType(ir.DataType.FLOAT),
-        )
-
-        graph, builder = _make_graph([pixel_values])
+        graph, builder = _make_graph()
         op = builder.op
+
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=ir.DataType.FLOAT,
+            shape=[batch, num_channels, image_size, image_size],
+        )
 
         last_hidden_state = module(op, pixel_values=pixel_values)
 
-        last_hidden_state.name = "last_hidden_state"
-        graph.outputs.append(last_hidden_state)
+        builder.add_output(last_hidden_state, "last_hidden_state")
 
         return ModelPackage({"model": _make_model(graph)}, config=config)

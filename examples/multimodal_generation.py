@@ -1,6 +1,6 @@
 #!/usr/bin/env python
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Multimodal generation example — image captioning with Gemma 3.
 
@@ -83,7 +83,7 @@ class MultimodalPipeline:
         self._config = pkg.config
         # VisionLanguageTask produces 3 separate models
         self._decoder = OnnxModelSession(pkg["decoder"])
-        self._vision = OnnxModelSession(pkg["vision"])
+        self._vision = OnnxModelSession(pkg["vision_encoder"])
         self._embedding = OnnxModelSession(pkg["embedding"])
 
         # Tokenizer and image processor

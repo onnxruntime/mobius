@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """SAM ViT-B vision encoder for DeepSeek-OCR-2.
 
@@ -21,10 +21,10 @@ from __future__ import annotations
 
 import numpy as np
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components._common import Linear
+from mobius.components._mlp import FCMLP
 
 
 class _SAMPatchEmbed(nn.Module):
@@ -50,7 +50,7 @@ class _SAMPatchEmbed(nn.Module):
         self.bias = nn.Parameter((embed_dim,), name="proj.bias")
         self._kernel_size = kernel_size
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # (B, 3, H, W) → (B, embed_dim, H/16, W/16)
         x = op.Conv(
             x,
@@ -78,7 +78,7 @@ class _SAMLayerNorm2d(nn.Module):
         self._eps = eps
         self._num_channels = num_channels
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # x: (B, C, H, W) — normalize over C dimension
         # Reshape to (B, C, H*W), normalize, reshape back
         # Or use InstanceNormalization which normalizes per-channel
@@ -138,7 +138,7 @@ class _SAMAttention(nn.Module):
         relative_coords = q_coords - k_coords + (k_size - 1)
         return relative_coords.astype(np.int64)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # x: (B, H, W, C)
         # Flatten spatial dims for attention
         B = op.Shape(x, start=0, end=1)  # noqa: N806
@@ -237,18 +237,6 @@ class _SAMAttention(nn.Module):
         )
 
 
-class _SAMMLPBlock(nn.Module):
-    """MLP block for SAM: Linear → GELU → Linear."""
-
-    def __init__(self, embedding_dim: int, mlp_dim: int):
-        super().__init__()
-        self.lin1 = Linear(embedding_dim, mlp_dim, bias=True)
-        self.lin2 = Linear(mlp_dim, embedding_dim, bias=True)
-
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
-        return self.lin2(op, op.Gelu(self.lin1(op, x)))
-
-
 class _SAMBlock(nn.Module):
     """SAM transformer block with optional window attention.
 
@@ -287,7 +275,8 @@ class _SAMBlock(nn.Module):
             input_size=attn_input_size,
         )
         self.norm2 = _SAMLayerNorm(dim)
-        self.mlp = _SAMMLPBlock(dim, int(dim * mlp_ratio))
+        # GELU MLP with bias (HF lin1/lin2 → up_proj/down_proj)
+        self.mlp = FCMLP(dim, int(dim * mlp_ratio), activation="gelu", bias=True)
 
         self._window_size = window_size
         self._input_size = input_size
@@ -299,7 +288,7 @@ class _SAMBlock(nn.Module):
             self._Hp = H + self._pad_h
             self._Wp = W + self._pad_w
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # x: (B, H, W, C)
         shortcut = x
         x = self.norm1(op, x)
@@ -376,7 +365,7 @@ class _SAMLayerNorm(nn.Module):
         self.bias = nn.Parameter([hidden_size])
         self._eps = eps
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return op.LayerNormalization(x, self.weight, self.bias, epsilon=self._eps, axis=-1)
 
 
@@ -397,7 +386,7 @@ class _SAMConv2dNoBias(nn.Module):
         self._stride = stride
         self._padding = padding
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         p = self._padding
         return op.Conv(
             x,
@@ -497,7 +486,7 @@ class SAMVisionEncoder(nn.Module):
                 padding=1,
             )
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         # pixel_values: (B, 3, 1024, 1024)
         # → (B, 64, 64, 768)
         x = self.patch_embed(op, pixel_values)
@@ -521,3 +510,43 @@ class SAMVisionEncoder(nn.Module):
             x = self.net_3(op, x)  # (B, 896, 16, 16)
 
         return x
+
+
+def preprocess_sam_encoder_weights(
+    hf_state_dict: dict[str, object],
+) -> dict[str, object]:
+    """Map HuggingFace SamVisionEncoder weight names to SAMVisionEncoder names.
+
+    HF → ONNX mappings:
+    - patch_embed.projection.* → patch_embed.proj.*
+    - layers.N.layer_norm1.* → blocks.N.norm1.*
+    - layers.N.layer_norm2.* → blocks.N.norm2.*
+    - layers.N.attn.* → blocks.N.attn.*  (sublayer names match)
+    - layers.N.mlp.* → blocks.N.mlp.*  (sublayer names match)
+    - neck.conv1.* → neck.0.*
+    - neck.layer_norm1.* → neck.1.*
+    - neck.conv2.* → neck.2.*
+    - neck.layer_norm2.* → neck.3.*
+    - mlp.lin1.* → mlp.up_proj.*
+    - mlp.lin2.* → mlp.down_proj.*
+    """
+    renamed = {}
+    for key, value in hf_state_dict.items():
+        new_key = key
+        # patch_embed.projection → patch_embed.proj (our nn.Parameter)
+        new_key = new_key.replace("patch_embed.projection.", "patch_embed.proj.")
+        # Neck conv/layernorm to indexed (BEFORE generic layer_norm)
+        new_key = new_key.replace("neck.conv1.", "neck.0.")
+        new_key = new_key.replace("neck.layer_norm1.", "neck.1.")
+        new_key = new_key.replace("neck.conv2.", "neck.2.")
+        new_key = new_key.replace("neck.layer_norm2.", "neck.3.")
+        # layers → blocks
+        new_key = new_key.replace("layers.", "blocks.")
+        # Block-level: layer_norm1 → norm1, layer_norm2 → norm2
+        new_key = new_key.replace(".layer_norm1.", ".norm1.")
+        new_key = new_key.replace(".layer_norm2.", ".norm2.")
+        # MLP: HF lin1/lin2 → ONNX FCMLP up_proj/down_proj
+        new_key = new_key.replace(".mlp.lin1.", ".mlp.up_proj.")
+        new_key = new_key.replace(".mlp.lin2.", ".mlp.down_proj.")
+        renamed[new_key] = value
+    return renamed

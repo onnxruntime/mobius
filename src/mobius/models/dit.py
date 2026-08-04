@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """DiT (Diffusion Transformer) 2D model.
 
@@ -22,8 +22,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components import LayerNorm as _LayerNorm
 from mobius.components import Linear as _Linear
@@ -102,9 +101,7 @@ class _DiTCrossAttention(nn.Module):
         self._num_heads = num_heads
         self._head_dim = hidden_size // num_heads
 
-    def forward(
-        self, op: builder.OpBuilder, hidden_states: ir.Value, encoder_hidden_states: ir.Value
-    ):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, encoder_hidden_states: ir.Value):
         normed = self.norm(op, hidden_states)
         q = self.to_q(op, normed)
         k = self.to_k(op, encoder_hidden_states)
@@ -135,7 +132,7 @@ class _DiTBlock(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         encoder_hidden_states: ir.Value,
         temb: ir.Value,
@@ -148,7 +145,7 @@ class _DiTBlock(nn.Module):
         )
 
         # Apply scale and shift to normed hidden_states for self-attention
-        one = op.Constant(value_float=1.0)
+        one = 1.0
         attn_input = op.Mul(normed, op.Add(one, op.Unsqueeze(scale_msa, [1])))
         attn_input = op.Add(attn_input, op.Unsqueeze(shift_msa, [1]))
 
@@ -230,7 +227,7 @@ class DiTTransformer2DModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         sample: ir.Value,
         timestep: ir.Value,
         encoder_hidden_states: ir.Value,
@@ -269,7 +266,7 @@ class DiTTransformer2DModel(nn.Module):
 
         return hidden_states
 
-    def _get_timestep_embedding(self, op: builder.OpBuilder, timestep):
+    def _get_timestep_embedding(self, op: OpBuilder, timestep):
         """Sinusoidal timestep embedding."""
         half_dim = self.time_proj_dim // 2
         exponent = -math.log(10000.0) / half_dim
@@ -280,7 +277,7 @@ class DiTTransformer2DModel(nn.Module):
         args = op.Mul(t, op.Unsqueeze(freq_const, [0]))
         return op.Concat(op.Cos(args), op.Sin(args), axis=-1)
 
-    def _unpatchify(self, op: builder.OpBuilder, hidden_states, original_input):
+    def _unpatchify(self, op: OpBuilder, hidden_states, original_input):
         """Reshape patches back to spatial dimensions."""
         p = self.config.patch_size
         c = self.config.out_channels

@@ -1,0 +1,21 @@
+model_id: "Qwen/Qwen2-VL-2B-Instruct"
+model_type: "qwen2_vl"
+revision: "895c3a49bc3f"
+task_type: "image-text-to-text"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Describe this image in detail."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 30
+  do_sample: false
+
+min_token_match_ratio: 0.25
+
+notes: "Qwen2-VL 2B. Vision encoder + embedding + decoder pipeline."

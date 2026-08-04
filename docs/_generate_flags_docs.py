@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Auto-generate docs/feature-flags.md from the _Flags dataclass.
 

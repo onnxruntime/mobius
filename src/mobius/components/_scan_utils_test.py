@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Tests for Scan subgraph utilities."""
 
@@ -101,7 +101,7 @@ class TestCompactScanOutput:
         lengths = create_test_input(builder, "lengths", [3], dtype=ir.DataType.INT64)
 
         result = compact_scan_output(op, scan_result, lengths)
-        builder._adapt_outputs([result])
+        builder._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
 
     def test_has_compress_op(self):

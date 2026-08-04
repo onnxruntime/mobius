@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Bamba hybrid Mamba2/SSD + Attention causal language model.
 
@@ -31,11 +31,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import BambaConfig
-from mobius._weight_utils import tie_word_embeddings
 from mobius.components import (
     MLP,
     Attention,
@@ -86,7 +84,7 @@ class BambaMambaDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple,
@@ -136,7 +134,7 @@ class BambaAttentionDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple,
@@ -197,7 +195,7 @@ class _BambaTextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -247,10 +245,12 @@ class BambaCausalLMModel(nn.Module):
         self.config = config
         self.model = _BambaTextModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -273,41 +273,11 @@ class BambaCausalLMModel(nn.Module):
 
         Handles:
         1. Weight tying (embed_tokens ↔ lm_head)
-        2. Mamba2 SSM params: A_log, D, dt_bias stay under mamba.ssm
-        3. Norm rename: mamba.norm → mamba.norm (matches HF naming)
-        4. MLP rename: feed_forward → feed_forward (matches HF naming)
         """
         if self.config.tie_word_embeddings:
-            tie_word_embeddings(state_dict)
+            if "model.embed_tokens.weight" not in state_dict:
+                state_dict["model.embed_tokens.weight"] = state_dict["lm_head.weight"]
+            state_dict.pop("lm_head.weight", None)
 
-        new_state_dict: dict[str, torch.Tensor] = {}
-        for key, value in state_dict.items():
-            new_key = _rename_bamba_weight(key)
-            new_state_dict[new_key] = value
-
-        return new_state_dict
-
-
-def _rename_bamba_weight(key: str) -> str:
-    """Rename a single HF weight key to match ONNX module structure.
-
-    HF BambaForCausalLM weight naming:
-        model.layers.N.mamba.{in_proj, conv1d, out_proj, norm, A_log, D, dt_bias}
-        model.layers.N.self_attn.{q,k,v,o}_proj
-        model.layers.N.feed_forward.{gate,up,down}_proj
-        model.layers.N.{input_layernorm, pre_ff_layernorm}
-        model.{embed_tokens, final_layernorm}
-        lm_head
-
-    ONNX parameter naming:
-        Same as HF, except SSM params are nested under mamba.ssm:
-        model.layers.N.mamba.ssm.{A_log, D, dt_bias}
-    """
-    # SSM params: nest A_log, D, dt_bias under mamba.ssm
-    ssm_params = (".mamba.A_log", ".mamba.D", ".mamba.dt_bias")
-    for param in ssm_params:
-        if key.endswith(param):
-            # e.g. "model.layers.0.mamba.A_log" → "model.layers.0.mamba.ssm.A_log"
-            return key.replace(".mamba.", ".mamba.ssm.")
-
-    return key
+        # HF and ONNX naming match directly — no renaming needed.
+        return state_dict

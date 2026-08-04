@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Tests for multimodal components."""
 
@@ -41,7 +41,7 @@ class TestGemma3MultiModalProjector:
         b, op, graph = create_test_builder()
         features = create_test_input(b, "features", [1, 16, 64])
         result = proj(op, features)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
 
     def test_forward_with_pooling(self):
@@ -54,7 +54,7 @@ class TestGemma3MultiModalProjector:
         b, op, graph = create_test_builder()
         features = create_test_input(b, "features", [1, 64, 64])
         result = proj(op, features)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
 
 
@@ -76,7 +76,7 @@ class TestMLPMultiModalProjector:
         b, op, graph = create_test_builder()
         features = create_test_input(b, "features", [1, 16, 64])
         result = proj(op, features)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
 
 
@@ -97,7 +97,7 @@ class TestLinearMultiModalProjector:
         b, op, graph = create_test_builder()
         features = create_test_input(b, "features", [1, 16, 64])
         result = proj(op, features)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
 
 
@@ -109,7 +109,7 @@ class TestInputMixer:
         vision_emb = create_test_input(b, "vision_emb", [1, 4, 64])
         input_ids = create_test_input(b, "input_ids", [1, 10], dtype=ir.DataType.INT64)
         result = mixer(op, text_emb, vision_emb, input_ids)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
 
     def test_image_token_id_stored(self):

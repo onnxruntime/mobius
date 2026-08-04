@@ -1,22 +1,26 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
-"""GraniteMoeHybrid: Mamba2/SSD + Attention hybrid with MoE FFN on all layers.
+"""GraniteMoeHybrid: Mamba2/SSD + Attention hybrid with optional MoE FFN.
 
-Every layer has both a routed MoE block (``block_sparse_moe``) and a dense
-shared MLP (``shared_mlp``). The layer type ("mamba2" or "full_attention")
-controls whether the attention sub-block is a Mamba2/SSD or standard GQA.
-Attention layers use NoPE (no rotary position embeddings).
+Each layer has a dense shared MLP (``shared_mlp``) and, when the config has
+routed experts (``num_local_experts > 0``), a routed MoE block
+(``block_sparse_moe``); variants with no experts (e.g. granite-4.0-1b) run
+only the shared MLP. The layer type ("mamba2" or "full_attention") controls
+whether the token-mixing sub-block is a Mamba2/SSD or standard GQA. Attention
+layers use RoPE when ``position_embedding_type == 'rope'`` (granite-4.0-1b)
+and NoPE otherwise (granite-4.0-tiny-preview). Granite scaling multipliers
+(embedding/attention/residual/logits) are applied throughout.
 
 Forward pass per layer::
 
     residual = x
     x = input_layernorm(x)
-    x = mamba(x)  OR  self_attn(x, position_embeddings=None)
+    x = mamba(x)  OR  self_attn(x, position_embeddings)
     x = residual + x * residual_multiplier
     residual = x
     x = post_attention_layernorm(x)
-    x = block_sparse_moe(x) + shared_mlp(x)
+    x = shared_mlp(x)  [+ block_sparse_moe(x) if experts]
     x = residual + x * residual_multiplier
 
 HuggingFace reference: ``GraniteMoeHybridForCausalLM``.
@@ -24,33 +28,182 @@ HuggingFace reference: ``GraniteMoeHybridForCausalLM``.
 
 from __future__ import annotations
 
-import dataclasses
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import GraniteMoeHybridConfig
-from mobius._weight_utils import tie_word_embeddings
 from mobius.components import (
-    MLP,
     Attention,
     Embedding,
     Linear,
     Mamba2Block,
-    MoELayer,
     RMSNorm,
     TopKGate,
     create_attention_bias,
+    get_activation,
+    initialize_rope,
 )
 
 if TYPE_CHECKING:
     import onnx_ir as ir
 
 # ---------------------------------------------------------------------------
+# Fused MoE and shared-MLP blocks
+# ---------------------------------------------------------------------------
+
+
+class _Linear3D(nn.Module):
+    """3D stacked-expert linear layer.
+
+    Stores a single weight tensor ``[n_experts, out_features, in_features]``.
+    ``forward`` selects one expert slice by index and applies ``x @ W[e].T``,
+    equivalent to a per-expert :class:`Linear` without bias.
+    """
+
+    def __init__(self, n_experts: int, out_features: int, in_features: int):
+        super().__init__()
+        self.weight = nn.Parameter([n_experts, out_features, in_features])
+
+    def forward(self, op: OpBuilder, x: ir.Value, expert_index: int) -> ir.Value:
+        """Select expert *expert_index* and compute ``x @ W[expert_index].T``."""
+        # W[e]: [out_features, in_features]
+        w_e = op.Squeeze(op.Gather(self.weight, [expert_index], axis=0), [0])
+        return op.MatMul(x, op.Transpose(w_e))
+
+
+class _FusedMoEBlock(nn.Module):
+    """MoE block with fused 3D expert weights matching HuggingFace naming.
+
+    HF stores expert weights as fused 3D tensors:
+
+    * ``input_linear.weight``  — shape ``[n_experts, 2*intermediate, hidden]``
+      (gate + up projections concatenated along dim-1)
+    * ``output_linear.weight`` — shape ``[n_experts, hidden, intermediate]``
+      (down projection per expert)
+
+    Dispatch: loop over static expert indices, Gather from 3D tensors,
+    apply gated SiLU MLP, accumulate routing-weighted results.
+
+    This avoids splitting fused weights in ``preprocess_weights``.
+    """
+
+    def __init__(self, config: GraniteMoeHybridConfig):
+        super().__init__()
+        assert config.num_local_experts is not None
+        assert config.num_experts_per_tok is not None
+        self._num_experts = config.num_local_experts
+        self._intermediate_size = config.intermediate_size
+        self._top_k = config.num_experts_per_tok
+        self._act_fn = get_activation(config.hidden_act)
+
+        # Routing gate: HF name is router.layer, renamed to gate in preprocess_weights
+        self.gate = TopKGate(
+            config.hidden_size, config.num_local_experts, config.num_experts_per_tok
+        )
+
+        # Fused 3D expert weights — names match HF directly
+        # input_linear: [n_experts, 2*intermediate, hidden] (gate+up fused)
+        self.input_linear = _Linear3D(
+            config.num_local_experts,
+            2 * config.intermediate_size,
+            config.hidden_size,
+        )
+        # output_linear: [n_experts, hidden, intermediate] (down projection)
+        self.output_linear = _Linear3D(
+            config.num_local_experts,
+            config.hidden_size,
+            config.intermediate_size,
+        )
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
+        """Route tokens to experts and accumulate weighted outputs."""
+        # routing_weights: [batch*seq, top_k], selected_experts: [batch*seq, top_k]
+        routing_weights, selected_experts = self.gate(op, hidden_states)
+
+        result = None
+        for e_idx in range(self._num_experts):
+            # Gated MLP per expert:
+            # input_linear selects expert e → x @ W[e].T → [T, 2*inter]
+            proj = self.input_linear(op, hidden_states, e_idx)
+            gate, up = op.Split(proj, axis=-1, num_outputs=2, _outputs=2)
+            activated = op.Mul(self._act_fn(op, gate), up)  # [T, inter]
+            # output_linear selects expert e → activated @ W[e].T → [T, hidden]
+            expert_output = self.output_linear(op, activated, e_idx)
+
+            # Mask and weight: accumulate only for tokens routed to this expert
+            expert_id = op.Constant(value_int=e_idx)
+            match = op.Equal(selected_experts, expert_id)
+            match_float = op.CastLike(match, routing_weights)
+            weighted = op.Mul(routing_weights, match_float)
+            weight = op.ReduceSum(weighted, [-1], keepdims=True)
+            contribution = op.Mul(expert_output, weight)
+
+            if result is None:
+                result = contribution
+            else:
+                result = op.Add(result, contribution)
+
+        return result
+
+
+class _FusedSharedMLP(nn.Module):
+    """Shared MLP with fused gate+up matching HuggingFace naming.
+
+    HF stores shared-MLP weights as:
+
+    * ``input_linear.weight``  — shape ``[2*shared_intermediate, hidden]``
+    * ``output_linear.weight`` — shape ``[hidden, shared_intermediate]``
+
+    Forward::
+
+        gate_up = x @ input_linear.T       # [*, 2*shared_intermediate]
+        gate, up = split(gate_up, axis=-1)
+        return act(gate) * up @ output_linear.T  # [*, hidden]
+    """
+
+    def __init__(self, config: GraniteMoeHybridConfig):
+        super().__init__()
+        self.input_linear = Linear(
+            config.hidden_size,
+            2 * config.shared_intermediate_size,
+            bias=config.mlp_bias,
+        )
+        self.output_linear = Linear(
+            config.shared_intermediate_size,
+            config.hidden_size,
+            bias=config.mlp_bias,
+        )
+        self.act_fn = get_activation(config.hidden_act)
+
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
+        gate_up = self.input_linear(op, x)  # [*, 2*shared_intermediate]
+        gate, up = op.Split(gate_up, axis=-1, num_outputs=2, _outputs=2)
+        return self.output_linear(op, op.Mul(self.act_fn(op, gate), up))
+
+
+# ---------------------------------------------------------------------------
 # Decoder layers
 # ---------------------------------------------------------------------------
+
+
+def _feedforward(
+    op: OpBuilder,
+    hidden_states: ir.Value,
+    block_sparse_moe: nn.Module | None,
+    shared_mlp: nn.Module,
+) -> ir.Value:
+    """Combined routed-MoE + shared-MLP feedforward.
+
+    When routed experts exist, the output is ``moe(x) + shared_mlp(x)``; for
+    variants with ``num_local_experts == 0`` (e.g. granite-4.0-1b) only the
+    dense shared MLP runs. Mirrors HF ``GraniteMoeHybridDecoderLayer``.
+    """
+    shared_out = shared_mlp(op, hidden_states)
+    if block_sparse_moe is None:
+        return shared_out
+    return op.Add(block_sparse_moe(op, hidden_states), shared_out)
 
 
 class _GraniteMoeHybridMambaDecoderLayer(nn.Module):
@@ -82,26 +235,24 @@ class _GraniteMoeHybridMambaDecoderLayer(nn.Module):
         )
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Routed MoE: top-k expert selection with softmax weighting
-        gate = TopKGate(
-            config.hidden_size, config.num_local_experts, config.num_experts_per_tok
-        )
-        self.block_sparse_moe = MoELayer(config, gate=gate)
+        # Routed MoE with fused 3D expert weights. GraniteMoeHybrid variants with
+        # ``num_local_experts == 0`` (e.g. granite-4.0-1b) have no routed experts;
+        # only the dense shared MLP runs. Mirrors HF ``block_sparse_moe = MoE(...)
+        # if num_local_experts > 0 else None``.
+        self._has_experts = bool(config.num_local_experts)
+        self.block_sparse_moe = _FusedMoEBlock(config) if self._has_experts else None
 
-        # Dense shared MLP: runs on every token unconditionally
-        shared_config = dataclasses.replace(
-            config, intermediate_size=config.shared_intermediate_size
-        )
-        self.shared_mlp = MLP(shared_config)
+        # Dense shared MLP with fused gate+up weight
+        self.shared_mlp = _FusedSharedMLP(config)
 
         self._residual_multiplier = config.residual_multiplier
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
-        position_embeddings: tuple,
+        position_embeddings: tuple | None,
         past_key_value: tuple | None,
     ):
         """Forward pass. Returns (hidden_states, (conv_state, ssm_state)).
@@ -126,11 +277,7 @@ class _GraniteMoeHybridMambaDecoderLayer(nn.Module):
         # MoE + shared-MLP path with pre-norm
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(op, hidden_states)
-        # Both routed MoE and shared MLP run on every layer; outputs are summed
-        hidden_states = op.Add(
-            self.block_sparse_moe(op, hidden_states),
-            self.shared_mlp(op, hidden_states),
-        )
+        hidden_states = _feedforward(op, hidden_states, self.block_sparse_moe, self.shared_mlp)
         rm = op.CastLike(op.Constant(value_float=self._residual_multiplier), hidden_states)
         hidden_states = op.Add(residual, op.Mul(hidden_states, rm))
 
@@ -150,43 +297,43 @@ class _GraniteMoeHybridAttentionDecoderLayer(nn.Module):
     def __init__(self, config: GraniteMoeHybridConfig):
         super().__init__()
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # GraniteMoeHybrid attention uses NoPE (no position embeddings)
-        self.self_attn = Attention(config)
+        # Attention scale is Granite's ``attention_multiplier`` (a fixed value,
+        # not the default 1/sqrt(head_dim)); RoPE is applied only when the text
+        # model supplies ``position_embeddings`` (position_embedding_type='rope').
+        self.self_attn = Attention(config, scale=config.attention_multiplier)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Routed MoE: top-k expert selection with softmax weighting
-        gate = TopKGate(
-            config.hidden_size, config.num_local_experts, config.num_experts_per_tok
-        )
-        self.block_sparse_moe = MoELayer(config, gate=gate)
+        # Routed MoE with fused 3D expert weights. Absent when there are no
+        # routed experts (num_local_experts == 0), e.g. granite-4.0-1b.
+        self._has_experts = bool(config.num_local_experts)
+        self.block_sparse_moe = _FusedMoEBlock(config) if self._has_experts else None
 
-        # Dense shared MLP: runs on every token unconditionally
-        shared_config = dataclasses.replace(
-            config, intermediate_size=config.shared_intermediate_size
-        )
-        self.shared_mlp = MLP(shared_config)
+        # Dense shared MLP with fused gate+up weight
+        self.shared_mlp = _FusedSharedMLP(config)
 
         self._residual_multiplier = config.residual_multiplier
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
-        position_embeddings: tuple,
+        position_embeddings: tuple | None,
         past_key_value: tuple | None,
     ):
-        """Forward pass. Returns (hidden_states, (key, value))."""
-        del position_embeddings  # GraniteMoeHybrid uses NoPE: no rotary embeddings
+        """Forward pass. Returns (hidden_states, (key, value)).
 
-        # GQA attention path (no RoPE)
+        ``position_embeddings`` is ``None`` for NoPE variants and a
+        ``(cos, sin)`` tuple when ``position_embedding_type == 'rope'``.
+        """
+        # GQA attention path (RoPE applied iff position_embeddings is not None)
         residual = hidden_states
         hidden_states = self.input_layernorm(op, hidden_states)
         attn_out, present_kv = self.self_attn(
             op,
             hidden_states=hidden_states,
             attention_bias=attention_bias,
-            position_embeddings=None,  # NoPE: skip rotary embedding application
+            position_embeddings=position_embeddings,
             past_key_value=past_key_value,
         )
         rm = op.CastLike(op.Constant(value_float=self._residual_multiplier), attn_out)
@@ -195,10 +342,7 @@ class _GraniteMoeHybridAttentionDecoderLayer(nn.Module):
         # MoE + shared-MLP path with pre-norm
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(op, hidden_states)
-        hidden_states = op.Add(
-            self.block_sparse_moe(op, hidden_states),
-            self.shared_mlp(op, hidden_states),
-        )
+        hidden_states = _feedforward(op, hidden_states, self.block_sparse_moe, self.shared_mlp)
         rm = op.CastLike(op.Constant(value_float=self._residual_multiplier), hidden_states)
         hidden_states = op.Add(residual, op.Mul(hidden_states, rm))
 
@@ -214,7 +358,9 @@ class _GraniteMoeHybridTextModel(nn.Module):
     """GraniteMoeHybrid text backbone: embedding -> N x (Mamba2|Attention) layers -> norm.
 
     Layer type ("mamba2" or "full_attention") is read from ``config.layer_types``.
-    No rotary embeddings are used (NoPE for attention layers).
+    Attention layers use RoPE when ``config`` declares rotary parameters
+    (``position_embedding_type == 'rope'``, e.g. granite-4.0-1b) and NoPE
+    otherwise (e.g. granite-4.0-tiny-preview).
     """
 
     def __init__(self, config: GraniteMoeHybridConfig):
@@ -233,21 +379,29 @@ class _GraniteMoeHybridTextModel(nn.Module):
             else:
                 self.layers.append(_GraniteMoeHybridAttentionDecoderLayer(config))
 
-        self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # No rotary_emb: GraniteMoeHybrid uses NoPE (no positional encodings)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # RoPE when the config declares rotary params; None => NoPE (attention
+        # layers then receive position_embeddings=None).
+        self.rotary_emb = initialize_rope(config)
+        self.embedding_multiplier = config.embedding_multiplier
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
         past_key_values: list | None = None,
     ):
-        del position_ids  # unused: NoPE architecture has no positional embeddings
-
         # (batch, seq, hidden)
         hidden_states = self.embed_tokens(op, input_ids)
+        # Granite scales embeddings by embedding_multiplier after lookup.
+        hidden_states = op.Mul(hidden_states, self.embedding_multiplier)
+
+        # (cos, sin) tuple for RoPE, or None for NoPE variants.
+        position_embeddings = (
+            self.rotary_emb(op, position_ids) if self.rotary_emb is not None else None
+        )
         attention_bias = create_attention_bias(
             op,
             input_ids=input_ids,
@@ -262,12 +416,12 @@ class _GraniteMoeHybridTextModel(nn.Module):
                 op,
                 hidden_states=hidden_states,
                 attention_bias=attention_bias,
-                position_embeddings=None,  # NoPE: no RoPE
+                position_embeddings=position_embeddings,
                 past_key_value=past_kv,
             )
             present_key_values.append(present_kv)
 
-        hidden_states = self.final_layernorm(op, hidden_states)
+        hidden_states = self.norm(op, hidden_states)
         return hidden_states, present_key_values
 
 
@@ -293,10 +447,13 @@ class GraniteMoeHybridCausalLMModel(nn.Module):
         self.config = config
         self.model = _GraniteMoeHybridTextModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
+        self.logits_scaling = config.logits_scaling
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -310,6 +467,8 @@ class GraniteMoeHybridCausalLMModel(nn.Module):
             past_key_values=past_key_values,
         )
         logits = self.lm_head(op, hidden_states)
+        # Granite divides final logits by logits_scaling.
+        logits = op.Div(logits, self.logits_scaling)
         return logits, present_key_values
 
     def preprocess_weights(
@@ -319,24 +478,42 @@ class GraniteMoeHybridCausalLMModel(nn.Module):
 
         Handles:
         1. Weight tying (embed_tokens ↔ lm_head)
-        2. Mamba2 SSM params: A_log, D, dt_bias nested under mamba.ssm
-        3. MoE gate: block_sparse_moe.router.layer.weight → block_sparse_moe.gate.weight
-        4. MoE fused input: block_sparse_moe.input_linear [n_experts, 2*mid, hidden]
-           → per-expert block_sparse_moe.experts.{e}.{gate,up}_proj.weight
-        5. MoE fused output: block_sparse_moe.output_linear [n_experts, hidden, mid]
-           → per-expert block_sparse_moe.experts.{e}.down_proj.weight
-        6. Shared MLP fused gate+up: shared_mlp.input_linear [2*shared_mid, hidden]
-           → shared_mlp.gate_proj.weight + shared_mlp.up_proj.weight
-        7. Shared MLP down proj: shared_mlp.output_linear → shared_mlp.down_proj
+        2. MoE gate: block_sparse_moe.router[.layer].weight → block_sparse_moe.gate.weight
+        3. Fused expert weights: HF renamed the routed-expert tensors from
+           ``block_sparse_moe.{input,output}_linear.weight`` to
+           ``block_sparse_moe.experts.{gate_up,down}_proj`` (transformers >=5.x).
+           The layouts are identical, so only the names are remapped.
+
+        Shared-MLP weights (``shared_mlp.{input,output}_linear``) pass through
+        directly — the ONNX model stores them in the same fused layout as HF.
         """
         if self.config.tie_word_embeddings:
-            tie_word_embeddings(state_dict)
+            if "model.embed_tokens.weight" not in state_dict:
+                state_dict["model.embed_tokens.weight"] = state_dict["lm_head.weight"]
+            state_dict.pop("lm_head.weight", None)
 
         new_state_dict: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
-            new_key = _rename_granitemoehybrid_weight(key, value, new_state_dict)
-            if new_key is not None:
-                new_state_dict[new_key] = value
+            new_key = key
+            # MoE gate: router.layer.weight (legacy) / router.weight (current) → gate.weight
+            new_key = new_key.replace(
+                ".block_sparse_moe.router.layer.",
+                ".block_sparse_moe.gate.",
+            )
+            new_key = new_key.replace(
+                ".block_sparse_moe.router.weight",
+                ".block_sparse_moe.gate.weight",
+            )
+            # Routed-expert weights: HF renamed the fused 3D tensors.
+            new_key = new_key.replace(
+                ".block_sparse_moe.experts.gate_up_proj",
+                ".block_sparse_moe.input_linear.weight",
+            )
+            new_key = new_key.replace(
+                ".block_sparse_moe.experts.down_proj",
+                ".block_sparse_moe.output_linear.weight",
+            )
+            new_state_dict[new_key] = value
 
         return new_state_dict
 
@@ -344,126 +521,3 @@ class GraniteMoeHybridCausalLMModel(nn.Module):
 # ---------------------------------------------------------------------------
 # Weight name mapping
 # ---------------------------------------------------------------------------
-
-# Mamba2 SSM params stored flat on HF "mamba" that we nest under "mamba.ssm"
-_MAMBA2_SSM_PARAMS = (".mamba.A_log", ".mamba.D", ".mamba.dt_bias")
-
-
-def _rename_granitemoehybrid_weight(
-    key: str,
-    value: torch.Tensor,
-    out: dict[str, torch.Tensor],
-) -> str | None:
-    """Rename a single HF GraniteMoeHybrid weight key to our ONNX naming.
-
-    Returns the new key, or None if the weight was handled inline
-    (fused tensors split into multiple per-expert outputs).
-    """
-    # SSM params: nest A_log, D, dt_bias under mamba.ssm
-    # e.g. "model.layers.0.mamba.A_log" → "model.layers.0.mamba.ssm.A_log"
-    for param in _MAMBA2_SSM_PARAMS:
-        if key.endswith(param):
-            return key.replace(".mamba.", ".mamba.ssm.")
-
-    # MoE gate: router.layer.weight → gate.weight
-    # e.g. "…block_sparse_moe.router.layer.weight" → "…block_sparse_moe.gate.weight"
-    key = key.replace(".block_sparse_moe.router.layer.", ".block_sparse_moe.gate.")
-
-    # MoE fused input_linear [n_experts, 2*intermediate, hidden]
-    # → per-expert {gate,up}_proj.weight
-    if ".block_sparse_moe.input_linear" in key:
-        _split_moe_fused_gate_up(key, value, out)
-        return None  # handled inline
-
-    # MoE fused output_linear [n_experts, hidden, intermediate]
-    # → per-expert down_proj.weight
-    if ".block_sparse_moe.output_linear" in key:
-        _split_moe_fused_down(key, value, out)
-        return None  # handled inline
-
-    # Shared MLP fused input_linear [2*shared_intermediate, hidden]
-    # → gate_proj.weight + up_proj.weight
-    if ".shared_mlp.input_linear" in key:
-        _split_shared_mlp_fused_gate_up(key, value, out)
-        return None  # handled inline
-
-    # Shared MLP down proj: output_linear → down_proj
-    # e.g. "…shared_mlp.output_linear.weight" → "…shared_mlp.down_proj.weight"
-    if ".shared_mlp.output_linear" in key:
-        return key.replace(".shared_mlp.output_linear", ".shared_mlp.down_proj")
-
-    return key
-
-
-def _split_moe_fused_gate_up(
-    key: str,
-    value: torch.Tensor,
-    out: dict[str, torch.Tensor],
-) -> None:
-    """Expand fused MoE input_linear into per-expert gate_proj + up_proj.
-
-    HF stores:
-        ``layers.{i}.block_sparse_moe.input_linear.weight``
-        with shape ``[n_experts, 2*intermediate, hidden]``
-
-    We need per-expert:
-        ``layers.{i}.block_sparse_moe.experts.{e}.gate_proj.weight``
-        ``layers.{i}.block_sparse_moe.experts.{e}.up_proj.weight``
-    """
-    # Derive the base path: e.g. "model.layers.0.block_sparse_moe"
-    sep = ".block_sparse_moe.input_linear"
-    prefix = key[: key.index(sep)]
-    base = f"{prefix}.block_sparse_moe"
-
-    n_experts = value.shape[0]
-    intermediate = value.shape[1] // 2
-    for e in range(n_experts):
-        expert_w = value[e]  # [2*intermediate, hidden]
-        out[f"{base}.experts.{e}.gate_proj.weight"] = expert_w[:intermediate]
-        out[f"{base}.experts.{e}.up_proj.weight"] = expert_w[intermediate:]
-
-
-def _split_moe_fused_down(
-    key: str,
-    value: torch.Tensor,
-    out: dict[str, torch.Tensor],
-) -> None:
-    """Expand fused MoE output_linear into per-expert down_proj.
-
-    HF stores:
-        ``layers.{i}.block_sparse_moe.output_linear.weight``
-        with shape ``[n_experts, hidden, intermediate]``
-
-    We need per-expert:
-        ``layers.{i}.block_sparse_moe.experts.{e}.down_proj.weight``
-    """
-    sep = ".block_sparse_moe.output_linear"
-    prefix = key[: key.index(sep)]
-    base = f"{prefix}.block_sparse_moe"
-
-    n_experts = value.shape[0]
-    for e in range(n_experts):
-        out[f"{base}.experts.{e}.down_proj.weight"] = value[e]
-
-
-def _split_shared_mlp_fused_gate_up(
-    key: str,
-    value: torch.Tensor,
-    out: dict[str, torch.Tensor],
-) -> None:
-    """Expand fused shared_mlp input_linear into gate_proj + up_proj.
-
-    HF stores:
-        ``layers.{i}.shared_mlp.input_linear.weight``
-        with shape ``[2*shared_intermediate, hidden]``
-
-    We need:
-        ``layers.{i}.shared_mlp.gate_proj.weight``
-        ``layers.{i}.shared_mlp.up_proj.weight``
-    """
-    sep = ".shared_mlp.input_linear"
-    prefix = key[: key.index(sep)]
-
-    intermediate = value.shape[0] // 2
-    out[f"{prefix}.shared_mlp.gate_proj.weight"] = value[:intermediate]
-    out[f"{prefix}.shared_mlp.up_proj.weight"] = value[intermediate:]

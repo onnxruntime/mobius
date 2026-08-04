@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """GPT-OSS causal language model with Mixture-of-Experts and attention sinks.
 
@@ -22,8 +22,7 @@ import math
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import (
@@ -54,7 +53,7 @@ class _GptOssGate(nn.Module):
         self.weight = nn.Parameter([num_experts, hidden_size])
         self.bias = nn.Parameter([num_experts])
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # router_logits: [B, S, N_exp] = [B, S, H] @ [H, N_exp] + [N_exp]
         weight_t = op.Transpose(self.weight, perm=[1, 0])
         router_logits = op.MatMul(hidden_states, weight_t)
@@ -92,7 +91,7 @@ class _GptOssExpertMLP(nn.Module):
         self.up_proj = Linear(hidden_size, intermediate_size, bias=True)
         self.down_proj = Linear(intermediate_size, hidden_size, bias=True)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         gate = self.gate_proj(op, hidden_states)  # [B, S, inter]
         up = self.up_proj(op, hidden_states)  # [B, S, inter]
 
@@ -126,7 +125,7 @@ class _GptOssMoELayer(nn.Module):
             ]
         )
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         routing_weights, selected_experts = self.gate(op, hidden_states)
 
         # Loop over experts: mask-and-accumulate dispatch
@@ -204,7 +203,7 @@ class _GptOssAttention(nn.Module):
 
     def _expand_kv_for_gqa(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         kv: ir.Value,
         batch_1d: ir.Value,
         kv_len_1d: ir.Value,
@@ -237,7 +236,7 @@ class _GptOssAttention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | None,
         position_embeddings: tuple | None = None,
@@ -363,7 +362,7 @@ class _GptOssDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | None,
         position_embeddings: tuple,
@@ -405,7 +404,7 @@ class _GptOssTextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value | None,
         position_ids: ir.Value,
@@ -494,7 +493,33 @@ class GPTOSSCausalLMModel(CausalLMModel):
         - ``mlp.experts.down_proj [N, inter, hidden]``: transpose per-expert to
           ``down_proj.weight [hidden, inter]``
         - ``mlp.experts.down_proj_bias [N, hidden]``: split to per-expert ``down_proj.bias``
+
+        MXFP4 quantized checkpoints store ``_blocks`` + ``_scales`` instead
+        of full weight tensors.  These are dequantized first using HF's
+        ``_convert_moe_packed_tensors`` (4-bit nibble-packed with shared
+        exponent), producing the same ``[N, hidden, 2*inter]`` or
+        ``[N, inter, hidden]`` shapes that the non-quantized path expects.
         """
+        # Phase 1: Dequantize MXFP4 _blocks + _scales into full tensors.
+        # The mxfp4 module ships with the same transformers version that
+        # added GPT-OSS support, so no version guard is needed.
+        from transformers.integrations.mxfp4 import (
+            _convert_moe_packed_tensors,
+        )
+
+        blocks_keys = [k for k in state_dict if k.endswith("_blocks")]
+        for bk in blocks_keys:
+            sk = bk.replace("_blocks", "_scales")
+            if sk not in state_dict:
+                continue
+            base_key = bk.removesuffix("_blocks")
+            state_dict[base_key] = _convert_moe_packed_tensors(
+                state_dict.pop(bk),
+                state_dict.pop(sk),
+                dtype=torch.bfloat16,
+            )
+
+        # Phase 2: Split fused/stacked weights into per-expert tensors.
         result: dict[str, torch.Tensor] = {}
         for name, tensor in state_dict.items():
             # Router weight/bias rename
@@ -516,7 +541,7 @@ class GPTOSSCausalLMModel(CausalLMModel):
                     ].contiguous()
 
             # Expert fused gate+up weight: [N, hidden, 2*inter] — transposed + interleaved
-            elif "mlp.experts.gate_up_proj" in name:
+            elif name.endswith("mlp.experts.gate_up_proj"):
                 prefix = name.replace(".mlp.experts.gate_up_proj", "")
                 n_exp = tensor.shape[0]
                 for i in range(n_exp):
@@ -537,7 +562,7 @@ class GPTOSSCausalLMModel(CausalLMModel):
                     result[f"{prefix}.mlp.experts.{i}.down_proj.bias"] = tensor[i].contiguous()
 
             # Expert down projection weight: [N, inter, hidden] — transposed
-            elif "mlp.experts.down_proj" in name:
+            elif name.endswith("mlp.experts.down_proj"):
                 prefix = name.replace(".mlp.experts.down_proj", "")
                 n_exp = tensor.shape[0]
                 for i in range(n_exp):

@@ -1,4 +1,5 @@
 model_id: "apple/mobilevitv2-1.0-imagenet1k-256"
+model_type: "mobilevitv2"
 revision: "main"
 task_type: "image-classification"
 dtype: "float32"
@@ -7,6 +8,7 @@ inputs:
   images:
     - "pipeline-cat-chonk.jpeg"
 
+skip_reason: "Invalid ArchitectureConfig for MobileViTv2."
 level: "L4"
 
 notes: "MobileViTv2 1.0. Separable self-attention mobile vision transformer."

@@ -1,0 +1,14 @@
+model_id: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+model_type: "nemotron"
+revision: "main"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Here is my poem:"
+
+level: "L4"
+
+ci_skip_reason: "30B MoE model requires ~60GB VRAM; too large for CI."
+notes: "NemotronH Nano 30B-A3B. Hybrid Mamba2 + MoE + Attention from NVIDIA. 128 routed experts, top-6. L5 skipped: HF remote code generate() is broken (cache_position bug)."

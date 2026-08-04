@@ -1,4 +1,5 @@
 model_id: "facebook/hubert-base-ls960"
+model_type: "hubert"
 revision: "main"
 task_type: "audio-feature-extraction"
 dtype: "float32"

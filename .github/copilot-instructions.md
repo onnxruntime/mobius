@@ -90,7 +90,7 @@ and wrapper modules for nesting. See the `weight-name-alignment` skill.
   to source)
 - Top-level tests: `tests/build_graph_test.py` (graph construction),
   `tests/integration_test.py` (numerical accuracy vs HuggingFace)
-- Skills: `.github/skills/<name>/SKILL.md`
+- Skills: `.agents/skills/<name>/SKILL.md`
 
 ### Code style
 
@@ -98,8 +98,16 @@ and wrapper modules for nesting. See the `weight-name-alignment` skill.
 - Ruff for linting/formatting (line-length=95, Python 3.10+)
 - MyPy strict mode (excludes `*_test.py`)
 - Use `op.Shape(x, start=i, end=i+1)` for single dimension extraction
-- Use ONNX opset 23 `op.Attention` with `q_num_heads`/`kv_num_heads`
-  attributes (not `num_heads`)
+- Use the ONNX opset-24 `op.Attention` (introduced in opset 23) with
+  `q_num_heads`/`kv_num_heads` attributes (not `num_heads`). The codebase
+  emits opset 24 graphs (`OPSET_VERSION` in `src/mobius/_constants.py`).
+
+### Protobuf prohibition
+
+- **Zero explicit protobuf operations in this repo**
+- Never use `onnx.helper`, `onnx.TensorProto`, `onnx.ModelProto`, or any protobuf construction APIs
+- Always use `onnx_ir` APIs (`ir.Graph`, `ir.Node`, `ir.Function`, `ir.Value`, `ir.Tensor`) — `onnxscript.ir` is a deprecated alias, do not use it
+- This applies to all code: models, components, tasks, tests, utilities, and function bodies
 
 ### Comments and documentation
 
@@ -151,3 +159,5 @@ See the `adding-a-new-model` skill for the full guide.
 ### Git commits
 
 Linear commit history. Always signoff commits with --signoff.
+
+- **Write descriptive commit messages.** Title should summarize the change; body should explain what and why.

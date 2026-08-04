@@ -1,4 +1,5 @@
 model_id: "state-spaces/mamba-130m-hf"
+model_type: "mamba"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"
@@ -13,4 +14,5 @@ generation:
   max_new_tokens: 20
   do_sample: false
 
+skip_reason: "Mamba conv_state requires rank-3 tensors; weight loading fails"
 notes: "Mamba 130M. Pure state-space model (SSM) architecture, no attention."

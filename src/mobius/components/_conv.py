@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Convolution building blocks."""
 
@@ -7,11 +7,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+import onnx_ir as ir
+from onnxscript import OpBuilder, nn
 
 if TYPE_CHECKING:
-    import onnx_ir as ir
+    pass
 
 
 class Conv2d(nn.Module):
@@ -40,7 +40,7 @@ class Conv2d(nn.Module):
         self._padding = padding
         self._groups = groups
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         p = self._padding
         return op.Conv(
             x,
@@ -74,7 +74,7 @@ class Conv2dNoBias(nn.Module):
         self._padding = padding
         self._groups = groups
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         p = self._padding
         return op.Conv(
             x,
@@ -101,7 +101,7 @@ class BatchNorm2d(nn.Module):
         self.running_var = nn.Parameter((num_features,))
         self._eps = eps
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return op.BatchNormalization(
             x,
             self.weight,
@@ -130,7 +130,7 @@ class ConvTranspose2d(nn.Module):
         self._stride = stride
         self._padding = padding
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         p = self._padding
         return op.ConvTranspose(
             x,
@@ -139,4 +139,38 @@ class ConvTranspose2d(nn.Module):
             kernel_shape=[self._kernel_size, self._kernel_size],
             strides=[self._stride, self._stride],
             pads=[p, p, p, p],
+        )
+
+
+class CausalDepthwiseConv1d(nn.Module):
+    """Causal depthwise 1-D convolution (left-pad only, no bias).
+
+    Left-pads by ``kernel_size - 1`` so that each output frame depends only
+    on the current and past input frames (causal). The padding is folded into
+    the ONNX Conv ``pads`` attribute (rather than a separate Pad node) so that
+    static shape inference can propagate through the layer.
+
+    Weight layout: ``[channels, 1, kernel_size]`` (depthwise: ``groups=channels``).
+
+    Args:
+        channels: Number of input (and output) channels.
+        kernel_size: Convolution kernel size along the time axis.
+    """
+
+    def __init__(self, channels: int, kernel_size: int):
+        super().__init__()
+        self.weight = nn.Parameter([channels, 1, kernel_size])
+        self._channels = channels
+        self._kernel_size = kernel_size
+
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
+        # x: [B, C, T]
+        left_pad = self._kernel_size - 1
+        return op.Conv(
+            x,
+            self.weight,
+            kernel_shape=[self._kernel_size],
+            strides=[1],
+            pads=[left_pad, 0],  # [begin, end] on T — causal (past only)
+            group=self._channels,
         )

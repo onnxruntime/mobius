@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """GPT-2 model with absolute positional embeddings and pre-norm LayerNorm.
 
@@ -12,8 +12,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import (
@@ -22,6 +21,7 @@ from mobius.components import (
     LayerNorm,
     Linear,
     create_padding_mask,
+    create_sliding_window_mask,
 )
 from mobius.components._attention import Attention
 from mobius.models.base import CausalLMModel
@@ -57,7 +57,7 @@ class GPT2CausalLMModel(CausalLMModel):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -123,6 +123,15 @@ class GPT2CausalLMModel(CausalLMModel):
                 name = "transformer.h." + name[len("biogpt.layers.") :]
             elif name.startswith("model.layers."):
                 name = "transformer.h." + name[len("model.layers.") :]
+            # GPT-2 / OpenAI-GPT / GPT-SW3 HF safetensors omit the
+            # "transformer." prefix (e.g. "h.N.*", "wte.*", "ln_f.*").
+            # GPT-Neo and GPT-BigCode already include it.
+            # biogpt.* / model.* / output_projection.* / lm_head.* are
+            # handled separately below and must not be prefixed here.
+            elif not name.startswith(
+                ("transformer.", "biogpt.", "model.", "output_projection.", "lm_head.")
+            ):
+                name = "transformer." + name
 
             # ── 2. Top-level embedding / norm renames ────────────────────────
             # OpenAI-GPT
@@ -302,6 +311,9 @@ class _GPT2TextModel(nn.Module):
     def __init__(self, config: ArchitectureConfig, post_norm: bool = False):
         super().__init__()
         self.post_norm = post_norm
+        # Per-layer attention type ("global" vs "local") for GPT-Neo
+        self.layer_types = config.layer_types
+        self.sliding_window = config.sliding_window
         self.wte = Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
         self.wpe = Embedding(config.max_position_embeddings, config.hidden_size)
         self.h = nn.ModuleList(
@@ -310,11 +322,14 @@ class _GPT2TextModel(nn.Module):
                 for _ in range(config.num_hidden_layers)
             ]
         )
-        self.ln_f = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # OpenAI-GPT (post_norm) has no final layer norm — each decoder
+        # layer already applies post-attention and post-MLP norms.
+        if not post_norm:
+            self.ln_f = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -329,15 +344,37 @@ class _GPT2TextModel(nn.Module):
         position_embeds = self.wpe(op, position_ids)
         hidden_states = op.Add(hidden_states, position_embeds)
 
-        attention_bias = create_padding_mask(
+        # Default mask: bool padding mask (causal handled by Attention op)
+        global_mask = create_padding_mask(
             op,
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
 
+        # GPT-Neo local attention: sliding window mask for "local" layers
+        local_mask = None
+        if self.layer_types and self.sliding_window:
+            local_mask = create_sliding_window_mask(
+                op,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                window_size=self.sliding_window,
+            )
+
         present_key_values = []
         past_kvs = past_key_values or [None] * len(self.h)
-        for layer, past_kv in zip(self.h, past_kvs):
+        for i, (layer, past_kv) in enumerate(zip(self.h, past_kvs)):
+            # Select mask: local layers use sliding window, global use standard
+            if (
+                local_mask is not None
+                and self.layer_types is not None
+                and i < len(self.layer_types)
+                and self.layer_types[i] == "local"
+            ):
+                attention_bias = local_mask
+            else:
+                attention_bias = global_mask
+
             hidden_states, present_kv = layer(
                 op,
                 hidden_states=hidden_states,
@@ -377,7 +414,7 @@ class _GPT2DecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         past_key_value: tuple | None = None,

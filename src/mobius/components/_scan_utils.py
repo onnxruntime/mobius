@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Utilities for building ONNX Scan subgraphs.
 
@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import onnx_ir as ir
-from onnxscript._internal import builder
+from onnxscript import GraphBuilder
 
 from mobius._constants import OPSET_VERSION
 
@@ -25,7 +25,7 @@ def create_body_graph(
     state_inputs: Sequence[ir.Value],
     scan_inputs: Sequence[ir.Value],
     name: str = "scan_body",
-) -> tuple[ir.Graph, builder.GraphBuilder]:
+) -> tuple[ir.Graph, GraphBuilder]:
     """Create a Scan body graph and its builder.
 
     Args:
@@ -45,7 +45,7 @@ def create_body_graph(
         name=name,
         opset_imports={"": OPSET_VERSION},
     )
-    body_builder = builder.GraphBuilder(body_graph)
+    body_builder = GraphBuilder(body_graph)
     return body_graph, body_builder
 
 

@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """ModernBERT encoder and decoder models.
 
@@ -22,8 +22,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._activations import ACT2FN
@@ -61,7 +60,7 @@ class _ModernBertAttention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_mask: ir.Value,
         position_embeddings: tuple,
@@ -117,7 +116,7 @@ class _ModernBertMLP(nn.Module):
         self.Wo = Linear(config.intermediate_size, config.hidden_size, bias=config.mlp_bias)
         self._act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         gate = self._act_fn(op, self.gate_proj(op, hidden_states))
         up = self.up_proj(op, hidden_states)
         return self.Wo(op, op.Mul(gate, up))
@@ -142,7 +141,7 @@ class _ModernBertLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_mask: ir.Value,
         position_embeddings: tuple,
@@ -194,7 +193,7 @@ class ModernBertModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         token_type_ids: ir.Value,  # Unused but required by feature-extraction task
@@ -331,7 +330,7 @@ class _ModernBertDecoderTextModel(_TextModel):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value | None,
         position_ids: ir.Value,
@@ -366,7 +365,7 @@ class _ModernBertDecoderLMHead(nn.Module):
         self.norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.decoder = Linear(config.hidden_size, config.vocab_size, bias=True)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value) -> ir.Value:
+    def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
         # dense → norm → decoder projection with vocab bias
         hidden_states = self.dense(op, hidden_states)
         hidden_states = self.norm(op, hidden_states)

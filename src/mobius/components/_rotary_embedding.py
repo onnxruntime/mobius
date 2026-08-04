@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 from __future__ import annotations
 
@@ -7,15 +7,17 @@ import math
 
 import numpy as np
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._common import INT64_MAX
 
 
 def _get_default_inv_freq(config: ArchitectureConfig) -> np.ndarray:
-    dim = int(config.head_dim * config.partial_rotary_factor)
+    # For MLA models (MiniCPM3, DeepSeek-V2), rope applies only to the
+    # qk_rope portion — use qk_rope_head_dim instead of full head_dim.
+    rope_head_dim = config.qk_rope_head_dim or config.head_dim
+    dim = int(rope_head_dim * config.partial_rotary_factor)
     return 1.0 / (config.rope_theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
 
 
@@ -32,7 +34,7 @@ def _get_cos_sin_cache(
     )
 
 
-def get_rotary_pos_emb(op: builder.OpBuilder, position_ids, cos_cache, sin_cache):
+def get_rotary_pos_emb(op: OpBuilder, position_ids, cos_cache, sin_cache):
     """Retrieve cos/sin positional embeddings based on position IDs.
 
     Uses Gather to look up the embeddings for the given position IDs.
@@ -52,7 +54,7 @@ def get_rotary_pos_emb(op: builder.OpBuilder, position_ids, cos_cache, sin_cache
 
 
 def apply_rotary_pos_emb(
-    op: builder.OpBuilder,
+    op: OpBuilder,
     x,
     position_embeddings: tuple,
     num_heads: int,
@@ -61,14 +63,17 @@ def apply_rotary_pos_emb(
 ):
     """Apply Rotary Positional Embedding (RoPE) to the input.
 
-    Uses the ONNX opset 23 ``RotaryEmbedding`` op with pre-gathered
+    Uses the ONNX opset 24 ``RotaryEmbedding`` op with pre-gathered
     cos/sin embeddings (3D tensors without position_ids).
 
     Args:
         op: The OpBuilder.
         x: Input tensor of shape ``(batch_size, seq_length, num_heads * head_dim)``.
-        position_embeddings: Tuple of ``(cos, sin)`` embeddings, each
-            ``(batch_size, seq_length, rotary_dim)``.
+        position_embeddings: Tuple of ``(cos, sin)`` or ``(cos, sin, attn_scale)``
+            embeddings. The cos/sin tensors have shape
+            ``(batch_size, seq_length, rotary_dim)``. The optional attn_scale
+            (used by Ministral3/Mistral4) is not consumed here — it is applied
+            separately in the attention module after RoPE.
         num_heads: Number of attention heads.
         rotary_embedding_dim: Dimension for partial RoPE (0 = full embedding).
         interleaved: If True, use interleaved RoPE layout where real/imag
@@ -78,7 +83,7 @@ def apply_rotary_pos_emb(
     Returns:
         Tensor with RoPE applied, same shape as input.
     """
-    cos, sin = position_embeddings
+    cos, sin = position_embeddings[0], position_embeddings[1]
     return op.RotaryEmbedding(
         x,
         cos,
@@ -90,10 +95,31 @@ def apply_rotary_pos_emb(
 
 
 class BaseRope(nn.Module):
-    """Base class for rotary position embeddings."""
+    """Base class for rotary position embeddings.
 
-    def __init__(self, cos_cache_data: np.ndarray, sin_cache_data: np.ndarray):
+    Subclasses that accept an ``ArchitectureConfig`` should pass
+    ``dtype=config.dtype`` to ``super().__init__()`` so that cos/sin
+    embeddings are cast to the model compute dtype.
+
+    Args:
+        cos_cache_data: Precomputed cosine cache (numpy float32).
+        sin_cache_data: Precomputed sine cache (numpy float32).
+        dtype: Model compute dtype. When not FP32, a Cast is inserted
+            after gathering cos/sin embeddings so that the
+            ``RotaryEmbedding`` op receives inputs with matching types.
+            The cache itself stays FP32 for precision; only the gathered
+            per-position embeddings are cast.
+    """
+
+    def __init__(
+        self,
+        cos_cache_data: np.ndarray,
+        sin_cache_data: np.ndarray,
+        *,
+        dtype: ir.DataType = ir.DataType.FLOAT,
+    ):
         super().__init__()
+        self._dtype = dtype
         self.cos_cache = nn.Parameter(
             list(cos_cache_data.shape),
             name="cos_cache",
@@ -105,15 +131,75 @@ class BaseRope(nn.Module):
             data=ir.tensor(sin_cache_data),
         )
 
-    def forward(self, op: builder.OpBuilder, position_ids: ir.Value):
-        return get_rotary_pos_emb(op, position_ids, self.cos_cache, self.sin_cache)
+    def _cast_embeddings(
+        self,
+        op: OpBuilder,
+        cos: ir.Value,
+        sin: ir.Value,
+    ) -> tuple[ir.Value, ir.Value]:
+        """Cast cos/sin embeddings to model dtype if needed.
+
+        The RotaryEmbedding op requires all tensor inputs to share the
+        same type ``T``.  Since caches are stored in FP32, a Cast is
+        needed when the model uses FP16 or BF16.
+        """
+        if self._dtype != ir.DataType.FLOAT:
+            cos = op.Cast(cos, to=self._dtype)
+            sin = op.Cast(sin, to=self._dtype)
+        return cos, sin
+
+    def forward(self, op: OpBuilder, position_ids: ir.Value):
+        cos, sin = get_rotary_pos_emb(op, position_ids, self.cos_cache, self.sin_cache)
+        return self._cast_embeddings(op, cos, sin)
 
 
 class DefaultRope(BaseRope):
     def __init__(self, config: ArchitectureConfig):
         inv_freq = _get_default_inv_freq(config)
         cos_cache, sin_cache = _get_cos_sin_cache(config.max_position_embeddings, inv_freq)
-        super().__init__(cos_cache, sin_cache)
+        super().__init__(cos_cache, sin_cache, dtype=config.dtype)
+
+
+class ProportionalRope(BaseRope):
+    """Proportional RoPE as used in Gemma4 full-attention layers.
+
+    Matches HuggingFace ``_compute_proportional_rope_parameters``: the
+    inv_freq table is padded with zeros to ``head_dim // 2`` so that the
+    cos/sin cache has shape ``[max_pos, head_dim]``.  Applying this with
+    ``rotary_embedding_dim=0`` (full head) gives the same result as HF's
+    ``apply_rotary_pos_emb`` with ``rotate_half`` over the full head:
+    - dims 0 .. rope_angles*2-1 actually rotate (non-zero frequencies)
+    - remaining dims map to cos=1, sin=0 → identity transform
+
+    The key difference from ``DefaultRope`` with partial_rotary_factor:
+    ``DefaultRope`` pairs dims {0..k-1} with {k..2k-1} (compact block).
+    ``ProportionalRope`` pairs dims {0..k-1} with {head_dim//2..head_dim//2+k-1}
+    (split-half convention over the full head), matching HF's ``rotate_half``.
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        head_dim = config.head_dim
+        rope_proportion = config.partial_rotary_factor
+        rope_theta = config.rope_theta
+
+        # Number of rotation pairs: e.g. int(0.25 * 512 // 2) = 64 for Gemma4
+        rope_angles = int(rope_proportion * head_dim // 2)
+        inv_freq_rotated = 1.0 / (
+            rope_theta ** (np.arange(0, 2 * rope_angles, 2, dtype=np.float32) / head_dim)
+        )  # shape [rope_angles]
+
+        # Pad with zeros so inv_freq covers the full head_dim // 2
+        nope_angles = head_dim // 2 - rope_angles
+        if nope_angles > 0:
+            inv_freq = np.concatenate(
+                [inv_freq_rotated, np.zeros(nope_angles, dtype=np.float32)]
+            )  # shape [head_dim // 2]
+        else:
+            inv_freq = inv_freq_rotated
+
+        # cos/sin cache shape: [max_pos, head_dim] (emb = cat([freqs, freqs]))
+        cos_cache, sin_cache = _get_cos_sin_cache(config.max_position_embeddings, inv_freq)
+        super().__init__(cos_cache, sin_cache, dtype=config.dtype)
 
 
 class LinearRope(BaseRope):
@@ -121,7 +207,7 @@ class LinearRope(BaseRope):
         inv_freq = _get_default_inv_freq(config)
         inv_freq = inv_freq / config.rope_scaling["factor"]
         cos_cache, sin_cache = _get_cos_sin_cache(config.max_position_embeddings, inv_freq)
-        super().__init__(cos_cache, sin_cache)
+        super().__init__(cos_cache, sin_cache, dtype=config.dtype)
 
 
 class DynamicNTKRope(BaseRope):
@@ -132,16 +218,22 @@ class DynamicNTKRope(BaseRope):
     This spreads frequencies more evenly across the extended context,
     preserving the model's positional inductive bias better than linear
     scaling for long-context extrapolation.
+
+    HunyuanV1 uses ``alpha`` instead of ``factor`` for the scaling
+    exponent (same formula, different config key). When ``alpha`` is
+    present in ``rope_scaling``, it takes precedence over ``factor``.
     """
 
     def __init__(self, config: ArchitectureConfig):
         dim = int(config.head_dim * config.partial_rotary_factor)
-        factor = config.rope_scaling["factor"]
+        # HunyuanV1 uses "alpha" as the scaling factor; standard
+        # dynamic NTK uses "factor". Prefer alpha when present.
+        scaling = config.rope_scaling.get("alpha") or config.rope_scaling["factor"]
         # NTK-aware base scaling
-        new_theta = config.rope_theta * (factor ** (dim / (dim - 2)))
+        new_theta = config.rope_theta * (scaling ** (dim / (dim - 2)))
         inv_freq = 1.0 / (new_theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
         cos_cache, sin_cache = _get_cos_sin_cache(config.max_position_embeddings, inv_freq)
-        super().__init__(cos_cache, sin_cache)
+        super().__init__(cos_cache, sin_cache, dtype=config.dtype)
 
 
 class Llama3Rope(BaseRope):
@@ -170,7 +262,7 @@ class Llama3Rope(BaseRope):
         cos_cache, sin_cache = _get_cos_sin_cache(
             config.max_position_embeddings, inv_freq_llama
         )
-        super().__init__(cos_cache, sin_cache)
+        super().__init__(cos_cache, sin_cache, dtype=config.dtype)
 
 
 class LongRope(BaseRope):
@@ -196,7 +288,7 @@ class LongRope(BaseRope):
             original_max_pos, inv_freq / short_factor, attention_factor
         )
         if not self.has_long_cache:
-            super().__init__(short_cos, short_sin)
+            super().__init__(short_cos, short_sin, dtype=config.dtype)
             return
 
         long_cos, long_sin = _get_cos_sin_cache(
@@ -206,9 +298,9 @@ class LongRope(BaseRope):
         )
         cos_cache = np.concatenate([short_cos, long_cos], axis=0)
         sin_cache = np.concatenate([short_sin, long_sin], axis=0)
-        super().__init__(cos_cache, sin_cache)
+        super().__init__(cos_cache, sin_cache, dtype=config.dtype)
 
-    def forward(self, op: builder.OpBuilder, position_ids: ir.Value):
+    def forward(self, op: OpBuilder, position_ids: ir.Value):
         if self.has_long_cache:
             max_pos = op.ReduceMax(position_ids, keepdims=False)
             use_long = op.Cast(
@@ -217,14 +309,20 @@ class LongRope(BaseRope):
             )
             offset = op.Mul(use_long, self.original_max_position_embeddings)
             position_ids = op.Add(position_ids, offset)
-        return get_rotary_pos_emb(op, position_ids, self.cos_cache, self.sin_cache)
+        cos, sin = get_rotary_pos_emb(op, position_ids, self.cos_cache, self.sin_cache)
+        return self._cast_embeddings(op, cos, sin)
 
 
 class YarnRope(BaseRope):
     """YaRN (Yet another RoPE extensioN) rotary embeddings.
 
-    Used by DeepSeek-V2/V3. Blends interpolated and extrapolated
-    frequencies with a linear ramp, and applies mscale attention factor.
+    Used by DeepSeek-V2/V3 and Ministral3 (Pixtral). Blends interpolated
+    and extrapolated frequencies with a linear ramp, and applies mscale
+    attention factor.
+
+    For Ministral3/Mistral4 models with ``llama_4_scaling_beta`` in
+    rope_scaling, ``forward()`` returns a 3-tuple ``(cos, sin, attn_scale)``
+    where ``attn_scale`` is a position-dependent query scaling factor.
 
     Reference: https://huggingface.co/papers/2309.00071
     """
@@ -289,7 +387,33 @@ class YarnRope(BaseRope):
         cos_cache, sin_cache = _get_cos_sin_cache(
             config.max_position_embeddings, inv_freq, attention_factor
         )
-        super().__init__(cos_cache, sin_cache)
+        super().__init__(cos_cache, sin_cache, dtype=config.dtype)
+
+        # Store llama_4_scaling_beta for Ministral3 position-dependent query scaling.
+        # When set, forward() returns (cos, sin, attn_scale) instead of (cos, sin).
+        self._llama4_beta = rope_scaling.get("llama_4_scaling_beta")
+        self._llama4_original_max_pos = float(original_max_pos)
+
+    def forward(self, op: OpBuilder, position_ids: ir.Value):
+        cos, sin = get_rotary_pos_emb(op, position_ids, self.cos_cache, self.sin_cache)
+        cos, sin = self._cast_embeddings(op, cos, sin)
+        if self._llama4_beta is None:
+            return cos, sin
+
+        # Compute position-dependent attention scale for Ministral3/Mistral4:
+        #   scale = 1 + beta * log(1 + floor(position_ids / original_max_pos))
+        # For pos < original_max_pos: floor(pos / max) = 0 → scale = 1.0
+        # Computed in FP32 for precision, then cast to match model dtype.
+        pos_float = op.Cast(position_ids, to=ir.DataType.FLOAT)
+        floored = op.Floor(op.Div(pos_float, float(self._llama4_original_max_pos)))
+        log_term = op.Log(op.Add(floored, 1.0))
+        attn_scale = op.Add(op.Mul(log_term, float(self._llama4_beta)), 1.0)
+        # Cast to match model compute dtype
+        if self._dtype != ir.DataType.FLOAT:
+            attn_scale = op.Cast(attn_scale, to=self._dtype)
+        # Unsqueeze to [batch, seq_len, 1] for broadcasting with 3D query states
+        attn_scale = op.Unsqueeze(attn_scale, [-1])
+        return (cos, sin, attn_scale)
 
 
 class _MRopeBase(BaseRope):
@@ -311,7 +435,7 @@ class _MRopeBase(BaseRope):
     ):
         inv_freq = _get_default_inv_freq(config)
         cos_cache, sin_cache = _get_cos_sin_cache(config.max_position_embeddings, inv_freq)
-        super().__init__(cos_cache, sin_cache)
+        super().__init__(cos_cache, sin_cache, dtype=config.dtype)
 
         rotary_dim = len(inv_freq)
         self.h_mask = nn.Parameter(
@@ -325,7 +449,7 @@ class _MRopeBase(BaseRope):
             data=ir.tensor(w_mask),
         )
 
-    def forward(self, op: builder.OpBuilder, position_ids: ir.Value):
+    def forward(self, op: OpBuilder, position_ids: ir.Value):
         """Compute MRoPE cos/sin embeddings.
 
         Args:
@@ -374,7 +498,7 @@ class _MRopeBase(BaseRope):
         sin = op.Where(self.h_mask, sin_h, sin_t)
         sin = op.Where(self.w_mask, sin_w, sin)
 
-        return cos, sin
+        return self._cast_embeddings(op, cos, sin)
 
 
 class ChunkedMRope(_MRopeBase):
@@ -441,14 +565,28 @@ class InterleavedMRope(_MRopeBase):
         super().__init__(config, h_mask, w_mask)
 
 
-def initialize_rope(config: ArchitectureConfig) -> nn.Module:
-    """Factory function to create the appropriate RoPE variant."""
+def initialize_rope(config: ArchitectureConfig) -> nn.Module | None:
+    """Factory function to create the appropriate RoPE variant.
+
+    Returns ``None`` when the model does not use RoPE at all — detected by
+    the absence of both ``config.mrope_section`` (multimodal RoPE signal)
+    and ``config.rope_type`` (standard RoPE signal).
+    :meth:`ArchitectureConfig.from_transformers` populates ``rope_type`` as
+    ``None`` when the source HuggingFace config has no ``rope_parameters`` /
+    ``rope_scaling`` / legacy rotary fields. Callers (e.g. :class:`TextModel`)
+    must handle the ``None`` return by passing ``position_embeddings=None``
+    to every attention layer.
+    """
     if config.mrope_section is not None:
         if config.mrope_interleaved:
             return InterleavedMRope(config)
         return ChunkedMRope(config)
+    if config.rope_type is None:
+        return None
     if config.rope_type == "default":
         return DefaultRope(config)
+    if config.rope_type == "proportional":
+        return ProportionalRope(config)
     if config.rope_type == "linear":
         return LinearRope(config)
     if config.rope_type == "dynamic":

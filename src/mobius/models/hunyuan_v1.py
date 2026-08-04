@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """HunYuan V1 Dense causal language model.
 
@@ -19,6 +19,7 @@ import dataclasses
 import torch
 
 from mobius._configs import ArchitectureConfig
+from mobius._weight_utils import rename_weight_keys
 from mobius.models.base import CausalLMModel
 
 
@@ -42,9 +43,10 @@ class HunYuanV1DenseCausalLMModel(CausalLMModel):
         state_dict = super().preprocess_weights(state_dict)
         # HF uses .query_layernorm. / .key_layernorm.;
         # ONNX Attention uses .q_norm. / .k_norm.
-        return {
-            k.replace(".query_layernorm.", ".q_norm.").replace(
-                ".key_layernorm.", ".k_norm."
-            ): v
-            for k, v in state_dict.items()
-        }
+        return rename_weight_keys(
+            state_dict,
+            [
+                (".query_layernorm.", ".q_norm."),
+                (".key_layernorm.", ".k_norm."),
+            ],
+        )

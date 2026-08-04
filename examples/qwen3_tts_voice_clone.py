@@ -1,6 +1,6 @@
 #!/usr/bin/env python
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Qwen3-TTS voice cloning: record your voice, then speak as you.
 
@@ -15,7 +15,7 @@ Architecture:
 
 Prerequisites::
 
-    pip install mobius-ai[transformers] sounddevice soundfile librosa
+    pip install mobius-onnx[transformers] sounddevice soundfile librosa
 
 Usage::
 

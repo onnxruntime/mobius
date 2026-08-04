@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 __all__ = [
     "AdaLayerNormOutput",
@@ -7,11 +7,11 @@ __all__ = [
     "Attention",
     "BatchNorm2d",
     "BertEmbeddings",
+    "BlockQuantizedLinear",
     "CausalConv1d",
     "CausalConvNd",
+    "CausalDepthwiseConv1d",
     "CausalTransConv1d",
-    "CodecDecoderTransformerModel",
-    "CodecEncoderTransformerModel",
     "ConformerEncoder",
     "Conv1d",
     "Conv2d",
@@ -21,7 +21,6 @@ __all__ = [
     "DecoderBlock",
     "DecoderLayer",
     "DecoderResidualUnit",
-    "DeepSeekMLA",
     "DiffusionFFN",
     "DiffusionSelfAttention",
     "Embedding",
@@ -29,54 +28,33 @@ __all__ = [
     "EncoderDecoderAttention",
     "EncoderLayer",
     "FCMLP",
+    "FusedGateUpMLP",
     "GatedDeltaNet",
+    "GatedMLP",
     "GatedRMSNorm",
-    "Gemma3MultiModalProjector",
+    "ClippableLinear",
     "GroupNorm",
+    "GQAContext",
     "INT64_MAX",
     "InputMixer",
-    "JambaSelectiveScan",
     "LayerNorm",
     "LayerNormNoAffine",
     "LayerNormNoBias",
     "OffsetLayerNorm",
     "LayerScale",
-    "LightningAttention",
     "Linear",
     "LinearMultiModalProjector",
     "LoRALinear",
     "MLP",
     "MLPMultiModalProjector",
-    "Mamba2Block",
-    "Mamba2Scan",
-    "MambaBlock",
     "MoELayer",
     "OffsetRMSNorm",
     "PatchEmbed",
     "PatchEmbedding",
     "PostGatedRMSNorm",
     "PostNormDecoderLayer",
-    "QFormer",
-    "QFormerAttention",
-    "QFormerLayer",
+    "QuantizedEmbedding",
     "QuantizedLinear",
-    "Qwen25VLPatchEmbed",
-    "Qwen25VLPatchMerger",
-    "Qwen25VLVisionAttention",
-    "Qwen25VLVisionBlock",
-    "Qwen25VLVisionMLP",
-    "Qwen25VLVisionModel",
-    "Qwen25VLVisionRotaryEmbedding",
-    "Qwen35Attention",
-    "Qwen3ASRAudioAttention",
-    "Qwen3ASRAudioEncoderLayer",
-    "Qwen3VLPatchEmbed",
-    "Qwen3VLPatchMerger",
-    "Qwen3VLVisionAttention",
-    "Qwen3VLVisionBlock",
-    "Qwen3VLVisionMLP",
-    "Qwen3VLVisionModel",
-    "Qwen3VLVisionRotaryEmbedding",
     "RMSNorm",
     "SelectiveScan",
     "SiLU",
@@ -88,18 +66,18 @@ __all__ = [
     "SplitResidualVectorQuantizer",
     "StaticCacheState",
     "TimestepEmbedding",
+    "TiedQuantizedLMHead",
     "TopKGate",
     "VisionAttention",
     "VisionEncoder",
     "VisionEncoderLayer",
     "VisionModel",
-    "WhisperAttention",
-    "WhisperDecoderLayer",
-    "WhisperEncoderLayer",
     "apply_rms_norm",
     "create_attention_bias",
     "create_decoder_layer",
     "create_padding_mask",
+    "create_sliding_window_mask",
+    "create_static_cache_attention_bias",
     "get_activation",
     "initialize_rope",
     "make_quantized_linear_factory",
@@ -108,8 +86,11 @@ __all__ = [
 from mobius.components._activations import SiLU, get_activation
 from mobius.components._attention import (
     Attention,
-    Qwen35Attention,
+    GQAContext,
     StaticCacheState,
+)
+from mobius.components._attention import (
+    Qwen35Attention as Qwen35Attention,
 )
 from mobius.components._audio import ConformerEncoder
 from mobius.components._codec_conv import (
@@ -123,8 +104,10 @@ from mobius.components._codec_conv import (
     SnakeBeta,
 )
 from mobius.components._codec_transformer import (
-    CodecDecoderTransformerModel,
-    CodecEncoderTransformerModel,
+    CodecDecoderTransformerModel as CodecDecoderTransformerModel,
+)
+from mobius.components._codec_transformer import (
+    CodecEncoderTransformerModel as CodecEncoderTransformerModel,
 )
 from mobius.components._codec_vq import SplitResidualVectorQuantizer
 from mobius.components._common import (
@@ -138,9 +121,12 @@ from mobius.components._common import (
     OffsetLayerNorm,
     create_attention_bias,
     create_padding_mask,
+    create_sliding_window_mask,
+    create_static_cache_attention_bias,
 )
 from mobius.components._conv import (
     BatchNorm2d,
+    CausalDepthwiseConv1d,
     Conv2d,
     Conv2dNoBias,
     ConvTranspose2d,
@@ -150,7 +136,7 @@ from mobius.components._decoder import (
     PostNormDecoderLayer,
     create_decoder_layer,
 )
-from mobius.components._deepseek_mla import DeepSeekMLA
+from mobius.components._deepseek_mla import DeepSeekMLA as DeepSeekMLA
 from mobius.components._diffusion import (
     AdaLayerNormOutput,
     AdaLayerNormZero,
@@ -169,10 +155,13 @@ from mobius.components._encoder_decoder_attention import (
     EncoderDecoderAttention,
 )
 from mobius.components._gated_deltanet import GatedDeltaNet
-from mobius.components._lightning_attention import LightningAttention
+from mobius.components._gemma4_audio import ClippableLinear
+from mobius.components._gemma4_audio import Gemma4AudioEncoder as Gemma4AudioEncoder
+from mobius.components._lightning_attention import LightningAttention as LightningAttention
 from mobius.components._lora import LoRALinear
-from mobius.components._mamba_block import Mamba2Block, MambaBlock
-from mobius.components._mlp import FCMLP, MLP
+from mobius.components._mamba_block import Mamba2Block as Mamba2Block
+from mobius.components._mamba_block import MambaBlock as MambaBlock
+from mobius.components._mlp import FCMLP, MLP, FusedGateUpMLP, GatedMLP
 from mobius.components._moe import (
     MoELayer,
     SigmoidTopKGate,
@@ -181,41 +170,82 @@ from mobius.components._moe import (
     TopKGate,
 )
 from mobius.components._multimodal import (
-    Gemma3MultiModalProjector,
+    Gemma3MultiModalProjector as Gemma3MultiModalProjector,
+)
+from mobius.components._multimodal import (
     InputMixer,
     LinearMultiModalProjector,
     MLPMultiModalProjector,
 )
+from mobius.components._pixtral_vision import (
+    Mistral3MultiModalProjector as Mistral3MultiModalProjector,
+)
+from mobius.components._pixtral_vision import (
+    PixtralVisionTower as PixtralVisionTower,
+)
 from mobius.components._qformer import (
-    QFormer,
-    QFormerAttention,
-    QFormerLayer,
+    QFormer as QFormer,
+)
+from mobius.components._qformer import (
+    QFormerAttention as QFormerAttention,
+)
+from mobius.components._qformer import (
+    QFormerLayer as QFormerLayer,
 )
 from mobius.components._quantized_linear import (
+    BlockQuantizedLinear,
+    QuantizedEmbedding,
     QuantizedLinear,
+    TiedQuantizedLMHead,
     make_quantized_linear_factory,
 )
 from mobius.components._qwen3_asr_audio import (
-    Qwen3ASRAudioAttention,
-    Qwen3ASRAudioEncoderLayer,
+    Qwen3ASRAudioAttention as Qwen3ASRAudioAttention,
+)
+from mobius.components._qwen3_asr_audio import (
+    Qwen3ASRAudioEncoderLayer as Qwen3ASRAudioEncoderLayer,
 )
 from mobius.components._qwen3_vl_vision import (
-    Qwen3VLPatchEmbed,
-    Qwen3VLPatchMerger,
-    Qwen3VLVisionAttention,
-    Qwen3VLVisionBlock,
-    Qwen3VLVisionMLP,
-    Qwen3VLVisionModel,
-    Qwen3VLVisionRotaryEmbedding,
+    Qwen3VLPatchEmbed as Qwen3VLPatchEmbed,
+)
+from mobius.components._qwen3_vl_vision import (
+    Qwen3VLPatchMerger as Qwen3VLPatchMerger,
+)
+from mobius.components._qwen3_vl_vision import (
+    Qwen3VLVisionAttention as Qwen3VLVisionAttention,
+)
+from mobius.components._qwen3_vl_vision import (
+    Qwen3VLVisionBlock as Qwen3VLVisionBlock,
+)
+from mobius.components._qwen3_vl_vision import (
+    Qwen3VLVisionModel as Qwen3VLVisionModel,
+)
+from mobius.components._qwen3_vl_vision import (
+    Qwen3VLVisionRotaryEmbedding as Qwen3VLVisionRotaryEmbedding,
 )
 from mobius.components._qwen25_vl_vision import (
-    Qwen25VLPatchEmbed,
-    Qwen25VLPatchMerger,
-    Qwen25VLVisionAttention,
-    Qwen25VLVisionBlock,
-    Qwen25VLVisionMLP,
-    Qwen25VLVisionModel,
-    Qwen25VLVisionRotaryEmbedding,
+    Qwen2VLVisionBlock as Qwen2VLVisionBlock,
+)
+from mobius.components._qwen25_vl_vision import (
+    Qwen2VLVisionModel as Qwen2VLVisionModel,
+)
+from mobius.components._qwen25_vl_vision import (
+    Qwen25VLPatchEmbed as Qwen25VLPatchEmbed,
+)
+from mobius.components._qwen25_vl_vision import (
+    Qwen25VLPatchMerger as Qwen25VLPatchMerger,
+)
+from mobius.components._qwen25_vl_vision import (
+    Qwen25VLVisionAttention as Qwen25VLVisionAttention,
+)
+from mobius.components._qwen25_vl_vision import (
+    Qwen25VLVisionBlock as Qwen25VLVisionBlock,
+)
+from mobius.components._qwen25_vl_vision import (
+    Qwen25VLVisionModel as Qwen25VLVisionModel,
+)
+from mobius.components._qwen25_vl_vision import (
+    Qwen25VLVisionRotaryEmbedding as Qwen25VLVisionRotaryEmbedding,
 )
 from mobius.components._rms_norm import (
     GatedRMSNorm,
@@ -225,9 +255,19 @@ from mobius.components._rms_norm import (
     apply_rms_norm,
 )
 from mobius.components._rotary_embedding import initialize_rope
+from mobius.components._sanm_attention import (
+    SANMFFN as SANMFFN,
+)
+from mobius.components._sanm_attention import (
+    SANMAttention as SANMAttention,
+)
+from mobius.components._sanm_attention import (
+    SANMEncoderLayer as SANMEncoderLayer,
+)
 from mobius.components._ssm import (
-    JambaSelectiveScan,
-    Mamba2Scan,
+    JambaSelectiveScan as JambaSelectiveScan,
+)
+from mobius.components._ssm import (
     SelectiveScan,
 )
 from mobius.components._vision import (
@@ -239,7 +279,13 @@ from mobius.components._vision import (
 )
 from mobius.components._whisper import (
     Conv1d,
-    WhisperAttention,
-    WhisperDecoderLayer,
-    WhisperEncoderLayer,
+)
+from mobius.components._whisper import (
+    WhisperAttention as WhisperAttention,
+)
+from mobius.components._whisper import (
+    WhisperDecoderLayer as WhisperDecoderLayer,
+)
+from mobius.components._whisper import (
+    WhisperEncoderLayer as WhisperEncoderLayer,
 )

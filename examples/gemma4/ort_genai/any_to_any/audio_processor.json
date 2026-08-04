@@ -1,0 +1,12 @@
+{
+    "processor": {
+        "name": "gemma4_audio_processor",
+        "sample_rate": 16000,
+        "num_mel_bins": 128,
+        "frame_length_ms": 20,
+        "frame_step_ms": 10,
+        "fft_size": 512,
+        "mel_floor": 0.001,
+        "mel_upper_hertz": 8000
+    }
+}

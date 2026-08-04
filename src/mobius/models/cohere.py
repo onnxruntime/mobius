@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Cohere and Cohere2 causal language models.
 
@@ -22,8 +22,7 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import MLP, Attention, LayerNorm, LayerNormNoBias, StaticCacheState
@@ -49,7 +48,7 @@ class _CohereDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | None,
         position_embeddings: tuple,
@@ -114,7 +113,7 @@ class CohereCausalLMModel(LayerNormCausalLMModel):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value | None,
         position_ids: ir.Value,
@@ -127,7 +126,5 @@ class CohereCausalLMModel(LayerNormCausalLMModel):
             # Scale logits by the model's configured logit_scale scalar
             # (HF default: 0.0625 = 1/16 for all Cohere models).
             # CastLike ensures the constant matches logits dtype (fp16/bf16/fp32).
-            logits = op.Mul(
-                logits, op.CastLike(op.Constant(value_float=float(self.logit_scale)), logits)
-            )
+            logits = op.Mul(logits, op.CastLike(float(self.logit_scale), logits))
         return logits, present_key_values

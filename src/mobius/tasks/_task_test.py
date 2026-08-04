@@ -1,11 +1,12 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Tests for task classes.
 
 Covers: CausalLM, VisionLanguage, Seq2Seq, Denoising, VAE,
 FeatureExtraction, ImageClassification, SSM, SSM2, AudioFeatureExtraction,
-ObjectDetection, SpeechToText.
+ObjectDetection, SpeechToText, and shared builder helpers
+(build_decoder_from_embeds, build_embedding_from_features).
 """
 
 from __future__ import annotations
@@ -33,6 +34,8 @@ from mobius.tasks import (
     SSMCausalLMTask,
     VAETask,
     VisionLanguageTask,
+    build_decoder_from_embeds,
+    build_embedding_from_features,
     get_task,
 )
 
@@ -87,6 +90,38 @@ class TestCausalLMTask:
         assert "logits" in output_names
         assert "present.0.key" in output_names
         assert "present.0.value" in output_names
+
+    def test_present_outputs_match_past_inputs(self):
+        """present.{i}.* must match the corresponding past_key_values.{i}.* inputs.
+
+        They must declare the same kv_heads/head_dim/dtype as the corresponding
+        past_key_values.{i}.* inputs, with total (past+current) sequence length.
+        Guards the GQA present-head_dim export bug, where the contrib-op shape
+        inference would otherwise mis-declare head_dim.
+        """
+        config = make_config()
+        module = CausalLMModel(config)
+        pkg = CausalLMTask().build(module, config)
+        model = pkg["model"]
+        inputs = {v.name: v for v in model.graph.inputs}
+        outputs = {v.name: v for v in model.graph.outputs}
+
+        def dims(value):
+            return [d if isinstance(d, int) else str(d) for d in value.shape]
+
+        for i in range(config.num_hidden_layers):
+            for kind in ("key", "value"):
+                past = inputs[f"past_key_values.{i}.{kind}"]
+                present = outputs[f"present.{i}.{kind}"]
+                past_dims = dims(past)
+                present_dims = dims(present)
+                # batch, kv_heads, head_dim must match the past input exactly.
+                assert present_dims[0] == past_dims[0]
+                assert present_dims[1] == past_dims[1]
+                assert present_dims[3] == past_dims[3]
+                # present covers past + current tokens.
+                assert present_dims[2] == "past_sequence_len + sequence_len"
+                assert present.dtype == past.dtype
 
     def test_build_producer_info(self):
         config = make_config()
@@ -171,7 +206,7 @@ class TestVisionLanguageTask:
         task = VisionLanguageTask()
         pkg = task.build(module, config)
         assert isinstance(pkg, ModelPackage)
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
 
     def test_decoder_has_inputs_embeds(self):
         config = _make_multimodal_config()
@@ -209,7 +244,7 @@ class TestVisionLanguageTask:
         module = Gemma3MultiModalModel(config)
         task = VisionLanguageTask()
         pkg = task.build(module, config)
-        vision = pkg["vision"]
+        vision = pkg["vision_encoder"]
         input_names = [v.name for v in vision.graph.inputs]
         assert "pixel_values" in input_names
         output_names = [v.name for v in vision.graph.outputs]
@@ -932,3 +967,447 @@ class TestSpeechToTextTask:
         assert "logits" in output_names
         assert "present.0.key" in output_names
         assert "present.0.value" in output_names
+
+
+# ── build_decoder_from_embeds ─────────────────────────────────────────────
+
+
+class TestBuildDecoderFromEmbeds:
+    """Smoke tests for the shared build_decoder_from_embeds helper."""
+
+    def _make_decoder_module(self):
+        from mobius.models.gemma3 import Gemma3MultiModalModel
+
+        config = _make_multimodal_config()
+        module = Gemma3MultiModalModel(config)
+        return config, module.decoder
+
+    def test_returns_ir_model(self):
+        config, decoder = self._make_decoder_module()
+        model = build_decoder_from_embeds(decoder, config)
+        assert isinstance(model, ir.Model)
+
+    def test_graph_name_is_decoder(self):
+        config, decoder = self._make_decoder_module()
+        model = build_decoder_from_embeds(decoder, config)
+        # name= arg removed; builder overrides graph.name with model_id anyway
+        assert model.graph.name == "main_graph"
+
+    def test_inputs_include_inputs_embeds_and_kv_cache(self):
+        config, decoder = self._make_decoder_module()
+        model = build_decoder_from_embeds(decoder, config)
+        input_names = {v.name for v in model.graph.inputs}
+        assert "inputs_embeds" in input_names
+        assert "attention_mask" in input_names
+        assert "position_ids" in input_names
+        assert "past_key_values.0.key" in input_names
+
+    def test_outputs_include_logits_and_kv_cache(self):
+        config, decoder = self._make_decoder_module()
+        model = build_decoder_from_embeds(decoder, config)
+        output_names = {v.name for v in model.graph.outputs}
+        assert "logits" in output_names
+        assert "present.0.key" in output_names
+
+    def test_mrope_position_ids_are_3d(self):
+        config, decoder = self._make_decoder_module()
+        model = build_decoder_from_embeds(decoder, config, mrope=True)
+        pos_ids = next(v for v in model.graph.inputs if v.name == "position_ids")
+        # MRoPE shape: [3, batch, seq_len]
+        assert pos_ids.shape is not None
+        assert pos_ids.shape[0] == 3
+
+
+# ── build_embedding_from_features ─────────────────────────────────────────
+
+
+class TestBuildEmbeddingFromFeatures:
+    """Smoke tests for the shared build_embedding_from_features helper."""
+
+    def _make_embedding_module(self):
+        from mobius.models.gemma3 import Gemma3MultiModalModel
+
+        config = _make_multimodal_config()
+        module = Gemma3MultiModalModel(config)
+        return config, module.embedding
+
+    def test_returns_ir_model(self):
+        config, embedding = self._make_embedding_module()
+        model = build_embedding_from_features(
+            embedding, config, feature_name="image_features", feature_dim=config.hidden_size
+        )
+        assert isinstance(model, ir.Model)
+
+    def test_graph_name_is_embedding(self):
+        config, embedding = self._make_embedding_module()
+        model = build_embedding_from_features(
+            embedding, config, feature_name="image_features", feature_dim=config.hidden_size
+        )
+        assert model.graph.name == "embedding"
+
+    def test_inputs_include_input_ids_and_features(self):
+        config, embedding = self._make_embedding_module()
+        model = build_embedding_from_features(
+            embedding, config, feature_name="image_features", feature_dim=config.hidden_size
+        )
+        input_names = {v.name for v in model.graph.inputs}
+        assert "input_ids" in input_names
+        assert "image_features" in input_names
+
+    def test_output_is_inputs_embeds(self):
+        config, embedding = self._make_embedding_module()
+        model = build_embedding_from_features(
+            embedding, config, feature_name="image_features", feature_dim=config.hidden_size
+        )
+        output_names = {v.name for v in model.graph.outputs}
+        assert "inputs_embeds" in output_names
+
+    def test_custom_feature_name(self):
+        # Use a stub module that accepts any feature name to verify
+        # that the feature_name argument correctly controls graph input naming.
+        from onnxscript import nn as onnx_nn
+
+        class _StubEmbedding(onnx_nn.Module):
+            def forward(self, op, input_ids, audio_features):
+                return op.Identity(input_ids)
+
+        config = _make_multimodal_config()
+        model = build_embedding_from_features(
+            _StubEmbedding(), config, feature_name="audio_features", feature_dim=64
+        )
+        input_names = {v.name for v in model.graph.inputs}
+        assert "audio_features" in input_names
+
+
+# ── build_decoder_from_embeds — hybrid branch ────────────────────────────
+
+
+class TestBuildDecoderFromEmbedsHybrid:
+    """Cover the hybrid=True branch of build_decoder_from_embeds."""
+
+    def _make_hybrid_config(self):
+        """Config with linear_attention + full_attention layers for hybrid cache."""
+        return make_config(
+            layer_types=["linear_attention", "full_attention"],
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+            linear_key_head_dim=16,
+            linear_value_head_dim=16,
+            linear_conv_kernel_dim=4,
+        )
+
+    def _make_stub_hybrid_decoder(self, config):
+        """Stub decoder that pipes hybrid cache states through unchanged."""
+        from onnxscript import nn as onnx_nn
+
+        class _StubHybridDecoder(onnx_nn.Module):
+            def forward(
+                self, op, inputs_embeds, attention_mask, position_ids, past_key_values
+            ):
+                # Return dummy 1-token logits + pass states through
+                batch = op.Shape(inputs_embeds, start=0, end=1)
+                vocab = op.Constant(value_ints=[config.vocab_size])
+                one = op.Constant(value_ints=[1])
+                shape = op.Concat(batch, one, vocab, axis=0)
+                logits = op.ConstantOfShape(shape)
+                # Pass back whatever states we received
+                present = list(past_key_values)
+                return logits, present
+
+        return _StubHybridDecoder()
+
+    def test_hybrid_returns_ir_model(self):
+        config = self._make_hybrid_config()
+        decoder = self._make_stub_hybrid_decoder(config)
+        model = build_decoder_from_embeds(decoder, config, mrope=False, hybrid=True)
+        assert isinstance(model, ir.Model)
+
+    def test_hybrid_graph_name_is_decoder(self):
+        config = self._make_hybrid_config()
+        decoder = self._make_stub_hybrid_decoder(config)
+        model = build_decoder_from_embeds(decoder, config, hybrid=True)
+        # name= arg removed; builder overrides graph.name with model_id anyway
+        assert model.graph.name == "main_graph"
+
+    def test_hybrid_has_linear_attention_state_inputs(self):
+        config = self._make_hybrid_config()
+        decoder = self._make_stub_hybrid_decoder(config)
+        model = build_decoder_from_embeds(decoder, config, hybrid=True)
+        input_names = {v.name for v in model.graph.inputs}
+        # Layer 0 is linear_attention — should have conv_state + recurrent_state
+        assert any("conv_state" in n for n in input_names)
+
+    def test_hybrid_has_full_attention_kv_inputs(self):
+        config = self._make_hybrid_config()
+        decoder = self._make_stub_hybrid_decoder(config)
+        model = build_decoder_from_embeds(decoder, config, hybrid=True)
+        input_names = {v.name for v in model.graph.inputs}
+        # Layer 1 is full_attention — should have key + value
+        assert any(".key" in n for n in input_names)
+
+
+# ── VisionLanguageTask — config.vision=None path ─────────────────────────
+
+
+class TestVisionLanguageTaskNoVisionConfig:
+    """Operator-precedence fix: config.vision=None must not crash."""
+
+    def _make_stub_vision(self):
+        from onnxscript import nn as onnx_nn
+
+        class _StubVision(onnx_nn.Module):
+            def forward(self, op, pixel_values):
+                return op.Identity(pixel_values)
+
+        return _StubVision()
+
+    def _make_stub_embedding(self):
+        from onnxscript import nn as onnx_nn
+
+        class _StubEmbed(onnx_nn.Module):
+            def forward(self, op, input_ids, image_features):
+                return op.Identity(image_features)
+
+        return _StubEmbed()
+
+    def test_build_vision_defaults_when_no_vision_config(self):
+        """_build_vision should use image_size=224 when config.vision is None."""
+        task = VisionLanguageTask()
+        # config with no vision sub-config
+        config = make_config()
+        assert config.vision is None
+
+        stub_vision = self._make_stub_vision()
+        model = task._build_vision(stub_vision, config)
+        assert isinstance(model, ir.Model)
+        # Default image_size=224 → pixel_values shape should include 224
+        pv = next(v for v in model.graph.inputs if v.name == "pixel_values")
+        assert pv.shape is not None
+        assert 224 in pv.shape
+
+    def test_build_vision_uses_vision_config_when_present(self):
+        """_build_vision should use image_size from config.vision when present."""
+        task = VisionLanguageTask()
+        config = _make_multimodal_config()  # has vision.image_size=32
+        stub_vision = self._make_stub_vision()
+        model = task._build_vision(stub_vision, config)
+        pv = next(v for v in model.graph.inputs if v.name == "pixel_values")
+        assert 32 in pv.shape
+
+
+# ── SpeechLanguageTask — config.audio=None path ──────────────────────────
+
+
+class TestSpeechLanguageTaskNoAudioConfig:
+    """Operator-precedence fix: config.audio=None must not crash."""
+
+    def _make_stub_audio_encoder(self):
+        from onnxscript import nn as onnx_nn
+
+        class _StubAudio(onnx_nn.Module):
+            def forward(self, op, input_features, feature_attention_mask):
+                # Return (audio_features, audio_feature_lengths) to match
+                # the SpeechLanguageTask contract.
+                lengths = op.ReduceSum(feature_attention_mask, keepdims=False)
+                return op.Identity(input_features), lengths
+
+        return _StubAudio()
+
+    def test_audio_encoder_defaults_when_no_audio_config(self):
+        """_build_audio_encoder should use n_mels=128 when config.audio is None."""
+        from mobius.tasks._speech_language import SpeechLanguageTask
+
+        task = SpeechLanguageTask()
+        config = make_config()
+        assert config.audio is None
+
+        stub_audio = self._make_stub_audio_encoder()
+        model = task._build_audio_encoder(stub_audio, config)
+        assert isinstance(model, ir.Model)
+        # Default n_mels=128 → input_features shape should include 128
+        inp = next(v for v in model.graph.inputs if v.name == "input_features")
+        assert inp.shape is not None
+        assert 128 in inp.shape
+
+    def test_output_dim_defaults_to_hidden_size_when_no_audio_config(self):
+        """output_dim should fall back to config.hidden_size when config.audio is None."""
+        from mobius.tasks._speech_language import SpeechLanguageTask
+
+        task = SpeechLanguageTask()
+        config = make_config()  # hidden_size=64, audio=None
+        assert config.audio is None
+
+        stub_audio = self._make_stub_audio_encoder()
+        model = task._build_audio_encoder(stub_audio, config)
+        # The embedding feature_dim would be config.hidden_size=64 — verify the
+        # audio encoder model itself was built without errors (it doesn't embed)
+        assert isinstance(model, ir.Model)
+
+
+# ── TTSTask — speaker_encoder optional ───────────────────────────────────
+
+
+class TestTTSTaskSpeakerEncoderOptional:
+    """speaker_encoder is optional — build() must handle both cases."""
+
+    def _make_tts_module_no_speaker(self):
+        """Stub TTS module without a speaker encoder."""
+        from onnxscript import nn as onnx_nn
+
+        class _StubTalker(onnx_nn.Module):
+            def forward(
+                self, op, inputs_embeds, attention_mask, position_ids, past_key_values
+            ):
+                batch = op.Shape(inputs_embeds, start=0, end=1)
+                one = op.Constant(value_ints=[1])
+                vocab = op.Constant(value_ints=[100])
+                logits = op.ConstantOfShape(op.Concat(batch, one, vocab, axis=0))
+                hidden = op.Identity(inputs_embeds)
+                return logits, hidden, past_key_values
+
+        class _StubCodePredictor(onnx_nn.Module):
+            def forward(self, op, inputs_embeds, step_index, past_key_values):
+                batch = op.Shape(inputs_embeds, start=0, end=1)
+                one = op.Constant(value_ints=[1])
+                vocab = op.Constant(value_ints=[100])
+                logits = op.ConstantOfShape(op.Concat(batch, one, vocab, axis=0))
+                return logits, past_key_values, op.Identity(inputs_embeds)
+
+        class _StubEmbed(onnx_nn.Module):
+            def forward(self, op, text_ids, codec_ids):
+                text_embeds = op.Identity(text_ids)
+                codec_embeds = op.Identity(codec_ids)
+                return text_embeds, codec_embeds
+
+        class _StubTTSModule(onnx_nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.talker = _StubTalker()
+                self.code_predictor = _StubCodePredictor()
+                self.embedding = _StubEmbed()
+                self.speaker_encoder = None  # Optional — absent
+
+        return _StubTTSModule()
+
+    def test_build_without_speaker_encoder_excludes_key(self):
+        """When speaker_encoder is None, package must not contain 'speaker_encoder'."""
+        # Verify ComponentSpec validation passes and speaker_encoder is absent.
+        module = self._make_tts_module_no_speaker()
+        assert module.speaker_encoder is None
+        # ComponentSpec only checks talker, code_predictor, embedding — should pass
+        from mobius.tasks._base import ComponentSpec as _ComponentSpec
+
+        spec = _ComponentSpec(
+            talker="talker", code_predictor="code_predictor", embedding="embedding"
+        )
+        spec.validate(module, "TTSTask")  # must not raise
+
+    def test_build_with_speaker_encoder_attribute(self):
+        """TTSTask's ComponentSpec omits speaker_encoder — it's treated as optional."""
+        from mobius.tasks import TTSTask as _TTSTask
+
+        task = _TTSTask()
+        # ComponentSpec must NOT include speaker_encoder
+        assert task.components is not None
+        keys = task.components.keys()
+        assert "speaker_encoder" not in keys
+        assert "talker" in keys
+        assert "code_predictor" in keys
+        assert "embedding" in keys
+
+
+# ── ComponentSpec validation ─────────────────────────────────────────────
+
+
+class TestComponentSpecValidation:
+    """ComponentSpec.validate() must raise TypeError for missing attributes."""
+
+    def test_missing_single_attribute_raises_type_error(self):
+        from mobius.tasks._base import ComponentSpec
+
+        class _Incomplete:
+            decoder = object()
+            # 'vision_encoder' is missing
+
+        spec = ComponentSpec(decoder="decoder", vision="vision_encoder")
+        with pytest.raises(TypeError, match="vision_encoder"):
+            spec.validate(_Incomplete(), "FakeTask")
+
+    def test_all_present_does_not_raise(self):
+        from mobius.tasks._base import ComponentSpec
+
+        class _Complete:
+            decoder = object()
+            vision_encoder = object()
+
+        spec = ComponentSpec(decoder="decoder", vision="vision_encoder")
+        spec.validate(_Complete(), "FakeTask")  # should not raise
+
+    def test_dot_notation_nested_attribute(self):
+        from mobius.tasks._base import ComponentSpec
+
+        class _Inner:
+            encoder = object()
+
+        class _Outer:
+            model = _Inner()
+
+        spec = ComponentSpec(enc="model.encoder")
+        spec.validate(_Outer(), "FakeTask")  # should not raise
+
+    def test_dot_notation_missing_nested_raises(self):
+        from mobius.tasks._base import ComponentSpec
+
+        class _OuterNoEncoder:
+            # model attribute exists but has no 'encoder'
+            class _EmptyModel:
+                pass
+
+            model = _EmptyModel()
+
+        spec = ComponentSpec(enc="model.encoder")
+        with pytest.raises(TypeError, match=r"model\.encoder"):
+            spec.validate(_OuterNoEncoder(), "FakeTask")
+
+    def test_error_message_contains_task_name(self):
+        from mobius.tasks._base import ComponentSpec
+
+        class _Empty:
+            pass
+
+        spec = ComponentSpec(decoder="decoder")
+        with pytest.raises(TypeError, match="MySpecialTask"):
+            spec.validate(_Empty(), "MySpecialTask")
+
+    def test_vision_language_task_raises_on_missing_component(self):
+        """VisionLanguageTask._validate_components raises TypeError on missing attrs."""
+
+        class _IncompleteModule:
+            decoder = object()
+            # Missing vision_encoder and embedding
+
+        task = VisionLanguageTask()
+        with pytest.raises(TypeError, match="vision_encoder"):
+            task._validate_components(_IncompleteModule())
+
+    def test_seq2seq_task_raises_on_missing_component(self):
+        """Seq2SeqTask._validate_components raises TypeError on missing attrs."""
+
+        class _NoDecoder:
+            encoder = object()
+            # Missing decoder
+
+        task = Seq2SeqTask()
+        with pytest.raises(TypeError, match="decoder"):
+            task._validate_components(_NoDecoder())
+
+    def test_vae_task_raises_on_missing_component(self):
+        """VAETask._validate_components raises TypeError on missing attrs."""
+
+        class _NoDecoder:
+            encoder = object()
+            # Missing decoder
+
+        task = VAETask()
+        with pytest.raises(TypeError, match="decoder"):
+            task._validate_components(_NoDecoder())

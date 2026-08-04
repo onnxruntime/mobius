@@ -1,4 +1,5 @@
 model_id: "xlnet/xlnet-base-cased"
+model_type: "xlnet"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"
@@ -9,4 +10,5 @@ inputs:
 
 level: "L4"
 
+skip_reason: "XLNet config extraction fails (KeyError)"
 notes: "XLNet base cased. Generalized autoregressive pre-training."

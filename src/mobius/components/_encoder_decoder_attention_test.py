@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Tests for EncoderDecoderAttention component."""
 
@@ -57,7 +57,7 @@ class TestEncoderDecoderAttention:
         hidden = create_test_input(builder, "hidden", [1, 8, 64])
 
         output, (pk, pv) = attn(op, hidden)
-        builder._adapt_outputs([output, pk, pv])
+        builder._adapt_outputs([output, pk, pv], "")
         assert count_op_type(graph, "Attention") >= 1
 
     def test_cross_attention_forward(self):
@@ -69,7 +69,7 @@ class TestEncoderDecoderAttention:
         encoder_hidden = create_test_input(builder, "enc", [1, 8, 64])
 
         output, (pk, pv) = attn(op, decoder_hidden, key_value_states=encoder_hidden)
-        builder._adapt_outputs([output, pk, pv])
+        builder._adapt_outputs([output, pk, pv], "")
         assert count_op_type(graph, "Attention") >= 1
 
     def test_self_attention_with_past_kv(self):
@@ -81,7 +81,7 @@ class TestEncoderDecoderAttention:
         past_value = create_test_input(builder, "pv", [1, 8, 4, 16])
 
         output, (pk, pv) = attn(op, hidden, past_key_value=(past_key, past_value))
-        builder._adapt_outputs([output, pk, pv])
+        builder._adapt_outputs([output, pk, pv], "")
         assert count_op_type(graph, "Attention") >= 1
 
     def test_cross_attention_with_past_kv_ignores_cache(self):
@@ -105,7 +105,7 @@ class TestEncoderDecoderAttention:
             key_value_states=encoder_hidden,
             past_key_value=(past_key, past_value),
         )
-        builder._adapt_outputs([output, pk, pv])
+        builder._adapt_outputs([output, pk, pv], "")
         assert count_op_type(graph, "Attention") >= 1
         # Verify the past_key input is NOT connected to the Attention op
         attn_node = next(n for n in graph if n.op_type == "Attention")
@@ -140,5 +140,5 @@ class TestEncoderDecoderAttention:
         bias = create_test_input(builder, "attn_bias", [1, 4, 8, 8])
 
         output, _ = attn(op, hidden, attention_bias=bias)
-        builder._adapt_outputs([output])
+        builder._adapt_outputs([output], "")
         assert count_op_type(graph, "Attention") >= 1

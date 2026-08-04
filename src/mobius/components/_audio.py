@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Audio encoder components (Conformer-style).
 
@@ -18,8 +18,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components._common import Embedding, LayerNorm, Linear
 
@@ -27,7 +26,7 @@ if TYPE_CHECKING:
     import onnx_ir as ir
 
 
-def _swish(op: builder.OpBuilder, x):
+def _swish(op: OpBuilder, x):
     """Swish activation: x * sigmoid(x)."""
     return op.Mul(x, op.Sigmoid(x))
 
@@ -40,14 +39,21 @@ def _swish(op: builder.OpBuilder, x):
 class _SwishModule(nn.Module):
     """Swish activation as an nn.Module (no parameters)."""
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return op.Mul(x, op.Sigmoid(x))
+
+
+class _ReLUModule(nn.Module):
+    """ReLU activation as an nn.Module (no parameters)."""
+
+    def forward(self, op: OpBuilder, x: ir.Value):
+        return op.Relu(x)
 
 
 class _IdentityModule(nn.Module):
     """Identity (no-op) module, placeholder for dropout layers."""
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return x
 
 
@@ -73,7 +79,7 @@ class _Conv2d(nn.Module):
         self._pads = [padding, padding, padding, padding]
         self._groups = groups
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return op.Conv(
             x,
             self.weight,
@@ -105,7 +111,7 @@ class _ConvWeight(nn.Module):
         self._pads = pads or [0, 0]
         self._groups = groups
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return op.Conv(
             x,
             self.weight,
@@ -124,7 +130,7 @@ class _GLULinear(nn.Module):
         super().__init__()
         self.linear = Linear(input_dim, output_dim * 2)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         x = self.linear(op, x)  # [B, T, output_dim * 2]
         first, second = op.Split(x, axis=-1, num_outputs=2, _outputs=2)
         return op.Mul(first, _swish(op, second))
@@ -143,7 +149,7 @@ class _GLUPointWiseConv(nn.Module):
         self.b1 = nn.Parameter([1, channels, 1])
         self.b2 = nn.Parameter([1, channels, 1])
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # [B, C, T] → [B, 2C, T] → split → GLU gate
         glu_out = self.ext_pw_conv_1d(op, x)  # [B, 2C, T]
         first, second = op.Split(glu_out, axis=1, num_outputs=2, _outputs=2)
@@ -153,19 +159,25 @@ class _GLUPointWiseConv(nn.Module):
 
 
 class _DepthwiseSepConv(nn.Module):
-    """Depthwise separable convolution: depthwise Conv1d + pointwise Conv1d."""
+    """Depthwise separable convolution: depthwise Conv1d + pointwise Conv1d.
+
+    Uses causal (left-only) padding so each output frame depends only on the
+    current and past input frames. This matches HF NeMo's causal ConvModule
+    which uses symmetric PyTorch padding then trims the right-side overflow.
+    """
 
     def __init__(self, channels: int, kernel_size: int):
         super().__init__()
         self.dw_conv = _ConvWeight(
             [channels, 1, kernel_size],
             kernel_shape=[kernel_size],
-            pads=[kernel_size // 2, kernel_size // 2],
+            # Causal: pad (kernel_size-1) on the left, 0 on the right
+            pads=[kernel_size - 1, 0],
             groups=channels,
         )
         self.pw_conv = _ConvWeight([channels, channels, 1])
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         x = self.dw_conv(op, x)
         return self.pw_conv(op, x)
 
@@ -181,8 +193,15 @@ class NeMoConvSubsampling(nn.Module):
     Three stride-2 convolution stages reduce the time dimension by 8x.
     A depthwise-separable pattern is used for the 2nd and 3rd stages.
 
+    The activation between conv stages is ReLU — not Swish/SiLU.  This
+    matches NeMo's ``NemoConvSubsampling`` which uses ``nn.ReLU()`` as
+    its activation (see NeMo ASR subsampling implementation and
+    HuggingFace Phi4MM ``speech_conformer_encoder.py``).  The conformer
+    blocks themselves use Swish, but the subsampling module predates that
+    convention and retained ReLU.
+
     Input:  ``[batch, time, input_size]``
-    Output: ``[batch, time // 8, feat_out]``
+    Output: ``[batch, ceil(time/8), feat_out]``
     """
 
     def __init__(self, input_size: int, conv_channels: int, feat_out: int):
@@ -197,18 +216,18 @@ class NeMoConvSubsampling(nn.Module):
         self.conv = nn.ModuleList(
             [
                 _Conv2d(1, c, kernel_size=3, stride=2, padding=1),  # 0
-                _SwishModule(),  # 1
+                _ReLUModule(),  # 1
                 _Conv2d(c, c, kernel_size=3, stride=2, padding=1, groups=c),  # 2
                 _Conv2d(c, c, kernel_size=1),  # 3
-                _SwishModule(),  # 4
+                _ReLUModule(),  # 4
                 _Conv2d(c, c, kernel_size=3, stride=2, padding=1, groups=c),  # 5
                 _Conv2d(c, c, kernel_size=1),  # 6
-                _SwishModule(),  # 7
+                _ReLUModule(),  # 7
             ]
         )
         self.out = Linear(conv_channels * freq, feat_out)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # x: [B, T, input_size]
         x = op.Unsqueeze(x, [1])  # [B, 1, T, F]
 
@@ -234,7 +253,7 @@ class MeanVarianceNorm(nn.Module):
         self.global_mean = nn.Parameter([input_size])
         self.global_invstd = nn.Parameter([input_size])
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         x = op.Sub(x, self.global_mean)
         return op.Mul(x, self.global_invstd)
 
@@ -254,18 +273,18 @@ class T5RelativeAttentionBias(nn.Module):
         self._max_distance = max_distance
         self._num_buckets = num_buckets
 
-    def forward(self, op: builder.OpBuilder, seq_length: ir.Value):
+    def forward(self, op: OpBuilder, seq_length: ir.Value):
         # seq_length: scalar tensor (int64)
         zero = op.Constant(value_int=0)
         one = op.Constant(value_int=1)
         positions = op.Range(zero, seq_length, one)  # [seq]
 
-        # Pairwise relative positions: query_pos - key_pos
+        # Pairwise relative positions: key_pos - query_pos (memory - context, matching T5 convention)
         q_pos = op.Unsqueeze(positions, [1])  # [seq, 1]
         k_pos = op.Unsqueeze(positions, [0])  # [1, seq]
-        relative_pos = op.Sub(q_pos, k_pos)  # [seq, seq]
+        relative_pos = op.Sub(k_pos, q_pos)  # [seq, seq]: positive when key is ahead of query
 
-        # Shift and clip to valid bucket range
+        # Shift and clip to valid bucket range [0, num_buckets - 1]
         shifted = op.Add(relative_pos, op.Constant(value_int=self._max_distance))
         clipped = op.Clip(
             shifted,
@@ -301,7 +320,7 @@ class ConformerFeedForward(nn.Module):
             ]
         )
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         x = self.layer_norm(op, x)
         for layer in self.net:
             x = layer(op, x)
@@ -324,7 +343,7 @@ class ConformerConvModule(nn.Module):
         self.dw_sep_conv_1d = _DepthwiseSepConv(channels, kernel_size)
         self.ext_pw_conv_1d = _ConvWeight([channels, channels, 1])
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # x: [B, T, C]
         x = self.layer_norm(op, x)
         x = op.Transpose(x, perm=[0, 2, 1])  # [B, C, T]
@@ -345,37 +364,39 @@ class ConformerConvModule(nn.Module):
 class ConformerAttention(nn.Module):
     """Multi-head attention with relative position bias.
 
-    Uses the ONNX Attention op (opset 23) with separate Q/K/V/O projections.
-    The T5 relative bias is passed as ``attn_mask`` (attention bias) to the
-    Attention op.
+    Implements encoder-style (non-causal, no KV cache) multi-head attention
+    using the ONNX Attention op. The T5 relative bias is passed as an
+    additive attention mask (added to QK^T/scale before softmax).
+
+    Q/K/V projections produce [B, T, H*D_h]; op.Attention handles the
+    internal reshape to [B, H, T, D_h] and back.
     """
 
     def __init__(self, d_model: int, num_heads: int):
         super().__init__()
         self._num_heads = num_heads
         self._head_dim = d_model // num_heads
-        self._scale = float(self._head_dim) ** -0.5
         self.linear_q = Linear(d_model, d_model)
         self.linear_k = Linear(d_model, d_model)
         self.linear_v = Linear(d_model, d_model)
         self.linear_out = Linear(d_model, d_model)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value, relative_attention_bias: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value, relative_attention_bias: ir.Value):
         # x: [B, T, D], relative_attention_bias: [1, H, T, T]
-        q = self.linear_q(op, x)
+        q = self.linear_q(op, x)  # [B, T, H*D_h]
         k = self.linear_k(op, x)
         v = self.linear_v(op, x)
 
-        # op.Attention expects [B, T, H*D_h] for Q/K/V and [1, H, T, T] for bias
+        # op.Attention handles reshape, scale, softmax, and output reshape.
+        # The T5 relative bias is additive (added before softmax).
         attn_output = op.Attention(
             q,
             k,
             v,
-            relative_attention_bias,
-            kv_num_heads=self._num_heads,
+            relative_attention_bias,  # [1, H, T, T] additive bias
             q_num_heads=self._num_heads,
-            scale=self._scale,
-            _outputs=1,
+            kv_num_heads=self._num_heads,
+            scale=float(self._head_dim**-0.5),
         )
 
         return self.linear_out(op, attn_output)
@@ -408,11 +429,9 @@ class ConformerEncoderLayer(nn.Module):
         self.layer_norm_att = LayerNorm(d_model)
         self.layer_norm = LayerNorm(d_model)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value, relative_attention_bias: ir.Value):
-        half = op.Constant(value_float=0.5)
-
+    def forward(self, op: OpBuilder, x: ir.Value, relative_attention_bias: ir.Value):
         # Macaron feed-forward in
-        x = op.Add(x, op.Mul(self.feed_forward_in(op, x), half))
+        x = op.Add(x, op.Mul(self.feed_forward_in(op, x), 0.5))
 
         # Multi-head attention with pre-norm
         norm_x = self.layer_norm_att(op, x)
@@ -422,7 +441,7 @@ class ConformerEncoderLayer(nn.Module):
         x = op.Add(x, self.conv(op, x))
 
         # Macaron feed-forward out
-        x = op.Add(x, op.Mul(self.feed_forward_out(op, x), half))
+        x = op.Add(x, op.Mul(self.feed_forward_out(op, x), 0.5))
 
         return self.layer_norm(op, x)
 
@@ -471,16 +490,59 @@ class ConformerEncoder(nn.Module):
             ]
         )
 
-    def forward(self, op: builder.OpBuilder, audio_features: ir.Value):
+    def forward(self, op: OpBuilder, audio_features: ir.Value):
         # audio_features: [B, T, input_size]
         x = self.encoder_embedding(op, audio_features)
         x = self.embed(op, x)  # [B, T', attention_dim]
 
-        # Compute relative attention bias from subsampled sequence length
-        seq_length = op.Shape(x, start=1, end=2)
-        rel_bias = self.relative_attention_bias_layer(op, seq_length)
+        # HF encoder chunks audio when T' > MAX_CHUNK=500 to keep positions
+        # within the T5 relative-bias table bounds (speech_conformer_encoder.py
+        # L2849).  We always use chunk_size = min(T', 500) so:
+        #   T' ≤ 500 → chunk_size = T', num_chunks = 1 → identity (no change).
+        #   T' > 500 → chunk_size = 500, multiple chunks processed as a batch.
+        batch = op.Shape(x, start=0, end=1)  # [1]
+        seq_len = op.Shape(x, start=1, end=2)  # [1]
+        d_model = op.Shape(x, start=2, end=3)  # [1]
+
+        max_chunk = op.Constant(value_ints=[500])
+        chunk_size = op.Min(seq_len, max_chunk)  # min(T', 500); [1]
+
+        # Ceiling division: num_chunks = ⌈T' / chunk_size⌉
+        num_chunks = op.Div(
+            op.Add(seq_len, op.Sub(chunk_size, op.Constant(value_ints=[1]))),
+            chunk_size,
+        )  # [1]
+        padded_len = op.Mul(num_chunks, chunk_size)  # num_chunks * chunk_size; [1]
+        pad_size = op.Sub(padded_len, seq_len)  # 0 when T' ≤ 500; [1]
+
+        # Pad time dim to a multiple of chunk_size (no-op when pad_size = 0).
+        # ONNX Pad pads layout for 3D [B, T, D]:
+        #   [begin_B, begin_T, begin_D, end_B, end_T, end_D]
+        pads = op.Concat(
+            op.Constant(value_ints=[0, 0, 0, 0]),  # begin all dims + end_B
+            pad_size,  # end_T (dynamic)
+            op.Constant(value_ints=[0]),  # end_D
+            axis=0,
+        )
+        x = op.Pad(x, pads)  # [B, padded_len, D]
+
+        # Fold into chunks: [B, padded_len, D] → [B*num_chunks, chunk_size, D]
+        # Merging batch and chunk dims lets downstream layers broadcast
+        # correctly even when B > 1.
+        b_times_chunks = op.Mul(batch, num_chunks)
+        chunk_shape = op.Concat(b_times_chunks, chunk_size, d_model, axis=0)
+        x = op.Reshape(x, chunk_shape)  # [B*num_chunks, chunk_size, D]
+
+        # T5 relative bias sized for chunk positions (not global T')
+        rel_bias = self.relative_attention_bias_layer(op, chunk_size)
 
         for layer in self.encoders:
-            x = layer(op, x, rel_bias)
+            x = layer(op, x, rel_bias)  # [B*num_chunks, chunk_size, D]
+
+        # Unfold back and strip padding:
+        # [B*num_chunks, chunk_size, D] → [B, padded_len, D] → [B, T', D]
+        fold_shape = op.Concat(batch, padded_len, d_model, axis=0)
+        x = op.Reshape(x, fold_shape)  # [B, padded_len, D]
+        x = op.Slice(x, op.Constant(value_ints=[0]), seq_len, op.Constant(value_ints=[1]))
 
         return x

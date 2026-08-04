@@ -465,7 +465,7 @@ Add `gguf` as an optional dependency in a new extras group:
 [project.optional-dependencies]
 gguf = ["gguf>=0.10.0"]
 # Combined:
-all = ["mobius-ai[transformers,gguf]"]
+all = ["mobius-onnx[transformers,gguf]"]
 ```
 
 The `gguf` import is lazy — users who don't use GGUF features
@@ -779,7 +779,7 @@ the fp16/fp32 activation, `B` is the packed uint8 weight blob.
    to fuse (e.g., unusual shape, unsupported config), performance
    degrades to "dequantize then fp matmul" — 2-4× slower.
 
-4. **INT4 requires opset 21+**: Our codebase uses opset 23, so this
+4. **INT4 requires opset 21+**: Our codebase uses opset 24, so this
    isn't a blocker, but older runtimes (pre-2024) can't load int4 QDQ
    models.
 

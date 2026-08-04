@@ -1,4 +1,5 @@
 model_id: "facebook/data2vec-vision-base-ft1k"
+model_type: "data2vec-vision"
 revision: "main"
 task_type: "image-classification"
 dtype: "float32"
@@ -8,5 +9,6 @@ inputs:
     - "pipeline-cat-chonk.jpeg"
 
 level: "L4"
+skip_reason: "No safetensors weights on HuggingFace Hub"
 
 notes: "Data2Vec vision base. Self-supervised vision encoder fine-tuned on ImageNet."

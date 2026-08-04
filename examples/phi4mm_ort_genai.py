@@ -1,6 +1,6 @@
 #!/usr/bin/env python
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 r"""Phi-4 Multimodal generation with onnxruntime-genai.
 
@@ -10,14 +10,14 @@ generation with image and/or audio input.
 
 The model is split into 4 ONNX graphs:
 
-    - **Vision**  (``vision/model.onnx``): SigLIP encoder + projection
-    - **Speech**  (``speech/model.onnx``): Conformer encoder + projection
+    - **Vision**  (``vision_encoder/model.onnx``): SigLIP encoder + projection
+    - **Speech**  (``audio_encoder/model.onnx``): Conformer encoder + projection
     - **Embedding** (``embedding/model.onnx``): token embed + InputMixer
-    - **Decoder** (``model/model.onnx``): LoRA text decoder + lm_head
+    - **Decoder** (``decoder/model.onnx``): LoRA text decoder + lm_head
 
 Requirements::
 
-    pip install mobius-ai[ort-genai] torchaudio
+    pip install mobius-onnx[ort-genai] torchaudio
 
 Usage::
 
@@ -53,6 +53,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 
 import numpy as np
 import onnxruntime_genai as og
@@ -95,7 +96,7 @@ def _write_genai_config(config, output_dir: str) -> None:
             "pad_token_id": config.pad_token_id or 199999,
             "image_token_id": IMAGE_TOKEN_ID,
             "decoder": {
-                "filename": "model/model.onnx",
+                "filename": "decoder/model.onnx",
                 "hidden_size": config.hidden_size,
                 "head_size": config.head_dim,
                 "num_attention_heads": config.num_attention_heads,
@@ -109,6 +110,8 @@ def _write_genai_config(config, output_dir: str) -> None:
                     "inputs_embeds": "inputs_embeds",
                     "attention_mask": "attention_mask",
                     "position_ids": "position_ids",
+                    "vision_gate": "vision_gate",
+                    "speech_gate": "speech_gate",
                     "past_key_names": "past_key_values.%d.key",
                     "past_value_names": "past_key_values.%d.value",
                 },
@@ -131,10 +134,12 @@ def _write_genai_config(config, output_dir: str) -> None:
                 },
                 "outputs": {
                     "inputs_embeds": "inputs_embeds",
+                    "vision_gate": "vision_gate",
+                    "speech_gate": "speech_gate",
                 },
             },
             "vision": {
-                "filename": "vision/model.onnx",
+                "filename": "vision_encoder/model.onnx",
                 "config_filename": "vision_processor.json",
                 "session_options": {
                     "log_id": "onnxruntime-genai",
@@ -143,14 +148,15 @@ def _write_genai_config(config, output_dir: str) -> None:
                 "inputs": {
                     "pixel_values": "pixel_values",
                     "image_sizes": "image_sizes",
+                    "image_attention_mask": "image_attention_mask",
                 },
                 "outputs": {
                     "image_features": "image_features",
                 },
             },
-            "speech": {
-                "filename": "speech/model.onnx",
-                "config_filename": "speech_processor.json",
+            "audio": {
+                "filename": "audio_encoder/model.onnx",
+                "config_filename": "audio_processor.json",
                 "session_options": {
                     "log_id": "onnxruntime-genai",
                     "provider_options": [],
@@ -286,7 +292,7 @@ def generate_multimodal(
     *,
     image_path: str | None = None,
     audio_path: str | None = None,
-) -> None:
+) -> str:
     """Run multimodal generation (text + image + audio).
 
     Uses the ORT GenAI ``PhiMultiModalProcessor`` for image
@@ -332,17 +338,19 @@ def generate_multimodal(
     print("-" * 40)
 
     tokenizer_stream = tokenizer.create_stream()
-    tokens_generated = 0
+    generated_tokens: list[int] = []
     while not generator.is_done():
         generator.generate_next_token()
         token = generator.get_next_tokens()[0]
+        generated_tokens.append(token)
         print(tokenizer_stream.decode(token), end="", flush=True)
-        tokens_generated += 1
-        if tokens_generated >= max_new_tokens:
+        if len(generated_tokens) >= max_new_tokens:
             break
 
     print("\n" + "-" * 40)
+    output = tokenizer.decode(generated_tokens)
     del generator
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -504,6 +512,11 @@ def main():
         action="store_true",
         help="Also run with HuggingFace and compare outputs.",
     )
+    parser.add_argument(
+        "--ci",
+        action="store_true",
+        help="Exit with non-zero code on failure (for CI pipelines).",
+    )
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -549,7 +562,7 @@ def main():
     print("=" * 60)
 
     if has_image or has_audio:
-        generate_multimodal(
+        onnx_result = generate_multimodal(
             model_dir,
             prompt,
             args.max_new_tokens,
@@ -557,7 +570,7 @@ def main():
             audio_path=args.audio,
         )
     else:
-        generate_text(model_dir, prompt, args.max_new_tokens)
+        onnx_result = generate_text(model_dir, prompt, args.max_new_tokens)
 
     # ------------------------------------------------------------------
     # Optional HuggingFace comparison
@@ -573,10 +586,23 @@ def main():
             image_path=args.image,
             audio_path=args.audio,
         )
-        print(f"[HF] Output: {hf_result}")
+        print(f"\n[HF]  : {hf_result}")
+        print(f"[ONNX]: {onnx_result}")
+        if onnx_result.strip() == hf_result.strip():
+            print("\n\u2713 Outputs match exactly!")
+        else:
+            print("\n\u2717 Outputs differ!")
+            if args.ci:
+                sys.exit(1)
 
     print("\nDone.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        if "--ci" in sys.argv:
+            print(f"FAILED: {e}", file=sys.stderr)
+            sys.exit(1)
+        raise

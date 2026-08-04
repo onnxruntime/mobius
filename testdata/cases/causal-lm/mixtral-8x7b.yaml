@@ -1,4 +1,5 @@
 model_id: "mistralai/Mixtral-8x7B-v0.1"
+model_type: "mixtral"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"
@@ -14,4 +15,4 @@ generation:
   do_sample: false
 
 notes: "Mixtral 8x7B. Canonical sparse Mixture-of-Experts with top-2 gating."
-skip_reason: "Model too large (47B MoE) for CPU golden generation."
+ci_skip_reason: "Model too large (47B MoE) for CI."

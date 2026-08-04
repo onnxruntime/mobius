@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Qwen3-VL vision encoder components.
 
@@ -8,8 +8,7 @@ Provides modules for the Qwen3-VL vision backbone:
 - ``Qwen3VLPatchEmbed``: Conv3d patch tokenisation (temporal + spatial).
 - ``Qwen3VLVisionRotaryEmbedding``: 2D rotary embeddings from grid positions.
 - ``Qwen3VLVisionAttention``: Packed bidirectional MHA with ``cu_seqlens``.
-- ``Qwen3VLVisionMLP``: Single-gate MLP (Linear → activation → Linear).
-- ``Qwen3VLVisionBlock``: Pre-norm transformer block.
+- ``Qwen3VLVisionBlock``: Pre-norm transformer block (uses ``FCMLP``).
 - ``Qwen3VLPatchMerger``: Spatial merge to reduce token count.
 - ``Qwen3VLVisionModel``: Full encoder stack with DeepStack outputs.
 
@@ -24,10 +23,11 @@ import math
 
 import numpy as np
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
-from mobius.components._common import LayerNorm, Linear
+from mobius._build_context import ep_capabilities, get_build_dtype
+from mobius.components._common import LayerNorm, Linear, build_packed_token_offset
+from mobius.components._mlp import FCMLP
 from mobius.components._scan_utils import (
     compact_scan_output,
     create_body_graph,
@@ -63,7 +63,7 @@ class Qwen3VLPatchEmbed(nn.Module):
         )
         self.bias = nn.Parameter([hidden_size], name="proj.bias")
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # hidden_states: (total_patches, C * T_p * P * P)
         # Reshape to (total_patches, C, T_p, P, P) for Conv3d
         x = op.Reshape(
@@ -111,7 +111,7 @@ class Qwen3VLVisionRotaryEmbedding(nn.Module):
             data=ir.tensor(sin_table),
         )
 
-    def forward(self, op: builder.OpBuilder, position_ids: ir.Value):
+    def forward(self, op: OpBuilder, position_ids: ir.Value):
         """Look up cos/sin for 2D position IDs.
 
         Args:
@@ -142,7 +142,7 @@ class Qwen3VLVisionAttention(nn.Module):
     """Packed bidirectional multi-head attention for the vision encoder.
 
     Iterates over sub-sequences delimited by ``cu_seqlens`` and applies
-    standard ONNX Attention (opset 23) to each independently.  This avoids
+    standard ONNX Attention (opset 24) to each independently.  This avoids
     cross-image attention while processing all patches in a single flat
     sequence.
     """
@@ -159,7 +159,7 @@ class Qwen3VLVisionAttention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         cu_seqlens: ir.Value,
         position_embeddings: tuple,
@@ -180,6 +180,9 @@ class Qwen3VLVisionAttention(nn.Module):
         k = op.Reshape(k, [0, self.num_heads, self.head_dim])
 
         # Apply rotary embedding (vision uses full rotation, no partial)
+        # Cast cos/sin to match query dtype (tables are float32, model may be f16/bf16)
+        cos = op.CastLike(cos, q)
+        sin = op.CastLike(sin, q)
         cos = op.Unsqueeze(cos, [1])  # (total_seq, 1, rotary_dim)
         sin = op.Unsqueeze(sin, [1])
 
@@ -202,6 +205,79 @@ class Qwen3VLVisionAttention(nn.Module):
         q_rot = op.Reshape(q_rot, [0, -1])
         k_rot = op.Reshape(k_rot, [0, -1])
 
+        capabilities = ep_capabilities()
+        if capabilities.supports_packed_multi_head_attention:
+            attn_output = self._emit_packed_mha(op, q_rot, k_rot, v, cu_seqlens, hidden_states)
+        else:
+            attn_output = self._emit_standard_attention(
+                op, q_rot, k_rot, v, cu_seqlens, hidden_states
+            )
+
+        return self.proj(op, attn_output)
+
+    def _emit_packed_mha(self, op, query, key, value, cu_seqlens, hidden_states):
+        """Emit com.microsoft.PackedMultiHeadAttention.
+
+        Uses cu_seqlens natively, avoiding the O(N^2) block-diagonal bias.
+        Each sub-sequence delimited by ``cu_seqlens`` (one per image/frame)
+        is one packed batch element, so block-diagonal masking is expressed
+        through the varlen contract rather than an explicit bias.
+
+        Args:
+            query, key: (total_seq, hidden_size) after rotary embedding
+            value: (total_seq, hidden_size) from QKV split
+            cu_seqlens: (num_sub_seqs + 1,) cumulative sequence lengths
+            hidden_states: original input, used only for shape
+        """
+        # token_offset: (num_sub_seqs, max_seq_len) mapping packed tokens to
+        # their padded (batch, seq) layout. ORT derives batch_size from
+        # token_offset.shape[0] and requires cumulative_sequence_length to have
+        # length batch_size + 1, so this MUST encode every sub-sequence (image
+        # or frame), not a single (1, N) batch — otherwise the kernel rejects
+        # multi-sequence cu_seqlens and computes full instead of block-diagonal
+        # attention.
+        token_offset = build_packed_token_offset(op, cu_seqlens)
+
+        cu_seqlens_int32 = op.Cast(cu_seqlens, to=6)  # INT32
+
+        # PackedMHA supports float32 and float16 only; cast bfloat16 builds to
+        # float16 and leave float32/float16 native to preserve precision.
+        if get_build_dtype() == ir.DataType.BFLOAT16:
+            query_mha = op.Cast(query, to=ir.DataType.FLOAT16)
+            key_mha = op.Cast(key, to=ir.DataType.FLOAT16)
+            value_mha = op.Cast(value, to=ir.DataType.FLOAT16)
+        else:
+            query_mha, key_mha, value_mha = query, key, value
+
+        attn_output = op.PackedMultiHeadAttention(
+            query_mha,
+            key_mha,
+            value_mha,
+            None,  # bias (optional, not used)
+            token_offset,
+            cu_seqlens_int32,
+            num_heads=self.num_heads,
+            scale=self.scale,
+            _domain="com.microsoft",
+            _outputs=["packed_attn_out"],
+        )  # (total_seq, hidden_size)
+
+        # Cast back to original dtype
+        attn_output = op.CastLike(attn_output, query)
+
+        return attn_output
+
+    def _emit_standard_attention(self, op, query, key, value, cu_seqlens, hidden_states):
+        """Emit standard Attention with block-diagonal bias from cu_seqlens.
+
+        Fallback path for EPs without PackedMultiHeadAttention support.
+
+        Args:
+            query, key: (total_seq, hidden_size) after rotary embedding
+            value: (total_seq, hidden_size) from QKV split
+            cu_seqlens: (num_sub_seqs + 1,) cumulative lengths
+            hidden_states: original input, used only for shape
+        """
         # Build block-diagonal attention bias from cu_seqlens
         # Each token only attends to tokens in the same sub-sequence
         total_seq = op.Shape(hidden_states, start=0, end=1)
@@ -213,33 +289,35 @@ class Qwen3VLVisionAttention(nn.Module):
         )
         positions_2d = op.Unsqueeze(positions, [1])  # (total_seq, 1)
         cu_seqlens_2d = op.Unsqueeze(cu_seqlens, [0])  # (1, num_sub_seqs+1)
-        ge = op.GreaterOrEqual(positions_2d, cu_seqlens_2d)  # (total_seq, num_sub_seqs+1)
-        ge_int = op.Cast(ge, to=7)  # INT64
+        greater_or_equal = op.GreaterOrEqual(
+            positions_2d, cu_seqlens_2d
+        )  # (total_seq, num_sub_seqs+1)
+        greater_or_equal_int = op.Cast(greater_or_equal, to=7)  # INT64
         segment_ids = op.Sub(
-            op.ReduceSum(ge_int, [1], keepdims=False),
+            op.ReduceSum(greater_or_equal_int, [1], keepdims=False),
             op.Constant(value_int=1),
         )  # (total_seq,) — segment ID per token
 
-        seg_row = op.Unsqueeze(segment_ids, [1])  # (total_seq, 1)
-        seg_col = op.Unsqueeze(segment_ids, [0])  # (1, total_seq)
-        same_segment = op.Equal(seg_row, seg_col)  # (total_seq, total_seq)
+        segment_row = op.Unsqueeze(segment_ids, [1])  # (total_seq, 1)
+        segment_column = op.Unsqueeze(segment_ids, [0])  # (1, total_seq)
+        same_segment = op.Equal(segment_row, segment_column)  # (total_seq, total_seq)
         attn_bias = op.Where(
             same_segment,
-            op.Constant(value_float=0.0),
-            op.Constant(value_float=-10000.0),
+            op.CastLike(0.0, query),
+            op.CastLike(-10000.0, query),
         )
         # Reshape for Attention: (1, 1, total_seq, total_seq)
         attn_bias = op.Unsqueeze(attn_bias, [0, 1])
 
         # Add batch dim: (1, total_seq, hidden_size)
-        q_out = op.Unsqueeze(q_rot, [0])
-        k_out = op.Unsqueeze(k_rot, [0])
-        v_out = op.Unsqueeze(v, [0])
+        query_batched = op.Unsqueeze(query, [0])
+        key_batched = op.Unsqueeze(key, [0])
+        value_batched = op.Unsqueeze(value, [0])
 
         attn_output = op.Attention(
-            q_out,
-            k_out,
-            v_out,
+            query_batched,
+            key_batched,
+            value_batched,
             attn_bias,
             kv_num_heads=self.num_heads,
             q_num_heads=self.num_heads,
@@ -250,21 +328,7 @@ class Qwen3VLVisionAttention(nn.Module):
         # Remove batch dim: (total_seq, hidden_size)
         attn_output = op.Squeeze(attn_output, [0])
 
-        return self.proj(op, attn_output)
-
-
-class Qwen3VLVisionMLP(nn.Module):
-    """Single-gate MLP for the vision encoder."""
-
-    def __init__(self, hidden_size: int, intermediate_size: int):
-        super().__init__()
-        self.linear_fc1 = Linear(hidden_size, intermediate_size, bias=True)
-        self.linear_fc2 = Linear(intermediate_size, hidden_size, bias=True)
-
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
-        hidden_states = self.linear_fc1(op, hidden_states)
-        hidden_states = op.Gelu(hidden_states, approximate="tanh")
-        return self.linear_fc2(op, hidden_states)
+        return attn_output
 
 
 class Qwen3VLVisionBlock(nn.Module):
@@ -278,11 +342,12 @@ class Qwen3VLVisionBlock(nn.Module):
         self.norm1 = LayerNorm(hidden_size, eps=1e-6)
         self.attn = Qwen3VLVisionAttention(hidden_size, num_heads)
         self.norm2 = LayerNorm(hidden_size, eps=1e-6)
-        self.mlp = Qwen3VLVisionMLP(hidden_size, intermediate_size)
+        # GELU (tanh approx) MLP with bias (HF linear_fc1/linear_fc2 → up_proj/down_proj)
+        self.mlp = FCMLP(hidden_size, intermediate_size, activation="gelu_new", bias=True)
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         cu_seqlens: ir.Value,
         position_embeddings: tuple,
@@ -323,7 +388,7 @@ class Qwen3VLPatchMerger(nn.Module):
         self.linear_fc1 = Linear(self.merged_size, self.merged_size, bias=True)
         self.linear_fc2 = Linear(self.merged_size, out_hidden_size, bias=True)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         if self.use_postshuffle_norm:
             # Reshape to merged dim, then normalise
             x = op.Reshape(hidden_states, [-1, self.merged_size])
@@ -555,12 +620,12 @@ class Qwen3VLVisionModel(nn.Module):
         )
 
         h_idxs = body_op.Div(
-            body_op.Mul(h_range, body_op.Constant(value_float=n_minus_1)),
-            body_op.Sub(H_f, body_op.Constant(value_float=1.0)),
+            body_op.Mul(h_range, n_minus_1),
+            body_op.Sub(H_f, 1.0),
         )
         w_idxs = body_op.Div(
-            body_op.Mul(w_range, body_op.Constant(value_float=n_minus_1)),
-            body_op.Sub(W_f, body_op.Constant(value_float=1.0)),
+            body_op.Mul(w_range, n_minus_1),
+            body_op.Sub(W_f, 1.0),
         )
 
         # Floor/ceil indices
@@ -594,8 +659,8 @@ class Qwen3VLVisionModel(nn.Module):
         idx_10 = body_op.Reshape(body_op.Add(bh_c2, wf2), [-1])
         idx_11 = body_op.Reshape(body_op.Add(bh_c2, wc2), [-1])
 
-        one_minus_dh = body_op.Sub(body_op.Constant(value_float=1.0), dh)
-        one_minus_dw = body_op.Sub(body_op.Constant(value_float=1.0), dw)
+        one_minus_dh = body_op.Sub(1.0, dh)
+        one_minus_dw = body_op.Sub(1.0, dw)
         dh2 = body_op.Unsqueeze(dh, [1])
         omdh2 = body_op.Unsqueeze(one_minus_dh, [1])
         dw2 = body_op.Unsqueeze(dw, [0])
@@ -606,11 +671,12 @@ class Qwen3VLVisionModel(nn.Module):
         w_10 = body_op.Reshape(body_op.Mul(dh2, omdw2), [-1, 1])
         w_11 = body_op.Reshape(body_op.Mul(dh2, dw2), [-1, 1])
 
-        # Gather from learned pos_embed (implicit input from parent graph)
-        e_00 = body_op.Mul(body_op.Gather(self.pos_embed, idx_00), w_00)
-        e_01 = body_op.Mul(body_op.Gather(self.pos_embed, idx_01), w_01)
-        e_10 = body_op.Mul(body_op.Gather(self.pos_embed, idx_10), w_10)
-        e_11 = body_op.Mul(body_op.Gather(self.pos_embed, idx_11), w_11)
+        # Gather from learned pos_embed (implicit input from parent graph).
+        # Cast to float32 for bilinear interpolation (pos_embed may be bf16/f16).
+        e_00 = body_op.Mul(body_op.Cast(body_op.Gather(self.pos_embed, idx_00), to=1), w_00)
+        e_01 = body_op.Mul(body_op.Cast(body_op.Gather(self.pos_embed, idx_01), to=1), w_01)
+        e_10 = body_op.Mul(body_op.Cast(body_op.Gather(self.pos_embed, idx_10), to=1), w_10)
+        e_11 = body_op.Mul(body_op.Cast(body_op.Gather(self.pos_embed, idx_11), to=1), w_11)
         pos_embeds = body_op.Add(
             body_op.Add(e_00, e_01),
             body_op.Add(e_10, e_11),
@@ -650,7 +716,7 @@ class Qwen3VLVisionModel(nn.Module):
             body_op.Constant(value_ints=[0]),
             axis=0,
         )
-        padded = body_op.Pad(pos_embeds, pads, body_op.Constant(value_float=0.0))
+        padded = body_op.Pad(pos_embeds, pads, 0.0)
         padded.name = "padded_pos_embed"
         body_graph.outputs.append(padded)
 
@@ -780,7 +846,7 @@ class Qwen3VLVisionModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         grid_thw: ir.Value,
     ):
@@ -799,8 +865,10 @@ class Qwen3VLVisionModel(nn.Module):
         # Patch embedding
         hidden_states = self.patch_embed(op, hidden_states)
 
-        # Bilinear-interpolated position embeddings from learned grid
+        # Bilinear-interpolated position embeddings from learned grid.
+        # Cast to match hidden_states dtype (Scan body computes in float32).
         pos_embeds = self._interpolate_pos_embed(op, grid_thw)
+        pos_embeds = op.CastLike(pos_embeds, hidden_states)
         hidden_states = op.Add(hidden_states, pos_embeds)
 
         # Compute rotary position IDs and embeddings from grid_thw

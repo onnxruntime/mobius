@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Tests for ArchitectureConfig."""
 
@@ -33,7 +33,13 @@ class TestArchitectureConfig:
         assert config.hidden_size == DEFAULT_INT
         assert config.num_hidden_layers == DEFAULT_INT
         assert config.rms_norm_eps == pytest.approx(1e-6)
-        assert config.rope_type == "default"
+        # rope_type defaults to None (NoPE) so that directly-constructed
+        # ArchitectureConfig instances without an explicit rope_type are
+        # treated as having no RoPE, matching the signal from_transformers
+        # uses for NoPE models. The other RoPE fields keep inert numeric
+        # defaults so that specifying only rope_type="default" is enough
+        # for test / reproducer configs.
+        assert config.rope_type is None
         assert config.rope_theta == pytest.approx(10_000.0)
         assert config.partial_rotary_factor == pytest.approx(1.0)
         assert config.attn_qkv_bias is False
@@ -125,6 +131,9 @@ class TestArchitectureConfig:
             rms_norm_eps = 1e-5
             rope_theta = 10000.0
             rope_scaling = None
+            # Real HuggingFace LlamaConfig populates rope_parameters in
+            # __post_init__ for any model that declares RoPE support.
+            rope_parameters: ClassVar[dict] = {"rope_type": "default"}
 
         config = ArchitectureConfig.from_transformers(FakeLlamaConfig())
         assert config.vocab_size == 32000
@@ -179,6 +188,39 @@ class TestArchitectureConfig:
         config = ArchitectureConfig.from_transformers(FakeQwen3Config())
         assert config.attn_qk_norm is True
 
+    def test_from_transformers_chatglm4_legacy_fields(self):
+        class FakeChatGLMConfig:
+            model_type = "chatglm"
+            num_attention_heads = 32
+            multi_query_attention = True
+            multi_query_group_num = 2
+            num_layers = 40
+            hidden_size = 4096
+            ffn_hidden_size = 13696
+            kv_channels = 128
+            padded_vocab_size = 151552
+            vocab_size = 151552
+            seq_length = 131072
+            layernorm_epsilon = 1.5625e-7
+            add_bias_linear = False
+            add_qkv_bias = True
+            pad_token_id = 151329
+            tie_word_embeddings = False
+
+        config = ArchitectureConfig.from_transformers(FakeChatGLMConfig())
+
+        assert config.num_hidden_layers == 40
+        assert config.num_key_value_heads == 2
+        assert config.head_dim == 128
+        assert config.intermediate_size == 13696
+        assert config.hidden_act == "silu"
+        assert config.max_position_embeddings == 131072
+        assert config.partial_rotary_factor == pytest.approx(0.5)
+        assert config.rope_interleave is True
+        assert config.attn_qkv_bias is True
+        assert config.attn_o_bias is False
+        assert config.mlp_bias is False
+
     def test_from_transformers_rope_scaling(self):
         class FakeConfig:
             model_type = "llama"
@@ -206,30 +248,170 @@ class TestArchitectureConfig:
         assert config.rope_type == "llama3"
         assert config.original_max_position_embeddings == 8192
 
+    def test_from_transformers_stores_model_type_and_token_ids(self):
+        """model_type, bos_token_id, eos_token_id are preserved on ArchitectureConfig."""
+
+        class FakeConfig:
+            model_type = "gemma2"
+            num_attention_heads = 8
+            num_key_value_heads = 4
+            num_hidden_layers = 2
+            vocab_size = 256
+            hidden_size = 64
+            intermediate_size = 128
+            hidden_act = "gelu"
+            max_position_embeddings = 128
+            head_dim = 8
+            pad_token_id = 0
+            bos_token_id = 2
+            eos_token_id = 1
+            rms_norm_eps = 1e-6
+            rope_theta = 10000.0
+            rope_scaling = None
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        assert config.model_type == "gemma2"
+        assert config.bos_token_id == 2
+        assert config.eos_token_id == 1
+
+    def test_from_transformers_nope_model_has_none_rope(self):
+        """NoPE models (e.g. NemotronH) get ``rope=None`` and ``rope_type=None``.
+
+        This is the Phase 1 fix for the silent-RoPE-on-NoPE-models bug:
+        when the HuggingFace config declares neither ``rope_parameters``
+        nor ``rope_scaling`` nor the legacy ``rotary_dim`` / ``rotary_pct``
+        / ``rotary_emb_base`` fields, the resulting ``ArchitectureConfig``
+        must express "no RoPE" structurally so that ``initialize_rope``
+        returns ``None`` and ``TextModel`` skips rotary encoding entirely.
+        """
+
+        class FakeNemotronH:
+            # Minimal NemotronH-like config: carries a stale ``rope_theta``
+            # as dead data but declares NO ``rope_parameters`` / ``rope_scaling``
+            # / ``rotary_*`` fields — so this is a NoPE model.
+            model_type = "nemotron_h"
+            num_attention_heads = 8
+            num_key_value_heads = 2
+            num_hidden_layers = 4
+            vocab_size = 128
+            hidden_size = 64
+            intermediate_size = 128
+            hidden_act = "relu2"
+            max_position_embeddings = 128
+            head_dim = 8
+            pad_token_id = 0
+            rms_norm_eps = 1e-6
+            rope_theta = 10_000.0  # stale — ignored because no rope_parameters
+
+        config = ArchitectureConfig.from_transformers(FakeNemotronH())
+        # Sub-config is None: no RoPE data exists at all.
+        assert config.rope is None
+        # Flat fields are all None: no spurious "default" values.
+        assert config.rope_type is None
+        assert config.rope_theta is None
+        assert config.partial_rotary_factor is None
+        assert config.rope_scaling is None
+        assert config.rope_local_base_freq is None
+        assert config.original_max_position_embeddings is None
+        # rope_interleave stays at its inert False default.
+        assert config.rope_interleave is False
+
+    def test_from_transformers_legacy_rotary_dim_enables_rope(self):
+        """GPT-J / CodeGen-style legacy configs use ``rotary_dim``."""
+
+        class FakeGPTJ:
+            model_type = "gptj"
+            num_attention_heads = 4
+            num_key_value_heads = 4
+            num_hidden_layers = 2
+            vocab_size = 128
+            hidden_size = 64
+            intermediate_size = 128
+            hidden_act = "gelu"
+            max_position_embeddings = 128
+            head_dim = 16
+            pad_token_id = 0
+            rms_norm_eps = 1e-6
+            rotary_dim = 8  # legacy partial-RoPE signal
+
+        config = ArchitectureConfig.from_transformers(FakeGPTJ())
+        # Legacy rotary_dim activates RoPE with partial_rotary_factor = 8/16.
+        assert config.rope is not None
+        assert config.rope_type == "default"
+        assert config.partial_rotary_factor == pytest.approx(0.5)
+
 
 class TestExtractRopeConfig:
     """Unit tests for _extract_rope_config helper."""
 
     def test_defaults_when_no_rope_attrs(self):
-        """Bare config with no rope attrs yields sensible defaults."""
+        """Bare config with no RoPE signal yields ``None`` (NoPE model)."""
 
         class Bare:
             pass
 
         result = _extract_rope_config(Bare())
+        assert result is None
+
+    def test_rope_theta_alone_is_not_a_rope_signal(self):
+        """rope_theta without rope_parameters/rope_scaling is not a RoPE signal.
+
+        For example NemotronH carries ``rope_theta`` as dead data while
+        declaring no actual RoPE support — so the absence of
+        ``rope_parameters`` / ``rope_scaling`` / legacy rotary fields must
+        produce ``None`` (NoPE), not a spurious ``RoPEConfig``.
+        """
+
+        class Cfg:
+            # No rope_scaling, no rope_parameters — just a stale rope_theta.
+            rope_theta = 10_000.0
+
+        assert _extract_rope_config(Cfg()) is None
+
+    def test_nondefault_rope_theta_without_rope_scaling_activates_rope(self):
+        """Non-default rope_theta alone (e.g. 50000) is treated as a RoPE signal.
+
+        Models like Arctic and Jamba set a custom rope_theta without
+        exposing rope_scaling in their config JSON.  The non-default value
+        distinguishes them from NoPE models that inherit 10000.0 as dead data.
+        """
+
+        class Cfg:
+            rope_theta = 50_000.0  # no rope_scaling, no rope_parameters
+
+        result = _extract_rope_config(Cfg())
+        assert result is not None
         assert result.rope_type == "default"
-        assert result.rope_theta == pytest.approx(10_000.0)
-        assert result.rope_scaling is None
-        assert result.partial_rotary_factor == pytest.approx(1.0)
-        assert result.rope_local_base_freq is None
-        assert result.original_max_position_embeddings is None
+        assert result.rope_theta == pytest.approx(50_000.0)
+
+    def test_rope_parameters_activates_rope(self):
+        """``rope_parameters`` on the HF config is the modern RoPE signal."""
+
+        class Cfg:
+            rope_parameters: ClassVar[dict] = {"rope_type": "default"}
+
+        result = _extract_rope_config(Cfg())
+        assert result is not None
+        assert result.rope_type == "default"
+
+    def test_legacy_rotary_dim_activates_rope(self):
+        """Legacy GPT-J / CodeGen configs use ``rotary_dim``."""
+
+        class Cfg:
+            rotary_dim = 64
+
+        result = _extract_rope_config(Cfg())
+        assert result is not None
+        assert result.rope_type == "default"
 
     def test_rope_theta_from_config_attr(self):
         class Cfg:
             rope_theta = 500_000.0
-            rope_scaling = None
+            # rope_parameters triggers the RoPE path so rope_theta is read.
+            rope_parameters: ClassVar[dict] = {"rope_type": "default"}
 
         result = _extract_rope_config(Cfg())
+        assert result is not None
         assert result.rope_theta == pytest.approx(500_000.0)
 
     def test_rope_type_from_rope_scaling(self):
@@ -242,9 +424,10 @@ class TestExtractRopeConfig:
     def test_partial_rotary_factor(self):
         class Cfg:
             partial_rotary_factor = 0.5
-            rope_scaling = None
+            rope_parameters: ClassVar[dict] = {"rope_type": "default"}
 
         result = _extract_rope_config(Cfg())
+        assert result is not None
         assert result.partial_rotary_factor == pytest.approx(0.5)
 
     def test_partial_rotary_factor_zero_is_preserved(self):
@@ -252,9 +435,10 @@ class TestExtractRopeConfig:
 
         class Cfg:
             partial_rotary_factor = 0.0
-            rope_scaling = None
+            rope_parameters: ClassVar[dict] = {"rope_type": "default"}
 
         result = _extract_rope_config(Cfg())
+        assert result is not None
         assert result.partial_rotary_factor == pytest.approx(0.0)
 
     def test_rope_theta_zero_is_preserved(self):
@@ -262,9 +446,10 @@ class TestExtractRopeConfig:
 
         class Cfg:
             rope_theta = 0.0
-            rope_scaling = None
+            rope_parameters: ClassVar[dict] = {"rope_type": "default"}
 
         result = _extract_rope_config(Cfg())
+        assert result is not None
         assert result.rope_theta == pytest.approx(0.0)
 
     def test_mrope_interleaved_from_rope_scaling(self):
@@ -290,12 +475,27 @@ class TestExtractRopeConfig:
         assert result["mrope_interleaved"] is True
         assert result["mrope_section"] == [8, 16, 8]
 
+    def test_mrope_interleaved_alias_from_rope_scaling(self):
+        """Qwen3-TTS talker spells the flag as bare ``interleaved``."""
+
+        class Cfg:
+            rope_scaling: ClassVar[dict] = {
+                "interleaved": True,
+                "mrope_section": [24, 20, 20],
+                "rope_type": "default",
+            }
+
+        result = _extract_mrope_fields(Cfg())
+        assert result["mrope_interleaved"] is True
+        assert result["mrope_section"] == [24, 20, 20]
+
     def test_original_max_position_embeddings(self):
         class Cfg:
             original_max_position_embeddings = 8192
-            rope_scaling = None
+            rope_parameters: ClassVar[dict] = {"rope_type": "default"}
 
         result = _extract_rope_config(Cfg())
+        assert result is not None
         assert result.original_max_position_embeddings == 8192
 
 
@@ -628,6 +828,15 @@ class TestQuantizationConfig:
         hf = type("HFConfig", (), {"quantization_config": {"quant_method": "none"}})()
         assert QuantizationConfig.from_transformers(hf) is None
 
+    def test_from_transformers_fp8_returns_none(self):
+        """FP8 per-tensor quantization is not block quantization; returns None."""
+        hf = type(
+            "HFConfig",
+            (),
+            {"quantization_config": {"quant_method": "fp8", "bits": 8}},
+        )()
+        assert QuantizationConfig.from_transformers(hf) is None
+
     def test_from_transformers_to_dict_object(self):
         """HF QuantizationConfig objects have a to_dict() method."""
         inner = type(
@@ -647,6 +856,49 @@ class TestQuantizationConfig:
         assert qc is not None
         assert qc.bits == 8
         assert qc.group_size == 32
+
+    def test_from_transformers_symmetric_key_fallback(self):
+        """Olive uses ``symmetric`` rather than GPTQ's ``sym`` key."""
+        hf = type(
+            "HFConfig",
+            (),
+            {
+                "quantization_config": {
+                    "quant_method": "olive",
+                    "bits": 4,
+                    "group_size": 32,
+                    "symmetric": False,
+                }
+            },
+        )()
+        qc = QuantizationConfig.from_transformers(hf)
+        assert qc is not None
+        assert qc.sym is False
+
+    def test_from_transformers_olive_embeds_and_lm_head(self):
+        """Olive RTN exports flag quantized embeddings and LM head."""
+        hf = type(
+            "HFConfig",
+            (),
+            {
+                "quantization_config": {
+                    "quant_method": "olive",
+                    "bits": 4,
+                    "group_size": 32,
+                    "embeds": True,
+                    "lm_head": True,
+                }
+            },
+        )()
+        qc = QuantizationConfig.from_transformers(hf)
+        assert qc is not None
+        assert qc.quantize_embeddings is True
+        assert qc.quantize_lm_head is True
+
+    def test_quantize_embed_lm_head_default_false(self):
+        qc = QuantizationConfig()
+        assert qc.quantize_embeddings is False
+        assert qc.quantize_lm_head is False
 
     def test_architecture_config_has_quantization_field(self):
         config = ArchitectureConfig()
@@ -764,3 +1016,153 @@ class TestArchitectureConfigValidate:
         msg = str(exc_info.value)
         assert "hidden_size" in msg
         assert "num_hidden_layers" in msg
+
+
+class TestGemma4Config:
+    """Tests for Gemma4Config.from_transformers."""
+
+    def test_boa_token_id_extracted_from_parent(self):
+        """boa_token_id lives on the parent HF config, not text_config."""
+        from mobius._configs import Gemma4Config
+
+        text_config = type(
+            "TextConfig",
+            (),
+            {
+                "model_type": "gemma4_text",
+                "hidden_size": 1536,
+                "intermediate_size": 6144,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 1,
+                "head_dim": 256,
+                "vocab_size": 262144,
+                "rms_norm_eps": 1e-6,
+                "hidden_act": "silu",
+                "rope_theta": 10_000.0,
+                "max_position_embeddings": 131072,
+                "bos_token_id": 2,
+                "eos_token_id": 1,
+                "pad_token_id": 0,
+            },
+        )()
+        parent_config = type(
+            "ParentConfig",
+            (),
+            {"boa_token_id": 256000, "model_type": "gemma4"},
+        )()
+
+        config = Gemma4Config.from_transformers(text_config, parent_config=parent_config)
+        assert config.boa_token_id == 256000
+
+    def test_boa_token_id_none_when_absent(self):
+        """boa_token_id defaults to None when parent doesn't have it."""
+        from mobius._configs import Gemma4Config
+
+        text_config = type(
+            "TextConfig",
+            (),
+            {
+                "model_type": "gemma4_text",
+                "hidden_size": 1536,
+                "intermediate_size": 6144,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 1,
+                "head_dim": 256,
+                "vocab_size": 262144,
+                "rms_norm_eps": 1e-6,
+                "hidden_act": "silu",
+                "rope_theta": 10_000.0,
+                "max_position_embeddings": 131072,
+            },
+        )()
+
+        config = Gemma4Config.from_transformers(text_config)
+        assert config.boa_token_id is None
+
+
+class TestActivationFallbacks:
+    """Tests for hidden_act extraction fallbacks (ff_activation, gelu_activation)."""
+
+    def test_ff_activation_fallback(self):
+        """ff_activation is used when hidden_act is absent (XLNet pattern)."""
+
+        class FakeConfig:
+            model_type = "xlnet"
+            num_attention_heads = 8
+            num_key_value_heads = 8
+            num_hidden_layers = 2
+            vocab_size = 1000
+            hidden_size = 256
+            intermediate_size = 512
+            max_position_embeddings = 1024
+            head_dim = 32
+            ff_activation = "gelu"
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        assert config.hidden_act == "gelu"
+
+    def test_gelu_activation_true_fallback(self):
+        """gelu_activation=True maps to 'gelu' (XLM pattern)."""
+
+        class FakeConfig:
+            model_type = "xlm"
+            num_attention_heads = 8
+            num_key_value_heads = 8
+            num_hidden_layers = 2
+            vocab_size = 1000
+            hidden_size = 256
+            intermediate_size = 512
+            max_position_embeddings = 1024
+            head_dim = 32
+            gelu_activation = True
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        assert config.hidden_act == "gelu"
+
+    def test_gelu_activation_false_does_not_set_gelu(self):
+        """gelu_activation=False should not set hidden_act to gelu."""
+
+        class FakeConfig:
+            model_type = "some_model"
+            num_attention_heads = 8
+            num_key_value_heads = 8
+            num_hidden_layers = 2
+            vocab_size = 1000
+            hidden_size = 256
+            intermediate_size = 512
+            max_position_embeddings = 1024
+            head_dim = 32
+            gelu_activation = False
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        # With gelu_activation=False and no other activation attr,
+        # hidden_act should be None (not "gelu")
+        assert config.hidden_act is None
+
+
+class TestImplicitRopeDefaults:
+    """Tests for models in _IMPLICIT_ROPE_DEFAULTS."""
+
+    def test_arctic_gets_rope_config(self):
+        """Arctic (rope_theta=10000, rope_scaling=null) should get RoPE."""
+
+        class FakeConfig:
+            model_type = "arctic"
+            num_attention_heads = 8
+            num_key_value_heads = 8
+            num_hidden_layers = 2
+            vocab_size = 1000
+            hidden_size = 256
+            intermediate_size = 512
+            max_position_embeddings = 4096
+            head_dim = 32
+            hidden_act = "silu"
+            # Arctic has rope_theta=10000 (default) and no rope_scaling
+            rope_theta = 10_000.0
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        # Arctic must get RoPE via _IMPLICIT_ROPE_DEFAULTS
+        assert config.rope_type == "default"
+        assert config.rope_theta == pytest.approx(10_000.0)

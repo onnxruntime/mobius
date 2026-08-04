@@ -1,4 +1,5 @@
 model_id: "uclanlp/plbart-base"
+model_type: "plbart"
 revision: "main"
 task_type: "seq2seq"
 dtype: "float32"
@@ -8,6 +9,7 @@ inputs:
     - "def add(a, b): return a + b"
   decoder_prompt: ""
 
+skip_reason: "No safetensors weights on HuggingFace Hub."
 level: "L4+L5"
 
 generation:

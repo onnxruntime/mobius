@@ -1,0 +1,17 @@
+model_id: "kyutai/helium-1-preview-2b"
+model_type: "helium"
+revision: "645c94758493"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Once upon a time"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+notes: "Helium 1 preview 2B. Kyutai dense language model."

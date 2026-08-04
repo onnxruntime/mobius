@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Transformer components for the Qwen3-TTS codec tokenizer.
 
@@ -16,14 +16,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components._codec_conv import LayerScale
 from mobius.components._common import (
     LayerNorm,
     Linear,
 )
+from mobius.components._mlp import FCMLP, GatedMLP
 from mobius.components._rms_norm import RMSNorm
 from mobius.components._rotary_embedding import (
     BaseRope,
@@ -76,12 +76,13 @@ class CodecDecoderTransformerLayer(nn.Module):
         self.self_attn_layer_scale = LayerScale(hidden_size)
 
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.mlp = _SwiGLUMLP(hidden_size, intermediate_size)
+        # SwiGLU MLP: SiLU(gate_proj(x)) * up_proj(x) → down_proj
+        self.mlp = GatedMLP(hidden_size, intermediate_size, activation="silu", bias=False)
         self.mlp_layer_scale = LayerScale(hidden_size)
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         position_embeddings: tuple,
         attention_mask: ir.Value | None = None,
@@ -117,7 +118,7 @@ class _CodecDecoderAttention(nn.Module):
     """Multi-head attention with RoPE for the codec decoder transformer.
 
     Uses ``op.RotaryEmbedding`` on Q and K before passing them
-    to the ONNX ``Attention`` op (opset 23).
+    to the ONNX ``Attention`` op (opset 24).
 
     Parameters:
         hidden_size: Model hidden dimension.
@@ -147,7 +148,7 @@ class _CodecDecoderAttention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         position_embeddings: tuple,
         attention_mask: ir.Value | None = None,
@@ -194,23 +195,6 @@ class _CodecDecoderAttention(nn.Module):
         )
 
         return self.o_proj(op, attn_out)
-
-
-class _SwiGLUMLP(nn.Module):
-    """SwiGLU MLP: SiLU(gate_proj(x)) * up_proj(x) → down_proj."""
-
-    def __init__(self, hidden_size: int, intermediate_size: int):
-        super().__init__()
-        self.gate_proj = Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = Linear(intermediate_size, hidden_size, bias=False)
-
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
-        gate = self.gate_proj(op, x)
-        up = self.up_proj(op, x)
-        # SiLU(gate) * up
-        activated = op.Mul(op.Mul(gate, op.Sigmoid(gate)), up)
-        return self.down_proj(op, activated)
 
 
 class CodecDecoderTransformerModel(nn.Module):
@@ -274,7 +258,7 @@ class CodecDecoderTransformerModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         position_ids: ir.Value,
         attention_mask: ir.Value | None = None,
@@ -334,19 +318,21 @@ class CodecEncoderTransformerLayer(nn.Module):
         num_kv_heads: int,
         head_dim: int,
         intermediate_size: int,
+        layer_norm_eps: float = 1e-6,
     ):
         super().__init__()
-        self.input_layernorm = LayerNorm(hidden_size)
+        self.input_layernorm = LayerNorm(hidden_size, eps=layer_norm_eps)
         self.self_attn = _CodecDecoderAttention(hidden_size, num_heads, num_kv_heads, head_dim)
         self.self_attn_layer_scale = LayerScale(hidden_size)
 
-        self.post_attention_layernorm = LayerNorm(hidden_size)
-        self.mlp = _GELUFc1Fc2MLP(hidden_size, intermediate_size)
+        self.post_attention_layernorm = LayerNorm(hidden_size, eps=layer_norm_eps)
+        # GELU fc1/fc2 MLP (no bias, matches Mimi encoder)
+        self.mlp = FCMLP(hidden_size, intermediate_size, activation="gelu", bias=False)
         self.mlp_layer_scale = LayerScale(hidden_size)
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         position_embeddings: tuple,
         attention_mask: ir.Value | None = None,
@@ -374,18 +360,6 @@ class CodecEncoderTransformerLayer(nn.Module):
         hidden_states = op.Add(residual, hidden_states)
 
         return hidden_states
-
-
-class _GELUFc1Fc2MLP(nn.Module):
-    """Simple MLP: fc1 → GELU → fc2."""
-
-    def __init__(self, hidden_size: int, intermediate_size: int):
-        super().__init__()
-        self.fc1 = Linear(hidden_size, intermediate_size, bias=False)
-        self.fc2 = Linear(intermediate_size, hidden_size, bias=False)
-
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
-        return self.fc2(op, op.Gelu(self.fc1(op, x)))
 
 
 class CodecEncoderTransformerModel(nn.Module):
@@ -418,6 +392,7 @@ class CodecEncoderTransformerModel(nn.Module):
         head_dim: int = 64,
         rope_theta: float = 10000.0,
         max_position_embeddings: int = 4096,
+        layer_norm_eps: float = 1e-6,
     ):
         super().__init__()
         self.layers = nn.ModuleList(
@@ -428,6 +403,7 @@ class CodecEncoderTransformerModel(nn.Module):
                     num_kv_heads=num_key_value_heads,
                     head_dim=head_dim,
                     intermediate_size=intermediate_size,
+                    layer_norm_eps=layer_norm_eps,
                 )
                 for _ in range(num_hidden_layers)
             ]
@@ -442,7 +418,7 @@ class CodecEncoderTransformerModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         position_ids: ir.Value,
         attention_mask: ir.Value | None = None,

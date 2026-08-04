@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Model test-coverage audit: every registered architecture must have L1-L5 data.
 
@@ -29,7 +29,7 @@ Adding a new model?
 3. Add YAML in ``testdata/cases/``             →  L4
 4. Generate golden JSON (or add ``skip_reason`` to YAML)  →  L5
 
-See ``.github/skills/writing-tests/SKILL.md`` for the full guide.
+See ``.agents/skills/writing-tests/SKILL.md`` for the full guide.
 """
 
 from __future__ import annotations
@@ -145,6 +145,10 @@ def _all_registered_with_test_id() -> dict[str, str]:
 #   - CausalLM / other models without YAML
 #
 _COVERAGE_SKIP: dict[str, str] = {
+    # --- Specialized-test models (covered by a co-located test class) ---
+    "llada": "Masked-diffusion LM — covered by src/mobius/models/llada_test.py "
+    "(graph build + diffusers-parity + bidirectionality); no small public "
+    "checkpoint and non-standard I/O (no attention_mask/KV cache/golden data)",
     # --- Internal / duplicate aliases ---
     "code_llama": "Alias for llama — covered by llama",
     "command_r": "Alias for cohere — covered by cohere",
@@ -165,7 +169,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "blip": "VL model — requires image inputs",
     "blip-2": "VL model — requires image inputs",
     "florence2": "VL model — requires image inputs",
-    "gemma3_multimodal": "VL model — requires image inputs",
+    "gemma3": "VL model — requires image inputs",
     "idefics2": "VL model — requires image inputs",
     "idefics3": "VL model — requires image inputs",
     "instructblip": "VL model — requires image inputs",
@@ -197,6 +201,8 @@ _COVERAGE_SKIP: dict[str, str] = {
     "wav2vec2-conformer": "Audio model — requires audio inputs",
     "wavlm": "Audio model — requires audio inputs",
     "whisper": "Speech-to-text — requires audio inputs",
+    "mms": "CTC ASR model — tested via TestBuildMMSGraph",
+    "fastconformer_rnnt": "NeMo .nemo RNN-T ASR — tested via tests/nemo_rnnt_integration_test.py",
     # --- Models requiring trust_remote_code ---
     "chatglm": "Requires trust_remote_code (custom HF modeling code)",
     "dots1": "Requires trust_remote_code (custom HF modeling code)",
@@ -204,6 +210,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "arctic": "Very large MoE (480B) — no small public checkpoint",
     "dbrx": "Large MoE (132B) — no small public checkpoint",
     "deepseek_v3": "Very large MoE (671B) — no small public checkpoint",
+    "deepseek_v4": "Very large MoE (284B) — no small public checkpoint",
     "llama4_text": "Very large MoE (109B) — no small public checkpoint",
     "qwen3_5_moe": "Large MoE (22B) — no small public checkpoint",
     # --- Models without test_model_id ---
@@ -269,7 +276,20 @@ _COVERAGE_SKIP: dict[str, str] = {
     "qwen": "CausalLM — YAML not yet created",
     "youtu": "CausalLM — YAML not yet created",
     "zamba": "CausalLM — YAML not yet created",
-    "zamba2": "CausalLM — YAML not yet created",
+    "zamba2": "HybridCausalLM — YAML not yet created",
+    # --- Speculative-decoding drafters (bespoke IO; generic L1-L3/L2 matrix
+    # cannot drive them — they consume target hidden states / shared KV rather
+    # than input_ids). Covered by dedicated specialized tests + golden. ---
+    "DFlashDraftModel": "Drafter (noise_embedding + target_hidden IO) — covered by src/mobius/models/_dflash_test.py + L4 golden (dflash-draft)",
+    "gemma4_assistant": "Drafter (target shared KV + hidden state) — covered by _gemma4_assistant_test.py + L4/L5 golden (gemma4-assistant)",
+    "Gemma4AssistantForCausalLM": "Drafter alias of gemma4_assistant — covered by _gemma4_assistant_test.py + L4/L5 golden",
+    "gemma4_unified_assistant": "Drafter (unified variant) — covered by _gemma4_assistant_test.py + L4/L5 golden",
+    "Gemma4UnifiedAssistantForCausalLM": "Drafter alias of gemma4_unified_assistant — covered by _gemma4_assistant_test.py + L4/L5 golden",
+    "Qwen35MtpModel": "Drafter (inputs_embeds + target hidden_states IO; borrows target embed/lm_head) — covered by src/mobius/models/_qwen35_mtp_test.py + L4 golden (qwen35-mtp)",
+    "Eagle3LlamaForCausalLM": "Drafter (inputs_embeds + fused/recycled hidden IO; own draft-vocab lm_head) — covered by src/mobius/models/_eagle3_test.py",
+    "LlamaForCausalLMEagle3": "Drafter (EAGLE-3 arch alias used by the Qwen3-8B checkpoint) — covered by src/mobius/models/_eagle3_test.py",
+    "Eagle3Speculator": "Drafter (speculators-format EAGLE-3, RedHat Qwen3) — covered by src/mobius/models/_eagle3_test.py",
+    "Eagle3DraftModel": "Drafter (speculators-format EAGLE-3, RedHat Gemma4) — covered by src/mobius/models/_eagle3_test.py",
 }
 
 
@@ -321,18 +341,25 @@ class TestL1L3GraphBuildCoverage:
                 + "\n\nFix: add a config entry to "
                 "tests/_test_configs.py or add to _COVERAGE_SKIP."
             )
+        # Report coverage percentage
+        covered = len([mt for mt in all_reg if mt in l13])
+        pct = 100.0 * covered / len(all_reg) if all_reg else 0
+        assert pct >= 90.0, (
+            f"L1/L3 coverage {covered}/{len(all_reg)} = {pct:.1f}% (target ≥ 95%)"
+        )
 
     @pytest.mark.parametrize("arch", _all_registered())
     def test_model_has_l1_l3_config(self, arch: str):
         """Per-model check for L1/L3 test config."""
+        l13 = _l1_l3_model_types()
+        if arch in l13:
+            return  # Has config — pass even if in _COVERAGE_SKIP
         if arch in _COVERAGE_SKIP:
             pytest.skip(_COVERAGE_SKIP[arch])
-        l13 = _l1_l3_model_types()
-        if arch not in l13:
-            pytest.fail(
-                f"Model '{arch}' has no test config in "
-                f"tests/_test_configs.py. Add one for L1/L3 coverage."
-            )
+        pytest.fail(
+            f"Model '{arch}' has no test config in "
+            f"tests/_test_configs.py. Add one for L1/L3 coverage."
+        )
 
 
 class TestL2ConfigValidation:
@@ -361,13 +388,14 @@ class TestL2ConfigValidation:
     @pytest.mark.parametrize("arch", _all_registered())
     def test_model_has_test_model_id(self, arch: str):
         """Per-model check for test_model_id (L2)."""
+        if arch in _TEST_MODEL_IDS:
+            return  # Has test_model_id — pass even if in _COVERAGE_SKIP
         if arch in _COVERAGE_SKIP:
             pytest.skip(_COVERAGE_SKIP[arch])
-        if arch not in _TEST_MODEL_IDS:
-            pytest.fail(
-                f"Model '{arch}' has no test_model_id in "
-                f"_TEST_MODEL_IDS. Add one for L2 config validation."
-            )
+        pytest.fail(
+            f"Model '{arch}' has no test_model_id in "
+            f"_TEST_MODEL_IDS. Add one for L2 config validation."
+        )
 
 
 class TestL4L5GoldenDataCoverage:

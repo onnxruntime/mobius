@@ -1,6 +1,6 @@
 #!/usr/bin/env python
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 r"""Phi-4 Multimodal generation -- text, vision, audio, and combined.
 
@@ -16,7 +16,8 @@ generation across all supported modalities:
 The model is split into 4 ONNX graphs, each running in its own
 ONNX Runtime session:
 
-    - **Vision**:    ``pixel_values`` + ``image_sizes`` → ``image_features``
+    - **Vision**:    ``pixel_values`` + ``image_sizes`` +
+      ``image_attention_mask`` → ``image_features``
       (SigLIP encoder + projection)
     - **Speech**:    ``audio_features`` + ``audio_sizes`` +
       ``audio_projection_mode`` → ``audio_features``
@@ -31,7 +32,7 @@ only the embedding and decoder sessions are used (no vision/speech).
 
 Prerequisites::
 
-    pip install mobius-ai[transformers] torchaudio
+    pip install mobius-onnx[transformers] torchaudio
 
 Usage::
 
@@ -68,6 +69,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import sys
 
 import numpy as np
 import transformers
@@ -110,12 +112,16 @@ def prepare_vision_feeds(
     """Prepare feeds for the **vision** session.
 
     Returns:
-        ``{"pixel_values": [1, 3, H, W], "image_sizes": [1, 2]}``
-        ready for the vision ONNX model.
+        ``{"pixel_values": [crops, 3, H, W], "image_sizes": [1, 2],
+        "image_attention_mask": [crops, P, P]}`` ready for the vision
+        ONNX model (single image).
     """
-    pixel_values = _load_image(image_path, processor)
-    image_sizes = np.array([[pixel_values.shape[-2], pixel_values.shape[-1]]], dtype=np.int64)
-    return {"pixel_values": pixel_values, "image_sizes": image_sizes}
+    pixel_values, image_sizes, image_attention_mask = _load_image(image_path, processor)
+    return {
+        "pixel_values": pixel_values,
+        "image_sizes": image_sizes,
+        "image_attention_mask": image_attention_mask,
+    }
 
 
 def prepare_speech_feeds(
@@ -174,6 +180,8 @@ def prepare_decoder_feeds(
     inputs_embeds: np.ndarray,
     past_seq_len: int,
     past_kv: dict[str, np.ndarray],
+    vision_gate: np.ndarray,
+    speech_gate: np.ndarray,
 ) -> dict[str, np.ndarray]:
     """Prepare feeds for the **decoder** session.
 
@@ -184,6 +192,10 @@ def prepare_decoder_feeds(
         inputs_embeds: ``[batch, cur_seq_len, hidden_size]`` float32.
         past_seq_len: Number of tokens already in the KV cache.
         past_kv: Dict of ``past_key_values.{i}.key/value`` arrays.
+        vision_gate: Scalar LoRA gate emitted by the embedding model
+            (1.0 if any image token is present, else 0.0).
+        speech_gate: Scalar LoRA gate emitted by the embedding model
+            (1.0 if audio present and no image, else 0.0).
 
     Returns:
         Complete feeds dict for the decoder ONNX model.
@@ -196,6 +208,11 @@ def prepare_decoder_feeds(
         "inputs_embeds": inputs_embeds,
         "attention_mask": np.ones((batch_size, total_seq_len), dtype=np.int64),
         "position_ids": np.arange(past_seq_len, total_seq_len, dtype=np.int64)[np.newaxis, :],
+        # The decoder declares vision_gate/speech_gate as required scalar
+        # inputs; they are produced by the embedding model and select the
+        # active per-modality LoRA adapter.
+        "vision_gate": vision_gate,
+        "speech_gate": speech_gate,
         **past_kv,
     }
 
@@ -278,17 +295,27 @@ def _build_input_ids_vision_audio(
 # ---------------------------------------------------------------------------
 
 
-def _load_image(image_path: str, processor) -> np.ndarray:
+def _load_image(image_path: str, processor) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Load and preprocess an image using the HuggingFace processor.
 
+    Phi4MM's image processor performs an HD multi-crop transform and emits
+    ``input_image_embeds`` (the crop pixel tensor), ``image_sizes`` and an
+    ``image_attention_mask`` marking valid (non-padding) patches per crop.
+
     Returns:
-        ``pixel_values`` as ``[1, 3, H, W]`` float32 numpy array.
+        ``(pixel_values [crops, 3, H, W], image_sizes [1, 2],
+        image_attention_mask [crops, P, P])`` as float32/int64 arrays for a
+        single image.
     """
     from PIL import Image
 
     img = Image.open(image_path).convert("RGB")
     processed = processor.image_processor(images=img, return_tensors="np")
-    return processed["pixel_values"].astype(np.float32)
+    # Single image -> index 0 of the leading num_images dimension.
+    pixel_values = processed["input_image_embeds"][0].astype(np.float32)
+    image_sizes = processed["image_sizes"][0:1].astype(np.int64)
+    image_attention_mask = processed["image_attention_mask"][0].astype(np.float32)
+    return pixel_values, image_sizes, image_attention_mask
 
 
 def _load_audio(
@@ -416,9 +443,15 @@ def generate(
         )
         embed_out = embedding_session.run(embed_feeds)
         inputs_embeds = embed_out["inputs_embeds"]
+        # The embedding model also emits the per-modality LoRA gates derived
+        # from input_ids; thread them into the decoder, which requires them.
+        vision_gate = embed_out["vision_gate"]
+        speech_gate = embed_out["speech_gate"]
 
         # --- Decoder session ---
-        decoder_feeds = prepare_decoder_feeds(inputs_embeds, past_seq_len, past_kv)
+        decoder_feeds = prepare_decoder_feeds(
+            inputs_embeds, past_seq_len, past_kv, vision_gate, speech_gate
+        )
         outputs = decoder_session.run(decoder_feeds)
 
         logits = outputs["logits"]
@@ -824,6 +857,11 @@ def main():
         action="store_true",
         help=("Also run with HuggingFace transformers and compare outputs."),
     )
+    parser.add_argument(
+        "--ci",
+        action="store_true",
+        help="Exit with non-zero code on failure (for CI pipelines).",
+    )
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -844,10 +882,10 @@ def main():
     # Step 2: Create 4 inference sessions and tokenizer
     # ------------------------------------------------------------------
     print("Creating ONNX Runtime sessions ...")
-    vision_session = OnnxModelSession(pkg["vision"])
-    speech_session = OnnxModelSession(pkg["speech"])
+    vision_session = OnnxModelSession(pkg["vision_encoder"])
+    speech_session = OnnxModelSession(pkg["audio_encoder"])
     embedding_session = OnnxModelSession(pkg["embedding"])
-    decoder_session = OnnxModelSession(pkg["model"])
+    decoder_session = OnnxModelSession(pkg["decoder"])
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.model_id, trust_remote_code=True
@@ -944,9 +982,17 @@ def main():
                 print("✅ Outputs match!")
             else:
                 print("⚠️  Outputs differ (may be due to numerical precision).")
+                if args.ci:
+                    sys.exit(1)
 
     print("\nDone.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        if "--ci" in sys.argv:
+            print(f"FAILED: {e}", file=sys.stderr)
+            sys.exit(1)
+        raise

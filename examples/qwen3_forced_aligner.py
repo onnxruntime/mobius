@@ -1,6 +1,6 @@
 #!/usr/bin/env python
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Qwen3-ForcedAligner — speech-text alignment with ONNX models.
 
@@ -13,7 +13,7 @@ head. The classifier output is interpreted as alignment probabilities.
 
 Prerequisites::
 
-    pip install mobius-ai[transformers] torchaudio
+    pip install mobius-onnx[transformers] torchaudio
 
 Usage::
 
@@ -156,9 +156,18 @@ def run_alignment(
     alignment_text += "<timestamp><timestamp>"
 
     # Step 2: Compute mel spectrogram and run audio encoder
-    mel = compute_mel_spectrogram(audio)
-    audio_out = sessions["audio_encoder"].run({"input_features": mel})
+    mel, feature_attention_mask = compute_mel_spectrogram(audio)
+    audio_out = sessions["audio_encoder"].run(
+        {
+            "input_features": mel,
+            "feature_attention_mask": feature_attention_mask,
+        }
+    )
     audio_features = audio_out["audio_features"]
+    audio_feature_lengths = audio_out["audio_feature_lengths"]
+    # Crop padding-derived audio tokens
+    valid_audio_tokens = int(audio_feature_lengths[0])
+    audio_features = audio_features[:, :valid_audio_tokens, :]
     num_audio_tokens = audio_features.shape[1]
     audio_features_2d = audio_features.reshape(-1, audio_features.shape[-1])
 
@@ -288,6 +297,11 @@ def main():
         default=None,
         help="Save ONNX models to DIR and exit.",
     )
+    parser.add_argument(
+        "--ci",
+        action="store_true",
+        help="Exit with non-zero code on failure (for CI pipelines).",
+    )
     args = parser.parse_args()
 
     # Build 3 ONNX models (auto-detected from model_type)
@@ -322,4 +336,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        if "--ci" in sys.argv:
+            print(f"FAILED: {e}", file=sys.stderr)
+            sys.exit(1)
+        raise

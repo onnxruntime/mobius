@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """SD3 and Flux transformer denoisers.
 
@@ -17,8 +17,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components import LayerNorm as _LayerNorm
 from mobius.components import Linear as _Linear
@@ -108,7 +107,7 @@ class _JointAttentionBlock(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         encoder_hidden_states: ir.Value,
         temb: ir.Value,
@@ -119,7 +118,7 @@ class _JointAttentionBlock(nn.Module):
             hidden_states,
             temb,
         )
-        one = op.Constant(value_float=1.0)
+        one = 1.0
         img_input = op.Mul(normed, op.Add(one, op.Unsqueeze(scale_msa, [1])))
         img_input = op.Add(img_input, op.Unsqueeze(shift_msa, [1]))
 
@@ -203,7 +202,7 @@ class SD3Transformer2DModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         sample: ir.Value,
         timestep: ir.Value,
         encoder_hidden_states: ir.Value,
@@ -251,7 +250,7 @@ class SD3Transformer2DModel(nn.Module):
         )
         return hidden_states
 
-    def _get_timestep_embedding(self, op: builder.OpBuilder, timestep):
+    def _get_timestep_embedding(self, op: OpBuilder, timestep):
         half_dim = self.time_proj_dim // 2
         exponent = -math.log(10000.0) / half_dim
         freqs = np.exp(np.arange(half_dim) * exponent).astype(np.float32)
@@ -318,13 +317,13 @@ class _FluxSingleBlock(nn.Module):
         self.attn = _DiTSelfAttention(hidden_size, num_heads)
         self.ff = _DiTFFN(hidden_size)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value, temb: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, temb: ir.Value):
         normed, shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm(
             op,
             hidden_states,
             temb,
         )
-        one = op.Constant(value_float=1.0)
+        one = 1.0
         attn_input = op.Mul(normed, op.Add(one, op.Unsqueeze(scale_msa, [1])))
         attn_input = op.Add(attn_input, op.Unsqueeze(shift_msa, [1]))
 
@@ -387,7 +386,7 @@ class FluxTransformer2DModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         sample: ir.Value,
         timestep: ir.Value,
         encoder_hidden_states: ir.Value,
@@ -455,7 +454,7 @@ class FluxTransformer2DModel(nn.Module):
         )
         return hidden_states
 
-    def _get_timestep_embedding(self, op: builder.OpBuilder, timestep):
+    def _get_timestep_embedding(self, op: OpBuilder, timestep):
         half_dim = self.time_proj_dim // 2
         exponent = -math.log(10000.0) / half_dim
         freqs = np.exp(np.arange(half_dim) * exponent).astype(np.float32)

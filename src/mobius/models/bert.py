@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """BERT encoder-only model and masked LM with HF-aligned weight naming.
 
@@ -24,8 +24,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._activations import ACT2FN
@@ -77,9 +76,7 @@ class _BertAttention(nn.Module):
         self.self = self_attn
         self.output = _BertAttentionOutput(hidden_size, eps, bias)
 
-    def forward(
-        self, op: builder.OpBuilder, hidden_states: ir.Value, attention_mask: ir.Value
-    ):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, attention_mask: ir.Value):
         self_attn = self.self
         query = self_attn.query(op, hidden_states)
         key = self_attn.key(op, hidden_states)
@@ -113,7 +110,7 @@ class _BertIntermediate(nn.Module):
         self.dense = Linear(hidden_size, intermediate_size, bias=bias)
         self._act_fn = ACT2FN[hidden_act]
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         return self._act_fn(op, self.dense(op, hidden_states))
 
 
@@ -153,7 +150,7 @@ class _BertEncoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_mask: ir.Value | None = None,
     ):
@@ -185,12 +182,12 @@ class _BertEmbeddings(nn.Module):
         # Capital 'LayerNorm' matches HF BERT naming
         self.LayerNorm = LayerNorm(hidden_size, eps=layer_norm_eps)
 
-    def forward(self, op: builder.OpBuilder, input_ids: ir.Value, token_type_ids: ir.Value):
+    def forward(self, op: OpBuilder, input_ids: ir.Value, token_type_ids: ir.Value):
         word_embeds = self.word_embeddings(op, input_ids)
         seq_len = op.Shape(input_ids, start=1, end=2)
         position_ids = op.Range(
             op.Constant(value_int=0),
-            op.Squeeze(seq_len),
+            seq_len,
             op.Constant(value_int=1),
         )
         position_ids = op.Cast(position_ids, to=7)  # INT64
@@ -236,7 +233,7 @@ class BertModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         token_type_ids: ir.Value,
@@ -280,9 +277,7 @@ class _BertEncoder(nn.Module):
             ]
         )
 
-    def forward(
-        self, op: builder.OpBuilder, hidden_states: ir.Value, attention_mask: ir.Value
-    ):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, attention_mask: ir.Value):
         for layer in self.layer:
             hidden_states = layer(op, hidden_states, attention_mask)
         return hidden_states
@@ -374,7 +369,7 @@ class _MaskedLMHead(nn.Module):
         self.decoder = Linear(hidden_size, vocab_size, bias=True)
         self._act_fn = ACT2FN[hidden_act]
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # hidden_states: (batch, seq, hidden_size) -> logits: (batch, seq, vocab)
         x = self.dense(op, hidden_states)
         x = self._act_fn(op, x)
@@ -419,7 +414,7 @@ class BertForMaskedLM(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         token_type_ids: ir.Value,

@@ -1,0 +1,17 @@
+{
+  "model_id": "microsoft/Phi-4-multimodal-instruct",
+  "prompt": "Describe what you see in the image and what you hear in the audio.",
+  "generated_tokens": [
+    32,
+    9059,
+    382,
+    15015,
+    306,
+    290,
+    15214,
+    13,
+    200020,
+    199999
+  ],
+  "generated_text": "A cat is walking in the snow."
+}

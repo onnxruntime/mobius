@@ -3,11 +3,11 @@
 Build an ONNX `ModelPackage` from a GGUF model file.
 
 ```python
-from mobius.integrations.gguf import build_from_gguf
+from mobius import build_from_gguf
 ```
 
 > **Note**: Requires the optional `gguf` package:
-> `pip install mobius-ai[gguf]`
+> `pip install mobius-onnx[gguf]`
 
 ## Signature
 
@@ -37,7 +37,7 @@ def build_from_gguf(
 ## Examples
 
 ```python
-from mobius.integrations.gguf import build_from_gguf
+from mobius import build_from_gguf
 
 # Basic conversion (dequantizes to float)
 pkg = build_from_gguf("llama-3.2-1b-q4_0.gguf")

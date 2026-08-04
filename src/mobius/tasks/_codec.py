@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Codec tokenizer 2-model task for Qwen3-TTS-Tokenizer-12Hz.
 
@@ -10,12 +10,15 @@ Builds two ONNX models:
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import onnx_ir as ir
 from onnxscript import nn
 
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
+    ComponentSpec,
     ModelTask,
     _make_graph,
     _make_model,
@@ -32,11 +35,15 @@ class CodecTask(ModelTask):
     Each is wired into its own ONNX graph with no KV cache.
     """
 
+    model_roles: ClassVar[dict[str, str]] = {"encoder": "encoder", "decoder": "decoder"}
+    components: ClassVar[ComponentSpec] = ComponentSpec(encoder="encoder", decoder="decoder")
+
     def build(
         self,
         module: nn.Module,
         config: ArchitectureConfig,
     ) -> ModelPackage:
+        self._validate_components(module)
         models: dict[str, ir.Model] = {}
         models["decoder"] = self._build_decoder(module.decoder, config)
         models["encoder"] = self._build_encoder(module.encoder, config)
@@ -58,17 +65,12 @@ class CodecTask(ModelTask):
         num_q = ir.SymbolicDim("num_quantizers")
         seq_len = ir.SymbolicDim("sequence_len")
 
-        codes = ir.Value(
-            name="codes",
-            shape=ir.Shape([batch, num_q, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
+        graph, builder = _make_graph()
+        codes = builder.input("codes", dtype=ir.DataType.INT64, shape=[batch, num_q, seq_len])
 
-        graph, builder = _make_graph([codes], name="decoder")
         waveform = decoder(builder.op, codes)
 
-        waveform.name = "waveform"
-        graph.outputs.append(waveform)
+        builder.add_output(waveform, "waveform")
         return _make_model(graph)
 
     def _build_encoder(
@@ -86,15 +88,12 @@ class CodecTask(ModelTask):
         batch = ir.SymbolicDim("batch")
         audio_len = ir.SymbolicDim("audio_length")
 
-        waveform = ir.Value(
-            name="waveform",
-            shape=ir.Shape([batch, 1, audio_len]),
-            type=ir.TensorType(ir.DataType.FLOAT),
+        graph, builder = _make_graph(name="encoder")
+        waveform = builder.input(
+            "waveform", dtype=ir.DataType.FLOAT, shape=[batch, 1, audio_len]
         )
 
-        graph, builder = _make_graph([waveform], name="encoder")
         codes = encoder(builder.op, waveform)
 
-        codes.name = "codes"
-        graph.outputs.append(codes)
+        builder.add_output(codes, "codes")
         return _make_model(graph)

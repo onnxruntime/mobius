@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """HunyuanDiT (Hunyuan Diffusion Transformer) 2D model.
 
@@ -30,9 +30,9 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
+from mobius._weight_utils import rename_weight_keys
 from mobius.components import LayerNorm as _LayerNorm
 from mobius.components import Linear as _Linear
 from mobius.components import SiLU as _SiLU
@@ -104,12 +104,12 @@ class _LayerNormNoAffine(nn.Module):
         self._dim = dim
         self._eps = eps
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # Use ReduceMean + variance computation for norm without params
         mean = op.ReduceMean(x, [-1], keepdims=True)
         diff = op.Sub(x, mean)
         var = op.ReduceMean(op.Mul(diff, diff), [-1], keepdims=True)
-        eps = op.Constant(value_float=self._eps)
+        eps = self._eps
         return op.Div(diff, op.Sqrt(op.Add(var, eps)))
 
 
@@ -128,7 +128,7 @@ class _AdaLayerNormShift(nn.Module):
         self.linear = _Linear(hidden_size, hidden_size)
         self._silu = _SiLU()
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value, temb: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, temb: ir.Value):
         # shift = Linear(SiLU(temb))
         shift = self._silu(op, temb)
         shift = self.linear(op, shift)
@@ -156,7 +156,7 @@ class _HunyuanSelfAttention(nn.Module):
             self.norm_q = _LayerNorm(self._head_dim, eps=1e-6)
             self.norm_k = _LayerNorm(self._head_dim, eps=1e-6)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         q = self.to_q(op, hidden_states)
         k = self.to_k(op, hidden_states)
         v = self.to_v(op, hidden_states)
@@ -215,9 +215,7 @@ class _HunyuanCrossAttention(nn.Module):
             self.norm_q = _LayerNorm(self._head_dim, eps=1e-6)
             self.norm_k = _LayerNorm(self._head_dim, eps=1e-6)
 
-    def forward(
-        self, op: builder.OpBuilder, hidden_states: ir.Value, encoder_hidden_states: ir.Value
-    ):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, encoder_hidden_states: ir.Value):
         q = self.to_q(op, hidden_states)
         k = self.to_k(op, encoder_hidden_states)
         v = self.to_v(op, encoder_hidden_states)
@@ -259,7 +257,7 @@ class _GEGLU(nn.Module):
         super().__init__()
         self.proj = _Linear(hidden_size, intermediate_size * 2)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         projected = self.proj(op, hidden_states)
         # Split into gate and value: [B, seq, 2*inter] → 2x [B, seq, inter]
         hidden, gate = op.Split(projected, num_outputs=2, axis=-1, _outputs=2)
@@ -278,7 +276,7 @@ class _HunyuanFFN(nn.Module):
         self.geglu = _GEGLU(hidden_size, intermediate_size)
         self.linear_out = _Linear(intermediate_size, hidden_size)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         hidden_states = self.geglu(op, hidden_states)
         return self.linear_out(op, hidden_states)
 
@@ -326,7 +324,7 @@ class _HunyuanDiTBlock(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         encoder_hidden_states: ir.Value,
         temb: ir.Value,
@@ -376,14 +374,14 @@ class _AdaLayerNormContinuous(nn.Module):
         self.linear = _Linear(hidden_size, hidden_size * 2)
         self._silu = _SiLU()
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value, temb: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, temb: ir.Value):
         emb = self._silu(op, temb)
         emb = self.linear(op, emb)
         # Split into scale and shift
         scale, shift = op.Split(emb, num_outputs=2, axis=-1, _outputs=2)
         # Norm → (1 + scale) * normed + shift
         normed = self.norm(op, hidden_states)
-        one = op.Constant(value_float=1.0)
+        one = 1.0
         normed = op.Mul(normed, op.Add(one, op.Unsqueeze(scale, [1])))
         return op.Add(normed, op.Unsqueeze(shift, [1]))
 
@@ -463,7 +461,7 @@ class HunyuanDiT2DModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         sample: ir.Value,
         timestep: ir.Value,
         encoder_hidden_states: ir.Value,
@@ -523,7 +521,7 @@ class HunyuanDiT2DModel(nn.Module):
 
         return hidden_states
 
-    def _get_timestep_embedding(self, op: builder.OpBuilder, timestep):
+    def _get_timestep_embedding(self, op: OpBuilder, timestep):
         """Sinusoidal timestep embedding."""
         half_dim = self._time_proj_dim // 2
         exponent = -math.log(10000.0) / half_dim
@@ -534,7 +532,7 @@ class HunyuanDiT2DModel(nn.Module):
         args = op.Mul(t, op.Unsqueeze(freq_const, [0]))
         return op.Concat(op.Cos(args), op.Sin(args), axis=-1)
 
-    def _unpatchify(self, op: builder.OpBuilder, hidden_states, original):
+    def _unpatchify(self, op: OpBuilder, hidden_states, original):
         """Reshape patches back to spatial dimensions."""
         p = self.config.patch_size
         c = self._out_channels
@@ -580,13 +578,14 @@ class HunyuanDiT2DModel(nn.Module):
         - blocks.{i}.ff.net.2 → blocks.{i}.ff.linear_out
         - time_extra_emb.timestep_embedder → time_embed (simplified)
         """
-        new_state_dict: dict[str, torch.Tensor] = {}
-        for key, value in state_dict.items():
-            new_key = key
-            # GEGLU FFN renames
-            new_key = new_key.replace(".ff.net.0.proj.", ".ff.geglu.proj.")
-            new_key = new_key.replace(".ff.net.2.", ".ff.linear_out.")
-            # Timestep embedding (simplified from HF's combined embedding)
-            new_key = new_key.replace("time_extra_emb.timestep_embedder.", "time_embed.")
-            new_state_dict[new_key] = value
+        new_state_dict: dict[str, torch.Tensor] = rename_weight_keys(
+            state_dict,
+            [
+                # GEGLU FFN renames
+                (".ff.net.0.proj.", ".ff.geglu.proj."),
+                (".ff.net.2.", ".ff.linear_out."),
+                # Timestep embedding (simplified from HF's combined embedding)
+                ("time_extra_emb.timestep_embedder.", "time_embed."),
+            ],
+        )
         return new_state_dict

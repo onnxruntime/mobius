@@ -1,4 +1,5 @@
 model_id: "deepseek-ai/DeepSeek-V2-Lite"
+model_type: "deepseek_v2"
 revision: "604d5664dddd88a0433dbae533b7fe9472482de0"
 task_type: "text-generation"
 dtype: "float32"

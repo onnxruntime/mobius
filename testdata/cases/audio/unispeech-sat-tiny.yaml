@@ -1,4 +1,5 @@
 model_id: "optimum-intel-internal-testing/tiny-random-UnispeechSatModel"
+model_type: "unispeech-sat"
 revision: "main"
 task_type: "audio-feature-extraction"
 dtype: "float32"
@@ -10,3 +11,5 @@ inputs:
 level: "L4"
 
 notes: "UniSpeechSat tiny random. Speaker-aware self-supervised audio encoder."
+
+skip_reason: "Model only has .bin weights (no safetensors)"

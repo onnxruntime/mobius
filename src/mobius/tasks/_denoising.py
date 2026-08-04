@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Denoising task for diffusion models (UNet, DiT, etc.).
 
@@ -8,6 +8,8 @@ and produces noise prediction.
 """
 
 from __future__ import annotations
+
+from typing import ClassVar
 
 import onnx_ir as ir
 
@@ -19,40 +21,47 @@ from mobius.tasks._base import ModelTask, _make_graph, _make_model
 class DenoisingTask(ModelTask):
     """Build ONNX graph for diffusion denoising."""
 
-    name = "denoising"
+    model_roles: ClassVar[dict[str, str]] = {"model": "encoder"}
 
     def build(
         self,
         module,
         config: UNet2DConfig,
     ) -> ModelPackage:
-        sample = ir.Value(
-            name="sample",
-            type=ir.TensorType(ir.DataType.FLOAT),
-            shape=ir.Shape(("batch", config.in_channels, "height", "width")),
-        )
-        timestep = ir.Value(
-            name="timestep",
-            type=ir.TensorType(ir.DataType.INT64),
-            shape=ir.Shape(("batch",)),
-        )
-        encoder_hidden_states = ir.Value(
-            name="encoder_hidden_states",
-            type=ir.TensorType(ir.DataType.FLOAT),
-            shape=ir.Shape(("batch", "sequence_length", config.cross_attention_dim)),
-        )
-
-        graph, builder = _make_graph([sample, timestep, encoder_hidden_states])
+        graph, builder = _make_graph()
         op = builder.op
 
+        sample = builder.input(
+            "sample",
+            dtype=ir.DataType.FLOAT,
+            shape=["batch", config.in_channels, "height", "width"],
+        )
+        timestep = builder.input("timestep", dtype=ir.DataType.INT64, shape=["batch"])
+        encoder_hidden_states = builder.input(
+            "encoder_hidden_states",
+            dtype=ir.DataType.FLOAT,
+            shape=["batch", "sequence_length", config.cross_attention_dim],
+        )
+
+        # Runtime LoRA gates: one scalar `lora_gate.{name}` input per baked
+        # adapter (1.0 = active, 0.0 = inactive, or a blend strength), so a loaded
+        # model can switch/blend LoRAs at run time with no rebuild. Only modules
+        # that declare adapters (`_lora_adapter_names`) receive the gates.
+        lora_gates = {}
+        for name in getattr(module, "_lora_adapter_names", []):
+            lora_gates[name] = builder.input(
+                f"lora_gate.{name}", dtype=ir.DataType.FLOAT, shape=[]
+            )
+
+        extra_kwargs = {"lora_gates": lora_gates} if lora_gates else {}
         noise_pred = module(
             op,
             sample=sample,
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
+            **extra_kwargs,
         )
 
-        noise_pred.name = "noise_pred"
-        graph.outputs.append(noise_pred)
+        builder.add_output(noise_pred, "noise_pred")
 
-        return ModelPackage({"model": _make_model(graph)})
+        return ModelPackage({"model": _make_model(graph)}, config=config)

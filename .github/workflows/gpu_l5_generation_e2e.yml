@@ -1,0 +1,120 @@
+name: "L5: End-to-End Generation (GPU)"
+
+on:
+  schedule:
+    # Run nightly at 5am UTC (after L4 golden tests)
+    - cron: '0 5 * * *'
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      affected_models:
+        description: >-
+          JSON array of affected model names (e.g. '["qwen2", "llama"]').
+          Empty string or empty array means run all models.
+        required: false
+        type: string
+        default: ""
+    secrets:
+      HF_TOKEN:
+        required: false
+      CODECOV_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-l5-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  generation-tests:
+    name: L5 - Full token generation and decoding correctness
+    runs-on:
+      - self-hosted
+      - "1ES.Pool=onnxruntime-ep-mobius-github-linux-a10"
+      - "JobId=gpu-l5-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}"
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/huggingface
+          key: hf-gpu-${{ hashFiles('testdata/cases/**/*.yaml') }}
+          restore-keys: |
+            hf-gpu-
+
+      - name: Install PyTorch (CUDA)
+        run: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements/ci/requirements.txt
+          pip install soundfile librosa ml_dtypes flatbuffers numpy packaging protobuf sympy coloredlogs
+          pip install -e '.[testing,transformers]'
+          pip install --pre --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-12-nightly/pypi/simple/ onnxruntime-gpu onnxruntime-genai-cuda
+
+      - name: Run L5 generation E2E tests
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MOBIUS_TEST_DEVICE: cuda
+        run: |
+          AFFECTED='${{ inputs.affected_models }}'
+          if [ -z "$AFFECTED" ] || [ "$AFFECTED" = "[]" ]; then
+            echo "Running all L5 generation E2E tests"
+            pytest tests/e2e_golden_test.py \
+              -m generation \
+              -v \
+              --timeout=300 \
+              --junitxml=junit-l5.xml \
+              --cov=src --cov-report=xml --cov-branch \
+              --tb=short
+          else
+            echo "Running L5 generation tests for affected models: $AFFECTED"
+            # Convert JSON array to comma-separated list for --models
+            MODELS=$(echo "$AFFECTED" | python -c "import json, sys; print(','.join(json.load(sys.stdin)))")
+            if [ -n "$MODELS" ]; then
+              pytest tests/e2e_golden_test.py \
+                -m generation \
+                -v \
+                --models "$MODELS" \
+                --timeout=300 \
+                --junitxml=junit-l5.xml \
+                --cov=src --cov-report=xml --cov-branch \
+                --tb=short \
+                || { rc=$?; if [ $rc -eq 5 ]; then echo "No matching tests found — skipping"; else exit $rc; fi; }
+            else
+              echo "No affected models — skipping"
+            fi
+          fi
+        timeout-minutes: 60
+
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: gpu-l5
+      - name: Upload L5 test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: gpu-l5
+          report-type: test_results
+          files: junit-l5.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gpu-l5-test-results
+          path: junit-l5.xml
+          retention-days: 30

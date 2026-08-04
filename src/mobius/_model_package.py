@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """ModelPackage: a collection of named ONNX models forming a complete model.
 
@@ -29,6 +29,7 @@ import onnx_ir as ir
 import torch
 import tqdm
 
+from mobius._optimizations import fold_initializers_after_weights
 from mobius._weight_loading import _assign_weight
 
 logger = logging.getLogger(__name__)
@@ -72,11 +73,28 @@ class ModelPackage(UserDict[str, ir.Model]):
         ``model.onnx`` in *directory*.  When multiple models are present,
         each is saved in its own subfolder as ``{name}/model.onnx``.
 
+        .. note::
+            This method writes ONNX files only.  If you need a directory that
+            ``onnxruntime-genai`` can load (i.e. with ``genai_config.json`` and
+            tokenizer files), use
+            :func:`mobius.integrations.ort_genai.export_package` instead. For
+            onnx-genai, call
+            :func:`mobius.integrations.onnx_genai.write_onnx_genai_config`
+            after saving, or use ``mobius build --runtime onnx-genai``.
+
         Args:
             directory: Path to the output directory (created if needed).
             external_data: External data format. ``"onnx"`` (default) saves
                 weights to ``model.onnx.data``. ``"safetensors"`` saves
                 weights in safetensors format.
+
+                .. warning::
+                    The safetensors format does not guarantee 256-byte offset
+                    alignment for tensor data within the file.  This can cause
+                    ``CUBLAS_STATUS_INVALID_VALUE`` ("misaligned address")
+                    errors on some CUDA/cuBLAS versions when loading weights
+                    via memory-mapped I/O.  Use ``"onnx"`` (the default) for
+                    models targeting CUDA execution.
             max_shard_size_bytes: Maximum shard size in bytes for safetensors
                 format.  Only used when *external_data* is ``"safetensors"``.
             components: Optional predicate ``(name) -> bool`` that selects
@@ -232,6 +250,12 @@ class ModelPackage(UserDict[str, ir.Model]):
                     applied |= _apply_weights_to_model(model, unmatched)
 
         _log_weight_mapping(state_dict, applied)
+
+        # Fold constants now that weights have been loaded.
+        # PackQKV emits Concat(w_q, w_k, w_v) in the graph; those nodes can only
+        # be constant-folded once the weight tensors carry their const_value.
+        for model in self.data.values():
+            fold_initializers_after_weights(model)
 
 
 def _make_progress_callback():

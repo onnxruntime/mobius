@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """BLIP-2 multimodal model (vision + text) — 3-model split.
 
@@ -34,8 +34,7 @@ import re
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius._weight_utils import vlm_decoder_weights, vlm_embedding_weights
@@ -62,7 +61,7 @@ class _Blip2DecoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -111,7 +110,7 @@ class _Blip2VisionEncoderModel(nn.Module):
         # Project Q-Former output to text embedding dimension
         self.language_projection = Linear(qformer_hidden, config.hidden_size)
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         # ViT: [batch, C, H, W] → [batch, num_patches, vision_hidden_size]
         vision_features = self.vision_model(op, pixel_values)
         # Q-Former: cross-attend → [batch, num_query_tokens, qformer_hidden_size]
@@ -126,6 +125,9 @@ class _Blip2VisionEncoderModel(nn.Module):
         for key, value in state_dict.items():
             # Vision model weights (ViT)
             if key.startswith("vision_model."):
+                # VisionModel MLP uses up_proj/down_proj; HF uses fc1/fc2
+                key = key.replace(".mlp.fc1.", ".mlp.up_proj.")
+                key = key.replace(".mlp.fc2.", ".mlp.down_proj.")
                 renamed[key] = value
             # Language projection (Q-Former output → text dim)
             elif key.startswith("language_projection."):
@@ -152,7 +154,7 @@ class _Blip2EmbeddingModel(nn.Module):
         )
         self.image_token_id = config.image_token_id or 0
 
-    def forward(self, op: builder.OpBuilder, input_ids: ir.Value, image_features: ir.Value):
+    def forward(self, op: OpBuilder, input_ids: ir.Value, image_features: ir.Value):
         text_embeds = self.embed_tokens(op, input_ids)
 
         image_mask = op.Equal(
@@ -163,7 +165,7 @@ class _Blip2EmbeddingModel(nn.Module):
 
         # Build indices to scatter image features into text positions
         mask_int = op.Cast(image_mask, to=7)
-        cumsum = op.CumSum(mask_int, op.Constant(value_int=1))
+        cumsum = op.CumSum(mask_int, 1)
         indices = op.Sub(cumsum, op.Constant(value_int=1))
         indices = op.Clip(indices, op.Constant(value_int=0))
 
@@ -197,7 +199,7 @@ class Blip2Model(nn.Module):
         self.vision_encoder = _Blip2VisionEncoderModel(config)
         self.embedding = _Blip2EmbeddingModel(config)
 
-    def forward(self, op: builder.OpBuilder, **kwargs):
+    def forward(self, op: OpBuilder, **kwargs):
         raise NotImplementedError(
             "Blip2Model uses VisionLanguageTask which calls "
             "each sub-module (decoder, vision_encoder, embedding) separately."

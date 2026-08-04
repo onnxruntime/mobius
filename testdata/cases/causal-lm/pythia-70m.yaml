@@ -1,4 +1,5 @@
 model_id: "EleutherAI/pythia-70m"
+model_type: "gpt_neox"
 revision: "a39f36b100fe8a5377810d56c3f4789b9c53ac42"
 task_type: "text-generation"
 dtype: "float32"

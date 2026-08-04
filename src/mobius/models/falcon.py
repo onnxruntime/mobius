@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Falcon and Bloom CausalLM models.
 
@@ -38,7 +38,7 @@ from mobius.components._common import Embedding, LayerNorm, Linear
 
 if TYPE_CHECKING:
     import onnx_ir as ir
-    from onnxscript._internal import builder
+    from onnxscript import OpBuilder
 
 
 class _ALiBiAttention(nn.Module):
@@ -72,7 +72,7 @@ class _ALiBiAttention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         past_key_value: tuple | None = None,
@@ -124,13 +124,13 @@ class _ALiBiDecoderLayer(nn.Module):
         self.mlp = FCMLP(
             config.hidden_size,
             config.intermediate_size,
-            activation="gelu",
+            activation=config.hidden_act or "gelu",
             bias=config.mlp_bias,
         )
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         past_key_value: tuple | None = None,
@@ -189,13 +189,13 @@ class _FalconDecoderLayer(nn.Module):
         self.mlp = FCMLP(
             config.hidden_size,
             config.intermediate_size,
-            activation="gelu",
+            activation=config.hidden_act or "gelu",
             bias=config.mlp_bias,
         )
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple,
@@ -293,10 +293,11 @@ def _create_alibi_bias(op, num_heads: int, seq_len, total_len):
     alibi = op.Mul(slopes_4d, bias_2d)  # [1, num_heads, seq_len, total_len]
 
     # Causal mask: mask future positions with large negative value
+    # CastLike before Where so only the scalar is cast (cheaper than post-broadcast)
     causal_mask = op.Where(
         op.GreaterOrEqual(q_with_offset, kv_expanded),
-        op.Constant(value_float=0.0),
-        op.Constant(value_float=-10000.0),
+        op.CastLike(0.0, neg_distance),
+        op.CastLike(-10000.0, neg_distance),
     )  # [seq_len, total_len]
     causal_4d = op.Unsqueeze(causal_mask, [0, 1])  # [1, 1, seq_len, total_len]
     return op.Add(alibi, causal_4d)
@@ -332,7 +333,7 @@ class _FalconTextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -400,7 +401,7 @@ class _BloomTextModel(_FalconTextModel):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -514,10 +515,13 @@ class FalconCausalLMModel(nn.Module):
         self.config = config
         self.transformer = _FalconTextModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings:
+            # _FalconTextModel uses self.word_embeddings (not embed_tokens)
+            self.lm_head.weight = self.transformer.word_embeddings.weight
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -577,12 +581,22 @@ class FalconCausalLMModel(nn.Module):
             new_key = new_key.replace(".mlp.dense_4h_to_h.", ".mlp.down_proj.")
             new_state_dict[new_key] = value
 
-        # Handle weight tying
+        # HF Falcon / Bloom safetensors omit the "transformer." prefix
+        # (e.g. "h.N.*", "word_embeddings.*", "ln_f.*").  ONNX initialiser
+        # names include it because the outer attribute is ``self.transformer``.
+        # ``lm_head.*`` is a top-level attribute and stays as-is.
+        new_state_dict = {
+            (k if k.startswith(("transformer.", "lm_head.")) else "transformer." + k): v
+            for k, v in new_state_dict.items()
+        }
+
+        # Handle weight tying: lm_head.weight is tied at graph level.
+        # Discard lm_head.weight if present; transformer.word_embeddings.weight covers both.
         if self.config.tie_word_embeddings:
             embed_key = "transformer.word_embeddings.weight"
-            head_key = "lm_head.weight"
-            if head_key not in new_state_dict and embed_key in new_state_dict:
-                new_state_dict[head_key] = new_state_dict[embed_key]
+            if embed_key not in new_state_dict:
+                new_state_dict[embed_key] = new_state_dict["lm_head.weight"]
+            new_state_dict.pop("lm_head.weight", None)
 
         return new_state_dict
 
@@ -600,9 +614,18 @@ class BloomCausalLMModel(FalconCausalLMModel):
         # Bloom always uses ALiBi positional encoding — enforce it regardless
         # of whether the caller set alibi=True in the config, since HF's
         # BloomConfig has no alibi field and ArchitectureConfig defaults to False.
-        config = dataclasses.replace(config, alibi=True)
+        # Bloom's MLP uses ``BloomGelu`` — the tanh GELU approximation
+        # (x * 0.5 * (1 + tanh(0.79788456 * x * (1 + 0.044715 * x^2)))) — not
+        # the exact erf GELU. BloomConfig has no ``hidden_act`` field, so set it
+        # explicitly; otherwise the layer defaults to exact GELU, producing a
+        # small per-layer error that compounds over all blocks.
+        config = dataclasses.replace(config, alibi=True, hidden_act="gelu_pytorch_tanh")
         super().__init__(config)
         self.transformer = _BloomTextModel(config)
+        # Re-tie lm_head after overriding self.transformer; the parent's
+        # __init__ tied lm_head to the old _FalconTextModel's embeddings.
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.transformer.word_embeddings.weight
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]

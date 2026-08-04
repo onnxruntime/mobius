@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """ECAPA-TDNN speaker encoder components for Qwen3-TTS.
 
@@ -22,8 +22,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 
@@ -31,7 +30,7 @@ if TYPE_CHECKING:
     import onnx_ir as ir
 
 
-def _reflect_pad_1d(op: builder.OpBuilder, x, padding: int):
+def _reflect_pad_1d(op: OpBuilder, x, padding: int):
     """Apply reflect padding along the last dimension (time axis).
 
     ONNX Conv does not support reflect padding natively, so we use
@@ -73,7 +72,7 @@ class TimeDelayNetBlock(nn.Module):
         self._padding = (kernel_size - 1) * dilation // 2
         self.conv = _TDNNConv1d(in_channels, out_channels, kernel_size, dilation)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # hidden_states: (batch, channels, time)
         hidden_states = _reflect_pad_1d(op, hidden_states, self._padding)
         hidden_states = self.conv(op, hidden_states)
@@ -96,7 +95,7 @@ class _TDNNConv1d(nn.Module):
         self._kernel_size = kernel_size
         self._dilation = dilation
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # x is already padded by reflect_pad_1d
         return op.Conv(
             x,
@@ -147,7 +146,7 @@ class Res2NetBlock(nn.Module):
         self._scale = scale
         self._in_channel = in_channel
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # hidden_states: (batch, channels, time)
         # Split into scale chunks along channel dim
         # Use Slice instead of Split since scale varies dynamically
@@ -198,7 +197,7 @@ class SqueezeExcitationBlock(nn.Module):
         self.conv1 = _SEConv1d(in_channels, se_channels)
         self.conv2 = _SEConv1d(se_channels, out_channels)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # hidden_states: (batch, channels, time)
         # Global mean pooling over time dimension → (batch, channels, 1)
         hidden_states_mean = op.ReduceMean(hidden_states, [2], keepdims=True)
@@ -219,7 +218,7 @@ class _SEConv1d(nn.Module):
         self.weight = nn.Parameter([out_channels, in_channels, 1])
         self.bias = nn.Parameter([out_channels])
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return op.Conv(
             x,
             self.weight,
@@ -261,7 +260,7 @@ class SqueezeExcitationRes2NetBlock(nn.Module):
         self.tdnn2 = TimeDelayNetBlock(out_channels, out_channels, kernel_size=1, dilation=1)
         self.se_block = SqueezeExcitationBlock(out_channels, se_channels, out_channels)
 
-    def forward(self, op: builder.OpBuilder, hidden_state: ir.Value):
+    def forward(self, op: OpBuilder, hidden_state: ir.Value):
         # hidden_state: (batch, channels, time)
         residual = hidden_state
 
@@ -297,7 +296,7 @@ class AttentiveStatisticsPooling(nn.Module):
         # Conv1d to produce per-channel attention weights
         self.conv = _SEConv1d(attention_channels, channels)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # hidden_states: (batch, channels, time)
         seq_length = op.Shape(hidden_states, start=2, end=3)  # (1,)
         seq_length_float = op.Cast(seq_length, to=1)  # float32
@@ -313,7 +312,7 @@ class AttentiveStatisticsPooling(nn.Module):
             op.ReduceSum(op.Mul(diff, diff), [2], keepdims=True),
             seq_length_float,
         )
-        eps_const = op.Constant(value_float=self._eps)
+        eps_const = self._eps
         std = op.Sqrt(op.Add(variance, eps_const))
 
         # Expand mean and std to (batch, channels, time) for concatenation
@@ -432,7 +431,7 @@ class SpeakerEncoder(nn.Module):
         # Final projection: (2 * enc_channels[-1]) → enc_dim
         self.fc = _SEConv1d(enc_channels[-1] * 2, enc_dim)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # hidden_states: (batch, time, mel_dim) — mel spectrogram
         # Transpose to (batch, mel_dim, time) for Conv1d processing
         hidden_states = op.Transpose(hidden_states, perm=[0, 2, 1])

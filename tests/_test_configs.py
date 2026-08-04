@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Shared test configurations for all test tiers.
 
@@ -26,6 +26,7 @@ from mobius._configs import (
     DepthAnythingConfig,
     Gemma2Config,
     Gemma3nConfig,
+    Gemma4Config,
     GraniteMoeHybridConfig,
     JambaConfig,
     JetMoeConfig,
@@ -40,6 +41,7 @@ from mobius._configs import (
     VisionConfig,
     WhisperConfig,
     YolosConfig,
+    Zamba2Config,
 )
 
 # ---------------------------------------------------------------------------
@@ -54,6 +56,13 @@ TINY_LAYERS = 2
 TINY_VOCAB = 256
 
 LONGROPE_FACTORS = [1.0] * (int(TINY_HEAD_DIM * 0.5) // 2)
+
+# NOTE (MLA models): Multi-head Latent Attention models (DeepSeek-V2/V3,
+# LongCat-Flash, ...) reconstruct full-head K/V from a shared latent, so they do
+# not use grouped-query attention.  Their tiny configs must set
+# num_key_value_heads == num_attention_heads; otherwise HuggingFace's repeat_kv()
+# in the SDPA path duplicates the already-full-head K/V tensors, producing a
+# head-count mismatch against the query.
 
 
 def _base_config(config_cls=None, **overrides) -> ArchitectureConfig:
@@ -104,7 +113,23 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ("cohere2", {"tie_word_embeddings": True, "logit_scale": 0.0625}, False),
     ("diffllama", {}, False),
     ("doge", {}, False),
-    ("dots1", {}, False),
+    (
+        "dots1",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "n_group": 1,
+            "topk_group": 1,
+            "routed_scaling_factor": 2.5,
+            "scoring_func": "sigmoid",
+            "topk_method": "noaux_tc",
+            "first_k_dense_replace": 1,
+            "n_shared_experts": 2,
+            "attn_qk_norm": True,
+        },
+        False,
+    ),
     ("exaone4", {}, False),
     (
         "glm",
@@ -186,7 +211,18 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         {"hidden_act": "gelu_pytorch_tanh", "tie_word_embeddings": True},
         True,
     ),
-    ("youtu", {"tie_word_embeddings": True}, False),
+    (
+        "youtu",
+        {
+            "q_lora_rank": 32,
+            "kv_lora_rank": 16,
+            "qk_nope_head_dim": 16,
+            "qk_rope_head_dim": 8,
+            "v_head_dim": 16,
+            "tie_word_embeddings": True,
+        },
+        False,
+    ),
     # === Absolute positional embeddings (non-RoPE) ===
     (
         "ctrl",
@@ -290,6 +326,49 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         True,
     ),
     (
+        "gemma4_text",
+        {
+            "_config_cls": Gemma4Config,
+            "attn_qk_norm": True,
+            "rope_local_base_freq": 10_000.0,
+            # 2-layer test: 1 sliding + 1 full (must match TINY_LAYERS=2)
+            "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 8,
+            "global_head_dim": TINY_HEAD_DIM,
+            "global_rope_theta": 10_000.0,
+            "final_logit_softcapping": 30.0,
+            # Per-layer embedding: small dim to match HF (default 256)
+            "hidden_size_per_layer_input": 32,
+            "vocab_size_per_layer_input": TINY_VOCAB,
+        },
+        True,
+    ),
+    (
+        # gemma-4-12B text backbone (reuses Gemma4CausalLMModel): dual head_dim
+        # (local 16 / global 32), single global KV head with attention_k_eq_v,
+        # vision-block bidirectional attention.  Built generically here; numeric
+        # parity is covered by the real-weight integration test (no HF model_type
+        # for this internal alias, so it is excluded from synthetic parity).
+        "gemma4_unified_text",
+        {
+            "_config_cls": Gemma4Config,
+            "hidden_act": "gelu_pytorch_tanh",
+            "attn_qk_norm": True,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 8,
+            "global_head_dim": 2 * TINY_HEAD_DIM,
+            "global_rope_theta": 1_000_000.0,
+            "global_partial_rotary_factor": 0.25,
+            "final_logit_softcapping": 30.0,
+            "hidden_size_per_layer_input": 0,
+            "num_global_key_value_heads": 1,
+            "attention_k_eq_v": True,
+            "use_bidirectional_attention": "vision",
+            "tie_word_embeddings": True,
+        },
+        False,
+    ),
+    (
         "gemma3n_text",
         {
             "_config_cls": Gemma3nConfig,
@@ -363,7 +442,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         True,
     ),
     ("qwen3_vl_text", {"attn_qk_norm": True}, False),
-    ("smollm3", {}, False),
+    ("smollm3", {"no_rope_layers": [1, 0]}, True),  # exercise per-layer RoPE gating
     # === Mixture of Experts ===
     (
         "phimoe",
@@ -440,9 +519,34 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         True,
     ),
+    # Text-only sibling of the Qwen3.5-MoE-VL (Qwen3.6-35B-A3B) checkpoint,
+    # exported via ``build(..., text_only=True)``. Same hybrid MoE backbone as
+    # ``qwen3_5_moe`` above; registered separately so the VL ``text_config``'s
+    # ``model_type=qwen3_5_moe_text`` and the text-only override both resolve.
+    (
+        "qwen3_5_moe_text",
+        {
+            "hidden_act": "silu",
+            "layer_types": ["linear_attention", "full_attention"],
+            "partial_rotary_factor": 0.25,
+            "mrope_interleaved": True,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "shared_expert_intermediate_size": 32,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+        },
+        True,
+    ),
     # === Falcon and Bloom ===
     # dual_ln=True: Falcon with new_decoder_architecture uses separate ln_attn + ln_mlp.
-    ("falcon", {"parallel_attn": True, "dual_ln": True}, True),
+    # hidden_act="gelu": real Falcon uses GELU (HF FalconConfig.activation default);
+    # the generic _base_config default is "silu", so set it explicitly to match HF.
+    ("falcon", {"parallel_attn": True, "dual_ln": True, "hidden_act": "gelu"}, True),
     (
         "falcon_h1",
         # ALiBi bias shape (1, num_heads, q, total) requires kv_num_heads == num_heads
@@ -476,6 +580,8 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     (
         "deepseek_v3",
         {
+            # MLA: kv heads must equal attn heads (see MLA note near top of file).
+            "num_key_value_heads": TINY_HEADS,
             "q_lora_rank": 32,
             "kv_lora_rank": 16,
             "qk_nope_head_dim": 16,
@@ -505,8 +611,40 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         True,
     ),
     (
+        "deepseek_v4",
+        {
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "q_lora_rank": 32,
+            "qk_rope_head_dim": 8,
+            "o_groups": 2,
+            "o_lora_rank": 16,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "n_shared_experts": 1,
+            "routed_scaling_factor": 1.5,
+            "scoring_func": "sqrtsoftplus",
+            "num_hash_layers": 1,
+            "hc_mult": 2,
+            "hc_sinkhorn_iters": 2,
+            "swiglu_limit": 10.0,
+            "rope_interleave": True,
+            "rope_type": "yarn",
+            "rope_scaling": {
+                "factor": 4.0,
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "original_max_position_embeddings": 128,
+            },
+        },
+        True,
+    ),
+    (
         "deepseek_v2",
         {
+            # MLA: kv heads must equal attn heads (see MLA note near top of file).
+            "num_key_value_heads": TINY_HEADS,
             "q_lora_rank": 32,
             "kv_lora_rank": 16,
             "qk_nope_head_dim": 16,
@@ -526,6 +664,30 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         True,
     ),
     ("exaone", {}, False),
+    # deepseek_v2_moe: same config as deepseek_v2 (MoE variant alias)
+    (
+        "deepseek_v2_moe",
+        {
+            # MLA: kv heads must equal attn heads (see MLA note near top of file).
+            "num_key_value_heads": TINY_HEADS,
+            "q_lora_rank": 32,
+            "kv_lora_rank": 16,
+            "qk_nope_head_dim": 16,
+            "qk_rope_head_dim": 8,
+            "v_head_dim": 16,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "n_group": 2,
+            "topk_group": 1,
+            "routed_scaling_factor": 1.0,
+            "scoring_func": "softmax",
+            "topk_method": "group_limited_greedy",
+            "first_k_dense_replace": 1,
+            "n_shared_experts": 1,
+        },
+        False,
+    ),
     # DeepSeek-V2 without MLA (standard attention + MoE, like OCR-2 LLM)
     (
         "deepseek_v2",
@@ -548,7 +710,6 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ),
     ("minicpm", {}, True),
     ("minicpm3", {}, True),
-    ("mistral3", {}, False),
     ("openelm", {}, True),
     (
         "persimmon",
@@ -570,7 +731,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ("chatglm", {}, True),
     ("ernie4_5", {}, True),
     (
-        "gemma3",
+        "gemma3_text",
         {
             "attn_qk_norm": True,
             "rope_local_base_freq": 10_000.0,
@@ -679,6 +840,8 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         "longcat_flash",
         {
             "_config_cls": LongcatFlashConfig,
+            # MLA: kv heads must equal attn heads (see MLA note near top of file).
+            "num_key_value_heads": TINY_HEADS,
             "q_lora_rank": 16,
             "kv_lora_rank": 8,
             "qk_nope_head_dim": 8,
@@ -699,7 +862,37 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     # seed_oss uses attention_bias=True by default (HF always has q/k/v biases).
     # Set attn_qkv_bias=True so our ONNX model also has these biases for parity.
     ("seed_oss", {"attn_qkv_bias": True}, False),
-    ("zamba2", {}, False),
+    # zamba2: hybrid Mamba2+Attention (requires Zamba2Config)
+    # Physical layers [mamba, mamba, hybrid, mamba] expand to 5 logical layers.
+    # head_dim = attention_hidden_size / num_attention_heads (not hidden_size / heads)
+    (
+        "zamba2",
+        {
+            "_config_cls": Zamba2Config,
+            "num_hidden_layers": 5,
+            "layer_types": [
+                "mamba2",
+                "mamba2",
+                "full_attention",
+                "mamba2",
+                "mamba2",
+            ],
+            "head_dim": 2 * TINY_HIDDEN // TINY_HEADS,
+            "mamba_n_heads": 4,
+            "mamba_d_head": 32,
+            "mamba_d_state": 8,
+            "mamba_n_groups": 1,
+            "mamba_d_conv": 4,
+            "mamba_expand": 2,
+            "attention_hidden_size": 2 * TINY_HIDDEN,
+            "num_mem_blocks": 1,
+            "adapter_rank": 8,
+            "hybrid_layer_indices": [2],
+            "num_key_value_heads": TINY_HEADS,
+            "mamba_time_step_min": 0.001,
+        },
+        True,
+    ),
     # === Additional GPT2 aliases ===
     # num_key_value_heads=TINY_HEADS: GPT-2 family never uses GQA; setting
     # kv_heads = num_heads ensures ONNX KV-cache and HF weight shapes agree.
@@ -825,7 +1018,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ),
     (
         "glm4v_text",
-        {},
+        {"attn_qkv_bias": True},
         False,
     ),
     (
@@ -833,6 +1026,8 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         {
             "num_local_experts": 4,
             "num_experts_per_tok": 2,
+            "moe_intermediate_size": 128,
+            "shared_expert_intermediate_size": 128,
         },
         False,
     ),
@@ -841,6 +1036,8 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         {
             "num_local_experts": 4,
             "num_experts_per_tok": 2,
+            "moe_intermediate_size": TINY_INTERMEDIATE,
+            "attn_qk_norm": True,
         },
         False,
     ),
@@ -849,6 +1046,8 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         {
             "num_local_experts": 4,
             "num_experts_per_tok": 2,
+            "moe_intermediate_size": TINY_INTERMEDIATE,
+            "attn_qk_norm": True,
         },
         False,
     ),
@@ -954,6 +1153,8 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     (
         "deepseek_v2",
         {
+            # MLA: kv heads must equal attn heads (see MLA note near top of file).
+            "num_key_value_heads": TINY_HEADS,
             "q_lora_rank": 32,
             "kv_lora_rank": 16,
             "qk_nope_head_dim": 16,
@@ -1061,12 +1262,12 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         False,
     ),
-    # nemotron_h: hybrid Mamba2+Attention+MLP (requires NemotronHConfig)
+    # nemotron_h: hybrid Mamba2+Attention (requires NemotronHConfig)
     (
         "nemotron_h",
         {
             "hidden_act": "relu2",
-            "layer_types": ["mamba2", "mlp", "full_attention", "mlp"],
+            "layer_types": ["mamba2", "mlp", "full_attention", "mamba2"],
             "_config_cls": NemotronHConfig,
             "num_hidden_layers": 4,
             "mamba_n_heads": TINY_KV_HEADS,
@@ -1075,6 +1276,36 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "mamba_n_groups": 1,
             "mamba_d_conv": 4,
             "mamba_expand": 2,
+        },
+        True,
+    ),
+    # nemotron_h MoE variant: hybrid Mamba2+MoE+Attention (Nemotron-3 30B/120B)
+    (
+        "nemotron_h",
+        {
+            "hidden_act": "relu2",
+            "layer_types": [
+                "mamba2",
+                "moe",
+                "mamba2",
+                "moe",
+                "full_attention",
+                "moe",
+            ],
+            "_config_cls": NemotronHConfig,
+            "num_hidden_layers": 6,
+            "mamba_n_heads": TINY_KV_HEADS,
+            "mamba_d_head": TINY_HEAD_DIM,
+            "mamba_d_state": 16,
+            "mamba_n_groups": 1,
+            "mamba_d_conv": 4,
+            "mamba_expand": 2,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": TINY_INTERMEDIATE,
+            "shared_expert_intermediate_size": TINY_INTERMEDIATE * 2,
+            "norm_topk_prob": True,
+            "routed_scaling_factor": 2.5,
         },
         True,
     ),
@@ -1619,7 +1850,27 @@ VISION_CONFIGS: list[tuple[str, dict, bool]] = [
         True,
     ),
     (
+        "siglip",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        False,
+    ),
+    (
         "siglip2_vision_model",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        False,
+    ),
+    (
+        "siglip2",
         {
             "hidden_act": "gelu",
             "image_size": 32,
@@ -1772,18 +2023,32 @@ SSM_CONFIGS: list[tuple[str, dict, bool]] = [
         True,
     ),
     # mamba2: pure Mamba2/SSD (no attention) — requires Mamba2Config
+    # intermediate_size must equal num_heads * head_dim for Mamba2.
     (
         "mamba2",
         {
             "_config_cls": Mamba2Config,
             "num_heads": 4,
             "head_dim": 16,
+            "intermediate_size": 64,
             "state_size": 8,
             "n_groups": 2,
             "conv_kernel": 4,
             "expand": 2,
         },
         True,
+    ),
+    # falcon_mamba: Mamba1-based (same as mamba, uses MambaConfig)
+    (
+        "falcon_mamba",
+        {
+            "_config_cls": MambaConfig,
+            "state_size": 8,
+            "conv_kernel": 4,
+            "expand": 2,
+            "time_step_rank": 4,
+        },
+        False,
     ),
 ]
 
@@ -1849,6 +2114,16 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
     ("glm4v", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
     ("glm4v_moe", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
     ("got_ocr2", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    (
+        "hunyuan_vl_mot",
+        {
+            "vision": _TINY_VISION,
+            "image_token_id": 32000,
+            "attn_qk_norm": True,
+            "rms_norm_eps": 1e-5,
+        },
+        True,
+    ),
     ("idefics2", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
     ("idefics3", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
     ("instructblip", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
@@ -1864,13 +2139,16 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
     ("smolvlm", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
     ("video_llava", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
     ("vipllava", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    # --- Microsoft Phi vision-language models ---
+    ("phi3_v", {"vision": _TINY_VISION, "image_token_id": 32044}, True),
+    ("phi4-siglip", {"vision": _TINY_VISION, "image_token_id": -200}, True),
     # --- InternVL family ---
     ("internvl_chat", {"vision": _TINY_VISION, "image_token_id": 32000}, True),
     ("internvl2", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
     ("internvl", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
     # --- Gemma3 multimodal (requires rope_local_base_freq, layer_types) ---
     (
-        "gemma3_multimodal",
+        "gemma3",
         {
             "attn_qk_norm": True,
             "rope_local_base_freq": 10_000.0,
@@ -1889,6 +2167,69 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
             "image_token_id": 255999,
         },
         True,
+    ),
+    # --- Gemma4 multimodal (3-model split: decoder + vision + embedding) ---
+    (
+        "gemma4",
+        {
+            "_config_cls": Gemma4Config,
+            "attn_qk_norm": True,
+            "rope_local_base_freq": 10_000.0,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 8,
+            "global_head_dim": TINY_HEAD_DIM,
+            "global_rope_theta": 10_000.0,
+            "global_partial_rotary_factor": 0.25,
+            "final_logit_softcapping": 30.0,
+            "vision": VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=28,
+                patch_size=14,
+                norm_eps=1e-6,
+                mm_tokens_per_image=4,
+            ),
+            "mm_tokens_per_image": 4,
+            "image_token_id": 255999,
+        },
+        False,
+    ),
+    # --- Gemma4 Any-to-Any (4-model split: decoder + vision + speech + embedding) ---
+    # Tested directly in test_gemma4_any_to_any_graph; omitted from parametrized suite
+    # because it uses the unified "gemma4" registry key, same as the VL-only config above.
+    # --- Gemma4 unified gemma-4-12B (encoder-free 3-model split here; the 4-model
+    # audio path is exercised by test_gemma4_unified_multimodal_graph) ---
+    (
+        "gemma4_unified",
+        {
+            "_config_cls": Gemma4Config,
+            "hidden_act": "gelu_pytorch_tanh",
+            "attn_qk_norm": True,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 8,
+            "global_head_dim": 2 * TINY_HEAD_DIM,
+            "global_rope_theta": 1_000_000.0,
+            "global_partial_rotary_factor": 0.25,
+            "final_logit_softcapping": 30.0,
+            "hidden_size_per_layer_input": 0,
+            "num_global_key_value_heads": 1,
+            "attention_k_eq_v": True,
+            "use_bidirectional_attention": "vision",
+            "image_token_id": 255999,
+            "tie_word_embeddings": True,
+            # Encoder-free vision embedder (raw patches → pooled image features).
+            "vision": VisionConfig(
+                hidden_size=48,
+                patch_size=4,
+                pooling_kernel_size=2,
+                position_embedding_size=64,
+                out_hidden_size=48,
+                norm_eps=1e-6,
+            ),
+        },
+        False,
     ),
     # --- Blip2 (ViT + Q-Former + LLM) ---
     (
@@ -1985,6 +2326,50 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         True,
     ),
+    # qwen3_5: alias for qwen3_5_vl (same module: Qwen35VL3ModelCausalLMModel)
+    (
+        "qwen3_5",
+        {
+            "vision": _TINY_QWEN3_VL_VISION,
+            "image_token_id": 32000,
+            "temporal_patch_size": 2,
+            "mrope_section": [16, 24, 24],
+            "attn_qk_norm": True,
+        },
+        False,
+    ),
+    # qwen3_5_moe_vl: Qwen3.6-35B-A3B family. Hybrid linear/full attention
+    # MoE text backbone + Qwen3VL ViT, exported as a 3-model split.
+    (
+        "qwen3_5_moe_vl",
+        {
+            "hidden_act": "silu",
+            "layer_types": ["linear_attention", "full_attention"],
+            "partial_rotary_factor": 0.25,
+            "mrope_interleaved": True,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "shared_expert_intermediate_size": 32,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+            "vision": _TINY_QWEN3_VL_VISION,
+            "image_token_id": 32000,
+            "temporal_patch_size": 2,
+            "mrope_section": [16, 24, 24],
+            "attn_qk_norm": True,
+        },
+        True,
+    ),
+    # mistral3: Pixtral-VL model (same task as pixtral)
+    (
+        "mistral3",
+        {"vision": _TINY_VISION, "image_token_id": 32000},
+        False,
+    ),
 ]
 
 
@@ -2053,6 +2438,30 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         False,
     ),
+    # --- Fun-ASR-Nano (speech-language, 3-model split with SANM encoder) ---
+    (
+        "fun_asr",
+        {
+            "attn_qk_norm": True,
+            "rope_type": "default",
+            "audio": AudioConfig(
+                input_size=32,
+                attention_dim=64,
+                attention_heads=4,
+                num_blocks=3,
+                linear_units=128,
+                kernel_size=5,
+                tp_num_blocks=2,
+                output_dim=64,
+                audio_token_id=100,
+                adaptor_proj_dim=128,
+                adaptor_num_blocks=2,
+                adaptor_ffn_dim=32,
+                adaptor_num_heads=4,
+            ),
+        },
+        True,
+    ),
     # --- Qwen3-TTS Codec Tokenizer (codec, 2-model split) ---
     (
         "qwen3_tts_tokenizer_12hz",
@@ -2092,12 +2501,42 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         True,
     ),
+    # --- Wav2Vec2-family audio feature extractors (all use Wav2Vec2Model) ---
+    # Default ArchitectureConfig works because Wav2Vec2Model reads
+    # conv_channels/conv_kernel_sizes via getattr with sensible defaults.
+    ("wav2vec2", {}, True),
+    ("hubert", {}, False),
+    ("data2vec-audio", {}, False),
+    ("wavlm", {}, False),
+    ("sew", {}, False),
+    ("sew-d", {}, False),
+    ("unispeech", {}, False),
+    ("unispeech-sat", {}, False),
+    ("wav2vec2-bert", {}, False),
+    ("wav2vec2-conformer", {}, False),
+    ("musicgen", {}, False),
+    ("seamless_m4t", {}, False),
+    ("seamless_m4t_v2", {}, False),
+    ("speecht5", {}, False),
+    ("voxtral_encoder", {}, False),
+    ("mctct", {}, False),
+    # --- SenseVoiceSmall (CTC encoder-only ASR) ---
+    (
+        "sensevoice_small",
+        {
+            "audio": AudioConfig(
+                input_size=32,
+                attention_dim=TINY_HIDDEN,
+                attention_heads=TINY_HEADS,
+                linear_units=TINY_INTERMEDIATE,
+                kernel_size=5,
+                num_blocks=3,
+                tp_num_blocks=2,
+            ),
+        },
+        True,
+    ),
 ]
-
-
-# ---------------------------------------------------------------------------
-# Aggregate lists
-# ---------------------------------------------------------------------------
 ALL_CONFIGS: list[tuple[str, dict, bool]] = (
     CAUSAL_LM_CONFIGS
     + ENCODER_CONFIGS
@@ -2117,20 +2556,7 @@ _EXPLICIT_MODEL_TYPES: set[str] = {mt for mt, _, _ in ALL_CONFIGS}
 # Internal aliases removed from test configs — they are still registered in
 # the registry but should not appear in any test parametrization.  Their real
 # HF model_type counterpart (or the underlying model class) is already tested.
-_EXCLUDED_ALIASES: set[str] = {
-    "qwen3_5_vl_text",  # VL text decoder; real type is qwen3_5_text
-    "qwen3_omni_moe",  # VL MoE; no HF AutoModelForCausalLM support
-    "qwen3_vl_moe",  # VL MoE; no HF AutoModelForCausalLM support
-    "glm4v_moe_text",  # VL MoE text; no HF AutoModelForCausalLM support
-    "glm4v_text",  # VL text; GLM architecture incompatible with CausalLMModel
-    "deepseek_v2_moe",  # our custom alias; real type is deepseek_v2
-    # VL text-only submodels (tested via VL parent model)
-    "qwen2_vl_text",
-    "qwen2_5_vl_text",
-    "qwen3_vl_text",
-    # Duplicate VL alias
-    "qwen3_5",  # same as qwen3_5_vl (Qwen35VL3ModelCausalLMModel)
-}
+_EXCLUDED_ALIASES: set[str] = set()
 
 
 # ---------------------------------------------------------------------------

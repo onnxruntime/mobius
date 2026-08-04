@@ -1,4 +1,5 @@
 model_id: "microsoft/phi-1_5"
+model_type: "phi"
 revision: "77aa61eeac94fbf33d492b9f2744c98b42d5b5eb"
 task_type: "text-generation"
 dtype: "float32"

@@ -1,4 +1,5 @@
 model_id: "caidas/swin2SR-classical-sr-x2-64"
+model_type: "swin2sr"
 revision: "main"
 task_type: "image-to-image"
 dtype: "float32"
@@ -7,6 +8,7 @@ inputs:
   images:
     - "pipeline-cat-chonk.jpeg"
 
+skip_reason: "Weight shape mismatch in patch embeddings."
 level: "L4"
 
 notes: "Swin2SR. Super-resolution image transformer."

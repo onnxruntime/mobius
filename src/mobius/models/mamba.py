@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Mamba and Mamba2 (Selective State Space) causal language models.
 
@@ -30,8 +30,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import Mamba2Config, MambaConfig
 from mobius.components import (
@@ -74,7 +73,7 @@ class MambaBackbone(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         past_states: list[tuple] | None = None,
     ):
@@ -130,7 +129,7 @@ class _MambaResidualBlock(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         past_state: tuple | None = None,
     ):
@@ -183,10 +182,13 @@ class MambaCausalLMModel(nn.Module):
         self.config = config
         self.model = MambaBackbone(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings:
+            # MambaBackbone uses self.embeddings (not embed_tokens)
+            self.lm_head.weight = self.model.embeddings.weight
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         past_states: list[tuple] | None = None,
     ):
@@ -243,12 +245,12 @@ class MambaCausalLMModel(nn.Module):
         for old_key, new_key in renames.items():
             state_dict[new_key] = state_dict.pop(old_key)
 
-        # Tied embeddings
+        # Tied embeddings: lm_head.weight shares graph initializer with model.embeddings.weight.
+        # Ensure model.embeddings.weight is present; discard lm_head.weight.
         if self.config.tie_word_embeddings:
-            if "lm_head.weight" in state_dict:
+            if "model.embeddings.weight" not in state_dict:
                 state_dict["model.embeddings.weight"] = state_dict["lm_head.weight"]
-            elif "model.embeddings.weight" in state_dict:
-                state_dict["lm_head.weight"] = state_dict["model.embeddings.weight"]
+            state_dict.pop("lm_head.weight", None)
 
         return state_dict
 
@@ -292,7 +294,7 @@ class _Mamba2ResidualBlock(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         past_state: tuple | None = None,
     ):
@@ -355,7 +357,7 @@ class Mamba2Backbone(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         past_states: list[tuple] | None = None,
     ):
@@ -404,10 +406,13 @@ class Mamba2CausalLMModel(nn.Module):
         self.config = config
         self.backbone = Mamba2Backbone(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings:
+            # Mamba2Backbone uses self.embeddings (not embed_tokens)
+            self.lm_head.weight = self.backbone.embeddings.weight
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         past_states: list[tuple] | None = None,
     ):
@@ -431,40 +436,18 @@ class Mamba2CausalLMModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Map HuggingFace Mamba2ForCausalLM weights to ONNX names.
 
-        HF naming:
+        HF and ONNX naming match directly — no SSM param renaming needed:
             backbone.layers.{i}.norm.weight (same)
-            backbone.layers.{i}.mixer.{A_log,D,dt_bias}
-                -> backbone.layers.{i}.mixer.ssm.{A_log,D,dt_bias}
-            backbone.layers.{i}.mixer.{in_proj,conv1d,norm,out_proj}
+            backbone.layers.{i}.mixer.{A_log,D,dt_bias,in_proj,conv1d,norm,out_proj}
                 (same)
             backbone.embeddings.weight (same)
             backbone.norm_f.weight (same)
             lm_head.weight (same)
         """
-        renames = {}
-        _ssm_params = ("A_log", "D", "dt_bias")
-
-        for key in list(state_dict):
-            new_key = key
-            # mixer.{ssm_param} -> mixer.ssm.{ssm_param}
-            for param in _ssm_params:
-                old_seg = f".mixer.{param}"
-                new_seg = f".mixer.ssm.{param}"
-                if new_key.endswith(old_seg):
-                    new_key = new_key.replace(old_seg, new_seg)
-                    break
-
-            if new_key != key:
-                renames[key] = new_key
-
-        for old_key, new_key in renames.items():
-            state_dict[new_key] = state_dict.pop(old_key)
-
         # Tied embeddings (Mamba2 uses self.backbone, not self.model)
         if self.config.tie_word_embeddings:
-            if "lm_head.weight" in state_dict:
+            if "backbone.embeddings.weight" not in state_dict:
                 state_dict["backbone.embeddings.weight"] = state_dict["lm_head.weight"]
-            elif "backbone.embeddings.weight" in state_dict:
-                state_dict["lm_head.weight"] = state_dict["backbone.embeddings.weight"]
+            state_dict.pop("lm_head.weight", None)
 
         return state_dict

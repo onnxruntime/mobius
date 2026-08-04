@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Reference ir.Function for the CausalConvWithState operator.
 
@@ -13,14 +13,11 @@ Op spec: https://github.com/onnx/onnx/issues/7689
 from __future__ import annotations
 
 import onnx_ir as ir
-from onnxscript._internal import builder
+from onnxscript._internal.builder import build_function
 
 from mobius._constants import OPSET_VERSION
 
 DOMAIN = "com.microsoft"
-
-
-# TODO(justinchuby): Simplify function creation boilerplate
 
 
 def causal_conv_nd_with_state(
@@ -94,80 +91,71 @@ def causal_conv_nd_with_state(
     # The temporal axis = last spatial dim = index (ndim + 1) in (B, D, *spatial).
     temporal_axis = ndim + 1
 
-    input_val = ir.Value(name="input")
-    weight_val = ir.Value(name="weight")
-    bias_val = ir.Value(name="bias")
-    conv_state_val = ir.Value(name="conv_state")
+    def body(op, input_val, weight_val, bias_val, conv_state_val):
+        # Step 1: Prepend conv_state along the temporal axis.
+        conv_input = op.Concat(conv_state_val, input_val, axis=temporal_axis)
 
-    graph = ir.Graph(
-        inputs=[input_val, weight_val, bias_val, conv_state_val],
-        outputs=[],
-        nodes=[],
-        name="CausalConvWithState_body",
-        opset_imports={"": OPSET_VERSION},
-    )
-    gb = builder.GraphBuilder(graph)
-    op = gb.op
-
-    # Step 1: Prepend conv_state along the temporal axis.
-    conv_input = op.Concat(conv_state_val, input_val, axis=temporal_axis)
-
-    # Step 2: Extract new carry state — last K-1 positions of conv_input.
-    total_len = op.Gather(op.Shape(conv_input), op.Constant(value_int=temporal_axis), axis=0)
-    state_start = op.Sub(total_len, op.Constant(value_int=state_width))
-    present_state = op.Slice(
-        conv_input,
-        op.Reshape(state_start, op.Constant(value_ints=[1])),
-        op.Reshape(total_len, op.Constant(value_ints=[1])),
-        op.Constant(value_ints=[temporal_axis]),
-    )
-    present_state.name = "present_state"
-
-    # Step 3: Depthwise N-d Conv (group = channels, no padding — already prepended).
-    kernel_shape = [kernel_size] * ndim
-    dilations = [1] * ndim
-    pads = [0] * (2 * ndim)
-    conv_out = op.Conv(
-        conv_input,
-        weight_val,
-        kernel_shape=kernel_shape,
-        dilations=dilations,
-        pads=pads,
-        group=channels,
-    )
-
-    # Step 4: Add bias — reshape to (1, D, *[1]*ndim) for broadcasting.
-    bias_shape = [1, -1] + [1] * ndim
-    bias_reshaped = op.Reshape(bias_val, op.Constant(value_ints=bias_shape))
-    conv_out = op.Add(conv_out, bias_reshaped)
-
-    # Step 5: Apply activation.
-    if activation in ("silu", "swish"):
-        output = op.Mul(conv_out, op.Sigmoid(conv_out))
-    elif activation == "none":
-        output = conv_out
-    else:
-        raise ValueError(
-            f"Unsupported activation: {activation!r}. Expected 'silu', 'swish', or 'none'."
+        # Step 2: Extract new carry state — last K-1 positions of conv_input.
+        total_len = op.Gather(
+            op.Shape(conv_input), op.Constant(value_int=temporal_axis), axis=0
         )
-    output.name = "output"
+        state_start = op.Sub(total_len, op.Constant(value_int=state_width))
+        present_state = op.Slice(
+            conv_input,
+            op.Reshape(state_start, op.Constant(value_ints=[1])),
+            op.Reshape(total_len, op.Constant(value_ints=[1])),
+            op.Constant(value_ints=[temporal_axis]),
+        )
+        present_state.name = "present_state"
 
-    graph.outputs.extend([output, present_state])
+        # Step 3: Depthwise N-d Conv (group = channels, no padding — already prepended).
+        kernel_shape = [kernel_size] * ndim
+        dilations = [1] * ndim
+        pads = [0] * (2 * ndim)
+        conv_out = op.Conv(
+            conv_input,
+            weight_val,
+            kernel_shape=kernel_shape,
+            dilations=dilations,
+            pads=pads,
+            group=channels,
+        )
+
+        # Step 4: Add bias — reshape to (1, D, *[1]*ndim) for broadcasting.
+        bias_shape = [1, -1] + [1] * ndim
+        bias_reshaped = op.Reshape(bias_val, op.Constant(value_ints=bias_shape))
+        conv_out = op.Add(conv_out, bias_reshaped)
+
+        # Step 5: Apply activation.
+        if activation in ("silu", "swish"):
+            output = op.Mul(conv_out, op.Sigmoid(conv_out))
+        elif activation == "none":
+            output = conv_out
+        else:
+            raise ValueError(
+                f"Unsupported activation: {activation!r}. Expected 'silu', 'swish', or 'none'."
+            )
+        output.name = "output"
+
+        return output, present_state
 
     # NOTE: Do not set ``overload`` here — call sites (op.CausalConvWithState)
     # do not set an overload, so setting one on the function would prevent the
     # serializer from matching nodes to this function definition.
-    return ir.Function(
+    return build_function(
+        body,
+        [
+            ir.Value(name="input"),
+            ir.Value(name="weight"),
+            ir.Value(name="bias"),
+            ir.Value(name="conv_state"),
+        ],
         domain=DOMAIN,
         name="CausalConvWithState",
-        graph=graph,
-        attributes={
-            "activation": ir.Attr(
-                "activation",
-                ir.AttributeType.STRING,
-                activation,
-            ),
-        },
+        attributes=[
+            ir.Attr("activation", ir.AttributeType.STRING, activation),
+        ],
+        opset_imports={"": OPSET_VERSION},
     )
 
 
@@ -189,7 +177,3 @@ def causal_conv1d_with_state(
         ndim=1,
         activation=activation,
     )
-
-
-# PascalCase alias — matches the ONNX op type name for discoverability.
-CausalConvWithState = causal_conv_nd_with_state

@@ -1,0 +1,18 @@
+model_id: "microsoft/Phi-4-multimodal-instruct"
+model_type: "phi4mm"
+revision: "main"
+task_type: "phi4mm-multimodal"
+dtype: "float32"
+trust_remote_code: true
+
+inputs:
+  prompts:
+    - "What is the capital of France?"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+notes: "Phi-4-MM text-only input. No vision or audio — tests pure text path through the 4-model split (embedding + decoder only)."

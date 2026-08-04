@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Tests for vision encoder components."""
 
@@ -20,7 +20,6 @@ from mobius.components._vision import (
     VisionEncoder,
     VisionEncoderLayer,
     VisionLayerNorm,
-    VisionMLP,
     VisionModel,
 )
 
@@ -41,7 +40,7 @@ class TestPatchEmbedding:
         b, op, graph = create_test_builder()
         pixels = create_test_input(b, "pixels", [1, 3, 32, 32])
         result = emb(op, pixels)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
 
 
@@ -59,7 +58,7 @@ class TestVisionAttention:
         b, op, graph = create_test_builder()
         hidden = create_test_input(b, "hidden", [1, 16, 64])
         result = attn(op, hidden)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
 
     def test_uses_attention_op(self):
@@ -68,18 +67,8 @@ class TestVisionAttention:
         b, op, graph = create_test_builder()
         hidden = create_test_input(b, "hidden", [1, 16, 64])
         result = attn(op, hidden)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert count_op_type(graph, "Attention") == 1
-
-
-class TestVisionMLP:
-    def test_forward(self):
-        mlp = VisionMLP(hidden_size=64, intermediate_size=128)
-        b, op, graph = create_test_builder()
-        hidden = create_test_input(b, "hidden", [1, 16, 64])
-        result = mlp(op, hidden)
-        b._adapt_outputs([result])
-        assert graph.num_nodes() > 0
 
 
 class TestVisionLayerNorm:
@@ -94,7 +83,7 @@ class TestVisionLayerNorm:
         b, op, graph = create_test_builder()
         hidden = create_test_input(b, "hidden", [1, 16, 64])
         result = norm(op, hidden)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
 
 
@@ -104,7 +93,7 @@ class TestVisionEncoderLayer:
         b, op, graph = create_test_builder()
         hidden = create_test_input(b, "hidden", [1, 16, 64])
         result = layer(op, hidden)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
 
     def test_has_attn_and_mlp(self):
@@ -126,7 +115,7 @@ class TestVisionEncoder:
         b, op, graph = create_test_builder()
         hidden = create_test_input(b, "hidden", [1, 16, 64])
         result = enc(op, hidden)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
 
 
@@ -159,7 +148,7 @@ class TestVisionModel:
         b, op, graph = create_test_builder()
         pixels = create_test_input(b, "pixel_values", [1, 3, 32, 32])
         result = model(op, pixels)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
 
     def test_requires_vision_config(self):

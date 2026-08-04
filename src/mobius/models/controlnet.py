@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """ControlNet model for conditional image generation.
 
@@ -23,8 +23,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components import Conv2d as _BaseConv2d
 from mobius.components import SiLU as _SiLU
@@ -86,7 +85,7 @@ class _ControlNetConditioningEmbedding(nn.Module):
         )
         self._silu = _SiLU()
 
-    def forward(self, op: builder.OpBuilder, conditioning: ir.Value):
+    def forward(self, op: OpBuilder, conditioning: ir.Value):
         hidden = self.conv_in(op, conditioning)
         hidden = self._silu(op, hidden)
         for block in self.blocks:
@@ -180,7 +179,7 @@ class ControlNetModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         sample: ir.Value,
         timestep: ir.Value,
         encoder_hidden_states: ir.Value,

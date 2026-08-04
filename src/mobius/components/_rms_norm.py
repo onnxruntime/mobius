@@ -1,24 +1,23 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 from __future__ import annotations
 
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._flags import flags
 
 
 class RMSNorm(nn.Module):
-    """RMS Layer Normalization using the ONNX RMSNormalization op (opset 23)."""
+    """RMS Layer Normalization using the ONNX RMSNormalization op (opset 24)."""
 
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter([hidden_size])
         self.variance_epsilon = eps
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         return apply_rms_norm(op, hidden_states, self.weight, self.variance_epsilon)
 
 
@@ -36,7 +35,7 @@ class OffsetRMSNorm(nn.Module):
         self.weight = nn.Parameter([hidden_size])
         self.variance_epsilon = eps
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         effective_weight = op.Add(self.weight, 1.0)
         return op.RMSNormalization(
             hidden_states,
@@ -73,7 +72,7 @@ class GatedRMSNorm(nn.Module):
         self.variance_epsilon = eps
         self.group_size = group_size
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value, gate: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, gate: ir.Value):
         # SiLU gating in fp32 for precision, matching HF.
         h_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
         g_f32 = op.Cast(gate, to=ir.DataType.FLOAT)
@@ -81,16 +80,18 @@ class GatedRMSNorm(nn.Module):
         gated = op.Mul(h_f32, gate_activated)
 
         if self.group_size is not None and self.group_size < self.hidden_size:
-            # Grouped RMSNorm: reshape to (batch, n_groups, group_size),
-            # normalize within each group, then reshape back.
+            # Grouped RMSNorm: normalize within each group of size group_size.
+            # Input may be 2D (B, H) or 3D (B, T, H). Flatten leading dims
+            # so that Reshape always sees (..., n_groups, group_size).
             n_groups = self.hidden_size // self.group_size
+            orig_shape = op.Shape(gated)
             if flags.ort_cuda_grouped_rmsnorm_workaround:
                 # ORT ≤1.24.4 CUDA kernel for RMSNormalization produces
                 # wrong results when scale is 2D. Decompose into basic
                 # ops as a workaround.
                 grouped = op.Reshape(
                     gated,
-                    op.Constant(value_ints=[0, n_groups, self.group_size]),
+                    op.Constant(value_ints=[-1, n_groups, self.group_size]),
                 )
                 variance = op.ReduceMean(
                     op.Mul(grouped, grouped),
@@ -101,10 +102,7 @@ class GatedRMSNorm(nn.Module):
                     op.Sqrt(op.Add(variance, self.variance_epsilon)),
                 )
                 normed = op.Mul(grouped, rnorm)
-                normed = op.Reshape(
-                    normed,
-                    op.Constant(value_ints=[0, self.hidden_size]),
-                )
+                normed = op.Reshape(normed, orig_shape)
                 normed = op.Mul(
                     normed,
                     op.Cast(self.weight, to=ir.DataType.FLOAT),
@@ -115,7 +113,7 @@ class GatedRMSNorm(nn.Module):
                 gated = op.CastLike(gated, hidden_states)
                 grouped = op.Reshape(
                     gated,
-                    op.Constant(value_ints=[0, n_groups, self.group_size]),
+                    op.Constant(value_ints=[-1, n_groups, self.group_size]),
                 )
                 weight_grouped = op.Reshape(
                     self.weight,
@@ -127,10 +125,7 @@ class GatedRMSNorm(nn.Module):
                     epsilon=self.variance_epsilon,
                     axis=-1,
                 )
-                normed = op.Reshape(
-                    normed,
-                    op.Constant(value_ints=[0, self.hidden_size]),
-                )
+                normed = op.Reshape(normed, orig_shape)
         else:
             # Standard RMSNorm over the full dimension.
             # Cast gated back to native dtype; stash_type=1 handles fp32.
@@ -164,7 +159,7 @@ class PostGatedRMSNorm(nn.Module):
         self.weight = nn.Parameter([hidden_size])
         self.variance_epsilon = eps
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value, gate: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, gate: ir.Value):
         # RMSNorm uses stash_type=1 internally for fp32 variance.
         normed = op.RMSNormalization(
             hidden_states,
@@ -181,7 +176,7 @@ class PostGatedRMSNorm(nn.Module):
         return op.CastLike(result, hidden_states)
 
 
-def apply_rms_norm(op: builder.OpBuilder, x, weight, eps):
+def apply_rms_norm(op: OpBuilder, x, weight, eps):
     """Apply RMS normalization using the ONNX RMSNormalization op.
 
     Args:

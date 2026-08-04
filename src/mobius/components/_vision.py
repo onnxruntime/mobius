@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Vision encoder components (SigLIP-style).
 
@@ -16,10 +16,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
+from mobius.components._mlp import FCMLP
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -55,7 +55,7 @@ class PatchEmbedding(nn.Module):
             name="position_embedding.weight",
         )
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         # pixel_values: [batch, channels, height, width]
         # Conv2d: extract patches
         patches = op.Conv(
@@ -88,7 +88,7 @@ class PatchEmbedding(nn.Module):
 class VisionAttention(nn.Module):
     """Bidirectional multi-head attention for vision encoders.
 
-    Uses the ONNX Attention op (opset 23). Unlike text attention,
+    Uses the ONNX Attention op (opset 24). Unlike text attention,
     this has no causal mask and no KV cache.
     """
 
@@ -102,18 +102,26 @@ class VisionAttention(nn.Module):
         self.v_proj = _VisionLinear(hidden_size, hidden_size)
         self.out_proj = _VisionLinear(hidden_size, hidden_size)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        attention_mask: ir.Value | None = None,
+    ):
         # hidden_states: [batch, seq_len, hidden_size]
         q = self.q_proj(op, hidden_states)
         k = self.k_proj(op, hidden_states)
         v = self.v_proj(op, hidden_states)
 
-        # op.Attention expects [batch, seq_len, num_heads * head_dim]
-        # No mask, no past KV for vision (bidirectional)
+        # op.Attention expects [batch, seq_len, num_heads * head_dim].
+        # attention_mask (optional) is an additive bias broadcastable to
+        # [batch, num_heads, q_seq, kv_seq] — used by encoders with padded
+        # patches (e.g. Phi4MM HD sub-crops) so padding keys are masked out.
         attn_output = op.Attention(
             q,
             k,
             v,
+            attention_mask,
             kv_num_heads=self.num_heads,
             q_num_heads=self.num_heads,
             scale=self.scale,
@@ -124,31 +132,21 @@ class VisionAttention(nn.Module):
 
 
 class _VisionLinear(nn.Module):
-    """Linear layer with bias for vision encoder."""
+    """Linear layer with Transpose+MatMul using standard ONNX ops.
 
-    def __init__(self, in_features: int, out_features: int):
+    Always includes bias. The ``bias`` kwarg is accepted for API
+    compatibility with ``FCMLP``'s ``linear_class`` protocol but is always True.
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
         super().__init__()
         self.weight = nn.Parameter([out_features, in_features])
         self.bias = nn.Parameter([out_features])
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         weight_t = op.Transpose(self.weight, perm=[1, 0])
         result = op.MatMul(x, weight_t)
         return op.Add(result, self.bias)
-
-
-class VisionMLP(nn.Module):
-    """Two-layer MLP with GELU activation for vision encoders."""
-
-    def __init__(self, hidden_size: int, intermediate_size: int):
-        super().__init__()
-        self.fc1 = _VisionLinear(hidden_size, intermediate_size)
-        self.fc2 = _VisionLinear(intermediate_size, hidden_size)
-
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
-        hidden_states = self.fc1(op, hidden_states)
-        hidden_states = op.Gelu(hidden_states, approximate="tanh")
-        return self.fc2(op, hidden_states)
 
 
 class VisionLayerNorm(nn.Module):
@@ -160,7 +158,7 @@ class VisionLayerNorm(nn.Module):
         self.bias = nn.Parameter([hidden_size])
         self.eps = eps
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         return op.LayerNormalization(
             hidden_states,
             self.weight,
@@ -187,12 +185,27 @@ class VisionEncoderLayer(nn.Module):
         self.layer_norm1 = VisionLayerNorm(hidden_size, eps=norm_eps)
         self.self_attn = VisionAttention(hidden_size, num_heads)
         self.layer_norm2 = VisionLayerNorm(hidden_size, eps=norm_eps)
-        self.mlp = VisionMLP(hidden_size, intermediate_size)
+        # GELU (tanh approx) MLP with bias (HF fc1/fc2 → up_proj/down_proj).
+        # Uses _VisionLinear (Transpose+MatMul) to ensure ONNX symbolic shape
+        # inference can propagate output shapes through models that feed vision
+        # features into dynamic Expand ops (e.g. BLIP-2).
+        self.mlp = FCMLP(
+            hidden_size,
+            intermediate_size,
+            activation="gelu_new",
+            bias=True,
+            linear_class=_VisionLinear,
+        )
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        attention_mask: ir.Value | None = None,
+    ):
         residual = hidden_states
         hidden_states = self.layer_norm1(op, hidden_states)
-        hidden_states = self.self_attn(op, hidden_states)
+        hidden_states = self.self_attn(op, hidden_states, attention_mask)
         hidden_states = op.Add(residual, hidden_states)
 
         residual = hidden_states
@@ -221,9 +234,14 @@ class VisionEncoder(nn.Module):
             ]
         )
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        attention_mask: ir.Value | None = None,
+    ):
         for layer in self.layers:
-            hidden_states = layer(op, hidden_states)
+            hidden_states = layer(op, hidden_states, attention_mask)
         return hidden_states
 
 
@@ -260,7 +278,7 @@ class _VisionModelInner(nn.Module):
         )
         self.post_layernorm = VisionLayerNorm(vc.hidden_size, eps=vc.norm_eps)
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         hidden_states = self.embeddings(op, pixel_values)
         hidden_states = self.encoder(op, hidden_states)
         hidden_states = self.post_layernorm(op, hidden_states)
@@ -281,5 +299,5 @@ class VisionModel(nn.Module):
         super().__init__()
         self.vision_model = _VisionModelInner(config)
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         return self.vision_model(op, pixel_values)

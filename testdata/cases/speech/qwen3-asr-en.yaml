@@ -1,0 +1,20 @@
+model_id: "Qwen/Qwen3-ASR-0.6B"
+model_type: "qwen3_asr"
+revision: "main"
+task_type: "speech-language"
+dtype: "float32"
+trust_remote_code: true
+
+inputs:
+  prompts:
+    - "language English<asr_text>"
+  audio:
+    - "652-129742-0006.flac"
+
+generation:
+  max_new_tokens: 50
+  do_sample: false
+
+level: "L4+L5"
+
+notes: "Qwen3-ASR with forced English language. Prompt is appended to assistant turn as decoder prefix to skip language detection."

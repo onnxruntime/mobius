@@ -1,4 +1,5 @@
 model_id: "nghuyong/ernie-3.0-base-zh"
+model_type: "ernie"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"
@@ -8,5 +9,6 @@ inputs:
     - "The quick brown fox jumps over the lazy dog."
 
 level: "L4"
+skip_reason: "No safetensors weights on HuggingFace Hub"
 
 notes: "ERNIE 3.0 base Chinese. Knowledge-enhanced Chinese encoder."

@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """BART encoder-decoder model."""
 
@@ -8,8 +8,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._activations import ACT2FN
@@ -38,7 +37,7 @@ class _BartEncoderBlock(nn.Module):
         self.final_layer_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
         self._act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         residual = hidden_states
         hidden_states, _ = self.self_attn(op, hidden_states)
         hidden_states = op.Add(residual, hidden_states)
@@ -70,7 +69,7 @@ class _BartDecoderBlock(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         encoder_hidden_states: ir.Value,
         past_key_value: tuple | None = None,
@@ -128,7 +127,7 @@ class _BartEncoder(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value | None = None,
     ):
@@ -172,7 +171,7 @@ class _BartDecoder(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         encoder_hidden_states: ir.Value,
         position_ids: ir.Value | None = None,

@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """StarCoder2 causal language model.
 
@@ -33,7 +33,7 @@ class _StarCoder2DecoderLayer(DecoderLayer):
         super().__init__(config, norm_class=LayerNorm)
         # Override the gated MLP with a non-gated two-layer MLP.
         # Bias is handled by mlp_bias config field (default False for tests).
-        bias = getattr(config, "mlp_bias", False)
+        bias = config.mlp_bias
         self.mlp = FCMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,

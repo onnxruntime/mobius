@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Model registry mapping architecture names to module classes.
 
@@ -24,6 +24,10 @@ from onnxscript import nn
 
 from mobius._configs import (
     BaseModelConfig,
+    Eagle3Config,
+    Gemma4AssistantConfig,
+    Gemma4Config,
+    MMSConfig,
     WhisperConfig,
 )
 from mobius.models import (
@@ -33,24 +37,35 @@ from mobius.models import (
     ChatGLMCausalLMModel,
     DeepSeekOCR2CausalLMModel,
     DeepSeekV3CausalLMModel,
+    DeepSeekV4CausalLMModel,
+    DFlashDraftModel,
     DiffLlamaCausalLMModel,
     DogeCausalLMModel,
+    Eagle3DraftModel,
+    EncDecRNNTModel,
     Ernie45MoECausalLMModel,
     ErnieCausalLMModel,
     ExaOne4CausalLMModel,
     Gemma2CausalLMModel,
     Gemma3CausalLMModel,
     Gemma3MultiModalModel,
+    Gemma4AssistantCausalLMModel,
+    Gemma4CausalLMModel,
+    Gemma4Model,
+    Gemma4UnifiedModel,
     GemmaCausalLMModel,
     Glm4CausalLMModel,
     Glm4MoECausalLMModel,
     GlmCausalLMModel,
     GPTOSSCausalLMModel,
     GraniteCausalLMModel,
+    GraniteMoECausalLMModel,
     HunYuanMoEV1CausalLMModel,
     HunYuanV1DenseCausalLMModel,
+    HunYuanVLMoTModel,
     InternLM2CausalLMModel,
     LayerNormCausalLMModel,
+    LLaDAModel,
     Llama4CausalLMModel,
     MoECausalLMModel,
     NanoChatCausalLMModel,
@@ -60,9 +75,12 @@ from mobius.models import (
     Phi3CausalLMModel,
     Phi3MoECausalLMModel,
     Phi3SmallCausalLMModel,
+    Phi3VModel,
     Phi4MMMultiModalModel,
+    Phi4SigLIPModel,
     PhiCausalLMModel,
     Qwen2MoECausalLMModel,
+    Qwen2VLCausalLMModel,
     Qwen3CausalLMModel,
     Qwen3NextCausalLMModel,
     Qwen3VL3ModelCausalLMModel,
@@ -72,6 +90,8 @@ from mobius.models import (
     Qwen25VLTextModel,
     Qwen35CausalLMModel,
     Qwen35MoECausalLMModel,
+    Qwen35MoEVL3ModelCausalLMModel,
+    Qwen35MtpModel,
     Qwen35VL3ModelCausalLMModel,
     Qwen35VLTextModel,
     QwenCausalLMModel,
@@ -83,12 +103,13 @@ from mobius.models.bart import BartForConditionalGeneration
 from mobius.models.bert import BertForMaskedLM, BertModel
 from mobius.models.blip import BlipVisionModel
 from mobius.models.blip2 import Blip2Model
-from mobius.models.clip import CLIPTextModel, CLIPVisionModel
+from mobius.models.clip import CLIPTextModel, CLIPVisionModel, SigLIPVisionModel
 from mobius.models.cohere import CohereCausalLMModel
 from mobius.models.ctrl import CTRLCausalLMModel
 from mobius.models.depth_anything import DepthAnythingForDepthEstimation
 from mobius.models.distilbert import DistilBertModel
 from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel, MPTCausalLMModel
+from mobius.models.fun_asr import FunASRForConditionalGeneration
 from mobius.models.gemma3n import Gemma3nCausalLMModel
 from mobius.models.gpt2 import GPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
@@ -104,6 +125,7 @@ from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
 from mobius.models.minimax import MiniMaxCausalLMModel
 from mobius.models.mllama import MllamaCausalLMModel
 from mobius.models.modernbert import ModernBertDecoderModel, ModernBertModel
+from mobius.models.nemotron_h import NemotronHCausalLMModel
 from mobius.models.opt import OPTCausalLMModel
 from mobius.models.persimmon import PersimmonCausalLMModel
 from mobius.models.qwen3_asr import Qwen3ASRForConditionalGeneration
@@ -111,13 +133,16 @@ from mobius.models.qwen3_tts import Qwen3TTSForConditionalGeneration
 from mobius.models.qwen3_tts_tokenizer import Qwen3TTSTokenizerV2Model
 from mobius.models.sam2 import Sam2VisionModel
 from mobius.models.segformer import SegformerForSemanticSegmentation
+from mobius.models.sensevoice_small import SenseVoiceSmallModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5ForConditionalGeneration
 from mobius.models.trocr import TrOCRForConditionalGeneration
 from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
+from mobius.models.wav2vec2_ctc import Wav2Vec2ForCTCModel
 from mobius.models.xlm import XLMCausalLMModel
 from mobius.models.yolos import YolosForObjectDetection
+from mobius.models.zamba2 import Zamba2CausalLMModel
 
 
 @dataclasses.dataclass(frozen=True)
@@ -328,386 +353,462 @@ def _detect_fallback_registration(hf_config) -> ModelRegistration | None:
     return ModelRegistration(CausalLMModel)
 
 
-def _create_default_registry() -> ModelRegistry:
-    """Create the default registry with all built-in architectures."""
-    reg = ModelRegistry()
-
+# ---------------------------------------------------------------------------
+# Declarative registration table
+#
+# Each entry maps an architecture name (HF ``config.model_type``) to a
+# ``ModelRegistration``.  Use keyword arguments when ``task`` or
+# ``config_class`` differ from their defaults (``None``).
+#
+# test_model_id, family, and variant are applied separately via
+# ``_apply_test_metadata()`` using the dicts below.
+# ---------------------------------------------------------------------------
+_REGISTRATIONS: dict[str, ModelRegistration] = {
     # --- Text Generation (Llama-compatible) ---
-    for name in (
-        "baichuan",
-        "code_llama",
-        "codegen2",
-        "command_r",
-        "csm",
-        "dots1",
-        "evolla",
-        "exaone",
-        "helium",
-        "llama",
-        "llama4_text",
-        "minicpm",
-        "minicpm3",
-        "ministral",
-        "ministral3",
-        "mistral",
-        "mistral3",
-        "open-llama",
-        "openelm",
-        "qwen2",
-        "seed_oss",
-        "solar_open",
-        "yi",
-        "youtu",
-        "zamba",
-        "zamba2",
-    ):
-        reg.register(name, CausalLMModel)
-
+    "baichuan": ModelRegistration(CausalLMModel),
+    "code_llama": ModelRegistration(CausalLMModel),
+    "codegen2": ModelRegistration(CausalLMModel),
+    "command_r": ModelRegistration(CausalLMModel),
+    "csm": ModelRegistration(CausalLMModel),
+    "dots1": ModelRegistration(DeepSeekV3CausalLMModel),
+    "evolla": ModelRegistration(CausalLMModel),
+    "exaone": ModelRegistration(CausalLMModel),
+    "helium": ModelRegistration(CausalLMModel),
+    "llama": ModelRegistration(CausalLMModel),
+    "minicpm": ModelRegistration(CausalLMModel),
+    "minicpm3": ModelRegistration(CausalLMModel),
+    "ministral": ModelRegistration(CausalLMModel),
+    "ministral3": ModelRegistration(CausalLMModel),
+    "mistral": ModelRegistration(CausalLMModel),
+    "open-llama": ModelRegistration(CausalLMModel),
+    "openelm": ModelRegistration(CausalLMModel),
+    "qwen2": ModelRegistration(CausalLMModel),
+    "seed_oss": ModelRegistration(CausalLMModel),
+    "solar_open": ModelRegistration(CausalLMModel),
+    "yi": ModelRegistration(CausalLMModel),
+    "youtu": ModelRegistration(DeepSeekV3CausalLMModel),
+    "zamba": ModelRegistration(CausalLMModel),
+    "zamba2": ModelRegistration(Zamba2CausalLMModel),
     # --- Text Generation (architecture-specific) ---
-    for name, cls in {
-        "apertus": ApertusCausalLMModel,
-        "arcee": ArceeCausalLMModel,
-        "bloom": BloomCausalLMModel,
-        "chatglm": ChatGLMCausalLMModel,
-        "codegen": CodeGenCausalLMModel,
-        "cohere": CohereCausalLMModel,
-        "cohere2": CohereCausalLMModel,
-        "ernie4_5": ErnieCausalLMModel,
-        "exaone4": ExaOne4CausalLMModel,
-        "falcon": FalconCausalLMModel,
-        "falcon_h1": FalconCausalLMModel,
-        "gpt_neox": GPTNeoXCausalLMModel,
-        "gpt_neox_japanese": GPTNeoXJapaneseCausalLMModel,
-        "gptj": GPTJCausalLMModel,
-        "mpt": MPTCausalLMModel,
-        "nanochat": NanoChatCausalLMModel,
-        "persimmon": PersimmonCausalLMModel,
-        "stablelm": LayerNormCausalLMModel,
-        "starcoder2": StarCoder2CausalLMModel,
-        "gemma": GemmaCausalLMModel,
-        "gemma2": Gemma2CausalLMModel,
-        "shieldgemma2": Gemma2CausalLMModel,
-        "gemma3_text": Gemma3CausalLMModel,
-        "gemma3n_text": Gemma3nCausalLMModel,
-        "granite": GraniteCausalLMModel,
-        "diffllama": DiffLlamaCausalLMModel,
-        "doge": DogeCausalLMModel,
-        "internlm2": InternLM2CausalLMModel,
-        "llama4_text": Llama4CausalLMModel,
-        "modernbert-decoder": ModernBertDecoderModel,
-        "nemotron": NemotronCausalLMModel,
-        "olmo": OLMoCausalLMModel,
-        "olmo2": OLMo2CausalLMModel,
-        "olmo3": OLMo2CausalLMModel,
-        "phi": PhiCausalLMModel,
-        "phi3": Phi3CausalLMModel,
-        "phi3small": Phi3SmallCausalLMModel,
-        "qwen": QwenCausalLMModel,
-        "qwen3": Qwen3CausalLMModel,
-        "qwen3_5_text": Qwen35CausalLMModel,
-        "smollm3": SmolLM3CausalLMModel,
-    }.items():
-        reg.register(name, cls)
-
+    "apertus": ModelRegistration(ApertusCausalLMModel),
+    "arcee": ModelRegistration(ArceeCausalLMModel),
+    "bloom": ModelRegistration(BloomCausalLMModel),
+    "chatglm": ModelRegistration(ChatGLMCausalLMModel),
+    "codegen": ModelRegistration(CodeGenCausalLMModel),
+    "cohere": ModelRegistration(CohereCausalLMModel),
+    "cohere2": ModelRegistration(CohereCausalLMModel),
+    "diffllama": ModelRegistration(DiffLlamaCausalLMModel),
+    "doge": ModelRegistration(DogeCausalLMModel),
+    "ernie4_5": ModelRegistration(ErnieCausalLMModel),
+    "exaone4": ModelRegistration(ExaOne4CausalLMModel),
+    "falcon": ModelRegistration(FalconCausalLMModel),
+    "falcon_h1": ModelRegistration(FalconCausalLMModel),
+    "gemma": ModelRegistration(GemmaCausalLMModel),
+    "gemma2": ModelRegistration(Gemma2CausalLMModel),
+    "gemma3": ModelRegistration(Gemma3MultiModalModel, task="vision-language"),
+    "gemma3_text": ModelRegistration(Gemma3CausalLMModel),
+    "gemma3n": ModelRegistration(Gemma3nCausalLMModel),
+    "gemma3n_text": ModelRegistration(Gemma3nCausalLMModel),
+    "gemma4_text": ModelRegistration(Gemma4CausalLMModel, config_class=Gemma4Config),
+    "gemma4_unified_text": ModelRegistration(Gemma4CausalLMModel, config_class=Gemma4Config),
+    # Gemma4-Assistant ships ``model_type="gemma4_assistant"`` plus
+    # ``architectures=["Gemma4AssistantForCausalLM"]``.  Both keys point
+    # at the assistant drafter so build() can dispatch via either.  The
+    # ``gemma4_unified_assistant`` family is structurally identical (same
+    # 4-layer Gemma4 decoder, KV-shared with target, optional ordered-
+    # embeddings head) but ships under a different ``model_type``;
+    # register all four keys at the same class.
+    "gemma4_assistant": ModelRegistration(
+        Gemma4AssistantCausalLMModel,
+        task="gemma4-assistant",
+        config_class=Gemma4AssistantConfig,
+        family="gemma4_assistant",
+    ),
+    "Gemma4AssistantForCausalLM": ModelRegistration(
+        Gemma4AssistantCausalLMModel,
+        task="gemma4-assistant",
+        config_class=Gemma4AssistantConfig,
+        family="gemma4_assistant",
+    ),
+    "gemma4_unified_assistant": ModelRegistration(
+        Gemma4AssistantCausalLMModel,
+        task="gemma4-assistant",
+        config_class=Gemma4AssistantConfig,
+        family="gemma4_assistant",
+        variant="unified",
+    ),
+    "Gemma4UnifiedAssistantForCausalLM": ModelRegistration(
+        Gemma4AssistantCausalLMModel,
+        task="gemma4-assistant",
+        config_class=Gemma4AssistantConfig,
+        family="gemma4_assistant",
+        variant="unified",
+    ),
+    "glm": ModelRegistration(GlmCausalLMModel),
+    "glm4": ModelRegistration(Glm4CausalLMModel),
+    "gpt_neox": ModelRegistration(GPTNeoXCausalLMModel),
+    "gpt_neox_japanese": ModelRegistration(GPTNeoXJapaneseCausalLMModel),
+    "gpt_oss": ModelRegistration(GPTOSSCausalLMModel),
+    "gptj": ModelRegistration(GPTJCausalLMModel),
+    "granite": ModelRegistration(GraniteCausalLMModel),
+    "hunyuan_v1_dense": ModelRegistration(HunYuanV1DenseCausalLMModel),
+    "internlm2": ModelRegistration(InternLM2CausalLMModel),
+    "llama4_text": ModelRegistration(Llama4CausalLMModel),
+    "llada": ModelRegistration(LLaDAModel, task="masked-diffusion"),
+    "modernbert-decoder": ModelRegistration(ModernBertDecoderModel),
+    "mpt": ModelRegistration(MPTCausalLMModel),
+    "nanochat": ModelRegistration(NanoChatCausalLMModel),
+    "nemotron": ModelRegistration(NemotronCausalLMModel),
+    "olmo": ModelRegistration(OLMoCausalLMModel),
+    "olmo2": ModelRegistration(OLMo2CausalLMModel),
+    "olmo3": ModelRegistration(OLMo2CausalLMModel),
+    "persimmon": ModelRegistration(PersimmonCausalLMModel),
+    "phi": ModelRegistration(PhiCausalLMModel),
+    "phi3": ModelRegistration(Phi3CausalLMModel),
+    "phi3small": ModelRegistration(Phi3SmallCausalLMModel),
+    "qwen": ModelRegistration(QwenCausalLMModel),
+    "qwen3": ModelRegistration(Qwen3CausalLMModel),
+    "qwen3_5_text": ModelRegistration(Qwen35CausalLMModel),
+    # DFlash drafters share ``model_type=qwen3`` with the base Qwen3 family;
+    # build() routes to DFlashDraftModel by the ``architectures`` field in the
+    # checkpoint config.  The registry entry below allows direct lookup by
+    # architecture name and exposes the task.
+    "DFlashDraftModel": ModelRegistration(
+        DFlashDraftModel, task="dflash-draft", family="dflash", variant="qwen3"
+    ),
+    # Qwen3.6 MTP self-speculative head.  Like DFlash, it is an auxiliary
+    # drafter that is NOT auto-routed by ``model_type`` (the main checkpoint
+    # maps to the qwen3_5 VL / text model); it is looked up directly by
+    # architecture name and exposes the ``qwen35-mtp`` task.
+    "Qwen35MtpModel": ModelRegistration(
+        Qwen35MtpModel, task="qwen35-mtp", family="qwen", variant="mtp"
+    ),
+    "Eagle3LlamaForCausalLM": ModelRegistration(
+        Eagle3DraftModel,
+        task="eagle3-draft",
+        config_class=Eagle3Config,
+        family="eagle3",
+        variant="qwen3",
+    ),
+    # AngelSlim ships two equivalent EAGLE-3 architecture strings: Qwen3-4B uses
+    # "Eagle3LlamaForCausalLM", Qwen3-8B uses "LlamaForCausalLMEagle3".
+    "LlamaForCausalLMEagle3": ModelRegistration(
+        Eagle3DraftModel,
+        task="eagle3-draft",
+        config_class=Eagle3Config,
+        family="eagle3",
+        variant="qwen3",
+    ),
+    # speculators-format EAGLE-3 checkpoints (RedHat): the Qwen3 checkpoint
+    # declares "Eagle3Speculator", the Gemma4 one "Eagle3DraftModel". Both nest
+    # the arch config under transformer_layer_config and set norm_before_residual.
+    "Eagle3Speculator": ModelRegistration(
+        Eagle3DraftModel,
+        task="eagle3-draft",
+        config_class=Eagle3Config,
+        family="eagle3",
+        variant="speculators",
+    ),
+    "Eagle3DraftModel": ModelRegistration(
+        Eagle3DraftModel,
+        task="eagle3-draft",
+        config_class=Eagle3Config,
+        family="eagle3",
+        variant="speculators",
+    ),
+    "shieldgemma2": ModelRegistration(Gemma2CausalLMModel),
+    "smollm3": ModelRegistration(SmolLM3CausalLMModel),
+    "stablelm": ModelRegistration(LayerNormCausalLMModel),
+    "starcoder2": ModelRegistration(StarCoder2CausalLMModel),
     # --- Mixture of Experts ---
-    for name in (
-        "arctic",
-        "dbrx",
-        "flex_olmo",
-        "granitemoe",
-        "granitemoeshared",
-        "mixtral",
-        "olmoe",
-        "qwen3_moe",
-        "qwen3_omni_moe",
-        "qwen3_vl_moe",
-    ):
-        reg.register(name, MoECausalLMModel)
-    reg.register("ernie4_5_moe", Ernie45MoECausalLMModel)
-    reg.register("glm", GlmCausalLMModel)
-    reg.register("glm4", Glm4CausalLMModel)
-    reg.register("glm4_moe", Glm4MoECausalLMModel)
-
-    reg.register("jetmoe", JetMoeCausalLMModel)
-    reg.register("hunyuan_v1_dense", HunYuanV1DenseCausalLMModel)
-    reg.register("hunyuan_v1_moe", HunYuanMoEV1CausalLMModel)
-    reg.register("qwen2_moe", Qwen2MoECausalLMModel)
-
-    reg.register("longcat_flash", LongcatFlashCausalLMModel)
-
-    # --- GraniteMoeHybrid (Mamba2+Attention hybrid with MoE on all layers) ---
-    reg.register("granitemoehybrid", GraniteMoeHybridCausalLMModel)
-
-    reg.register("minimax", MiniMaxCausalLMModel)
-    reg.register("gpt_oss", GPTOSSCausalLMModel)
-    reg.register("phimoe", Phi3MoECausalLMModel)
-    reg.register("qwen3_5_moe", Qwen35MoECausalLMModel)
-    reg.register("qwen3_next", Qwen3NextCausalLMModel)
-
+    "arctic": ModelRegistration(MoECausalLMModel),
+    "dbrx": ModelRegistration(MoECausalLMModel),
+    "ernie4_5_moe": ModelRegistration(Ernie45MoECausalLMModel),
+    "flex_olmo": ModelRegistration(MoECausalLMModel),
+    "glm4_moe": ModelRegistration(Glm4MoECausalLMModel),
+    "granitemoe": ModelRegistration(GraniteMoECausalLMModel),
+    "granitemoehybrid": ModelRegistration(GraniteMoeHybridCausalLMModel),
+    "granitemoeshared": ModelRegistration(GraniteMoECausalLMModel),
+    "hunyuan_v1_moe": ModelRegistration(HunYuanMoEV1CausalLMModel),
+    "jetmoe": ModelRegistration(JetMoeCausalLMModel),
+    "minimax": ModelRegistration(MiniMaxCausalLMModel),
+    "mixtral": ModelRegistration(MoECausalLMModel),
+    "olmoe": ModelRegistration(MoECausalLMModel),
+    "phimoe": ModelRegistration(Phi3MoECausalLMModel),
+    "qwen2_moe": ModelRegistration(Qwen2MoECausalLMModel),
+    "qwen3_5_moe": ModelRegistration(Qwen35MoECausalLMModel),
+    "qwen3_moe": ModelRegistration(MoECausalLMModel),
+    "qwen3_next": ModelRegistration(Qwen3NextCausalLMModel),
+    "qwen3_omni_moe": ModelRegistration(MoECausalLMModel),
+    "qwen3_vl_moe": ModelRegistration(MoECausalLMModel),
     # --- DeepSeek (MLA + MoE) ---
-    for name in (
-        "deepseek_v2",
-        "deepseek_v2_moe",
-        "deepseek_v3",
-    ):
-        reg.register(name, DeepSeekV3CausalLMModel)
-
-    # --- DeepSeek-OCR-2 (VL) ---
-    reg.register("deepseek_vl_v2", DeepSeekOCR2CausalLMModel)
-
+    "deepseek_v2": ModelRegistration(DeepSeekV3CausalLMModel),
+    "deepseek_v2_moe": ModelRegistration(DeepSeekV3CausalLMModel),
+    "deepseek_v3": ModelRegistration(DeepSeekV3CausalLMModel),
+    "deepseek_v4": ModelRegistration(DeepSeekV4CausalLMModel, task="deepseek-v4"),
+    "deepseek_vl_v2": ModelRegistration(DeepSeekOCR2CausalLMModel),
     # --- SSM (Mamba / Mamba2) ---
-    reg.register("mamba", MambaCausalLMModel)
-    reg.register("falcon_mamba", MambaCausalLMModel)
-    reg.register("mamba2", Mamba2CausalLMModel)
-
-    # --- Hybrid SSM+Attention (Jamba) ---
-    reg.register("jamba", JambaCausalLMModel)
-
-    # --- Hybrid Mamba2+Attention (Bamba) ---
-    reg.register("bamba", BambaCausalLMModel)
-
-    # --- Hybrid Mamba2+Attention+MLP (NemotronH) ---
-    from mobius.models.nemotron_h import NemotronHCausalLMModel
-
-    reg.register("nemotron_h", NemotronHCausalLMModel)
-
+    "falcon_mamba": ModelRegistration(MambaCausalLMModel),
+    "mamba": ModelRegistration(MambaCausalLMModel),
+    "mamba2": ModelRegistration(Mamba2CausalLMModel),
+    # --- Hybrid SSM+Attention ---
+    "bamba": ModelRegistration(BambaCausalLMModel),
+    "jamba": ModelRegistration(JambaCausalLMModel),
+    "nemotron_h": ModelRegistration(NemotronHCausalLMModel),
+    # --- Hybrid linear-attention ---
+    "longcat_flash": ModelRegistration(LongcatFlashCausalLMModel),
     # --- Multimodal ---
-    for name in (
-        "chameleon",
-        "cohere2_vision",
-        "florence2",
-        "fuyu",
-        "idefics2",
-        "idefics3",
-        "instructblip",
-        "instructblipvideo",
-        "llava",
-        "llava_next",
-        "llava_next_video",
-        "llava_onevision",
-        "molmo",
-        "paligemma",
-        "pixtral",
-        "smolvlm",
-        "video_llava",
-        "aya_vision",
-        "deepseek_vl",
-        "deepseek_vl_hybrid",
-        "got_ocr2",
-        "janus",
-        "ovis2",
-        "vipllava",
-    ):
-        reg.register(name, LLaVAModel, task="vision-language")
-
-    for name in ("internvl_chat", "internvl2", "internvl"):
-        reg.register(name, InternVL2Model, task="vision-language")
-    reg.register("gemma3", Gemma3CausalLMModel)
-    reg.register("gemma3_multimodal", Gemma3MultiModalModel, task="vision-language")
-    reg.register("gemma3n", Gemma3nCausalLMModel)
-    reg.register("glm4v", LLaVAModel, task="vision-language")
-    reg.register("glm4v_moe", LLaVAModel, task="vision-language")
-    reg.register("glm4v_moe_text", MoECausalLMModel)
-    reg.register("glm4v_text", CausalLMModel)
-    reg.register("mllama", MllamaCausalLMModel, task="mllama-vision-language")
-
-    reg.register("blip-2", Blip2Model, task="vision-language")
-    reg.register("phi4mm", Phi4MMMultiModalModel, task="phi4mm-multimodal")
-    reg.register("phi4_multimodal", Phi4MMMultiModalModel, task="phi4mm-multimodal")
-    reg.register("qwen2_vl", Qwen25VLCausalLMModel, task="qwen-vl")
-    reg.register("qwen2_vl_text", Qwen25VLTextModel)
-    reg.register("qwen2_5_vl", Qwen25VLCausalLMModel, task="qwen-vl")
-    reg.register("qwen2_5_vl_text", Qwen25VLTextModel)
-    reg.register("qwen3_vl", Qwen3VL3ModelCausalLMModel, task="qwen-vl")
-    reg.register("qwen3_vl_single", Qwen3VLCausalLMModel, task="qwen3-vl-vision-language")
-    reg.register("qwen3_vl_text", Qwen3VLTextModel)
-    reg.register("qwen3_5", Qwen35VL3ModelCausalLMModel, task="hybrid-qwen-vl")
-    reg.register("qwen3_5_vl", Qwen35VL3ModelCausalLMModel, task="hybrid-qwen-vl")
-    reg.register("qwen3_5_vl_text", Qwen35VLTextModel)
-
+    "aya_vision": ModelRegistration(LLaVAModel, task="vision-language"),
+    "blip-2": ModelRegistration(Blip2Model, task="vision-language"),
+    "chameleon": ModelRegistration(LLaVAModel, task="vision-language"),
+    "cohere2_vision": ModelRegistration(LLaVAModel, task="vision-language"),
+    "deepseek_vl": ModelRegistration(LLaVAModel, task="vision-language"),
+    "deepseek_vl_hybrid": ModelRegistration(LLaVAModel, task="vision-language"),
+    "florence2": ModelRegistration(LLaVAModel, task="vision-language"),
+    "fuyu": ModelRegistration(LLaVAModel, task="vision-language"),
+    "gemma4": ModelRegistration(Gemma4Model, task="gemma4", config_class=Gemma4Config),
+    "gemma4_unified": ModelRegistration(
+        Gemma4UnifiedModel, task="gemma4-unified", config_class=Gemma4Config
+    ),
+    "glm4v": ModelRegistration(LLaVAModel, task="vision-language"),
+    "glm4v_moe": ModelRegistration(LLaVAModel, task="vision-language"),
+    "glm4v_moe_text": ModelRegistration(Glm4MoECausalLMModel),
+    "glm4v_text": ModelRegistration(Glm4CausalLMModel),
+    "got_ocr2": ModelRegistration(LLaVAModel, task="vision-language"),
+    "hunyuan_vl_mot": ModelRegistration(HunYuanVLMoTModel, task="hunyuan-vl-mot"),
+    "idefics2": ModelRegistration(LLaVAModel, task="vision-language"),
+    "idefics3": ModelRegistration(LLaVAModel, task="vision-language"),
+    "instructblip": ModelRegistration(LLaVAModel, task="vision-language"),
+    "instructblipvideo": ModelRegistration(LLaVAModel, task="vision-language"),
+    "internvl": ModelRegistration(InternVL2Model, task="vision-language"),
+    "internvl2": ModelRegistration(InternVL2Model, task="vision-language"),
+    "internvl_chat": ModelRegistration(InternVL2Model, task="vision-language"),
+    "janus": ModelRegistration(LLaVAModel, task="vision-language"),
+    "llava": ModelRegistration(LLaVAModel, task="vision-language"),
+    "llava_next": ModelRegistration(LLaVAModel, task="vision-language"),
+    "llava_next_video": ModelRegistration(LLaVAModel, task="vision-language"),
+    "llava_onevision": ModelRegistration(LLaVAModel, task="vision-language"),
+    "mistral3": ModelRegistration(LLaVAModel, task="pixtral-vl"),
+    "mllama": ModelRegistration(MllamaCausalLMModel, task="mllama-vision-language"),
+    "molmo": ModelRegistration(LLaVAModel, task="vision-language"),
+    "ovis2": ModelRegistration(LLaVAModel, task="vision-language"),
+    "paligemma": ModelRegistration(LLaVAModel, task="vision-language"),
+    "phi4_multimodal": ModelRegistration(Phi4MMMultiModalModel, task="phi4mm-multimodal"),
+    "phi4mm": ModelRegistration(Phi4MMMultiModalModel, task="phi4mm-multimodal"),
+    "phi3_v": ModelRegistration(Phi3VModel, task="vision-language"),
+    "phi4-siglip": ModelRegistration(Phi4SigLIPModel, task="vision-language"),
+    "pixtral": ModelRegistration(LLaVAModel, task="pixtral-vl"),
+    "qwen2_5_vl": ModelRegistration(Qwen25VLCausalLMModel, task="qwen-vl"),
+    "qwen2_5_vl_text": ModelRegistration(Qwen25VLTextModel),
+    "qwen2_vl": ModelRegistration(Qwen2VLCausalLMModel, task="qwen-vl"),
+    "qwen2_vl_text": ModelRegistration(Qwen25VLTextModel),
+    "qwen3_5": ModelRegistration(Qwen35VL3ModelCausalLMModel, task="hybrid-qwen-vl"),
+    "qwen3_5_moe_vl": ModelRegistration(Qwen35MoEVL3ModelCausalLMModel, task="hybrid-qwen-vl"),
+    # Text-only sibling of ``qwen3_5_moe_vl`` (Qwen3.6-35B-A3B). The MoE
+    # backbone ``Qwen35MoECausalLMModel`` already strips ``language_model.``
+    # and drops ``visual.``/MTP keys, so it consumes the VL checkpoint's text
+    # weights directly; ``build(..., text_only=True)`` routes here via
+    # ``_TEXT_ONLY_MODEL_TYPE``. It also matches the VL ``text_config``'s own
+    # ``model_type=qwen3_5_moe_text`` so that config resolves cleanly.
+    "qwen3_5_moe_text": ModelRegistration(Qwen35MoECausalLMModel),
+    "qwen3_5_vl": ModelRegistration(Qwen35VL3ModelCausalLMModel, task="hybrid-qwen-vl"),
+    "qwen3_5_vl_text": ModelRegistration(Qwen35VLTextModel),
+    "qwen3_vl": ModelRegistration(Qwen3VL3ModelCausalLMModel, task="qwen-vl"),
+    "qwen3_vl_single": ModelRegistration(
+        Qwen3VLCausalLMModel, task="qwen3-vl-vision-language"
+    ),
+    "qwen3_vl_text": ModelRegistration(Qwen3VLTextModel),
+    "smolvlm": ModelRegistration(LLaVAModel, task="vision-language"),
+    "video_llava": ModelRegistration(LLaVAModel, task="vision-language"),
+    "vipllava": ModelRegistration(LLaVAModel, task="vision-language"),
     # --- Speech ---
-    reg.register(
-        "whisper",
+    # Fun-ASR uses config.yaml (not config.json). build() auto-detection
+    # won't work — use build_from_module() with manual config construction.
+    # See examples/fun_asr.py for the full pipeline.
+    "fun_asr": ModelRegistration(
+        FunASRForConditionalGeneration, task="fun-asr-speech-language"
+    ),
+    "qwen3_asr": ModelRegistration(Qwen3ASRForConditionalGeneration, task="speech-language"),
+    "qwen3_forced_aligner": ModelRegistration(
+        Qwen3ASRForConditionalGeneration, task="speech-language"
+    ),
+    "sensevoice_small": ModelRegistration(SenseVoiceSmallModel, task="audio-ctc"),
+    "qwen3_tts": ModelRegistration(Qwen3TTSForConditionalGeneration),
+    "qwen3_tts_tokenizer_12hz": ModelRegistration(Qwen3TTSTokenizerV2Model, task="codec"),
+    "whisper": ModelRegistration(
         WhisperForConditionalGeneration,
         task="speech-to-text",
         config_class=WhisperConfig,
-    )
-
-    reg.register("qwen3_asr", Qwen3ASRForConditionalGeneration, task="speech-language")
-    reg.register(
-        "qwen3_forced_aligner", Qwen3ASRForConditionalGeneration, task="speech-language"
-    )
-
-    reg.register("qwen3_tts", Qwen3TTSForConditionalGeneration)
-
-    reg.register("qwen3_tts_tokenizer_12hz", Qwen3TTSTokenizerV2Model, task="codec")
-
+    ),
     # --- Encoder-only ---
-    for name in (
-        "albert",
-        "bert",
-        "camembert",
-        "data2vec-text",
-        "deberta",
-        "deberta-v2",
-        "electra",
-        "ernie",
-        "ernie_m",
-        "esm",
-        "flaubert",
-        "ibert",
-        "megatron-bert",
-        "mobilebert",
-        "mpnet",
-        "nezha",
-        "qdqbert",
-        "rembert",
-        "roberta",
-        "roberta-prelayernorm",
-        "roc_bert",
-        "roformer",
-        "splinter",
-        "squeezebert",
-        "xlm-roberta",
-        "xlm-roberta-xl",
-        "xlnet",
-        "xmod",
-        # Document/layout models (BERT-like encoder)
-        "bros",
-        "layoutlm",
-        "layoutlmv2",
-        "lilt",
-        "markuplm",
-        "mega",
-        "mra",
-        "nystromformer",
-        "yoso",
-    ):
-        reg.register(name, BertModel, task="feature-extraction")
-    reg.register("distilbert", DistilBertModel, task="feature-extraction")
-    reg.register("clip_text_model", CLIPTextModel, task="feature-extraction")
-    reg.register("layoutlmv3", LayoutLMv3Model, task="feature-extraction")
-    reg.register("modernbert", ModernBertModel, task="feature-extraction")
-
+    "albert": ModelRegistration(BertModel, task="feature-extraction"),
+    "bert": ModelRegistration(BertModel, task="feature-extraction"),
+    "bros": ModelRegistration(BertModel, task="feature-extraction"),
+    "camembert": ModelRegistration(BertModel, task="feature-extraction"),
+    "clip_text_model": ModelRegistration(CLIPTextModel, task="feature-extraction"),
+    "data2vec-text": ModelRegistration(BertModel, task="feature-extraction"),
+    "deberta": ModelRegistration(BertModel, task="feature-extraction"),
+    "deberta-v2": ModelRegistration(BertModel, task="feature-extraction"),
+    "distilbert": ModelRegistration(DistilBertModel, task="feature-extraction"),
+    "electra": ModelRegistration(BertModel, task="feature-extraction"),
+    "ernie": ModelRegistration(BertModel, task="feature-extraction"),
+    "ernie_m": ModelRegistration(BertModel, task="feature-extraction"),
+    "esm": ModelRegistration(BertModel, task="feature-extraction"),
+    "flaubert": ModelRegistration(BertModel, task="feature-extraction"),
+    "ibert": ModelRegistration(BertModel, task="feature-extraction"),
+    "layoutlm": ModelRegistration(BertModel, task="feature-extraction"),
+    "layoutlmv2": ModelRegistration(BertModel, task="feature-extraction"),
+    "layoutlmv3": ModelRegistration(LayoutLMv3Model, task="feature-extraction"),
+    "lilt": ModelRegistration(BertModel, task="feature-extraction"),
+    "markuplm": ModelRegistration(BertModel, task="feature-extraction"),
+    "mega": ModelRegistration(BertModel, task="feature-extraction"),
+    "megatron-bert": ModelRegistration(BertModel, task="feature-extraction"),
+    "mobilebert": ModelRegistration(BertModel, task="feature-extraction"),
+    "modernbert": ModelRegistration(ModernBertModel, task="feature-extraction"),
+    "mpnet": ModelRegistration(BertModel, task="feature-extraction"),
+    "mra": ModelRegistration(BertModel, task="feature-extraction"),
+    "nezha": ModelRegistration(BertModel, task="feature-extraction"),
+    "nystromformer": ModelRegistration(BertModel, task="feature-extraction"),
+    "qdqbert": ModelRegistration(BertModel, task="feature-extraction"),
+    "rembert": ModelRegistration(BertModel, task="feature-extraction"),
+    "roberta": ModelRegistration(BertModel, task="feature-extraction"),
+    "roberta-prelayernorm": ModelRegistration(BertModel, task="feature-extraction"),
+    "roc_bert": ModelRegistration(BertModel, task="feature-extraction"),
+    "roformer": ModelRegistration(BertModel, task="feature-extraction"),
+    "splinter": ModelRegistration(BertModel, task="feature-extraction"),
+    "squeezebert": ModelRegistration(BertModel, task="feature-extraction"),
+    "xlm-roberta": ModelRegistration(BertModel, task="feature-extraction"),
+    "xlm-roberta-xl": ModelRegistration(BertModel, task="feature-extraction"),
+    "xlnet": ModelRegistration(BertModel, task="feature-extraction"),
+    "xmod": ModelRegistration(BertModel, task="feature-extraction"),
+    "yoso": ModelRegistration(BertModel, task="feature-extraction"),
     # --- Masked LM (encoder + prediction head) ---
-    for name in (
-        "bert_masked_lm",
-        "esm_masked_lm",
-        "roberta_masked_lm",
-    ):
-        reg.register(name, BertForMaskedLM, task="masked-lm")
-
+    "bert_masked_lm": ModelRegistration(BertForMaskedLM, task="masked-lm"),
+    "esm_masked_lm": ModelRegistration(BertForMaskedLM, task="masked-lm"),
+    "roberta_masked_lm": ModelRegistration(BertForMaskedLM, task="masked-lm"),
     # --- Absolute positional embeddings (non-RoPE) ---
-    reg.register("gpt2", GPT2CausalLMModel)
-    for name in (
-        "biogpt",
-        "gpt-sw3",
-        "gpt_bigcode",
-        "gpt_neo",
-        "imagegpt",
-        "openai-gpt",
-        "xglm",
-    ):
-        reg.register(name, GPT2CausalLMModel)
-    reg.register("ctrl", CTRLCausalLMModel)
-    reg.register("xlm", XLMCausalLMModel)
-    reg.register("opt", OPTCausalLMModel)
-
+    "biogpt": ModelRegistration(GPT2CausalLMModel),
+    "ctrl": ModelRegistration(CTRLCausalLMModel),
+    "gpt-sw3": ModelRegistration(GPT2CausalLMModel),
+    "gpt2": ModelRegistration(GPT2CausalLMModel),
+    "gpt_bigcode": ModelRegistration(GPT2CausalLMModel),
+    "gpt_neo": ModelRegistration(GPT2CausalLMModel),
+    "imagegpt": ModelRegistration(GPT2CausalLMModel),
+    "openai-gpt": ModelRegistration(GPT2CausalLMModel),
+    "opt": ModelRegistration(OPTCausalLMModel),
+    "xglm": ModelRegistration(GPT2CausalLMModel),
+    "xlm": ModelRegistration(XLMCausalLMModel),
     # --- Encoder-decoder ---
-    for name in (
-        "bart",
-        "bigbird_pegasus",
-        "blenderbot",
-        "blenderbot-small",
-        "fsmt",
-        "led",
-        "m2m_100",
-        "marian",
-        "mbart",
-        "mvp",
-        "nllb-moe",
-        "nllb_moe",
-        "pegasus",
-        "pegasus_x",
-        "plbart",
-        "prophetnet",
-        "xlm-prophetnet",
-    ):
-        reg.register(name, BartForConditionalGeneration, task="seq2seq")
-    for name in ("longt5", "mt5", "switch_transformers", "t5", "umt5"):
-        reg.register(name, T5ForConditionalGeneration, task="seq2seq")
-    reg.register("trocr", TrOCRForConditionalGeneration, task="seq2seq")
-
+    "bart": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "bigbird_pegasus": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "blenderbot": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "blenderbot-small": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "fsmt": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "led": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "longt5": ModelRegistration(T5ForConditionalGeneration, task="seq2seq"),
+    "m2m_100": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "marian": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "mbart": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "mt5": ModelRegistration(T5ForConditionalGeneration, task="seq2seq"),
+    "mvp": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "nllb-moe": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "nllb_moe": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "pegasus": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "pegasus_x": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "plbart": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "prophetnet": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "switch_transformers": ModelRegistration(T5ForConditionalGeneration, task="seq2seq"),
+    "t5": ModelRegistration(T5ForConditionalGeneration, task="seq2seq"),
+    "trocr": ModelRegistration(TrOCRForConditionalGeneration, task="seq2seq"),
+    "umt5": ModelRegistration(T5ForConditionalGeneration, task="seq2seq"),
+    "xlm-prophetnet": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
     # --- Vision ---
-    reg.register("blip", BlipVisionModel, task="image-classification")
-    reg.register(
-        "depth_anything", DepthAnythingForDepthEstimation, task="image-classification"
-    )
-    for name in (
-        "beit",
-        "cvt",
-        "data2vec-vision",
-        "deit",
-        "dinov2",
-        "dinov2_with_registers",
-        "dinov3_vit",
-        "hiera",
-        "ijepa",
-        "mobilevit",
-        "mobilevitv2",
-        "pvt",
-        "pvt_v2",
-        "swin",
-        "swin2sr",
-        "swinv2",
-        "vit",
-        "vit_hybrid",
-        "vit_mae",
-        "vit_msn",
-    ):
-        reg.register(name, ViTModel, task="image-classification")
-    for name in ("clip_vision_model", "siglip_vision_model", "siglip2_vision_model"):
-        reg.register(name, CLIPVisionModel, task="image-classification")
-
-    # --- Object detection ---
-    reg.register("yolos", YolosForObjectDetection, task="object-detection")
-
-    # --- Segmentation ---
-    reg.register("sam2", Sam2VisionModel, task="image-classification")
-    reg.register("segformer", SegformerForSemanticSegmentation, task="image-classification")
-
+    "beit": ModelRegistration(ViTModel, task="image-classification"),
+    "blip": ModelRegistration(BlipVisionModel, task="image-classification"),
+    "clip_vision_model": ModelRegistration(CLIPVisionModel, task="image-classification"),
+    "cvt": ModelRegistration(ViTModel, task="image-classification"),
+    "data2vec-vision": ModelRegistration(ViTModel, task="image-classification"),
+    "deit": ModelRegistration(ViTModel, task="image-classification"),
+    "depth_anything": ModelRegistration(
+        DepthAnythingForDepthEstimation, task="image-classification"
+    ),
+    "dinov2": ModelRegistration(ViTModel, task="image-classification"),
+    "dinov2_with_registers": ModelRegistration(ViTModel, task="image-classification"),
+    "dinov3_vit": ModelRegistration(ViTModel, task="image-classification"),
+    "hiera": ModelRegistration(ViTModel, task="image-classification"),
+    "ijepa": ModelRegistration(ViTModel, task="image-classification"),
+    "mobilevit": ModelRegistration(ViTModel, task="image-classification"),
+    "mobilevitv2": ModelRegistration(ViTModel, task="image-classification"),
+    "pvt": ModelRegistration(ViTModel, task="image-classification"),
+    "pvt_v2": ModelRegistration(ViTModel, task="image-classification"),
+    "sam2": ModelRegistration(Sam2VisionModel, task="image-classification"),
+    "segformer": ModelRegistration(
+        SegformerForSemanticSegmentation, task="image-classification"
+    ),
+    "siglip": ModelRegistration(SigLIPVisionModel, task="image-classification"),
+    "siglip2": ModelRegistration(SigLIPVisionModel, task="image-classification"),
+    "siglip2_vision_model": ModelRegistration(SigLIPVisionModel, task="image-classification"),
+    "siglip_vision_model": ModelRegistration(SigLIPVisionModel, task="image-classification"),
+    "swin": ModelRegistration(ViTModel, task="image-classification"),
+    "swin2sr": ModelRegistration(ViTModel, task="image-classification"),
+    "swinv2": ModelRegistration(ViTModel, task="image-classification"),
+    "vit": ModelRegistration(ViTModel, task="image-classification"),
+    "vit_hybrid": ModelRegistration(ViTModel, task="image-classification"),
+    "vit_mae": ModelRegistration(ViTModel, task="image-classification"),
+    "vit_msn": ModelRegistration(ViTModel, task="image-classification"),
+    "yolos": ModelRegistration(YolosForObjectDetection, task="object-detection"),
     # --- Audio ---
-    for name in (
-        "data2vec-audio",
-        "hubert",
-        "mctct",
-        "musicgen",
-        "seamless_m4t",
-        "seamless_m4t_v2",
-        "sew",
-        "sew-d",
-        "speecht5",
-        "unispeech",
-        "unispeech-sat",
-        "voxtral_encoder",
-        "wav2vec2",
-        "wav2vec2-bert",
-        "wav2vec2-conformer",
-        "wavlm",
-    ):
-        reg.register(name, Wav2Vec2Model, task="audio-feature-extraction")
+    "data2vec-audio": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "hubert": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "mctct": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "musicgen": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "seamless_m4t": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "seamless_m4t_v2": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "sew": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "sew-d": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "speecht5": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "unispeech": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "unispeech-sat": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "voxtral_encoder": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "wav2vec2": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "wav2vec2-bert": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "wav2vec2-conformer": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "wavlm": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "mms": ModelRegistration(Wav2Vec2ForCTCModel, task="ctc-asr", config_class=MMSConfig),
+    "fastconformer_rnnt": ModelRegistration(EncDecRNNTModel, task="fastconformer-rnnt"),
+}
 
-    # -----------------------------------------------------------------
-    # Test metadata — applied after all registrations
-    #
-    # test_model_id: HF model whose config.json is used for L2
-    #     architecture validation (full-size graph, no weights).
-    # family: Groups related model_types in the dashboard.
-    # variant: Labels the code-path variant for dashboard display.
-    # -----------------------------------------------------------------
+
+def _create_default_registry() -> ModelRegistry:
+    """Create the default registry with all built-in architectures."""
+    reg = ModelRegistry()
+    for arch, entry in _REGISTRATIONS.items():
+        reg.register(
+            arch, entry.module_class, task=entry.task, config_class=entry.config_class
+        )
+    # Attach test_model_id, family, and variant metadata to registrations.
     _apply_test_metadata(reg)
-
     return reg
+
+
+# -- Text-only export overrides --
+# Maps a multimodal ``model_type`` to its text-only registry sibling, used by
+# ``build(..., text_only=True)`` to export the text backbone of a multimodal
+# checkpoint as a standalone decoder-only LLM (e.g. so it can use
+# GroupQueryAttention instead of the multimodal bidirectional float-bias path).
+# Entries must point at a registered text-only model_type. The mapping is
+# idempotent: a text-only model_type maps to itself so ``text_only=True`` is a
+# no-op when the resolved type is already text-only.
+_TEXT_ONLY_MODEL_TYPE: dict[str, str] = {
+    "gemma4_unified": "gemma4_unified_text",
+    "gemma4_unified_text": "gemma4_unified_text",
+    # Qwen3.5-MoE-VL (Qwen3.6-35B-A3B): export just the hybrid MoE text
+    # backbone as a standalone decoder-only LLM. The builder overrides
+    # ``qwen3_5_moe`` -> ``qwen3_5_moe_vl`` when a ``vision_config`` is present,
+    # so the text-only override keys off the VL type here.
+    "qwen3_5_moe_vl": "qwen3_5_moe_text",
+    "qwen3_5_moe_text": "qwen3_5_moe_text",
+}
 
 
 # fmt: off
@@ -742,7 +843,6 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "helium": "kyutai/helium-1-preview-2b",
     "minicpm": "optimum-intel-internal-testing/tiny-random-minicpm",
     "minicpm3": "openbmb/MiniCPM3-4B",
-    "mistral3": "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
     "ministral3": "Aratako/Ministral-3-3B-Instruct-2512-BF16-TextOnly",
     "nanochat": "nanochat-students/nanochat-d20",
     "olmo3": "allenai/Olmo-3-7B-Instruct",
@@ -750,16 +850,26 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "youtu": "tencent/Youtu-LLM-2B-Base",
     "zamba": "Zyphra/Zamba-7B-v1",
     "zamba2": "Zyphra/Zamba2-1.2B",
+    "codegen2": "Salesforce/codegen2-1B",
+    "command_r": "CohereForAI/c4ai-command-r-v01",
+    "csm": "sesame/csm-1b",
+    "evolla": "westlake-repl/Evolla-10B-hf",
+    "nemotron_h": "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
+    "open-llama": "openlm-research/open_llama_3b",
+    "persimmon": "adept/persimmon-8b-base",
+    "shieldgemma2": "google/shieldgemma-2b",
+    "solar_open": "upstage/solar-pro-preview-instruct",
 
     # --- CausalLM (architecture-specific) ---
     "falcon": "tiiuae/falcon-7b",
     "bloom": "bigscience/bloom-560m",
     "gemma": "google/gemma-2b",
     "gemma2": "google/gemma-2-2b",
-    "gemma3": "google/gemma-3-1b-pt",
+    "gemma3": "google/gemma-3-4b-it",
     "gemma3_text": "google/gemma-3-1b-pt",
     "gemma3n": "google/gemma-3n-E2B-pt",
     "gemma3n_text": "google/gemma-3n-E2B-pt",
+    "gemma4_text": "google/gemma-4-E2B-it",
     "granite": "ibm-granite/granite-3.3-2b-instruct",
     "internlm2": "internlm/internlm2_5-7b-chat",
     "nemotron": "nvidia/Nemotron-Mini-4B-Instruct",
@@ -771,6 +881,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "qwen": "Qwen/Qwen-1_8B-Chat",
     "qwen3": "Qwen/Qwen3-0.6B",
     "qwen3_5_text": "Qwen/Qwen3.5-2B",
+    "Eagle3LlamaForCausalLM": "AngelSlim/Qwen3-4B_eagle3",
+    "LlamaForCausalLMEagle3": "AngelSlim/Qwen3-8B_eagle3",
     "smollm3": "HuggingFaceTB/SmolLM3-3B",
     "gpt2": "openai-community/gpt2",
     "opt": "facebook/opt-125m",
@@ -799,6 +911,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
     "qwen3_moe": "Qwen/Qwen3-30B-A3B",
     "qwen3_5_moe": "Qwen/Qwen3.5-MoE-A3B-128K",
+    "qwen3_5_moe_text": "Qwen/Qwen3.6-35B-A3B",
     "qwen3_next": "Qwen/Qwen3-235B-A22B",
     "granitemoe": "ibm-granite/granite-3.0-1b-a400m-instruct",
     "olmoe": "allenai/OLMoE-1B-7B-0924",
@@ -819,6 +932,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "deepseek_v2": "deepseek-ai/DeepSeek-V2-Lite",
     "deepseek_v2_moe": "deepseek-ai/DeepSeek-V2-Lite",
     "deepseek_v3": "deepseek-ai/DeepSeek-V3",
+    "deepseek_v4": "deepseek-ai/DeepSeek-V4-Flash",
 
     # --- SSM (Mamba) ---
     "mamba": "state-spaces/mamba-130m-hf",
@@ -840,10 +954,14 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "llava": "llava-hf/llava-1.5-7b-hf",
     "llava_next": "llava-hf/llava-v1.6-mistral-7b-hf",
     "mllama": "meta-llama/Llama-3.2-11B-Vision-Instruct",
-    "gemma3_multimodal": "google/gemma-3-4b-it",
+    "gemma4": "google/gemma-4-E2B-it",
+    "gemma4_unified": "google/gemma-4-12B",
+    "gemma4_unified_text": "google/gemma-4-12B",
     "internvl2": "OpenGVLab/InternVL2-1B",
     "phi4mm": "microsoft/Phi-4-multimodal-instruct",
     "phi4_multimodal": "microsoft/Phi-4-multimodal-instruct",
+    "phi3_v": "microsoft/Phi-3.5-vision-instruct",
+    "phi4-siglip": "microsoft/Phi-4-reasoning-vision-15B",
     "blip-2": "Salesforce/blip2-opt-2.7b",
     "florence2": "microsoft/Florence-2-base",
     "idefics2": "HuggingFaceM4/idefics2-8b",
@@ -851,10 +969,43 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "instructblip": "Salesforce/instructblip-flan-t5-xl",
     "llava_onevision": "llava-hf/llava-onevision-qwen2-0.5b-ov-hf",
     "molmo": "allenai/MolmoE-1B-0924",
+    "mistral3": "mistralai/Ministral-3-3B-Instruct-2512",
+    "aya_vision": "CohereForAI/aya-vision-8b",
+    "chameleon": "facebook/chameleon-7b",
+    "cohere2_vision": "CohereForAI/c4ai-command-r7b-12-2024",
+    "deepseek_vl": "deepseek-ai/deepseek-vl2-tiny",
+    "deepseek_vl_hybrid": "deepseek-ai/deepseek-vl2-tiny",
+    "deepseek_vl_v2": "deepseek-ai/deepseek-vl2-tiny",
+    "fuyu": "adept/fuyu-8b",
+    "glm4v": "THUDM/glm-4v-9b",
+    "glm4v_moe": "THUDM/glm-4v-9b",
+    "glm4v_moe_text": "THUDM/glm-4v-9b",
+    "glm4v_text": "THUDM/glm-4v-9b",
+    "got_ocr2": "stepfun-ai/GOT-OCR2_0",
+    "hunyuan_vl_mot": "tencent/HY-Embodied-0.5-X",
+    "instructblipvideo": "Salesforce/instructblip-flan-t5-xl",
+    "internvl": "OpenGVLab/InternVL2-1B",
+    "internvl_chat": "OpenGVLab/InternVL-Chat-V1-5",
+    "janus": "deepseek-ai/Janus-Pro-1B",
+    "llava_next_video": "llava-hf/LLaVA-NeXT-Video-7B-hf",
+    "ovis2": "AIDC-AI/Ovis2-1B",
+    "paligemma": "google/paligemma-3b-pt-224",
+    "pixtral": "mistralai/Pixtral-12B-2409",
+    "qwen3_5_moe_vl": "Qwen/Qwen3.6-35B-A3B",
+    "qwen3_5_vl": "Qwen/Qwen3.5-2B",
+    "qwen3_5_vl_text": "Qwen/Qwen3.5-2B",
+    "qwen3_vl_single": "Qwen/Qwen3-VL-2B-Instruct",
+    "sam2": "facebook/sam2-hiera-base-plus",
+    "smolvlm": "HuggingFaceTB/SmolVLM-256M-Instruct",
+    "video_llava": "LanguageBind/Video-LLaVA-7B-hf",
+    "vipllava": "llava-hf/vip-llava-7b-hf",
 
     # --- Speech ---
     "whisper": "openai/whisper-tiny",
-    "qwen3_asr": "Qwen/Qwen3-ASR-2B-Instruct",
+    "qwen3_asr": "Qwen/Qwen3-ASR-0.6B",
+    "fun_asr": "justinchuby/Fun-ASR-Nano-2512",
+    "sensevoice_small": "mlx-community/SenseVoiceSmall",
+    "mms": "facebook/mms-300m",
     "speecht5": "microsoft/speecht5_asr",
     "sew": "asapp/sew-tiny-100k",
     "sew-d": "asapp/sew-d-tiny-100k",
@@ -866,6 +1017,11 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "musicgen": "facebook/musicgen-small",
     "seamless_m4t": "facebook/hf-seamless-m4t-medium",
     "seamless_m4t_v2": "facebook/seamless-m4t-v2-large",
+    "mctct": "speechbrain/m-ctc-t-large",
+    "qwen3_forced_aligner": "Qwen/Qwen3-ForcedAligner-0.6B",
+    "qwen3_tts": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    "qwen3_tts_tokenizer_12hz": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+    "voxtral_encoder": "mistralai/Ministral-3-3B-Instruct-2512",
 
     # --- Encoder-only ---
     "bert": "google-bert/bert-base-uncased",
@@ -877,6 +1033,9 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "deberta-v2": "microsoft/deberta-v3-base",
     "xlm-roberta": "FacebookAI/xlm-roberta-base",
     "modernbert": "answerdotai/ModernBERT-base",
+    "modernbert-decoder": "answerdotai/ModernBERT-base",
+    "megatron-bert": "nvidia/megatron-bert-uncased-345m",
+    "qdqbert": "google-bert/bert-base-uncased",
     "clip_text_model": "openai/clip-vit-base-patch32",
     "bros": "naver-clova-ocr/bros-base-uncased",
     "camembert": "almanach/camembert-base",
@@ -934,6 +1093,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "switch_transformers": "google/switch-base-8",
     "umt5": "IMISLab/GreekT5-umt5-small-greeksum",
     "xlm-prophetnet": "microsoft/xprophetnet-large-wiki100-cased",
+    "nllb-moe": "facebook/nllb-moe-54b",
+    "nllb_moe": "facebook/nllb-moe-54b",
 
     # --- Vision ---
     "vit": "google/vit-base-patch16-224",
@@ -955,12 +1116,17 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "mobilevitv2": "apple/mobilevitv2-1.0-imagenet1k-256",
     "pvt": "Zetatech/pvt-tiny-224",
     "pvt_v2": "OpenGVLab/pvt_v2_b0",
+    "siglip": "google/siglip-base-patch16-224",
+    "siglip2": "google/siglip2-base-patch16-224",
     "siglip_vision_model": "google/siglip-base-patch16-224",
     "siglip2_vision_model": "google/siglip2-base-patch16-224",
     "swin2sr": "caidas/swin2SR-classical-sr-x2-64",
     "swinv2": "microsoft/swinv2-tiny-patch4-window16-256",
     "vit_mae": "facebook/vit-mae-base",
     "vit_msn": "facebook/vit-msn-small",
+    "dinov3_vit": "facebook/dinov2-small",
+    "ijepa": "facebook/ijepa_vith14_1k",
+    "vit_hybrid": "google/vit-hybrid-base-bit-384",
 
     # --- Audio ---
     "wav2vec2": "facebook/wav2vec2-base",
@@ -978,6 +1144,8 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "phimoe": "phi",
     "phi4mm": "phi",
     "phi4_multimodal": "phi",
+    "phi3_v": "phi",
+    "phi4-siglip": "phi",
     "gemma": "gemma",
     "gemma2": "gemma",
     "shieldgemma2": "gemma",
@@ -985,7 +1153,6 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "gemma3_text": "gemma",
     "gemma3n": "gemma",
     "gemma3n_text": "gemma",
-    "gemma3_multimodal": "gemma",
     "internlm2": "internlm",
     "internvl_chat": "internlm",
     "internvl2": "internlm",
@@ -997,6 +1164,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "qwen3_moe": "qwen",
     "qwen3_5_text": "qwen",
     "qwen3_5_moe": "qwen",
+    "qwen3_5_moe_text": "qwen",
     "qwen3_next": "qwen",
     "qwen2_vl": "qwen",
     "qwen2_vl_text": "qwen",
@@ -1007,15 +1175,18 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "qwen3_vl_single": "qwen",
     "qwen3_vl_moe": "qwen",
     "qwen3_5": "qwen",
+    "qwen3_5_moe_vl": "qwen",
     "qwen3_5_vl": "qwen",
     "qwen3_omni_moe": "qwen",
     "qwen3_asr": "qwen",
     "qwen3_forced_aligner": "qwen",
+    "fun_asr": "qwen",
     "qwen3_tts": "qwen",
     "qwen3_tts_tokenizer_12hz": "qwen",
     "deepseek_v2": "deepseek",
     "deepseek_v2_moe": "deepseek",
     "deepseek_v3": "deepseek",
+    "deepseek_v4": "deepseek",
     "deepseek_vl_v2": "deepseek",
     "olmo": "olmo",
     "olmo2": "olmo",
@@ -1062,6 +1233,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "wav2vec2-conformer": "wav2vec2",
     "hubert": "wav2vec2",
     "wavlm": "wav2vec2",
+    "mms": "wav2vec2",
     "vit": "vit",
     "vit_hybrid": "vit",
     "vit_mae": "vit",
@@ -1075,6 +1247,8 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "swinv2": "swin",
     "clip_text_model": "clip",
     "clip_vision_model": "clip",
+    "siglip": "clip",
+    "siglip2": "clip",
     "siglip_vision_model": "clip",
     "siglip2_vision_model": "clip",
 }
@@ -1084,6 +1258,7 @@ _VARIANT_LABELS: dict[str, str] = {
     "deepseek_v2": "mla",
     "deepseek_v2_moe": "mla+moe",
     "deepseek_v3": "mla+moe",
+    "deepseek_v4": "dense-csa-fallback+mtp+moe+hc",
     "phi3small": "blocksparse",
     "falcon_h1": "hybrid-ssm",
     "mamba": "ssm",

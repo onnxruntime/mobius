@@ -1,0 +1,27 @@
+{
+  "model_id": "microsoft/Phi-4-multimodal-instruct",
+  "prompt": "What is the capital of France?",
+  "generated_tokens": [
+    976,
+    9029,
+    328,
+    10128,
+    382,
+    12650,
+    13,
+    1225,
+    382,
+    625,
+    1606,
+    290,
+    10574,
+    5030,
+    306,
+    10128,
+    889,
+    1217,
+    261,
+    5035
+  ],
+  "generated_text": "The capital of France is Paris. It is not only the largest city in France but also a major"
+}

@@ -1,4 +1,5 @@
 model_id: "Qwen/Qwen3-235B-A22B"
+model_type: "qwen3_next"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"

@@ -1,4 +1,5 @@
 model_id: "Xenova/tiny-random-ErnieMModel"
+model_type: "ernie_m"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

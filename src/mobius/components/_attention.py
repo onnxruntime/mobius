@@ -1,21 +1,56 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, NamedTuple
+from typing import NamedTuple
 
-from onnxscript import nn
-from onnxscript._internal import builder
+import onnx_ir as ir
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._common import Linear
 from mobius.components._rms_norm import OffsetRMSNorm, RMSNorm
 from mobius.components._rotary_embedding import apply_rotary_pos_emb
 
-if TYPE_CHECKING:
-    import onnx_ir as ir
+
+class GQAContext(NamedTuple):
+    """Context for direct ``com.microsoft::GroupQueryAttention`` emission.
+
+    Created once per graph by :class:`~mobius.models.base.TextModel` when the
+    active EP (from :func:`~mobius._build_context.ep_capabilities`) supports
+    GQA for the current build dtype.  Passed through DecoderLayer as the
+    ``attention_bias`` argument so that :class:`Attention` can detect it and
+    emit ``GroupQueryAttention`` directly instead of the generic
+    ``Attention + RotaryEmbedding`` sequence.
+
+    Using this context skips the post-hoc
+    :class:`~mobius.rewrite_rules._group_query_attention.RotaryAttentionToGQA`
+    rewrite rule for models that use the standard :class:`TextModel` backbone.
+    The rewrite rule remains as a fallback for models with non-standard RoPE
+    (e.g. Qwen3.5 with 3D mRoPE).
+
+    Fields:
+        seqlens_k: Per-batch last valid KV index ``[batch]`` INT32.
+            Computed as ``ReduceSum(attention_mask, axis=1) - 1``; this is a
+            0-based index into the valid KV tokens, not the KV length itself.
+        total_seq_len: Scalar total sequence length INT32.
+            Computed as ``Shape(attention_mask)[1]``.
+        cos_cache: Full cosine RoPE table ``[max_seq_len, rotary_dim]`` FLOAT.
+            Taken directly from the model's ``rotary_emb.cos_cache`` parameter.
+        sin_cache: Full sine RoPE table ``[max_seq_len, rotary_dim]`` FLOAT.
+            Taken directly from the model's ``rotary_emb.sin_cache`` parameter.
+        local_window_size: Left window size for local/sliding-window attention.
+            ``-1`` means unused (full causal attention).  Maps to the
+            ``local_window_size`` attribute on ``GroupQueryAttention``.
+    """
+
+    seqlens_k: ir.Value
+    total_seq_len: ir.Value
+    cos_cache: ir.Value
+    sin_cache: ir.Value
+    local_window_size: int = -1
 
 
 class StaticCacheState(NamedTuple):
@@ -27,8 +62,8 @@ class StaticCacheState(NamedTuple):
     ``nonpad_kv_seqlen`` to indicate valid token counts.
 
     Fields:
-        key_cache: Pre-allocated key cache [B, max_seq, kv_hidden] 3D.
-        value_cache: Pre-allocated value cache [B, max_seq, kv_hidden] 3D.
+        key_cache: Pre-allocated key cache [B, max_seq_len, kv_hidden] 3D.
+        value_cache: Pre-allocated value cache [B, max_seq_len, kv_hidden] 3D.
         write_indices: Position to write new tokens [B] int64.
         nonpad_kv_seqlen: Valid KV length per batch entry [B] int64.
     """
@@ -40,7 +75,7 @@ class StaticCacheState(NamedTuple):
 
 
 def _apply_attention(
-    op: builder.OpBuilder,
+    op: OpBuilder,
     query: ir.Value,
     key: ir.Value,
     value: ir.Value,
@@ -51,7 +86,9 @@ def _apply_attention(
     num_attention_heads: int,
     num_key_value_heads: int,
     scale: float,
+    softcap: float = 0.0,
     static_cache: StaticCacheState | None = None,
+    is_causal: int = 1,
 ) -> tuple[ir.Value, ir.Value, ir.Value]:
     """Apply the ONNX Attention op with internal or static KV cache.
 
@@ -64,13 +101,35 @@ def _apply_attention(
     Static cache mode (``static_cache is not None``):
         Scatters new key/value into the static cache via TensorScatter,
         then attends over the full cache using ``nonpad_kv_seqlen``.
-        Also uses ``is_causal=1``.
+        Uses ``is_causal=1`` when ``attn_mask`` is ``None`` (maskless
+        default), or ``is_causal=0`` when ``attn_mask`` is a float additive
+        bias (the bias then carries the full causal + sliding + block +
+        padding mask).  The incoming ``is_causal`` argument is ignored in
+        this mode; causality is derived from ``attn_mask`` presence so the
+        two can never disagree.
         Returns ``(attn_output, updated_key_cache, updated_value_cache)``.
 
+    Args:
+        is_causal: Whether the Attention op applies its built-in causal
+            mask (default ``1``). Set to ``0`` when ``attn_mask`` already
+            bakes the FULL mask (causal + sliding + padding, and any
+            bidirectional unmasking such as Gemma4's vision-block overlay)
+            into a float additive bias. Leaving ``is_causal=1`` in that
+            case would re-apply causality and cancel any future-position
+            unmasking encoded in the bias.
+
     Note:
-        Both paths set ``is_causal=1`` on the Attention op, which enables
-        built-in causal masking. This means ``attn_mask`` should encode
-        only padding information (as a bool mask), not causality.
+        This applies to the DYNAMIC cache path only. There, the Attention op
+        defaults to ``is_causal=1`` for built-in causal masking, so
+        ``attn_mask`` should encode only padding information (as a bool mask),
+        not causality, unless ``is_causal=0`` is passed explicitly. In STATIC
+        cache mode the incoming ``is_causal`` argument is ignored — causality
+        is derived from ``attn_mask`` presence (see above).
+
+    Note:
+        ``nonpad_kv_seqlen`` (input #6) is only valid in static cache mode
+        (no ``past_key``/``past_value``). ORT asserts that it cannot be
+        combined with dynamic KV cache inputs.
 
     Note:
         In static cache mode, RoPE must be applied to key *before*
@@ -97,35 +156,53 @@ def _apply_attention(
             axis=1,
         )  # [B, max_seq, kv_hidden]
 
-        # Attend over the full cache.  We pass None for attn_mask and use
-        # is_causal=1 instead — the Attention op handles causal + padding
-        # masking internally via is_causal + nonpad_kv_seqlen.  Using
-        # create_attention_bias() here would produce incorrect causality
-        # during prefill because it cannot represent the relationship
-        # between query positions and the full cache length.
+        # External-cache masking.  Two modes, selected by whether the caller
+        # supplied a float additive bias:
         #
-        # NOTE: The ONNX Attention spec supports attn_mask alongside
-        # nonpad_kv_seqlen for custom masking (e.g., user-defined masks
-        # beyond causal + padding).  Currently we rely on is_causal=1 +
-        # nonpad_kv_seqlen for standard LLM causal + padding masking.
-        # TODO(titaiwang): Support user-provided attn_mask in external
-        # cache mode for advanced use cases (e.g., prefix masking,
-        # document boundaries in batched inference).
-        # TODO(titaiwang): Support sliding window (circular cache mode)
-        # with static cache for long-context models that use local
-        # attention windows.
+        #   * attn_mask is None (default, maskless): pass None and use
+        #     is_causal=1 — the Attention op derives causal + padding masking
+        #     internally from is_causal + nonpad_kv_seqlen.  This is the
+        #     Flash-eligible form (onnx#8068 / onnxruntime#28958).
+        #   * attn_mask is not None (float-bias decoders): pass the bias and
+        #     STRICTLY pair it with is_causal=0.  The bias already bakes in the
+        #     FULL mask (causal + sliding + Gemma4 block overlay + padding), so
+        #     leaving is_causal=1 would double-apply causality and cancel any
+        #     bidirectional unmasking encoded in the bias.  This routes ORT to
+        #     the MEA external-cache path (Flash is precluded by any bias).
+        #
+        # nonpad_kv_seqlen stays as input #6 in BOTH modes: it bounds the valid
+        # KV prefix and, on the CUDA Flash path, drives the fully-masked-row
+        # zero guard (LaunchZeroFullyMaskedRows).  In bias mode the additive
+        # bias already encodes the same ``slot < nonpad`` validity.  The
+        # cross-repo invariant is ``nonpad == write_indices + valid_token_count``
+        # (the count of UNPADDED query tokens), which equals
+        # ``write_indices + S_q`` only when the chunk is unpadded — S_q is the
+        # PADDED chunk width.  When the chunk is unpadded, every query row keeps
+        # its own diagonal slot valid, so a fully-masked (all-``dtype.min``) row
+        # never arises.  With intra-prompt padding plus a sliding window,
+        # however, a pad-token query row CAN fall outside every valid slot and
+        # become fully masked.  In that case the CPU MEA path this bias mode uses
+        # does NOT apply the Flash zero-guard: it returns a finite mean-of-V row
+        # (not NaN, not exactly 0).  This finite-row behavior was empirically
+        # verified on ORT 1.27 CPU MEA; it is an observed ORT-version behavior,
+        # not a permanent op-spec invariant — see test_fully_masked_row_stays_finite.
+        if attn_mask is not None:
+            mask_arg, causal = attn_mask, 0
+        else:
+            mask_arg, causal = None, 1
         attn_output, _, _ = op.Attention(
             query,
             updated_k,
             updated_v,
-            None,  # no attn_mask — is_causal handles masking
+            mask_arg,
             None,  # no past_key (full cache is already provided)
             None,  # no past_value
             static_cache.nonpad_kv_seqlen,
             q_num_heads=num_attention_heads,
             kv_num_heads=num_key_value_heads,
             scale=scale,
-            is_causal=1,
+            softcap=softcap,
+            is_causal=causal,
             _outputs=3,
         )
         return attn_output, updated_k, updated_v
@@ -134,6 +211,10 @@ def _apply_attention(
     # is_causal=1 enables built-in causal masking, eliminating the need for
     # callers to embed causality in the attn_mask. This allows attn_mask to
     # be a simple bool padding mask, which unlocks Flash Attention eligibility.
+    #
+    # NOTE: nonpad_kv_seqlen cannot be used here — ORT requires that
+    # nonpad_kv_seqlen is NOT combined with past_key/past_value inputs.
+    # It is only valid in static cache mode (no past_key/past_value).
     attn_output, present_key, present_value = op.Attention(
         query,
         key,
@@ -144,7 +225,8 @@ def _apply_attention(
         q_num_heads=num_attention_heads,
         kv_num_heads=num_key_value_heads,
         scale=scale,
-        is_causal=1,
+        softcap=softcap,
+        is_causal=is_causal,
         _outputs=3,
     )
     return attn_output, present_key, present_value
@@ -181,12 +263,16 @@ class Attention(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.scaling = scale if scale is not None else self.head_dim**-0.5
-        self.rotary_embedding_dim = (
-            0
-            if math.isclose(config.partial_rotary_factor, 1.0)
-            else int(self.head_dim * config.partial_rotary_factor)
-        )
+        # NoPE models leave ``partial_rotary_factor`` as ``None``; treat as
+        # the inert 1.0 for the purpose of computing ``rotary_embedding_dim``
+        # (which will itself be 0, i.e. no partial-RoPE splitting). The
+        # actual RoPE call sites are guarded by ``position_embeddings is not
+        # None``, so this value is never consumed for NoPE models.
+        prf = config.partial_rotary_factor if config.partial_rotary_factor is not None else 1.0
+        self.rotary_embedding_dim = 0 if math.isclose(prf, 1.0) else int(self.head_dim * prf)
         self._rope_interleave = config.rope_interleave
+        # Gemma2-style logit soft-capping; 0.0 means disabled.
+        self._softcap = getattr(config, "attn_logit_softcapping", 0.0) or 0.0
 
         self.q_proj = linear_class(
             self.hidden_size,
@@ -229,9 +315,9 @@ class Attention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
-        attention_bias: ir.Value | None,
+        attention_bias: ir.Value | GQAContext | None,
         position_embeddings: tuple | None = None,
         past_key_value: tuple | None = None,
         static_cache: StaticCacheState | None = None,
@@ -254,8 +340,30 @@ class Attention(nn.Module):
                 query_states = op.Reshape(query_states, [0, 0, -1])
                 key_states = op.Reshape(key_states, [0, 0, -1])
 
+        # Direct GroupQueryAttention path: skip external RoPE, fuse everything.
+        if isinstance(attention_bias, GQAContext):
+            return self._forward_gqa(
+                op,
+                query_states,
+                key_states,
+                value_states,
+                attention_bias,
+                past_key_value,
+            )
+
         # Apply rotary position embeddings (skip when not provided)
         if position_embeddings is not None:
+            # Apply llama_4_attn_scale if present (Ministral3/Mistral4).
+            # The scale is computed from position_ids by the RoPE module
+            # and passed as the 3rd element of position_embeddings.
+            # Applied BEFORE RoPE so the graph keeps the
+            # RotaryEmbedding → Attention pattern that the
+            # RotaryAttentionToGQA rewrite rule matches. Scaling
+            # commutes with rotation: scale(RoPE(q)) == RoPE(scale(q)).
+            if len(position_embeddings) > 2:
+                attn_scale = position_embeddings[2]
+                query_states = op.Mul(query_states, attn_scale)
+
             query_states = apply_rotary_pos_emb(
                 op,
                 x=query_states,
@@ -284,11 +392,71 @@ class Attention(nn.Module):
             num_attention_heads=self.num_attention_heads,
             num_key_value_heads=self.num_key_value_heads,
             scale=self.scaling,
+            softcap=self._softcap,
             static_cache=static_cache,
         )
 
         attn_output = self.o_proj(op, attn_output)
         return attn_output, (present_key, present_value)
+
+    def _forward_gqa(
+        self,
+        op: OpBuilder,
+        query_states: ir.Value,
+        key_states: ir.Value,
+        value_states: ir.Value,
+        gqa_ctx: GQAContext,
+        past_key_value: tuple | None,
+    ):
+        """Emit ``com.microsoft::GroupQueryAttention`` directly.
+
+        Called from :meth:`forward` when ``attention_bias`` is a
+        :class:`GQAContext`.  Bypasses the external
+        :class:`~mobius.components._rotary_embedding.RotaryEmbeddingBase`
+        forward pass and the post-hoc
+        :class:`~mobius.rewrite_rules._group_query_attention.RotaryAttentionToGQA`
+        rewrite rule; RoPE is handled by the ``do_rotary=1`` attribute instead.
+
+        Returns ``(attn_output, (present_key, present_value))`` in the same
+        shape as the standard :meth:`forward` path.
+        """
+        past_key = past_key_value[0] if past_key_value is not None else None
+        past_value = past_key_value[1] if past_key_value is not None else None
+
+        gqa_attrs: dict = {
+            "num_heads": self.num_attention_heads,
+            "kv_num_heads": self.num_key_value_heads,
+            "scale": self.scaling,
+            "do_rotary": 1,
+            "rotary_interleaved": int(self._rope_interleave),
+        }
+        if self._softcap:
+            gqa_attrs["softcap"] = self._softcap
+        if self.rotary_embedding_dim:
+            # Partial RoPE: only rotate the first rotary_embedding_dim elements.
+            gqa_attrs["rotary_embedding_dim"] = self.rotary_embedding_dim
+        if gqa_ctx.local_window_size > 0:
+            gqa_attrs["local_window_size"] = gqa_ctx.local_window_size
+
+        # Emit GroupQueryAttention: RoPE + attention + KV cache in one op.
+        # Outputs: (attn_output [B, S, hidden], present_key, present_value)
+        attn_out, present_key, present_value = op.GroupQueryAttention(
+            query_states,  # [B, S, num_heads * head_dim]
+            key_states,  # [B, S, kv_heads * head_dim]
+            value_states,  # [B, S, kv_heads * head_dim]
+            past_key,  # [B, kv_heads, past_S, head_dim] or None
+            past_value,  # [B, kv_heads, past_S, head_dim] or None
+            gqa_ctx.seqlens_k,  # [B] INT32
+            gqa_ctx.total_seq_len,  # scalar INT32
+            gqa_ctx.cos_cache,  # [max_seq, rotary_dim]
+            gqa_ctx.sin_cache,  # [max_seq, rotary_dim]
+            _domain="com.microsoft",
+            _outputs=3,
+            **gqa_attrs,
+        )
+
+        attn_out = self.o_proj(op, attn_out)
+        return attn_out, (present_key, present_value)
 
 
 class Qwen35Attention(nn.Module):
@@ -311,11 +479,10 @@ class Qwen35Attention(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
-        self.rotary_embedding_dim = (
-            0
-            if math.isclose(config.partial_rotary_factor, 1.0)
-            else int(self.head_dim * config.partial_rotary_factor)
-        )
+        # NoPE-safe: ``partial_rotary_factor`` may be ``None`` for models
+        # without RoPE. Treat ``None`` as the inert 1.0.
+        prf = config.partial_rotary_factor if config.partial_rotary_factor is not None else 1.0
+        self.rotary_embedding_dim = 0 if math.isclose(prf, 1.0) else int(self.head_dim * prf)
         self._rope_interleave = config.rope_interleave
 
         q_dim = self.num_attention_heads * self.head_dim
@@ -345,7 +512,7 @@ class Qwen35Attention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | None,
         position_embeddings: tuple,

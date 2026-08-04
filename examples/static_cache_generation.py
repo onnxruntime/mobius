@@ -1,6 +1,6 @@
 #!/usr/bin/env python
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Static-cache text generation example — greedy decoding with pre-allocated KV buffers.
 
@@ -13,7 +13,8 @@ Key differences from dynamic cache:
 - No ``attention_mask`` input — causal masking is handled internally.
 - 3-D cache shape ``[batch, max_seq_len, kv_hidden]`` (not 4-D).
 - ``write_indices`` tracks where to write the next token's KV entry.
-- ``nonpad_kv_seqlen`` tracks how many valid KV entries exist.
+- ``nonpad_kv_seqlen`` is the number of valid KV entries after the current
+  chunk is scattered into the cache (``write_indices + cur_seq_len``).
 - Outputs are ``updated_key_cache.{i}`` / ``updated_value_cache.{i}``.
 
 Usage::
@@ -33,6 +34,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import sys
 
 import numpy as np
 import transformers
@@ -101,10 +103,6 @@ def generate(
     # starting from here); for decode steps it advances by 1 each step.
     write_indices = np.zeros((batch_size,), dtype=np.int64)
 
-    # nonpad_kv_seqlen: number of valid (non-padding) entries in the
-    # cache so far.  Starts at 0 before the first forward pass.
-    nonpad_kv_seqlen = np.zeros((batch_size,), dtype=np.int64)
-
     generated_ids: list[int] = []
 
     for _step in range(max_new_tokens):
@@ -128,7 +126,14 @@ def generate(
             "input_ids": cur_input_ids,
             "position_ids": position_ids,
             "write_indices": write_indices,
-            "nonpad_kv_seqlen": nonpad_kv_seqlen,
+            # nonpad_kv_seqlen is the number of valid KV entries AFTER this
+            # chunk is scattered into the cache (the model scatters K/V before
+            # the maskless is_causal Attention reads nonpad_kv_seqlen).  Under
+            # the bottom-right contract that valid count must include the chunk
+            # just written, so it is write_indices (entries already in cache)
+            # + cur_seq_len (entries added by this chunk) — e.g. prompt_len at
+            # prefill and write_indices + 1 on each decode step.
+            "nonpad_kv_seqlen": write_indices + cur_seq_len,
             **cache,
         }
 
@@ -152,9 +157,10 @@ def generate(
             cache[f"key_cache.{i}"] = outputs[f"updated_key_cache.{i}"]
             cache[f"value_cache.{i}"] = outputs[f"updated_value_cache.{i}"]
 
-        # Advance write position and valid-length counters
+        # Advance write position for the next step.  nonpad_kv_seqlen is
+        # derived from write_indices at feed time (write_indices + cur_seq_len),
+        # so there is no separate valid-length counter to maintain here.
         write_indices = write_indices + cur_seq_len
-        nonpad_kv_seqlen = nonpad_kv_seqlen + cur_seq_len
 
         # Decode one token at a time after the prefill step
         cur_input_ids = next_token.astype(np.int64)
@@ -200,6 +206,11 @@ def main():
         default=None,
         help=("Save the ONNX model package to DIR and exit (no inference)."),
     )
+    parser.add_argument(
+        "--ci",
+        action="store_true",
+        help="Exit with non-zero code on failure (for CI pipelines).",
+    )
     args = parser.parse_args()
 
     # Build the model with static cache
@@ -234,4 +245,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        if "--ci" in sys.argv:
+            print(f"FAILED: {e}", file=sys.stderr)
+            sys.exit(1)
+        raise

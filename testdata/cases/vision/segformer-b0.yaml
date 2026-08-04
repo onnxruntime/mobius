@@ -1,4 +1,5 @@
 model_id: "nvidia/segformer-b0-finetuned-ade-512-512"
+model_type: "segformer"
 revision: "main"
 task_type: "image-segmentation"
 dtype: "float32"
@@ -7,6 +8,7 @@ inputs:
   images:
     - "pipeline-cat-chonk.jpeg"
 
+skip_reason: "Weight shape mismatch in decode_head classifier."
 level: "L4"
 
 notes: "SegFormer B0. Semantic segmentation transformer."

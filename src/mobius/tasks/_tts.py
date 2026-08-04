@@ -1,18 +1,22 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
-"""TTS 4-model split task for Qwen3-TTS.
+"""TTS multi-model split task for Qwen3-TTS.
 
-Builds four separate ONNX models:
+Builds separate ONNX models (five required + one optional speaker encoder):
 1. **talker**: inputs_embeds → logits (first code group) + last_hidden_state + KV cache
 2. **code_predictor**: inputs_embeds → hidden_states + KV cache (1D RoPE)
 3. **embedding**: text_ids + codec_ids → text_embeds + codec_embeds
-4. **speaker_encoder**: mel_input → speaker_embedding
+4. **talker_step_embedder**: frame_codes + text_embed → inputs_embeds
+5. **talker_prefill_embedder**: text_ids → prefill_embeds + trailing_text_embeds
+6. **speaker_encoder**: mel_input → speaker_embedding
 
 Used by Qwen3TTSForConditionalGeneration.
 """
 
 from __future__ import annotations
+
+from typing import ClassVar
 
 import onnx_ir as ir
 from onnxscript import nn
@@ -20,37 +24,68 @@ from onnxscript import nn
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
+    ComponentSpec,
     ModelTask,
     _make_graph,
-    _make_kv_cache_inputs,
     _make_model,
+)
+from mobius.tasks._cache_utils import (
+    _make_kv_cache_inputs,
     _register_kv_cache_outputs,
 )
 
 
 class TTSTask(ModelTask):
-    """4-model split for Qwen3-TTS.
+    """Multi-model split for Qwen3-TTS.
 
-    The module must provide four sub-modules as attributes:
+    The module must provide five required sub-modules and one optional:
 
     - ``talker``: Decoder producing logits + last_hidden_state
     - ``code_predictor``: Small decoder for remaining code groups
     - ``embedding``: Text + codec embedding model
-    - ``speaker_encoder``: ECAPA-TDNN speaker encoder
+    - ``talker_step_embedder``: Per-frame ``frame_codes [+ text_embed] ->
+      inputs_embeds`` pre-embedder for the talker
+    - ``talker_prefill_embedder``: ``text_ids -> prefill_embeds +
+      trailing_text_embeds`` prefill/trailing-text builder
+    - ``speaker_encoder``: ECAPA-TDNN speaker encoder *(optional — omitted
+      when the model uses a pre-computed speaker embedding instead)*
 
     Each sub-module is wired into its own ONNX graph.
     """
+
+    model_roles: ClassVar[dict[str, str]] = {
+        "talker": "decoder",
+        "code_predictor": "decoder",
+        "embedding": "embedding",
+        "talker_step_embedder": "embedding",
+        "talker_prefill_embedder": "embedding",
+        "speaker_encoder": "encoder",
+    }
+    components: ClassVar[ComponentSpec] = ComponentSpec(
+        talker="talker",
+        code_predictor="code_predictor",
+        embedding="embedding",
+        talker_step_embedder="talker_step_embedder",
+        talker_prefill_embedder="talker_prefill_embedder",
+    )
 
     def build(
         self,
         module: nn.Module,
         config: ArchitectureConfig,
     ) -> ModelPackage:
+        self._validate_components(module)
         models: dict[str, ir.Model] = {}
 
         models["talker"] = self._build_talker(module.talker, config)
         models["code_predictor"] = self._build_code_predictor(module.code_predictor, config)
         models["embedding"] = self._build_embedding(module.embedding, config)
+        models["talker_step_embedder"] = self._build_talker_step_embedder(
+            module.talker_step_embedder, config
+        )
+        models["talker_prefill_embedder"] = self._build_talker_prefill_embedder(
+            module.talker_prefill_embedder, config
+        )
         if module.speaker_encoder is not None:
             models["speaker_encoder"] = self._build_speaker_encoder(
                 module.speaker_encoder, config
@@ -71,26 +106,27 @@ class TTSTask(ModelTask):
         seq_len = ir.SymbolicDim("sequence_len")
         past_seq_len = ir.SymbolicDim("past_sequence_len")
 
-        inputs_embeds = ir.Value(
-            name="inputs_embeds",
-            shape=ir.Shape([batch, seq_len, config.hidden_size]),
-            type=ir.TensorType(config.dtype),
+        graph, builder = _make_graph(name="talker")
+
+        inputs_embeds = builder.input(
+            "inputs_embeds",
+            dtype=config.dtype,
+            shape=[batch, seq_len, config.hidden_size],
         )
-        attention_mask = ir.Value(
-            name="attention_mask",
-            shape=ir.Shape([batch, "past_seq_len + seq_len"]),
-            type=ir.TensorType(ir.DataType.INT64),
+        attention_mask = builder.input(
+            "attention_mask",
+            dtype=ir.DataType.INT64,
+            shape=[batch, "past_seq_len + seq_len"],
         )
         # MRoPE: 3D position_ids (3, batch, seq_len)
-        position_ids = ir.Value(
-            name="position_ids",
-            shape=ir.Shape([3, batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
+        position_ids = builder.input(
+            "position_ids",
+            dtype=ir.DataType.INT64,
+            shape=[3, batch, seq_len],
         )
 
-        graph_inputs = [inputs_embeds, attention_mask, position_ids]
-
-        kv_inputs, past_key_values = _make_kv_cache_inputs(
+        past_key_values = _make_kv_cache_inputs(
+            builder,
             config.num_hidden_layers,
             config.num_key_value_heads,
             config.head_dim,
@@ -98,9 +134,7 @@ class TTSTask(ModelTask):
             batch,
             past_seq_len,
         )
-        graph_inputs.extend(kv_inputs)
 
-        graph, builder = _make_graph(graph_inputs, name="talker")
         logits, last_hidden_state, present_key_values = talker(
             builder.op,
             inputs_embeds=inputs_embeds,
@@ -109,11 +143,9 @@ class TTSTask(ModelTask):
             past_key_values=past_key_values,
         )
 
-        logits.name = "logits"
-        last_hidden_state.name = "last_hidden_state"
-        graph.outputs.append(logits)
-        graph.outputs.append(last_hidden_state)
-        _register_kv_cache_outputs(graph, present_key_values)
+        builder.add_output(logits, "logits")
+        builder.add_output(last_hidden_state, "last_hidden_state")
+        _register_kv_cache_outputs(builder, present_key_values)
         return _make_model(graph)
 
     def _build_code_predictor(
@@ -147,39 +179,35 @@ class TTSTask(ModelTask):
         seq_len = ir.SymbolicDim("sequence_len")
         past_seq_len = ir.SymbolicDim("past_sequence_len")
 
+        graph, builder = _make_graph(name="code_predictor")
+
         # Pre-embedded input in talker_hidden space (constructed by
         # generation loop). The model projects to cp_hidden internally.
-        inputs_embeds = ir.Value(
-            name="inputs_embeds",
-            shape=ir.Shape([batch, seq_len, config.hidden_size]),
-            type=ir.TensorType(config.dtype),
+        inputs_embeds = builder.input(
+            "inputs_embeds",
+            dtype=config.dtype,
+            shape=[batch, seq_len, config.hidden_size],
         )
         # Step index: selects which lm_head to use (0..14)
-        step_index = ir.Value(
-            name="step_index",
-            shape=ir.Shape([]),
-            type=ir.TensorType(ir.DataType.INT64),
+        step_index = builder.input(
+            "step_index",
+            dtype=ir.DataType.INT64,
+            shape=[],
         )
-        attention_mask = ir.Value(
-            name="attention_mask",
-            shape=ir.Shape([batch, "past_seq_len + seq_len"]),
-            type=ir.TensorType(ir.DataType.INT64),
+        attention_mask = builder.input(
+            "attention_mask",
+            dtype=ir.DataType.INT64,
+            shape=[batch, "past_seq_len + seq_len"],
         )
         # 1D RoPE: 2D position_ids (batch, seq_len)
-        position_ids = ir.Value(
-            name="position_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
+        position_ids = builder.input(
+            "position_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, seq_len],
         )
 
-        graph_inputs = [
-            inputs_embeds,
-            step_index,
-            attention_mask,
-            position_ids,
-        ]
-
-        kv_inputs, past_key_values = _make_kv_cache_inputs(
+        past_key_values = _make_kv_cache_inputs(
+            builder,
             cp_num_hidden_layers,
             cp_num_key_value_heads,
             cp_head_dim,
@@ -187,9 +215,7 @@ class TTSTask(ModelTask):
             batch,
             past_seq_len,
         )
-        graph_inputs.extend(kv_inputs)
 
-        graph, builder = _make_graph(graph_inputs, name="code_predictor")
         logits, present_key_values, codec_embeddings = code_predictor(
             builder.op,
             inputs_embeds=inputs_embeds,
@@ -199,14 +225,12 @@ class TTSTask(ModelTask):
             past_key_values=past_key_values,
         )
 
-        logits.name = "logits"
-        graph.outputs.append(logits)
+        builder.add_output(logits, "logits")
         # Expose stacked codec embeddings for generation loop to extract.
         # The Identity node ensures renaming the output doesn't affect
         # the initializer name used for weight loading.
-        codec_embeddings.name = "codec_embeddings"
-        graph.outputs.append(codec_embeddings)
-        _register_kv_cache_outputs(graph, present_key_values)
+        builder.add_output(codec_embeddings, "codec_embeddings")
+        _register_kv_cache_outputs(builder, present_key_values)
         return _make_model(graph)
 
     def _build_embedding(
@@ -219,28 +243,106 @@ class TTSTask(ModelTask):
         text_seq = ir.SymbolicDim("text_sequence_len")
         codec_seq = ir.SymbolicDim("codec_sequence_len")
 
-        text_ids = ir.Value(
-            name="text_ids",
-            shape=ir.Shape([batch, text_seq]),
-            type=ir.TensorType(ir.DataType.INT64),
+        graph, builder = _make_graph(name="embedding")
+
+        text_ids = builder.input(
+            "text_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, text_seq],
         )
-        codec_ids = ir.Value(
-            name="codec_ids",
-            shape=ir.Shape([batch, codec_seq]),
-            type=ir.TensorType(ir.DataType.INT64),
+        codec_ids = builder.input(
+            "codec_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, codec_seq],
         )
 
-        graph, builder = _make_graph([text_ids, codec_ids], name="embedding")
         text_embeds, codec_embeds = embedding(
             builder.op,
             text_ids=text_ids,
             codec_ids=codec_ids,
         )
 
-        text_embeds.name = "text_embeds"
-        codec_embeds.name = "codec_embeds"
-        graph.outputs.append(text_embeds)
-        graph.outputs.append(codec_embeds)
+        builder.add_output(text_embeds, "text_embeds")
+        builder.add_output(codec_embeds, "codec_embeds")
+        return _make_model(graph)
+
+    def _build_talker_step_embedder(
+        self,
+        talker_step_embedder: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build talker step embedder: frame_codes + text_embed → inputs_embeds.
+
+        Materializes the per-step talker ``codec_sum`` construction in-graph:
+        ``codec_sum = talker.codec_embed(code_0) + Σ cp_codec_weights[i][code]``
+        and returns ``codec_sum + text_embed``. Lets a generic runtime loop
+        drive the talker from the previous frame's raw integer codes instead
+        of a pre-built ``inputs_embeds``.
+        """
+        tts = config.tts
+        num_code_groups = tts.num_code_groups if tts else 16
+
+        batch = ir.SymbolicDim("batch")
+
+        graph, builder = _make_graph(name="talker_step_embedder")
+
+        frame_codes = builder.input(
+            "frame_codes",
+            dtype=ir.DataType.INT64,
+            shape=[batch, num_code_groups],
+        )
+        text_embed = builder.input(
+            "text_embed",
+            dtype=config.dtype,
+            shape=[batch, 1, config.hidden_size],
+        )
+
+        inputs_embeds = talker_step_embedder(
+            builder.op,
+            frame_codes=frame_codes,
+            text_embed=text_embed,
+        )
+
+        builder.add_output(inputs_embeds, "inputs_embeds")
+        return _make_model(graph)
+
+    def _build_talker_prefill_embedder(
+        self,
+        talker_prefill_embedder: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build talker prefill embedder: text_ids → prefill + trailing embeds.
+
+        Materializes the up-front PREFILL and trailing-text embedding
+        construction in-graph (Auto language, no speaker, no instruct):
+
+        - ``prefill_embeds`` = role(3) + codec_text_pairs(N-1) + first_text_codec(1),
+          length ``3 + 4 + 1 = 8`` (constant, independent of text length).
+        - ``trailing_text_embeds`` = text_embeds[:, 4:-5] ++ tts_eos,
+          length ``text_len - 8``.
+
+        Reuses the embedding model's text + codec tables (shared weights). Lets
+        a generic runtime loop drive the talker without Qwen3-TTS-specific
+        slicing/interleaving logic.
+        """
+        batch = ir.SymbolicDim("batch")
+        text_seq = ir.SymbolicDim("text_sequence_len")
+
+        graph, builder = _make_graph(name="talker_prefill_embedder")
+
+        text_ids = builder.input(
+            "text_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, text_seq],
+        )
+
+        prefill_embeds, trailing_text_embeds = talker_prefill_embedder(
+            builder.op,
+            text_ids=text_ids,
+        )
+
+        builder.add_output(prefill_embeds, "prefill_embeds")
+        builder.add_output(trailing_text_embeds, "trailing_text_embeds")
         return _make_model(graph)
 
     def _build_speaker_encoder(
@@ -255,15 +357,15 @@ class TTSTask(ModelTask):
         se = tts.speaker_encoder if tts else None
         mel_dim = se.mel_dim if se else 128
 
-        mel_input = ir.Value(
-            name="mel_input",
-            shape=ir.Shape([batch, mel_seq, mel_dim]),
-            type=ir.TensorType(config.dtype),
+        graph, builder = _make_graph(name="speaker_encoder")
+
+        mel_input = builder.input(
+            "mel_input",
+            dtype=config.dtype,
+            shape=[batch, mel_seq, mel_dim],
         )
 
-        graph, builder = _make_graph([mel_input], name="speaker_encoder")
         speaker_embedding = speaker_encoder(builder.op, mel_input)
 
-        speaker_embedding.name = "speaker_embedding"
-        graph.outputs.append(speaker_embedding)
+        builder.add_output(speaker_embedding, "speaker_embedding")
         return _make_model(graph)

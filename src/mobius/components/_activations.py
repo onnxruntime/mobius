@@ -1,72 +1,71 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 from __future__ import annotations
 
 from collections import OrderedDict
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 if TYPE_CHECKING:
     import onnx_ir as ir
 
 
-def silu(op: builder.OpBuilder, x):
+def silu(op: OpBuilder, x):
     """SiLU (Swish) activation: x * sigmoid(x)."""
     return op.Mul(x, op.Sigmoid(x))
 
 
-def gelu(op: builder.OpBuilder, x):
+def gelu(op: OpBuilder, x):
     """GELU activation using the 'none' approximation."""
     return op.Gelu(x)
 
 
-def gelu_tanh(op: builder.OpBuilder, x):
+def gelu_tanh(op: OpBuilder, x):
     """GELU activation using the tanh approximation."""
     return op.Gelu(x, approximate="tanh")
 
 
-def relu(op: builder.OpBuilder, x):
+def relu(op: OpBuilder, x):
     """ReLU activation."""
     return op.Relu(x)
 
 
-def relu2(op: builder.OpBuilder, x):
+def relu2(op: OpBuilder, x):
     """Squared ReLU activation: relu(x)^2."""
     r = op.Relu(x)
     return op.Mul(r, r)
 
 
-def quick_gelu(op: builder.OpBuilder, x):
+def quick_gelu(op: OpBuilder, x):
     """QuickGELU activation: x * sigmoid(1.702 * x)."""
     return op.Mul(x, op.Sigmoid(op.Mul(1.702, x)))
 
 
-def mish(op: builder.OpBuilder, x):
+def mish(op: OpBuilder, x):
     """Mish activation: x * tanh(softplus(x))."""
     softplus = op.Softplus(x)
     return op.Mul(x, op.Tanh(softplus))
 
 
-def sigmoid(op: builder.OpBuilder, x):
+def sigmoid(op: OpBuilder, x):
     """Sigmoid activation."""
     return op.Sigmoid(x)
 
 
-def tanh(op: builder.OpBuilder, x):
+def tanh(op: OpBuilder, x):
     """Tanh activation."""
     return op.Tanh(x)
 
 
-def linear(op: builder.OpBuilder, x):
+def linear(op: OpBuilder, x):
     """Linear (identity) activation."""
     return x
 
 
 # Mapping from activation string names to functions.
-# Each function takes (op: builder.OpBuilder, x) and returns the activated tensor.
+# Each function takes (op: OpBuilder, x) and returns the activated tensor.
 ACT2FN: OrderedDict[str, callable] = OrderedDict(
     {
         "gegelu": gelu,
@@ -83,6 +82,12 @@ ACT2FN: OrderedDict[str, callable] = OrderedDict(
         "silu": silu,
         "swish": silu,
         "tanh": tanh,
+        # xielu is a parametric learnable activation (used by Apertus).
+        # Mapped to silu here so CausalLMModel.__init__ can construct the
+        # base MLP without crashing. ApertusCausalLMModel immediately
+        # replaces the MLP with ApertusFCMLP that uses the real
+        # XIELUActivation nn.Module (with alpha_p/alpha_n parameters).
+        "xielu": silu,
     }
 )
 
@@ -90,7 +95,7 @@ ACT2FN: OrderedDict[str, callable] = OrderedDict(
 def get_activation(activation_string: str | None):
     """Get an activation function by name.
 
-    Returns a callable with signature (op: builder.OpBuilder, x) -> result.
+    Returns a callable with signature (op: OpBuilder, x) -> result.
 
     Raises:
         ValueError: If *activation_string* is ``None``.
@@ -113,5 +118,5 @@ class SiLU(nn.Module):
     Useful as a child in ``nn.Sequential`` where a Module is needed.
     """
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return silu(op, x)

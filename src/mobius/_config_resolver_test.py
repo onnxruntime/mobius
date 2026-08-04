@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Tests for _config_resolver.py — pure function input/output tests."""
 
@@ -19,7 +19,13 @@ from mobius._configs import (
 
 
 def _fake_hf_config(model_type: str, **overrides):
-    """Create a minimal HF-config-like object for testing."""
+    """Create a minimal HF-config-like object for testing.
+
+    ``rope_parameters`` is present by default so the resolver treats the
+    fake config as a RoPE-capable model (matching how real HuggingFace
+    configs populate this field in ``PretrainedConfig.__post_init__``).
+    Pass ``rope_parameters=None`` explicitly to exercise the NoPE path.
+    """
     defaults = {
         "model_type": model_type,
         "vocab_size": 100,
@@ -35,6 +41,7 @@ def _fake_hf_config(model_type: str, **overrides):
         "rms_norm_eps": 1e-6,
         "rope_theta": 10_000.0,
         "rope_scaling": None,
+        "rope_parameters": {"rope_type": "default"},
     }
     defaults.update(overrides)
     return type("FakeHFConfig", (), defaults)()
@@ -111,7 +118,9 @@ class TestConfigFromHfPhi:
         )
         result = _config_from_hf(hf)
         assert isinstance(result, ArchitectureConfig)
-        assert result.rope_type == "su"
+        # The legacy Phi-3 ``"su"`` rope_type is canonicalized to ``"longrope"``
+        # (they name the same LongRoPE algorithm); see _canonical_rope_type.
+        assert result.rope_type == "longrope"
 
     def test_phi3_partial_rotary(self):
         hf = _fake_hf_config("phi3", partial_rotary_factor=0.5)
@@ -141,6 +150,9 @@ class TestConfigFromHfGemma:
         hf = _fake_hf_config(
             "gemma3_text",
             rope_theta=None,  # force fallback to nested lookup
+            # Disable the default rope_parameters so the nested
+            # rope_scaling entries are used for rope_type resolution.
+            rope_parameters=None,
             rope_scaling={
                 "full_attention": {
                     "rope_type": "linear",
@@ -280,6 +292,10 @@ class TestDeepSeekMLA:
             rms_norm_eps=1e-6,
             rope_theta=10000.0,
             rope_scaling=None,
+            # Real HF DeepSeek configs populate rope_parameters in
+            # __post_init__; include it here so _extract_rope_config
+            # treats this as a RoPE-capable model (not NoPE).
+            rope_parameters={"rope_type": "default"},
             # MLA-specific fields
             q_lora_rank=1536,
             kv_lora_rank=512,
@@ -461,3 +477,49 @@ class TestDictToPretrainedConfig:
         config = _dict_to_pretrained_config(d)
         assert config.thinker_config.model_type == "qwen3"
         assert config.thinker_config.text_config.model_type == "qwen3"
+
+    def test_composite_config_strips_rope_fields(self):
+        """Composite configs strip top-level rope_scaling/rope_parameters."""
+        d = {
+            "model_type": "composite",
+            "rope_scaling": {"type": "longrope"},
+            "rope_parameters": {"rope_type": "default"},
+            "text_config": {"model_type": "inner", "hidden_size": 256},
+        }
+        config = _dict_to_pretrained_config(d)
+        # Rope fields stripped from top level
+        assert not hasattr(config, "rope_scaling") or config.rope_scaling is None
+        # Nested config still works
+        assert config.text_config.model_type == "inner"
+
+    def test_flat_config_keeps_rope_fields(self):
+        """Non-composite (flat) configs keep rope_scaling as attribute."""
+        d = {
+            "model_type": "flat",
+            "hidden_size": 256,
+            "max_position_embeddings": 4096,
+            # Simple rope_scaling that won't crash PretrainedConfig
+            "rope_theta": 10000.0,
+        }
+        config = _dict_to_pretrained_config(d)
+        assert config.rope_theta == pytest.approx(10000.0)
+
+    def test_rope_retry_restores_fields(self):
+        """When PretrainedConfig init crashes on rope, fields are restored."""
+        # Simulate a config with rope_scaling that crashes standardization
+        # by including rope_scaling without the fields needed for
+        # standardization (matching Phi4-MM's failure pattern).
+        d = {
+            "model_type": "phi4mm",
+            "rope_scaling": {"type": "longrope", "long_factor": [1.0]},
+            "rope_theta": 10000.0,
+            "hidden_size": 256,
+            "max_position_embeddings": 4096,
+        }
+        # This should succeed (either directly or via retry)
+        config = _dict_to_pretrained_config(d)
+        assert config.model_type == "phi4mm"
+        # If the retry path ran, rope_scaling should be restored as attr
+        rope_scaling = getattr(config, "rope_scaling", None)
+        if rope_scaling is not None:
+            assert rope_scaling["type"] == "longrope"

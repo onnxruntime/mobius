@@ -7,12 +7,12 @@ audio, and diffusion) built directly as ONNX graphs using
 automatic weight downloading and conversion, including bfloat16 models via
 `ir.LazyTensor`-based dtype casting.
 
-📦 [GitHub Repository](https://github.com/microsoft/mobius)
+📦 [GitHub Repository](https://github.com/onnxruntime/mobius)
 
 ## Installation
 
 ```bash
-pip install mobius-ai
+pip install mobius-onnx
 ```
 
 For development and testing:
@@ -99,7 +99,7 @@ pkg = build("facebook/wav2vec2-base")
 Convert a GGUF model (e.g. from llama.cpp) to ONNX:
 
 ```python
-from mobius.integrations.gguf import build_from_gguf
+from mobius import build_from_gguf
 
 pkg = build_from_gguf("path/to/model.gguf")
 pkg.save("output/model/")
@@ -112,7 +112,7 @@ mobius build-gguf path/to/model.gguf --output output/model/
 ```
 
 > **Note**: GGUF support requires the optional `gguf` package:
-> `pip install mobius-ai[gguf]`
+> `pip install mobius-onnx[gguf]`
 
 ### Build quantized models (GPTQ/AWQ)
 
@@ -177,59 +177,35 @@ rewrite(model, pattern_rewrite_rules=skip_norm_rules())
 Or via CLI:
 
 ```bash
-mobius build --model Qwen/Qwen2.5-0.5B output/ --optimize
+mobius build --model Qwen/Qwen2.5-0.5B output/ --ep cuda --dtype f16
 ```
 
-## CLI Reference
-
-The package provides the `mobius` CLI with these subcommands:
-
-### `build` — Build an ONNX model from HuggingFace
+## CLI Quick Start
 
 ```bash
-# From a HuggingFace model ID
+# Basic build
 mobius build --model meta-llama/Llama-3.2-1B output/
 
-# From a local config directory (with safetensors weights)
-mobius build --config /path/to/model/ output/
+# Build for CUDA with f16
+mobius build --model meta-llama/Llama-3.2-1B output/ --ep cuda --dtype f16
 
-# With options
-mobius build --model Qwen/Qwen2.5-0.5B output/ \
-    --dtype f16 \
-    --external-data safetensors \
-    --optimize
+# Build for ORT GenAI runtime
+mobius build --model meta-llama/Llama-3.2-1B output/ --ep cuda --dtype f16 --runtime ort-genai
 ```
 
-Key flags:
-- `--dtype` — Target dtype (`f32`, `f16`, `bf16`)
-- `--no-weights` — Build graph only (no weight download)
-- `--external-data` — `onnx` (default) or `safetensors`
-- `--optimize` — Apply rewrite rules (e.g. fused attention)
-- `--component` — Build only one component from a diffusers pipeline
+The `mobius` CLI has these subcommands:
 
-### `build-gguf` — Build from a GGUF file
+- **`build`** — Build an ONNX model from a HuggingFace model ID or local config.
+- **`build-gguf`** — Convert a GGUF file to ONNX.
+- **`list`** — List supported models, tasks, dtypes, or execution providers.
+- **`info`** — Inspect a model without building it.
 
-```bash
-mobius build-gguf model.gguf --output output/
-```
-
-### `list` — List supported resources
-
-```bash
-mobius list models   # All supported architectures
-mobius list tasks    # Available task types
-mobius list dtypes   # Supported dtypes
-```
-
-### `info` — Inspect a model
-
-```bash
-mobius info meta-llama/Llama-3.2-1B
-```
+For the full CLI reference including all flags, execution providers, and
+optimization options, see [CLI Reference](cli_reference.md).
 
 ### Adding a new model
 
-See the [adding-a-new-model skill](../.github/skills/adding-a-new-model/SKILL.md)
+See the [adding-a-new-model skill](../.agents/skills/adding-a-new-model/SKILL.md)
 for copy-paste examples and step-by-step instructions.
 
 ## Output Format

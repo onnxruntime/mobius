@@ -1,4 +1,5 @@
 model_id: "microsoft/xprophetnet-large-wiki100-cased"
+model_type: "xlm-prophetnet"
 revision: "main"
 task_type: "seq2seq"
 dtype: "float32"
@@ -10,5 +11,5 @@ inputs:
 
 level: "L4"
 
-skip_reason: "XLM-ProphetNet large is large — too large for CI golden generation."
 notes: "XLM-ProphetNet large. Multilingual future n-gram prediction."
+skip_reason: "Tokenizer backend instantiation fails in current transformers."

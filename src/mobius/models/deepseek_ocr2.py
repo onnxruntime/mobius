@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """DeepSeek-OCR-2 vision-language model.
 
@@ -21,8 +21,7 @@ from __future__ import annotations
 import numpy as np
 import onnx_ir as ir
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import (
@@ -79,7 +78,7 @@ class _Qwen2EncoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple,
@@ -159,9 +158,13 @@ class _Qwen2DecoderAsEncoder(nn.Module):
         # Learned query embeddings (for 1024x1024 images)
         self.query_1024 = Embedding(num_queries_1024, hidden_size)
 
-        # RoPE for position encoding
+        # RoPE for position encoding. ArchitectureConfig defaults
+        # ``rope_type`` to ``None`` (NoPE) since April 2026 to fix a
+        # silent RoPE-for-NoPE-models bug; set it explicitly here so
+        # ``initialize_rope`` returns a ``DefaultRope`` module.
         rope_config = ArchitectureConfig(
             head_dim=head_dim,
+            rope_type="default",
             rope_theta=rope_theta,
             max_position_embeddings=max_position_embeddings,
         )
@@ -169,7 +172,7 @@ class _Qwen2DecoderAsEncoder(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         sam_features: ir.Value,
     ):
         # sam_features: (B, 896, H_sam, W_sam) — e.g., (B, 896, 16, 16)
@@ -309,7 +312,7 @@ class DeepSeekOCR2VisionEncoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         pixel_values: ir.Value,
     ):
         # SAM: (B, 3, 1024, 1024) → (B, 896, 16, 16)
@@ -337,7 +340,9 @@ class DeepSeekOCR2VisionEncoderModel(nn.Module):
             new_key = key[len("model.") :]
 
             if new_key.startswith("sam_model."):
-                # SAM weights map directly
+                # SAM weights: lin1/lin2 → up_proj/down_proj
+                new_key = new_key.replace(".mlp.lin1.", ".mlp.up_proj.")
+                new_key = new_key.replace(".mlp.lin2.", ".mlp.down_proj.")
                 renamed[new_key] = value
             elif new_key.startswith("qwen2_model."):
                 # HF: qwen2_model.model.model.layers.N.* → qwen2_model.layers.N.*
@@ -378,7 +383,7 @@ class DeepSeekOCR2EmbeddingModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         image_features: ir.Value,
     ):
@@ -394,13 +399,13 @@ class DeepSeekOCR2EmbeddingModel(nn.Module):
 
         # Cumulative sum to map flat image_features indices
         mask_int = op.Cast(image_mask, to=7)  # INT64
-        cumsum = op.CumSum(mask_int, op.Constant(value_int=1))
+        cumsum = op.CumSum(mask_int, 1)
         indices = op.Sub(cumsum, op.Constant(value_int=1))
         indices = op.Clip(indices, op.Constant(value_int=0))
 
         # Pad image_features for text-only safety
         pad_row = op.Expand(
-            op.Constant(value_float=0.0),
+            0.0,
             op.Concat(
                 op.Constant(value_ints=[1]),
                 op.Shape(image_features, start=1, end=2),
@@ -450,7 +455,7 @@ class DeepSeekOCR2DecoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,

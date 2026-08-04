@@ -1,0 +1,14 @@
+model_id: "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
+model_type: "nemotron"
+revision: "main"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Here is my poem:"
+
+level: "L4"
+
+ci_skip_reason: "120B MoE model requires ~240GB VRAM; too large for CI."
+notes: "NemotronH Super 120B-A12B. Hybrid Mamba2 + MoE + Attention from NVIDIA. 512 routed experts, top-22, latent projections. L5 skipped: HF remote code generate() is broken (cache_position bug)."

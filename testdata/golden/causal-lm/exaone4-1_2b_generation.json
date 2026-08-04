@@ -1,0 +1,9 @@
+{
+  "model_id": "LGAI-EXAONE/EXAONE-4.0-1.2B",
+  "prompt": "Once upon a time",
+  "generated_tokens": [
+    1486,
+    361
+  ],
+  "generated_text": " when"
+}

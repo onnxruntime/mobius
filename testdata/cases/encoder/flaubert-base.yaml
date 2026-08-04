@@ -1,4 +1,5 @@
 model_id: "flaubert/flaubert_base_cased"
+model_type: "flaubert"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"
@@ -7,6 +8,7 @@ inputs:
   prompts:
     - "The quick brown fox jumps over the lazy dog."
 
+skip_reason: "Hidden activation is None; not handled in ACT2FN."
 level: "L4"
 
 notes: "FlauBERT base cased. French encoder-only model."

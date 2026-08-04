@@ -1,6 +1,6 @@
 #!/usr/bin/env python
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """NemotronH text generation — standalone greedy decoding (no onnxruntime-genai).
 
@@ -22,14 +22,14 @@ The model is instruction-tuned and uses a ChatML template with a
 
 Usage::
 
-    # Text-only generation (default model):
-    python examples/nemotron_3_nano_text_generation.py
+    # Interactive mode (no --prompt → prompts you for queries):
+    python examples/nemotron_3_nano_text_generation.py --device cuda
 
-    # Custom prompt:
+    # Single prompt:
     python examples/nemotron_3_nano_text_generation.py --prompt "What is 2+3?"
 
-    # Compare output with HuggingFace transformers:
-    python examples/nemotron_3_nano_text_generation.py --compare-hf
+    # Interactive mode with HF comparison (runs HF after all queries):
+    python examples/nemotron_3_nano_text_generation.py --device cuda --compare-hf
 
     # Run on GPU:
     python examples/nemotron_3_nano_text_generation.py --device cuda
@@ -46,7 +46,9 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import sys
 import time
+import warnings
 
 import ml_dtypes
 import numpy as np
@@ -56,6 +58,9 @@ from mobius import build
 from mobius._flags import override_flags
 from mobius._testing.ort_inference import OnnxModelSession
 
+# Suppress harmless HF warning about trust_remote_code model_type mismatch
+warnings.filterwarnings("ignore", message="You are using a model of type")
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -63,6 +68,7 @@ from mobius._testing.ort_inference import OnnxModelSession
 MODEL_ID = "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16"
 DEFAULT_PROMPT = "What is the capital of France?"
 MAX_NEW_TOKENS = 300
+REPETITION_PENALTY = 1.2
 
 DTYPE_MAP = {"f16": np.float16, "f32": np.float32, "bf16": ml_dtypes.bfloat16}
 
@@ -70,6 +76,57 @@ DTYPE_MAP = {"f16": np.float16, "f32": np.float32, "bf16": ml_dtypes.bfloat16}
 # ---------------------------------------------------------------------------
 # NemotronH monkey-patch for HuggingFace transformers
 # ---------------------------------------------------------------------------
+
+
+def _fix_nemotron_h_dt_bias(model) -> None:
+    """Reload dt_bias from the checkpoint.
+
+    HuggingFace's ``_init_weights`` unconditionally overwrites ``dt_bias``
+    with ``torch.rand(...)`` *after* loading checkpoint weights.
+
+    A separate bug with ``out_proj.weight`` (reinitialized via
+    ``kaiming_uniform_``) is avoided by setting
+    ``config.rescale_prenorm_residual = False`` before loading.
+
+    This reloads the correct dt_bias values directly from safetensors.
+    """
+    from huggingface_hub import HfApi
+    from safetensors.torch import load_file
+
+    # Keys that _init_weights corrupts and must be reloaded
+    _CORRUPTED_KEYS = {"dt_bias"}  # noqa: N806
+
+    model_id = model.config._name_or_path
+    api = HfApi()
+    shard_files = [
+        f.rfilename
+        for f in api.model_info(model_id).siblings
+        if f.rfilename.endswith(".safetensors")
+    ]
+    repo_dir = os.path.dirname(transformers.utils.cached_file(model_id, shard_files[0]))
+
+    sd = model.state_dict()
+
+    patched = 0
+    for shard_name in shard_files:
+        shard_path = os.path.join(repo_dir, shard_name)
+        shard_weights = load_file(shard_path)
+        for key, value in shard_weights.items():
+            if not any(c in key for c in _CORRUPTED_KEYS):
+                continue
+            # Try direct match first, then backbone. <-> model. remap
+            sd_key = key
+            if sd_key not in sd:
+                if key.startswith("backbone."):
+                    sd_key = "model." + key[len("backbone.") :]
+                elif key.startswith("model."):
+                    sd_key = "backbone." + key[len("model.") :]
+            if sd_key in sd:
+                sd[sd_key] = value
+                patched += 1
+    if patched:
+        model.load_state_dict(sd)
+        print(f"  Fixed {patched} corrupted parameters from checkpoint")
 
 
 def _apply_nemotron_h_patch():
@@ -164,15 +221,17 @@ def init_hybrid_states(config, dtype: np.dtype = np.float32) -> dict[str, np.nda
     """
     batch_size = 1
     states: dict[str, np.ndarray] = {}
-    layer_types = config.layer_types or []
+    layer_types = (
+        getattr(config, "layers_block_type", getattr(config, "layer_types", None)) or []
+    )
 
-    # Mamba2 dims from NemotronH config
-    n_heads = config.mamba_n_heads
-    d_head = config.mamba_d_head
-    d_state = config.mamba_d_state
-    n_groups = config.mamba_n_groups
+    # Mamba2 dims from NemotronH config (handle both old and new attr names)
+    n_heads = getattr(config, "mamba_n_heads", None) or config.mamba_num_heads
+    d_head = getattr(config, "mamba_d_head", None) or config.mamba_head_dim
+    d_state = getattr(config, "mamba_d_state", None) or config.ssm_state_size
+    n_groups = getattr(config, "mamba_n_groups", None) or config.n_groups
     d_inner = n_heads * d_head
-    d_conv = config.mamba_d_conv
+    d_conv = getattr(config, "mamba_d_conv", None) or config.conv_kernel
     # conv_state covers d_inner + 2 * n_groups * d_state
     conv_dim = d_inner + 2 * n_groups * d_state
 
@@ -183,9 +242,9 @@ def init_hybrid_states(config, dtype: np.dtype = np.float32) -> dict[str, np.nda
             states[f"past_key_values.{i}.conv_state"] = np.zeros(
                 (batch_size, conv_dim, d_conv - 1), dtype=dtype
             )
-            # ssm_state: (batch, n_heads, d_head, d_state)
+            # ssm_state: (batch, n_heads, d_state, d_head) — LinearAttention convention
             states[f"past_key_values.{i}.ssm_state"] = np.zeros(
-                (batch_size, n_heads, d_head, d_state),
+                (batch_size, n_heads, d_state, d_head),
                 dtype=dtype,
             )
         elif ltype in ("attention", "full_attention"):
@@ -218,7 +277,9 @@ def update_states(
     config,
 ) -> dict[str, np.ndarray]:
     """Copy present-state outputs back into the past-state inputs."""
-    layer_types = config.layer_types or []
+    layer_types = (
+        getattr(config, "layers_block_type", getattr(config, "layer_types", None)) or []
+    )
     new_states: dict[str, np.ndarray] = {}
 
     for i in range(config.num_hidden_layers):
@@ -292,6 +353,28 @@ def display_output(tokenizer, generated_ids: list[int]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _apply_repetition_penalty(
+    logits: np.ndarray,
+    token_ids: list[int],
+    penalty: float,
+) -> np.ndarray:
+    """Apply repetition penalty to logits for previously generated tokens.
+
+    For each token in ``token_ids``, the corresponding logit is divided
+    by ``penalty`` if positive, or multiplied by ``penalty`` if negative.
+    This matches the HuggingFace ``RepetitionPenaltyLogitsProcessor``.
+    """
+    if penalty == 1.0 or not token_ids:  # noqa: RUF069
+        return logits
+    logits = logits.copy()
+    for tid in set(token_ids):
+        if logits[tid] > 0:
+            logits[tid] /= penalty
+        else:
+            logits[tid] *= penalty
+    return logits
+
+
 def generate(
     session: OnnxModelSession,
     tokenizer,
@@ -300,13 +383,16 @@ def generate(
     *,
     dtype: np.dtype = np.float32,
     max_new_tokens: int = MAX_NEW_TOKENS,
+    repetition_penalty: float = REPETITION_PENALTY,
     use_chat: bool = True,
 ) -> str:
     """Greedy autoregressive generation with the hybrid architecture.
 
     Uses a single ONNX model built with ``NemotronHCausalLMModel``.
-    Because Mamba2 layers only support single-token decode, every
-    token (including the prompt) is processed one at a time.
+    This example processes both the prompt and generated output
+    token-by-token (``seq_len=1`` per session run), even if other
+    Mamba2 execution modes may support multi-token processing.
+    Tokens are streamed to stdout as they are generated.
     """
     input_ids = tokenize_prompt(tokenizer, prompt, use_chat)
     batch_size = 1
@@ -318,6 +404,8 @@ def generate(
     states = init_hybrid_states(config, dtype=dtype)
     past_seq_len = 0
     generated_ids: list[int] = []
+    # Track all token IDs (prompt + generated) for repetition penalty
+    all_token_ids: list[int] = list(input_ids)
 
     t0 = time.time()
 
@@ -340,13 +428,22 @@ def generate(
     prefill_time = time.time() - t0
     print(f"  Prefill: {prompt_len} tokens in {prefill_time:.2f}s")
 
-    # Generate new tokens
-    logits = outputs["logits"]
-    next_token_id = int(np.argmax(logits[:, -1, :]))
+    # Generate new tokens, streaming each to stdout
+    raw_logits = outputs["logits"][0, -1, :]
+    penalized = _apply_repetition_penalty(raw_logits, all_token_ids, repetition_penalty)
+    next_token_id = int(np.argmax(penalized))
     t0 = time.time()
 
     for _ in range(max_new_tokens):
         generated_ids.append(next_token_id)
+        all_token_ids.append(next_token_id)
+
+        # Stream: decode and print the new token immediately
+        token_str = tokenizer.decode([next_token_id], skip_special_tokens=False)
+        # Suppress common end-of-sequence markers from display
+        if token_str not in ("<|im_end|>", "</s>", "<|endoftext|>"):
+            sys.stdout.write(token_str)
+            sys.stdout.flush()
 
         if next_token_id == tokenizer.eos_token_id:
             break
@@ -365,15 +462,18 @@ def generate(
         states = update_states(states, outputs, config)
         past_seq_len = total_seq_len
 
-        logits = outputs["logits"]
-        next_token_id = int(np.argmax(logits[:, -1, :]))
+        raw_logits = outputs["logits"][0, -1, :]
+        penalized = _apply_repetition_penalty(raw_logits, all_token_ids, repetition_penalty)
+        next_token_id = int(np.argmax(penalized))
+
+    # End the streamed output line
+    print()
 
     gen_time = time.time() - t0
     if generated_ids:
         tps = len(generated_ids) / gen_time if gen_time > 0 else 0
-        print(f"  Generated: {len(generated_ids)} tokens in {gen_time:.1f}s ({tps:.1f} tok/s)")
+        print(f"  [{len(generated_ids)} tokens in {gen_time:.1f}s ({tps:.1f} tok/s)]")
 
-    display_output(tokenizer, generated_ids)
     return format_output(tokenizer, generated_ids)
 
 
@@ -389,6 +489,7 @@ def generate_hf(
     max_new_tokens: int,
     device: str = "cpu",
     use_chat: bool = True,
+    repetition_penalty: float = REPETITION_PENALTY,
 ) -> str:
     """Run text-only generation with HuggingFace transformers."""
     import torch
@@ -397,13 +498,18 @@ def generate_hf(
 
     print(f"[HF] Loading {model_id} ...")
     torch_dtype = torch.float32 if device == "cpu" else "auto"
+    hf_config = transformers.AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    # Disable GPT-2 residual scaling init — it's a training-time flag that
+    # corrupts out_proj.weight when loading pretrained checkpoints.
+    hf_config.rescale_prenorm_residual = False
     model = (
         transformers.AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=torch_dtype, device_map=None
+            model_id, config=hf_config, torch_dtype=torch_dtype, device_map=None
         )
         .to(device)
         .eval()
     )
+    _fix_nemotron_h_dt_bias(model)
 
     input_ids = tokenize_prompt(tokenizer, prompt, use_chat)
     ids_tensor = torch.tensor([input_ids], device=device)
@@ -417,6 +523,7 @@ def generate_hf(
             ids_tensor,
             max_new_tokens=max_new_tokens,
             do_sample=False,
+            repetition_penalty=repetition_penalty,
             eos_token_id=tokenizer.eos_token_id,
         )
     elapsed = time.time() - t0
@@ -448,7 +555,10 @@ def main():
     parser.add_argument(
         "--prompt",
         default=None,
-        help="Text prompt. If omitted, a built-in default prompt is used.",
+        help=(
+            "Text prompt. If omitted, enters interactive mode "
+            "(type queries, 'quit' or Ctrl-D to stop)."
+        ),
     )
     parser.add_argument(
         "--max-new-tokens",
@@ -483,20 +593,44 @@ def main():
         "--device",
         choices=["cpu", "cuda"],
         default="cpu",
-        help="Device for ONNX Runtime and PyTorch inference (default: %(default)s).",
+        help=(
+            "Device for inference (used for ONNX Runtime and for "
+            "HuggingFace comparison when --compare-hf is set) "
+            "(default: %(default)s)."
+        ),
+    )
+    parser.add_argument(
+        "--ep",
+        choices=["cpu", "cuda", "onnx-standard"],
+        default=None,
+        help=(
+            "Execution provider for ONNX model build. "
+            "'onnx-standard' inlines custom ops (LinearAttention, etc.) "
+            "into standard ONNX ops, runnable on any ORT version. "
+            "Defaults to matching --device."
+        ),
     )
     parser.add_argument(
         "--no-chat",
         action="store_true",
         help="Disable chat template (send raw text).",
     )
+    parser.add_argument(
+        "--ci",
+        action="store_true",
+        help="Exit with non-zero code on failure (for CI pipelines).",
+    )
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=REPETITION_PENALTY,
+        help="Repetition penalty (1.0 = none, default: %(default)s).",
+    )
     args = parser.parse_args()
 
     use_chat = not args.no_chat
-    prompt = args.prompt or DEFAULT_PROMPT
 
     if args.load_from:
-        # Step 2: load pre-built ONNX model from disk
         import onnx_ir as ir
 
         from mobius._configs import NemotronHConfig
@@ -510,17 +644,18 @@ def main():
         config = NemotronHConfig.from_transformers(hf_config)
         session = OnnxModelSession(onnx_model, device=args.device)
     else:
-        # Step 1 (+ optional inference): build from HuggingFace
         build_flags = {}
         if args.device == "cuda":
             build_flags["ort_cuda_grouped_rmsnorm_workaround"] = True
-        print(f"Building model for {args.model!r} (dtype={args.dtype}) ...")
+        ep = args.ep or ("cuda" if args.device == "cuda" else "cpu")
+        print(f"Building model for {args.model!r} (dtype={args.dtype}, ep={ep}) ...")
         with override_flags(**build_flags):
             pkg = build(
                 args.model,
                 dtype=args.dtype,
                 load_weights=True,
                 trust_remote_code=True,
+                execution_provider=ep,
             )
         config = pkg.config
 
@@ -532,47 +667,93 @@ def main():
         session = OnnxModelSession(pkg["model"], device=args.device)
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.model)
 
-    print(f"\nPrompt: {prompt}")
-    if use_chat:
-        print("(chat template enabled)")
-    print("-" * 40)
+    # Collect prompts: either single --prompt or interactive loop
+    if args.prompt:
+        prompts = [args.prompt]
+    else:
+        prompts = []
+        print("\nInteractive mode — enter prompts (type 'quit' or Ctrl-D to stop).")
 
-    onnx_output = generate(
-        session,
-        tokenizer,
-        prompt,
-        config,
-        dtype=DTYPE_MAP[args.dtype],
-        max_new_tokens=args.max_new_tokens,
-        use_chat=use_chat,
-    )
-    print("-" * 40)
-
-    if args.compare_hf:
-        print("\n" + "=" * 60)
-        print("HuggingFace Transformers")
-        print("=" * 60)
-        hf_output = generate_hf(
-            args.model,
-            prompt,
+    # Run ONNX generation for each prompt
+    results: list[tuple[str, str]] = []  # (prompt, onnx_output)
+    for prompt in prompts:
+        print(f"\nPrompt: {prompt}")
+        if use_chat:
+            print("(chat template enabled)")
+        print("-" * 40)
+        onnx_output = generate(
+            session,
             tokenizer,
-            args.max_new_tokens,
-            device=args.device,
+            prompt,
+            config,
+            dtype=DTYPE_MAP[args.dtype],
+            max_new_tokens=args.max_new_tokens,
+            repetition_penalty=args.repetition_penalty,
             use_chat=use_chat,
         )
-        _, answer_onnx = parse_think_output(onnx_output)
-        _, answer_hf = parse_think_output(hf_output)
+        print("-" * 40)
+        results.append((prompt, onnx_output))
 
+    if not args.prompt:
+        # Interactive loop
+        while True:
+            try:
+                prompt = input("\n> ").strip()
+            except EOFError:
+                print()
+                break
+            if not prompt or prompt.lower() == "quit":
+                break
+            print(f"\nPrompt: {prompt}")
+            if use_chat:
+                print("(chat template enabled)")
+            print("-" * 40)
+            onnx_output = generate(
+                session,
+                tokenizer,
+                prompt,
+                config,
+                dtype=DTYPE_MAP[args.dtype],
+                max_new_tokens=args.max_new_tokens,
+                repetition_penalty=args.repetition_penalty,
+                use_chat=use_chat,
+            )
+            print("-" * 40)
+            results.append((prompt, onnx_output))
+
+    if args.compare_hf and results:
         print("\n" + "=" * 60)
-        print("Comparison")
+        print("HuggingFace Transformers Comparison")
         print("=" * 60)
-        if answer_onnx == answer_hf:
-            print("✓ Answers match exactly!")
-        else:
-            print("✗ Answers differ:")
-            print(f"  ONNX: {answer_onnx!r}")
-            print(f"  HF:   {answer_hf!r}")
+        for prompt, onnx_output in results:
+            hf_output = generate_hf(
+                args.model,
+                prompt,
+                tokenizer,
+                args.max_new_tokens,
+                device=args.device,
+                use_chat=use_chat,
+                repetition_penalty=args.repetition_penalty,
+            )
+            _, answer_onnx = parse_think_output(onnx_output)
+            _, answer_hf = parse_think_output(hf_output)
+
+            print(f"\nPrompt: {prompt!r}")
+            if answer_onnx == answer_hf:
+                print("  ✓ Answers match exactly!")
+            else:
+                print("  ✗ Answers differ:")
+                print(f"    ONNX: {answer_onnx!r}")
+                print(f"    HF:   {answer_hf!r}")
+                if args.ci:
+                    sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        if "--ci" in sys.argv:
+            print(f"FAILED: {e}", file=sys.stderr)
+            sys.exit(1)
+        raise

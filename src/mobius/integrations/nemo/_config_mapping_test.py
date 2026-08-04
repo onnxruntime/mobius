@@ -1,0 +1,140 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+"""Tests for the NeMo config → ArchitectureConfig mapping."""
+
+from __future__ import annotations
+
+import pytest
+
+from mobius.integrations.nemo._config_mapping import (
+    nemo_model_type,
+    nemo_to_config,
+)
+
+_RNNT_CONFIG = {
+    "target": "nemo.collections.asr.models.rnnt_bpe_models.EncDecRNNTBPEModel",
+    "encoder": {
+        "feat_in": 128,
+        "n_layers": 24,
+        "d_model": 1024,
+        "n_heads": 8,
+        "subsampling_factor": 8,
+        "subsampling_conv_channels": 256,
+        "ff_expansion_factor": 4,
+        "conv_kernel_size": 9,
+        "pos_emb_max_len": 5000,
+        "xscaling": False,
+        "use_bias": False,
+    },
+    "decoder": {"prednet": {"pred_hidden": 640, "pred_rnn_layers": 2}, "vocab_size": 1024},
+    "joint": {
+        "jointnet": {"joint_hidden": 640, "encoder_hidden": 1024, "pred_hidden": 640},
+        "num_classes": 1024,
+    },
+}
+
+
+class TestNemoToConfig:
+    def test_maps_core_dimensions(self):
+        config = nemo_to_config(_RNNT_CONFIG)
+        assert config.model_type == "fastconformer_rnnt"
+        # vocab includes the blank symbol.
+        assert config.vocab_size == 1025
+        assert config.hidden_size == 1024
+        assert config.num_hidden_layers == 24
+        assert config.num_attention_heads == 8
+        assert config.head_dim == 128
+        # ff_expansion_factor * d_model.
+        assert config.intermediate_size == 4096
+
+    def test_maps_fastconformer_and_rnnt_fields(self):
+        config = nemo_to_config(_RNNT_CONFIG)
+        assert config.audio_input_size == 128
+        assert config.fastconformer_subsampling_factor == 8
+        assert config.fastconformer_subsampling_conv_channels == 256
+        assert config.fastconformer_conv_kernel_size == 9
+        assert config.fastconformer_pos_emb_max_len == 5000
+        assert config.rnnt_pred_hidden == 640
+        assert config.rnnt_pred_rnn_layers == 2
+        assert config.rnnt_joint_hidden == 640
+        assert config.rnnt_num_classes == 1024
+        # Cache-aware streaming sizes (derived): cache = att_context left (70),
+        # drop_extra = 1 + (pre_encode_cache - 1) // subsampling_factor.
+        assert config.fastconformer_streaming_cache_size == 70
+        assert config.fastconformer_streaming_drop_extra == 2
+
+    def test_unsupported_target_raises(self):
+        with pytest.raises(KeyError, match="Unsupported NeMo target"):
+            nemo_model_type("nemo.collections.asr.models.SomethingElse")
+
+    def test_default_ff_expansion(self):
+        cfg = {**_RNNT_CONFIG, "encoder": {**_RNNT_CONFIG["encoder"]}}
+        del cfg["encoder"]["ff_expansion_factor"]
+        config = nemo_to_config(cfg)
+        assert config.intermediate_size == 1024 * 4
+
+    def test_unsupported_subsampling_raises(self):
+        cfg = {
+            **_RNNT_CONFIG,
+            "encoder": {**_RNNT_CONFIG["encoder"], "subsampling": "striding"},
+        }
+        with pytest.raises(ValueError, match="Unsupported FastConformer"):
+            nemo_to_config(cfg)
+
+    def test_unsupported_self_attention_raises(self):
+        cfg = {
+            **_RNNT_CONFIG,
+            "encoder": {**_RNNT_CONFIG["encoder"], "self_attention_model": "abs_pos"},
+        }
+        with pytest.raises(ValueError, match="self_attention_model"):
+            nemo_to_config(cfg)
+
+    def test_use_bias_true_raises(self):
+        # NeMo default use_bias=True is unsupported (the stack hardcodes bias=False).
+        cfg = {
+            **_RNNT_CONFIG,
+            "encoder": {**_RNNT_CONFIG["encoder"], "use_bias": True},
+        }
+        with pytest.raises(ValueError, match="use_bias"):
+            nemo_to_config(cfg)
+
+    def test_unsupported_att_context_style_raises(self):
+        cfg = {
+            **_RNNT_CONFIG,
+            "encoder": {**_RNNT_CONFIG["encoder"], "att_context_style": "regular"},
+        }
+        with pytest.raises(ValueError, match="att_context_style"):
+            nemo_to_config(cfg)
+
+    def test_unlimited_right_context_raises(self):
+        cfg = {
+            **_RNNT_CONFIG,
+            "encoder": {**_RNNT_CONFIG["encoder"], "att_context_size": [70, -1]},
+        }
+        with pytest.raises(ValueError, match="right context"):
+            nemo_to_config(cfg)
+
+    def test_xscaling_raises(self):
+        cfg = {**_RNNT_CONFIG, "encoder": {**_RNNT_CONFIG["encoder"], "xscaling": True}}
+        with pytest.raises(ValueError, match="xscaling"):
+            nemo_to_config(cfg)
+
+    def test_list_pre_encode_cache_size(self):
+        # Cache-aware multi-context training stores a list; use the last entry.
+        cfg = {
+            **_RNNT_CONFIG,
+            "encoder": {**_RNNT_CONFIG["encoder"], "pre_encode_cache_size": [4, 9]},
+        }
+        config = nemo_to_config(cfg)
+        # drop_extra = 1 + (9 - 1) // 8 = 2.
+        assert config.fastconformer_streaming_drop_extra == 2
+
+    def test_list_att_context_size(self):
+        # NeMo may store att_context_size as a list of [left, right] rows.
+        cfg = {
+            **_RNNT_CONFIG,
+            "encoder": {**_RNNT_CONFIG["encoder"], "att_context_size": [[70, 13], [140, 27]]},
+        }
+        config = nemo_to_config(cfg)
+        assert config.fastconformer_streaming_cache_size == 70

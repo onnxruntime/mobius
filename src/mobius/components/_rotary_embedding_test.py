@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Tests for rotary embeddings."""
 
@@ -12,6 +12,7 @@ from mobius._testing import create_test_builder, create_test_input, make_config
 from mobius.components._rotary_embedding import (
     ChunkedMRope,
     DefaultRope,
+    DynamicNTKRope,
     InterleavedMRope,
     LinearRope,
     Llama3Rope,
@@ -127,6 +128,92 @@ class TestRopeVariants:
         assert rope.has_long_cache
         assert next(iter(rope.cos_cache.shape)) == 96
 
+    def test_dynamic_ntk_rope_with_factor(self):
+        """DynamicNTKRope with factor (standard, no alpha) applies NTK scaling."""
+        config = make_config(
+            rope_type="dynamic",
+            rope_scaling={"factor": 4.0},
+        )
+        rope = DynamicNTKRope(config)
+        assert next(iter(rope.cos_cache.shape)) == config.max_position_embeddings
+
+        # Verify NTK scaling: new_theta = theta * factor^(dim/(dim-2))
+        dim = config.head_dim
+        expected_theta = config.rope_theta * (4.0 ** (dim / (dim - 2)))
+        expected_inv = 1.0 / (expected_theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
+        expected_cos1 = np.cos(expected_inv)
+        actual_cos1 = rope.cos_cache.const_value.numpy()[1, : dim // 2]
+        np.testing.assert_allclose(actual_cos1, expected_cos1, atol=1e-5)
+
+    def test_dynamic_ntk_rope_with_alpha(self):
+        """DynamicNTKRope with alpha (HunyuanV1) uses alpha instead of factor."""
+        config = make_config(
+            rope_type="dynamic",
+            rope_scaling={"factor": 1.0, "alpha": 1000.0},
+        )
+        rope = DynamicNTKRope(config)
+
+        # With alpha=1000, scaling should use 1000 not factor=1.0
+        dim = config.head_dim
+        expected_theta = config.rope_theta * (1000.0 ** (dim / (dim - 2)))
+        expected_inv = 1.0 / (expected_theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
+        expected_cos1 = np.cos(expected_inv)
+        actual_cos1 = rope.cos_cache.const_value.numpy()[1, : dim // 2]
+        np.testing.assert_allclose(actual_cos1, expected_cos1, atol=1e-5)
+
+        # Verify it differs from factor=1.0 (no scaling)
+        default_inv = 1.0 / (
+            config.rope_theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim)
+        )
+        default_cos1 = np.cos(default_inv)
+        assert not np.allclose(actual_cos1, default_cos1, atol=1e-3), (
+            "alpha=1000 should produce different frequencies than default"
+        )
+
+    def test_dynamic_ntk_rope_alpha_matches_hunyuan_hf(self):
+        """DynamicNTKRope with HunyuanV1 config matches HF inv_freq exactly."""
+        # HunyuanV1 HF formula: base = theta * alpha^(dim/(dim-2))
+        # inv_freq = 1.0 / (base ** (arange(0, dim, 2) / dim))
+        config = make_config(
+            rope_theta=10000.0,
+            head_dim=128,
+            rope_type="dynamic",
+            rope_scaling={
+                "factor": 1.0,
+                "alpha": 1000.0,
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "mscale": 1.0,
+                "mscale_all_dim": 1.0,
+            },
+        )
+        rope = DynamicNTKRope(config)
+
+        # Reference: HF HunYuanDenseV1RotaryEmbedding
+        dim = 128
+        base = 10000.0 * 1000.0 ** (dim / (dim - 2))
+        hf_inv_freq = 1.0 / (base ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
+
+        # Compare cos at position 1 (cos(1 * inv_freq))
+        hf_cos1 = np.cos(hf_inv_freq)
+        actual_cos1 = rope.cos_cache.const_value.numpy()[1, : dim // 2]
+        np.testing.assert_allclose(actual_cos1, hf_cos1, atol=1e-5)
+
+    def test_dynamic_ntk_rope_factor_only_backward_compatible(self):
+        """DynamicNTKRope without alpha still works with factor alone."""
+        config = make_config(
+            rope_type="dynamic",
+            rope_scaling={"factor": 2.0},
+        )
+        rope = DynamicNTKRope(config)
+
+        dim = config.head_dim
+        expected_theta = config.rope_theta * (2.0 ** (dim / (dim - 2)))
+        expected_inv = 1.0 / (expected_theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
+        expected_cos1 = np.cos(expected_inv)
+        actual_cos1 = rope.cos_cache.const_value.numpy()[1, : dim // 2]
+        np.testing.assert_allclose(actual_cos1, expected_cos1, atol=1e-5)
+
 
 class TestInitializeRope:
     def test_default(self):
@@ -156,6 +243,19 @@ class TestInitializeRope:
         rope = initialize_rope(config)
         assert isinstance(rope, LongRope)
 
+    def test_dynamic(self):
+        config = make_config(rope_type="dynamic", rope_scaling={"factor": 2.0})
+        rope = initialize_rope(config)
+        assert isinstance(rope, DynamicNTKRope)
+
+    def test_dynamic_with_alpha(self):
+        config = make_config(
+            rope_type="dynamic",
+            rope_scaling={"factor": 1.0, "alpha": 1000.0},
+        )
+        rope = initialize_rope(config)
+        assert isinstance(rope, DynamicNTKRope)
+
     def test_unsupported_raises(self):
         config = make_config(rope_type="unknown")
         with pytest.raises(ValueError, match="Unsupported rope type"):
@@ -170,6 +270,17 @@ class TestInitializeRope:
         config = make_config(mrope_section=[11, 11, 10], mrope_interleaved=True)
         rope = initialize_rope(config)
         assert isinstance(rope, InterleavedMRope)
+
+    def test_nope_returns_none(self):
+        """initialize_rope returns None when rope_type is None (NoPE).
+
+        NoPE models like NemotronH and GraniteMoeHybrid leave ``rope_type``
+        at its ``None`` default so that callers do not silently apply
+        rotary encoding to a model that shouldn't have any. This is the
+        Phase 1 fix for the default-value bug.
+        """
+        config = make_config(rope_type=None)
+        assert initialize_rope(config) is None
 
 
 class TestChunkedMRope:
@@ -254,3 +365,70 @@ class TestApplyRotaryPosEmb:
         cos, sin = get_rotary_pos_emb(op, pos_ids, cos_cache, sin_cache)
         assert cos is not None
         assert sin is not None
+
+
+class TestYarnRopeAttnScale:
+    """Tests for YarnRope with llama_4_attn_scale (Ministral3)."""
+
+    def test_yarn_without_attn_scale_returns_2tuple(self):
+        """Standard YaRN (no llama_4_scaling_beta) returns (cos, sin)."""
+        from mobius.components._rotary_embedding import YarnRope
+
+        config = make_config(
+            head_dim=128,
+            max_position_embeddings=16384,
+            rope_theta=1000000.0,
+            rope_scaling={
+                "rope_type": "yarn",
+                "factor": 16.0,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0,
+                "mscale": 1.0,
+                "mscale_all_dim": 1.0,
+                "original_max_position_embeddings": 16384,
+            },
+        )
+        rope = YarnRope(config)
+        builder, op, _graph = create_test_builder()
+        pos_ids = create_test_input(builder, "pos_ids", [1, 4])
+        result = rope.forward(op, pos_ids)
+        assert len(result) == 2, "Without llama_4_scaling_beta, should return (cos, sin)"
+
+    def test_yarn_with_attn_scale_returns_3tuple(self):
+        """YaRN with llama_4_scaling_beta returns (cos, sin, attn_scale)."""
+        from mobius.components._rotary_embedding import YarnRope
+
+        config = make_config(
+            head_dim=128,
+            max_position_embeddings=262144,
+            rope_theta=1000000.0,
+            rope_scaling={
+                "rope_type": "yarn",
+                "factor": 16.0,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0,
+                "mscale": 1.0,
+                "mscale_all_dim": 1.0,
+                "original_max_position_embeddings": 16384,
+                "llama_4_scaling_beta": 0.1,
+            },
+        )
+        rope = YarnRope(config)
+        builder, op, _graph = create_test_builder()
+        pos_ids = create_test_input(builder, "pos_ids", [1, 4])
+        result = rope.forward(op, pos_ids)
+        assert len(result) == 3, (
+            "With llama_4_scaling_beta, should return (cos, sin, attn_scale)"
+        )
+
+    def test_apply_rotary_pos_emb_ignores_3rd_element(self):
+        """apply_rotary_pos_emb should work with both 2-tuple and 3-tuple."""
+        builder, op, _graph = create_test_builder()
+        x = create_test_input(builder, "x", [1, 4, 64])
+        cos = create_test_input(builder, "cos", [1, 4, 8])
+        sin = create_test_input(builder, "sin", [1, 4, 8])
+        scale = create_test_input(builder, "scale", [1, 4, 1])
+
+        # 3-tuple should work — apply_rotary_pos_emb only uses [0] and [1]
+        result = apply_rotary_pos_emb(op, x, (cos, sin, scale), num_heads=4)
+        assert result is not None

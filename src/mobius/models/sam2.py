@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """SAM2 (Segment Anything Model 2) vision encoder.
 
@@ -18,8 +18,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import Sam2Config
 from mobius.components._activations import ACT2FN
@@ -65,7 +64,7 @@ class _Sam2HieraBlock(nn.Module):
         if self._has_dim_proj:
             self.proj = Linear(dim_in, dim_out)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # hidden_states: [B, S, dim_in]
         residual = hidden_states
         hidden_states = self.layer_norm1(op, hidden_states)
@@ -86,7 +85,7 @@ class _Sam2HieraBlock(nn.Module):
 
         # Scaled dot-product attention
         scale = self._head_dim**-0.5
-        q = op.Mul(q, op.Constant(value_float=scale))
+        q = op.Mul(q, scale)
         k_t = op.Transpose(k, perm=[0, 1, 3, 2])
         scores = op.MatMul(q, k_t)
         attn_weights = op.Softmax(scores, axis=-1)
@@ -186,7 +185,7 @@ class Sam2VisionModel(nn.Module):
                 Conv2dNoBias(dim, fpn_hidden_size, kernel_size=1, stride=1, padding=0)
             )
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         # Patch embedding: [B, 3, H, W] → [B, C, H', W']
         x = self.patch_embed(op, pixel_values)
         # Flatten spatial dims: [B, C, H', W'] → [B, H'*W', C]

@@ -1,0 +1,18 @@
+# Mobius (ONNX model construction) — install from this repo:
+#   pip install -e '.[transformers]'
+# Or from PyPI/git:
+#   pip install mobius-onnx[transformers]
+
+torch>=2.10.0,<2.11.0
+transformers>=4.57.0
+
+# Optional: Olive for text decoder quantization (INT4/FP16)
+# pip install olive-ai
+
+# For eval.py
+datasets
+Pillow
+
+# ORT GenAI runtime (install separately):
+#   CPU: pip install onnxruntime-genai
+#   GPU: pip install onnxruntime-genai-cuda

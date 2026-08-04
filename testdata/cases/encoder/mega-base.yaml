@@ -1,4 +1,5 @@
 model_id: "mnaylor/mega-base-wikitext"
+model_type: "mega"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

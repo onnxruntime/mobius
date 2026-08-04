@@ -1,0 +1,13 @@
+{
+  "model_id": "google/gemma-4-e2b-it-assistant",
+  "prompt": "Here is my poem:",
+  "generated_tokens": [
+    3442,
+    786,
+    1144,
+    611,
+    236789,
+    500
+  ],
+  "generated_text": " tell me what you're"
+}

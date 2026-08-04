@@ -1,0 +1,689 @@
+#!/usr/bin/env python
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+"""Fun-ASR-Nano speech recognition with ONNX models.
+
+Builds three ONNX models from ``mobius`` (audio encoder,
+embedding, decoder) and runs the full ASR pipeline:
+
+    audio → fbank → LFR → audio encoder → embedding fusion → decoder → text
+
+The audio frontend (fbank + LFR + CMVN) runs in Python, *not* inside
+the ONNX graph.  This differs from Qwen3-ASR which uses
+WhisperFeatureExtractor.
+
+Supports real-time microphone input and audio file input.
+
+Prerequisites::
+
+    pip install mobius-onnx[transformers] sounddevice torchaudio pyyaml
+
+Usage::
+
+    # Record from microphone (press Enter to stop)
+    python examples/fun_asr.py
+
+    # Transcribe an audio file
+    python examples/fun_asr.py --audio speech.wav
+
+    # Continuous mic mode (Ctrl+C to exit)
+    python examples/fun_asr.py --continuous
+
+    # Force a specific language
+    python examples/fun_asr.py --language zh          # Chinese
+    python examples/fun_asr.py --language en           # English
+    python examples/fun_asr.py --language ja           # Japanese
+
+    # Use a different model
+    python examples/fun_asr.py --model FunAudioLLM/Fun-ASR-Nano-2512
+
+    # GPU inference with half precision
+    python examples/fun_asr.py --device cuda --dtype f16
+
+    # Disable streaming output
+    python examples/fun_asr.py --no-stream
+
+    # Save ONNX models without running inference
+    python examples/fun_asr.py --save-to output/fun-asr/
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import threading
+from pathlib import Path
+
+import ml_dtypes
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from asr_utils import (
+    LFR_M,
+    N_MELS,
+    SAMPLE_RATE,
+    load_audio_file,
+    preprocess_audio,
+)
+
+from mobius import ArchitectureConfig, build_from_module
+from mobius._configs import AudioConfig
+from mobius._testing.ort_inference import OnnxModelSession
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+MODEL_ID = "justinchuby/Fun-ASR-Nano-2512"
+MAX_RECORD_SECONDS = 60
+MAX_NEW_TOKENS = 4096
+
+# Language mapping for Fun-ASR-Nano-2512 (zh, en, ja).
+# Values are Chinese language names used in the prompt (fullwidth colon is required).
+LANGUAGE_MAP: dict[str, str] = {
+    "auto": "",
+    "zh": "中文",
+    "chinese": "中文",
+    "中文": "中文",
+    "en": "英文",
+    "english": "英文",
+    "英文": "英文",
+    "ja": "日文",
+    "japanese": "日文",
+    "日文": "日文",
+}
+
+
+# ---------------------------------------------------------------------------
+# Microphone recording
+# ---------------------------------------------------------------------------
+
+
+def record_until_enter(
+    sample_rate: int = SAMPLE_RATE,
+    max_seconds: int = MAX_RECORD_SECONDS,
+) -> np.ndarray:
+    """Record audio from the default mic until Enter is pressed."""
+    import sounddevice as sd
+
+    chunks: list[np.ndarray] = []
+    stop_event = threading.Event()
+
+    def callback(indata, frames, time, status):
+        if status:
+            print(f"  [mic] {status}", file=sys.stderr)
+        chunks.append(indata.copy())
+
+    stream = sd.InputStream(
+        samplerate=sample_rate,
+        channels=1,
+        dtype="float32",
+        callback=callback,
+        blocksize=int(sample_rate * 0.1),
+    )
+
+    print("🎤 Recording... Press Enter to stop.")
+    stream.start()
+
+    input_thread = threading.Thread(target=lambda: (input(), stop_event.set()))
+    input_thread.daemon = True
+    input_thread.start()
+    input_thread.join(timeout=max_seconds)
+    stop_event.set()
+
+    stream.stop()
+    stream.close()
+
+    if not chunks:
+        return np.array([], dtype=np.float32)
+
+    audio = np.concatenate(chunks, axis=0).flatten()
+    duration = len(audio) / sample_rate
+    print(f"  Recorded {duration:.1f}s of audio.")
+    return audio
+
+
+# ---------------------------------------------------------------------------
+# Model config construction
+# ---------------------------------------------------------------------------
+
+
+def build_fun_asr_config(model_id: str, dtype: str = "f32") -> ArchitectureConfig:
+    """Build an ArchitectureConfig for Fun-ASR from the HF repo files.
+
+    Supports two config formats:
+    - config.yaml + Qwen3-0.6B/config.json (original FunAudioLLM format)
+    - config.json (mlx-community format with all config in one file)
+    """
+    import json
+
+    from huggingface_hub import hf_hub_download
+
+    # Try config.json first (mlx-community format)
+    try:
+        cfg_path = hf_hub_download(model_id, "config.json")
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        if "encoder" in cfg and "llm" in cfg:
+            # mlx-community format: flat config.json
+            enc_raw = cfg["encoder"]
+            adaptor_raw = cfg.get("adaptor", {})
+            llm_cfg = cfg["llm"]
+            enc = {
+                "output_size": enc_raw.get("encoder_dim", 512),
+                "attention_heads": enc_raw.get("num_heads", 4),
+                "linear_units": enc_raw.get("ffn_dim", 2048),
+                "kernel_size": enc_raw.get("kernel_size", 11),
+                "num_blocks": enc_raw.get("num_encoders0", 1)
+                + enc_raw.get("num_encoders", 49),
+                "tp_blocks": enc_raw.get("num_tp_encoders", 20),
+            }
+            adaptor = {
+                "linear_size": adaptor_raw.get("llm_dim", 1024),
+                "num_blocks": adaptor_raw.get("n_layer", 2),
+                "ffn_dim": adaptor_raw.get("ffn_dim", 2048),
+                "attention_heads": adaptor_raw.get("attention_heads", 8),
+            }
+            input_size = enc_raw.get(
+                "input_dim", cfg.get("lfr_m", LFR_M) * cfg.get("n_mels", N_MELS)
+            )
+            return _build_config(enc, adaptor, llm_cfg, input_size, dtype)
+    except Exception:  # config.json missing or wrong format — try config.yaml
+        pass  # Expected for repos using config.yaml format (e.g. original FunASR)
+
+    # Fall back to config.yaml (original format)
+    import yaml
+
+    yaml_path = hf_hub_download(model_id, "config.yaml")
+    with open(yaml_path) as f:
+        cfg = yaml.safe_load(f)
+
+    llm_subfolder = cfg.get("llm_conf", {}).get("init_param_path", "Qwen3-0.6B")
+    llm_config_path = hf_hub_download(model_id, f"{llm_subfolder}/config.json")
+    with open(llm_config_path) as f:
+        llm_cfg = json.load(f)
+
+    enc = cfg.get("audio_encoder_conf", {})
+    adaptor = cfg.get("audio_adaptor_conf", {})
+    frontend = cfg.get("frontend_conf", {})
+    lfr_m = frontend.get("lfr_m", LFR_M)
+    n_mels = frontend.get("n_mels", N_MELS)
+    input_size = lfr_m * n_mels
+
+    return _build_config(enc, adaptor, llm_cfg, input_size, dtype)
+
+
+def _build_config(
+    enc: dict, adaptor: dict, llm_cfg: dict, input_size: int, dtype: str
+) -> ArchitectureConfig:
+    """Build ArchitectureConfig from parsed encoder/adaptor/llm dicts."""
+    from onnx_ir import DataType
+
+    dtype_map = {"f32": DataType.FLOAT, "f16": DataType.FLOAT16, "bf16": DataType.BFLOAT16}
+
+    return ArchitectureConfig(
+        model_type="fun_asr",
+        vocab_size=llm_cfg["vocab_size"],
+        hidden_size=llm_cfg["hidden_size"],
+        num_hidden_layers=llm_cfg["num_hidden_layers"],
+        num_attention_heads=llm_cfg["num_attention_heads"],
+        num_key_value_heads=llm_cfg.get("num_key_value_heads", llm_cfg["num_attention_heads"]),
+        intermediate_size=llm_cfg.get("intermediate_size", llm_cfg["hidden_size"] * 4),
+        hidden_act=llm_cfg.get("hidden_act", "silu"),
+        head_dim=llm_cfg.get(
+            "head_dim", llm_cfg["hidden_size"] // llm_cfg["num_attention_heads"]
+        ),
+        rms_norm_eps=llm_cfg.get("rms_norm_eps", 1e-6),
+        rope_theta=llm_cfg.get("rope_theta", 1000000.0),
+        rope_type="default",
+        max_position_embeddings=llm_cfg.get("max_position_embeddings", 40960),
+        attn_qk_norm=True,
+        dtype=dtype_map.get(dtype, DataType.FLOAT),
+        audio=AudioConfig(
+            input_size=input_size,
+            attention_dim=enc.get("output_size", 512),
+            attention_heads=enc.get("attention_heads", 4),
+            num_blocks=enc.get("num_blocks", 50),
+            linear_units=enc.get("linear_units", 2048),
+            kernel_size=enc.get("kernel_size", 11),
+            tp_num_blocks=enc.get("tp_blocks", 20),
+            output_dim=enc.get("output_size", 512),
+            audio_token_id=0,  # Fun-ASR uses token_id=0 as audio placeholder
+            adaptor_proj_dim=adaptor.get("ffn_dim", 2048),
+            adaptor_num_blocks=adaptor.get("n_layer", 2),
+            adaptor_ffn_dim=256,  # FFN hidden dim inside adaptor blocks (from weights)
+            adaptor_num_heads=8,  # Reference defaults to 8 for adaptor attention
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# ASR inference pipeline
+# ---------------------------------------------------------------------------
+
+
+def transcribe(
+    sessions: dict[str, OnnxModelSession],
+    tokenizer,
+    audio: np.ndarray,
+    config: ArchitectureConfig,
+    *,
+    max_new_tokens: int = MAX_NEW_TOKENS,
+    language: str = "",
+    stream: bool = True,
+    model_dtype: np.dtype = np.float32,
+    embed_table: np.ndarray | None = None,
+) -> str:
+    """Full ASR pipeline: audio → text.
+
+    Runs three ONNX models in sequence:
+    1. Audio encoder: LFR fbank features → audio features
+    2. Embedding: fuse text tokens with audio features
+    3. Decoder: autoregressive text generation with KV cache
+
+    Args:
+        language: If non-empty, force language by prepending
+            ``language <NAME>`` as the assistant prefix.
+        stream: If True, print tokens as they are generated.
+        model_dtype: Numpy dtype matching the model precision.
+        embed_table: Pre-extracted embedding weight table for decode steps.
+            Used to avoid token_id=0 collision with the audio placeholder
+            during autoregressive decoding.
+    """
+    batch_size = 1
+
+    # Step 1: Compute LFR fbank features
+    input_features = preprocess_audio(audio).astype(model_dtype)  # (1, T, 560)
+
+    # Step 2: Run audio encoder (includes adaptor → LLM-dim output)
+    audio_out = sessions["audio_encoder"].run({"input_features": input_features})
+    audio_features = audio_out["audio_features"]  # (1, audio_seq, llm_hidden)
+    num_audio_tokens = audio_features.shape[1]
+
+    # Flatten to (num_audio_tokens, llm_hidden) for the embedding model
+    audio_features_2d = audio_features.reshape(-1, audio_features.shape[-1])
+
+    # Step 3: Build prompt with Fun-ASR format
+    # Fun-ASR uses: system="You are a helpful assistant."
+    #   user="语音转写成{language}：" + fake_tokens for audio positions  # noqa: RUF003
+    if language:
+        user_text = f"语音转写成{language}："  # noqa: RUF001
+    else:
+        user_text = "语音转写："  # noqa: RUF001
+
+    system_prompt = "You are a helpful assistant."
+    chat_prefix = (
+        f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{user_text}"
+    )
+    prefix_ids = tokenizer.encode(chat_prefix, add_special_tokens=False)
+
+    # Audio placeholder tokens — will be overwritten with audio embeddings
+    audio_placeholder_ids = [0] * num_audio_tokens
+
+    chat_suffix = "<|im_end|>\n<|im_start|>assistant\n"
+    suffix_ids = tokenizer.encode(chat_suffix, add_special_tokens=False)
+
+    prompt_ids = prefix_ids + audio_placeholder_ids + suffix_ids
+    input_ids = np.array([prompt_ids], dtype=np.int64)
+
+    # Step 4: Run embedding model to fuse text + audio
+    # The ONNX embedding model:
+    #   1. Embeds input_ids via embed_tokens
+    #   2. Identifies token_id=0 positions (audio placeholders)
+    #   3. Replaces those positions with audio_features
+    #   4. Outputs fused inputs_embeds
+    embed_out = sessions["embedding"].run(
+        {"input_ids": input_ids, "audio_features": audio_features_2d}
+    )
+    inputs_embeds = embed_out["inputs_embeds"]  # (1, seq_len, hidden)
+
+    # Step 5: Autoregressive decoding with the decoder model
+    num_layers = config.num_hidden_layers
+    num_kv_heads = config.num_key_value_heads
+    head_dim = config.head_dim
+
+    # Initialize empty KV cache
+    past_kv = {}
+    for i in range(num_layers):
+        past_kv[f"past_key_values.{i}.key"] = np.zeros(
+            (batch_size, num_kv_heads, 0, head_dim), dtype=model_dtype
+        )
+        past_kv[f"past_key_values.{i}.value"] = np.zeros(
+            (batch_size, num_kv_heads, 0, head_dim), dtype=model_dtype
+        )
+
+    # Prefill pass with fused embeddings
+    # Fun-ASR uses standard RoPE (not MRoPE), so position_ids is (1, seq_len)
+    prefill_len = inputs_embeds.shape[1]
+    position_ids = np.arange(prefill_len, dtype=np.int64)[np.newaxis, :]  # (1, seq_len)
+
+    decoder_feeds = {
+        "inputs_embeds": inputs_embeds,
+        "attention_mask": np.ones((batch_size, prefill_len), dtype=np.int64),
+        "position_ids": position_ids,
+        **past_kv,
+    }
+    out = sessions["decoder"].run(decoder_feeds)
+
+    # Get first generated token
+    logits = out["logits"]
+    next_token = int(np.argmax(logits[:, -1, :]))
+    generated_ids = [next_token]
+
+    # Update KV cache
+    for i in range(num_layers):
+        past_kv[f"past_key_values.{i}.key"] = out[f"present.{i}.key"]
+        past_kv[f"past_key_values.{i}.value"] = out[f"present.{i}.value"]
+
+    past_seq_len = prefill_len
+
+    # Decode loop
+    eos_ids = {151643, 151645}  # <|endoftext|>, <|im_end|>
+    stream_ids: list[int] = []
+    printed_len = 0
+    for _ in range(max_new_tokens - 1):
+        if next_token in eos_ids:
+            break
+
+        # Decode step: embed single token via numpy lookup.
+        # Avoids using the ONNX embedding model to prevent token_id=0
+        # collision with the audio placeholder during autoregressive decoding.
+        if embed_table is not None:
+            cur_embeds = embed_table[next_token][np.newaxis, np.newaxis, :]
+            cur_embeds = cur_embeds.astype(model_dtype)
+        else:
+            cur_ids = np.array([[next_token]], dtype=np.int64)
+            dummy_audio = np.zeros((0, audio_features_2d.shape[-1]), dtype=model_dtype)
+            embed_out = sessions["embedding"].run(
+                {"input_ids": cur_ids, "audio_features": dummy_audio}
+            )
+            cur_embeds = embed_out["inputs_embeds"]
+
+        total_seq_len = past_seq_len + 1
+        position_ids = np.array([[past_seq_len]], dtype=np.int64)  # (1, 1)
+
+        decoder_feeds = {
+            "inputs_embeds": cur_embeds,
+            "attention_mask": np.ones((batch_size, total_seq_len), dtype=np.int64),
+            "position_ids": position_ids,
+            **past_kv,
+        }
+        out = sessions["decoder"].run(decoder_feeds)
+
+        logits = out["logits"]
+        next_token = int(np.argmax(logits[:, -1, :]))
+        generated_ids.append(next_token)
+
+        # Stream output
+        stream_ids.append(next_token)
+        if stream:
+            full_text = tokenizer.decode(stream_ids, skip_special_tokens=True)
+            new_text = full_text[printed_len:]
+            safe_end = new_text.find("\ufffd")
+            if safe_end == -1:
+                if new_text:
+                    print(new_text, end="", flush=True)
+                    printed_len = len(full_text)
+            elif safe_end > 0:
+                print(new_text[:safe_end], end="", flush=True)
+                printed_len += safe_end
+
+        for i in range(num_layers):
+            past_kv[f"past_key_values.{i}.key"] = out[f"present.{i}.key"]
+            past_kv[f"past_key_values.{i}.value"] = out[f"present.{i}.value"]
+        past_seq_len = total_seq_len
+
+    # Flush remaining buffered characters
+    if stream and stream_ids:
+        final_text = tokenizer.decode(stream_ids, skip_special_tokens=True)
+        remaining = final_text[printed_len:]
+        if remaining:
+            remaining = remaining.replace("\ufffd", "")
+            if remaining:
+                print(remaining, end="", flush=True)
+
+    print()
+    return tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+
+def transcribe_long(
+    sessions,
+    tokenizer,
+    audio: np.ndarray,
+    config,
+    *,
+    chunk_length: float = 30.0,
+    **kwargs,
+) -> str:
+    """Transcribe audio of any length by chunking.
+
+    Splits audio into segments of ``chunk_length`` seconds and
+    transcribes each independently, concatenating the results.
+    """
+    samples_per_chunk = int(chunk_length * SAMPLE_RATE)
+    total_samples = len(audio)
+
+    if total_samples <= samples_per_chunk:
+        return transcribe(sessions, tokenizer, audio, config, **kwargs)
+
+    num_chunks = (total_samples + samples_per_chunk - 1) // samples_per_chunk
+    results = []
+    for i in range(num_chunks):
+        start = i * samples_per_chunk
+        end = min(start + samples_per_chunk, total_samples)
+        chunk = audio[start:end]
+        if len(chunk) < SAMPLE_RATE * 0.3:
+            continue  # Skip very short trailing chunks
+        print(f"\n[Chunk {i + 1}/{num_chunks}] ", end="", flush=True)
+        text = transcribe(sessions, tokenizer, chunk, config, **kwargs)
+        results.append(text.strip())
+
+    return " ".join(results)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Fun-ASR-Nano speech recognition with ONNX models.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--model",
+        default=MODEL_ID,
+        help="HuggingFace model ID (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--audio",
+        default=None,
+        help="Path to an audio file. If omitted, records from mic.",
+    )
+    parser.add_argument(
+        "--language",
+        default="auto",
+        help=(
+            "Force language. Languages: auto, zh, en, ja. Default: auto (model auto-detects)."
+        ),
+    )
+    parser.add_argument(
+        "--device",
+        default="cpu",
+        choices=["cpu", "cuda", "webgpu"],
+        help="Execution provider (default: cpu).",
+    )
+    parser.add_argument(
+        "--dtype",
+        default="f32",
+        choices=["f32", "f16", "bf16"],
+        help="Model precision (default: f32).",
+    )
+    parser.add_argument(
+        "--no-stream",
+        action="store_true",
+        help="Disable streaming output (print all at once).",
+    )
+    parser.add_argument(
+        "--continuous",
+        action="store_true",
+        help="Continuously record and transcribe (loop until Ctrl+C).",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=MAX_NEW_TOKENS,
+        help="Maximum tokens to generate per chunk (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--chunk-length",
+        type=float,
+        default=30.0,
+        help="Audio chunk length in seconds for long files (default: 30). "
+        "Must be ≤360s to stay within the encoder's 6000-frame PE table.",
+    )
+    parser.add_argument(
+        "--save-to",
+        metavar="DIR",
+        default=None,
+        help="Save ONNX models to DIR and exit (no inference).",
+    )
+    parser.add_argument(
+        "--ci",
+        action="store_true",
+        help="Exit with non-zero code on failure (for CI pipelines).",
+    )
+    args = parser.parse_args()
+
+    # Resolve language
+    lang_key = args.language.lower().strip()
+    if lang_key not in LANGUAGE_MAP:
+        supported = ", ".join(sorted(set(LANGUAGE_MAP.keys()) - {"auto"}))
+        parser.error(f"Unknown language {args.language!r}. Supported: auto, {supported}")
+    forced_language = LANGUAGE_MAP[lang_key]
+
+    # Build config from model YAML + LLM config
+    print(f"Building ONNX models from {args.model!r} (dtype={args.dtype}) ...")
+    config = build_fun_asr_config(args.model, dtype=args.dtype)
+
+    # Build the 3 ONNX models using build_from_module
+    from mobius.models.fun_asr import FunASRForConditionalGeneration
+    from mobius.tasks import FunASRSpeechLanguageTask
+
+    module = FunASRForConditionalGeneration(config)
+    pkg = build_from_module(module, config, task=FunASRSpeechLanguageTask())
+
+    if args.save_to:
+        pkg.save(args.save_to, check_weights=False)
+        print(f"Saved to {args.save_to}")
+        return
+
+    # Apply weights from safetensors checkpoint on HuggingFace Hub.
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+
+    weights_path = hf_hub_download(args.model, "model.safetensors")
+    state_dict = load_file(weights_path)
+    if hasattr(module, "preprocess_weights"):
+        state_dict = module.preprocess_weights(state_dict)
+    prefix_map = getattr(module, "weight_prefix_map", None)
+
+    # Extract embedding table for decode steps before apply_weights consumes it.
+    # This avoids token_id=0 collision with the audio placeholder when the
+    # model generates token 0 during autoregressive decoding.
+    embed_table = None
+    for key, tensor in state_dict.items():
+        if "embed_tokens.weight" in key:
+            embed_table = tensor.float().numpy()
+            break
+
+    pkg.apply_weights(state_dict, prefix_map=prefix_map)
+
+    # Create ORT sessions for each model
+    device = args.device
+    print(f"Creating inference sessions (device={device}) ...")
+    sessions = {name: OnnxModelSession(model, device=device) for name, model in pkg.items()}
+
+    # Load tokenizer — try subfolder first (original format), then root
+    import transformers
+
+    try:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            args.model, subfolder="Qwen3-0.6B", trust_remote_code=True
+        )
+    except Exception:  # No Qwen3-0.6B subfolder — tokenizer at repo root
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            args.model, trust_remote_code=True
+        )
+
+    print("Ready.\n")
+    if forced_language:
+        print(f"Language: {forced_language} (forced)")
+    else:
+        print("Language: auto-detect")
+
+    do_stream = not args.no_stream
+
+    np_dtype_map = {
+        "f32": np.float32,
+        "f16": np.float16,
+        "bf16": ml_dtypes.bfloat16,
+    }
+    np_dtype = np_dtype_map[args.dtype]
+
+    transcribe_kwargs = dict(
+        max_new_tokens=args.max_new_tokens,
+        language=forced_language,
+        stream=do_stream,
+        model_dtype=np_dtype,
+        embed_table=embed_table,
+    )
+
+    def do_transcribe(audio_data):
+        return transcribe_long(
+            sessions,
+            tokenizer,
+            audio_data,
+            config,
+            chunk_length=args.chunk_length,
+            **transcribe_kwargs,
+        )
+
+    if args.audio:
+        print(f"Loading audio: {args.audio}")
+        audio = load_audio_file(args.audio)
+        print(f"Audio: {len(audio) / SAMPLE_RATE:.1f}s\n")
+        text = do_transcribe(audio)
+        print(f"\n📝 Result: {text}")
+    elif args.continuous:
+        print("=== Continuous ASR Mode (Ctrl+C to exit) ===\n")
+        try:
+            while True:
+                audio = record_until_enter()
+                if len(audio) < SAMPLE_RATE * 0.5:
+                    print("  (too short, skipping)\n")
+                    continue
+                text = do_transcribe(audio)
+                print(f"📝 {text}\n")
+        except KeyboardInterrupt:
+            print("\nDone.")
+    else:
+        audio = record_until_enter()
+        if len(audio) < SAMPLE_RATE * 0.3:
+            print("No audio recorded.")
+            return
+        text = do_transcribe(audio)
+        print(f"\n📝 Result: {text}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        if "--ci" in sys.argv:
+            print(f"FAILED: {e}", file=sys.stderr)
+            sys.exit(1)
+        raise

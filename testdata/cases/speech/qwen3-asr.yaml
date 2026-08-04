@@ -1,7 +1,9 @@
-model_id: "Qwen/Qwen3-ASR"
+model_id: "Qwen/Qwen3-ASR-0.6B"
+model_type: "qwen3_asr"
 revision: "main"
 task_type: "speech-language"
 dtype: "float32"
+trust_remote_code: true
 
 inputs:
   audio:
@@ -13,5 +15,4 @@ generation:
 
 level: "L4+L5"
 
-skip_reason: "Requires audio preprocessing pipeline not yet supported in test harness."
-notes: "Qwen3-ASR speech recognition. 3-model split: audio_encoder + embedding + decoder."
+notes: "Qwen3-ASR speech recognition (auto language detection). 3-model split: audio_encoder + embedding + decoder. Uses fixed chat template with audio-only input."

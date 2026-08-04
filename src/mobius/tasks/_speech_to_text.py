@@ -1,9 +1,11 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Speech-to-text task for encoder-decoder models (e.g. Whisper)."""
 
 from __future__ import annotations
+
+from typing import ClassVar
 
 import onnx_ir as ir
 from onnxscript import nn
@@ -11,10 +13,13 @@ from onnxscript import nn
 from mobius._configs import BaseModelConfig, WhisperConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
+    ComponentSpec,
     ModelTask,
     _make_graph,
-    _make_kv_cache_inputs,
     _make_model,
+)
+from mobius.tasks._cache_utils import (
+    _make_kv_cache_inputs,
     _register_kv_cache_outputs,
 )
 
@@ -33,11 +38,17 @@ class SpeechToTextTask(ModelTask):
     (matching the :class:`WhisperForConditionalGeneration` layout).
     """
 
+    model_roles: ClassVar[dict[str, str]] = {"encoder": "encoder", "decoder": "decoder"}
+    components: ClassVar[ComponentSpec] = ComponentSpec(
+        encoder="model.encoder", decoder="model.decoder"
+    )
+
     def build(
         self,
         module: nn.Module,
         config: BaseModelConfig,
     ) -> ModelPackage:
+        self._validate_components(module)
         if not isinstance(config, WhisperConfig):
             raise TypeError(
                 f"SpeechToTextTask requires WhisperConfig, got {type(config).__name__}"
@@ -58,19 +69,18 @@ class SpeechToTextTask(ModelTask):
         batch = ir.SymbolicDim("batch")
         audio_seq_len = ir.SymbolicDim("audio_seq_len")
 
-        input_features = ir.Value(
-            name="input_features",
-            shape=ir.Shape([batch, config.num_mel_bins, audio_seq_len]),
-            type=ir.TensorType(ir.DataType.FLOAT),
-        )
-
-        graph, builder = _make_graph([input_features], name="encoder")
+        graph, builder = _make_graph(name="encoder")
         op = builder.op
+
+        input_features = builder.input(
+            "input_features",
+            dtype=ir.DataType.FLOAT,
+            shape=[batch, config.num_mel_bins, audio_seq_len],
+        )
 
         encoder_hidden_states = encoder(op, input_features=input_features)
 
-        encoder_hidden_states.name = "encoder_hidden_states"
-        graph.outputs.append(encoder_hidden_states)
+        builder.add_output(encoder_hidden_states, "encoder_hidden_states")
 
         return _make_model(graph)
 
@@ -84,25 +94,27 @@ class SpeechToTextTask(ModelTask):
         past_seq_len = ir.SymbolicDim("past_sequence_len")
         encoder_seq_len = ir.SymbolicDim("encoder_sequence_len")
 
-        decoder_input_ids = ir.Value(
-            name="decoder_input_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
+        graph, builder = _make_graph()
+        op = builder.op
+
+        decoder_input_ids = builder.input(
+            "decoder_input_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, seq_len],
         )
-        encoder_hidden_states = ir.Value(
-            name="encoder_hidden_states",
-            shape=ir.Shape([batch, encoder_seq_len, config.hidden_size]),
-            type=ir.TensorType(config.dtype),
+        encoder_hidden_states = builder.input(
+            "encoder_hidden_states",
+            dtype=config.dtype,
+            shape=[batch, encoder_seq_len, config.hidden_size],
         )
-        position_ids = ir.Value(
-            name="position_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
+        position_ids = builder.input(
+            "position_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, seq_len],
         )
 
-        graph_inputs = [decoder_input_ids, encoder_hidden_states, position_ids]
-
-        kv_inputs, past_key_values = _make_kv_cache_inputs(
+        past_key_values = _make_kv_cache_inputs(
+            builder,
             config.num_hidden_layers,
             config.num_key_value_heads,
             config.head_dim,
@@ -110,10 +122,6 @@ class SpeechToTextTask(ModelTask):
             batch,
             past_seq_len,
         )
-        graph_inputs.extend(kv_inputs)
-
-        graph, builder = _make_graph(graph_inputs, name="decoder")
-        op = builder.op
 
         logits, present_key_values = decoder(
             op,
@@ -123,8 +131,7 @@ class SpeechToTextTask(ModelTask):
             past_key_values=past_key_values,
         )
 
-        logits.name = "logits"
-        graph.outputs.append(logits)
-        _register_kv_cache_outputs(graph, present_key_values)
+        builder.add_output(logits, "logits")
+        _register_kv_cache_outputs(builder, present_key_values)
 
         return _make_model(graph)

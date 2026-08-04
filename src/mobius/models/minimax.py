@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """MiniMax causal language model with Lightning Attention.
 
@@ -22,8 +22,7 @@ import math
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import (
@@ -89,7 +88,7 @@ class MiniMaxDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | None,
         position_embeddings: tuple[ir.Value, ir.Value],
@@ -145,7 +144,7 @@ class MiniMaxTextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -209,7 +208,7 @@ class MiniMaxCausalLMModel(CausalLMModel):
 
 
 def _scaled_add(
-    op: builder.OpBuilder,
+    op: OpBuilder,
     residual: ir.Value,
     sub_layer_out: ir.Value,
     alpha: float,

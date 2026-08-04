@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Qwen3-TTS Codec Tokenizer 12Hz — ONNX model classes.
 
@@ -20,8 +20,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components._codec_conv import (
     CausalConv1d,
@@ -145,7 +144,7 @@ class Qwen3TTSCodecDecoderModel(nn.Module):
         )
         self.decoder = nn.Sequential(*decoder_modules)
 
-    def forward(self, op: builder.OpBuilder, codes: ir.Value):
+    def forward(self, op: OpBuilder, codes: ir.Value):
         """Decode audio codes to waveform.
 
         Args:
@@ -187,8 +186,8 @@ class Qwen3TTSCodecDecoderModel(nn.Module):
         # 6. Clamp to [-1, 1]
         hidden = op.Clip(
             hidden,
-            op.Constant(value_float=-1.0),
-            op.Constant(value_float=1.0),
+            -1.0,
+            1.0,
         )
 
         return hidden
@@ -256,7 +255,7 @@ class Qwen3TTSCodecEncoderModel(nn.Module):
         # We reuse the same SplitRVQ structure but add encode logic
         self.quantizer = _EncoderSplitRVQ(config)
 
-    def forward(self, op: builder.OpBuilder, waveform: ir.Value):
+    def forward(self, op: OpBuilder, waveform: ir.Value):
         """Encode waveform to audio codes.
 
         Args:
@@ -333,7 +332,7 @@ class _MimiConvEncoder(nn.Module):
             _EncoderConvLayer(1024, 512, 3, 1),  # 14
         )
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         """Encode waveform through conv layers.
 
         Args:
@@ -353,7 +352,7 @@ class _ELUModule(nn.Module):
     that must be computed (not skipped).
     """
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return op.Elu(x, alpha=1.0)
 
 
@@ -381,7 +380,7 @@ class _EncoderConvLayer(nn.Module):
             stride=stride,
         )
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # Causal padding: left-pad by (kernel - 1)
         pad_left = self._kernel - 1
         if pad_left > 0:
@@ -410,7 +409,7 @@ class _EncoderResBlock(nn.Module):
             _EncoderConvLayer(half, dim, 1, 1),  # 3: pointwise conv
         )
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         residual = x
         return op.Add(residual, self.block(op, x))
 
@@ -433,7 +432,7 @@ class _DownsampleConv(nn.Module):
             stride=stride,
         )
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # Causal left-pad: (B, C, T) -> (B, C, T + kernel-1)
         pad_left = self._kernel - 1
         if pad_left > 0:
@@ -483,7 +482,7 @@ class _EncoderSplitRVQ(nn.Module):
         self._num_semantic = num_semantic
         self._num_valid = config.num_quantizers if hasattr(config, "num_quantizers") else 16
 
-    def forward(self, op: builder.OpBuilder, hidden: ir.Value):
+    def forward(self, op: OpBuilder, hidden: ir.Value):
         """Encode features to discrete codes.
 
         Args:
@@ -530,7 +529,7 @@ class _EncoderRVQ(nn.Module):
             [_EncoderVQ(codebook_size, dim) for _ in range(num_quantizers)]
         )
 
-    def forward(self, op: builder.OpBuilder, hidden: ir.Value):
+    def forward(self, op: OpBuilder, hidden: ir.Value):
         """Encode to codes with residual quantization.
 
         Args:
@@ -575,7 +574,7 @@ class _EncoderVQ(nn.Module):
         # codebook.embed_sum -> precomputed to codebook.embedding
         self.codebook = _EncoderCodebook(codebook_size, dim)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         """Find nearest codebook entry.
 
         Args:
@@ -598,7 +597,7 @@ class _EncoderVQ(nn.Module):
             op.Unsqueeze(embedding, [0]), [-1], keepdims=0
         )  # (1, codebook_size)
         dot = op.MatMul(x_t, op.Transpose(embedding, perm=[1, 0]))
-        distances = op.Add(op.Sub(x_sq, op.Mul(dot, op.Constant(value_float=2.0))), e_sq)
+        distances = op.Add(op.Sub(x_sq, op.Mul(dot, 2.0)), e_sq)
 
         # ArgMin across codebook dimension
         codes = op.ArgMin(distances, axis=-1, keepdims=0)  # (B, T)
@@ -620,7 +619,7 @@ class _EncoderCodebook(nn.Module):
         super().__init__()
         self.embedding = nn.Parameter([codebook_size, dim])
 
-    def forward(self, op: builder.OpBuilder):
+    def forward(self, op: OpBuilder):
         """Return the embedding table as an identity op.
 
         This ensures onnxscript registers the parameter.
@@ -708,6 +707,10 @@ class Qwen3TTSTokenizerV2Model(nn.Module):
             if "codebook.initialized" in key:
                 continue
 
+            # Rename encoder transformer MLP weights:
+            # HF uses fc1/fc2; ONNX uses up_proj/down_proj
+            key = key.replace(".mlp.fc1.", ".mlp.up_proj.")
+            key = key.replace(".mlp.fc2.", ".mlp.down_proj.")
             # Pass through everything else
             cleaned[key] = value
 

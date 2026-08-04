@@ -22,7 +22,8 @@ class MaskedLMTask(ModelTask):
     Inputs:
         - input_ids: [batch, sequence_len] INT64
         - attention_mask: [batch, sequence_len] INT64
-        - token_type_ids: [batch, sequence_len] INT64 (optional, for BERT)
+        - token_type_ids: [batch, sequence_len] INT64 (always emitted; pass
+          zeros for models such as RoBERTa/ESM that do not use segment IDs)
 
     Outputs:
         - logits: [batch, sequence_len, vocab_size] FLOAT
@@ -36,24 +37,16 @@ class MaskedLMTask(ModelTask):
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
 
-        input_ids = ir.Value(
-            name="input_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
-        attention_mask = ir.Value(
-            name="attention_mask",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
-        token_type_ids = ir.Value(
-            name="token_type_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
-
-        graph, builder = _make_graph([input_ids, attention_mask, token_type_ids])
+        graph, builder = _make_graph()
         op = builder.op
+
+        input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
+        attention_mask = builder.input(
+            "attention_mask", dtype=ir.DataType.INT64, shape=[batch, seq_len]
+        )
+        token_type_ids = builder.input(
+            "token_type_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len]
+        )
 
         logits = module(
             op,
@@ -62,7 +55,6 @@ class MaskedLMTask(ModelTask):
             token_type_ids=token_type_ids,
         )
 
-        logits.name = "logits"
-        graph.outputs.append(logits)
+        builder.add_output(logits, "logits")
 
         return ModelPackage({"model": _make_model(graph)}, config=config)

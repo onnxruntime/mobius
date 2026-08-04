@@ -1,6 +1,6 @@
 #!/usr/bin/env python
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Qwen2.5-VL generation with onnxruntime-genai.
 
@@ -10,7 +10,7 @@ text generation — with or without an image.
 
 Requirements::
 
-    pip install mobius-ai[ort-genai]
+    pip install mobius-onnx[ort-genai]
 
 Usage::
 
@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 
 import onnxruntime_genai as og
 
@@ -92,8 +93,8 @@ def _write_genai_config(config, output_dir: str) -> None:
                 },
             },
             "vision": {
-                "filename": "vision/model.onnx",
-                "config_filename": "processor_config.json",
+                "filename": "vision_encoder/model.onnx",
+                "config_filename": "image_processor.json",
                 "spatial_merge_size": 2,
                 "tokens_per_second": 2.0,
                 "inputs": {
@@ -144,13 +145,13 @@ def _copy_tokenizer(model_id: str, output_dir: str) -> None:
     processor = AutoProcessor.from_pretrained(model_id)
     processor.save_pretrained(output_dir)
 
-    # ORT GenAI expects ort-extensions processor_config.json format
+    # ORT GenAI expects ort-extensions image_processor.json format
     # (not the HuggingFace format), so overwrite with the correct schema.
     _write_processor_config(processor, output_dir)
 
 
 def _write_processor_config(processor, output_dir: str) -> None:
-    """Write processor_config.json in the ort-extensions format.
+    """Write image_processor.json in the ort-extensions format.
 
     NOTE: The ``width`` / ``height`` in the Resize step are default hints.
     Call ``_update_resize_for_image`` before running multimodal inference
@@ -222,14 +223,14 @@ def _write_processor_config(processor, output_dir: str) -> None:
             ],
         }
     }
-    with open(os.path.join(output_dir, "processor_config.json"), "w") as f:
+    with open(os.path.join(output_dir, "image_processor.json"), "w") as f:
         json.dump(processor_config, f, indent=2)
 
 
 def _update_resize_for_image(
     model_dir: str, image_path: str, patch_size: int = 14, merge_size: int = 2
 ) -> None:
-    """Update processor_config.json resize dims to match HF smart_resize.
+    """Update image_processor.json resize dims to match HF smart_resize.
 
     The ORT GenAI processor uses the configured width/height as the
     target resize.  HuggingFace instead computes target dimensions from
@@ -247,7 +248,7 @@ def _update_resize_for_image(
     new_h = max(factor, round(h / factor) * factor)
     new_w = max(factor, round(w / factor) * factor)
 
-    config_path = os.path.join(model_dir, "processor_config.json")
+    config_path = os.path.join(model_dir, "image_processor.json")
     with open(config_path) as f:
         config = json.load(f)
 
@@ -377,19 +378,21 @@ def generate_with_image(
     print("-" * 40)
 
     tokenizer_stream = tokenizer.create_stream()
-    tokens_generated = 0
+    generated_tokens: list[int] = []
     while not generator.is_done():
         generator.generate_next_token()
         token = generator.get_next_tokens()[0]
+        generated_tokens.append(token)
         print(tokenizer_stream.decode(token), end="", flush=True)
-        tokens_generated += 1
-        if tokens_generated >= max_new_tokens:
+        if len(generated_tokens) >= max_new_tokens:
             break
 
     print()
     print("-" * 40)
 
+    output = tokenizer.decode(generated_tokens)
     del generator
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -530,6 +533,11 @@ def main():
         action="store_true",
         help="Also run with HuggingFace transformers and compare outputs.",
     )
+    parser.add_argument(
+        "--ci",
+        action="store_true",
+        help="Exit with non-zero code on failure (for CI pipelines).",
+    )
     args = parser.parse_args()
 
     if args.save_to:
@@ -548,29 +556,51 @@ def main():
         print("=" * 60)
         print("ORT GenAI")
         print("=" * 60)
-        generate_with_image(model_dir, prompt, args.image, args.max_new_tokens)
+        onnx_output = generate_with_image(model_dir, prompt, args.image, args.max_new_tokens)
         if args.compare_hf:
             print("\n" + "=" * 60)
             print("HuggingFace Transformers")
             print("=" * 60)
-            generate_with_image_hf(
+            hf_output = generate_with_image_hf(
                 args.model_id,
                 prompt,
                 args.image,
                 args.max_new_tokens,
             )
+            if onnx_output.strip() == hf_output.strip():
+                print("\n\u2713 Outputs match exactly!")
+            else:
+                print("\n\u2717 Outputs differ!")
+                print(f"  ONNX: {onnx_output!r}")
+                print(f"  HF:   {hf_output!r}")
+                if args.ci:
+                    sys.exit(1)
     else:
         prompt = args.prompt or DEFAULT_PROMPT
         print("=" * 60)
         print("ORT GenAI")
         print("=" * 60)
-        generate_text(model_dir, prompt, args.max_new_tokens)
+        onnx_output = generate_text(model_dir, prompt, args.max_new_tokens)
         if args.compare_hf:
             print("\n" + "=" * 60)
             print("HuggingFace Transformers")
             print("=" * 60)
-            generate_text_hf(args.model_id, prompt, args.max_new_tokens)
+            hf_output = generate_text_hf(args.model_id, prompt, args.max_new_tokens)
+            if onnx_output.strip() == hf_output.strip():
+                print("\n\u2713 Outputs match exactly!")
+            else:
+                print("\n\u2717 Outputs differ!")
+                print(f"  ONNX: {onnx_output!r}")
+                print(f"  HF:   {hf_output!r}")
+                if args.ci:
+                    sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        if "--ci" in sys.argv:
+            print(f"FAILED: {e}", file=sys.stderr)
+            sys.exit(1)
+        raise

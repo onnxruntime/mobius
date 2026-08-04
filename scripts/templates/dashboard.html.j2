@@ -14,6 +14,10 @@
   --accent: #0969da;
   --l0: #cf222e; --l1: #9a6700; --l2: #bf8700;
   --l3: #1a7f37; --l4: #116329; --l5: #0969da;
+  /* xfail: deliberately outside the L0–L5 spectrum (red→amber→green→blue)
+     because "expected failure" is a status modifier, not a level. Purple
+     avoids visual collision with the amber L1/L2 passing dots. */
+  --xfail: #8250df;
 }
 [data-theme="dark"] {
   --bg: #0d1117;
@@ -24,6 +28,7 @@
   --accent: #58a6ff;
   --l0: #f85149; --l1: #d29922; --l2: #e3b341;
   --l3: #3fb950; --l4: #2ea043; --l5: #58a6ff;
+  --xfail: #a371f7;
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
@@ -103,8 +108,8 @@ tr:hover { background: rgba(88, 166, 255, 0.05); }
 .dot.active-5 { background: var(--l5); border-color: var(--l5); }
 .dot.failed { background: var(--l0); border-color: var(--l0); }
 .dot.xfail {
-  /* test runs but is expected to fail — amber solid fill */
-  background: rgba(210,153,34,0.35); border-color: var(--l1);
+  /* test runs but is expected to fail — lighter interior + solid border */
+  background: rgba(163,113,247,0.35); border-color: var(--xfail);
   border-style: solid; border-width: 2px;
 }
 .dot.skipped {
@@ -147,15 +152,17 @@ tr:hover { background: rgba(88, 166, 255, 0.05); }
 .family-toggle { margin-right: 8px; }
 .family-paths { font-weight: 400; }
 /* Series histogram: small level badges in family header */
-.series-hist { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+.series-hist { display: flex; gap: 4px; align-items: center; flex-wrap: nowrap; }
 .series-hist .hist-badge {
   font-size: 0.7em; font-weight: 600; padding: 1px 5px; border-radius: 4px;
   white-space: nowrap;
 }
-.l3-status { font-size: 0.75em; font-weight: 600; padding: 1px 6px; border-radius: 4px; }
-.l3-pass { background: rgba(63,185,80,0.2); color: var(--l3); }
-.l3-xfail { background: rgba(210,153,34,0.2); color: var(--l1); }
-.l3-skip { background: rgba(139,148,158,0.2); color: var(--text-muted); }
+/* Per-level status badges (xfail / pass / skip). Level-neutral by design:
+   the same classes are reused for L2 and L3 badges so visual treatment of
+   "expected failure", "pass", and "skipped" stays consistent across levels. */
+.status-badge { font-size: 0.75em; font-weight: 600; padding: 1px 6px; border-radius: 4px; }
+.status-xfail { background: rgba(163,113,247,0.2); color: var(--xfail); }
+.status-skip { background: rgba(139,148,158,0.2); color: var(--text-muted); }
 .ratio-badge { font-size: 0.75em; font-weight: 600; padding: 1px 6px; border-radius: 4px; }
 .ratio-high { background: rgba(63,185,80,0.2); color: var(--l3); }
 .ratio-medium { background: rgba(210,153,34,0.2); color: var(--l1); }
@@ -207,12 +214,16 @@ tr:hover { background: rgba(88, 166, 255, 0.05); }
   color: var(--text-muted); white-space: nowrap;
   background: var(--surface); position: sticky; right: 0; z-index: 2;
 }
-/* Level color scale — rgba keeps it readable in both light and dark themes */
-.cell-l1 { background: rgba(76,175,80,0.15); }
-.cell-l2 { background: rgba(76,175,80,0.32); }
-.cell-l3 { background: rgba(76,175,80,0.52); }
-.cell-l4 { background: rgba(76,175,80,0.72); }
-.cell-l5 { background: rgba(76,175,80,0.92); }
+/* Component matrix uses the same L1-L5 hues as coverage dots/badges. */
+/* Solid fills (not translucent) so cells read at full saturation, matching
+   the main coverage dots. Translucency washed colors toward the dark
+   surface and crushed the brightness gap between same-hue neighbors
+   (L1 vs L2 amber, L3 vs L4 green), making them indistinguishable. */
+.cell-l1 { background: var(--l1); border-color: var(--l1); }
+.cell-l2 { background: var(--l2); border-color: var(--l2); }
+.cell-l3 { background: var(--l3); border-color: var(--l3); }
+.cell-l4 { background: var(--l4); border-color: var(--l4); }
+.cell-l5 { background: var(--l5); border-color: var(--l5); }
 .matrix-legend {
   display: flex; align-items: center; gap: 12px; margin-top: 8px;
   font-size: 0.8em; color: var(--text-muted); flex-wrap: wrap;
@@ -255,6 +266,8 @@ table, th, .detail-row td, .config-block, .component-section,
   margin-left: auto; font-size: 0.8em; color: var(--text-muted);
 }
 .dot-legend-item { display: flex; gap: 4px; align-items: center; }
+.dot-legend-pass { display: inline-flex; gap: 3px; align-items: center; }
+.dot-legend-pass .dot { width: 12px; height: 12px; }
 </style>
 </head>
 <body>
@@ -271,7 +284,7 @@ document.documentElement.setAttribute('data-theme',t);}())
   </div>
 </div>
 <p class="subtitle">
-  Generated {{ timestamp }} &middot; Commit <code>{{ commit }}</code> &middot; {{ total_models }} registered model types
+  Generated {{ timestamp }} &middot; Commit <code>{{ commit }}</code> &middot; {{ total_models }} Registered Model Types
 </p>
 <div class="summary" role="region" aria-label="Coverage summary" id="summary-bar"></div>
 
@@ -295,12 +308,12 @@ document.documentElement.setAttribute('data-theme',t);}())
     <button data-group="flat" aria-pressed="false">Flat</button>
   </div>
   <div class="dot-legend">
-    <span class="dot-legend-item"><span class="dot active-3" style="display:inline-block;vertical-align:middle"></span> Tested</span>
+    <span class="dot-legend-item"><span class="dot-legend-pass"><span class="dot active-1"></span><span class="dot active-2"></span><span class="dot active-3"></span><span class="dot active-4"></span><span class="dot active-5"></span></span> Pass (L1-L5)</span>
     <span class="dot-legend-item"><span class="dot failed" style="display:inline-block;vertical-align:middle"></span> Failed</span>
-    <span class="dot-legend-item"><span class="dot xfail" style="display:inline-block;vertical-align:middle"></span> Expected failure</span>
+    <span class="dot-legend-item"><span class="dot xfail" style="display:inline-block;vertical-align:middle"></span> Expected Failure</span>
     <span class="dot-legend-item"><span class="dot skipped" style="display:inline-block;vertical-align:middle"></span> Skipped</span>
-    <span class="dot-legend-item"><span class="dot pending" style="display:inline-block;vertical-align:middle"></span> Awaiting data</span>
-    <span class="dot-legend-item"><span class="dot untested" style="display:inline-block;vertical-align:middle"></span> No test</span>
+    <span class="dot-legend-item"><span class="dot pending" style="display:inline-block;vertical-align:middle"></span> Awaiting Data</span>
+    <span class="dot-legend-item"><span class="dot untested" style="display:inline-block;vertical-align:middle"></span> No Test</span>
   </div>
 </div>
 
@@ -323,7 +336,7 @@ document.documentElement.setAttribute('data-theme',t);}())
 
 <div class="component-section">
   <h2>Component Coverage</h2>
-  <p class="subtitle">Which architectural components are exercised — and at what test level (darker = higher)</p>
+  <p class="subtitle">Which architectural components are exercised — and at what test level (L1-L5 colors mirror the main coverage dots)</p>
   <div class="matrix-scroll"><div id="component-matrix-container"></div></div>
   <details style="margin-top:16px">
     <summary style="cursor:pointer;font-size:0.9em;color:var(--text-muted)">Component details &amp; example configs</summary>
@@ -379,22 +392,34 @@ const LEVEL_DESCRIPTIONS = {
   const bar = document.getElementById('summary-bar');
   const totalCard = `<div class="summary-card">
     <div class="number">${SUMMARY.total}</div>
-    <div class="label">Total models</div>
+    <div class="label">Total Models</div>
   </div>`;
   bar.innerHTML = totalCard;
   for (let i = 0; i <= 5; i++) {
     const count = SUMMARY.by_level[i] || 0;
-    // Annotate L4 and L5 cards with skipped + awaiting-data counts so the full
-    // picture is visible without a separate redundant card.
+    // Annotate level cards with status breakdowns. All level annotations
+    // pull from a per-level ``l<N>_status_counts`` dict whose buckets
+    // sum to SUMMARY.total, so no models are silently dropped.
     let annotation = '';
-    if (i === 4 || i === 5) {
-      const skipped = i === 4 ? (SUMMARY.l4_skipped_count || 0) : (SUMMARY.l5_skipped_count || 0);
-      const caseKey = i === 4 ? 'l4_case' : 'l5_case';
-      const levelKey = 'l' + i;
-      const awaiting = MODEL_DATA.filter(m => m[caseKey] && !m[levelKey]).length;
+    if (i === 2) {
+      // L2 admits an extra ``xfail_graph_only`` flavor (config parses but
+      // full-graph build xfails); fold it into a single xfail bucket here.
+      const s = SUMMARY.l2_status_counts || {};
       const parts = [];
-      if (skipped) parts.push(`${skipped} skipped`);
-      if (awaiting) parts.push(`${awaiting} awaiting data`);
+      const xf = (s.xfail || 0) + (s.xfail_graph_only || 0);
+      if (xf) parts.push(`${xf} XFail`);
+      if (parts.length) annotation = `<div class="card-annotation">${parts.join(' \u00B7 ')}</div>`;
+    }
+    if (i >= 3) {
+      // L3/L4/L5: show only non-pass buckets in the footer annotation.
+      // The card's large headline number already shows pass count, so
+      // repeating it below is redundant noise.
+      const s = SUMMARY[`l${i}_status_counts`] || {};
+      const parts = [];
+      if (s.xfail) parts.push(`${s.xfail} XFail`);
+      if (s.skip) parts.push(`${s.skip} Skip`);
+      if (s.awaiting) parts.push(`${s.awaiting} Awaiting Data`);
+      if (s.untested) parts.push(`${s.untested} Untested`);
       if (parts.length) annotation = `<div class="card-annotation">${parts.join(' \u00B7 ')}</div>`;
     }
     bar.innerHTML += `<div class="summary-card level-${i}" title="${LEVEL_DESCRIPTIONS[i]}">
@@ -403,19 +428,7 @@ const LEVEL_DESCRIPTIONS = {
       ${annotation}
     </div>`;
   }
-  // L3 parity breakdown
-  const l3s = SUMMARY.l3_status_counts || {};
-  if (l3s.pass || l3s.xfail || l3s.skip) {
-    bar.innerHTML += `<div class="summary-card" title="L3 parity status breakdown">
-      <div class="number" style="font-size:1em;line-height:1.4">
-        <span style="color:var(--l3)">${l3s.pass || 0}\u2713</span>
-        <span style="color:var(--l1)">${l3s.xfail || 0}\u26A0</span>
-        <span style="color:var(--text-muted)">${l3s.skip || 0}\u23ED</span>
-      </div>
-      <div class="label">L3 Parity Status</div>
-    </div>`;
-  }
-  // (L4/L5 skipped counts are shown as annotations on the L4/L5 level cards above.)
+  // (L2/L3 status, L4/L5 skipped counts shown as annotations on level cards above.)
 })();
 
 // --- Category filter ---
@@ -520,55 +533,81 @@ function renderTable() {
 
 function renderModelRow(m) {
   const dotLabels = ['L1: Graph', 'L2: Config', 'L3: Parity', 'L4: Golden', 'L5: Generation'];
+  // Per-level state extraction. L2..L5 share the {status, configured}
+  // contract (status \u2208 {pass, xfail, skip, null}, plus xfail_graph_only
+  // for L2). L1 is a single boolean with no granular status, so it falls
+  // back to {active: m.l1, configured: has L1 config overrides}.
+  // Skip status only applies to L3/L4/L5 (L2 cannot be skipped).
   const dots = [1,2,3,4,5].map(i => {
-    const levelKey = 'l' + i;
-    const active = (i === 3) ? (m.l3 && m.l3_status === 'pass') : m[levelKey];
-    const hasTest = (i === 1 && m.config_overrides.length > 0)
-      || (i === 2 && m.test_model_id)
-      || (i === 3 && m.l3_status != null)
-      || (i === 4 && m.l4_case)
-      || (i === 5 && m.l5_case);
-    // xfail: test RUNS but is expected to fail (known failure).
-    const isXfail = i === 3 && m.l3_status === 'xfail';
-    // isSkipped: test has a skip_reason — not run, reason documented.
-    const isL3Skip = i === 3 && m.l3_status === 'skip';
-    const isSkipped = (i === 4 && m.l4_skipped) || (i === 5 && m.l5_skipped) || isL3Skip;
-    // isPending: YAML test case defined but no golden data generated yet (awaiting data).
-    const isPending = hasTest && !active && !isXfail && !isL3Skip &&
-      ((i === 4 && m.l4_case) || (i === 5 && m.l5_case));
+    let active, configured, status;
+    if (i === 1) {
+      active = m.l1;
+      configured = m.config_overrides.length > 0;
+      status = null;
+    } else {
+      active = m[`l${i}`];                  // l<i>_passes (bool)
+      configured = m[`l${i}_configured`];    // l<i>_has_test_case / l<i>_arch_validation
+      status = m[`l${i}_status`];
+    }
+    const isXfail = status === 'xfail' || status === 'xfail_graph_only';
+    const isSkipped = status === 'skip';
+    // "awaiting / pending" is status=null AND configured (yaml case exists
+    // but no golden generated yet, or L1 config exists but graph build
+    // hasn't been verified). Only meaningful for L4/L5 in practice.
+    const isPending = !active && !isXfail && !isSkipped && configured && (i === 4 || i === 5);
     let cls = 'dot';
     let label = dotLabels[i-1];
     if (active) {
       cls += ' active-' + i;
-      label += ' (passed)';
+      label += ' (Passed)';
     } else if (isXfail) {
       cls += ' xfail';
-      label += ` (expected failure: ${esc(m.l3_reason || 'xfail')})`;
+      const reason = m[`l${i}_reason`] || 'xfail';
+      label += ` (Expected failure: ${esc(reason)})`;
     } else if (isSkipped) {
+      const reason = m[`l${i}_reason`] || m.yaml_skip_reason || 'known issue';
       cls += ' skipped';
-      if (isL3Skip) label += ` (skipped: ${esc(m.l3_reason || '')})`;
-      else label += ` (skipped: ${esc(m.yaml_skip_reason || 'known issue')})`;
+      label += ` (Skipped: ${esc(reason)})`;
     } else if (isPending) {
       cls += ' pending';
-      label += ' (test case defined, awaiting golden data)';
-    } else if (hasTest) {
+      label += ' (Test case defined, awaiting golden data)';
+    } else if (configured) {
       cls += ' failed';
-      label += ' (test exists, not passing)';
+      label += ' (Test exists, not passing)';
     } else {
       cls += ' untested';
-      label += ' (no test)';
+      label += ' (No test)';
     }
     return `<div class="${cls}" title="${label}" role="img" aria-label="${label}"></div>`;
   }).join('');
 
-  // L3 status badge
+  // Per-level inline badges next to the model_type. L3 surfaces all three
+  // pass/xfail/skip outcomes; L2/L4/L5 surface only xfail because their
+  // dot already conveys pass/skip unambiguously and xfail is the only
+  // state that is otherwise visually identical to a fail.
+  let l2Badge = '';
+  if (m.l2_status === 'xfail') {
+    l2Badge = ` <span class="status-badge status-xfail" title="L2 known failure: ${esc(m.l2_reason || '')}">XFail</span>`;
+  } else if (m.l2_status === 'xfail_graph_only') {
+    l2Badge = ` <span class="status-badge status-xfail" title="L2 graph-build xfail: ${esc(m.l2_reason || '')}">XFail</span>`;
+  }
+  // Positive states (L3 parity pass, L5 e2e verified) are intentionally NOT
+  // badged here: they would duplicate the Confidence column and the L1-L5 dot
+  // strip. Only exception states (xfail / skip) get inline badges, since those
+  // are the signals not otherwise distinguishable at a glance.
   let l3Badge = '';
-  if (m.l3_status === 'pass') {
-    l3Badge = ' <span class="l3-status l3-pass" title="L3 synthetic parity passes">\u2713</span>';
-  } else if (m.l3_status === 'xfail') {
-    l3Badge = ` <span class="l3-status l3-xfail" title="L3 known failure: ${esc(m.l3_reason || '')}">xfail</span>`;
+  if (m.l3_status === 'xfail') {
+    l3Badge = ` <span class="status-badge status-xfail" title="L3 known failure: ${esc(m.l3_reason || '')}">XFail</span>`;
   } else if (m.l3_status === 'skip') {
-    l3Badge = ` <span class="l3-status l3-skip" title="L3 skipped / not run: ${esc(m.l3_reason || '')}">skip</span>`;
+    l3Badge = ` <span class="status-badge status-skip" title="L3 skipped / not run: ${esc(m.l3_reason || '')}">Skip</span>`;
+  }
+  let l4Badge = '';
+  if (m.l4_status === 'xfail') {
+    l4Badge = ` <span class="status-badge status-xfail" title="L4 known failure: ${esc(m.l4_reason || '')}">XFail</span>`;
+  }
+  let l5Badge = '';
+  if (m.l5_status === 'xfail') {
+    l5Badge = ` <span class="status-badge status-xfail" title="L5 known failure: ${esc(m.l5_reason || '')}">XFail</span>`;
   }
 
   // min_token_match_ratio badge
@@ -587,7 +626,7 @@ function renderModelRow(m) {
   // Use single-quoted HTML attributes so JSON.stringify's double quotes don't
   // break attribute parsing when this string is set via innerHTML.
   let row = `<tr style="cursor:pointer" onclick='toggleDetail(${JSON.stringify(m.model_type)})'>
-    <td style="padding-left: ${groupByFamily ? '32px' : '12px'}">${esc(m.model_type)}${l3Badge}${ratioBadge}</td>
+    <td style="padding-left: ${groupByFamily ? '32px' : '12px'}">${esc(m.model_type)}${l2Badge}${l3Badge}${l4Badge}${l5Badge}${ratioBadge}</td>
     <td>${esc(m.category)}</td>
     <td><code style="font-size:0.8em">${esc(m.module_class)}</code></td>
     <td><span class="badge badge-${m.confidence_level}">${LEVEL_LABELS[m.confidence_level]}</span></td>
@@ -602,28 +641,36 @@ function renderModelRow(m) {
   return row;
 }
 
+// Map a {status, active, configured} triple to a status emoji for the
+// detail-row level table. Mirrors the dot dispatch but uses glyphs:
+//   \u2705 \u2713 pass    \u26A0\uFE0F warning xfail    \u23ED next-track skip
+//   \u23F3 hourglass awaiting    \u274C cross failed    \u2796 dash untested
+function statusIcon(status, active, configured) {
+  if (active) return '\u2705';
+  if (status === 'xfail' || status === 'xfail_graph_only') return '\u26A0\uFE0F';
+  if (status === 'skip') return '\u23ED';
+  if (configured) return status == null ? '\u23F3' : '\u274C';
+  return '\u2796';
+}
+
 function renderDetailRow(m) {
-  const l3Active = m.l3 && m.l3_status === 'pass';
-  // xfail = test runs but expected to fail; skip = test not run at all.
-  const l3IconOverride = l3Active ? null
-    : m.l3_status === 'xfail' ? '\u26A0\uFE0F'  // ⚠️ known failure
-    : m.l3_status === 'skip'  ? '\u23ED'         // ⏭ not run
-    : null;
+  // Build the per-level rows from the unified status fields. Each entry:
+  //   [label, active (passing bool), description, configured, icon]
   const levels = [
-    ['L1: Graph Build', m.l1, 'Model builds a valid ONNX graph from tiny config', m.config_overrides.length > 0, null],
-    ['L2: Config Compatible', m.l2, 'Full-size HF config produces valid graph', !!m.test_model_id, null],
-    ['L3: Synthetic Parity', l3Active, 'Random-weight forward pass matches HF (atol)', m.l3_status != null, l3IconOverride],
-    ['L4: Golden Match', m.l4, 'Real-weight logits match golden reference', m.l4_case && !m.l4_skipped, (m.l4_case && !m.l4 && !m.l4_skipped) ? '\u23F3' : null],
-    ['L5: Generation', m.l5, 'Full generation matches golden output', m.l5_case && !m.l5_skipped, (m.l5_case && !m.l5 && !m.l5_skipped) ? '\u23F3' : null],
+    ['L1: Graph Build',       m.l1, 'Model builds a valid ONNX graph from tiny config',
+      m.config_overrides.length > 0, statusIcon(null, m.l1, m.config_overrides.length > 0)],
+    ['L2: Config Compatible', m.l2, 'Full-size HF config produces valid graph',
+      m.l2_configured, statusIcon(m.l2_status, m.l2, m.l2_configured)],
+    ['L3: Synthetic Parity',  m.l3, 'Random-weight forward pass matches HF (atol)',
+      m.l3_configured, statusIcon(m.l3_status, m.l3, m.l3_configured)],
+    ['L4: Golden Match',      m.l4, 'Real-weight logits match golden reference',
+      m.l4_configured, statusIcon(m.l4_status, m.l4, m.l4_configured)],
+    ['L5: Generation',        m.l5, 'Full generation matches golden output',
+      m.l5_configured, statusIcon(m.l5_status, m.l5, m.l5_configured)],
   ];
 
   let levelHtml = '<table style="width:100%;margin-bottom:8px;border:none">';
-  levels.forEach(([name, active, desc, hasTest, iconOverride]) => {
-    let icon;
-    if (active) icon = '\u2705';
-    else if (iconOverride) icon = iconOverride;
-    else if (hasTest) icon = '\u274C';
-    else icon = '\u2796';
+  levels.forEach(([name, _active, desc, _configured, icon]) => {
     levelHtml += `<tr><td style="border:none;padding:2px 8px;width:30px">${icon}</td>
       <td style="border:none;padding:2px 8px;font-weight:600">${name}</td>
       <td style="border:none;padding:2px 8px;color:var(--text-muted)">${desc}</td></tr>`;
@@ -641,24 +688,53 @@ function renderDetailRow(m) {
   } else {
     goldenHtml += '<div class="status-row"><span class="status-icon">\u274C</span> No YAML test case defined</div>';
   }
-  goldenHtml += `<div class="status-row"><span class="status-icon">${m.l4 ? '\u2705' : m.l4_skipped ? '\u23ED' : m.l4_case ? '\u274C' : '\u2796'}</span> L4 golden data: ${m.l4 ? 'available' : m.l4_skipped ? `skipped (${esc(m.yaml_skip_reason || 'known issue')})` : m.l4_case ? 'test case exists, run generate_golden.py' : 'none'}</div>`;
-  goldenHtml += `<div class="status-row"><span class="status-icon">${m.l5 ? '\u2705' : m.l5_skipped ? '\u23ED' : m.l5_case ? '\u274C' : '\u2796'}</span> L5 golden data: ${m.l5 ? 'available' : m.l5_skipped ? `skipped (${esc(m.yaml_skip_reason || 'known issue')})` : m.l5_case ? 'test case exists, run generate_golden.py' : 'none'}</div>`;
+  // L4/L5 golden data rows. Dispatch on the unified l<N>_status field;
+  // xfail wins because the golden file usually still exists on disk (it
+  // is the HF reference output, generated even for xfailed tests) but
+  // the test itself is expected to fail \u2014 reporting "available" would be
+  // misleading.
+  function goldenDetail(status, passing, configured, reason) {
+    if (status === 'xfail') return `XFail (${esc(reason || '')})`;
+    if (passing) return 'Available';
+    if (status === 'skip') return `Skipped (${esc(reason || m.yaml_skip_reason || 'known issue')})`;
+    if (configured) return 'Test case exists, run generate_golden.py';
+    return 'None';
+  }
+  const l4Icon = statusIcon(m.l4_status, m.l4, m.l4_configured);
+  goldenHtml += `<div class="status-row"><span class="status-icon">${l4Icon}</span> L4 golden data: ${goldenDetail(m.l4_status, m.l4, m.l4_configured, m.l4_reason)}</div>`;
+  const l5Icon = statusIcon(m.l5_status, m.l5, m.l5_configured);
+  goldenHtml += `<div class="status-row"><span class="status-icon">${l5Icon}</span> L5 golden data: ${goldenDetail(m.l5_status, m.l5, m.l5_configured, m.l5_reason)}</div>`;
 
   if (m.min_token_match_ratio != null) {
     const r = m.min_token_match_ratio;
     const ratioClass = r >= 0.9 ? 'ratio-high' : r >= 0.5 ? 'ratio-medium' : 'ratio-low';
     const pct = Math.round(r * 100);
-    const msg = r < 0.5 ? ' \u26A0\uFE0F low \u2014 test may not be meaningful'
-              : r < 0.9 ? ' \u26A0\uFE0F below recommended threshold (0.9)'
+    const msg = r < 0.5 ? ' \u26A0\uFE0F Low \u2014 test may not be meaningful'
+              : r < 0.9 ? ' \u26A0\uFE0F Below recommended threshold (0.9)'
               : '';
     goldenHtml += `<div class="status-row"><span class="status-icon">\uD83C\uDFAF</span> L5 token match threshold: <span class="ratio-badge ${ratioClass}">${pct}%</span><span style="color:var(--text-muted)">${msg}</span></div>`;
   }
 
+  if (m.yaml_ci_skip_reason) {
+    goldenHtml += `<div class="status-row"><span class="status-icon">\u23ED</span> CI-skipped: <span style="color:var(--text-muted)">${esc(m.yaml_ci_skip_reason)}</span></div>`;
+  }
+
+  if (m.l2_status) {
+    const l2Color = m.l2_status === 'pass' ? 'var(--l3)' : 'var(--l1)';
+    const l2Label = m.l2_status === 'pass' ? 'Pass'
+      : m.l2_status === 'xfail' ? 'Known failure (parse+graph xfail)'
+      : m.l2_status === 'xfail_graph_only' ? 'Known failure (graph-build xfail)'
+      : m.l2_status;
+    goldenHtml += `<div class="status-row"><span class="status-icon" style="color:${l2Color}">\u25CF</span> L2 arch validation: <strong>${l2Label}</strong>`;
+    if (m.l2_reason) goldenHtml += ` <span style="color:var(--text-muted)">\u2014 ${esc(m.l2_reason)}</span>`;
+    goldenHtml += '</div>';
+  }
+
   if (m.l3_status) {
     const statusColor = m.l3_status === 'pass' ? 'var(--l3)' : m.l3_status === 'xfail' ? 'var(--l1)' : 'var(--text-muted)';
-    const statusLabel = m.l3_status === 'pass' ? 'pass'
-      : m.l3_status === 'xfail' ? 'known failure (xfail)'
-      : m.l3_status === 'skip'  ? 'skipped / not run'
+    const statusLabel = m.l3_status === 'pass' ? 'Pass'
+      : m.l3_status === 'xfail' ? 'Known failure (xfail)'
+      : m.l3_status === 'skip'  ? 'Skipped / not run'
       : m.l3_status;
     goldenHtml += `<div class="status-row"><span class="status-icon" style="color:${statusColor}">\u25CF</span> L3 parity: <strong>${statusLabel}</strong>`;
     if (m.l3_reason) goldenHtml += ` <span style="color:var(--text-muted)">\u2014 ${esc(m.l3_reason)}</span>`;
@@ -751,8 +827,8 @@ document.querySelectorAll('#group-toggle button').forEach(btn => {
   // Map confidence level (0–5) to a CSS class for the cell background.
   const levelClass = l => l <= 0 ? '' : `cell-l${Math.min(l, 5)}`;
   const levelTitle = l => {
-    const labels = ['No test', 'L1: Graph builds', 'L2: Config compat',
-                    'L3: Synthetic parity', 'L4: Golden match', 'L5: Generation'];
+    const labels = ['No Test', 'L1: Graph Builds', 'L2: Config Compatible',
+                    'L3: Synthetic Parity', 'L4: Golden Match', 'L5: Generation Verified'];
     return labels[Math.max(0, Math.min(l, 5))];
   };
 
@@ -791,8 +867,8 @@ document.querySelectorAll('#group-toggle button').forEach(btn => {
 
   // Colour legend.
   html += '<div class="matrix-legend">';
-  html += '<span>Level key:</span>';
-  [['', 'Not used'], ['cell-l1', 'L1'], ['cell-l2', 'L2'],
+  html += '<span>Level Key:</span>';
+  [['', 'Not Used'], ['cell-l1', 'L1'], ['cell-l2', 'L2'],
    ['cell-l3', 'L3'], ['cell-l4', 'L4'], ['cell-l5', 'L5']].forEach(([cls, lbl]) => {
     const extra = cls ? '' : 'border:1px solid var(--border)';
     html += `<span class="legend-item"><span class="legend-dot ${cls}" style="${extra}"></span>${lbl}</span>`;
@@ -810,7 +886,12 @@ document.querySelectorAll('#group-toggle button').forEach(btn => {
   CODE_PATH_INFO.forEach(cp => {
     const count = SUMMARY.code_path_coverage[cp.label] || 0;
     const pct = total > 0 ? Math.round(count / total * 100) : 0;
-    const color = pct > 50 ? 'var(--l3)' : pct > 20 ? 'var(--l2)' : 'var(--l0)';
+    const color = pct >= 90 ? 'var(--l5)'
+      : pct >= 70 ? 'var(--l4)'
+      : pct >= 50 ? 'var(--l3)'
+      : pct >= 30 ? 'var(--l2)'
+      : pct > 0 ? 'var(--l1)'
+      : 'var(--l0)';
     grid.innerHTML += `<div class="component-card">
       <h4><span class="tag">${esc(cp.label)}</span> ${esc(cp.description)}</h4>
       <div class="coverage">${count} / ${total} models (${pct}%)</div>
@@ -823,9 +904,12 @@ document.querySelectorAll('#group-toggle button').forEach(btn => {
 // --- Missing coverage ---
 (function renderMissing() {
   const el = document.getElementById('missing-coverage');
-  // A model has coverage if it has an L1 test config OR any YAML test case.
+  // A model has coverage if it has an L1 test config OR a yaml case
+  // (configured or skipped \u2014 a skip still implies the model was
+  // considered for L4/L5 testing).
   const missing = MODEL_DATA.filter(m =>
-    !m.l1 && !m.l4_case && !m.l5_case && !m.l4_skipped && !m.l5_skipped
+    !m.l1 && !m.l4_configured && !m.l5_configured
+    && m.l4_status !== 'skip' && m.l5_status !== 'skip'
   );
   if (missing.length === 0) {
     el.innerHTML = '<p style="color:var(--l3)">\u2705 All models have at least some test coverage!</p>';

@@ -1,4 +1,5 @@
 model_id: "google-t5/t5-small"
+model_type: "t5"
 revision: "df1b051c49625cf57a3d0d8d3863ed4d13564fe4"
 task_type: "seq2seq"
 dtype: "float32"

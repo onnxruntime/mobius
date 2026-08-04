@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Gemma3 multimodal model (vision + text) — 3-model split.
 
@@ -15,11 +15,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import vlm_decoder_weights, vlm_embedding_weights
+from mobius._weight_utils import (
+    vlm_decoder_weights,
+    vlm_embedding_weights,
+    vlm_vision_weights,
+)
 from mobius.components import (
     Gemma3MultiModalProjector,
     Linear,
@@ -46,7 +49,7 @@ class _Gemma3DecoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -87,19 +90,23 @@ class _Gemma3VisionEncoderModel(nn.Module):
             ),
         )
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         vision_features = self.vision_tower(op, pixel_values)
-        return self.multi_modal_projector(op, vision_features)
+        image_features = self.multi_modal_projector(op, vision_features)
+        # Projector returns (batch, tokens, hidden); squeeze the leading
+        # batch dim to (tokens, hidden) to match the 2-D ``image_features``
+        # contract expected by the embedding sub-model (Gather along axis 0)
+        # and the ort-genai runtime, which processes one image at a time.
+        #
+        # Precondition: this assumes exactly one image (leading dim == 1).
+        # True batch>1 / multi-image inference is unsupported here; callers
+        # run the vision encoder once per image and concatenate features.
+        return op.Squeeze(image_features, [0])
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        renamed: dict[str, torch.Tensor] = {
-            key: value
-            for key, value in state_dict.items()
-            if key.startswith(("vision_tower.", "multi_modal_projector."))
-        }
-        return renamed
+        return vlm_vision_weights(state_dict, ("vision_tower.", "multi_modal_projector."))
 
 
 class _Gemma3EmbeddingModel(nn.Module):
@@ -122,7 +129,7 @@ class _Gemma3EmbeddingModel(nn.Module):
         )
         self.image_token_id = config.image_token_id or 0
 
-    def forward(self, op: builder.OpBuilder, input_ids: ir.Value, image_features: ir.Value):
+    def forward(self, op: OpBuilder, input_ids: ir.Value, image_features: ir.Value):
         text_embeds = self.embed_tokens(op, input_ids)
 
         image_mask = op.Equal(
@@ -132,11 +139,18 @@ class _Gemma3EmbeddingModel(nn.Module):
         image_mask_3d = op.Unsqueeze(image_mask, [-1])
 
         mask_int = op.Cast(image_mask, to=7)
-        cumsum = op.CumSum(mask_int, op.Constant(value_int=1))
+        cumsum = op.CumSum(mask_int, 1)
         indices = op.Sub(cumsum, op.Constant(value_int=1))
         indices = op.Clip(indices, op.Constant(value_int=0))
 
-        gathered = op.Gather(image_features, indices, axis=0)
+        # Decode steps may pass empty image features ([0, hidden]); append one
+        # zero row so the Gather below has a valid row that Where will not use.
+        hidden_dim = op.Shape(image_features, start=1, end=2)
+        pad_shape = op.Concat(op.Constant(value_ints=[1]), hidden_dim, axis=0)
+        zero_pad = op.Expand(op.CastLike(0.0, image_features), pad_shape)
+        image_features_padded = op.Concat(image_features, zero_pad, axis=0)
+
+        gathered = op.Gather(image_features_padded, indices, axis=0)
         return op.Where(image_mask_3d, gathered, text_embeds)
 
     def preprocess_weights(
@@ -164,7 +178,7 @@ class Gemma3MultiModalModel(nn.Module):
         self.vision_encoder = _Gemma3VisionEncoderModel(config)
         self.embedding = _Gemma3EmbeddingModel(config)
 
-    def forward(self, op: builder.OpBuilder, **kwargs):
+    def forward(self, op: OpBuilder, **kwargs):
         raise NotImplementedError(
             "Gemma3MultiModalModel uses VisionLanguageTask which calls "
             "each sub-module (decoder, vision_encoder, embedding) separately."
@@ -199,7 +213,13 @@ class Gemma3MultiModalModel(nn.Module):
                 if key == "language_model.model.embed_tokens.weight":
                     renamed["embedding.embed_tokens.weight"] = value
             elif key.startswith("vision_tower."):
-                renamed["vision_encoder." + key] = value
+                # Vision MLP uses ``fc1``/``fc2`` in HF; rename to the
+                # ``FCMLP`` component naming (``up_proj``/``down_proj``).
+                new_key = "vision_encoder." + key
+                new_key = new_key.replace(".mlp.fc1.", ".mlp.up_proj.").replace(
+                    ".mlp.fc2.", ".mlp.down_proj."
+                )
+                renamed[new_key] = value
             elif key.startswith("multi_modal_projector."):
                 renamed["vision_encoder." + key] = value
             else:

@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Convolution and activation components for the Qwen3-TTS codec tokenizer.
 
@@ -15,8 +15,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components._common import LayerNorm, Linear
 
@@ -65,7 +64,7 @@ class CausalConv1d(nn.Module):
             dilation=dilation,
         )
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         """Forward pass.
 
         Args:
@@ -139,7 +138,7 @@ class CausalConvNd(nn.Module):
         self.weight = nn.Parameter(weight_shape)
         self.bias = nn.Parameter([out_channels]) if bias else None
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         """Apply N-d causal convolution.
 
         Args:
@@ -225,7 +224,7 @@ class CausalTransConv1d(nn.Module):
         # Named 'conv' to match HF MimiConvTranspose1d.conv weight names
         self.conv = _TransConv1dParams(in_channels, out_channels, kernel_size, stride, bias)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         """Upsample input.
 
         Args:
@@ -277,7 +276,7 @@ class _Conv1dParams(nn.Module):
         self.weight = nn.Parameter([out_ch, in_ch, kernel])
         self.bias = nn.Parameter([out_ch]) if bias else None
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         if self.bias is not None:
             return op.Conv(
                 x,
@@ -321,7 +320,7 @@ class _TransConv1dParams(nn.Module):
         self.weight = nn.Parameter([in_ch, out_ch, kernel])
         self.bias = nn.Parameter([out_ch]) if bias else None
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         if self.bias is not None:
             return op.ConvTranspose(
                 x,
@@ -360,7 +359,7 @@ class SnakeBeta(nn.Module):
         self.alpha = nn.Parameter([channels])
         self.beta = nn.Parameter([channels])
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         """Apply SnakeBeta activation.
 
         Args:
@@ -402,7 +401,7 @@ class LayerScale(nn.Module):
         super().__init__()
         self.scale = nn.Parameter([dim])
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         """Apply learned scale.
 
         Args:
@@ -445,7 +444,7 @@ class ConvNeXtBlock(nn.Module):
         # Gamma scale
         self.gamma = nn.Parameter([dim])
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         """Forward pass with residual connection.
 
         Args:
@@ -496,7 +495,7 @@ class _DepthwiseConv1dParams(nn.Module):
             group=dim,
         )
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         """Apply depthwise convolution (no padding — caller pads)."""
         return self.conv(op, x)
 
@@ -523,7 +522,7 @@ class DecoderResidualUnit(nn.Module):
         self.act2 = SnakeBeta(dim)
         self.conv2 = CausalConv1d(dim, dim, kernel_size=1)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         """Forward with residual.
 
         Args:
@@ -576,7 +575,7 @@ class DecoderBlock(nn.Module):
             DecoderResidualUnit(out_dim, dilation=9),
         )
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         """Upsample and refine.
 
         Args:

@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Rewrite rules for fusing Add + LayerNormalization into SkipLayerNormalization.
 
@@ -12,7 +12,10 @@ result, mean, inv_std_var, and the skip (unnormalized sum).
 This complements the ``skip_norm_rules`` which handles Add + RMSNormalization
 → SkipSimplifiedLayerNormalization for models using RMSNorm.
 
-These rules are **not applied by default**.  Apply them post-export::
+These rules are applied automatically by
+:func:`~mobius._optimizations.optimize_model` for EPs that support
+SkipLayerNormalization (``supports_skip_layer_norm=True``; all EPs except
+TRT-RTX).  They can also be applied manually::
 
     from mobius.rewrite_rules import skip_layer_norm_rules
     from onnxscript.rewriter import rewrite
@@ -68,15 +71,27 @@ class AddLayerNormToSkipLayerNorm(RewriteRuleClassBase):
         if producer is None or producer.op_type != "Add":
             return result.fail("Input to LayerNorm is not from an Add node")
 
-        # The Add output must have multiple consumers (LayerNorm + residual)
-        uses = list(add_out.uses())
-        if len(uses) < 2:
-            return result.fail(
-                f"Add output has only {len(uses)} consumer(s), "
-                "expected at least 2 (LayerNorm + downstream residual)"
-            )
+        # Both Add inputs must have at least 2 dimensions.  This prevents
+        # fusing a bias-Add (e.g. MatMul + 1D bias → LayerNorm) which
+        # would produce a SkipLayerNormalization with a 1D skip input
+        # that ORT rejects.  Unknown shapes are allowed through since
+        # most intermediate values lack static shape info.
+        for i, inp in enumerate(producer.inputs):
+            if inp is not None and inp.shape is not None:
+                rank = len(inp.shape)
+                if rank < 2:
+                    return result.fail(
+                        f"Add input[{i}] has rank {rank}, need ≥ 2 for skip connection"
+                    )
 
-        # Verify LayerNormalization has epsilon attribute
+        # Don't fuse if add_out is itself a graph output — that indicates we're inside
+        # an ONNX function body where replace_all_uses_with would fail or produce
+        # nested fusion.
+        graph = producer.graph
+        if graph is not None and add_out in graph.outputs:
+            return result.fail("Add output is a graph output — skip to avoid nested fusion")
+
+        # Verify LayerNormalization has epsilon attribute and correct axis
         ln = norm_out.producer()
         if ln.attributes.get_float("epsilon", None) is None:
             return result.fail("Missing epsilon attribute on LayerNormalization")
@@ -99,12 +114,14 @@ class AddLayerNormToSkipLayerNorm(RewriteRuleClassBase):
         input_a = add_node.inputs[0]
         input_b = add_node.inputs[1]
 
-        outputs = op.op_multi_out(
-            "SkipLayerNormalization",
-            inputs=[input_a, input_b, weight, bias],
-            domain="com.microsoft",
-            attributes={"epsilon": epsilon},
-            num_outputs=4,
+        outputs = op.SkipLayerNormalization(
+            input_a,
+            input_b,
+            weight,
+            bias,
+            _domain="com.microsoft",
+            epsilon=epsilon,
+            _outputs=4,
         )
         new_norm_out = outputs[0]
         skip_out = outputs[3]
@@ -141,12 +158,24 @@ class AddLayerNormNoBiasToSkipLayerNorm(RewriteRuleClassBase):
         if producer is None or producer.op_type != "Add":
             return result.fail("Input to LayerNorm is not from an Add node")
 
-        uses = list(add_out.uses())
-        if len(uses) < 2:
-            return result.fail(
-                f"Add output has only {len(uses)} consumer(s), "
-                "expected at least 2 (LayerNorm + downstream residual)"
-            )
+        # Both Add inputs must have at least 2 dimensions — reject
+        # bias-Add patterns (e.g. MatMul + 1D bias → LayerNorm).
+        # Unknown shapes are allowed through since most intermediate
+        # values lack static shape info.
+        for i, inp in enumerate(producer.inputs):
+            if inp is not None and inp.shape is not None:
+                rank = len(inp.shape)
+                if rank < 2:
+                    return result.fail(
+                        f"Add input[{i}] has rank {rank}, need ≥ 2 for skip connection"
+                    )
+
+        # Don't fuse if add_out is itself a graph output — that indicates we're inside
+        # an ONNX function body where replace_all_uses_with would fail or produce
+        # nested fusion.
+        graph = producer.graph
+        if graph is not None and add_out in graph.outputs:
+            return result.fail("Add output is a graph output — skip to avoid nested fusion")
 
         ln = norm_out.producer()
         if ln.attributes.get_float("epsilon", None) is None:
@@ -173,12 +202,13 @@ class AddLayerNormNoBiasToSkipLayerNorm(RewriteRuleClassBase):
         input_b = add_node.inputs[1]
 
         # SkipLayerNormalization with gamma only (no beta)
-        outputs = op.op_multi_out(
-            "SkipLayerNormalization",
-            inputs=[input_a, input_b, weight],
-            domain="com.microsoft",
-            attributes={"epsilon": epsilon},
-            num_outputs=4,
+        outputs = op.SkipLayerNormalization(
+            input_a,
+            input_b,
+            weight,
+            _domain="com.microsoft",
+            epsilon=epsilon,
+            _outputs=4,
         )
         new_norm_out = outputs[0]
         skip_out = outputs[3]

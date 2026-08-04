@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Multimodal components for bridging vision and text models.
 
@@ -19,8 +19,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components._common import Linear
 from mobius.components._rms_norm import RMSNorm
@@ -56,7 +55,7 @@ class Gemma3MultiModalProjector(nn.Module):
         self.pool_kernel = patches_per_image // tokens_per_side
         self.mm_input_projection_weight = nn.Parameter([vision_hidden_size, text_hidden_size])
 
-    def forward(self, op: builder.OpBuilder, vision_features: ir.Value):
+    def forward(self, op: OpBuilder, vision_features: ir.Value):
         # vision_features: [batch, num_patches, vision_hidden_size]
         batch_size = op.Shape(vision_features, start=0, end=1)
         hidden_size = op.Shape(vision_features, start=2, end=3)
@@ -110,7 +109,7 @@ class MLPMultiModalProjector(nn.Module):
         self.linear_1 = Linear(vision_hidden_size, text_hidden_size, bias=bias)
         self.linear_2 = Linear(text_hidden_size, text_hidden_size, bias=bias)
 
-    def forward(self, op: builder.OpBuilder, vision_features: ir.Value):
+    def forward(self, op: OpBuilder, vision_features: ir.Value):
         # vision_features: [batch, num_patches, vision_hidden_size]
         hidden = self.linear_1(op, vision_features)
         hidden = op.Gelu(hidden)
@@ -137,7 +136,7 @@ class LinearMultiModalProjector(nn.Module):
         super().__init__()
         self.linear = Linear(vision_hidden_size, text_hidden_size, bias=bias)
 
-    def forward(self, op: builder.OpBuilder, vision_features: ir.Value):
+    def forward(self, op: OpBuilder, vision_features: ir.Value):
         return self.linear(op, vision_features)
 
 
@@ -154,7 +153,7 @@ class InputMixer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         text_embeddings: ir.Value,
         vision_embeddings: ir.Value,
         input_ids: ir.Value,
@@ -182,7 +181,7 @@ class InputMixer(nn.Module):
             axis=0,
         )
         zero_pad = op.Expand(
-            op.CastLike(op.Constant(value_float=0.0), vision_embeddings),
+            op.CastLike(0.0, vision_embeddings),
             pad_shape,
         )
         # [batch, vision_seq + 1, hidden]

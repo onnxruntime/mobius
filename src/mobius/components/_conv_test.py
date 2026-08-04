@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Tests for convolution components."""
 
@@ -44,7 +44,7 @@ class TestConv2d:
         x = create_test_input(builder, "x", [1, 3, 32, 32])
 
         result = conv(op, x)
-        builder._adapt_outputs([result])
+        builder._adapt_outputs([result], "")
         assert count_op_type(graph, "Conv") >= 1
 
     def test_stride_setting(self):
@@ -83,7 +83,7 @@ class TestConv2dNoBias:
         x = create_test_input(builder, "x", [1, 3, 32, 32])
 
         result = conv(op, x)
-        builder._adapt_outputs([result])
+        builder._adapt_outputs([result], "")
         assert count_op_type(graph, "Conv") >= 1
 
 
@@ -109,7 +109,7 @@ class TestBatchNorm2d:
         x = create_test_input(builder, "x", [1, 16, 32, 32])
 
         result = bn(op, x)
-        builder._adapt_outputs([result])
+        builder._adapt_outputs([result], "")
         assert count_op_type(graph, "BatchNormalization") >= 1
 
 
@@ -136,7 +136,7 @@ class TestConvTranspose2d:
         x = create_test_input(builder, "x", [1, 16, 8, 8])
 
         result = conv(op, x)
-        builder._adapt_outputs([result])
+        builder._adapt_outputs([result], "")
         assert count_op_type(graph, "ConvTranspose") >= 1
 
 
@@ -185,7 +185,7 @@ class TestCausalConvNd:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, 16])
         result = conv(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert count_op_type(graph, "Conv") >= 1
         assert count_op_type(graph, "Pad") >= 1
 
@@ -194,7 +194,7 @@ class TestCausalConvNd:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, 8, 8])
         result = conv(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert count_op_type(graph, "Conv") >= 1
         # Causal padding on last dim: pad_left = (3-1)*1 = 2 > 0 → Pad op present
         assert count_op_type(graph, "Pad") >= 1
@@ -204,7 +204,7 @@ class TestCausalConvNd:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, 4, 4, 4])
         result = conv(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert count_op_type(graph, "Conv") >= 1
         assert count_op_type(graph, "Pad") >= 1
 
@@ -214,7 +214,7 @@ class TestCausalConvNd:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, 8, 8])
         result = conv(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert count_op_type(graph, "Conv") >= 1
         assert count_op_type(graph, "Pad") == 0
 
@@ -224,7 +224,7 @@ class TestCausalConvNd:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, 16])
         result = conv(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert count_op_type(graph, "Pad") >= 1
 
     def test_invalid_ndim_raises(self):

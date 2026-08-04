@@ -1,4 +1,5 @@
 model_id: "facebook/xmod-base"
+model_type: "xmod"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"
@@ -7,6 +8,7 @@ inputs:
   prompts:
     - "The quick brown fox jumps over the lazy dog."
 
+skip_reason: "No safetensors weights on HuggingFace Hub."
 level: "L4"
 
 notes: "X-MOD base. Modular multilingual encoder."

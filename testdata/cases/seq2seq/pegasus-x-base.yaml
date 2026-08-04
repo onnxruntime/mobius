@@ -1,4 +1,5 @@
 model_id: "google/pegasus-x-base"
+model_type: "pegasus_x"
 revision: "main"
 task_type: "seq2seq"
 dtype: "float32"
@@ -9,6 +10,7 @@ inputs:
   decoder_prompt: ""
 
 level: "L4+L5"
+skip_reason: "No safetensors weights on HuggingFace Hub"
 
 generation:
   max_new_tokens: 20

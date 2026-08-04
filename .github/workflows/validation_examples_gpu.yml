@@ -1,0 +1,91 @@
+name: GPU Examples
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: examples-gpu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  run-example:
+    name: "Validation Example / ${{ matrix.name }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "phi4mm_multimodal (text)"
+            command: >-
+              python examples/phi4mm_multimodal.py
+              --ci --compare-hf --mode text
+          - name: "phi4mm_ort_genai (vision)"
+            command: >-
+              python examples/phi4mm_ort_genai.py
+              --ci --compare-hf
+              --image testdata/pipeline-cat-chonk.jpeg
+          - name: "qwen35_text_generation"
+            command: >-
+              python examples/qwen35_text_generation.py
+              --ci --compare-hf --device cuda
+          - name: "qwen25_vl_ort_genai"
+            command: >-
+              python examples/qwen25_vl_ort_genai.py
+              --ci --compare-hf
+              --image testdata/pipeline-cat-chonk.jpeg
+          - name: "qwen3_vl_ort_genai"
+            command: >-
+              python examples/qwen3_vl_ort_genai.py
+              --ci --compare-hf
+              --image testdata/pipeline-cat-chonk.jpeg
+          - name: "qwen35_vl_ort_genai"
+            command: >-
+              python examples/qwen35_vl_ort_genai.py
+              --ci --compare-hf
+              --image testdata/pipeline-cat-chonk.jpeg
+          - name: "nemotron_3_nano_text_generation"
+            command: >-
+              python examples/nemotron_3_nano_text_generation.py
+              --ci --compare-hf --device cuda
+          - name: "static_cache_generation"
+            command: >-
+              python examples/static_cache_generation.py --ci
+    runs-on:
+      - self-hosted
+      - "1ES.Pool=onnxruntime-ep-mobius-github-linux-a10"
+      - "JobId=gpu-examples-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}"
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/huggingface
+          key: hf-examples-gpu-${{ hashFiles('examples/*.py') }}
+          restore-keys: |
+            hf-examples-gpu-
+
+      - name: Install PyTorch (CUDA)
+        run: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements/ci/requirements.txt
+          pip install -e '.[testing,transformers]'
+          pip install soundfile librosa ml_dtypes flatbuffers numpy packaging protobuf sympy coloredlogs
+          pip install --pre --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-12-nightly/pypi/simple/ onnxruntime-gpu onnxruntime-genai-cuda
+
+      - name: Run ${{ matrix.name }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: ${{ matrix.command }}

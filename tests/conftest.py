@@ -1,14 +1,25 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Shared pytest configuration and fixtures for mobius tests."""
 
 from __future__ import annotations
 
+import os
 import random
 
 import numpy as np
 import pytest
+
+# Disable TF32 for all test runs.  On Ampere+/Hopper GPUs the ORT CUDA EP
+# uses TF32 for fp32 matmuls by default, while the PyTorch reference computes
+# in true fp32 (torch defaults ``allow_tf32=False``).  That ~1e-2 discrepancy
+# makes fp32 logits-parity tests (rtol/atol 1e-3) fail spuriously on GPU.
+# Forcing the CUDA libraries to ignore TF32 aligns ORT with the reference.
+# Set here (before any test imports torch / onnxruntime and initializes the
+# CUDA libraries) so the override is honoured.  ``setdefault`` lets a user opt
+# back in by exporting the variable explicitly.
+os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "0")
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +99,12 @@ def pytest_collection_modifyitems(
             if not hasattr(item, "callspec"):
                 continue
             if "model_type" not in item.callspec.params:
+                # Golden tests use a "case" param with a model_type field
+                if "case" in item.callspec.params:
+                    case = item.callspec.params["case"]
+                    mt = getattr(case, "model_type", None)
+                    if mt and mt not in selected_models:
+                        item.add_marker(skip_model)
                 continue
             model_type = item.callspec.params["model_type"]
             if model_type not in selected_models:

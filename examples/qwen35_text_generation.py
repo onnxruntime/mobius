@@ -1,6 +1,6 @@
 #!/usr/bin/env python
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Qwen3.5 text generation — standalone greedy decoding (no onnxruntime-genai).
 
@@ -37,6 +37,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import sys
 
 import ml_dtypes
 import numpy as np
@@ -587,6 +588,11 @@ def main():
         default="cpu",
         help="Device for ONNX Runtime and PyTorch inference (default: %(default)s).",
     )
+    parser.add_argument(
+        "--ci",
+        action="store_true",
+        help="Exit with non-zero code on failure (for CI pipelines).",
+    )
     args = parser.parse_args()
 
     if args.image:
@@ -604,7 +610,7 @@ def main():
             return
 
         decoder_session = OnnxModelSession(pkg["decoder"], device=args.device)
-        vision_session = OnnxModelSession(pkg["vision"], device=args.device)
+        vision_session = OnnxModelSession(pkg["vision_encoder"], device=args.device)
         embed_session = OnnxModelSession(pkg["embedding"], device=args.device)
         processor = transformers.AutoProcessor.from_pretrained(args.model)
 
@@ -641,6 +647,8 @@ def main():
                 print("\n✗ Outputs differ!")
                 print(f"  ONNX: {onnx_output!r}")
                 print(f"  HF:   {hf_output!r}")
+                if args.ci:
+                    sys.exit(1)
     else:
         # ---------------------------------------------------------------
         # Text-only mode: single ONNX model
@@ -694,7 +702,15 @@ def main():
                 print("\n✗ Outputs differ!")
                 print(f"  ONNX: {onnx_output!r}")
                 print(f"  HF:   {hf_output!r}")
+                if args.ci:
+                    sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        if "--ci" in sys.argv:
+            print(f"FAILED: {e}", file=sys.stderr)
+            sys.exit(1)
+        raise

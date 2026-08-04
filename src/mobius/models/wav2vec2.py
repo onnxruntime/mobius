@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Wav2Vec2 encoder-only audio model.
 
@@ -21,8 +21,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import FCMLP
@@ -45,7 +44,7 @@ class _Conv1dFeatureExtractor(nn.Module):
             layer = _ConvLayerBlock(in_ch, out_ch, kernel, use_group_norm=(i == 0))
             self.conv_layers.append(layer)
 
-    def forward(self, op: builder.OpBuilder, input_values: ir.Value):
+    def forward(self, op: OpBuilder, input_values: ir.Value):
         # input_values: [batch, time] → [batch, 1, time]
         hidden_states = op.Unsqueeze(input_values, [1])
         for layer in self.conv_layers:
@@ -74,7 +73,7 @@ class _ConvLayerBlock(nn.Module):
             self.layer_norm = nn.Parameter((out_channels,))
             self.layer_norm_bias = nn.Parameter((out_channels,))
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         hidden_states = op.Conv(hidden_states, self.conv, self.conv_bias)
         if self.use_group_norm:
             hidden_states = op.GroupNormalization(
@@ -95,7 +94,7 @@ class _FeatureProjection(nn.Module):
         self.layer_norm = LayerNorm(conv_dim, eps=eps)
         self.projection = Linear(conv_dim, hidden_size)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         hidden_states = self.layer_norm(op, hidden_states)
         hidden_states = self.projection(op, hidden_states)
         return hidden_states
@@ -116,7 +115,7 @@ class _Wav2Vec2EncoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_mask: ir.Value | None = None,
     ):
@@ -146,7 +145,7 @@ class _Wav2Vec2Attention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_mask: ir.Value | None = None,
     ):
@@ -182,7 +181,7 @@ class _Wav2Vec2Encoder(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_mask: ir.Value | None = None,
     ):
@@ -233,7 +232,7 @@ class Wav2Vec2Model(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_values: ir.Value,
         attention_mask: ir.Value | None = None,
     ):

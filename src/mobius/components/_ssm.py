@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Selective State Space Model (S6) component for Mamba architectures.
 
@@ -29,8 +29,7 @@ HuggingFace reference: ``MambaMixer`` (SSM portion).
 from __future__ import annotations
 
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components._common import Linear
 
@@ -60,7 +59,7 @@ class SelectiveScan(nn.Module):
         # D: (d_inner,) — skip connection / feedthrough
         self.D = nn.Parameter([d_inner])
 
-    def _project_ssm_params(self, op: builder.OpBuilder, x_db):
+    def _project_ssm_params(self, op: OpBuilder, x_db):
         """Split x_proj output into dt_raw, B, C.
 
         Subclasses can override to apply extra transformations (e.g.
@@ -75,7 +74,7 @@ class SelectiveScan(nn.Module):
         """
         dt_raw, b_mat, c_mat = op.Split(
             x_db,
-            op.Constant(value_ints=[self.dt_rank, self.d_state, self.d_state]),
+            [self.dt_rank, self.d_state, self.d_state],
             axis=-1,
             _outputs=3,
         )
@@ -83,7 +82,7 @@ class SelectiveScan(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         x: ir.Value,
         ssm_state: ir.Value,
     ):
@@ -180,7 +179,7 @@ class JambaSelectiveScan(SelectiveScan):
         """Split + layernorm on dt, B, C."""
         dt_raw, b_mat, c_mat = op.Split(
             x_db,
-            op.Constant(value_ints=[self.dt_rank, self.d_state, self.d_state]),
+            [self.dt_rank, self.d_state, self.d_state],
             axis=-1,
             _outputs=3,
         )
@@ -214,6 +213,7 @@ class Mamba2Scan(nn.Module):
         d_head: int,
         d_state: int,
         n_groups: int = 1,
+        time_step_min: float = 0.0,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -221,6 +221,7 @@ class Mamba2Scan(nn.Module):
         self.d_state = d_state
         self.n_groups = n_groups
         self.heads_per_group = num_heads // n_groups
+        self.time_step_min = time_step_min
 
         self.A_log = nn.Parameter([num_heads])
         self.D = nn.Parameter([num_heads])
@@ -228,7 +229,7 @@ class Mamba2Scan(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         dt_input: ir.Value,
         b_mat: ir.Value,
@@ -258,6 +259,9 @@ class Mamba2Scan(nn.Module):
                 op.Cast(self.dt_bias, to=ir.DataType.FLOAT),
             )
         )
+        # Clamp dt to time_step_min (matches HF torch.clamp(dt, min=...))
+        if self.time_step_min > 0.0:
+            dt = op.Clip(dt, self.time_step_min)
 
         # A = -exp(A_log) in fp32: (num_heads,)
         a_neg = op.Neg(op.Exp(op.Cast(self.A_log, to=ir.DataType.FLOAT)))
@@ -269,16 +273,18 @@ class Mamba2Scan(nn.Module):
         da = op.Exp(op.Mul(dt_4d, a_4d))
 
         # Reshape hidden: (batch, num_heads, d_head)
-        hidden_shape = op.Constant(value_ints=[0, self.num_heads, self.d_head])
-        hidden_3d = op.Cast(op.Reshape(hidden_states, hidden_shape), to=ir.DataType.FLOAT)
+        hidden_3d = op.Cast(
+            op.Reshape(hidden_states, [0, self.num_heads, self.d_head]),
+            to=ir.DataType.FLOAT,
+        )
 
         # Expand B from groups to heads (in fp32)
-        b_shape = op.Constant(value_ints=[0, self.n_groups, 1, self.d_state])
+        b_shape = [0, self.n_groups, 1, self.d_state]
         b_4d = op.Reshape(op.Cast(b_mat, to=ir.DataType.FLOAT), b_shape)
-        b_expand_shape = op.Constant(value_ints=[1, 1, self.heads_per_group, 1])
-        b_expanded = op.Expand(b_4d, b_expand_shape)
-        b_heads_shape = op.Constant(value_ints=[0, self.num_heads, self.d_state])
-        b_heads = op.Reshape(b_expanded, b_heads_shape)
+        expand_shape = [1, 1, self.heads_per_group, 1]
+        b_expanded = op.Expand(b_4d, expand_shape)
+        heads_shape = [0, self.num_heads, self.d_state]
+        b_heads = op.Reshape(b_expanded, heads_shape)
         b_ssm = op.Unsqueeze(b_heads, [2])
 
         # dBx: dt * B * x (in fp32)
@@ -291,8 +297,8 @@ class Mamba2Scan(nn.Module):
 
         # Readout: y = C . h + D * x (in fp32)
         c_4d = op.Reshape(op.Cast(c_mat, to=ir.DataType.FLOAT), b_shape)
-        c_expanded = op.Expand(c_4d, b_expand_shape)
-        c_heads = op.Reshape(c_expanded, b_heads_shape)
+        c_expanded = op.Expand(c_4d, expand_shape)
+        c_heads = op.Reshape(c_expanded, heads_shape)
         c_ssm = op.Unsqueeze(c_heads, [2])
 
         y = op.ReduceSum(
@@ -304,8 +310,10 @@ class Mamba2Scan(nn.Module):
         y = op.Add(y, op.Mul(d_3d, hidden_3d))
 
         # Flatten and cast back to input dtype: (batch, num_heads * d_head)
-        flat_shape = op.Constant(value_ints=[0, self.num_heads * self.d_head])
-        y = op.CastLike(op.Reshape(y, flat_shape), hidden_states)
+        y = op.CastLike(
+            op.Reshape(y, [0, self.num_heads * self.d_head]),
+            hidden_states,
+        )
 
         return y, op.CastLike(new_ssm_state, ssm_state)
 
@@ -318,13 +326,13 @@ class _RMSNorm(nn.Module):
         self.weight = nn.Parameter([size])
         self._eps = eps
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # Upcast to fp32 for variance computation (matching HF RMSNorm).
         x_f32 = op.Cast(x, to=ir.DataType.FLOAT)
         variance = op.ReduceMean(op.Mul(x_f32, x_f32), [-1], keepdims=True)
         x_normed = op.Div(
             x_f32,
-            op.Sqrt(op.Add(variance, op.Constant(value_float=self._eps))),
+            op.Sqrt(op.Add(variance, self._eps)),
         )
         result = op.Mul(x_normed, op.Cast(self.weight, to=ir.DataType.FLOAT))
         return op.CastLike(result, x)

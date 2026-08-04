@@ -1,32 +1,35 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
-"""Repack GGUF quantized blocks into ORT MatMulNBits format.
+"""Preserve or repack GGUF quantized blocks for ORT custom operators.
 
-Converts raw GGUF block data for Q4_0, Q4_1, and Q8_0 quantization
-types into the (weight, scales, zero_points) tensors expected by the
-``com.microsoft.MatMulNBits`` operator.
+Converts raw GGUF block data for Q4_0, Q4_1, Q8_0, Q4_K, and Q1_0
+quantization types into the (weight, scales, zero_points) tensors
+expected by the ``com.microsoft.MatMulNBits`` operator.
 
-GGUF block layouts (32 elements per block):
-    Q4_0 (18 bytes): [fp16 scale][16B packed nibbles]
-    Q4_1 (20 bytes): [fp16 scale][fp16 min][16B packed nibbles]
-    Q8_0 (34 bytes): [fp16 scale][32B int8 values]
+The runtime-native IQ/MXFP4 formats are retained byte-for-byte for
+``pkg.nxrt.BlockQuantizedMatMul``.
+
+GGUF block layouts:
+    Q4_0 (18 bytes, 32 elt):  [fp16 scale][16B packed nibbles]
+    Q4_1 (20 bytes, 32 elt):  [fp16 scale][fp16 min][16B packed nibbles]
+    Q8_0 (34 bytes, 32 elt):  [fp16 scale][32B int8 values]
+    Q4_K (144 bytes, 256 elt): [fp16 d][fp16 dmin][12B sub-scales][128B nibbles]
+    Q1_0 (18 bytes, 128 elt): [fp16 scale][16B packed bits, LSB-first]
+        Dequant: ``bit ? +d : -d`` (1-bit binary).
 
 MatMulNBits expects:
     weight:      [N, n_blocks, blob_size] uint8
     scales:      [N, n_blocks]            float16
-    zero_points: [N, zp_dim]             uint8 (nibble-packed for 4-bit)
+    zero_points: [N, ceil(n_blocks*bits/8)] uint8 (bit-packed)
 """
 
 from __future__ import annotations
 
-import logging
 import math
 from dataclasses import dataclass
 
 import numpy as np
-
-logger = logging.getLogger(__name__)
 
 _BLOCK_SIZE = 32
 
@@ -35,6 +38,17 @@ _GGUF_Q4_0 = 2
 _GGUF_Q4_1 = 3
 _GGUF_Q8_0 = 8
 _GGUF_Q4_K = 12
+_GGUF_IQ2_XXS = 16
+_GGUF_IQ2_XS = 17
+_GGUF_IQ3_XXS = 18
+_GGUF_IQ1_S = 19
+_GGUF_IQ4_NL = 20
+_GGUF_IQ3_S = 21
+_GGUF_IQ2_S = 22
+_GGUF_IQ4_XS = 23
+_GGUF_IQ1_M = 29
+_GGUF_MXFP4 = 39
+_GGUF_Q1_0 = 41
 
 # Block byte sizes per GGUF type
 _BLOCK_BYTES = {
@@ -42,18 +56,54 @@ _BLOCK_BYTES = {
     _GGUF_Q4_1: 20,  # 2B scale + 2B min + 16B quants
     _GGUF_Q8_0: 34,  # 2B scale + 32B int8 values
     _GGUF_Q4_K: 144,  # 2B d + 2B dmin + 12B scales + 128B quants
+    _GGUF_Q1_0: 18,  # 2B scale + 16B packed bits (128 elements)
 }
 
 # Elements per GGUF block. Q4_K uses 256-element "super-blocks"
-# that decompose into 8 sub-blocks of 32 for MatMulNBits.
+# that decompose into 8 sub-blocks of 32 for MatMulNBits. Q1_0 uses
+# 128-element blocks (QK1_0 from llama.cpp).
 _GGUF_BLOCK_ELEMENTS = {
     _GGUF_Q4_0: 32,
     _GGUF_Q4_1: 32,
     _GGUF_Q8_0: 32,
     _GGUF_Q4_K: 256,
+    _GGUF_Q1_0: 128,
 }
 
 _SUPPORTED_TYPES = frozenset(_BLOCK_BYTES.keys())
+
+# MatMulNBits representation produced for each supported GGUF type.
+_REPACK_PARAMS = {
+    _GGUF_Q4_0: (4, 32),
+    _GGUF_Q4_1: (4, 32),
+    _GGUF_Q8_0: (8, 32),
+    _GGUF_Q4_K: (4, 32),
+    _GGUF_Q1_0: (2, 128),
+}
+
+
+@dataclass(frozen=True)
+class NativeBlockSpec:
+    """Serialized GGUF block layout accepted directly by the runtime."""
+
+    format: str
+    elements: int
+    bytes: int
+
+
+_NATIVE_BLOCK_SPECS = {
+    _GGUF_MXFP4: NativeBlockSpec("mxfp4", 32, 17),
+    _GGUF_IQ4_NL: NativeBlockSpec("iq4_nl", 32, 18),
+    _GGUF_IQ4_XS: NativeBlockSpec("iq4_xs", 256, 136),
+    _GGUF_IQ3_S: NativeBlockSpec("iq3_s", 256, 110),
+    _GGUF_IQ3_XXS: NativeBlockSpec("iq3_xxs", 256, 98),
+    _GGUF_IQ2_XXS: NativeBlockSpec("iq2_xxs", 256, 66),
+    _GGUF_IQ2_XS: NativeBlockSpec("iq2_xs", 256, 74),
+    _GGUF_IQ2_S: NativeBlockSpec("iq2_s", 256, 82),
+    _GGUF_IQ1_S: NativeBlockSpec("iq1_s", 256, 50),
+    _GGUF_IQ1_M: NativeBlockSpec("iq1_m", 256, 56),
+}
+NATIVE_BLOCK_BYTE_SIZES = frozenset(spec.bytes for spec in _NATIVE_BLOCK_SPECS.values())
 
 
 @dataclass
@@ -77,9 +127,44 @@ class RepackedTensor:
     bits: int
 
 
+def native_block_spec(gguf_type: int) -> NativeBlockSpec | None:
+    """Return the runtime-native block layout for a GGUF type, if supported."""
+    return _NATIVE_BLOCK_SPECS.get(gguf_type)
+
+
+def preserve_native_blocks(
+    raw_data: np.ndarray,
+    gguf_type: int,
+    shape: tuple[int, ...],
+) -> np.ndarray:
+    """Validate and reshape raw GGUF blocks without changing any bytes."""
+    spec = native_block_spec(gguf_type)
+    if spec is None:
+        raise ValueError(f"GGUF type {gguf_type} is not runtime-native")
+    if len(shape) != 2:
+        raise ValueError(f"Expected 2D shape (N, K), got {shape}")
+
+    n_out, k_in = shape
+    n_blocks = math.ceil(k_in / spec.elements)
+    expected_bytes = n_out * n_blocks * spec.bytes
+    packed = raw_data.ravel().view(np.uint8)
+    if packed.size != expected_bytes:
+        raise ValueError(
+            f"Native {spec.format} data size mismatch: got {packed.size} bytes, "
+            f"expected {expected_bytes} for shape {shape} "
+            f"with {n_out * n_blocks} blocks x {spec.bytes} bytes"
+        )
+    return packed.reshape(n_out, n_blocks, spec.bytes)
+
+
 def can_repack(gguf_type: int) -> bool:
     """Return True if the GGUF type can be repacked to MatMulNBits."""
-    return gguf_type in _SUPPORTED_TYPES
+    return repack_quant_params(gguf_type) is not None
+
+
+def repack_quant_params(gguf_type: int) -> tuple[int, int] | None:
+    """Return the ``(bits, block_size)`` produced for a GGUF type."""
+    return _REPACK_PARAMS.get(gguf_type)
 
 
 def repack_gguf_tensor(
@@ -93,8 +178,8 @@ def repack_gguf_tensor(
         raw_data: Raw bytes as a uint8 numpy array (flat).
         gguf_type: GGUF quantization type ID (e.g. 2 for Q4_0).
         shape: Logical weight shape ``(N, K)`` where N = out_features,
-            K = in_features.  GGUF tensors are typically stored as
-            ``(N, K)`` with blocks laid out row-by-row.
+            K = in_features. K-quant super-blocks are contiguous over the
+            flattened tensor and may cross logical row boundaries.
 
     Returns:
         A ``RepackedTensor`` with MatMulNBits-compatible arrays.
@@ -114,7 +199,15 @@ def repack_gguf_tensor(
     block_bytes = _BLOCK_BYTES[gguf_type]
     gguf_block_elems = _GGUF_BLOCK_ELEMENTS[gguf_type]
     n_blocks_per_row = math.ceil(k_in / gguf_block_elems)
-    total_blocks = n_out * n_blocks_per_row
+    if gguf_type == _GGUF_Q4_K:
+        # K-quant super-blocks are laid out over the flattened tensor, not
+        # independently padded at each logical row boundary. This matters for
+        # dimensions such as Qwen2's K=896: rows end halfway through a
+        # 256-element Q4_K super-block, while they still align perfectly to
+        # MatMulNBits' 32-element blocks.
+        total_blocks = math.ceil(n_out * k_in / gguf_block_elems)
+    else:
+        total_blocks = n_out * n_blocks_per_row
     expected_bytes = total_blocks * block_bytes
 
     if raw_data.size != expected_bytes:
@@ -132,7 +225,9 @@ def repack_gguf_tensor(
     elif gguf_type == _GGUF_Q4_1:
         return _repack_q4_1(blocks, n_out, n_blocks_per_row)
     elif gguf_type == _GGUF_Q4_K:
-        return _repack_q4_k(blocks, n_out, n_blocks_per_row)
+        return _repack_q4_k(blocks, n_out, k_in)
+    elif gguf_type == _GGUF_Q1_0:
+        return _repack_q1_0(blocks, n_out, n_blocks_per_row)
     else:
         return _repack_q8_0(blocks, n_out, n_blocks_per_row)
 
@@ -176,7 +271,7 @@ def _repack_q4_0(
     """Repack Q4_0 blocks.
 
     Q4_0 block (18 bytes): [fp16 scale (2B)][16B packed 4-bit quants]
-    Dequant: (nibble - 8) * scale  →  symmetric with zero_point = 8.
+    Dequant: (nibble - 8) * scale  ->  symmetric with zero_point = 8.
 
     GGUF nibble ordering differs from MatMulNBits — we reorder during
     repacking.  See ``_reorder_nibbles_gguf_to_ort`` for details.
@@ -185,7 +280,7 @@ def _repack_q4_0(
     raw_scales = blocks[:, :2].copy()
     raw_quants = blocks[:, 2:]  # (total_blocks, 16)
 
-    # Scales: view as fp16 → (total_blocks,) → reshape to (N, n_blocks)
+    # Scales: view as fp16 -> (total_blocks,) -> reshape to (N, n_blocks)
     scales = raw_scales.view(np.float16).reshape(n_out, n_blocks_per_row)
 
     # Reorder nibbles from GGUF order to MatMulNBits order
@@ -219,7 +314,7 @@ def _repack_q4_1(
     """Repack Q4_1 blocks.
 
     Q4_1 block (20 bytes): [fp16 scale (2B)][fp16 min (2B)][16B quants]
-    Dequant: nibble * scale + min  →  asymmetric.
+    Dequant: nibble * scale + min  ->  asymmetric.
 
     MatMulNBits dequant: (nibble - zp) * scale
     So: zp = round(-min / scale), clamped to [0, 15].
@@ -274,7 +369,7 @@ def _repack_q8_0(
     """Repack Q8_0 blocks.
 
     Q8_0 block (34 bytes): [fp16 scale (2B)][32 x int8 values (32B)]
-    Dequant: int8_val * scale  →  symmetric around 0.
+    Dequant: int8_val * scale  ->  symmetric around 0.
 
     MatMulNBits dequant: (uint8_val - zp) * scale
     Convert: uint8_val = int8_val + 128, zp = 128.
@@ -284,7 +379,7 @@ def _repack_q8_0(
 
     scales = raw_scales.view(np.float16).reshape(n_out, n_blocks_per_row)
 
-    # Convert signed int8 → unsigned uint8 by adding 128
+    # Convert signed int8 -> unsigned uint8 by adding 128
     quants_int8 = raw_quants.view(np.int8).astype(np.int16)
     quants_uint8 = (quants_int8 + 128).astype(np.uint8)
     weight = quants_uint8.reshape(n_out, n_blocks_per_row, 32)
@@ -310,12 +405,12 @@ def _unpack_q4_k_scales(
     packed into 12 bytes using 6-bit encoding.  The packing layout (from
     llama.cpp) uses three 4-byte groups::
 
-        Bytes 0-3 (d):   low 6 bits → sub_scale[0..3],
-                         high 2 bits → sub_scale[4..7] bits 4-5
-        Bytes 4-7 (m):   low 6 bits → sub_min[0..3],
-                         high 2 bits → sub_min[4..7] bits 4-5
-        Bytes 8-11 (md): low 4 bits → sub_scale[4..7] bits 0-3,
-                         high 4 bits → sub_min[4..7] bits 0-3
+        Bytes 0-3 (d):   low 6 bits -> sub_scale[0..3],
+                         high 2 bits -> sub_scale[4..7] bits 4-5
+        Bytes 4-7 (m):   low 6 bits -> sub_min[0..3],
+                         high 2 bits -> sub_min[4..7] bits 4-5
+        Bytes 8-11 (md): low 4 bits -> sub_scale[4..7] bits 0-3,
+                         high 4 bits -> sub_min[4..7] bits 0-3
 
     Args:
         scales_raw: uint8 array, shape ``(n_super_blocks, 12)``.
@@ -340,26 +435,26 @@ def _unpack_q4_k_scales(
 def _repack_q4_k(
     blocks: np.ndarray,
     n_out: int,
-    n_super_blocks_per_row: int,
+    k_in: int,
 ) -> RepackedTensor:
-    """Repack Q4_K super-blocks into MatMulNBits sub-blocks.
+    """Dequantize Q4_K super-blocks and requantize to MatMulNBits.
 
     Q4_K uses 256-element super-blocks with a two-level scale hierarchy:
-    ``value = d * sub_scale[i] * nibble - dmin * sub_min[i]``.  Each
-    super-block is decomposed into 8 sub-blocks of 32 elements, and the
-    two-level hierarchy is flattened to MatMulNBits' single-level format:
-    ``value = (nibble - zero_point) * effective_scale``.
+    ``value = d * sub_scale[i] * nibble - dmin * sub_min[i]``. Its
+    fractional effective zero-points cannot generally be represented by
+    MatMulNBits' packed uint4 zero-points. We therefore reference-dequantize
+    the super-blocks, restore the logical row layout, and affine-requantize
+    each 32-element MatMulNBits block.
 
-    **This flattening is lossy.**  The additive offset ``dmin * sub_min``
-    is approximated as a multiplicative zero-point by dividing and
-    rounding.  Rounding error is at most 0.5 * eff_scale.  Clamping
-    error can be much larger when the offset exceeds 15 * eff_scale
-    (i.e., when ``round(dmin * sub_min / eff_scale) > 15``).
+    Requantization is lossy, but every source value is represented within
+    half of the emitted block scale (apart from floating-point roundoff).
+    Unlike directly rounding Q4_K's effective zero-point, this never clamps
+    a large source offset to 15 while keeping an incompatible source scale.
 
     Args:
         blocks: uint8 array, shape ``(total_super_blocks, 144)``.
         n_out: Number of output rows (N dimension).
-        n_super_blocks_per_row: Super-blocks per row.
+        k_in: Number of input columns (K dimension).
 
     Returns:
         A ``RepackedTensor`` with ``block_size=32`` and ``bits=4``.
@@ -381,64 +476,181 @@ def _repack_q4_k(
     sub_scales_f = sub_scales.astype(np.float32)  # (total, 8)
     sub_mins_f = sub_mins.astype(np.float32)  # (total, 8)
 
-    # Effective per-sub-block scale: d * sub_scale[i]
+    # Effective per-sub-block scale and minimum.
     eff_scales = d[:, None] * sub_scales_f  # (total, 8)
-
-    # Effective zero-point: zp = round(dmin * sub_min / eff_scale)
-    # GGUF dequant: d * sub_scale * nibble - dmin * sub_min
-    # MatMulNBits: (nibble - zp) * eff_scale = eff_scale * nibble - eff_scale * zp
-    # So eff_scale * zp = dmin * sub_min → zp = dmin * sub_min / eff_scale
-    numerator = dmin[:, None] * sub_mins_f  # (total, 8)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        zp_float = np.where(
-            eff_scales != 0,
-            np.round(numerator / eff_scales),
-            0.0,
-        )
-    zp_uint4 = np.clip(zp_float, 0, 15).astype(np.uint8)  # (total, 8)
-
-    n_clamped = int(np.count_nonzero(zp_float > 15) + np.count_nonzero(zp_float < 0))
-    if n_clamped > 0.05 * zp_float.size:
-        logger.warning(
-            "%d/%d Q4_K zero-points clamped — precision loss may be significant",
-            n_clamped,
-            zp_float.size,
-        )
+    eff_mins = dmin[:, None] * sub_mins_f  # (total, 8)
 
     # Unpack 4-bit quants from Q4_K layout.
     # 128 bytes = 4 groups of 32 bytes. Each group encodes two sub-blocks:
-    #   byte[j] low nibble  → even sub-block element j
-    #   byte[j] high nibble → odd sub-block element j
+    #   byte[j] low nibble  -> even sub-block element j
+    #   byte[j] high nibble -> odd sub-block element j
     qs = qs_raw.reshape(total, 4, 1, 32)
     shifts = np.array([0, 4], dtype=np.uint8).reshape(1, 1, 2, 1)
     qs = (qs >> shifts) & np.uint8(0x0F)  # (total, 4, 2, 32)
     qs = qs.reshape(total, 8, 32)  # (total, 8, 32) — 8 sub-blocks
 
-    # Repack each sub-block's 32 nibbles → 16 MatMulNBits bytes.
-    # ORT format: byte[j] = (element[2j+1] << 4) | element[2j]
-    pairs = qs.reshape(total, 8, 16, 2)
-    ort_packed = (pairs[..., 1] << 4) | pairs[..., 0]  # (total, 8, 16)
+    dequantized = (
+        eff_scales[:, :, None] * qs.astype(np.float32) - eff_mins[:, :, None]
+    ).reshape(-1)
+    logical_elements = n_out * k_in
+    if dequantized.size < logical_elements:
+        raise ValueError(
+            f"Q4_K data has {dequantized.size} elements, "
+            f"but shape ({n_out}, {k_in}) requires {logical_elements}"
+        )
 
-    # Reshape to output dimensions: 8 sub-blocks per super-block
-    n_sub_blocks_per_row = n_super_blocks_per_row * 8
-    weight = ort_packed.reshape(n_out, n_sub_blocks_per_row, 16)
-    scales_out = eff_scales.astype(np.float16).reshape(n_out, n_sub_blocks_per_row)
+    values = dequantized[:logical_elements].reshape(n_out, k_in)
+    return repack_dequantized_tensor(values, bits=4, block_size=_BLOCK_SIZE)
 
-    # Pack two 4-bit zero-points per byte
-    zp_2d = zp_uint4.reshape(n_out, n_sub_blocks_per_row)
-    zp_cols = math.ceil(n_sub_blocks_per_row / 2)
-    # n_sub_blocks_per_row is always a multiple of 8, so always even
-    zp_padded = zp_2d
-    if n_sub_blocks_per_row % 2 == 1:  # pragma: no cover — safety
-        zp_padded = np.zeros((n_out, n_sub_blocks_per_row + 1), dtype=np.uint8)
-        zp_padded[:, :n_sub_blocks_per_row] = zp_2d
-    zp_pairs = zp_padded.reshape(n_out, zp_cols, 2)
-    zero_points = zp_pairs[:, :, 0] | (zp_pairs[:, :, 1] << 4)
+
+def repack_dequantized_tensor(
+    values: np.ndarray,
+    *,
+    bits: int = 4,
+    block_size: int = _BLOCK_SIZE,
+    symmetric: bool = False,
+) -> RepackedTensor:
+    """Affine-quantize a float matrix into MatMulNBits layout.
+
+    This is used for mixed GGUF presets such as Q4_K_M, where projection
+    tensors may use Q4_K, Q5_0, Q6_K, and Q8_0 within one model while the
+    ONNX graph must use one MatMulNBits configuration throughout.
+    """
+    if values.ndim != 2:
+        raise ValueError(f"Expected 2D values (N, K), got shape {values.shape}")
+    if bits != 4 or block_size != _BLOCK_SIZE:
+        raise ValueError(
+            "Float requantization currently supports only "
+            f"bits=4, block_size={_BLOCK_SIZE}; got bits={bits}, "
+            f"block_size={block_size}"
+        )
+
+    n_out, k_in = values.shape
+    n_blocks = math.ceil(k_in / block_size)
+    padded_k = n_blocks * block_size
+    padded = np.zeros((n_out, padded_k), dtype=np.float32)
+    padded[:, :k_in] = values.astype(np.float32, copy=False)
+    blocks = padded.reshape(n_out, n_blocks, block_size)
+
+    if symmetric:
+        # MatMulNBits' implicit uint4 zero-point is 8. Choose a scale that
+        # covers the asymmetric signed code range [-8, 7].
+        block_min = blocks.min(axis=-1)
+        block_max = blocks.max(axis=-1)
+        scales = np.maximum(-block_min / 8.0, block_max / 7.0)
+        zero_points = np.full_like(scales, 8, dtype=np.uint8)
+    else:
+        # Include zero in the representable range so the rounded zero-point
+        # always fits in uint4 without changing the selected scale.
+        block_min = np.minimum(blocks.min(axis=-1), 0.0)
+        block_max = np.maximum(blocks.max(axis=-1), 0.0)
+        scales = (block_max - block_min) / 15.0
+        safe_scales = np.where(scales != 0, scales, 1.0)
+        zero_points = np.clip(np.rint(-block_min / safe_scales), 0, 15).astype(np.uint8)
+
+    safe_scales = np.where(scales != 0, scales, 1.0)
+    quants = np.rint(blocks / safe_scales[:, :, None])
+    quants += zero_points[:, :, None]
+    quants = np.clip(quants, 0, 15).astype(np.uint8)
+    quants = np.where(scales[:, :, None] != 0, quants, 0).astype(np.uint8)
+
+    pairs = quants.reshape(n_out, n_blocks, block_size // 2, 2)
+    weight = (pairs[..., 1] << 4) | pairs[..., 0]
+
+    if symmetric:
+        packed_zero_points = None
+    else:
+        zp_cols = math.ceil(n_blocks / 2)
+        zp_padded = np.zeros((n_out, zp_cols * 2), dtype=np.uint8)
+        zp_padded[:, :n_blocks] = zero_points
+        zp_pairs = zp_padded.reshape(n_out, zp_cols, 2)
+        packed_zero_points = zp_pairs[:, :, 0] | (zp_pairs[:, :, 1] << 4)
 
     return RepackedTensor(
         weight=weight,
-        scales=scales_out,
+        scales=scales.astype(np.float32),
+        zero_points=packed_zero_points,
+        block_size=block_size,
+        bits=bits,
+    )
+
+
+# Lookup table: 4-bit nibble (LSB-first) -> 8-bit ORT 2-bit packed byte.
+# Each Q1_0 bit b in {0, 1} maps to MatMulNBits 2-bit code 2*b in {0, 2}
+# (which under zp=1 dequantizes to {-1, +1}).
+#
+# Q1_0 bit packing: bit `j % 8` of `qs[j // 8]` holds element j.
+# MatMulNBits 2-bit packing: code k of byte i = (byte >> (2*k)) & 0x3.
+#
+# nibble layout (LSB-first):    bit0 bit1 bit2 bit3
+# packed 2-bit byte (LSB-first): c0   c1   c2   c3
+#   where c_k = 2 * bit_k, giving byte = (bit3<<7)|(bit2<<5)|(bit1<<3)|(bit0<<1).
+def _build_q1_0_expand_table() -> np.ndarray:
+    table = np.zeros(16, dtype=np.uint8)
+    for nibble in range(16):
+        byte = 0
+        for k in range(4):
+            bit = (nibble >> k) & 1
+            byte |= (bit * 2) << (2 * k)
+        table[nibble] = byte
+    return table
+
+
+_Q1_0_EXPAND = _build_q1_0_expand_table()
+
+
+def _repack_q1_0(
+    blocks: np.ndarray,
+    n_out: int,
+    n_blocks_per_row: int,
+) -> RepackedTensor:
+    """Repack Q1_0 (1-bit binary) blocks into MatMulNBits 2-bit format.
+
+    Q1_0 block (18 bytes, 128 elements):
+        ``[fp16 scale (2B)][16B packed bits, LSB-first within each byte]``
+    Dequant per llama.cpp: ``bit ? +scale : -scale``.
+
+    MatMulNBits has no native 1-bit format, so we inflate each Q1_0 bit
+    ``b in {0, 1}`` to a 2-bit code ``B in {0, 2}``. With zero-point=1 and
+    scale=d, the op then dequantizes to ``(B - 1) * d = {-d, +d}`` — an
+    exact equivalent of Q1_0 at 2x the on-disk weight bytes but bit-exact
+    in values.
+
+    Each 8-bit Q1_0 byte encodes 8 elements, producing 2 MatMulNBits 2-bit
+    bytes (4 codes per byte).
+    """
+    raw_scales = blocks[:, :2].copy()
+    raw_bits = blocks[:, 2:]  # (total_blocks, 16)
+
+    scales = raw_scales.view(np.float16).reshape(n_out, n_blocks_per_row)
+
+    # Expand each Q1_0 byte (8 bits) into 2 MatMulNBits 2-bit bytes
+    # via the precomputed 4-bit nibble -> 8-bit lookup table.
+    low_nibbles = raw_bits & 0x0F  # bits 0..3 of each Q1_0 byte
+    high_nibbles = (raw_bits >> 4) & 0x0F  # bits 4..7
+
+    ort_low = _Q1_0_EXPAND[low_nibbles]  # (total_blocks, 16) — even ORT bytes
+    ort_high = _Q1_0_EXPAND[high_nibbles]  # (total_blocks, 16) — odd ORT bytes
+
+    # Interleave: ORT bytes for elements 0..7 are (ort_low[0], ort_high[0]),
+    # for elements 8..15 are (ort_low[1], ort_high[1]), etc.
+    blob_size = 32  # 128 elements * 2 bits / 8 = 32 bytes per block
+    interleaved = np.empty((raw_bits.shape[0], blob_size), dtype=np.uint8)
+    interleaved[:, 0::2] = ort_low
+    interleaved[:, 1::2] = ort_high
+    weight = interleaved.reshape(n_out, n_blocks_per_row, blob_size)
+
+    # Zero points: all blocks share zp=1 (so dequant maps {0,2} -> {-1,+1}).
+    # Packed as 4 ZPs per byte (bits=2): byte = (1<<6) | (1<<4) | (1<<2) | 1 = 0x55.
+    # Tail of the last byte (when n_blocks_per_row % 4 != 0) is unused by ORT;
+    # we still fill it with 0x55 for cleanliness.
+    zp_cols = math.ceil(n_blocks_per_row / 4)
+    zero_points = np.full((n_out, zp_cols), 0x55, dtype=np.uint8)
+
+    return RepackedTensor(
+        weight=weight,
+        scales=scales,
         zero_points=zero_points,
-        block_size=_BLOCK_SIZE,
-        bits=4,
+        block_size=128,
+        bits=2,
     )

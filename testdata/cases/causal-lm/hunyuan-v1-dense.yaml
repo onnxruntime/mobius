@@ -1,4 +1,5 @@
 model_id: "optimum-intel-internal-testing/tiny-random-hunyuan-v1-dense"
+model_type: "hunyuan_v1_dense"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"

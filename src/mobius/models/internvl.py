@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """InternVL2 multimodal model (vision + text) — 3-model split.
 
@@ -30,8 +30,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius._weight_utils import (
@@ -63,7 +62,7 @@ class _InternVisionLinear(nn.Module):
         self.weight = nn.Parameter([out_features, in_features])
         self.bias = nn.Parameter([out_features])
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         weight_t = op.Transpose(self.weight, perm=[1, 0])
         result = op.MatMul(x, weight_t)
         return op.Add(result, self.bias)
@@ -99,7 +98,7 @@ class _InternVisionEmbeddings(nn.Module):
         # Position embedding includes CLS position — bare parameter
         self.position_embedding = nn.Parameter([1, self.num_patches + 1, hidden_size])
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         # pixel_values: [batch, channels, height, width]
         patch_embeds = self.patch_embedding(op, pixel_values)
         # patch_embeds: [batch, hidden_size, grid_h, grid_w]
@@ -145,7 +144,7 @@ class _InternVisionAttention(nn.Module):
         self.qkv = _InternVisionLinear(hidden_size, 3 * hidden_size)
         self.proj = _InternVisionLinear(hidden_size, hidden_size)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # hidden_states: [batch, seq_len, hidden_size]
         qkv = self.qkv(op, hidden_states)  # [batch, seq, 3*hidden]
         # Split into Q, K, V along last dimension
@@ -175,7 +174,7 @@ class _InternVisionMLP(nn.Module):
         self.fc1 = _InternVisionLinear(hidden_size, intermediate_size)
         self.fc2 = _InternVisionLinear(intermediate_size, hidden_size)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         hidden_states = self.fc1(op, hidden_states)
         hidden_states = op.Gelu(hidden_states)
         return self.fc2(op, hidden_states)
@@ -209,7 +208,7 @@ class _InternVisionEncoderLayer(nn.Module):
         self.ls1 = nn.Parameter([hidden_size])
         self.ls2 = nn.Parameter([hidden_size])
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # Pre-norm attention with layer scale
         residual = hidden_states
         hidden_states = self.norm1(op, hidden_states)
@@ -248,7 +247,7 @@ class _InternVisionEncoder(nn.Module):
             ]
         )
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         for layer in self.layers:
             hidden_states = layer(op, hidden_states)
         return hidden_states
@@ -281,7 +280,7 @@ class _InternVisionModel(nn.Module):
             norm_eps=vc.norm_eps,
         )
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         hidden_states = self.embeddings(op, pixel_values)
         hidden_states = self.encoder(op, hidden_states)
         return hidden_states
@@ -301,7 +300,7 @@ class _GELUPlaceholder(nn.Module):
     weight names ``mlp1.1.*`` and ``mlp1.3.*`` match HuggingFace.
     """
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return op.Gelu(x)
 
 
@@ -325,7 +324,7 @@ class _InternVL2DecoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -381,7 +380,7 @@ class _InternVL2VisionEncoderModel(nn.Module):
             Linear(llm_hidden, llm_hidden, bias=True),
         )
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         # Run InternViT encoder
         vit_embeds = self.vision_model(op, pixel_values)
         # vit_embeds: [batch, num_patches+1, hidden_size] (includes CLS)
@@ -434,11 +433,11 @@ class _InternVL2VisionEncoderModel(nn.Module):
 
         # Step 1: view(N, W, H*scale, C/scale)
         h_scaled = op.Cast(
-            op.Mul(op.Cast(h, to=1), op.Constant(value_float=scale)),
+            op.Mul(op.Cast(h, to=1), scale),
             to=7,
         )
         c_over_scale = op.Cast(
-            op.Div(op.Cast(channels, to=1), op.Constant(value_float=scale)),
+            op.Div(op.Cast(channels, to=1), scale),
             to=7,
         )
         shape_step1 = op.Concat(batch, w, h_scaled, c_over_scale, axis=0)
@@ -449,13 +448,13 @@ class _InternVL2VisionEncoderModel(nn.Module):
 
         # Step 3: view(N, H*scale, W*scale, C/(scale^2))
         w_scaled = op.Cast(
-            op.Mul(op.Cast(w, to=1), op.Constant(value_float=scale)),
+            op.Mul(op.Cast(w, to=1), scale),
             to=7,
         )
         c_over_scale2 = op.Cast(
             op.Div(
                 op.Cast(channels, to=1),
-                op.Constant(value_float=scale * scale),
+                scale * scale,
             ),
             to=7,
         )
@@ -506,7 +505,7 @@ class _InternVL2EmbeddingModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         image_features: ir.Value,
     ):
@@ -521,7 +520,7 @@ class _InternVL2EmbeddingModel(nn.Module):
 
         # Compute indices into image_features via cumulative sum
         mask_int = op.Cast(image_mask, to=7)
-        cumsum = op.CumSum(mask_int, op.Constant(value_int=1))
+        cumsum = op.CumSum(mask_int, 1)
         indices = op.Sub(cumsum, op.Constant(value_int=1))
         indices = op.Clip(indices, op.Constant(value_int=0))
 
@@ -555,7 +554,7 @@ class InternVL2Model(nn.Module):
         self.vision_encoder = _InternVL2VisionEncoderModel(config)
         self.embedding = _InternVL2EmbeddingModel(config)
 
-    def forward(self, op: builder.OpBuilder, **kwargs):
+    def forward(self, op: OpBuilder, **kwargs):
         raise NotImplementedError(
             "InternVL2Model uses VisionLanguageTask which calls "
             "each sub-module (decoder, vision_encoder, embedding) "

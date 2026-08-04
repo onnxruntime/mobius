@@ -1,0 +1,27 @@
+{
+  "model_id": "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
+  "prompt": "Here is my poem:",
+  "generated_tokens": [
+    1429,
+    1784,
+    11560,
+    15368,
+    1307,
+    39935,
+    1044,
+    1044,
+    1044,
+    1044,
+    1050,
+    1048,
+    1050,
+    1048,
+    1050,
+    1048,
+    1050,
+    1048,
+    1050,
+    1048
+  ],
+  "generated_text": " \"The Great Wall of Beijing,,,,2020202020"
+}

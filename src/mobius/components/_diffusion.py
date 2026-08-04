@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Shared building blocks for diffusion transformer models.
 
@@ -12,8 +12,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components._activations import SiLU
 from mobius.components._common import LayerNorm, Linear
@@ -41,7 +40,7 @@ class AdaLayerNormZero(nn.Module):
         self.linear = Linear(hidden_size, hidden_size * 6)
         self._silu = SiLU()
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value, timestep_emb: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, timestep_emb: ir.Value):
         emb = self._silu(op, timestep_emb)
         emb = self.linear(op, emb)
         # [B, 6*C] → 6 x [B, C]
@@ -79,13 +78,12 @@ class AdaLayerNormOutput(nn.Module):
         self.linear = Linear(hidden_size, hidden_size * 2)
         self._silu = SiLU()
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value, timestep_emb: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, timestep_emb: ir.Value):
         emb = self._silu(op, timestep_emb)
         emb = self.linear(op, emb)
         shift, scale = op.Split(emb, num_outputs=2, axis=-1, _outputs=2)
-        one = op.Constant(value_float=1.0)
         hidden_states = self.norm(op, hidden_states)
-        hidden_states = op.Mul(hidden_states, op.Add(one, op.Unsqueeze(scale, [1])))
+        hidden_states = op.Mul(hidden_states, op.Add(1.0, op.Unsqueeze(scale, [1])))
         hidden_states = op.Add(hidden_states, op.Unsqueeze(shift, [1]))
         return hidden_states
 
@@ -107,7 +105,7 @@ class PatchEmbed(nn.Module):
             padding=0,
         )
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # [B, C, H, W] → [B, hidden, H/p, W/p]
         x = self.proj(op, x)
         batch = op.Shape(x, start=0, end=1)
@@ -135,7 +133,7 @@ class TimestepEmbedding(nn.Module):
         self.linear_2 = Linear(time_embed_dim, time_embed_dim)
         self._silu = SiLU()
 
-    def forward(self, op: builder.OpBuilder, sample: ir.Value):
+    def forward(self, op: OpBuilder, sample: ir.Value):
         sample = self.linear_1(op, sample)
         sample = self._silu(op, sample)
         sample = self.linear_2(op, sample)
@@ -155,7 +153,7 @@ class DiffusionFFN(nn.Module):
         self.linear_1 = Linear(hidden_size, intermediate_size)
         self.linear_2 = Linear(intermediate_size, hidden_size)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         hidden_states = self.linear_1(op, hidden_states)
         # GELU with tanh approximation
         hidden_states = op.Gelu(hidden_states)
@@ -181,7 +179,7 @@ class DiffusionSelfAttention(nn.Module):
         self._num_heads = num_heads
         self._head_dim = hidden_size // num_heads
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         q = self.to_q(op, hidden_states)
         k = self.to_k(op, hidden_states)
         v = self.to_v(op, hidden_states)

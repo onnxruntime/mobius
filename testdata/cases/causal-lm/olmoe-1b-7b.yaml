@@ -1,4 +1,5 @@
 model_id: "allenai/OLMoE-1B-7B-0924"
+model_type: "olmoe"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"
