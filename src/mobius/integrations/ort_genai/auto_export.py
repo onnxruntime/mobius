@@ -893,6 +893,13 @@ def _write_genai_config(
 
             if vision_input_mapping is not None:
                 vision_kwargs["input_names"] = vision_input_mapping
+            # Introspect vision outputs so extra maps (e.g. Qwen3-VL
+            # ``deepstack_features``) are forwarded to the embedding model
+            # via genai_config.json; defaulting to ``image_features`` alone
+            # would silently drop DeepStack at runtime.
+            vision_output_mapping = _introspect_outputs(pkg, "vision_encoder")
+            if vision_output_mapping is not None:
+                vision_kwargs["output_names"] = vision_output_mapping
             if embedding_input_mapping is not None:
                 vision_kwargs["embedding_input_names"] = embedding_input_mapping
 

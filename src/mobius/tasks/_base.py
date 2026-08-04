@@ -203,6 +203,7 @@ def build_decoder_from_embeds(
     *,
     mrope: bool = False,
     hybrid: bool = False,
+    deepstack: bool = False,
 ) -> ir.Model:
     """Build an ``inputs_embeds → logits + KV cache`` decoder ONNX graph.
 
@@ -219,6 +220,10 @@ def build_decoder_from_embeds(
             ``[batch, seq_len]``.
         hybrid: If ``True``, uses hybrid KV + DeltaNet cache inputs/outputs
             (for Qwen3.5-VL and similar).  Requires ``config.layer_types``.
+        deepstack: If ``True`` (Qwen3-VL family with
+            ``deepstack_visual_indexes``), adds a ``deepstack_embeds`` input
+            ``[D, batch, seq_len, hidden_size]`` that the decoder injects into
+            its first ``D`` layers.
 
     Returns:
         A built :class:`ir.Model` for the decoder.
@@ -257,6 +262,17 @@ def build_decoder_from_embeds(
         shape=[3, batch, seq_len] if mrope else [batch, seq_len],
     )
 
+    # DeepStack intermediate vision features, pre-scattered to full sequence
+    # length by the embedding model.  Shape [D, batch, seq_len, hidden_size].
+    deepstack_embeds = None
+    num_deepstack = len(getattr(config, "deepstack_visual_indexes", None) or [])
+    if deepstack and num_deepstack > 0:
+        deepstack_embeds = builder.input(
+            "deepstack_embeds",
+            dtype=config.dtype,
+            shape=[num_deepstack, batch, seq_len, config.hidden_size],
+        )
+
     if hybrid:
         past_key_values = _make_hybrid_cache_inputs(
             builder,
@@ -276,12 +292,17 @@ def build_decoder_from_embeds(
             past_seq_len,
         )
 
+    decoder_kwargs = {}
+    if deepstack_embeds is not None:
+        decoder_kwargs["deepstack_embeds"] = deepstack_embeds
+
     logits, present_key_values = decoder(
         builder.op,
         inputs_embeds=inputs_embeds,
         attention_mask=attention_mask,
         position_ids=position_ids,
         past_key_values=past_key_values,
+        **decoder_kwargs,
     )
 
     builder.add_output(logits, "logits")
@@ -306,6 +327,7 @@ def build_embedding_from_features(
     *,
     feature_name: str,
     feature_dim: int,
+    deepstack: bool = False,
 ) -> ir.Model:
     """Build an ``input_ids + features → inputs_embeds`` embedding ONNX graph.
 
@@ -319,6 +341,10 @@ def build_embedding_from_features(
         feature_name: Name of the second input (e.g. ``"image_features"`` or
             ``"audio_features"``).
         feature_dim: Feature dimension for the second input's last axis.
+        deepstack: If ``True`` (Qwen3-VL family with
+            ``deepstack_visual_indexes``), adds a ``deepstack_features`` input
+            ``[D, num_feature_tokens, feature_dim]`` and emits a second
+            ``deepstack_embeds`` output ``[D, batch, seq_len, hidden_size]``.
 
     Returns:
         A built :class:`ir.Model` for the embedding model.
@@ -339,11 +365,26 @@ def build_embedding_from_features(
         shape=[num_feature_tokens, feature_dim],
     )
 
-    inputs_embeds = embedding(
+    embedding_kwargs = {feature_name: features}
+    num_deepstack = len(getattr(config, "deepstack_visual_indexes", None) or [])
+    if deepstack and num_deepstack > 0:
+        deepstack_features = builder.input(
+            "deepstack_features",
+            dtype=config.dtype,
+            shape=[num_deepstack, num_feature_tokens, feature_dim],
+        )
+        embedding_kwargs["deepstack_features"] = deepstack_features
+
+    outputs = embedding(
         builder.op,
         input_ids=input_ids,
-        **{feature_name: features},
+        **embedding_kwargs,
     )
 
-    builder.add_output(inputs_embeds, "inputs_embeds")
+    if isinstance(outputs, tuple):
+        inputs_embeds, deepstack_embeds = outputs
+        builder.add_output(inputs_embeds, "inputs_embeds")
+        builder.add_output(deepstack_embeds, "deepstack_embeds")
+    else:
+        builder.add_output(outputs, "inputs_embeds")
     return _make_model(graph)

@@ -19,6 +19,7 @@ from mobius.integrations.ort_genai.auto_export import (
     _fix_chat_template,
     _fix_tokenizer_config,
     _graph_input_names,
+    _introspect_outputs,
     _resolve_ort_genai_model_type,
     _select_ort_model_type,
     _write_audio_processor_config,
@@ -38,6 +39,18 @@ def _mock_model_with_inputs(names):
         inputs.append(inp)
     m = mock.MagicMock()
     m.graph.inputs = inputs
+    return m
+
+
+def _mock_model_with_outputs(names):
+    """Create a mock ir.Model whose graph.outputs have the given names."""
+    outputs = []
+    for n in names:
+        out = mock.MagicMock()
+        out.name = n
+        outputs.append(out)
+    m = mock.MagicMock()
+    m.graph.outputs = outputs
     return m
 
 
@@ -1550,6 +1563,34 @@ class TestGraphInputNames:
             "attention_mask",
             "position_ids",
         ]
+
+
+class TestIntrospectVisionOutputs:
+    """_introspect_outputs surfaces extra vision outputs (DeepStack)."""
+
+    def test_vision_deepstack_output_is_surfaced(self):
+        """A Qwen3-VL vision encoder's deepstack_features output is mapped."""
+        from mobius._model_package import ModelPackage
+
+        pkg = ModelPackage(
+            {
+                "vision_encoder": _mock_model_with_outputs(
+                    ["image_features", "deepstack_features"]
+                ),
+            },
+            config=mock.MagicMock(),
+        )
+        mapping = _introspect_outputs(pkg, "vision_encoder")
+        assert mapping == {
+            "image_features": "image_features",
+            "deepstack_features": "deepstack_features",
+        }
+
+    def test_missing_key_returns_none(self):
+        from mobius._model_package import ModelPackage
+
+        pkg = ModelPackage({}, config=mock.MagicMock())
+        assert _introspect_outputs(pkg, "vision_encoder") is None
 
 
 class TestGemma4RealModel:
