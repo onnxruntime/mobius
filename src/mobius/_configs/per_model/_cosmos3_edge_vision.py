@@ -35,7 +35,12 @@ def _cosmos3_edge_vision(config, parent_config, model_type: str, fields: dict):
         num_patches = getattr(hf_vision, "num_patches", None)
         patch_size = getattr(hf_vision, "patch_size", None) or fields.get("patch_size")
         if num_patches is not None and patch_size is not None:
-            grid = round(math.sqrt(num_patches))
+            grid = math.isqrt(num_patches)
+            if grid * grid != num_patches:
+                raise ValueError(
+                    "Cosmos3-Edge vision num_patches must form a square grid, "
+                    f"got {num_patches}"
+                )
             fields["image_size"] = grid * patch_size
 
     # Pixel-shuffle projector intermediate size from projector_config.

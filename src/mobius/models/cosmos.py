@@ -218,6 +218,11 @@ class _Cosmos3EdgeVisionEncoderModel(nn.Module):
                 "Cosmos3-Edge projector output must match the text hidden size, "
                 f"got {vc.out_hidden_size} != {config.hidden_size}"
             )
+        if vc.image_size % vc.patch_size != 0:
+            raise ValueError(
+                f"image_size ({vc.image_size}) must be divisible by "
+                f"patch_size ({vc.patch_size})"
+            )
         self.vision_tower = VisionModel(config)
         # Fixed square patch grid (image_size // patch_size), e.g. 256 -> 16.
         grid_size = vc.image_size // vc.patch_size

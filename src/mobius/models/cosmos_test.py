@@ -5,15 +5,19 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from mobius._configs import ArchitectureConfig, VisionConfig
+from mobius._configs.per_model._cosmos3_edge_vision import _cosmos3_edge_vision
 from mobius.models.cosmos import (
     Cosmos3EdgeTextModel,
     Cosmos3EdgeVLModel,
     _Cosmos3EdgeVisionEncoderModel,
 )
+from mobius.tasks import Cosmos3EdgeVLTask
 
 
 def _tiny_config(
@@ -21,6 +25,8 @@ def _tiny_config(
     tie_word_embeddings: bool = False,
     spatial_merge_size: int | None = 2,
     out_hidden_size: int | None = 64,
+    image_size: int = 28,
+    patch_size: int = 14,
 ) -> ArchitectureConfig:
     return ArchitectureConfig(
         model_type="cosmos3_edge",
@@ -41,8 +47,8 @@ def _tiny_config(
             intermediate_size=64,
             num_hidden_layers=1,
             num_attention_heads=2,
-            image_size=28,
-            patch_size=14,
+            image_size=image_size,
+            patch_size=patch_size,
             spatial_merge_size=spatial_merge_size,
             out_hidden_size=out_hidden_size,
             projector_intermediate_size=64,
@@ -100,3 +106,39 @@ def test_vision_encoder_defaults_missing_spatial_merge_size():
 def test_vision_encoder_rejects_projector_width_mismatch():
     with pytest.raises(AssertionError, match="projector output must match"):
         _Cosmos3EdgeVisionEncoderModel(_tiny_config(out_hidden_size=32))
+
+
+def test_vl_task_vision_output_matches_embedding_input():
+    config = _tiny_config()
+    package = Cosmos3EdgeVLTask().build(Cosmos3EdgeVLModel(config), config)
+
+    pixel_values = package["vision_encoder"].graph.inputs[0]
+    image_features = package["vision_encoder"].graph.outputs[0]
+    embedding_features = next(
+        value for value in package["embedding"].graph.inputs if value.name == "image_features"
+    )
+
+    assert pixel_values.shape[0] == 1
+    assert len(image_features.shape) == 2
+    assert len(embedding_features.shape) == 2
+    assert image_features.shape[-1] == embedding_features.shape[-1] == config.hidden_size
+
+
+def test_vision_encoder_rejects_non_integral_patch_grid():
+    with pytest.raises(ValueError, match=r"image_size .* divisible by patch_size"):
+        _Cosmos3EdgeVisionEncoderModel(_tiny_config(image_size=30, patch_size=14))
+
+
+def test_vision_encoder_rejects_unmergeable_patch_grid():
+    with pytest.raises(ValueError, match=r"grid_size .* divisible"):
+        _Cosmos3EdgeVisionEncoderModel(
+            _tiny_config(image_size=42, patch_size=14, spatial_merge_size=2)
+        )
+
+
+def test_vision_config_rejects_non_square_num_patches():
+    vision_config = SimpleNamespace(num_patches=255, patch_size=16)
+    config = SimpleNamespace(vision_config=vision_config)
+
+    with pytest.raises(ValueError, match="num_patches must form a square grid"):
+        _cosmos3_edge_vision(config, None, "cosmos3_edge", {"image_size": None})

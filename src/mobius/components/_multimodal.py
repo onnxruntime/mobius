@@ -148,6 +148,15 @@ class Cosmos3EdgeMultiModalProjector(nn.Module):
         norm_eps: float = 1e-6,
     ):
         super().__init__()
+        if grid_size <= 0:
+            raise ValueError(f"grid_size must be positive, got {grid_size}")
+        if spatial_merge_size <= 0:
+            raise ValueError(f"spatial_merge_size must be positive, got {spatial_merge_size}")
+        if grid_size % spatial_merge_size != 0:
+            raise ValueError(
+                f"grid_size ({grid_size}) must be divisible by "
+                f"spatial_merge_size ({spatial_merge_size})"
+            )
         self._grid = grid_size
         self._ms = spatial_merge_size
         self._vision_hidden = vision_hidden_size
