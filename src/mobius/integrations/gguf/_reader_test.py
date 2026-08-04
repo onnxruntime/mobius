@@ -17,6 +17,9 @@ import pytest
 from mobius.integrations.gguf._config_mapping import (
     GGUF_ARCH_TO_MODEL_TYPE,
     _extract_config_fields,
+    _infer_attn_o_bias,
+    _infer_attn_qkv_bias,
+    _infer_mlp_bias,
     _infer_tie_embeddings,
     gguf_to_config,
 )
@@ -405,7 +408,71 @@ class TestConfigMapping:
         assert GGUF_ARCH_TO_MODEL_TYPE["llama"] == "llama"
         assert GGUF_ARCH_TO_MODEL_TYPE["mistral"] == "llama"
         assert GGUF_ARCH_TO_MODEL_TYPE["qwen2"] == "qwen2"
+        assert GGUF_ARCH_TO_MODEL_TYPE["qwen35"] == "qwen3_5_text"
         assert GGUF_ARCH_TO_MODEL_TYPE["phi3"] == "phi3"
+        assert GGUF_ARCH_TO_MODEL_TYPE["deepseek4"] == "deepseek_v4"
+
+    def test_deepseek4_config_extraction(self):
+        metadata = {
+            "general.architecture": "deepseek4",
+            "deepseek4.embedding_length": 4096,
+            "deepseek4.block_count": 43,
+            "deepseek4.attention.head_count": 64,
+            "deepseek4.attention.head_count_kv": 1,
+            "deepseek4.attention.key_length": 512,
+            "deepseek4.context_length": 1048576,
+            "deepseek4.rope.dimension_count": 64,
+            "deepseek4.rope.freq_base": 10000.0,
+            "deepseek4.rope.scaling.type": "yarn",
+            "deepseek4.rope.scaling.factor": 16.0,
+            "deepseek4.rope.scaling.original_context_length": 65536,
+            "deepseek4.rope.scaling.yarn_beta_fast": 32.0,
+            "deepseek4.rope.scaling.yarn_beta_slow": 1.0,
+            "deepseek4.attention.layer_norm_rms_epsilon": 1e-6,
+            "deepseek4.expert_count": 256,
+            "deepseek4.expert_used_count": 6,
+            "deepseek4.expert_feed_forward_length": 2048,
+            "deepseek4.expert_shared_count": 1,
+            "deepseek4.expert_weights_scale": 1.5,
+            "deepseek4.expert_weights_norm": True,
+            "deepseek4.swiglu_clamp_exp": [10.0] * 43,
+            "deepseek4.attention.q_lora_rank": 1024,
+            "deepseek4.attention.sliding_window": 128,
+            "deepseek4.attention.output_group_count": 8,
+            "deepseek4.attention.output_lora_rank": 1024,
+            "deepseek4.attention.indexer.head_count": 64,
+            "deepseek4.attention.indexer.key_length": 128,
+            "deepseek4.attention.indexer.top_k": 512,
+            "deepseek4.attention.compress_ratios": [0, 0, 4, 128],
+            "deepseek4.attention.compress_rope_freq_base": 160000.0,
+            "deepseek4.hyper_connection.count": 4,
+            "deepseek4.hyper_connection.sinkhorn_iterations": 20,
+            "deepseek4.hyper_connection.epsilon": 1e-6,
+            "deepseek4.hash_layer_count": 3,
+        }
+
+        class _FakeModel:
+            architecture = "deepseek4"
+
+            def __init__(self, values):
+                self.metadata = values
+                self.tensor_names = ["token_embd.weight", "output.weight"]
+
+            def get_metadata(self, key, default=None):
+                return self.metadata.get(key, default)
+
+        config = gguf_to_config(_FakeModel(metadata))
+        assert config.model_type == "deepseek_v4"
+        assert config.head_dim == 512
+        assert config.qk_rope_head_dim == 64
+        assert config.num_local_experts == 256
+        assert config.scoring_func == "sqrtsoftplus"
+        assert config.hc_mult == 4
+        assert config.num_hash_layers == 3
+        assert config.swiglu_limit == pytest.approx(10.0)
+        assert config.rope_interleave is True
+        assert config.rope_type == "yarn"
+        assert config.original_max_position_embeddings == 65536
 
     def test_tie_embeddings_detected(self, tied_gguf: Path):
         model = GGUFModel(tied_gguf)
@@ -416,6 +483,48 @@ class TestConfigMapping:
         model = GGUFModel(llama_gguf)
         config = gguf_to_config(model)
         assert config.tie_word_embeddings is False
+
+    def test_infer_projection_biases_from_tensor_names(self):
+        """Q/K/V, output, and MLP biases are inferred from tensor names.
+
+        Regression for the invalid Q4 bug: Qwen2 carries Q/K/V biases in
+        GGUF (``blk.N.attn_{q,k,v}.bias``). If ``attn_qkv_bias`` is not
+        inferred, the graph builder omits the bias Add and the model emits
+        garbage. Attention-output and MLP biases are absent for Qwen2.
+        """
+
+        class _FakeModel:
+            def __init__(self, names):
+                self.tensor_names = names
+
+        qwen_like = _FakeModel(
+            [
+                "blk.0.attn_q.weight",
+                "blk.0.attn_q.bias",
+                "blk.0.attn_k.bias",
+                "blk.0.attn_v.bias",
+                "blk.0.ffn_down.weight",
+            ]
+        )
+        assert _infer_attn_qkv_bias(qwen_like) is True
+        assert _infer_attn_o_bias(qwen_like) is False
+        assert _infer_mlp_bias(qwen_like) is False
+
+        no_bias = _FakeModel(["blk.0.attn_q.weight", "blk.0.ffn_down.weight"])
+        assert _infer_attn_qkv_bias(no_bias) is False
+        assert _infer_attn_o_bias(no_bias) is False
+        assert _infer_mlp_bias(no_bias) is False
+
+        full_bias = _FakeModel(
+            [
+                "blk.0.attn_qkv.bias",
+                "blk.0.attn_output.bias",
+                "blk.0.ffn_up.bias",
+            ]
+        )
+        assert _infer_attn_qkv_bias(full_bias) is True
+        assert _infer_attn_o_bias(full_bias) is True
+        assert _infer_mlp_bias(full_bias) is True
 
     def test_custom_rope_theta(self, tmp_path: Path):
         path = tmp_path / "rope.gguf"

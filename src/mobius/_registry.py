@@ -37,6 +37,7 @@ from mobius.models import (
     ChatGLMCausalLMModel,
     DeepSeekOCR2CausalLMModel,
     DeepSeekV3CausalLMModel,
+    DeepSeekV4CausalLMModel,
     DFlashDraftModel,
     DiffLlamaCausalLMModel,
     DogeCausalLMModel,
@@ -64,6 +65,7 @@ from mobius.models import (
     HunYuanVLMoTModel,
     InternLM2CausalLMModel,
     LayerNormCausalLMModel,
+    LLaDAModel,
     Llama4CausalLMModel,
     MoECausalLMModel,
     NanoChatCausalLMModel,
@@ -73,7 +75,9 @@ from mobius.models import (
     Phi3CausalLMModel,
     Phi3MoECausalLMModel,
     Phi3SmallCausalLMModel,
+    Phi3VModel,
     Phi4MMMultiModalModel,
+    Phi4SigLIPModel,
     PhiCausalLMModel,
     Qwen2MoECausalLMModel,
     Qwen2VLCausalLMModel,
@@ -450,6 +454,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "hunyuan_v1_dense": ModelRegistration(HunYuanV1DenseCausalLMModel),
     "internlm2": ModelRegistration(InternLM2CausalLMModel),
     "llama4_text": ModelRegistration(Llama4CausalLMModel),
+    "llada": ModelRegistration(LLaDAModel, task="masked-diffusion"),
     "modernbert-decoder": ModelRegistration(ModernBertDecoderModel),
     "mpt": ModelRegistration(MPTCausalLMModel),
     "nanochat": ModelRegistration(NanoChatCausalLMModel),
@@ -540,6 +545,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "deepseek_v2": ModelRegistration(DeepSeekV3CausalLMModel),
     "deepseek_v2_moe": ModelRegistration(DeepSeekV3CausalLMModel),
     "deepseek_v3": ModelRegistration(DeepSeekV3CausalLMModel),
+    "deepseek_v4": ModelRegistration(DeepSeekV4CausalLMModel, task="deepseek-v4"),
     "deepseek_vl_v2": ModelRegistration(DeepSeekOCR2CausalLMModel),
     # --- SSM (Mamba / Mamba2) ---
     "falcon_mamba": ModelRegistration(MambaCausalLMModel),
@@ -589,6 +595,8 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "paligemma": ModelRegistration(LLaVAModel, task="vision-language"),
     "phi4_multimodal": ModelRegistration(Phi4MMMultiModalModel, task="phi4mm-multimodal"),
     "phi4mm": ModelRegistration(Phi4MMMultiModalModel, task="phi4mm-multimodal"),
+    "phi3_v": ModelRegistration(Phi3VModel, task="vision-language"),
+    "phi4-siglip": ModelRegistration(Phi4SigLIPModel, task="vision-language"),
     "pixtral": ModelRegistration(LLaVAModel, task="pixtral-vl"),
     "qwen2_5_vl": ModelRegistration(Qwen25VLCausalLMModel, task="qwen-vl"),
     "qwen2_5_vl_text": ModelRegistration(Qwen25VLTextModel),
@@ -596,6 +604,13 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "qwen2_vl_text": ModelRegistration(Qwen25VLTextModel),
     "qwen3_5": ModelRegistration(Qwen35VL3ModelCausalLMModel, task="hybrid-qwen-vl"),
     "qwen3_5_moe_vl": ModelRegistration(Qwen35MoEVL3ModelCausalLMModel, task="hybrid-qwen-vl"),
+    # Text-only sibling of ``qwen3_5_moe_vl`` (Qwen3.6-35B-A3B). The MoE
+    # backbone ``Qwen35MoECausalLMModel`` already strips ``language_model.``
+    # and drops ``visual.``/MTP keys, so it consumes the VL checkpoint's text
+    # weights directly; ``build(..., text_only=True)`` routes here via
+    # ``_TEXT_ONLY_MODEL_TYPE``. It also matches the VL ``text_config``'s own
+    # ``model_type=qwen3_5_moe_text`` so that config resolves cleanly.
+    "qwen3_5_moe_text": ModelRegistration(Qwen35MoECausalLMModel),
     "qwen3_5_vl": ModelRegistration(Qwen35VL3ModelCausalLMModel, task="hybrid-qwen-vl"),
     "qwen3_5_vl_text": ModelRegistration(Qwen35VLTextModel),
     "qwen3_vl": ModelRegistration(Qwen3VL3ModelCausalLMModel, task="qwen-vl"),
@@ -783,6 +798,12 @@ def _create_default_registry() -> ModelRegistry:
 _TEXT_ONLY_MODEL_TYPE: dict[str, str] = {
     "gemma4_unified": "gemma4_unified_text",
     "gemma4_unified_text": "gemma4_unified_text",
+    # Qwen3.5-MoE-VL (Qwen3.6-35B-A3B): export just the hybrid MoE text
+    # backbone as a standalone decoder-only LLM. The builder overrides
+    # ``qwen3_5_moe`` -> ``qwen3_5_moe_vl`` when a ``vision_config`` is present,
+    # so the text-only override keys off the VL type here.
+    "qwen3_5_moe_vl": "qwen3_5_moe_text",
+    "qwen3_5_moe_text": "qwen3_5_moe_text",
 }
 
 
@@ -886,6 +907,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
     "qwen3_moe": "Qwen/Qwen3-30B-A3B",
     "qwen3_5_moe": "Qwen/Qwen3.5-MoE-A3B-128K",
+    "qwen3_5_moe_text": "Qwen/Qwen3.6-35B-A3B",
     "qwen3_next": "Qwen/Qwen3-235B-A22B",
     "granitemoe": "ibm-granite/granite-3.0-1b-a400m-instruct",
     "olmoe": "allenai/OLMoE-1B-7B-0924",
@@ -906,6 +928,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "deepseek_v2": "deepseek-ai/DeepSeek-V2-Lite",
     "deepseek_v2_moe": "deepseek-ai/DeepSeek-V2-Lite",
     "deepseek_v3": "deepseek-ai/DeepSeek-V3",
+    "deepseek_v4": "deepseek-ai/DeepSeek-V4-Flash",
 
     # --- SSM (Mamba) ---
     "mamba": "state-spaces/mamba-130m-hf",
@@ -933,6 +956,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "internvl2": "OpenGVLab/InternVL2-1B",
     "phi4mm": "microsoft/Phi-4-multimodal-instruct",
     "phi4_multimodal": "microsoft/Phi-4-multimodal-instruct",
+    "phi3_v": "microsoft/Phi-3.5-vision-instruct",
+    "phi4-siglip": "microsoft/Phi-4-reasoning-vision-15B",
     "blip-2": "Salesforce/blip2-opt-2.7b",
     "florence2": "microsoft/Florence-2-base",
     "idefics2": "HuggingFaceM4/idefics2-8b",
@@ -1110,6 +1135,8 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "phimoe": "phi",
     "phi4mm": "phi",
     "phi4_multimodal": "phi",
+    "phi3_v": "phi",
+    "phi4-siglip": "phi",
     "gemma": "gemma",
     "gemma2": "gemma",
     "shieldgemma2": "gemma",
@@ -1128,6 +1155,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "qwen3_moe": "qwen",
     "qwen3_5_text": "qwen",
     "qwen3_5_moe": "qwen",
+    "qwen3_5_moe_text": "qwen",
     "qwen3_next": "qwen",
     "qwen2_vl": "qwen",
     "qwen2_vl_text": "qwen",
@@ -1149,6 +1177,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "deepseek_v2": "deepseek",
     "deepseek_v2_moe": "deepseek",
     "deepseek_v3": "deepseek",
+    "deepseek_v4": "deepseek",
     "deepseek_vl_v2": "deepseek",
     "olmo": "olmo",
     "olmo2": "olmo",
@@ -1220,6 +1249,7 @@ _VARIANT_LABELS: dict[str, str] = {
     "deepseek_v2": "mla",
     "deepseek_v2_moe": "mla+moe",
     "deepseek_v3": "mla+moe",
+    "deepseek_v4": "dense-csa-fallback+mtp+moe+hc",
     "phi3small": "blocksparse",
     "falcon_h1": "hybrid-ssm",
     "mamba": "ssm",

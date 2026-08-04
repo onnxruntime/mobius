@@ -1,22 +1,26 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""GraniteMoeHybrid: Mamba2/SSD + Attention hybrid with MoE FFN on all layers.
+"""GraniteMoeHybrid: Mamba2/SSD + Attention hybrid with optional MoE FFN.
 
-Every layer has both a routed MoE block (``block_sparse_moe``) and a dense
-shared MLP (``shared_mlp``). The layer type ("mamba2" or "full_attention")
-controls whether the attention sub-block is a Mamba2/SSD or standard GQA.
-Attention layers use NoPE (no rotary position embeddings).
+Each layer has a dense shared MLP (``shared_mlp``) and, when the config has
+routed experts (``num_local_experts > 0``), a routed MoE block
+(``block_sparse_moe``); variants with no experts (e.g. granite-4.0-1b) run
+only the shared MLP. The layer type ("mamba2" or "full_attention") controls
+whether the token-mixing sub-block is a Mamba2/SSD or standard GQA. Attention
+layers use RoPE when ``position_embedding_type == 'rope'`` (granite-4.0-1b)
+and NoPE otherwise (granite-4.0-tiny-preview). Granite scaling multipliers
+(embedding/attention/residual/logits) are applied throughout.
 
 Forward pass per layer::
 
     residual = x
     x = input_layernorm(x)
-    x = mamba(x)  OR  self_attn(x, position_embeddings=None)
+    x = mamba(x)  OR  self_attn(x, position_embeddings)
     x = residual + x * residual_multiplier
     residual = x
     x = post_attention_layernorm(x)
-    x = block_sparse_moe(x) + shared_mlp(x)
+    x = shared_mlp(x)  [+ block_sparse_moe(x) if experts]
     x = residual + x * residual_multiplier
 
 HuggingFace reference: ``GraniteMoeHybridForCausalLM``.
@@ -39,6 +43,7 @@ from mobius.components import (
     TopKGate,
     create_attention_bias,
     get_activation,
+    initialize_rope,
 )
 
 if TYPE_CHECKING:
@@ -183,6 +188,24 @@ class _FusedSharedMLP(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def _feedforward(
+    op: OpBuilder,
+    hidden_states: ir.Value,
+    block_sparse_moe: nn.Module | None,
+    shared_mlp: nn.Module,
+) -> ir.Value:
+    """Combined routed-MoE + shared-MLP feedforward.
+
+    When routed experts exist, the output is ``moe(x) + shared_mlp(x)``; for
+    variants with ``num_local_experts == 0`` (e.g. granite-4.0-1b) only the
+    dense shared MLP runs. Mirrors HF ``GraniteMoeHybridDecoderLayer``.
+    """
+    shared_out = shared_mlp(op, hidden_states)
+    if block_sparse_moe is None:
+        return shared_out
+    return op.Add(block_sparse_moe(op, hidden_states), shared_out)
+
+
 class _GraniteMoeHybridMambaDecoderLayer(nn.Module):
     """GraniteMoeHybrid Mamba2 layer.
 
@@ -212,8 +235,12 @@ class _GraniteMoeHybridMambaDecoderLayer(nn.Module):
         )
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Routed MoE with fused 3D expert weights
-        self.block_sparse_moe = _FusedMoEBlock(config)
+        # Routed MoE with fused 3D expert weights. GraniteMoeHybrid variants with
+        # ``num_local_experts == 0`` (e.g. granite-4.0-1b) have no routed experts;
+        # only the dense shared MLP runs. Mirrors HF ``block_sparse_moe = MoE(...)
+        # if num_local_experts > 0 else None``.
+        self._has_experts = bool(config.num_local_experts)
+        self.block_sparse_moe = _FusedMoEBlock(config) if self._has_experts else None
 
         # Dense shared MLP with fused gate+up weight
         self.shared_mlp = _FusedSharedMLP(config)
@@ -225,7 +252,7 @@ class _GraniteMoeHybridMambaDecoderLayer(nn.Module):
         op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
-        position_embeddings: tuple,
+        position_embeddings: tuple | None,
         past_key_value: tuple | None,
     ):
         """Forward pass. Returns (hidden_states, (conv_state, ssm_state)).
@@ -250,11 +277,7 @@ class _GraniteMoeHybridMambaDecoderLayer(nn.Module):
         # MoE + shared-MLP path with pre-norm
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(op, hidden_states)
-        # Both routed MoE and shared MLP run on every layer; outputs are summed
-        hidden_states = op.Add(
-            self.block_sparse_moe(op, hidden_states),
-            self.shared_mlp(op, hidden_states),
-        )
+        hidden_states = _feedforward(op, hidden_states, self.block_sparse_moe, self.shared_mlp)
         rm = op.CastLike(op.Constant(value_float=self._residual_multiplier), hidden_states)
         hidden_states = op.Add(residual, op.Mul(hidden_states, rm))
 
@@ -274,12 +297,16 @@ class _GraniteMoeHybridAttentionDecoderLayer(nn.Module):
     def __init__(self, config: GraniteMoeHybridConfig):
         super().__init__()
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # GraniteMoeHybrid attention uses NoPE (no position embeddings)
-        self.self_attn = Attention(config)
+        # Attention scale is Granite's ``attention_multiplier`` (a fixed value,
+        # not the default 1/sqrt(head_dim)); RoPE is applied only when the text
+        # model supplies ``position_embeddings`` (position_embedding_type='rope').
+        self.self_attn = Attention(config, scale=config.attention_multiplier)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Routed MoE with fused 3D expert weights
-        self.block_sparse_moe = _FusedMoEBlock(config)
+        # Routed MoE with fused 3D expert weights. Absent when there are no
+        # routed experts (num_local_experts == 0), e.g. granite-4.0-1b.
+        self._has_experts = bool(config.num_local_experts)
+        self.block_sparse_moe = _FusedMoEBlock(config) if self._has_experts else None
 
         # Dense shared MLP with fused gate+up weight
         self.shared_mlp = _FusedSharedMLP(config)
@@ -291,20 +318,22 @@ class _GraniteMoeHybridAttentionDecoderLayer(nn.Module):
         op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
-        position_embeddings: tuple,
+        position_embeddings: tuple | None,
         past_key_value: tuple | None,
     ):
-        """Forward pass. Returns (hidden_states, (key, value))."""
-        del position_embeddings  # GraniteMoeHybrid uses NoPE: no rotary embeddings
+        """Forward pass. Returns (hidden_states, (key, value)).
 
-        # GQA attention path (no RoPE)
+        ``position_embeddings`` is ``None`` for NoPE variants and a
+        ``(cos, sin)`` tuple when ``position_embedding_type == 'rope'``.
+        """
+        # GQA attention path (RoPE applied iff position_embeddings is not None)
         residual = hidden_states
         hidden_states = self.input_layernorm(op, hidden_states)
         attn_out, present_kv = self.self_attn(
             op,
             hidden_states=hidden_states,
             attention_bias=attention_bias,
-            position_embeddings=None,  # NoPE: skip rotary embedding application
+            position_embeddings=position_embeddings,
             past_key_value=past_key_value,
         )
         rm = op.CastLike(op.Constant(value_float=self._residual_multiplier), attn_out)
@@ -313,10 +342,7 @@ class _GraniteMoeHybridAttentionDecoderLayer(nn.Module):
         # MoE + shared-MLP path with pre-norm
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(op, hidden_states)
-        hidden_states = op.Add(
-            self.block_sparse_moe(op, hidden_states),
-            self.shared_mlp(op, hidden_states),
-        )
+        hidden_states = _feedforward(op, hidden_states, self.block_sparse_moe, self.shared_mlp)
         rm = op.CastLike(op.Constant(value_float=self._residual_multiplier), hidden_states)
         hidden_states = op.Add(residual, op.Mul(hidden_states, rm))
 
@@ -332,7 +358,9 @@ class _GraniteMoeHybridTextModel(nn.Module):
     """GraniteMoeHybrid text backbone: embedding -> N x (Mamba2|Attention) layers -> norm.
 
     Layer type ("mamba2" or "full_attention") is read from ``config.layer_types``.
-    No rotary embeddings are used (NoPE for attention layers).
+    Attention layers use RoPE when ``config`` declares rotary parameters
+    (``position_embedding_type == 'rope'``, e.g. granite-4.0-1b) and NoPE
+    otherwise (e.g. granite-4.0-tiny-preview).
     """
 
     def __init__(self, config: GraniteMoeHybridConfig):
@@ -352,7 +380,10 @@ class _GraniteMoeHybridTextModel(nn.Module):
                 self.layers.append(_GraniteMoeHybridAttentionDecoderLayer(config))
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # No rotary_emb: GraniteMoeHybrid uses NoPE (no positional encodings)
+        # RoPE when the config declares rotary params; None => NoPE (attention
+        # layers then receive position_embeddings=None).
+        self.rotary_emb = initialize_rope(config)
+        self.embedding_multiplier = config.embedding_multiplier
 
     def forward(
         self,
@@ -362,10 +393,15 @@ class _GraniteMoeHybridTextModel(nn.Module):
         position_ids: ir.Value,
         past_key_values: list | None = None,
     ):
-        del position_ids  # unused: NoPE architecture has no positional embeddings
-
         # (batch, seq, hidden)
         hidden_states = self.embed_tokens(op, input_ids)
+        # Granite scales embeddings by embedding_multiplier after lookup.
+        hidden_states = op.Mul(hidden_states, self.embedding_multiplier)
+
+        # (cos, sin) tuple for RoPE, or None for NoPE variants.
+        position_embeddings = (
+            self.rotary_emb(op, position_ids) if self.rotary_emb is not None else None
+        )
         attention_bias = create_attention_bias(
             op,
             input_ids=input_ids,
@@ -380,7 +416,7 @@ class _GraniteMoeHybridTextModel(nn.Module):
                 op,
                 hidden_states=hidden_states,
                 attention_bias=attention_bias,
-                position_embeddings=None,  # NoPE: no RoPE
+                position_embeddings=position_embeddings,
                 past_key_value=past_kv,
             )
             present_key_values.append(present_kv)
@@ -413,6 +449,7 @@ class GraniteMoeHybridCausalLMModel(nn.Module):
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
+        self.logits_scaling = config.logits_scaling
 
     def forward(
         self,
@@ -430,6 +467,8 @@ class GraniteMoeHybridCausalLMModel(nn.Module):
             past_key_values=past_key_values,
         )
         logits = self.lm_head(op, hidden_states)
+        # Granite divides final logits by logits_scaling.
+        logits = op.Div(logits, self.logits_scaling)
         return logits, present_key_values
 
     def preprocess_weights(

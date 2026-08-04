@@ -7,7 +7,7 @@ from mobius import build_from_gguf
 ```
 
 > **Note**: Requires the optional `gguf` package:
-> `pip install mobius-ai[gguf]`
+> `pip install mobius-onnx[gguf]`
 
 ## Signature
 

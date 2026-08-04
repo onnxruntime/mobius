@@ -414,5 +414,36 @@ class AutoencoderKLModel(nn.Module):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        """No renaming needed — parameter names match diffusers directly."""
-        return state_dict
+        """Map legacy diffusers VAE attention names to the current convention.
+
+        Older Stable-Diffusion VAE checkpoints (e.g. OFA-Sys/small-stable-diffusion-v0)
+        name the mid-block self-attention projections ``query``/``key``/``value``/
+        ``proj_attn``; current diffusers (and this builder) use ``to_q``/``to_k``/
+        ``to_v``/``to_out.0``. The projections are plain Linears in both, so this is
+        a pure rename. Newer checkpoints already match and pass through unchanged.
+        Legacy checkpoints sometimes store the projections as 1x1 convolutions
+        (rank-4 ``[C, C, 1, 1]``); squeeze those to the ``[C, C]`` Linear form.
+        """
+        rename = {
+            ".query.": ".to_q.",
+            ".key.": ".to_k.",
+            ".value.": ".to_v.",
+            ".proj_attn.": ".to_out.0.",
+        }
+        out: dict[str, torch.Tensor] = {}
+        for key, tensor in state_dict.items():
+            new_key = key
+            if ".attentions." in key:
+                for old, new in rename.items():
+                    if old in new_key:
+                        new_key = new_key.replace(old, new)
+                        break
+                # Legacy 1x1-conv projections -> Linear weight matrices.
+                if (
+                    new_key.endswith(".weight")
+                    and tensor.dim() == 4
+                    and tensor.shape[2:] == (1, 1)
+                ):
+                    tensor = tensor.squeeze(-1).squeeze(-1)
+            out[new_key] = tensor
+        return out

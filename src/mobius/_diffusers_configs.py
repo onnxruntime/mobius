@@ -6,6 +6,53 @@
 from __future__ import annotations
 
 import dataclasses
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from mobius._configs import ArchitectureConfig
+
+
+class CLIPTextConfig:
+    """Adapter that builds an :class:`ArchitectureConfig` for a CLIP text encoder.
+
+    Classic Stable Diffusion 1.x/2.x pipelines use a ``transformers``
+    ``CLIPTextModel`` as their prompt encoder. Its ``text_encoder/config.json``
+    uses transformers field names, which this adapter maps onto the generic
+    :class:`mobius._configs.ArchitectureConfig` consumed by
+    :class:`mobius.models.clip.CLIPTextModel`.
+    """
+
+    @classmethod
+    def from_diffusers(cls, config: dict) -> ArchitectureConfig:
+        """Create an :class:`ArchitectureConfig` from a diffusers text-encoder config.
+
+        Args:
+            config: Parsed ``text_encoder/config.json`` dictionary.
+
+        Returns:
+            An :class:`ArchitectureConfig` describing the CLIP text encoder. The
+            transformers ``layer_norm_eps`` is mapped onto ``rms_norm_eps`` (the
+            field the from-scratch CLIP layers read for their ``LayerNorm`` eps),
+            and ``head_dim`` is derived from ``hidden_size / num_attention_heads``.
+        """
+        from mobius._configs import ArchitectureConfig
+
+        if hasattr(config, "to_dict"):
+            config = dict(config.items())
+        hidden_size = config.get("hidden_size", 768)
+        num_attention_heads = config.get("num_attention_heads", 12)
+        return ArchitectureConfig(
+            vocab_size=config.get("vocab_size", 49408),
+            hidden_size=hidden_size,
+            intermediate_size=config.get("intermediate_size", 3072),
+            num_hidden_layers=config.get("num_hidden_layers", 12),
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_attention_heads,
+            head_dim=hidden_size // num_attention_heads,
+            max_position_embeddings=config.get("max_position_embeddings", 77),
+            rms_norm_eps=config.get("layer_norm_eps", 1e-5),
+            hidden_act=config.get("hidden_act", "quick_gelu"),
+        )
 
 
 @dataclasses.dataclass
@@ -59,9 +106,23 @@ class UNet2DConfig:
     attention_head_dim: int = 8
     act_fn: str = "silu"
     sample_size: int = 64
+    # Per-block type names from diffusers. A block gets cross-attention only when
+    # its type name contains ``CrossAttn`` (Stable Diffusion 1.x uses a plain
+    # ``DownBlock2D`` for the last down block and ``UpBlock2D`` for the first up
+    # block). ``None`` = every block has cross-attention (legacy behavior).
+    down_block_types: tuple[str, ...] | None = None
+    up_block_types: tuple[str, ...] | None = None
     addition_embed_type: str | None = None
     addition_time_embed_dim: int | None = None
     projection_class_embeddings_input_dim: int | None = None
+    # Whether the Transformer2D blocks use a Linear (True) or 1x1 Conv (False,
+    # Stable Diffusion 1.x default) for their proj_in/proj_out.
+    use_linear_projection: bool = False
+    # Runtime LoRA adapters to bake into the attention projections as
+    # `(name, rank, scale)`. Each becomes a low-rank branch gated at run time by
+    # a scalar `lora_gate.{name}` input (1.0 = on, 0.0 = off, or a blend
+    # strength). Empty = no LoRA (plain projections).
+    lora_adapters: tuple[tuple[str, int, float], ...] = ()
 
     @classmethod
     def from_diffusers(cls, config: dict) -> UNet2DConfig:
@@ -78,11 +139,22 @@ class UNet2DConfig:
             attention_head_dim=config.get("attention_head_dim", 8),
             act_fn=config.get("act_fn", "silu"),
             sample_size=config.get("sample_size", 64),
+            down_block_types=(
+                tuple(config["down_block_types"])
+                if config.get("down_block_types") is not None
+                else None
+            ),
+            up_block_types=(
+                tuple(config["up_block_types"])
+                if config.get("up_block_types") is not None
+                else None
+            ),
             addition_embed_type=config.get("addition_embed_type"),
             addition_time_embed_dim=config.get("addition_time_embed_dim"),
             projection_class_embeddings_input_dim=config.get(
                 "projection_class_embeddings_input_dim"
             ),
+            use_linear_projection=config.get("use_linear_projection", False),
         )
 
 

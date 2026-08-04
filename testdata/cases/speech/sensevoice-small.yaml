@@ -10,6 +10,12 @@ inputs:
 
 level: "L4+L5"
 
+skip_reason: >
+  audio-ctc L4/L5 is not wired into the e2e harness: the encoder needs
+  custom LFR-fbank ``input_features`` (560-dim) plus a ``language_id``,
+  and the reference is FunASR (no transformers class), so
+  generate_golden.py has no audio-ctc generator. Tracked as a follow-up.
+
 notes: >
   SenseVoiceSmall CTC encoder-only ASR. Single model: SANM encoder + CTC head.
   Audio input is LFR fbank features (batch, seq_len, 560) with language ID.

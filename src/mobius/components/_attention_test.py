@@ -351,6 +351,34 @@ class TestGQAContextDispatch:
         # Standard ONNX Attention should not appear
         assert ops.get("Attention", 0) == 0
 
+    def test_build_with_webgpu_ep_emits_gqa_directly(self):
+        """WebGPU float16 builds keep attention and KV updates in GQA."""
+        from mobius._builder import build_from_module
+        from mobius._registry import registry
+        from mobius.rewrite_rules._testing_utils import count_ops
+
+        config = make_config(
+            dtype=ir.DataType.FLOAT16,
+            max_position_embeddings=128,
+            rope_type="default",
+            rope_theta=10000.0,
+        )
+        pkg = build_from_module(
+            registry.get("llama")(config),
+            config,
+            execution_provider="webgpu",
+        )
+        model = pkg["model"]
+        ops = count_ops(model)
+
+        assert ops.get("GroupQueryAttention", 0) == config.num_hidden_layers
+        assert ops.get("Attention", 0) == 0
+        assert all(
+            node.domain == "com.microsoft"
+            for node in model.graph
+            if node.op_type == "GroupQueryAttention"
+        )
+
     def test_build_with_default_ep_uses_standard_attention(self):
         """build_from_module with default EP keeps standard ONNX Attention (no GQA)."""
         from mobius._builder import build_from_module

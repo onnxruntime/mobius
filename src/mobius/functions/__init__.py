@@ -33,6 +33,9 @@ from mobius.functions.causal_conv import (
 from mobius.functions.linear_attention import (
     linear_attention,
 )
+from mobius.functions.matmul_nbits import (
+    matmul_nbits,
+)
 from mobius.functions.packed_multi_head_attention import (
     packed_multi_head_attention,
 )
@@ -53,6 +56,7 @@ _DOMAIN = "com.microsoft"
 # (kernel_size, channels, num_heads are baked into the function body) and are
 # registered per-model by ``tasks._base._register_linear_attention_functions``.
 _FUNCTION_BUILDERS: dict[ir.OperatorIdentifier, Callable[[], ir.Function]] = {
+    (_DOMAIN, "MatMulNBits", ""): matmul_nbits,
     (_DOMAIN, "PackedMultiHeadAttention", ""): packed_multi_head_attention,
     (_DOMAIN, "SkipLayerNormalization", ""): skip_layer_normalization,
     (_DOMAIN, "SkipSimplifiedLayerNormalization", ""): skip_simplified_layer_normalization,
@@ -100,6 +104,7 @@ __all__ = [
     "causal_conv_nd_with_state",
     "get_function",
     "linear_attention",
+    "matmul_nbits",
     "packed_multi_head_attention",
     "register_function_bodies",
     "skip_layer_normalization",

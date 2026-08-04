@@ -217,7 +217,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   intentionally skipped tensors (tokenizer, rope_freqs) from
   genuinely unmapped ones.
 - `gguf` optional dependency group in `pyproject.toml`
-  (`pip install mobius-ai[gguf]`).
+  (`pip install mobius-onnx[gguf]`).
 - 28 unit tests for GGUF reader, config mapping, tensor mapping,
   tensor processors, and CLI using synthetic GGUF files.
 

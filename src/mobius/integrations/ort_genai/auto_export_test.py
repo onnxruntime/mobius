@@ -229,6 +229,80 @@ class TestWriteProcessorConfig:
         permute = transforms[5]["operation"]["attrs"]
         assert permute["dims"] == [2, 0, 1]
 
+    def test_gemma3_vision_config(self, tmp_path):
+        """Gemma3 gets a fixed-size resize + Permute3D (not the generic branch).
+
+        Regression guard: gemma3's config unwraps to text_config, so
+        ``config.model_type`` is "gemma3_text". The generic-VLM branch would
+        emit smart_resize (variable HxW) with min_pixels/max_pixels and no
+        Permute3D, producing a variable-size HWC tensor that fails the SigLIP
+        encoder's fixed NCHW [batch, 3, 896, 896] input.
+        """
+        vision = mock.MagicMock()
+        vision.image_size = 896
+        vision.model_type = "siglip_vision_model"
+        config = mock.MagicMock()
+        config.vision = vision
+        # Unwrapped text-config model_type — NOT "gemma3".
+        config.model_type = "gemma3_text"
+
+        # No hf_model_id → uses gemma3 defaults (image_size=896, mean/std=0.5).
+        path = _write_vision_processor_config(config, str(tmp_path))
+        assert path is not None
+        assert path.endswith("processor_config.json")
+        with open(path) as f:
+            data = json.load(f)
+
+        proc = data["processor"]
+        transforms = proc["transforms"]
+
+        # 6-step pipeline ending in Permute3D (HWC→CHW).
+        types = [t["operation"]["type"] for t in transforms]
+        assert types == [
+            "DecodeImage",
+            "ConvertRGB",
+            "Resize",
+            "Rescale",
+            "Normalize",
+            "Permute3D",
+        ]
+
+        # Fixed-size resize: smart_resize disabled, no variable-pixel bounds.
+        resize = transforms[2]["operation"]["attrs"]
+        assert resize["smart_resize"] == 0
+        assert resize["height"] == 896
+        assert resize["width"] == 896
+        assert "min_pixels" not in resize
+        assert "max_pixels" not in resize
+
+        # Trailing Permute3D matches the encoder's channels-first contract.
+        assert transforms[5]["operation"]["attrs"]["dims"] == [2, 0, 1]
+
+    def test_siglip_vision_config_non_gemma3_uses_generic_branch(self, tmp_path):
+        """A SigLIP vision tower alone is not enough to select Gemma3 preprocessing."""
+        vision = mock.MagicMock()
+        vision.image_size = 448
+        vision.patch_size = 14
+        vision.spatial_merge_size = 2
+        vision.model_type = "siglip_vision_model"
+        config = mock.MagicMock()
+        config.vision = vision
+        config.model_type = "paligemma"
+        config.spatial_merge_size = 2
+
+        path = _write_vision_processor_config(config, str(tmp_path))
+        assert path is not None
+        with open(path) as f:
+            data = json.load(f)
+
+        transforms = data["processor"]["transforms"]
+        types = [t["operation"]["type"] for t in transforms]
+        assert types == ["DecodeImage", "ConvertRGB", "Resize", "Rescale", "Normalize"]
+        resize = transforms[2]["operation"]["attrs"]
+        assert resize["smart_resize"] == 1
+        assert "min_pixels" in resize
+        assert "max_pixels" in resize
+
     def test_hf_processor_fallback_to_clip_defaults(self, tmp_path):
         """Falls back to CLIP-standard defaults when HF processor can't be loaded."""
         vision = mock.MagicMock()
@@ -528,6 +602,36 @@ class TestWriteOrtGenaiConfigLocalDir:
         mock_hf.assert_called_once()
         mock_local.assert_not_called()
 
+    def test_local_hf_model_id_uses_local_tokenizer_copy(self, tmp_path):
+        """A local hf_model_id should copy tokenizer files locally, not call the Hub."""
+        src = tmp_path / "local_model"
+        src.mkdir()
+        (src / "config.json").write_text(
+            '{"model_type": "llama", "bos_token_id": 1, "eos_token_id": 2}'
+        )
+        (src / "tokenizer.json").write_text('{"local": true}')
+
+        out = tmp_path / "output"
+        out.mkdir()
+        pkg = self._make_pkg()
+
+        with (
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files",
+                return_value=[],
+            ) as mock_hub_copy,
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files_from_local",
+                wraps=_copy_tokenizer_files_from_local,
+            ) as mock_local_copy,
+        ):
+            result = write_ort_genai_config(pkg, str(out), hf_model_id=str(src))
+
+        mock_hub_copy.assert_not_called()
+        mock_local_copy.assert_called_once_with(str(src), str(out))
+        assert "tokenizer.json" in result
+        assert (out / "tokenizer.json").read_text() == '{"local": true}'
+
 
 class TestExportForOrtGenai:
     """Unit tests for write_ort_genai_config()."""
@@ -582,7 +686,7 @@ class TestExportForOrtGenai:
             },
             config=FakeConfig(),
         )
-        result = write_ort_genai_config(pkg, str(tmp_path))
+        result = write_ort_genai_config(pkg, str(tmp_path), ep="cuda")
 
         assert "processor_config" in result
         assert os.path.isfile(result["processor_config"])
@@ -595,6 +699,57 @@ class TestExportForOrtGenai:
         # Verify resize uses config values
         resize = transforms[2]["operation"]["attrs"]
         assert resize["patch_size"] == 14
+
+    def test_qwen3_vl_writes_qwen3_vl_model_type_and_vision_fields(self, tmp_path):
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 448
+            patch_size: int = 16
+            spatial_merge_size: int = 2
+            window_size: int = 64
+            model_type: str | None = None
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "qwen3_vl"
+            vocab_size: int = 151936
+            hidden_size: int = 2048
+            num_hidden_layers: int = 1
+            num_attention_heads: int = 16
+            num_key_value_heads: int = 8
+            head_dim: int = 128
+            image_token_id: int = 151655
+            vision_start_token_id: int = 151652
+            video_token_id: int = 151656
+            tokens_per_second: float = 2.0
+            temporal_patch_size: int = 2
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+
+        pkg = ModelPackage(
+            {
+                "decoder": mock.MagicMock(),
+                "vision_encoder": mock.MagicMock(),
+                "embedding": mock.MagicMock(),
+            },
+            config=FakeConfig(),
+        )
+
+        result = write_ort_genai_config(pkg, str(tmp_path), ep="cuda")
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+        model = data["model"]
+        assert model["type"] == "qwen3_vl"
+        assert model["vision_start_token_id"] == 151652
+        assert model["video_token_id"] == 151656
+        assert model["vision"]["tokens_per_second"] == pytest.approx(2.0)
+        assert model["vision"]["patch_size"] == 16
+        assert model["vision"]["window_size"] == 64
 
     def test_processor_config_not_written_without_vision(self, tmp_path):
         """image_processor.json is NOT written when pkg.config has no vision attr."""
@@ -920,6 +1075,48 @@ class TestExportForOrtGenai:
             data = json.load(f)
         # "gemma2" maps to "gemma" in _ORT_GENAI_MODEL_TYPE
         assert data["model"]["type"] == "gemma"
+
+    def test_config_mode_gemma3_text_vlm_uses_multimodal_model_type(self, tmp_path):
+        """Gemma3 VLM --config exports use ORT's multimodal gemma3 type."""
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 896
+            patch_size: int = 14
+            spatial_merge_size: int = 2
+            model_type: str = "siglip_vision_model"
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            # build() stores the unwrapped text sub-config type on Gemma3 VLMs.
+            model_type: str = "gemma3_text"
+            vocab_size: int = 262144
+            hidden_size: int = 64
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 4
+            num_key_value_heads: int = 2
+            head_dim: int = 16
+            max_position_embeddings: int = 128
+            image_token_id: int = 255999
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+
+        pkg = ModelPackage(
+            {
+                "decoder": _mock_model_with_inputs(["inputs_embeds", "attention_mask"]),
+                "vision_encoder": _mock_model_with_inputs(["pixel_values"]),
+                "embedding": _mock_model_with_inputs(["input_ids", "image_features"]),
+            },
+            config=FakeConfig(),
+        )
+        result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+        assert data["model"]["type"] == "gemma3"
 
     def test_config_mode_token_ids_propagated(self, tmp_path):
         """bos/eos token IDs in genai_config.json come from config fields in --config mode."""

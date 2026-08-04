@@ -9,7 +9,7 @@ import onnx_ir as ir
 import pytest
 
 from mobius._build_context import build_context, ep_capabilities, get_build_dtype
-from mobius._execution_providers import EpCapabilities
+from mobius._execution_providers import EpCapabilities, ep_registry
 
 _CUDA_CAPABILITIES = EpCapabilities(
     name="cuda",
@@ -36,6 +36,11 @@ class TestBuildContextDefaults:
         capabilities = ep_capabilities()
         assert len(capabilities.gqa_dtypes) == 0
         assert len(capabilities.qkv_pack_dtypes) == 0
+
+    def test_webgpu_capabilities_enable_fp16_gqa(self):
+        capabilities = ep_registry.require("webgpu")
+        assert ir.DataType.FLOAT16 in capabilities.gqa_dtypes
+        assert capabilities.supports_past_present_share_buffer
 
 
 class TestBuildContextScoping:

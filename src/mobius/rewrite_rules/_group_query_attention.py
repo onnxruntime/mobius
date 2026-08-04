@@ -43,11 +43,49 @@ They can also be applied manually::
 
 from __future__ import annotations
 
+import onnx_ir as ir
 from onnxscript.rewriter._basics import MatchFailureError, MatchResult
 from onnxscript.rewriter._rewrite_rule import (
     RewriteRuleClassBase,
     RewriteRuleSet,
 )
+
+from mobius._passes._dtype_utils import initializer_dtype
+
+
+def _propagate_dtype(source: ir.Value, *targets: ir.Value) -> None:
+    """Stamp ``source``'s dtype onto rewrite-created intermediate values.
+
+    Values produced by the replacement builder (``op.Concat(...)``,
+    ``op.Transpose(...)``) carry no declared type. When those intermediates are
+    later folded into initializers, a missing declared type forces the fold
+    passes to recover the dtype from ``const_value`` — or, absent that, to
+    default to ``FLOAT``, silently widening fp16 weights. Stamping the dtype of
+    the parameter the value is derived from keeps the type consistent from the
+    point the packed weight is created.
+    """
+    dtype = initializer_dtype(source)
+    if dtype is None:
+        return
+    for target in targets:
+        target.dtype = dtype
+
+
+def _has_unequal_kv_head_dimensions(k, v, past_key, past_value) -> bool:
+    """Return whether static K/V shapes prove incompatible GQA head dimensions."""
+
+    def _static_last_dim(value):
+        if value is None or value.shape is None or len(value.shape) == 0:
+            return None
+        dim = value.shape[-1]
+        return dim if isinstance(dim, int) else None
+
+    for key, value in ((k, v), (past_key, past_value)):
+        key_dim = _static_last_dim(key)
+        value_dim = _static_last_dim(value)
+        if key_dim is not None and value_dim is not None and key_dim != value_dim:
+            return True
+    return False
 
 
 class RotaryAttentionToGQA(RewriteRuleClassBase):
@@ -119,7 +157,7 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
 
     # ------------------------------------------------------------------ check
 
-    def check(self, context, attn_out, cos, sin, past_key, past_value, **_):
+    def check(self, context, attn_out, k_pre, v, cos, sin, past_key, past_value, **_):
         result = MatchResult()
 
         attn = attn_out.producer()
@@ -146,6 +184,9 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
             return result.fail("past_key is not a graph input")
         if past_value.producer() is not None:
             return result.fail("past_value is not a graph input")
+
+        if _has_unequal_kv_head_dimensions(k_pre, v, past_key, past_value):
+            return result.fail("K and V head dimensions differ; retain standard Attention")
 
         return result
 
@@ -344,6 +385,9 @@ class PackQKVForGQA(RewriteRuleClassBase):
         packed_w = op.Concat(q_w, k_w, v_w, axis=0)
         # Transpose packed weight: (q_out+k_out+v_out, hidden) → (hidden, q_out+k_out+v_out)
         packed_wt = op.Transpose(packed_w, perm=[1, 0])
+        # Concat/Transpose outputs have no declared type; carry the weight dtype
+        # forward so the folded packed initializer keeps the model dtype.
+        _propagate_dtype(q_w, packed_w, packed_wt)
         packed_qkv = op.MatMul(hidden, packed_wt)
 
         # Recover remaining GQA inputs and attributes from the matched node
@@ -467,10 +511,14 @@ class PackQKVWithBiasForGQA(RewriteRuleClassBase):
         packed_w = op.Concat(q_w, k_w, v_w, axis=0)
         # Transpose packed weight: (q_out+k_out+v_out, hidden) → (hidden, q_out+k_out+v_out)
         packed_wt = op.Transpose(packed_w, perm=[1, 0])
+        # Concat/Transpose outputs have no declared type; carry the weight dtype
+        # forward so the folded packed initializer keeps the model dtype.
+        _propagate_dtype(q_w, packed_w, packed_wt)
         packed_mm = op.MatMul(hidden, packed_wt)
 
         # Concat biases: (q_out + k_out + v_out,)
         packed_bias = op.Concat(bias_q, bias_k, bias_v, axis=0)
+        _propagate_dtype(bias_q, packed_bias)
         # GQA has no bias input — the Add stays in the graph.
         packed_qkv = op.Add(packed_mm, packed_bias)
 
@@ -547,7 +595,7 @@ class AttentionToGQA(RewriteRuleClassBase):
 
     # ------------------------------------------------------------------ check
 
-    def check(self, context, attn_out, past_key, past_value, **_):
+    def check(self, context, attn_out, k, v, past_key, past_value, **_):
         result = MatchResult()
         attn = attn_out.producer()
 
@@ -570,6 +618,9 @@ class AttentionToGQA(RewriteRuleClassBase):
         graph = attn.graph
         if not any(gi.name == "attention_mask" for gi in graph.inputs):
             return result.fail("No attention_mask graph input — cannot build seqlens_k")
+
+        if _has_unequal_kv_head_dimensions(k, v, past_key, past_value):
+            return result.fail("K and V head dimensions differ; retain standard Attention")
 
         return result
 

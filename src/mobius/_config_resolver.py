@@ -161,8 +161,24 @@ def _dict_to_pretrained_config(d: dict):
             setattr(config, k, v)
 
     # Recursively convert known nested config keys
+    rope_keys = ("rope_scaling", "rope_parameters")
     for key in nested_config_keys:
         val = getattr(config, key, None)
         if isinstance(val, dict):
-            setattr(config, key, _dict_to_pretrained_config(val))
+            # Capture the raw rope fields before conversion: constructing a
+            # nested PretrainedConfig runs HF rope standardization, which
+            # silently drops non-standard rope_scaling formats (e.g. the
+            # Qwen3-TTS talker's ``{"interleaved": True, "mrope_section": ...,
+            # "type": "default"}``). Restore them onto the converted config so
+            # _extract_mrope_fields / _extract_rope_config can still read them.
+            raw_rope = {k: val[k] for k in rope_keys if k in val}
+            nested = _dict_to_pretrained_config(val)
+            for k, v in raw_rope.items():
+                # The raw config.json value is authoritative for our extractors.
+                # Restore it whenever HF standardization dropped (None) OR
+                # rewrote it to a different value, so non-standard formats
+                # (e.g. Qwen3-TTS's ``interleaved``/``mrope_section``) survive.
+                if getattr(nested, k, None) != v:
+                    setattr(nested, k, v)
+            setattr(config, key, nested)
     return config

@@ -17,7 +17,7 @@ The model is split into 4 ONNX graphs:
 
 Requirements::
 
-    pip install mobius-ai[ort-genai] torchaudio
+    pip install mobius-onnx[ort-genai] torchaudio
 
 Usage::
 
