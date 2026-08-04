@@ -27,6 +27,7 @@ from mobius.models.qwen_vl import (
     Qwen3VLEmbeddingModel,
     Qwen3VLVisionEncoderModel,
     _QwenVLTextMixin,
+    split_deepstack_embeds,
 )
 
 if TYPE_CHECKING:
@@ -134,6 +135,7 @@ class Qwen35TextModel(nn.Module):
         position_ids: ir.Value,
         past_key_values: list | None = None,
         inputs_embeds: ir.Value | None = None,
+        deepstack_embeds: list | None = None,
     ):
         # Embed tokens: (batch, seq_len) → (batch, seq_len, hidden_size)
         if inputs_embeds is not None:
@@ -153,7 +155,7 @@ class Qwen35TextModel(nn.Module):
 
         present_key_values: list = []
         past_kvs = past_key_values or [None] * len(self.layers)
-        for layer, past_kv in zip(self.layers, past_kvs):
+        for layer_idx, (layer, past_kv) in enumerate(zip(self.layers, past_kvs)):
             hidden_states, present_kv = layer(
                 op,
                 hidden_states=hidden_states,
@@ -162,6 +164,9 @@ class Qwen35TextModel(nn.Module):
                 past_key_value=past_kv,
             )
             present_key_values.append(present_kv)
+            # DeepStack injection (see TextModel.forward for the rationale).
+            if deepstack_embeds is not None and layer_idx < len(deepstack_embeds):
+                hidden_states = op.Add(hidden_states, deepstack_embeds[layer_idx])
 
         hidden_states = self.norm(op, hidden_states)
         return hidden_states, present_key_values
@@ -282,6 +287,7 @@ class Qwen35MoETextModel(nn.Module):
         position_ids: ir.Value,
         past_key_values: list | None = None,
         inputs_embeds: ir.Value | None = None,
+        deepstack_embeds: list | None = None,
     ):
         # Embed tokens unless caller already provided fused inputs_embeds
         # (e.g. the VL decoder, which interleaves vision features before
@@ -301,7 +307,7 @@ class Qwen35MoETextModel(nn.Module):
 
         present_key_values: list = []
         past_kvs = past_key_values or [None] * len(self.layers)
-        for layer, past_kv in zip(self.layers, past_kvs):
+        for layer_idx, (layer, past_kv) in enumerate(zip(self.layers, past_kvs)):
             hidden_states, present_kv = layer(
                 op,
                 hidden_states=hidden_states,
@@ -310,6 +316,9 @@ class Qwen35MoETextModel(nn.Module):
                 past_key_value=past_kv,
             )
             present_key_values.append(present_kv)
+            # DeepStack injection (see TextModel.forward for the rationale).
+            if deepstack_embeds is not None and layer_idx < len(deepstack_embeds):
+                hidden_states = op.Add(hidden_states, deepstack_embeds[layer_idx])
 
         hidden_states = self.norm(op, hidden_states)
         return hidden_states, present_key_values
@@ -517,6 +526,7 @@ class Qwen35VLDecoderModel(nn.Module):
         attention_mask: ir.Value,
         position_ids: ir.Value,
         past_key_values: list | None = None,
+        deepstack_embeds: ir.Value | None = None,
     ):
         hidden_states, present_key_values = self.model(
             op,
@@ -525,6 +535,7 @@ class Qwen35VLDecoderModel(nn.Module):
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
+            deepstack_embeds=split_deepstack_embeds(op, deepstack_embeds, self.config),
         )
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
@@ -579,6 +590,7 @@ class Qwen35MoEVLDecoderModel(nn.Module):
         attention_mask: ir.Value,
         position_ids: ir.Value,
         past_key_values: list | None = None,
+        deepstack_embeds: ir.Value | None = None,
     ):
         hidden_states, present_key_values = self.model(
             op,
@@ -587,6 +599,7 @@ class Qwen35MoEVLDecoderModel(nn.Module):
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
+            deepstack_embeds=split_deepstack_embeds(op, deepstack_embeds, self.config),
         )
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values

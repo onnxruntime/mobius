@@ -35,6 +35,7 @@ from mobius.models import (
     ArceeCausalLMModel,
     CausalLMModel,
     ChatGLMCausalLMModel,
+    Cosmos3OmniReasonerModel,
     DeepSeekOCR2CausalLMModel,
     DeepSeekV3CausalLMModel,
     DeepSeekV4CausalLMModel,
@@ -398,6 +399,9 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "codegen": ModelRegistration(CodeGenCausalLMModel),
     "cohere": ModelRegistration(CohereCausalLMModel),
     "cohere2": ModelRegistration(CohereCausalLMModel),
+    "cosmos3_omni": ModelRegistration(
+        Cosmos3OmniReasonerModel, task="qwen-vl", family="cosmos", variant="reasoner"
+    ),
     "diffllama": ModelRegistration(DiffLlamaCausalLMModel),
     "doge": ModelRegistration(DogeCausalLMModel),
     "ernie4_5": ModelRegistration(ErnieCausalLMModel),
@@ -888,6 +892,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "biogpt": "microsoft/biogpt",
     "chatglm": "zai-org/chatglm2-6b",
     "codegen": "Salesforce/codegen-350M-mono",
+    "cosmos3_omni": "nvidia/Cosmos3-Nano",
     "ctrl": "Salesforce/ctrl",
     "ernie4_5": "baidu/ERNIE-4.5-0.3B-PT",
     "falcon_h1": "tiiuae/Falcon-H1-0.5B-Base",

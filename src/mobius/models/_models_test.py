@@ -254,6 +254,65 @@ class TestPruneLmHead:
         assert input_ids.shape[1] != 1
 
 
+class TestDeepStackCaptureOrdering:
+    """``output_layer_indices`` must capture the post-DeepStack-injection state.
+
+    Regression for the ordering bug where intermediate hidden states were
+    captured *before* the DeepStack ``Add``, so requested layers within the
+    DeepStack range missed the injected vision contribution (and diverged from
+    HuggingFace ``output_hidden_states`` semantics, where ``hidden_states[k+1]``
+    is layer ``k``'s output with DeepStack already added).
+    """
+
+    def test_intermediate_capture_reflects_deepstack_injection(self):
+        from mobius.tasks._base import _make_graph
+
+        # 3 layers, all captured; DeepStack embeds cover only layers 0 and 1.
+        config = make_config(num_hidden_layers=3, output_layer_indices=[0, 1, 2])
+        model = TextModel(config)
+
+        _graph, builder = _make_graph()
+        op = builder.op
+        batch = ir.SymbolicDim("batch")
+        seq = ir.SymbolicDim("sequence_len")
+        input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[batch, seq])
+        attention_mask = builder.input(
+            "attention_mask", dtype=ir.DataType.INT64, shape=[batch, seq]
+        )
+        position_ids = builder.input(
+            "position_ids", dtype=ir.DataType.INT64, shape=[batch, seq]
+        )
+        deepstack = [
+            builder.input(
+                f"deepstack_embeds.{i}",
+                dtype=config.dtype,
+                shape=[batch, seq, config.hidden_size],
+            )
+            for i in range(2)
+        ]
+
+        _hidden, _present, intermediates = model(
+            op,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            deepstack_embeds=deepstack,
+        )
+        captured = dict(zip([0, 1, 2], intermediates))
+
+        # Layers 0 and 1: the captured value is the output of the DeepStack Add,
+        # whose inputs include the corresponding deepstack_embeds tensor.
+        for layer_idx in (0, 1):
+            producer = captured[layer_idx].producer()
+            assert producer is not None and producer.op_type == "Add"
+            assert deepstack[layer_idx] in list(producer.inputs)
+
+        # Layer 2 has no DeepStack embed: its captured value is the raw layer
+        # output and must not consume any deepstack_embeds tensor.
+        prod2 = captured[2].producer()
+        assert prod2 is None or all(d not in list(prod2.inputs) for d in deepstack)
+
+
 class TestModelRegistry:
     def test_registry_not_empty(self):
         assert len(registry) > 0
