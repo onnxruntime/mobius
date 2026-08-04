@@ -55,9 +55,7 @@ def _olive_expert_state_dict() -> dict[str, torch.Tensor]:
             0, 256, (_E, _H, _INT * _BITS // 8), dtype=torch.uint8
         ),
         p + "experts.down_proj.scales": torch.rand(_E, _H, _INT // _BLK),
-        p + "experts.down_proj.qzeros": torch.randint(
-            0, 256, (_E, _H, 1), dtype=torch.uint8
-        ),
+        p + "experts.down_proj.qzeros": torch.randint(0, 256, (_E, _H, 1), dtype=torch.uint8),
         p + "gate.weight": torch.rand(_E, _H),
     }
 

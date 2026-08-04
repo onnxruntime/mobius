@@ -169,9 +169,7 @@ class TestMoELayer:
 
     def test_olive_group_size_not_power_of_two_falls_back_to_dense(self):
         """Non-pow2 block_size is unrunnable by CUDA QMoE -> dense fallback."""
-        quant = QuantizationConfig(
-            bits=4, group_size=48, quant_method="olive", sym=False
-        )
+        quant = QuantizationConfig(bits=4, group_size=48, quant_method="olive", sym=False)
         assert _supported_qmoe_quantization(quant) is None
         config = make_config(
             hidden_size=96,
