@@ -1,9 +1,13 @@
-model_id: "justinchuby/Fun-ASR-Nano-2512"
+model_id: "FunAudioLLM/Fun-ASR-Nano-2512"
 model_type: "fun_asr"
 revision: "main"
 task_type: "fun-asr-speech-language"
 dtype: "float32"
 trust_remote_code: true
+ci_skip_reason: >
+  The upstream checkpoint lacks config.json model_type metadata, so build()
+  auto-detection is unavailable in CI's generic golden pipeline.
+
 inputs:
   audio:
     - "652-129742-0006.flac"
@@ -18,4 +22,4 @@ notes: >
   Fun-ASR-Nano speech recognition. 3-model split: audio_encoder (SANM
   encoder) + embedding (adaptor + text/audio fusion) + decoder (Qwen3-0.6B).
   Audio input is LFR fbank features (batch, seq_len, 560).
-  Weights in safetensors format at justinchuby/Fun-ASR-Nano-2512.
+  Weights in safetensors format at FunAudioLLM/Fun-ASR-Nano-2512.

@@ -190,6 +190,9 @@ _COVERAGE_SKIP: dict[str, str] = {
     "qwen3_vl": "VL model — requires image inputs",
     # --- Audio / speech models (require audio inputs) ---
     "data2vec-audio": "Audio model — requires audio inputs",
+    "fun_asr": "Golden YAML uses the upstream FunAudioLLM checkpoint, which lacks "
+    "config.json model_type metadata; L2 config validation uses the metadata-enabled "
+    "justinchuby mirror",
     "hubert": "Audio model — requires audio inputs",
     "musicgen": "Audio model — requires audio inputs",
     "seamless_m4t": "Audio model — requires audio inputs",
