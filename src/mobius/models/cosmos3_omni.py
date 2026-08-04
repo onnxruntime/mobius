@@ -69,7 +69,12 @@ _DROPPED_UNIFIED_KEY_PATTERNS = [
 _DROPPED_UNIFIED_KEY_RE = re.compile("|".join(_DROPPED_UNIFIED_KEY_PATTERNS))
 
 # --- Reasoner self-attention: native (diffusers-style) -> HuggingFace Qwen3-VL
+# NOTE: order matters — the loop below applies the first matching rename and
+# stops, so the more specific ``to_out.0.`` (diffusers wraps the output
+# projection in an ``nn.Sequential`` [Linear, Dropout]) must precede the plain
+# ``to_out.`` entry.  Both collapse to the single HF ``o_proj`` Linear.
 _TEXT_ATTN_RENAMES = {
+    ".self_attn.to_out.0.": ".self_attn.o_proj.",
     ".self_attn.to_q.": ".self_attn.q_proj.",
     ".self_attn.to_k.": ".self_attn.k_proj.",
     ".self_attn.to_v.": ".self_attn.v_proj.",
