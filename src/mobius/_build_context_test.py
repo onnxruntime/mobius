@@ -8,7 +8,13 @@ import threading
 import onnx_ir as ir
 import pytest
 
-from mobius._build_context import build_context, ep_capabilities, get_build_dtype
+from mobius._build_context import (
+    build_context,
+    ep_capabilities,
+    get_build_dtype,
+    is_lm_head_pruning_enabled,
+    lm_head_pruning,
+)
 from mobius._execution_providers import EpCapabilities, ep_registry
 
 _CUDA_CAPABILITIES = EpCapabilities(
@@ -30,6 +36,9 @@ class TestBuildContextDefaults:
     def test_default_dtype_is_float32(self):
         """No context active → returns FLOAT."""
         assert get_build_dtype() == ir.DataType.FLOAT
+
+    def test_lm_head_pruning_is_disabled(self):
+        assert not is_lm_head_pruning_enabled()
 
     def test_default_capabilities_has_no_fusions(self):
         """Default EP has no GQA dtypes (portable ONNX)."""
@@ -64,6 +73,11 @@ class TestBuildContextScoping:
             raise RuntimeError("deliberate")
         assert ep_capabilities().name == "default"
         assert get_build_dtype() == ir.DataType.FLOAT
+
+    def test_lm_head_pruning_restored_after_context(self):
+        with lm_head_pruning(True):
+            assert is_lm_head_pruning_enabled()
+        assert not is_lm_head_pruning_enabled()
 
 
 class TestBuildContextNesting:

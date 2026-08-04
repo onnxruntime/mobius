@@ -15,14 +15,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   single Rust/cargo-style option. Accepts a comma-separated list and may be
   repeated (`--features fp8-kv-cache,static-cache` or `--features fp8-kv-cache
   --features static-cache`). Available features: `static-cache`, `fp8-kv-cache`,
-  `text-only`. Unknown feature names are rejected with an error listing the
-  valid set.
+  `prune-lm-head`, `text-only`. Unknown feature names are rejected with an error
+  listing the valid set.
 
 #### Changed
 
 - The boolean flags `--static-cache`, `--fp8-kv-cache`, and `--text-only` have
   been **removed** in favor of the equivalent `--features` value. Companion
   value args (`--max-seq-len`, `--kv-cache-scale-file`) are unchanged.
+
+### Final-token LM-head pruning (`--features prune-lm-head`)
+
+#### Added
+
+- `build(prune_lm_head=True)` and `mobius build --features prune-lm-head`
+  select the final hidden-state position before the LM-head projection, reducing
+  prefill logits from `[B, S, vocab]` to `[B, 1, vocab]`. This avoids computing
+  unused per-token logits for single-token autoregressive generation. Models
+  with custom forward paths that do not support pre-projection pruning fail
+  explicitly instead of silently producing an unoptimized graph.
 
 ### FP8 (E4M3) KV-cache export (`--features fp8-kv-cache`)
 

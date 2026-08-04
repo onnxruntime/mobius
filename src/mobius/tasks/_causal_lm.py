@@ -8,6 +8,7 @@ from __future__ import annotations
 import onnx_ir as ir
 from onnxscript import GraphBuilder, nn
 
+from mobius._build_context import lm_head_pruning
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
 from mobius.components._attention import StaticCacheState
@@ -188,31 +189,21 @@ class CausalLMTask(ModelTask):
                 value_head_dim=kv_value_head_dim,
             )
 
-        result = module(
-            op,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-        )
+        with lm_head_pruning(self._prune_lm_head):
+            result = module(
+                op,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+            )
         intermediate_hidden_states: list | None = None
         if len(result) == 3:
             logits, present_key_values, intermediate_hidden_states = result
         else:
             logits, present_key_values = result
 
-        if self._prune_lm_head:
-            # Select only the last token's logits: [B, S, vocab] -> [B, 1, vocab].
-            # Use a scalar (rank-0) index so Gather collapses dim 1:
-            #   [B, S, vocab] --Gather(axis=1, idx=-1)--> [B, vocab]
-            #   --Unsqueeze(axis=1)--> [B, 1, vocab]
-            # ONNX Runtime's graph optimizer can push this Gather backward
-            # through the LM head MatMul, avoiding the full [B, S, vocab]
-            # computation during prefill.  Mirrors onnxruntime-genai Model
-            # Builder's prune_lm_head option.
-            last_idx = op.Constant(value_int=-1)  # scalar (rank-0) INT64
-            last_token_logits = op.Gather(logits, last_idx, axis=1)  # [B, vocab]
-            logits = op.Unsqueeze(last_token_logits, op.Constant(value_ints=[1]))  # [B, 1, vocab]
+        _validate_pruned_logits(logits, self._prune_lm_head, module)
 
         builder.add_output(logits, "logits")
 
@@ -268,7 +259,7 @@ class HybridCausalLMTask(ModelTask):
 
     Args:
         prune_lm_head: If ``True``, insert ``Gather(axis=1, index=-1)``
-            after the LM head so only the last token's logits are emitted.
+            before the LM head so only the last token's logits are emitted.
             See :class:`CausalLMTask` for full documentation.
     """
 
@@ -305,31 +296,21 @@ class HybridCausalLMTask(ModelTask):
             past_seq_len,
         )
 
-        result = module(
-            op,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-        )
+        with lm_head_pruning(self._prune_lm_head):
+            result = module(
+                op,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+            )
         intermediate_hidden_states: list | None = None
         if len(result) == 3:
             logits, present_key_values, intermediate_hidden_states = result
         else:
             logits, present_key_values = result
 
-        if self._prune_lm_head:
-            # Select only the last token's logits: [B, S, vocab] -> [B, 1, vocab].
-            # Use a scalar (rank-0) index so Gather collapses dim 1:
-            #   [B, S, vocab] --Gather(axis=1, idx=-1)--> [B, vocab]
-            #   --Unsqueeze(axis=1)--> [B, 1, vocab]
-            # ONNX Runtime's graph optimizer can push this Gather backward
-            # through the LM head MatMul, avoiding the full [B, S, vocab]
-            # computation during prefill.  Mirrors onnxruntime-genai Model
-            # Builder's prune_lm_head option.
-            last_idx = op.Constant(value_int=-1)  # scalar (rank-0) INT64
-            last_token_logits = op.Gather(logits, last_idx, axis=1)  # [B, vocab]
-            logits = op.Unsqueeze(last_token_logits, op.Constant(value_ints=[1]))  # [B, 1, vocab]
+        _validate_pruned_logits(logits, self._prune_lm_head, module)
 
         builder.add_output(logits, "logits")
         _register_hybrid_cache_outputs(
@@ -346,6 +327,22 @@ class HybridCausalLMTask(ModelTask):
         model = _make_model(graph)
         _register_linear_attention_functions(model, config)
         return ModelPackage({"model": model}, config=config)
+
+
+def _validate_pruned_logits(
+    logits: ir.Value,
+    prune_lm_head: bool,
+    module: nn.Module,
+) -> None:
+    """Fail when a custom model forward ignores the task's pruning request."""
+    if not prune_lm_head:
+        return
+    shape = logits.shape
+    if shape is None or len(shape) != 3 or shape[1] != 1:
+        raise ValueError(
+            f"{type(module).__name__} does not support prune_lm_head. "
+            "The model must select the final hidden state before its LM-head projection."
+        )
 
 
 def _register_intermediate_hidden_states(

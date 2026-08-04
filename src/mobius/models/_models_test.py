@@ -225,7 +225,7 @@ class TestPruneLmHead:
         assert logits.shape[2] == config.vocab_size
 
     def test_prune_emits_gather_on_logits(self):
-        """With prune_lm_head=True, logits dim 1 collapses to 1 (still rank-3)."""
+        """Pruning selects the final hidden state before the LM-head MatMul."""
         model = self._build(prune_lm_head=True)
 
         logits = next(v for v in model.graph.outputs if v.name == "logits")
@@ -240,6 +240,12 @@ class TestPruneLmHead:
         # Last dim is still the vocabulary size
         config = make_config()
         assert logits.shape[2] == config.vocab_size
+        lm_head = logits.producer()
+        assert lm_head is not None and lm_head.op_type == "MatMul"
+        unsqueeze = lm_head.inputs[0].producer()
+        assert unsqueeze is not None and unsqueeze.op_type == "Unsqueeze"
+        gather = unsqueeze.inputs[0].producer()
+        assert gather is not None and gather.op_type == "Gather"
 
     def test_prune_does_not_change_input_shapes(self):
         """Pruning only affects output.
@@ -252,6 +258,29 @@ class TestPruneLmHead:
         input_ids = next(v for v in model.graph.inputs if v.name == "input_ids")
         # input dim 1 (sequence_length) should still be dynamic, not 1
         assert input_ids.shape[1] != 1
+
+    def test_custom_forward_that_ignores_pruning_fails(self):
+        class UnsupportedCausalLM(CausalLMModel):
+            def forward(
+                self,
+                op,
+                input_ids,
+                attention_mask,
+                position_ids,
+                past_key_values=None,
+            ):
+                hidden_states, present = self.model(
+                    op,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                )
+                return self.lm_head(op, hidden_states), present
+
+        config = make_config()
+        with pytest.raises(ValueError, match="does not support prune_lm_head"):
+            build_from_module(UnsupportedCausalLM(config), config, prune_lm_head=True)
 
 
 class TestDeepStackCaptureOrdering:
