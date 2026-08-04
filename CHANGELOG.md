@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### NVIDIA Cosmos 3 Edge vision-language model (`cosmos3_edge`)
+
+#### Added
+
+- Support for the **full `cosmos3_edge` vision-language model**
+  (`nvidia/Cosmos3-Edge`, `Cosmos3EdgeForConditionalGeneration`) as a 3-model
+  onnxruntime-genai split (`decoder` + `vision_encoder` + `embedding`):
+  - **decoder**: grouped-query-attention text reasoner with a **non-gated
+    squared-ReLU FFN** (`hidden_act="relu2"`, `up_proj → relu2 → down_proj`)
+    and 3D multimodal RoPE (`mrope_section=[24, 20, 20]`); takes
+    `inputs_embeds`.
+  - **vision_encoder**: SigLIP vision tower + a new
+    `Cosmos3EdgeMultiModalProjector` (pre-shuffle `LayerNorm` → 2×2
+    pixel-shuffle → `linear_fc1` → GELU → `linear_fc2`).
+  - **embedding**: token embedding + image-feature fusion at
+    `image_token_id=19`.
+  `preprocess_weights` routes the single HF checkpoint to the three
+  sub-models: `model.visual.*` / `model.projector.*` → vision (with SigLIP
+  `mlp.fc1/fc2` → `up_proj/down_proj`), `embed_tokens` → embedding, the
+  top-level text tower (`layers.*` / `norm` / `lm_head`) → decoder (renaming
+  `self_attn.to_{q,k,v,out}` → `{q,k,v,o}_proj`), and drops the
+  generator-tower `k_norm_und_for_gen` key-norm. Built via a new
+  `Cosmos3EdgeVLTask` (`cosmos3-edge-vl`). The decoder-only text reasoner
+  remains available as `cosmos3_edge_text`.
+- **L1 graph-build tested only.** NVIDIA does not publish modeling code for
+  `cosmos3_edge` (not in `transformers`, no remote-code module), so the exact
+  pixel-shuffle ordering and numerical parity are unverifiable; L4/L5 parity
+  is deferred. The `cosmos3_omni` variants (`Cosmos3-Nano`/`-Super`) are
+  two-tower diffusion world models tracked separately.
+
 ### Cargo-style `--features` build option
 
 #### Added
@@ -15,14 +45,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   single Rust/cargo-style option. Accepts a comma-separated list and may be
   repeated (`--features fp8-kv-cache,static-cache` or `--features fp8-kv-cache
   --features static-cache`). Available features: `static-cache`, `fp8-kv-cache`,
-  `text-only`. Unknown feature names are rejected with an error listing the
-  valid set.
+  `prune-lm-head`, `text-only`. Unknown feature names are rejected with an error
+  listing the valid set.
 
 #### Changed
 
 - The boolean flags `--static-cache`, `--fp8-kv-cache`, and `--text-only` have
   been **removed** in favor of the equivalent `--features` value. Companion
   value args (`--max-seq-len`, `--kv-cache-scale-file`) are unchanged.
+
+### Final-token LM-head pruning (`--features prune-lm-head`)
+
+#### Added
+
+- `build(prune_lm_head=True)` and `mobius build --features prune-lm-head`
+  select the final hidden-state position before the LM-head projection, reducing
+  prefill logits from `[B, S, vocab]` to `[B, 1, vocab]`. This avoids computing
+  unused per-token logits for single-token autoregressive generation. Models
+  with custom forward paths that do not support pre-projection pruning fail
+  explicitly instead of silently producing an unoptimized graph.
 
 ### FP8 (E4M3) KV-cache export (`--features fp8-kv-cache`)
 

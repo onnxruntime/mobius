@@ -95,6 +95,54 @@ class VisionLanguageTask(ModelTask):
         return _make_model(graph)
 
 
+class Cosmos3EdgeVLTask(VisionLanguageTask):
+    """NVIDIA Cosmos3-Edge VL 3-model split.
+
+    Builds the text decoder with 3D multimodal RoPE
+    (``mrope_section=[24, 20, 20]``), so ``position_ids`` has shape
+    ``[3, batch, seq]``. The vision runtime processes one image at a time and
+    removes the image batch dimension so its output matches the embedding
+    model's rank-2 ``[num_image_tokens, hidden]`` input contract.
+    """
+
+    def build(
+        self,
+        module: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ModelPackage:
+        self._validate_components(module)
+        models: dict[str, ir.Model] = {}
+        models["decoder"] = build_decoder_from_embeds(module.decoder, config, mrope=True)
+        models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
+        models["embedding"] = build_embedding_from_features(
+            module.embedding,
+            config,
+            feature_name="image_features",
+            feature_dim=config.hidden_size,
+        )
+        return ModelPackage(models, config=config)
+
+    def _build_vision(
+        self,
+        vision: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build the single-image vision encoder with rank-2 feature output."""
+        image_size = (config.vision.image_size if config.vision else None) or 224
+
+        graph, builder = _make_graph(name="vision_encoder")
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=config.dtype,
+            shape=[1, 3, image_size, image_size],
+        )
+        image_features = vision(builder.op, pixel_values=pixel_values)
+        image_features = builder.op.Squeeze(image_features, [0])
+
+        builder.add_output(image_features, "image_features")
+        return _make_model(graph)
+
+
 class QwenVLTask(VisionLanguageTask):
     """Qwen-family VL 3-model split with packed-attention vision and MRoPE.
 

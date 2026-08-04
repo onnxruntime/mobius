@@ -111,6 +111,11 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ("qwen2", {}, True),
     ("cohere", {"tie_word_embeddings": True, "logit_scale": 0.0625}, True),
     ("cohere2", {"tie_word_embeddings": True, "logit_scale": 0.0625}, False),
+    (
+        "cosmos3_edge_text",
+        {"hidden_act": "relu2", "mlp_bias": False, "mrope_section": [24, 20, 20]},
+        True,
+    ),
     ("diffllama", {}, False),
     ("doge", {}, False),
     (
@@ -2085,6 +2090,20 @@ _TINY_QWEN3_VL_VISION = VisionConfig(
 )
 
 
+_TINY_COSMOS3_EDGE_VISION = VisionConfig(
+    hidden_size=32,
+    intermediate_size=64,
+    num_hidden_layers=1,
+    num_attention_heads=2,
+    image_size=28,
+    patch_size=14,
+    norm_eps=1e-6,
+    spatial_merge_size=2,
+    out_hidden_size=64,
+    projector_intermediate_size=64,
+)
+
+
 # ---------------------------------------------------------------------------
 # Vision-Language configs  (task: vision-language and variants)
 # ---------------------------------------------------------------------------
@@ -2094,6 +2113,17 @@ _TINY_QWEN3_VL_VISION = VisionConfig(
 VL_CONFIGS: list[tuple[str, dict, bool]] = [
     # --- LLaVA family (vision-language, 3-model split) ---
     ("llava", {"vision": _TINY_VISION, "image_token_id": 32000}, True),
+    (
+        "cosmos3_edge",
+        {
+            "vision": _TINY_COSMOS3_EDGE_VISION,
+            "image_token_id": 19,
+            "hidden_act": "relu2",
+            "mlp_bias": False,
+            "mrope_section": [24, 20, 20],
+        },
+        True,
+    ),
     ("aya_vision", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
     ("chameleon", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
     ("cohere2_vision", {"vision": _TINY_VISION, "image_token_id": 32000}, False),

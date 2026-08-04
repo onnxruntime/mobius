@@ -157,7 +157,12 @@ _COVERAGE_SKIP: dict[str, str] = {
     "seed_oss": "Internal model — no public HF checkpoint",
     "shieldgemma2": "Alias for gemma2 — covered by gemma2",
     "yi": "Alias for llama — covered by llama",
-    # --- VL text-decoder submodels (tested via their parent VL model) ---
+    # --- VL models / text-decoder submodels (L1 graph-build only) ---
+    "cosmos3_edge": "Cosmos3-Edge VLM (SigLIP + pixel-shuffle projector + "
+    "squared-ReLU GQA decoder) — L1 graph-build only; L4/L5 parity needs "
+    "NVIDIA's custom edge modeling code (not in transformers)",
+    "cosmos3_edge_text": "Cosmos3-Edge standalone text reasoner — L1 graph-build "
+    "only; L4/L5 parity needs NVIDIA's custom edge modeling code (not in transformers)",
     "glm4v_moe_text": "VL text decoder — tested via glm4v_moe",
     "glm4v_text": "VL text decoder — tested via glm4v",
     "qwen2_5_vl_text": "VL text decoder — tested via qwen2_5_vl",
