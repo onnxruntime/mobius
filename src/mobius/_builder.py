@@ -135,6 +135,8 @@ def build_from_module(
     *,
     execution_provider: str = "default",
     trace_optimization: bool = False,
+    fp8_kv_cache: bool = False,
+    kv_cache_scales: dict[int, tuple[float, float]] | None = None,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a module instance and config.
 
@@ -165,6 +167,16 @@ def build_from_module(
         trace_optimization: When ``True``, log step-by-step diagnostic
             output at INFO level for each optimization stage, showing which
             rules matched and how many nodes were added/removed.
+        fp8_kv_cache: When ``True``, store each decoder
+            ``GroupQueryAttention`` KV cache as ``FLOAT8E4M3FN`` (per-tensor
+            E4M3). Only applies on GQA-capable EP/dtype combinations (e.g.
+            ``execution_provider="cuda"`` with an fp16/bf16 dtype); otherwise a
+            warning is emitted and the request is ignored. Requires an ORT
+            build with the FP8 KV-cache GQA kernel (SM89+ CUDA).
+        kv_cache_scales: Optional ``layer_id -> (k_scale, v_scale)`` map of
+            per-tensor FP8 scales (from offline calibration), used only when
+            ``fp8_kv_cache`` is ``True``. Layers absent from the map use a unit
+            scale of ``1.0``.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -213,6 +225,8 @@ def build_from_module(
             dtype=dtype,
             model_role=role,
             trace=trace_optimization,
+            fp8_kv_cache=fp8_kv_cache,
+            kv_cache_scales=kv_cache_scales,
         )
 
     _maybe_apply_opset_lowering(pkg, execution_provider)
@@ -355,6 +369,8 @@ def build(
     execution_provider: str = "default",
     trace_optimization: bool = False,
     text_only: bool = False,
+    fp8_kv_cache: bool = False,
+    kv_cache_scales: dict[int, tuple[float, float]] | None = None,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a HuggingFace model ID.
 
@@ -417,7 +433,19 @@ def build(
             can use ``GroupQueryAttention`` on GQA-capable execution providers.
             Raises :class:`ValueError` if the resolved ``model_type`` has no
             text-only sibling. Currently supported for ``gemma4_unified``
-            (``google/gemma-4-12B``).
+            (``google/gemma-4-12B``) and ``qwen3_5_moe_vl``
+            (``Qwen/Qwen3.6-35B-A3B``).
+        fp8_kv_cache: When ``True``, store each decoder
+            ``GroupQueryAttention`` KV cache as ``FLOAT8E4M3FN`` (per-tensor
+            E4M3), halving KV-cache memory at long context. Only applies on
+            GQA-capable EP/dtype combinations (e.g.
+            ``execution_provider="cuda"`` with an fp16/bf16 dtype); otherwise a
+            warning is emitted and the request is ignored. Requires an ORT
+            build with the FP8 KV-cache GQA kernel (SM89+ CUDA).
+        kv_cache_scales: Optional ``layer_id -> (k_scale, v_scale)`` map of
+            per-tensor FP8 scales (from offline calibration), used only when
+            ``fp8_kv_cache`` is ``True``. Layers absent from the map use a unit
+            scale of ``1.0``.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -447,6 +475,7 @@ def build(
     from mobius._config_resolver import (
         _config_from_hf,
         _default_task_for_model,
+        _dict_to_pretrained_config,
         _try_load_config_json,
     )
     from mobius._diffusers_builder import build_diffusers_pipeline
@@ -481,7 +510,13 @@ def build(
         hf_config = hf_config.talker_config
     elif hasattr(hf_config, "thinker_config"):
         thinker = hf_config.thinker_config
-        if hasattr(thinker, "text_config"):
+        # Some checkpoints (e.g. Qwen3-ASR) ship ``thinker_config`` as a plain
+        # dict rather than a nested ``PretrainedConfig``. Convert it so the
+        # decoder ``text_config`` (and its scalar fields such as hidden_size)
+        # is reachable via attribute access.
+        if isinstance(thinker, dict):
+            thinker = _dict_to_pretrained_config(thinker)
+        if getattr(thinker, "text_config", None) is not None:
             hf_config = thinker.text_config
     elif hasattr(hf_config, "decoder_config") and model_type == "qwen3_tts_tokenizer_12hz":
         # Codec tokenizer: use decoder_config as the primary config source
@@ -587,6 +622,8 @@ def build(
         task,
         execution_provider=execution_provider,
         trace_optimization=trace_optimization,
+        fp8_kv_cache=fp8_kv_cache,
+        kv_cache_scales=kv_cache_scales,
     )
 
     for name, model in pkg.items():

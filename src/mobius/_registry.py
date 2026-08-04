@@ -96,6 +96,7 @@ from mobius.models import (
     Qwen35VLTextModel,
     QwenCausalLMModel,
     SmolLM3CausalLMModel,
+    SortformerDiarizationModel,
     WhisperForConditionalGeneration,
 )
 from mobius.models.bamba import BambaCausalLMModel
@@ -604,6 +605,13 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "qwen2_vl_text": ModelRegistration(Qwen25VLTextModel),
     "qwen3_5": ModelRegistration(Qwen35VL3ModelCausalLMModel, task="hybrid-qwen-vl"),
     "qwen3_5_moe_vl": ModelRegistration(Qwen35MoEVL3ModelCausalLMModel, task="hybrid-qwen-vl"),
+    # Text-only sibling of ``qwen3_5_moe_vl`` (Qwen3.6-35B-A3B). The MoE
+    # backbone ``Qwen35MoECausalLMModel`` already strips ``language_model.``
+    # and drops ``visual.``/MTP keys, so it consumes the VL checkpoint's text
+    # weights directly; ``build(..., text_only=True)`` routes here via
+    # ``_TEXT_ONLY_MODEL_TYPE``. It also matches the VL ``text_config``'s own
+    # ``model_type=qwen3_5_moe_text`` so that config resolves cleanly.
+    "qwen3_5_moe_text": ModelRegistration(Qwen35MoECausalLMModel),
     "qwen3_5_vl": ModelRegistration(Qwen35VL3ModelCausalLMModel, task="hybrid-qwen-vl"),
     "qwen3_5_vl_text": ModelRegistration(Qwen35VLTextModel),
     "qwen3_vl": ModelRegistration(Qwen3VL3ModelCausalLMModel, task="qwen-vl"),
@@ -765,6 +773,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "wavlm": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
     "mms": ModelRegistration(Wav2Vec2ForCTCModel, task="ctc-asr", config_class=MMSConfig),
     "fastconformer_rnnt": ModelRegistration(EncDecRNNTModel, task="fastconformer-rnnt"),
+    "sortformer": ModelRegistration(SortformerDiarizationModel, task="diarization"),
 }
 
 
@@ -791,6 +800,12 @@ def _create_default_registry() -> ModelRegistry:
 _TEXT_ONLY_MODEL_TYPE: dict[str, str] = {
     "gemma4_unified": "gemma4_unified_text",
     "gemma4_unified_text": "gemma4_unified_text",
+    # Qwen3.5-MoE-VL (Qwen3.6-35B-A3B): export just the hybrid MoE text
+    # backbone as a standalone decoder-only LLM. The builder overrides
+    # ``qwen3_5_moe`` -> ``qwen3_5_moe_vl`` when a ``vision_config`` is present,
+    # so the text-only override keys off the VL type here.
+    "qwen3_5_moe_vl": "qwen3_5_moe_text",
+    "qwen3_5_moe_text": "qwen3_5_moe_text",
 }
 
 
@@ -894,6 +909,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
     "qwen3_moe": "Qwen/Qwen3-30B-A3B",
     "qwen3_5_moe": "Qwen/Qwen3.5-MoE-A3B-128K",
+    "qwen3_5_moe_text": "Qwen/Qwen3.6-35B-A3B",
     "qwen3_next": "Qwen/Qwen3-235B-A22B",
     "granitemoe": "ibm-granite/granite-3.0-1b-a400m-instruct",
     "olmoe": "allenai/OLMoE-1B-7B-0924",
@@ -1141,6 +1157,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "qwen3_moe": "qwen",
     "qwen3_5_text": "qwen",
     "qwen3_5_moe": "qwen",
+    "qwen3_5_moe_text": "qwen",
     "qwen3_next": "qwen",
     "qwen2_vl": "qwen",
     "qwen2_vl_text": "qwen",

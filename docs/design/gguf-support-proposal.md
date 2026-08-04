@@ -465,7 +465,7 @@ Add `gguf` as an optional dependency in a new extras group:
 [project.optional-dependencies]
 gguf = ["gguf>=0.10.0"]
 # Combined:
-all = ["mobius-ai[transformers,gguf]"]
+all = ["mobius-onnx[transformers,gguf]"]
 ```
 
 The `gguf` import is lazy — users who don't use GGUF features

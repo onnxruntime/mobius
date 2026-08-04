@@ -837,6 +837,24 @@ class TestQuantizationConfig:
         )()
         assert QuantizationConfig.from_transformers(hf) is None
 
+    def test_from_transformers_modelopt_nvfp4_raises(self):
+        """ModelOpt NVFP4/FP8 checkpoints fail loudly rather than mis-quantizing.
+
+        The INT4 path would silently mis-dequantize packed E2M1/float8 weights,
+        so ``from_transformers`` raises until the ModelOpt loader is wired.
+        """
+        import pytest
+
+        for qc in (
+            {"quant_method": "modelopt"},
+            {"quant_method": "modelopt", "quant_algo": "NVFP4"},
+            {"quant_algo": "W4A16_NVFP4"},
+            {"quant_algo": "FP8"},
+        ):
+            hf = type("HFConfig", (), {"quantization_config": qc})()
+            with pytest.raises(NotImplementedError, match="ModelOpt"):
+                QuantizationConfig.from_transformers(hf)
+
     def test_from_transformers_to_dict_object(self):
         """HF QuantizationConfig objects have a to_dict() method."""
         inner = type(

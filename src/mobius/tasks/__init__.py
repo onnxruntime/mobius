@@ -33,6 +33,7 @@ __all__ = [
     "Eagle3DraftTask",
     "Qwen35MtpTask",
     "DenoisingTask",
+    "DiarizationTask",
     "FeatureExtractionTask",
     "FunASRSpeechLanguageTask",
     "Gemma4AssistantTask",
@@ -90,6 +91,7 @@ from mobius.tasks._ctc_asr import CTCAsrTask
 from mobius.tasks._deepseek_v4 import DeepSeekV4Task
 from mobius.tasks._denoising import DenoisingTask
 from mobius.tasks._dflash import DFlashDraftTask
+from mobius.tasks._diarization import DiarizationTask
 from mobius.tasks._eagle3 import Eagle3DraftTask
 from mobius.tasks._feature_extraction import FeatureExtractionTask
 from mobius.tasks._fun_asr_speech_language import FunASRSpeechLanguageTask
@@ -137,6 +139,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "codec": CodecTask,
     "controlnet": ControlNetTask,
     "denoising": DenoisingTask,
+    "diarization": DiarizationTask,
     "feature-extraction": FeatureExtractionTask,
     "masked-diffusion": MaskedDiffusionTask,
     "image-classification": ImageClassificationTask,

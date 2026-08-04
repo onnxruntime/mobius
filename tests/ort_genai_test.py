@@ -7,7 +7,7 @@ Verifies that exported ONNX models work end-to-end with the
 onnxruntime-genai inference runtime. Requires the ``ort-genai``
 extra to be installed::
 
-    pip install mobius-ai[ort-genai]
+    pip install mobius-onnx[ort-genai]
 
 Run::
 
