@@ -73,11 +73,44 @@ def _layer_id_from_name(name: str | None) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _validate_scales(
+    scales: dict[int, tuple[float, float]],
+) -> dict[int, tuple[float, float]]:
+    """Return a validated copy of *scales*."""
+    validated: dict[int, tuple[float, float]] = {}
+    for layer_id, pair in scales.items():
+        try:
+            k, v = pair
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"kv_cache_scales[{layer_id!r}] must be a (k_scale, v_scale) "
+                f"pair, got {pair!r}."
+            ) from error
+        try:
+            k_f, v_f = float(k), float(v)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"kv_cache_scales[{layer_id!r}] has a non-numeric scale "
+                f"(k={k!r}, v={v!r}); FP8 KV-cache scales must be finite and > 0."
+            ) from error
+        if not (math.isfinite(k_f) and k_f > 0.0 and math.isfinite(v_f) and v_f > 0.0):
+            raise ValueError(
+                f"kv_cache_scales[{layer_id!r}] is non-positive or non-finite "
+                f"(k={k}, v={v}); FP8 KV-cache scales must be finite and > 0."
+            )
+        validated[layer_id] = (k_f, v_f)
+    return validated
+
+
 def _retype_fp8(value: ir.Value | None) -> None:
     """Retype *value* to ``FLOAT8E4M3FN`` in place, preserving its shape."""
     if value is None:
         return
     value.type = ir.TensorType(_FP8)
+    if value.const_value is not None and value.const_value.size == 0:
+        value.const_value = ir.tensor(
+            np.zeros(tuple(value.const_value.shape), dtype=_FP8.numpy()), name=value.name
+        )
 
 
 def _is_retypable_cache(value: ir.Value) -> bool:
@@ -101,11 +134,12 @@ class Fp8KvCachePass(ir.passes.InPlacePass):
             per-tensor FP8 scales (typically produced by an offline
             calibration). Layers absent from the map — and every layer when
             *scales* is ``None`` — use a unit scale of ``1.0``.
+
     """
 
     def __init__(self, scales: dict[int, tuple[float, float]] | None = None) -> None:
         super().__init__()
-        self._scales = scales or {}
+        self._scales = _validate_scales(scales or {})
 
     def call(self, model: ir.Model) -> ir.passes.PassResult:
         graph = model.graph
@@ -217,6 +251,7 @@ def load_kv_cache_scale_file(path: str) -> dict[int, tuple[float, float]]:
     Raises:
         ValueError: If the file lacks ``scales.k_scales`` / ``scales.v_scales``
             or the two lists differ in length.
+
     """
     with open(path, encoding="utf-8") as handle:
         data = json.load(handle)
@@ -236,13 +271,5 @@ def load_kv_cache_scale_file(path: str) -> dict[int, tuple[float, float]]:
             f"{path!r}: k_scales and v_scales must have equal length "
             f"(got k={len(k_scales)}, v={len(v_scales)})."
         )
-    scales: dict[int, tuple[float, float]] = {}
-    for i, (k, v) in enumerate(zip(k_scales, v_scales)):
-        k_f, v_f = float(k), float(v)
-        if not (math.isfinite(k_f) and k_f > 0.0 and math.isfinite(v_f) and v_f > 0.0):
-            raise ValueError(
-                f"{path!r}: layer {i} has a non-positive or non-finite scale "
-                f"(k={k}, v={v}); FP8 KV-cache scales must be finite and > 0."
-            )
-        scales[i] = (k_f, v_f)
-    return scales
+    scales = {i: (k, v) for i, (k, v) in enumerate(zip(k_scales, v_scales))}
+    return _validate_scales(scales)

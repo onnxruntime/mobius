@@ -38,20 +38,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Only graph-input or empty-placeholder caches are retyped — a non-empty
   initializer cache is skipped with a warning.
 
-### Text-only export for multimodal Gemma 4 (`--text-only`)
+### Text-only export for multimodal Gemma 4 (`--features text-only`)
 
 #### Added
 
-- `build(text_only=True)` and the `mobius build --text-only` CLI flag export the
+- `build(text_only=True)` and `mobius build --features text-only` export the
   **text backbone** of a unified multimodal checkpoint as a standalone
   decoder-only LLM. For `gemma4_unified` (`google/gemma-4-12B`) this remaps the
   model type to its text sibling (`gemma4_unified_text`) and strips the
   vision/audio config so the decoder fuses to `GroupQueryAttention` on
   GQA-capable execution providers (CUDA/DML) instead of the float-bias
   `Attention` path forced by the multimodal bidirectional vision-block overlay.
-  `--text-only` is rejected with `--config` / `--component` and now also bypasses
-  diffusers autodetect so `build()` validation runs (a diffusers/unsupported repo
-  raises instead of silently exporting a pipeline).
+  The `text-only` feature is rejected with `--config` / `--component` and now
+  also bypasses diffusers autodetect so `build()` validation runs (a
+  diffusers/unsupported repo raises instead of silently exporting a pipeline).
 
 #### Changed
 

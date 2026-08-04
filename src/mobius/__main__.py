@@ -177,9 +177,9 @@ def _cmd_build(args: argparse.Namespace) -> None:
     # validation reads them.
     _resolve_build_features(args)
 
-    # Validate --max-seq-len requires --static-cache
+    # Validate --max-seq-len requires the static-cache feature.
     if args.max_seq_len is not None and not args.static_cache:
-        raise SystemExit("Error: --max-seq-len can only be used with --static-cache.")
+        raise SystemExit("Error: --max-seq-len can only be used with --features static-cache.")
 
     # Validate --max-seq-len is positive
     if args.max_seq_len is not None and args.max_seq_len <= 0:
@@ -191,28 +191,28 @@ def _cmd_build(args: argparse.Namespace) -> None:
     if max_length is not None and max_length <= 0:
         raise SystemExit("Error: --max-length must be a positive integer.")
 
-    # Validate --static-cache + --task compatibility
+    # Validate static-cache + --task compatibility.
     if args.static_cache and args.task is not None:
         raise SystemExit(
-            "Error: --static-cache cannot be combined with --task. "
-            "Remove --task to use --static-cache."
+            "Error: --features static-cache cannot be combined with --task. "
+            "Remove --task to use --features static-cache."
         )
 
-    # --text-only resolution lives in build() (model_type remap + config
+    # text-only resolution lives in build() (model_type remap + config
     # stripping), which is only reached on the HuggingFace model-ID path.
     if args.text_only and args.config:
         raise SystemExit(
-            "Error: --text-only is not supported with --config (local "
-            "directory). Use --model <hf-id> --text-only instead."
+            "Error: --features text-only is not supported with --config (local "
+            "directory). Use --model <hf-id> --features text-only instead."
         )
 
-    # --component selects one component of a diffusers pipeline; --text-only
+    # --component selects one component of a diffusers pipeline; text-only
     # produces a single decoder-only model. Combining them would silently
     # filter that model away unless --component happens to be 'model'.
     if args.text_only and args.component:
         raise SystemExit(
-            "Error: --text-only is not supported with --component. "
-            "--text-only produces a single decoder-only model, while "
+            "Error: --features text-only is not supported with --component. "
+            "The text-only feature produces a single decoder-only model, while "
             "--component selects a component of a diffusers pipeline."
         )
 
@@ -225,7 +225,9 @@ def _cmd_build(args: argparse.Namespace) -> None:
     kv_cache_scales: dict[int, tuple[float, float]] | None = None
     scale_file = getattr(args, "kv_cache_scale_file", None)
     if scale_file is not None and not fp8_kv_cache:
-        raise SystemExit("Error: --kv-cache-scale-file can only be used with --fp8-kv-cache.")
+        raise SystemExit(
+            "Error: --kv-cache-scale-file can only be used with --features fp8-kv-cache."
+        )
     if fp8_kv_cache and scale_file is not None:
         from mobius._passes._fp8_kv_cache import load_kv_cache_scale_file
 
@@ -248,7 +250,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
     component_filter = args.component
     execution_provider = args.execution_provider
 
-    # Auto-detect diffusers pipelines.  Skipped when --text-only is set:
+    # Auto-detect diffusers pipelines. Skipped when the text-only feature is set:
     # that flag only applies to transformers decoder exports, so we let the
     # central build() validation reject a diffusers/unsupported repo rather
     # than silently exporting a diffusion pipeline and ignoring the flag.
@@ -724,7 +726,8 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         metavar="N",
         help="Maximum sequence length for static cache buffers. "
-        "Only used with --static-cache. Defaults to max_position_embeddings from config.",
+        "Only used with --features static-cache. "
+        "Defaults to max_position_embeddings from config.",
     )
     build_parser.add_argument(
         "--ep",
@@ -761,8 +764,8 @@ def main(argv: list[str] | None = None) -> None:
         help=(
             "Optional JSON file of calibrated per-layer FP8 KV-cache scales "
             "(onnxruntime-genai format: {'scales': {'k_scales': [...], "
-            "'v_scales': [...]}}). Only used with --fp8-kv-cache; without it "
-            "all layers use a unit scale of 1.0."
+            "'v_scales': [...]}}). Only used with --features fp8-kv-cache; "
+            "without it all layers use a unit scale of 1.0."
         ),
     )
     build_parser.set_defaults(func=_cmd_build)

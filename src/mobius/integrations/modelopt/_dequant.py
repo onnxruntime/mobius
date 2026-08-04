@@ -54,9 +54,7 @@ def unpack_nvfp4_codes(packed_nk2: np.ndarray) -> np.ndarray:
     """
     packed = np.asarray(packed_nk2)
     if packed.ndim != 2:
-        raise ValueError(
-            f"NVFP4 packed codes must be 2D [N, K/2], got shape {packed.shape}."
-        )
+        raise ValueError(f"NVFP4 packed codes must be 2D [N, K/2], got shape {packed.shape}.")
     if packed.dtype != np.uint8:
         raise ValueError(f"NVFP4 packed codes must be uint8, got dtype {packed.dtype}.")
     packed = np.ascontiguousarray(packed)

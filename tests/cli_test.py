@@ -76,8 +76,11 @@ class TestCLIBuild:
             main(["build", tmpdir])  # no --model or --config
 
     def test_text_only_with_config_errors(self):
-        """--text-only is rejected on the --config (local dir) path."""
-        with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit):
+        """The text-only feature is rejected on the --config (local dir) path."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(SystemExit, match=r"--features text-only.*--config"),
+        ):
             main(
                 [
                     "build",
@@ -91,8 +94,11 @@ class TestCLIBuild:
             )
 
     def test_text_only_with_component_errors(self):
-        """--text-only is rejected when combined with --component."""
-        with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit):
+        """The text-only feature is rejected when combined with --component."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(SystemExit, match=r"--features text-only.*--component"),
+        ):
             main(
                 [
                     "build",
@@ -283,7 +289,10 @@ class TestCLIBuild:
             )
 
     def test_max_seq_len_without_static_cache_errors(self):
-        with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(SystemExit, match=r"--features static-cache"),
+        ):
             main(
                 [
                     "build",
@@ -297,8 +306,11 @@ class TestCLIBuild:
             )
 
     def test_static_cache_with_task_errors(self):
-        """--static-cache cannot be combined with any --task."""
-        with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit):
+        """The static-cache feature cannot be combined with any --task."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(SystemExit, match=r"--features static-cache.*--task"),
+        ):
             main(
                 [
                     "build",
@@ -310,6 +322,23 @@ class TestCLIBuild:
                     "static-cache",
                     "--task",
                     "text-generation",
+                ]
+            )
+
+    def test_kv_cache_scale_file_without_fp8_feature_errors(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(SystemExit, match=r"--features fp8-kv-cache"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "Qwen/Qwen2.5-0.5B",
+                    tmpdir,
+                    "--no-weights",
+                    "--kv-cache-scale-file",
+                    "scales.json",
                 ]
             )
 
