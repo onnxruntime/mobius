@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Cargo-style `--features` build option
+
+#### Added
+
+- `mobius build --features <a,b,...>` collects the build-mode toggles under a
+  single Rust/cargo-style option. Accepts a comma-separated list and may be
+  repeated (`--features fp8-kv-cache,static-cache` or `--features fp8-kv-cache
+  --features static-cache`). Available features: `static-cache`, `fp8-kv-cache`,
+  `text-only`. Unknown feature names are rejected with an error listing the
+  valid set.
+
+#### Changed
+
+- The boolean flags `--static-cache`, `--fp8-kv-cache`, and `--text-only` have
+  been **removed** in favor of the equivalent `--features` value. Companion
+  value args (`--max-seq-len`, `--kv-cache-scale-file`) are unchanged.
+
+### FP8 (E4M3) KV-cache export (`--features fp8-kv-cache`)
+
+#### Added
+
+- `build(fp8_kv_cache=True)` and `mobius build --features fp8-kv-cache` retype the
+  fused `GroupQueryAttention` KV cache to `FLOAT8E4M3FN` (per-tensor E4M3) after
+  GQA fusion, adding `k_scale`/`v_scale` initializers and the
+  `k_quant_type`/`v_quant_type="PER_TENSOR"`, `kv_cache_bit_width=8` attributes.
+  Halves KV-cache memory at long context on ORT runtimes with the FP8 KV kernel
+  (SM89+). `--kv-cache-scale-file` supplies calibrated per-layer scales
+  (onnxruntime-genai format); without it all layers use a unit scale of 1.0.
+  Only graph-input or empty-placeholder caches are retyped — a non-empty
+  initializer cache is skipped with a warning.
+
 ### Text-only export for multimodal Gemma 4 (`--text-only`)
 
 #### Added
