@@ -41,44 +41,9 @@ The ONNX graph is constructed through `onnxscript.nn.Module` and
 `onnx_ir.GraphBuilder`; PyTorch is used only as a possible source of weight
 tensors.
 
-## Run with ONNX Runtime
-
-Install the optional runtime dependency:
-
-```bash
-pip install -e ".[runtime]"
-```
-
-`WorldModelRunner` validates the graph contract and retains `next_state`
-between calls:
-
-```python
-import numpy as np
-
-from mobius.integrations.onnxruntime import WorldModelRunner
-
-runner = WorldModelRunner.from_path(
-    "world-model-onnx/model.onnx",
-    providers=["CPUExecutionProvider"],
-)
-
-observation = np.zeros((1, 64), dtype=np.float32)
-action = np.zeros((1, 6), dtype=np.float32)
-
-# The first call creates a zero state. Later calls reuse next_state.
-result = runner.step(observation, action)
-result = runner.step(observation, action)
-
-trajectory = runner.rollout(
-    [observation, observation],
-    [action, action],
-)
-```
-
-Pass `state=` to `step()` or `initial_state=` to `rollout()` when the model
-uses a learned or externally sampled initial state. Each `rollout()` starts
-from zero state unless `initial_state` is provided; repeated `step()` calls
-continue from the runner's retained state.
+Runtime execution is intentionally outside Mobius. A runtime only needs to
+implement this tensor contract and feed each `next_state` back as the following
+step's `state`; it may use any ONNX-compatible execution backend.
 
 ## Implement a custom world model
 

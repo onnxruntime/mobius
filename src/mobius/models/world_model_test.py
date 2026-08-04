@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import numpy as np
+import onnxruntime as ort
 import pytest
 import torch
 import torch.nn.functional as functional
@@ -15,7 +16,6 @@ from mobius import (
     WorldModelTask,
     build_from_module,
 )
-from mobius.integrations.onnxruntime import WorldModelRunner
 from mobius.tasks import TASK_REGISTRY, get_task
 
 
@@ -130,7 +130,7 @@ class TestWorldModelTask:
             WorldModelTask().build(InvalidWorldModel(), _config())
 
 
-def test_mlp_world_model_matches_pytorch_and_preserves_state(tmp_path):
+def test_mlp_world_model_matches_pytorch(tmp_path):
     torch.manual_seed(7)
     config = _config()
     reference = _TorchMLPWorldModel(config).eval()
@@ -143,8 +143,8 @@ def test_mlp_world_model_matches_pytorch_and_preserves_state(tmp_path):
     package.apply_weights(dict(reference.state_dict()))
     package.save(str(tmp_path), progress_bar=False)
 
-    runner = WorldModelRunner.from_path(
-        tmp_path / "model.onnx",
+    session = ort.InferenceSession(
+        str(tmp_path / "model.onnx"),
         providers=["CPUExecutionProvider"],
     )
     rng = np.random.default_rng(11)
@@ -158,15 +158,17 @@ def test_mlp_world_model_matches_pytorch_and_preserves_state(tmp_path):
             torch.from_numpy(action),
             torch.from_numpy(state),
         )
-    actual = runner.step(observation, action, state=state)
+    actual = session.run(
+        list(WorldModelTask.output_names),
+        {
+            "observation": observation,
+            "action": action,
+            "state": state,
+        },
+    )
 
     for actual_value, expected_value in zip(
-        (
-            actual.next_state,
-            actual.observation_prediction,
-            actual.reward,
-            actual.continuation,
-        ),
+        actual,
         expected,
         strict=True,
     ):
@@ -185,12 +187,18 @@ def test_mlp_world_model_matches_pytorch_and_preserves_state(tmp_path):
             torch.from_numpy(next_action),
             expected[0],
         )
-    actual_next = runner.step(next_observation, next_action)
+    actual_next = session.run(
+        list(WorldModelTask.output_names),
+        {
+            "observation": next_observation,
+            "action": next_action,
+            "state": actual[0],
+        },
+    )
 
     np.testing.assert_allclose(
-        actual_next.next_state,
+        actual_next[0],
         expected_next[0].numpy(),
         rtol=1e-5,
         atol=1e-6,
     )
-    assert runner.state is actual_next.next_state
