@@ -29,6 +29,7 @@ from _test_configs import (
     DETECTION_CONFIGS,
     ENCODER_CONFIGS,
     LONGROPE_FACTORS,
+    MASKED_LM_CONFIGS,
     SEQ2SEQ_CONFIGS,
     SPEECH_CONFIGS,
     SSM_CONFIGS,
@@ -451,6 +452,68 @@ class TestBuildEncoderGraph:
 
     def test_outputs_have_shapes_and_dtypes(self, model_type: str, config_overrides: dict):
         """Verify shape inference populates all output shapes and dtypes."""
+        config = _base_config(**config_overrides)
+        model_cls = registry.get(model_type)
+        module = model_cls(config)
+        task = get_task(_default_task_for_model(model_type))
+        pkg = task.build(module, config)
+        _assert_outputs_have_shapes_and_dtypes(pkg, model_type)
+
+
+# === Masked LM model configs (imported from _test_configs) ===
+_MASKED_LM_MODEL_PARAMS = _make_params(MASKED_LM_CONFIGS)
+
+
+@pytest.mark.parametrize("model_type,config_overrides", _MASKED_LM_MODEL_PARAMS)
+class TestBuildMaskedLMGraph:
+    """Verify that encoder-only models build valid masked LM ONNX graphs."""
+
+    def test_graph_builds_without_weights(self, model_type: str, config_overrides: dict):
+        config = _base_config(**config_overrides)
+        model_cls = registry.get(model_type)
+        module = model_cls(config)
+        task = get_task(_default_task_for_model(model_type))
+        pkg = task.build(module, config)
+        model = pkg["model"]
+
+        assert model.graph is not None
+        input_names = {inp.name for inp in model.graph.inputs}
+        assert "input_ids" in input_names
+        assert "attention_mask" in input_names
+        assert "token_type_ids" in input_names
+
+        output_names = {out.name for out in model.graph.outputs}
+        assert "logits" in output_names
+        # No KV cache outputs for masked LM
+        assert not any(n.startswith("present.") for n in output_names)
+        # No hidden_state output (that's feature-extraction, not masked-lm)
+        assert "last_hidden_state" not in output_names
+
+    def test_graph_has_lm_head_initializers(self, model_type: str, config_overrides: dict):
+        config = _base_config(**config_overrides)
+        model_cls = registry.get(model_type)
+        module = model_cls(config)
+        task = get_task(_default_task_for_model(model_type))
+        pkg = task.build(module, config)
+        model = pkg["model"]
+
+        init_names = list(model.graph.initializers)
+        assert len(init_names) > 0
+        has_lm_head = any("lm_head" in n for n in init_names)
+        has_encoder = any("encoder" in n for n in init_names)
+        assert has_lm_head, "Should have LM head parameters"
+        assert has_encoder, "Should have encoder parameters"
+
+    def test_onnx_checker_passes(self, model_type: str, config_overrides: dict):
+        """Run the ONNX CheckerPass to catch attribute/shape/type errors."""
+        config = _base_config(**config_overrides)
+        model_cls = registry.get(model_type)
+        module = model_cls(config)
+        task = get_task(_default_task_for_model(model_type))
+        pkg = task.build(module, config)
+        _run_onnx_checker(pkg, model_type)
+
+    def test_outputs_have_shapes_and_dtypes(self, model_type: str, config_overrides: dict):
         config = _base_config(**config_overrides)
         model_cls = registry.get(model_type)
         module = model_cls(config)

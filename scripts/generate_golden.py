@@ -979,6 +979,55 @@ def _generate_image_classification(case: TestCase, json_path: Path, device: str)
     )
 
 
+def _generate_masked_lm(case: TestCase, json_path: Path, device: str) -> None:
+    """Generate golden data for a masked LM model (BERT, RoBERTa, ESM-2, etc.).
+
+    Runs a forward pass with a masked input and captures the logits at the
+    position of the first mask token.  For protein language models (ESM-2),
+    the mask token is ``<mask>``; for BERT-style models it is ``[MASK]``.
+    """
+    from mobius._testing.golden import save_golden_ref
+    from mobius._testing.torch_reference import (
+        load_torch_masked_lm_model,
+        torch_masked_lm_forward,
+    )
+
+    model, tokenizer = load_torch_masked_lm_model(
+        case.model_id,
+        revision=case.revision,
+        device=device,
+        trust_remote_code=case.trust_remote_code,
+    )
+
+    encoded = tokenizer(case.prompts[0], return_tensors="np", padding=False)
+    input_ids = encoded["input_ids"]
+    attention_mask = encoded["attention_mask"]
+    token_type_ids = encoded.get("token_type_ids")
+
+    # Forward pass → (batch, seq_len, vocab_size)
+    logits = torch_masked_lm_forward(model, input_ids, attention_mask, token_type_ids)
+
+    # Find the first mask token position and extract its logits.
+    # Fall back to position 1 (first non-CLS token) if no mask token is found.
+    mask_id = tokenizer.mask_token_id
+    flat_ids = input_ids[0].tolist()
+    mask_pos = flat_ids.index(mask_id) if mask_id in flat_ids else 1
+    mask_logits = logits[0, mask_pos, :]  # (vocab_size,)
+
+    golden = _extract_logits_golden(mask_logits)
+
+    # Masked-LM is L4-only (no autoregressive generation)
+    save_golden_ref(
+        json_path,
+        top1_id=golden["top1_id"],
+        top2_id=golden["top2_id"],
+        top10_ids=golden["top10_ids"],
+        top10_logits=golden["top10_logits"],
+        logits_summary=golden["logits_summary"],
+        input_ids=input_ids,
+    )
+
+
 def _detection_forced_size(model_id: str, trust_remote_code: bool) -> dict | None:
     """Return a fixed ``{height, width}`` size for object-detection export.
 
@@ -1644,6 +1693,7 @@ def _generate_dflash_draft(case: TestCase, json_path: Path, device: str) -> None
 _GENERATORS = {
     "text-generation": _generate_causal_lm,
     "feature-extraction": _generate_encoder,
+    "masked-lm": _generate_masked_lm,
     "seq2seq": _generate_seq2seq,
     "image-text-to-text": _generate_vision_language,
     "image-classification": _generate_image_classification,

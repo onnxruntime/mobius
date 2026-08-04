@@ -1,7 +1,6 @@
 model_id: "facebook/esm2_t6_8M_UR50D"
-model_type: "esm"
 revision: "c731040fcd8d73dceaa04b0a8e6329b345b0f5df"
-task_type: "feature-extraction"
+task_type: "masked-lm"
 dtype: "float32"
 
 inputs:
@@ -10,5 +9,4 @@ inputs:
 
 level: "L4"
 
-skip_reason: "Architecture-specific differences from generic BERT (extra embeddings, missing params)."
-notes: "ESM-2 8M. Protein language model."
+notes: "ESM-2 8M with masked LM head. Protein language model for predicting masked amino acids."

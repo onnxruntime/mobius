@@ -55,6 +55,7 @@
         "image-text-to-text",
         "image-to-image",
         "image-to-text",
+        "masked-lm",
         "object-detection",
         "phi4mm-multimodal",
         "qwen35-mtp",

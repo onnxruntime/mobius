@@ -100,7 +100,7 @@ from mobius.models import (
 )
 from mobius.models.bamba import BambaCausalLMModel
 from mobius.models.bart import BartForConditionalGeneration
-from mobius.models.bert import BertModel
+from mobius.models.bert import BertForMaskedLM, BertModel
 from mobius.models.blip import BlipVisionModel
 from mobius.models.blip2 import Blip2Model
 from mobius.models.clip import CLIPTextModel, CLIPVisionModel, SigLIPVisionModel
@@ -682,6 +682,10 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "xlnet": ModelRegistration(BertModel, task="feature-extraction"),
     "xmod": ModelRegistration(BertModel, task="feature-extraction"),
     "yoso": ModelRegistration(BertModel, task="feature-extraction"),
+    # --- Masked LM (encoder + prediction head) ---
+    "bert_masked_lm": ModelRegistration(BertForMaskedLM, task="masked-lm"),
+    "esm_masked_lm": ModelRegistration(BertForMaskedLM, task="masked-lm"),
+    "roberta_masked_lm": ModelRegistration(BertForMaskedLM, task="masked-lm"),
     # --- Absolute positional embeddings (non-RoPE) ---
     "biogpt": ModelRegistration(GPT2CausalLMModel),
     "ctrl": ModelRegistration(CTRLCausalLMModel),
@@ -1061,6 +1065,11 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "xlnet": "xlnet/xlnet-base-cased",
     "xmod": "facebook/xmod-base",
     "yoso": "uw-madison/yoso-4096",
+
+    # --- Masked LM (encoder + prediction head) ---
+    "bert_masked_lm": "google-bert/bert-base-uncased",
+    "esm_masked_lm": "facebook/esm2_t6_8M_UR50D",
+    "roberta_masked_lm": "FacebookAI/roberta-base",
 
     # --- Encoder-decoder ---
     "bart": "facebook/bart-base",

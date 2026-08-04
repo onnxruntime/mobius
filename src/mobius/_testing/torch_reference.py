@@ -485,6 +485,64 @@ def torch_encoder_forward(
 
 
 # ---------------------------------------------------------------------------
+# Masked LM models (BERT, RoBERTa, ESM-2, etc.)
+# ---------------------------------------------------------------------------
+
+
+def load_torch_masked_lm_model(
+    model_id: str,
+    revision: str | None = None,
+    dtype: torch.dtype = torch.float32,
+    device: str = "cpu",
+    trust_remote_code: bool = False,
+):
+    """Load a HuggingFace masked LM model for reference inference.
+
+    Uses AutoModelForMaskedLM for BERT/RoBERTa/ESM-2-style architectures.
+
+    Returns:
+        Tuple of (model, tokenizer).
+    """
+    import transformers
+
+    kwargs: dict = {"trust_remote_code": trust_remote_code}
+    if revision:
+        kwargs["revision"] = revision
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model_id, **kwargs)
+    model = transformers.AutoModelForMaskedLM.from_pretrained(
+        model_id,
+        torch_dtype=dtype,
+        device_map=device,
+        **kwargs,
+    )
+    model.eval()
+    return model, tokenizer
+
+
+@torch.no_grad()
+def torch_masked_lm_forward(
+    model,
+    input_ids: np.ndarray,
+    attention_mask: np.ndarray,
+    token_type_ids: np.ndarray | None = None,
+) -> np.ndarray:
+    """Run a single forward pass on a HuggingFace masked LM model.
+
+    Returns:
+        logits as numpy array [batch, seq_len, vocab_size].
+    """
+    device = next(model.parameters()).device
+    kwargs: dict = {
+        "input_ids": torch.from_numpy(input_ids).to(device),
+        "attention_mask": torch.from_numpy(attention_mask).to(device),
+    }
+    if token_type_ids is not None:
+        kwargs["token_type_ids"] = torch.from_numpy(token_type_ids).to(device)
+    outputs = model(**kwargs)
+    return outputs.logits.cpu().numpy()
+
+
+# ---------------------------------------------------------------------------
 # Seq2seq models (BART, T5, mBART, etc.)
 # ---------------------------------------------------------------------------
 

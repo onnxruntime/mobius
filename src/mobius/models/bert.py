@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""BERT encoder-only model with HF-aligned weight naming.
+"""BERT encoder-only model and masked LM with HF-aligned weight naming.
 
 HF BERT uses deeply nested naming for encoder layers:
   attention.self.query / attention.self.key / attention.self.value
@@ -11,8 +11,12 @@ HF BERT uses deeply nested naming for encoder layers:
   embeddings.LayerNorm
 
 Module attributes here match HF conventions to eliminate the
-rename dict entirely. Only prefix stripping (bert./roberta.)
+rename dict entirely. Only prefix stripping (bert./roberta./esm.)
 and gamma/beta compat remain in preprocess_weights.
+
+BertForMaskedLM adds a masked language model head on top of the
+encoder for predicting masked tokens. Supports BERT, RoBERTa, ESM-2,
+and similar encoder-only architectures.
 """
 
 from __future__ import annotations
@@ -283,26 +287,13 @@ class _BertEncoder(nn.Module):
 _PARAM_RENAMES = {"gamma": "weight", "beta": "bias"}
 
 
-def _rename_bert_weight(name: str) -> str | None:
-    """Rename a single HF BERT weight to our convention.
+def _rename_bert_encoder_weight(name: str) -> str:
+    """Collapse nested HF naming and handle gamma/beta compat.
 
-    Strips model prefixes (bert./roberta./esm./mpnet./etc.), collapses
-    nested HF naming (.self./.output.) to match the flat ONNX initializer
-    paths, and handles old-BERT gamma/beta compat. Returns None for
-    pooler/cls weights we don't need.
+    This is the shared encoder-weight rename logic used by both
+    ``_rename_bert_weight`` and ``_rename_masked_lm_weight``.
+    Assumes model prefix (bert./roberta./esm.) is already stripped.
     """
-    # Strip model-type prefix (e.g. bert., roberta., esm., mpnet., squeezebert.)
-    # HF safetensors use the model class prefix before embeddings/encoder.
-    first_dot = name.find(".")
-    if first_dot > 0:
-        after = name[first_dot + 1 :]
-        if after.startswith(("embeddings.", "encoder.", "pooler.", "cls.", "lm_head.")):
-            name = after
-
-    # Skip pooler, classification heads, and lm_head
-    if name.startswith(("pooler.", "cls.", "lm_head.")):
-        return None
-
     # Collapse nested HF naming to match flat ONNX paths:
     #   attention.self.query → attention.query
     #   attention.output.dense → attention.dense
@@ -318,3 +309,175 @@ def _rename_bert_weight(name: str) -> str | None:
         name = f"{parts[0]}.{_PARAM_RENAMES[parts[1]]}"
 
     return name
+
+
+def _rename_bert_weight(name: str) -> str | None:
+    """Rename a single HF BERT weight to our convention.
+
+    Strips model prefixes (bert./roberta./esm.), collapses nested HF naming
+    (.self./.output.) to match the flat ONNX initializer paths, and
+    handles old-BERT gamma/beta compat. Returns None for pooler/cls
+    weights we don't need.
+    """
+    # Strip "bert." / "roberta." / "esm." prefix if present
+    if name.startswith("bert."):
+        name = name[5:]
+    elif name.startswith("roberta."):
+        name = name[8:]
+    elif name.startswith("esm."):
+        name = name[4:]
+
+    # Skip pooler and classification heads
+    if name.startswith(("pooler.", "cls.")):
+        return None
+
+    return _rename_bert_encoder_weight(name)
+
+
+# ---------------------------------------------------------------------------
+# Masked LM Head and BertForMaskedLM
+# ---------------------------------------------------------------------------
+
+# BERT cls.predictions.transform.* -> our lm_head.* naming
+_BERT_CLS_TO_LM_HEAD = {
+    "cls.predictions.transform.dense.": "lm_head.dense.",
+    "cls.predictions.transform.LayerNorm.": "lm_head.layer_norm.",
+    "cls.predictions.decoder.": "lm_head.decoder.",
+    # Top-level bias on the BERT predictions head
+    "cls.predictions.bias": "lm_head.decoder.bias",
+}
+
+
+class _MaskedLMHead(nn.Module):
+    """Masked LM prediction head: dense -> activation -> LayerNorm -> decoder.
+
+    Matches HF ESM/RoBERTa naming: lm_head.dense, lm_head.layer_norm,
+    lm_head.decoder. BERT uses different naming (cls.predictions.*) which
+    is handled by preprocess_weights.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        vocab_size: int,
+        hidden_act: str = "gelu",
+        layer_norm_eps: float = 1e-12,
+    ):
+        super().__init__()
+        self.dense = Linear(hidden_size, hidden_size, bias=True)
+        self.layer_norm = LayerNorm(hidden_size, eps=layer_norm_eps)
+        self.decoder = Linear(hidden_size, vocab_size, bias=True)
+        self._act_fn = ACT2FN[hidden_act]
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
+        # hidden_states: (batch, seq, hidden_size) -> logits: (batch, seq, vocab)
+        x = self.dense(op, hidden_states)
+        x = self._act_fn(op, x)
+        x = self.layer_norm(op, x)
+        return self.decoder(op, x)
+
+
+class BertForMaskedLM(nn.Module):
+    """BERT/ESM/RoBERTa encoder with masked language model head.
+
+    Predicts vocabulary logits for each token position, used for
+    masked token prediction (fill-mask).
+
+    Supports ESM-2 (protein masked LM), BERT, RoBERTa, and similar
+    encoder architectures. Output is per-token logits over the vocabulary.
+
+    Replicates HuggingFace's ``EsmForMaskedLM`` / ``BertForMaskedLM`` /
+    ``RobertaForMaskedLM``.
+    """
+
+    default_task = "masked-lm"
+    category = "encoder"
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        self.config = config
+        self.embeddings = _BertEmbeddings(
+            vocab_size=config.vocab_size,
+            hidden_size=config.hidden_size,
+            max_position_embeddings=config.max_position_embeddings,
+            type_vocab_size=getattr(config, "type_vocab_size", 2),
+            layer_norm_eps=config.rms_norm_eps,
+            pad_token_id=config.pad_token_id or 0,
+        )
+        self.encoder = _BertEncoder(config)
+        self.lm_head = _MaskedLMHead(
+            hidden_size=config.hidden_size,
+            vocab_size=config.vocab_size,
+            hidden_act=config.hidden_act,
+            layer_norm_eps=config.rms_norm_eps,
+        )
+
+    def forward(
+        self,
+        op: OpBuilder,
+        input_ids: ir.Value,
+        attention_mask: ir.Value,
+        token_type_ids: ir.Value,
+    ):
+        hidden_states = self.embeddings(op, input_ids, token_type_ids)
+        hidden_states = self.encoder(op, hidden_states, attention_mask)
+        logits = self.lm_head(op, hidden_states)
+        return logits
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Rename HF weight names to match our parameter names.
+
+        Handles ESM (esm.* prefix + lm_head.*), RoBERTa (roberta.* +
+        lm_head.*), and BERT (bert.* + cls.predictions.*) conventions.
+        """
+        new_state_dict = {}
+        for name, tensor in state_dict.items():
+            new_name = _rename_masked_lm_weight(name)
+            if new_name is not None:
+                new_state_dict[new_name] = tensor
+        return new_state_dict
+
+
+def _rename_masked_lm_weight(name: str) -> str | None:
+    """Rename a single HF masked LM weight to our convention.
+
+    Handles LM head weights (BERT cls.predictions.* -> lm_head.*,
+    ESM/RoBERTa lm_head.* passes through) and delegates encoder
+    weights to ``_rename_bert_weight``.
+    """
+    # Strip "bert." / "roberta." / "esm." prefix from encoder weights
+    if name.startswith("bert."):
+        name = name[5:]
+    elif name.startswith("roberta."):
+        name = name[8:]
+    elif name.startswith("esm."):
+        name = name[4:]
+
+    # Skip pooler (not needed for MLM)
+    if name.startswith("pooler."):
+        return None
+
+    # Skip contact_head (ESM-specific, not needed for MLM)
+    if name.startswith("contact_head."):
+        return None
+
+    # Map BERT cls.predictions.* -> lm_head.*
+    for bert_prefix, our_prefix in _BERT_CLS_TO_LM_HEAD.items():
+        if name.startswith(bert_prefix):
+            name = our_prefix + name[len(bert_prefix) :]
+            return name
+
+    # lm_head.* passes through directly (ESM/RoBERTa convention)
+    if name.startswith("lm_head."):
+        return name
+
+    # Skip other cls.* heads (e.g. cls.seq_relationship for NSP)
+    if name.startswith("cls."):
+        return None
+
+    # Encoder weights: delegate to shared rename logic.
+    # Prefix is already stripped, so pass directly to the encoder
+    # rename which handles HF naming collapse + gamma/beta compat.
+    return _rename_bert_encoder_weight(name)
