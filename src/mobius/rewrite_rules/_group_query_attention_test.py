@@ -726,6 +726,50 @@ class TestGroupQueryAttentionRules:
                 "Transpose input should be Concat of W_q, W_k, W_v"
             )
 
+    @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
+    def test_packed_weight_intermediates_declare_weight_dtype(self, dtype):
+        """Concat/Transpose intermediates carry the projection weight dtype.
+
+        The replacement builder leaves new values untyped. Without an explicit
+        stamp, folding ``Transpose(Concat(W_q, W_k, W_v))`` into an initializer
+        has no declared type to inherit and can widen fp16 weights to fp32.
+        """
+        config = dataclasses.replace(_LLAMA_CONFIG, dtype=dtype)
+        m = build_from_module(registry.get("llama")(config), config)["model"]
+
+        rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
+        rewrite(m, pattern_rewrite_rules=pack_qkv_for_gqa_rules())
+
+        gqa_nodes = [n for n in m.graph if n.op_type == "GroupQueryAttention"]
+        assert len(gqa_nodes) == config.num_hidden_layers
+
+        for gqa in gqa_nodes:
+            transpose = gqa.inputs[0].producer().inputs[1].producer()
+            assert transpose.op_type == "Transpose"
+            concat = transpose.inputs[0].producer()
+            assert concat.op_type == "Concat"
+            assert concat.outputs[0].dtype == dtype
+            assert transpose.outputs[0].dtype == dtype
+
+    @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
+    def test_packed_bias_intermediate_declares_bias_dtype(self, dtype):
+        """The packed-bias Concat intermediate carries the bias dtype."""
+        config = dataclasses.replace(_QWEN2_BIAS_CONFIG, dtype=dtype)
+        m = build_from_module(registry.get("qwen2")(config), config)["model"]
+
+        rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
+        rewrite(m, pattern_rewrite_rules=pack_qkv_for_gqa_rules())
+
+        gqa_nodes = [n for n in m.graph if n.op_type == "GroupQueryAttention"]
+        assert len(gqa_nodes) == config.num_hidden_layers
+
+        for gqa in gqa_nodes:
+            add = gqa.inputs[0].producer()
+            assert add.op_type == "Add"
+            bias_concat = add.inputs[1].producer()
+            assert bias_concat.op_type == "Concat"
+            assert bias_concat.outputs[0].dtype == dtype
+
     def test_packed_qkv_with_bias_runs_with_ort(self):
         """Biased packed-QKV GQA model runs correctly with ORT."""
         model = registry.get("qwen2")(_QWEN2_BIAS_CONFIG)
