@@ -48,18 +48,20 @@ class WorldModelTask(ModelTask):
         batch = ir.SymbolicDim("batch")
         graph, builder = _make_graph(name="world_model_step")
 
+        observation_name, action_name, state_name = self.input_names
+
         observation = builder.input(
-            "observation",
+            observation_name,
             dtype=config.dtype,
             shape=[batch, *config.observation_shape],
         )
         action = builder.input(
-            "action",
+            action_name,
             dtype=config.dtype,
             shape=[batch, *config.action_shape],
         )
         state = builder.input(
-            "state",
+            state_name,
             dtype=config.dtype,
             shape=[batch, *config.state_shape],
         )
