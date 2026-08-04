@@ -244,6 +244,30 @@ class TestCLIBuild:
             )
         assert mock_build.call_args.kwargs.get("fp8_kv_cache") is True
 
+    def test_features_prune_lm_head_passed_through(self):
+        """--features prune-lm-head sets prune_lm_head on the build() call."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius._diffusers_builder._load_diffusers_pipeline_index",
+                return_value=None,
+            ),
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "some/model",
+                    tmpdir,
+                    "--no-weights",
+                    "--features",
+                    "prune-lm-head",
+                ]
+            )
+        assert mock_build.call_args.kwargs.get("prune_lm_head") is True
+
     def test_features_comma_separated_multiple(self):
         """A single --features accepts a comma-separated list."""
         with (
@@ -263,12 +287,13 @@ class TestCLIBuild:
                     tmpdir,
                     "--no-weights",
                     "--features",
-                    "text-only,fp8-kv-cache",
+                    "text-only,fp8-kv-cache,prune-lm-head",
                 ]
             )
         kwargs = mock_build.call_args.kwargs
         assert kwargs.get("text_only") is True
         assert kwargs.get("fp8_kv_cache") is True
+        assert kwargs.get("prune_lm_head") is True
 
     def test_features_unknown_errors(self):
         """An unrecognised feature name is rejected with a clear error."""

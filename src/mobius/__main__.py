@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 _BUILD_FEATURES: dict[str, str] = {
     "static-cache": "static_cache",
     "fp8-kv-cache": "fp8_kv_cache",
+    "prune-lm-head": "prune_lm_head",
     "text-only": "text_only",
 }
 
@@ -222,6 +223,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
     # FP8 KV cache: resolve the optional per-layer scale file up front so both
     # the --config and --model build paths can pass the same scales.
     fp8_kv_cache = getattr(args, "fp8_kv_cache", False)
+    prune_lm_head = getattr(args, "prune_lm_head", False)
     kv_cache_scales: dict[int, tuple[float, float]] | None = None
     scale_file = getattr(args, "kv_cache_scale_file", None)
     if scale_file is not None and not fp8_kv_cache:
@@ -311,6 +313,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             execution_provider=execution_provider,
             fp8_kv_cache=fp8_kv_cache,
             kv_cache_scales=kv_cache_scales,
+            prune_lm_head=prune_lm_head,
         )
         for name, model in pkg.items():
             model.graph.name = f"{config_path}/{name}"
@@ -340,6 +343,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             text_only=args.text_only,
             fp8_kv_cache=fp8_kv_cache,
             kv_cache_scales=kv_cache_scales,
+            prune_lm_head=prune_lm_head,
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)

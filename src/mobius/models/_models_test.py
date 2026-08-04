@@ -137,6 +137,16 @@ class TestBuildFromModule:
         assert isinstance(model, ir.Model)
         assert model.graph.num_nodes() > 0
 
+    def test_build_with_prune_lm_head_feature(self):
+        config = make_config()
+        module = CausalLMModel(config)
+        model = build_from_module(module, config, prune_lm_head=True)["model"]
+
+        logits = next(v for v in model.graph.outputs if v.name == "logits")
+        assert len(logits.shape) == 3
+        assert logits.shape[1] == 1
+        assert logits.shape[2] == config.vocab_size
+
     def test_build_with_output_layer_indices(self):
         config = make_config(num_hidden_layers=4, output_layer_indices=[1, 2])
         module = CausalLMModel(config)
@@ -232,7 +242,9 @@ class TestPruneLmHead:
         assert logits.shape[2] == config.vocab_size
 
     def test_prune_does_not_change_input_shapes(self):
-        """Pruning only affects output; input_ids still has dynamic sequence_length
+        """Pruning only affects output.
+
+        input_ids still has dynamic sequence_length
         so the model accepts arbitrary prompts.
         """
         model = self._build(prune_lm_head=True)
