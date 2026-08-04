@@ -19,9 +19,9 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Set up Python "3.13"
-      uses: actions/setup-python@v6
+      uses: actions/setup-python@v7
       with:
         python-version: "3.13"
     - name: Lint with lintrunner
@@ -35,7 +35,7 @@ jobs:
       run_all: ${{ steps.detect.outputs.run_all }}
       has_affected: ${{ steps.detect.outputs.has_affected }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Get changed files
@@ -79,13 +79,13 @@ jobs:
     needs: [detect-affected]
     if: always() && !cancelled()
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Cache pip packages
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/pip
           key: pip-smoke-${{ hashFiles('pyproject.toml', 'requirements/ci/requirements.txt') }}
@@ -126,13 +126,13 @@ jobs:
       (needs.detect-affected.result == 'failure' ||
        needs.detect-affected.outputs.has_affected == 'true')
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Cache pip packages
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/pip
           key: pip-parity-${{ hashFiles('pyproject.toml', 'requirements/ci/requirements.txt') }}
@@ -221,13 +221,13 @@ jobs:
         python_version: ["3.11", "3.12", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python_version }}
       - name: Cache pip packages
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/pip
           key: pip-${{ runner.os }}-${{ matrix.python_version }}-${{ hashFiles('pyproject.toml', 'requirements/ci/requirements.txt') }}
@@ -264,13 +264,13 @@ jobs:
       - "1ES.Pool=onnxruntime-ep-mobius-github-linux-a10"
       - "JobId=gpu-integration-fast-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Cache HuggingFace models
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface
           key: hf-integration-fast-${{ hashFiles('tests/integration_test.py') }}
@@ -283,7 +283,7 @@ jobs:
           pip install -r requirements/ci/requirements.txt
           pip install soundfile librosa ml_dtypes flatbuffers numpy packaging protobuf sympy coloredlogs
           pip install -e '.[testing]'
-          pip install --pre --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-12-nightly/pypi/simple/ onnxruntime-gpu onnxruntime-genai-cuda
+          pip install --pre --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-12-nightly/pypi/simple/ "onnxruntime-gpu<1.27" onnxruntime-genai-cuda
       - name: Run fast integration tests
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -311,11 +311,11 @@ jobs:
     needs: [test]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install Python build dependencies
@@ -324,27 +324,3 @@ jobs:
       - name: Build wheels
         run: |
           python -m build
-      - name: Upload wheels
-        uses: actions/upload-artifact@v7
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        with:
-          name: dist
-          path: dist
-
-  release:
-    name: Release
-    environment: release
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [test, build]
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: dist
-          path: dist
-      - name: Publish package
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          attestations: true

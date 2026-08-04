@@ -74,6 +74,10 @@ class VisionConfig:
     pooling_kernel_size: int | None = None
     # MLP activation for vision encoder layers (e.g. "gelu_pytorch_tanh" for Gemma4 SigLIP)
     hidden_act: str | None = None
+    # CLIP-style feature extraction: which ``hidden_states`` index to output
+    # (HuggingFace convention, e.g. -2 for Phi-3.5-Vision). ``None`` means use
+    # the final hidden state (all layers + post_layernorm).
+    feature_layer: int | None = None
 
 
 @dataclasses.dataclass

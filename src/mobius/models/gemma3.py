@@ -143,7 +143,14 @@ class _Gemma3EmbeddingModel(nn.Module):
         indices = op.Sub(cumsum, op.Constant(value_int=1))
         indices = op.Clip(indices, op.Constant(value_int=0))
 
-        gathered = op.Gather(image_features, indices, axis=0)
+        # Decode steps may pass empty image features ([0, hidden]); append one
+        # zero row so the Gather below has a valid row that Where will not use.
+        hidden_dim = op.Shape(image_features, start=1, end=2)
+        pad_shape = op.Concat(op.Constant(value_ints=[1]), hidden_dim, axis=0)
+        zero_pad = op.Expand(op.CastLike(0.0, image_features), pad_shape)
+        image_features_padded = op.Concat(image_features, zero_pad, axis=0)
+
+        gathered = op.Gather(image_features_padded, indices, axis=0)
         return op.Where(image_mask_3d, gathered, text_embeds)
 
     def preprocess_weights(

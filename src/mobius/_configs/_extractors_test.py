@@ -285,6 +285,44 @@ def test_hunyuan_vl_mot_filter_only_fires_for_that_model(loaded_vision_hooks):
     assert out == {}
 
 
+def test_phi3_v_vision_parses_img_processor(loaded_vision_hooks):
+    """Phi-3.5-Vision reads image_dim_out + layer_idx from the img_processor dict."""
+    cfg = _FakeHFConfig(
+        img_processor={
+            "name": "clip_vision_model",
+            "model_name": "openai/clip-vit-large-patch14-336",
+            "image_dim_out": 1024,
+            "num_img_tokens": 144,
+        }
+    )
+    out = _extractors.extract_vision_config(cfg, None, "phi3_v")
+    vision = out["vision"]
+    # CLIP ViT-L/14-336 geometry.
+    assert vision.hidden_size == 1024
+    assert vision.intermediate_size == 4096
+    assert vision.num_hidden_layers == 24
+    assert vision.num_attention_heads == 16
+    assert vision.image_size == 336
+    assert vision.patch_size == 14
+    assert vision.hidden_act == "quick_gelu"
+    # layer_idx defaults to -2 (feature extraction skips the last layer).
+    assert vision.feature_layer == -2
+
+
+def test_phi3_v_vision_respects_explicit_layer_idx(loaded_vision_hooks):
+    cfg = _FakeHFConfig(
+        img_processor={"name": "clip_vision_model", "image_dim_out": 1024, "layer_idx": -1}
+    )
+    out = _extractors.extract_vision_config(cfg, None, "phi3_v")
+    assert out["vision"].feature_layer == -1
+
+
+def test_phi3_v_vision_does_not_fire_for_unrelated_model(loaded_vision_hooks):
+    cfg = _FakeHFConfig(img_processor={"image_dim_out": 1024})
+    out = _extractors.extract_vision_config(cfg, None, "llama")
+    assert out == {}
+
+
 def test_phi4mm_image_token_id_survives_default_hook(loaded_vision_hooks):
     """Per-model image_token_id must not be clobbered by _vision_default.
 

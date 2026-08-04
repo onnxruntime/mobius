@@ -1,0 +1,20 @@
+model_id: "microsoft/Phi-3.5-vision-instruct"
+model_type: "phi3_v"
+revision: "12b77fb40b63"
+task_type: "image-text-to-text"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "What is shown in this image?"
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 30
+  do_sample: false
+
+trust_remote_code: true
+notes: "Phi-3.5 Vision. CLIP ViT-L/14-336 vision encoder + host-side HD feature transform + img_projection MLP + Phi-3.5 (rope_type=su) text decoder. Vision config stored in img_processor dict (non-standard). Vision encoder ONNX emits raw CLIP patch features (num_crops, 576, 1024); the HD 2x2 patch merge, learnable sub_GN/glb_GN separators and img_projection run host-side (image-size dependent)."

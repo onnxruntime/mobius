@@ -30,7 +30,12 @@ Usage::
 
 from __future__ import annotations
 
-__all__ = ["process_tensors", "_reverse_permute"]
+__all__ = [
+    "process_tensors",
+    "_reverse_permute",
+    "needs_llama_qk_permute",
+    "LLAMA_QK_PERMUTE_MODEL_TYPES",
+]
 
 import logging
 from typing import Any
@@ -39,6 +44,22 @@ import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
+
+# Model types whose GGUF Q/K weights are stored with llama.cpp's
+# interleaved-rope permutation and therefore require reverse-permutation
+# on import. These are the architectures whose llama.cpp converter calls
+# ``permute()`` on ``attn_q``/``attn_k`` (GGML "normal" rope).
+#
+# Qwen2/Qwen3, Gemma, GPT-2, Mamba, etc. use non-interleaved (NEOX-style)
+# rope and store Q/K in plain HF row order — applying the permute to them
+# scrambles the attention heads and produces garbage output. They must
+# NOT be reverse-permuted.
+LLAMA_QK_PERMUTE_MODEL_TYPES = frozenset({"llama", "mistral"})
+
+
+def needs_llama_qk_permute(model_type: str | None) -> bool:
+    """Return True if this model type needs llama.cpp Q/K reverse-permute."""
+    return model_type in LLAMA_QK_PERMUTE_MODEL_TYPES
 
 
 def process_tensors(
@@ -111,10 +132,20 @@ def _reverse_permute(
 ) -> torch.Tensor:
     """Reverse the Q/K weight permutation applied by llama.cpp.
 
-    llama.cpp interleaves head dimensions as:
-        ``(n_head, dim, 2, ...) -> swapaxes(2,1) -> reshape``
+    llama.cpp's forward permute (``convert_hf_to_gguf.py``) is::
 
-    We reverse this to get standard HF layout.
+        weights.reshape(n_head, 2, dim, ...).swapaxes(1, 2).reshape(orig)
+
+    where ``dim = out_features // n_head // 2``. The exact inverse — and
+    the transform HF's ``modeling_gguf_pytorch_utils._reverse_permute_weights``
+    applies when loading GGUF — reshapes with ``dim`` and ``2`` swapped::
+
+        weights.reshape(n_head, dim, 2, ...).swapaxes(1, 2).reshape(orig)
+
+    Using the forward reshape order here (``(n_head, 2, dim)``) only
+    coincidentally inverts the permute when ``dim == 2`` (head_dim == 4);
+    for real head dims (e.g. 64) it scrambles the Q/K rows, corrupting
+    rope and producing garbage output.
 
     Args:
         weights: The Q or K projection weight tensor.
@@ -122,7 +153,7 @@ def _reverse_permute(
             for Q weights, ``num_key_value_heads`` for K weights.
     """
     dim = weights.shape[0] // n_head // 2
-    w = weights.reshape(n_head, 2, dim, *weights.shape[1:])
+    w = weights.reshape(n_head, dim, 2, *weights.shape[1:])
     return w.swapaxes(1, 2).reshape(weights.shape)
 
 
@@ -199,11 +230,14 @@ def _process_mamba(
 
 # Map model_type → processor function.
 # Architectures not listed here need no tensor transforms.
+#
+# NOTE: Qwen2/Qwen3 are intentionally NOT mapped to ``_process_llama``.
+# Unlike Llama/Mistral, llama.cpp does not permute Qwen Q/K weights
+# (Qwen uses NEOX-style rope), so reverse-permuting them corrupts the
+# attention heads. See ``LLAMA_QK_PERMUTE_MODEL_TYPES``.
 _PROCESSORS: dict[str, Any] = {
     "llama": _process_llama,
     "mistral": _process_llama,
-    "qwen2": _process_llama,
-    "qwen3": _process_llama,
     "gemma": _process_gemma,
     "gemma2": _process_gemma,
     "gemma3": _process_gemma,
