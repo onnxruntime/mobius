@@ -519,6 +519,29 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         True,
     ),
+    # Text-only sibling of the Qwen3.5-MoE-VL (Qwen3.6-35B-A3B) checkpoint,
+    # exported via ``build(..., text_only=True)``. Same hybrid MoE backbone as
+    # ``qwen3_5_moe`` above; registered separately so the VL ``text_config``'s
+    # ``model_type=qwen3_5_moe_text`` and the text-only override both resolve.
+    (
+        "qwen3_5_moe_text",
+        {
+            "hidden_act": "silu",
+            "layer_types": ["linear_attention", "full_attention"],
+            "partial_rotary_factor": 0.25,
+            "mrope_interleaved": True,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "shared_expert_intermediate_size": 32,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+        },
+        True,
+    ),
     # === Falcon and Bloom ===
     # dual_ln=True: Falcon with new_decoder_architecture uses separate ln_attn + ln_mlp.
     # hidden_act="gelu": real Falcon uses GELU (HF FalconConfig.activation default);
@@ -2268,6 +2291,22 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
             "temporal_patch_size": 2,
             "mrope_section": [16, 24, 24],
             "attn_qk_norm": True,
+            "deepstack_visual_indexes": [0],
+        },
+        True,
+    ),
+    # Cosmos3-Omni understanding tower ("Reasoner"): architecturally identical
+    # to Qwen3-VL (nvidia/Cosmos3-Nano/Super).  Interleaved 3D M-RoPE, QK-norm.
+    (
+        "cosmos3_omni",
+        {
+            "vision": _TINY_QWEN3_VL_VISION,
+            "image_token_id": 32000,
+            "temporal_patch_size": 2,
+            "mrope_section": [16, 24, 24],
+            "mrope_interleaved": True,
+            "attn_qk_norm": True,
+            "deepstack_visual_indexes": [0],
         },
         True,
     ),
@@ -2290,6 +2329,7 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
             "temporal_patch_size": 2,
             "mrope_section": [16, 24, 24],
             "attn_qk_norm": True,
+            "deepstack_visual_indexes": [0],
         },
         True,
     ),
@@ -2302,6 +2342,7 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
             "temporal_patch_size": 2,
             "mrope_section": [16, 24, 24],
             "attn_qk_norm": True,
+            "deepstack_visual_indexes": [0],
         },
         False,
     ),
@@ -2328,6 +2369,7 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
             "temporal_patch_size": 2,
             "mrope_section": [16, 24, 24],
             "attn_qk_norm": True,
+            "deepstack_visual_indexes": [0],
         },
         True,
     ),

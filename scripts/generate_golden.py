@@ -237,12 +237,23 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
         _apply_nemotron_h_generate_patch(model)
 
         model_device = _get_model_device(model, device)
+        gen_ids = torch.from_numpy(input_ids).to(model_device)
+        max_new = case.generation_params.get("max_new_tokens", 20)
         with torch.no_grad():
-            gen_output = model.generate(
-                torch.from_numpy(input_ids).to(model_device),
-                max_new_tokens=case.generation_params.get("max_new_tokens", 20),
-                do_sample=False,
-            )
+            try:
+                gen_output = model.generate(gen_ids, max_new_tokens=max_new, do_sample=False)
+            except ValueError as e:
+                # All-attention GraniteMoeHybrid variants (e.g. granite-4.0-1b)
+                # trip transformers' hybrid Mamba/attention generation cache,
+                # which assumes at least one linear-attention (Mamba) layer:
+                # "`has_previous_state` can only be called on LinearAttention
+                # layers". Greedy output is cache-independent, so fall back to
+                # the (slower) cache-free path.
+                if "has_previous_state" not in str(e):
+                    raise
+                gen_output = model.generate(
+                    gen_ids, max_new_tokens=max_new, do_sample=False, use_cache=False
+                )
         generated_ids = gen_output[0, seq_len:].cpu().numpy()
 
     save_golden_ref(

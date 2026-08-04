@@ -93,6 +93,12 @@ class EpCapabilities:
             default) leaves ``Range`` unchanged.  Set ``False`` only when
             static cache is used on runtimes that lack a ``Range`` kernel (QNN
             HTP), where the ``Range`` node would otherwise be forced onto CPU.
+        supports_fp8_kv_cache: ``True`` allows :class:`~mobius._passes.
+            Fp8KvCachePass` to retype the ``GroupQueryAttention`` KV cache to
+            ``FLOAT8E4M3FN``.  Only CUDA (SM89+ Ada/Hopper/Blackwell) ships the
+            FP8 GQA kernel, so this defaults to ``False`` for every other EP —
+            ``--features fp8-kv-cache`` is ignored (with a warning) on EPs that
+            cannot run an FP8 KV cache, preventing invalid/unloadable models.
         supports_matmul_nbits: ``False`` converts ``com.microsoft::MatMulNBits``
             (blockwise-INT4 weight) into a standard ``DequantizeLinear`` +
             ``MatMul`` (QDQ) pair via MatMulNBitsToQDQ.  ``True`` leaves the
@@ -153,6 +159,7 @@ class EpCapabilities:
     supports_rotary_embedding: bool = True
     supports_tensor_scatter: bool = True
     supports_range: bool = True
+    supports_fp8_kv_cache: bool = False
     default_int4_accuracy_level: int = 0
     provider_options: dict[str, str] = dataclasses.field(default_factory=dict)
     enable_graph_capture: bool = False
@@ -309,6 +316,9 @@ def _register_builtins() -> None:
                 "enable_skip_layer_norm_strict_mode": "1",
             },
             supports_past_present_share_buffer=True,
+            # Only CUDA ships the FP8 (E4M3) GroupQueryAttention KV-cache kernel
+            # (SM89+ Ada/Hopper/Blackwell).
+            supports_fp8_kv_cache=True,
         ),
         EpCapabilities(
             name="dml",

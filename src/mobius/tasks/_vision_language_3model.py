@@ -109,14 +109,18 @@ class QwenVLTask(VisionLanguageTask):
         config: ArchitectureConfig,
     ) -> ModelPackage:
         self._validate_components(module)
+        deepstack = bool(getattr(config, "deepstack_visual_indexes", None))
         models: dict[str, ir.Model] = {}
-        models["decoder"] = build_decoder_from_embeds(module.decoder, config, mrope=True)
+        models["decoder"] = build_decoder_from_embeds(
+            module.decoder, config, mrope=True, deepstack=deepstack
+        )
         models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
         models["embedding"] = build_embedding_from_features(
             module.embedding,
             config,
             feature_name="image_features",
             feature_dim=config.hidden_size,
+            deepstack=deepstack,
         )
         return ModelPackage(models, config=config)
 
@@ -125,7 +129,12 @@ class QwenVLTask(VisionLanguageTask):
         vision: nn.Module,
         config: ArchitectureConfig,
     ) -> ir.Model:
-        """Build Qwen VL vision encoder with packed patches and grid_thw."""
+        """Build Qwen VL vision encoder with packed patches and grid_thw.
+
+        When ``deepstack_visual_indexes`` is set (Qwen3-VL family), the vision
+        encoder emits an extra ``deepstack_features`` output stacking the
+        intermediate DeepStack maps: ``[D, num_merged_patches, out_hidden]``.
+        """
         total_patches = ir.SymbolicDim("total_patches")
         num_images = ir.SymbolicDim("num_images")
 
@@ -147,13 +156,18 @@ class QwenVLTask(VisionLanguageTask):
             shape=[num_images, 3],
         )
 
-        image_features = vision(
+        outputs = vision(
             op,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
         )
 
-        builder.add_output(image_features, "image_features")
+        if isinstance(outputs, tuple):
+            image_features, deepstack_features = outputs
+            builder.add_output(image_features, "image_features")
+            builder.add_output(deepstack_features, "deepstack_features")
+        else:
+            builder.add_output(outputs, "image_features")
         return _make_model(graph)
 
 
@@ -172,9 +186,10 @@ class HybridQwenVLTask(QwenVLTask):
         config: ArchitectureConfig,
     ) -> ModelPackage:
         self._validate_components(module)
+        deepstack = bool(getattr(config, "deepstack_visual_indexes", None))
         models: dict[str, ir.Model] = {}
         models["decoder"] = build_decoder_from_embeds(
-            module.decoder, config, mrope=True, hybrid=True
+            module.decoder, config, mrope=True, hybrid=True, deepstack=deepstack
         )
         models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
         models["embedding"] = build_embedding_from_features(
@@ -182,6 +197,7 @@ class HybridQwenVLTask(QwenVLTask):
             config,
             feature_name="image_features",
             feature_dim=config.hidden_size,
+            deepstack=deepstack,
         )
         return ModelPackage(models, config=config)
 

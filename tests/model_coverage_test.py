@@ -201,6 +201,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "whisper": "Speech-to-text — requires audio inputs",
     "mms": "CTC ASR model — tested via TestBuildMMSGraph",
     "fastconformer_rnnt": "NeMo .nemo RNN-T ASR — tested via tests/nemo_rnnt_integration_test.py",
+    "sortformer": "NeMo .nemo speaker diarization — tested via tests/sortformer_integration_test.py",
     # --- Models requiring trust_remote_code ---
     "chatglm": "Requires trust_remote_code (custom HF modeling code)",
     "dots1": "Requires trust_remote_code (custom HF modeling code)",

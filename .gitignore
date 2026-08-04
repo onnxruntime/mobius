@@ -228,3 +228,5 @@ docs/feature-flags.md
 *.m4a
 *.wav
 .olive-cache/
+.scratch/
+uv.lock
