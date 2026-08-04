@@ -20,7 +20,6 @@ from __future__ import annotations
 import json
 import sys
 
-import ml_dtypes
 import numpy as np
 import onnx_ir as ir
 import onnxruntime as ort
@@ -33,6 +32,7 @@ from _test_configs import _base_config
 from mobius import build_from_module
 from mobius._passes._fp8_kv_cache import (
     Fp8KvCachePass,
+    _retype_fp8,
     load_kv_cache_scale_file,
 )
 from mobius._registry import registry
@@ -78,6 +78,20 @@ def _build_fp8_decoder(fp8_kv_cache=True, kv_cache_scales=None):
 
 
 class TestFp8KvCacheGraph:
+    def test_retypes_empty_initializer_data(self):
+        value = ir.Value(
+            name="past_key",
+            type=ir.TensorType(ir.DataType.FLOAT16),
+            shape=ir.Shape([1, 1, 0, 16]),
+        )
+        value.const_value = ir.tensor(np.zeros((1, 1, 0, 16), dtype=np.float16))
+
+        _retype_fp8(value)
+
+        assert value.dtype == _FP8
+        assert value.const_value.dtype == _FP8
+        assert value.const_value.shape == ir.Shape([1, 1, 0, 16])
+
     def test_all_kv_io_typed_fp8(self):
         model, config = _build_fp8_decoder()
         ins = {v.name: v for v in model.graph.inputs}
@@ -257,6 +271,27 @@ class TestLoadScaleFile:
             load_kv_cache_scale_file(str(path))
 
 
+class TestDirectScaleMapValidation:
+    @pytest.mark.parametrize(
+        "bad_scales",
+        [
+            {0: (0.0, 1.0)},
+            {0: (-1.0, 1.0)},
+            {0: (1.0, float("nan"))},
+            {0: (float("inf"), 1.0)},
+            {0: (1.0,)},
+            {0: ("invalid", 1.0)},
+        ],
+    )
+    def test_pass_rejects_invalid_scales(self, bad_scales):
+        with pytest.raises(ValueError):
+            Fp8KvCachePass(bad_scales)
+
+    def test_build_rejects_invalid_scale_map(self):
+        with pytest.raises(ValueError, match="finite and > 0"):
+            _build_fp8_decoder(kv_cache_scales={0: (0.0, 1.0)})
+
+
 @pytest.mark.skipif(not _FP8_CUDA, reason="requires CUDA FP8 GQA kernel (SM89+)")
 def test_fp8_kv_gqa_runs_on_cuda(tmp_path):
     """The emitted FP8 GQA op signature is accepted and computes on CUDA.
@@ -318,13 +353,8 @@ def test_fp8_kv_gqa_runs_on_cuda(tmp_path):
     assert graph.outputs[1].dtype == _FP8
     assert node.attributes.get_int("kv_cache_bit_width") == 8
 
-    # Match the empty past constants' data to their new FP8 declared type.
-    past_key.const_value = ir.tensor(
-        np.zeros((b, kv, 0, d), dtype=ml_dtypes.float8_e4m3fn), name="past_key"
-    )
-    past_value.const_value = ir.tensor(
-        np.zeros((b, kv, 0, d), dtype=ml_dtypes.float8_e4m3fn), name="past_value"
-    )
+    assert past_key.const_value.dtype == _FP8
+    assert past_value.const_value.dtype == _FP8
 
     path = tmp_path / "gqa.onnx"
     ir.save(model, str(path))
