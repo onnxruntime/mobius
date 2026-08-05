@@ -1331,6 +1331,43 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         False,
     ),
+    # gemma3n_text: mixed layer types *together with* KV sharing, which is what
+    # the real E4B checkpoint has (35 layers, num_kv_shared_layers=15) and which
+    # neither entry above reaches -- one has mixed types with sharing off, the
+    # other has sharing on but a single layer type. Only this combination
+    # exercises HF's per-type source selection, where a sliding shared layer and
+    # a full-attention shared layer must borrow K,V from *different* source
+    # layers. Getting that wrong still produces a loadable graph with plausible
+    # attention, so a shape-only test would not catch it.
+    #
+    # 4 layers with num_kv_shared_layers=2 gives prev_layers = [sliding, full]:
+    # layer 2 (sliding) borrows from layer 0, layer 3 (full) borrows from layer 1.
+    # Also keeps activation sparsity on for a subset of layers.
+    (
+        "gemma3n_text",
+        {
+            "_config_cls": Gemma3nConfig,
+            "attn_qk_norm": True,
+            "hidden_act": "gelu_pytorch_tanh",
+            "rope_local_base_freq": 10_000.0,
+            "num_hidden_layers": 4,
+            "layer_types": [
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            "altup_num_inputs": 2,
+            "altup_active_idx": 0,
+            "altup_correct_scale": True,
+            "laurel_rank": 16,
+            "hidden_size_per_layer_input": 32,
+            "vocab_size_per_layer_input": 256,
+            "num_kv_shared_layers": 2,
+            "activation_sparsity_pattern": [0.95, 0.95, 0.0, 0.0],
+        },
+        False,
+    ),
     # granite: with non-default scaling multipliers
     (
         "granite",
