@@ -1383,9 +1383,8 @@ def write_ort_genai_config(
     # Ensure chat_template is in tokenizer_config.json
     _fix_chat_template(directory, hf_model_id)
 
-    # Keep ORT's standalone and tokenizer-config templates identical. Gemma-4
-    # QAT checkpoints can carry structured-media branches that use Python
-    # ``.get`` calls unsupported by ORT's Jinja implementation.
+    # Keep ORT's standalone and tokenizer-config templates identical. Replace
+    # Gemma-4 templates only when structured text/image/audio rendering fails.
     chat_template_path = synchronize_chat_template_for_ort(directory, ort_model_type)
     if chat_template_path:
         result["chat_template.jinja"] = chat_template_path

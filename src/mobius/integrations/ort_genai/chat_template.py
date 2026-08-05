@@ -44,9 +44,6 @@ GEMMA4_ORT_CHAT_TEMPLATE = """{{- bos_token -}}
 """
 
 _MULTIMODAL_GEMMA4_MODEL_TYPES = frozenset({"gemma4", "gemma4_unified"})
-_UNSUPPORTED_STRUCTURED_MEDIA_GET = re.compile(
-    r"""\b(?:message|item)\.get\(\s*["'](?:content|type)["']"""
-)
 _STRINGIFIED_MAPPING = re.compile(r"""[\[{]\s*["']type["']\s*:""")
 
 
@@ -57,13 +54,9 @@ def _is_multimodal_gemma4_model_type(model_type: str) -> bool:
 def gemma4_template_needs_ort_normalization(template: str) -> bool:
     """Return whether a Gemma-4 template fails ORT-safe structured-media validation.
 
-    The static ``.get`` rejection covers the known ORT-Jinja incompatibility.
-    A sandboxed render then proves that text, image, and audio inputs produce
-    distinct prompts with the required media tokens and no stringified mapping.
+    A sandboxed render proves that text, image, and audio inputs produce distinct
+    prompts with the required media tokens and no stringified mapping.
     """
-    if _UNSUPPORTED_STRUCTURED_MEDIA_GET.search(template):
-        return True
-
     try:
         from jinja2.sandbox import ImmutableSandboxedEnvironment
 

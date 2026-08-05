@@ -909,6 +909,20 @@ class TestGemma4ChatTemplateCompatibility:
 {%- endif -%}
 {%- endfor -%}
 """
+    _COMPATIBLE_GET_TEMPLATE = """{{- bos_token -}}
+{%- for message in messages -%}
+{%- if message.get('content') is string -%}
+{{- message.get('content') -}}
+{%- else -%}
+{%- for item in message.get('content') -%}
+{%- if item.get('type') == 'text' -%}{{- item.get('text') -}}
+{%- elif item.get('type') == 'image' -%}{{- '<|image|>' -}}
+{%- elif item.get('type') == 'audio' -%}{{- '<|audio|>' -}}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{%- endfor -%}
+"""
 
     def _write_templates(self, tmp_path, template):
         (tmp_path / "chat_template.jinja").write_text(template)
@@ -938,6 +952,18 @@ class TestGemma4ChatTemplateCompatibility:
         )
         tokenizer_config = json.loads((tmp_path / "tokenizer_config.json").read_text())
         assert tokenizer_config["chat_template"] == self._COMPATIBLE_CUSTOM_TEMPLATE
+
+    def test_preserves_compatible_get_based_gemma_template(self, tmp_path):
+        self._write_templates(tmp_path, self._COMPATIBLE_GET_TEMPLATE)
+
+        synchronize_chat_template_for_ort(tmp_path, "gemma4")
+
+        assert not gemma4_template_needs_ort_normalization(self._COMPATIBLE_GET_TEMPLATE)
+        assert (tmp_path / "chat_template.jinja").read_text() == (
+            self._COMPATIBLE_GET_TEMPLATE
+        )
+        tokenizer_config = json.loads((tmp_path / "tokenizer_config.json").read_text())
+        assert tokenizer_config["chat_template"] == self._COMPATIBLE_GET_TEMPLATE
 
     def test_normalizes_template_that_stringifies_structured_content(self, tmp_path):
         stringifying_template = (
@@ -1019,6 +1045,7 @@ class TestGemma4ChatTemplateCompatibility:
         for template in (
             GEMMA4_ORT_CHAT_TEMPLATE,
             self._COMPATIBLE_CUSTOM_TEMPLATE,
+            self._COMPATIBLE_GET_TEMPLATE,
         ):
             rendered = tokenizer.apply_chat_template(
                 messages=messages,
