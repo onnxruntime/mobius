@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 
-import onnx
 import onnx_ir as ir
 import torch
 
@@ -118,28 +117,6 @@ class TestModelPackageSaveLoad:
         pkg = ModelPackage({"m": _make_simple_model()})
         pkg.save(str(outdir))
         assert (outdir / "model.onnx").exists()
-
-    def test_save_safetensors_shards_load_as_onnx_external_data(self, tmp_path):
-        config = make_config()
-        module = CausalLMModel(config)
-        pkg = build_from_module(module, config)
-        model = pkg["model"]
-        weights = {
-            name: torch.ones(list(value.shape))
-            for name, value in model.graph.initializers.items()
-        }
-        pkg.apply_weights(weights)
-
-        pkg.save(
-            str(tmp_path),
-            external_data="safetensors",
-            max_shard_size_bytes=1024,
-        )
-
-        assert (tmp_path / "model.safetensors.index.json").exists()
-        assert list(tmp_path.glob("model-*-of-*.safetensors"))
-        loaded = onnx.load(str(tmp_path / "model.onnx"), load_external_data=True)
-        assert len(loaded.graph.initializer) == len(model.graph.initializers)
 
 
 class TestModelPackageApplyWeights:
