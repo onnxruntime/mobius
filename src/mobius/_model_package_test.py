@@ -5,9 +5,13 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 
+import numpy as np
+import onnx
 import onnx_ir as ir
+import pytest
 import torch
 
 from mobius._builder import build_from_module
@@ -22,6 +26,19 @@ from mobius.tasks import CausalLMTask, VisionLanguageTask
 def _make_simple_model(name: str = "test") -> ir.Model:
     """Create a minimal ir.Model for testing."""
     graph = ir.Graph([], [], nodes=[], name=name)
+    return ir.Model(graph, ir_version=10)
+
+
+def _make_model_with_initializers() -> ir.Model:
+    """Create a minimal model with enough tensor data to exercise external-data sharding."""
+    graph = ir.Graph([], [], nodes=[], name="weighted")
+    for index in range(3):
+        value = ir.Value(name=f"weight_{index}")
+        data = np.full((128,), index, dtype=np.float32)
+        value.shape = ir.Shape(list(data.shape))
+        value.dtype = ir.DataType.FLOAT
+        value.const_value = ir.tensor(data)
+        graph.register_initializer(value)
     return ir.Model(graph, ir_version=10)
 
 
@@ -117,6 +134,67 @@ class TestModelPackageSaveLoad:
         pkg = ModelPackage({"m": _make_simple_model()})
         pkg.save(str(outdir))
         assert (outdir / "model.onnx").exists()
+
+    def test_save_passes_onnx_max_shard_size_to_ir_save(self, tmp_path, monkeypatch):
+        captured = {}
+
+        def fake_save(
+            model,
+            path,
+            format=None,
+            external_data=None,
+            size_threshold_bytes=256,
+            max_shard_size_bytes=None,
+            callback=None,
+        ):
+            captured["external_data"] = external_data
+            captured["max_shard_size_bytes"] = max_shard_size_bytes
+
+        monkeypatch.setattr(ir, "save", fake_save)
+
+        pkg = ModelPackage({"m": _make_simple_model()})
+        pkg.save(str(tmp_path), max_shard_size_bytes=1234)
+
+        assert captured == {
+            "external_data": "model.onnx.data",
+            "max_shard_size_bytes": 1234,
+        }
+
+    def test_save_onnx_sharding_requires_new_onnx_ir(self, tmp_path, monkeypatch):
+        def old_save(
+            model,
+            path,
+            format=None,
+            external_data=None,
+            size_threshold_bytes=256,
+            callback=None,
+        ):
+            raise AssertionError("old onnx-ir save should not be called")
+
+        monkeypatch.setattr(ir, "save", old_save)
+
+        pkg = ModelPackage({"m": _make_simple_model()})
+        with pytest.raises(RuntimeError, match=r"onnx-ir newer than 0\.2\.1"):
+            pkg.save(str(tmp_path), max_shard_size_bytes=1234)
+
+    def test_save_onnx_external_data_shards_when_supported(self, tmp_path):
+        if "max_shard_size_bytes" not in inspect.signature(ir.save).parameters:
+            pytest.skip("ONNX external-data sharding requires onnx-ir newer than 0.2.1")
+
+        pkg = ModelPackage({"m": _make_model_with_initializers()})
+        pkg.save(str(tmp_path), max_shard_size_bytes=700)
+
+        shards = sorted(tmp_path.glob("model*.data"))
+        assert len(shards) == 3
+        proto = onnx.load(tmp_path / "model.onnx", load_external_data=False)
+        locations = {
+            item.value.decode("utf-8") if isinstance(item.value, bytes) else item.value
+            for initializer in proto.graph.initializer
+            for item in initializer.external_data
+            if item.key == "location"
+        }
+        assert locations == {shard.name for shard in shards}
+        onnx.load(tmp_path / "model.onnx", load_external_data=True)
 
 
 class TestModelPackageApplyWeights:

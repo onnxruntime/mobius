@@ -20,6 +20,7 @@ from __future__ import annotations
 
 __all__ = ["ModelPackage"]
 
+import inspect
 import logging
 import os
 from collections import UserDict
@@ -33,6 +34,27 @@ from mobius._optimizations import fold_initializers_after_weights
 from mobius._weight_loading import _assign_weight
 
 logger = logging.getLogger(__name__)
+
+
+def _save_onnx_external_data(
+    model: ir.Model,
+    path: str,
+    *,
+    max_shard_size_bytes: int | None,
+    callback: Callable[[ir.TensorProtocol, ir.external_data.CallbackInfo], None] | None,
+) -> None:
+    """Save ONNX external data, using onnx-ir sharding when requested."""
+    save_kwargs = {"external_data": "model.onnx.data", "callback": callback}
+    save_parameters = inspect.signature(ir.save).parameters
+    if max_shard_size_bytes is not None:
+        if "max_shard_size_bytes" not in save_parameters:
+            raise RuntimeError(
+                "ONNX external-data sharding requires onnx-ir newer than 0.2.1 "
+                "(onnx/ir-py PR #427); install onnx-ir from git main until that "
+                "feature is released."
+            )
+        save_kwargs["max_shard_size_bytes"] = max_shard_size_bytes
+    ir.save(model, path, **save_kwargs)
 
 
 class ModelPackage(UserDict[str, ir.Model]):
@@ -95,8 +117,9 @@ class ModelPackage(UserDict[str, ir.Model]):
                     errors on some CUDA/cuBLAS versions when loading weights
                     via memory-mapped I/O.  Use ``"onnx"`` (the default) for
                     models targeting CUDA execution.
-            max_shard_size_bytes: Maximum shard size in bytes for safetensors
-                format.  Only used when *external_data* is ``"safetensors"``.
+            max_shard_size_bytes: Maximum shard size in bytes for external-data
+                shards. ONNX external-data sharding requires onnx-ir newer than
+                0.2.1 (onnx/ir-py PR #427).
             components: Optional predicate ``(name) -> bool`` that selects
                 which components to save.  When ``None`` (default), all
                 components are saved.  Examples::
@@ -149,7 +172,12 @@ class ModelPackage(UserDict[str, ir.Model]):
                     callback=callback,
                 )
             else:
-                ir.save(model, path, external_data="model.onnx.data", callback=callback)
+                _save_onnx_external_data(
+                    model,
+                    path,
+                    max_shard_size_bytes=max_shard_size_bytes,
+                    callback=callback,
+                )
 
     @classmethod
     def load(cls, directory: str) -> ModelPackage:

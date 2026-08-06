@@ -42,7 +42,7 @@ def save(
 |---|---|---|---|
 | `directory` | `str` | (required) | Output directory path. |
 | `external_data` | `str` | `"onnx"` | `"onnx"` or `"safetensors"` format. |
-| `max_shard_size_bytes` | `int \| None` | `None` | Max shard size (safetensors only). |
+| `max_shard_size_bytes` | `int \| None` | `None` | Max external-data shard size. ONNX sharding requires onnx-ir newer than 0.2.1. |
 | `components` | `Callable \| None` | `None` | Predicate to select components to save. |
 | `check_weights` | `bool` | `True` | Verify all initializers have weight data. |
 

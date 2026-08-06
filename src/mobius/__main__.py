@@ -381,9 +381,11 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         execution_provider=args.execution_provider,
     )
 
+    max_shard_size_bytes = _parse_size(args.max_shard_size) if args.max_shard_size else None
     pkg.save(
         output_dir,
         external_data=args.external_data,
+        max_shard_size_bytes=max_shard_size_bytes,
     )
     for name in pkg:
         use_subfolders = len(pkg) > 1
@@ -530,7 +532,7 @@ def main(argv: list[str] | None = None) -> None:
         "--max-shard-size",
         metavar="SIZE",
         default=None,
-        help="Max shard size for safetensors (e.g. '5GB'). Only used with --external-data safetensors.",
+        help="Max external-data shard size (e.g. '5GB'). ONNX sharding requires onnx-ir newer than 0.2.1.",
     )
     build_parser.add_argument(
         "--no-weights",
@@ -656,6 +658,12 @@ def main(argv: list[str] | None = None) -> None:
         choices=["onnx", "safetensors"],
         default="onnx",
         help="External data format (default: onnx).",
+    )
+    gguf_parser.add_argument(
+        "--max-shard-size",
+        metavar="SIZE",
+        default=None,
+        help="Max external-data shard size (e.g. '5GB'). ONNX sharding requires onnx-ir newer than 0.2.1.",
     )
     gguf_parser.add_argument(
         "--ep",
