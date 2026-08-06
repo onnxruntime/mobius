@@ -22,6 +22,7 @@ __all__ = [
     "ModelRegistration",
     "ModelRegistry",
     "ModelTask",
+    "MLPWorldModel",
     "MMSConfig",
     "OPSET_VERSION",
     "Sam2Config",
@@ -29,6 +30,8 @@ __all__ = [
     "VisionConfig",
     "VisionLanguageConfig",
     "WhisperConfig",
+    "WorldModelConfig",
+    "WorldModelTask",
     "YolosConfig",
     "apply_weights",
     "build",
@@ -76,6 +79,7 @@ from mobius._configs import (
     VisionConfig,
     VisionLanguageConfig,
     WhisperConfig,
+    WorldModelConfig,
     YolosConfig,
 )
 from mobius._constants import OPSET_VERSION
@@ -91,4 +95,5 @@ from mobius._registry import (
 from mobius._weight_loading import apply_weights
 from mobius.integrations.gguf import build_from_gguf
 from mobius.integrations.nemo import build_from_nemo
-from mobius.tasks import CausalLMTask, ModelTask
+from mobius.models import MLPWorldModel
+from mobius.tasks import CausalLMTask, ModelTask, WorldModelTask

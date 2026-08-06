@@ -149,6 +149,7 @@ __all__ = [
     "Wav2Vec2ForCTCModel",
     "Wav2Vec2Model",
     "WhisperForConditionalGeneration",
+    "MLPWorldModel",
     "XLMCausalLMModel",
     "Zamba2CausalLMModel",
     "mimi_default_config",
@@ -309,5 +310,6 @@ from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
 from mobius.models.wav2vec2_ctc import Wav2Vec2ForCTCModel
 from mobius.models.whisper import WhisperForConditionalGeneration
+from mobius.models.world_model import MLPWorldModel
 from mobius.models.xlm import XLMCausalLMModel
 from mobius.models.zamba2 import Zamba2CausalLMModel

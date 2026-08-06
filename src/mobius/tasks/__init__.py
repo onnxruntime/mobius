@@ -67,6 +67,7 @@ __all__ = [
     "VAETask",
     "VideoDenoisingTask",
     "VisionLanguageTask",
+    "WorldModelTask",
     "build_decoder_from_embeds",
     "build_embedding_from_features",
     "get_task",
@@ -128,6 +129,7 @@ from mobius.tasks._vision_language_3model import (
     QwenVLTask,
     VisionLanguageTask,
 )
+from mobius.tasks._world_model import WorldModelTask
 
 # ---------------------------------------------------------------------------
 # Task registry
@@ -179,6 +181,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "ssm2-text-generation": SSM2CausalLMTask,
     "tts": TTSTask,
     "video-denoising": VideoDenoisingTask,
+    "world-model": WorldModelTask,
 }
 
 
