@@ -528,7 +528,7 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
         map_gguf_to_hf_names,
     )
 
-    # Symmetry of each supported GGUF quantization type.
+    # Whether the graph can omit zero_points for each supported GGUF type.
     #
     # Mainline Q1_0 (1-bit binary) is repacked into 2-bit MatMulNBits
     # with zp=1 — see _repack_q1_0. Tencent's custom Q1_0 (2-bit SEQ,
@@ -536,11 +536,17 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
     # parse_tencent_q1_0_tensor — because the ORT CPU unpacked-float-zp
     # path is currently only implemented for bits=4, and the half-integer
     # SEQ offset 1.5 cannot be expressed with integer zp at bits=2.
-    type_symmetry: dict = {
-        GGMLQuantizationType.Q4_0: True,
+    #
+    # Q4_0 and Q8_0 are symmetric formats, but their GGUF dequantization
+    # formulas are still ``(q - 8) * scale`` and ``(q - 128) * scale``.
+    # Emit those zero_points explicitly: GatherBlockQuantized has diverging
+    # CPU/CUDA defaults when the input is omitted, which corrupts embeddings
+    # on CUDA before the first decoder layer runs.
+    type_can_omit_zero_points: dict = {
+        GGMLQuantizationType.Q4_0: False,
         GGMLQuantizationType.Q4_1: False,
         GGMLQuantizationType.Q4_K: False,
-        GGMLQuantizationType.Q8_0: True,
+        GGMLQuantizationType.Q8_0: False,
         GGMLQuantizationType.Q1_0: False,
     }
 
@@ -561,9 +567,18 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
         {qtype: count for qtype, count in counts.items() if _native_block_format(qtype)}
     )
     if native_counts:
-        asymmetric_types = {"Q2_K", "Q4_1", "Q4_K", "Q5_1", "Q5_K"}
-        is_sym = not any(
-            getattr(qtype, "name", None) in asymmetric_types
+        explicit_zero_point_types = {
+            "Q1_0",
+            "Q2_K",
+            "Q4_0",
+            "Q4_1",
+            "Q4_K",
+            "Q5_1",
+            "Q5_K",
+            "Q8_0",
+        }
+        can_omit_zero_points = not any(
+            getattr(qtype, "name", None) in explicit_zero_point_types
             for qtype in counts
             if qtype not in native_counts
         )
@@ -571,7 +586,7 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
             "Native GGUF quant types present; using 4-bit/block-32 module "
             "scaffolding for non-native quantized tensors",
         )
-        return 4, 32, is_sym
+        return 4, 32, can_omit_zero_points
 
     # Q4_K_M is deliberately a mixed preset. Depending on tensor dimensions
     # and importance it may contain mostly Q5_0 plus Q4_K, Q6_K, and Q8_0.
@@ -598,7 +613,7 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
     params = repack_quant_params(dominant_value)
     assert params is not None
     bits, block_size = params
-    is_sym = type_symmetry[dominant]
+    is_sym = type_can_omit_zero_points[dominant]
 
     # Tencent Q1_0 files reuse the Q1_0 type id but ship a different
     # on-disk layout (2-bit SEQ, 512-element blocks, fp16 scale per block).
