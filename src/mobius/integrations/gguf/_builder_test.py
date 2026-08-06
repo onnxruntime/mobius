@@ -8,7 +8,70 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import onnx_ir as ir
+import onnxruntime as ort
 import pytest
+
+
+def _run_gather_block_quantized(
+    tmp_path: Path,
+    *,
+    zero_point: int,
+) -> np.ndarray:
+    """Run a tiny GatherBlockQuantized graph with a controlled zero point."""
+    qweight = np.full((2, 16), 0xAA, dtype=np.uint8)
+    scales = np.array([[0.5], [0.25]], dtype=np.float16)
+    zero_points = np.full((2, 1), zero_point, dtype=np.uint8)
+
+    def _const(name: str, arr: np.ndarray) -> ir.Value:
+        value = ir.Value(name=name)
+        tensor = ir.tensor(arr)
+        value.const_value = tensor
+        value.shape = ir.Shape(arr.shape)
+        value.dtype = tensor.dtype
+        return value
+
+    input_ids = ir.Value(
+        name="input_ids",
+        shape=ir.Shape([2]),
+        type=ir.TensorType(ir.DataType.INT64),
+    )
+    output = ir.Value(
+        name="output",
+        shape=ir.Shape([2, 32]),
+        type=ir.TensorType(ir.DataType.FLOAT16),
+    )
+    qweight_init = _const("qweight", qweight)
+    scales_init = _const("scales", scales)
+    zero_points_init = _const("zero_points", zero_points)
+    node = ir.Node(
+        "com.microsoft",
+        "GatherBlockQuantized",
+        inputs=[
+            qweight_init,
+            input_ids,
+            scales_init,
+            zero_points_init,
+        ],
+        outputs=[output],
+        attributes=ir.convenience.convert_attributes(
+            {"bits": 4, "block_size": 32, "gather_axis": 0, "quantize_axis": 1}
+        ),
+    )
+    graph = ir.Graph(
+        inputs=[input_ids],
+        outputs=[output],
+        nodes=[node],
+        initializers=[qweight_init, scales_init, zero_points_init],
+        opset_imports={"": 18, "com.microsoft": 1},
+        name="gbq_zero_point",
+    )
+    model = ir.Model(graph, ir_version=10)
+    path = tmp_path / f"gbq_zp_{zero_point}.onnx"
+    ir.save(model, path)
+    session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    (result,) = session.run(None, {"input_ids": np.array([0, 1], dtype=np.int64)})
+    return result
 
 
 def _write_quantized_gguf(
@@ -311,6 +374,20 @@ class TestBuildQuantizedGguf:
             f"Expected MatMulNBits in ops, got: {sorted(op_types)}"
         )
 
+    def test_q4_0_matmulnbits_has_explicit_zero_points(self, q4_0_gguf: Path):
+        """GGUF Q4_0 projections explicitly encode zp=8 instead of EP defaults."""
+        from mobius.integrations.gguf import build_from_gguf
+
+        model = build_from_gguf(q4_0_gguf, keep_quantized=True)["model"]
+        nodes = [node for node in model.graph if node.op_type == "MatMulNBits"]
+        assert nodes
+        for node in nodes:
+            assert len(node.inputs) == 4
+            zero_point_name = node.inputs[3].name
+            assert zero_point_name.endswith(".zero_points")
+            zero_points = model.graph.initializers[zero_point_name]
+            np.testing.assert_array_equal(zero_points.const_value.numpy(), 0x88)
+
     def test_native_blocks_emit_block_quantized_matmul_and_preserve_bytes(
         self,
         native_block_gguf: tuple[Path, str, int, int],
@@ -380,6 +457,7 @@ class TestBuildQuantizedGguf:
         gather_nodes = [node for node in model.graph if node.op_type == "GatherBlockQuantized"]
         assert len(gather_nodes) == 1
         assert gather_nodes[0].domain == "com.microsoft"
+        assert len(gather_nodes[0].inputs) == 4
 
         qweight = model.graph.initializers["model.embed_tokens.qweight"]
         assert qweight.dtype == ir.DataType.UINT8
@@ -388,7 +466,25 @@ class TestBuildQuantizedGguf:
             256,
             2,
         ]
+        zero_points = model.graph.initializers["model.embed_tokens.zero_points"]
+        assert zero_points.dtype == ir.DataType.UINT8
+        assert list(zero_points.shape) == [256, 1]
+        np.testing.assert_array_equal(zero_points.const_value.numpy(), 0x88)
         assert "model.embed_tokens.weight" not in model.graph.initializers
+
+    def test_gatherblockquantized_zero_point_dequantizes_q4_0(self, tmp_path: Path):
+        """GatherBlockQuantized output must match GGUF Q4_0's ``(q - 8) * scale``."""
+        actual = _run_gather_block_quantized(tmp_path, zero_point=0x08).astype(np.float32)
+        expected = np.stack(
+            [
+                np.full(32, (10 - 8) * 0.5, dtype=np.float32),
+                np.full(32, (10 - 8) * 0.25, dtype=np.float32),
+            ]
+        )
+        np.testing.assert_allclose(actual, expected)
+
+        wrong = _run_gather_block_quantized(tmp_path, zero_point=0x00).astype(np.float32)
+        assert not np.allclose(wrong, expected)
 
     def test_tied_quantized_embedding_drives_matmulnbits_head(
         self, q4_0_tied_embedding_gguf: Path
@@ -401,6 +497,7 @@ class TestBuildQuantizedGguf:
         assert op_types.count("GatherBlockQuantized") == 1
         assert "MatMulNBits" in op_types
         assert "model.embed_tokens.qweight" in model.graph.initializers
+        assert "model.embed_tokens.zero_points" in model.graph.initializers
         assert not any(name.startswith("lm_head.") for name in model.graph.initializers)
 
     def test_untied_quantized_head_uses_q4_matmulnbits(
@@ -479,7 +576,7 @@ class TestBuildQuantizedGguf:
         bits, block_size, is_sym = _detect_quant_params(gguf_model, gguf_model.architecture)
         assert bits == 4
         assert block_size == 32
-        assert is_sym is True
+        assert is_sym is False
 
     def test_embedding_quantization_check_is_metadata_only(self, monkeypatch):
         """Embedding compatibility does not read or repack tensor data."""
