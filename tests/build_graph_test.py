@@ -3036,6 +3036,72 @@ class TestBuildGraphQwen3ASR:
         assert logits.shape[1] == seq_len
 
 
+class TestBuildGraphQwen25Omni:
+    """Verify the Qwen2.5-Omni Thinker four-model split."""
+
+    def _omni_config(self):
+        return _base_config(
+            model_type="qwen2_5_omni_text",
+            attn_qkv_bias=True,
+            hidden_act="silu",
+            mrope_section=[4, 2, 2],
+            audio=AudioConfig(
+                d_model=64,
+                encoder_layers=2,
+                encoder_attention_heads=4,
+                encoder_ffn_dim=128,
+                num_mel_bins=32,
+                max_source_positions=128,
+                output_dim=64,
+                audio_token_id=100,
+                n_window=8,
+            ),
+            vision=VisionConfig(
+                hidden_size=64,
+                intermediate_size=128,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                patch_size=14,
+                temporal_patch_size=2,
+                in_channels=3,
+                out_hidden_size=64,
+                spatial_merge_size=2,
+                fullatt_block_indexes=[0],
+                window_size=112,
+                image_token_id=101,
+                video_token_id=102,
+            ),
+            image_token_id=101,
+            video_token_id=102,
+        )
+
+    def test_package_builds_four_models(self):
+        from mobius.models import Qwen25OmniThinkerForConditionalGeneration
+        from mobius.tasks import Qwen25OmniTask
+
+        config = self._omni_config()
+        module = Qwen25OmniThinkerForConditionalGeneration(config)
+        package = build_from_module(module, config, task=Qwen25OmniTask())
+
+        assert set(package) == {
+            "audio_encoder",
+            "vision_encoder",
+            "embedding",
+            "decoder",
+        }
+        assert {value.name for value in package["audio_encoder"].graph.inputs} == {
+            "input_features",
+            "chunk_lengths",
+            "pool_indices",
+        }
+        assert {value.name for value in package["embedding"].graph.inputs} == {
+            "input_ids",
+            "audio_features",
+            "image_features",
+            "video_features",
+        }
+
+
 class TestBuildGraphFunASR:
     """Verify Fun-ASR-Nano 3-model split with FunASRSpeechLanguageTask."""
 
@@ -5119,6 +5185,7 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "mms",
     "qwen3_asr",
     "qwen3_forced_aligner",
+    "qwen2_5_omni",
     "qwen3_tts",
     "qwen3_tts_tokenizer_12hz",
     "whisper",

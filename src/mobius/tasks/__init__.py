@@ -32,6 +32,7 @@ __all__ = [
     "DFlashDraftTask",
     "Eagle3DraftTask",
     "Qwen35MtpTask",
+    "Qwen25OmniTask",
     "DenoisingTask",
     "DiarizationTask",
     "FeatureExtractionTask",
@@ -110,6 +111,7 @@ from mobius.tasks._moshi import MoshiDepformerTask, MoshiTemporalTask
 from mobius.tasks._multimodal import MultiModalTask
 from mobius.tasks._object_detection import ObjectDetectionTask
 from mobius.tasks._phi4mm_multimodal import Phi4MMMultiModalTask
+from mobius.tasks._qwen25_omni import Qwen25OmniTask
 from mobius.tasks._qwen35_mtp import Qwen35MtpTask
 from mobius.tasks._qwen_image_vae import QwenImageVAETask
 from mobius.tasks._rnnt import RNNTTask
@@ -157,6 +159,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "dflash-draft": DFlashDraftTask,
     "eagle3-draft": Eagle3DraftTask,
     "qwen35-mtp": Qwen35MtpTask,
+    "qwen25-omni": Qwen25OmniTask,
     "vae": VAETask,
     "qwen-image-vae": QwenImageVAETask,
     "vision-language": VisionLanguageTask,

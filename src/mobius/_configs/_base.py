@@ -494,6 +494,7 @@ class ArchitectureConfig(BaseModelConfig):
     # Vision shared fields (accessed as top-level config.X by tasks)
     mm_tokens_per_image: int | None = None
     image_token_id: int | None = None
+    video_token_id: int | None = None
     spatial_merge_size: int = 2
     temporal_patch_size: int = 2
     deepstack_visual_indexes: list[int] | None = None
@@ -745,6 +746,7 @@ class ArchitectureConfig(BaseModelConfig):
                                         "bloom",
                                         "qwen2",
                                         "qwen2_5_vl_text",
+                                        "qwen2_5_omni_text",
                                         "qwen2_moe",
                                         "qwen2_vl_text",
                                     ),
