@@ -378,7 +378,7 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
         map_gguf_to_hf_names,
     )
 
-    # Symmetry of each supported GGUF quantization type.
+    # Whether the graph can omit zero_points for each supported GGUF type.
     #
     # Mainline Q1_0 (1-bit binary) is repacked into 2-bit MatMulNBits
     # with zp=1 — see _repack_q1_0. Tencent's custom Q1_0 (2-bit SEQ,
@@ -386,11 +386,17 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
     # parse_tencent_q1_0_tensor — because the ORT CPU unpacked-float-zp
     # path is currently only implemented for bits=4, and the half-integer
     # SEQ offset 1.5 cannot be expressed with integer zp at bits=2.
+    #
+    # Q4_0 and Q8_0 are symmetric formats, but their GGUF dequantization
+    # formulas are still ``(q - 8) * scale`` and ``(q - 128) * scale``.
+    # Emit those zero_points explicitly: GatherBlockQuantized has diverging
+    # CPU/CUDA defaults when the input is omitted, which corrupts embeddings
+    # on CUDA before the first decoder layer runs.
     type_symmetry: dict = {
-        GGMLQuantizationType.Q4_0: True,
+        GGMLQuantizationType.Q4_0: False,
         GGMLQuantizationType.Q4_1: False,
         GGMLQuantizationType.Q4_K: False,
-        GGMLQuantizationType.Q8_0: True,
+        GGMLQuantizationType.Q8_0: False,
         GGMLQuantizationType.Q1_0: False,
     }
 
