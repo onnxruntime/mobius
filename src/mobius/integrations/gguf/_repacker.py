@@ -182,18 +182,16 @@ def _reorder_nibbles_gguf_to_ort(
     Returns:
         uint8 array with same shape, nibbles reordered for MatMulNBits.
     """
-    low = gguf_packed & 0x0F  # Elements 0..15
-    high = (gguf_packed >> 4) & 0x0F  # Elements 16..31
-
-    # Group each set of 16 nibbles into 8 pairs, pack each pair
-    shape = gguf_packed.shape[:-1]
-    low_pairs = low.reshape(*shape, 8, 2)
-    high_pairs = high.reshape(*shape, 8, 2)
-
-    ort_low = (low_pairs[..., 1] << 4) | low_pairs[..., 0]  # 8 bytes
-    ort_high = (high_pairs[..., 1] << 4) | high_pairs[..., 0]  # 8 bytes
-
-    return np.concatenate([ort_low, ort_high], axis=-1)  # 16 bytes
+    # Build the output directly instead of materializing full low/high nibble
+    # arrays and concatenating them. On large Q4_0 GGUFs this routine dominates
+    # repack time, so avoiding those temporaries materially reduces conversion
+    # wall-clock and peak memory.
+    even = gguf_packed[..., 0::2]
+    odd = gguf_packed[..., 1::2]
+    out = np.empty_like(gguf_packed)
+    out[..., :8] = ((odd & 0x0F) << 4) | (even & 0x0F)
+    out[..., 8:] = (odd & 0xF0) | ((even >> 4) & 0x0F)
+    return out
 
 
 def _repack_q4_0(

@@ -20,7 +20,9 @@ from __future__ import annotations
 __all__ = ["build_from_gguf"]
 
 import logging
+import os
 from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import tqdm
@@ -29,6 +31,27 @@ from huggingface_hub import HfApi, hf_hub_download
 from mobius._model_package import ModelPackage
 
 logger = logging.getLogger(__name__)
+
+
+def _gguf_repack_workers() -> int:
+    """Return the number of worker threads used for independent tensor repacks."""
+    raw = os.environ.get("MOBIUS_GGUF_REPACK_WORKERS")
+    if raw:
+        try:
+            workers = int(raw)
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid MOBIUS_GGUF_REPACK_WORKERS=%r; expected an integer",
+                raw,
+            )
+        else:
+            if workers > 0:
+                return workers
+            logger.warning(
+                "Ignoring invalid MOBIUS_GGUF_REPACK_WORKERS=%r; expected > 0",
+                raw,
+            )
+    return max(1, min(16, os.cpu_count() or 1))
 
 
 def _looks_like_hf_repo_id(value: str) -> bool:
@@ -608,62 +631,52 @@ def _load_quantized_state_dict(
     state_dict: dict[str, torch.Tensor] = {}
     n_repacked = 0
     n_requantized = 0
+    repacked_bytes = 0
     target_bits = config.quantization.bits
     target_block_size = config.quantization.group_size
     target_symmetric = config.quantization.sym
+    repack_workers = _gguf_repack_workers()
+    max_in_flight = repack_workers * 2
+    logger.info(
+        "Repacking GGUF tensors with %d worker thread(s); set "
+        "MOBIUS_GGUF_REPACK_WORKERS to override",
+        repack_workers,
+    )
 
-    for gguf_name, raw, qtype, np_shape in tqdm.tqdm(
-        gguf_model.tensor_items_raw(),
-        desc="Repacking tensors",
-        total=len(gguf_model._tensor_index),
-    ):
-        hf_name = map_gguf_to_hf_names(gguf_name, gguf_arch)
-        if hf_name is None:
-            logger.warning("Unmapped GGUF tensor: %s (skipped)", gguf_name)
-            continue
+    def finish_repack(future) -> None:
+        nonlocal n_repacked, n_requantized, repacked_bytes
+        entries, requantized, entry_bytes = future.result()
+        state_dict.update(entries)
+        n_repacked += 1
+        n_requantized += requantized
+        repacked_bytes += entry_bytes
 
-        # Determine the int value of the quant type for can_repack
+    def repack_one(
+        gguf_name: str,
+        hf_name: str,
+        stem: str,
+        raw,
+        qtype,
+        np_shape,
+        is_tencent_q1_0_tensor: bool,
+        is_quantized_embedding: bool,
+    ) -> tuple[dict[str, torch.Tensor], int, int]:
+        requantized = 0
         qtype_val = qtype.value if hasattr(qtype, "value") else qtype
-
-        # Repack every target QuantizedLinear weight. Mixed GGUF presets
-        # otherwise leave unsupported source types as full float matrices,
-        # which cannot fit the graph's packed MatMulNBits initializer shape.
-        stem = hf_name[: -len(".weight")] if hf_name.endswith(".weight") else None
-        is_tencent_q1_0_tensor = tencent_q1_0 and qtype == GGMLQuantizationType.Q1_0
-        is_quantized_embedding = stem is not None and stem in quantized_embedding_stems
-        should_repack = stem is not None and (
-            stem in quantized_stems or is_quantized_embedding
-        )
-
-        if should_repack:
-            if is_tencent_q1_0_tensor:
-                repacked = parse_tencent_q1_0_tensor(
-                    gguf_path,
-                    data_section_offset,
-                    tensors_by_name[gguf_name],
-                )
-            elif can_repack(qtype_val):
-                shape_2d = (int(np_shape[0]), int(np_shape[1]))
-                repacked = repack_gguf_tensor(
-                    raw.ravel().view(np.uint8),
-                    qtype_val,
-                    shape_2d,
-                )
-                if repacked.bits != target_bits or repacked.block_size != target_block_size:
-                    _require_supported_requantization(
-                        bits=target_bits,
-                        block_size=target_block_size,
-                        tensor_name=hf_name,
-                    )
-                    values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
-                    repacked = repack_dequantized_tensor(
-                        values,
-                        bits=target_bits,
-                        block_size=target_block_size,
-                        symmetric=target_symmetric,
-                    )
-                    n_requantized += 1
-            else:
+        if is_tencent_q1_0_tensor:
+            repacked = parse_tencent_q1_0_tensor(
+                gguf_path,
+                data_section_offset,
+                tensors_by_name[gguf_name],
+            )
+        elif can_repack(qtype_val):
+            shape_2d = (int(np_shape[0]), int(np_shape[1]))
+            repacked = repack_gguf_tensor(
+                raw.ravel().view(np.uint8),
+                qtype_val,
+                shape_2d,
+            )
+            if repacked.bits != target_bits or repacked.block_size != target_block_size:
                 _require_supported_requantization(
                     bits=target_bits,
                     block_size=target_block_size,
@@ -676,47 +689,119 @@ def _load_quantized_state_dict(
                     block_size=target_block_size,
                     symmetric=target_symmetric,
                 )
-                n_requantized += 1
-            w = torch.from_numpy(repacked.weight)
-            s = torch.from_numpy(repacked.scales)
-
-            # Apply Q/K row permutation to quantized tensors
-            # (same transform as _process_llama, on all arrays). Only
-            # llama-family archs use the interleaved-rope permute; Qwen
-            # and others must NOT be permuted.
-            if _needs_qk_permute(hf_name, num_heads, num_kv_heads, model_type):
-                n_head = (
-                    num_heads
-                    if ".q_proj." in hf_name or ".qkv_proj." in hf_name
-                    else num_kv_heads
-                )
-                w = _reverse_permute(w, n_head)
-                s = _reverse_permute(s, n_head)
-
-            if is_quantized_embedding:
-                state_dict[f"{stem}.qweight"] = w.reshape(w.shape[0], -1)
-            else:
-                state_dict[hf_name] = w
-            state_dict[f"{stem}.scales"] = s
-            if repacked.zero_points is not None:
-                zp = torch.from_numpy(repacked.zero_points)
-                if _needs_qk_permute(hf_name, num_heads, num_kv_heads, model_type):
-                    zp = _reverse_permute(zp, n_head)
-                state_dict[f"{stem}.zero_points"] = zp
-            n_repacked += 1
+                requantized += 1
         else:
-            # Dequantize to float
-            if qtype in (
-                GGMLQuantizationType.F32,
-                GGMLQuantizationType.F16,
-            ):
-                arr = gguf_model.get_tensor(gguf_name)
-                # F32/F16 tensors are mmap'd read-only views
-                if not arr.flags.writeable:
-                    arr = np.array(arr)
+            _require_supported_requantization(
+                bits=target_bits,
+                block_size=target_block_size,
+                tensor_name=hf_name,
+            )
+            values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
+            repacked = repack_dequantized_tensor(
+                values,
+                bits=target_bits,
+                block_size=target_block_size,
+                symmetric=target_symmetric,
+            )
+            requantized += 1
+
+        w = torch.from_numpy(repacked.weight)
+        s = torch.from_numpy(repacked.scales)
+
+        # Apply Q/K row permutation to quantized tensors
+        # (same transform as _process_llama, on all arrays). Only
+        # llama-family archs use the interleaved-rope permute; Qwen
+        # and others must NOT be permuted.
+        needs_qk_permute = _needs_qk_permute(hf_name, num_heads, num_kv_heads, model_type)
+        if needs_qk_permute:
+            n_head = (
+                num_heads if ".q_proj." in hf_name or ".qkv_proj." in hf_name else num_kv_heads
+            )
+            w = _reverse_permute(w, n_head)
+            s = _reverse_permute(s, n_head)
+
+        entries: dict[str, torch.Tensor] = {}
+        if is_quantized_embedding:
+            entries[f"{stem}.qweight"] = w.reshape(w.shape[0], -1)
+        else:
+            entries[hf_name] = w
+        entries[f"{stem}.scales"] = s
+        if repacked.zero_points is not None:
+            zp = torch.from_numpy(repacked.zero_points)
+            if needs_qk_permute:
+                zp = _reverse_permute(zp, n_head)
+            entries[f"{stem}.zero_points"] = zp
+        entry_bytes = sum(t.numel() * t.element_size() for t in entries.values())
+        return entries, requantized, entry_bytes
+
+    pending = set()
+    with ThreadPoolExecutor(max_workers=repack_workers) as executor:
+        progress = tqdm.tqdm(
+            gguf_model.tensor_items_raw(),
+            desc="Repacking tensors",
+            total=len(gguf_model._tensor_index),
+        )
+        for gguf_name, raw, qtype, np_shape in progress:
+            hf_name = map_gguf_to_hf_names(gguf_name, gguf_arch)
+            if hf_name is None:
+                logger.warning("Unmapped GGUF tensor: %s (skipped)", gguf_name)
+                continue
+
+            # Repack every target QuantizedLinear weight. Mixed GGUF presets
+            # otherwise leave unsupported source types as full float matrices,
+            # which cannot fit the graph's packed MatMulNBits initializer shape.
+            stem = hf_name[: -len(".weight")] if hf_name.endswith(".weight") else None
+            is_tencent_q1_0_tensor = tencent_q1_0 and qtype == GGMLQuantizationType.Q1_0
+            is_quantized_embedding = stem is not None and stem in quantized_embedding_stems
+            should_repack = stem is not None and (
+                stem in quantized_stems or is_quantized_embedding
+            )
+
+            if should_repack:
+                pending.add(
+                    executor.submit(
+                        repack_one,
+                        gguf_name,
+                        hf_name,
+                        stem,
+                        raw,
+                        qtype,
+                        np_shape,
+                        is_tencent_q1_0_tensor,
+                        is_quantized_embedding,
+                    )
+                )
+                if len(pending) >= max_in_flight:
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        finish_repack(future)
+                progress.set_postfix(
+                    repacked=n_repacked,
+                    in_flight=len(pending),
+                    packed_gib=f"{repacked_bytes / (1024**3):.2f}",
+                )
             else:
-                arr = dequantize(raw, qtype).reshape(np_shape)
-            state_dict[hf_name] = torch.from_numpy(arr)
+                # Dequantize to float. Keep these large one-off tensors in the
+                # main thread so multiple multi-GB embeddings are not expanded
+                # concurrently and mistaken for a memory leak or hang.
+                if qtype in (
+                    GGMLQuantizationType.F32,
+                    GGMLQuantizationType.F16,
+                ):
+                    arr = gguf_model.get_tensor(gguf_name)
+                    # F32/F16 tensors are mmap'd read-only views
+                    if not arr.flags.writeable:
+                        arr = np.array(arr)
+                else:
+                    arr = dequantize(raw, qtype).reshape(np_shape)
+                state_dict[hf_name] = torch.from_numpy(arr)
+
+        for future in tqdm.tqdm(
+            pending,
+            desc="Finishing repacks",
+            total=len(pending),
+        ):
+            finish_repack(future)
 
     logger.info(
         "Loaded %d state_dict entries (%d GGUF tensors repacked for quantized ops, "

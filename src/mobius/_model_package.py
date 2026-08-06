@@ -272,6 +272,7 @@ def _make_progress_callback():
         pbar.set_description(
             f"Saving {tensor.name} ({tensor.dtype.short_name()}, {tensor.shape})"
         )
+        pbar.set_postfix(written_gib=f"{metadata.offset / (1024**3):.2f}")
 
     return callback
 
