@@ -8,6 +8,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import onnx_ir as ir
+import onnxruntime as ort
 import pytest
 
 
@@ -17,9 +19,6 @@ def _run_gather_block_quantized(
     zero_point: int,
 ) -> np.ndarray:
     """Run a tiny GatherBlockQuantized graph with a controlled zero point."""
-    ort = pytest.importorskip("onnxruntime")
-    import onnx_ir as ir
-
     qweight = np.full((2, 16), 0xAA, dtype=np.uint8)
     scales = np.array([[0.5], [0.25]], dtype=np.float16)
     zero_points = np.full((2, 1), zero_point, dtype=np.uint8)
