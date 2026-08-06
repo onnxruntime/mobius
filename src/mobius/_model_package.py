@@ -20,11 +20,14 @@ from __future__ import annotations
 
 __all__ = ["ModelPackage"]
 
+import json
 import logging
 import os
 from collections import UserDict
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
 import onnx_ir as ir
 import torch
 import tqdm
@@ -142,7 +145,7 @@ class ModelPackage(UserDict[str, ir.Model]):
                 model_dir = directory
             path = os.path.join(model_dir, "model.onnx")
             if external_data == "safetensors":
-                ir.save_safetensors(
+                _save_safetensors_external_data(
                     model,
                     path,
                     max_shard_size_bytes=max_shard_size_bytes,
@@ -275,6 +278,179 @@ def _make_progress_callback():
         pbar.set_postfix(written_gib=f"{metadata.offset / (1024**3):.2f}")
 
     return callback
+
+
+def _safetensors_write_workers(total_shards: int) -> int:
+    """Return the number of shard writer threads for safetensors output."""
+    raw = os.environ.get("MOBIUS_SAFETENSORS_WRITE_WORKERS")
+    if raw:
+        try:
+            workers = int(raw)
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid MOBIUS_SAFETENSORS_WRITE_WORKERS=%r; expected an integer",
+                raw,
+            )
+        else:
+            if workers > 0:
+                return min(workers, total_shards)
+            logger.warning(
+                "Ignoring invalid MOBIUS_SAFETENSORS_WRITE_WORKERS=%r; expected > 0",
+                raw,
+            )
+    return max(1, min(4, total_shards))
+
+
+def _tensor_to_safetensors_array(tensor: ir.TensorProtocol) -> np.ndarray:
+    """Return a NumPy array with the storage representation safetensors expects."""
+    if tensor.dtype.bitwidth < 8:
+        return np.frombuffer(tensor.tobytes(), dtype=np.uint8)
+    return np.asarray(tensor)
+
+
+def _save_safetensors_external_data(
+    model: ir.Model,
+    path: str,
+    *,
+    max_shard_size_bytes: int | None,
+    callback: Callable[[ir.TensorProtocol, ir.external_data.CallbackInfo], None] | None = None,
+) -> None:
+    """Save ONNX with sharded safetensors external data.
+
+    ``onnx_ir.save_safetensors`` shards but writes each shard serially and, with
+    newer ``safetensors`` releases, can fail because the low-level
+    ``serialize_file`` API now expects ``TensorSpec`` objects. This compatibility
+    saver uses the public NumPy safetensors API and writes independent shards in
+    a bounded thread pool.
+    """
+    import safetensors.numpy
+
+    safe_globals = ir.save_safetensors.__globals__
+    shard_tensors = safe_globals["_shard_tensors"]
+    get_shard_filename = safe_globals["_get_shard_filename"]
+    read_safetensors = safe_globals["_read_safetensors"]
+    migrate_tensor_shape_dtype = safe_globals["_migrate_tensor_shape_dtype"]
+
+    path_str = str(path)
+    base_name = (
+        os.path.splitext(os.path.basename(path_str))[0]
+        if "." in os.path.basename(path_str)
+        else os.path.basename(path_str)
+    )
+    location = f"{base_name}.safetensors"
+    base_dir = os.path.dirname(path)
+
+    value_tensor_pairs: list[tuple[ir.Value, ir.TensorProtocol]] = []
+    initializer_names: set[str] = set()
+    for graph in model.graphs():
+        for value in graph.initializers.values():
+            tensor = value.const_value
+            name = value.name
+            if name is None:
+                raise ValueError(
+                    f"Initializer value '{value!r}' has no name (in graph {graph.name!r}). "
+                    "All initializers must have names."
+                )
+            if tensor is None:
+                continue
+            if name in initializer_names:
+                raise ValueError(
+                    f"Duplicate initializer name found: {name} (in graph {graph.name!r}). "
+                    "Rename the initializers to have unique names before saving to safetensors."
+                )
+            initializer_names.add(name)
+            value_tensor_pairs.append((value, tensor))
+
+    values_to_save: list[ir.Value] = []
+    tensors_to_save: list[ir.TensorProtocol] = []
+    for value, tensor in value_tensor_pairs:
+        if tensor.nbytes >= 256:
+            values_to_save.append(value)
+            tensors_to_save.append(tensor)
+
+    if not tensors_to_save:
+        ir.save(model, path)
+        return
+
+    tensor_shards = shard_tensors(tensors_to_save, max_shard_size_bytes)
+    total_shards = len(tensor_shards)
+    total_tensors = len(tensors_to_save)
+    total_size = sum(tensor.nbytes for tensor in tensors_to_save)
+    filenames = [
+        get_shard_filename(location, shard_idx, total_shards)
+        for shard_idx in range(1, total_shards + 1)
+    ]
+    workers = _safetensors_write_workers(total_shards)
+    logger.info(
+        "Writing %d safetensors shard(s) with %d worker thread(s)", total_shards, workers
+    )
+
+    # Precompute stable progress metadata and the HF-style weight map before
+    # shard writes run concurrently.
+    tensor_progress: dict[str, tuple[int, int]] = {}
+    weight_map: dict[str, str] = {}
+    current_offset = 0
+    current_index = 0
+    for filename, shard in zip(filenames, tensor_shards, strict=True):
+        for tensor in shard:
+            assert tensor.name is not None
+            tensor_progress[tensor.name] = (current_index, current_offset)
+            weight_map[tensor.name] = filename
+            current_offset += tensor.nbytes
+            current_index += 1
+
+    def write_shard(filename: str, shard: list[ir.TensorProtocol]) -> None:
+        shard_dict: dict[str, np.ndarray] = {}
+        for tensor in shard:
+            assert tensor.name is not None
+            shard_dict[tensor.name] = _tensor_to_safetensors_array(tensor)
+        safetensors.numpy.save_file(shard_dict, os.path.join(base_dir, filename))
+        if callback is not None:
+            for tensor in shard:
+                assert tensor.name is not None
+                index, offset = tensor_progress[tensor.name]
+                callback(
+                    tensor,
+                    ir.external_data.CallbackInfo(
+                        total=total_tensors,
+                        index=index,
+                        offset=offset + tensor.nbytes,
+                        filename=filename,
+                    ),
+                )
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(write_shard, filename, shard)
+            for filename, shard in zip(filenames, tensor_shards, strict=True)
+        ]
+        for future in futures:
+            future.result()
+
+    if total_shards > 1:
+        index_filename = location.rsplit(".safetensors", 1)[0] + ".safetensors.index.json"
+        with open(os.path.join(base_dir, index_filename), "w") as f:
+            json.dump(
+                {
+                    "metadata": {"total_size": total_size},
+                    "weight_map": weight_map,
+                },
+                f,
+                indent=2,
+            )
+
+    try:
+        value_map: dict[str, ir.Value] = {value.name: value for value in values_to_save}  # type: ignore[misc]
+        for filename in filenames:
+            for name, safe_tensor in read_safetensors(filename, base_dir=base_dir).items():
+                value = value_map[name]
+                model_tensor = value.const_value
+                assert model_tensor is not None
+                value.const_value = migrate_tensor_shape_dtype(model_tensor, safe_tensor)
+        ir.save(model, path)
+    finally:
+        for value, tensor in value_tensor_pairs:
+            value.const_value = tensor
 
 
 def _check_weights(component_name: str, model: ir.Model) -> None:

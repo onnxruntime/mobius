@@ -381,9 +381,19 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         execution_provider=args.execution_provider,
     )
 
+    max_shard_size_bytes = _parse_size(args.max_shard_size) if args.max_shard_size else None
+
+    if args.external_data == "safetensors" and args.execution_provider == "cuda":
+        logging.getLogger(__name__).warning(
+            "Safetensors external data does not guarantee 256-byte offset "
+            "alignment, which can cause CUBLAS misaligned address errors on "
+            "CUDA. Consider using --external-data onnx for CUDA builds."
+        )
+
     pkg.save(
         output_dir,
         external_data=args.external_data,
+        max_shard_size_bytes=max_shard_size_bytes,
     )
     for name in pkg:
         use_subfolders = len(pkg) > 1
@@ -656,6 +666,11 @@ def main(argv: list[str] | None = None) -> None:
         choices=["onnx", "safetensors"],
         default="onnx",
         help="External data format (default: onnx).",
+    )
+    gguf_parser.add_argument(
+        "--max-shard-size",
+        default=None,
+        help="Max shard size for safetensors (e.g. '5GB'). Only used with --external-data safetensors.",
     )
     gguf_parser.add_argument(
         "--ep",
