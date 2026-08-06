@@ -17,46 +17,56 @@ def _run_gather_block_quantized(
     zero_point: int,
 ) -> np.ndarray:
     """Run a tiny GatherBlockQuantized graph with a controlled zero point."""
-    onnx = pytest.importorskip("onnx")
     ort = pytest.importorskip("onnxruntime")
-    from onnx import TensorProto, helper, numpy_helper
+    import onnx_ir as ir
 
     qweight = np.full((2, 16), 0xAA, dtype=np.uint8)
     scales = np.array([[0.5], [0.25]], dtype=np.float16)
     zero_points = np.full((2, 1), zero_point, dtype=np.uint8)
-    input_ids = helper.make_tensor_value_info("input_ids", TensorProto.INT64, [2])
-    output = helper.make_tensor_value_info("output", TensorProto.FLOAT16, [2, 32])
-    node = helper.make_node(
+
+    def _const(name: str, arr: np.ndarray) -> ir.Value:
+        value = ir.Value(name=name)
+        tensor = ir.tensor(arr)
+        value.const_value = tensor
+        value.shape = ir.Shape(arr.shape)
+        value.dtype = tensor.dtype
+        return value
+
+    input_ids = ir.Value(
+        name="input_ids",
+        shape=ir.Shape([2]),
+        type=ir.TensorType(ir.DataType.INT64),
+    )
+    output = ir.Value(
+        name="output",
+        shape=ir.Shape([2, 32]),
+        type=ir.TensorType(ir.DataType.FLOAT16),
+    )
+    node = ir.Node(
+        "com.microsoft",
         "GatherBlockQuantized",
-        ["qweight", "input_ids", "scales", "zero_points"],
-        ["output"],
-        domain="com.microsoft",
-        bits=4,
-        block_size=32,
-        gather_axis=0,
-        quantize_axis=1,
-    )
-    graph = helper.make_graph(
-        [node],
-        "gbq_zero_point",
-        [input_ids],
-        [output],
-        [
-            numpy_helper.from_array(qweight, "qweight"),
-            numpy_helper.from_array(scales, "scales"),
-            numpy_helper.from_array(zero_points, "zero_points"),
+        inputs=[
+            _const("qweight", qweight),
+            input_ids,
+            _const("scales", scales),
+            _const("zero_points", zero_points),
         ],
+        outputs=[output],
+        attributes=ir.convenience.convert_attributes(
+            {"bits": 4, "block_size": 32, "gather_axis": 0, "quantize_axis": 1}
+        ),
     )
-    model = helper.make_model(
-        graph,
-        opset_imports=[
-            helper.make_opsetid("", 18),
-            helper.make_opsetid("com.microsoft", 1),
-        ],
+    graph = ir.Graph(
+        inputs=[input_ids],
+        outputs=[output],
+        nodes=[node],
+        initializers=[node.inputs[0], node.inputs[2], node.inputs[3]],
+        opset_imports={"": 18, "com.microsoft": 1},
+        name="gbq_zero_point",
     )
-    model.ir_version = 10
+    model = ir.Model(graph, ir_version=10)
     path = tmp_path / f"gbq_zp_{zero_point}.onnx"
-    onnx.save(model, path)
+    ir.save(model, path)
     session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
     (result,) = session.run(None, {"input_ids": np.array([0, 1], dtype=np.int64)})
     return result
@@ -367,15 +377,14 @@ class TestBuildQuantizedGguf:
         from mobius.integrations.gguf import build_from_gguf
 
         model = build_from_gguf(q4_0_gguf, keep_quantized=True)["model"]
-        node = next(node for node in model.graph if node.op_type == "MatMulNBits")
-
-        assert len(node.inputs) == 4
-        zero_points = next(
-            value
-            for name, value in model.graph.initializers.items()
-            if name.endswith(".zero_points")
-        )
-        np.testing.assert_array_equal(zero_points.const_value.numpy(), 0x88)
+        nodes = [node for node in model.graph if node.op_type == "MatMulNBits"]
+        assert nodes
+        for node in nodes:
+            assert len(node.inputs) == 4
+            zero_point_name = node.inputs[3].name
+            assert zero_point_name.endswith(".zero_points")
+            zero_points = model.graph.initializers[zero_point_name]
+            np.testing.assert_array_equal(zero_points.const_value.numpy(), 0x88)
 
     def test_native_blocks_emit_block_quantized_matmul_and_preserve_bytes(
         self,
