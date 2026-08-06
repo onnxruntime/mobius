@@ -42,14 +42,17 @@ def _run_gather_block_quantized(
         shape=ir.Shape([2, 32]),
         type=ir.TensorType(ir.DataType.FLOAT16),
     )
+    qweight_init = _const("qweight", qweight)
+    scales_init = _const("scales", scales)
+    zero_points_init = _const("zero_points", zero_points)
     node = ir.Node(
         "com.microsoft",
         "GatherBlockQuantized",
         inputs=[
-            _const("qweight", qweight),
+            qweight_init,
             input_ids,
-            _const("scales", scales),
-            _const("zero_points", zero_points),
+            scales_init,
+            zero_points_init,
         ],
         outputs=[output],
         attributes=ir.convenience.convert_attributes(
@@ -60,7 +63,7 @@ def _run_gather_block_quantized(
         inputs=[input_ids],
         outputs=[output],
         nodes=[node],
-        initializers=[node.inputs[0], node.inputs[2], node.inputs[3]],
+        initializers=[qweight_init, scales_init, zero_points_init],
         opset_imports={"": 18, "com.microsoft": 1},
         name="gbq_zero_point",
     )
