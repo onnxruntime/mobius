@@ -9,6 +9,7 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
+from mobius._weight_utils import pack_qmoe_expert_weights
 from mobius.components._attention import Qwen35Attention
 from mobius.components._common import (
     Embedding,
@@ -17,6 +18,7 @@ from mobius.components._common import (
 )
 from mobius.components._gated_deltanet import GatedDeltaNet
 from mobius.components._mlp import MLP
+from mobius.components._moe import _supported_qmoe_quantization
 from mobius.components._rms_norm import OffsetRMSNorm
 from mobius.components._rotary_embedding import initialize_rope
 from mobius.models.base import CausalLMModel
@@ -25,6 +27,7 @@ from mobius.models.qwen_vl import (
     Qwen3VLEmbeddingModel,
     Qwen3VLVisionEncoderModel,
     _QwenVLTextMixin,
+    split_deepstack_embeds,
 )
 
 if TYPE_CHECKING:
@@ -132,6 +135,7 @@ class Qwen35TextModel(nn.Module):
         position_ids: ir.Value,
         past_key_values: list | None = None,
         inputs_embeds: ir.Value | None = None,
+        deepstack_embeds: list | None = None,
     ):
         # Embed tokens: (batch, seq_len) → (batch, seq_len, hidden_size)
         if inputs_embeds is not None:
@@ -151,7 +155,7 @@ class Qwen35TextModel(nn.Module):
 
         present_key_values: list = []
         past_kvs = past_key_values or [None] * len(self.layers)
-        for layer, past_kv in zip(self.layers, past_kvs):
+        for layer_idx, (layer, past_kv) in enumerate(zip(self.layers, past_kvs)):
             hidden_states, present_kv = layer(
                 op,
                 hidden_states=hidden_states,
@@ -160,6 +164,9 @@ class Qwen35TextModel(nn.Module):
                 past_key_value=past_kv,
             )
             present_key_values.append(present_kv)
+            # DeepStack injection (see TextModel.forward for the rationale).
+            if deepstack_embeds is not None and layer_idx < len(deepstack_embeds):
+                hidden_states = op.Add(hidden_states, deepstack_embeds[layer_idx])
 
         hidden_states = self.norm(op, hidden_states)
         return hidden_states, present_key_values
@@ -280,6 +287,7 @@ class Qwen35MoETextModel(nn.Module):
         position_ids: ir.Value,
         past_key_values: list | None = None,
         inputs_embeds: ir.Value | None = None,
+        deepstack_embeds: list | None = None,
     ):
         # Embed tokens unless caller already provided fused inputs_embeds
         # (e.g. the VL decoder, which interleaves vision features before
@@ -299,7 +307,7 @@ class Qwen35MoETextModel(nn.Module):
 
         present_key_values: list = []
         past_kvs = past_key_values or [None] * len(self.layers)
-        for layer, past_kv in zip(self.layers, past_kvs):
+        for layer_idx, (layer, past_kv) in enumerate(zip(self.layers, past_kvs)):
             hidden_states, present_kv = layer(
                 op,
                 hidden_states=hidden_states,
@@ -308,6 +316,9 @@ class Qwen35MoETextModel(nn.Module):
                 past_key_value=past_kv,
             )
             present_key_values.append(present_kv)
+            # DeepStack injection (see TextModel.forward for the rationale).
+            if deepstack_embeds is not None and layer_idx < len(deepstack_embeds):
+                hidden_states = op.Add(hidden_states, deepstack_embeds[layer_idx])
 
         hidden_states = self.norm(op, hidden_states)
         return hidden_states, present_key_values
@@ -342,8 +353,17 @@ class Qwen35MoECausalLMModel(CausalLMModel):
         - Dropping visual encoder keys (``model.visual.*``)
         - Weight tying (``tie_word_embeddings``)
         - Unpacking fused expert weights (``experts.gate_up_proj``,
-          ``experts.down_proj``) into per-expert tensors
+          ``experts.down_proj``) into per-expert tensors for the portable
+          dense fallback, OR keeping them expert-major and packing them into
+          native ``com.microsoft::QMoE`` parameters when the quantization
+          config matches the QMoE ABI (mirrors DeepSeek-V3's ``use_qmoe``
+          path so both MoE families share one emission route).
         """
+        # When the int4 block scheme matches the native QMoE ABI, keep the
+        # fused expert-major tensors and route them through the QMoE repacker
+        # instead of un-fusing into per-expert MLPs. Uses the same predicate
+        # as MoELayer so the weights and the emitted graph never disagree.
+        use_qmoe = _supported_qmoe_quantization(self.config.quantization) is not None
         cleaned: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             if key.startswith(("mtp_", "mtp.")):
@@ -366,9 +386,13 @@ class Qwen35MoECausalLMModel(CausalLMModel):
             else:
                 key = f"model.{stripped}" if key.startswith("model.") else key
 
-            # Unpack fused expert weights into per-expert tensors.
+            # Unpack fused float expert weights into per-expert tensors for the
+            # dense fallback. When ``use_qmoe`` is set the fused quantized
+            # tensors arrive as ``.qweight``/``.scales``/``.qzeros`` (which do
+            # not match these suffixes) and are kept expert-major for
+            # ``pack_qmoe_expert_weights`` below.
             # HF format: [num_experts, fused_dim, hidden] with gate+up fused
-            if key.endswith(".mlp.experts.gate_up_proj"):
+            if not use_qmoe and key.endswith(".mlp.experts.gate_up_proj"):
                 prefix = key[: -len("experts.gate_up_proj")]
                 num_experts = value.shape[0]
                 half = value.shape[1] // 2
@@ -378,7 +402,7 @@ class Qwen35MoECausalLMModel(CausalLMModel):
                 continue
 
             # Stacked expert down_proj without .weight suffix (HF format)
-            if key.endswith(".mlp.experts.down_proj"):
+            if not use_qmoe and key.endswith(".mlp.experts.down_proj"):
                 prefix = key[: -len("experts.down_proj")]
                 num_experts = value.shape[0]
                 for i in range(num_experts):
@@ -387,7 +411,12 @@ class Qwen35MoECausalLMModel(CausalLMModel):
 
             cleaned[key] = value
 
-        return super().preprocess_weights(cleaned)
+        processed = super().preprocess_weights(cleaned)
+        if use_qmoe:
+            # Qwen3.5-MoE's MoELayer lives directly at ``.mlp`` (Qwen35MoEBlock
+            # is the MoELayer), unlike DeepSeek's nested ``.mlp.moe``.
+            processed = pack_qmoe_expert_weights(processed, target_moe_path=".mlp")
+        return processed
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +526,7 @@ class Qwen35VLDecoderModel(nn.Module):
         attention_mask: ir.Value,
         position_ids: ir.Value,
         past_key_values: list | None = None,
+        deepstack_embeds: ir.Value | None = None,
     ):
         hidden_states, present_key_values = self.model(
             op,
@@ -505,6 +535,7 @@ class Qwen35VLDecoderModel(nn.Module):
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
+            deepstack_embeds=split_deepstack_embeds(op, deepstack_embeds, self.config),
         )
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
@@ -559,6 +590,7 @@ class Qwen35MoEVLDecoderModel(nn.Module):
         attention_mask: ir.Value,
         position_ids: ir.Value,
         past_key_values: list | None = None,
+        deepstack_embeds: ir.Value | None = None,
     ):
         hidden_states, present_key_values = self.model(
             op,
@@ -567,6 +599,7 @@ class Qwen35MoEVLDecoderModel(nn.Module):
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
+            deepstack_embeds=split_deepstack_embeds(op, deepstack_embeds, self.config),
         )
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values

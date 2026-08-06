@@ -19,7 +19,11 @@ import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
-from mobius._build_context import ep_capabilities, get_build_dtype
+from mobius._build_context import (
+    ep_capabilities,
+    get_build_dtype,
+    is_lm_head_pruning_enabled,
+)
 from mobius._configs import ArchitectureConfig, CausalLMConfig
 from mobius._flags import flags
 from mobius._weight_utils import (
@@ -173,6 +177,7 @@ class TextModel(nn.Module):
         position_ids: ir.Value,
         past_key_values: list | None = None,
         inputs_embeds: ir.Value | None = None,
+        deepstack_embeds: list | None = None,
     ):
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
@@ -305,6 +310,24 @@ class TextModel(nn.Module):
                 past_key_value=past_kv,
             )
             present_key_values.append(present_kv)
+
+            # DeepStack (Qwen3-VL family): add pre-scattered intermediate
+            # vision features to the hidden states of the first ``D`` decoder
+            # layers, where ``D = len(deepstack_embeds)``.  Each entry is a
+            # full-length ``[batch, seq, hidden]`` tensor that is zero at
+            # non-image positions, so a plain Add reproduces HuggingFace's
+            # "inject at visual token positions" semantics.  ``deepstack_embeds``
+            # is ``None`` for every non-DeepStack model, making this inert.
+            #
+            # Injected BEFORE the intermediate-hidden-state capture below so
+            # ``output_layer_indices`` observes the post-injection tensor that
+            # the model actually propagates to the next layer.  This matches
+            # HuggingFace ``output_hidden_states`` semantics, where
+            # ``hidden_states[k + 1]`` is layer ``k``'s output with the DeepStack
+            # contribution already added.
+            if deepstack_embeds is not None and layer_idx < len(deepstack_embeds):
+                hidden_states = op.Add(hidden_states, deepstack_embeds[layer_idx])
+
             if layer_idx in capture_set:
                 captured_by_index[layer_idx] = hidden_states
 
@@ -425,9 +448,11 @@ class CausalLMModel(nn.Module):
         )
         if len(result) == 3:
             hidden_states, present_key_values, intermediate_hidden_states = result
+            hidden_states = _prune_lm_head_hidden_states(op, hidden_states)
             logits = self.lm_head(op, hidden_states)
             return logits, present_key_values, intermediate_hidden_states
         hidden_states, present_key_values = result
+        hidden_states = _prune_lm_head_hidden_states(op, hidden_states)
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
 
@@ -472,6 +497,14 @@ class CausalLMModel(nn.Module):
             # unifies them at load time via replace_all_uses_with.
             tie_word_embeddings(state_dict)
         return state_dict
+
+
+def _prune_lm_head_hidden_states(op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
+    """Select the final sequence position before the LM-head projection."""
+    if not is_lm_head_pruning_enabled():
+        return hidden_states
+    last_hidden = op.Gather(hidden_states, op.Constant(value_int=-1), axis=1)
+    return op.Unsqueeze(last_hidden, op.Constant(value_ints=[1]))
 
 
 class LayerNormTextModel(TextModel):

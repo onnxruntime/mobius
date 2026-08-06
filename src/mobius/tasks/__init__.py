@@ -33,6 +33,7 @@ __all__ = [
     "Eagle3DraftTask",
     "Qwen35MtpTask",
     "DenoisingTask",
+    "DiarizationTask",
     "FeatureExtractionTask",
     "FunASRSpeechLanguageTask",
     "Gemma4AssistantTask",
@@ -40,6 +41,7 @@ __all__ = [
     "Gemma4UnifiedTask",
     "Gemma4TextCausalLMTask",
     "HybridCausalLMTask",
+    "Cosmos3EdgeVLTask",
     "HybridQwenVLTask",
     "ImageClassificationTask",
     "ModelTask",
@@ -90,6 +92,7 @@ from mobius.tasks._ctc_asr import CTCAsrTask
 from mobius.tasks._deepseek_v4 import DeepSeekV4Task
 from mobius.tasks._denoising import DenoisingTask
 from mobius.tasks._dflash import DFlashDraftTask
+from mobius.tasks._diarization import DiarizationTask
 from mobius.tasks._eagle3 import Eagle3DraftTask
 from mobius.tasks._feature_extraction import FeatureExtractionTask
 from mobius.tasks._fun_asr_speech_language import FunASRSpeechLanguageTask
@@ -118,6 +121,7 @@ from mobius.tasks._vae import VAETask
 from mobius.tasks._video_denoising import VideoDenoisingTask
 from mobius.tasks._vision_language import Qwen3VLVisionLanguageTask
 from mobius.tasks._vision_language_3model import (
+    Cosmos3EdgeVLTask,
     HybridQwenVLTask,
     MllamaVisionLanguageTask,
     PixtralVLTask,
@@ -137,6 +141,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "codec": CodecTask,
     "controlnet": ControlNetTask,
     "denoising": DenoisingTask,
+    "diarization": DiarizationTask,
     "feature-extraction": FeatureExtractionTask,
     "masked-diffusion": MaskedDiffusionTask,
     "image-classification": ImageClassificationTask,
@@ -153,6 +158,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "vae": VAETask,
     "qwen-image-vae": QwenImageVAETask,
     "vision-language": VisionLanguageTask,
+    "cosmos3-edge-vl": Cosmos3EdgeVLTask,
     "pixtral-vl": PixtralVLTask,
     "mllama-vision-language": MllamaVisionLanguageTask,
     "qwen-vl": QwenVLTask,

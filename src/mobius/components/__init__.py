@@ -47,6 +47,7 @@ __all__ = [
     "LoRALinear",
     "MLP",
     "MLPMultiModalProjector",
+    "Cosmos3EdgeMultiModalProjector",
     "MoELayer",
     "OffsetRMSNorm",
     "PatchEmbed",
@@ -168,6 +169,9 @@ from mobius.components._moe import (
     SoftmaxTopKGate,
     SparseMixerGate,
     TopKGate,
+)
+from mobius.components._multimodal import (
+    Cosmos3EdgeMultiModalProjector as Cosmos3EdgeMultiModalProjector,
 )
 from mobius.components._multimodal import (
     Gemma3MultiModalProjector as Gemma3MultiModalProjector,

@@ -23,6 +23,9 @@ __all__ = [
     "CogVideoXTransformer3DModel",
     "CohereCausalLMModel",
     "ControlNetModel",
+    "Cosmos3EdgeTextModel",
+    "Cosmos3EdgeVLModel",
+    "Cosmos3OmniReasonerModel",
     "DeepSeekOCR2CausalLMModel",
     "DeepSeekV3CausalLMModel",
     "DeepSeekV4CausalLMModel",
@@ -115,6 +118,8 @@ __all__ = [
     "Qwen3CausalLMModel",
     "Qwen3NextCausalLMModel",
     "SenseVoiceSmallModel",
+    "SortformerConfig",
+    "SortformerDiarizationModel",
     "Qwen3TTSCodePredictorModel",
     "Qwen3TTSCodecDecoderModel",
     "Qwen3TTSCodecEncoderModel",
@@ -164,6 +169,8 @@ from mobius.models.clip import CLIPVisionModel, SigLIPVisionModel
 from mobius.models.cogvideox import CogVideoXTransformer3DModel
 from mobius.models.cohere import CohereCausalLMModel
 from mobius.models.controlnet import ControlNetModel
+from mobius.models.cosmos import Cosmos3EdgeTextModel, Cosmos3EdgeVLModel
+from mobius.models.cosmos3_omni import Cosmos3OmniReasonerModel
 from mobius.models.ctrl import CTRLCausalLMModel
 from mobius.models.deepseek import DeepSeekV3CausalLMModel
 from mobius.models.deepseek_ocr2 import DeepSeekOCR2CausalLMModel
@@ -288,6 +295,7 @@ from mobius.models.qwen_vl import (
 )
 from mobius.models.sensevoice_small import SenseVoiceSmallModel
 from mobius.models.smollm import SmolLM3CausalLMModel
+from mobius.models.sortformer import SortformerConfig, SortformerDiarizationModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5ForConditionalGeneration
 from mobius.models.unet import (

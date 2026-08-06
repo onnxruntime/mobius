@@ -57,6 +57,7 @@ from mobius._flags import flags
 from mobius._passes import (
     FoldConcatInitializersPass,
     FoldTransposedInitializerPass,
+    Fp8KvCachePass,
     RemoveDeadGraphInputsPass,
 )
 from mobius.functions import register_function_bodies
@@ -368,6 +369,8 @@ def optimize_model(
     dtype: ir.DataType = ir.DataType.FLOAT,
     model_role: str = "decoder",
     trace: bool = False,
+    fp8_kv_cache: bool = False,
+    kv_cache_scales: dict[int, tuple[float, float]] | None = None,
 ) -> None:
     """Apply EP-aware optimization passes to *model* in-place.
 
@@ -392,6 +395,17 @@ def optimize_model(
         dtype: Model dtype for support-matrix lookups.
         model_role: Semantic role of this model component.
         trace: When ``True``, emit per-stage diagnostic logs at INFO level.
+        fp8_kv_cache: When ``True``, convert decoder
+            ``GroupQueryAttention`` KV caches to ``FLOAT8E4M3FN`` (per-tensor
+            E4M3) via :class:`~mobius._passes.Fp8KvCachePass`. Only applied
+            when GQA fusion is active for ``(ep, dtype)``,
+            ``model_role == "decoder"``, and the EP ships the FP8 GQA kernel
+            (``caps.supports_fp8_kv_cache`` — currently CUDA only); otherwise a
+            warning is emitted and the request is ignored.
+        kv_cache_scales: Optional ``layer_id -> (k_scale, v_scale)`` map of
+            per-tensor FP8 scales (from offline calibration). Only used when
+            ``fp8_kv_cache`` is ``True``; layers absent from the map use a unit
+            scale of ``1.0``.
 
     Raises:
         ValueError: If *ep* is not a registered execution provider.
@@ -553,6 +567,23 @@ def optimize_model(
                 f"Check that the attention pattern matches the GQA rewrite rule.",
                 stacklevel=4,
             )
+
+    # FP8 KV cache: convert GroupQueryAttention KV caches to FLOAT8E4M3FN.
+    # Runs after fusion so the GQA nodes exist. Requires GQA (a decoder on a
+    # GQA-capable EP/dtype); otherwise there is no KV-cache op to convert.
+    if fp8_kv_cache:
+        gqa_active = model_role == "decoder" and dtype in caps.gqa_dtypes
+        if not gqa_active or not caps.supports_fp8_kv_cache:
+            warnings.warn(
+                f"fp8_kv_cache=True was requested but the FP8 GQA KV-cache kernel "
+                f"is not available for ep={ep!r}/dtype={dtype}/role={model_role!r}. "
+                f"FP8 KV cache requires a GroupQueryAttention decoder on an EP with "
+                f"the FP8 kernel (currently only --execution-provider cuda with an "
+                f"fp16/bf16 dtype). Ignoring the request.",
+                stacklevel=4,
+            )
+        else:
+            Fp8KvCachePass(kv_cache_scales)(model)
 
 
 def fold_initializers_after_weights(model: ir.Model) -> None:

@@ -7,11 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Paged / block-table KV cache export (`--paged-cache`)
+### Paged / block-table KV cache export (`--features paged-cache`)
 
 #### Added
 
-- `CausalLMTask(paged_cache=True)` and the `mobius build --paged-cache` CLI flag
+- `CausalLMTask(paged_cache=True)` and `mobius build --features paged-cache`
   export a **paged / block-table KV cache** (onnx-genai `docs/DESIGN.md` §39.4
   Option C — vLLM PagedAttention / SGLang RadixAttention layout). KV lives in a
   shared per-layer **page pool** `key_pool.{i}` / `value_pool.{i}`
@@ -20,31 +20,102 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for each newly written token. Attention writes new K/V into the pool via
   `ScatterND`, assembles the sequence's pages contiguously via
   `Gather(pool, block_table)`, then runs the opset-24 `Attention` op with
-  `nonpad_kv_seqlen` (input #6) — identical op contract to `--static-cache`, but
-  over non-contiguous pages. Because sequences can list the *same* physical page
-  in their `block_table`, the same graph expresses RadixAttention shared-prefix
-  pages with no change. Paging uses only standard ONNX ops (no custom op).
-  New tuning flags `--page-size` (default 16) and `--num-pages` (dynamic when
-  omitted). Requires `DecoderLayer` / `MoEDecoderLayer` models; mutually
-  exclusive with `--static-cache`. Targets a single active sequence
-  (`batch == 1`); multi-sequence batching is a documented TODO.
+  `nonpad_kv_seqlen` (input #6) — identical op contract to `--features
+  static-cache`, but over non-contiguous pages. Because sequences can list the
+  *same* physical page in their `block_table`, the same graph expresses
+  RadixAttention shared-prefix pages with no change. Paging uses only standard
+  ONNX ops (no custom op). New tuning flags `--page-size` (default 16) and
+  `--num-pages` (dynamic when omitted). Requires `DecoderLayer` /
+  `MoEDecoderLayer` models; mutually exclusive with `--features static-cache`.
+  Targets a single active sequence (`batch == 1`); multi-sequence batching is a
+  documented TODO.
 
----
-
-### Text-only export for multimodal Gemma 4 (`--text-only`)
+### NVIDIA Cosmos 3 Edge vision-language model (`cosmos3_edge`)
 
 #### Added
 
-- `build(text_only=True)` and the `mobius build --text-only` CLI flag export the
+- Support for the **full `cosmos3_edge` vision-language model**
+  (`nvidia/Cosmos3-Edge`, `Cosmos3EdgeForConditionalGeneration`) as a 3-model
+  onnxruntime-genai split (`decoder` + `vision_encoder` + `embedding`):
+  - **decoder**: grouped-query-attention text reasoner with a **non-gated
+    squared-ReLU FFN** (`hidden_act="relu2"`, `up_proj → relu2 → down_proj`)
+    and 3D multimodal RoPE (`mrope_section=[24, 20, 20]`); takes
+    `inputs_embeds`.
+  - **vision_encoder**: SigLIP vision tower + a new
+    `Cosmos3EdgeMultiModalProjector` (pre-shuffle `LayerNorm` → 2×2
+    pixel-shuffle → `linear_fc1` → GELU → `linear_fc2`).
+  - **embedding**: token embedding + image-feature fusion at
+    `image_token_id=19`.
+  `preprocess_weights` routes the single HF checkpoint to the three
+  sub-models: `model.visual.*` / `model.projector.*` → vision (with SigLIP
+  `mlp.fc1/fc2` → `up_proj/down_proj`), `embed_tokens` → embedding, the
+  top-level text tower (`layers.*` / `norm` / `lm_head`) → decoder (renaming
+  `self_attn.to_{q,k,v,out}` → `{q,k,v,o}_proj`), and drops the
+  generator-tower `k_norm_und_for_gen` key-norm. Built via a new
+  `Cosmos3EdgeVLTask` (`cosmos3-edge-vl`). The decoder-only text reasoner
+  remains available as `cosmos3_edge_text`.
+- **L1 graph-build tested only.** NVIDIA does not publish modeling code for
+  `cosmos3_edge` (not in `transformers`, no remote-code module), so the exact
+  pixel-shuffle ordering and numerical parity are unverifiable; L4/L5 parity
+  is deferred. The `cosmos3_omni` variants (`Cosmos3-Nano`/`-Super`) are
+  two-tower diffusion world models tracked separately.
+
+### Cargo-style `--features` build option
+
+#### Added
+
+- `mobius build --features <a,b,...>` collects the build-mode toggles under a
+  single Rust/cargo-style option. Accepts a comma-separated list and may be
+  repeated (`--features fp8-kv-cache,static-cache` or `--features fp8-kv-cache
+  --features static-cache`). Available features: `static-cache`, `fp8-kv-cache`,
+  `prune-lm-head`, `text-only`. Unknown feature names are rejected with an error
+  listing the valid set.
+
+#### Changed
+
+- The boolean flags `--static-cache`, `--fp8-kv-cache`, and `--text-only` have
+  been **removed** in favor of the equivalent `--features` value. Companion
+  value args (`--max-seq-len`, `--kv-cache-scale-file`) are unchanged.
+
+### Final-token LM-head pruning (`--features prune-lm-head`)
+
+#### Added
+
+- `build(prune_lm_head=True)` and `mobius build --features prune-lm-head`
+  select the final hidden-state position before the LM-head projection, reducing
+  prefill logits from `[B, S, vocab]` to `[B, 1, vocab]`. This avoids computing
+  unused per-token logits for single-token autoregressive generation. Models
+  with custom forward paths that do not support pre-projection pruning fail
+  explicitly instead of silently producing an unoptimized graph.
+
+### FP8 (E4M3) KV-cache export (`--features fp8-kv-cache`)
+
+#### Added
+
+- `build(fp8_kv_cache=True)` and `mobius build --features fp8-kv-cache` retype the
+  fused `GroupQueryAttention` KV cache to `FLOAT8E4M3FN` (per-tensor E4M3) after
+  GQA fusion, adding `k_scale`/`v_scale` initializers and the
+  `k_quant_type`/`v_quant_type="PER_TENSOR"`, `kv_cache_bit_width=8` attributes.
+  Halves KV-cache memory at long context on ORT runtimes with the FP8 KV kernel
+  (SM89+). `--kv-cache-scale-file` supplies calibrated per-layer scales
+  (onnxruntime-genai format); without it all layers use a unit scale of 1.0.
+  Only graph-input or empty-placeholder caches are retyped — a non-empty
+  initializer cache is skipped with a warning.
+
+### Text-only export for multimodal Gemma 4 (`--features text-only`)
+
+#### Added
+
+- `build(text_only=True)` and `mobius build --features text-only` export the
   **text backbone** of a unified multimodal checkpoint as a standalone
   decoder-only LLM. For `gemma4_unified` (`google/gemma-4-12B`) this remaps the
   model type to its text sibling (`gemma4_unified_text`) and strips the
   vision/audio config so the decoder fuses to `GroupQueryAttention` on
   GQA-capable execution providers (CUDA/DML) instead of the float-bias
   `Attention` path forced by the multimodal bidirectional vision-block overlay.
-  `--text-only` is rejected with `--config` / `--component` and now also bypasses
-  diffusers autodetect so `build()` validation runs (a diffusers/unsupported repo
-  raises instead of silently exporting a pipeline).
+  The `text-only` feature is rejected with `--config` / `--component` and now
+  also bypasses diffusers autodetect so `build()` validation runs (a
+  diffusers/unsupported repo raises instead of silently exporting a pipeline).
 
 #### Changed
 

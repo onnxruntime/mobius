@@ -8,6 +8,7 @@ from __future__ import annotations
 import onnx_ir as ir
 from onnxscript import GraphBuilder, nn
 
+from mobius._build_context import lm_head_pruning
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
 from mobius.components._attention import PagedCacheState, StaticCacheState
@@ -110,6 +111,16 @@ class CausalLMTask(ModelTask):
         num_pages: Number of physical pages in the pool.  Only used when
             ``paged_cache=True``.  Left symbolic (dynamic) when ``None`` so the
             runtime can size the pool; pass an int to stamp a fixed pool size.
+        prune_lm_head: If ``True``, insert ``Gather(axis=1, index=-1)``
+            before the LM head so only the last token's hidden state is
+            projected to logits.  Output logits shape becomes ``[B, 1,
+            vocab]`` instead of ``[B, S, vocab]``, reducing prefill cost
+            for large-vocabulary models.  Set this when the downstream
+            runtime only needs the final token's logits (single-token
+            autoregressive generation).  Breaks workflows that require
+            per-token logits (logprob scoring, speculative decoding,
+            multi-token generation).  Mirrors the ``prune_lm_head`` extra
+            option in onnxruntime-genai's Model Builder.
     """
 
     def __init__(
@@ -120,6 +131,7 @@ class CausalLMTask(ModelTask):
         max_seq_len: int | None = None,
         page_size: int = 16,
         num_pages: int | None = None,
+        prune_lm_head: bool = False,
     ):
         if static_cache and paged_cache:
             raise ValueError(
@@ -130,6 +142,7 @@ class CausalLMTask(ModelTask):
         self._max_seq_len = max_seq_len
         self._page_size = page_size
         self._num_pages = num_pages
+        self._prune_lm_head = prune_lm_head
 
     def build(
         self,
@@ -246,18 +259,21 @@ class CausalLMTask(ModelTask):
                 value_head_dim=kv_value_head_dim,
             )
 
-        result = module(
-            op,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-        )
+        with lm_head_pruning(self._prune_lm_head):
+            result = module(
+                op,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+            )
         intermediate_hidden_states: list | None = None
         if len(result) == 3:
             logits, present_key_values, intermediate_hidden_states = result
         else:
             logits, present_key_values = result
+
+        _validate_pruned_logits(logits, self._prune_lm_head, module)
 
         builder.add_output(logits, "logits")
 
@@ -315,7 +331,15 @@ class HybridCausalLMTask(ModelTask):
     Outputs:
         - logits: FLOAT
         - present.{i}.{key|value|conv_state|recurrent_state}: FLOAT
+
+    Args:
+        prune_lm_head: If ``True``, insert ``Gather(axis=1, index=-1)``
+            before the LM head so only the last token's logits are emitted.
+            See :class:`CausalLMTask` for full documentation.
     """
+
+    def __init__(self, *, prune_lm_head: bool = False):
+        self._prune_lm_head = prune_lm_head
 
     def build(
         self,
@@ -347,18 +371,21 @@ class HybridCausalLMTask(ModelTask):
             past_seq_len,
         )
 
-        result = module(
-            op,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-        )
+        with lm_head_pruning(self._prune_lm_head):
+            result = module(
+                op,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+            )
         intermediate_hidden_states: list | None = None
         if len(result) == 3:
             logits, present_key_values, intermediate_hidden_states = result
         else:
             logits, present_key_values = result
+
+        _validate_pruned_logits(logits, self._prune_lm_head, module)
 
         builder.add_output(logits, "logits")
         _register_hybrid_cache_outputs(
@@ -375,6 +402,22 @@ class HybridCausalLMTask(ModelTask):
         model = _make_model(graph)
         _register_linear_attention_functions(model, config)
         return ModelPackage({"model": model}, config=config)
+
+
+def _validate_pruned_logits(
+    logits: ir.Value,
+    prune_lm_head: bool,
+    module: nn.Module,
+) -> None:
+    """Fail when a custom model forward ignores the task's pruning request."""
+    if not prune_lm_head:
+        return
+    shape = logits.shape
+    if shape is None or len(shape) != 3 or shape[1] != 1:
+        raise ValueError(
+            f"{type(module).__name__} does not support prune_lm_head. "
+            "The model must select the final hidden state before its LM-head projection."
+        )
 
 
 def _register_intermediate_hidden_states(

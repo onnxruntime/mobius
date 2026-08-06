@@ -137,6 +137,16 @@ class TestBuildFromModule:
         assert isinstance(model, ir.Model)
         assert model.graph.num_nodes() > 0
 
+    def test_build_with_prune_lm_head_feature(self):
+        config = make_config()
+        module = CausalLMModel(config)
+        model = build_from_module(module, config, prune_lm_head=True)["model"]
+
+        logits = next(v for v in model.graph.outputs if v.name == "logits")
+        assert len(logits.shape) == 3
+        assert logits.shape[1] == 1
+        assert logits.shape[2] == config.vocab_size
+
     def test_build_with_output_layer_indices(self):
         config = make_config(num_hidden_layers=4, output_layer_indices=[1, 2])
         module = CausalLMModel(config)
@@ -179,6 +189,157 @@ class TestTextModelOutputHiddenStates:
         config = make_config(num_hidden_layers=4, output_layer_indices=[0, 3])
         model = TextModel(config)
         assert model.output_layer_indices == [0, 3]
+
+
+class TestPruneLmHead:
+    """Tests for the ``prune_lm_head`` option in :class:`CausalLMTask`.
+
+    When ``True``, a ``Gather + Unsqueeze`` is inserted after the LM head
+    so logits are produced for only the last sequence position.
+    Mirrors onnxruntime-genai Model Builder's ``prune_lm_head`` opt-in.
+    """
+
+    def _build(self, prune_lm_head: bool = False) -> ir.Model:
+        config = make_config()
+        module = CausalLMModel(config)
+        task = CausalLMTask(prune_lm_head=prune_lm_head)
+        return build_from_module(module, config, task=task)["model"]
+
+    def test_default_emits_no_lm_head_pruning(self):
+        """Default (prune_lm_head=False): graph emits full [B, S, vocab] logits."""
+        model = self._build(prune_lm_head=False)
+
+        logits = next(v for v in model.graph.outputs if v.name == "logits")
+        # Logits must remain rank-3 [B, S, vocab]
+        assert len(logits.shape) == 3, (
+            f"Expected rank-3 logits [B, S, V], got rank {len(logits.shape)}: "
+            f"shape={list(logits.shape)!r}"
+        )
+        # The full path: shape[1] is a symbolic dim ("sequence_length"), not 1
+        seq_dim = logits.shape[1]
+        assert seq_dim != 1, (
+            f"Expected dynamic sequence_length in logits dim 1, got {seq_dim!r}"
+        )
+        # Last dim is the vocabulary size
+        config = make_config()
+        assert logits.shape[2] == config.vocab_size
+
+    def test_prune_emits_gather_on_logits(self):
+        """Pruning selects the final hidden state before the LM-head MatMul."""
+        model = self._build(prune_lm_head=True)
+
+        logits = next(v for v in model.graph.outputs if v.name == "logits")
+        # Logits must still be rank-3 [B, 1, vocab] (NOT rank-4 [B, 1, 1, V])
+        assert len(logits.shape) == 3, (
+            f"Expected rank-3 logits [B, 1, V] after pruning, got rank "
+            f"{len(logits.shape)}: shape={list(logits.shape)!r}"
+        )
+        # Pruned: dim 1 must be the literal integer 1
+        seq_dim = logits.shape[1]
+        assert seq_dim == 1, f"Expected logits dim 1 to be 1 after pruning, got {seq_dim!r}"
+        # Last dim is still the vocabulary size
+        config = make_config()
+        assert logits.shape[2] == config.vocab_size
+        lm_head = logits.producer()
+        assert lm_head is not None and lm_head.op_type == "MatMul"
+        unsqueeze = lm_head.inputs[0].producer()
+        assert unsqueeze is not None and unsqueeze.op_type == "Unsqueeze"
+        gather = unsqueeze.inputs[0].producer()
+        assert gather is not None and gather.op_type == "Gather"
+
+    def test_prune_does_not_change_input_shapes(self):
+        """Pruning only affects output.
+
+        input_ids still has dynamic sequence_length
+        so the model accepts arbitrary prompts.
+        """
+        model = self._build(prune_lm_head=True)
+
+        input_ids = next(v for v in model.graph.inputs if v.name == "input_ids")
+        # input dim 1 (sequence_length) should still be dynamic, not 1
+        assert input_ids.shape[1] != 1
+
+    def test_custom_forward_that_ignores_pruning_fails(self):
+        class UnsupportedCausalLM(CausalLMModel):
+            def forward(
+                self,
+                op,
+                input_ids,
+                attention_mask,
+                position_ids,
+                past_key_values=None,
+            ):
+                hidden_states, present = self.model(
+                    op,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                )
+                return self.lm_head(op, hidden_states), present
+
+        config = make_config()
+        with pytest.raises(ValueError, match="does not support prune_lm_head"):
+            build_from_module(UnsupportedCausalLM(config), config, prune_lm_head=True)
+
+
+class TestDeepStackCaptureOrdering:
+    """``output_layer_indices`` must capture the post-DeepStack-injection state.
+
+    Regression for the ordering bug where intermediate hidden states were
+    captured *before* the DeepStack ``Add``, so requested layers within the
+    DeepStack range missed the injected vision contribution (and diverged from
+    HuggingFace ``output_hidden_states`` semantics, where ``hidden_states[k+1]``
+    is layer ``k``'s output with DeepStack already added).
+    """
+
+    def test_intermediate_capture_reflects_deepstack_injection(self):
+        from mobius.tasks._base import _make_graph
+
+        # 3 layers, all captured; DeepStack embeds cover only layers 0 and 1.
+        config = make_config(num_hidden_layers=3, output_layer_indices=[0, 1, 2])
+        model = TextModel(config)
+
+        _graph, builder = _make_graph()
+        op = builder.op
+        batch = ir.SymbolicDim("batch")
+        seq = ir.SymbolicDim("sequence_len")
+        input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[batch, seq])
+        attention_mask = builder.input(
+            "attention_mask", dtype=ir.DataType.INT64, shape=[batch, seq]
+        )
+        position_ids = builder.input(
+            "position_ids", dtype=ir.DataType.INT64, shape=[batch, seq]
+        )
+        deepstack = [
+            builder.input(
+                f"deepstack_embeds.{i}",
+                dtype=config.dtype,
+                shape=[batch, seq, config.hidden_size],
+            )
+            for i in range(2)
+        ]
+
+        _hidden, _present, intermediates = model(
+            op,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            deepstack_embeds=deepstack,
+        )
+        captured = dict(zip([0, 1, 2], intermediates))
+
+        # Layers 0 and 1: the captured value is the output of the DeepStack Add,
+        # whose inputs include the corresponding deepstack_embeds tensor.
+        for layer_idx in (0, 1):
+            producer = captured[layer_idx].producer()
+            assert producer is not None and producer.op_type == "Add"
+            assert deepstack[layer_idx] in list(producer.inputs)
+
+        # Layer 2 has no DeepStack embed: its captured value is the raw layer
+        # output and must not consume any deepstack_embeds tensor.
+        prod2 = captured[2].producer()
+        assert prod2 is None or all(d not in list(prod2.inputs) for d in deepstack)
 
 
 class TestModelRegistry:

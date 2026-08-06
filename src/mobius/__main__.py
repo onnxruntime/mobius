@@ -33,6 +33,44 @@ from mobius._registry import registry
 logger = logging.getLogger(__name__)
 
 
+# Rust/cargo-style build features. Each feature name (kebab-case) maps to the
+# boolean attribute on the parsed args that it enables. `--features a,b` (or a
+# repeated `--features`) is the canonical way to toggle these build modes.
+_BUILD_FEATURES: dict[str, str] = {
+    "static-cache": "static_cache",
+    "fp8-kv-cache": "fp8_kv_cache",
+    "paged-cache": "paged_cache",
+    "prune-lm-head": "prune_lm_head",
+    "text-only": "text_only",
+}
+
+
+def _resolve_build_features(args: argparse.Namespace) -> None:
+    """Fold ``--features`` values into the boolean build-mode attributes.
+
+    ``--features`` accepts a comma-separated list and may be repeated (cargo
+    style), e.g. ``--features fp8-kv-cache,static-cache`` or
+    ``--features fp8-kv-cache --features static-cache``. Each recognised feature
+    sets its corresponding attribute (``fp8-kv-cache`` -> ``args.fp8_kv_cache``).
+    Unknown feature names raise ``SystemExit``.
+    """
+    for dest in _BUILD_FEATURES.values():
+        if not hasattr(args, dest):
+            setattr(args, dest, False)
+
+    raw = getattr(args, "features", None) or []
+    requested: list[str] = []
+    for chunk in raw:
+        requested.extend(f.strip() for f in chunk.split(",") if f.strip())
+
+    for feature in requested:
+        dest = _BUILD_FEATURES.get(feature)
+        if dest is None:
+            valid = ", ".join(sorted(_BUILD_FEATURES))
+            raise SystemExit(f"Error: unknown feature '{feature}'. Valid features: {valid}.")
+        setattr(args, dest, True)
+
+
 def _parse_size(size_str: str) -> int:
     """Parse a human-readable size string (e.g. '5GB') to bytes."""
     size_str = size_str.strip().upper()
@@ -137,9 +175,13 @@ def _cmd_build(args: argparse.Namespace) -> None:
             )
         return CausalLMTask(static_cache=True, max_seq_len=args.max_seq_len)
 
-    # Validate --max-seq-len requires --static-cache
+    # Fold --features into the boolean build-mode attributes before any
+    # validation reads them.
+    _resolve_build_features(args)
+
+    # Validate --max-seq-len requires the static-cache feature.
     if args.max_seq_len is not None and not args.static_cache:
-        raise SystemExit("Error: --max-seq-len can only be used with --static-cache.")
+        raise SystemExit("Error: --max-seq-len can only be used with --features static-cache.")
 
     # Validate --max-seq-len is positive
     if args.max_seq_len is not None and args.max_seq_len <= 0:
@@ -151,53 +193,69 @@ def _cmd_build(args: argparse.Namespace) -> None:
     if max_length is not None and max_length <= 0:
         raise SystemExit("Error: --max-length must be a positive integer.")
 
-    # Validate --static-cache + --task compatibility
+    # Validate static-cache + --task compatibility.
     if args.static_cache and args.task is not None:
         raise SystemExit(
-            "Error: --static-cache cannot be combined with --task. "
-            "Remove --task to use --static-cache."
+            "Error: --features static-cache cannot be combined with --task. "
+            "Remove --task to use --features static-cache."
         )
 
-    # Validate --paged-cache combinations
+    # Validate --features paged-cache combinations
     if args.paged_cache and args.static_cache:
         raise SystemExit(
-            "Error: --paged-cache cannot be combined with --static-cache; "
-            "choose one KV cache layout."
+            "Error: --features paged-cache cannot be combined with "
+            "--features static-cache; choose one KV cache layout."
         )
     if args.paged_cache and args.task is not None:
         raise SystemExit(
-            "Error: --paged-cache cannot be combined with --task. "
-            "Remove --task to use --paged-cache."
+            "Error: --features paged-cache cannot be combined with --task. "
+            "Remove --task to use --features paged-cache."
         )
     if args.page_size is not None and not args.paged_cache:
-        raise SystemExit("Error: --page-size can only be used with --paged-cache.")
+        raise SystemExit("Error: --page-size can only be used with --features paged-cache.")
     if args.page_size is not None and args.page_size <= 0:
         raise SystemExit("Error: --page-size must be a positive integer.")
     if args.num_pages is not None and not args.paged_cache:
-        raise SystemExit("Error: --num-pages can only be used with --paged-cache.")
+        raise SystemExit("Error: --num-pages can only be used with --features paged-cache.")
     if args.num_pages is not None and args.num_pages <= 0:
         raise SystemExit("Error: --num-pages must be a positive integer.")
 
-    # --text-only resolution lives in build() (model_type remap + config
+    # text-only resolution lives in build() (model_type remap + config
     # stripping), which is only reached on the HuggingFace model-ID path.
     if args.text_only and args.config:
         raise SystemExit(
-            "Error: --text-only is not supported with --config (local "
-            "directory). Use --model <hf-id> --text-only instead."
+            "Error: --features text-only is not supported with --config (local "
+            "directory). Use --model <hf-id> --features text-only instead."
         )
 
-    # --component selects one component of a diffusers pipeline; --text-only
+    # --component selects one component of a diffusers pipeline; text-only
     # produces a single decoder-only model. Combining them would silently
     # filter that model away unless --component happens to be 'model'.
     if args.text_only and args.component:
         raise SystemExit(
-            "Error: --text-only is not supported with --component. "
-            "--text-only produces a single decoder-only model, while "
+            "Error: --features text-only is not supported with --component. "
+            "The text-only feature produces a single decoder-only model, while "
             "--component selects a component of a diffusers pipeline."
         )
 
     load_weights = not args.no_weights
     task: str | ModelTask | None = args.task
+
+    # FP8 KV cache: resolve the optional per-layer scale file up front so both
+    # the --config and --model build paths can pass the same scales.
+    fp8_kv_cache = getattr(args, "fp8_kv_cache", False)
+    prune_lm_head = getattr(args, "prune_lm_head", False)
+    kv_cache_scales: dict[int, tuple[float, float]] | None = None
+    scale_file = getattr(args, "kv_cache_scale_file", None)
+    if scale_file is not None and not fp8_kv_cache:
+        raise SystemExit(
+            "Error: --kv-cache-scale-file can only be used with --features fp8-kv-cache."
+        )
+    if fp8_kv_cache and scale_file is not None:
+        from mobius._passes._fp8_kv_cache import load_kv_cache_scale_file
+
+        kv_cache_scales = load_kv_cache_scale_file(scale_file)
+
     if args.static_cache:
         # Defer task creation — we need to know the model type first.
         # Store parameters for later resolution.
@@ -222,7 +280,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
     component_filter = args.component
     execution_provider = args.execution_provider
 
-    # Auto-detect diffusers pipelines.  Skipped when --text-only is set:
+    # Auto-detect diffusers pipelines. Skipped when the text-only feature is set:
     # that flag only applies to transformers decoder exports, so we let the
     # central build() validation reject a diffusers/unsupported repo rather
     # than silently exporting a diffusion pipeline and ignoring the flag.
@@ -277,7 +335,13 @@ def _cmd_build(args: argparse.Namespace) -> None:
         module_class = registry.get(model_type)
         model_module = module_class(config)
         pkg = build_from_module(
-            model_module, config, task=task, execution_provider=execution_provider
+            model_module,
+            config,
+            task=task,
+            execution_provider=execution_provider,
+            fp8_kv_cache=fp8_kv_cache,
+            kv_cache_scales=kv_cache_scales,
+            prune_lm_head=prune_lm_head,
         )
         for name, model in pkg.items():
             model.graph.name = f"{config_path}/{name}"
@@ -305,6 +369,9 @@ def _cmd_build(args: argparse.Namespace) -> None:
             trust_remote_code=trust_remote_code,
             execution_provider=execution_provider,
             text_only=args.text_only,
+            fp8_kv_cache=fp8_kv_cache,
+            kv_cache_scales=kv_cache_scales,
+            prune_lm_head=prune_lm_head,
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)
@@ -673,10 +740,17 @@ def main(argv: list[str] | None = None) -> None:
         help="Build only this component from a diffusers pipeline (e.g. --component vae_decoder).",
     )
     build_parser.add_argument(
-        "--static-cache",
-        action="store_true",
-        help="Use static KV cache (pre-allocated buffers with TensorScatter). "
-        "Requires models using DecoderLayer or MoEDecoderLayer.",
+        "--features",
+        action="append",
+        default=None,
+        metavar="FEATURES",
+        help=(
+            "Comma-separated list of build features to enable (cargo-style; "
+            "may be repeated). Available: "
+            + ", ".join(sorted(_BUILD_FEATURES))
+            + ". Example: --features fp8-kv-cache,static-cache. This is the "
+            "canonical way to enable these build modes."
+        ),
     )
     build_parser.add_argument(
         "--max-seq-len",
@@ -684,15 +758,8 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         metavar="N",
         help="Maximum sequence length for static cache buffers. "
-        "Only used with --static-cache. Defaults to max_position_embeddings from config.",
-    )
-    build_parser.add_argument(
-        "--paged-cache",
-        action="store_true",
-        help="Use a paged / block-table KV cache (vLLM PagedAttention / SGLang "
-        "RadixAttention layout): a page pool + block_table + slot_mapping, with "
-        "Gather-based page assembly and ScatterND writes (onnx-genai "
-        "DESIGN §39.4 Option C). Requires DecoderLayer or MoEDecoderLayer models.",
+        "Only used with --features static-cache. "
+        "Defaults to max_position_embeddings from config.",
     )
     build_parser.add_argument(
         "--page-size",
@@ -700,7 +767,7 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         metavar="N",
         help="Tokens per page for the paged KV cache. Only used with "
-        "--paged-cache. Defaults to 16.",
+        "--features paged-cache. Defaults to 16.",
     )
     build_parser.add_argument(
         "--num-pages",
@@ -708,7 +775,7 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         metavar="N",
         help="Number of physical pages in the pool for the paged KV cache. "
-        "Only used with --paged-cache. Left dynamic (symbolic) when omitted.",
+        "Only used with --features paged-cache. Left dynamic (symbolic) when omitted.",
     )
     build_parser.add_argument(
         "--ep",
@@ -738,15 +805,15 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     build_parser.add_argument(
-        "--text-only",
-        dest="text_only",
-        action="store_true",
+        "--kv-cache-scale-file",
+        dest="kv_cache_scale_file",
+        default=None,
+        metavar="PATH",
         help=(
-            "Export the text backbone of a multimodal checkpoint as a "
-            "standalone decoder-only LLM. Strips vision/audio routing so the "
-            "decoder uses GroupQueryAttention on GQA-capable EPs. Currently "
-            "supported for gemma4_unified (google/gemma-4-12B). Not compatible "
-            "with --config or --component (use --model <hf-id>)."
+            "Optional JSON file of calibrated per-layer FP8 KV-cache scales "
+            "(onnxruntime-genai format: {'scales': {'k_scales': [...], "
+            "'v_scales': [...]}}). Only used with --features fp8-kv-cache; "
+            "without it all layers use a unit scale of 1.0."
         ),
     )
     build_parser.set_defaults(func=_cmd_build)

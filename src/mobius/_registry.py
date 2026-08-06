@@ -35,6 +35,9 @@ from mobius.models import (
     ArceeCausalLMModel,
     CausalLMModel,
     ChatGLMCausalLMModel,
+    Cosmos3EdgeTextModel,
+    Cosmos3EdgeVLModel,
+    Cosmos3OmniReasonerModel,
     DeepSeekOCR2CausalLMModel,
     DeepSeekV3CausalLMModel,
     DeepSeekV4CausalLMModel,
@@ -96,6 +99,7 @@ from mobius.models import (
     Qwen35VLTextModel,
     QwenCausalLMModel,
     SmolLM3CausalLMModel,
+    SortformerDiarizationModel,
     WhisperForConditionalGeneration,
 )
 from mobius.models.bamba import BambaCausalLMModel
@@ -397,6 +401,11 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "codegen": ModelRegistration(CodeGenCausalLMModel),
     "cohere": ModelRegistration(CohereCausalLMModel),
     "cohere2": ModelRegistration(CohereCausalLMModel),
+    "cosmos3_edge": ModelRegistration(Cosmos3EdgeVLModel),
+    "cosmos3_edge_text": ModelRegistration(Cosmos3EdgeTextModel),
+    "cosmos3_omni": ModelRegistration(
+        Cosmos3OmniReasonerModel, task="qwen-vl", family="cosmos", variant="reasoner"
+    ),
     "diffllama": ModelRegistration(DiffLlamaCausalLMModel),
     "doge": ModelRegistration(DogeCausalLMModel),
     "ernie4_5": ModelRegistration(ErnieCausalLMModel),
@@ -772,6 +781,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "wavlm": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
     "mms": ModelRegistration(Wav2Vec2ForCTCModel, task="ctc-asr", config_class=MMSConfig),
     "fastconformer_rnnt": ModelRegistration(EncDecRNNTModel, task="fastconformer-rnnt"),
+    "sortformer": ModelRegistration(SortformerDiarizationModel, task="diarization"),
 }
 
 
@@ -818,6 +828,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "qwen2": "Qwen/Qwen2.5-0.5B",
     "cohere": "CohereForAI/c4ai-command-r7b-12-2024",
     "cohere2": "CohereForAI/c4ai-command-r7b-12-2024",
+    "cosmos3_edge": "nvidia/Cosmos3-Edge",
+    "cosmos3_edge_text": "nvidia/Cosmos3-Edge",
     "exaone": "LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct",
     "glm": "THUDM/glm-4-9b-chat-hf",
     "glm4": "THUDM/glm-4-9b-chat-hf",
@@ -886,6 +898,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "biogpt": "microsoft/biogpt",
     "chatglm": "zai-org/chatglm2-6b",
     "codegen": "Salesforce/codegen-350M-mono",
+    "cosmos3_omni": "nvidia/Cosmos3-Nano",
     "ctrl": "Salesforce/ctrl",
     "ernie4_5": "baidu/ERNIE-4.5-0.3B-PT",
     "falcon_h1": "tiiuae/Falcon-H1-0.5B-Base",
