@@ -79,6 +79,7 @@ from mobius._configs._sub_configs import (
     TTSConfig,
     VisionConfig,
 )
+from mobius._configs._world_model import WorldModelConfig
 
 __all__ = [
     "DEFAULT_INT",
@@ -117,6 +118,7 @@ __all__ = [
     "VisionConfig",
     "VisionLanguageConfig",
     "WhisperConfig",
+    "WorldModelConfig",
     "YolosConfig",
     "Zamba2Config",
     "_as_int",
