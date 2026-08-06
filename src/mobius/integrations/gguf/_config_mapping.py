@@ -72,6 +72,7 @@ _DEFAULT_KEY_MAP: dict[str, str] = {
     "attention.head_count": "num_attention_heads",
     "attention.head_count_kv": "num_key_value_heads",
     "attention.layer_norm_rms_epsilon": "rms_norm_eps",
+    "attention.sliding_window": "sliding_window",
     "rope.freq_base": "rope_theta",
     "context_length": "max_position_embeddings",
     "vocab_size": "vocab_size",
@@ -88,6 +89,9 @@ _DEFAULT_KEY_MAP: dict[str, str] = {
     "ssm.time_step_rank": "linear_num_value_heads",
     "ssm.conv_kernel": "linear_conv_kernel_dim",
 }
+
+
+_GEMMA3_SLIDING_WINDOW_PATTERN = 6
 
 
 # GGUF hidden_act values → HuggingFace activation function names
@@ -238,8 +242,27 @@ def gguf_to_config(
     num_hidden_layers = hf_fields["num_hidden_layers"]
     layer_types: list[str] | None = None
     if full_attention_interval is not None:
+        non_full_attention_type = (
+            "sliding_attention" if model_type == "gemma3_text" else "linear_attention"
+        )
         layer_types = [
-            "full_attention" if (i + 1) % full_attention_interval == 0 else "linear_attention"
+            "full_attention"
+            if (i + 1) % full_attention_interval == 0
+            else non_full_attention_type
+            for i in range(num_hidden_layers)
+        ]
+    elif model_type == "gemma3_text" and hf_fields.get("sliding_window") is not None:
+        # Gemma3 GGUF declares that sliding-window attention exists, but the
+        # format does not carry HuggingFace's ``layer_types`` list or legacy
+        # ``sliding_window_pattern`` kwarg. HF Gemma3TextConfig.__post_init__
+        # defaults that pattern to 6 and derives ``layer_types`` as five
+        # sliding-window layers followed by one full-attention layer. Recreate
+        # that architectural default here to avoid
+        # ``TypeError: 'NoneType' object is not iterable`` in gemma3_text.py.
+        layer_types = [
+            "sliding_attention"
+            if (i + 1) % _GEMMA3_SLIDING_WINDOW_PATTERN
+            else "full_attention"
             for i in range(num_hidden_layers)
         ]
 
@@ -275,6 +298,27 @@ def gguf_to_config(
             rope_type = "default"
         elif rope_scaling_type in ("linear", "yarn", "longrope"):
             rope_type = rope_scaling_type
+            # These variants all index ``config.rope_scaling["factor"]``, so
+            # selecting the variant without populating the factor produces a
+            # ``TypeError: 'NoneType' object is not subscriptable`` deep inside
+            # the rope constructor rather than a diagnosable config error.
+            # GGUF carries the factor under ``<arch>.rope.scaling.factor``;
+            # when it is absent, 1.0 is the identity and keeps the model
+            # buildable instead of failing at graph construction.
+            rope_scaling_factor = metadata.get(f"{gguf_arch}.rope.scaling.factor")
+            if rope_scaling_factor is None:
+                logger.warning(
+                    "GGUF declares rope.scaling.type=%r but no "
+                    "rope.scaling.factor; using 1.0 (no scaling)",
+                    rope_scaling_type,
+                )
+            rope_scaling = {
+                "rope_type": rope_scaling_type,
+                "type": rope_scaling_type,
+                "factor": float(rope_scaling_factor)
+                if rope_scaling_factor is not None
+                else 1.0,
+            }
         elif rope_scaling_type == "dynamic":
             rope_type = "dynamic"
         else:
@@ -316,10 +360,28 @@ def gguf_to_config(
         }
         hf_fields["rope_theta"] = 10000.0
 
+    # Local (sliding-window) RoPE base frequency.
+    #
+    # Gemma3 and Gemma3n run two RoPE frequencies: a scaled global one and an
+    # unscaled local one for the sliding-window layers. Their model code reads
+    # ``config.rope_local_base_freq`` unconditionally, so leaving it ``None``
+    # fails with ``unsupported operand type(s) for **: 'NoneType' and 'float'``
+    # inside the rope constructor -- a stack trace that names neither GGUF nor
+    # the missing key.
+    #
+    # GGUF has no standard key for it. ``rope.freq_base_swa`` is used by some
+    # converters, so prefer it; otherwise fall back to 10000.0, which is what
+    # the HuggingFace Gemma3 configs declare and what this repository's own
+    # resolver tests assert.
+    rope_local_base_freq = metadata.get(f"{gguf_arch}.rope.freq_base_swa")
+    if rope_local_base_freq is None and metadata.get(f"{gguf_arch}.attention.sliding_window"):
+        rope_local_base_freq = 10000.0
+
     # Build config — required fields validated above, optional fields
     # use safe defaults
     config = ArchitectureConfig(
         hidden_size=hidden_size,
+        rope_local_base_freq=rope_local_base_freq,
         intermediate_size=hf_fields.get("intermediate_size", 4 * hidden_size),
         num_hidden_layers=num_hidden_layers,
         num_attention_heads=num_attention_heads,
@@ -338,6 +400,7 @@ def gguf_to_config(
         # attention and yields garbage output.
         attn_qkv_bias=_infer_attn_qkv_bias(model),
         attn_o_bias=_infer_attn_o_bias(model),
+        attn_qk_norm=model_type == "gemma3_text",
         mlp_bias=_infer_mlp_bias(model),
         partial_rotary_factor=partial_rotary_factor,
         rope_interleave=rope_interleave,
@@ -349,6 +412,7 @@ def gguf_to_config(
         # Hybrid architecture fields
         layer_types=layer_types,
         full_attention_interval=full_attention_interval,
+        sliding_window=hf_fields.get("sliding_window"),
         # DeltaNet / linear attention fields
         linear_num_key_heads=hf_fields.get("linear_num_key_heads"),
         linear_num_value_heads=hf_fields.get("linear_num_value_heads"),
@@ -558,6 +622,9 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
 
 def _default_activation(model_type: str) -> str:
     """Return the default activation function for a model type."""
+    if model_type == "gemma3_text":
+        return "gelu_pytorch_tanh"
+
     # Most modern models use SiLU/Swish
     gelu_models = {"gpt2", "bloom", "starcoder2", "t5"}
     if model_type in gelu_models:

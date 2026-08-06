@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import copy
-from typing import TYPE_CHECKING
 
 import numpy as np
+import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
@@ -16,13 +16,13 @@ from mobius.components import (
     Attention,
     Embedding,
     OffsetRMSNorm,
+    QuantizedEmbedding,
+    TiedQuantizedLMHead,
     create_attention_bias,
     initialize_rope,
+    make_quantized_linear_factory,
 )
 from mobius.models.base import CausalLMModel
-
-if TYPE_CHECKING:
-    import onnx_ir as ir
 
 
 class Gemma3TextScaledWordEmbedding(Embedding):
@@ -46,10 +46,12 @@ class Gemma3TextScaledWordEmbedding(Embedding):
 class Gemma3DecoderLayer(nn.Module):
     """Gemma3 decoder layer with pre/post feedforward layer norms."""
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(self, config: ArchitectureConfig, linear_class: type | None = None):
         super().__init__()
-        self.self_attn = Attention(config, rms_norm_class=OffsetRMSNorm)
-        self.mlp = MLP(config)
+        self.self_attn = Attention(
+            config, rms_norm_class=OffsetRMSNorm, linear_class=linear_class
+        )
+        self.mlp = MLP(config, linear_class=linear_class)
         self.input_layernorm = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = OffsetRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -98,15 +100,44 @@ class Gemma3TextModel(nn.Module):
         super().__init__()
         self._dtype = config.dtype
 
+        linear_class = None
+        qc = getattr(config, "quantization", None)
+        if qc is not None and qc.quant_method != "none":
+            zp_dtype = (
+                config.dtype if getattr(qc, "float_zero_point", False) else ir.DataType.UINT8
+            )
+            linear_class = make_quantized_linear_factory(
+                bits=qc.bits,
+                block_size=qc.group_size,
+                has_zero_point=not qc.sym,
+                zero_point_dtype=zp_dtype,
+            )
+
         embed_scale = float(np.float16(config.hidden_size**0.5))
-        self.embed_tokens = Gemma3TextScaledWordEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            config.pad_token_id,
-            embed_scale=embed_scale,
-        )
+        self._scale_quantized_embeddings = False
+        if qc is not None and getattr(qc, "quantize_embeddings", False):
+            self.embed_tokens = QuantizedEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                bits=qc.bits,
+                block_size=qc.group_size,
+                has_zero_point=not qc.sym,
+                padding_idx=config.pad_token_id,
+            )
+            self._scale_quantized_embeddings = True
+            self._embed_scale = embed_scale
+        else:
+            self.embed_tokens = Gemma3TextScaledWordEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                config.pad_token_id,
+                embed_scale=embed_scale,
+            )
         self.layers = nn.ModuleList(
-            [Gemma3DecoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [
+                Gemma3DecoderLayer(config, linear_class=linear_class)
+                for _ in range(config.num_hidden_layers)
+            ]
         )
         self.layer_types = config.layer_types
         self.sliding_window = config.sliding_window
@@ -134,6 +165,8 @@ class Gemma3TextModel(nn.Module):
             hidden_states = inputs_embeds
         else:
             hidden_states = self.embed_tokens(op, input_ids)
+            if self._scale_quantized_embeddings:
+                hidden_states = op.Mul(hidden_states, self._embed_scale)
 
         position_embeddings_dict = {
             "full_attention": self.rotary_emb(op, position_ids),
@@ -181,6 +214,21 @@ class Gemma3CausalLMModel(CausalLMModel):
         super().__init__(config)
         # Override the model with Gemma3TextModel
         self.model = Gemma3TextModel(config)
+        qc = getattr(config, "quantization", None)
+        quantize_lm_head = qc is not None and getattr(qc, "quantize_lm_head", False)
+        embed_quantized = qc is not None and getattr(qc, "quantize_embeddings", False)
+        tie = config.tie_word_embeddings or (
+            qc is not None and getattr(qc, "tie_word_embeddings", False)
+        )
+        if quantize_lm_head and embed_quantized and tie:
+            self.lm_head = TiedQuantizedLMHead(
+                self.model.embed_tokens, config.hidden_size, config.vocab_size
+            )
+        elif tie and not quantize_lm_head and not embed_quantized:
+            # ``super().__init__`` ties lm_head to the base TextModel embedding.
+            # Gemma3 replaces that model with Gemma3TextModel, so retie the head
+            # here to avoid writing a duplicate multi-GB embedding initializer.
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]

@@ -115,6 +115,28 @@ class TestMapGGUFToHFNames:
         result = map_gguf_to_hf_names("blk.0.attn_q.weight", "gemma2")
         assert result == "model.layers.0.self_attn.q_proj.weight"
 
+    def test_gemma3_attention_qk_norms(self) -> None:
+        assert (
+            map_gguf_to_hf_names("blk.0.ffn_norm.weight", "gemma3")
+            == "model.layers.0.pre_feedforward_layernorm.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("blk.0.post_attention_norm.weight", "gemma3")
+            == "model.layers.0.post_attention_layernorm.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("blk.0.post_ffw_norm.weight", "gemma3")
+            == "model.layers.0.post_feedforward_layernorm.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("blk.0.attn_q_norm.weight", "gemma3")
+            == "model.layers.0.self_attn.q_norm.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("blk.0.attn_k_norm.weight", "gemma3")
+            == "model.layers.0.self_attn.k_norm.weight"
+        )
+
     # ---- Gemma 4 ----
 
     def test_gemma4_inherits_llama_base(self) -> None:

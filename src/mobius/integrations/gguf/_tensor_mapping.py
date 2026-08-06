@@ -71,6 +71,15 @@ _GEMMA2_EXTRAS: dict[str, str] = {
     "blk.{bid}.post_ffn_norm": ("model.layers.{bid}.post_feedforward_layernorm"),
 }
 
+
+_GEMMA3_EXTRAS: dict[str, str] = {
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.pre_feedforward_layernorm",
+    "blk.{bid}.post_attention_norm": "model.layers.{bid}.post_attention_layernorm",
+    "blk.{bid}.post_ffw_norm": "model.layers.{bid}.post_feedforward_layernorm",
+    "blk.{bid}.attn_q_norm": "model.layers.{bid}.self_attn.q_norm",
+    "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
+}
+
 # Gemma 4 extras on top of the Llama base + Gemma2 extras.
 # Gemma 4 GGUF tensor names are taken from llama.cpp constants (gguf-py/gguf/constants.py).
 #
@@ -262,6 +271,8 @@ def _build_mapping(
     elif arch in _GEMMA_FAMILY:
         result = dict(_LLAMA_MAPPING)
         result.update(_GEMMA2_EXTRAS)
+        if arch == "gemma3":
+            result.update(_GEMMA3_EXTRAS)
     elif arch == "gemma4":
         # Gemma 4 starts from the Llama base but needs several overrides and
         # many new tensor types for Q/K norms, per-layer scalars, MoE norms,
