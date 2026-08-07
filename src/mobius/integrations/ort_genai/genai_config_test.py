@@ -79,6 +79,27 @@ class TestGenaiConfigGeneratorLLM:
         assert outputs["present_key_names"] == "present.%d.key"
         assert outputs["present_value_names"] == "present.%d.value"
 
+    def test_lfm2_decoder_declares_hybrid_cache(self):
+        gen = GenaiConfigGenerator(
+            "lfm2",
+            vocab_size=65536,
+            hidden_size=1024,
+            num_hidden_layers=4,
+            num_attention_heads=16,
+            num_key_value_heads=8,
+            head_dim=64,
+            layer_types=["conv", "conv", "full_attention", "conv"],
+            conv_cache_size=3,
+        )
+
+        decoder = gen.generate()["model"]["decoder"]
+
+        assert decoder["layer_types"] == ["conv", "conv", "full_attention", "conv"]
+        assert decoder["conv_cache_size"] == 3
+        assert decoder["inputs"]["past_conv_names"] == "past_key_values.%d.conv_state"
+        assert decoder["outputs"]["present_conv_names"] == "present.%d.conv_state"
+        assert gen.generate()["search"]["past_present_share_buffer"] is False
+
     def test_token_ids_included_when_set(self):
         """Token IDs are included in the model section."""
         gen = GenaiConfigGenerator(

@@ -177,6 +177,8 @@ class GenaiConfigGenerator:
         decoder_filename: str | None = None,
         supports_in_place_kv_cache: bool | None = None,
         decoder_graph_capture: bool | None = None,
+        layer_types: list[str] | None = None,
+        conv_cache_size: int | None = None,
     ):
         self.model_type = model_type
         self.vocab_size = vocab_size
@@ -202,6 +204,8 @@ class GenaiConfigGenerator:
         # that don't introspect the graph.
         self._supports_in_place_kv_cache = supports_in_place_kv_cache
         self._decoder_graph_capture = decoder_graph_capture
+        self._layer_types = layer_types
+        self._conv_cache_size = conv_cache_size
 
         # Optional VLM fields (set via with_vision())
         self._vision: dict[str, Any] | None = None
@@ -279,6 +283,8 @@ class GenaiConfigGenerator:
             decoder_inputs=decoder_inputs,
             decoder_filename=decoder_filename,
             supports_in_place_kv_cache=supports_in_place_kv_cache,
+            layer_types=getattr(config, "layer_types", None),
+            conv_cache_size=getattr(config, "short_conv_kernel", None),
         )
 
     def with_vision(
@@ -467,6 +473,11 @@ class GenaiConfigGenerator:
             "num_hidden_layers": self.num_hidden_layers,
             "num_key_value_heads": self.num_key_value_heads,
         }
+        if self.model_type == "lfm2":
+            decoder["layer_types"] = self._layer_types or []
+            decoder["conv_cache_size"] = self._conv_cache_size or 3
+            decoder["inputs"]["past_conv_names"] = "past_key_values.%d.conv_state"
+            decoder["outputs"]["present_conv_names"] = "present.%d.conv_state"
 
         # Model section
         model: dict[str, Any] = {
@@ -502,6 +513,10 @@ class GenaiConfigGenerator:
             context_length=self.context_length,
             supports_in_place_kv_cache=self._supports_in_place_kv_cache,
         )
+        if self.model_type == "lfm2":
+            # ORT GenAI's LFM2 cache mixes fixed convolution windows with
+            # dynamic attention KV; shared in-place KV buffers are unsupported.
+            search["past_present_share_buffer"] = False
         search.update(self._search_overrides)
 
         return {
