@@ -478,6 +478,8 @@ def test_attributes_match_qmoe_abi() -> None:
     assert attrs["swiglu_fusion"].value == 2
     assert attrs["normalize_routing_weights"].value == 1
     assert attrs["activation_type"].value == "swiglu"
+    assert attrs["quant_type"].value == "int"
+    assert attrs["weights_prepacked"].value == 0
 
 
 @pytest.mark.parametrize(

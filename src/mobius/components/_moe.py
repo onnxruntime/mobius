@@ -366,6 +366,8 @@ class MoELayer(nn.Module):
             expert_weight_bits=quantization.bits,
             block_size=quantization.group_size,
             swiglu_fusion=2,
+            quant_type="int",
+            weights_prepacked=0,
             _domain="com.microsoft",
         )
         if output_scale != 1.0:  # noqa: RUF069
