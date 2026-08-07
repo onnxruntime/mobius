@@ -107,6 +107,16 @@ def _base_config(config_cls=None, **overrides) -> ArchitectureConfig:
 CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     # === Text Generation (Llama-compatible) ===
     ("llama", {}, True),
+    (
+        "lfm2",
+        {
+            "layer_types": ["conv", "full_attention"],
+            "attn_qk_norm": True,
+            "short_conv_kernel": 3,
+            "short_conv_bias": False,
+        },
+        True,
+    ),
     ("mistral", {}, False),
     ("qwen2", {}, True),
     ("cohere", {"tie_word_embeddings": True, "logit_scale": 0.0625}, True),
