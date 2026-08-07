@@ -160,6 +160,7 @@ def build_from_module(
     fp8_kv_cache: bool = False,
     kv_cache_scales: dict[int, tuple[float, float]] | None = None,
     prune_lm_head: bool = False,
+    qdq: bool = False,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a module instance and config.
 
@@ -204,6 +205,10 @@ def build_from_module(
             via the causal-LM task so runtimes can avoid full prefill LM-head
             projection. Only supported by ``text-generation`` and
             ``hybrid-text-generation`` tasks.
+        qdq: When ``True``, lower quantized ``com.microsoft::MatMulNBits``
+            weights to standard ONNX QDQ form (``DequantizeLinear`` +
+            ``MatMul``) even if the selected execution provider has a native
+            ``MatMulNBits`` kernel.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -256,6 +261,7 @@ def build_from_module(
             trace=trace_optimization,
             fp8_kv_cache=fp8_kv_cache,
             kv_cache_scales=kv_cache_scales,
+            qdq=qdq,
         )
 
     _maybe_apply_opset_lowering(pkg, execution_provider)
@@ -401,6 +407,7 @@ def build(
     fp8_kv_cache: bool = False,
     kv_cache_scales: dict[int, tuple[float, float]] | None = None,
     prune_lm_head: bool = False,
+    qdq: bool = False,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a HuggingFace model ID.
 
@@ -481,6 +488,10 @@ def build(
             (``[B, 1, vocab]``). This is intended for single-token
             autoregressive generation and is incompatible with workflows that
             need per-token logits.
+        qdq: When ``True``, lower quantized ``com.microsoft::MatMulNBits``
+            weights to standard ONNX QDQ form (``DequantizeLinear`` +
+            ``MatMul``) even if the selected execution provider has a native
+            ``MatMulNBits`` kernel.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -660,6 +671,7 @@ def build(
         fp8_kv_cache=fp8_kv_cache,
         kv_cache_scales=kv_cache_scales,
         prune_lm_head=prune_lm_head,
+        qdq=qdq,
     )
 
     for name, model in pkg.items():

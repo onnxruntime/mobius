@@ -133,7 +133,7 @@ class TestMatMulNBitsInlineParity:
 class TestMatMulNBitsEpGating:
     """A qnn build lowers MatMulNBits to QDQ; a cpu build keeps the contrib op."""
 
-    def _build(self, ep: str):
+    def _build(self, ep: str, qdq: bool = False):
         import dataclasses
         from collections import Counter
 
@@ -166,7 +166,11 @@ class TestMatMulNBitsEpGating:
         )
         module = registry.get("qwen2")(cfg)
         model = build_from_module(
-            module, cfg, task=_default_task_for_model("qwen2"), execution_provider=ep
+            module,
+            cfg,
+            task=_default_task_for_model("qwen2"),
+            execution_provider=ep,
+            qdq=qdq,
         )["model"]
         return Counter(n.op_type for n in model.graph)
 
@@ -177,5 +181,10 @@ class TestMatMulNBitsEpGating:
 
     def test_qnn_lowers_to_qdq(self):
         ops = self._build("qnn")
+        assert ops.get("MatMulNBits", 0) == 0
+        assert ops.get("DequantizeLinear", 0) > 0
+
+    def test_qdq_feature_lowers_to_qdq_on_cpu(self):
+        ops = self._build("cpu", qdq=True)
         assert ops.get("MatMulNBits", 0) == 0
         assert ops.get("DequantizeLinear", 0) > 0

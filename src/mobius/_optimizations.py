@@ -371,6 +371,7 @@ def optimize_model(
     trace: bool = False,
     fp8_kv_cache: bool = False,
     kv_cache_scales: dict[int, tuple[float, float]] | None = None,
+    qdq: bool = False,
 ) -> None:
     """Apply EP-aware optimization passes to *model* in-place.
 
@@ -406,6 +407,9 @@ def optimize_model(
             per-tensor FP8 scales (from offline calibration). Only used when
             ``fp8_kv_cache`` is ``True``; layers absent from the map use a unit
             scale of ``1.0``.
+        qdq: When ``True``, force ``com.microsoft::MatMulNBits`` lowering to
+            standard ONNX QDQ form (``DequantizeLinear`` + ``MatMul``),
+            regardless of whether *ep* has a native ``MatMulNBits`` kernel.
 
     Raises:
         ValueError: If *ep* is not a registered execution provider.
@@ -460,11 +464,13 @@ def optimize_model(
         if func.domain == "com.microsoft" and func.name == "PackedMultiHeadAttention":
             return not caps.supports_packed_multi_head_attention
         # MatMulNBits (blockwise-INT4) → QDQ (DequantizeLinear + MatMul) for EPs
-        # without a MatMulNBits kernel (QNN HTP). Supported EPs (CPU/CUDA/…) keep
-        # the compact contrib op and its native kernel; the function body stays
-        # registered but uninlined (kernels take precedence over local functions).
+        # without a MatMulNBits kernel (QNN HTP), or when the user explicitly
+        # requests standard QDQ operators via the qdq build feature. Supported
+        # EPs (CPU/CUDA/…) keep the compact contrib op and its native kernel by
+        # default; the function body stays registered but uninlined (kernels
+        # take precedence over local functions).
         if func.domain == "com.microsoft" and func.name == "MatMulNBits":
-            return not caps.supports_matmul_nbits
+            return qdq or not caps.supports_matmul_nbits
         return False
 
     inline_pass = common_passes.InlinePass(criteria=_should_inline)
