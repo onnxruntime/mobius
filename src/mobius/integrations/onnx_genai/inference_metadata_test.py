@@ -1621,6 +1621,29 @@ class TestBuildDiffusionPipelineMetadata:
         assert sched.kind == "euler"
         assert sched.beta_schedule == "scaled_linear"
 
+    def test_scheduler_maps_qwen_flow_match_fields(self):
+        sched = SchedulerConfig.from_diffusers(
+            {
+                "_class_name": "FlowMatchEulerDiscreteScheduler",
+                "num_train_timesteps": 1000,
+                "base_image_seq_len": 256,
+                "max_image_seq_len": 8192,
+                "base_shift": 0.5,
+                "max_shift": 0.9,
+                "shift": 1.0,
+                "shift_terminal": 0.02,
+                "time_shift_type": "exponential",
+                "use_dynamic_shifting": True,
+            }
+        )
+        metadata = sched.to_metadata()
+        assert metadata["kind"] == "flow_match_euler"
+        assert metadata["prediction_type"] == "flow_prediction"
+        assert metadata["max_image_seq_len"] == 8192
+        assert metadata["shift_terminal"] == pytest.approx(0.02)
+        assert metadata["use_dynamic_shifting"] is True
+        assert "beta_start" not in metadata
+
     def test_scheduler_maps_dpmsolver_class(self):
         sched = SchedulerConfig.from_diffusers({"_class_name": "DPMSolverMultistepScheduler"})
         assert sched.kind == "dpmpp_2m"

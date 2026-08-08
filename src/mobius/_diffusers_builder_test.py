@@ -53,6 +53,7 @@ class TestInitDiffusersClassMap:
             "FluxTransformer2DModel",
             "SD3Transformer2DModel",
             "QwenImageTransformer2DModel",
+            "Qwen2_5_VLForConditionalGeneration",
             "UNet2DConditionModel",
             "CLIPTextModel",
             "AutoencoderKL",
@@ -81,6 +82,8 @@ class TestInitDiffusersClassMap:
             "denoising",
             "vae",
             "qwen-image-vae",
+            "qwen-image-denoising",
+            "qwen-image-text-encoding",
             "video-denoising",
             "feature-extraction",
         }
@@ -346,7 +349,7 @@ class TestBuildDiffusersPipelineSuccess:
         )
         mock_load_config.return_value = {}
 
-        def fake_build(module, config, task_name):
+        def fake_build(module, config, task_name, **kwargs):
             graph = ir.Graph([], [], nodes=[], name="g")
             return ModelPackage({"model": ir.Model(graph, ir_version=10)})
 
@@ -399,6 +402,69 @@ class TestBuildDiffusersPipelineSuccess:
         )
         # Verify build_from_module was called (ir.DataType accepted without error)
         mock_build_from_module.assert_called_once()
+
+    @patch("mobius._diffusers_builder.build_from_module")
+    @patch("mobius._diffusers_builder._load_diffusers_component_config")
+    @patch("mobius._diffusers_builder._load_diffusers_pipeline_index")
+    def test_qwen_edit_uses_normalized_vae_task(
+        self,
+        mock_load_index,
+        mock_load_config,
+        mock_build_from_module,
+    ):
+        mock_load_index.return_value = {
+            "_class_name": "QwenImageEditPlusPipeline",
+            "vae": ["diffusers", "AutoencoderKLQwenImage"],
+        }
+        mock_load_config.return_value = {
+            "base_dim": 8,
+            "z_dim": 4,
+            "dim_mult": [1, 2],
+            "num_res_blocks": 1,
+            "temperal_downsample": [False],
+            "latents_mean": [0.0] * 4,
+            "latents_std": [1.0] * 4,
+        }
+        graph = ir.Graph([], [], nodes=[], name="vae")
+        mock_build_from_module.return_value = ModelPackage(
+            {"model": ir.Model(graph, ir_version=10)}
+        )
+
+        result = build_diffusers_pipeline("fake/qwen-edit", load_weights=False)
+
+        assert "vae" in result
+        assert mock_build_from_module.call_args.args[2] == "qwen-image-edit-vae"
+        assert result.config.model_type == "qwen_image_edit"
+
+    @patch("mobius._diffusers_builder.build_from_module")
+    @patch("mobius._diffusers_builder._load_diffusers_component_config")
+    @patch("mobius._diffusers_builder._load_diffusers_pipeline_index")
+    def test_component_allowlist_avoids_building_other_components(
+        self,
+        mock_load_index,
+        mock_load_config,
+        mock_build_from_module,
+    ):
+        mock_load_index.return_value = _fake_pipeline_index(
+            {
+                "transformer": ["diffusers", "FluxTransformer2DModel"],
+                "vae": ["diffusers", "AutoencoderKL"],
+            }
+        )
+        mock_load_config.return_value = {}
+        graph = ir.Graph([], [], nodes=[], name="transformer")
+        mock_build_from_module.return_value = ModelPackage(
+            {"model": ir.Model(graph, ir_version=10)}
+        )
+
+        result = build_diffusers_pipeline(
+            "fake/filtered",
+            load_weights=False,
+            components={"transformer"},
+        )
+
+        assert set(result) == {"transformer"}
+        mock_load_config.assert_called_once_with("fake/filtered", "transformer")
 
 
 # ── build_diffusers_pipeline weight loading ──────────────────────────────
@@ -504,7 +570,7 @@ class TestBuildDiffusersPipelineWeights:
 
         # The module class will have preprocess_weights set by AutoencoderKLModel
         # We patch it at the module instance level via build_from_module's first arg
-        def capture_build(module, config, task_name):
+        def capture_build(module, config, task_name, **kwargs):
             module.preprocess_weights = lambda sd: processed_weights
             return ModelPackage({"model": model})
 

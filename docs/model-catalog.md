@@ -243,8 +243,12 @@ Supported component classes include:
 - `ControlNetModel` — ControlNet conditioning
 - `CogVideoXTransformer3DModel` — CogVideoX
 - `VideoAutoencoderModel` — Video VAE
-- `QwenImageTransformer2DModel` — Qwen image generation
-- `AutoencoderKLQwenImageModel` — Qwen image VAE
+- `QwenImageTransformer2DModel` — Qwen image generation and packed-token
+  Qwen-Image-Edit-2509 denoising with source-image conditioning, masks, and 3D RoPE
+- `AutoencoderKLQwenImageModel` — Qwen image VAE, including edit-pipeline latent
+  normalization
+- `Qwen2_5_VLForConditionalGeneration` — image-aware prompt encoder used by
+  Qwen-Image-Edit-2509
 
 ```python
 from mobius import build

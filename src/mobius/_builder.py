@@ -536,6 +536,7 @@ def build(
                 model_id,
                 dtype=dtype,
                 load_weights=load_weights,
+                execution_provider=execution_provider,
             )
 
     model_type = hf_config.model_type
