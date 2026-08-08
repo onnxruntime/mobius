@@ -6,25 +6,40 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING
 
+import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import (
+    MLP,
     Attention,
     Embedding,
     GatedShortConv,
-    MLP,
     RMSNorm,
     create_padding_mask,
     initialize_rope,
 )
 from mobius.models.base import CausalLMModel
 
-if TYPE_CHECKING:
-    import onnx_ir as ir
+
+class Lfm2RMSNorm(RMSNorm):
+    """LFM2 RMSNorm with fp32 variance accumulation, matching Transformers."""
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
+        hidden_states_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
+        variance = op.ReduceMean(
+            op.Mul(hidden_states_f32, hidden_states_f32),
+            [-1],
+            keepdims=1,
+        )
+        normalized_f32 = op.Mul(
+            hidden_states_f32,
+            op.Reciprocal(op.Sqrt(op.Add(variance, self.variance_epsilon))),
+        )
+        # Transformers casts the normalized activation back before applying gamma.
+        return op.Mul(op.CastLike(normalized_f32, hidden_states), self.weight)
 
 
 class Lfm2DecoderLayer(nn.Module):
@@ -43,11 +58,11 @@ class Lfm2DecoderLayer(nn.Module):
                 bias=config.short_conv_bias,
             )
         else:
-            self.self_attn = Attention(config)
+            self.self_attn = Attention(config, rms_norm_class=Lfm2RMSNorm)
 
         self.feed_forward = MLP(config)
-        self.operator_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.operator_norm = Lfm2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.ffn_norm = Lfm2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -99,7 +114,7 @@ class Lfm2TextModel(nn.Module):
         self.layers = nn.ModuleList(
             [Lfm2DecoderLayer(config, i) for i in range(config.num_hidden_layers)]
         )
-        self.embedding_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.embedding_norm = Lfm2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = initialize_rope(config)
 
     def forward(
