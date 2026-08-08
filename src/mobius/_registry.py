@@ -141,6 +141,7 @@ from mobius.models.layoutlmv3 import LayoutLMv3Model
 from mobius.models.llava import LLaVAModel
 from mobius.models.longcat_flash import LongcatFlashCausalLMModel
 from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
+from mobius.models.minicpmv4_6 import MiniCPMV46ForConditionalGeneration
 from mobius.models.minimax import MiniMaxCausalLMModel
 from mobius.models.mllama import MllamaCausalLMModel
 from mobius.models.modernbert import ModernBertDecoderModel, ModernBertModel
@@ -626,6 +627,10 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "llava_next_video": ModelRegistration(LLaVAModel, task="vision-language"),
     "llava_onevision": ModelRegistration(LLaVAModel, task="vision-language"),
     "mistral3": ModelRegistration(LLaVAModel, task="pixtral-vl"),
+    "minicpmv4_6": ModelRegistration(
+        MiniCPMV46ForConditionalGeneration,
+        task="minicpm-vl",
+    ),
     "mllama": ModelRegistration(MllamaCausalLMModel, task="mllama-vision-language"),
     "muse_glimmer": ModelRegistration(
         MuseGlimmerForConditionalGeneration,
@@ -1038,6 +1043,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "llava_onevision": "llava-hf/llava-onevision-qwen2-0.5b-ov-hf",
     "molmo": "allenai/MolmoE-1B-0924",
     "mistral3": "mistralai/Ministral-3-3B-Instruct-2512",
+    "minicpmv4_6": "openbmb/MiniCPM-V-4.6",
     "aya_vision": "CohereForAI/aya-vision-8b",
     "chameleon": "facebook/chameleon-7b",
     "cohere2_vision": "CohereForAI/c4ai-command-r7b-12-2024",

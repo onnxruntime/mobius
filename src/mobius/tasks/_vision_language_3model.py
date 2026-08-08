@@ -311,6 +311,68 @@ class HybridQwenVLTask(QwenVLTask):
         return ModelPackage(models, config=config)
 
 
+class MiniCPMVLTask(VisionLanguageTask):
+    """MiniCPM-V packed-NaViT vision with a Qwen3.5 hybrid decoder."""
+
+    def build(
+        self,
+        module: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ModelPackage:
+        self._validate_components(module)
+        models: dict[str, ir.Model] = {}
+        models["decoder"] = build_decoder_from_embeds(
+            module.decoder,
+            config,
+            hybrid=True,
+        )
+        models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
+        models["embedding"] = build_embedding_from_features(
+            module.embedding,
+            config,
+            feature_name="image_features",
+            feature_dim=config.hidden_size,
+        )
+        return ModelPackage(models, config=config)
+
+    def _build_vision(
+        self,
+        vision: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build packed pixels + patch-grid sizes -> compressed visual tokens."""
+        packed_batch = ir.SymbolicDim("packed_batch")
+        packed_width = ir.SymbolicDim("packed_width")
+        num_visual_units = ir.SymbolicDim("num_visual_units")
+        vision_config = config.vision
+        assert vision_config is not None
+        patch_size = vision_config.patch_size or 14
+
+        graph, builder = _make_graph(name="vision_encoder")
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=config.dtype,
+            shape=[
+                packed_batch,
+                vision_config.in_channels,
+                patch_size,
+                packed_width,
+            ],
+        )
+        target_sizes = builder.input(
+            "target_sizes",
+            dtype=ir.DataType.INT32,
+            shape=[num_visual_units, 2],
+        )
+        image_features = vision(
+            builder.op,
+            pixel_values=pixel_values,
+            target_sizes=target_sizes,
+        )
+        builder.add_output(image_features, "image_features")
+        return _make_model(graph)
+
+
 class PixtralVLTask(VisionLanguageTask):
     """Vision-language task with dynamic-resolution Pixtral vision encoder.
 

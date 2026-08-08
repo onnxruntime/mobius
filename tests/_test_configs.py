@@ -2161,6 +2161,22 @@ _TINY_QWEN3_VL_VISION = VisionConfig(
     window_size=4,
 )
 
+_TINY_MINICPMV46_VISION = VisionConfig(
+    hidden_size=32,
+    intermediate_size=64,
+    num_hidden_layers=2,
+    num_attention_heads=2,
+    image_size=56,
+    patch_size=14,
+    norm_eps=1e-6,
+    in_channels=3,
+    num_position_embeddings=16,
+    insert_layer_id=0,
+    window_kernel_size=(2, 2),
+    merge_kernel_size=(2, 2),
+    merger_times=1,
+)
+
 
 _TINY_COSMOS3_EDGE_VISION = VisionConfig(
     hidden_size=32,
@@ -2237,6 +2253,28 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
             "vision": _TINY_MUSE_GLIMMER_VISION,
             "image_token_id": 200092,
             "video_token_id": 200091,
+        },
+        True,
+    ),
+    (
+        "minicpmv4_6",
+        {
+            "vision": _TINY_MINICPMV46_VISION,
+            "image_token_id": 250,
+            "video_token_id": 251,
+            "num_hidden_layers": 4,
+            "layer_types": [
+                "linear_attention",
+                "linear_attention",
+                "linear_attention",
+                "full_attention",
+            ],
+            "partial_rotary_factor": 0.25,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 16,
+            "linear_num_value_heads": 2,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
         },
         True,
     ),

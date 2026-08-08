@@ -103,6 +103,11 @@ class VisionConfig:
     do_pooling: bool = True
     # RMSNorm epsilon for the vision tower (may differ from the text decoder's).
     rms_norm_eps: float | None = None
+    # MiniCPM-V packed-NaViT vision encoder and its two spatial mergers.
+    insert_layer_id: int | None = None
+    window_kernel_size: tuple[int, int] = (2, 2)
+    merge_kernel_size: tuple[int, int] = (2, 2)
+    merger_times: int = 1
 
 
 @dataclasses.dataclass

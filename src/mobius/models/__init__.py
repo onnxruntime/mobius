@@ -83,6 +83,7 @@ __all__ = [
     "Mamba2CausalLMModel",
     "MambaCausalLMModel",
     "MiniMaxCausalLMModel",
+    "MiniCPMV46ForConditionalGeneration",
     "MoonshineForConditionalGeneration",
     "MuseGlimmerForConditionalGeneration",
     "MuseGlimmerTextCausalLMModel",
@@ -235,6 +236,7 @@ from mobius.models.longcat_flash import LongcatFlashCausalLMModel
 from mobius.models.mage_vl import MageVLForConditionalGeneration
 from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
 from mobius.models.mimi import MimiModel, mimi_default_config
+from mobius.models.minicpmv4_6 import MiniCPMV46ForConditionalGeneration
 from mobius.models.minimax import MiniMaxCausalLMModel
 from mobius.models.moe import (
     Ernie45MoECausalLMModel,
