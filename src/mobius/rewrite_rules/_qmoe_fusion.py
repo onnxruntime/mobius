@@ -404,6 +404,8 @@ def _fuse_layer(graph: ir.Graph, layer: _DenseMoELayer, index: int) -> None:
             "expert_weight_bits": bits,
             "block_size": block_size,
             "swiglu_fusion": 2,
+            "quant_type": "int",
+            "weights_prepacked": 0,
         },
         domain=_MS_DOMAIN,
         num_outputs=1,
