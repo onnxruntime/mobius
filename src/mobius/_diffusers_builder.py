@@ -46,6 +46,7 @@ def _init_diffusers_class_map() -> None:
         CLIPTextConfig,
         CogVideoXConfig,
         QwenImageConfig,
+        QwenImageTextEncoderConfig,
         QwenImageVAEConfig,
         UNet2DConfig,
         VAEConfig,
@@ -64,6 +65,7 @@ def _init_diffusers_class_map() -> None:
     from mobius.models.hunyuan_dit import HunyuanDiT2DModel, HunyuanDiTConfig
     from mobius.models.qwen_image import QwenImageTransformer2DModel
     from mobius.models.qwen_image_vae import AutoencoderKLQwenImageModel
+    from mobius.models.qwen_vl import Qwen25VLCausalLMModel
     from mobius.models.unet import UNet2DConditionModel
     from mobius.models.vae import AutoencoderKLModel
     from mobius.models.video_vae import VideoAutoencoderModel, VideoVAEConfig
@@ -86,7 +88,12 @@ def _init_diffusers_class_map() -> None:
             "QwenImageTransformer2DModel": (
                 QwenImageTransformer2DModel,
                 QwenImageConfig,
-                "denoising",
+                "qwen-image-denoising",
+            ),
+            "Qwen2_5_VLForConditionalGeneration": (
+                Qwen25VLCausalLMModel,
+                QwenImageTextEncoderConfig,
+                "qwen-image-text-encoding",
             ),
             "AutoencoderKL": (AutoencoderKLModel, VAEConfig, "vae"),
             "AutoencoderKLQwenImage": (
@@ -227,6 +234,19 @@ def _load_diffusers_component_config(
         return json.load(f)
 
 
+def _load_optional_diffusers_json(model_id: str, filename: str) -> dict:
+    """Load optional non-neural pipeline metadata without failing the build."""
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.utils import EntryNotFoundError
+
+    try:
+        path = hf_hub_download(repo_id=model_id, filename=filename)
+    except EntryNotFoundError:
+        return {}
+    with open(path) as f:
+        return json.load(f)
+
+
 def _prepare_unet_loras(unet_loras: dict) -> tuple[tuple, dict]:
     """Load each UNet LoRA ``.safetensors``; return baked-adapter specs + merged weights.
 
@@ -261,6 +281,8 @@ def build_diffusers_pipeline(
     dtype: str | ir.DataType | None = None,
     load_weights: bool = True,
     unet_loras: dict | None = None,
+    components: set[str] | None = None,
+    execution_provider: str = "default",
 ) -> ModelPackage:
     """Build ONNX models for all supported components in a diffusers pipeline.
 
@@ -281,6 +303,9 @@ def build_diffusers_pipeline(
             inferred from the file); at inference a ``lora_gate.{name}`` scalar
             input switches/blends it. Requires ``load_weights=True`` to apply the
             adapter weights.
+        components: Optional component-name allowlist. Non-neural pipeline metadata
+            is still retained so a single-component export preserves its contract.
+        execution_provider: Target execution provider for EP-aware graph optimization.
 
     Returns:
         A :class:`ModelPackage` containing the built component model(s).
@@ -301,9 +326,13 @@ def build_diffusers_pipeline(
         dtype = resolve_dtype(dtype)
 
     package = ModelPackage({})
+    component_configs: dict[str, dict] = {}
+    pipeline_class = str(pipeline_index.get("_class_name", "DiffusionPipeline"))
 
     for component_name, component_info in pipeline_index.items():
         if component_name.startswith("_"):
+            continue
+        if components is not None and component_name not in components:
             continue
         if not isinstance(component_info, list) or len(component_info) != 2:
             continue
@@ -330,6 +359,7 @@ def build_diffusers_pipeline(
             component_name,
             revision=revision,
         )
+        component_configs[component_name] = component_config_dict
         config = config_class.from_diffusers(component_config_dict)
 
         if dtype is not None and hasattr(config, "dtype"):
@@ -348,7 +378,17 @@ def build_diffusers_pipeline(
 
         model_module = module_class(config)
 
-        sub_pkg = build_from_module(model_module, config, task_name)
+        if (
+            pipeline_class == "QwenImageEditPlusPipeline"
+            and class_name == "AutoencoderKLQwenImage"
+        ):
+            task_name = "qwen-image-edit-vae"
+        sub_pkg = build_from_module(
+            model_module,
+            config,
+            task_name,
+            execution_provider=execution_provider,
+        )
 
         # Flatten sub-package into the top-level package
         if len(sub_pkg) == 1 and "model" in sub_pkg:
@@ -356,8 +396,11 @@ def build_diffusers_pipeline(
             package[component_name] = sub_pkg["model"]
         else:
             for sub_name, sub_model in sub_pkg.items():
-                sub_model.graph.name = f"{model_id}/{component_name}_{sub_name}"
-                package[f"{component_name}_{sub_name}"] = sub_model
+                package_name = (
+                    component_name if sub_name == "model" else f"{component_name}_{sub_name}"
+                )
+                sub_model.graph.name = f"{model_id}/{package_name}"
+                package[package_name] = sub_model
 
         if load_weights:
             state_dict = _download_diffusers_component_weights(
@@ -378,4 +421,24 @@ def build_diffusers_pipeline(
             f"Supported diffusers classes: {sorted(_DIFFUSERS_CLASS_MAP)}."
         )
 
+    from mobius._diffusers_configs import DiffusersPipelineConfig
+
+    package.config = DiffusersPipelineConfig(
+        source_model_id=model_id,
+        pipeline_class=pipeline_class,
+        component_configs=component_configs,
+        scheduler_config=(
+            _load_optional_diffusers_json(model_id, "scheduler/scheduler_config.json")
+            if "scheduler" in pipeline_index
+            else {}
+        ),
+        processor_config=(
+            _load_optional_diffusers_json(model_id, "processor/preprocessor_config.json")
+            if "processor" in pipeline_index
+            else {}
+        ),
+        model_type=(
+            "qwen_image_edit" if pipeline_class == "QwenImageEditPlusPipeline" else "diffusers"
+        ),
+    )
     return package

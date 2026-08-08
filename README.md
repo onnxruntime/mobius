@@ -35,7 +35,7 @@ multi-component export for pipelines.
 | **Speech-to-Text** | Whisper, Moonshine, FastConformer-RNNT, FunASR, Qwen3-ASR, SenseVoice |
 | **Audio** | Wav2Vec2, HuBERT, WavLM, SpeechT5 |
 | **Vision** | ViT, BEiT, DeiT, DINOv2, Swin, CLIP, SigLIP |
-| **Diffusion** | Stable Diffusion (UNet + VAE + ControlNet), Flux, SD3, DiT, QwenImage, HunyuanDiT, CogVideoX |
+| **Diffusion** | Stable Diffusion (UNet + VAE + ControlNet), Flux, SD3, DiT, QwenImage / Qwen-Image-Edit-2509, HunyuanDiT, CogVideoX |
 | **Adapters** | T2I-Adapter, IP-Adapter |
 
 Mage-VL supports direct three-model ONNX export. ORT GenAI export is currently

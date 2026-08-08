@@ -8,6 +8,8 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING
 
+import onnx_ir as ir
+
 if TYPE_CHECKING:
     from mobius._configs import ArchitectureConfig
 
@@ -53,6 +55,37 @@ class CLIPTextConfig:
             rms_norm_eps=config.get("layer_norm_eps", 1e-5),
             hidden_act=config.get("hidden_act", "quick_gelu"),
         )
+
+
+class QwenImageTextEncoderConfig:
+    """Adapter for the Qwen2.5-VL prompt encoder bundled with Qwen Image Edit."""
+
+    @classmethod
+    def from_diffusers(cls, config: dict) -> ArchitectureConfig:
+        """Build the native Mobius Qwen2.5-VL configuration tree."""
+        import transformers
+
+        from mobius._configs import ArchitectureConfig
+
+        if hasattr(config, "to_dict"):
+            config = config.to_dict()
+        fields = dict(config)
+        model_type = fields.pop("model_type", "qwen2_5_vl")
+        hf_config = transformers.AutoConfig.for_model(model_type, **fields)
+        text_config = hf_config.text_config if hasattr(hf_config, "text_config") else hf_config
+        return ArchitectureConfig.from_transformers(text_config, parent_config=hf_config)
+
+
+@dataclasses.dataclass
+class DiffusersPipelineConfig:
+    """Non-neural diffusers pipeline metadata retained on a ModelPackage."""
+
+    source_model_id: str
+    pipeline_class: str
+    component_configs: dict[str, dict]
+    scheduler_config: dict
+    processor_config: dict
+    model_type: str = "diffusers"
 
 
 @dataclasses.dataclass
@@ -229,6 +262,7 @@ class QwenImageConfig:
     guidance_embeds: bool = False
     axes_dims_rope: tuple[int, ...] = (16, 56, 56)
     norm_eps: float = 1e-6
+    dtype: ir.DataType = ir.DataType.FLOAT
     # cross_attention_dim is used by DenoisingTask for encoder_hidden_states shape
     cross_attention_dim: int = 3584
 
@@ -262,6 +296,9 @@ class QwenImageVAEConfig:
     attn_scales: tuple[float, ...] = ()
     temperal_downsample: tuple[bool, ...] = (False, True, True)
     dropout: float = 0.0
+    latents_mean: tuple[float, ...] | None = None
+    latents_std: tuple[float, ...] | None = None
+    dtype: ir.DataType = ir.DataType.FLOAT
 
     @classmethod
     def from_diffusers(cls, config: dict) -> QwenImageVAEConfig:
@@ -276,4 +313,12 @@ class QwenImageVAEConfig:
             attn_scales=tuple(config.get("attn_scales", [])),
             temperal_downsample=tuple(config.get("temperal_downsample", [False, True, True])),
             dropout=config.get("dropout", 0.0),
+            latents_mean=(
+                tuple(config["latents_mean"])
+                if config.get("latents_mean") is not None
+                else None
+            ),
+            latents_std=(
+                tuple(config["latents_std"]) if config.get("latents_std") is not None else None
+            ),
         )

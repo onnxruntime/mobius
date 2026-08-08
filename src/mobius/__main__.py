@@ -262,10 +262,21 @@ def _cmd_build(args: argparse.Namespace) -> None:
             print(
                 f"Detected diffusers pipeline: {pipeline_index.get('_class_name', 'Unknown')}"
             )
+            pipeline_components = None
+            if component_filter:
+                roots = [
+                    name
+                    for name in pipeline_index
+                    if not name.startswith("_")
+                    and (component_filter == name or component_filter.startswith(f"{name}_"))
+                ]
+                pipeline_components = {max(roots, key=len)} if roots else {component_filter}
             pkg = build_diffusers_pipeline(
                 args.model,
                 dtype=dtype_override,
                 load_weights=load_weights,
+                components=pipeline_components,
+                execution_provider=execution_provider,
             )
             _save_package(pkg, output_dir, args, optimize, component_filter)
             return

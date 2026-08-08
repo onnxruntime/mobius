@@ -1893,9 +1893,10 @@ class TestQwenImageVAEDecoder:
         # ONNX decode
         import tempfile
 
-        with tempfile.NamedTemporaryFile(suffix=".onnx") as f:
-            onnx_ir.save(dec_model, f.name)
-            sess = ort.InferenceSession(f.name)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "decoder.onnx")
+            onnx_ir.save(dec_model, path)
+            sess = ort.InferenceSession(path)
             onnx_out = sess.run(None, {"latent_sample": z.numpy()})[0]
 
         np.testing.assert_allclose(onnx_out, hf_out, atol=1e-4, rtol=1e-4)
@@ -1945,9 +1946,10 @@ class TestQwenImageVAEDecoder:
 
         import tempfile
 
-        with tempfile.NamedTemporaryFile(suffix=".onnx") as f:
-            onnx_ir.save(enc_model, f.name)
-            sess = ort.InferenceSession(f.name)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "encoder.onnx")
+            onnx_ir.save(enc_model, path)
+            sess = ort.InferenceSession(path)
             onnx_out = sess.run(None, {"sample": x.numpy()})[0]
 
         np.testing.assert_allclose(onnx_out, hf_out, atol=1e-4, rtol=1e-4)

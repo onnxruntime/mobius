@@ -1063,6 +1063,36 @@ class TestBuildGraphVisionLanguage:
         assert model.graph is not None
         assert "logits" in {out.name for out in model.graph.outputs}
 
+    def test_qwen_image_edit_text_encoder_graphs(self):
+        """Build the Qwen2.5-VL hidden-state encoder split used by image edit."""
+        from mobius.tasks import QwenImageTextEncoderTask
+
+        config = _base_config(
+            attn_qkv_bias=True,
+            mrope_section=[8, 12, 12],
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                patch_size=14,
+                in_channels=3,
+                out_hidden_size=64,
+            ),
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+            fullatt_block_indexes=[1],
+            image_token_id=151655,
+        )
+        module = registry.get("qwen2_5_vl")(config)
+        package = QwenImageTextEncoderTask().build(module, config)
+
+        assert set(package) == {"model", "vision_encoder", "embedding"}
+        assert {output.name for output in package["model"].graph.outputs} == {
+            "prompt_embeds",
+            "prompt_embeds_mask",
+        }
+
     def test_qwen3_vl_graph(self):
         """Build Qwen3-VL with its auto-detected 3-model task."""
         config = _base_config(
@@ -4207,7 +4237,7 @@ class TestBuildQwenImageGraph:
     def test_qwen_image_transformer_graph_builds(self):
         from mobius._diffusers_configs import QwenImageConfig
         from mobius.models.qwen_image import QwenImageTransformer2DModel
-        from mobius.tasks import DenoisingTask
+        from mobius.tasks import QwenImageDenoisingTask
 
         config = QwenImageConfig(
             in_channels=4,
@@ -4220,7 +4250,7 @@ class TestBuildQwenImageGraph:
             cross_attention_dim=64,
         )
         module = QwenImageTransformer2DModel(config)
-        task = DenoisingTask()
+        task = QwenImageDenoisingTask()
         pkg = task.build(module, config)
         model = pkg["model"]
 
@@ -4229,6 +4259,9 @@ class TestBuildQwenImageGraph:
         assert "sample" in input_names
         assert "timestep" in input_names
         assert "encoder_hidden_states" in input_names
+        assert "encoder_hidden_states_mask" in input_names
+        assert "image_rotary_cos" in input_names
+        assert "target_sequence_length" in input_names
         assert "noise_pred" in {out.name for out in model.graph.outputs}
 
     def test_qwen_image_vae_encoder_decoder_graphs_build(self):

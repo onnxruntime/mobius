@@ -1,0 +1,13 @@
+model_id: "Qwen/Qwen-Image-Edit-2509"
+model_type: "qwen_image_edit"
+revision: "d3968ef930e841f4c73640fb8afa3b306a78167e"
+task_type: "image-to-image"
+dtype: "bfloat16"
+level: "L4+L5"
+inputs:
+  prompts:
+    - "Make the cat wear a bright red scarf while preserving its pose."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+skip_reason: "The official 20.4B pipeline requires over 57 GB of weights; deterministic diffusion-stage L4/L5 goldens are covered by src/mobius/models/qwen_image_test.py."
+notes: "QwenImageEditPlusPipeline with Qwen2.5-VL prompt conditioning, packed source-image latents, 3D RoPE, and FlowMatch Euler scheduling."

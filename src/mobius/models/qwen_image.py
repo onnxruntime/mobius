@@ -13,9 +13,9 @@ HF diffusers class: QwenImageTransformer2DModel
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
 
 import numpy as np
+import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
@@ -33,12 +33,101 @@ from mobius.components import (
     SiLU as _SiLU,
 )
 
-if TYPE_CHECKING:
-    import onnx_ir as ir
-
 # ---------------------------------------------------------------------------
 # Model-specific building blocks
 # ---------------------------------------------------------------------------
+
+
+def prepare_qwen_image_rotary_embeddings(
+    image_shapes: list[tuple[int, int, int]],
+    text_sequence_length: int,
+    axes_dims_rope: tuple[int, ...] = (16, 56, 56),
+    theta: float = 10000.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Create the real-valued 3D RoPE inputs used by Qwen Image.
+
+    ``image_shapes`` contains the generated latent grid first, followed by any
+    source-image latent grids. The image index is the temporal/layer position,
+    matching diffusers ``QwenEmbedRope(scale_rope=True)``.
+    """
+    if not image_shapes:
+        raise ValueError("image_shapes must contain at least the generated latent grid")
+    if text_sequence_length < 1:
+        raise ValueError("text_sequence_length must be positive")
+    if len(axes_dims_rope) != 3 or any(dim <= 0 or dim % 2 for dim in axes_dims_rope):
+        raise ValueError("axes_dims_rope must contain three positive even dimensions")
+
+    inv_freqs = [
+        theta ** (-np.arange(0, dim, 2, dtype=np.float32) / dim) for dim in axes_dims_rope
+    ]
+    image_phases: list[np.ndarray] = []
+    max_spatial_index = 0
+    for layer_index, (frames, height, width) in enumerate(image_shapes):
+        if min(frames, height, width) < 1:
+            raise ValueError(f"invalid image shape {(frames, height, width)!r}")
+        frame_ids = np.arange(layer_index, layer_index + frames, dtype=np.float32)
+        height_ids = np.arange(-(height - height // 2), height // 2, dtype=np.float32)
+        width_ids = np.arange(-(width - width // 2), width // 2, dtype=np.float32)
+        frame_grid, height_grid, width_grid = np.meshgrid(
+            frame_ids, height_ids, width_ids, indexing="ij"
+        )
+        phase = np.concatenate(
+            [
+                frame_grid.reshape(-1, 1) * inv_freqs[0],
+                height_grid.reshape(-1, 1) * inv_freqs[1],
+                width_grid.reshape(-1, 1) * inv_freqs[2],
+            ],
+            axis=1,
+        )
+        image_phases.append(phase)
+        max_spatial_index = max(max_spatial_index, height // 2, width // 2)
+
+    text_ids = np.arange(
+        max_spatial_index,
+        max_spatial_index + text_sequence_length,
+        dtype=np.float32,
+    )
+    text_phase = np.concatenate(
+        [text_ids[:, None] * inv_freq for inv_freq in inv_freqs],
+        axis=1,
+    )
+    image_phase = np.concatenate(image_phases, axis=0)
+    return (
+        np.cos(image_phase).astype(np.float32),
+        np.sin(image_phase).astype(np.float32),
+        np.cos(text_phase).astype(np.float32),
+        np.sin(text_phase).astype(np.float32),
+    )
+
+
+def _apply_qwen_rotary(
+    op: OpBuilder,
+    value: ir.Value,
+    cos: ir.Value,
+    sin: ir.Value,
+) -> ir.Value:
+    """Apply interleaved complex RoPE to ``(B, S, H, D)`` Q/K tensors."""
+    shape = op.Shape(value)
+    pairs = op.Reshape(
+        value,
+        op.Concat(
+            op.Slice(shape, [0], [3]),
+            op.Constant(value_ints=[-1, 2]),
+            axis=0,
+        ),
+    )
+    real = op.Gather(pairs, op.Constant(value_int=0), axis=-1)
+    imag = op.Gather(pairs, op.Constant(value_int=1), axis=-1)
+    cos = op.CastLike(op.Unsqueeze(op.Unsqueeze(cos, [0]), [2]), value)
+    sin = op.CastLike(op.Unsqueeze(op.Unsqueeze(sin, [0]), [2]), value)
+    rotated_real = op.Sub(op.Mul(real, cos), op.Mul(imag, sin))
+    rotated_imag = op.Add(op.Mul(real, sin), op.Mul(imag, cos))
+    rotated = op.Concat(
+        op.Unsqueeze(rotated_real, [-1]),
+        op.Unsqueeze(rotated_imag, [-1]),
+        axis=-1,
+    )
+    return op.Reshape(rotated, shape)
 
 
 class _TimestepMLP(nn.Module):
@@ -84,7 +173,7 @@ class _AdaLayerNormOutput(nn.Module):
     def forward(self, op: OpBuilder, hidden_states: ir.Value, timestep_emb: ir.Value):
         emb = op.Swish(timestep_emb)
         emb = self.linear(op, emb)
-        shift, scale = op.Split(emb, num_outputs=2, axis=-1, _outputs=2)
+        scale, shift = op.Split(emb, num_outputs=2, axis=-1, _outputs=2)
         one = 1.0
         hidden_states = self.norm(op, hidden_states)
         hidden_states = op.Mul(hidden_states, op.Add(one, op.Unsqueeze(scale, [1])))
@@ -189,7 +278,17 @@ class _QwenImageJointAttention(nn.Module):
         self.norm_added_q = _RMSNormQK(head_dim, eps=eps)
         self.norm_added_k = _RMSNormQK(head_dim, eps=eps)
 
-    def forward(self, op: OpBuilder, img_hidden: ir.Value, txt_hidden: ir.Value):
+    def forward(
+        self,
+        op: OpBuilder,
+        img_hidden: ir.Value,
+        txt_hidden: ir.Value,
+        attention_bias: ir.Value,
+        image_rotary_cos: ir.Value,
+        image_rotary_sin: ir.Value,
+        text_rotary_cos: ir.Value,
+        text_rotary_sin: ir.Value,
+    ):
         batch = op.Shape(img_hidden, start=0, end=1)
 
         # Image stream QKV
@@ -222,42 +321,51 @@ class _QwenImageJointAttention(nn.Module):
         add_q = self.norm_added_q(op, add_q)
         add_k = self.norm_added_k(op, add_k)
 
-        # Concatenate image + text for joint attention
-        # [batch, img_seq + txt_seq, heads, head_dim]
-        q_cat = op.Concat(q, add_q, axis=1)
-        k_cat = op.Concat(k, add_k, axis=1)
-        v_cat = op.Concat(v, add_v, axis=1)
+        # Diffusers applies 3D RoPE independently to source/target image tokens
+        # and prompt tokens before concatenating the streams.
+        q = _apply_qwen_rotary(op, q, image_rotary_cos, image_rotary_sin)
+        k = _apply_qwen_rotary(op, k, image_rotary_cos, image_rotary_sin)
+        add_q = _apply_qwen_rotary(op, add_q, text_rotary_cos, text_rotary_sin)
+        add_k = _apply_qwen_rotary(op, add_k, text_rotary_cos, text_rotary_sin)
+
+        # Joint attention order is [text, image], matching QwenDoubleStreamAttnProcessor2_0.
+        # (B, text_seq + image_seq, heads, head_dim)
+        q_cat = op.Concat(add_q, q, axis=1)
+        k_cat = op.Concat(add_k, k, axis=1)
+        v_cat = op.Concat(add_v, v, axis=1)
 
         # Transpose to [batch, heads, seq, head_dim]
         q_cat = op.Transpose(q_cat, perm=[0, 2, 1, 3])
         k_cat = op.Transpose(k_cat, perm=[0, 2, 1, 3])
         v_cat = op.Transpose(v_cat, perm=[0, 2, 1, 3])
 
-        # Scaled dot-product attention
+        # Scaled dot-product attention.
         scale = float(self.head_dim**-0.5)
         attn_out = op.Attention(
             q_cat,
             k_cat,
             v_cat,
+            attention_bias,
             scale=scale,
             q_num_heads=self.num_heads,
             kv_num_heads=self.num_heads,
+            is_causal=0,
         )
 
         # [batch, heads, total_seq, head_dim] -> [batch, total_seq, heads, head_dim]
         attn_out = op.Transpose(attn_out, perm=[0, 2, 1, 3])
 
-        # Split back into image and text parts
-        img_seq_len = op.Shape(img_hidden, start=1, end=2)
-        img_attn = op.Slice(
-            attn_out,
-            op.Constant(value_ints=[0]),
-            img_seq_len,
-            op.Constant(value_ints=[1]),
-        )
+        # Split [text, image] back into the two streams.
+        txt_seq_len = op.Shape(txt_hidden, start=1, end=2)
         txt_attn = op.Slice(
             attn_out,
-            img_seq_len,
+            op.Constant(value_ints=[0]),
+            txt_seq_len,
+            op.Constant(value_ints=[1]),
+        )
+        img_attn = op.Slice(
+            attn_out,
+            txt_seq_len,
             op.Constant(value_ints=[INT64_MAX]),
             op.Constant(value_ints=[1]),
         )
@@ -300,7 +408,16 @@ class _QwenImageTransformerBlock(nn.Module):
         self.txt_mlp = _GeluApproxFFN(dim)
 
     def forward(
-        self, op: OpBuilder, img_hidden: ir.Value, txt_hidden: ir.Value, temb: ir.Value
+        self,
+        op: OpBuilder,
+        img_hidden: ir.Value,
+        txt_hidden: ir.Value,
+        temb: ir.Value,
+        attention_bias: ir.Value,
+        image_rotary_cos: ir.Value,
+        image_rotary_sin: ir.Value,
+        text_rotary_cos: ir.Value,
+        text_rotary_sin: ir.Value,
     ):
         one = 1.0
 
@@ -338,7 +455,16 @@ class _QwenImageTransformerBlock(nn.Module):
         )
 
         # Joint attention
-        img_attn, txt_attn = self.attn(op, img_modulated, txt_modulated)
+        img_attn, txt_attn = self.attn(
+            op,
+            img_modulated,
+            txt_modulated,
+            attention_bias,
+            image_rotary_cos,
+            image_rotary_sin,
+            text_rotary_cos,
+            text_rotary_sin,
+        )
 
         # Residual + gate
         img_hidden = op.Add(img_hidden, op.Mul(op.Unsqueeze(img_gate1, [1]), img_attn))
@@ -389,7 +515,7 @@ class QwenImageTransformer2DModel(nn.Module):
         self.img_in = _Linear(config.in_channels, hidden_size)
         self.txt_norm = _RMSNorm(config.joint_attention_dim, eps=config.norm_eps)
         self.txt_in = _Linear(config.joint_attention_dim, hidden_size)
-        self.time_text_embed = _TimestepEmbedding(hidden_size, hidden_size)
+        self.time_text_embed = _TimestepEmbedding(256, hidden_size)
 
         self.transformer_blocks = nn.ModuleList()
         for _ in range(config.num_layers):
@@ -414,33 +540,70 @@ class QwenImageTransformer2DModel(nn.Module):
         sample: ir.Value,
         timestep: ir.Value,
         encoder_hidden_states: ir.Value,
+        encoder_hidden_states_mask: ir.Value,
+        image_rotary_cos: ir.Value,
+        image_rotary_sin: ir.Value,
+        text_rotary_cos: ir.Value,
+        text_rotary_sin: ir.Value,
     ):
         config = self.config
-        hidden_size = config.num_attention_heads * config.attention_head_dim
 
-        # Patch embed: [batch, channels, H, W] → [batch, num_patches, hidden_size]
+        # Packed latent projection: (batch, image_tokens, in_channels) -> hidden size.
         hidden_states = self.img_in(op, sample)
 
         # Text: RMSNorm → Linear
         txt = self.txt_norm(op, encoder_hidden_states)
         txt = self.txt_in(op, txt)
 
+        # Hoist the shared text-padding bias out of the 60 transformer blocks.
+        batch = op.Shape(sample, start=0, end=1)
+        image_sequence_length = op.Shape(sample, start=1, end=2)
+        image_mask = op.Expand(
+            op.Cast(op.Constant(value_int=1), to=ir.DataType.BOOL),
+            op.Concat(batch, image_sequence_length, axis=0),
+        )
+        joint_mask = op.Concat(encoder_hidden_states_mask, image_mask, axis=1)
+        total_sequence_length = op.Shape(joint_mask, start=1, end=2)
+        attention_bias = op.Expand(
+            op.Unsqueeze(op.Where(joint_mask, 0.0, -10000.0), [1, 2]),
+            op.Concat(
+                batch,
+                op.Constant(value_ints=[1]),
+                total_sequence_length,
+                total_sequence_length,
+                axis=0,
+            ),
+        )
+        attention_bias = op.CastLike(attention_bias, hidden_states)
+
         # Timestep embedding
-        t_emb = self._get_timestep_embedding(op, timestep, hidden_size)
+        t_emb = self._get_timestep_embedding(op, timestep)
         temb = self.time_text_embed(op, t_emb)
 
         # Double-stream transformer blocks
         for block in self.transformer_blocks:
-            hidden_states, txt = block(op, hidden_states, txt, temb)
+            hidden_states, txt = block(
+                op,
+                hidden_states,
+                txt,
+                temb,
+                attention_bias,
+                image_rotary_cos,
+                image_rotary_sin,
+                text_rotary_cos,
+                text_rotary_sin,
+            )
 
         # Output: AdaLN + projection
         hidden_states = self.norm_out(op, hidden_states, temb)
         output = self.proj_out(op, hidden_states)
 
+        if config.dtype == ir.DataType.FLOAT16:
+            output = op.Clip(output, -65504.0, 65504.0)
         return output
 
-    def _get_timestep_embedding(self, op: OpBuilder, timestep, dim):
-        """Compute sinusoidal timestep embedding."""
+    def _get_timestep_embedding(self, op: OpBuilder, timestep):
+        """Compute the fixed 256-wide Qwen sinusoidal timestep embedding."""
         half_dim = 256 // 2
         exponent = -math.log(10000.0) / half_dim
         freqs = np.exp(np.arange(half_dim) * exponent).astype(np.float32)
@@ -449,7 +612,8 @@ class QwenImageTransformer2DModel(nn.Module):
         t = op.Mul(t, 1000.0)
         t = op.Unsqueeze(t, [1])
         args = op.Mul(t, op.Unsqueeze(freq_const, [0]))
-        return op.Concat(op.Sin(args), op.Cos(args), axis=-1)
+        embedding = op.Concat(op.Cos(args), op.Sin(args), axis=-1)
+        return op.CastLike(embedding, timestep)
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
