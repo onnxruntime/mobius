@@ -188,7 +188,7 @@ Available features:
 | `fp8-kv-cache` | Store the `GroupQueryAttention` KV cache as `FLOAT8E4M3FN` (per-tensor E4M3), halving KV-cache memory. Requires a GQA build (e.g. `--ep cuda --dtype f16`) and an ORT runtime with the FP8 KV-cache kernel (SM89+). Pair with `--kv-cache-scale-file` for calibrated scales. |
 | `prune-lm-head` | Select the final hidden-state position before the LM-head projection and emit logits shaped `[B, 1, vocab]`. Supported by models using the base `CausalLMModel.forward()` path; unsupported custom forwards fail explicitly. Use only when the downstream workflow does not need per-token logits. |
 | `text-only` | Export the text backbone of a multimodal checkpoint as a standalone decoder-only LLM (see below). |
-| `world-model` | Export every registered neural subsystem as one validated compositional pipeline with `pipeline.json`. Cannot combine with `--task`, `--component`, decoder-only features, or runtime-specific config emission. |
+| `world-model` | Export a supported world-model package containing ONNX components and `pipeline.json`. |
 
 The legacy boolean flags `--static-cache`, `--fp8-kv-cache`, and
 `--text-only` have been removed in favor of `--features`.
@@ -204,6 +204,9 @@ mobius build --model meta-llama/Llama-3.2-1B output/ \
     --features prune-lm-head
 
 mobius build --model nvidia/Cosmos3-Nano output/cosmos3/ \
+    --features world-model
+
+mobius build --model nvidia/Cosmos3-Edge output/cosmos3-edge/ \
     --features world-model
 ```
 
