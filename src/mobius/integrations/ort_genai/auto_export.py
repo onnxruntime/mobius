@@ -93,6 +93,10 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "qwen3_vl_text": "qwen3_vl",
     "qwen3_5": "qwen2_5_vl",
     "qwen3_5_vl": "qwen2_5_vl",
+    # MiniCPM uses standard 1D decoder position IDs (unlike Qwen-VL MRoPE).
+    # The phi3v multimodal runtime provides that contract; callers supply
+    # HF-preprocessed packed pixels through Generator.set_inputs().
+    "minicpmv4_6": "phi3v",
 }
 
 _GEMMA4_MODEL_TYPES = frozenset(
@@ -107,6 +111,7 @@ _GEMMA4_MODEL_TYPES = frozenset(
 # must preprocess with the HuggingFace processor and feed tensors via
 # ``Generator.set_inputs`` (see examples/gemma4_unified_ort_genai.py).
 _GEMMA4_UNIFIED_MODEL_TYPES = frozenset({"gemma4_unified", "gemma4_unified_text"})
+_MINICPM_MODEL_TYPES = frozenset({"minicpmv4_6"})
 # gemma-3 multimodal. build() unwraps the composite HF config to its text
 # sub-config, so at export time ``config.model_type`` is "gemma3_text" (not
 # "gemma3").
@@ -134,6 +139,9 @@ _TOKENIZER_FILES = [
     "merges.txt",  # BPE
     "vocab.json",  # BPE
     "chat_template.jinja",  # Chat template for ORT GenAI
+    # Preserve HuggingFace processor metadata for VLMs whose preprocessing
+    # cannot be represented by an ort-extensions image_processor.json.
+    "preprocessor_config.json",
 ]
 
 
@@ -460,6 +468,17 @@ def _write_vision_processor_config(
         logger.info(
             "Skipping image_processor.json for encoder-free %s "
             "(no native ort-extensions transform; use HF processor + set_inputs)",
+            model_type,
+        )
+        return None
+    if model_type in _MINICPM_MODEL_TYPES:
+        # MiniCPM needs adaptive slicing and NaViT horizontal patch packing.
+        # ort-extensions has no equivalent transform, so preserving the HF
+        # processor output and injecting it through set_inputs is the only
+        # numerically faithful runtime path.
+        logger.info(
+            "Skipping image_processor.json for %s "
+            "(use MiniCPMV4_6Processor + Generator.set_inputs)",
             model_type,
         )
         return None
@@ -848,16 +867,26 @@ def _write_genai_config(
         if image_token_id is not None:
             vision_input_mapping = _introspect_inputs(pkg, "vision_encoder")
             embedding_input_mapping = _introspect_inputs(pkg, "embedding")
+            if (
+                model_type := getattr(config, "model_type", "")
+            ) in _MINICPM_MODEL_TYPES and vision_input_mapping is not None:
+                # ORT GenAI's VisionInputs schema only accepts its predefined
+                # semantic keys. ``target_sizes`` remains an ONNX graph input
+                # and is supplied as a named tensor through set_inputs().
+                vision_input_mapping.pop("target_sizes", None)
 
             # spatial_merge_size and config_filename are config-level
             # properties that cannot be inferred from the graph.
             vision_kwargs: dict[str, Any] = {}
-            model_type = getattr(config, "model_type", "")
             if model_type in _GEMMA4_MODEL_TYPES:
                 vision_cfg = getattr(config, "vision", None)
                 vision_kwargs["spatial_merge_size"] = getattr(
                     vision_cfg, "spatial_merge_size", 2
                 )
+            elif model_type in _MINICPM_MODEL_TYPES:
+                # MiniCPM performs both 2x2 merges inside the ONNX vision
+                # graph and consumes HF-prepacked pixels, not Qwen grid_thw.
+                vision_kwargs["spatial_merge_size"] = None
             elif has_speech:
                 vision_kwargs["spatial_merge_size"] = None
             elif (

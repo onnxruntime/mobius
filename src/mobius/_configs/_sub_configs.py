@@ -82,6 +82,11 @@ class VisionConfig:
     # (HuggingFace convention, e.g. -2 for Phi-3.5-Vision). ``None`` means use
     # the final hidden state (all layers + post_layernorm).
     feature_layer: int | None = None
+    # MiniCPM-V packed-NaViT vision encoder and its two spatial mergers.
+    insert_layer_id: int | None = None
+    window_kernel_size: tuple[int, int] = (2, 2)
+    merge_kernel_size: tuple[int, int] = (2, 2)
+    merger_times: int = 1
 
 
 @dataclasses.dataclass

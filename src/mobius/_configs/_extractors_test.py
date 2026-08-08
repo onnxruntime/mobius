@@ -343,3 +343,35 @@ def test_hunyuan_vl_mot_image_token_id_survives_default_hook(loaded_vision_hooks
     out = _extractors.extract_vision_config(cfg, None, "hunyuan_vl_mot")
     assert out["vision"].image_token_id == 12
     assert out.get("image_token_id") == 12
+
+
+def test_minicpm_vision_defaults_explicit_none_kernels(loaded_vision_hooks):
+    """Explicit None merger kernels fall back to MiniCPM's 2x2 defaults."""
+    vision_config = _FakeHFConfig(
+        model_type="minicpmv4_6_vision",
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        image_size=56,
+        patch_size=14,
+        layer_norm_eps=1e-6,
+        num_channels=3,
+        window_kernel_size=None,
+    )
+    parent_config = _FakeHFConfig(
+        model_type="minicpmv4_6",
+        vision_config=vision_config,
+        image_token_id=250,
+        merge_kernel_size=None,
+    )
+    text_config = _FakeHFConfig(model_type="qwen3_5_text")
+
+    out = _extractors.extract_vision_config(
+        text_config,
+        parent_config,
+        "qwen3_5_text",
+    )
+
+    assert out["vision"].window_kernel_size == (2, 2)
+    assert out["vision"].merge_kernel_size == (2, 2)

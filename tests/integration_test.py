@@ -68,6 +68,75 @@ def _model_accessible(model_id: str) -> bool:
         return True
 
 
+@pytest.mark.integration
+def test_minicpmv4_6_real_weight_vision_parity():
+    """Real nonzero pixels match through SigLIP2 and both visual mergers."""
+    import gc
+
+    from transformers import AutoModelForImageTextToText, AutoProcessor
+
+    model_id = "openbmb/MiniCPM-V-4.6"
+    processor = AutoProcessor.from_pretrained(model_id)
+    image = Image.open("testdata/pipeline-cat-chonk.jpeg").convert("RGB")
+    # A square source triggers the default overview + slice path with
+    # non-uniform patch grids (e.g. 32x32 overview and 40x24 slices).
+    image = image.resize((1024, 1024))
+    prompt = processor.apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": "testdata/pipeline-cat-chonk.jpeg"},
+                    {"type": "text", "text": "Describe this image in detail."},
+                ],
+            }
+        ],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    inputs = processor(
+        text=prompt,
+        images=[image],
+        return_tensors="pt",
+    )
+
+    hf_model = AutoModelForImageTextToText.from_pretrained(
+        model_id,
+        dtype=torch.float32,
+    ).eval()
+    expected_parts = []
+    start = 0
+    with torch.no_grad():
+        for size in inputs["target_sizes"]:
+            num_patches = int(size.prod())
+            end = start + num_patches * 14
+            unit_pixels = inputs["pixel_values"][:, :, :, start:end]
+            expected_parts.extend(
+                hf_model.get_image_features(
+                    unit_pixels,
+                    size.unsqueeze(0),
+                ).pooler_output
+            )
+            start = end
+    expected = torch.cat(expected_parts, dim=0).numpy()
+    del hf_model
+    gc.collect()
+
+    package = build(model_id, dtype="float32", load_weights=True)
+    session = _make_session(package["vision_encoder"])
+    actual = session.run(
+        {
+            "pixel_values": inputs["pixel_values"].numpy(),
+            "target_sizes": inputs["target_sizes"].numpy(),
+        }
+    )["image_features"]
+    session.close()
+
+    assert float(np.linalg.norm(inputs["pixel_values"].numpy())) > 0.0
+    assert np.unique(inputs["target_sizes"].numpy(), axis=0).shape[0] > 1
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-3)
+
+
 # ---------------------------------------------------------------------------
 # Model catalogue: small models for each supported architecture
 #
