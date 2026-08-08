@@ -332,6 +332,36 @@ def test_dispatch_speech_to_text_pipeline(tmp_path):
     ]
 
 
+def test_dispatch_speech_to_text_routes_encoder_mask(tmp_path):
+    pkg = _EncoderDecoderPkg(
+        {
+            "encoder": _FakeModel(
+                ["input_values", "attention_mask"],
+                ["encoder_hidden_states", "encoder_attention_mask"],
+            ),
+            "decoder": _FakeModel(
+                [
+                    "decoder_input_ids",
+                    "encoder_hidden_states",
+                    "encoder_attention_mask",
+                ],
+                ["logits"],
+            ),
+        }
+    )
+    artifacts = write_onnx_genai_config(pkg, str(tmp_path))
+
+    with open(artifacts["inference_metadata"]) as handle:
+        metadata = yaml.safe_load(handle)
+
+    assert metadata["pipeline"]["dataflow"][1] == {
+        "from": "encoder.encoder_attention_mask",
+        "to": "decoder.encoder_attention_mask",
+        "dtype": "int64",
+        "device_transfer": False,
+    }
+
+
 def test_dispatch_audio_codec_pipeline(tmp_path):
     # A neural codec: encoder outputs codes consumed by a single-pass decoder,
     # with no cross-attention. It is a pure tensor pipeline (no decoder config).

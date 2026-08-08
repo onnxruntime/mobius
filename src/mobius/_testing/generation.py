@@ -341,6 +341,7 @@ class OnnxSpeechToTextGenerator:
     def generate(
         self,
         encoder_hidden_states: np.ndarray,
+        encoder_attention_mask: np.ndarray | None = None,
         max_new_tokens: int = 50,
         eos_token_id: int | None = None,
         decoder_start_token_id: int = 0,
@@ -349,6 +350,7 @@ class OnnxSpeechToTextGenerator:
 
         Args:
             encoder_hidden_states: [batch, enc_seq_len, hidden] float32.
+            encoder_attention_mask: Optional [batch, enc_seq_len] encoder padding mask.
             max_new_tokens: Maximum tokens to generate.
             eos_token_id: Stop token.
             decoder_start_token_id: Token to seed the decoder (e.g. 50258).
@@ -394,6 +396,15 @@ class OnnxSpeechToTextGenerator:
                     dec_feeds[name] = cur_dec_ids
                 elif name == "position_ids":
                     dec_feeds[name] = position_ids
+                elif name == "encoder_attention_mask":
+                    dec_feeds[name] = (
+                        encoder_attention_mask
+                        if encoder_attention_mask is not None
+                        else np.ones(
+                            (batch_size, encoder_hidden_states.shape[1]),
+                            dtype=np.int64,
+                        )
+                    )
 
             outputs = self.dec_session.run(dec_feeds)
 

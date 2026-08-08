@@ -32,6 +32,7 @@ from _test_configs import (
     DETECTION_CONFIGS,
     ENCODER_CONFIGS,
     SEQ2SEQ_CONFIGS,
+    SPEECH_CONFIGS,
     VISION_CONFIGS,
     VL_CONFIGS,
     _base_config,
@@ -199,6 +200,20 @@ _SEQ2SEQ_PARAMS = _mark_xfail_if_filtering_set(SEQ2SEQ_CONFIGS, _FILTERING_SEQ2S
 @pytest.mark.parametrize("model_type,config_overrides", _SEQ2SEQ_PARAMS)
 class TestSeq2SeqWeightAlignment:
     """Verify preprocess_weights() preserves all parameter names for seq2seq models."""
+
+    def test_identity_state_dict_roundtrip(self, model_type: str, config_overrides: dict):
+        _assert_identity_roundtrip(model_type, config_overrides)
+
+
+# ---------------------------------------------------------------------------
+# Speech encoder-decoder weight alignment
+# ---------------------------------------------------------------------------
+_SPEECH_PARAMS = _mark_xfail_if_filtering(SPEECH_CONFIGS)
+
+
+@pytest.mark.parametrize("model_type,config_overrides", _SPEECH_PARAMS)
+class TestSpeechWeightAlignment:
+    """Verify speech encoder-decoder preprocessors preserve aligned parameters."""
 
     def test_identity_state_dict_roundtrip(self, model_type: str, config_overrides: dict):
         _assert_identity_roundtrip(model_type, config_overrides)
