@@ -2773,7 +2773,7 @@ class TestBuildGraphMultiModal:
 class TestBuildGraphWhisper:
     """Verify Whisper encoder-decoder builds with SpeechToTextTask."""
 
-    def _whisper_config(self):
+    def _whisper_config(self, *, num_mel_bins=16):
         from mobius._configs import WhisperConfig
 
         return WhisperConfig(
@@ -2792,7 +2792,7 @@ class TestBuildGraphWhisper:
             encoder_layers=TINY_LAYERS,
             encoder_attention_heads=TINY_HEADS,
             encoder_ffn_dim=TINY_INTERMEDIATE,
-            num_mel_bins=16,
+            num_mel_bins=num_mel_bins,
             max_source_positions=100,
             max_target_positions=50,
             scale_embedding=True,
@@ -2827,6 +2827,22 @@ class TestBuildGraphWhisper:
         output_names = {out.name for out in encoder.graph.outputs}
         assert "input_features" in input_names
         assert "encoder_hidden_states" in output_names
+
+    def test_whisper_128_mel_encoder_input_shape(self):
+        """Whisper large-v3/turbo graphs use their configured 128 mel channels."""
+        from mobius._builder import build_from_module
+        from mobius.models.whisper import WhisperForConditionalGeneration
+        from mobius.tasks import SpeechToTextTask
+
+        config = self._whisper_config(num_mel_bins=128)
+        module = WhisperForConditionalGeneration(config)
+        encoder = build_from_module(module, config, task=SpeechToTextTask())["encoder"]
+        input_features = next(
+            value for value in encoder.graph.inputs if value.name == "input_features"
+        )
+
+        assert config.encoder_input_channels == 128
+        assert input_features.shape[1] == 128
 
     def test_whisper_decoder_io(self):
         """Verify decoder inputs/outputs including KV cache."""
