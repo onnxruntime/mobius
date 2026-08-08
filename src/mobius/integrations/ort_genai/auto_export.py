@@ -819,6 +819,47 @@ def _write_audio_processor_config(
             }
         }
         proc_filename = "audio_feature_extraction.json"
+    elif model_type in _GEMMA3N_MODEL_TYPES:
+        # Gemma3n reuses gemma4's Gemma4LogMel op, but NOT its attribute values:
+        # Gemma3nAudioFeatureExtractor is a different filterbank. Values below are
+        # from the E4B preprocessor_config.json; the ones that differ from the
+        # gemma4 branch above are marked.
+        #
+        # frame_length/hop_length are given in samples upstream (512/160 @ 16 kHz)
+        # and converted to the milliseconds this op takes: 512/16000 = 32 ms,
+        # 160/16000 = 10 ms. fft_length 1024 is implied by fft_overdrive (the next
+        # power of two above frame_length, doubled) and has no separate attribute.
+        processor = {
+            "feature_extraction": {
+                "sequence": [
+                    {
+                        "operation": {
+                            "name": "audio_decoder",
+                            "type": "AudioDecoder",
+                        }
+                    },
+                    {
+                        "operation": {
+                            "name": "gemma3n_log_mel",
+                            "type": "Gemma4LogMel",
+                            "attrs": {
+                                "feature_size": 128,
+                                "sampling_rate": 16000,
+                                "frame_length_ms": 32.0,  # differs (gemma4: 20.0)
+                                "hop_length_ms": 10.0,
+                                "min_frequency": 125.0,  # differs (gemma4: 0.0)
+                                "max_frequency": 7600.0,  # differs (gemma4: 8000.0)
+                                "preemphasis": 0.97,  # differs (gemma4: 0.0)
+                                "preemphasis_htk_flavor": 1,
+                                "fft_overdrive": 1,  # differs (gemma4: 0)
+                                "mel_floor": 1e-05,  # differs (gemma4: 0.001)
+                            },
+                        }
+                    },
+                ]
+            }
+        }
+        proc_filename = "audio_feature_extraction.json"
     else:
         # Generic audio processor — add model-specific branches as needed.
         return None
@@ -913,6 +954,13 @@ def _write_genai_config(
                 )
             elif has_speech:
                 vision_kwargs["spatial_merge_size"] = None
+                # Gemma3n shares gemma3's fixed-resize branch in
+                # _write_vision_processor_config, which writes
+                # processor_config.json. Without this, with_vision's
+                # "image_processor.json" default would be referenced instead —
+                # a filename only the gemma4 branch above ever writes.
+                if model_type in _GEMMA3N_MODEL_TYPES:
+                    vision_kwargs["config_filename"] = "processor_config.json"
             elif (
                 model_type in _PIXTRAL_MODEL_TYPES
                 or getattr(getattr(config, "vision", None), "model_type", None) == "pixtral"
@@ -967,8 +1015,28 @@ def _write_genai_config(
                 "audio_embeds": "input_features",
                 "attention_mask": "input_features_mask",
             }
-        elif audio_input_mapping is not None:
-            audio_kwargs["input_names"] = audio_input_mapping
+        elif model_type in _GEMMA3N_MODEL_TYPES:
+            # Same USM log-mel contract as gemma4 (and the same writer), so it
+            # names the same file. The reference must be present: ORT-GenAI
+            # rejects a speech section that sets ``filename`` without
+            # ``config_filename`` ("Both are required for audio support"),
+            # so omitting it would turn a missing-file error into a
+            # load-time throw.
+            audio_kwargs["config_filename"] = "audio_feature_extraction.json"
+            # Same two graph inputs as gemma4, so the same schema mapping. This
+            # must not come from _introspect_inputs: unlike the decoder and
+            # vision sections, ``model.speech.inputs`` keys are a *closed set*
+            # the runtime defines (audio_embeds / attention_mask / audio_sizes /
+            # audio_projection_mode), not graph input names. An identity map is
+            # rejected outright with 'model:speech:inputs: Unknown value
+            # "input_features"'.
+            audio_kwargs["input_names"] = {
+                "audio_embeds": "input_features",
+                "attention_mask": "input_features_mask",
+            }
+        else:
+            if audio_input_mapping is not None:
+                audio_kwargs["input_names"] = audio_input_mapping
         generator.with_audio(
             audio_token_id=audio_token_id,
             boa_token_id=boa_token_id,

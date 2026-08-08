@@ -371,7 +371,13 @@ class GenaiConfigGenerator:
             audio_token_id: Token ID for audio placeholders.
             boa_token_id: Beginning-of-audio token ID.
             filename: Audio ONNX model filename.
-            config_filename: Audio processor config filename.
+            config_filename: Audio processor config filename. Must name a file
+                that is actually written: ORT-GenAI loads it through
+                ``OrtxCreateSpeechFeatureExtractor``, and rejects a speech
+                section that sets ``filename`` without ``config_filename``.
+                Note this is a *separate* file from the vision
+                ``config_filename`` — the two are parsed by different APIs with
+                different schemas and cannot be merged.
             input_names: Override audio model input name mapping.
                 Defaults to audio_embeds + audio_sizes +
                 audio_projection_mode.
