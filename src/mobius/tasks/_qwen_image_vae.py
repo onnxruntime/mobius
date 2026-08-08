@@ -79,11 +79,23 @@ class QwenImageVAETask(ModelTask):
 class QwenImageEditVAETask(QwenImageVAETask):
     """Build VAE graphs with Qwen Image Edit latent normalization embedded."""
 
+    @staticmethod
+    def _validate_latent_statistics(config: QwenImageVAEConfig) -> None:
+        for name, values in (
+            ("latents_mean", config.latents_mean),
+            ("latents_std", config.latents_std),
+        ):
+            if values is None:
+                raise ValueError(f"Qwen Image Edit VAE config requires {name}")
+            if len(values) != config.z_dim:
+                raise ValueError(
+                    f"Qwen Image Edit VAE {name} must contain {config.z_dim} values, "
+                    f"but received {len(values)}"
+                )
+
     def _build_encoder_graph(self, module, config: QwenImageVAEConfig) -> ir.Model:
-        if config.latents_mean is None or config.latents_std is None:
-            raise ValueError(
-                "Qwen Image Edit VAE config requires latents_mean and latents_std"
-            )
+        self._validate_latent_statistics(config)
+        assert config.latents_mean is not None and config.latents_std is not None
         graph, builder = _make_graph(name="vae_encoder")
         sample = builder.input(
             "sample", dtype=config.dtype, shape=["batch", 3, "frames", "height", "width"]
@@ -105,10 +117,8 @@ class QwenImageEditVAETask(QwenImageVAETask):
         return _make_model(graph)
 
     def _build_decoder_graph(self, module, config: QwenImageVAEConfig) -> ir.Model:
-        if config.latents_mean is None or config.latents_std is None:
-            raise ValueError(
-                "Qwen Image Edit VAE config requires latents_mean and latents_std"
-            )
+        self._validate_latent_statistics(config)
+        assert config.latents_mean is not None and config.latents_std is not None
         graph, builder = _make_graph(name="vae_decoder")
         latent_sample = builder.input(
             "latent_sample",

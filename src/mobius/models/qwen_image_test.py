@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -151,6 +152,24 @@ def test_vae_weight_names_match_diffusers():
     assert {name for name, _ in module.named_parameters()} == set(hf_vae.state_dict())
 
 
+def test_edit_vae_rejects_wrong_latent_statistics_length():
+    from mobius._diffusers_configs import QwenImageVAEConfig
+    from mobius.models.qwen_image_vae import AutoencoderKLQwenImageModel
+    from mobius.tasks import QwenImageEditVAETask
+
+    config = QwenImageVAEConfig(
+        base_dim=8,
+        z_dim=4,
+        dim_mult=(1, 2),
+        num_res_blocks=1,
+        temperal_downsample=(False,),
+        latents_mean=(0.0, 0.0, 0.0),
+        latents_std=(1.0, 1.0, 1.0, 1.0),
+    )
+    with pytest.raises(ValueError, match="latents_mean must contain 4 values"):
+        QwenImageEditVAETask().build(AutoencoderKLQwenImageModel(config), config)
+
+
 @pytest.mark.integration
 @pytest.mark.integration_fast
 def test_transformer_matches_diffusers_with_source_image_and_mask():
@@ -168,7 +187,7 @@ def test_transformer_matches_diffusers_with_source_image_and_mask():
         ).sample[:, :4]
 
     with tempfile.TemporaryDirectory() as directory:
-        path = f"{directory}\\model.onnx"
+        path = os.path.join(directory, "model.onnx")
         ir.save(model, path)
         actual = ort.InferenceSession(path, providers=["CPUExecutionProvider"]).run(
             None, feeds
@@ -184,12 +203,14 @@ def test_cuda_matches_cpu():
     ort.preload_dlls()
     _, model, feeds, _ = _create_model_and_feeds()
     with tempfile.TemporaryDirectory() as directory:
-        path = f"{directory}\\model.onnx"
+        path = os.path.join(directory, "model.onnx")
         ir.save(model, path)
-        cpu = ort.InferenceSession(path, providers=["CPUExecutionProvider"]).run(None, feeds)[0]
+        cpu = ort.InferenceSession(path, providers=["CPUExecutionProvider"]).run(None, feeds)[
+            0
+        ]
         options = ort.SessionOptions()
         options.enable_profiling = True
-        options.profile_file_prefix = f"{directory}\\cuda_profile"
+        options.profile_file_prefix = os.path.join(directory, "cuda_profile")
         session = ort.InferenceSession(
             path, sess_options=options, providers=["CUDAExecutionProvider"]
         )
@@ -214,7 +235,9 @@ def test_cuda_matches_cpu():
 )
 def test_all_supported_dtypes_build(dtype: ir.DataType):
     config = _tiny_config(dtype)
-    model = QwenImageDenoisingTask().build(QwenImageTransformer2DModel(config), config)["model"]
+    model = QwenImageDenoisingTask().build(QwenImageTransformer2DModel(config), config)[
+        "model"
+    ]
     assert model.graph.inputs[0].dtype == dtype
     assert not any(node.op_type == "Identity" for node in model.graph)
 
@@ -264,7 +287,9 @@ def test_edit_vae_matches_diffusers_on_real_source_image():
     pixels = pixels[None, :, None, :, :]
     with torch.no_grad():
         moments = hf_vae._encode(torch.from_numpy(pixels))
-        expected_latents = (moments.chunk(2, dim=1)[0] - torch.tensor(means)[None, :, None, None, None])
+        expected_latents = (
+            moments.chunk(2, dim=1)[0] - torch.tensor(means)[None, :, None, None, None]
+        )
         expected_latents = expected_latents / torch.tensor(stds)[None, :, None, None, None]
         denormalized = (
             expected_latents * torch.tensor(stds)[None, :, None, None, None]
@@ -273,8 +298,8 @@ def test_edit_vae_matches_diffusers_on_real_source_image():
         expected_image = hf_vae.decode(denormalized).sample.numpy()
 
     with tempfile.TemporaryDirectory() as directory:
-        encoder_path = f"{directory}\\encoder.onnx"
-        decoder_path = f"{directory}\\decoder.onnx"
+        encoder_path = os.path.join(directory, "encoder.onnx")
+        decoder_path = os.path.join(directory, "decoder.onnx")
         ir.save(package["encoder"], encoder_path)
         ir.save(package["decoder"], decoder_path)
         actual_latents = ort.InferenceSession(
@@ -368,7 +393,7 @@ def test_deterministic_l4_l5_image_edit_golden():
     scheduler.set_timesteps(steps, sigmas=sigmas, mu=mu)
 
     with tempfile.TemporaryDirectory() as directory:
-        path = f"{directory}\\model.onnx"
+        path = os.path.join(directory, "model.onnx")
         ir.save(model, path)
         session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
         first_noise = None
@@ -414,7 +439,10 @@ def test_cuda_low_precision_matches_diffusers(dtype, torch_dtype, numpy_dtype):
     ort = pytest.importorskip("onnxruntime")
     torch = pytest.importorskip("torch")
     diffusers = pytest.importorskip("diffusers")
-    if not torch.cuda.is_available() or "CUDAExecutionProvider" not in ort.get_available_providers():
+    if (
+        not torch.cuda.is_available()
+        or "CUDAExecutionProvider" not in ort.get_available_providers()
+    ):
         pytest.skip("CUDA is not available")
 
     from mobius import build_from_module
@@ -450,7 +478,9 @@ def test_cuda_low_precision_matches_diffusers(dtype, torch_dtype, numpy_dtype):
         task="qwen-image-denoising",
         execution_provider="cuda",
     )["model"]
-    weights = {name: value.to(torch_type).cpu() for name, value in hf_model.state_dict().items()}
+    weights = {
+        name: value.to(torch_type).cpu() for name, value in hf_model.state_dict().items()
+    }
     apply_weights(model, module.preprocess_weights(weights))
 
     generator = torch.Generator().manual_seed(29)
@@ -460,13 +490,19 @@ def test_cuda_low_precision_matches_diffusers(dtype, torch_dtype, numpy_dtype):
     timestep = torch.tensor([0.5])
     image_shapes = [(1, 2, 2), (1, 2, 2)]
     with torch.no_grad():
-        expected = hf_model(
-            hidden_states=sample.to(device="cuda", dtype=torch_type),
-            timestep=timestep.to(device="cuda", dtype=torch_type),
-            encoder_hidden_states=prompt_embeds.to(device="cuda", dtype=torch_type),
-            encoder_hidden_states_mask=prompt_mask.to("cuda"),
-            img_shapes=[image_shapes],
-        ).sample[:, :4].float().cpu().numpy()
+        expected = (
+            hf_model(
+                hidden_states=sample.to(device="cuda", dtype=torch_type),
+                timestep=timestep.to(device="cuda", dtype=torch_type),
+                encoder_hidden_states=prompt_embeds.to(device="cuda", dtype=torch_type),
+                encoder_hidden_states_mask=prompt_mask.to("cuda"),
+                img_shapes=[image_shapes],
+            )
+            .sample[:, :4]
+            .float()
+            .cpu()
+            .numpy()
+        )
     image_cos, image_sin, text_cos, text_sin = prepare_qwen_image_rotary_embeddings(
         image_shapes, 3, (2, 2, 4)
     )
@@ -483,7 +519,7 @@ def test_cuda_low_precision_matches_diffusers(dtype, torch_dtype, numpy_dtype):
     }
 
     with tempfile.TemporaryDirectory() as directory:
-        path = f"{directory}\\model.onnx"
+        path = os.path.join(directory, "model.onnx")
         ir.save(model, path)
         session = ort.InferenceSession(path, providers=["CUDAExecutionProvider"])
         if session.get_providers()[0] != "CUDAExecutionProvider":
