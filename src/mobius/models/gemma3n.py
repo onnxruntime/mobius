@@ -105,14 +105,24 @@ class Gemma3nAttention(Attention):
 
     Extends the base Attention by adding a parameterless V normalization
     (``v_norm`` with ``with_scale=False`` in HF) applied after ``v_proj``.
-    Q and K use standard OffsetRMSNorm from the parent; V is divided by its
-    per-head RMS without any learnable scale parameter.
+    Q and K use the parent's per-head ``q_norm``/``k_norm``, built from
+    :class:`RMSNorm` rather than ``OffsetRMSNorm`` because ``Gemma3nRMSNorm``
+    scales by the gain directly with no ``1 + w`` offset.  Those two norms are
+    load-bearing: HF hardcodes ``scaling = 1.0`` instead of ``head_dim**-0.5``
+    precisely because they leave Q and K at unit RMS, so dropping them leaves
+    the attention logits scaled by ``|q||k|`` and drives softmax to a near
+    one-hot argmax.  They are enabled by ``config.attn_qk_norm``, which
+    ``ArchitectureConfig.from_transformers`` keys off the model type.
 
     Layers at or after ``first_kv_shared_layer_idx`` are *KV-shared*: they
     borrow the already-RoPE'd K,V of the last non-shared layer of the same
     attention type instead of running their own ``k_proj``/``v_proj``.  Such
     layers own no KV cache entry and hold no K/V weights — matching HF
-    ``Gemma3nTextAttention``, which does not even construct them.
+    ``Gemma3nTextAttention``, which does not even construct them.  Because the
+    borrowed K,V already span past + current, they are passed whole and the
+    layer supplies no ``past_key``/``past_value``; those layers therefore emit
+    ``is_causal=0`` and lean on the explicit causal ``attn_mask`` (see
+    :meth:`forward`).
 
     Args:
         config: Gemma3n configuration.
@@ -255,6 +265,12 @@ class Gemma3nAttention(Attention):
             past_key = past_key_value[0] if past_key_value is not None else None
             past_value = past_key_value[1] if past_key_value is not None else None
 
+        if self.is_kv_shared_layer and attention_bias is None:
+            raise ValueError(
+                f"layer {self.layer_idx} is KV-shared and therefore relies on an "
+                "explicit causal attn_mask, but attention_bias is None"
+            )
+
         attn_output, present_key, present_value = _apply_attention(
             op,
             query_states,
@@ -267,6 +283,21 @@ class Gemma3nAttention(Attention):
             num_key_value_heads=self.num_key_value_heads,
             scale=self.scaling,
             static_cache=static_cache,
+            # KV-shared layers hand K,V over WHOLE (past + current) with no
+            # past_key/past_value, so at decode q_len=1 while kv_len=total.
+            # The opset-24 spec aligns the built-in causal mask UPPER-LEFT --
+            # "the attention masking has the form of the upper left causal bias
+            # due to the alignment" -- which pins that lone query to key 0 and
+            # collapses the layer to the BOS token.  ORT <= 1.27 aligned it
+            # bottom-right (non-conforming) and hid this; 1.28 conforms and the
+            # decode output degenerates.  ``attention_bias`` from
+            # ``create_attention_bias`` already bakes causal + sliding + padding
+            # keyed on absolute cumsum positions, so it carries causality on its
+            # own at any q_len/kv_len ratio.  Non-shared layers keep is_causal=1:
+            # they pass past_key/past_value, which takes the op's cache path
+            # (bottom-right aligned in every ORT version), and at prefill
+            # q_len == kv_len makes the two alignments identical.
+            is_causal=0 if self.is_kv_shared_layer else 1,
         )
 
         # Source layers publish their K,V for the downstream shared layers.
