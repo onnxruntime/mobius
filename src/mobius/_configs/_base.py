@@ -2493,7 +2493,7 @@ class SpeechToTextConfig(ArchitectureConfig):
     """Shared configuration contract for encoder-decoder speech models."""
 
     encoder_input_name: str = "input_features"
-    encoder_input_channels: int | None = 80
+    encoder_input_channels: int | None = None
     encoder_uses_attention_mask: bool = False
     decoder_uses_encoder_attention_mask: bool = False
     decoder_start_token_id: int | None = None
@@ -2511,6 +2511,16 @@ class WhisperConfig(SpeechToTextConfig):
     max_source_positions: int = 1500
     max_target_positions: int = 448
     scale_embedding: bool = False
+
+    def __post_init__(self):
+        if self.encoder_input_channels is None:
+            self.encoder_input_channels = self.num_mel_bins
+        elif self.encoder_input_channels != self.num_mel_bins:
+            raise ValueError(
+                "WhisperConfig: encoder_input_channels "
+                f"({self.encoder_input_channels}) must equal num_mel_bins "
+                f"({self.num_mel_bins})."
+            )
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> WhisperConfig:

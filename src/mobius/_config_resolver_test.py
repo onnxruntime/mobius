@@ -409,9 +409,15 @@ class TestWhisperEncoderDecoder:
         hf = self._whisper_hf_config()
         result = _config_from_hf(hf)
         assert result.num_mel_bins == 80
+        assert result.encoder_input_channels == 80
         assert result.max_source_positions == 1500
         assert result.max_target_positions == 448
         assert result.decoder_start_token_id == 50258
+
+    def test_whisper_128_mel_channels_are_synchronized(self):
+        result = _config_from_hf(self._whisper_hf_config(num_mel_bins=128))
+        assert result.num_mel_bins == 128
+        assert result.encoder_input_channels == 128
 
     def test_whisper_default_task(self):
         assert _default_task_for_model("whisper") == "speech-to-text"
