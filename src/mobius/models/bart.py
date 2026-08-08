@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from onnxscript import OpBuilder, nn
@@ -233,6 +233,12 @@ class BartForConditionalGeneration(nn.Module):
 
     default_task = "seq2seq"
     category = "encoder-decoder"
+
+    # Runtime HF ``named_modules()`` sub-trees per ONNX component.
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "encoder": ("model.encoder",),
+        "decoder": ("model.decoder", "lm_head"),
+    }
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()

@@ -18,7 +18,7 @@ Encoder (waveform -> codes):
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from onnxscript import OpBuilder, nn
 
@@ -644,6 +644,12 @@ class Qwen3TTSTokenizerV2Model(nn.Module):
     Parameters:
         config: Architecture config.
     """
+
+    # Runtime HF RVQ codec encoder/decoder sub-trees.
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "encoder": ("encoder",),
+        "decoder": ("decoder",),
+    }
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()

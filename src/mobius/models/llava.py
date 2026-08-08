@@ -21,7 +21,7 @@ HuggingFace weight names:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from onnxscript import OpBuilder, nn
@@ -193,6 +193,47 @@ class LLaVAModel(nn.Module):
 
     default_task: str = "vision-language"
     category: str = "Multimodal"
+
+    # Runtime HF ``named_modules()`` sub-trees for the LLaVA/PaliGemma/Mistral3
+    # layout. Decoder paths exclude token embeddings, which are a separate graph.
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": (
+            "model.language_model.layers",
+            "model.language_model.norm",
+            "model.language_model.rotary_emb",
+            "lm_head",
+        ),
+        "vision_encoder": ("model.vision_tower", "model.multi_modal_projector"),
+        "embedding": ("model.language_model.embed_tokens",),
+    }
+    _IDEFICS_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": (
+            "model.text_model.layers",
+            "model.text_model.norm",
+            "model.text_model.rotary_emb",
+            "lm_head",
+        ),
+        "vision_encoder": ("model.vision_model", "model.connector"),
+        "embedding": ("model.text_model.embed_tokens",),
+    }
+
+    @classmethod
+    def get_hf_component_sources(
+        cls,
+        *,
+        model_type: str,
+        hf_config: object,
+    ) -> dict[str, tuple[str, ...]]:
+        """Return static runtime paths for verified HF layouts served by this class."""
+        del hf_config
+        if model_type in {"llava", "llava_next", "llava_onevision", "paligemma", "mistral3"}:
+            return cls.HF_COMPONENT_SOURCES
+        if model_type in {"idefics2", "idefics3", "smolvlm"}:
+            return cls._IDEFICS_COMPONENT_SOURCES
+        # This generic mobius class is registered for additional HF families
+        # whose runtime trees differ. Empty paths prevent tools from slicing
+        # against a guessed checkpoint-style prefix.
+        return {}
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()

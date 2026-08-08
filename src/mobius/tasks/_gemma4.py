@@ -21,6 +21,8 @@ entries for the first ``num_hidden_layers - num_kv_shared_layers`` layers.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import onnx_ir as ir
 from onnxscript import GraphBuilder, nn
 
@@ -410,6 +412,15 @@ class Gemma4Task(ModelTask):
         (dynamic mode), or ``write_indices``/``nonpad_kv_seqlen`` for
         pre-allocated cache (static mode).
     """
+
+    #: decoder + vision + embedding, plus audio when ``config.audio`` is set.
+    #: ``audio_encoder`` is declared statically (it is config-gated at build time).
+    model_roles: ClassVar[dict[str, str]] = {
+        "decoder": "decoder",
+        "vision_encoder": "encoder",
+        "audio_encoder": "encoder",
+        "embedding": "embedding",
+    }
 
     def __init__(
         self,
