@@ -80,6 +80,7 @@ __all__ = [
     "Mamba2CausalLMModel",
     "MambaCausalLMModel",
     "MiniMaxCausalLMModel",
+    "MoonshineForConditionalGeneration",
     "MimiModel",
     "MoshiDepformerModel",
     "MoshiTemporalModel",
@@ -226,6 +227,7 @@ from mobius.models.moe import (
     Phi3MoECausalLMModel,
     Qwen2MoECausalLMModel,
 )
+from mobius.models.moonshine import MoonshineForConditionalGeneration
 from mobius.models.moshi import (
     MoshiDepformerModel,
     MoshiTemporalModel,

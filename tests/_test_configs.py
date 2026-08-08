@@ -34,6 +34,7 @@ from mobius._configs import (
     Mamba2Config,
     MambaConfig,
     MllamaConfig,
+    MoonshineConfig,
     NanoChatConfig,
     NemotronHConfig,
     Sam2Config,
@@ -2416,6 +2417,21 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
 # Speech / TTS / Codec configs
 # ---------------------------------------------------------------------------
 SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
+    # --- Moonshine (raw-waveform RoPE encoder-decoder ASR) ---
+    (
+        "moonshine",
+        {
+            "_config_cls": MoonshineConfig,
+            "num_key_value_heads": TINY_HEADS,
+            "partial_rotary_factor": 0.75,
+            "rope_type": "default",
+            "rope_interleave": True,
+            "encoder_num_hidden_layers": TINY_LAYERS,
+            "encoder_num_attention_heads": TINY_HEADS,
+            "encoder_num_key_value_heads": TINY_HEADS,
+        },
+        True,
+    ),
     # --- Whisper (speech-to-text, encoder-decoder) ---
     (
         "whisper",

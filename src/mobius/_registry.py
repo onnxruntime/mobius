@@ -28,6 +28,7 @@ from mobius._configs import (
     Gemma4AssistantConfig,
     Gemma4Config,
     MMSConfig,
+    MoonshineConfig,
     WhisperConfig,
 )
 from mobius.models import (
@@ -71,6 +72,7 @@ from mobius.models import (
     LLaDAModel,
     Llama4CausalLMModel,
     MoECausalLMModel,
+    MoonshineForConditionalGeneration,
     NanoChatCausalLMModel,
     NemotronCausalLMModel,
     OLMo2CausalLMModel,
@@ -649,6 +651,11 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         task="speech-to-text",
         config_class=WhisperConfig,
     ),
+    "moonshine": ModelRegistration(
+        MoonshineForConditionalGeneration,
+        task="speech-to-text",
+        config_class=MoonshineConfig,
+    ),
     # --- Encoder-only ---
     "albert": ModelRegistration(BertModel, task="feature-extraction"),
     "bert": ModelRegistration(BertModel, task="feature-extraction"),
@@ -1010,6 +1017,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "vipllava": "llava-hf/vip-llava-7b-hf",
 
     # --- Speech ---
+    "moonshine": "moonshine-ai/moonshine-tiny",
     "whisper": "openai/whisper-tiny",
     "qwen3_asr": "Qwen/Qwen3-ASR-0.6B",
     "fun_asr": "justinchuby/Fun-ASR-Nano-2512",

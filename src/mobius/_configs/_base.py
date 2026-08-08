@@ -2489,7 +2489,19 @@ class JetMoeConfig(CausalLMConfig):
 
 
 @dataclasses.dataclass
-class WhisperConfig(BaseModelConfig):
+class SpeechToTextConfig(ArchitectureConfig):
+    """Shared configuration contract for encoder-decoder speech models."""
+
+    encoder_input_name: str = "input_features"
+    encoder_input_channels: int | None = 80
+    encoder_uses_attention_mask: bool = False
+    decoder_uses_encoder_attention_mask: bool = False
+    decoder_start_token_id: int | None = None
+    layer_norm_eps: float = 1e-5
+
+
+@dataclasses.dataclass
+class WhisperConfig(SpeechToTextConfig):
     """Configuration for Whisper encoder-decoder models."""
 
     encoder_layers: int = DEFAULT_INT
@@ -2499,11 +2511,9 @@ class WhisperConfig(BaseModelConfig):
     max_source_positions: int = 1500
     max_target_positions: int = 448
     scale_embedding: bool = False
-    decoder_start_token_id: int | None = None
-    layer_norm_eps: float = 1e-5
 
     @classmethod
-    def from_transformers(cls, config) -> WhisperConfig:
+    def from_transformers(cls, config, parent_config=None) -> WhisperConfig:
         if config.model_type != "whisper":
             raise ValueError(
                 f"WhisperConfig expects model_type='whisper', got '{config.model_type}'"
@@ -2540,6 +2550,81 @@ class WhisperConfig(BaseModelConfig):
         if resolved is not None:
             options["dtype"] = resolved
 
+        return cls(**options)
+
+
+@dataclasses.dataclass
+class MoonshineConfig(SpeechToTextConfig):
+    """Configuration for Moonshine raw-waveform encoder-decoder ASR models."""
+
+    encoder_input_name: str = "input_values"
+    encoder_input_channels: int | None = None
+    encoder_uses_attention_mask: bool = True
+    decoder_uses_encoder_attention_mask: bool = True
+    encoder_num_hidden_layers: int = DEFAULT_INT
+    encoder_num_attention_heads: int = DEFAULT_INT
+    encoder_num_key_value_heads: int = DEFAULT_INT
+    encoder_hidden_act: str = "gelu"
+    decoder_hidden_act: str = "silu"
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> MoonshineConfig:
+        if config.model_type != "moonshine":
+            raise ValueError(
+                f"MoonshineConfig expects model_type='moonshine', got '{config.model_type}'"
+            )
+
+        hidden_size = config.hidden_size
+        decoder_heads = config.decoder_num_attention_heads
+        encoder_heads = config.encoder_num_attention_heads
+        rope_parameters = getattr(config, "rope_parameters", None) or getattr(
+            config, "rope_scaling", None
+        )
+        rope_type = (rope_parameters or {}).get("rope_type", "default")
+        options = dict(
+            vocab_size=config.vocab_size,
+            hidden_size=hidden_size,
+            intermediate_size=config.intermediate_size,
+            num_hidden_layers=config.decoder_num_hidden_layers,
+            num_attention_heads=decoder_heads,
+            num_key_value_heads=getattr(config, "decoder_num_key_value_heads", decoder_heads),
+            head_dim=hidden_size // decoder_heads,
+            hidden_act=getattr(config, "decoder_hidden_act", "silu"),
+            pad_token_id=getattr(config, "pad_token_id", 2),
+            tie_word_embeddings=getattr(config, "tie_word_embeddings", True),
+            attn_qkv_bias=getattr(config, "attention_bias", False),
+            attn_o_bias=getattr(config, "attention_bias", False),
+            max_position_embeddings=getattr(config, "max_position_embeddings", 194),
+            rope_type=rope_type,
+            rope_theta=getattr(
+                config,
+                "rope_theta",
+                (rope_parameters or {}).get("rope_theta", 10_000.0),
+            ),
+            rope_scaling=rope_parameters,
+            partial_rotary_factor=getattr(
+                config,
+                "partial_rotary_factor",
+                (rope_parameters or {}).get("partial_rotary_factor", 0.9),
+            ),
+            rope_interleave=True,
+            mlp_bias=True,
+            encoder_num_hidden_layers=config.encoder_num_hidden_layers,
+            encoder_num_attention_heads=encoder_heads,
+            encoder_num_key_value_heads=getattr(
+                config, "encoder_num_key_value_heads", encoder_heads
+            ),
+            encoder_hidden_act=getattr(config, "encoder_hidden_act", "gelu"),
+            decoder_hidden_act=getattr(config, "decoder_hidden_act", "silu"),
+            decoder_start_token_id=getattr(config, "decoder_start_token_id", 1),
+            layer_norm_eps=getattr(config, "layer_norm_eps", 1e-5),
+            model_type="moonshine",
+            bos_token_id=getattr(config, "bos_token_id", 1),
+            eos_token_id=getattr(config, "eos_token_id", 2),
+        )
+        resolved = _resolve_dtype(config)
+        if resolved is not None:
+            options["dtype"] = resolved
         return cls(**options)
 
 

@@ -1237,7 +1237,8 @@ def _run_speech_to_text_prefill(
         enc_feeds: dict[str, np.ndarray] = {}
         for name in enc_session.input_names:
             if name in processed:
-                enc_feeds[name] = processed[name].astype(np.float32)
+                dtype = enc_session.get_input_dtype(name) or np.float32
+                enc_feeds[name] = processed[name].astype(dtype)
         enc_outputs = enc_session.run(enc_feeds)
     finally:
         enc_session.close()
@@ -1269,8 +1270,10 @@ def _run_speech_to_text_prefill(
             if name in ("input_ids", "decoder_input_ids"):
                 dec_feeds[name] = dec_input_ids
             elif name == "encoder_attention_mask":
-                enc_seq_len = enc_hidden.shape[1]
-                dec_feeds[name] = np.ones((1, enc_seq_len), dtype=np.int64)
+                dec_feeds[name] = enc_outputs.get(
+                    "encoder_attention_mask",
+                    np.ones((1, enc_hidden.shape[1]), dtype=np.int64),
+                )
             elif name == "position_ids":
                 dec_feeds[name] = np.zeros((1, 1), dtype=np.int64)
             elif name.startswith("past_key_values."):
@@ -2202,7 +2205,8 @@ def _run_speech_to_text_generation(
         enc_feeds: dict[str, np.ndarray] = {}
         for name in enc_session.input_names:
             if name in processed:
-                enc_feeds[name] = processed[name].astype(np.float32)
+                dtype = enc_session.get_input_dtype(name) or np.float32
+                enc_feeds[name] = processed[name].astype(dtype)
         enc_outputs = enc_session.run(enc_feeds)
     finally:
         enc_session.close()
@@ -2227,6 +2231,7 @@ def _run_speech_to_text_generation(
         generator = OnnxSpeechToTextGenerator(dec_session, config)
         all_ids = generator.generate(
             enc_hidden,
+            encoder_attention_mask=enc_outputs.get("encoder_attention_mask"),
             max_new_tokens=max_new_tokens,
             eos_token_id=eos_token_id,
             decoder_start_token_id=decoder_start_id,
