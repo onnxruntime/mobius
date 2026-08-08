@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 from onnxscript import OpBuilder, nn
 
-from mobius.components._common import Linear
+from mobius.components._common import INT64_MAX, Linear
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -36,7 +36,7 @@ class _DepthwiseShortConv1d(nn.Module):
         past = op.Slice(
             conv_state,
             op.Constant(value_ints=[1]),
-            op.Constant(value_ints=[2**31 - 1]),
+            op.Constant(value_ints=[INT64_MAX]),
             op.Constant(value_ints=[2]),
         )
         conv_input = op.Concat(past, hidden_states, axis=2)
@@ -59,7 +59,7 @@ class _DepthwiseShortConv1d(nn.Module):
         present_state = op.Slice(
             conv_input,
             op.Constant(value_ints=[-self._kernel_size]),
-            op.Constant(value_ints=[2**31 - 1]),
+            op.Constant(value_ints=[INT64_MAX]),
             op.Constant(value_ints=[2]),
         )
         return conv_output, present_state
@@ -101,7 +101,7 @@ class GatedShortConv(nn.Module):
             current_mask = op.Slice(
                 attention_mask,
                 op.Neg(seq_len),
-                op.Constant(value_ints=[2**31 - 1]),
+                op.Constant(value_ints=[INT64_MAX]),
                 op.Constant(value_ints=[1]),
             )
             current_mask = op.Unsqueeze(current_mask, op.Constant(value_ints=[-1]))
