@@ -152,7 +152,7 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # Argmax correct (near-tie), cosine≥0.995, top10_jaccard=1.0 — functionally correct.
     # Only the text entry appears here: the "gemma3n" key builds the multimodal
     # model, which this causal-LM suite does not cover.
-    "gemma3n_text": 0.1,  # ~0.094 max diff worst-case (AltUp magnitude ratio)
+    "gemma3n_text": 0.05,  # ~0.026 max diff worst-case (AltUp magnitude ratio)
     # Gemma3 VL: same QK-norm FP accumulation as gemma3_text (~0.045 max diff).
     # argmax_match=True (near-tie), cosine=0.996 — functionally correct.
     "gemma3": 0.05,
