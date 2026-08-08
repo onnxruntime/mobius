@@ -31,10 +31,15 @@ class _DepthwiseShortConv1d(nn.Module):
         hidden_states: ir.Value,
         conv_state: ir.Value,
     ) -> tuple[ir.Value, ir.Value]:
-        # Keep a full K-wide state, matching ORT GenAI's LFM2 cache contract.
-        # Concatenating it with T current values yields T+1 valid Conv outputs;
-        # the first is all-past, so only the final T outputs are propagated.
-        conv_input = op.Concat(conv_state, hidden_states, axis=2)
+        # The cache contract is K-wide, but causal Conv only needs its newest
+        # K-1 values. Appending T inputs then produces exactly T outputs.
+        past = op.Slice(
+            conv_state,
+            op.Constant(value_ints=[1]),
+            op.Constant(value_ints=[2**31 - 1]),
+            op.Constant(value_ints=[2]),
+        )
+        conv_input = op.Concat(past, hidden_states, axis=2)
         if self.bias is None:
             conv_output = op.Conv(
                 conv_input,
@@ -51,25 +56,13 @@ class _DepthwiseShortConv1d(nn.Module):
                 group=self._channels,
             )
 
-        seq_len = op.Shape(hidden_states, start=2, end=3)
-        conv_len = op.Shape(conv_output, start=2, end=3)
-        output_start = op.Sub(conv_len, seq_len)
-        output = op.Slice(
-            conv_output,
-            output_start,
-            conv_len,
-            op.Constant(value_ints=[2]),
-        )
-
-        input_len = op.Shape(conv_input, start=2, end=3)
-        state_start = op.Sub(input_len, op.Constant(value_ints=[self._kernel_size]))
         present_state = op.Slice(
             conv_input,
-            state_start,
-            input_len,
+            op.Constant(value_ints=[-self._kernel_size]),
+            op.Constant(value_ints=[2**31 - 1]),
             op.Constant(value_ints=[2]),
         )
-        return output, present_state
+        return conv_output, present_state
 
 
 class GatedShortConv(nn.Module):
@@ -85,7 +78,6 @@ class GatedShortConv(nn.Module):
         self.in_proj = Linear(hidden_size, 3 * hidden_size, bias=bias)
         self.conv = _DepthwiseShortConv1d(hidden_size, kernel_size, bias=bias)
         self.out_proj = Linear(hidden_size, hidden_size, bias=bias)
-        self._hidden_size = hidden_size
 
     def forward(
         self,
@@ -106,12 +98,10 @@ class GatedShortConv(nn.Module):
         if attention_mask is not None:
             # Recurrent layers only consume the mask for the current token span.
             seq_len = op.Shape(hidden_states, start=1, end=2)
-            mask_len = op.Shape(attention_mask, start=1, end=2)
-            mask_start = op.Sub(mask_len, seq_len)
             current_mask = op.Slice(
                 attention_mask,
-                mask_start,
-                mask_len,
+                op.Neg(seq_len),
+                op.Constant(value_ints=[2**31 - 1]),
                 op.Constant(value_ints=[1]),
             )
             current_mask = op.Unsqueeze(current_mask, op.Constant(value_ints=[-1]))
@@ -119,12 +109,7 @@ class GatedShortConv(nn.Module):
 
         # (B, T, H) -> (B, 3H, T), split into the two gates and conv input.
         projected = op.Transpose(self.in_proj(op, hidden_states), perm=[0, 2, 1])
-        gate_b, gate_c, conv_input = op.Split(
-            projected,
-            op.Constant(value_ints=[self._hidden_size, self._hidden_size, self._hidden_size]),
-            axis=1,
-            _outputs=3,
-        )
+        gate_b, gate_c, conv_input = op.Split(projected, num_outputs=3, axis=1, _outputs=3)
         conv_input = op.Mul(gate_b, conv_input)  # (B, H, T)
         conv_output, present_state = self.conv(op, conv_input, conv_state)
         output = op.Mul(gate_c, conv_output)  # (B, H, T)
