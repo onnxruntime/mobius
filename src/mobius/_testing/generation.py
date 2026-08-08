@@ -349,7 +349,7 @@ class OnnxSpeechToTextGenerator:
         """Generate tokens from pre-computed encoder output.
 
         Args:
-            encoder_hidden_states: [batch, enc_seq_len, hidden] float32.
+            encoder_hidden_states: [batch, enc_seq_len, hidden] model-dtype tensor.
             encoder_attention_mask: Optional [batch, enc_seq_len] encoder padding mask.
             max_new_tokens: Maximum tokens to generate.
             eos_token_id: Stop token.
@@ -368,9 +368,10 @@ class OnnxSpeechToTextGenerator:
         past_kv: dict[str, np.ndarray] = {}
         for name in self.dec_session.input_names:
             if name.startswith("past_key_values."):
+                cache_dtype = self.dec_session.get_input_dtype(name) or np.dtype(np.float32)
                 past_kv[name] = np.zeros(
                     (batch_size, num_kv_heads, 0, head_dim),
-                    dtype=np.float32,
+                    dtype=cache_dtype,
                 )
 
         # Seed with decoder_start_token_id

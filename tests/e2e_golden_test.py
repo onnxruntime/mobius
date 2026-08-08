@@ -493,13 +493,13 @@ def _run_seq2seq_prefill(
                         # Cross-attention cache: enc_seq_len=0 initially
                         dec_feeds[name] = np.zeros(
                             (1, num_kv_heads, 0, head_dim),
-                            dtype=np.float32,
+                            dtype=dec_session.get_input_dtype(name) or np.dtype(np.float32),
                         )
                     else:
                         # Self-attention cache: past_seq_len=0
                         dec_feeds[name] = np.zeros(
                             (1, num_kv_heads, 0, head_dim),
-                            dtype=np.float32,
+                            dtype=dec_session.get_input_dtype(name) or np.dtype(np.float32),
                         )
 
         outputs = dec_session.run(dec_feeds)
@@ -1346,7 +1346,7 @@ def _run_speech_to_text_prefill(
                 )
                 dec_feeds[name] = np.zeros(
                     (1, num_kv_heads, 0, head_dim),
-                    dtype=np.float32,
+                    dtype=dec_session.get_input_dtype(name) or np.dtype(np.float32),
                 )
         outputs = dec_session.run(dec_feeds)
     finally:
