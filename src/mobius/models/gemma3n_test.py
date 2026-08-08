@@ -456,6 +456,126 @@ class TestGemma3nMultiModalPreprocessWeights:
         assert "decoder.model.norm.weight" in result
 
 
+def _build_text_decoder(**overrides):
+    """Build the text-only gemma3n causal-LM graph from a tiny config."""
+    from mobius._registry import registry
+    from mobius.tasks import get_task
+
+    defaults = dict(
+        max_position_embeddings=128,
+        rms_norm_eps=1e-6,
+        rope_type="default",
+        rope_theta=10_000.0,
+        rope_local_base_freq=10_000.0,
+    )
+    defaults.update(overrides)
+    config = _tiny_gemma3n_config(**defaults)
+    module = registry.get("gemma3n_text")(config)
+    return config, get_task(module.default_task).build(module, config)["model"]
+
+
+def _fill_random_weights(model: ir.Model) -> None:
+    """Assign small random constants to every unfilled initializer."""
+    rng = np.random.default_rng(0)
+    for value in model.graph.initializers.values():
+        if value.const_value is not None:
+            continue
+        shape = [d if isinstance(d, int) else 1 for d in value.shape]
+        value.const_value = ir.tensor(rng.standard_normal(shape).astype(np.float32) * 0.05)
+
+
+class TestGemma3nKvSharedCausalMasking:
+    """KV-shared layers must not use the Attention op's built-in causal mask.
+
+    They pass the borrowed K,V *whole* with no ``past_key``/``past_value``, so
+    at decode ``q_len=1`` while ``kv_len=total``.  The opset-24 spec aligns the
+    built-in mask upper-left, which pins that single query to key 0.  ORT <=
+    1.27 aligned it bottom-right and masked the bug; 1.28 conforms and the
+    decode output collapses onto BOS.  Causality has to come from the explicit
+    ``attn_mask`` instead.
+    """
+
+    @staticmethod
+    def _attention_nodes(model: ir.Model):
+        """Split Attention nodes by whether they feed the op's KV cache path."""
+        with_past, without_past = [], []
+        for node in model.graph:
+            if node.op_type != "Attention":
+                continue
+            has_past = len(node.inputs) > 4 and node.inputs[4] is not None
+            (with_past if has_past else without_past).append(node)
+        return with_past, without_past
+
+    def test_shared_layers_disable_is_causal(self):
+        _, model = _build_text_decoder(
+            layer_types=["full_attention", "full_attention"],
+            num_kv_shared_layers=1,
+        )
+        with_past, without_past = self._attention_nodes(model)
+
+        assert len(with_past) == 1, "layer 0 owns a cache entry"
+        assert len(without_past) == 1, "layer 1 borrows K,V whole"
+        assert without_past[0].attributes["is_causal"].as_int() == 0
+        assert with_past[0].attributes["is_causal"].as_int() == 1
+
+    def test_no_sharing_keeps_is_causal(self):
+        """Without sharing every layer takes the cache path and keeps the flag."""
+        _, model = _build_text_decoder(num_kv_shared_layers=0)
+        with_past, without_past = self._attention_nodes(model)
+
+        assert not without_past
+        assert with_past and all(n.attributes["is_causal"].as_int() == 1 for n in with_past)
+
+    def test_decode_step_matches_full_prefill(self):
+        """The invariant the flag broke: cached decode == re-running the prefill.
+
+        Feeding the whole shared K,V with an upper-left causal mask makes the
+        decode query attend to position 0 alone, so its logits stop tracking the
+        equivalent row of a full forward.  This is prefill-vs-decode, so the
+        prefill-only synthetic parity sweep cannot see it.
+        """
+        config, model = _build_text_decoder(
+            num_hidden_layers=3,
+            layer_types=["full_attention", "sliding_attention", "sliding_attention"],
+            num_kv_shared_layers=1,
+            sliding_window=64,
+        )
+        _fill_random_weights(model)
+        session = ort.InferenceSession(
+            ir.serde.serialize_model(model).SerializeToString(),
+            providers=["CPUExecutionProvider"],
+        )
+        out_names = [o.name for o in session.get_outputs()]
+        past_names = [i.name for i in session.get_inputs() if i.name.startswith("past_")]
+
+        rng = np.random.default_rng(0)
+        tokens = rng.integers(1, config.vocab_size, size=(1, 5)).astype(np.int64)
+
+        def feed(ids, mask_len, past):
+            return {
+                "input_ids": ids,
+                "attention_mask": np.ones((1, mask_len), dtype=np.int64),
+                "position_ids": np.arange(
+                    mask_len - ids.shape[1], mask_len, dtype=np.int64
+                )[np.newaxis, :],
+                **past,
+            }
+
+        empty = {
+            name: np.zeros((1, config.num_key_value_heads, 0, config.head_dim), np.float32)
+            for name in past_names
+        }
+        prefill = session.run(None, feed(tokens[:, :4], 4, empty))
+        prefill = dict(zip(out_names, prefill))
+        cache = {
+            name: prefill[name.replace("past_key_values", "present")] for name in past_names
+        }
+        decode = session.run(None, feed(tokens[:, 4:], 5, cache))[out_names.index("logits")]
+
+        reference = session.run(None, feed(tokens, 5, empty))[out_names.index("logits")]
+        np.testing.assert_allclose(decode[:, -1], reference[:, -1], rtol=1e-3, atol=1e-3)
+
+
 def _hf_key_for(initializer_name: str) -> str:
     """Invert ``preprocess_weights`` for one ONNX initializer name.
 
