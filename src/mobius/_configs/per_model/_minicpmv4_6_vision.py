@@ -31,8 +31,8 @@ def _minicpmv4_6_vision(config, parent_config, model_type: str, fields: dict):
         num_position_embeddings=(image_size // patch_size) ** 2,
         image_token_id=parent_config.image_token_id,
         insert_layer_id=getattr(parent_config, "insert_layer_id", 6),
-        window_kernel_size=tuple(getattr(vision, "window_kernel_size", (2, 2))),
-        merge_kernel_size=tuple(getattr(parent_config, "merge_kernel_size", (2, 2))),
+        window_kernel_size=tuple(getattr(vision, "window_kernel_size", None) or (2, 2)),
+        merge_kernel_size=tuple(getattr(parent_config, "merge_kernel_size", None) or (2, 2)),
         merger_times=getattr(parent_config, "merger_times", 1),
     )
     return None
