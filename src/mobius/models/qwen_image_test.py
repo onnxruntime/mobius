@@ -316,17 +316,33 @@ def test_edit_vae_matches_diffusers_on_real_source_image():
 @pytest.mark.integration
 @pytest.mark.integration_fast
 def test_deterministic_l4_l5_image_edit_golden():
+    """Compare an independent diffusers edit chain with the full Mobius ONNX chain."""
     ort = pytest.importorskip("onnxruntime")
     torch = pytest.importorskip("torch")
     diffusers = pytest.importorskip("diffusers")
     image_module = pytest.importorskip("PIL.Image")
 
+    from mobius._diffusers_configs import QwenImageVAEConfig
+    from mobius.models.qwen_image_vae import AutoencoderKLQwenImageModel
+    from mobius.tasks import QwenImageEditVAETask
+
     golden_path = Path("testdata/golden/diffusion/qwen-image-edit-2509.json")
     with open(golden_path, encoding="utf-8") as golden_file:
         golden = json.load(golden_file)
 
+    means = (-0.2, -0.1, 0.1, 0.2)
+    stds = (1.1, 1.2, 1.3, 1.4)
     torch.manual_seed(golden["seed"])
-    hf_model = diffusers.QwenImageTransformer2DModel(
+    hf_vae = diffusers.AutoencoderKLQwenImage(
+        base_dim=8,
+        z_dim=4,
+        dim_mult=[1, 2],
+        num_res_blocks=1,
+        temperal_downsample=[False],
+        latents_mean=list(means),
+        latents_std=list(stds),
+    ).eval()
+    hf_transformer = diffusers.QwenImageTransformer2DModel(
         patch_size=2,
         in_channels=16,
         out_channels=4,
@@ -336,7 +352,7 @@ def test_deterministic_l4_l5_image_edit_golden():
         joint_attention_dim=8,
         axes_dims_rope=(2, 2, 4),
     ).eval()
-    config = QwenImageConfig(
+    transformer_config = QwenImageConfig(
         in_channels=16,
         out_channels=4,
         patch_size=2,
@@ -347,83 +363,233 @@ def test_deterministic_l4_l5_image_edit_golden():
         cross_attention_dim=8,
         axes_dims_rope=(2, 2, 4),
     )
-    module = QwenImageTransformer2DModel(config)
-    model = QwenImageDenoisingTask().build(module, config)["model"]
-    apply_weights(model, module.preprocess_weights(dict(hf_model.state_dict())))
+    vae_config = QwenImageVAEConfig(
+        base_dim=8,
+        z_dim=4,
+        dim_mult=(1, 2),
+        num_res_blocks=1,
+        temperal_downsample=(False,),
+        latents_mean=means,
+        latents_std=stds,
+    )
+    transformer_module = QwenImageTransformer2DModel(transformer_config)
+    transformer_model = QwenImageDenoisingTask().build(transformer_module, transformer_config)[
+        "model"
+    ]
+    transformer_weights = transformer_module.preprocess_weights(
+        dict(hf_transformer.state_dict())
+    )
+    apply_weights(transformer_model, transformer_weights)
+    vae_module = AutoencoderKLQwenImageModel(vae_config)
+    vae_package = QwenImageEditVAETask().build(vae_module, vae_config)
+    vae_weights = vae_module.preprocess_weights(dict(hf_vae.state_dict()))
+    apply_weights(vae_package["encoder"], vae_weights)
+    apply_weights(vae_package["decoder"], vae_weights)
 
-    rng = np.random.default_rng(golden["seed"])
-    latents = rng.normal(size=(1, 4, 16)).astype(np.float32)
     image = image_module.open(Path("testdata") / golden["source_image"]).convert("RGB")
-    rgb = np.asarray(image.resize((2, 2)), dtype=np.float32).reshape(4, 3) / 127.5 - 1.0
-    luminance = rgb.mean(axis=1, keepdims=True)
-    source_latents = np.concatenate(
-        [
-            rgb,
-            luminance,
-            rgb**2,
-            np.sin(rgb),
-            np.cos(rgb),
-            rgb[:, 0:1] * rgb[:, 1:2],
-            rgb[:, 1:2] * rgb[:, 2:3],
-            luminance**2,
-        ],
-        axis=1,
-    )[None].astype(np.float32)
-    prompt_embeds = rng.normal(size=(1, 3, 8)).astype(np.float32)
-    prompt_mask = np.array([[True, False, True]])
-    image_shapes = [(1, 2, 2), (1, 2, 2)]
+    source_pixels = np.asarray(image.resize((16, 16)), dtype=np.float32)
+    source_pixels = source_pixels.transpose(2, 0, 1) / 127.5 - 1.0
+    source_pixels = source_pixels[None, :, None, :, :]
+
+    generator = torch.Generator().manual_seed(golden["seed"] + 1)
+    initial_target_latents = torch.randn((1, 4, 1, 8, 8), generator=generator)
+    prompt_embeds = torch.randn((1, 3, 8), generator=generator)
+    prompt_mask = torch.tensor([[True, False, True]])
+    mean_tensor = torch.tensor(means).view(1, 4, 1, 1, 1)
+    std_tensor = torch.tensor(stds).view(1, 4, 1, 1, 1)
+
+    def pack_latents(latents):
+        batch, channels, frames, height, width = latents.shape
+        assert frames == 1 and height % 2 == 0 and width % 2 == 0
+        return (
+            latents.reshape(batch, channels, height // 2, 2, width // 2, 2)
+            .permute(0, 2, 4, 1, 3, 5)
+            .reshape(batch, (height // 2) * (width // 2), channels * 4)
+        )
+
+    def unpack_latents(latents):
+        batch, _, packed_channels = latents.shape
+        channels = packed_channels // 4
+        return (
+            latents.reshape(batch, 4, 4, channels, 2, 2)
+            .permute(0, 3, 1, 4, 2, 5)
+            .reshape(batch, channels, 1, 8, 8)
+        )
+
+    def pack_numpy_latents(latents):
+        batch, channels, frames, height, width = latents.shape
+        assert frames == 1 and height % 2 == 0 and width % 2 == 0
+        return (
+            latents.reshape(batch, channels, height // 2, 2, width // 2, 2)
+            .transpose(0, 2, 4, 1, 3, 5)
+            .reshape(batch, (height // 2) * (width // 2), channels * 4)
+        )
+
+    def unpack_numpy_latents(latents):
+        batch, _, packed_channels = latents.shape
+        channels = packed_channels // 4
+        return (
+            latents.reshape(batch, 4, 4, channels, 2, 2)
+            .transpose(0, 3, 1, 4, 2, 5)
+            .reshape(batch, channels, 1, 8, 8)
+        )
+
+    with torch.no_grad():
+        reference_moments = hf_vae._encode(torch.from_numpy(source_pixels))
+        reference_source_latents = reference_moments.chunk(2, dim=1)[0] - mean_tensor
+        reference_source_latents = reference_source_latents / std_tensor
+        reference_source_tokens = pack_latents(reference_source_latents)
+        initial_target_tokens = pack_latents(initial_target_latents)
+
+    image_shapes = [(1, 4, 4), (1, 4, 4)]
     image_cos, image_sin, text_cos, text_sin = prepare_qwen_image_rotary_embeddings(
         image_shapes, 3, (2, 2, 4)
     )
 
-    scheduler = diffusers.FlowMatchEulerDiscreteScheduler(
-        base_image_seq_len=256,
-        base_shift=0.5,
-        max_image_seq_len=8192,
-        max_shift=0.9,
-        shift=1.0,
-        shift_terminal=0.02,
-        time_shift_type="exponential",
-        use_dynamic_shifting=True,
-    )
     steps = golden["num_inference_steps"]
     sigmas = np.linspace(1.0, 1 / steps, steps)
     slope = (0.9 - 0.5) / (8192 - 256)
-    mu = 4 * slope + (0.5 - slope * 256)
-    scheduler.set_timesteps(steps, sigmas=sigmas, mu=mu)
+    mu = initial_target_tokens.shape[1] * slope + (0.5 - slope * 256)
+
+    def create_scheduler():
+        scheduler = diffusers.FlowMatchEulerDiscreteScheduler(
+            base_image_seq_len=256,
+            base_shift=0.5,
+            max_image_seq_len=8192,
+            max_shift=0.9,
+            shift=1.0,
+            shift_terminal=0.02,
+            time_shift_type="exponential",
+            use_dynamic_shifting=True,
+        )
+        scheduler.set_timesteps(steps, sigmas=sigmas, mu=mu)
+        return scheduler
+
+    # Independent reference: real image -> reduced diffusers VAE -> packed
+    # source conditioning -> three reduced diffusers transformer/scheduler steps
+    # -> reduced diffusers VAE decode.
+    reference_scheduler = create_scheduler()
+    reference_target_tokens = initial_target_tokens.clone()
+    reference_first_noise = None
+    with torch.no_grad():
+        for timestep in reference_scheduler.timesteps:
+            reference_noise = hf_transformer(
+                hidden_states=torch.cat(
+                    [reference_target_tokens, reference_source_tokens], dim=1
+                ),
+                timestep=timestep.expand(1).to(reference_target_tokens.dtype) / 1000,
+                encoder_hidden_states=prompt_embeds,
+                encoder_hidden_states_mask=prompt_mask,
+                img_shapes=[image_shapes],
+            ).sample[:, : reference_target_tokens.shape[1]]
+            if reference_first_noise is None:
+                reference_first_noise = reference_noise.clone()
+            reference_target_tokens = reference_scheduler.step(
+                reference_noise,
+                timestep,
+                reference_target_tokens,
+                return_dict=False,
+            )[0]
+        reference_final_latents = unpack_latents(reference_target_tokens)
+        reference_final_image = hf_vae.decode(
+            reference_final_latents * std_tensor + mean_tensor
+        ).sample.clip(-1.0, 1.0)
+
+    np.testing.assert_allclose(
+        reference_first_noise.numpy().reshape(-1),
+        golden["l4_noise_pred"],
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        reference_target_tokens.numpy().reshape(-1),
+        golden["l5_final_latents"],
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        reference_final_image.numpy().reshape(-1),
+        golden["l5_final_image"],
+        rtol=1e-6,
+        atol=1e-6,
+    )
 
     with tempfile.TemporaryDirectory() as directory:
-        path = os.path.join(directory, "model.onnx")
-        ir.save(model, path)
-        session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
-        first_noise = None
-        for timestep in scheduler.timesteps.numpy():
+        transformer_path = os.path.join(directory, "transformer.onnx")
+        encoder_path = os.path.join(directory, "vae_encoder.onnx")
+        decoder_path = os.path.join(directory, "vae_decoder.onnx")
+        ir.save(transformer_model, transformer_path)
+        ir.save(vae_package["encoder"], encoder_path)
+        ir.save(vae_package["decoder"], decoder_path)
+        transformer_session = ort.InferenceSession(
+            transformer_path, providers=["CPUExecutionProvider"]
+        )
+        encoder_session = ort.InferenceSession(
+            encoder_path, providers=["CPUExecutionProvider"]
+        )
+        decoder_session = ort.InferenceSession(
+            decoder_path, providers=["CPUExecutionProvider"]
+        )
+        onnx_source_latents = encoder_session.run(None, {"sample": source_pixels})[0]
+        np.testing.assert_allclose(
+            onnx_source_latents,
+            reference_source_latents.numpy(),
+            rtol=1e-4,
+            atol=1e-4,
+        )
+        onnx_source_tokens = pack_numpy_latents(onnx_source_latents)
+        np.testing.assert_allclose(
+            onnx_source_tokens,
+            reference_source_tokens.numpy(),
+            rtol=1e-4,
+            atol=1e-4,
+        )
+        onnx_target_tokens = pack_numpy_latents(initial_target_latents.numpy())
+        onnx_scheduler = create_scheduler()
+        onnx_first_noise = None
+        for timestep in onnx_scheduler.timesteps.numpy():
             feeds = {
-                "sample": np.concatenate([latents, source_latents], axis=1),
+                "sample": np.concatenate([onnx_target_tokens, onnx_source_tokens], axis=1),
                 "timestep": np.array([timestep / 1000], dtype=np.float32),
-                "encoder_hidden_states": prompt_embeds,
-                "encoder_hidden_states_mask": prompt_mask,
+                "encoder_hidden_states": prompt_embeds.numpy(),
+                "encoder_hidden_states_mask": prompt_mask.numpy(),
                 "image_rotary_cos": image_cos,
                 "image_rotary_sin": image_sin,
                 "text_rotary_cos": text_cos,
                 "text_rotary_sin": text_sin,
-                "target_sequence_length": np.array([4], dtype=np.int64),
+                "target_sequence_length": np.array(
+                    [onnx_target_tokens.shape[1]], dtype=np.int64
+                ),
             }
-            noise_pred = session.run(None, feeds)[0]
-            if first_noise is None:
-                first_noise = noise_pred.copy()
-            latents = scheduler.step(
-                torch.from_numpy(noise_pred),
+            onnx_noise = transformer_session.run(None, feeds)[0]
+            if onnx_first_noise is None:
+                onnx_first_noise = onnx_noise.copy()
+            onnx_target_tokens = onnx_scheduler.step(
+                torch.from_numpy(onnx_noise),
                 torch.tensor(timestep),
-                torch.from_numpy(latents),
+                torch.from_numpy(onnx_target_tokens),
                 return_dict=False,
             )[0].numpy()
+        onnx_final_latents = unpack_numpy_latents(onnx_target_tokens)
+        onnx_final_image = decoder_session.run(None, {"latent_sample": onnx_final_latents})[0]
 
     np.testing.assert_allclose(
-        first_noise.reshape(-1), golden["l4_noise_pred"], rtol=1e-4, atol=1e-4
+        onnx_first_noise,
+        reference_first_noise.numpy(),
+        rtol=1e-4,
+        atol=1e-4,
     )
     np.testing.assert_allclose(
-        latents.reshape(-1), golden["l5_final_latents"], rtol=1e-4, atol=1e-4
+        onnx_target_tokens,
+        reference_target_tokens.numpy(),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    np.testing.assert_allclose(
+        onnx_final_image,
+        reference_final_image.numpy(),
+        rtol=1e-4,
+        atol=1e-4,
     )
 
 
