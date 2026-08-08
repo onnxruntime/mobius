@@ -378,6 +378,44 @@ def _fix_chat_template(output_dir: str, hf_model_id: str | None) -> bool:
     return False
 
 
+# PIL resample constant -> ort-extensions Resize "interpolation" name.  HF image
+# processors store ``resample`` as the PIL integer; ort-extensions names the same
+# filters differently and defaults to CUBIC, so an unmapped value silently
+# resamples with the wrong kernel.  PIL BOX/HAMMING (4/5) have no counterpart.
+_PIL_RESAMPLE_TO_INTERPOLATION = {0: "NEAREST", 1: "LANCZOS", 2: "LINEAR", 3: "CUBIC"}
+
+
+def _size_mapping(size: Any) -> dict[str, Any]:
+    """Normalise an HF ``image_processor.size`` to a plain dict.
+
+    transformers >= 5 hands back a ``SizeDict``, which is *not* a ``dict``
+    subclass, so an ``isinstance(size, dict)`` guard silently discards it and
+    falls through to whatever default the caller hardcoded.
+    """
+    if isinstance(size, dict):
+        return size
+    if hasattr(size, "get"):  # SizeDict and friends
+        return {k: getattr(size, k, None) for k in ("height", "width", "longest_edge", "shortest_edge")}
+    return {}
+
+
+def _resize_interpolation(resample: Any) -> str | None:
+    """Map an HF ``image_processor.resample`` to an ort-extensions filter name."""
+    if resample is None:
+        return None
+    try:
+        name = _PIL_RESAMPLE_TO_INTERPOLATION.get(int(resample))
+    except (TypeError, ValueError):
+        return None
+    if name is None:
+        logger.warning(
+            "Unsupported image resample %s; ort-extensions has no matching "
+            "filter and will fall back to its CUBIC default",
+            resample,
+        )
+    return name
+
+
 def _build_vision_transform_pipeline(
     *,
     image_size: int,
@@ -388,13 +426,32 @@ def _build_vision_transform_pipeline(
     image_std: list[float],
     min_pixels: int = 784,
     max_pixels: int = 2371600,
+    resample: Any = None,
 ) -> list[dict[str, Any]]:
-    """Build the common 5-step vision transform pipeline.
+    """Build the common 4-step vision transform pipeline.
 
-    Returns the base transforms: DecodeImage → ConvertRGB → Resize →
-    Rescale → Normalize.  Callers may append model-specific steps
-    (e.g. Permute3D, PixtralImageSizes) after this.
+    Returns the base transforms: DecodeImage → Resize → Rescale → Normalize.
+    Callers may append model-specific steps (e.g. Permute3D, PixtralImageSizes)
+    after this.
+
+    No ``ConvertRGB``: ort-extensions' ``convert_to_rgb`` *unconditionally*
+    swaps R and B (it exists to fix up a BGR decode), while ``DecodeImage`` with
+    ``color_space="RGB"`` already emits RGB.  Chaining the two hands the encoder
+    BGR — see :func:`_write_vision_processor_config`.
     """
+    resize_attrs: dict[str, Any] = {
+        "height": image_size,
+        "width": image_size,
+        "smart_resize": 1,
+        "min_pixels": min_pixels,
+        "max_pixels": max_pixels,
+        "patch_size": patch_size,
+        "merge_size": merge_size,
+    }
+    interpolation = _resize_interpolation(resample)
+    if interpolation is not None:
+        resize_attrs["interpolation"] = interpolation
+
     return [
         {
             "operation": {
@@ -405,23 +462,9 @@ def _build_vision_transform_pipeline(
         },
         {
             "operation": {
-                "name": "convert_to_rgb",
-                "type": "ConvertRGB",
-            }
-        },
-        {
-            "operation": {
                 "name": "resize",
                 "type": "Resize",
-                "attrs": {
-                    "height": image_size,
-                    "width": image_size,
-                    "smart_resize": 1,
-                    "min_pixels": min_pixels,
-                    "max_pixels": max_pixels,
-                    "patch_size": patch_size,
-                    "merge_size": merge_size,
-                },
+                "attrs": resize_attrs,
             }
         },
         {
@@ -467,19 +510,26 @@ def _write_vision_processor_config(
       encoder-free model has no matching ort-extensions transform; callers feed
       HF-preprocessed pixel_values via ``Generator.set_inputs``.
     - **Gemma3** (``gemma3`` or ``gemma3_text``): Writes
-      ``processor_config.json`` with a 6-step pipeline (DecodeImage →
-      ConvertRGB → Resize[fixed] → Rescale → Normalize → Permute3D). Uses a
+      ``processor_config.json`` with a 5-step pipeline (DecodeImage →
+      Resize[fixed] → Rescale → Normalize → Permute3D). Uses a
       fixed-size resize (no ``smart_resize``) so the SigLIP encoder's fixed
       NCHW ``pixel_values`` input contract is met.
     - **Gemma3n** (``gemma3n`` or ``gemma3n_text``): Same fixed-resize pipeline
       at 768x768 for the MobileNet-V5 tower, but with the ``Normalize`` step
       *omitted* — the checkpoint's processor sets ``do_normalize=False``, so
-      pixels stay in [0, 1] (5 steps).
-    - **Pixtral / Mistral3**: Writes ``processor_config.json`` with a 7-step
-      pipeline (DecodeImage → ConvertRGB → Resize → Rescale → Normalize →
+      pixels stay in [0, 1] (4 steps).
+    - **Pixtral / Mistral3**: Writes ``processor_config.json`` with a 6-step
+      pipeline (DecodeImage → Resize → Rescale → Normalize →
       Permute3D → PixtralImageSizes).
-    - **Other VLMs**: Writes ``processor_config.json`` with a 5-step pipeline
-      (DecodeImage → ConvertRGB → Resize → Rescale → Normalize).
+    - **Other VLMs**: Writes ``processor_config.json`` with a 4-step pipeline
+      (DecodeImage → Resize → Rescale → Normalize).
+
+    No pipeline emits ``ConvertRGB``.  ort-extensions' ``convert_to_rgb``
+    unconditionally swaps R and B — it is the fix-up for a BGR decode — so
+    pairing it with ``DecodeImage(color_space="RGB")`` fed every VLM BGR
+    pixels.  The ``Resize`` step carries an explicit ``interpolation`` derived
+    from the HF processor's ``resample``, since ort-extensions otherwise
+    defaults to CUBIC where HF models overwhelmingly use BILINEAR.
 
     Returns the written file path, or None if the config has no vision section.
     """
@@ -555,6 +605,9 @@ def _write_vision_processor_config(
         # is trained on [0, 1] pixels, so a mean/std-0.5 Normalize would shift
         # them to [-1, 1] and silently degrade every caption.
         do_normalize = not is_gemma3n
+        # Both families' processors resample with PIL BILINEAR; ort-extensions
+        # would otherwise apply its CUBIC default.
+        resample: Any = 2
         if hf_model_id is not None:
             try:
                 from transformers import AutoProcessor
@@ -568,8 +621,9 @@ def _write_vision_processor_config(
                     hf_do_normalize = getattr(ip, "do_normalize", None)
                     if hf_do_normalize is not None:
                         do_normalize = bool(hf_do_normalize)
-                    size = getattr(ip, "size", None)
-                    if isinstance(size, dict):
+                    resample = getattr(ip, "resample", resample)
+                    size = _size_mapping(getattr(ip, "size", None))
+                    if size:
                         image_size = (
                             size.get("height") or size.get("longest_edge") or image_size
                         )
@@ -583,6 +637,14 @@ def _write_vision_processor_config(
                     do_normalize,
                     exc_info=True,
                 )
+        resize_attrs: dict[str, Any] = {
+            "height": image_size,
+            "width": image_size,
+            "smart_resize": 0,
+        }
+        interpolation = _resize_interpolation(resample)
+        if interpolation is not None:
+            resize_attrs["interpolation"] = interpolation
         transforms = [
             {
                 "operation": {
@@ -593,19 +655,9 @@ def _write_vision_processor_config(
             },
             {
                 "operation": {
-                    "name": "convert_to_rgb",
-                    "type": "ConvertRGB",
-                }
-            },
-            {
-                "operation": {
                     "name": "resize",
                     "type": "Resize",
-                    "attrs": {
-                        "height": image_size,
-                        "width": image_size,
-                        "smart_resize": 0,
-                    },
+                    "attrs": resize_attrs,
                 }
             },
             {
@@ -654,6 +706,7 @@ def _write_vision_processor_config(
         min_pixels = 784
         max_pixels = 2371600
         image_size = getattr(vision, "image_size", None)
+        resample = None
 
         if hf_model_id is not None:
             try:
@@ -665,15 +718,17 @@ def _write_vision_processor_config(
                     image_mean = list(getattr(ip, "image_mean", image_mean))
                     image_std = list(getattr(ip, "image_std", image_std))
                     rescale_factor = getattr(ip, "rescale_factor", rescale_factor)
+                    resample = getattr(ip, "resample", resample)
                     if hasattr(ip, "size"):
                         size = ip.size
-                        if isinstance(size, dict):
-                            if "longest_edge" in size:
-                                image_size = size["longest_edge"]
-                            min_pixels = size.get("shortest_edge", min_pixels)
-                            max_pixels = size.get("longest_edge", max_pixels)
-                        elif isinstance(size, int):
+                        if isinstance(size, int):
                             image_size = size
+                        else:
+                            size = _size_mapping(size)
+                            if size.get("longest_edge") is not None:
+                                image_size = size["longest_edge"]
+                            min_pixels = size.get("shortest_edge") or min_pixels
+                            max_pixels = size.get("longest_edge") or max_pixels
             except Exception:
                 logger.warning(
                     "Could not load HF processor for %s; "
@@ -694,6 +749,7 @@ def _write_vision_processor_config(
             image_std=image_std,
             min_pixels=min_pixels,
             max_pixels=max_pixels,
+            resample=resample,
         )
 
         if is_pixtral:
