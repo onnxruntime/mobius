@@ -65,7 +65,7 @@ def _resolve_hidden_act(config, model_type: str) -> str | None:
         or getattr(config, "afn", None)
         # LLaDA/OLMo expose the activation as ``activation_type`` (e.g. "silu").
         or getattr(config, "activation_type", None)
-        or ("silu" if model_type in ("qwen", "chatglm") else None)
+        or ("silu" if model_type in ("qwen", "chatglm", "lfm2") else None)
         # gelu_activation is a boolean (XLM) — must be after all string
         # attrs so it cannot override an explicit hidden_act.
         or ("gelu" if getattr(config, "gelu_activation", False) else None)
@@ -411,6 +411,10 @@ class ArchitectureConfig(BaseModelConfig):
     linear_num_key_heads: int | None = None
     linear_num_value_heads: int | None = None
 
+    # Double-gated short-convolution config (LFM2-style hybrid layers).
+    short_conv_kernel: int = 3
+    short_conv_bias: bool = False
+
     rms_norm_eps: float = 1e-6
 
     # Rotary embedding config.
@@ -706,6 +710,8 @@ class ArchitectureConfig(BaseModelConfig):
             linear_value_head_dim=(getattr(config, "linear_value_head_dim", None)),
             linear_num_key_heads=(getattr(config, "linear_num_key_heads", None)),
             linear_num_value_heads=(getattr(config, "linear_num_value_heads", None)),
+            short_conv_kernel=getattr(config, "conv_L_cache", 3),
+            short_conv_bias=getattr(config, "conv_bias", False),
             pad_token_id=(getattr(config, "pad_token_id", 0)),
             model_type=model_type,
             bos_token_id=getattr(config, "bos_token_id", None),
@@ -786,6 +792,7 @@ class ArchitectureConfig(BaseModelConfig):
                 model_type
                 in (
                     "gemma3_text",
+                    "lfm2",
                     "flex_olmo",
                     "olmoe",
                     "olmo2",

@@ -283,6 +283,10 @@ class TestBuildGraph:
                 assert f"present.{i}.ssm_state" in output_names, (
                     f"Missing present.{i}.ssm_state"
                 )
+            elif ltype == "conv":
+                assert f"present.{i}.conv_state" in output_names, (
+                    f"Missing present.{i}.conv_state"
+                )
             else:
                 assert f"present.{i}.key" in output_names, f"Missing present.{i}.key"
                 assert f"present.{i}.value" in output_names, f"Missing present.{i}.value"

@@ -68,6 +68,7 @@ from mobius.models import (
     HunYuanVLMoTModel,
     InternLM2CausalLMModel,
     LayerNormCausalLMModel,
+    Lfm2CausalLMModel,
     LLaDAModel,
     Llama4CausalLMModel,
     MoECausalLMModel,
@@ -463,6 +464,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "hunyuan_v1_dense": ModelRegistration(HunYuanV1DenseCausalLMModel),
     "internlm2": ModelRegistration(InternLM2CausalLMModel),
     "llama4_text": ModelRegistration(Llama4CausalLMModel),
+    "lfm2": ModelRegistration(Lfm2CausalLMModel),
     "llada": ModelRegistration(LLaDAModel, task="masked-diffusion"),
     "modernbert-decoder": ModelRegistration(ModernBertDecoderModel),
     "mpt": ModelRegistration(MPTCausalLMModel),
@@ -951,6 +953,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     # --- Hybrid SSM+Attention ---
     "jamba": "ai21labs/Jamba-v0.1",
     "bamba": "ibm-fms/Bamba-9B",
+    "lfm2": "LiquidAI/LFM2.5-230M",
 
     # --- Multimodal ---
     "qwen2_vl": "Qwen/Qwen2-VL-2B-Instruct",
@@ -1199,6 +1202,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "llama": "llama",
     "code_llama": "llama",
     "llama4_text": "llama",
+    "lfm2": "lfm",
     "mllama": "llama",
     "mistral": "mistral",
     "mistral3": "mistral",
@@ -1270,6 +1274,7 @@ _VARIANT_LABELS: dict[str, str] = {
     "falcon_mamba": "ssm",
     "jamba": "hybrid-ssm+attn",
     "bamba": "hybrid-mamba2+attn",
+    "lfm2": "hybrid-conv+attn",
     "qwen3_next": "moe+linear-attn",
 }
 

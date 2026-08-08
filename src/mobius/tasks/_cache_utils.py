@@ -279,12 +279,12 @@ def _make_hybrid_cache_inputs(
             pairs.append((conv_state, rec_state))
         elif ltype == "conv":
             # ShortConv layers: conv_state only (no SSM state)
-            # State: (batch, hidden_size, short_conv_kernel - 1)
+            # LFM2/ORT GenAI state: full K-wide pre-convolution window.
             short_conv_kernel = getattr(config, "short_conv_kernel", 3)
             conv_state = builder.input(
                 f"{prefix}.{i}.conv_state",
                 dtype=dtype,
-                shape=[batch, config.hidden_size, short_conv_kernel - 1],
+                shape=[batch, config.hidden_size, short_conv_kernel],
             )
             pairs.append((conv_state,))  # 1-tuple: conv has no second state
         elif ltype in ("mlp", "moe"):
