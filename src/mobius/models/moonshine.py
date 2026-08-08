@@ -18,7 +18,6 @@ from mobius._configs import MoonshineConfig
 from mobius.components import (
     Conv1d,
     Embedding,
-    GroupNorm,
     LayerNormNoBias,
     Linear,
     apply_rotary_pos_emb,
@@ -50,6 +49,39 @@ def _padding_attention_bias(
     valid = op.Expand(valid, target_shape)
     bias = op.Where(valid, 0.0, float(dtype.min))
     return op.Cast(bias, to=dtype)
+
+
+class MoonshineGroupNorm(nn.Module):
+    """Single-group normalization without the CPU-only ONNX GroupNormalization op."""
+
+    def __init__(self, channels: int, eps: float, dtype: ir.DataType):
+        super().__init__()
+        self.weight = nn.Parameter([channels])
+        self.bias = nn.Parameter([channels])
+        self._eps = eps
+        self._dtype = dtype
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
+        # GroupNorm(num_groups=1) normalizes each sample jointly across channels
+        # and time. Upcast the reduction to fp32 like PyTorch's mixed-precision
+        # kernel, then restore the model dtype after the affine transform.
+        compute = hidden_states
+        weight = self.weight
+        bias = self.bias
+        if self._dtype != ir.DataType.FLOAT:
+            compute = op.Cast(compute, to=ir.DataType.FLOAT)
+            weight = op.Cast(weight, to=ir.DataType.FLOAT)
+            bias = op.Cast(bias, to=ir.DataType.FLOAT)
+        mean = op.ReduceMean(compute, [1, 2], keepdims=1)
+        centered = op.Sub(compute, mean)
+        variance = op.ReduceMean(op.Mul(centered, centered), [1, 2], keepdims=1)
+        normalized = op.Div(centered, op.Sqrt(op.Add(variance, self._eps)))
+        scale = op.Reshape(weight, [1, -1, 1])
+        offset = op.Reshape(bias, [1, -1, 1])
+        normalized = op.Add(op.Mul(normalized, scale), offset)
+        if self._dtype != ir.DataType.FLOAT:
+            normalized = op.Cast(normalized, to=self._dtype)
+        return normalized
 
 
 class MoonshineRotaryEmbedding(nn.Module):
@@ -297,7 +329,9 @@ class MoonshineEncoderModel(nn.Module):
         self.conv1 = Conv1d(1, hidden_size, kernel_size=127, stride=64, bias=False)
         self.conv2 = Conv1d(hidden_size, 2 * hidden_size, kernel_size=7, stride=3)
         self.conv3 = Conv1d(2 * hidden_size, hidden_size, kernel_size=3, stride=2)
-        self.groupnorm = GroupNorm(1, hidden_size, eps=config.layer_norm_eps)
+        self.groupnorm = MoonshineGroupNorm(
+            hidden_size, eps=config.layer_norm_eps, dtype=config.dtype
+        )
         self.layers = nn.ModuleList(
             [MoonshineEncoderLayer(config) for _ in range(config.encoder_num_hidden_layers)]
         )
