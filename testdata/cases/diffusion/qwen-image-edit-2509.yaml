@@ -9,5 +9,5 @@ inputs:
     - "Make the cat wear a bright red scarf while preserving its pose."
   images:
     - "pipeline-cat-chonk.jpeg"
-skip_reason: "The official 20.4B pipeline requires over 57 GB of weights; deterministic diffusion-stage L4/L5 goldens are covered by src/mobius/models/qwen_image_test.py."
-notes: "QwenImageEditPlusPipeline with Qwen2.5-VL prompt conditioning, packed source-image latents, 3D RoPE, and FlowMatch Euler scheduling."
+skip_reason: "The official 20.4B pipeline requires over 57 GB of weights; genuine reduced-config diffusion L4/L5 goldens are covered by src/mobius/models/qwen_image_test.py and are explicitly not official-weight outputs."
+notes: "QwenImageEditPlusPipeline. The reduced golden encodes pipeline-cat-chonk.jpeg through a seeded diffusers Qwen Image VAE, packs the normalized posterior mode as source conditioning, runs the diffusers transformer and three FlowMatch Euler steps, and decodes the final edit latent. Mobius independently replays the same VAE-to-denoiser-to-decoder chain."
