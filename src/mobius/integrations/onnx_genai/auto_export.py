@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 from typing import Any
 
 import yaml
@@ -104,6 +105,106 @@ def _write_clip_tokenizer(output_dir: str, source: str | None) -> str | None:
     path = os.path.join(output_dir, "tokenizer.json")
     backend.save(path)
     return path
+
+
+def _copy_qwen_image_processor_assets(output_dir: str, source: str | None) -> dict[str, str]:
+    """Copy the Qwen2-VL image processor/tokenizer assets used by image edit."""
+    if not source:
+        return {}
+    filenames = (
+        "processor/preprocessor_config.json",
+        "processor/video_preprocessor_config.json",
+        "processor/tokenizer_config.json",
+        "processor/tokenizer.json",
+        "processor/chat_template.jinja",
+    )
+    artifacts: dict[str, str] = {}
+    for filename in filenames:
+        source_path = os.path.join(source, *filename.split("/"))
+        try:
+            if not os.path.isfile(source_path):
+                from huggingface_hub import hf_hub_download
+
+                source_path = hf_hub_download(source, filename)
+        except (OSError, ValueError) as error:
+            _LOGGER.warning(
+                "Could not copy Qwen Image processor asset %s: %s", filename, error
+            )
+            continue
+        destination = os.path.join(output_dir, os.path.basename(filename))
+        shutil.copyfile(source_path, destination)
+        artifacts[f"processor_{os.path.basename(filename)}"] = destination
+    return artifacts
+
+
+def _augment_qwen_image_edit_metadata(path: str, pkg: Any, config: Any) -> None:
+    """Describe the non-neural packing, RoPE, and image-conditioning contract."""
+    with open(path, encoding="utf-8") as handle:
+        metadata = yaml.safe_load(handle)
+    pipeline = metadata["pipeline"]
+    models = pipeline["models"]
+    names = set(pkg.keys())
+    for name, model_type in (
+        ("text_encoder_vision_encoder", "vision_encoder"),
+        ("text_encoder_embedding", "embedding"),
+        ("vae_encoder", "vae_encoder"),
+    ):
+        if name in names:
+            models[name] = {"filename": f"{name}/model.onnx", "type": model_type}
+
+    dataflow = pipeline["dataflow"]
+    if {"text_encoder_vision_encoder", "text_encoder_embedding"} <= names:
+        dataflow.extend(
+            [
+                {
+                    "from": "text_encoder_vision_encoder.image_features",
+                    "to": "text_encoder_embedding.image_features",
+                },
+                {
+                    "from": "text_encoder_embedding.inputs_embeds",
+                    "to": "text_encoder.inputs_embeds",
+                },
+            ]
+        )
+    phases = dict(pipeline.get("phases", {}))
+    for name in ("text_encoder_vision_encoder", "text_encoder_embedding", "vae_encoder"):
+        if name in names:
+            phases[name] = {"run_on": "prompt_only"}
+    pipeline["phases"] = phases
+    pipeline["image_edit"] = {
+        "prompt_template": (
+            "<|im_start|>system\nDescribe the key features of the input image "
+            "(color, shape, size, texture, objects, background), then explain how "
+            "the user's text instruction should alter or modify the image. Generate "
+            "a new image that meets the user's requirements while maintaining "
+            "consistency with the original input where appropriate.<|im_end|>\n"
+            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
+        ),
+        "prompt_prefix_tokens": 64,
+        "condition_image_area": 384 * 384,
+        "vae_image_area": 1024 * 1024,
+        "dimension_multiple": 16,
+        "latent_packing": {
+            "patch_size": 2,
+            "layout": "B,C,1,H,W -> B,(H/2*W/2),(C*4)",
+            "source_tokens": "concatenate after target tokens",
+            "target_sequence_length_input": "target_sequence_length",
+            "vae_encoder_output": "normalized posterior mode (z_dim channels)",
+            "latent_channels": getattr(config, "component_configs", {})
+            .get("vae", {})
+            .get("z_dim", 16),
+        },
+        "rotary_inputs": [
+            "image_rotary_cos",
+            "image_rotary_sin",
+            "text_rotary_cos",
+            "text_rotary_sin",
+        ],
+        "scheduler_shift_from_target_sequence_length": True,
+        "processor": getattr(config, "processor_config", {}),
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(metadata, handle, sort_keys=False)
 
 
 def _write_hf_tokenizer(output_dir: str, source: str | None) -> str | None:
@@ -359,17 +460,22 @@ def _diffusion_component_kwargs(pkg: Any) -> dict[str, Any]:
         return {}
 
     derived: dict[str, Any] = {}
+    single_component = len(names) == 1
+
+    def filename(key: str) -> str:
+        return "model.onnx" if single_component else f"{key}/model.onnx"
+
     for key in _DENOISER_KEYS:
         if key in names:
-            derived["denoiser_filename"] = f"{key}/model.onnx"
+            derived["denoiser_filename"] = filename(key)
             break
     if "text_encoder" in names:
-        derived["text_encoder_filename"] = "text_encoder/model.onnx"
+        derived["text_encoder_filename"] = filename("text_encoder")
     if "vae_decoder" in names:
-        derived["vae_filename"] = "vae_decoder/model.onnx"
+        derived["vae_filename"] = filename("vae_decoder")
         derived["vae_latent_input"] = "latent_sample"
     elif "vae" in names:
-        derived["vae_filename"] = "vae/model.onnx"
+        derived["vae_filename"] = filename("vae")
     return derived
 
 
@@ -415,6 +521,9 @@ def write_onnx_genai_config(
     """
     os.makedirs(output_dir, exist_ok=True)
     if _looks_like_diffusion(pkg):
+        is_qwen_image_edit = getattr(getattr(pkg, "config", None), "model_type", None) == (
+            "qwen_image_edit"
+        )
         if scheduler is None:
             scheduler = load_diffusers_scheduler_config(source)
         # Fill in component filenames from the package layout, letting any
@@ -422,6 +531,12 @@ def write_onnx_genai_config(
         derived = _diffusion_component_kwargs(pkg)
         for name, value in derived.items():
             kwargs.setdefault(name, value)
+        if is_qwen_image_edit:
+            kwargs["text_encoder_output"] = "prompt_embeds"
+            kwargs["text_encoder_edges"] = [
+                ("prompt_embeds", "encoder_hidden_states"),
+                ("prompt_embeds_mask", "encoder_hidden_states_mask"),
+            ]
         # Classic text-conditioned diffusion (a text encoder is present) uses
         # classifier-free guidance by default; SD's canonical scale is 7.5.
         if guidance_scale is None and "text_encoder_filename" in kwargs:
@@ -434,6 +549,9 @@ def write_onnx_genai_config(
             **kwargs,
         )
         artifacts = {"inference_metadata": path}
+        if is_qwen_image_edit:
+            _augment_qwen_image_edit_metadata(path, pkg, pkg.config)
+            artifacts.update(_copy_qwen_image_processor_assets(output_dir, source))
         # Emit the CLIP tokenizer.json for text-conditioned pipelines so the
         # onnx-genai runners can tokenize prompts from the package alone.
         if "text_encoder_filename" in kwargs:

@@ -56,6 +56,9 @@ __all__ = [
     "PixtralVLTask",
     "Qwen3VLVisionLanguageTask",
     "QwenImageVAETask",
+    "QwenImageDenoisingTask",
+    "QwenImageEditVAETask",
+    "QwenImageTextEncoderTask",
     "QwenVLTask",
     "SSM2CausalLMTask",
     "SSMCausalLMTask",
@@ -111,7 +114,9 @@ from mobius.tasks._multimodal import MultiModalTask
 from mobius.tasks._object_detection import ObjectDetectionTask
 from mobius.tasks._phi4mm_multimodal import Phi4MMMultiModalTask
 from mobius.tasks._qwen35_mtp import Qwen35MtpTask
-from mobius.tasks._qwen_image_vae import QwenImageVAETask
+from mobius.tasks._qwen_image import QwenImageDenoisingTask
+from mobius.tasks._qwen_image_text_encoder import QwenImageTextEncoderTask
+from mobius.tasks._qwen_image_vae import QwenImageEditVAETask, QwenImageVAETask
 from mobius.tasks._rnnt import RNNTTask
 from mobius.tasks._seq2seq import Seq2SeqTask
 from mobius.tasks._speech_language import SpeechLanguageTask
@@ -159,6 +164,9 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "qwen35-mtp": Qwen35MtpTask,
     "vae": VAETask,
     "qwen-image-vae": QwenImageVAETask,
+    "qwen-image-denoising": QwenImageDenoisingTask,
+    "qwen-image-edit-vae": QwenImageEditVAETask,
+    "qwen-image-text-encoding": QwenImageTextEncoderTask,
     "vision-language": VisionLanguageTask,
     "cosmos3-edge-vl": Cosmos3EdgeVLTask,
     "pixtral-vl": PixtralVLTask,

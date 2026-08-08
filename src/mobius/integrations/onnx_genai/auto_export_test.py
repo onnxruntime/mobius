@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import dataclasses
+import json
+from types import SimpleNamespace
 
 import onnx_ir as ir
 import pytest
@@ -62,6 +64,76 @@ def test_dispatch_diffusion(tmp_path):
         meta = yaml.safe_load(handle)
     assert meta["pipeline"]["strategy"]["kind"] == "iterative"
     assert "vae" in meta["pipeline"]["models"]
+
+
+def test_single_diffusion_component_uses_flat_model_path(tmp_path):
+    pkg = _DiffusionPkg({"transformer": object()})
+    artifacts = write_onnx_genai_config(pkg, str(tmp_path), num_inference_steps=2)
+    with open(artifacts["inference_metadata"], encoding="utf-8") as handle:
+        metadata = yaml.safe_load(handle)
+    assert metadata["pipeline"]["models"]["denoiser"]["filename"] == "model.onnx"
+
+
+def test_dispatch_qwen_image_edit_metadata_and_assets(tmp_path):
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    (source / "scheduler").mkdir(parents=True)
+    (source / "processor").mkdir()
+    (source / "scheduler" / "scheduler_config.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "FlowMatchEulerDiscreteScheduler",
+                "base_image_seq_len": 256,
+                "max_image_seq_len": 8192,
+                "base_shift": 0.5,
+                "max_shift": 0.9,
+                "use_dynamic_shifting": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    for filename in (
+        "preprocessor_config.json",
+        "video_preprocessor_config.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "chat_template.jinja",
+    ):
+        (source / "processor" / filename).write_text("{}", encoding="utf-8")
+
+    pkg = _DiffusionPkg(
+        {
+            "transformer": object(),
+            "text_encoder": object(),
+            "text_encoder_vision_encoder": object(),
+            "text_encoder_embedding": object(),
+            "vae_encoder": object(),
+            "vae_decoder": object(),
+        }
+    )
+    pkg.config = SimpleNamespace(
+        model_type="qwen_image_edit",
+        processor_config={"patch_size": 14, "merge_size": 2},
+    )
+    artifacts = write_onnx_genai_config(
+        pkg,
+        str(output),
+        source=str(source),
+        num_inference_steps=3,
+    )
+
+    with open(artifacts["inference_metadata"], encoding="utf-8") as handle:
+        metadata = yaml.safe_load(handle)
+    pipeline = metadata["pipeline"]
+    assert pipeline["strategy"]["scheduler_config"]["kind"] == "flow_match_euler"
+    assert pipeline["image_edit"]["prompt_prefix_tokens"] == 64
+    assert pipeline["image_edit"]["latent_packing"]["patch_size"] == 2
+    assert pipeline["models"]["text_encoder_vision_encoder"]["type"] == "vision_encoder"
+    assert {
+        "from": "text_encoder.prompt_embeds_mask",
+        "to": "denoiser.encoder_hidden_states_mask",
+    } in pipeline["dataflow"]
+    assert (output / "preprocessor_config.json").is_file()
 
 
 def test_dispatch_diffusion_emits_clip_tokenizer(tmp_path, monkeypatch):
