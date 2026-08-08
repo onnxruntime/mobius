@@ -494,6 +494,8 @@ class ArchitectureConfig(BaseModelConfig):
     # Vision shared fields (accessed as top-level config.X by tasks)
     mm_tokens_per_image: int | None = None
     image_token_id: int | None = None
+    video_token_id: int | None = None
+    downsample_mode: str = "16x"
     spatial_merge_size: int = 2
     temporal_patch_size: int = 2
     deepstack_visual_indexes: list[int] | None = None

@@ -390,3 +390,26 @@ class TestOrtGenaiQwen3VL:
             "Model should generate at least one token"
         )
         del generator
+
+
+@pytest.mark.integration
+@pytest.mark.integration_slow
+def test_minicpmv4_6_package_loads(tmp_path):
+    """MiniCPM's custom packed vision graph loads through ORT GenAI."""
+    from mobius import build
+    from mobius.integrations.ort_genai import export_package
+
+    model_id = "openbmb/MiniCPM-V-4.6"
+    package = build(model_id, dtype="f32", load_weights=True)
+    output_dir = str(tmp_path / "minicpm-v-4.6")
+    manifest = export_package(
+        package,
+        output_dir,
+        hf_model_id=model_id,
+        progress_bar=False,
+    )
+
+    assert os.path.isfile(manifest["genai_config"])
+    assert os.path.isfile(os.path.join(output_dir, "preprocessor_config.json"))
+    model = ort_genai.Model(output_dir)
+    assert ort_genai.Tokenizer(model) is not None
