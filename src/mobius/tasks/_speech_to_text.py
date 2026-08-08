@@ -29,13 +29,15 @@ class SpeechToTextTask(ModelTask):
 
     This task builds **two** separate ONNX models via :meth:`build`:
 
-    - **encoder**: ``input_features`` → ``encoder_hidden_states``
+    - **encoder**: the model-declared audio input, plus an optional
+      ``attention_mask`` → ``encoder_hidden_states`` and an optional
+      ``encoder_attention_mask``
     - **decoder**: ``decoder_input_ids``, ``encoder_hidden_states``,
-      ``attention_mask``, ``position_ids``, ``past_key_values``
+      optional ``encoder_attention_mask``, ``position_ids``, ``past_key_values``
       → ``logits``, ``present_key_values``
 
     The module must expose ``model.encoder`` and ``model.decoder`` sub-modules
-    (matching the :class:`WhisperForConditionalGeneration` layout).
+    following the common encoder-decoder speech model layout.
     """
 
     model_roles: ClassVar[dict[str, str]] = {"encoder": "encoder", "decoder": "decoder"}
