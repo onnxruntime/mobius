@@ -786,6 +786,8 @@ class ArchitectureConfig(BaseModelConfig):
                 model_type
                 in (
                     "gemma3_text",
+                    "gemma3n",
+                    "gemma3n_text",
                     "flex_olmo",
                     "olmoe",
                     "olmo2",
