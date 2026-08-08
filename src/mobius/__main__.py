@@ -41,6 +41,7 @@ _BUILD_FEATURES: dict[str, str] = {
     "fp8-kv-cache": "fp8_kv_cache",
     "prune-lm-head": "prune_lm_head",
     "text-only": "text_only",
+    "qdq": "qdq",
 }
 
 
@@ -224,6 +225,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
     # the --config and --model build paths can pass the same scales.
     fp8_kv_cache = getattr(args, "fp8_kv_cache", False)
     prune_lm_head = getattr(args, "prune_lm_head", False)
+    qdq = getattr(args, "qdq", False)
     kv_cache_scales: dict[int, tuple[float, float]] | None = None
     scale_file = getattr(args, "kv_cache_scale_file", None)
     if scale_file is not None and not fp8_kv_cache:
@@ -314,6 +316,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             fp8_kv_cache=fp8_kv_cache,
             kv_cache_scales=kv_cache_scales,
             prune_lm_head=prune_lm_head,
+            qdq=qdq,
         )
         for name, model in pkg.items():
             model.graph.name = f"{config_path}/{name}"
@@ -344,6 +347,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             fp8_kv_cache=fp8_kv_cache,
             kv_cache_scales=kv_cache_scales,
             prune_lm_head=prune_lm_head,
+            qdq=qdq,
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)
