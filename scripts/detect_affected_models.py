@@ -58,17 +58,19 @@ def classify_file(path: str) -> str:
     """Classify a changed file path.
 
     Returns one of: 'model', 'traceable', 'shared_infra',
-    'test', 'other'.
+    'test_config', 'test', 'other'.
     """
     normalized = path.replace("\\", "/")
 
     if not normalized.startswith("src/mobius/"):
         # Test infrastructure files that affect all models
-        if normalized in (
-            "tests/conftest.py",
-            "tests/_test_configs.py",
-        ):
+        if normalized == "tests/conftest.py":
             return "shared_infra"
+        if normalized == "tests/_test_configs.py":
+            # A config-only change is broad, but new model implementations also
+            # add an entry here. Defer the run-all decision until model files
+            # have been collected so those PRs can use import-graph scoping.
+            return "test_config"
         if normalized.endswith("_test.py") or normalized.startswith("tests/"):
             return "test"
         return "other"
@@ -427,6 +429,7 @@ def detect_affected_models(
     """
     affected: set[str] = set()
     run_all = False
+    test_config_changed = False
 
     # Classify files
     model_files: list[str] = []
@@ -436,6 +439,8 @@ def detect_affected_models(
         if category == "shared_infra":
             run_all = True
             break
+        elif category == "test_config":
+            test_config_changed = True
         elif category == "model":
             # Deleted model files could break dependents — run all
             full_path = _PROJECT_ROOT / path
@@ -451,6 +456,9 @@ def detect_affected_models(
             traceable_files.append(path)
 
     if run_all:
+        return {"affected": [], "run_all": True}
+
+    if test_config_changed and not model_files:
         return {"affected": [], "run_all": True}
 
     if not model_files and not traceable_files:
