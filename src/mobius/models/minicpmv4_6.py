@@ -10,8 +10,7 @@ merger, a second MLP spatial merger, and the Qwen3.5 hybrid text decoder.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
+import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
@@ -25,9 +24,6 @@ from mobius.components import (
     get_activation,
 )
 from mobius.models.qwen35 import Qwen35TextModel
-
-if TYPE_CHECKING:
-    import onnx_ir as ir
 
 
 class MiniCPMV46Config(ArchitectureConfig):
@@ -284,6 +280,7 @@ class _MiniCPMViTWindowAttentionMerger(nn.Module):
         assert vision.intermediate_size is not None
         self.hidden_size = vision.hidden_size
         self.kernel_size = vision.window_kernel_size
+        self._needs_bf16_cast = config.dtype == ir.DataType.BFLOAT16
         window_tokens = self.kernel_size[0] * self.kernel_size[1]
         window_hidden = self.hidden_size * window_tokens
         window_intermediate = vision.intermediate_size * window_tokens
@@ -347,15 +344,18 @@ class _MiniCPMViTWindowAttentionMerger(nn.Module):
         merged_grid, _, _ = _spatial_windows(
             op, hidden_states, target_sizes, self.hidden_size, self.kernel_size
         )
-        # ReduceMean does not have an ORT BF16 kernel on CPU or CUDA.
-        merge_residual = op.CastLike(
-            op.ReduceMean(
-                op.CastLike(merged_grid, 0.0),
-                [3, 4],
-                keepdims=0,
-            ),
-            merged_grid,
-        )
+        if self._needs_bf16_cast:
+            # ReduceMean does not have an ORT BF16 kernel on CPU or CUDA.
+            merge_residual = op.CastLike(
+                op.ReduceMean(
+                    op.CastLike(merged_grid, 0.0),
+                    [3, 4],
+                    keepdims=0,
+                ),
+                merged_grid,
+            )
+        else:
+            merge_residual = op.ReduceMean(merged_grid, [3, 4], keepdims=0)
         merge_residual = op.Reshape(
             merge_residual,
             op.Constant(value_ints=[-1, self.hidden_size]),
@@ -517,6 +517,7 @@ class _MiniCPMMerger(nn.Module):
         self.kernel_size = vision.merge_kernel_size
         self.merger_times = vision.merger_times
         self.vision_downsample = 1 if config.downsample_mode == "4x" else 2
+        self._needs_bf16_cast = config.dtype == ir.DataType.BFLOAT16
         self.output_sizes = [
             self.hidden_size if i < self.merger_times - 1 else config.hidden_size
             for i in range(self.merger_times)
@@ -591,14 +592,16 @@ class _MiniCPMMerger(nn.Module):
                 axis=0,
             ),
         )
-        # ONNX Compress excludes BF16 from its type constraint. Compaction is
-        # data movement only, so cast through FLOAT and restore the model dtype.
-        compacted = op.Compress(
-            op.CastLike(hidden_states, 0.0),
-            valid,
-            axis=0,
-        )
-        return op.CastLike(compacted, hidden_states)
+        if self._needs_bf16_cast:
+            # ONNX Compress excludes BF16 from its type constraint. Compaction
+            # is data movement only, so cast through FLOAT and restore dtype.
+            compacted = op.Compress(
+                op.CastLike(hidden_states, 0.0),
+                valid,
+                axis=0,
+            )
+            return op.CastLike(compacted, hidden_states)
+        return op.Compress(hidden_states, valid, axis=0)
 
 
 class _MiniCPMVisionEncoderModel(nn.Module):
