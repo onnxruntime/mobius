@@ -70,13 +70,13 @@ def _packed_patch_coordinates(
 
     # The first cumulative end greater than each packed index identifies its
     # source image crop or video frame.
-    before_end = op.Less(
+    reached_end = op.GreaterOrEqual(
         op.Unsqueeze(packed_index, [1]),
         op.Unsqueeze(ends, [0]),
     )
-    visual_index = op.ArgMax(
-        op.Cast(before_end, to=7),
-        axis=1,
+    visual_index = op.ReduceSum(
+        op.Cast(reached_end, to=7),
+        [1],
         keepdims=0,
     )
     local_index = op.Sub(packed_index, op.Gather(starts, visual_index))
@@ -347,7 +347,15 @@ class _MiniCPMViTWindowAttentionMerger(nn.Module):
         merged_grid, _, _ = _spatial_windows(
             op, hidden_states, target_sizes, self.hidden_size, self.kernel_size
         )
-        merge_residual = op.ReduceMean(merged_grid, [3, 4], keepdims=0)
+        # ReduceMean does not have an ORT BF16 kernel on CPU or CUDA.
+        merge_residual = op.CastLike(
+            op.ReduceMean(
+                op.CastLike(merged_grid, 0.0),
+                [3, 4],
+                keepdims=0,
+            ),
+            merged_grid,
+        )
         merge_residual = op.Reshape(
             merge_residual,
             op.Constant(value_ints=[-1, self.hidden_size]),
@@ -583,7 +591,14 @@ class _MiniCPMMerger(nn.Module):
                 axis=0,
             ),
         )
-        return op.Compress(hidden_states, valid, axis=0)
+        # ONNX Compress excludes BF16 from its type constraint. Compaction is
+        # data movement only, so cast through FLOAT and restore the model dtype.
+        compacted = op.Compress(
+            op.CastLike(hidden_states, 0.0),
+            valid,
+            axis=0,
+        )
+        return op.CastLike(compacted, hidden_states)
 
 
 class _MiniCPMVisionEncoderModel(nn.Module):
