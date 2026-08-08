@@ -512,16 +512,22 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
 
 
 def _generate_speech_to_text(case: TestCase, json_path: Path, device: str) -> None:
-    """Generate golden data for a speech-to-text (Whisper) model."""
+    """Generate golden data for an encoder-decoder speech recognition model."""
     import librosa
     import torch
+    import transformers
 
     from mobius._testing.golden import save_generation_json, save_golden_ref
-    from mobius._testing.torch_reference import (
-        load_torch_whisper_model,
-    )
 
-    model, processor = load_torch_whisper_model(case.model_id, device=device)
+    model = transformers.AutoModelForSpeechSeq2Seq.from_pretrained(
+        case.model_id,
+        device_map=device,
+        trust_remote_code=case.trust_remote_code,
+    )
+    model.eval()
+    processor = transformers.AutoProcessor.from_pretrained(
+        case.model_id, trust_remote_code=case.trust_remote_code
+    )
 
     # Load and preprocess audio
     audio_path = Path("testdata") / case.audio[0]
@@ -530,8 +536,6 @@ def _generate_speech_to_text(case: TestCase, json_path: Path, device: str) -> No
     processed = processor(audio_array, sampling_rate=sample_rate, return_tensors="pt").to(
         model_device
     )
-    input_features = processed["input_features"]
-
     # L4: single decoder step with forced decoder start token
     decoder_start_id = (
         model.config.decoder_start_token_id or model.generation_config.decoder_start_token_id
@@ -541,7 +545,7 @@ def _generate_speech_to_text(case: TestCase, json_path: Path, device: str) -> No
     )
     with torch.no_grad():
         outputs = model(
-            input_features=input_features,
+            **processed,
             decoder_input_ids=decoder_input_ids,
         )
     last_logits = outputs.logits[0, -1, :].cpu().numpy()
@@ -553,11 +557,18 @@ def _generate_speech_to_text(case: TestCase, json_path: Path, device: str) -> No
     if "L5" in case.level:
         with torch.no_grad():
             gen = model.generate(
-                input_features=input_features,
+                **processed,
                 max_new_tokens=case.generation_params.get("max_new_tokens", 50),
                 do_sample=False,
             )
         generated_ids = gen[0].cpu().numpy()
+        # Generic encoder-decoder generation includes the decoder start token,
+        # while Whisper's specialized generation returns content tokens only.
+        if len(generated_ids) and generated_ids[0] == decoder_start_id:
+            generated_ids = generated_ids[1:]
+        eos_token_id = model.generation_config.eos_token_id
+        while len(generated_ids) and generated_ids[-1] == eos_token_id:
+            generated_ids = generated_ids[:-1]
 
     save_golden_ref(
         json_path,

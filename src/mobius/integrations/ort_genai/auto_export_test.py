@@ -54,6 +54,23 @@ def _mock_model_with_outputs(names):
     return m
 
 
+def test_moonshine_native_runtime_is_rejected(tmp_path):
+    from mobius._model_package import ModelPackage
+
+    config = mock.MagicMock()
+    config.model_type = "moonshine"
+    package = ModelPackage(
+        {"encoder": mock.MagicMock(), "decoder": mock.MagicMock()},
+        config=config,
+    )
+
+    with pytest.raises(
+        NotImplementedError,
+        match="variable-length raw-waveform encoder",
+    ):
+        write_ort_genai_config(package, str(tmp_path))
+
+
 def _make_fake_llm_pkg(model_type: str = "qwen2"):
     """Build a minimal LLM-only ModelPackage with a fake config."""
     import dataclasses

@@ -1008,6 +1008,13 @@ def write_ort_genai_config(
             "Diffusion models (which have no config) are not supported."
         )
 
+    if getattr(config, "model_type", None) == "moonshine":
+        raise NotImplementedError(
+            "onnxruntime-genai does not support Moonshine's variable-length raw-waveform "
+            "encoder. Export with runtime='onnx-genai' or run the encoder and cached "
+            "decoder directly with onnxruntime."
+        )
+
     os.makedirs(directory, exist_ok=True)
 
     # Normalize EP: 'default' and 'onnx-standard' are portable-ONNX modes
