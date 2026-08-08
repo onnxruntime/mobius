@@ -121,9 +121,7 @@ class GatedShortConv(nn.Module):
         projected = op.Transpose(self.in_proj(op, hidden_states), perm=[0, 2, 1])
         gate_b, gate_c, conv_input = op.Split(
             projected,
-            op.Constant(
-                value_ints=[self._hidden_size, self._hidden_size, self._hidden_size]
-            ),
+            op.Constant(value_ints=[self._hidden_size, self._hidden_size, self._hidden_size]),
             axis=1,
             _outputs=3,
         )
