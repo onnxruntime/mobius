@@ -67,6 +67,8 @@ from mobius._configs._base import (
     _shallow_fields,
     _shared_expert_size,
 )
+from mobius._configs._cosmos3_audio import Cosmos3AudioConfig
+from mobius._configs._cosmos3_omni_generator import Cosmos3OmniGeneratorConfig
 from mobius._configs._quantization import QuantizationConfig
 from mobius._configs._sub_configs import (
     AudioConfig,
@@ -79,7 +81,8 @@ from mobius._configs._sub_configs import (
     TTSConfig,
     VisionConfig,
 )
-from mobius._configs._world_model import WorldModelConfig
+from mobius._configs._wan_vae import WanVAEConfig
+from mobius._configs._world_model import LatentDynamicsConfig, WorldModelConfig
 
 __all__ = [
     "DEFAULT_INT",
@@ -89,6 +92,8 @@ __all__ = [
     "BaseModelConfig",
     "CausalLMConfig",
     "CodePredictorConfig",
+    "Cosmos3AudioConfig",
+    "Cosmos3OmniGeneratorConfig",
     "CodecDecoderConfig",
     "CodecEncoderConfig",
     "DepthAnythingConfig",
@@ -102,6 +107,7 @@ __all__ = [
     "JambaConfig",
     "JetMoeConfig",
     "LongcatFlashConfig",
+    "LatentDynamicsConfig",
     "Mamba2Config",
     "MambaConfig",
     "MllamaConfig",
@@ -117,6 +123,7 @@ __all__ = [
     "TTSConfig",
     "VisionConfig",
     "VisionLanguageConfig",
+    "WanVAEConfig",
     "WhisperConfig",
     "WorldModelConfig",
     "YolosConfig",

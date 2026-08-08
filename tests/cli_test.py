@@ -143,6 +143,68 @@ class TestCLIBuild:
         mock_build.assert_called_once()
         assert mock_build.call_args.kwargs.get("text_only") is True
 
+    def test_world_model_feature_dispatches_complete_pipeline(self):
+        package = mock.MagicMock()
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius._diffusers_builder._load_diffusers_pipeline_index"
+            ) as mock_diffusers,
+            mock.patch(
+                "mobius._world_model_builder.build_world_model",
+                return_value=package,
+            ) as mock_build_world_model,
+            mock.patch("mobius.__main__._save_package") as mock_save,
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "nvidia/Cosmos3-Nano",
+                    tmpdir,
+                    "--features",
+                    "world-model",
+                    "--no-weights",
+                    "--dtype",
+                    "bf16",
+                    "--ep",
+                    "cuda",
+                ]
+            )
+
+        mock_diffusers.assert_not_called()
+        mock_build_world_model.assert_called_once()
+        kwargs = mock_build_world_model.call_args.kwargs
+        assert kwargs["load_weights"] is False
+        assert kwargs["execution_provider"] == "cuda"
+        mock_save.assert_called_once_with(
+            package, tmpdir, mock.ANY, mock.ANY, component_filter=None
+        )
+
+    @pytest.mark.parametrize(
+        ("extra_args", "message"),
+        [
+            (["--task", "qwen-vl"], "--task"),
+            (["--component", "generator"], "--component"),
+            (["--runtime", "onnx-genai"], "--runtime"),
+            (["--features", "text-only"], "decoder-specific"),
+        ],
+    )
+    def test_world_model_rejects_incompatible_options(self, extra_args, message):
+        with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit, match=message):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "nvidia/Cosmos3-Nano",
+                    tmpdir,
+                    "--features",
+                    "world-model",
+                    "--no-weights",
+                    *extra_args,
+                ]
+            )
+
     def test_build_static_cache(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             main(

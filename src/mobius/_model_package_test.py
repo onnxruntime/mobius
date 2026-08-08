@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 import logging
+from unittest import mock
 
 import onnx_ir as ir
+import pytest
 import torch
 
 from mobius._builder import build_from_module
@@ -156,6 +158,31 @@ class TestModelPackageApplyWeights:
             prefix_map={"text.": "text", "vision_encoder.": "vision_encoder"},
         )
         assert model1.graph.initializers[init_name].const_value is not None
+
+    def test_partial_weights_defer_folding_until_finalize(self):
+        config = make_config()
+        pkg = build_from_module(CausalLMModel(config), config)
+        model = pkg["model"]
+        init_name = next(iter(model.graph.initializers))
+        shape = list(model.graph.initializers[init_name].shape)
+
+        with mock.patch(
+            "mobius._model_package.fold_initializers_after_weights"
+        ) as fold_initializers:
+            applied = pkg.apply_weights_partial({init_name: torch.ones(shape)})
+            fold_initializers.assert_not_called()
+
+            pkg.finalize_weights()
+
+        assert applied == {init_name}
+        fold_initializers.assert_called_once_with(model)
+
+    def test_validate_weights_rejects_unassigned_initializers(self):
+        config = make_config()
+        pkg = build_from_module(CausalLMModel(config), config)
+
+        with pytest.raises(ValueError, match="without weights"):
+            pkg.validate_weights()
 
 
 class TestBuildPackageFromModule:

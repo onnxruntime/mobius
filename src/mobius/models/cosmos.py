@@ -46,13 +46,15 @@ for both paths.
    pixel-shuffle ordering and numerical parity are unverifiable. These builds
    are validated at graph-construction (L1) confidence only.
 
-The ``cosmos3_omni`` variants (``nvidia/Cosmos3-Nano`` / ``-Super``) are
-two-tower diffusion world models exported as diffusers pipelines and are
-tracked separately.
+The complete ``cosmos3_edge`` world-model package (this Reasoner plus the
+shared MoT Generator, Wan VAE, and Action head) is composed by
+``build_cosmos3_edge_world_model``. The ``cosmos3_omni`` variants use the same
+Generator/VAE building blocks with a Qwen3-VL Reasoner.
 """
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 from onnxscript import OpBuilder, nn
@@ -70,6 +72,30 @@ from mobius.models.base import CausalLMModel, TextModel
 if TYPE_CHECKING:
     import onnx_ir as ir
     import torch
+
+
+_DROPPED_UNIFIED_KEY_RE = re.compile(
+    "|".join(
+        (
+            r"\.add_q_proj\.",
+            r"\.add_k_proj\.",
+            r"\.add_v_proj\.",
+            r"\.to_add_out\.",
+            r"\.norm_added_q\.",
+            r"\.norm_added_k\.",
+            r"moe_gen",
+            r"^proj_out\.",
+            r"^proj_in\.",
+            r"^time_embedder\.",
+            r"^audio_proj_out\.",
+            r"^audio_proj_in\.",
+            r"^audio_modality_embed$",
+            r"^action_proj_out\.",
+            r"^action_proj_in\.",
+            r"^action_modality_embed$",
+        )
+    )
+)
 
 
 def _rename_cosmos_text_key(key: str) -> str:
@@ -224,6 +250,8 @@ class _Cosmos3EdgeVisionEncoderModel(nn.Module):
                 f"patch_size ({vc.patch_size})"
             )
         self.vision_tower = VisionModel(config)
+        self._vision_patch_size = vc.patch_size
+        self._vision_num_channels = vc.in_channels
         # Fixed square patch grid (image_size // patch_size), e.g. 256 -> 16.
         grid_size = vc.image_size // vc.patch_size
         self.multi_modal_projector = Cosmos3EdgeMultiModalProjector(
@@ -248,6 +276,19 @@ class _Cosmos3EdgeVisionEncoderModel(nn.Module):
         for key, value in state_dict.items():
             if key.startswith("model.visual."):
                 new_key = "vision_tower.vision_model." + key[len("model.visual.") :]
+                if key == "model.visual.embeddings.patch_embedding.weight":
+                    expected_flat = (
+                        self._vision_num_channels
+                        * self._vision_patch_size
+                        * self._vision_patch_size
+                    )
+                    if value.ndim == 2 and value.shape[1] == expected_flat:
+                        value = value.reshape(
+                            value.shape[0],
+                            self._vision_num_channels,
+                            self._vision_patch_size,
+                            self._vision_patch_size,
+                        )
                 # SigLIP MLP: fc1/fc2 -> up_proj/down_proj (FCMLP convention).
                 new_key = new_key.replace(".mlp.fc1.", ".mlp.up_proj.").replace(
                     ".mlp.fc2.", ".mlp.down_proj."
@@ -370,6 +411,8 @@ class Cosmos3EdgeVLModel(nn.Module):
         for key, value in state_dict.items():
             # Generator-tower key-norm is not used by the reasoner (see docstring).
             if "k_norm_und_for_gen" in key:
+                continue
+            if _DROPPED_UNIFIED_KEY_RE.search(key):
                 continue
             if key.startswith(("model.visual.", "model.projector.")):
                 vision_sd[key] = value

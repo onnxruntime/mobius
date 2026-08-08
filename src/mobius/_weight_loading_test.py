@@ -32,7 +32,7 @@ import torch
 from mobius._builder import build_from_module
 from mobius._model_package import ModelPackage
 from mobius._testing import make_config
-from mobius._weight_loading import _download_weights, apply_weights
+from mobius._weight_loading import _download_weights, apply_weights, iter_weight_shards
 from mobius.models.base import CausalLMModel
 from mobius.tasks import CausalLMTask, ModelTask
 
@@ -188,6 +188,71 @@ class TestLocalSafetensorsLoading:
 
         assert torch.equal(state_dict["a.weight"], shard_a["a.weight"])
         assert torch.equal(state_dict["b.weight"], shard_b["b.weight"])
+
+    def test_local_weight_shards_are_yielded_individually(self, tmp_path, monkeypatch):
+        shard_a = {"a.weight": torch.ones(1)}
+        shard_b = {"b.weight": torch.zeros(1)}
+        safetensors.torch.save_file(shard_a, str(tmp_path / "part-a.safetensors"))
+        safetensors.torch.save_file(shard_b, str(tmp_path / "nested-part-b.safetensors"))
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "metadata": {},
+                    "weight_map": {
+                        "a.weight": "part-a.safetensors",
+                        "b.weight": "nested-part-b.safetensors",
+                    },
+                }
+            )
+        )
+
+        def _unexpected_hub_call(*_args, **_kwargs):
+            raise AssertionError("local checkpoint should not call hf_hub_download")
+
+        monkeypatch.setattr("mobius._weight_loading.hf_hub_download", _unexpected_hub_call)
+
+        shards = list(iter_weight_shards(str(tmp_path)))
+
+        assert [set(shard) for shard in shards] == [{"b.weight"}, {"a.weight"}]
+        assert torch.equal(shards[0]["b.weight"], shard_b["b.weight"])
+        assert torch.equal(shards[1]["a.weight"], shard_a["a.weight"])
+
+    def test_fp8_scale_in_different_shard_is_applied_after_merge(self, tmp_path, monkeypatch):
+        weight = torch.full((2, 2), 4.0, dtype=torch.float8_e4m3fn)
+        scale = torch.tensor(8.0)
+        safetensors.torch.save_file(
+            {"layer.weight": weight},
+            str(tmp_path / "weight.safetensors"),
+        )
+        safetensors.torch.save_file(
+            {"layer.weight_scale_inv": scale},
+            str(tmp_path / "scale.safetensors"),
+        )
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "metadata": {},
+                    "weight_map": {
+                        "layer.weight": "weight.safetensors",
+                        "layer.weight_scale_inv": "scale.safetensors",
+                    },
+                }
+            )
+        )
+
+        def _unexpected_hub_call(*_args, **_kwargs):
+            raise AssertionError("local checkpoint should not call hf_hub_download")
+
+        monkeypatch.setattr("mobius._weight_loading.hf_hub_download", _unexpected_hub_call)
+
+        state_dict = _download_weights(str(tmp_path))
+
+        assert state_dict["layer.weight"].dtype == torch.bfloat16
+        torch.testing.assert_close(
+            state_dict["layer.weight"],
+            torch.full((2, 2), 32.0, dtype=torch.bfloat16),
+        )
+        assert "layer.weight_scale_inv" not in state_dict
 
     def test_local_directory_without_safetensors_raises_without_hub(
         self, tmp_path, monkeypatch

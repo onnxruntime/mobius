@@ -59,6 +59,8 @@ class TestInitDiffusersClassMap:
             "AutoencoderKLQwenImage",
             "AutoencoderKLCogVideoX",
             "CogVideoXTransformer3DModel",
+            "Cosmos3OmniTransformer",
+            "AutoencoderKLWan",
         }
         assert expected_keys == set(_DIFFUSERS_CLASS_MAP.keys())
 
@@ -83,6 +85,8 @@ class TestInitDiffusersClassMap:
             "qwen-image-vae",
             "video-denoising",
             "feature-extraction",
+            "cosmos3-omni-generator",
+            "wan-vae",
         }
         for class_name, (_, _, task_name) in _DIFFUSERS_CLASS_MAP.items():
             assert task_name in valid_tasks, f"Unknown task '{task_name}' for {class_name}"
@@ -346,7 +350,7 @@ class TestBuildDiffusersPipelineSuccess:
         )
         mock_load_config.return_value = {}
 
-        def fake_build(module, config, task_name):
+        def fake_build(module, config, task_name, **_kwargs):
             graph = ir.Graph([], [], nodes=[], name="g")
             return ModelPackage({"model": ir.Model(graph, ir_version=10)})
 
@@ -399,6 +403,33 @@ class TestBuildDiffusersPipelineSuccess:
         )
         # Verify build_from_module was called (ir.DataType accepted without error)
         mock_build_from_module.assert_called_once()
+
+    @patch("mobius._diffusers_builder.build_from_module")
+    @patch(
+        "mobius._diffusers_builder._load_diffusers_component_config",
+    )
+    @patch(
+        "mobius._diffusers_builder._load_diffusers_pipeline_index",
+    )
+    def test_execution_provider_forwarded_to_component_build(
+        self,
+        mock_load_index,
+        mock_load_config,
+        mock_build_from_module,
+    ):
+        self._mock_build_for_vae(mock_load_index, mock_load_config, mock_build_from_module)
+
+        build_diffusers_pipeline(
+            "fake/vae-model",
+            load_weights=False,
+            execution_provider="cuda",
+            trace_optimization=True,
+        )
+
+        assert mock_build_from_module.call_args.kwargs == {
+            "execution_provider": "cuda",
+            "trace_optimization": True,
+        }
 
 
 # ── build_diffusers_pipeline weight loading ──────────────────────────────
@@ -504,7 +535,7 @@ class TestBuildDiffusersPipelineWeights:
 
         # The module class will have preprocess_weights set by AutoencoderKLModel
         # We patch it at the module instance level via build_from_module's first arg
-        def capture_build(module, config, task_name):
+        def capture_build(module, config, task_name, **_kwargs):
             module.preprocess_weights = lambda sd: processed_weights
             return ModelPackage({"model": model})
 

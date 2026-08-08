@@ -17,8 +17,8 @@ generation:
   do_sample: false
 
 notes: >
-  Cosmos3-Omni understanding tower ("Reasoner"). Architecturally identical to
-  Qwen3-VL (interleaved 3D M-RoPE, QK-norm, DeepStack layers [8, 16, 24]); the
-  reasoner sub-tower of the unified Cosmos3 checkpoint is exported via the
-  Qwen3-VL 3-model split with DeepStack preserved. Generator / Sound / Action
-  towers are dropped.
+  This VLM case validates the Cosmos3-Omni understanding tower ("Reasoner")
+  independently. Architecturally it is Qwen3-VL (interleaved 3D M-RoPE,
+  QK-norm, DeepStack layers [8, 16, 24]). Complete world-model export,
+  including Generator, Wan VAE, Sound, and Action, uses
+  build_world_model() / --features world-model.

@@ -23,7 +23,7 @@ import math
 from mobius._configs._extractors import register_vision_hook
 
 
-@register_vision_hook("cosmos3_edge", "cosmos3_edge_vision")
+@register_vision_hook("cosmos3_edge", "cosmos3_edge_text", "cosmos3_edge_vision")
 def _cosmos3_edge_vision(config, parent_config, model_type: str, fields: dict):
     vision_source = parent_config or config
     hf_vision = getattr(vision_source, "vision_config", None) or getattr(

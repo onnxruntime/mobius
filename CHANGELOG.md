@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Compositional world-model pipelines
+
+#### Added
+
+- A runtime-agnostic `PipelineBuilder` / `PipelineManifest` /
+  `PipelinePackage` framework for heterogeneous world models. It validates
+  typed graph ports, input-source closure, dataflow, recurrent state,
+  registered roles/strategies/transforms, runtime capabilities, safe assets,
+  and atomic `pipeline.json` persistence.
+- Executable pipeline schema 1.1: versioned model profiles, input semantics,
+  registered generated-input programs, explicit state lifecycle,
+  scheduler/sampling/stopping controls, transform parameters, and per-component
+  dtype/EP hints.
+- `build_world_model()` and `--features world-model`, with a complete
+  `cosmos3_omni` implementation: Qwen3-VL Reasoner, unified MoT diffusion
+  Generator, Wan video VAE, optional full/decoder-only Cosmos3 AVAE, Sound
+  projection, and domain-aware Action projection.
+- Complete `cosmos3_edge` world-model composition for
+  `nvidia/Cosmos3-Edge` and `Cosmos3-Edge-Policy-DROID`: Edge
+  Nemotron/SigLIP Reasoner, shared MoT Generator, Wan VAE, and Action head.
+- Exact Mobius implementations for `Cosmos3OmniTransformer`,
+  `AutoencoderKLWan`, and `Cosmos3AVAEAudioTokenizer`.
+
+#### Changed
+
+- The original fixed four-output world-model API is now accurately named
+  `LatentDynamicsTask` / `LatentDynamicsConfig` /
+  `MLPLatentDynamicsModel`. The original `WorldModel*` names remain aliases.
+
 ### NVIDIA Cosmos 3 Edge vision-language model (`cosmos3_edge`)
 
 #### Added
@@ -36,6 +65,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pixel-shuffle ordering and numerical parity are unverifiable; L4/L5 parity
   is deferred. The `cosmos3_omni` variants (`Cosmos3-Nano`/`-Super`) are
   two-tower diffusion world models tracked separately.
+- The complete Cosmos3-Edge world-model pipeline is also available through
+  `build_world_model()` / `--features world-model`; this VLM confidence note
+  still applies specifically to the Edge Reasoner graph.
 
 ### Cargo-style `--features` build option
 
@@ -45,8 +77,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   single Rust/cargo-style option. Accepts a comma-separated list and may be
   repeated (`--features fp8-kv-cache,static-cache` or `--features fp8-kv-cache
   --features static-cache`). Available features: `static-cache`, `fp8-kv-cache`,
-  `prune-lm-head`, `text-only`. Unknown feature names are rejected with an error
-  listing the valid set.
+  `prune-lm-head`, `text-only`, `world-model`. Unknown feature names are
+  rejected with an error listing the valid set.
 
 #### Changed
 

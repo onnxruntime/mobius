@@ -97,6 +97,33 @@ def test_vl_tied_lm_head_populates_embedding():
     assert result["embedding.embed_tokens.weight"] is weight
 
 
+def test_vl_drops_unified_generator_and_action_weights():
+    module = Cosmos3EdgeVLModel(_tiny_config())
+    weights = {
+        "layers.0.self_attn.add_q_proj.weight": torch.zeros(1),
+        "layers.0.mlp_moe_gen.up_proj.weight": torch.zeros(1),
+        "time_embedder.linear_1.weight": torch.zeros(1),
+        "proj_in.weight": torch.zeros(1),
+        "action_proj_in.fc.weight": torch.zeros(1),
+        "action_modality_embed": torch.zeros(1),
+    }
+
+    assert module.preprocess_weights(weights) == {}
+
+
+def test_vision_patch_embedding_weight_is_reshaped_for_conv():
+    module = Cosmos3EdgeVLModel(_tiny_config())
+    weight = torch.arange(32 * 3 * 14 * 14).reshape(32, 3 * 14 * 14)
+
+    result = module.preprocess_weights(
+        {"model.visual.embeddings.patch_embedding.weight": weight}
+    )
+
+    assert result[
+        "vision_encoder.vision_tower.vision_model.embeddings.patch_embedding.weight"
+    ].shape == (32, 3, 14, 14)
+
+
 def test_vision_encoder_defaults_missing_spatial_merge_size():
     module = _Cosmos3EdgeVisionEncoderModel(_tiny_config(spatial_merge_size=None))
 
@@ -142,3 +169,17 @@ def test_vision_config_rejects_non_square_num_patches():
 
     with pytest.raises(ValueError, match="num_patches must form a square grid"):
         _cosmos3_edge_vision(config, None, "cosmos3_edge", {"image_size": None})
+
+
+def test_vision_config_hook_runs_for_unwrapped_edge_text_config():
+    config = SimpleNamespace(
+        model_type="cosmos3_edge_text",
+        vision_config=SimpleNamespace(num_patches=256, patch_size=16),
+        projector_config={"merger_intermediate_size": 128, "out_hidden_size": 64},
+    )
+    fields = {"image_size": None, "patch_size": 16, "out_hidden_size": None}
+
+    _cosmos3_edge_vision(config, config, "cosmos3_edge_text", fields)
+
+    assert fields["image_size"] == 256
+    assert fields["projector_intermediate_size"] == 128
