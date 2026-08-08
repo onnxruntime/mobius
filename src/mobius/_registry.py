@@ -855,8 +855,10 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "gemma2": "google/gemma-2-2b",
     "gemma3": "google/gemma-3-4b-it",
     "gemma3_text": "google/gemma-3-1b-pt",
-    "gemma3n": "google/gemma-3n-E2B-pt",
-    "gemma3n_text": "google/gemma-3n-E2B-pt",
+    # No text-only gemma3n checkpoint was ever published; the -it releases are
+    # multimodal, and "gemma3n_text" reaches the text path via _TEXT_ONLY_MODEL_TYPE.
+    "gemma3n": "google/gemma-3n-E4B-it",
+    "gemma3n_text": "google/gemma-3n-E2B-it",
     "gemma4_text": "google/gemma-4-E2B-it",
     "granite": "ibm-granite/granite-3.3-2b-instruct",
     "internlm2": "internlm/internlm2_5-7b-chat",
