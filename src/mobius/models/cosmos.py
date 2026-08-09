@@ -5,8 +5,8 @@
 
 Supports the ``cosmos3_edge`` checkpoint (``nvidia/Cosmos3-Edge``,
 ``Cosmos3EdgeForConditionalGeneration``) both as a full vision-language model
-(:class:`Cosmos3EdgeVLModel`, 3-model onnxruntime-genai split) and as a
-standalone text reasoner (:class:`Cosmos3EdgeTextModel`).
+(:class:`Cosmos3EdgeVLModel`, 3-model split) and as a standalone text reasoner
+(:class:`Cosmos3EdgeTextModel`).
 
 Cosmos3-Edge is a LLaVA-style VLM built from three towers:
 
@@ -16,15 +16,27 @@ Cosmos3-Edge is a LLaVA-style VLM built from three towers:
   - **Non-gated feed-forward network** — ``down_proj(relu2(up_proj(x)))`` using
     a squared-ReLU activation (``hidden_act="relu2"``), rather than the
     GLU-style gated MLP used by Llama/Qwen. This maps onto :class:`FCMLP`.
-  - **3D multimodal RoPE** (``mrope_section=[24, 20, 20]``). For text-only
-    inference the three sections use the same positions, so it reduces to
-    standard 1D RoPE (same simplification used by the Qwen-VL text decoders).
+  - **Interleaved 3D multimodal RoPE** (``mrope_section=[24, 20, 20]``).
+    Frequency channel ``i`` is driven by the height axis when
+    ``i % 3 == 1 and i < 3 * mrope_section[1]``, by the width axis when
+    ``i % 3 == 2 and i < 3 * mrope_section[2]``, and by the temporal axis
+    otherwise — *not* the contiguous chunking used by Qwen-VL. For text-only
+    inference the three axes carry the same positions, so it reduces to
+    standard 1D RoPE.
 
-- **Vision encoder** — a SigLIP-style patch-embedding + transformer tower
-  (``model.visual.*``).
+- **Vision encoder** — a *variable-resolution* SigLIP2 tower
+  (:class:`Cosmos3EdgeVisionTower`, ``model.visual.*``) consuming
+  pre-patchified, packed pixel values plus a ``grid_thw`` triple.
 - **Merger projector** — a pixel-shuffle projector
-  (:class:`Cosmos3EdgeMultiModalProjector`, ``model.projector.*``) that merges
-  each 2x2 patch block and projects to the text hidden size.
+  (:class:`Cosmos3EdgePatchMerger`, ``model.projector.*``) that merges each
+  2x2 patch block and projects to the text hidden size.
+
+Images and videos share the same tower, projector and token expansion: the
+processor emits one ``<|vision_start|> ... <|vision_end|>`` span per image and
+one span **per video frame**, with placeholder ids 19 (image) and 18 (video).
+:class:`_Cosmos3EdgeEmbeddingModel` therefore scatters two independent feature
+streams — ``image_features`` at id 19 and ``video_features`` at id 18 — exactly
+mirroring ``Cosmos3EdgeModel.forward``'s two ``masked_scatter`` calls.
 
 The HuggingFace weights use ``self_attn.to_{q,k,v,out}`` projection names and
 place the text tower at the top level (``layers.*``, ``embed_tokens``,
@@ -41,10 +53,11 @@ applied in the reasoner's own causal self-attention. It is therefore dropped
 for both paths.
 
 .. note::
-   NVIDIA does not publish modeling code for ``cosmos3_edge`` (it is not in
-   ``transformers`` and the repo ships no remote-code module), so exact
-   pixel-shuffle ordering and numerical parity are unverifiable. These builds
-   are validated at graph-construction (L1) confidence only.
+   The Reasoner architecture is reproduced from the published
+   ``transformers`` ``cosmos3_edge`` modeling code (cross-checked against
+   vLLM's ``cosmos3_edge.py``). The *Generator*/Action towers that share the
+   same checkpoint remain proprietary rectified-flow components and are not
+   reproduced here.
 
 The complete ``cosmos3_edge`` world-model package (this Reasoner plus the
 shared MoT Generator, Wan VAE, and Action head) is composed by
@@ -62,10 +75,10 @@ from onnxscript import OpBuilder, nn
 from mobius._configs import ArchitectureConfig
 from mobius.components import (
     FCMLP,
-    Cosmos3EdgeMultiModalProjector,
+    Cosmos3EdgePatchMerger,
+    Cosmos3EdgeVisionTower,
     Embedding,
     Linear,
-    VisionModel,
 )
 from mobius.models.base import CausalLMModel, TextModel
 
@@ -224,18 +237,30 @@ class _Cosmos3EdgeDecoderModel(nn.Module):
 
 
 class _Cosmos3EdgeVisionEncoderModel(nn.Module):
-    """Cosmos3-Edge vision encoder: SigLIP tower + pixel-shuffle projector.
+    """Cosmos3-Edge vision encoder: SigLIP2 tower + pixel-shuffle projector.
 
-    ``pixel_values [B, 3, H, W]`` → SigLIP encoder → ``[B, num_patches, D]``
-    → :class:`Cosmos3EdgeMultiModalProjector` → ``[B, num_merged, text_hidden]``.
+    ``pixel_values [total_patches, patch_dim]`` + ``grid_thw [3]`` →
+    :class:`Cosmos3EdgeVisionTower` → ``[total_patches, vision_hidden]`` →
+    :class:`Cosmos3EdgePatchMerger` → ``[total_patches / merge², text_hidden]``.
+
+    One call handles exactly one packed visual item: a single image
+    (``grid_t == 1``) or all frames of one video (``grid_t == num_frames``),
+    matching ``Cosmos3EdgeModel.get_image_features`` /
+    ``get_video_features`` (which share the same code path).
+
+    Sub-module attribute names (``visual`` / ``projector``) mirror the
+    HuggingFace layout so weight mapping is a plain ``model.`` prefix strip.
     """
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         vc = config.vision
         assert vc is not None, "Cosmos3-Edge requires a VisionConfig"
-        assert vc.image_size is not None and vc.patch_size is not None
         assert vc.hidden_size is not None
+        assert vc.intermediate_size is not None
+        assert vc.num_hidden_layers is not None
+        assert vc.num_attention_heads is not None
+        assert vc.patch_size is not None
         assert vc.projector_intermediate_size is not None, (
             "Cosmos3-Edge projector requires projector_intermediate_size"
         )
@@ -244,67 +269,81 @@ class _Cosmos3EdgeVisionEncoderModel(nn.Module):
                 "Cosmos3-Edge projector output must match the text hidden size, "
                 f"got {vc.out_hidden_size} != {config.hidden_size}"
             )
-        if vc.image_size % vc.patch_size != 0:
-            raise ValueError(
-                f"image_size ({vc.image_size}) must be divisible by "
-                f"patch_size ({vc.patch_size})"
-            )
-        self.vision_tower = VisionModel(config)
-        self._vision_patch_size = vc.patch_size
-        self._vision_num_channels = vc.in_channels
-        # Fixed square patch grid (image_size // patch_size), e.g. 256 -> 16.
-        grid_size = vc.image_size // vc.patch_size
-        self.multi_modal_projector = Cosmos3EdgeMultiModalProjector(
+        # ``num_patches`` sizes the learned position grid; fall back to the
+        # nominal image_size//patch_size square when the config omits it.
+        num_patches = vc.num_patches
+        if num_patches is None:
+            assert vc.image_size is not None
+            if vc.image_size % vc.patch_size != 0:
+                raise ValueError(
+                    f"image_size ({vc.image_size}) must be divisible by "
+                    f"patch_size ({vc.patch_size})"
+                )
+            num_patches = (vc.image_size // vc.patch_size) ** 2
+        merge = vc.spatial_merge_size or 2
+        self.patch_size = vc.patch_size
+        self.temporal_patch_size = vc.temporal_patch_size or 1
+        self.num_channels = vc.in_channels
+        self.spatial_merge_size = merge
+        self.patch_dim = (
+            self.patch_size * self.patch_size * self.num_channels * self.temporal_patch_size
+        )
+        self.visual = Cosmos3EdgeVisionTower(
+            hidden_size=vc.hidden_size,
+            intermediate_size=vc.intermediate_size,
+            num_hidden_layers=vc.num_hidden_layers,
+            num_attention_heads=vc.num_attention_heads,
+            patch_size=self.patch_size,
+            num_channels=self.num_channels,
+            num_patches=num_patches,
+            norm_eps=vc.norm_eps,
+            temporal_patch_size=self.temporal_patch_size,
+            spatial_merge_size=merge,
+        )
+        self.projector = Cosmos3EdgePatchMerger(
             vision_hidden_size=vc.hidden_size,
             text_hidden_size=config.hidden_size,
             intermediate_size=vc.projector_intermediate_size,
-            grid_size=grid_size,
-            spatial_merge_size=vc.spatial_merge_size or 2,
+            spatial_merge_size=merge,
+            use_postshuffle_norm=vc.use_postshuffle_norm,
             norm_eps=vc.norm_eps,
         )
 
-    def forward(self, op: OpBuilder, pixel_values: ir.Value):
-        vision_features = self.vision_tower(op, pixel_values)
-        return self.multi_modal_projector(op, vision_features)
+    def forward(self, op: OpBuilder, pixel_values: ir.Value, grid_thw: ir.Value):
+        # grid_thw: [3] int64 = (frames, grid_h, grid_w) for this visual item.
+        grid_t = op.Gather(grid_thw, op.Constant(value_int=0))
+        grid_h = op.Gather(grid_thw, op.Constant(value_int=1))
+        grid_w = op.Gather(grid_thw, op.Constant(value_int=2))
+        vision_features = self.visual(op, pixel_values, grid_t, grid_h, grid_w)
+        return self.projector(op, vision_features)
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        # state_dict here is the vision-routed slice: ``model.visual.*`` (SigLIP
-        # tower) and ``model.projector.*`` (merger projector).
+        # state_dict here is the vision-routed slice: ``model.visual.*`` (SigLIP2
+        # tower) and ``model.projector.*`` (merger projector). The module tree
+        # mirrors those names, so only the ``model.`` prefix and the SigLIP
+        # ``mlp.fc1/fc2`` -> ``FCMLP.up_proj/down_proj`` naming differ.
         renamed: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
-            if key.startswith("model.visual."):
-                new_key = "vision_tower.vision_model." + key[len("model.visual.") :]
-                if key == "model.visual.embeddings.patch_embedding.weight":
-                    expected_flat = (
-                        self._vision_num_channels
-                        * self._vision_patch_size
-                        * self._vision_patch_size
-                    )
-                    if value.ndim == 2 and value.shape[1] == expected_flat:
-                        value = value.reshape(
-                            value.shape[0],
-                            self._vision_num_channels,
-                            self._vision_patch_size,
-                            self._vision_patch_size,
-                        )
-                # SigLIP MLP: fc1/fc2 -> up_proj/down_proj (FCMLP convention).
-                new_key = new_key.replace(".mlp.fc1.", ".mlp.up_proj.").replace(
-                    ".mlp.fc2.", ".mlp.down_proj."
-                )
-                renamed[new_key] = value
-            elif key.startswith("model.projector."):
-                new_key = "multi_modal_projector." + key[len("model.projector.") :]
-                renamed[new_key] = value
+            if not key.startswith(("model.visual.", "model.projector.")):
+                continue
+            new_key = key[len("model.") :]
+            new_key = new_key.replace(".mlp.fc1.", ".mlp.up_proj.").replace(
+                ".mlp.fc2.", ".mlp.down_proj."
+            )
+            renamed[new_key] = value
         return renamed
 
 
 class _Cosmos3EdgeEmbeddingModel(nn.Module):
-    """Cosmos3-Edge embedding: token lookup + image feature fusion.
+    """Cosmos3-Edge embedding: token lookup + image/video feature fusion.
 
     Scatters projected vision features into the text embedding sequence at
-    ``image_token_id`` (19) positions, matching the LLaVA embedding contract.
+    ``image_token_id`` (19) and ``video_token_id`` (18) positions. The two
+    streams are independent, mirroring ``Cosmos3EdgeModel.forward``, which
+    runs one ``masked_scatter`` per modality. Either stream may be empty
+    (zero rows) for text-only, image-only or video-only prompts.
     """
 
     def __init__(self, config: ArchitectureConfig):
@@ -314,32 +353,54 @@ class _Cosmos3EdgeEmbeddingModel(nn.Module):
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
         self.image_token_id = config.image_token_id or 0
+        vision = config.vision
+        self.video_token_id = (
+            vision.video_token_id if vision is not None and vision.video_token_id else None
+        )
 
-    def forward(self, op: OpBuilder, input_ids: ir.Value, image_features: ir.Value):
-        text_embeds = self.embed_tokens(op, input_ids)
+    def _scatter(
+        self,
+        op: OpBuilder,
+        embeds: ir.Value,
+        input_ids: ir.Value,
+        features: ir.Value,
+        token_id: int,
+    ) -> ir.Value:
+        """Replace ``token_id`` positions with rows of ``features`` in order."""
+        mask = op.Equal(input_ids, op.Constant(value_int=token_id))  # [B, S]
+        mask_3d = op.Unsqueeze(mask, [-1])
 
-        image_mask = op.Equal(input_ids, op.Constant(value_int=self.image_token_id))
-        image_mask_3d = op.Unsqueeze(image_mask, [-1])
+        # Running index of the placeholder within the sequence.
+        cumsum = op.CumSum(op.Cast(mask, to=7), 1)
+        indices = op.Clip(op.Sub(cumsum, op.Constant(value_int=1)), op.Constant(value_int=0))
 
-        mask_int = op.Cast(image_mask, to=7)
-        cumsum = op.CumSum(mask_int, 1)
-        indices = op.Sub(cumsum, op.Constant(value_int=1))
-        indices = op.Clip(indices, op.Constant(value_int=0))
-
-        # Pad image_features with one zero row so Gather stays in-bounds for
-        # text-only input (num_image_tokens == 0); the mask discards it.
+        # Pad the feature table with one zero row so Gather stays in-bounds
+        # when the modality is absent (num_feature_tokens == 0); the mask
+        # discards the padded row.
         pad_row = op.Expand(
-            op.CastLike(0.0, image_features),
+            op.CastLike(0.0, features),
             op.Concat(
                 op.Constant(value_ints=[1]),
-                op.Shape(image_features, start=1, end=2),
+                op.Shape(features, start=1, end=2),
                 axis=0,
             ),
         )
-        padded_features = op.Concat(image_features, pad_row, axis=0)
+        padded = op.Concat(features, pad_row, axis=0)
+        gathered = op.Gather(padded, indices, axis=0)
+        return op.Where(mask_3d, gathered, embeds)
 
-        gathered = op.Gather(padded_features, indices, axis=0)
-        return op.Where(image_mask_3d, gathered, text_embeds)
+    def forward(
+        self,
+        op: OpBuilder,
+        input_ids: ir.Value,
+        image_features: ir.Value,
+        video_features: ir.Value | None = None,
+    ):
+        embeds = self.embed_tokens(op, input_ids)
+        embeds = self._scatter(op, embeds, input_ids, image_features, self.image_token_id)
+        if video_features is not None and self.video_token_id is not None:
+            embeds = self._scatter(op, embeds, input_ids, video_features, self.video_token_id)
+        return embeds
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
@@ -354,17 +415,21 @@ class Cosmos3EdgeVLModel(nn.Module):
 
     ``model_type: cosmos3_edge`` / ``Cosmos3EdgeForConditionalGeneration``.
 
-    Builds three ONNX models for onnxruntime-genai deployment:
+    Builds three ONNX models:
 
-    - **decoder**: squared-ReLU GQA text reasoner taking ``inputs_embeds``.
-    - **vision_encoder**: SigLIP vision tower + pixel-shuffle merger projector.
-    - **embedding**: token embedding + image feature fusion at
-      ``image_token_id`` (19).
+    - **decoder**: squared-ReLU GQA text reasoner taking ``inputs_embeds`` and
+      interleaved 3D M-RoPE ``position_ids [3, batch, seq]``.
+    - **vision_encoder**: variable-resolution SigLIP2 tower + pixel-shuffle
+      merger projector, driven by packed ``pixel_values [total_patches,
+      patch_dim]`` and ``grid_thw [3]``. The *same* graph serves images
+      (``grid_t == 1``) and videos (``grid_t == num_frames``).
+    - **embedding**: token embedding + feature fusion at ``image_token_id``
+      (19) and ``video_token_id`` (18).
 
     HuggingFace weight layout (single checkpoint, no ``language_model.``
     prefix):
 
-    - ``model.visual.*`` → vision tower (SigLIP)
+    - ``model.visual.*`` → vision tower (SigLIP2)
     - ``model.projector.*`` → merger projector
     - ``embed_tokens.weight`` → embedding
     - ``layers.*`` / ``norm.weight`` / ``lm_head.weight`` → decoder
@@ -372,10 +437,10 @@ class Cosmos3EdgeVLModel(nn.Module):
       module docstring)
 
     .. note::
-       NVIDIA does not publish modeling code for ``cosmos3_edge`` (it is not in
-       ``transformers`` and the repo ships no remote-code module), so the exact
-       pixel-shuffle ordering and numerical parity are unverifiable. This build
-       is validated at graph-construction (L1) confidence only.
+       The Reasoner is validated numerically against a PyTorch transcription
+       of the published ``transformers`` ``cosmos3_edge`` modeling code (see
+       ``tests/_cosmos3_edge_reference.py``). The Generator/Action towers in
+       the same checkpoint remain proprietary and are not reproduced.
     """
 
     default_task: str = "cosmos3-edge-vl"

@@ -75,6 +75,18 @@ Mobius includes only the components present in the checkpoint.
 - Use `--dtype f32` for CPU inference. The native Cosmos3 transformer dtype is
   BF16 and normally targets CUDA.
 
-The Cosmos3 Edge Reasoner is graph-build and runtime smoke-tested, but NVIDIA
-does not publish its authoritative Transformers modeling implementation for
-full numerical parity testing.
+## Cosmos3 Edge image and video input
+
+`reasoner_vision_encoder` accepts packed image or video patches:
+
+| Input | Shape |
+|---|---|
+| `pixel_values` | `[total_patches, patch_dim]` |
+| `grid_thw` | `[3]` (`frames`, `grid_height`, `grid_width`) |
+
+Use the checkpoint's Cosmos3 Edge image/video processor to resize, normalize,
+and patchify media. Route the encoder output to `image_features` for images or
+`video_features` for videos.
+
+The Edge Reasoner vision, fusion, and decoder outputs are numerically verified
+against the published Transformers implementation with the real checkpoint.

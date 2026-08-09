@@ -98,11 +98,21 @@ class VisionLanguageTask(ModelTask):
 class Cosmos3EdgeVLTask(VisionLanguageTask):
     """NVIDIA Cosmos3-Edge VL 3-model split.
 
-    Builds the text decoder with 3D multimodal RoPE
+    The decoder uses interleaved 3D multimodal RoPE
     (``mrope_section=[24, 20, 20]``), so ``position_ids`` has shape
-    ``[3, batch, seq]``. The vision runtime processes one image at a time and
-    removes the image batch dimension so its output matches the embedding
-    model's rank-2 ``[num_image_tokens, hidden]`` input contract.
+    ``[3, batch, seq]``.
+
+    The vision encoder mirrors the published packed SigLIP2 contract: it takes
+    pre-patchified ``pixel_values [total_patches, patch_dim]`` plus a
+    ``grid_thw [3]`` triple describing one visual item, and emits rank-2
+    ``image_features [total_patches / merge**2, text_hidden]``. Because
+    ``Cosmos3EdgeModel.get_video_features`` simply delegates to
+    ``get_image_features``, this single graph serves both images
+    (``grid_t == 1``) and videos (``grid_t == num_frames``).
+
+    The embedding model accepts two feature streams so the runtime can route
+    each modality to its own placeholder id: ``image_features`` (token 19) and
+    ``video_features`` (token 18). Either may have zero rows.
     """
 
     def build(
@@ -114,12 +124,7 @@ class Cosmos3EdgeVLTask(VisionLanguageTask):
         models: dict[str, ir.Model] = {}
         models["decoder"] = build_decoder_from_embeds(module.decoder, config, mrope=True)
         models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
-        models["embedding"] = build_embedding_from_features(
-            module.embedding,
-            config,
-            feature_name="image_features",
-            feature_dim=config.hidden_size,
-        )
+        models["embedding"] = self._build_embedding(module.embedding, config)
         return ModelPackage(models, config=config)
 
     def _build_vision(
@@ -127,19 +132,60 @@ class Cosmos3EdgeVLTask(VisionLanguageTask):
         vision: nn.Module,
         config: ArchitectureConfig,
     ) -> ir.Model:
-        """Build the single-image vision encoder with rank-2 feature output."""
-        image_size = (config.vision.image_size if config.vision else None) or 224
+        """Build the packed, variable-resolution vision encoder."""
+        total_patches = ir.SymbolicDim("total_patches")
 
         graph, builder = _make_graph(name="vision_encoder")
         pixel_values = builder.input(
             "pixel_values",
             dtype=config.dtype,
-            shape=[1, 3, image_size, image_size],
+            shape=[total_patches, vision.patch_dim],
         )
-        image_features = vision(builder.op, pixel_values=pixel_values)
-        image_features = builder.op.Squeeze(image_features, [0])
+        # (grid_t, grid_h, grid_w) for the single packed image or video.
+        grid_thw = builder.input(
+            "grid_thw",
+            dtype=ir.DataType.INT64,
+            shape=[3],
+        )
+        image_features = vision(builder.op, pixel_values=pixel_values, grid_thw=grid_thw)
 
         builder.add_output(image_features, "image_features")
+        return _make_model(graph)
+
+    def _build_embedding(
+        self,
+        embedding: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build ``input_ids + image_features + video_features → inputs_embeds``."""
+        batch = ir.SymbolicDim("batch")
+        seq_len = ir.SymbolicDim("sequence_len")
+        num_image_tokens = ir.SymbolicDim("num_image_tokens")
+        num_video_tokens = ir.SymbolicDim("num_video_tokens")
+
+        graph, builder = _make_graph(name="embedding")
+        input_ids = builder.input(
+            "input_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, seq_len],
+        )
+        image_features = builder.input(
+            "image_features",
+            dtype=config.dtype,
+            shape=[num_image_tokens, config.hidden_size],
+        )
+        video_features = builder.input(
+            "video_features",
+            dtype=config.dtype,
+            shape=[num_video_tokens, config.hidden_size],
+        )
+        inputs_embeds = embedding(
+            builder.op,
+            input_ids=input_ids,
+            image_features=image_features,
+            video_features=video_features,
+        )
+        builder.add_output(inputs_embeds, "inputs_embeds")
         return _make_model(graph)
 
 

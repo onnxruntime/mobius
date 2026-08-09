@@ -134,6 +134,10 @@ _REASONER_NAMES = {
     "vision_encoder": "reasoner_vision_encoder",
     "embedding": "reasoner_embedding",
 }
+# Presence key for the optional video-understanding feature stream on the
+# Reasoner embedding graph (Cosmos3-Edge routes video frames through the same
+# vision encoder but scatters them at the video placeholder id).
+_VIDEO_UNDERSTANDING = "video_understanding"
 _GENERATOR_NAME = "generator"
 _VIDEO_ENCODER_NAME = "video_encoder"
 _VIDEO_DECODER_NAME = "video_decoder"
@@ -786,8 +790,12 @@ def _compose_pipeline(
             return "text.token_ids"
         if input_name == "pixel_values":
             return "vision.pixel_values"
+        if input_name == "grid_thw":
+            return "vision.grid_thw"
         if input_name == "image_features":
             return "vision.image_features"
+        if input_name == "video_features":
+            return "vision.video_features"
         if input_name == "audio":
             return "audio.waveform"
         if input_name == "sample":
@@ -852,6 +860,15 @@ def _compose_pipeline(
                     required = False
                 elif component_name == _AUDIO_ENCODER_NAME:
                     presence = "audio_conditioning"
+                    required = False
+                elif (
+                    component_name == _REASONER_NAMES["embedding"]
+                    and value.name == "video_features"
+                ):
+                    # Video frames reuse the Reasoner vision encoder; the host
+                    # runs it once per visual item and routes the projected
+                    # features to the placeholder id of that item's modality.
+                    presence = _VIDEO_UNDERSTANDING
                     required = False
                 elif component_name == _REASONER_NAMES["vision_encoder"]:
                     presence = None

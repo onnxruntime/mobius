@@ -47,7 +47,9 @@ __all__ = [
     "LoRALinear",
     "MLP",
     "MLPMultiModalProjector",
-    "Cosmos3EdgeMultiModalProjector",
+    "Cosmos3EdgePatchMerger",
+    "Cosmos3EdgeVisionEmbeddings",
+    "Cosmos3EdgeVisionTower",
     "MoELayer",
     "OffsetRMSNorm",
     "PatchEmbed",
@@ -132,6 +134,15 @@ from mobius.components._conv import (
     Conv2dNoBias,
     ConvTranspose2d,
 )
+from mobius.components._cosmos3_edge_vision import (
+    Cosmos3EdgePatchMerger as Cosmos3EdgePatchMerger,
+)
+from mobius.components._cosmos3_edge_vision import (
+    Cosmos3EdgeVisionEmbeddings as Cosmos3EdgeVisionEmbeddings,
+)
+from mobius.components._cosmos3_edge_vision import (
+    Cosmos3EdgeVisionTower as Cosmos3EdgeVisionTower,
+)
 from mobius.components._decoder import (
     DecoderLayer,
     PostNormDecoderLayer,
@@ -169,9 +180,6 @@ from mobius.components._moe import (
     SoftmaxTopKGate,
     SparseMixerGate,
     TopKGate,
-)
-from mobius.components._multimodal import (
-    Cosmos3EdgeMultiModalProjector as Cosmos3EdgeMultiModalProjector,
 )
 from mobius.components._multimodal import (
     Gemma3MultiModalProjector as Gemma3MultiModalProjector,

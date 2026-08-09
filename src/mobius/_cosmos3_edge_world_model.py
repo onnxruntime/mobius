@@ -15,6 +15,7 @@ import onnx_ir as ir
 
 from mobius._configs.per_model import _cosmos3_edge_vision  # noqa: F401
 from mobius._cosmos3_world_model import (
+    _REASONER_NAMES,
     _apply_checkpoint_weights,
     _build_components,
     _collect_assets,
@@ -47,6 +48,92 @@ _SCHEDULER_MODE_OVERRIDES: dict[str, Any] = {
     },
 }
 _DEFAULT_INFERENCE_STEPS = 50
+
+# Cosmos3-Edge Reasoner vision/video-understanding contract. The exported
+# ``reasoner_vision_encoder`` graph consumes the *pre-patchified* tensor that
+# ``Cosmos3EdgeImageProcessor`` / ``Cosmos3EdgeVideoProcessor`` produce, so the
+# manifest has to spell out that preprocessing for a runtime to reproduce it.
+_IMAGE_PROCESSOR_ASSET = "preprocessor_config.json"
+_VIDEO_PROCESSOR_ASSET = "video_preprocessor_config.json"
+
+
+def _vision_understanding_metadata(
+    root_config: Mapping[str, Any],
+    reasoner_config: Any,
+) -> dict[str, Any]:
+    """Describe the Reasoner's packed image/video input contract."""
+    vision = getattr(reasoner_config, "vision", None)
+    patch_size = getattr(vision, "patch_size", None) or 16
+    merge_size = getattr(vision, "spatial_merge_size", None) or 2
+    channels = getattr(vision, "in_channels", None) or 3
+    temporal_patch_size = getattr(vision, "temporal_patch_size", None) or 1
+    return {
+        "encoder": _REASONER_NAMES["vision_encoder"],
+        "invocation": "once_per_visual_item",
+        "tokens": {
+            "image": root_config.get("image_token_id", 19),
+            "video": root_config.get("video_token_id", 18),
+            "vision_start": root_config.get("vision_start_token_id", 20),
+            "vision_end": root_config.get("vision_end_token_id", 21),
+        },
+        "token_expansion": {
+            "image": (
+                "<|vision_start|> + grid_h*grid_w/merge_size**2 image tokens + <|vision_end|>"
+            ),
+            "video": (
+                "one '<T.T seconds>' timestamp followed by "
+                "<|vision_start|> + grid_h*grid_w/merge_size**2 video tokens + "
+                "<|vision_end|>, repeated per sampled frame"
+            ),
+        },
+        "routing": {
+            "image": f"{_REASONER_NAMES['embedding']}.image_features",
+            "video": f"{_REASONER_NAMES['embedding']}.video_features",
+        },
+        "presence": {"video": "video_understanding"},
+        "preprocessing": {
+            "image_processor_asset": _IMAGE_PROCESSOR_ASSET,
+            "video_processor_asset": _VIDEO_PROCESSOR_ASSET,
+            # ``size`` in the shipped processor assets holds pixel *areas*
+            # (shortest_edge/longest_edge), not edge lengths.
+            "resize": "smart_resize_area_bounded_multiple_of_patch_times_merge",
+            "alignment": patch_size * merge_size,
+            # Class defaults of Cosmos3EdgeImageProcessor /
+            # Cosmos3EdgeVideoProcessor; they are NOT serialised into the
+            # shipped *_preprocessor_config.json assets.
+            "resample": "bicubic",
+            "convert_rgb": True,
+            "rescale_factor": 1 / 255,
+            "normalize": {"mean": [0.5, 0.5, 0.5], "std": [0.5, 0.5, 0.5]},
+            "video_frame_sampling": {"fps": 2, "min_frames": 4, "max_frames": 768},
+            "patchify": {
+                "layout": "time_major_block_major",
+                "patch_value_order": "patch_height_patch_width_channel",
+                "patch_size": patch_size,
+                "merge_size": merge_size,
+                "temporal_patch_size": temporal_patch_size,
+                "patch_dim": patch_size * patch_size * channels * temporal_patch_size,
+            },
+        },
+        "grid_thw": {
+            "layout": "t_h_w",
+            "units": "patches",
+            "source": "image_grid_thw[i] / video_grid_thw[i]",
+            "note": "grid_h and grid_w must be multiples of merge_size",
+        },
+        "position_ids": {
+            "mrope": "interleaved",
+            "mrope_section": list(getattr(reasoner_config, "mrope_section", None) or []),
+            "axis_assignment": (
+                "channel i uses height when i%3==1 and i<3*mrope_section[1], "
+                "width when i%3==2 and i<3*mrope_section[2], temporal otherwise"
+            ),
+            "video_index_rule": (
+                "expand video_grid_thw to one row per frame and set grid_t=1, so "
+                "every frame is an independent visual span for position indexing"
+            ),
+        },
+    }
 
 
 def _edge_text_model_type(root_config: Mapping[str, Any]) -> str | None:
@@ -163,7 +250,10 @@ def build_cosmos3_edge_world_model(
                 "edge": {
                     "checkpoint_model_type": root_config.get("model_type"),
                     "policy": policy,
-                }
+                },
+                "vision_understanding": _vision_understanding_metadata(
+                    root_config, reasoner_package.config
+                ),
             },
         ),
         reasoner_package=reasoner_package,

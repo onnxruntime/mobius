@@ -94,7 +94,17 @@ def test_edge_builder_uses_edge_reasoner_and_shared_generator_pipeline() -> None
             "scheduler/scheduler_config.json",
         ),
     }
-    reasoner_package = mock.sentinel.reasoner_package
+    reasoner_package = SimpleNamespace(
+        config=SimpleNamespace(
+            vision=SimpleNamespace(
+                patch_size=16,
+                spatial_merge_size=2,
+                in_channels=3,
+                temporal_patch_size=1,
+            ),
+            mrope_section=[24, 20, 20],
+        )
+    )
     reasoner_module = mock.sentinel.reasoner_module
     generator_package = mock.sentinel.generator_package
     generator_module = SimpleNamespace(config=mock.sentinel.generator_config)
@@ -160,6 +170,32 @@ def test_edge_builder_uses_edge_reasoner_and_shared_generator_pipeline() -> None
         "image_to_video": {"flow_shift": 3.0, "use_karras_sigmas": False},
         "action": {"flow_shift": 10.0, "use_karras_sigmas": False},
     }
+    vision = pipeline_config.extra_metadata["vision_understanding"]
+    assert vision["encoder"] == "reasoner_vision_encoder"
+    assert vision["tokens"] == {
+        "image": 19,
+        "video": 18,
+        "vision_start": 20,
+        "vision_end": 21,
+    }
+    assert vision["routing"]["video"] == "reasoner_embedding.video_features"
+    preprocessing = vision["preprocessing"]
+    assert preprocessing["patchify"] == {
+        "layout": "time_major_block_major",
+        "patch_value_order": "patch_height_patch_width_channel",
+        "patch_size": 16,
+        "merge_size": 2,
+        "temporal_patch_size": 1,
+        "patch_dim": 16 * 16 * 3,
+    }
+    assert preprocessing["alignment"] == 32
+    # Class defaults that the shipped preprocessor_config.json assets omit.
+    assert preprocessing["resample"] == "bicubic"
+    assert preprocessing["rescale_factor"] == pytest.approx(1 / 255)
+    assert preprocessing["convert_rgb"] is True
+    assert vision["position_ids"]["mrope"] == "interleaved"
+    assert vision["position_ids"]["mrope_section"] == [24, 20, 20]
+    assert "grid_t=1" in vision["position_ids"]["video_index_rule"]
 
 
 def test_edge_builder_rejects_non_edge_checkpoint(tmp_path) -> None:

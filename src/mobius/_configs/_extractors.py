@@ -188,6 +188,7 @@ def extract_vision_config(config, parent_config, model_type: str) -> dict:
         "fullatt_block_indexes",
         "window_size",
         "mrope_section",
+        "mrope_interleaved",
         "image_crop_size",
     ):
         val = fields.get(shared)
