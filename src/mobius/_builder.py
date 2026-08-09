@@ -144,8 +144,8 @@ def _enable_prefill_prefix_pruning_task(task: str | ModelTask) -> str | ModelTas
             prune_prefill_prefix=True,
         )
     raise ValueError(
-        "prune_prefill_prefix=True is only supported for text-generation and "
-        "hybrid-text-generation tasks."
+        "prune_prefill_prefix=True is only supported for text-generation, "
+        "hybrid-text-generation, gemma4-text-generation, and gemma4 tasks."
     )
 
 
