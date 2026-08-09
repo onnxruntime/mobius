@@ -53,8 +53,11 @@ __all__ = [
     "VisionConfig",
     "VisionLanguageConfig",
     "WhisperConfig",
-    "WorldModelConfig",
     "WorldModelBuilderRegistry",
+    "WorldModelBuildConfig",
+    "WorldModelConfig",
+    "WorldModelGenerationConfig",
+    "WorldModelPipelineConfig",
     "WorldModelTask",
     "WanVAEConfig",
     "WanVAETask",
@@ -162,6 +165,11 @@ from mobius._world_model_builder import (
     WorldModelBuilderRegistry,
     build_world_model,
     world_model_registry,
+)
+from mobius._world_model_config import (
+    WorldModelBuildConfig,
+    WorldModelGenerationConfig,
+    WorldModelPipelineConfig,
 )
 from mobius.integrations.gguf import build_from_gguf
 from mobius.integrations.nemo import build_from_nemo

@@ -23,33 +23,39 @@ from __future__ import annotations
 __all__ = ["build_cosmos3_world_model"]
 
 import dataclasses
-import json
 import logging
-import pathlib
 from collections.abc import Iterable, Mapping
 from typing import Any
 
 import onnx_ir as ir
-import safetensors.torch
-from huggingface_hub import HfApi, hf_hub_download
-from huggingface_hub.utils import EntryNotFoundError
-from safetensors import safe_open
 
 from mobius._builder import build as build_model
-from mobius._builder import build_from_module, resolve_dtype
+from mobius._builder import build_from_module
 from mobius._configs import (
     Cosmos3AudioConfig,
     Cosmos3OmniGeneratorConfig,
     WanVAEConfig,
 )
-from mobius._diffusers_builder import _download_diffusers_component_weights
+from mobius._diffusers_checkpoint import (
+    component_class,
+    component_weight_names,
+    load_checkpoint_json,
+    load_component_weights,
+    load_optional_checkpoint_json,
+    resolve_assets,
+)
 from mobius._model_package import ModelPackage
 from mobius._pipeline import (
     PipelineBuilder,
     PipelinePackage,
     register_transform,
 )
-from mobius._weight_loading import _dequantize_fp8_weights, iter_weight_shards
+from mobius._weight_loading import iter_weight_shards
+from mobius._world_model_config import (
+    WorldModelBuildConfig,
+    WorldModelGenerationConfig,
+    WorldModelPipelineConfig,
+)
 from mobius.models.cosmos3_audio import create_cosmos3_avae_audio_tokenizer
 from mobius.models.cosmos3_omni import Cosmos3OmniReasonerModel
 from mobius.models.cosmos3_omni_generator import Cosmos3OmniGeneratorModel
@@ -200,181 +206,10 @@ _ASSET_CANDIDATES: tuple[tuple[str, bool], ...] = (
 )
 
 
-def _resolve_file(model_id: str, filename: str, *, required: bool = True) -> str | None:
-    """Resolve one local-or-Hub checkpoint file without interpreting it."""
-    root = pathlib.Path(model_id)
-    if root.is_dir():
-        path = (root / pathlib.PurePosixPath(filename)).resolve()
-        try:
-            path.relative_to(root.resolve())
-        except ValueError as error:
-            raise ValueError(
-                f"Checkpoint file escapes model directory: {filename!r}"
-            ) from error
-        if path.is_file():
-            return str(path)
-        if required:
-            raise FileNotFoundError(f"Required checkpoint file not found: {path}")
-        return None
-    try:
-        return hf_hub_download(repo_id=model_id, filename=filename)
-    except EntryNotFoundError:
-        if required:
-            raise
-        return None
-
-
-def _load_json(model_id: str, filename: str) -> tuple[dict[str, Any], str]:
-    path = _resolve_file(model_id, filename)
-    assert path is not None
-    with open(path, encoding="utf-8") as handle:
-        value = json.load(handle)
-    if not isinstance(value, dict):
-        raise TypeError(f"{filename!r} must contain a JSON object")
-    return value, path
-
-
-def _load_optional_json(model_id: str, filename: str) -> dict[str, Any]:
-    path = _resolve_file(model_id, filename, required=False)
-    if path is None:
-        return {}
-    with open(path, encoding="utf-8") as handle:
-        value = json.load(handle)
-    if not isinstance(value, dict):
-        raise TypeError(f"{filename!r} must contain a JSON object")
-    return value
-
-
-def _component_class(
-    pipeline_index: Mapping[str, Any],
-    component: str,
-) -> str | None:
-    info = pipeline_index.get(component)
-    if info in (None, [None, None]):
-        return None
-    if not isinstance(info, list) or len(info) != 2 or not isinstance(info[1], str):
-        raise ValueError(f"Invalid model_index.json entry for {component!r}: {info!r}")
-    return info[1]
-
-
-def _component_weight_names(model_id: str, component: str) -> set[str]:
-    """Read only safetensors metadata to determine component graph shape."""
-    index_names = (
-        "diffusion_pytorch_model.safetensors.index.json",
-        "model.safetensors.index.json",
-    )
-    single_names = (
-        "diffusion_pytorch_model.safetensors",
-        "model.safetensors",
-    )
-    root = pathlib.Path(model_id)
-    if root.is_dir():
-        component_dir = root / component
-        for name in index_names:
-            path = component_dir / name
-            if path.is_file():
-                with path.open(encoding="utf-8") as handle:
-                    index = json.load(handle)
-                return set(index["weight_map"])
-        for name in single_names:
-            path = component_dir / name
-            if path.is_file():
-                with safe_open(str(path), framework="pt", device="cpu") as file:
-                    return set(file.keys())
-        raise FileNotFoundError(
-            f"No safetensors checkpoint found for component {component!r} in {model_id!r}"
-        )
-
-    for name in index_names:
-        filename = f"{component}/{name}"
-        path = _resolve_file(model_id, filename, required=False)
-        if path is not None:
-            with open(path, encoding="utf-8") as handle:
-                index = json.load(handle)
-            return set(index["weight_map"])
-    api = HfApi()
-    for name in single_names:
-        filename = f"{component}/{name}"
-        try:
-            metadata = api.parse_safetensors_file_metadata(model_id, filename)
-        except EntryNotFoundError:
-            continue
-        return set(metadata.tensors)
-    raise FileNotFoundError(
-        f"No safetensors checkpoint found for component {component!r} in {model_id!r}"
-    )
-
-
-def _safe_component_files(model_dir: pathlib.Path, component: str) -> list[pathlib.Path]:
-    """Resolve local component shards with traversal protection."""
-    component_dir = (model_dir / component).resolve()
-    try:
-        component_dir.relative_to(model_dir.resolve())
-    except ValueError as error:
-        raise ValueError(f"Unsafe component path {component!r}") from error
-
-    for basename in (
-        "diffusion_pytorch_model",
-        "model",
-    ):
-        index_path = component_dir / f"{basename}.safetensors.index.json"
-        if not index_path.is_file():
-            continue
-        with index_path.open(encoding="utf-8") as handle:
-            index = json.load(handle)
-        paths: list[pathlib.Path] = []
-        for filename in sorted(set(index["weight_map"].values())):
-            relative = pathlib.PurePosixPath(str(filename).replace("\\", "/"))
-            if relative.is_absolute() or ".." in relative.parts:
-                raise ValueError(f"Unsafe component weight filename: {filename!r}")
-            path = (component_dir / relative).resolve()
-            try:
-                path.relative_to(component_dir)
-            except ValueError as error:
-                raise ValueError(
-                    f"Component weight filename escapes its directory: {filename!r}"
-                ) from error
-            if not path.is_file():
-                raise FileNotFoundError(path)
-            paths.append(path)
-        return paths
-
-    for basename in ("diffusion_pytorch_model.safetensors", "model.safetensors"):
-        path = component_dir / basename
-        if path.is_file():
-            return [path]
-    raise FileNotFoundError(
-        f"No safetensors checkpoint found for component {component!r} in {model_dir}"
-    )
-
-
-def _load_component_weights(
-    model_id: str,
-    component: str,
-) -> dict[str, Any]:
-    """Load one diffusers component, supporting Hub and local directories."""
-    root = pathlib.Path(model_id)
-    if not root.is_dir():
-        return _download_diffusers_component_weights(model_id, component)
-
-    state_dict: dict[str, Any] = {}
-    for path in _safe_component_files(root, component):
-        state_dict.update(safetensors.torch.load_file(str(path)))
-    return _dequantize_fp8_weights(state_dict)
-
-
-def _resolved_dtype(dtype: str | ir.DataType | None) -> ir.DataType | None:
-    if dtype is None or isinstance(dtype, ir.DataType):
-        return dtype
-    return resolve_dtype(dtype)
-
-
 def _build_components(
     model_id: str,
     *,
-    dtype: str | ir.DataType | None,
-    execution_provider: str,
-    trace_optimization: bool,
+    build_config: WorldModelBuildConfig,
     pipeline_index: Mapping[str, Any],
     transformer_config_dict: Mapping[str, Any],
     vae_config_dict: Mapping[str, Any],
@@ -398,10 +233,10 @@ def _build_components(
         model_id,
         task=reasoner_task,
         module_class=reasoner_module_class,
-        dtype=dtype,
+        dtype=build_config.dtype,
         load_weights=False,
-        execution_provider=execution_provider,
-        trace_optimization=trace_optimization,
+        execution_provider=build_config.execution_provider,
+        trace_optimization=build_config.trace_optimization,
     )
     if not has_reasoner_vision:
         reasoner_package.pop("vision_encoder", None)
@@ -416,7 +251,7 @@ def _build_components(
     reasoner_module = reasoner_module_class(reasoner_package.config)
 
     generator_config = Cosmos3OmniGeneratorConfig.from_diffusers(transformer_config_dict)
-    if resolved_dtype := _resolved_dtype(dtype):
+    if resolved_dtype := build_config.resolved_dtype():
         generator_config = dataclasses.replace(generator_config, dtype=resolved_dtype)
         generator_config.validate()
     generator_module = Cosmos3OmniGeneratorModel(generator_config)
@@ -424,8 +259,8 @@ def _build_components(
         generator_module,
         generator_config,
         task="cosmos3-omni-generator",
-        execution_provider=execution_provider,
-        trace_optimization=trace_optimization,
+        execution_provider=build_config.execution_provider,
+        trace_optimization=build_config.trace_optimization,
     )
 
     vae_config = WanVAEConfig.from_diffusers(vae_config_dict)
@@ -434,13 +269,13 @@ def _build_components(
         vae_module,
         vae_config,
         task=WanVAETask(),
-        execution_provider=execution_provider,
-        trace_optimization=trace_optimization,
+        execution_provider=build_config.execution_provider,
+        trace_optimization=build_config.trace_optimization,
     )
 
     audio_package: ModelPackage | None = None
     audio_module: Any | None = None
-    sound_class = _component_class(pipeline_index, "sound_tokenizer")
+    sound_class = component_class(pipeline_index, "sound_tokenizer")
     if generator_config.sound_gen and sound_class is None:
         raise ValueError(
             "The transformer enables Sound generation, but model_index.json has no "
@@ -461,8 +296,8 @@ def _build_components(
             audio_module,
             audio_config,
             task=audio_task,
-            execution_provider=execution_provider,
-            trace_optimization=trace_optimization,
+            execution_provider=build_config.execution_provider,
+            trace_optimization=build_config.trace_optimization,
         )
 
     return (
@@ -511,11 +346,11 @@ def _apply_checkpoint_weights(
     reasoner_package.finalize_weights()
     generator_package.finalize_weights()
 
-    vae_weights = _load_component_weights(model_id, "vae")
+    vae_weights = load_component_weights(model_id, "vae")
     vae_package.apply_weights(vae_module.preprocess_weights(vae_weights))
 
     if audio_package is not None and audio_module is not None:
-        audio_weights = _load_component_weights(model_id, "sound_tokenizer")
+        audio_weights = load_component_weights(model_id, "sound_tokenizer")
         audio_package.apply_weights(audio_module.preprocess_weights(audio_weights))
 
     reasoner_package.validate_weights()
@@ -547,20 +382,9 @@ def _component_metadata(dtype: ir.DataType, **values: Any) -> dict[str, Any]:
     return {"dtype": dtype.name, **values}
 
 
-def _preferred_execution_providers(
-    requested: str,
-    dtype: ir.DataType,
-) -> tuple[str, ...]:
-    if requested != "default":
-        return (requested,)
-    if dtype == ir.DataType.BFLOAT16:
-        return ("cuda", "cpu")
-    return ("cuda", "dml", "cpu")
-
-
 def _compose_pipeline(
     *,
-    model_id: str,
+    pipeline_config: WorldModelPipelineConfig,
     reasoner_package: ModelPackage,
     generator_package: ModelPackage,
     vae_package: ModelPackage,
@@ -569,16 +393,18 @@ def _compose_pipeline(
     vae_config: WanVAEConfig,
     scheduler_config: Mapping[str, Any],
     assets: Mapping[str, tuple[str, bool]],
-    pipeline_model_type: str = "cosmos3_omni",
     reasoner_architecture: str = "qwen3_vl",
-    extra_metadata: Mapping[str, Any] | None = None,
-    execution_provider: str = "default",
-    generation_config: Mapping[str, Any] | None = None,
-    default_inference_steps: int = 35,
     default_action_domain: str = "no_action",
-    scheduler_mode_overrides: Mapping[str, Any] | None = None,
 ) -> PipelinePackage:
-    """Compose already-built component graphs into the complete topology."""
+    """Compose already-built component graphs into the complete topology.
+
+    *pipeline_config* carries the model-agnostic identity, build, and runtime
+    settings; the remaining arguments are the Cosmos3-specific packages,
+    architecture configs, and action-domain default.
+    """
+    model_id = pipeline_config.model_id
+    build_config = pipeline_config.build
+    generation = pipeline_config.generation
     if generator_config.sound_gen and audio_package is None:
         raise ValueError(
             "A transformer with sound_gen=True requires a sound-tokenizer package."
@@ -631,8 +457,7 @@ def _compose_pipeline(
                 subsystem="reasoner",
                 architecture=reasoner_architecture,
             ),
-            preferred_execution_providers=_preferred_execution_providers(
-                execution_provider,
+            preferred_execution_providers=build_config.preferred_execution_providers(
                 reasoner_package.config.dtype,
             ),
             parameter_dtype=reasoner_package.config.dtype.name,
@@ -653,8 +478,7 @@ def _compose_pipeline(
             action_gen=generator_config.action_gen,
             patch_latent_dim=generator_config.patch_latent_dim,
         ),
-        preferred_execution_providers=_preferred_execution_providers(
-            execution_provider,
+        preferred_execution_providers=build_config.preferred_execution_providers(
             generator_config.dtype,
         ),
         parameter_dtype=generator_config.dtype.name,
@@ -677,8 +501,7 @@ def _compose_pipeline(
                 spatial_compression=vae_config.scale_factor_spatial,
                 temporal_compression=vae_config.scale_factor_temporal,
             ),
-            preferred_execution_providers=_preferred_execution_providers(
-                execution_provider,
+            preferred_execution_providers=build_config.preferred_execution_providers(
                 vae_config.dtype,
             ),
             parameter_dtype=vae_config.dtype.name,
@@ -706,8 +529,7 @@ def _compose_pipeline(
                     sample_rate=audio_config.sampling_rate,
                     hop_size=audio_config.resolved_hop_size,
                 ),
-                preferred_execution_providers=_preferred_execution_providers(
-                    execution_provider,
+                preferred_execution_providers=build_config.preferred_execution_providers(
                     audio_config.dtype,
                 ),
                 parameter_dtype=audio_config.dtype.name,
@@ -1042,18 +864,6 @@ def _compose_pipeline(
                     presence=presence,
                 )
 
-    generation_values = dict(generation_config or {})
-    eos_token_ids = generation_values.get("eos_token_id", [])
-    if isinstance(eos_token_ids, int):
-        eos_token_ids = [eos_token_ids]
-    sampling = {
-        "do_sample": generation_values.get("do_sample", False),
-        "temperature": generation_values.get("temperature", 1.0),
-        "top_k": generation_values.get("top_k", 50),
-        "top_p": generation_values.get("top_p", 1.0),
-        "repetition_penalty": generation_values.get("repetition_penalty", 1.0),
-    }
-
     reasoner_prompt_components = [_REASONER_NAMES["embedding"]]
     if _REASONER_NAMES["vision_encoder"] in models:
         reasoner_prompt_components.insert(0, _REASONER_NAMES["vision_encoder"])
@@ -1074,25 +884,21 @@ def _compose_pipeline(
                 if "tokenizer.json" in assets
                 else "text_tokenizer/tokenizer.json"
             ),
-            "sampling": sampling,
-            "stop": {
-                "kind": "token_ids",
-                "eos_token_ids": eos_token_ids,
-                "max_sequence_length": getattr(
+            "sampling": generation.sampling_manifest(),
+            "stop": generation.stop_manifest(
+                max_sequence_length=getattr(
                     reasoner_package.config,
                     "max_position_embeddings",
                     None,
                 ),
-            },
-            "max_tokens": {
-                "default": generation_values.get("max_new_tokens"),
-                "required_override": generation_values.get("max_new_tokens") is None,
-                "limit": getattr(
+            ),
+            "max_tokens": generation.max_tokens_manifest(
+                limit=getattr(
                     reasoner_package.config,
                     "max_position_embeddings",
                     None,
                 ),
-            },
+            ),
             "state_names": [
                 state["name"] for state in state_specs if state["kind"] == "kv_cache"
             ],
@@ -1113,9 +919,9 @@ def _compose_pipeline(
                     "flow_shift",
                     "use_karras_sigmas",
                 ],
-                "mode_overrides": dict(scheduler_mode_overrides or {}),
+                "mode_overrides": generation.scheduler_mode_overrides_manifest(),
             },
-            "default_steps": default_inference_steps,
+            "default_steps": generation.default_inference_steps,
             "timestep": {
                 "generator": "scheduler_timesteps",
                 "scale": generator_config.timestep_scale,
@@ -1178,10 +984,9 @@ def _compose_pipeline(
 
     for destination, (source, required) in assets.items():
         builder.add_asset(destination, source, required=required)
-    builder.set_profile(pipeline_model_type.replace("_", "-"), "1.0")
-    builder.set_metadata("profile", "world-model")
-    builder.set_metadata("model_type", pipeline_model_type)
-    builder.set_metadata("source", model_id)
+    builder.set_profile(pipeline_config.profile_name, pipeline_config.profile_version)
+    for key, value in pipeline_config.manifest_metadata().items():
+        builder.set_metadata(key, value)
     builder.set_metadata(
         "modalities",
         {
@@ -1265,7 +1070,7 @@ def _compose_pipeline(
                 "resolution_tiers": [256, 480, 704, 720],
             },
         )
-    for key, value in (extra_metadata or {}).items():
+    for key, value in pipeline_config.extra_metadata.items():
         builder.set_metadata(key, value)
 
     return builder.build(
@@ -1279,14 +1084,11 @@ def _collect_assets(
     *,
     has_sound_tokenizer: bool,
 ) -> dict[str, tuple[str, bool]]:
-    assets: dict[str, tuple[str, bool]] = {}
+    """Resolve the runtime assets a Cosmos3 package must ship."""
     candidates = list(_ASSET_CANDIDATES)
     if has_sound_tokenizer:
         candidates.append(("sound_tokenizer/config.json", True))
-    for destination, required in candidates:
-        source = _resolve_file(model_id, destination, required=required)
-        if source is not None:
-            assets[destination] = (source, required)
+    assets = resolve_assets(model_id, candidates)
     tokenizer_paths = ("tokenizer.json", "text_tokenizer/tokenizer.json")
     available_tokenizers = [path for path in tokenizer_paths if path in assets]
     if not available_tokenizers:
@@ -1309,8 +1111,14 @@ def build_cosmos3_world_model(
     **_options: Any,
 ) -> PipelinePackage:
     """Build the complete neural Cosmos3-Omni world-model package."""
-    pipeline_index, _ = _load_json(model_id, "model_index.json")
-    root_config, _ = _load_json(model_id, "config.json")
+    build_config = WorldModelBuildConfig(
+        dtype=dtype,
+        load_weights=load_weights,
+        execution_provider=execution_provider,
+        trace_optimization=trace_optimization,
+    )
+    pipeline_index, _ = load_checkpoint_json(model_id, "model_index.json")
+    root_config, _ = load_checkpoint_json(model_id, "config.json")
     text_config = root_config.get("text_config") or {}
     if (
         isinstance(text_config, Mapping)
@@ -1326,18 +1134,23 @@ def build_cosmos3_world_model(
             trace_optimization=trace_optimization,
             **_options,
         )
-    transformer_class = _component_class(pipeline_index, "transformer")
-    vae_class = _component_class(pipeline_index, "vae")
+    transformer_class = component_class(pipeline_index, "transformer")
+    vae_class = component_class(pipeline_index, "vae")
     if transformer_class != "Cosmos3OmniTransformer":
         raise ValueError(f"Unsupported Cosmos3 transformer class {transformer_class!r}")
     if vae_class != "AutoencoderKLWan":
         raise ValueError(f"Unsupported Cosmos3 VAE class {vae_class!r}")
 
-    transformer_config_dict, _ = _load_json(model_id, "transformer/config.json")
-    vae_config_dict, _ = _load_json(model_id, "vae/config.json")
-    scheduler_config, _ = _load_json(model_id, "scheduler/scheduler_config.json")
-    generation_config = _load_optional_json(model_id, "generation_config.json")
-    checkpoint_config = _load_optional_json(model_id, "checkpoint.json")
+    transformer_config_dict, _ = load_checkpoint_json(model_id, "transformer/config.json")
+    vae_config_dict, _ = load_checkpoint_json(model_id, "vae/config.json")
+    scheduler_config, _ = load_checkpoint_json(model_id, "scheduler/scheduler_config.json")
+    generation_config = WorldModelGenerationConfig.from_generation_config(
+        load_optional_checkpoint_json(model_id, "generation_config.json"),
+        # Distilled 4-step checkpoints advertise their step budget only in the
+        # repository name.
+        default_inference_steps=4 if "4Step" in model_id else 35,
+    )
+    checkpoint_config = load_optional_checkpoint_json(model_id, "checkpoint.json")
     policy_config = checkpoint_config.get("policy")
     default_action_domain = (
         policy_config.get("domain_name", "no_action")
@@ -1345,13 +1158,13 @@ def build_cosmos3_world_model(
         else "no_action"
     )
 
-    has_sound = _component_class(pipeline_index, "sound_tokenizer") is not None
-    has_reasoner_vision = _component_class(pipeline_index, "vision_encoder") is not None
+    has_sound = component_class(pipeline_index, "sound_tokenizer") is not None
+    has_reasoner_vision = component_class(pipeline_index, "vision_encoder") is not None
     audio_config_dict: dict[str, Any] | None = None
     audio_weight_names: set[str] | None = None
     if has_sound:
-        audio_config_dict, _ = _load_json(model_id, "sound_tokenizer/config.json")
-        audio_weight_names = _component_weight_names(model_id, "sound_tokenizer")
+        audio_config_dict, _ = load_checkpoint_json(model_id, "sound_tokenizer/config.json")
+        audio_weight_names = component_weight_names(model_id, "sound_tokenizer")
 
     (
         reasoner_package,
@@ -1364,9 +1177,7 @@ def build_cosmos3_world_model(
         audio_module,
     ) = _build_components(
         model_id,
-        dtype=dtype,
-        execution_provider=execution_provider,
-        trace_optimization=trace_optimization,
+        build_config=build_config,
         pipeline_index=pipeline_index,
         transformer_config_dict=transformer_config_dict,
         vae_config_dict=vae_config_dict,
@@ -1375,7 +1186,7 @@ def build_cosmos3_world_model(
         has_reasoner_vision=has_reasoner_vision,
     )
 
-    if load_weights:
+    if build_config.load_weights:
         _apply_checkpoint_weights(
             model_id,
             reasoner_package=reasoner_package,
@@ -1390,7 +1201,12 @@ def build_cosmos3_world_model(
 
     assets = _collect_assets(model_id, has_sound_tokenizer=has_sound)
     return _compose_pipeline(
-        model_id=model_id,
+        pipeline_config=WorldModelPipelineConfig(
+            model_id=model_id,
+            model_type="cosmos3_omni",
+            build=build_config,
+            generation=generation_config,
+        ),
         reasoner_package=reasoner_package,
         generator_package=generator_package,
         vae_package=vae_package,
@@ -1399,8 +1215,5 @@ def build_cosmos3_world_model(
         vae_config=vae_module.config,
         scheduler_config=scheduler_config,
         assets=assets,
-        execution_provider=execution_provider,
-        generation_config=generation_config,
-        default_inference_steps=(4 if "4Step" in model_id else 35),
         default_action_domain=default_action_domain,
     )

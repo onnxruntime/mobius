@@ -18,14 +18,35 @@ from mobius._cosmos3_world_model import (
     _apply_checkpoint_weights,
     _build_components,
     _collect_assets,
-    _component_class,
     _compose_pipeline,
-    _load_json,
-    _load_optional_json,
-    _resolve_file,
+)
+from mobius._diffusers_checkpoint import (
+    component_class,
+    load_checkpoint_json,
+    load_optional_checkpoint_json,
+    resolve_checkpoint_file,
 )
 from mobius._pipeline import PipelinePackage
+from mobius._world_model_config import (
+    WorldModelBuildConfig,
+    WorldModelGenerationConfig,
+    WorldModelPipelineConfig,
+)
 from mobius.models.cosmos import Cosmos3EdgeVLModel
+
+# Cosmos3-Edge tunes the rectified-flow scheduler per generation mode. These
+# values belong to the Edge checkpoint contract, not to a generic default.
+_SCHEDULER_MODE_OVERRIDES: dict[str, Any] = {
+    "image_to_video": {
+        "flow_shift": 3.0,
+        "use_karras_sigmas": False,
+    },
+    "action": {
+        "flow_shift": 10.0,
+        "use_karras_sigmas": False,
+    },
+}
+_DEFAULT_INFERENCE_STEPS = 50
 
 
 def _edge_text_model_type(root_config: Mapping[str, Any]) -> str | None:
@@ -52,17 +73,23 @@ def build_cosmos3_edge_world_model(
     The latter advertises top-level ``model_type="cosmos3_omni"``; dispatch is
     therefore based on ``text_config.model_type="cosmos3_edge_text"``.
     """
-    root_config, _ = _load_json(model_id, "config.json")
+    build_config = WorldModelBuildConfig(
+        dtype=dtype,
+        load_weights=load_weights,
+        execution_provider=execution_provider,
+        trace_optimization=trace_optimization,
+    )
+    root_config, _ = load_checkpoint_json(model_id, "config.json")
     if _edge_text_model_type(root_config) != "cosmos3_edge_text":
         raise ValueError(
             f"{model_id!r} is not a Cosmos3-Edge checkpoint: expected "
             "text_config.model_type='cosmos3_edge_text'."
         )
 
-    pipeline_index, _ = _load_json(model_id, "model_index.json")
-    transformer_class = _component_class(pipeline_index, "transformer")
-    vae_class = _component_class(pipeline_index, "vae")
-    sound_class = _component_class(pipeline_index, "sound_tokenizer")
+    pipeline_index, _ = load_checkpoint_json(model_id, "model_index.json")
+    transformer_class = component_class(pipeline_index, "transformer")
+    vae_class = component_class(pipeline_index, "vae")
+    sound_class = component_class(pipeline_index, "sound_tokenizer")
     if transformer_class != "Cosmos3OmniTransformer":
         raise ValueError(f"Unsupported Cosmos3-Edge transformer class {transformer_class!r}")
     if vae_class != "AutoencoderKLWan":
@@ -73,10 +100,14 @@ def build_cosmos3_edge_world_model(
             f"unexpected sound tokenizer {sound_class!r}."
         )
 
-    transformer_config, _ = _load_json(model_id, "transformer/config.json")
-    vae_config, _ = _load_json(model_id, "vae/config.json")
-    scheduler_config, _ = _load_json(model_id, "scheduler/scheduler_config.json")
-    generation_config = _load_optional_json(model_id, "generation_config.json")
+    transformer_config, _ = load_checkpoint_json(model_id, "transformer/config.json")
+    vae_config, _ = load_checkpoint_json(model_id, "vae/config.json")
+    scheduler_config, _ = load_checkpoint_json(model_id, "scheduler/scheduler_config.json")
+    generation_config = WorldModelGenerationConfig.from_generation_config(
+        load_optional_checkpoint_json(model_id, "generation_config.json"),
+        default_inference_steps=_DEFAULT_INFERENCE_STEPS,
+        scheduler_mode_overrides=_SCHEDULER_MODE_OVERRIDES,
+    )
 
     (
         reasoner_package,
@@ -89,9 +120,7 @@ def build_cosmos3_edge_world_model(
         audio_module,
     ) = _build_components(
         model_id,
-        dtype=dtype,
-        execution_provider=execution_provider,
-        trace_optimization=trace_optimization,
+        build_config=build_config,
         pipeline_index=pipeline_index,
         transformer_config_dict=transformer_config,
         vae_config_dict=vae_config,
@@ -103,7 +132,7 @@ def build_cosmos3_edge_world_model(
     )
     assert audio_package is None and audio_module is None
 
-    if load_weights:
+    if build_config.load_weights:
         _apply_checkpoint_weights(
             model_id,
             reasoner_package=reasoner_package,
@@ -118,14 +147,25 @@ def build_cosmos3_edge_world_model(
 
     assets = _collect_assets(model_id, has_sound_tokenizer=False)
     policy: dict[str, Any] | None = None
-    checkpoint_path = _resolve_file(model_id, "checkpoint.json", required=False)
+    checkpoint_path = resolve_checkpoint_file(model_id, "checkpoint.json", required=False)
     if checkpoint_path is not None:
         with open(checkpoint_path, encoding="utf-8") as handle:
             checkpoint = json.load(handle)
         if isinstance(checkpoint, Mapping) and isinstance(checkpoint.get("policy"), dict):
             policy = dict(checkpoint["policy"])
     return _compose_pipeline(
-        model_id=model_id,
+        pipeline_config=WorldModelPipelineConfig(
+            model_id=model_id,
+            model_type="cosmos3_edge",
+            build=build_config,
+            generation=generation_config,
+            extra_metadata={
+                "edge": {
+                    "checkpoint_model_type": root_config.get("model_type"),
+                    "policy": policy,
+                }
+            },
+        ),
         reasoner_package=reasoner_package,
         generator_package=generator_package,
         vae_package=vae_package,
@@ -134,28 +174,8 @@ def build_cosmos3_edge_world_model(
         vae_config=vae_module.config,
         scheduler_config=scheduler_config,
         assets=assets,
-        pipeline_model_type="cosmos3_edge",
         reasoner_architecture="cosmos3_edge",
-        execution_provider=execution_provider,
-        generation_config=generation_config,
-        default_inference_steps=50,
         default_action_domain=(
             policy.get("domain_name", "no_action") if policy is not None else "no_action"
         ),
-        scheduler_mode_overrides={
-            "image_to_video": {
-                "flow_shift": 3.0,
-                "use_karras_sigmas": False,
-            },
-            "action": {
-                "flow_shift": 10.0,
-                "use_karras_sigmas": False,
-            },
-        },
-        extra_metadata={
-            "edge": {
-                "checkpoint_model_type": root_config.get("model_type"),
-                "policy": policy,
-            }
-        },
     )

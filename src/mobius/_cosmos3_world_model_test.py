@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 from types import SimpleNamespace
+from unittest import mock
 
 import onnx_ir as ir
 import pytest
@@ -12,11 +14,25 @@ import safetensors.torch
 import torch
 
 from mobius._configs import Cosmos3AudioConfig, Cosmos3OmniGeneratorConfig, WanVAEConfig
-from mobius._cosmos3_world_model import (
-    _component_weight_names,
-    _compose_pipeline,
-)
+from mobius._cosmos3_world_model import _compose_pipeline, build_cosmos3_world_model
+from mobius._diffusers_checkpoint import component_weight_names
 from mobius._model_package import ModelPackage
+from mobius._world_model_config import (
+    WorldModelBuildConfig,
+    WorldModelGenerationConfig,
+    WorldModelPipelineConfig,
+)
+
+
+def _pipeline_config(
+    model_id: str = "example/world",
+    **overrides,
+) -> WorldModelPipelineConfig:
+    return WorldModelPipelineConfig(
+        model_id=model_id,
+        model_type=overrides.pop("model_type", "cosmos3_omni"),
+        **overrides,
+    )
 
 
 def _value(
@@ -197,7 +213,7 @@ def test_compose_complete_cosmos3_pipeline(tmp_path) -> None:
     reasoner, generator, vae, audio = _packages()
     config = generator.config
     package = _compose_pipeline(
-        model_id="nvidia/Cosmos3-Nano",
+        pipeline_config=_pipeline_config("nvidia/Cosmos3-Nano"),
         reasoner_package=reasoner,
         generator_package=generator,
         vae_package=vae,
@@ -264,7 +280,7 @@ def test_compose_complete_cosmos3_pipeline(tmp_path) -> None:
 def test_compose_without_optional_sound_or_action(tmp_path) -> None:
     reasoner, generator, vae, audio = _packages(sound=False, action=False)
     package = _compose_pipeline(
-        model_id="example/world",
+        pipeline_config=_pipeline_config(),
         reasoner_package=reasoner,
         generator_package=generator,
         vae_package=vae,
@@ -284,7 +300,7 @@ def test_sound_head_requires_sound_tokenizer() -> None:
 
     with pytest.raises(ValueError, match="sound_gen=True"):
         _compose_pipeline(
-            model_id="example/world",
+            pipeline_config=_pipeline_config(),
             reasoner_package=reasoner,
             generator_package=generator,
             vae_package=vae,
@@ -307,7 +323,7 @@ def test_local_audio_weight_metadata_detects_encoder(tmp_path) -> None:
         str(component / "diffusion_pytorch_model.safetensors"),
     )
 
-    names = _component_weight_names(str(tmp_path), "sound_tokenizer")
+    names = component_weight_names(str(tmp_path), "sound_tokenizer")
 
     assert names == {"encoder.layers.0.weight", "decoder.conv1.weight"}
 
@@ -315,7 +331,7 @@ def test_local_audio_weight_metadata_detects_encoder(tmp_path) -> None:
 def test_decoder_only_audio_package_is_supported(tmp_path) -> None:
     reasoner, generator, vae, audio = _packages(audio_encoder=False)
     package = _compose_pipeline(
-        model_id="example/world",
+        pipeline_config=_pipeline_config(),
         reasoner_package=reasoner,
         generator_package=generator,
         vae_package=vae,
@@ -334,7 +350,7 @@ def test_reasoner_without_standalone_vision_tower_is_supported(tmp_path) -> None
     reasoner, generator, vae, audio = _packages(sound=False, action=False)
     del reasoner["vision_encoder"]
     package = _compose_pipeline(
-        model_id="example/distilled-world",
+        pipeline_config=_pipeline_config("example/distilled-world"),
         reasoner_package=reasoner,
         generator_package=generator,
         vae_package=vae,
@@ -362,7 +378,7 @@ def test_generator_and_video_vae_latent_width_must_match() -> None:
 
     with pytest.raises(ValueError, match="latent width"):
         _compose_pipeline(
-            model_id="example/world",
+            pipeline_config=_pipeline_config(),
             reasoner_package=reasoner,
             generator_package=generator,
             vae_package=vae,
@@ -372,3 +388,232 @@ def test_generator_and_video_vae_latent_width_must_match() -> None:
             scheduler_config={},
             assets={},
         )
+
+
+def test_manifest_carries_generation_and_pipeline_config(tmp_path) -> None:
+    reasoner, generator, vae, audio = _packages(sound=False, action=False)
+    generation = WorldModelGenerationConfig.from_generation_config(
+        {
+            "do_sample": True,
+            "temperature": 0.6,
+            "top_k": 20,
+            "top_p": 0.95,
+            "repetition_penalty": 1.05,
+            "max_new_tokens": 512,
+            "eos_token_id": 151645,
+        },
+        default_inference_steps=4,
+        scheduler_mode_overrides={"action": {"flow_shift": 10.0}},
+    )
+    package = _compose_pipeline(
+        pipeline_config=WorldModelPipelineConfig(
+            model_id="example/world-4Step",
+            model_type="cosmos3_edge",
+            build=WorldModelBuildConfig(execution_provider="cuda"),
+            generation=generation,
+            extra_metadata={"edge": {"policy": None}},
+        ),
+        reasoner_package=reasoner,
+        generator_package=generator,
+        vae_package=vae,
+        audio_package=audio,
+        generator_config=generator.config,
+        vae_config=vae.config,
+        scheduler_config={"_class_name": "FlowMatchEulerDiscreteScheduler"},
+        assets=_runtime_assets(tmp_path),
+        reasoner_architecture="cosmos3_edge",
+    )
+
+    decode = next(
+        stage for stage in package.manifest.stages if stage.name == "reasoner_decode"
+    )
+    assert decode.options["sampling"] == {
+        "do_sample": True,
+        "temperature": 0.6,
+        "top_k": 20,
+        "top_p": 0.95,
+        "repetition_penalty": 1.05,
+    }
+    assert decode.options["stop"]["eos_token_ids"] == [151645]
+    assert decode.options["max_tokens"] == {
+        "default": 512,
+        "required_override": False,
+        "limit": None,
+    }
+    generation_stage = next(
+        stage for stage in package.manifest.stages if stage.name == "world_generation"
+    )
+    assert generation_stage.options["default_steps"] == 4
+    assert generation_stage.options["scheduler"]["mode_overrides"] == {
+        "action": {"flow_shift": 10.0}
+    }
+    assert package.manifest.metadata["profile"] == "world-model"
+    assert package.manifest.metadata["model_type"] == "cosmos3_edge"
+    assert package.manifest.metadata["source"] == "example/world-4Step"
+    assert package.manifest.metadata["edge"] == {"policy": None}
+    assert package.manifest.profile is not None
+    assert package.manifest.profile.name == "cosmos3-edge"
+    assert package.manifest.component("generator").preferred_execution_providers == ("cuda",)
+
+
+def test_missing_generation_config_requires_runtime_token_budget(tmp_path) -> None:
+    reasoner, generator, vae, audio = _packages(sound=False, action=False)
+    package = _compose_pipeline(
+        pipeline_config=_pipeline_config(),
+        reasoner_package=reasoner,
+        generator_package=generator,
+        vae_package=vae,
+        audio_package=audio,
+        generator_config=generator.config,
+        vae_config=vae.config,
+        scheduler_config={},
+        assets=_runtime_assets(tmp_path),
+    )
+
+    decode = next(
+        stage for stage in package.manifest.stages if stage.name == "reasoner_decode"
+    )
+    assert decode.options["sampling"] == {
+        "do_sample": False,
+        "temperature": 1.0,
+        "top_k": 50,
+        "top_p": 1.0,
+        "repetition_penalty": 1.0,
+    }
+    assert decode.options["stop"] == {
+        "kind": "token_ids",
+        "eos_token_ids": [],
+        "max_sequence_length": None,
+    }
+    assert decode.options["max_tokens"]["required_override"] is True
+
+
+def test_build_cosmos3_world_model_threads_shared_configs(tmp_path) -> None:
+    (tmp_path / "model_index.json").write_text(
+        json.dumps(
+            {
+                "transformer": ["diffusers", "Cosmos3OmniTransformer"],
+                "vae": ["diffusers", "AutoencoderKLWan"],
+                "sound_tokenizer": [None, None],
+                "vision_encoder": ["transformers", "Qwen3VLVisionModel"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "cosmos3_omni"}),
+        encoding="utf-8",
+    )
+    for name in ("transformer", "vae"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "config.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "scheduler").mkdir()
+    (tmp_path / "scheduler" / "scheduler_config.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "generation_config.json").write_text(
+        json.dumps({"max_new_tokens": 256, "eos_token_id": 11}),
+        encoding="utf-8",
+    )
+    (tmp_path / "checkpoint.json").write_text(
+        json.dumps({"policy": {"domain_name": "droid_lerobot"}}),
+        encoding="utf-8",
+    )
+    generator_module = SimpleNamespace(config=mock.sentinel.generator_config)
+    vae_module = SimpleNamespace(config=mock.sentinel.vae_config)
+    package = mock.sentinel.pipeline_package
+
+    with (
+        mock.patch(
+            "mobius._cosmos3_world_model._build_components",
+            return_value=(
+                mock.sentinel.reasoner_package,
+                mock.sentinel.reasoner_module,
+                mock.sentinel.generator_package,
+                generator_module,
+                mock.sentinel.vae_package,
+                vae_module,
+                None,
+                None,
+            ),
+        ) as build_components,
+        mock.patch(
+            "mobius._cosmos3_world_model._collect_assets",
+            return_value={},
+        ),
+        mock.patch(
+            "mobius._cosmos3_world_model._compose_pipeline",
+            return_value=package,
+        ) as compose,
+    ):
+        result = build_cosmos3_world_model(
+            str(tmp_path),
+            dtype="f16",
+            load_weights=False,
+            execution_provider="cuda",
+        )
+
+    assert result is package
+    build_config = build_components.call_args.kwargs["build_config"]
+    assert build_config.resolved_dtype() is ir.DataType.FLOAT16
+    assert build_config.execution_provider == "cuda"
+    assert build_config.load_weights is False
+    pipeline_config = compose.call_args.kwargs["pipeline_config"]
+    assert pipeline_config.model_type == "cosmos3_omni"
+    assert pipeline_config.model_id == str(tmp_path)
+    assert pipeline_config.build is build_config
+    assert pipeline_config.generation.max_new_tokens == 256
+    assert pipeline_config.generation.eos_token_ids == (11,)
+    assert pipeline_config.generation.default_inference_steps == 35
+    assert pipeline_config.generation.scheduler_mode_overrides_manifest() == {}
+    assert compose.call_args.kwargs["default_action_domain"] == "droid_lerobot"
+
+
+def test_build_cosmos3_world_model_uses_distilled_step_budget(tmp_path) -> None:
+    checkpoint = tmp_path / "Cosmos3-Omni-4Step"
+    checkpoint.mkdir()
+    (checkpoint / "model_index.json").write_text(
+        json.dumps(
+            {
+                "transformer": ["diffusers", "Cosmos3OmniTransformer"],
+                "vae": ["diffusers", "AutoencoderKLWan"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (checkpoint / "config.json").write_text(
+        json.dumps({"model_type": "cosmos3_omni"}),
+        encoding="utf-8",
+    )
+    for name in ("transformer", "vae"):
+        (checkpoint / name).mkdir()
+        (checkpoint / name / "config.json").write_text("{}", encoding="utf-8")
+    (checkpoint / "scheduler").mkdir()
+    (checkpoint / "scheduler" / "scheduler_config.json").write_text("{}", encoding="utf-8")
+
+    with (
+        mock.patch(
+            "mobius._cosmos3_world_model._build_components",
+            return_value=(
+                mock.sentinel.reasoner_package,
+                mock.sentinel.reasoner_module,
+                mock.sentinel.generator_package,
+                SimpleNamespace(config=mock.sentinel.generator_config),
+                mock.sentinel.vae_package,
+                SimpleNamespace(config=mock.sentinel.vae_config),
+                None,
+                None,
+            ),
+        ),
+        mock.patch(
+            "mobius._cosmos3_world_model._collect_assets",
+            return_value={},
+        ),
+        mock.patch(
+            "mobius._cosmos3_world_model._compose_pipeline",
+            return_value=mock.sentinel.pipeline_package,
+        ) as compose,
+    ):
+        build_cosmos3_world_model(str(checkpoint), load_weights=False)
+
+    pipeline_config = compose.call_args.kwargs["pipeline_config"]
+    assert pipeline_config.generation.default_inference_steps == 4
+    assert compose.call_args.kwargs["default_action_domain"] == "no_action"

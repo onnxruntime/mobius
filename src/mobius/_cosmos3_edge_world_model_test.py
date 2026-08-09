@@ -7,6 +7,9 @@ import json
 from types import SimpleNamespace
 from unittest import mock
 
+import onnx_ir as ir
+import pytest
+
 from mobius._cosmos3_edge_world_model import (
     _edge_text_model_type,
     build_cosmos3_edge_world_model,
@@ -101,7 +104,7 @@ def test_edge_builder_uses_edge_reasoner_and_shared_generator_pipeline() -> None
 
     with (
         mock.patch(
-            "mobius._cosmos3_edge_world_model._load_json",
+            "mobius._cosmos3_edge_world_model.load_checkpoint_json",
             side_effect=lambda _model_id, filename: loaded[filename],
         ),
         mock.patch(
@@ -122,11 +125,11 @@ def test_edge_builder_uses_edge_reasoner_and_shared_generator_pipeline() -> None
             return_value={},
         ),
         mock.patch(
-            "mobius._cosmos3_edge_world_model._load_optional_json",
+            "mobius._cosmos3_edge_world_model.load_optional_checkpoint_json",
             return_value={},
         ),
         mock.patch(
-            "mobius._cosmos3_edge_world_model._resolve_file",
+            "mobius._cosmos3_edge_world_model.resolve_checkpoint_file",
             return_value=None,
         ),
         mock.patch(
@@ -134,13 +137,36 @@ def test_edge_builder_uses_edge_reasoner_and_shared_generator_pipeline() -> None
             return_value=package,
         ) as compose,
     ):
-        result = build_cosmos3_edge_world_model("nvidia/Cosmos3-Edge", load_weights=False)
+        result = build_cosmos3_edge_world_model(
+            "nvidia/Cosmos3-Edge",
+            dtype="bf16",
+            load_weights=False,
+        )
 
     assert result is package
     assert build_components.call_args.kwargs["reasoner_module_class"] is Cosmos3EdgeVLModel
     assert build_components.call_args.kwargs["reasoner_task"] == "cosmos3-edge-vl"
-    assert compose.call_args.kwargs["pipeline_model_type"] == "cosmos3_edge"
+    build_config = build_components.call_args.kwargs["build_config"]
+    assert build_config.resolved_dtype() is ir.DataType.BFLOAT16
+    assert build_config.load_weights is False
+    pipeline_config = compose.call_args.kwargs["pipeline_config"]
+    assert pipeline_config.model_type == "cosmos3_edge"
+    assert pipeline_config.model_id == "nvidia/Cosmos3-Edge"
+    assert pipeline_config.build is build_config
     assert compose.call_args.kwargs["reasoner_architecture"] == "cosmos3_edge"
-    assert compose.call_args.kwargs["extra_metadata"]["edge"]["checkpoint_model_type"] == (
-        "cosmos3_edge"
+    assert pipeline_config.extra_metadata["edge"]["checkpoint_model_type"] == "cosmos3_edge"
+    assert pipeline_config.generation.default_inference_steps == 50
+    assert pipeline_config.generation.scheduler_mode_overrides_manifest() == {
+        "image_to_video": {"flow_shift": 3.0, "use_karras_sigmas": False},
+        "action": {"flow_shift": 10.0, "use_karras_sigmas": False},
+    }
+
+
+def test_edge_builder_rejects_non_edge_checkpoint(tmp_path) -> None:
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "cosmos3_omni"}),
+        encoding="utf-8",
     )
+
+    with pytest.raises(ValueError, match="not a Cosmos3-Edge checkpoint"):
+        build_cosmos3_edge_world_model(str(tmp_path), load_weights=False)
