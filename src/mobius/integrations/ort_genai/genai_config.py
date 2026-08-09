@@ -104,7 +104,9 @@ def _default_search_params(
     }
 
 
-def _make_session_options(ep: str) -> dict[str, Any]:
+def _make_session_options(
+    ep: str, *, graph_capture: bool | None = None
+) -> dict[str, Any]:
     """Return session options with EP-specific provider_options.
 
     Args:
@@ -115,7 +117,7 @@ def _make_session_options(ep: str) -> dict[str, Any]:
 
     return {
         "log_id": "onnxruntime-genai",
-        "provider_options": make_provider_options(ep),
+        "provider_options": make_provider_options(ep, graph_capture=graph_capture),
     }
 
 
@@ -322,7 +324,9 @@ class GenaiConfigGenerator:
             "config_filename": config_filename,
             "inputs": input_names,
             "outputs": output_names,
-            "session_options": _make_session_options(self.ep),
+            "session_options": _make_session_options(
+                self.ep, graph_capture=False
+            ),
         }
         if spatial_merge_size is not None:
             self._vision["spatial_merge_size"] = spatial_merge_size
@@ -341,7 +345,9 @@ class GenaiConfigGenerator:
             else {
                 "inputs_embeds": "inputs_embeds",
             },
-            "session_options": _make_session_options(self.ep),
+            "session_options": _make_session_options(
+                self.ep, graph_capture=False
+            ),
         }
         self._vlm_token_ids["image_token_id"] = image_token_id
         if vision_start_token_id is not None:
@@ -391,7 +397,9 @@ class GenaiConfigGenerator:
             "config_filename": config_filename,
             "inputs": input_names,
             "outputs": output_names,
-            "session_options": _make_session_options(self.ep),
+            "session_options": _make_session_options(
+                self.ep, graph_capture=False
+            ),
         }
 
         if audio_token_id is not None:

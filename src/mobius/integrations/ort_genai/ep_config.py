@@ -33,6 +33,8 @@ _ORT_PROVIDER_NAMES: dict[str, str] = {
 
 def make_provider_options(
     ep: str,
+    *,
+    graph_capture: bool | None = None,
 ) -> list[dict[str, dict[str, str]]]:
     """Build the ``provider_options`` list for genai_config.json.
 
@@ -57,7 +59,8 @@ def make_provider_options(
 
     # Graph capture comes from the EP's registered capability flag (the registry
     # is the single source of truth). Translate it into the EP-specific option.
-    graph_capture = bool(caps and caps.enable_graph_capture)
+    if graph_capture is None:
+        graph_capture = bool(caps and caps.enable_graph_capture)
 
     if ep == "webgpu":
         options["enableGraphCapture"] = "1" if graph_capture else "0"
