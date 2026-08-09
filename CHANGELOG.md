@@ -29,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Nemotron/SigLIP Reasoner, shared MoT Generator, Wan VAE, and Action head.
 - Exact Mobius implementations for `Cosmos3OmniTransformer`,
   `AutoencoderKLWan`, and `Cosmos3AVAEAudioTokenizer`.
+- Single-frame (image) mode for the Wan video VAE: the exported encoder accepts
+  `frames = 1` and the decoder accepts `latent_frames = 1`, matching upstream
+  diffusers' chunk-0 behaviour, which enables native Cosmos3 text-to-image.
 
 #### Changed
 

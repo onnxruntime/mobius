@@ -196,6 +196,31 @@ TINY_WAN21: dict = {
     "z_dim": 4,
 }
 
+#: Cosmos3-shaped but tiny: 4 stages, **two** temporal resampling stages and
+#: ``patch_size = 2``, i.e. the exact topology of ``nvidia/Cosmos3-Nano/vae``
+#: with the channel widths shrunk. Exercises chained temporal upsampling, which
+#: the single-stage :data:`TINY_WAN22` cannot.
+TINY_COSMOS3: dict = {
+    "_class_name": "AutoencoderKLWan",
+    "attn_scales": [],
+    "base_dim": 8,
+    "clip_output": False,
+    "decoder_base_dim": 8,
+    "dim_mult": [1, 2, 4, 4],
+    "dropout": 0.0,
+    "in_channels": 12,
+    "is_residual": True,
+    "latents_mean": [0.1, -0.2, 0.3, -0.4],
+    "latents_std": [1.1, 0.9, 1.2, 0.8],
+    "num_res_blocks": 1,
+    "out_channels": 12,
+    "patch_size": 2,
+    "scale_factor_spatial": 16,
+    "scale_factor_temporal": 4,
+    "temperal_downsample": [False, True, True],
+    "z_dim": 4,
+}
+
 
 def _build(config_dict: dict):
     """Parse a config, instantiate the module and build both graphs."""
@@ -592,6 +617,32 @@ def _single_block_graph(block, torch_input, dtype=ir.DataType.FLOAT):
     return _make_model(graph)
 
 
+def _reference_and_package(config_dict: dict):
+    """Instantiate the diffusers reference and a weight-loaded mobius package."""
+    torch = pytest.importorskip("torch")
+    from mobius._weight_loading import apply_weights
+
+    autoencoder_kl_wan = _wan_module("AutoencoderKLWan")
+    torch.manual_seed(0)
+    kwargs = {k: v for k, v in config_dict.items() if not k.startswith("_")}
+    kwargs.pop("clip_output", None)
+    reference = autoencoder_kl_wan(**kwargs).eval()
+    state_dict = dict(reference.state_dict())
+
+    config, _, package = _build(config_dict)
+    for model in package.values():
+        initializers = set(model.graph.initializers)
+        apply_weights(model, {k: v for k, v in state_dict.items() if k in initializers})
+    return reference, config, package
+
+
+def _latent_stats(config: WanVAEConfig) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(latents_mean, latents_std)`` broadcast to ``(1, z, 1, 1, 1)``."""
+    mean = np.asarray(config.latents_mean, dtype=np.float32).reshape(1, -1, 1, 1, 1)
+    std = np.asarray(config.latents_std, dtype=np.float32).reshape(1, -1, 1, 1, 1)
+    return mean, std
+
+
 class TestParity:
     """Compare individual blocks and the full VAE against diffusers PyTorch."""
 
@@ -700,6 +751,57 @@ class TestParity:
         assert actual.shape == expected.shape
         assert np.abs(actual - expected).max() < 1e-5
 
+    def test_upsample3d_single_frame_is_a_temporal_no_op(self):
+        """A lone frame is chunk 0, whose ``time_conv`` upstream never runs."""
+        pytest.importorskip("onnxruntime")
+        torch = pytest.importorskip("torch")
+        from mobius._weight_loading import apply_weights
+        from mobius.models.wan_vae import _WanResample
+
+        wan_resample = _wan_module("WanResample")
+        torch.manual_seed(0)
+        reference = wan_resample(4, mode="upsample3d", upsample_out_dim=4).eval()
+        block = _WanResample(4, mode="upsample3d", upsample_out_dim=4)
+
+        x = torch.randn(1, 4, 1, 4, 4)
+        feat_cache: list = [None]
+        with torch.no_grad():
+            expected = reference(x, feat_cache=feat_cache, feat_idx=[0]).numpy()
+
+        model = _single_block_graph(block, x)
+        apply_weights(model, dict(reference.state_dict()))
+        actual = _run(model, {"x": x.numpy()})[0]
+
+        # 2 * 1 - 1 == 1: no temporal doubling for the very first chunk.
+        assert actual.shape[2] == 1
+        assert actual.shape == expected.shape
+        assert np.abs(actual - expected).max() < 1e-5
+
+    def test_downsample3d_single_frame_is_a_temporal_no_op(self):
+        """Upstream caches chunk 0 verbatim instead of striding over it."""
+        pytest.importorskip("onnxruntime")
+        torch = pytest.importorskip("torch")
+        from mobius._weight_loading import apply_weights
+        from mobius.models.wan_vae import _WanResample
+
+        wan_resample = _wan_module("WanResample")
+        torch.manual_seed(0)
+        reference = wan_resample(4, mode="downsample3d").eval()
+        block = _WanResample(4, mode="downsample3d")
+
+        x = torch.randn(1, 4, 1, 8, 8)
+        feat_cache: list = [None]
+        with torch.no_grad():
+            expected = reference(x, feat_cache=feat_cache, feat_idx=[0]).numpy()
+
+        model = _single_block_graph(block, x)
+        apply_weights(model, dict(reference.state_dict()))
+        actual = _run(model, {"x": x.numpy()})[0]
+
+        assert actual.shape[2] == 1
+        assert actual.shape == expected.shape
+        assert np.abs(actual - expected).max() < 1e-5
+
     @pytest.mark.parametrize("config_dict", [TINY_WAN22, TINY_WAN21])
     def test_encoder_and_decoder_match_diffusers(self, config_dict):
         pytest.importorskip("onnxruntime")
@@ -804,3 +906,143 @@ class TestParity:
         assert actual.shape == video.shape
         assert actual.shape == expected.shape
         assert np.abs(actual - expected).max() < 1e-4
+
+
+# ---------------------------------------------------------------------------
+# Single-frame (image) mode
+# ---------------------------------------------------------------------------
+
+
+class TestSingleFrame:
+    """``T_latent = 1`` / ``T_video = 1``, the Cosmos3 text-to-image path.
+
+    Upstream decodes one latent frame per chunk and skips ``time_conv`` for
+    chunk 0, so a lone latent frame decodes to a lone video frame.  The exported
+    graph reproduces that with a safe (right-padded, then sliced) temporal
+    window instead of a Python-level branch.
+    """
+
+    @pytest.mark.parametrize("config_dict", [TINY_WAN22, TINY_WAN21, TINY_COSMOS3])
+    @pytest.mark.parametrize("latent_frames", [1, 2, 3])
+    def test_decoder_matches_diffusers_for_any_latent_frame_count(
+        self, config_dict, latent_frames
+    ):
+        pytest.importorskip("onnxruntime")
+        torch = pytest.importorskip("torch")
+
+        reference, config, package = _reference_and_package(config_dict)
+        latents_mean, latents_std = _latent_stats(config)
+
+        z = torch.randn(1, config.z_dim, latent_frames, 2, 2)
+        with torch.no_grad():
+            expected = reference.decode(z).sample.numpy()
+        normalized = ((z.numpy() - latents_mean) / latents_std).astype(np.float32)
+        actual = _run(package["decoder"], {"latent": normalized})[0]
+
+        # T_video = scale_factor_temporal * (T_latent - 1) + 1, so a single
+        # latent frame decodes to a single video frame.
+        assert expected.shape[2] == config.scale_factor_temporal * (latent_frames - 1) + 1
+        assert actual.shape == expected.shape
+        assert actual.shape[1] == config.decoded_video_channels
+        assert actual.shape[3:] == (2 * config.scale_factor_spatial,) * 2
+        assert np.abs(actual - expected).max() < 1e-4
+
+    @pytest.mark.parametrize("config_dict", [TINY_WAN22, TINY_WAN21, TINY_COSMOS3])
+    def test_encoder_matches_diffusers_for_a_single_video_frame(self, config_dict):
+        pytest.importorskip("onnxruntime")
+        torch = pytest.importorskip("torch")
+
+        reference, config, package = _reference_and_package(config_dict)
+        latents_mean, latents_std = _latent_stats(config)
+
+        video = torch.randn(
+            1,
+            config.video_channels,
+            1,
+            2 * config.scale_factor_spatial,
+            2 * config.scale_factor_spatial,
+        )
+        with torch.no_grad():
+            posterior = reference.encode(video).latent_dist
+        mean, logvar, latent = _run(package["encoder"], {"sample": video.numpy()})
+
+        assert mean.shape == (1, config.z_dim, 1, 2, 2)
+        assert mean.shape == tuple(posterior.mean.shape)
+        assert np.abs(mean - posterior.mean.numpy()).max() < 1e-4
+        assert np.abs(logvar - posterior.logvar.numpy()).max() < 1e-4
+        assert np.abs(latent - (mean - latents_mean) / latents_std).max() < 1e-5
+
+    def test_image_round_trip_through_both_graphs(self):
+        """Encode one frame, decode the resulting latent, recover one frame."""
+        pytest.importorskip("onnxruntime")
+        torch = pytest.importorskip("torch")
+
+        reference, config, package = _reference_and_package(TINY_COSMOS3)
+
+        image = torch.randn(1, config.video_channels, 1, 32, 32)
+        _, _, latent = _run(package["encoder"], {"sample": image.numpy()})
+        assert latent.shape == (1, config.z_dim, 1, 2, 2)
+
+        decoded = _run(package["decoder"], {"latent": latent})[0]
+        with torch.no_grad():
+            posterior = reference.encode(image).latent_dist
+            expected = reference.decode(posterior.mean).sample.numpy()
+
+        assert decoded.shape == image.shape
+        assert decoded.shape == expected.shape
+        assert np.abs(decoded - expected).max() < 1e-4
+
+    def test_multi_frame_numerics_are_unaffected_by_the_safe_window(self):
+        """The padded-then-sliced window must not perturb longer sequences.
+
+        ``time_conv`` is causal, so the frames retained after the right-hand
+        zero padding are the frames the unpadded convolution would produce.  A
+        decode of ``T`` latent frames must therefore agree with independently
+        decoding its ``T - 1`` frame prefix on the shared video frames.
+        """
+        pytest.importorskip("onnxruntime")
+        torch = pytest.importorskip("torch")
+
+        _, config, package = _reference_and_package(TINY_COSMOS3)
+        latents_mean, latents_std = _latent_stats(config)
+
+        z = torch.randn(1, config.z_dim, 3, 2, 2).numpy()
+        normalized = ((z - latents_mean) / latents_std).astype(np.float32)
+        full = _run(package["decoder"], {"latent": normalized})[0]
+        prefix = _run(package["decoder"], {"latent": normalized[:, :, :2]})[0]
+
+        # The decoder is causal in time: the prefix decode is a prefix of the
+        # full decode, frame for frame.
+        assert prefix.shape[2] == config.scale_factor_temporal + 1
+        assert np.abs(full[:, :, : prefix.shape[2]] - prefix).max() < 1e-6
+
+    def test_built_package_saves_and_decodes_one_frame_from_disk(self, tmp_path):
+        """Build -> apply weights -> ``ModelPackage.save`` -> ORT decode at T=1."""
+        ort = pytest.importorskip("onnxruntime")
+        torch = pytest.importorskip("torch")
+
+        reference, config, package = _reference_and_package(TINY_COSMOS3)
+        package.save(str(tmp_path), progress_bar=False)
+
+        decoder_path = tmp_path / "decoder" / "model.onnx"
+        assert decoder_path.is_file()
+        assert (tmp_path / "encoder" / "model.onnx").is_file()
+
+        latents_mean, latents_std = _latent_stats(config)
+        z = torch.randn(1, config.z_dim, 1, 2, 2)
+        normalized = ((z.numpy() - latents_mean) / latents_std).astype(np.float32)
+
+        session = ort.InferenceSession(str(decoder_path))
+        # The saved graph keeps latent_frames symbolic, so nothing pins it to 1.
+        latent_input = session.get_inputs()[0]
+        assert latent_input.name == "latent"
+        assert latent_input.shape[2] == "latent_frames"
+
+        (sample,) = session.run(None, {"latent": normalized})
+        with torch.no_grad():
+            expected = reference.decode(z).sample.numpy()
+
+        assert sample.shape == (1, config.decoded_video_channels, 1, 32, 32)
+        assert sample.shape == expected.shape
+        assert np.abs(sample - expected).max() < 1e-4
+        assert sample.min() >= -1.0 and sample.max() <= 1.0

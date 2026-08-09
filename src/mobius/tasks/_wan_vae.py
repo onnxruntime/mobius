@@ -15,11 +15,12 @@ Builds a :class:`~mobius._model_package.ModelPackage` with two graphs:
     ``latent`` ``(B, z_dim, T', H', W')`` (pipeline-normalised)
     -> ``sample`` ``(B, video_channels, frames, height, width)``.
 
-Both graphs are fully dynamic in batch and spatial extent.  The temporal extent
-must satisfy ``frames = scale_factor_temporal * k + 1`` with ``k >= 1`` (encoder)
-and ``latent_frames >= 2`` (decoder); see the "Supported frame counts" note in
-:mod:`mobius.models.wan_vae`.  ``height``/``width`` must be divisible by
-``scale_factor_spatial``.
+Both graphs are fully dynamic in batch, temporal and spatial extent.  The
+temporal extent must satisfy ``frames = scale_factor_temporal * k + 1`` with
+``k >= 0`` (encoder) and ``latent_frames = k + 1 >= 1`` (decoder); ``k == 0``
+is the single-frame image mode used by text-to-image pipelines such as Cosmos3.
+See the "Single-frame (image) mode" note in :mod:`mobius.models.wan_vae`.
+``height``/``width`` must be divisible by ``scale_factor_spatial``.
 
 Why a dedicated task instead of reusing :class:`~mobius.tasks._vae.VAETask` or
 :class:`~mobius.tasks._qwen_image_vae.QwenImageVAETask`:
@@ -87,8 +88,8 @@ class WanVAETask(ModelTask):
         op = builder.op
 
         # Pixel-space video in [-1, 1]. ``frames`` must be
-        # ``scale_factor_temporal * k + 1`` (k >= 1) so the temporal downsampling
-        # stages line up with upstream's chunked encode.
+        # ``scale_factor_temporal * k + 1`` (k >= 0) so the temporal downsampling
+        # stages line up with upstream's chunked encode; k == 0 is a single image.
         sample = builder.input(
             "sample",
             dtype=config.dtype,
@@ -118,7 +119,7 @@ class WanVAETask(ModelTask):
         op = builder.op
 
         # Pipeline-normalised latents, i.e. the ``latent`` output of the encoder
-        # graph or the denoiser's sample. ``latent_frames`` must be >= 2.
+        # graph or the denoiser's sample. ``latent_frames`` may be 1 (image mode).
         latent = builder.input(
             "latent",
             dtype=config.dtype,

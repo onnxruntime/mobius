@@ -48,17 +48,23 @@ written in *whole-sequence* form.  The two are numerically identical:
   is exactly what chunk 0 contributes when the per-chunk outputs are concatenated.
 
 The equivalence holds for the supported frame counts: ``T_video = 4k + 1``
-(encoder) and ``T_latent = k + 1`` (decoder).
+(encoder) and ``T_latent = k + 1`` (decoder), for ``k >= 0``.
 
-**Supported frame counts.**  Every temporal resampling stage must see at least
-three frames, because its ``time_conv`` has a kernel of 3 and the whole-sequence
-form feeds it ``x`` (down) or ``x[:, :, 1:]`` (up).  Concretely, with
-``scale_factor_temporal = 4`` the encoder accepts ``T_video in {5, 9, 13, ...}``
-and the decoder accepts ``T_latent >= 2``.  Upstream additionally supports
-``T_video = 1`` / ``T_latent = 1`` by skipping ``time_conv`` for the very first
-chunk; a static graph cannot express that Python-level branch without an ``If``
-subgraph (ONNX ``Conv`` rejects a temporal extent shorter than the kernel), and
-no Wan/Cosmos3 pipeline feeds a single frame, so it is intentionally left out.
+**Single-frame (image) mode.**  ``T_video = 1`` / ``T_latent = 1`` is a first
+class upstream case — ``_encode`` runs ``1 + (T_video - 1) // 4`` chunks and
+``_decode`` one chunk per latent frame, so a lone frame is decoded as chunk 0,
+whose ``time_conv`` is skipped entirely (``feat_cache[idx] is None`` -> ``"Rep"``
+for ``upsample3d``, ``feat_cache[idx] = x`` for ``downsample3d``).  A static
+graph cannot skip a node, and the naive whole-sequence form would hand ``Conv``
+a temporal extent shorter than its kernel (ONNX Runtime rejects that outright),
+so both temporal resamplers use a *safe window*: the temporal axis is
+zero-padded on the **right** by exactly the number of frames the kernel needs,
+and the surplus trailing outputs are sliced off afterwards.  Because each
+``time_conv`` is causal in time, the retained outputs are bit-identical to
+the unpadded convolution, so multi-frame numerics are untouched and the
+single-frame case degenerates to "keep frame 0 only", exactly like chunk 0
+upstream.  The final ``Slice`` is applied *after* the frame-0 concatenation so
+no zero-length tensor is ever materialised.
 
 Weight names match the HuggingFace ``AutoencoderKLWan`` ``state_dict`` exactly,
 so :meth:`AutoencoderKLWanModel.preprocess_weights` performs no renaming.
@@ -455,32 +461,64 @@ class _WanResample(nn.Module):
         return x
 
     def _temporal_upsample(self, op: OpBuilder, x: ir.Value) -> ir.Value:
-        """Duplicate every frame after the first via ``time_conv`` + interleave."""
-        # Frame 0 passes through untouched: upstream's first decode chunk never
-        # runs time_conv, and the causal sequence restarts (zero-padded) at frame 1.
-        first = op.Slice(x, [0], [1], [2])
-        rest = op.Slice(x, [1], [INT64_MAX], [2])
+        """Duplicate every frame after the first via ``time_conv`` + interleave.
 
-        # (B, C, T-1, H, W) -> (B, 2C, T-1, H, W)
+        Whole-sequence form of upstream's per-chunk ``upsample3d``:
+        ``concat(x[:, :, :1], interleave(time_conv(x[:, :, 1:])))``, i.e. frame 0
+        passes through untouched (upstream's first decode chunk never runs
+        ``time_conv``) and the causal sequence restarts, zero-padded, at frame 1.
+
+        ``x[:, :, 1:]`` is empty for a single latent frame, which no ``Conv``
+        kernel accepts.  Instead the temporal axis is zero-padded by one frame on
+        the right *before* dropping frame 0, so the convolution always sees
+        ``T >= 1`` frames; the surplus pair of interleaved output frames is then
+        sliced off.  ``time_conv`` is causal, so the retained frames are exactly
+        those of the unpadded convolution.
+        """
+        batch, channels, t_len, height, width = _dims5(op, x)
+        first = op.Slice(x, [0], [1], [2])
+
+        # (B, C, T, H, W) -> (B, C, T + 1, H, W) -> drop frame 0 -> T frames.
+        padded = op.Pad(x, [0, 0, 0, 0, 0, 0, 0, 1, 0, 0])
+        rest = op.Slice(padded, [1], [INT64_MAX], [2])
+
+        # (B, C, T, H, W) -> (B, 2C, T, H, W)
         doubled = self.time_conv(op, rest)
-        batch, channels, t_rest, height, width = _dims5(op, rest)
         # Split the 2C channels into the two interleaved half-frames.
         even, odd = op.Split(doubled, num_outputs=2, axis=1, _outputs=2)
-        # Interleave along a new axis: (B, C, T-1, 2, H, W) -> (B, C, 2(T-1), H, W)
+        # Interleave along a new axis: (B, C, T, 2, H, W) -> (B, C, 2T, H, W)
         stacked = op.Concat(op.Unsqueeze(even, [3]), op.Unsqueeze(odd, [3]), axis=3)
         rest = op.Reshape(
             stacked,
-            op.Concat(batch, channels, op.Mul(t_rest, 2), height, width, axis=0),
+            op.Concat(batch, channels, op.Mul(t_len, 2), height, width, axis=0),
         )
-        return op.Concat(first, rest, axis=2)
+        # (B, C, 1 + 2T, H, W) -> keep 2T - 1 frames (== 1 for a single frame).
+        out = op.Concat(first, rest, axis=2)
+        return op.Slice(out, [0], op.Sub(op.Mul(t_len, 2), 1), [2])
 
     def _temporal_downsample(self, op: OpBuilder, x: ir.Value) -> ir.Value:
-        """Stride-2 causal-free temporal convolution, keeping frame 0 verbatim."""
-        # Upstream skips time_conv for chunk 0 and, from chunk 1 on, prepends the
-        # previous chunk's last frame; concatenated, the kernel-3/stride-2 windows
-        # start at global frames 0, 2, 4, ... over the whole sequence.
+        """Stride-2 causal-free temporal convolution, keeping frame 0 verbatim.
+
+        Upstream skips ``time_conv`` for chunk 0 and, from chunk 1 on, prepends
+        the previous chunk's last frame; concatenated, the kernel-3/stride-2
+        windows start at global frames ``0, 2, 4, ...`` over the whole sequence,
+        i.e. ``concat(x[:, :, :1], time_conv(x))``.
+
+        A single-frame clip is shorter than the kernel, so the temporal axis is
+        zero-padded by two frames on the right and the surplus trailing output
+        frame is sliced off.  The convolution only ever looks backwards in time,
+        so the retained frames match the unpadded convolution exactly.
+        """
+        t_len = _dim(op, x, 2)
         first = op.Slice(x, [0], [1], [2])
-        return op.Concat(first, self.time_conv(op, x), axis=2)
+
+        # (B, C, T, H, W) -> (B, C, T + 2, H, W) -> stride-2 conv -> (T - 1) // 2 + 1.
+        padded = op.Pad(x, [0, 0, 0, 0, 0, 0, 0, 2, 0, 0])
+        strided = self.time_conv(op, padded)
+        # Keep 1 + (T - 1) // 2 frames, dropping the one window that read padding.
+        out = op.Concat(first, strided, axis=2)
+        keep = op.Add(op.Div(op.Sub(t_len, 1), 2), 1)
+        return op.Slice(out, [0], keep, [2])
 
     def _spatial_resample(self, op: OpBuilder, x: ir.Value) -> ir.Value:
         """Apply the 2D ``resample`` Sequential frame-by-frame."""
