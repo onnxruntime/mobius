@@ -246,14 +246,10 @@ class TestGenaiConfigGeneratorLLM:
         config = gen.with_vision(image_token_id=255999).with_audio().generate()
 
         model = config["model"]
-        decoder_webgpu = model["decoder"]["session_options"]["provider_options"][0][
-            "webgpu"
-        ]
+        decoder_webgpu = model["decoder"]["session_options"]["provider_options"][0]["webgpu"]
         assert decoder_webgpu["enableGraphCapture"] == "1"
         for component in ("vision", "embedding", "speech"):
-            webgpu = model[component]["session_options"]["provider_options"][0][
-                "webgpu"
-            ]
+            webgpu = model[component]["session_options"]["provider_options"][0]["webgpu"]
             assert webgpu["enableGraphCapture"] == "0"
             assert webgpu["validationMode"] == "basic"
 

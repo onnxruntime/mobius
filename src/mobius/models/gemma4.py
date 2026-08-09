@@ -88,22 +88,14 @@ def _split_per_layer_projection_weight(
 
     expected_rows = config.num_hidden_layers * per_layer_dim
     if weight.shape[0] != expected_rows:
-        raise ValueError(
-            f"{weight_key} dim 0 expected {expected_rows}, got {weight.shape[0]}"
-        )
+        raise ValueError(f"{weight_key} dim 0 expected {expected_rows}, got {weight.shape[0]}")
     producer_rows = (config.num_hidden_layers - shared_layers) * per_layer_dim
-    producer, consumer = weight.split(
-        [producer_rows, expected_rows - producer_rows], dim=0
-    )
+    producer, consumer = weight.split([producer_rows, expected_rows - producer_rows], dim=0)
     state_dict[weight_key] = producer.contiguous()
-    state_dict[f"{prefix}per_layer_model_projection_consumer.weight"] = (
-        consumer.contiguous()
-    )
+    state_dict[f"{prefix}per_layer_model_projection_consumer.weight"] = consumer.contiguous()
 
 
-def _typed_scalar_constant(
-    op: OpBuilder, value: float, dtype: ir.DataType
-) -> ir.Value:
+def _typed_scalar_constant(op: OpBuilder, value: float, dtype: ir.DataType) -> ir.Value:
     """Create a scalar constant directly in the model compute dtype."""
     return op.Constant(value=ir.tensor(np.asarray(value, dtype=dtype.numpy())))
 
@@ -210,9 +202,7 @@ class Gemma4ScaledWordEmbedding(Gemma3TextScaledWordEmbedding):
     def forward(self, op: OpBuilder, input_ids: ir.Value) -> ir.Value:
         embeddings = Embedding.forward(self, op, input_ids)
         scale = op.Constant(
-            value=ir.tensor(
-                np.asarray(self.embed_scale, dtype=self.weight.dtype.numpy())
-            )
+            value=ir.tensor(np.asarray(self.embed_scale, dtype=self.weight.dtype.numpy()))
         )
         return op.Mul(embeddings, scale)
 
@@ -249,9 +239,7 @@ class Gemma4ScaledQuantizedWordEmbedding(QuantizedEmbedding):
     def forward(self, op: OpBuilder, input_ids: ir.Value) -> ir.Value:
         embeddings = super().forward(op, input_ids)
         scale = op.Constant(
-            value=ir.tensor(
-                np.asarray(self.embed_scale, dtype=self.scales.dtype.numpy())
-            )
+            value=ir.tensor(np.asarray(self.embed_scale, dtype=self.scales.dtype.numpy()))
         )
         return op.Mul(embeddings, scale)
 
@@ -1830,9 +1818,7 @@ class Gemma4TextModel(nn.Module):
         # (text-only) mode, they are computed here from input_ids.
         self._per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
         self._num_layers = config.num_hidden_layers
-        self._first_kv_shared_layer = (
-            self._num_layers - config.num_kv_shared_layers
-        )
+        self._first_kv_shared_layer = self._num_layers - config.num_kv_shared_layers
         self._hidden_size = config.hidden_size
         self._image_token_id: int = config.image_token_id or 0
         # The vision-block overlay keys on image_token_id. A 0/None id means the
@@ -1878,8 +1864,7 @@ class Gemma4TextModel(nn.Module):
             if self._first_kv_shared_layer < self._num_layers:
                 self.per_layer_model_projection_consumer = Linear(
                     config.hidden_size,
-                    (self._num_layers - self._first_kv_shared_layer)
-                    * self._per_layer_dim,
+                    (self._num_layers - self._first_kv_shared_layer) * self._per_layer_dim,
                     bias=False,
                 )
             self.per_layer_projection_norm = RMSNorm(
@@ -1972,9 +1957,7 @@ class Gemma4TextModel(nn.Module):
                 per_layer_embs.append(op.Unsqueeze(embedding, [2]))
             producer_emb = op.Concat(*per_layer_embs[:producer_count], axis=2)
             consumer_emb = (
-                op.Concat(*per_layer_embs[producer_count:], axis=2)
-                if consumer_count
-                else None
+                op.Concat(*per_layer_embs[producer_count:], axis=2) if consumer_count else None
             )
         else:
             fused_emb = self.embed_tokens_per_layer(op, masked_ids)
@@ -1982,9 +1965,7 @@ class Gemma4TextModel(nn.Module):
                 fused_emb,
                 op.Constant(value_ints=[0, 0, self._num_layers, self._per_layer_dim]),
             )
-            producer_emb = op.Slice(
-                fused_emb, starts=[0], ends=[producer_count], axes=[2]
-            )
+            producer_emb = op.Slice(fused_emb, starts=[0], ends=[producer_count], axes=[2])
             consumer_emb = None
             if consumer_count:
                 consumer_emb = op.Slice(
@@ -1995,18 +1976,14 @@ class Gemma4TextModel(nn.Module):
                 )
                 consumer_emb = _retain_last_sequence_token(op, consumer_emb)
 
-        producer_combined = op.Mul(
-            op.Add(producer_proj, producer_emb), float(0.5**0.5)
-        )
+        producer_combined = op.Mul(op.Add(producer_proj, producer_emb), float(0.5**0.5))
         per_layer_inputs = [
             op.Gather(producer_combined, op.Constant(value_int=i), axis=2)
             for i in range(producer_count)
         ]
         if consumer_count:
             assert consumer_proj is not None and consumer_emb is not None
-            consumer_combined = op.Mul(
-                op.Add(consumer_proj, consumer_emb), float(0.5**0.5)
-            )
+            consumer_combined = op.Mul(op.Add(consumer_proj, consumer_emb), float(0.5**0.5))
             per_layer_inputs.extend(
                 op.Gather(consumer_combined, op.Constant(value_int=i), axis=2)
                 for i in range(consumer_count)
@@ -3269,9 +3246,7 @@ class Gemma4Model(nn.Module):
                     )
                 ):
                     renamed[k.replace("embedding.", "decoder.model.", 1)] = renamed.pop(k)
-            _split_per_layer_projection_weight(
-                renamed, "decoder.model.", self.config
-            )
+            _split_per_layer_projection_weight(renamed, "decoder.model.", self.config)
 
         return renamed
 

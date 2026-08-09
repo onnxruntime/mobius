@@ -75,8 +75,7 @@ def test_prunes_gemma4_shared_layer_prefix() -> None:
     consumer = next(
         node
         for node in model.graph
-        if node.op_type == "MatMul"
-        and "/per_layer_model_projection_consumer/" in node.name
+        if node.op_type == "MatMul" and "/per_layer_model_projection_consumer/" in node.name
     )
     assert producer.outputs[0].shape[1] != 1
     assert producer.outputs[0].shape[2] == 16
@@ -98,8 +97,7 @@ def test_prunes_gemma4_shared_layer_prefix() -> None:
     assert any(
         node.op_type == "Gather"
         and any(
-            input_value is consumer_embedding_scale.outputs[0]
-            for input_value in node.inputs
+            input_value is consumer_embedding_scale.outputs[0] for input_value in node.inputs
         )
         for node in model.graph
     )
@@ -130,9 +128,7 @@ def test_splits_per_layer_projection_weight() -> None:
 
     _split_per_layer_projection_weight(state_dict, "model.", config)
 
-    assert torch.equal(
-        state_dict["model.per_layer_model_projection.weight"], original[:16]
-    )
+    assert torch.equal(state_dict["model.per_layer_model_projection.weight"], original[:16])
     assert torch.equal(
         state_dict["model.per_layer_model_projection_consumer.weight"],
         original[16:],

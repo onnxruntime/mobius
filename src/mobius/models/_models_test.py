@@ -280,9 +280,7 @@ class TestPrunePrefillPrefix:
 
         config = make_config()
         with pytest.raises(ValueError, match="does not support prune_prefill_prefix"):
-            build_from_module(
-                UnsupportedCausalLM(config), config, prune_prefill_prefix=True
-            )
+            build_from_module(UnsupportedCausalLM(config), config, prune_prefill_prefix=True)
 
 
 class TestDeepStackCaptureOrdering:
