@@ -200,6 +200,7 @@ _ASSET_CANDIDATES: tuple[tuple[str, bool], ...] = (
     ("chat_template.jinja", False),
     ("generation_config.json", False),
     ("checkpoint.json", False),
+    ("assets/negative_prompt.json", False),
     ("preprocessor_config.json", False),
     ("video_preprocessor_config.json", False),
     ("processor_config.json", False),
@@ -926,6 +927,7 @@ def _compose_pipeline(
         "iterative",
         [_GENERATOR_NAME],
         run_on="step",
+        capabilities=("classifier_free_guidance", "conditioned_diffusion"),
         options={
             "scheduler": {
                 "kind": scheduler_config.get("_class_name"),
@@ -937,6 +939,37 @@ def _compose_pipeline(
                     "use_karras_sigmas",
                 ],
                 "mode_overrides": generation.scheduler_mode_overrides_manifest(),
+            },
+            "guidance": {
+                "kind": "classifier_free",
+                "conditioning_input": f"{_GENERATOR_NAME}.input_ids",
+                "scale_option": "guidance_scale",
+                "default_scale": 1.0,
+                "combine": "unconditional + scale * (conditional - unconditional)",
+            },
+            "conditioning": {
+                "vision": {
+                    "encoder_stage": "encode_video",
+                    "encoder_input": f"{_VIDEO_ENCODER_NAME}.sample",
+                    "encoder_output": f"{_VIDEO_ENCODER_NAME}.latent",
+                    "state": "vision_state",
+                    "conditioned_latent_frames_option": "vision_conditioned_latent_frames",
+                    "default_conditioned_latent_frames": [],
+                    "preprocessing": {
+                        "resize": "bilinear",
+                        "normalize": {
+                            "mean": [0.5, 0.5, 0.5],
+                            "std": [0.5, 0.5, 0.5],
+                        },
+                    },
+                    "packing": {
+                        "spatial_patch_size": generator_config.latent_patch_size,
+                        "temporal_patch_size": 1,
+                        "input_layout": "BCTHW",
+                        "output_layout": "NC",
+                        "channel_order": "patch_height_patch_width_channel",
+                    },
+                },
             },
             "default_steps": generation.default_inference_steps,
             "timestep": {
@@ -1032,7 +1065,7 @@ def _compose_pipeline(
                     "temporal_patch_size": 1,
                     "input_layout": "BCTHW",
                     "output_layout": "NC",
-                    "channel_order": "patch_width_patch_height_channel",
+                    "channel_order": "patch_height_patch_width_channel",
                 },
                 "optional": True,
             },

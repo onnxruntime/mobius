@@ -718,6 +718,8 @@ for _strategy, _strategy_doc, _loop, _options in (
         True,
         (
             "scheduler",
+            "guidance",
+            "conditioning",
             "default_steps",
             "timestep",
             "state_inputs",

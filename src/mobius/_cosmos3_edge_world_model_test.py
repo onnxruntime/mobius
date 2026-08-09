@@ -75,7 +75,11 @@ def test_edge_builder_uses_edge_reasoner_and_shared_generator_pipeline() -> None
         "config.json": (
             {
                 "model_type": "cosmos3_edge",
-                "text_config": {"model_type": "cosmos3_edge_text"},
+                "text_config": {
+                    "model_type": "cosmos3_edge_text",
+                    "eos_token_id": 11,
+                },
+                "vision_start_token_id": 20,
             },
             "config.json",
         ),
@@ -132,7 +136,12 @@ def test_edge_builder_uses_edge_reasoner_and_shared_generator_pipeline() -> None
         ) as build_components,
         mock.patch(
             "mobius._cosmos3_edge_world_model._collect_assets",
-            return_value={},
+            return_value={
+                "assets/negative_prompt.json": (
+                    "cached/assets/negative_prompt.json",
+                    False,
+                )
+            },
         ),
         mock.patch(
             "mobius._cosmos3_edge_world_model.load_optional_checkpoint_json",
@@ -167,8 +176,31 @@ def test_edge_builder_uses_edge_reasoner_and_shared_generator_pipeline() -> None
     assert pipeline_config.extra_metadata["edge"]["checkpoint_model_type"] == "cosmos3_edge"
     assert pipeline_config.generation.default_inference_steps == 50
     assert pipeline_config.generation.scheduler_mode_overrides_manifest() == {
-        "image_to_video": {"flow_shift": 3.0, "use_karras_sigmas": False},
-        "action": {"flow_shift": 10.0, "use_karras_sigmas": False},
+        "image_to_video": {
+            "flow_shift": 3.0,
+            "use_karras_sigmas": False,
+            "num_inference_steps": 50,
+            "guidance_scale": 5.0,
+        },
+        "action": {
+            "flow_shift": 10.0,
+            "use_karras_sigmas": False,
+            "num_inference_steps": 30,
+            "guidance_scale": 1.0,
+        },
+    }
+    i2v = pipeline_config.extra_metadata["generation_recipes"]["image_to_video"]
+    assert i2v["conditioning"]["conditioned_latent_frames"] == [0]
+    assert i2v["prompt"]["negative_asset"] == "assets/negative_prompt.json"
+    assert i2v["prompt"]["negative_default"] == "asset"
+    assert (i2v["width"], i2v["height"], i2v["frames"]) == (832, 480, 121)
+    assert pipeline_config.extra_metadata["generator_prompt"] == {
+        "chat": {
+            "add_generation_prompt": True,
+            "add_vision_id": False,
+            "enable_thinking": True,
+        },
+        "suffix_token_ids": [11, 20],
     }
     vision = pipeline_config.extra_metadata["vision_understanding"]
     assert vision["encoder"] == "reasoner_vision_encoder"

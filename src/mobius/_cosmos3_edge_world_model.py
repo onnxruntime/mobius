@@ -35,16 +35,20 @@ from mobius._world_model_config import (
 )
 from mobius.models.cosmos import Cosmos3EdgeVLModel
 
-# Cosmos3-Edge tunes the rectified-flow scheduler per generation mode. These
-# values belong to the Edge checkpoint contract, not to a generic default.
+# Official Edge generation recipes use 50 steps for I2V and a mode-specific
+# flow schedule. Action recipes use a separate flow schedule.
 _SCHEDULER_MODE_OVERRIDES: dict[str, Any] = {
     "image_to_video": {
         "flow_shift": 3.0,
         "use_karras_sigmas": False,
+        "num_inference_steps": 50,
+        "guidance_scale": 5.0,
     },
     "action": {
         "flow_shift": 10.0,
         "use_karras_sigmas": False,
+        "num_inference_steps": 30,
+        "guidance_scale": 1.0,
     },
 }
 _DEFAULT_INFERENCE_STEPS = 50
@@ -233,6 +237,30 @@ def build_cosmos3_edge_world_model(
         )
 
     assets = _collect_assets(model_id, has_sound_tokenizer=False)
+    negative_prompt_asset = "assets/negative_prompt.json"
+    i2v_prompt: dict[str, Any] = {
+        "positive": "json_or_text",
+        "negative_default": (
+            "asset" if negative_prompt_asset in assets else "empty"
+        ),
+        "add_resolution_template": False,
+        "add_duration_template": False,
+        "use_system_prompt": False,
+    }
+    if negative_prompt_asset in assets:
+        i2v_prompt["negative_asset"] = negative_prompt_asset
+    text_config = root_config.get("text_config")
+    eos_token_id = (
+        text_config.get("eos_token_id")
+        if isinstance(text_config, Mapping)
+        else root_config.get("eos_token_id")
+    )
+    vision_start_token_id = root_config.get("vision_start_token_id")
+    if not isinstance(eos_token_id, int) or not isinstance(vision_start_token_id, int):
+        raise TypeError(
+            "Cosmos3-Edge requires integer text_config.eos_token_id and "
+            "vision_start_token_id for generator prompt packing."
+        )
     policy: dict[str, Any] | None = None
     checkpoint_path = resolve_checkpoint_file(model_id, "checkpoint.json", required=False)
     if checkpoint_path is not None:
@@ -250,6 +278,31 @@ def build_cosmos3_edge_world_model(
                 "edge": {
                     "checkpoint_model_type": root_config.get("model_type"),
                     "policy": policy,
+                },
+                "generation_recipes": {
+                    "image_to_video": {
+                        "conditioning": {
+                            "modality": "image",
+                            "encoder_stage": "encode_video",
+                            "conditioned_latent_frames": [0],
+                        },
+                        "prompt": i2v_prompt,
+                        "height": 480,
+                        "width": 832,
+                        "frames": 121,
+                        "fps": 24.0,
+                    },
+                },
+                "generator_prompt": {
+                    "chat": {
+                        "add_generation_prompt": True,
+                        "add_vision_id": False,
+                        "enable_thinking": True,
+                    },
+                    "suffix_token_ids": [
+                        eos_token_id,
+                        vision_start_token_id,
+                    ],
                 },
                 "vision_understanding": _vision_understanding_metadata(
                     root_config, reasoner_package.config

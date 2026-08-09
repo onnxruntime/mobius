@@ -447,6 +447,50 @@ def test_manifest_carries_generation_and_pipeline_config(tmp_path) -> None:
     assert generation_stage.options["scheduler"]["mode_overrides"] == {
         "action": {"flow_shift": 10.0}
     }
+    assert generation_stage.options["guidance"] == {
+        "kind": "classifier_free",
+        "conditioning_input": "generator.input_ids",
+        "scale_option": "guidance_scale",
+        "default_scale": 1.0,
+        "combine": "unconditional + scale * (conditional - unconditional)",
+    }
+    assert set(generation_stage.capabilities) == {
+        "classifier_free_guidance",
+        "conditioned_diffusion",
+        "loop_carried_state",
+    }
+    assert generation_stage.options["conditioning"]["vision"] == {
+        "encoder_stage": "encode_video",
+        "encoder_input": "video_encoder.sample",
+        "encoder_output": "video_encoder.latent",
+        "state": "vision_state",
+        "conditioned_latent_frames_option": "vision_conditioned_latent_frames",
+        "default_conditioned_latent_frames": [],
+        "preprocessing": {
+            "resize": "bilinear",
+            "normalize": {
+                "mean": [0.5, 0.5, 0.5],
+                "std": [0.5, 0.5, 0.5],
+            },
+        },
+        "packing": {
+            "spatial_patch_size": 2,
+            "temporal_patch_size": 1,
+            "input_layout": "BCTHW",
+            "output_layout": "NC",
+            "channel_order": "patch_height_patch_width_channel",
+        },
+    }
+    assert generation_stage.options["scheduler"]["overrideable"] == [
+        "num_inference_steps",
+        "guidance_scale",
+        "flow_shift",
+        "use_karras_sigmas",
+    ]
+    video_handoff = package.manifest.metadata["conditioning_handoffs"]["video"]
+    assert video_handoff["parameters"]["channel_order"] == (
+        "patch_height_patch_width_channel"
+    )
     assert package.manifest.metadata["profile"] == "world-model"
     assert package.manifest.metadata["model_type"] == "cosmos3_edge"
     assert package.manifest.metadata["source"] == "example/world-4Step"
