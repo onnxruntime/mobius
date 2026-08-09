@@ -50,7 +50,7 @@ from mobius.components import (
 from mobius.components._activations import get_activation
 from mobius.components._gemma4_audio import Gemma4AudioEncoder
 from mobius.components._mlp import GatedMLP
-from mobius.models.base import CausalLMModel
+from mobius.models.base import CausalLMModel, _retain_last_sequence_token
 from mobius.models.gemma3_text import Gemma3TextScaledWordEmbedding
 
 if TYPE_CHECKING:
@@ -68,6 +68,44 @@ if TYPE_CHECKING:
 # below are the single place the text components read the quantization config,
 # which keeps that "text quantized, vision/audio float" contract explicit.
 # ---------------------------------------------------------------------------
+
+
+def _split_per_layer_projection_weight(
+    state_dict: dict[str, torch.Tensor],
+    prefix: str,
+    config: Gemma4Config,
+) -> None:
+    """Split the packed PLE projection at the first KV-sharing layer."""
+    shared_layers = config.num_kv_shared_layers
+    per_layer_dim = config.hidden_size_per_layer_input
+    if not shared_layers or not per_layer_dim:
+        return
+
+    weight_key = f"{prefix}per_layer_model_projection.weight"
+    weight = state_dict.get(weight_key)
+    if weight is None:
+        return
+
+    expected_rows = config.num_hidden_layers * per_layer_dim
+    if weight.shape[0] != expected_rows:
+        raise ValueError(
+            f"{weight_key} dim 0 expected {expected_rows}, got {weight.shape[0]}"
+        )
+    producer_rows = (config.num_hidden_layers - shared_layers) * per_layer_dim
+    producer, consumer = weight.split(
+        [producer_rows, expected_rows - producer_rows], dim=0
+    )
+    state_dict[weight_key] = producer.contiguous()
+    state_dict[f"{prefix}per_layer_model_projection_consumer.weight"] = (
+        consumer.contiguous()
+    )
+
+
+def _typed_scalar_constant(
+    op: OpBuilder, value: float, dtype: ir.DataType
+) -> ir.Value:
+    """Create a scalar constant directly in the model compute dtype."""
+    return op.Constant(value=ir.tensor(np.asarray(value, dtype=dtype.numpy())))
 
 
 def _text_quantization_config(config: Gemma4Config):
@@ -143,7 +181,7 @@ def _make_scaled_word_embedding(
             block_size=quantization_config.group_size,
             has_zero_point=not quantization_config.sym,
         )
-    return Gemma3TextScaledWordEmbedding(
+    return Gemma4ScaledWordEmbedding(
         num_embeddings,
         embedding_dim,
         config.pad_token_id,
@@ -164,6 +202,19 @@ def _make_lm_head(config: Gemma4Config) -> nn.Module:
         if linear_cls is not None:
             return linear_cls(config.hidden_size, config.vocab_size, bias=False)
     return Linear(config.hidden_size, config.vocab_size, bias=False)
+
+
+class Gemma4ScaledWordEmbedding(Gemma3TextScaledWordEmbedding):
+    """Gemma embedding with a typed scale constant suitable for graph capture."""
+
+    def forward(self, op: OpBuilder, input_ids: ir.Value) -> ir.Value:
+        embeddings = Embedding.forward(self, op, input_ids)
+        scale = op.Constant(
+            value=ir.tensor(
+                np.asarray(self.embed_scale, dtype=self.weight.dtype.numpy())
+            )
+        )
+        return op.Mul(embeddings, scale)
 
 
 class Gemma4ScaledQuantizedWordEmbedding(QuantizedEmbedding):
@@ -197,7 +248,12 @@ class Gemma4ScaledQuantizedWordEmbedding(QuantizedEmbedding):
 
     def forward(self, op: OpBuilder, input_ids: ir.Value) -> ir.Value:
         embeddings = super().forward(op, input_ids)
-        return op.Mul(embeddings, self.embed_scale)
+        scale = op.Constant(
+            value=ir.tensor(
+                np.asarray(self.embed_scale, dtype=self.scales.dtype.numpy())
+            )
+        )
+        return op.Mul(embeddings, scale)
 
 
 def _dtype_safe_compress(
@@ -1773,6 +1829,10 @@ class Gemma4TextModel(nn.Module):
         # embedding model and passed as per_layer_inputs. In single-model
         # (text-only) mode, they are computed here from input_ids.
         self._per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
+        self._num_layers = config.num_hidden_layers
+        self._first_kv_shared_layer = (
+            self._num_layers - config.num_kv_shared_layers
+        )
         self._hidden_size = config.hidden_size
         self._image_token_id: int = config.image_token_id or 0
         # The vision-block overlay keys on image_token_id. A 0/None id means the
@@ -1785,7 +1845,6 @@ class Gemma4TextModel(nn.Module):
             config.audio.audio_token_id if config.audio is not None else None
         )
         if self._per_layer_dim:
-            self._num_layers = config.num_hidden_layers
             vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
             # Fused [V, L*D] table — used when split_per_layer_embedding is False.
             # Requires ORT >= 1.27 for CUDA Gather int64 index support (onnxruntime#28107).
@@ -1802,7 +1861,7 @@ class Gemma4TextModel(nn.Module):
             # ONNX initializer, so the unused one adds no graph weight.
             self.embed_tokens_per_layer_split = nn.ModuleList(
                 [
-                    Gemma3TextScaledWordEmbedding(
+                    Gemma4ScaledWordEmbedding(
                         vocab_per_layer,
                         self._per_layer_dim,
                         config.pad_token_id,
@@ -1813,9 +1872,16 @@ class Gemma4TextModel(nn.Module):
             )
             self.per_layer_model_projection = Linear(
                 config.hidden_size,
-                config.num_hidden_layers * self._per_layer_dim,
+                self._first_kv_shared_layer * self._per_layer_dim,
                 bias=False,
             )
+            if self._first_kv_shared_layer < self._num_layers:
+                self.per_layer_model_projection_consumer = Linear(
+                    config.hidden_size,
+                    (self._num_layers - self._first_kv_shared_layer)
+                    * self._per_layer_dim,
+                    bias=False,
+                )
             self.per_layer_projection_norm = RMSNorm(
                 self._per_layer_dim, eps=config.rms_norm_eps
             )
@@ -1859,12 +1925,26 @@ class Gemma4TextModel(nn.Module):
         inputs_embeds: ir.Value,
     ) -> list[ir.Value]:
         """Compute per-layer input embeddings for single-model (text-only) mode."""
-        proj = self.per_layer_model_projection(op, inputs_embeds)
-        proj = op.Mul(proj, float(self._hidden_size**-0.5))
-        proj = op.Reshape(
-            proj, op.Constant(value_ints=[0, 0, self._num_layers, self._per_layer_dim])
+        producer_count = self._first_kv_shared_layer
+        producer_proj = self.per_layer_model_projection(op, inputs_embeds)
+        producer_proj = op.Mul(producer_proj, float(self._hidden_size**-0.5))
+        producer_proj = op.Reshape(
+            producer_proj,
+            op.Constant(value_ints=[0, 0, producer_count, self._per_layer_dim]),
         )
-        proj = self.per_layer_projection_norm(op, proj)
+        producer_proj = self.per_layer_projection_norm(op, producer_proj)
+
+        consumer_count = self._num_layers - producer_count
+        consumer_proj: ir.Value | None = None
+        if consumer_count:
+            consumer_inputs = _retain_last_sequence_token(op, inputs_embeds)
+            consumer_proj = self.per_layer_model_projection_consumer(op, consumer_inputs)
+            consumer_proj = op.Mul(consumer_proj, float(self._hidden_size**-0.5))
+            consumer_proj = op.Reshape(
+                consumer_proj,
+                op.Constant(value_ints=[0, 0, consumer_count, self._per_layer_dim]),
+            )
+            consumer_proj = self.per_layer_projection_norm(op, consumer_proj)
 
         pad = op.Constant(value_int=0)
         masked_ids = input_ids
@@ -1884,25 +1964,54 @@ class Gemma4TextModel(nn.Module):
         if self.config.split_per_layer_embedding:
             # L separate Gathers on [V, D] tables — each fits within the EP's
             # max_buffer_size (e.g. WebGPU's 256 MiB limit).
-            per_layer_embs = [
-                op.Unsqueeze(self.embed_tokens_per_layer_split[i](op, masked_ids), [2])
-                for i in range(self._num_layers)
-            ]
-            fused_emb = op.Concat(*per_layer_embs, axis=2)  # [B, S, L, D]
+            per_layer_embs = []
+            for layer_idx in range(self._num_layers):
+                embedding = self.embed_tokens_per_layer_split[layer_idx](op, masked_ids)
+                if layer_idx >= producer_count:
+                    embedding = _retain_last_sequence_token(op, embedding)
+                per_layer_embs.append(op.Unsqueeze(embedding, [2]))
+            producer_emb = op.Concat(*per_layer_embs[:producer_count], axis=2)
+            consumer_emb = (
+                op.Concat(*per_layer_embs[producer_count:], axis=2)
+                if consumer_count
+                else None
+            )
         else:
             fused_emb = self.embed_tokens_per_layer(op, masked_ids)
             fused_emb = op.Reshape(
                 fused_emb,
                 op.Constant(value_ints=[0, 0, self._num_layers, self._per_layer_dim]),
             )
+            producer_emb = op.Slice(
+                fused_emb, starts=[0], ends=[producer_count], axes=[2]
+            )
+            consumer_emb = None
+            if consumer_count:
+                consumer_emb = op.Slice(
+                    fused_emb,
+                    starts=[producer_count],
+                    ends=[self._num_layers],
+                    axes=[2],
+                )
+                consumer_emb = _retain_last_sequence_token(op, consumer_emb)
 
-        combined = op.Add(proj, fused_emb)
-        combined = op.Mul(combined, float(0.5**0.5))
-
-        return [
-            op.Gather(combined, op.Constant(value_int=i), axis=2)
-            for i in range(self._num_layers)
+        producer_combined = op.Mul(
+            op.Add(producer_proj, producer_emb), float(0.5**0.5)
+        )
+        per_layer_inputs = [
+            op.Gather(producer_combined, op.Constant(value_int=i), axis=2)
+            for i in range(producer_count)
         ]
+        if consumer_count:
+            assert consumer_proj is not None and consumer_emb is not None
+            consumer_combined = op.Mul(
+                op.Add(consumer_proj, consumer_emb), float(0.5**0.5)
+            )
+            per_layer_inputs.extend(
+                op.Gather(consumer_combined, op.Constant(value_int=i), axis=2)
+                for i in range(consumer_count)
+            )
+        return per_layer_inputs
 
     def forward(
         self,
@@ -1934,6 +2043,10 @@ class Gemma4TextModel(nn.Module):
                 op.Squeeze(op.Slice(per_layer_4d, starts=[i], ends=[i + 1], axes=[2]), [2])
                 for i in range(num_layers)
             ]
+            for layer_idx in range(self._first_kv_shared_layer, num_layers):
+                per_layer_list[layer_idx] = _retain_last_sequence_token(
+                    op, per_layer_list[layer_idx]
+                )
         elif self._per_layer_dim and input_ids is not None:
             # Text-only: compute per-layer inputs from input_ids
             per_layer_list = self._compute_per_layer_inputs(op, input_ids, hidden_states)
@@ -2013,20 +2126,12 @@ class Gemma4TextModel(nn.Module):
                 op.Sub(reduce_sum, one_i32),
                 to=ir.DataType.INT32,
             )
-            if caps.requires_graph_capture_rewrite:
-                # Support graph capture for shared-KV layer models on WebGPU EP.
-                # Derive total_seq_len from reduce_sum (already computed) as a
-                # scalar INT32 via Gather index 0 (valid because graph capture
-                # requires batch=1).
-                total_seq_len = op.Gather(
-                    op.Cast(reduce_sum, to=ir.DataType.INT32),
-                    op.Constant(value_int=0),
-                )
-            else:
-                total_seq_len = op.Cast(
-                    op.Gather(op.Shape(attention_mask), 1),
-                    to=ir.DataType.INT32,
-                )
+            # Graph capture requires batch=1, so the first reduced sequence
+            # length is also the scalar total sequence length expected by GQA.
+            total_seq_len = op.Gather(
+                op.Cast(reduce_sum, to=ir.DataType.INT32),
+                op.Constant(value_int=0),
+            )
 
             # Per-layer-type GQA contexts with appropriate cos/sin caches
             # and local_window_size for sliding layers.
@@ -2157,6 +2262,8 @@ class Gemma4TextModel(nn.Module):
         for i, (layer, layer_type, past_kv) in enumerate(
             zip(self.layers, self.layer_types, past_kvs)
         ):
+            if i == self._first_kv_shared_layer and i < len(self.layers):
+                hidden_states = _retain_last_sequence_token(op, hidden_states)
             per_layer_input = per_layer_list[i] if per_layer_list is not None else None
 
             # Per-layer cache/attention dispatch:
@@ -2243,12 +2350,12 @@ class Gemma4CausalLMModel(CausalLMModel):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
         )
+        hidden_states = _retain_last_sequence_token(op, hidden_states)
         logits = self.lm_head(op, hidden_states)
         # Optional final logit soft-capping (tanh scaled): logit_cap * tanh(x / logit_cap)
         if self.config.final_logit_softcapping:
-            cap = op.CastLike(
-                self.config.final_logit_softcapping,
-                logits,
+            cap = _typed_scalar_constant(
+                op, self.config.final_logit_softcapping, self.config.dtype
             )
             logits = op.Mul(op.Tanh(op.Div(logits, cap)), cap)
         return logits, present_key_values
@@ -2268,6 +2375,7 @@ class Gemma4CausalLMModel(CausalLMModel):
         # (For WebGPU, splitting is handled by _Gemma4DecoderModel.preprocess_weights.)
         # Map HF expert weight names and fold router scale
         _remap_moe_expert_weights(state_dict, self.config)
+        _split_per_layer_projection_weight(state_dict, "model.", self.config)
         return super().preprocess_weights(state_dict)
 
     def static_kv_cache_specs(self) -> list[tuple[int, int]]:
@@ -2321,12 +2429,12 @@ class _Gemma4DecoderModel(nn.Module):
             per_layer_inputs=per_layer_inputs,
             block_sequence_ids=block_sequence_ids,
         )
+        hidden_states = _retain_last_sequence_token(op, hidden_states)
         logits = self.lm_head(op, hidden_states)
         # Gemma4 applies final logit soft-capping: logit_cap * tanh(x / logit_cap)
         if self.config.final_logit_softcapping:
-            cap = op.CastLike(
-                self.config.final_logit_softcapping,
-                logits,
+            cap = _typed_scalar_constant(
+                op, self.config.final_logit_softcapping, self.config.dtype
             )
             logits = op.Mul(op.Tanh(op.Div(logits, cap)), cap)
         return logits, present_key_values
@@ -2335,6 +2443,7 @@ class _Gemma4DecoderModel(nn.Module):
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         state_dict = vlm_decoder_weights(state_dict, tie=self.config.tie_word_embeddings)
+        _split_per_layer_projection_weight(state_dict, "model.", self.config)
         # For WebGPU: split the fused [V, L*D] per-layer embedding into L separate [V, D] tables.
         per_layer_dim = self.config.hidden_size_per_layer_input
         if per_layer_dim and self.config.split_per_layer_embedding:
@@ -3160,6 +3269,9 @@ class Gemma4Model(nn.Module):
                     )
                 ):
                     renamed[k.replace("embedding.", "decoder.model.", 1)] = renamed.pop(k)
+            _split_per_layer_projection_weight(
+                renamed, "decoder.model.", self.config
+            )
 
         return renamed
 
