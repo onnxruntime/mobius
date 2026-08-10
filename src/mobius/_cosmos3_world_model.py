@@ -63,8 +63,6 @@ from mobius.models.wan_vae import AutoencoderKLWanModel
 from mobius.tasks._cosmos3_audio import select_cosmos3_audio_task
 from mobius.tasks._wan_vae import WanVAETask
 
-logger = logging.getLogger(__name__)
-
 _VIDEO_DIFFUSION_FINALIZE = "video_diffusion_finalize"
 register_transform(
     _VIDEO_DIFFUSION_FINALIZE,
