@@ -110,10 +110,12 @@ class NemotronParseVisionEncoder(nn.Module):
         features = op.Transpose(features, perm=[0, 2, 3, 1])
         sequence_shape = op.Concat(
             batch,
-            op.Constant(value_ints=[
-                grid_height * (grid_width // 4),
-                self.config.hidden_size,
-            ]),
+            op.Constant(
+                value_ints=[
+                    grid_height * (grid_width // 4),
+                    self.config.hidden_size,
+                ]
+            ),
             axis=0,
         )
         features = op.Reshape(features, sequence_shape)

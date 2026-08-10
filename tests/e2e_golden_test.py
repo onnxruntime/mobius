@@ -513,7 +513,6 @@ def _prepare_image_to_text_inputs(
     case: GoldenTestCase,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Apply the checkpoint's processor to one real image and decoder prompt."""
-    import ml_dtypes
     import transformers
     from PIL import Image
 
@@ -530,10 +529,6 @@ def _prepare_image_to_text_inputs(
         add_special_tokens=False,
     )
     pixel_values = processed["pixel_values"].float().cpu().numpy()
-    if case.dtype == "float16":
-        pixel_values = pixel_values.astype(np.float16)
-    elif case.dtype == "bfloat16":
-        pixel_values = pixel_values.astype(ml_dtypes.bfloat16)
     return pixel_values, processed["input_ids"].cpu().numpy().astype(np.int64)
 
 

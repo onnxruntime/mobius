@@ -54,12 +54,15 @@ class VisionEncoderDecoderTask(Seq2SeqTask):
         graph, builder = _make_graph(name="vision_encoder")
         pixel_values = builder.input(
             "pixel_values",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[batch, 3, image_height, image_width],
         )
+        # Image processors universally emit float32. Cast at the graph boundary
+        # so reduced-precision exports remain directly consumable.
+        model_pixel_values = builder.op.Cast(pixel_values, to=config.dtype)
         encoder_hidden_states = module.vision_encoder(
             builder.op,
-            pixel_values=pixel_values,
+            pixel_values=model_pixel_values,
         )
         builder.add_output(encoder_hidden_states, "last_hidden_state")
         return _make_model(graph)

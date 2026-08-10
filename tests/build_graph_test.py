@@ -5649,7 +5649,8 @@ class TestBuildVLGraph:
             assert "encoder_hidden_states" in {i.name for i in decoder.graph.inputs}
             assert "logits" in {o.name for o in decoder.graph.outputs}
             vision = pkg["vision_encoder"]
-            assert "pixel_values" in {i.name for i in vision.graph.inputs}
+            pixel_values = next(i for i in vision.graph.inputs if i.name == "pixel_values")
+            assert pixel_values.dtype == ir.DataType.FLOAT
         else:
             assert "decoder" in pkg, f"{model_type} should produce 'decoder'"
             assert "vision_encoder" in pkg, f"{model_type} should produce 'vision_encoder'"
@@ -5660,7 +5661,8 @@ class TestBuildVLGraph:
             assert "logits" in {o.name for o in decoder.graph.outputs}
 
             vision = pkg["vision_encoder"]
-            assert "pixel_values" in {i.name for i in vision.graph.inputs}
+            pixel_values = next(i for i in vision.graph.inputs if i.name == "pixel_values")
+            assert pixel_values.dtype == ir.DataType.FLOAT
 
     def test_has_initializers(self, model_type: str, config_overrides: dict):
         """Verify all sub-models have non-empty initializers."""

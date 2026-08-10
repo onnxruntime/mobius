@@ -113,9 +113,7 @@ def test_nemotron_parse_real_weight_cuda_parity():
     vision_session = _make_session(pkg["vision_encoder"])
     decoder_session = _make_session(pkg["decoder"])
     try:
-        onnx_pixel_values = (
-            processed["pixel_values"].float().cpu().numpy().astype(ml_dtypes.bfloat16)
-        )
+        onnx_pixel_values = processed["pixel_values"].float().cpu().numpy()
         onnx_encoder = vision_session.run({"pixel_values": onnx_pixel_values})[
             "last_hidden_state"
         ]
