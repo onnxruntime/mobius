@@ -79,6 +79,7 @@ from mobius._configs._sub_configs import (
     TTSConfig,
     VisionConfig,
 )
+from mobius._configs._weathernext import WeatherNextConfig
 from mobius._configs._world_model import WorldModelConfig
 
 __all__ = [
@@ -118,6 +119,7 @@ __all__ = [
     "VisionConfig",
     "VisionLanguageConfig",
     "WhisperConfig",
+    "WeatherNextConfig",
     "WorldModelConfig",
     "YolosConfig",
     "Zamba2Config",

@@ -2,35 +2,29 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""WeatherNext-style ONNX conversion demo.
+"""Build and run a WeatherNext-style one-step forecast ONNX model.
 
-WeatherNext 2 is a JAX/Haiku + xarray model rather than a HuggingFace
-``transformers`` model, so it does not fit the normal ``mobius build`` path.
-This example demonstrates the ONNX workflow for that family of models by
-defining the same high-level one-step forecast contract used by WeatherNext:
+The formal Mobius support lives in ``mobius.models.WeatherNextModel``,
+``mobius.tasks.WeatherNextForecastTask``, and ``mobius.integrations.weathernext``.
+This script demonstrates that path and can run the exported model on either:
 
-``input weather grid + forcings + stochastic noise → next weather grid``.
+* an ``.npz`` file with ``input_state``, ``forcings``, and ``sample_noise`` arrays, or
+* a local xarray NetCDF/Zarr weather dataset plus selected variable names.
 
-The tiny model below uses WeatherNext-like graph data flow:
-
-1. encode lat/lon grid variables at each grid cell,
-2. aggregate grid cells onto a mesh,
-3. update the mesh latent state,
-4. project mesh latents back to the grid, and
-5. decode per-grid-cell forecast variables.
-
-It intentionally uses small deterministic weights so the demo can be run
-without downloading WeatherNext checkpoints.  The graph I/O and component
-boundaries are the pieces to keep when replacing the toy modules with a full
-translation of google-deepmind/weathernext's Haiku modules and ``.npz``
-checkpoints.
+If no data or checkpoint is provided, the script uses deterministic demo weights
+and synthetic inputs so the ONNX workflow remains runnable in a fresh checkout.
 
 Usage::
 
-    python examples/weathernext.py output/weathernext-mini --validate
+    PYTHONPATH=src python examples/weathernext.py output/weathernext-mini --validate
 
-    python examples/weathernext.py output/weathernext-mini \
-        --lat 8 --lon 16 --mesh-nodes 12 --hidden-size 32
+    PYTHONPATH=src python examples/weathernext.py output/weathernext-era5 \
+        --input-data era5_sample.npz --weights converted_weathernext_weights.npz --run
+
+    PYTHONPATH=src python examples/weathernext.py output/weathernext-xarray \
+        --input-data weatherbench_sample.zarr \
+        --input-variable-names 2m_temperature mean_sea_level_pressure \
+        --forcing-variable-names toa_incident_solar_radiation --run
 """
 
 from __future__ import annotations
@@ -38,221 +32,18 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from dataclasses import dataclass
 
 import numpy as np
 import onnx_ir as ir
-from onnxscript import GraphBuilder, OpBuilder, nn
 
-import mobius
-from mobius import OPSET_VERSION, ArchitectureConfig, ModelPackage, build_from_module
-from mobius.tasks import ModelTask
-
-
-@dataclass(frozen=True)
-class WeatherNextDemoShape:
-    """Concrete shape for the one-step WeatherNext forecast demo."""
-
-    lat: int
-    lon: int
-    mesh_nodes: int
-    input_variables: int
-    forcing_variables: int
-    noise_channels: int
-    output_variables: int
-    hidden_size: int
-
-    @property
-    def grid_points(self) -> int:
-        return self.lat * self.lon
-
-    @property
-    def encoder_channels(self) -> int:
-        return self.input_variables + self.forcing_variables + self.noise_channels
-
-
-def _make_parameter(rng: np.random.Generator, shape: tuple[int, ...]) -> nn.Parameter:
-    values = rng.standard_normal(shape).astype(np.float32) * 0.05
-    return nn.Parameter(list(shape), data=ir.tensor(values))
-
-
-class DemoLinear(nn.Module):
-    """Small deterministic ``Linear`` layer for a self-contained runnable demo."""
-
-    def __init__(self, rng: np.random.Generator, in_features: int, out_features: int):
-        super().__init__()
-        self.weight = _make_parameter(rng, (out_features, in_features))
-        self.bias = _make_parameter(rng, (out_features,))
-
-    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
-        # Project the trailing feature dimension: [..., in_features] -> [..., out_features].
-        x = op.MatMul(x, op.Transpose(self.weight, perm=[1, 0]))
-        return op.Add(x, self.bias)
-
-
-class WeatherNextGridMeshBlock(nn.Module):
-    """One grid→mesh→grid block mirroring WeatherNext's graph-forecast data flow."""
-
-    def __init__(self, rng: np.random.Generator, shape: WeatherNextDemoShape):
-        super().__init__()
-        self._shape = shape
-        self.grid_encoder = DemoLinear(rng, shape.encoder_channels, shape.hidden_size)
-        self.mesh_update_in = DemoLinear(rng, shape.hidden_size, 4 * shape.hidden_size)
-        self.mesh_update_out = DemoLinear(rng, 4 * shape.hidden_size, shape.hidden_size)
-        self.grid_decoder = DemoLinear(rng, shape.hidden_size, shape.output_variables)
-
-        grid_to_mesh = _projection_matrix(shape.mesh_nodes, shape.grid_points)
-        mesh_to_grid = _projection_matrix(shape.grid_points, shape.mesh_nodes)
-        self.grid_to_mesh = nn.Parameter(
-            [shape.mesh_nodes, shape.grid_points], data=ir.tensor(grid_to_mesh)
-        )
-        self.mesh_to_grid = nn.Parameter(
-            [shape.grid_points, shape.mesh_nodes], data=ir.tensor(mesh_to_grid)
-        )
-
-    def forward(
-        self,
-        op: OpBuilder,
-        input_state: ir.Value,
-        forcings: ir.Value,
-        sample_noise: ir.Value,
-    ) -> ir.Value:
-        s = self._shape
-
-        # Concatenate per-cell weather variables, known future forcings, and FGN noise:
-        # [B, lat, lon, input+forcing+noise].
-        grid_features = op.Concat(input_state, forcings, sample_noise, axis=-1)
-
-        # Encode each lat/lon cell independently, then flatten the grid to points:
-        # [B, lat, lon, hidden] -> [B, grid_points, hidden].
-        grid_latent = op.Tanh(self.grid_encoder(op, grid_features))
-        batch_dim = op.Shape(grid_latent, start=0, end=1)
-        flat_grid_shape = op.Concat(
-            batch_dim,
-            op.Constant(value_ints=[s.grid_points, s.hidden_size]),
-            axis=0,
-        )
-        grid_points = op.Reshape(
-            grid_latent,
-            flat_grid_shape,
-        )
-
-        # Aggregate grid points onto the mesh with a fixed sparse-style projection.
-        # MatMul broadcasts the 2-D projection over batch:
-        # [mesh_nodes, grid_points] @ [B, grid_points, hidden] -> [B, mesh_nodes, hidden].
-        mesh_latent = op.MatMul(self.grid_to_mesh, grid_points)
-
-        # A compact MLP stands in for WeatherNext's mesh GNN/update blocks.
-        mesh_delta = op.Tanh(self.mesh_update_in(op, mesh_latent))
-        mesh_latent = op.Add(mesh_latent, self.mesh_update_out(op, mesh_delta))
-
-        # Decode mesh latents back onto the lat/lon grid and add the encoded-grid residual.
-        # MatMul again broadcasts the 2-D projection over batch:
-        # [grid_points, mesh_nodes] @ [B, mesh_nodes, hidden] -> [B, grid_points, hidden].
-        grid_delta = op.MatMul(self.mesh_to_grid, mesh_latent)
-        grid_points = op.Add(grid_points, grid_delta)
-
-        # Return a one-step forecast grid: [B, lat, lon, output_variables].
-        forecast_points = self.grid_decoder(op, grid_points)
-        forecast_shape = op.Concat(
-            batch_dim,
-            op.Constant(value_ints=[s.lat, s.lon, s.output_variables]),
-            axis=0,
-        )
-        return op.Reshape(
-            forecast_points,
-            forecast_shape,
-        )
-
-
-class WeatherNextDemoTask(ModelTask):
-    """Task wiring for a one-step WeatherNext-style forecast graph."""
-
-    model_roles = {"model": "forecast"}
-
-    def __init__(self, shape: WeatherNextDemoShape):
-        self._shape = shape
-
-    def build(self, module: nn.Module, config: ArchitectureConfig) -> ModelPackage:
-        batch = ir.SymbolicDim("batch")
-        s = self._shape
-
-        graph, builder = _make_demo_graph("weathernext_one_step_forecast")
-        op = builder.op
-
-        input_state = builder.input(
-            "input_state",
-            dtype=config.dtype,
-            shape=[batch, s.lat, s.lon, s.input_variables],
-        )
-        forcings = builder.input(
-            "forcings",
-            dtype=config.dtype,
-            shape=[batch, s.lat, s.lon, s.forcing_variables],
-        )
-        sample_noise = builder.input(
-            "sample_noise",
-            dtype=config.dtype,
-            shape=[batch, s.lat, s.lon, s.noise_channels],
-        )
-
-        next_state = module(op, input_state, forcings, sample_noise)
-        builder.add_output(next_state, "next_state")
-
-        return ModelPackage({"model": _make_demo_model(graph)}, config=config)
-
-
-def _make_demo_graph(name: str) -> tuple[ir.Graph, GraphBuilder]:
-    graph = ir.Graph(
-        [],
-        [],
-        nodes=[],
-        name=name,
-        opset_imports={"": OPSET_VERSION, "com.microsoft": 1},
-    )
-    return graph, GraphBuilder(graph)
-
-
-def _make_demo_model(graph: ir.Graph) -> ir.Model:
-    model = ir.Model(graph, ir_version=11)
-    model.producer_name = "mobius"
-    model.producer_version = mobius.__version__
-    return model
-
-
-def _projection_matrix(rows: int, cols: int) -> np.ndarray:
-    """Create deterministic normalized projections between grid and mesh points."""
-
-    row_positions = np.linspace(0.0, 1.0, rows, dtype=np.float32)[:, None]
-    col_positions = np.linspace(0.0, 1.0, cols, dtype=np.float32)[None, :]
-    distance = np.abs(row_positions - col_positions)
-    weights = np.maximum(1.0 - 2.0 * distance, 0.0)
-    weights += 1e-3
-    weights /= weights.sum(axis=1, keepdims=True)
-    return weights.astype(np.float32)
-
-
-def build_weathernext_demo_package(shape: WeatherNextDemoShape, dtype: ir.DataType) -> ModelPackage:
-    """Build the demo WeatherNext-style ONNX package."""
-
-    rng = np.random.default_rng(20260810)
-    module = WeatherNextGridMeshBlock(rng, shape)
-    # build_from_module currently accepts BaseModelConfig subclasses; this task reads only
-    # config.dtype, while build_from_module validates and uses dtype to cast parameters.
-    # The remaining ArchitectureConfig fields are inert validation shims. A production
-    # WeatherNext port should replace this with a dedicated task/config pair that records
-    # grid resolution, variable metadata, and mesh topology instead of LLM placeholders.
-    config = ArchitectureConfig(
-        vocab_size=0,
-        hidden_size=shape.hidden_size,
-        intermediate_size=4 * shape.hidden_size,
-        num_hidden_layers=1,
-        num_attention_heads=1,
-        num_key_value_heads=1,
-        head_dim=shape.hidden_size,
-        dtype=dtype,
-    )
-    return build_from_module(module, config, task=WeatherNextDemoTask(shape))
+from mobius import WeatherNextConfig
+from mobius.integrations.weathernext import (
+    build_weathernext_package,
+    infer_config_from_feeds,
+    load_npz_forecast_inputs,
+    load_npz_weights,
+    load_xarray_forecast_inputs,
+)
 
 
 def _resolve_dtype(name: str) -> ir.DataType:
@@ -263,53 +54,52 @@ def _resolve_dtype(name: str) -> ir.DataType:
     raise ValueError(f"Unsupported dtype: {name}")
 
 
-def _validate_with_ort(output_dir: str, shape: WeatherNextDemoShape) -> None:
-    try:
-        import onnxruntime as ort
-    except ImportError:
-        print("onnxruntime is not installed; skipping validation.", file=sys.stderr)
-        return
+def _load_real_data(args: argparse.Namespace) -> dict[str, np.ndarray] | None:
+    if args.input_data is None:
+        return None
+    if args.input_data.endswith(".npz"):
+        return load_npz_forecast_inputs(args.input_data)
+    if not args.input_variable_names or not args.forcing_variable_names:
+        raise ValueError(
+            "--input-variable-names and --forcing-variable-names are required for xarray data"
+        )
+    return load_xarray_forecast_inputs(
+        args.input_data,
+        input_variables=args.input_variable_names,
+        forcing_variables=args.forcing_variable_names,
+        noise_channels=args.noise_channels,
+        batch_index=args.batch_index,
+        sample_noise_seed=args.sample_noise_seed,
+    )
 
-    model_path = os.path.join(output_dir, "model.onnx")
-    sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+
+def _synthetic_feeds(config: WeatherNextConfig) -> dict[str, np.ndarray]:
     rng = np.random.default_rng(42)
-    feeds = {
+    return {
         "input_state": rng.standard_normal(
-            (1, shape.lat, shape.lon, shape.input_variables)
+            (1, config.lat, config.lon, config.input_variables)
         ).astype(np.float32),
         "forcings": rng.standard_normal(
-            (1, shape.lat, shape.lon, shape.forcing_variables)
+            (1, config.lat, config.lon, config.forcing_variables)
         ).astype(np.float32),
         "sample_noise": rng.standard_normal(
-            (1, shape.lat, shape.lon, shape.noise_channels)
+            (1, config.lat, config.lon, config.noise_channels)
         ).astype(np.float32),
     }
-    (next_state,) = sess.run(None, feeds)
-    print(f"Validation output next_state shape: {next_state.shape}")
-    print(f"Validation output range: [{next_state.min():.6f}, {next_state.max():.6f}]")
 
 
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Build a runnable WeatherNext-style grid→mesh→grid ONNX demo.",
-    )
-    parser.add_argument("output_dir", help="Directory to save model.onnx and model.onnx.data.")
-    parser.add_argument("--lat", type=int, default=4, help="Number of latitude points.")
-    parser.add_argument("--lon", type=int, default=8, help="Number of longitude points.")
-    parser.add_argument("--mesh-nodes", type=int, default=6, help="Number of demo mesh nodes.")
-    parser.add_argument("--input-variables", type=int, default=5, help="Input weather channels.")
-    parser.add_argument("--forcing-variables", type=int, default=2, help="Known forcing channels.")
-    parser.add_argument("--noise-channels", type=int, default=2, help="FGN stochastic noise channels.")
-    parser.add_argument("--output-variables", type=int, default=5, help="Forecast weather channels.")
-    parser.add_argument("--hidden-size", type=int, default=16, help="Latent feature size.")
-    parser.add_argument("--dtype", choices=["f32", "f16"], default="f32", help="ONNX weight dtype.")
-    parser.add_argument("--validate", action="store_true", help="Run one ONNX Runtime inference.")
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = _parse_args()
-    shape = WeatherNextDemoShape(
+def _config_from_args(args: argparse.Namespace, feeds: dict[str, np.ndarray] | None):
+    dtype = _resolve_dtype(args.dtype)
+    if feeds is not None:
+        return infer_config_from_feeds(
+            feeds,
+            mesh_nodes=args.mesh_nodes,
+            hidden_size=args.hidden_size,
+            intermediate_size=args.intermediate_size,
+            num_hidden_layers=args.num_hidden_layers,
+            dtype=dtype,
+        )
+    return WeatherNextConfig(
         lat=args.lat,
         lon=args.lon,
         mesh_nodes=args.mesh_nodes,
@@ -318,35 +108,109 @@ def main() -> None:
         noise_channels=args.noise_channels,
         output_variables=args.output_variables,
         hidden_size=args.hidden_size,
+        intermediate_size=args.intermediate_size or 4 * args.hidden_size,
+        num_hidden_layers=args.num_hidden_layers,
+        dtype=dtype,
     )
 
-    if min(
-        shape.lat,
-        shape.lon,
-        shape.mesh_nodes,
-        shape.input_variables,
-        shape.forcing_variables,
-        shape.noise_channels,
-        shape.output_variables,
-        shape.hidden_size,
-    ) <= 0:
-        raise ValueError("All shape arguments must be positive.")
 
-    print("Building WeatherNext-style one-step forecast ONNX graph...")
-    print(f"  grid: {shape.lat} x {shape.lon} ({shape.grid_points} cells)")
-    print(f"  mesh nodes: {shape.mesh_nodes}")
-    print(f"  channels: input={shape.input_variables}, forcing={shape.forcing_variables}, "
-          f"noise={shape.noise_channels}, output={shape.output_variables}")
+def _run_with_ort(output_dir: str, feeds: dict[str, np.ndarray]) -> None:
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        print("onnxruntime is not installed; skipping inference.", file=sys.stderr)
+        return
 
-    pkg = build_weathernext_demo_package(shape, dtype=_resolve_dtype(args.dtype))
-    model = pkg["model"]
+    model_path = os.path.join(output_dir, "model.onnx")
+    sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+    (next_state,) = sess.run(["next_state"], feeds)
+    print(f"Inference output next_state shape: {next_state.shape}")
+    print(f"Inference output range: [{next_state.min():.6f}, {next_state.max():.6f}]")
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build a Mobius WeatherNext one-step forecast ONNX graph.",
+    )
+    parser.add_argument("output_dir", help="Directory to save model.onnx and model.onnx.data.")
+    parser.add_argument("--lat", type=int, default=4, help="Synthetic-data latitude points.")
+    parser.add_argument("--lon", type=int, default=8, help="Synthetic-data longitude points.")
+    parser.add_argument("--mesh-nodes", type=int, default=6, help="Forecast mesh nodes.")
+    parser.add_argument(
+        "--input-variables", type=int, default=5, help="Synthetic input channels."
+    )
+    parser.add_argument(
+        "--forcing-variables", type=int, default=2, help="Synthetic forcing channels."
+    )
+    parser.add_argument(
+        "--noise-channels", type=int, default=2, help="Stochastic noise channels."
+    )
+    parser.add_argument(
+        "--output-variables", type=int, default=5, help="Synthetic output channels."
+    )
+    parser.add_argument("--hidden-size", type=int, default=16, help="Latent feature size.")
+    parser.add_argument("--intermediate-size", type=int, help="Mesh MLP intermediate size.")
+    parser.add_argument("--num-hidden-layers", type=int, default=1, help="Mesh update blocks.")
+    parser.add_argument(
+        "--dtype", choices=["f32", "f16"], default="f32", help="ONNX weight dtype."
+    )
+    parser.add_argument("--weights", help="Optional Mobius-aligned WeatherNext weights .npz.")
+    parser.add_argument(
+        "--input-data",
+        help="Optional .npz, NetCDF, or Zarr weather sample used for real-data inference.",
+    )
+    parser.add_argument(
+        "--input-variable-names",
+        nargs="+",
+        help="xarray variables stacked into input_state channels.",
+    )
+    parser.add_argument(
+        "--forcing-variable-names",
+        nargs="+",
+        help="xarray variables stacked into forcings channels.",
+    )
+    parser.add_argument(
+        "--batch-index", type=int, default=0, help="Time/batch index for xarray."
+    )
+    parser.add_argument(
+        "--sample-noise-seed", type=int, default=0, help="Generated noise seed."
+    )
+    parser.add_argument("--run", action="store_true", help="Run one ONNX Runtime inference.")
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Alias for --run, kept for the original self-contained demo workflow.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    feeds = _load_real_data(args)
+    config = _config_from_args(args, feeds)
+    config.validate()
+
+    print("Building WeatherNext one-step forecast ONNX graph...")
+    print(f"  grid: {config.lat} x {config.lon} ({config.grid_points} cells)")
+    print(f"  mesh nodes: {config.mesh_nodes}")
+    print(
+        "  channels: "
+        f"input={config.input_variables}, forcing={config.forcing_variables}, "
+        f"noise={config.noise_channels}, output={config.output_variables}"
+    )
+
+    weights = load_npz_weights(args.weights) if args.weights else None
+    package = build_weathernext_package(config, weights=weights)
+    model = package["model"]
     print(f"Built model with {model.graph.num_nodes()} ONNX nodes.")
 
-    pkg.save(args.output_dir, check_weights=True, progress_bar=False)
-    print(f"Saved WeatherNext demo package to {args.output_dir!r}.")
+    package.save(args.output_dir, check_weights=True, progress_bar=False)
+    print(f"Saved WeatherNext package to {args.output_dir!r}.")
 
-    if args.validate:
-        _validate_with_ort(args.output_dir, shape)
+    if args.run or args.validate:
+        _run_with_ort(
+            args.output_dir, feeds if feeds is not None else _synthetic_feeds(config)
+        )
 
 
 if __name__ == "__main__":
