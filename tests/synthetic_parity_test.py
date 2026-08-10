@@ -976,7 +976,7 @@ def test_nemotron_parse_synthetic_parity():
             {
                 "input_ids": input_ids,
                 "attention_mask": np.ones_like(input_ids, dtype=np.int64),
-                "encoder_hidden_states": torch_encoder.numpy(),
+                "encoder_hidden_states": onnx_encoder,
                 **empty_cache,
             }
         )["logits"]
@@ -986,7 +986,7 @@ def test_nemotron_parse_synthetic_parity():
             {
                 "input_ids": unpadded_ids,
                 "attention_mask": np.ones_like(unpadded_ids, dtype=np.int64),
-                "encoder_hidden_states": torch_encoder.numpy(),
+                "encoder_hidden_states": onnx_encoder,
                 **empty_cache,
             }
         )["logits"]
@@ -995,7 +995,7 @@ def test_nemotron_parse_synthetic_parity():
             {
                 "input_ids": padded_ids,
                 "attention_mask": np.array([[0, 0, 1, 1]], dtype=np.int64),
-                "encoder_hidden_states": torch_encoder.numpy(),
+                "encoder_hidden_states": onnx_encoder,
                 **empty_cache,
             }
         )["logits"]
