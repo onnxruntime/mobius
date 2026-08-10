@@ -42,11 +42,11 @@ from dataclasses import dataclass
 
 import numpy as np
 import onnx_ir as ir
-from onnxscript import OpBuilder, nn
+from onnxscript import GraphBuilder, OpBuilder, nn
 
-from mobius import ArchitectureConfig, ModelPackage, build_from_module
+import mobius
+from mobius import OPSET_VERSION, ArchitectureConfig, ModelPackage, build_from_module
 from mobius.tasks import ModelTask
-from mobius.tasks._base import _make_graph, _make_model
 
 
 @dataclass(frozen=True)
@@ -158,7 +158,7 @@ class WeatherNextDemoTask(ModelTask):
         batch = ir.SymbolicDim("batch")
         s = self._shape
 
-        graph, builder = _make_graph("weathernext_one_step_forecast")
+        graph, builder = _make_demo_graph("weathernext_one_step_forecast")
         op = builder.op
 
         input_state = builder.input(
@@ -180,7 +180,25 @@ class WeatherNextDemoTask(ModelTask):
         next_state = module(op, input_state, forcings, sample_noise)
         builder.add_output(next_state, "next_state")
 
-        return ModelPackage({"model": _make_model(graph)}, config=config)
+        return ModelPackage({"model": _make_demo_model(graph)}, config=config)
+
+
+def _make_demo_graph(name: str) -> tuple[ir.Graph, GraphBuilder]:
+    graph = ir.Graph(
+        [],
+        [],
+        nodes=[],
+        name=name,
+        opset_imports={"": OPSET_VERSION, "com.microsoft": 1},
+    )
+    return graph, GraphBuilder(graph)
+
+
+def _make_demo_model(graph: ir.Graph) -> ir.Model:
+    model = ir.Model(graph, ir_version=11)
+    model.producer_name = "mobius"
+    model.producer_version = mobius.__version__
+    return model
 
 
 def _projection_matrix(rows: int, cols: int) -> np.ndarray:
@@ -298,10 +316,7 @@ def main() -> None:
 
     pkg = build_weathernext_demo_package(shape, dtype=_resolve_dtype(args.dtype))
     model = pkg["model"]
-    num_nodes = model.graph.num_nodes
-    if callable(num_nodes):
-        num_nodes = num_nodes()
-    print(f"Built model with {num_nodes} ONNX nodes.")
+    print(f"Built model with {model.graph.num_nodes()} ONNX nodes.")
 
     pkg.save(args.output_dir, check_weights=True, progress_bar=False)
     print(f"Saved WeatherNext demo package to {args.output_dir!r}.")
