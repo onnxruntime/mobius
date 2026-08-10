@@ -1025,6 +1025,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "gemma4_unified": "google/gemma-4-12B",
     "gemma4_unified_text": "google/gemma-4-12B",
     "internvl2": "OpenGVLab/InternVL2-1B",
+    "mage_vl": "microsoft/Mage-VL",
     "phi4mm": "microsoft/Phi-4-multimodal-instruct",
     "phi4_multimodal": "microsoft/Phi-4-multimodal-instruct",
     "phi3_v": "microsoft/Phi-3.5-vision-instruct",
