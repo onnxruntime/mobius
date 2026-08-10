@@ -43,7 +43,9 @@ class MageVLVisionRotaryEmbedding(nn.Module):
     def __init__(self, head_dim: int, rope_theta: float):
         super().__init__()
         if head_dim % 32 != 0:
-            raise ValueError(f"Mage-VL vision head_dim must be divisible by 32, got {head_dim}")
+            raise ValueError(
+                f"Mage-VL vision head_dim must be divisible by 32, got {head_dim}"
+            )
         half_dim = head_dim // 2
         unit = half_dim // 16
         self.t_size = 4 * unit
@@ -279,9 +281,7 @@ class MageVLVisionEmbeddings(nn.Module):
     def forward(self, op: OpBuilder, hidden_states: Value):
         patches = op.Reshape(
             hidden_states,
-            op.Constant(
-                value_ints=[-1, self.in_channels, self.patch_size, self.patch_size]
-            ),
+            op.Constant(value_ints=[-1, self.in_channels, self.patch_size, self.patch_size]),
         )
         hidden_states = self.patch_embedding(op, patches)  # (patches, hidden, 1, 1)
         return op.Reshape(
