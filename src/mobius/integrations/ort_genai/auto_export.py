@@ -92,6 +92,10 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "qwen2_vl": "qwen2_5_vl",
     "qwen3_vl": "qwen3_vl",
     "qwen3_vl_text": "qwen3_vl",
+    # Mage-VL reuses the Qwen multimodal package layout. Its decoder graph
+    # remains ordinary 1D-RoPE Qwen3; native media processing has a documented
+    # patch_positions limitation, so only text-only generation is native today.
+    "mage_vl": "qwen2_5_vl",
     "qwen3_5": "qwen2_5_vl",
     "qwen3_5_vl": "qwen2_5_vl",
 }
@@ -127,6 +131,7 @@ _QWEN_VL_MODEL_TYPES = frozenset(
         "qwen2_vl",
         "qwen2_5_vl",
         "qwen3_vl",
+        "mage_vl",
         "qwen3_vl_text",
         "qwen3_5",
         "qwen3_5_vl",
@@ -500,6 +505,7 @@ def _write_vision_processor_config(
     output_dir: str,
     *,
     hf_model_id: str | None = None,
+    trust_remote_code: bool = False,
 ) -> str | None:
     """Write the vision processor config file for VLM models.
 
@@ -527,6 +533,8 @@ def _write_vision_processor_config(
     - **Pixtral / Mistral3**: Writes ``processor_config.json`` with a 6-step
       pipeline (DecodeImage → Resize → Rescale → Normalize →
       Permute3D → PixtralImageSizes).
+    - **Mage-VL**: Writes ``image_processor.json`` with Qwen-style smart resize,
+      CLIP normalization, and packed patch extraction.
     - **Other VLMs**: Writes ``processor_config.json`` with a 4-step pipeline
       (DecodeImage → Resize → Rescale → Normalize).
 
@@ -618,7 +626,10 @@ def _write_vision_processor_config(
             try:
                 from transformers import AutoProcessor
 
-                hf_proc = AutoProcessor.from_pretrained(hf_model_id)
+                hf_proc = AutoProcessor.from_pretrained(
+                    hf_model_id,
+                    trust_remote_code=trust_remote_code,
+                )
                 ip = getattr(hf_proc, "image_processor", None)
                 if ip is not None:
                     image_mean = list(getattr(ip, "image_mean", image_mean))
@@ -718,7 +729,10 @@ def _write_vision_processor_config(
             try:
                 from transformers import AutoProcessor
 
-                hf_proc = AutoProcessor.from_pretrained(hf_model_id)
+                hf_proc = AutoProcessor.from_pretrained(
+                    hf_model_id,
+                    trust_remote_code=trust_remote_code,
+                )
                 ip = getattr(hf_proc, "image_processor", None)
                 if ip is not None:
                     image_mean = list(getattr(ip, "image_mean", image_mean))
@@ -815,7 +829,10 @@ def _write_vision_processor_config(
                 "transforms": transforms,
             }
         }
-        path = os.path.join(output_dir, "processor_config.json")
+        path = os.path.join(
+            output_dir,
+            "image_processor.json" if model_type == "mage_vl" else "processor_config.json",
+        )
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(processor_config, f, indent=4)
@@ -1002,13 +1019,25 @@ def _write_genai_config(
     if is_vlm:
         image_token_id = getattr(config, "image_token_id", None)
         if image_token_id is not None:
+            model_type = getattr(config, "model_type", "")
             vision_input_mapping = _introspect_inputs(pkg, "vision_encoder")
             embedding_input_mapping = _introspect_inputs(pkg, "embedding")
+            if model_type == "mage_vl" and vision_input_mapping is not None:
+                # ORT GenAI 0.15 rejects unknown vision input mapping keys while
+                # Mage-VL requires per-patch sampled-frame positions. Keep the
+                # config loadable for text-only generation; callers using media
+                # must run the standardized three-model package directly until
+                # the runtime schema and processor expose patch_positions.
+                vision_input_mapping.pop("patch_positions", None)
+                logger.warning(
+                    "ORT GenAI does not support Mage-VL's required patch_positions "
+                    "vision input; the generated config supports text-only generation. "
+                    "Run the standardized ONNX sub-models directly for image/video input."
+                )
 
             # spatial_merge_size and config_filename are config-level
             # properties that cannot be inferred from the graph.
             vision_kwargs: dict[str, Any] = {}
-            model_type = getattr(config, "model_type", "")
             if model_type in _GEMMA4_MODEL_TYPES:
                 vision_cfg = getattr(config, "vision", None)
                 vision_kwargs["spatial_merge_size"] = getattr(
@@ -1042,8 +1071,12 @@ def _write_genai_config(
                 )
                 if sms is not None:
                     vision_kwargs["spatial_merge_size"] = sms
-                vision_kwargs["config_filename"] = "processor_config.json"
-                if model_type in {"qwen3_vl", "qwen3_vl_text"}:
+                vision_kwargs["config_filename"] = (
+                    "image_processor.json"
+                    if model_type == "mage_vl"
+                    else "processor_config.json"
+                )
+                if model_type in {"mage_vl", "qwen3_vl", "qwen3_vl_text"}:
                     patch_size = getattr(vision_cfg, "patch_size", None)
                     window_size = getattr(vision_cfg, "window_size", None)
                     if patch_size is not None:
@@ -1139,6 +1172,7 @@ def write_ort_genai_config(
     ep: str = "cpu",
     context_length: int = 4096,
     local_config_dir: str | None = None,
+    trust_remote_code: bool = False,
 ) -> dict[str, str]:
     """Generate ORT-GenAI config artifacts for an already-built ModelPackage.
 
@@ -1169,6 +1203,8 @@ def write_ort_genai_config(
             this directory instead of downloaded from HuggingFace Hub.
             Typically set when the CLI ``--config`` flag points to a local
             directory rather than a HuggingFace model ID.
+        trust_remote_code: Allow custom HuggingFace configuration code when
+            resolving token IDs and model type.
 
     Returns:
         Dict mapping artifact name to file path, e.g.::
@@ -1234,7 +1270,9 @@ def write_ort_genai_config(
     if hf_model_id is not None:
         import transformers
 
-        hf_config = transformers.AutoConfig.from_pretrained(hf_model_id)
+        hf_config = transformers.AutoConfig.from_pretrained(
+            hf_model_id, trust_remote_code=trust_remote_code
+        )
         model_type = hf_config.model_type
         cfg_model_type = getattr(config, "model_type", None)
         # See _select_ort_model_type: decoder-only packages prefer the package's
@@ -1369,7 +1407,12 @@ def write_ort_genai_config(
             result[tf] = os.path.join(directory, tf)
 
     # Write processor config for VLMs
-    processor_path = _write_vision_processor_config(config, directory, hf_model_id=hf_model_id)
+    processor_path = _write_vision_processor_config(
+        config,
+        directory,
+        hf_model_id=hf_model_id,
+        trust_remote_code=trust_remote_code,
+    )
     if processor_path:
         result["processor_config"] = processor_path
 
@@ -1396,6 +1439,7 @@ def export_package(
     ep: str = "cpu",
     context_length: int = 4096,
     local_config_dir: str | None = None,
+    trust_remote_code: bool = False,
     external_data: str = "onnx",
     progress_bar: bool = True,
 ) -> dict[str, str]:
@@ -1433,6 +1477,8 @@ def export_package(
             larger.
         local_config_dir: Local model directory to copy tokenizer files from
             when ``hf_model_id`` is ``None``.
+        trust_remote_code: Allow custom HuggingFace configuration code when
+            resolving token IDs and model type.
         external_data: External-data format passed to :meth:`ModelPackage.save`
             (``"onnx"`` or ``"safetensors"``).
         progress_bar: Whether to show the save progress bar.
@@ -1488,6 +1534,7 @@ def export_package(
         ep=ep,
         context_length=context_length,
         local_config_dir=local_config_dir,
+        trust_remote_code=trust_remote_code,
     )
 
     # 3. Add ONNX paths to the manifest
@@ -1594,6 +1641,7 @@ def auto_export(
         hf_model_id=model_id,
         ep=ep,
         context_length=context_length,
+        trust_remote_code=trust_remote_code,
         external_data=external_data,
         progress_bar=progress_bar,
     )

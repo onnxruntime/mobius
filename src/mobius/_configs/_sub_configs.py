@@ -47,6 +47,9 @@ class VisionConfig:
     norm_eps: float = 1e-6
     mm_tokens_per_image: int | None = None
     image_token_id: int | None = None
+    video_token_id: int | None = None
+    vision_start_token_id: int | None = None
+    vision_end_token_id: int | None = None
     # Pixtral / Mistral-3 vision fields
     model_type: str | None = None
     head_dim: int | None = None
@@ -56,6 +59,8 @@ class VisionConfig:
     in_channels: int = 3
     spatial_merge_size: int = 2
     temporal_patch_size: int = 2
+    frame_windows_size: int = 4
+    tokens_per_second: float = 1.0
     num_position_embeddings: int | None = None
     deepstack_visual_indexes: list[int] | None = None
     fullatt_block_indexes: list[int] | None = None

@@ -209,6 +209,77 @@ class TestWriteProcessorConfig:
         assert len(norm_attrs["mean"]) == 3
         assert len(norm_attrs["std"]) == 3
 
+    def test_mage_vl_writes_packed_patch_processor(self, tmp_path):
+        vision = types.SimpleNamespace(
+            image_size=448,
+            patch_size=16,
+            spatial_merge_size=2,
+            temporal_patch_size=1,
+            model_type="mage_vl_vision",
+        )
+        config = types.SimpleNamespace(
+            vision=vision,
+            model_type="mage_vl",
+            spatial_merge_size=2,
+            temporal_patch_size=1,
+        )
+
+        path = _write_vision_processor_config(config, str(tmp_path))
+        assert path is not None
+        assert path.endswith("image_processor.json")
+        with open(path) as f:
+            data = json.load(f)
+
+        assert data["processor"]["name"] == "qwen2_5_image_processor"
+        transforms = data["processor"]["transforms"]
+        assert transforms[-1]["operation"] == {
+            "name": "patch_image",
+            "type": "PatchImage",
+            "attrs": {
+                "patch_size": 16,
+                "temporal_patch_size": 1,
+                "merge_size": 2,
+            },
+        }
+        normalize = next(
+            transform["operation"]
+            for transform in transforms
+            if transform["operation"]["type"] == "Normalize"
+        )
+        assert normalize["attrs"]["qwen2_5_vl"] == 1
+
+    def test_mage_vl_processor_propagates_trust_remote_code(self, tmp_path):
+        vision = types.SimpleNamespace(
+            image_size=448,
+            patch_size=16,
+            spatial_merge_size=2,
+            temporal_patch_size=1,
+            model_type="mage_vl_vision",
+        )
+        config = types.SimpleNamespace(
+            vision=vision,
+            model_type="mage_vl",
+            spatial_merge_size=2,
+            temporal_patch_size=1,
+        )
+        hf_processor = mock.MagicMock()
+        hf_processor.image_processor = None
+        with mock.patch(
+            "transformers.AutoProcessor.from_pretrained",
+            return_value=hf_processor,
+        ) as from_pretrained:
+            _write_vision_processor_config(
+                config,
+                str(tmp_path),
+                hf_model_id="microsoft/Mage-VL",
+                trust_remote_code=True,
+            )
+
+        from_pretrained.assert_called_once_with(
+            "microsoft/Mage-VL",
+            trust_remote_code=True,
+        )
+
     def test_gemma4_unified_skips_image_processor(self, tmp_path):
         """Encoder-free gemma4_unified has no native transform: no image_processor.json."""
         vision = mock.MagicMock()
@@ -1092,6 +1163,67 @@ class TestExportForOrtGenai:
         assert model["vision"]["patch_size"] == 16
         assert model["vision"]["window_size"] == 64
 
+    def test_mage_vl_omits_runtime_unsupported_patch_positions_mapping(self, tmp_path):
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 448
+            patch_size: int = 16
+            spatial_merge_size: int = 2
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "mage_vl"
+            vocab_size: int = 151936
+            hidden_size: int = 2560
+            num_hidden_layers: int = 1
+            num_attention_heads: int = 32
+            num_key_value_heads: int = 8
+            head_dim: int = 128
+            image_token_id: int = 151655
+            temporal_patch_size: int = 1
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+
+        pkg = ModelPackage(
+            {
+                "decoder": mock.MagicMock(),
+                "vision_encoder": mock.MagicMock(),
+                "embedding": mock.MagicMock(),
+            },
+            config=FakeConfig(),
+        )
+
+        def input_mapping(_pkg, component):
+            if component == "vision_encoder":
+                return {
+                    "pixel_values": "pixel_values",
+                    "image_grid_thw": "image_grid_thw",
+                    "patch_positions": "patch_positions",
+                }
+            if component == "embedding":
+                return {
+                    "input_ids": "input_ids",
+                    "image_features": "image_features",
+                }
+            return None
+
+        with mock.patch(
+            "mobius.integrations.ort_genai.auto_export._introspect_inputs",
+            side_effect=input_mapping,
+        ):
+            result = write_ort_genai_config(pkg, str(tmp_path))
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+        assert data["model"]["vision"]["inputs"] == {
+            "pixel_values": "pixel_values",
+            "image_grid_thw": "image_grid_thw",
+        }
+
     def test_processor_config_not_written_without_vision(self, tmp_path):
         """image_processor.json is NOT written when pkg.config has no vision attr."""
         from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
@@ -1328,6 +1460,30 @@ class TestExportForOrtGenai:
 
         mock_copy.assert_called_once_with("fake/model", str(tmp_path))
         assert "tokenizer.json" in result
+
+    def test_hf_config_propagates_trust_remote_code(self, tmp_path):
+        """Remote-code models can resolve their HuggingFace configuration."""
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        pkg = self._make_pkg()
+        with (
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files",
+                return_value=[],
+            ),
+            mock.patch("transformers.AutoConfig.from_pretrained") as mock_hf,
+        ):
+            mock_hf.return_value = mock.MagicMock(
+                model_type="mage_vl", bos_token_id=1, eos_token_id=2, pad_token_id=0
+            )
+            write_ort_genai_config(
+                pkg,
+                str(tmp_path),
+                hf_model_id="microsoft/Mage-VL",
+                trust_remote_code=True,
+            )
+
+        mock_hf.assert_called_once_with("microsoft/Mage-VL", trust_remote_code=True)
 
     def test_ep_default_normalizes_to_cpu(self, tmp_path):
         """ep='default' is normalized to cpu (provider_options=[])."""

@@ -240,6 +240,46 @@ class MuseGlimmerVLTask(QwenVLTask):
         return ModelPackage(models, config=config)
 
 
+class MageVLTask(VisionLanguageTask):
+    """Mage-VL split with packed patches and explicit sampled-frame positions."""
+
+    def _build_vision(
+        self,
+        vision: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        total_patches = ir.SymbolicDim("total_patches")
+        num_visuals = ir.SymbolicDim("num_visuals")
+        patch_size = (config.vision.patch_size if config.vision else None) or 16
+        in_channels = config.vision.in_channels if config.vision else 3
+        pixel_dim = in_channels * patch_size * patch_size
+
+        graph, builder = _make_graph(name="vision_encoder")
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=config.dtype,
+            shape=[total_patches, pixel_dim],
+        )
+        image_grid_thw = builder.input(
+            "image_grid_thw",
+            dtype=ir.DataType.INT64,
+            shape=[num_visuals, 3],
+        )
+        patch_positions = builder.input(
+            "patch_positions",
+            dtype=ir.DataType.INT64,
+            shape=[total_patches, 3],
+        )
+        image_features = vision(
+            builder.op,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            patch_positions=patch_positions,
+        )
+        builder.add_output(image_features, "image_features")
+        return _make_model(graph)
+
+
 class HybridQwenVLTask(QwenVLTask):
     """Qwen VL 3-model split with hybrid KV + DeltaNet cache.
 

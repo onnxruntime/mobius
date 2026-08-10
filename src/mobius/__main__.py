@@ -399,6 +399,7 @@ def _save_package(
             hf_model_id=hf_model_id,
             ep=ep,
             local_config_dir=local_config_dir,
+            trust_remote_code=getattr(args, "trust_remote_code", False),
         )
         for name, path in artifacts.items():
             print(f"  {name}: {path}")

@@ -95,6 +95,9 @@ class TestLoadTestCase:
         assert case.level == "L4"
         assert case.prompts == ["Hello world"]
         assert case.images == []
+        assert case.videos == []
+        assert case.video_num_frames is None
+        assert case.media_max_pixels is None
         assert case.audio == []
         assert case.decoder_prompt == ""
         assert case.generation_params == {}
