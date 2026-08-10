@@ -5,6 +5,7 @@ __all__ = [
     "AdaLayerNormOutput",
     "AdaLayerNormZero",
     "Attention",
+    "BatchNorm1d",
     "BatchNorm2d",
     "BertEmbeddings",
     "BlockQuantizedLinear",
@@ -52,6 +53,7 @@ __all__ = [
     "OffsetRMSNorm",
     "PatchEmbed",
     "PatchEmbedding",
+    "ParakeetFastConformerEncoder",
     "PostGatedRMSNorm",
     "PostNormDecoderLayer",
     "QuantizedEmbedding",
@@ -126,6 +128,7 @@ from mobius.components._common import (
     create_static_cache_attention_bias,
 )
 from mobius.components._conv import (
+    BatchNorm1d,
     BatchNorm2d,
     CausalDepthwiseConv1d,
     Conv2d,
@@ -181,6 +184,7 @@ from mobius.components._multimodal import (
     LinearMultiModalProjector,
     MLPMultiModalProjector,
 )
+from mobius.components._parakeet_audio import ParakeetFastConformerEncoder
 from mobius.components._pixtral_vision import (
     Mistral3MultiModalProjector as Mistral3MultiModalProjector,
 )

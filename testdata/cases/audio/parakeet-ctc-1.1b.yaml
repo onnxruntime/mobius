@@ -1,0 +1,18 @@
+model_id: "nvidia/parakeet-ctc-1.1b"
+model_type: "parakeet_ctc"
+revision: "20e63a0fed6aedba145b74b826dbd41df0941730"
+task_type: "feature-ctc-asr"
+dtype: "float32"
+
+inputs:
+  audio:
+    - "652-129742-0006.flac"
+
+level: "L4+L5"
+
+notes: >
+  NVIDIA Parakeet 1.1B offline FastConformer CTC ASR. The Hugging Face
+  processor converts real 16 kHz LibriSpeech audio to normalized 80-bin
+  log-mel features; L4 compares the final valid frame logits and L5 compares
+  every deterministic CTC frame argmax before collapse, with the decoded
+  transcript retained in the generation golden for human inspection.

@@ -90,6 +90,7 @@ __all__ = [
     "OLMo2CausalLMModel",
     "OLMoCausalLMModel",
     "OPTCausalLMModel",
+    "ParakeetForCTCModel",
     "PersimmonCausalLMModel",
     "Phi3CausalLMModel",
     "Phi3MoECausalLMModel",
@@ -238,6 +239,7 @@ from mobius.models.nemotron import NemotronCausalLMModel
 from mobius.models.nemotron_h import NemotronHCausalLMModel
 from mobius.models.olmo import OLMo2CausalLMModel, OLMoCausalLMModel
 from mobius.models.opt import OPTCausalLMModel
+from mobius.models.parakeet_ctc import ParakeetForCTCModel
 from mobius.models.persimmon import PersimmonCausalLMModel
 from mobius.models.phi import (
     Phi3SmallCausalLMModel,

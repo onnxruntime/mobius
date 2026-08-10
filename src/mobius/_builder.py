@@ -390,6 +390,7 @@ def build(
     model_id: str,
     task: str | ModelTask | None = None,
     *,
+    revision: str | None = None,
     module_class: type[nn.Module] | None = None,
     dtype: str | ir.DataType | None = None,
     output_layer_indices: list[int] | None = None,
@@ -422,6 +423,8 @@ def build(
         task: The model task. Either a task name string
             (e.g. ``"text-generation"``) or a :class:`ModelTask` instance.
             When ``None``, the task is auto-detected from the model type.
+        revision: Optional Hugging Face revision used consistently for the
+            configuration and every weight shard.
         module_class: Custom module class to use instead of the auto-detected
             one. The class must accept an :class:`ArchitectureConfig` as its
             constructor argument and have a ``forward()`` method compatible
@@ -516,14 +519,15 @@ def build(
     from mobius._diffusers_builder import build_diffusers_pipeline
 
     try:
-        hf_config = transformers.AutoConfig.from_pretrained(
-            model_id, trust_remote_code=trust_remote_code
-        )
+        config_kwargs = {"trust_remote_code": trust_remote_code}
+        if revision is not None:
+            config_kwargs["revision"] = revision
+        hf_config = transformers.AutoConfig.from_pretrained(model_id, **config_kwargs)
     except (ValueError, KeyError, OSError):
         # AutoConfig failed — the model_type may not be in transformers,
         # or the HF config class has a bug (e.g. NemotronH with '-' pattern).
         # Try loading config.json directly if the model is in our registry.
-        hf_config = _try_load_config_json(model_id)
+        hf_config = _try_load_config_json(model_id, revision=revision)
         if hf_config is None or hf_config.model_type not in registry:
             if text_only:
                 raise ValueError(
@@ -666,7 +670,7 @@ def build(
         model.graph.name = f"{model_id}/{name}"
 
     if load_weights:
-        state_dict = _download_weights(model_id)
+        state_dict = _download_weights(model_id, revision=revision)
         if hasattr(model_module, "preprocess_weights"):
             state_dict = model_module.preprocess_weights(state_dict)
         prefix_map = getattr(model_module, "weight_prefix_map", None)

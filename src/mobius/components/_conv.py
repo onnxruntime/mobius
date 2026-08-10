@@ -112,6 +112,32 @@ class BatchNorm2d(nn.Module):
         )
 
 
+class BatchNorm1d(nn.Module):
+    """1D batch normalization with frozen running statistics."""
+
+    def __init__(self, num_features: int, eps: float = 1e-5):
+        super().__init__()
+        self.weight = nn.Parameter((num_features,))
+        self.bias = nn.Parameter((num_features,))
+        self.running_mean = nn.Parameter((num_features,))
+        self.running_var = nn.Parameter((num_features,))
+        self._eps = eps
+
+    def forward(self, op: OpBuilder, x: ir.Value):
+        # Frozen BatchNorm expressed as elementwise inference math so CUDA can
+        # execute fp16 and bf16 models even when its BatchNormalization kernel
+        # does not support those element types.
+        channel_shape = op.Constant(value_ints=[1, -1, 1])
+        x_float = op.Cast(x, to=ir.DataType.FLOAT)
+        weight = op.Reshape(op.Cast(self.weight, to=ir.DataType.FLOAT), channel_shape)
+        bias = op.Reshape(op.Cast(self.bias, to=ir.DataType.FLOAT), channel_shape)
+        mean = op.Reshape(op.Cast(self.running_mean, to=ir.DataType.FLOAT), channel_shape)
+        variance = op.Reshape(op.Cast(self.running_var, to=ir.DataType.FLOAT), channel_shape)
+        eps = op.Constant(value_float=self._eps)
+        normalized = op.Div(op.Sub(x_float, mean), op.Sqrt(op.Add(variance, eps)))
+        return op.CastLike(op.Add(op.Mul(normalized, weight), bias), x)
+
+
 class ConvTranspose2d(nn.Module):
     """2D transposed convolution (deconvolution) with bias."""
 

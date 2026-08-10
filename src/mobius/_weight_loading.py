@@ -148,7 +148,11 @@ def apply_weights(model: ir.Model, state_dict: dict[str, torch.Tensor]) -> None:
 
 
 def _parallel_download(
-    model_id: str, filenames: list[str], *, desc: str = "files"
+    model_id: str,
+    filenames: list[str],
+    *,
+    revision: str | None = None,
+    desc: str = "files",
 ) -> list[str]:
     """Download files from HuggingFace Hub in parallel.
 
@@ -166,14 +170,19 @@ def _parallel_download(
     """
     if len(filenames) <= 1:
         # No benefit from parallelism for a single file
-        return [hf_hub_download(repo_id=model_id, filename=f) for f in filenames]
+        kwargs = {"repo_id": model_id}
+        if revision is not None:
+            kwargs["revision"] = revision
+        return [hf_hub_download(filename=f, **kwargs) for f in filenames]
 
     print(f"Downloading {len(filenames)} {desc} files (parallel)...")
     path_map: dict[str, str] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        kwargs = {"repo_id": model_id}
+        if revision is not None:
+            kwargs["revision"] = revision
         futures = {
-            executor.submit(hf_hub_download, repo_id=model_id, filename=f): f
-            for f in filenames
+            executor.submit(hf_hub_download, filename=f, **kwargs): f for f in filenames
         }
         for future in tqdm.tqdm(
             concurrent.futures.as_completed(futures),
@@ -295,7 +304,7 @@ def _dequantize_fp8_weights(state_dict: dict[str, torch.Tensor]) -> dict[str, to
     return {k: v for k, v in result.items() if not any(k.endswith(s) for s in aux_suffixes)}
 
 
-def _download_weights(model_id: str) -> dict[str, torch.Tensor]:
+def _download_weights(model_id: str, revision: str | None = None) -> dict[str, torch.Tensor]:
     """Download weights from HuggingFace and return as a state dict.
 
     Uses local safetensors files when *model_id* is a directory, otherwise
@@ -305,17 +314,20 @@ def _download_weights(model_id: str) -> dict[str, torch.Tensor]:
     paths = _local_weight_paths(pathlib.Path(model_id))
     if paths is None:
         try:
-            index_path = pathlib.Path(
-                hf_hub_download(
-                    repo_id=model_id,
-                    filename=_WEIGHT_INDEX_NAME,
-                )
-            )
+            kwargs = {"repo_id": model_id, "filename": _WEIGHT_INDEX_NAME}
+            if revision is not None:
+                kwargs["revision"] = revision
+            index_path = pathlib.Path(hf_hub_download(**kwargs))
             all_files = _weight_filenames_from_index(index_path)
         except EntryNotFoundError:
             all_files = [_SINGLE_WEIGHT_NAME]
 
-        paths = _parallel_download(model_id, all_files, desc="safetensors")
+        paths = _parallel_download(
+            model_id,
+            all_files,
+            revision=revision,
+            desc="safetensors",
+        )
 
     state_dict: dict[str, torch.Tensor] = {}
     for path in tqdm.tqdm(paths, desc="Loading weights"):

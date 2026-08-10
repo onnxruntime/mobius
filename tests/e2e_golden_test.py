@@ -408,6 +408,7 @@ def _build_model_package(case: GoldenTestCase) -> ModelPackage:
         task = reg.task or getattr(module_class, "default_task", None)
     return build(
         case.model_id,
+        revision=case.revision,
         task=task,
         module_class=module_class,
         dtype=case.dtype,
@@ -568,6 +569,7 @@ _HIDDEN_STATE_TASKS: frozenset[str] = frozenset(
         # comparator below slices to the last frame so the shape matches
         # the saved golden's per-token vector.
         "ctc-asr",
+        "feature-ctc-asr",
     }
 )
 
@@ -696,6 +698,31 @@ def _prepare_audio_feeds(
         "input_values": processed["input_values"].astype(np.float32),
     }
     return feeds
+
+
+def _prepare_feature_ctc_feeds(
+    case: GoldenTestCase,
+) -> dict[str, np.ndarray]:
+    """Prepare processor-generated log-mel features for feature-input CTC."""
+    import librosa
+    import transformers
+
+    processor = transformers.AutoProcessor.from_pretrained(
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
+    )
+    audio_path = _TESTDATA_DIR / case.audio[0]
+    audio_array, sample_rate = librosa.load(str(audio_path), sr=16000)
+    processed = processor(
+        audio_array,
+        sampling_rate=sample_rate,
+        return_tensors="np",
+    )
+    return {
+        "input_features": processed["input_features"].astype(np.float32),
+        "attention_mask": processed["attention_mask"].astype(bool),
+    }
 
 
 def _compute_mrope_position_ids(
@@ -1906,6 +1933,12 @@ class TestL4CheckpointVerified:
                 outputs = session.run(feeds)
             finally:
                 session.close()
+        elif case.task_type == "feature-ctc-asr":
+            session = _open_decoder_session(pkg)
+            try:
+                outputs = session.run(_prepare_feature_ctc_feeds(case))
+            finally:
+                session.close()
         elif len(pkg) > 1 and "embedding" in pkg:
             # Multi-model text-generation (e.g. Gemma4 VL text-only)
             outputs = _run_text_only_multimodel_prefill(pkg, golden, config)
@@ -1951,8 +1984,28 @@ _GENERATION_SUPPORTED_TASKS = frozenset(
         "speech-to-text",
         "speech-language",
         "gemma4-assistant",
+        "ctc-asr",
+        "feature-ctc-asr",
     }
 )
+
+
+def _run_ctc_generation(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+) -> list[int]:
+    """Run one CTC forward pass and return deterministic frame argmax IDs."""
+    session = _open_decoder_session(pkg)
+    try:
+        if case.task_type == "feature-ctc-asr":
+            feeds = _prepare_feature_ctc_feeds(case)
+        else:
+            feeds = _prepare_audio_feeds(case)
+            feeds["attention_mask"] = np.ones_like(feeds["input_values"], dtype=np.int64)
+        logits = session.run(feeds)["logits"]
+    finally:
+        session.close()
+    return np.argmax(logits[0], axis=-1).astype(np.int64).tolist()
 
 
 def _validate_greedy(case: GoldenTestCase) -> None:
@@ -2579,6 +2632,8 @@ class TestL5GenerationE2E:
                 golden,
                 max_new_tokens=case.generation_params.get("max_new_tokens", 50),
             )
+        elif case.task_type in {"ctc-asr", "feature-ctc-asr"}:
+            new_tokens = _run_ctc_generation(pkg, case)
         elif len(pkg) > 1 and "embedding" in pkg:
             # Multi-model text-generation (e.g. Gemma4 any-to-any text path):
             # embedding model maps input_ids -> inputs_embeds (+ extra decoder
@@ -2598,6 +2653,11 @@ class TestL5GenerationE2E:
         expected_tokens = np.array(expected_token_ids, dtype=np.int64)
         expected_len = len(expected_tokens)
         actual_len = len(new_tokens)
+        if case.task_type in {"ctc-asr", "feature-ctc-asr"} and actual_len != expected_len:
+            pytest.fail(
+                f"L5 FAIL: CTC frame count changed for {case.case_id}: "
+                f"expected {expected_len}, got {actual_len}"
+            )
         if actual_len != expected_len:
             warnings.warn(
                 f"Length mismatch for {case.case_id}: "

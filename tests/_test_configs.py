@@ -36,6 +36,7 @@ from mobius._configs import (
     MllamaConfig,
     NanoChatConfig,
     NemotronHConfig,
+    ParakeetCTCConfig,
     Sam2Config,
     SegformerConfig,
     VisionConfig,
@@ -2416,6 +2417,20 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
 # Speech / TTS / Codec configs
 # ---------------------------------------------------------------------------
 SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
+    # --- Parakeet CTC (feature-input offline FastConformer) ---
+    (
+        "parakeet_ctc",
+        {
+            "_config_cls": ParakeetCTCConfig,
+            "num_mel_bins": 16,
+            "subsampling_conv_channels": 8,
+            "conv_kernel_size": 5,
+            "attention_bias": True,
+            "convolution_bias": True,
+            "scale_input": True,
+        },
+        True,
+    ),
     # --- Whisper (speech-to-text, encoder-decoder) ---
     (
         "whisper",

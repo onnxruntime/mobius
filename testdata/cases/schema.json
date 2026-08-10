@@ -48,6 +48,7 @@
         "depth-estimation",
         "dflash-draft",
         "feature-extraction",
+        "feature-ctc-asr",
         "fun-asr-speech-language",
         "gemma4-assistant",
         "image-classification",

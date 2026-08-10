@@ -32,24 +32,29 @@ class Conv1d(nn.Module):
         kernel_size: int,
         stride: int = 1,
         padding: int = 0,
+        groups: int = 1,
+        bias: bool = True,
     ):
         super().__init__()
-        self.weight = nn.Parameter([out_channels, in_channels, kernel_size])
-        self.bias = nn.Parameter([out_channels])
+        self.weight = nn.Parameter([out_channels, in_channels // groups, kernel_size])
+        if bias:
+            self.bias = nn.Parameter([out_channels])
         self._kernel_shape = [kernel_size]
         self._strides = [stride]
         self._pads = [padding, padding]
+        self._groups = groups
 
     def forward(self, op: OpBuilder, x: ir.Value):
         # x: [batch, in_channels, seq_len]
-        return op.Conv(
-            x,
-            self.weight,
-            self.bias,
-            kernel_shape=self._kernel_shape,
-            strides=self._strides,
-            pads=self._pads,
-        )
+        kwargs = {
+            "kernel_shape": self._kernel_shape,
+            "strides": self._strides,
+            "pads": self._pads,
+            "group": self._groups,
+        }
+        if hasattr(self, "bias"):
+            return op.Conv(x, self.weight, self.bias, **kwargs)
+        return op.Conv(x, self.weight, **kwargs)
 
 
 class WhisperAttention(nn.Module):
