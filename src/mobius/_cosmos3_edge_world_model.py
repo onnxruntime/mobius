@@ -240,9 +240,7 @@ def build_cosmos3_edge_world_model(
     negative_prompt_asset = "assets/negative_prompt.json"
     i2v_prompt: dict[str, Any] = {
         "positive": "json_or_text",
-        "negative_default": (
-            "asset" if negative_prompt_asset in assets else "empty"
-        ),
+        "negative_default": ("asset" if negative_prompt_asset in assets else "empty"),
         "add_resolution_template": False,
         "add_duration_template": False,
         "use_system_prompt": False,

@@ -488,9 +488,7 @@ def test_manifest_carries_generation_and_pipeline_config(tmp_path) -> None:
         "use_karras_sigmas",
     ]
     video_handoff = package.manifest.metadata["conditioning_handoffs"]["video"]
-    assert video_handoff["parameters"]["channel_order"] == (
-        "patch_height_patch_width_channel"
-    )
+    assert video_handoff["parameters"]["channel_order"] == ("patch_height_patch_width_channel")
     assert package.manifest.metadata["profile"] == "world-model"
     assert package.manifest.metadata["model_type"] == "cosmos3_edge"
     assert package.manifest.metadata["source"] == "example/world-4Step"
