@@ -271,14 +271,14 @@ def _validate_with_ort(output_dir: str, shape: WeatherNextDemoShape) -> None:
     rng = np.random.default_rng(42)
     feeds = {
         "input_state": rng.standard_normal(
-            (1, shape.lat, shape.lon, shape.input_variables), dtype=np.float32
-        ),
+            (1, shape.lat, shape.lon, shape.input_variables)
+        ).astype(np.float32),
         "forcings": rng.standard_normal(
-            (1, shape.lat, shape.lon, shape.forcing_variables), dtype=np.float32
-        ),
+            (1, shape.lat, shape.lon, shape.forcing_variables)
+        ).astype(np.float32),
         "sample_noise": rng.standard_normal(
-            (1, shape.lat, shape.lon, shape.noise_channels), dtype=np.float32
-        ),
+            (1, shape.lat, shape.lon, shape.noise_channels)
+        ).astype(np.float32),
     }
     (next_state,) = sess.run(None, feeds)
     print(f"Validation output next_state shape: {next_state.shape}")
