@@ -126,7 +126,10 @@ class WeatherNextGridMeshBlock(nn.Module):
         # Encode each lat/lon cell independently, then flatten the grid to points:
         # [B, lat, lon, hidden] -> [B, grid_points, hidden].
         grid_latent = op.Tanh(self.grid_encoder(op, grid_features))
-        grid_points = op.Reshape(grid_latent, [0, s.grid_points, s.hidden_size])
+        grid_points = op.Reshape(
+            grid_latent,
+            op.Constant(value_ints=[0, s.grid_points, s.hidden_size]),
+        )
 
         # Aggregate grid points onto the mesh with a fixed sparse-style projection:
         # [mesh_points, grid_points] @ [B, grid_points, hidden] -> [B, mesh_points, hidden].
@@ -143,13 +146,16 @@ class WeatherNextGridMeshBlock(nn.Module):
 
         # Return a one-step forecast grid: [B, lat, lon, output_variables].
         forecast_points = self.grid_decoder(op, grid_points)
-        return op.Reshape(forecast_points, [0, s.lat, s.lon, s.output_variables])
+        return op.Reshape(
+            forecast_points,
+            op.Constant(value_ints=[0, s.lat, s.lon, s.output_variables]),
+        )
 
 
 class WeatherNextDemoTask(ModelTask):
     """Task wiring for a one-step WeatherNext-style forecast graph."""
 
-    model_roles = {"model": "encoder"}
+    model_roles = {"model": "forecast"}
 
     def __init__(self, shape: WeatherNextDemoShape):
         self._shape = shape
