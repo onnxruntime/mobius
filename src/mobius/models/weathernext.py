@@ -106,9 +106,9 @@ class WeatherNextModel(nn.Module):
         grid_points = op.Reshape(grid_latent, flat_grid_shape)
 
         # Aggregate encoded grid cells onto mesh nodes:
-        # [mesh_nodes, grid_points] @ [B, grid_points, hidden]
+        # [1, mesh_nodes, grid_points] @ [B, grid_points, hidden]
         # -> [B, mesh_nodes, hidden].
-        mesh_latent = op.MatMul(self.grid_to_mesh, grid_points)
+        mesh_latent = op.MatMul(op.Unsqueeze(self.grid_to_mesh, [0]), grid_points)
 
         # Apply one or more residual mesh-update MLP blocks.
         for update_in, update_out in zip(
@@ -118,9 +118,9 @@ class WeatherNextModel(nn.Module):
             mesh_latent = op.Add(mesh_latent, update_out(op, mesh_delta))
 
         # Decode mesh latents back to grid cells and retain the encoded-grid
-        # residual: [grid_points, mesh_nodes] @ [B, mesh_nodes, hidden]
+        # residual: [1, grid_points, mesh_nodes] @ [B, mesh_nodes, hidden]
         # -> [B, grid_points, hidden].
-        grid_delta = op.MatMul(self.mesh_to_grid, mesh_latent)
+        grid_delta = op.MatMul(op.Unsqueeze(self.mesh_to_grid, [0]), mesh_latent)
         grid_points = op.Add(grid_points, grid_delta)
 
         # Return one forecast step on the original grid:

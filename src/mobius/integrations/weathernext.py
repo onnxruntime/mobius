@@ -130,6 +130,7 @@ def load_xarray_forecast_inputs(
             forcing_variables,
             batch_index=batch_index,
         )
+        # The seed controls only the generated stochastic noise input.
         rng = np.random.default_rng(sample_noise_seed)
         sample_noise = rng.standard_normal(
             (input_state.shape[0], input_state.shape[1], input_state.shape[2], noise_channels)
