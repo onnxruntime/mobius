@@ -126,9 +126,15 @@ class WeatherNextGridMeshBlock(nn.Module):
         # Encode each lat/lon cell independently, then flatten the grid to points:
         # [B, lat, lon, hidden] -> [B, grid_points, hidden].
         grid_latent = op.Tanh(self.grid_encoder(op, grid_features))
+        batch_dim = op.Shape(grid_latent, start=0, end=1)
+        flat_grid_shape = op.Concat(
+            batch_dim,
+            op.Constant(value_ints=[s.grid_points, s.hidden_size]),
+            axis=0,
+        )
         grid_points = op.Reshape(
             grid_latent,
-            op.Constant(value_ints=[0, s.grid_points, s.hidden_size]),
+            flat_grid_shape,
         )
 
         # Aggregate grid points onto the mesh with a fixed sparse-style projection:
@@ -146,9 +152,14 @@ class WeatherNextGridMeshBlock(nn.Module):
 
         # Return a one-step forecast grid: [B, lat, lon, output_variables].
         forecast_points = self.grid_decoder(op, grid_points)
+        forecast_shape = op.Concat(
+            batch_dim,
+            op.Constant(value_ints=[s.lat, s.lon, s.output_variables]),
+            axis=0,
+        )
         return op.Reshape(
             forecast_points,
-            op.Constant(value_ints=[0, s.lat, s.lon, s.output_variables]),
+            forecast_shape,
         )
 
 
