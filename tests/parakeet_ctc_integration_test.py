@@ -32,9 +32,7 @@ def test_parakeet_real_audio_real_weight_cuda_parity():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for Parakeet 1.1B real-weight parity")
 
-    processor = transformers.AutoProcessor.from_pretrained(
-        _MODEL_ID, revision=_REVISION
-    )
+    processor = transformers.AutoProcessor.from_pretrained(_MODEL_ID, revision=_REVISION)
     audio, sample_rate = librosa.load(
         str(Path("testdata") / "652-129742-0006.flac"),
         sr=16_000,
@@ -53,9 +51,11 @@ def test_parakeet_real_audio_real_weight_cuda_parity():
     ).eval()
     hf_model.cuda()
     with torch.no_grad():
-        expected = hf_model(
-            **{name: value.cuda() for name, value in inputs.items()}
-        ).logits.cpu().numpy()
+        expected = (
+            hf_model(**{name: value.cuda() for name, value in inputs.items()})
+            .logits.cpu()
+            .numpy()
+        )
     hf_model.cpu()
     torch.cuda.empty_cache()
 
@@ -95,9 +95,7 @@ def test_parakeet_real_audio_fp16_cuda_matches_ctc_frames():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for Parakeet 1.1B fp16 validation")
 
-    processor = transformers.AutoProcessor.from_pretrained(
-        _MODEL_ID, revision=_REVISION
-    )
+    processor = transformers.AutoProcessor.from_pretrained(_MODEL_ID, revision=_REVISION)
     audio, sample_rate = librosa.load(
         str(Path("testdata") / "652-129742-0006.flac"),
         sr=16_000,
@@ -125,14 +123,9 @@ def test_parakeet_real_audio_fp16_cuda_matches_ctc_frames():
         session.close()
 
     with open(
-        Path("testdata")
-        / "golden"
-        / "audio"
-        / "parakeet-ctc-1.1b_generation.json"
+        Path("testdata") / "golden" / "audio" / "parakeet-ctc-1.1b_generation.json"
     ) as golden_file:
-        expected_ids = np.array(
-            json.load(golden_file)["generated_tokens"], dtype=np.int64
-        )
+        expected_ids = np.array(json.load(golden_file)["generated_tokens"], dtype=np.int64)
     actual_ids = np.argmax(logits[0], axis=-1)
     np.testing.assert_array_equal(actual_ids, expected_ids)
     assert (

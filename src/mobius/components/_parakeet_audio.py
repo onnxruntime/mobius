@@ -89,9 +89,7 @@ class _ParakeetSubsampling(nn.Module):
     def _downsample_lengths(self, op: OpBuilder, lengths: ir.Value) -> ir.Value:
         numerator = op.Add(
             lengths,
-            op.Constant(
-                value=ir.tensor(np.int64(2 * self._padding - self._kernel))
-            ),
+            op.Constant(value=ir.tensor(np.int64(2 * self._padding - self._kernel))),
         )
         return op.Add(
             op.Div(numerator, op.Constant(value=ir.tensor(np.int64(self._stride)))),
@@ -151,8 +149,7 @@ class _ParakeetRelativePositionEncoding(nn.Module):
         self._hidden_size = hidden_size
         self._dtype = dtype
         self._inv_freq = 1.0 / (
-            10_000.0
-            ** (np.arange(0, hidden_size, 2, dtype=np.float32) / hidden_size)
+            10_000.0 ** (np.arange(0, hidden_size, 2, dtype=np.float32) / hidden_size)
         )
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
@@ -297,9 +294,7 @@ class _ParakeetAttention(nn.Module):
         )
         query_v = op.Transpose(query_v, perm=[0, 2, 1, 3])
 
-        relative_key = self._split_heads(
-            op, self.relative_k_proj(op, position_embeddings)
-        )
+        relative_key = self._split_heads(op, self.relative_k_proj(op, position_embeddings))
         relative_key = op.Transpose(relative_key, perm=[0, 2, 1, 3])
         relative_scores = op.MatMul(
             query_v,
@@ -312,9 +307,7 @@ class _ParakeetAttention(nn.Module):
             _dim(op, key, 1),
             op.Constant(value_ints=[3]),
         )
-        relative_scores = op.Mul(
-            relative_scores, _scalar_like(op, scale, relative_scores)
-        )
+        relative_scores = op.Mul(relative_scores, _scalar_like(op, scale, relative_scores))
 
         additive_mask = op.Where(
             attention_mask,
@@ -415,9 +408,7 @@ class _ParakeetEncoderLayer(nn.Module):
         hidden_states = op.Add(
             hidden_states,
             op.Mul(
-                self.feed_forward1(
-                    op, self.norm_feed_forward1(op, hidden_states)
-                ),
+                self.feed_forward1(op, self.norm_feed_forward1(op, hidden_states)),
                 half,
             ),
         )
@@ -437,9 +428,7 @@ class _ParakeetEncoderLayer(nn.Module):
         hidden_states = op.Add(
             hidden_states,
             op.Mul(
-                self.feed_forward2(
-                    op, self.norm_feed_forward2(op, hidden_states)
-                ),
+                self.feed_forward2(op, self.norm_feed_forward2(op, hidden_states)),
                 half,
             ),
         )
@@ -465,12 +454,8 @@ class ParakeetFastConformerEncoder(nn.Module):
         self._num_subsampling_layers = int(math.log2(config.subsampling_factor))
         self._subsampling_kernel = config.subsampling_conv_kernel_size
         self._subsampling_stride = config.subsampling_conv_stride
-        self._subsampling_padding = (
-            config.subsampling_conv_kernel_size - 1
-        ) // 2
-        self._input_scale = (
-            math.sqrt(config.hidden_size) if config.scale_input else 1.0
-        )
+        self._subsampling_padding = (config.subsampling_conv_kernel_size - 1) // 2
+        self._input_scale = math.sqrt(config.hidden_size) if config.scale_input else 1.0
 
     def _output_mask(
         self,
@@ -483,12 +468,8 @@ class ParakeetFastConformerEncoder(nn.Module):
             axes=[1],
             keepdims=0,
         )
-        add_pad = (
-            2 * self._subsampling_padding - self._subsampling_kernel
-        )
-        stride = op.Constant(
-            value=ir.tensor(np.int64(self._subsampling_stride))
-        )
+        add_pad = 2 * self._subsampling_padding - self._subsampling_kernel
+        stride = op.Constant(value=ir.tensor(np.int64(self._subsampling_stride)))
         for _ in range(self._num_subsampling_layers):
             lengths = op.Add(
                 op.Div(
@@ -521,9 +502,7 @@ class ParakeetFastConformerEncoder(nn.Module):
             hidden_states, _scalar_like(op, self._input_scale, hidden_states)
         )
         position_embeddings = self.encode_positions(op, hidden_states)
-        output_mask = self._output_mask(
-            op, attention_mask, _dim(op, hidden_states, 1)
-        )
+        output_mask = self._output_mask(op, attention_mask, _dim(op, hidden_states, 1))
         attention_mask_4d = op.And(
             op.Unsqueeze(output_mask, op.Constant(value_ints=[1, 2])),
             op.Unsqueeze(output_mask, op.Constant(value_ints=[1, 3])),
