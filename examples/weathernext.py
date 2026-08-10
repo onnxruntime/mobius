@@ -137,16 +137,18 @@ class WeatherNextGridMeshBlock(nn.Module):
             flat_grid_shape,
         )
 
-        # Aggregate grid points onto the mesh with a fixed sparse-style projection:
-        # [mesh_points, grid_points] @ [B, grid_points, hidden] -> [B, mesh_points, hidden].
+        # Aggregate grid points onto the mesh with a fixed sparse-style projection.
+        # MatMul broadcasts the 2-D projection over batch:
+        # [mesh_nodes, grid_points] @ [B, grid_points, hidden] -> [B, mesh_nodes, hidden].
         mesh_latent = op.MatMul(self.grid_to_mesh, grid_points)
 
         # A compact MLP stands in for WeatherNext's mesh GNN/update blocks.
         mesh_delta = op.Tanh(self.mesh_update_in(op, mesh_latent))
         mesh_latent = op.Add(mesh_latent, self.mesh_update_out(op, mesh_delta))
 
-        # Decode mesh latents back onto the lat/lon grid and add the encoded-grid residual:
-        # [grid_points, mesh_points] @ [B, mesh_points, hidden] -> [B, grid_points, hidden].
+        # Decode mesh latents back onto the lat/lon grid and add the encoded-grid residual.
+        # MatMul again broadcasts the 2-D projection over batch:
+        # [grid_points, mesh_nodes] @ [B, mesh_nodes, hidden] -> [B, grid_points, hidden].
         grid_delta = op.MatMul(self.mesh_to_grid, mesh_latent)
         grid_points = op.Add(grid_points, grid_delta)
 
@@ -235,9 +237,11 @@ def build_weathernext_demo_package(shape: WeatherNextDemoShape, dtype: ir.DataTy
 
     rng = np.random.default_rng(20260810)
     module = WeatherNextGridMeshBlock(rng, shape)
-    # build_from_module currently accepts BaseModelConfig subclasses; ArchitectureConfig
-    # validates a few LLM fields even though this WeatherNext task only reads dtype.
-    # Use the smallest valid inert values: no vocabulary, one dummy attention head.
+    # build_from_module currently accepts BaseModelConfig subclasses; this task reads only
+    # config.dtype, while build_from_module validates and uses dtype to cast parameters.
+    # The remaining ArchitectureConfig fields are inert validation shims. A production
+    # WeatherNext port should replace this with a dedicated task/config pair that records
+    # grid resolution, variable metadata, and mesh topology instead of LLM placeholders.
     config = ArchitectureConfig(
         vocab_size=0,
         hidden_size=shape.hidden_size,
