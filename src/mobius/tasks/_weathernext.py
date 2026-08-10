@@ -29,7 +29,7 @@ class WeatherNextForecastTask(ModelTask):
 
     input_names: ClassVar[tuple[str, ...]] = ("input_state", "forcings", "sample_noise")
     output_names: ClassVar[tuple[str, ...]] = ("next_state",)
-    model_roles: ClassVar[dict[str, str]] = {"model": "encoder"}
+    model_roles: ClassVar[dict[str, str]] = {"model": "forecast"}
 
     def build(
         self,

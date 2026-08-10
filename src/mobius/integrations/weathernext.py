@@ -128,18 +128,17 @@ def load_xarray_forecast_inputs(
             forcing_variables,
             batch_index=batch_index,
         )
+        rng = np.random.default_rng(sample_noise_seed)
+        sample_noise = rng.standard_normal(
+            (input_state.shape[0], input_state.shape[1], input_state.shape[2], noise_channels)
+        ).astype(np.float32)
+        return {
+            "input_state": input_state,
+            "forcings": forcings,
+            "sample_noise": sample_noise,
+        }
     finally:
         dataset.close()
-
-    rng = np.random.default_rng(sample_noise_seed)
-    sample_noise = rng.standard_normal(
-        (input_state.shape[0], input_state.shape[1], input_state.shape[2], noise_channels)
-    ).astype(np.float32)
-    return {
-        "input_state": input_state,
-        "forcings": forcings,
-        "sample_noise": sample_noise,
-    }
 
 
 def infer_config_from_feeds(
