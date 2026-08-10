@@ -185,6 +185,8 @@ def _stack_xarray_variables(
     *,
     batch_index: int,
 ) -> np.ndarray:
+    if not names:
+        raise ValueError("At least one xarray variable name is required")
     arrays = []
     for name in names:
         if name not in dataset:
@@ -201,4 +203,4 @@ def _stack_xarray_variables(
             )
         arrays.append(array)
     stacked = np.stack(arrays, axis=-1)
-    return stacked[None, ...] if stacked.ndim == 3 else stacked
+    return stacked[None, ...]
