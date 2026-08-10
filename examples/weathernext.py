@@ -235,6 +235,9 @@ def build_weathernext_demo_package(shape: WeatherNextDemoShape, dtype: ir.DataTy
 
     rng = np.random.default_rng(20260810)
     module = WeatherNextGridMeshBlock(rng, shape)
+    # build_from_module currently accepts BaseModelConfig subclasses; ArchitectureConfig
+    # validates a few LLM fields even though this WeatherNext task only reads dtype.
+    # Use the smallest valid inert values: no vocabulary, one dummy attention head.
     config = ArchitectureConfig(
         vocab_size=0,
         hidden_size=shape.hidden_size,
