@@ -88,7 +88,9 @@ def _synthetic_feeds(config: WeatherNextConfig) -> dict[str, np.ndarray]:
     }
 
 
-def _config_from_args(args: argparse.Namespace, feeds: dict[str, np.ndarray] | None):
+def _config_from_args(
+    args: argparse.Namespace, feeds: dict[str, np.ndarray] | None
+) -> WeatherNextConfig:
     dtype = _resolve_dtype(args.dtype)
     if feeds is not None:
         return infer_config_from_feeds(

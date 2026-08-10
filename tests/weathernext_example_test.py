@@ -3,28 +3,19 @@
 
 from __future__ import annotations
 
-import argparse
-import importlib.util
+import os
+import subprocess
 import sys
 from pathlib import Path
 
 import numpy as np
+import onnx_ir as ir
 
 
-def _load_weathernext_example():
-    path = Path(__file__).parents[1] / "examples" / "weathernext.py"
-    spec = importlib.util.spec_from_file_location("weathernext_example", path)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_weathernext_example_infers_config_from_real_npz_inputs(tmp_path):
-    example = _load_weathernext_example()
+def test_weathernext_example_builds_from_real_npz_inputs(tmp_path):
+    repo_root = Path(__file__).parents[1]
     input_path = tmp_path / "sample.npz"
+    output_dir = tmp_path / "weathernext"
     np.savez(
         input_path,
         input_state=np.zeros((1, 3, 4, 2), dtype=np.float32),
@@ -32,25 +23,30 @@ def test_weathernext_example_infers_config_from_real_npz_inputs(tmp_path):
         sample_noise=np.zeros((1, 3, 4, 1), dtype=np.float32),
     )
 
-    args = argparse.Namespace(
-        input_data=str(input_path),
-        input_variable_names=None,
-        forcing_variable_names=None,
-        noise_channels=1,
-        batch_index=0,
-        sample_noise_seed=0,
-        mesh_nodes=5,
-        hidden_size=8,
-        intermediate_size=None,
-        num_hidden_layers=1,
-        dtype="f32",
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(repo_root / "src")
+    subprocess.run(
+        [
+            sys.executable,
+            str(repo_root / "examples" / "weathernext.py"),
+            str(output_dir),
+            "--input-data",
+            str(input_path),
+            "--mesh-nodes",
+            "5",
+            "--hidden-size",
+            "8",
+        ],
+        check=True,
+        cwd=repo_root,
+        env=env,
     )
-    feeds = example._load_real_data(args)
-    config = example._config_from_args(args, feeds)
 
-    assert config.lat == 3
-    assert config.lon == 4
-    assert config.input_variables == 2
-    assert config.forcing_variables == 1
-    assert config.noise_channels == 1
-    assert config.output_variables == 2
+    model = ir.load(output_dir / "model.onnx")
+    assert [value.name for value in model.graph.inputs] == [
+        "input_state",
+        "forcings",
+        "sample_noise",
+    ]
+    assert [value.name for value in model.graph.outputs] == ["next_state"]
+    assert model.graph.outputs[0].shape == ir.Shape(["batch", 3, 4, 2])

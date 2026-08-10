@@ -80,6 +80,13 @@ def build_weathernext_package(
 def load_npz_forecast_inputs(path: str | Path) -> dict[str, np.ndarray]:
     """Load ``input_state``, ``forcings``, and ``sample_noise`` arrays from ``.npz``."""
     with np.load(path) as data:
+        missing = [name for name in _INPUT_NAMES if name not in data]
+        if missing:
+            expected = ", ".join(_INPUT_NAMES)
+            missing_names = ", ".join(missing)
+            raise ValueError(
+                f"WeatherNext input file is missing {missing_names}; expected keys: {expected}"
+            )
         feeds = {name: np.asarray(data[name], dtype=np.float32) for name in _INPUT_NAMES}
     return feeds
 
@@ -186,6 +193,12 @@ def _stack_xarray_variables(
         for dim in value.dims:
             if dim.lower() in {"time", "batch"}:
                 value = value.isel({dim: batch_index})
-        arrays.append(np.asarray(value, dtype=np.float32))
+        array = np.asarray(value, dtype=np.float32)
+        if array.ndim != 2:
+            raise ValueError(
+                f"Variable {name!r} must resolve to a 2-D lat/lon array after "
+                f"time/batch selection, got shape {array.shape}"
+            )
+        arrays.append(array)
     stacked = np.stack(arrays, axis=-1)
     return stacked[None, ...] if stacked.ndim == 3 else stacked

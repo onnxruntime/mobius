@@ -7,7 +7,12 @@ import numpy as np
 import onnx_ir as ir
 import pytest
 
-from mobius import WeatherNextConfig, WeatherNextForecastTask, WeatherNextModel, build_from_module
+from mobius import (
+    WeatherNextConfig,
+    WeatherNextForecastTask,
+    WeatherNextModel,
+    build_from_module,
+)
 from mobius.integrations.weathernext import (
     build_weathernext_package,
     create_demo_state_dict,
@@ -108,3 +113,15 @@ def test_npz_inputs_infer_config(tmp_path):
     assert config.forcing_variables == 2
     assert config.noise_channels == 1
     assert config.output_variables == 3
+
+
+def test_npz_inputs_report_missing_keys(tmp_path):
+    input_path = tmp_path / "missing.npz"
+    np.savez(
+        input_path,
+        input_state=np.zeros((1, 2, 3, 1), dtype=np.float32),
+        forcings=np.zeros((1, 2, 3, 1), dtype=np.float32),
+    )
+
+    with pytest.raises(ValueError, match="sample_noise"):
+        load_npz_forecast_inputs(input_path)
