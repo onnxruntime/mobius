@@ -17,6 +17,8 @@ from mobius._configs import WeatherNextConfig
 from mobius._model_package import ModelPackage
 from mobius.models import WeatherNextModel
 
+_INPUT_NAMES = ("input_state", "forcings", "sample_noise")
+
 
 def load_npz_weights(path: str | Path) -> dict[str, torch.Tensor]:
     """Load a Mobius-aligned WeatherNext state dict from an ``.npz`` file."""
@@ -168,9 +170,6 @@ def infer_config_from_feeds(
         num_hidden_layers=num_hidden_layers,
         dtype=dtype,
     )
-
-
-_INPUT_NAMES = ("input_state", "forcings", "sample_noise")
 
 
 def _stack_xarray_variables(

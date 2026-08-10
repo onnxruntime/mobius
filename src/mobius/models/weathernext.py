@@ -10,13 +10,17 @@ instead, each graph stage is declared directly with ONNX ops.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 import onnx_ir as ir
-import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import WeatherNextConfig
 from mobius.components import Linear, get_activation
+
+if TYPE_CHECKING:
+    import torch
 
 
 def projection_matrix(rows: int, cols: int) -> np.ndarray:
