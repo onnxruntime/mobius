@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import onnx_ir as ir
@@ -12,6 +13,14 @@ from onnxscript import OpBuilder, nn
 
 if TYPE_CHECKING:
     pass
+
+
+def _pair(value: int | Sequence[int], name: str) -> tuple[int, int]:
+    if isinstance(value, int):
+        return value, value
+    if len(value) != 2:
+        raise ValueError(f"{name} must contain exactly two values, got {value!r}")
+    return int(value[0]), int(value[1])
 
 
 class Conv2d(nn.Module):
@@ -25,30 +34,31 @@ class Conv2d(nn.Module):
         self,
         in_channels: int,
         out_channels: int,
-        kernel_size: int = 3,
-        stride: int = 1,
-        padding: int = 0,
+        kernel_size: int | tuple[int, int] = 3,
+        stride: int | tuple[int, int] = 1,
+        padding: int | tuple[int, int] = 0,
         groups: int = 1,
     ):
         super().__init__()
-        self.weight = nn.Parameter(
-            (out_channels, in_channels // groups, kernel_size, kernel_size)
-        )
+        kernel_h, kernel_w = _pair(kernel_size, "kernel_size")
+        self.weight = nn.Parameter((out_channels, in_channels // groups, kernel_h, kernel_w))
         self.bias = nn.Parameter((out_channels,))
-        self._kernel_size = kernel_size
+        self._kernel_size = (kernel_h, kernel_w)
         self._stride = stride
+        self._strides = _pair(stride, "stride")
         self._padding = padding
+        self._pads = _pair(padding, "padding")
         self._groups = groups
 
     def forward(self, op: OpBuilder, x: ir.Value):
-        p = self._padding
+        pad_h, pad_w = self._pads
         return op.Conv(
             x,
             self.weight,
             self.bias,
-            kernel_shape=[self._kernel_size, self._kernel_size],
-            strides=[self._stride, self._stride],
-            pads=[p, p, p, p],
+            kernel_shape=list(self._kernel_size),
+            strides=list(self._strides),
+            pads=[pad_h, pad_w, pad_h, pad_w],
             group=self._groups,
         )
 
@@ -60,28 +70,29 @@ class Conv2dNoBias(nn.Module):
         self,
         in_channels: int,
         out_channels: int,
-        kernel_size: int = 3,
-        stride: int = 1,
-        padding: int = 0,
+        kernel_size: int | tuple[int, int] = 3,
+        stride: int | tuple[int, int] = 1,
+        padding: int | tuple[int, int] = 0,
         groups: int = 1,
     ):
         super().__init__()
-        self.weight = nn.Parameter(
-            (out_channels, in_channels // groups, kernel_size, kernel_size)
-        )
-        self._kernel_size = kernel_size
+        kernel_h, kernel_w = _pair(kernel_size, "kernel_size")
+        self.weight = nn.Parameter((out_channels, in_channels // groups, kernel_h, kernel_w))
+        self._kernel_size = (kernel_h, kernel_w)
         self._stride = stride
+        self._strides = _pair(stride, "stride")
         self._padding = padding
+        self._pads = _pair(padding, "padding")
         self._groups = groups
 
     def forward(self, op: OpBuilder, x: ir.Value):
-        p = self._padding
+        pad_h, pad_w = self._pads
         return op.Conv(
             x,
             self.weight,
-            kernel_shape=[self._kernel_size, self._kernel_size],
-            strides=[self._stride, self._stride],
-            pads=[p, p, p, p],
+            kernel_shape=list(self._kernel_size),
+            strides=list(self._strides),
+            pads=[pad_h, pad_w, pad_h, pad_w],
             group=self._groups,
         )
 

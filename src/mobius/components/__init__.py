@@ -56,6 +56,7 @@ __all__ = [
     "PostNormDecoderLayer",
     "QuantizedEmbedding",
     "QuantizedLinear",
+    "RadioVisionModel",
     "RMSNorm",
     "SelectiveScan",
     "SiLU",
@@ -251,6 +252,7 @@ from mobius.components._qwen25_vl_vision import (
 from mobius.components._qwen25_vl_vision import (
     Qwen25VLVisionRotaryEmbedding as Qwen25VLVisionRotaryEmbedding,
 )
+from mobius.components._radio_vision import RadioVisionModel
 from mobius.components._rms_norm import (
     GatedRMSNorm,
     OffsetRMSNorm,

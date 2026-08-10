@@ -1007,6 +1007,14 @@ def write_ort_genai_config(
             "This is set automatically when building with mobius.build(). "
             "Diffusion models (which have no config) are not supported."
         )
+    if {"vision_encoder", "decoder"}.issubset(pkg) and "embedding" not in pkg:
+        model_type = getattr(config, "model_type", "unknown")
+        raise NotImplementedError(
+            "onnxruntime-genai does not support generic vision encoder-decoder "
+            f"packages such as {model_type!r}. Run the vision_encoder and decoder "
+            "ONNX sessions directly; emitting genai_config.json would create an "
+            "artifact that the runtime cannot load."
+        )
 
     os.makedirs(directory, exist_ok=True)
 

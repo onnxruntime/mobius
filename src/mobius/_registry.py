@@ -28,6 +28,7 @@ from mobius._configs import (
     Gemma4AssistantConfig,
     Gemma4Config,
     MMSConfig,
+    NemotronParseConfig,
     WhisperConfig,
 )
 from mobius.models import (
@@ -73,6 +74,7 @@ from mobius.models import (
     MoECausalLMModel,
     NanoChatCausalLMModel,
     NemotronCausalLMModel,
+    NemotronParseForConditionalGeneration,
     OLMo2CausalLMModel,
     OLMoCausalLMModel,
     Phi3CausalLMModel,
@@ -564,6 +566,11 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "bamba": ModelRegistration(BambaCausalLMModel),
     "jamba": ModelRegistration(JambaCausalLMModel),
     "nemotron_h": ModelRegistration(NemotronHCausalLMModel),
+    "nemotron_parse": ModelRegistration(
+        NemotronParseForConditionalGeneration,
+        task="vision-encoder-decoder",
+        config_class=NemotronParseConfig,
+    ),
     # --- Hybrid linear-attention ---
     "longcat_flash": ModelRegistration(LongcatFlashCausalLMModel),
     # --- Multimodal ---
@@ -863,6 +870,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "csm": "sesame/csm-1b",
     "evolla": "westlake-repl/Evolla-10B-hf",
     "nemotron_h": "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
+    "nemotron_parse": "nvidia/NVIDIA-Nemotron-Parse-2.0",
     "open-llama": "openlm-research/open_llama_3b",
     "persimmon": "adept/persimmon-8b-base",
     "shieldgemma2": "google/shieldgemma-2b",

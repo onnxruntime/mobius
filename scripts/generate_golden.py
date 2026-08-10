@@ -511,6 +511,86 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
         )
 
 
+def _generate_image_to_text(case: TestCase, json_path: Path, device: str) -> None:
+    """Generate Nemotron Parse-style image-to-text reference data."""
+    import torch
+    from PIL import Image
+    from transformers import AutoModel, AutoProcessor
+
+    from mobius._testing.golden import save_generation_json, save_golden_ref
+
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    model = AutoModel.from_pretrained(
+        case.model_id,
+        revision=case.revision,
+        torch_dtype=dtype_map[case.dtype],
+        trust_remote_code=case.trust_remote_code,
+    ).to(device)
+    model.eval()
+    processor = AutoProcessor.from_pretrained(
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
+    )
+    images = [
+        Image.open(Path("testdata") / image_path).convert("RGB") for image_path in case.images
+    ]
+    processed = processor(
+        images=images,
+        text=case.decoder_prompt,
+        return_tensors="pt",
+        add_special_tokens=False,
+    ).to(device)
+    decoder_input_ids = processed["input_ids"]
+
+    with torch.no_grad():
+        outputs = model(
+            pixel_values=processed["pixel_values"],
+            decoder_input_ids=decoder_input_ids,
+        )
+    last_logits = outputs.logits[0, -1].float().cpu().numpy()
+    golden = _extract_logits_golden(last_logits)
+    input_ids = decoder_input_ids.cpu().numpy()
+
+    generated_ids = None
+    if "L5" in case.level:
+        with torch.no_grad():
+            generated = model.generate(
+                pixel_values=processed["pixel_values"],
+                decoder_input_ids=decoder_input_ids,
+                max_new_tokens=case.generation_params.get("max_new_tokens", 20),
+                do_sample=False,
+            )
+        generated_ids = generated[0, input_ids.shape[1] :].cpu().numpy()
+
+    save_golden_ref(
+        json_path,
+        top1_id=golden["top1_id"],
+        top2_id=golden["top2_id"],
+        top10_ids=golden["top10_ids"],
+        top10_logits=golden["top10_logits"],
+        logits_summary=golden["logits_summary"],
+        input_ids=input_ids,
+    )
+
+    if generated_ids is not None:
+        gen_path = json_path.with_name(json_path.stem + "_generation.json")
+        save_generation_json(
+            gen_path,
+            model_id=case.model_id,
+            prompt=case.decoder_prompt,
+            generated_tokens=generated_ids.tolist(),
+            generated_text=processor.decode(
+                generated_ids.tolist(),
+                skip_special_tokens=False,
+            ),
+        )
+
+
 def _generate_speech_to_text(case: TestCase, json_path: Path, device: str) -> None:
     """Generate golden data for a speech-to-text (Whisper) model."""
     import librosa
@@ -1646,6 +1726,7 @@ _GENERATORS = {
     "feature-extraction": _generate_encoder,
     "seq2seq": _generate_seq2seq,
     "image-text-to-text": _generate_vision_language,
+    "image-to-text": _generate_image_to_text,
     "image-classification": _generate_image_classification,
     "speech-to-text": _generate_speech_to_text,
     "speech-language": _generate_speech_language,

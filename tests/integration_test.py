@@ -21,6 +21,7 @@ Run only prefill tests::
 
 from __future__ import annotations
 
+import gc
 import os
 
 import numpy as np
@@ -44,6 +45,114 @@ from mobius._testing.torch_reference import (
     load_torch_multimodal_model,
     torch_forward,
 )
+
+
+@pytest.mark.integration
+@pytest.mark.integration_slow
+def test_nemotron_parse_real_weight_cuda_parity():
+    """Compare real BF16 C-RADIO features and decoder logits on a document image."""
+    if _get_test_device() != "cuda" or not torch.cuda.is_available():
+        pytest.skip("Nemotron Parse real-weight parity requires CUDA")
+
+    import ml_dtypes
+    from transformers import AutoModel, AutoProcessor
+
+    model_id = "nvidia/NVIDIA-Nemotron-Parse-2.0"
+    revision = "635b84d9b09bb9526b9a684d0b2c953d3cc3df05"
+    prompt = "</s><s><predict_bbox><predict_classes><output_markdown><predict_no_text_in_pic>"
+    image_path = os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "testdata",
+        "nemotron-parse-document.png",
+    )
+    processor = AutoProcessor.from_pretrained(
+        model_id,
+        revision=revision,
+        trust_remote_code=True,
+    )
+    processed = processor(
+        images=[Image.open(image_path).convert("RGB")],
+        text=prompt,
+        return_tensors="pt",
+        add_special_tokens=False,
+    )
+    hf_model = AutoModel.from_pretrained(
+        model_id,
+        revision=revision,
+        dtype=torch.bfloat16,
+        trust_remote_code=True,
+    ).to("cuda")
+    hf_model.eval()
+    pixel_values = processed["pixel_values"].to("cuda")
+    decoder_input_ids = processed["input_ids"].to("cuda")
+    with torch.no_grad():
+        encoder_outputs = hf_model.encoder(pixel_values=pixel_values)
+        hf_encoder = encoder_outputs[0].float().cpu().numpy()
+        hf_logits = (
+            hf_model(
+                encoder_outputs=encoder_outputs,
+                decoder_input_ids=decoder_input_ids,
+            )
+            .logits[:, -1]
+            .float()
+            .cpu()
+            .numpy()
+        )
+    del hf_model, encoder_outputs
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    pkg = build(
+        model_id,
+        dtype="bf16",
+        load_weights=True,
+        trust_remote_code=True,
+        execution_provider="cuda",
+    )
+    vision_session = _make_session(pkg["vision_encoder"])
+    decoder_session = _make_session(pkg["decoder"])
+    try:
+        onnx_pixel_values = (
+            processed["pixel_values"].float().cpu().numpy().astype(ml_dtypes.bfloat16)
+        )
+        onnx_encoder = vision_session.run({"pixel_values": onnx_pixel_values})[
+            "last_hidden_state"
+        ]
+        empty_cache = {
+            name: np.zeros(
+                (1, pkg.config.num_key_value_heads, 0, pkg.config.head_dim),
+                dtype=ml_dtypes.bfloat16,
+            )
+            for name in decoder_session.input_names
+            if name.startswith("past_key_values.")
+        }
+        onnx_logits = decoder_session.run(
+            {
+                "input_ids": processed["input_ids"].numpy().astype(np.int64),
+                "attention_mask": np.ones_like(processed["input_ids"].numpy(), dtype=np.int64),
+                "encoder_hidden_states": onnx_encoder,
+                **empty_cache,
+            }
+        )["logits"][:, -1]
+    finally:
+        vision_session.close()
+        decoder_session.close()
+
+    onnx_encoder_f32 = onnx_encoder.astype(np.float32)
+    encoder_cosine = np.dot(onnx_encoder_f32.ravel(), hf_encoder.ravel()) / (
+        np.linalg.norm(onnx_encoder_f32) * np.linalg.norm(hf_encoder)
+    )
+    onnx_logits_f32 = onnx_logits.astype(np.float32)
+    logits_cosine = np.dot(onnx_logits_f32.ravel(), hf_logits.ravel()) / (
+        np.linalg.norm(onnx_logits_f32) * np.linalg.norm(hf_logits)
+    )
+    assert encoder_cosine > 0.99
+    assert logits_cosine > 0.995
+    np.testing.assert_array_equal(
+        np.argmax(onnx_logits_f32, axis=-1),
+        np.argmax(hf_logits, axis=-1),
+    )
 
 
 def _get_test_device() -> str:

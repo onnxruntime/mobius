@@ -87,6 +87,7 @@ __all__ = [
     "NanoChatCausalLMModel",
     "NemotronCausalLMModel",
     "NemotronHCausalLMModel",
+    "NemotronParseForConditionalGeneration",
     "OLMo2CausalLMModel",
     "OLMoCausalLMModel",
     "OPTCausalLMModel",
@@ -236,6 +237,7 @@ from mobius.models.nanochat import NanoChatCausalLMModel
 from mobius.models.nemo_rnnt import EncDecRNNTModel
 from mobius.models.nemotron import NemotronCausalLMModel
 from mobius.models.nemotron_h import NemotronHCausalLMModel
+from mobius.models.nemotron_parse import NemotronParseForConditionalGeneration
 from mobius.models.olmo import OLMo2CausalLMModel, OLMoCausalLMModel
 from mobius.models.opt import OPTCausalLMModel
 from mobius.models.persimmon import PersimmonCausalLMModel
