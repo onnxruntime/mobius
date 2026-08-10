@@ -104,7 +104,9 @@ def load_xarray_forecast_inputs(
 
     The selected variables must share latitude/longitude dimensions. Optional
     time dimensions are indexed by ``batch_index`` and each variable is stacked
-    into the trailing channel dimension expected by the ONNX graph.
+    into the trailing channel dimension expected by the ONNX graph. The default
+    noise seed is deterministic so examples are reproducible; pass a different
+    seed when sampling stochastic forecast noise for real workflows.
     """
     try:
         import xarray as xr

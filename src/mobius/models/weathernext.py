@@ -94,8 +94,7 @@ class WeatherNextModel(nn.Module):
         # noise: [B, lat, lon, input+forcing+noise].
         grid_features = op.Concat(input_state, forcings, sample_noise, axis=-1)
 
-        # Encode each lat/lon cell independently, then flatten the spatial grid:
-        # [B, lat, lon, hidden] -> [B, grid_points, hidden].
+        # Encode each lat/lon cell independently: [B, lat, lon, hidden].
         grid_latent = self._activation(op, self.grid_encoder(op, grid_features))
         batch_dim = op.Shape(grid_latent, start=0, end=1)
         flat_grid_shape = op.Concat(
@@ -103,6 +102,7 @@ class WeatherNextModel(nn.Module):
             op.Constant(value_ints=[config.grid_points, config.hidden_size]),
             axis=0,
         )
+        # Flatten the spatial grid: [B, lat, lon, hidden] -> [B, grid_points, hidden].
         grid_points = op.Reshape(grid_latent, flat_grid_shape)
 
         # Aggregate encoded grid cells onto mesh nodes:
