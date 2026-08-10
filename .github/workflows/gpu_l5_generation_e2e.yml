@@ -48,8 +48,6 @@ jobs:
         with:
           path: ~/.cache/huggingface
           key: hf-gpu-${{ hashFiles('testdata/cases/**/*.yaml') }}
-          restore-keys: |
-            hf-gpu-
 
       - name: Install PyTorch (CUDA)
         run: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
