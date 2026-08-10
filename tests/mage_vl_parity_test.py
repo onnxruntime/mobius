@@ -12,8 +12,8 @@ import onnx_ir as ir
 import onnxruntime as ort
 import pytest
 import torch
-import torch.nn.functional as F
 from _test_configs import VL_CONFIGS, _base_config
+from torch.nn import functional
 
 from mobius import build_from_module
 from mobius._registry import registry
@@ -23,7 +23,7 @@ from mobius.tasks import get_task
 
 
 def _linear(x: torch.Tensor, state: dict[str, torch.Tensor], prefix: str) -> torch.Tensor:
-    return F.linear(x, state[f"{prefix}.weight"], state.get(f"{prefix}.bias"))
+    return functional.linear(x, state[f"{prefix}.weight"], state.get(f"{prefix}.bias"))
 
 
 def _layer_norm(
@@ -31,7 +31,7 @@ def _layer_norm(
     state: dict[str, torch.Tensor],
     prefix: str,
 ) -> torch.Tensor:
-    return F.layer_norm(
+    return functional.layer_norm(
         x,
         (x.shape[-1],),
         state[f"{prefix}.weight"],
@@ -48,7 +48,7 @@ def _reference_vision(
 ) -> torch.Tensor:
     prefix = "vision_encoder.visual"
     patch_weight = state[f"{prefix}.embeddings.patch_embedding.weight"]
-    hidden = F.conv2d(pixel_values.reshape(-1, 3, 4, 4), patch_weight, stride=4)
+    hidden = functional.conv2d(pixel_values.reshape(-1, 3, 4, 4), patch_weight, stride=4)
     hidden = hidden.reshape(1, -1, 64)
 
     # Mage-VL uses independent frequency scales for its 4:6:6 T/H/W split.
@@ -78,11 +78,11 @@ def _reference_vision(
         qkv = _linear(normed, state, f"{layer}.self_attn.qkv")
         q, k, v = qkv.chunk(3, dim=-1)
 
-        def _rope(x: torch.Tensor) -> torch.Tensor:
+        def _rope(x: torch.Tensor, target_dtype: torch.dtype = qkv.dtype) -> torch.Tensor:
             x = x.reshape(1, x.shape[1], 2, 32).float()
             even, odd = x[..., ::2], x[..., 1::2]
             rotated = torch.stack((-odd, even), dim=-1).flatten(-2)
-            return (x * cos + rotated * sin).to(qkv.dtype)
+            return (x * cos + rotated * sin).to(target_dtype)
 
         q = _rope(q).transpose(1, 2)
         k = _rope(k).transpose(1, 2)
@@ -96,11 +96,11 @@ def _reference_vision(
         residual = hidden
         hidden = _layer_norm(hidden, state, f"{layer}.layer_norm2")
         hidden = _linear(hidden, state, f"{layer}.mlp.fc1")
-        hidden = F.gelu(hidden)
+        hidden = functional.gelu(hidden)
         hidden = residual + _linear(hidden, state, f"{layer}.mlp.fc2")
 
     hidden = _layer_norm(hidden, state, f"{prefix}.merger.ln_q").reshape(-1, 256)
-    hidden = F.gelu(_linear(hidden, state, f"{prefix}.merger.mlp.0"))
+    hidden = functional.gelu(_linear(hidden, state, f"{prefix}.merger.mlp.0"))
     return _linear(hidden, state, f"{prefix}.merger.mlp.2")
 
 
@@ -160,9 +160,7 @@ def test_mage_vl_decode_embedding_accepts_no_new_media(tmp_path):
     """Single-token decode can run with an empty packed feature tensor."""
     overrides = next(overrides for mt, overrides, _ in VL_CONFIGS if mt == "mage_vl")
     config = _base_config(**overrides)
-    embedding = get_task("mage-vl").build(registry.get("mage_vl")(config), config)[
-        "embedding"
-    ]
+    embedding = get_task("mage-vl").build(registry.get("mage_vl")(config), config)["embedding"]
     state = {
         name: torch.randn(tuple(value.shape), generator=torch.Generator().manual_seed(1))
         for name, value in embedding.graph.initializers.items()
@@ -205,9 +203,7 @@ def test_mage_vl_embedding_uses_global_media_order_across_batch(tmp_path):
     """Packed visual features continue across prompt rows instead of restarting."""
     overrides = next(overrides for mt, overrides, _ in VL_CONFIGS if mt == "mage_vl")
     config = _base_config(**overrides)
-    embedding = get_task("mage-vl").build(registry.get("mage_vl")(config), config)[
-        "embedding"
-    ]
+    embedding = get_task("mage-vl").build(registry.get("mage_vl")(config), config)["embedding"]
     state = {
         name: torch.randn(tuple(value.shape), generator=torch.Generator().manual_seed(2))
         for name, value in embedding.graph.initializers.items()

@@ -93,8 +93,8 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "qwen3_vl": "qwen3_vl",
     "qwen3_vl_text": "qwen3_vl",
     # Mage-VL reuses the Qwen multimodal package layout. Its decoder graph
-    # remains ordinary 1D-RoPE Qwen3; native media processing has a documented
-    # patch_positions limitation, so only text-only generation is native today.
+    # remains ordinary 1D-RoPE Qwen3; native generation is waived until the
+    # runtime supports both 1D decoder positions and patch_positions.
     "mage_vl": "qwen2_5_vl",
     "qwen3_5": "qwen2_5_vl",
     "qwen3_5_vl": "qwen2_5_vl",
@@ -1025,14 +1025,14 @@ def _write_genai_config(
             if model_type == "mage_vl" and vision_input_mapping is not None:
                 # ORT GenAI 0.15 rejects unknown vision input mapping keys while
                 # Mage-VL requires per-patch sampled-frame positions. Keep the
-                # config loadable for text-only generation; callers using media
-                # must run the standardized three-model package directly until
-                # the runtime schema and processor expose patch_positions.
+                # config schema-loadable for inspection; callers must run the
+                # standardized three-model package directly until the runtime
+                # supports both this input and Mage-VL's 1D decoder positions.
                 vision_input_mapping.pop("patch_positions", None)
                 logger.warning(
                     "ORT GenAI does not support Mage-VL's required patch_positions "
-                    "vision input; the generated config supports text-only generation. "
-                    "Run the standardized ONNX sub-models directly for image/video input."
+                    "vision input or 1D decoder position contract; native generation "
+                    "is unavailable. Run the standardized ONNX sub-models directly."
                 )
 
             # spatial_merge_size and config_filename are config-level
