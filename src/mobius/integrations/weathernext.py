@@ -146,6 +146,7 @@ def infer_config_from_feeds(
     *,
     mesh_nodes: int,
     hidden_size: int,
+    output_variables: int | None = None,
     intermediate_size: int | None = None,
     num_hidden_layers: int = 1,
     dtype: ir.DataType = ir.DataType.FLOAT,
@@ -170,7 +171,9 @@ def infer_config_from_feeds(
         input_variables=int(input_state.shape[3]),
         forcing_variables=int(forcings.shape[3]),
         noise_channels=int(sample_noise.shape[3]),
-        output_variables=int(input_state.shape[3]),
+        output_variables=int(
+            input_state.shape[3] if output_variables is None else output_variables
+        ),
         hidden_size=hidden_size,
         intermediate_size=intermediate_size or 4 * hidden_size,
         num_hidden_layers=num_hidden_layers,

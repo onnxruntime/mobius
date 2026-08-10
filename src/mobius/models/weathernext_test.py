@@ -104,7 +104,12 @@ def test_npz_inputs_infer_config(tmp_path):
     )
 
     feeds = load_npz_forecast_inputs(input_path)
-    config = infer_config_from_feeds(feeds, mesh_nodes=7, hidden_size=8)
+    config = infer_config_from_feeds(
+        feeds,
+        mesh_nodes=7,
+        hidden_size=8,
+        output_variables=4,
+    )
 
     assert config.lat == 5
     assert config.lon == 6
@@ -112,7 +117,7 @@ def test_npz_inputs_infer_config(tmp_path):
     assert config.input_variables == 3
     assert config.forcing_variables == 2
     assert config.noise_channels == 1
-    assert config.output_variables == 3
+    assert config.output_variables == 4
 
 
 def test_npz_inputs_report_missing_keys(tmp_path):

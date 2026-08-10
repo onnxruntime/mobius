@@ -97,6 +97,7 @@ def _config_from_args(
             feeds,
             mesh_nodes=args.mesh_nodes,
             hidden_size=args.hidden_size,
+            output_variables=args.output_variables,
             intermediate_size=args.intermediate_size,
             num_hidden_layers=args.num_hidden_layers,
             dtype=dtype,
@@ -108,7 +109,9 @@ def _config_from_args(
         input_variables=args.input_variables,
         forcing_variables=args.forcing_variables,
         noise_channels=args.noise_channels,
-        output_variables=args.output_variables,
+        output_variables=args.input_variables
+        if args.output_variables is None
+        else args.output_variables,
         hidden_size=args.hidden_size,
         intermediate_size=args.intermediate_size or 4 * args.hidden_size,
         num_hidden_layers=args.num_hidden_layers,
@@ -148,7 +151,9 @@ def _parse_args() -> argparse.Namespace:
         "--noise-channels", type=int, default=2, help="Stochastic noise channels."
     )
     parser.add_argument(
-        "--output-variables", type=int, default=5, help="Synthetic output channels."
+        "--output-variables",
+        type=int,
+        help="Output channels. Defaults to input-variable count for synthetic and real data.",
     )
     parser.add_argument("--hidden-size", type=int, default=16, help="Latent feature size.")
     parser.add_argument("--intermediate-size", type=int, help="Mesh MLP intermediate size.")
