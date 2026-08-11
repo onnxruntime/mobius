@@ -1202,8 +1202,8 @@ def write_ort_genai_config(
     if getattr(config, "model_type", None) == "moonshine":
         raise NotImplementedError(
             "onnxruntime-genai does not support Moonshine's variable-length raw-waveform "
-            "encoder. Export with runtime='onnx-genai' or run the encoder and cached "
-            "decoder directly with onnxruntime."
+            "encoder. Run the exported encoder and cached decoder directly with "
+            "ONNX Runtime."
         )
 
     os.makedirs(directory, exist_ok=True)

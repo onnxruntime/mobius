@@ -2996,8 +2996,7 @@ class TestBuildGraphMoonshine:
         assert "decoder.layers.0.encoder_attn.q_proj.weight" in decoder_initializers
         assert "decoder.layers.0.mlp.fc1.weight" in decoder_initializers
         assert "decoder.proj_out.weight" in decoder_initializers
-        assert "GroupNormalization" not in {node.op_type for node in package["encoder"].graph}
-        assert "ReduceMean" in {node.op_type for node in package["encoder"].graph}
+        assert "GroupNormalization" in {node.op_type for node in package["encoder"].graph}
 
 
 class TestBuildGraphQwen3ASR:

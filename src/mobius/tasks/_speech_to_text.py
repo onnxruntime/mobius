@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Speech-to-text task for encoder-decoder ASR models."""
+"""Build configurable encoder and cached-decoder graphs for speech-to-text models."""
 
 from __future__ import annotations
 
@@ -25,19 +25,25 @@ from mobius.tasks._cache_utils import (
 
 
 class SpeechToTextTask(ModelTask):
-    """Encoder-decoder speech-to-text task.
+    """Encoder-decoder task shared by Whisper- and Moonshine-style ASR models.
 
     This task builds **two** separate ONNX models via :meth:`build`:
 
-    - **encoder**: the model-declared audio input, plus an optional
-      ``attention_mask`` → ``encoder_hidden_states`` and an optional
-      ``encoder_attention_mask``
+    - **encoder**: the audio input named by
+      :attr:`SpeechToTextConfig.encoder_input_name` and, when
+      :attr:`SpeechToTextConfig.encoder_uses_attention_mask` is true, an
+      ``attention_mask``. It returns ``encoder_hidden_states`` and, for masked
+      encoders such as Moonshine, ``encoder_attention_mask``.
     - **decoder**: ``decoder_input_ids``, ``encoder_hidden_states``,
-      optional ``encoder_attention_mask``, ``position_ids``, ``past_key_values``
-      → ``logits``, ``present_key_values``
+      ``position_ids``, and ``past_key_values``. When
+      :attr:`SpeechToTextConfig.decoder_uses_encoder_attention_mask` is true,
+      the encoder's mask is also routed to the decoder. It returns ``logits``
+      and ``present_key_values``.
 
     The module must expose ``model.encoder`` and ``model.decoder`` sub-modules
-    following the common encoder-decoder speech model layout.
+    following this configurable contract. Whisper uses ``input_features``
+    without an encoder mask; Moonshine uses ``input_values`` and routes its
+    downsampled encoder mask into cross-attention.
     """
 
     model_roles: ClassVar[dict[str, str]] = {"encoder": "encoder", "decoder": "decoder"}
@@ -68,6 +74,7 @@ class SpeechToTextTask(ModelTask):
         encoder: nn.Module,
         config: SpeechToTextConfig,
     ) -> ir.Model:
+        """Build the encoder graph from the configured audio input and mask contract."""
         batch = ir.SymbolicDim("batch")
         audio_seq_len = ir.SymbolicDim("audio_seq_len")
 
@@ -109,6 +116,7 @@ class SpeechToTextTask(ModelTask):
         decoder: nn.Module,
         config: SpeechToTextConfig,
     ) -> ir.Model:
+        """Build the cached decoder, routing the encoder mask only when configured."""
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
         past_seq_len = ir.SymbolicDim("past_sequence_len")

@@ -68,8 +68,10 @@ def test_moonshine_native_runtime_is_rejected(tmp_path):
     with pytest.raises(
         NotImplementedError,
         match="variable-length raw-waveform encoder",
-    ):
+    ) as error:
         write_ort_genai_config(package, str(tmp_path))
+    assert "onnx-genai" not in str(error.value)
+    assert "ONNX Runtime" in str(error.value)
 
 
 def _make_fake_llm_pkg(model_type: str = "qwen2"):

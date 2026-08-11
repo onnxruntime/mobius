@@ -16,12 +16,32 @@ import transformers
 from mobius import build, build_from_module
 from mobius._configs import MoonshineConfig
 from mobius._testing.comparison import assert_logits_close
+from mobius._testing.golden import (
+    discover_test_cases,
+    generation_json_path_for_case,
+    load_generation_golden,
+)
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.models import MoonshineForConditionalGeneration
 from mobius.tasks import SpeechToTextTask
 
 _MODEL_ID = "moonshine-ai/moonshine-tiny"
 _AUDIO_PATH = Path(__file__).parent.parent / "testdata" / "652-129742-0006.flac"
+
+
+def test_moonshine_l5_generation_reference_is_declared_and_valid():
+    cases = [
+        case
+        for case in discover_test_cases(level="L5")
+        if case.model_id == _MODEL_ID
+    ]
+    assert len(cases) == 1
+    case = cases[0]
+    generation_path = generation_json_path_for_case(case)
+    assert generation_path.exists()
+    generated_tokens = load_generation_golden(case)
+    assert generated_tokens
+    assert all(isinstance(token, int) for token in generated_tokens)
 
 
 def _tiny_hf_config() -> transformers.MoonshineConfig:
