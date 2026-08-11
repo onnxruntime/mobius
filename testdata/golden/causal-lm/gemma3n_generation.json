@@ -1,0 +1,27 @@
+{
+  "model_id": "google/gemma-3n-E2B-it",
+  "prompt": "Here is my poem:",
+  "generated_tokens": [
+    108,
+    1018,
+    818,
+    43015,
+    2025,
+    19657,
+    1018,
+    108,
+    902,
+    37676,
+    5268,
+    236764,
+    496,
+    6789,
+    83180,
+    236764,
+    107,
+    236776,
+    3710,
+    529
+  ],
+  "generated_text": "\n\n**The Clockwork Heart**\n\nIn shadows deep, a secret sleeps,\nA heart of"
+}
