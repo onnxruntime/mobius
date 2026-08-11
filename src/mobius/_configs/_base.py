@@ -1330,7 +1330,7 @@ class Lfm2Config(CausalLMConfig):
 
     @property
     def effective_intermediate_size(self) -> int:
-        """Return the MLP width constructed by HuggingFace's ``Lfm2MLP``."""
+        """The MLP width constructed by HuggingFace's ``Lfm2MLP``."""
         intermediate_size = self.intermediate_size
         if self.block_auto_adjust_ff_dim:
             intermediate_size = int(2 * intermediate_size / 3)
