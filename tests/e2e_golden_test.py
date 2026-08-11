@@ -27,10 +27,12 @@ from __future__ import annotations
 import dataclasses
 import functools
 import os
+import shutil
 import warnings
 from pathlib import Path
 from unittest import mock
 
+import huggingface_hub.constants as hf_constants
 import numpy as np
 import pytest
 
@@ -279,24 +281,37 @@ def _make_empty_kv_cache(
 
 
 @pytest.fixture(autouse=True)
-def _use_temp_hf_cache(tmp_path):
+def _use_temp_hf_cache(tmp_path, monkeypatch):
     """Redirect HuggingFace downloads to a per-test temp dir.
 
-    Each test gets a fresh cache that is deleted when the test finishes,
-    so only one model's weights are on disk at a time.  This prevents
-    unbounded disk growth across the full test suite.
+    Hugging Face resolves cache constants when its module is imported, so
+    changing only ``HF_HOME`` is too late for this test module. Patch the
+    runtime constants as well, including the Xet chunk cache used by large
+    checkpoints, and eagerly delete the cache after each test. This keeps
+    all-model GPU golden runs within the hosted runner's disk limit.
 
     Each pytest-xdist worker gets its own ``tmp_path``, so parallel
     workers don't collide.
     """
-    cache_dir = str(tmp_path / "hf_cache")
-    old = os.environ.get("HF_HOME")
-    os.environ["HF_HOME"] = cache_dir
-    yield
-    if old is None:
-        os.environ.pop("HF_HOME", None)
-    else:
-        os.environ["HF_HOME"] = old
+    cache_root = tmp_path / "hf_cache"
+    hub_cache = cache_root / "hub"
+    assets_cache = cache_root / "assets"
+    xet_cache = cache_root / "xet"
+
+    monkeypatch.setenv("HF_HOME", str(cache_root))
+    monkeypatch.setenv("HF_HUB_CACHE", str(hub_cache))
+    monkeypatch.setenv("HF_ASSETS_CACHE", str(assets_cache))
+    monkeypatch.setenv("HF_XET_CACHE", str(xet_cache))
+    monkeypatch.setattr(hf_constants, "HF_HOME", str(cache_root))
+    monkeypatch.setattr(hf_constants, "HF_HUB_CACHE", str(hub_cache))
+    monkeypatch.setattr(hf_constants, "HF_ASSETS_CACHE", str(assets_cache))
+    monkeypatch.setattr(hf_constants, "HF_XET_CACHE", str(xet_cache))
+
+    try:
+        yield
+    finally:
+        if cache_root.exists():
+            shutil.rmtree(cache_root)
 
 
 # ---------------------------------------------------------------------------
