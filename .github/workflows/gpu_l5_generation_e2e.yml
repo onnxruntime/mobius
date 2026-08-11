@@ -5,6 +5,13 @@ on:
     # Run nightly at 5am UTC (after L4 golden tests)
     - cron: '0 5 * * *'
   workflow_dispatch:
+    inputs:
+      affected_models:
+        description: >-
+          JSON array of model names. Empty string or empty array runs all models.
+        required: false
+        type: string
+        default: ""
   workflow_call:
     inputs:
       affected_models:
