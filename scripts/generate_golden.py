@@ -211,12 +211,28 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
     from mobius._testing.golden import save_generation_json, save_golden_ref
     from mobius._testing.torch_reference import (
         load_torch_model,
+        load_torch_multimodal_model,
         torch_forward,
     )
 
-    model, tokenizer = load_torch_model(
-        case.model_id, device=device, trust_remote_code=case.trust_remote_code
-    )
+    is_muse_text = case.model_type == "muse_glimmer_text"
+    if is_muse_text:
+        import torch
+
+        dtype_map = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }
+        model, tokenizer, _ = load_torch_multimodal_model(
+            case.model_id,
+            dtype=dtype_map[case.dtype],
+            device=device,
+        )
+    else:
+        model, tokenizer = load_torch_model(
+            case.model_id, device=device, trust_remote_code=case.trust_remote_code
+        )
 
     encoded = tokenizer(case.prompts[0], return_tensors="np", padding=False)
     input_ids = encoded["input_ids"]
@@ -225,7 +241,17 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
     position_ids = np.arange(seq_len).reshape(1, -1)
 
     # L4: single forward pass → last-token logits
-    logits, _ = torch_forward(model, input_ids, attention_mask, position_ids)
+    if is_muse_text:
+        with torch.no_grad():
+            outputs = model(
+                input_ids=torch.from_numpy(input_ids).to(model.device),
+                attention_mask=torch.from_numpy(attention_mask).to(model.device),
+                position_ids=torch.from_numpy(position_ids).to(model.device),
+                use_cache=False,
+            )
+        logits = outputs.logits.float().cpu().numpy()
+    else:
+        logits, _ = torch_forward(model, input_ids, attention_mask, position_ids)
     last_logits = logits[0, -1, :]  # (vocab_size,)
     golden = _extract_logits_golden(last_logits)
 

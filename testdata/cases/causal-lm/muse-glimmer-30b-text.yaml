@@ -1,0 +1,19 @@
+model_id: "meta-models/Muse-Glimmer-30B"
+model_type: "muse_glimmer_text"
+architecture: "muse_glimmer_text"
+revision: "97c77dff50b2797bcc558fa2d909761dbc575c59"
+task_type: "text-generation"
+dtype: "bfloat16"
+
+inputs:
+  prompts:
+    - "Here is my poem:"
+
+level: "L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+ci_skip_reason: "Muse Glimmer is a 30B dense model requiring about 60 GB of checkpoint storage and a large-memory GPU."
+notes: "Muse Glimmer 30B text-only export using the composite checkpoint's language backbone."
