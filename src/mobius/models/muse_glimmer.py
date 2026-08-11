@@ -485,7 +485,7 @@ class MuseGlimmerVisionEncoderModel(nn.Module):
 
 
 class MuseGlimmerEmbeddingModel(nn.Module):
-    """Normalized token lookup with image/video feature replacement."""
+    """Normalized token lookup with packed image-then-video feature replacement."""
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
@@ -509,15 +509,31 @@ class MuseGlimmerEmbeddingModel(nn.Module):
             op,
             self.embed_tokens(op, input_ids),
         )
-        feature_mask = op.Or(
-            op.Equal(input_ids, self._image_token_id),
-            op.Equal(input_ids, self._video_token_id),
+        image_mask = op.Equal(input_ids, self._image_token_id)
+        video_mask = op.Equal(input_ids, self._video_token_id)
+        feature_mask = op.Or(image_mask, video_mask)
+
+        # HF scatters image and video streams independently. The ONNX input
+        # packs all image features first, then all video features, regardless
+        # of placeholder order or batch boundaries.
+        flat_image_mask = op.Cast(
+            op.Reshape(image_mask, [-1]),
+            to=ir.DataType.INT64,
         )
-        # HF masked_scatter consumes packed features across the flattened batch.
-        flat_mask = op.Reshape(feature_mask, [-1])
-        feature_indices = op.Sub(
-            op.CumSum(op.Cast(flat_mask, to=ir.DataType.INT64), 0),
-            1,
+        flat_video_mask = op.Cast(
+            op.Reshape(video_mask, [-1]),
+            to=ir.DataType.INT64,
+        )
+        image_indices = op.Sub(op.CumSum(flat_image_mask, 0), 1)
+        num_image_features = op.ReduceSum(flat_image_mask, keepdims=0)
+        video_indices = op.Add(
+            op.Sub(op.CumSum(flat_video_mask, 0), 1),
+            num_image_features,
+        )
+        feature_indices = op.Where(
+            op.CastLike(flat_image_mask, image_mask),
+            image_indices,
+            video_indices,
         )
         feature_indices = op.Clip(feature_indices, 0)
         # Where evaluates both branches eagerly. Keep Gather valid when decode

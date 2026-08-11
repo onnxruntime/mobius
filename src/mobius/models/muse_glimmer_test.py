@@ -153,6 +153,27 @@ def test_muse_glimmer_tiny_multimodal_prefill_matches_hf():
         np.testing.assert_array_equal(batched_embeds[0, 0], packed_features[0])
         np.testing.assert_array_equal(batched_embeds[1, 0], packed_features[1])
 
+        # The feature input is packed by modality (all images, then all videos),
+        # while placeholders can appear in any order across batch rows.
+        media_features = np.stack(
+            [
+                np.full(config.hidden_size, 10.0, dtype=np.float32),
+                np.full(config.hidden_size, 20.0, dtype=np.float32),
+                np.full(config.hidden_size, 30.0, dtype=np.float32),
+                np.full(config.hidden_size, 40.0, dtype=np.float32),
+            ]
+        )
+        mixed_embeds = embedding_session.run(
+            {
+                "input_ids": np.array([[101, 5, 100], [100, 6, 101]], dtype=np.int64),
+                "image_features": media_features,
+            }
+        )["inputs_embeds"]
+        np.testing.assert_array_equal(mixed_embeds[0, 0], media_features[2])
+        np.testing.assert_array_equal(mixed_embeds[0, 2], media_features[0])
+        np.testing.assert_array_equal(mixed_embeds[1, 0], media_features[1])
+        np.testing.assert_array_equal(mixed_embeds[1, 2], media_features[3])
+
         decoder_feeds: dict[str, np.ndarray] = {
             "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
