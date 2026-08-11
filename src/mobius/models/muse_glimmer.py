@@ -290,13 +290,13 @@ class MuseGlimmerTextModel(nn.Module):
         position_embeddings = self.rotary_emb(op, position_ids)
         full_attention_bias = create_attention_bias(
             op,
-            input_ids=hidden_states if input_ids is None else input_ids,
+            input_ids=position_ids if input_ids is None else input_ids,
             attention_mask=attention_mask,
             dtype=self._dtype,
         )
         sliding_attention_bias = create_attention_bias(
             op,
-            input_ids=hidden_states if input_ids is None else input_ids,
+            input_ids=position_ids if input_ids is None else input_ids,
             attention_mask=attention_mask,
             sliding_window=self._sliding_window,
             dtype=self._dtype,

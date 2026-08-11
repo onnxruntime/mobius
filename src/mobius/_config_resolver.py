@@ -114,7 +114,15 @@ def _dict_to_pretrained_config(d: dict):
     works correctly.
     """
     import transformers
-    from huggingface_hub.errors import StrictDataclassClassValidationError
+    from huggingface_hub import errors as hub_errors
+
+    # Introduced in newer huggingface_hub releases. Older supported versions
+    # can still construct these configs and should not fail on the import.
+    strict_validation_error = getattr(
+        hub_errors,
+        "StrictDataclassClassValidationError",
+        TypeError,
+    )
 
     # Composite configs (e.g. configs with text_config/thinker_config) may
     # duplicate rope_scaling at the top level.  PretrainedConfig's rope
@@ -148,7 +156,7 @@ def _dict_to_pretrained_config(d: dict):
         AttributeError,
         KeyError,
         TypeError,
-        StrictDataclassClassValidationError,
+        strict_validation_error,
     ) as e:
         # Newer transformers may crash during rope standardization
         # (e.g. Phi4-MM longrope format where PretrainedConfig doesn't

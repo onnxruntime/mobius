@@ -504,7 +504,8 @@ def _create_hf_config(model_type: str, config_overrides: dict):
 
     if hf_model_type == "muse_glimmer_text":
         hf_kwargs["head_dim"] = TINY_HEAD_DIM
-        hf_kwargs["hidden_activation"] = hf_kwargs.pop("hidden_act", "silu")
+        hf_kwargs.setdefault("hidden_activation", hf_kwargs.get("hidden_act", "silu"))
+        hf_kwargs.pop("hidden_act", None)
         hf_kwargs["attention_bias"] = False
         hf_kwargs["rope_parameters"] = {
             "rope_type": "default",
@@ -698,6 +699,8 @@ def _create_hf_model(model_type: str, hf_config, seed: int):
                     logits = self.lm_head(hidden_states)
                     logits = logits * hf_config.output_multiplier
                     cap = hf_config.final_logit_softcapping
+                    if not cap:
+                        return type("MuseGlimmerOutput", (), {"logits": logits})()
                     return type(
                         "MuseGlimmerOutput",
                         (),
