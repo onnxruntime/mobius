@@ -36,6 +36,18 @@ logger = logging.getLogger(__name__)
 #: module class, config parser, and task used to build the ONNX graph.
 _DIFFUSERS_CLASS_MAP: dict[str, tuple[type, type, str]] = {}
 
+# A component class can require a different graph contract in a specific
+# pipeline while retaining the same neural-network implementation.
+_PIPELINE_COMPONENT_TASK_OVERRIDES: dict[str, dict[str, str]] = {
+    "QwenImageEditPlusPipeline": {
+        "AutoencoderKLQwenImage": "qwen-image-edit-vae",
+    },
+}
+
+_PIPELINE_MODEL_TYPES: dict[str, str] = {
+    "QwenImageEditPlusPipeline": "qwen_image_edit",
+}
+
 
 def _init_diffusers_class_map() -> None:
     """Lazily populate the diffusers class map on first use."""
@@ -378,11 +390,9 @@ def build_diffusers_pipeline(
 
         model_module = module_class(config)
 
-        if (
-            pipeline_class == "QwenImageEditPlusPipeline"
-            and class_name == "AutoencoderKLQwenImage"
-        ):
-            task_name = "qwen-image-edit-vae"
+        task_name = _PIPELINE_COMPONENT_TASK_OVERRIDES.get(pipeline_class, {}).get(
+            class_name, task_name
+        )
         sub_pkg = build_from_module(
             model_module,
             config,
@@ -437,8 +447,6 @@ def build_diffusers_pipeline(
             if "processor" in pipeline_index
             else {}
         ),
-        model_type=(
-            "qwen_image_edit" if pipeline_class == "QwenImageEditPlusPipeline" else "diffusers"
-        ),
+        model_type=_PIPELINE_MODEL_TYPES.get(pipeline_class, "diffusers"),
     )
     return package

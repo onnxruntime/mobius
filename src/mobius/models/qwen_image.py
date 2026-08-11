@@ -33,6 +33,8 @@ from mobius.components import (
     SiLU as _SiLU,
 )
 
+_QWEN_TIMESTEP_EMBEDDING_SIZE = 256
+
 # ---------------------------------------------------------------------------
 # Model-specific building blocks
 # ---------------------------------------------------------------------------
@@ -515,7 +517,11 @@ class QwenImageTransformer2DModel(nn.Module):
         self.img_in = _Linear(config.in_channels, hidden_size)
         self.txt_norm = _RMSNorm(config.joint_attention_dim, eps=config.norm_eps)
         self.txt_in = _Linear(config.joint_attention_dim, hidden_size)
-        self.time_text_embed = _TimestepEmbedding(256, hidden_size)
+        # Diffusers QwenImage uses a fixed 256-wide sinusoidal embedding before
+        # projecting to the transformer width; it is not derived from hidden_size.
+        self.time_text_embed = _TimestepEmbedding(
+            _QWEN_TIMESTEP_EMBEDDING_SIZE, hidden_size
+        )
 
         self.transformer_blocks = nn.ModuleList()
         for _ in range(config.num_layers):
@@ -604,7 +610,7 @@ class QwenImageTransformer2DModel(nn.Module):
 
     def _get_timestep_embedding(self, op: OpBuilder, timestep):
         """Compute the fixed 256-wide Qwen sinusoidal timestep embedding."""
-        half_dim = 256 // 2
+        half_dim = _QWEN_TIMESTEP_EMBEDDING_SIZE // 2
         exponent = -math.log(10000.0) / half_dim
         freqs = np.exp(np.arange(half_dim) * exponent).astype(np.float32)
         freq_const = op.Constant(value_floats=freqs.tolist())

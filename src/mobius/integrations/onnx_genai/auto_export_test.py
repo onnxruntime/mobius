@@ -74,7 +74,7 @@ def test_single_diffusion_component_uses_flat_model_path(tmp_path):
     assert metadata["pipeline"]["models"]["denoiser"]["filename"] == "model.onnx"
 
 
-def test_dispatch_qwen_image_edit_metadata_and_assets(tmp_path):
+def test_rejects_unsupported_qwen_image_edit_runtime_export(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "output"
     (source / "scheduler").mkdir(parents=True)
@@ -115,25 +115,13 @@ def test_dispatch_qwen_image_edit_metadata_and_assets(tmp_path):
         model_type="qwen_image_edit",
         processor_config={"patch_size": 14, "merge_size": 2},
     )
-    artifacts = write_onnx_genai_config(
-        pkg,
-        str(output),
-        source=str(source),
-        num_inference_steps=3,
-    )
-
-    with open(artifacts["inference_metadata"], encoding="utf-8") as handle:
-        metadata = yaml.safe_load(handle)
-    pipeline = metadata["pipeline"]
-    assert pipeline["strategy"]["scheduler_config"]["kind"] == "flow_match_euler"
-    assert pipeline["image_edit"]["prompt_prefix_tokens"] == 64
-    assert pipeline["image_edit"]["latent_packing"]["patch_size"] == 2
-    assert pipeline["models"]["text_encoder_vision_encoder"]["type"] == "vision_encoder"
-    assert {
-        "from": "text_encoder.prompt_embeds_mask",
-        "to": "denoiser.encoder_hidden_states_mask",
-    } in pipeline["dataflow"]
-    assert (output / "preprocessor_config.json").is_file()
+    with pytest.raises(ValueError, match="cannot execute Qwen Image Edit"):
+        write_onnx_genai_config(
+            pkg,
+            str(output),
+            source=str(source),
+            num_inference_steps=3,
+        )
 
 
 def test_dispatch_diffusion_emits_clip_tokenizer(tmp_path, monkeypatch):
