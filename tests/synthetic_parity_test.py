@@ -108,6 +108,10 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # dispatch, plus Mamba1 SSM single-token decode FP path differences.
     # Argmax correct, cosine=0.998 — model is functionally correct.
     "jamba": 0.04,
+    # Bamba's hybrid Mamba2 + attention path differs slightly in FP accumulation
+    # order from HuggingFace. Both deterministic seeds keep the same argmax and
+    # cosine >= 0.999996 with max absolute error below 0.0017.
+    "bamba": 0.002,
     # ModernBERT decoder has a 3-component LM head (dense→norm→decoder) whose
     # FP accumulation differs from PyTorch → ~0.043 max diff.
     # Argmax correct, cosine=0.996 — model is functionally correct.
