@@ -23,7 +23,6 @@ from __future__ import annotations
 __all__ = ["build_cosmos3_world_model"]
 
 import dataclasses
-import logging
 from collections.abc import Iterable, Mapping
 from typing import Any
 
