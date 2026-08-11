@@ -671,9 +671,12 @@ class _MiniCPMEmbeddingModel(nn.Module):
             op.Equal(input_ids, self.image_token_id),
             op.Equal(input_ids, self.video_token_id),
         )
+        # HF masked_scatter consumes the packed feature stream in batch-major
+        # order, so flatten before CumSum instead of restarting at each row.
+        flat_media_mask = op.Reshape(media_mask, [-1])
         media_indices = op.Clip(
             op.Sub(
-                op.CumSum(op.Cast(media_mask, to=7), 1),
+                op.CumSum(op.Cast(flat_media_mask, to=ir.DataType.INT64), 0),
                 1,
             ),
             0,
@@ -692,6 +695,7 @@ class _MiniCPMEmbeddingModel(nn.Module):
             media_indices,
             axis=0,
         )
+        features = op.Reshape(features, op.Shape(text_embeds))
         return op.Where(op.Unsqueeze(media_mask, [-1]), features, text_embeds)
 
 

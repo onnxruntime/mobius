@@ -218,21 +218,32 @@ def test_minicpmv4_6_synthetic_vision_parity():
 
 
 def test_minicpmv4_6_embedding_mixes_image_and_video_tokens():
-    """Image and video placeholders share the packed visual-feature stream."""
+    """Packed features follow HF masked_scatter order across batch rows."""
     config = _tiny_config()
     package = MiniCPMVLTask().build(
         MiniCPMV46ForConditionalGeneration(config),
         config,
     )
     rng = np.random.default_rng(42)
-    for initializer in package["embedding"].graph.initializers.values():
+    embedding_weight = None
+    for name, initializer in package["embedding"].graph.initializers.items():
         if initializer.const_value is None:
-            initializer.const_value = ir.tensor(
-                rng.standard_normal(initializer.shape).astype(np.float32)
-            )
+            value = rng.standard_normal(initializer.shape).astype(np.float32)
+            initializer.const_value = ir.tensor(value)
+            if name.endswith("embed_tokens.weight"):
+                embedding_weight = value
+    assert embedding_weight is not None
 
-    input_ids = np.array([[1, 250, 2, 251]], dtype=np.int64)
-    features = rng.standard_normal((2, config.hidden_size)).astype(np.float32)
+    input_ids = np.array(
+        [
+            [1, 250, 2, 251],
+            [251, 3, 250, 4],
+        ],
+        dtype=np.int64,
+    )
+    features = np.arange(4 * config.hidden_size, dtype=np.float32).reshape(
+        4, config.hidden_size
+    )
     session = OnnxModelSession(package["embedding"])
     result = session.run(
         {
@@ -240,7 +251,21 @@ def test_minicpmv4_6_embedding_mixes_image_and_video_tokens():
             "image_features": features,
         }
     )["inputs_embeds"]
-    session.close()
 
-    np.testing.assert_array_equal(result[0, 1], features[0])
-    np.testing.assert_array_equal(result[0, 3], features[1])
+    media_mask = (input_ids == config.image_token_id) | (
+        input_ids == config.video_token_id
+    )
+    expected = embedding_weight[input_ids].copy()
+    expected[media_mask] = features
+    np.testing.assert_array_equal(result, expected)
+
+    # Decode steps without new media pass an empty packed feature stream.
+    decode_ids = np.array([[5], [6]], dtype=np.int64)
+    decode_result = session.run(
+        {
+            "input_ids": decode_ids,
+            "image_features": np.empty((0, config.hidden_size), dtype=np.float32),
+        }
+    )["inputs_embeds"]
+    session.close()
+    np.testing.assert_array_equal(decode_result, embedding_weight[decode_ids])
