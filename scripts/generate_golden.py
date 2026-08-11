@@ -215,8 +215,8 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
         torch_forward,
     )
 
-    is_muse_text = case.model_type == "muse_glimmer_text"
-    if is_muse_text:
+    uses_multimodal_reference = case.reference_loader == "multimodal"
+    if uses_multimodal_reference:
         import torch
 
         dtype_map = {
@@ -241,7 +241,7 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
     position_ids = np.arange(seq_len).reshape(1, -1)
 
     # L4: single forward pass → last-token logits
-    if is_muse_text:
+    if uses_multimodal_reference:
         with torch.no_grad():
             outputs = model(
                 input_ids=torch.from_numpy(input_ids).to(model.device),

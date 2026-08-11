@@ -4,6 +4,7 @@ architecture: "muse_glimmer_text"
 revision: "97c77dff50b2797bcc558fa2d909761dbc575c59"
 task_type: "text-generation"
 dtype: "bfloat16"
+reference_loader: "multimodal"
 
 inputs:
   prompts:
