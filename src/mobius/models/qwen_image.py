@@ -519,9 +519,7 @@ class QwenImageTransformer2DModel(nn.Module):
         self.txt_in = _Linear(config.joint_attention_dim, hidden_size)
         # Diffusers QwenImage uses a fixed 256-wide sinusoidal embedding before
         # projecting to the transformer width; it is not derived from hidden_size.
-        self.time_text_embed = _TimestepEmbedding(
-            _QWEN_TIMESTEP_EMBEDDING_SIZE, hidden_size
-        )
+        self.time_text_embed = _TimestepEmbedding(_QWEN_TIMESTEP_EMBEDDING_SIZE, hidden_size)
 
         self.transformer_blocks = nn.ModuleList()
         for _ in range(config.num_layers):
