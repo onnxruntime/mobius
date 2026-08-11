@@ -251,7 +251,8 @@ class TestWriteProcessorConfig:
         vision.model_type = "muse_glimmer_vision"
         config = mock.MagicMock()
         config.vision = vision
-        config.model_type = "muse_glimmer"
+        # Composite builds unwrap to the text config before processor export.
+        config.model_type = "muse_glimmer_text"
         config.spatial_merge_size = 2
         config.temporal_patch_size = 2
 
