@@ -11,7 +11,7 @@ import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
-from mobius._configs import ArchitectureConfig
+from mobius._configs import ArchitectureConfig, Lfm2Config
 from mobius.components import (
     MLP,
     Attention,
@@ -156,14 +156,20 @@ class Lfm2CausalLMModel(CausalLMModel):
 
     default_task: str = "hybrid-text-generation"
     category: str = "Hybrid Convolution+Attention"
+    config_class: type = Lfm2Config
 
     def __init__(self, config: ArchitectureConfig):
         # LFM2 hardcodes per-head Q/K RMSNorm and SiLU-gated feed-forward blocks.
-        config = dataclasses.replace(
-            config,
-            attn_qk_norm=True,
-            hidden_act=config.hidden_act or "silu",
-        )
+        updates: dict[str, object] = {
+            "attn_qk_norm": True,
+            "hidden_act": config.hidden_act or "silu",
+        }
+        if isinstance(config, Lfm2Config):
+            updates["intermediate_size"] = config.effective_intermediate_size
+            # The width is now materialized; prevent subsequent consumers from
+            # applying the HuggingFace construction-time adjustment again.
+            updates["block_auto_adjust_ff_dim"] = False
+        config = dataclasses.replace(config, **updates)
         super().__init__(config)
         self.model = Lfm2TextModel(config)
         if config.tie_word_embeddings:

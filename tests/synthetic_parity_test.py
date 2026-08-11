@@ -534,7 +534,6 @@ def _create_hf_config(model_type: str, config_overrides: dict):
     if hf_model_type == "lfm2":
         hf_kwargs["conv_L_cache"] = hf_kwargs.pop("short_conv_kernel", 3)
         hf_kwargs["conv_bias"] = hf_kwargs.pop("short_conv_bias", False)
-        hf_kwargs["block_auto_adjust_ff_dim"] = False
         hf_kwargs["norm_eps"] = hf_kwargs.pop("rms_norm_eps")
         hf_kwargs["rope_parameters"] = {
             "rope_type": "default",

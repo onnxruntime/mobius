@@ -32,6 +32,7 @@ from mobius._configs import (
     GraniteMoeHybridConfig,
     JambaConfig,
     JetMoeConfig,
+    Lfm2Config,
     LongcatFlashConfig,
     Mamba2Config,
     MambaConfig,
@@ -132,6 +133,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     (
         "lfm2",
         {
+            "_config_cls": Lfm2Config,
             "layer_types": ["conv", "full_attention"],
             "attn_qk_norm": True,
             "short_conv_kernel": 3,

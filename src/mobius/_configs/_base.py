@@ -1321,6 +1321,39 @@ class MuseGlimmerConfig(ArchitectureConfig):
 
 
 @dataclasses.dataclass
+class Lfm2Config(CausalLMConfig):
+    """Configuration for LFM2's automatically adjusted feed-forward width."""
+
+    block_multiple_of: int = 256
+    block_ffn_dim_multiplier: float | int | None = 1.0
+    block_auto_adjust_ff_dim: bool = True
+
+    @property
+    def effective_intermediate_size(self) -> int:
+        """Return the MLP width constructed by HuggingFace's ``Lfm2MLP``."""
+        intermediate_size = self.intermediate_size
+        if self.block_auto_adjust_ff_dim:
+            intermediate_size = int(2 * intermediate_size / 3)
+            if self.block_ffn_dim_multiplier is not None:
+                intermediate_size = int(self.block_ffn_dim_multiplier * intermediate_size)
+                intermediate_size = self.block_multiple_of * (
+                    (intermediate_size + self.block_multiple_of - 1)
+                    // self.block_multiple_of
+                )
+        return intermediate_size
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Lfm2Config:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        return cls(
+            **_shallow_fields(base),
+            block_multiple_of=getattr(config, "block_multiple_of", 256),
+            block_ffn_dim_multiplier=getattr(config, "block_ffn_dim_multiplier", 1.0),
+            block_auto_adjust_ff_dim=getattr(config, "block_auto_adjust_ff_dim", True),
+        )
+
+
+@dataclasses.dataclass
 class DFlashConfig(CausalLMConfig):
     """Configuration for the DFlash speculative-decoding draft model.
 
