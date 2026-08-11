@@ -38,6 +38,10 @@ multi-component export for pipelines.
 | **Diffusion** | Stable Diffusion (UNet + VAE + ControlNet), Flux, SD3, DiT, QwenImage, HunyuanDiT, CogVideoX |
 | **Adapters** | T2I-Adapter, IP-Adapter |
 
+Mage-VL supports direct three-model ONNX export. ORT GenAI export is currently
+rejected because the runtime cannot supply its required `patch_positions` input
+or Mage-VL's 1D decoder positions.
+
 Supports **290+ Transformers model types** and **10 Diffusers component types**
 across **40+ task types** and **100+ reusable components**.
 

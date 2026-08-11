@@ -27,6 +27,7 @@ from mobius.integrations.ort_genai.auto_export import (
     _write_genai_config,
     _write_vision_processor_config,
     auto_export,
+    export_package,
     write_ort_genai_config,
 )
 
@@ -1163,7 +1164,7 @@ class TestExportForOrtGenai:
         assert model["vision"]["patch_size"] == 16
         assert model["vision"]["window_size"] == 64
 
-    def test_mage_vl_omits_runtime_unsupported_patch_positions_mapping(self, tmp_path):
+    def test_mage_vl_is_rejected_before_writing_runtime_artifacts(self, tmp_path):
         import dataclasses
 
         from mobius._model_package import ModelPackage
@@ -1197,32 +1198,13 @@ class TestExportForOrtGenai:
             config=FakeConfig(),
         )
 
-        def input_mapping(_pkg, component):
-            if component == "vision_encoder":
-                return {
-                    "pixel_values": "pixel_values",
-                    "image_grid_thw": "image_grid_thw",
-                    "patch_positions": "patch_positions",
-                }
-            if component == "embedding":
-                return {
-                    "input_ids": "input_ids",
-                    "image_features": "image_features",
-                }
-            return None
-
-        with mock.patch(
-            "mobius.integrations.ort_genai.auto_export._introspect_inputs",
-            side_effect=input_mapping,
+        output_dir = tmp_path / "ort-genai"
+        with pytest.raises(
+            ValueError,
+            match=r"Mage-VL.*patch_positions.*1D decoder position_ids",
         ):
-            result = write_ort_genai_config(pkg, str(tmp_path))
-
-        with open(result["genai_config"]) as f:
-            data = json.load(f)
-        assert data["model"]["vision"]["inputs"] == {
-            "pixel_values": "pixel_values",
-            "image_grid_thw": "image_grid_thw",
-        }
+            write_ort_genai_config(pkg, str(output_dir))
+        assert not output_dir.exists()
 
     def test_processor_config_not_written_without_vision(self, tmp_path):
         """image_processor.json is NOT written when pkg.config has no vision attr."""
@@ -1954,6 +1936,18 @@ class TestExportPackage:
         # ONNX path is in the manifest (single-component package)
         assert result["model"] == os.path.join(str(tmp_path), "model.onnx")
 
+    def test_mage_vl_is_rejected_before_saving_onnx(self, tmp_path):
+        pkg = self._make_pkg()
+        pkg.config.model_type = "mage_vl"
+
+        with (
+            mock.patch.object(pkg, "save") as save,
+            pytest.raises(ValueError, match=r"Mage-VL.*patch_positions"),
+        ):
+            export_package(pkg, str(tmp_path))
+
+        save.assert_not_called()
+
     def test_propagates_save_kwargs(self, tmp_path, monkeypatch):
         """external_data and progress_bar are forwarded to pkg.save."""
         from mobius.integrations.ort_genai.auto_export import export_package
@@ -2573,6 +2567,18 @@ class TestGemma4RealModel:
         # cpu maps to the portable default build (backward compatible).
         assert captured["execution_provider"] == "default"
         assert captured["text_only"] is False
+
+    def test_auto_export_rejects_mage_vl_before_saving(self, tmp_path):
+        pkg = _make_fake_llm_pkg("mage_vl")
+
+        with (
+            mock.patch("mobius._builder.build", return_value=pkg),
+            mock.patch.object(pkg, "save") as save,
+            pytest.raises(ValueError, match=r"Mage-VL.*patch_positions"),
+        ):
+            auto_export("microsoft/Mage-VL", str(tmp_path))
+
+        save.assert_not_called()
 
     def test_auto_export_produces_genai_config(self, tmp_path):
         """Mock build() to return a tiny package, verify genai_config."""

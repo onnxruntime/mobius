@@ -468,7 +468,7 @@ class TestCLIBuildRuntime:
                 [
                     "build",
                     "--model",
-                    "microsoft/Mage-VL",
+                    "Qwen/Qwen2.5-0.5B",
                     tmpdir,
                     "--no-weights",
                     "--trust-remote-code",
@@ -478,6 +478,34 @@ class TestCLIBuildRuntime:
             )
 
         assert mock_export.call_args.kwargs["trust_remote_code"] is True
+
+    def test_runtime_ort_genai_rejects_mage_vl_before_saving(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                mock.patch("mobius._model_package.ModelPackage.save") as save,
+                mock.patch(
+                    "mobius.integrations.ort_genai.write_ort_genai_config"
+                ) as config_writer,
+                pytest.raises(
+                    SystemExit,
+                    match=r"Mage-VL.*patch_positions.*1D decoder position_ids",
+                ),
+            ):
+                main(
+                    [
+                        "build",
+                        "--model",
+                        "microsoft/Mage-VL",
+                        tmpdir,
+                        "--no-weights",
+                        "--trust-remote-code",
+                        "--runtime",
+                        "ort-genai",
+                    ]
+                )
+
+        save.assert_not_called()
+        config_writer.assert_not_called()
 
     def test_runtime_onnx_genai_uses_native_vlm_emitter(self):
         pkg = mock.MagicMock()

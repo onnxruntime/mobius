@@ -25,6 +25,7 @@ Run::
 from __future__ import annotations
 
 import ast
+import contextlib
 import dataclasses
 import functools
 import os
@@ -67,6 +68,40 @@ def _load_phi3_vision_projector_weights_cached(model_id: str):
 
 # Root of test data (images, audio, etc.)
 _TESTDATA_DIR = Path(__file__).resolve().parent.parent / "testdata"
+_MISSING_ATTRIBUTE = object()
+
+
+@contextlib.contextmanager
+def _temporary_processor_max_pixels(processor: object, max_pixels: int | None):
+    """Temporarily override processor pixel limits and restore their exact state."""
+    if max_pixels is None:
+        yield
+        return
+
+    saved_attributes: list[tuple[object, str, object]] = []
+
+    def override(obj: object | None, name: str) -> None:
+        if obj is None:
+            return
+        saved_attributes.append((obj, name, getattr(obj, name, _MISSING_ATTRIBUTE)))
+        setattr(obj, name, max_pixels)
+
+    image_processor = getattr(processor, "image_processor", None)
+    video_processor = getattr(processor, "video_processor", None)
+    override(image_processor, "max_pixels")
+    image_size = getattr(image_processor, "size", None)
+    if image_size is not None and hasattr(image_size, "longest_edge"):
+        override(image_size, "longest_edge")
+    override(video_processor, "max_pixels")
+
+    try:
+        yield
+    finally:
+        for obj, name, previous in reversed(saved_attributes):
+            if previous is _MISSING_ATTRIBUTE:
+                delattr(obj, name)
+            else:
+                setattr(obj, name, previous)
 
 
 def _get_test_build_ep() -> str:
@@ -233,6 +268,29 @@ def test_phi3_vision_projector_weights_are_cached():
         assert _load_phi3_vision_projector_weights_cached("model-id") is weights
     load.assert_called_once_with("model-id")
     _load_phi3_vision_projector_weights_cached.cache_clear()
+
+
+def test_temporary_processor_max_pixels_restores_none_and_missing_attributes():
+    class ProcessorPart:
+        pass
+
+    image_processor = ProcessorPart()
+    image_processor.max_pixels = None
+    image_processor.size = ProcessorPart()
+    image_processor.size.longest_edge = None
+    video_processor = ProcessorPart()
+    processor = ProcessorPart()
+    processor.image_processor = image_processor
+    processor.video_processor = video_processor
+
+    with _temporary_processor_max_pixels(processor, 1234):
+        assert image_processor.max_pixels == 1234
+        assert image_processor.size.longest_edge == 1234
+        assert video_processor.max_pixels == 1234
+
+    assert image_processor.max_pixels is None
+    assert image_processor.size.longest_edge is None
+    assert not hasattr(video_processor, "max_pixels")
 
 
 def _make_empty_kv_cache(
@@ -1017,28 +1075,8 @@ def _prepare_vl_inputs(
     if videos:
         kwargs["videos"] = videos
         kwargs["num_frames"] = case.video_num_frames
-    image_processor = getattr(processor, "image_processor", None)
-    video_processor = getattr(processor, "video_processor", None)
-    saved_image_max = getattr(image_processor, "max_pixels", None)
-    image_size = getattr(image_processor, "size", None)
-    saved_image_longest = getattr(image_size, "longest_edge", None)
-    saved_video_max = getattr(video_processor, "max_pixels", None)
-    try:
-        if case.media_max_pixels is not None:
-            if image_processor is not None:
-                image_processor.max_pixels = case.media_max_pixels
-                if image_size is not None and saved_image_longest is not None:
-                    image_size.longest_edge = case.media_max_pixels
-            if video_processor is not None:
-                video_processor.max_pixels = case.media_max_pixels
+    with _temporary_processor_max_pixels(processor, case.media_max_pixels):
         processed_pt = processor(**kwargs)
-    finally:
-        if image_processor is not None and saved_image_max is not None:
-            image_processor.max_pixels = saved_image_max
-        if image_size is not None and saved_image_longest is not None:
-            image_size.longest_edge = saved_image_longest
-        if video_processor is not None and saved_video_max is not None:
-            video_processor.max_pixels = saved_video_max
     return {
         key: value.numpy() if hasattr(value, "numpy") else np.array(value)
         for key, value in processed_pt.items()

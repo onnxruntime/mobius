@@ -92,10 +92,6 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "qwen2_vl": "qwen2_5_vl",
     "qwen3_vl": "qwen3_vl",
     "qwen3_vl_text": "qwen3_vl",
-    # Mage-VL reuses the Qwen multimodal package layout. Its decoder graph
-    # remains ordinary 1D-RoPE Qwen3; native generation is waived until the
-    # runtime supports both 1D decoder positions and patch_positions.
-    "mage_vl": "qwen2_5_vl",
     "qwen3_5": "qwen2_5_vl",
     "qwen3_5_vl": "qwen2_5_vl",
 }
@@ -1022,19 +1018,6 @@ def _write_genai_config(
             model_type = getattr(config, "model_type", "")
             vision_input_mapping = _introspect_inputs(pkg, "vision_encoder")
             embedding_input_mapping = _introspect_inputs(pkg, "embedding")
-            if model_type == "mage_vl" and vision_input_mapping is not None:
-                # ORT GenAI 0.15 rejects unknown vision input mapping keys while
-                # Mage-VL requires per-patch sampled-frame positions. Keep the
-                # config schema-loadable for inspection; callers must run the
-                # standardized three-model package directly until the runtime
-                # supports both this input and Mage-VL's 1D decoder positions.
-                vision_input_mapping.pop("patch_positions", None)
-                logger.warning(
-                    "ORT GenAI does not support Mage-VL's required patch_positions "
-                    "vision input or 1D decoder position contract; native generation "
-                    "is unavailable. Run the standardized ONNX sub-models directly."
-                )
-
             # spatial_merge_size and config_filename are config-level
             # properties that cannot be inferred from the graph.
             vision_kwargs: dict[str, Any] = {}
@@ -1164,6 +1147,30 @@ def _write_genai_config(
     return generator.write(output_dir)
 
 
+def _validate_ort_genai_compatibility(pkg: ModelPackage) -> None:
+    """Reject packages whose required inputs cannot be supplied by ORT GenAI."""
+    config = getattr(pkg, "config", None)
+    if getattr(config, "model_type", None) == "parakeet_ctc":
+        raise ValueError(
+            "ORT GenAI does not define a feature-input CTC ASR pipeline; "
+            "export Parakeet CTC as ONNX and run it directly with ONNX Runtime."
+        )
+    if {"vision_encoder", "decoder"}.issubset(pkg) and "embedding" not in pkg:
+        model_type = getattr(config, "model_type", "unknown")
+        raise NotImplementedError(
+            "onnxruntime-genai does not support generic vision encoder-decoder "
+            f"packages such as {model_type!r}. Run the vision_encoder and decoder "
+            "ONNX sessions directly; emitting genai_config.json would create an "
+            "artifact that the runtime cannot load."
+        )
+    if getattr(config, "model_type", None) == "mage_vl":
+        raise ValueError(
+            "ORT GenAI does not support Mage-VL's required patch_positions vision "
+            "input or its 1D decoder position_ids contract. Export without "
+            "--runtime ort-genai to save the runnable direct three-model ONNX package."
+        )
+
+
 def write_ort_genai_config(
     pkg: ModelPackage,
     directory: str,
@@ -1226,19 +1233,7 @@ def write_ort_genai_config(
             "This is set automatically when building with mobius.build(). "
             "Diffusion models (which have no config) are not supported."
         )
-    if config.model_type == "parakeet_ctc":
-        raise ValueError(
-            "ORT GenAI does not define a feature-input CTC ASR pipeline; "
-            "export Parakeet CTC as ONNX and run it directly with ONNX Runtime."
-        )
-    if {"vision_encoder", "decoder"}.issubset(pkg) and "embedding" not in pkg:
-        model_type = getattr(config, "model_type", "unknown")
-        raise NotImplementedError(
-            "onnxruntime-genai does not support generic vision encoder-decoder "
-            f"packages such as {model_type!r}. Run the vision_encoder and decoder "
-            "ONNX sessions directly; emitting genai_config.json would create an "
-            "artifact that the runtime cannot load."
-        )
+    _validate_ort_genai_compatibility(pkg)
 
     if getattr(config, "model_type", None) == "moonshine":
         raise NotImplementedError(
@@ -1515,6 +1510,7 @@ def export_package(
             "Diffusion models (which have no config) are not supported — "
             "use ModelPackage.save() directly for those."
         )
+    _validate_ort_genai_compatibility(pkg)
 
     os.makedirs(output_dir, exist_ok=True)
 
