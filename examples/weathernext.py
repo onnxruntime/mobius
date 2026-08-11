@@ -88,7 +88,7 @@ def _synthetic_feeds(config: WeatherNextConfig) -> dict[str, np.ndarray]:
     }
 
 
-def _numpy_dtype(dtype: ir.DataType) -> type[np.float32] | type[np.float16]:
+def _numpy_dtype(dtype: ir.DataType) -> type[np.float32 | np.float16]:
     if dtype == ir.DataType.FLOAT:
         return np.float32
     if dtype == ir.DataType.FLOAT16:
@@ -134,9 +134,7 @@ def _config_from_args(
     )
 
 
-def _run_with_ort(
-    output_dir: str, feeds: dict[str, np.ndarray], dtype: ir.DataType
-) -> None:
+def _run_with_ort(output_dir: str, feeds: dict[str, np.ndarray], dtype: ir.DataType) -> None:
     try:
         import onnxruntime as ort
     except ImportError:
