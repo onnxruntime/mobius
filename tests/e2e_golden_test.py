@@ -842,6 +842,10 @@ def _run_vl_vision_to_image_features(
                     if hf_key.replace("image_", "pixel_") == name:
                         vis_feeds[name] = val if isinstance(val, np.ndarray) else np.array(val)
                         break
+        for name, value in vis_feeds.items():
+            input_dtype = vis_session.get_input_dtype(name)
+            if input_dtype is not None and value.dtype != input_dtype:
+                vis_feeds[name] = value.astype(input_dtype)
         vis_out = vis_session.run(vis_feeds)
         return vis_out, vis_out[next(iter(vis_out))]
     finally:
@@ -900,7 +904,10 @@ def _run_vision_language_prefill(
                 # Provide empty tensor for unused modalities (e.g. audio_features)
                 shape = emb_session.get_input_shape(name) or []
                 static_shape = [d if isinstance(d, int) and d > 0 else 0 for d in shape]
-                emb_feeds[name] = np.zeros(static_shape, dtype=np.float32)
+                emb_feeds[name] = np.zeros(
+                    static_shape,
+                    dtype=emb_session.get_input_dtype(name) or np.float32,
+                )
         emb_out = emb_session.run(emb_feeds)
     finally:
         emb_session.close()
@@ -1071,7 +1078,10 @@ def _run_vl_generation(
             if name not in emb_feeds:
                 shape = emb_session.get_input_shape(name) or []
                 static_shape = [d if isinstance(d, int) and d > 0 else 0 for d in shape]
-                emb_feeds[name] = np.zeros(static_shape, dtype=np.float32)
+                emb_feeds[name] = np.zeros(
+                    static_shape,
+                    dtype=emb_session.get_input_dtype(name) or np.float32,
+                )
         emb_out = emb_session.run(emb_feeds)
         inputs_embeds = emb_out[next(iter(emb_out))]  # [1, seq_len, hidden_size]
 
@@ -1158,7 +1168,10 @@ def _run_vl_generation(
                 if name not in step_emb_feeds:
                     shape = emb_session.get_input_shape(name) or []
                     static_shape = [d if isinstance(d, int) and d > 0 else 0 for d in shape]
-                    step_emb_feeds[name] = np.zeros(static_shape, dtype=np.float32)
+                    step_emb_feeds[name] = np.zeros(
+                        static_shape,
+                        dtype=emb_session.get_input_dtype(name) or np.float32,
+                    )
             step_emb_out = emb_session.run(step_emb_feeds)
             step_embeds = step_emb_out[next(iter(step_emb_out))]  # [1, 1, hidden_size]
             if embeds_dtype is not None and step_embeds.dtype != embeds_dtype:

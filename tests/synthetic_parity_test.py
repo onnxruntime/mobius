@@ -502,6 +502,18 @@ def _create_hf_config(model_type: str, config_overrides: dict):
     if model_type in _HF_EXTRA_CONFIG:
         hf_kwargs.update(_HF_EXTRA_CONFIG[model_type])
 
+    if hf_model_type == "muse_glimmer_text":
+        hf_kwargs["head_dim"] = TINY_HEAD_DIM
+        hf_kwargs["hidden_activation"] = hf_kwargs.pop("hidden_act", "silu")
+        hf_kwargs["attention_bias"] = False
+        hf_kwargs["rope_parameters"] = {
+            "rope_type": "default",
+            "rope_theta": hf_kwargs.pop("rope_theta", 10_000.0),
+        }
+        hf_kwargs.pop("rope_type", None)
+        hf_kwargs.pop("attn_qk_norm", None)
+        hf_kwargs.pop("no_rope_layers", None)
+
     # Convert layer_types to attn_layer_indices for hybrid Mamba models
     # Bamba uses attn_layer_indices (computed property layers_block_type)
     if hf_model_type in ("bamba",) and "layer_types" in hf_kwargs:
@@ -665,11 +677,36 @@ def _create_hf_config(model_type: str, config_overrides: dict):
 
 def _create_hf_model(model_type: str, hf_config, seed: int):
     """Create a HuggingFace model from config with deterministic init."""
-    from transformers import AutoModelForCausalLM
+    from transformers import AutoModel, AutoModelForCausalLM
 
     torch.manual_seed(seed)
     try:
-        hf_model = AutoModelForCausalLM.from_config(hf_config)
+        if model_type == "muse_glimmer_text":
+
+            class _MuseGlimmerTinyCausalLM(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.model = AutoModel.from_config(hf_config)
+                    self.lm_head = torch.nn.Linear(
+                        hf_config.hidden_size,
+                        hf_config.vocab_size,
+                        bias=False,
+                    )
+
+                def forward(self, **kwargs):
+                    hidden_states = self.model(**kwargs).last_hidden_state
+                    logits = self.lm_head(hidden_states)
+                    logits = logits * hf_config.output_multiplier
+                    cap = hf_config.final_logit_softcapping
+                    return type(
+                        "MuseGlimmerOutput",
+                        (),
+                        {"logits": cap * torch.tanh(logits / cap)},
+                    )()
+
+            hf_model = _MuseGlimmerTinyCausalLM()
+        else:
+            hf_model = AutoModelForCausalLM.from_config(hf_config)
     except Exception as e:
         pytest.skip(f"Cannot create HF model for {model_type}: {type(e).__name__}: {e}")
 

@@ -468,7 +468,9 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
     with torch.no_grad():
         outputs = model(**processed)
 
-    last_logits = outputs.logits[0, -1, :].cpu().numpy()
+    # NumPy has no native bfloat16 dtype; golden summaries are stored as
+    # float64, so normalize logits to float32 before crossing the boundary.
+    last_logits = outputs.logits[0, -1, :].float().cpu().numpy()
     golden = _extract_logits_golden(last_logits)
     input_ids_np = processed["input_ids"].cpu().numpy()
 
