@@ -1337,8 +1337,7 @@ class Lfm2Config(CausalLMConfig):
             if self.block_ffn_dim_multiplier is not None:
                 intermediate_size = int(self.block_ffn_dim_multiplier * intermediate_size)
                 intermediate_size = self.block_multiple_of * (
-                    (intermediate_size + self.block_multiple_of - 1)
-                    // self.block_multiple_of
+                    (intermediate_size + self.block_multiple_of - 1) // self.block_multiple_of
                 )
         return intermediate_size
 
