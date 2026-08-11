@@ -395,7 +395,10 @@ def _size_mapping(size: Any) -> dict[str, Any]:
     if isinstance(size, dict):
         return size
     if hasattr(size, "get"):  # SizeDict and friends
-        return {k: getattr(size, k, None) for k in ("height", "width", "longest_edge", "shortest_edge")}
+        return {
+            k: getattr(size, k, None)
+            for k in ("height", "width", "longest_edge", "shortest_edge")
+        }
     return {}
 
 

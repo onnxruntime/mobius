@@ -45,7 +45,7 @@ Three things genuinely diverge from Gemma 4 and are implemented here:
   and admits ``conf_attention_context_left`` = 13 keys where
   :class:`Gemma4Attention` admits 12 — so that class cannot be subclassed.
 
-**Chunked attention is flattened to full T×T attention here**, which is exactly
+**Chunked attention is flattened to full TxT attention here**, which is exactly
 equivalent for offline inference — see :class:`_Gemma3nAudioAttention`.
 
 **Mask polarity**: HF's ``audio_mel_mask`` is True for *padded* frames.  These
@@ -324,9 +324,7 @@ class _Gemma3nSubSampleConvProjection(nn.Module):
             channels[0], channels[1], freq_dims[0], kernels[1], strides[1], norm_eps
         )
         self.input_proj_in_features = channels[-1] * freq_dims[-1]
-        self.input_proj_linear = Linear(
-            self.input_proj_in_features, hidden_size, bias=False
-        )
+        self.input_proj_linear = Linear(self.input_proj_in_features, hidden_size, bias=False)
         # Original frames per subsampled frame; the encoder needs it to
         # subsample the mask.
         self.time_stride_product = math.prod(stride_h for stride_h, _ in strides)
@@ -389,9 +387,7 @@ class _Gemma3nAudioRelativePositionEmbedding(nn.Module):
         self.span = len(positions)
         self.sin_emb = nn.Parameter(
             [self.span, hidden_size],
-            data=ir.Tensor(
-                _timing_signal(positions, hidden_size), dtype=ir.DataType.FLOAT
-            ),
+            data=ir.Tensor(_timing_signal(positions, hidden_size), dtype=ir.DataType.FLOAT),
         )
 
     def forward(self, op: OpBuilder, queries: ir.Value, seq_len: ir.Value) -> ir.Value:
@@ -411,9 +407,7 @@ class _Gemma3nAudioRelativePositionEmbedding(nn.Module):
         sin_emb = op.CastLike(self.sin_emb, self.pos_proj.weight)
         projected = self.pos_proj(op, sin_emb)  # [span, H * head_dim]
         projected = op.Cast(projected, to=ir.DataType.FLOAT)
-        projected = op.Reshape(
-            projected, op.Constant(value_ints=[-1, num_heads, head_dim])
-        )
+        projected = op.Reshape(projected, op.Constant(value_ints=[-1, num_heads, head_dim]))
         projected = op.Transpose(projected, perm=[1, 2, 0])  # [H, head_dim, span]
         span_scores = op.MatMul(queries, op.Unsqueeze(projected, [0]))  # [B,H,T,span]
 
@@ -438,7 +432,7 @@ class _Gemma3nAudioRelativePositionEmbedding(nn.Module):
 
 
 class _Gemma3nAudioAttention(nn.Module):
-    """Gemma 3n audio self-attention (chunked attention, flattened to T×T).
+    """Gemma 3n audio self-attention (chunked attention, flattened to TxT).
 
     Matches ``Gemma3nAudioAttention``.  HF computes this in chunks: queries are
     grouped into blocks of ``conf_attention_chunk_size`` (``W``) frames, each
@@ -446,7 +440,7 @@ class _Gemma3nAudioAttention(nn.Module):
     ``[W, context]`` validity mask restricts each query inside it.  Working
     that mask through the block indexing, query ``i`` ends up attending exactly
     the keys ``j`` with ``-R <= i - j <= L``, and every masked-out score
-    contributes nothing to its softmax — so the blocked form and a full ``T×T``
+    contributes nothing to its softmax — so the blocked form and a full ``TxT``
     attention under the same local mask are numerically identical for offline
     (whole-utterance) inference.  The flattened form is used here: it avoids
     the pad / unfold / relative-shift chain, which in ONNX would mean dynamic
@@ -819,9 +813,7 @@ class Gemma3nAudioEncoder(nn.Module):
             ]
         )
 
-    def _subsample_mask(
-        self, op: OpBuilder, mask: ir.Value, encodings: ir.Value
-    ) -> ir.Value:
+    def _subsample_mask(self, op: OpBuilder, mask: ir.Value, encodings: ir.Value) -> ir.Value:
         """Pick the mask entry starting each subsampled frame's receptive field.
 
         Matches HF: ``clamp(arange(T') * time_stride_product, max=T - 1)``,

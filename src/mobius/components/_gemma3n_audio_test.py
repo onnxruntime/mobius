@@ -6,7 +6,7 @@
 HF's ``Gemma3nAudioEncoder`` is importable, so the arithmetic is diffed against
 it end to end rather than re-derived.  That parity check is the load-bearing
 one: it is what pins the cumulative group norm, the reverse-causal SSCP
-padding, and the claim that flattening HF's chunked attention to full T×T
+padding, and the claim that flattening HF's chunked attention to full TxT
 attention is exactly equivalent offline.
 
 It is run over a sweep of sequence lengths and context configurations, because
@@ -106,9 +106,7 @@ def _hf_reference(
 ):
     """Build the HF encoder with randomized weights, or skip if unavailable."""
     torch = pytest.importorskip("torch")
-    config_mod = pytest.importorskip(
-        "transformers.models.gemma3n.configuration_gemma3n"
-    )
+    config_mod = pytest.importorskip("transformers.models.gemma3n.configuration_gemma3n")
     modeling = pytest.importorskip("transformers.models.gemma3n.modeling_gemma3n")
 
     torch.manual_seed(seed)
@@ -271,8 +269,7 @@ def test_no_activation_clipping_bounds():
     """
     names = {n for n, _ in _make_encoder().named_parameters()}
     assert not any(
-        n.endswith((".input_min", ".input_max", ".output_min", ".output_max"))
-        for n in names
+        n.endswith((".input_min", ".input_max", ".output_min", ".output_max")) for n in names
     )
 
 
@@ -336,14 +333,10 @@ def test_timing_signal_matches_huggingface():
     """The sinusoid must use HF's concatenated (not interleaved) layout."""
     _, _, torch = _hf_reference()
     modeling = pytest.importorskip("transformers.models.gemma3n.modeling_gemma3n")
-    config_mod = pytest.importorskip(
-        "transformers.models.gemma3n.configuration_gemma3n"
-    )
+    config_mod = pytest.importorskip("transformers.models.gemma3n.configuration_gemma3n")
 
     hf_rpe = modeling.Gemma3nAudioRelativePositionEmbedding(
-        config_mod.Gemma3nAudioConfig(
-            hidden_size=_HIDDEN, conf_num_attention_heads=_HEADS
-        )
+        config_mod.Gemma3nAudioConfig(hidden_size=_HIDDEN, conf_num_attention_heads=_HEADS)
     )
     positions = np.arange(4, -3, -1)
     expected = hf_rpe._get_timing_signal_1d_pos(

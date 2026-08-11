@@ -349,9 +349,7 @@ class TestWriteProcessorConfig:
         hf_proc = mock.MagicMock()
         hf_proc.image_processor = image_processor
 
-        with mock.patch(
-            "transformers.AutoProcessor.from_pretrained", return_value=hf_proc
-        ):
+        with mock.patch("transformers.AutoProcessor.from_pretrained", return_value=hf_proc):
             path = _write_vision_processor_config(
                 config, str(tmp_path), hf_model_id="google/gemma-3n-E4B-it"
             )
@@ -434,18 +432,14 @@ class TestWriteProcessorConfig:
         hf_proc = mock.MagicMock()
         hf_proc.image_processor = image_processor
 
-        with mock.patch(
-            "transformers.AutoProcessor.from_pretrained", return_value=hf_proc
-        ):
+        with mock.patch("transformers.AutoProcessor.from_pretrained", return_value=hf_proc):
             path = _write_vision_processor_config(
                 config, str(tmp_path), hf_model_id="google/gemma-3n-E4B-it"
             )
 
         with open(path) as f:
             transforms = json.load(f)["processor"]["transforms"]
-        resize = next(
-            t["operation"] for t in transforms if t["operation"]["type"] == "Resize"
-        )
+        resize = next(t["operation"] for t in transforms if t["operation"]["type"] == "Resize")
         assert resize["attrs"]["interpolation"] == expected
 
     def test_unsupported_resample_omits_interpolation(self, tmp_path):
@@ -467,18 +461,14 @@ class TestWriteProcessorConfig:
         hf_proc = mock.MagicMock()
         hf_proc.image_processor = image_processor
 
-        with mock.patch(
-            "transformers.AutoProcessor.from_pretrained", return_value=hf_proc
-        ):
+        with mock.patch("transformers.AutoProcessor.from_pretrained", return_value=hf_proc):
             path = _write_vision_processor_config(
                 config, str(tmp_path), hf_model_id="google/gemma-3n-E4B-it"
             )
 
         with open(path) as f:
             transforms = json.load(f)["processor"]["transforms"]
-        resize = next(
-            t["operation"] for t in transforms if t["operation"]["type"] == "Resize"
-        )
+        resize = next(t["operation"] for t in transforms if t["operation"]["type"] == "Resize")
         assert "interpolation" not in resize["attrs"]
 
     def test_size_mapping_reads_transformers_v5_size_dict(self, tmp_path):
@@ -516,18 +506,14 @@ class TestWriteProcessorConfig:
         hf_proc = mock.MagicMock()
         hf_proc.image_processor = image_processor
 
-        with mock.patch(
-            "transformers.AutoProcessor.from_pretrained", return_value=hf_proc
-        ):
+        with mock.patch("transformers.AutoProcessor.from_pretrained", return_value=hf_proc):
             path = _write_vision_processor_config(
                 config, str(tmp_path), hf_model_id="google/gemma-3n-E4B-it"
             )
 
         with open(path) as f:
             transforms = json.load(f)["processor"]["transforms"]
-        resize = next(
-            t["operation"] for t in transforms if t["operation"]["type"] == "Resize"
-        )
+        resize = next(t["operation"] for t in transforms if t["operation"]["type"] == "Resize")
         assert resize["attrs"]["height"] == 512
         assert resize["attrs"]["width"] == 512
 

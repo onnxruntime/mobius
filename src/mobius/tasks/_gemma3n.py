@@ -27,6 +27,8 @@ Two Gemma 3n traits shape the decoder's cache contract:
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import onnx_ir as ir
 from onnxscript import nn
 
@@ -80,7 +82,7 @@ class Gemma3nTask(ModelTask):
     **Decoder** — standard ``attention_mask`` over ``past + current``.
     """
 
-    model_roles = {
+    model_roles: ClassVar[dict[str, str]] = {
         "decoder": "decoder",
         "vision_encoder": "encoder",
         "audio_encoder": "encoder",

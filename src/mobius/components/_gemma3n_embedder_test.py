@@ -54,9 +54,7 @@ def _make_embedder() -> Gemma3nMultimodalEmbedder:
 def _hf_reference():
     """Build the HF embedder with randomized weights, or skip if unavailable."""
     torch = pytest.importorskip("torch")
-    config_mod = pytest.importorskip(
-        "transformers.models.gemma3n.configuration_gemma3n"
-    )
+    config_mod = pytest.importorskip("transformers.models.gemma3n.configuration_gemma3n")
     modeling = pytest.importorskip("transformers.models.gemma3n.modeling_gemma3n")
 
     torch.manual_seed(0)
@@ -112,9 +110,7 @@ def _build_session(embedder, inputs, build_outputs, state):
             param.const_value = ir.tensor(state[name])
 
     proto = ir.serde.serialize_model(ir.Model(graph, ir_version=11))
-    return ort.InferenceSession(
-        proto.SerializeToString(), providers=["CPUExecutionProvider"]
-    )
+    return ort.InferenceSession(proto.SerializeToString(), providers=["CPUExecutionProvider"])
 
 
 def _feature_input(name: str = "inputs_embeds", tokens: int = 5) -> ir.Value:
@@ -193,10 +189,7 @@ def test_forward_requires_exactly_one_input(kwargs):
         inputs=[], outputs=[], nodes=[], name="t", opset_imports={"": OPSET_VERSION}
     )
     op = GraphBuilder(graph).op
-    resolved = {
-        k: (_feature_input() if k == "inputs_embeds" else _id_input())
-        for k in kwargs
-    }
+    resolved = {k: (_feature_input() if k == "inputs_embeds" else _id_input()) for k in kwargs}
     with pytest.raises(ValueError, match="exactly one"):
         embedder(op, **resolved)
 

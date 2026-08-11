@@ -452,15 +452,15 @@ def test_gemma3n_audio_maps_usm_conformer_fields(loaded_hooks):
     assert audio.conf_attention_chunk_size == 12
     assert audio.conf_attention_context_left == 13
     assert audio.conf_attention_context_right == 0
-    assert audio.conf_attention_logit_cap == 50.0
+    assert audio.conf_attention_logit_cap == pytest.approx(50.0)
     assert audio.conf_conv_kernel_size == 5
     assert audio.conf_reduction_factor == 4
-    assert audio.conf_residual_weight == 0.5
+    assert audio.conf_residual_weight == pytest.approx(0.5)
     assert audio.input_feat_size == 128
     assert audio.sscp_conv_channel_size == [128, 32]
     assert audio.sscp_conv_kernel_size == [[3, 3], [3, 3]]
     assert audio.sscp_conv_stride_size == [[2, 2], [2, 2]]
-    assert audio.sscp_conv_group_norm_eps == 1e-3
+    assert audio.sscp_conv_group_norm_eps == pytest.approx(1e-3)
     assert (audio.vocab_offset, audio.vocab_size) == (262272, 128)
     assert audio.audio_token_id == 262273
 

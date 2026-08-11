@@ -109,36 +109,20 @@ _MOBILENETV5_300M_ENC_BLOCKS: tuple[tuple[_BlockSpec, ...], ...] = (
     ),
     # Stage 1: 192x192 in -> 96x96 out, 256 channels.
     (
-        _UIBSpec(
-            out_chs=256, exp_chs=768, dw_start_kernel=3, dw_mid_kernel=5, stride=2
-        ),
-        _UIBSpec(
-            out_chs=256, exp_chs=1024, dw_start_kernel=5, dw_mid_kernel=0, stride=1
-        ),
-        _UIBSpec(
-            out_chs=256, exp_chs=1024, dw_start_kernel=3, dw_mid_kernel=0, stride=1
-        ),
-        _UIBSpec(
-            out_chs=256, exp_chs=1024, dw_start_kernel=5, dw_mid_kernel=0, stride=1
-        ),
-        _UIBSpec(
-            out_chs=256, exp_chs=1024, dw_start_kernel=3, dw_mid_kernel=0, stride=1
-        ),
+        _UIBSpec(out_chs=256, exp_chs=768, dw_start_kernel=3, dw_mid_kernel=5, stride=2),
+        _UIBSpec(out_chs=256, exp_chs=1024, dw_start_kernel=5, dw_mid_kernel=0, stride=1),
+        _UIBSpec(out_chs=256, exp_chs=1024, dw_start_kernel=3, dw_mid_kernel=0, stride=1),
+        _UIBSpec(out_chs=256, exp_chs=1024, dw_start_kernel=5, dw_mid_kernel=0, stride=1),
+        _UIBSpec(out_chs=256, exp_chs=1024, dw_start_kernel=3, dw_mid_kernel=0, stride=1),
     ),
     # Stage 2: 96x96 in -> 48x48 out, 640 channels. First MSFA input.
     (
-        _UIBSpec(
-            out_chs=640, exp_chs=1536, dw_start_kernel=5, dw_mid_kernel=5, stride=2
-        ),
+        _UIBSpec(out_chs=640, exp_chs=1536, dw_start_kernel=5, dw_mid_kernel=5, stride=2),
         *(
-            _UIBSpec(
-                out_chs=640, exp_chs=2560, dw_start_kernel=5, dw_mid_kernel=0, stride=1
-            )
+            _UIBSpec(out_chs=640, exp_chs=2560, dw_start_kernel=5, dw_mid_kernel=0, stride=1)
             for _ in range(7)
         ),
-        _UIBSpec(
-            out_chs=640, exp_chs=640, dw_start_kernel=0, dw_mid_kernel=0, stride=1
-        ),
+        _UIBSpec(out_chs=640, exp_chs=640, dw_start_kernel=0, dw_mid_kernel=0, stride=1),
         *(
             spec
             for _ in range(14)
@@ -162,9 +146,7 @@ _MOBILENETV5_300M_ENC_BLOCKS: tuple[tuple[_BlockSpec, ...], ...] = (
     ),
     # Stage 3: 48x48 in -> 24x24 out, 1280 channels. Second MSFA input.
     (
-        _UIBSpec(
-            out_chs=1280, exp_chs=3840, dw_start_kernel=5, dw_mid_kernel=5, stride=2
-        ),
+        _UIBSpec(out_chs=1280, exp_chs=3840, dw_start_kernel=5, dw_mid_kernel=5, stride=2),
         *(
             spec
             for _ in range(19)
@@ -189,9 +171,7 @@ _MOBILENETV5_300M_ENC_BLOCKS: tuple[tuple[_BlockSpec, ...], ...] = (
 )
 
 
-def _same_padding(
-    kernel_size: int, stride: int, input_size: int
-) -> tuple[int, int, int, int]:
+def _same_padding(kernel_size: int, stride: int, input_size: int) -> tuple[int, int, int, int]:
     """TensorFlow-style ``SAME`` padding as an ONNX ``[top, left, bottom, right]``.
 
     timm builds ``mobilenetv5_300m_enc`` with ``pad_type="same"``, which pads
@@ -284,9 +264,7 @@ class _UniversalInvertedBottleneck(nn.Module):
                 kernel_size=spec.dw_start_kernel,
                 stride=dw_start_stride,
                 groups=in_chs,
-                padding=_same_padding(
-                    spec.dw_start_kernel, dw_start_stride, input_size
-                ),
+                padding=_same_padding(spec.dw_start_kernel, dw_start_stride, input_size),
                 norm_eps=norm_eps,
             )
             input_size //= dw_start_stride
@@ -310,9 +288,7 @@ class _UniversalInvertedBottleneck(nn.Module):
         self.has_layer_scale = layer_scale
         if layer_scale:
             self.layer_scale = _LayerScale2d(spec.out_chs)
-        self.has_skip = (
-            in_chs == spec.out_chs and spec.stride == 1 and not noskip
-        )
+        self.has_skip = in_chs == spec.out_chs and spec.stride == 1 and not noskip
 
     def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
         shortcut = x
@@ -665,9 +641,7 @@ class _MobileNetV5MSFA(nn.Module):
         if stride > 1:
             # Input resolution is an exact multiple of the output, so timm
             # takes the average-pool path rather than bilinear interpolation.
-            x = op.AveragePool(
-                x, kernel_shape=[stride, stride], strides=[stride, stride]
-            )
+            x = op.AveragePool(x, kernel_shape=[stride, stride], strides=[stride, stride])
         return self.norm(op, x)
 
 

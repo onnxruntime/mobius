@@ -181,9 +181,7 @@ class CausalLMTask(ModelTask):
             # (Gemma 3n's ``num_kv_shared_layers``) own fewer cache entries
             # than they have layers; they report the count via this hook.
             count_fn = getattr(module, "kv_cache_layer_count", None)
-            num_cache_layers = (
-                count_fn() if callable(count_fn) else config.num_hidden_layers
-            )
+            num_cache_layers = count_fn() if callable(count_fn) else config.num_hidden_layers
 
             past_key_values = _make_kv_cache_inputs(
                 builder,

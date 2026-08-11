@@ -132,15 +132,15 @@ class TestGemma3nActivationSparsity:
         """Each layer reads its own entry from the pattern."""
         config = _tiny_gemma3n_config(activation_sparsity_pattern=[0.95, 0.0])
 
-        assert Gemma3nMLP(config, layer_idx=0).activation_sparsity == 0.95
-        assert Gemma3nMLP(config, layer_idx=1).activation_sparsity == 0.0
+        assert Gemma3nMLP(config, layer_idx=0).activation_sparsity == pytest.approx(0.95)
+        assert Gemma3nMLP(config, layer_idx=1).activation_sparsity == pytest.approx(0.0)
 
     def test_no_pattern_disables_sparsity(self):
         """Without a pattern the MLP keeps the plain gated path."""
         mlp = Gemma3nMLP(_tiny_gemma3n_config(), layer_idx=0)
 
-        assert mlp.activation_sparsity == 0.0
-        assert mlp._std_multiplier == 0.0
+        assert mlp.activation_sparsity == pytest.approx(0.0)
+        assert mlp._std_multiplier == pytest.approx(0.0)
 
     def test_dense_layer_emits_no_cutoff_ops(self):
         """A zero-sparsity layer must not pay for the mean/std subgraph."""
@@ -309,8 +309,10 @@ class TestGemma3nMultiModalPreprocessWeights:
         assert torch.equal(result["decoder.lm_head.weight"], head)
 
     def test_no_lm_head_when_untied(self):
-        """Without tying, a headless state dict stays headless (a load error
-        downstream is better than silently reusing the embedding)."""
+        """Without tying, a headless state dict stays headless.
+
+        A load error downstream is better than silently reusing the embedding.
+        """
         model = Gemma3nMultiModalModel(_tiny_multimodal_config(tie_word_embeddings=False))
 
         result = model.preprocess_weights(
@@ -382,8 +384,11 @@ class TestGemma3nMultiModalPreprocessWeights:
 
     @pytest.mark.parametrize("modality", ["vision", "audio"])
     def test_embedder_weights_are_duplicated_into_two_components(self, modality):
-        """Each embedder is used soft-path in its tower and hard-path in the
-        embedding graph, so both graphs need all four tensors."""
+        """Both graphs need every tensor of both embedders.
+
+        Each embedder is used soft-path in its own tower and hard-path in the
+        embedding graph.
+        """
         component = "vision_encoder" if modality == "vision" else "audio_encoder"
         model = Gemma3nMultiModalModel(_tiny_multimodal_config())
 
@@ -406,8 +411,11 @@ class TestGemma3nMultiModalPreprocessWeights:
             assert f"{prefix}soft_embedding_norm.weight" in result, prefix
 
     def test_audio_keys_dropped_when_config_has_no_audio(self):
-        """An audio-less package must not be handed audio weights: they would
-        only produce "not applied" warnings for a component that is absent."""
+        """An audio-less package must not be handed audio weights.
+
+        They would only produce "not applied" warnings for a component that is
+        absent.
+        """
         config = _tiny_multimodal_config(audio=None, audio_token_id=None)
         model = Gemma3nMultiModalModel(config)
         assert model.audio_encoder is None
@@ -555,9 +563,9 @@ class TestGemma3nKvSharedCausalMasking:
             return {
                 "input_ids": ids,
                 "attention_mask": np.ones((1, mask_len), dtype=np.int64),
-                "position_ids": np.arange(
-                    mask_len - ids.shape[1], mask_len, dtype=np.int64
-                )[np.newaxis, :],
+                "position_ids": np.arange(mask_len - ids.shape[1], mask_len, dtype=np.int64)[
+                    np.newaxis, :
+                ],
                 **past,
             }
 
@@ -662,9 +670,7 @@ class TestGemma3nMultiModalWeightCoverage:
         self._assert_full_coverage(_tiny_multimodal_config())
 
     def test_all_initializers_covered_without_audio(self):
-        self._assert_full_coverage(
-            _tiny_multimodal_config(audio=None, audio_token_id=None)
-        )
+        self._assert_full_coverage(_tiny_multimodal_config(audio=None, audio_token_id=None))
 
     def test_all_initializers_covered_with_kv_sharing(self):
         """KV sharing removes initializers; it must not remove needed ones."""

@@ -31,6 +31,7 @@ from mobius._constants import OPSET_VERSION
 from mobius.components._conv import RmsNorm2d
 from mobius.components._mobilenetv5 import (
     _MOBILENETV5_300M_ENC_BLOCKS,
+    MobileNetV5Encoder,
     _EdgeResidualSpec,
     _make_block,
     _MobileNetV5MSFA,
@@ -38,7 +39,6 @@ from mobius.components._mobilenetv5 import (
     _same_padding,
     _UIBSpec,
     _UniversalInvertedBottleneck,
-    MobileNetV5Encoder,
 )
 
 # E4B ships 768x768 images. 256 is the smallest resolution the tower accepts
@@ -239,7 +239,7 @@ def test_block_spec_attention_block_counts():
 
 
 def test_block_spec_stage_zero_is_edge_residual_only():
-    """timm's arch_def gives stage 0 ``er_`` blocks; later stages never do."""
+    """Timm's arch_def gives stage 0 ``er_`` blocks; later stages never do."""
     assert all(isinstance(s, _EdgeResidualSpec) for s in _MOBILENETV5_300M_ENC_BLOCKS[0])
     later = [s for stage in _MOBILENETV5_300M_ENC_BLOCKS[1:] for s in stage]
     assert not any(isinstance(s, _EdgeResidualSpec) for s in later)
@@ -403,9 +403,7 @@ def test_mqa_block_mixes_across_spatial_positions():
 
 def test_msfa_fuses_two_resolutions_into_the_soft_token_grid():
     """MSFA upsamples the lower-res input, concatenates, and pools to 16x16."""
-    msfa = _MobileNetV5MSFA(
-        in_chs=12, out_chs=8, input_resolutions=(32, 16), norm_eps=1e-6
-    )
+    msfa = _MobileNetV5MSFA(in_chs=12, out_chs=8, input_resolutions=(32, 16), norm_eps=1e-6)
     high = ir.Value(
         name="high", shape=ir.Shape([1, 4, 32, 32]), type=ir.TensorType(ir.DataType.FLOAT)
     )
@@ -499,9 +497,7 @@ def test_encoder_resolution_flow():
 
 def test_uib_block_without_depthwise_convs_has_no_dw_weights():
     """The ``(0, 0)`` kernel spec is what selects the FFN-only UIB shape."""
-    spec = _UIBSpec(
-        out_chs=64, exp_chs=128, dw_start_kernel=0, dw_mid_kernel=0, stride=1
-    )
+    spec = _UIBSpec(out_chs=64, exp_chs=128, dw_start_kernel=0, dw_mid_kernel=0, stride=1)
     block = _UniversalInvertedBottleneck(64, spec, input_size=8)
     names = {n for n, _ in block.named_parameters()}
     assert not any("dw_start" in n or "dw_mid" in n for n in names)

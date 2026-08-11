@@ -2050,9 +2050,7 @@ class TestBuildGraphVisionLanguage:
         audio = pkg["audio_encoder"]
         audio_inputs = {i.name: i for i in audio.graph.inputs}
         assert set(audio_inputs) == {"input_features", "input_features_mask"}
-        assert list(audio_inputs["input_features"].shape)[-1] == (
-            config.audio.input_feat_size
-        )
+        assert list(audio_inputs["input_features"].shape)[-1] == (config.audio.input_feat_size)
         assert audio_inputs["input_features_mask"].dtype == ir.DataType.BOOL
         assert {o.name for o in audio.graph.outputs} == {"audio_features"}
         audio_features = next(o for o in audio.graph.outputs if o.name == "audio_features")
@@ -2077,8 +2075,9 @@ class TestBuildGraphVisionLanguage:
         emb_per_layer = next(
             o for o in embedding.graph.outputs if o.name == "per_layer_inputs"
         )
-        assert list(emb_per_layer.shape)[-1] == (
-            list(decoder_inputs["per_layer_inputs"].shape)[-1]
+        assert (
+            list(emb_per_layer.shape)[-1]
+            == (list(decoder_inputs["per_layer_inputs"].shape)[-1])
         )
         # The 4.7 GB per-layer table belongs to the embedding model only.
         assert "embedding.embed_tokens_per_layer.weight" in embedding.graph.initializers

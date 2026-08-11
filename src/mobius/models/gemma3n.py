@@ -1255,9 +1255,7 @@ class _Gemma3nEmbeddingModel(nn.Module):
             self._num_layers * self._per_layer_dim,
             bias=False,
         )
-        self.per_layer_projection_norm = RMSNorm(
-            self._per_layer_dim, eps=config.rms_norm_eps
-        )
+        self.per_layer_projection_norm = RMSNorm(self._per_layer_dim, eps=config.rms_norm_eps)
 
         vision_eps = vision.rms_norm_eps or vision.norm_eps or config.rms_norm_eps
         self._vision_vocab_offset = vision.vocab_offset or 0
@@ -1304,9 +1302,7 @@ class _Gemma3nEmbeddingModel(nn.Module):
         in_range = op.GreaterOrEqual(input_ids, op.CastLike(lower, input_ids))
         if upper is not None:
             in_range = op.And(in_range, op.Less(input_ids, op.CastLike(upper, input_ids)))
-        dummy_id = op.CastLike(
-            embedder.vocab_offset + embedder.vocab_size - 1, input_ids
-        )
+        dummy_id = op.CastLike(embedder.vocab_offset + embedder.vocab_size - 1, input_ids)
         safe_ids = op.Where(in_range, input_ids, dummy_id)
         embeds = op.CastLike(embedder(op, input_ids=safe_ids), hidden)
         return op.Where(op.Unsqueeze(in_range, [-1]), embeds, hidden)
@@ -1417,9 +1413,7 @@ class _Gemma3nEmbeddingModel(nn.Module):
         # above ``vocab_size_per_layer_input``) as well as any negative id.
         in_vocab = op.And(
             op.GreaterOrEqual(input_ids, op.CastLike(0, input_ids)),
-            op.Less(
-                input_ids, op.CastLike(self.config.vocab_size_per_layer_input, input_ids)
-            ),
+            op.Less(input_ids, op.CastLike(self.config.vocab_size_per_layer_input, input_ids)),
         )
         masked_ids = op.Where(in_vocab, input_ids, op.CastLike(0, input_ids))
         token_embed = op.Reshape(
