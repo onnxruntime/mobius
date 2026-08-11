@@ -252,9 +252,7 @@ def test_minicpmv4_6_embedding_mixes_image_and_video_tokens():
         }
     )["inputs_embeds"]
 
-    media_mask = (input_ids == config.image_token_id) | (
-        input_ids == config.video_token_id
-    )
+    media_mask = (input_ids == config.image_token_id) | (input_ids == config.video_token_id)
     expected = embedding_weight[input_ids].copy()
     expected[media_mask] = features
     np.testing.assert_array_equal(result, expected)
