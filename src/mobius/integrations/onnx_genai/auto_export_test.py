@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 
 import onnx_ir as ir
 import pytest
@@ -483,3 +484,192 @@ def test_decoder_without_source_skips_tokenizer(tmp_path):
     artifacts = write_onnx_genai_config(object(), str(tmp_path), config=_Cfg())
     assert "tokenizer" not in artifacts
     assert not (tmp_path / "tokenizer.json").exists()
+
+
+class _GraphlessModel:
+    """Stand-in for a built component whose ONNX graph was streamed to disk.
+
+    Large decoders built with external-data / streamed weights do not retain
+    the ``ir.Graph`` in memory, so the in-memory package value exposes no
+    ``.graph`` attribute. The port contract must instead be derived from the
+    ``model.onnx`` written next to the sidecar.
+    """
+
+
+class _GraphlessPkg(dict):
+    pass
+
+
+def _ir_value(name: str, dtype: ir.DataType, shape: list[int | str]) -> ir.Value:
+    return ir.Value(name=name, type=ir.TensorType(dtype), shape=ir.Shape(shape))
+
+
+def _ir_decoder_model(
+    inputs: list[ir.Value],
+    output_specs: list[tuple[str, ir.DataType, list[int | str]]],
+) -> ir.Model:
+    outputs = [_ir_value(*spec) for spec in output_specs]
+    nodes = [
+        ir.Node("", "Identity", [inputs[0]], outputs=[out], name=f"emit_{out.name}")
+        for out in outputs
+    ]
+    graph = ir.Graph(
+        inputs=inputs,
+        outputs=outputs,
+        nodes=nodes,
+        name="decoder",
+        opset_imports={"": 21},
+    )
+    return ir.Model(graph, ir_version=10)
+
+
+@dataclasses.dataclass
+class _HybridCfg(_Cfg):
+    # A hybrid decoder mirroring Qwen3.6-27B: linear-attention layers carrying
+    # conv_state + recurrent_state interleaved with grouped-query-attention KV
+    # layers. This is the shape that shipped thin metadata (io block dropped).
+    layer_types: list[str] | None = dataclasses.field(
+        default_factory=lambda: [
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+        ]
+    )
+
+
+def _write_hybrid_decoder_onnx(directory: str) -> None:
+    inputs = [
+        _ir_value("input_ids", ir.DataType.INT64, ["batch", "sequence"]),
+        _ir_value("attention_mask", ir.DataType.INT64, ["batch", "past_sequence + sequence"]),
+        _ir_value("position_ids", ir.DataType.INT64, ["batch", "sequence"]),
+    ]
+    output_specs = [("logits", ir.DataType.FLOAT, ["batch", "sequence", 128])]
+    # Layers 0-1: linear attention (conv_state + recurrent_state replace-state).
+    for layer in (0, 1):
+        inputs.extend(
+            [
+                _ir_value(
+                    f"past_key_values.{layer}.conv_state",
+                    ir.DataType.FLOAT,
+                    ["batch", 10240, 3],
+                ),
+                _ir_value(
+                    f"past_key_values.{layer}.recurrent_state",
+                    ir.DataType.FLOAT,
+                    ["batch", 48, 128, 128],
+                ),
+            ]
+        )
+        output_specs.extend(
+            [
+                (f"present.{layer}.conv_state", ir.DataType.FLOAT, ["batch", 10240, 3]),
+                (
+                    f"present.{layer}.recurrent_state",
+                    ir.DataType.FLOAT,
+                    ["batch", 48, 128, 128],
+                ),
+            ]
+        )
+    # Layer 2: grouped-query attention (KV append cache).
+    inputs.extend(
+        [
+            _ir_value(
+                "past_key_values.2.key", ir.DataType.FLOAT, ["batch", 4, "past_sequence", 256]
+            ),
+            _ir_value(
+                "past_key_values.2.value",
+                ir.DataType.FLOAT,
+                ["batch", 4, "past_sequence", 256],
+            ),
+        ]
+    )
+    output_specs.extend(
+        [
+            ("present.2.key", ir.DataType.FLOAT, ["batch", 4, "total_sequence", 256]),
+            ("present.2.value", ir.DataType.FLOAT, ["batch", 4, "total_sequence", 256]),
+        ]
+    )
+    model = _ir_decoder_model(inputs, output_specs)
+    ir.save(model, os.path.join(directory, "model.onnx"))
+
+
+def test_graphless_decoder_reloads_io_from_disk(tmp_path):
+    # Regression: when the in-memory package value lacks `.graph` (external-data /
+    # streamed build), the sidecar MUST still gain its explicit `model.io` port
+    # contract by reloading `model.onnx` from disk — never ship thin metadata.
+    _write_hybrid_decoder_onnx(str(tmp_path))
+    pkg = _GraphlessPkg({"model": _GraphlessModel()})
+    assert not hasattr(pkg["model"], "graph")
+
+    arts = write_onnx_genai_config(pkg, str(tmp_path), config=_HybridCfg())
+    with open(arts["inference_metadata"]) as handle:
+        meta = yaml.safe_load(handle)
+
+    io = meta["model"]["io"]
+    assert io["kv_inputs"] == ["past_key_values.2.key", "past_key_values.2.value"]
+    assert io["kv_outputs"] == ["present.2.key", "present.2.value"]
+    # The linear-attention layers' conv/recurrent state are replace-state pairs,
+    # locking the 27B hybrid scenario.
+    state_inputs = {pair["input"] for pair in io["state_pairs"]}
+    assert state_inputs == {
+        "past_key_values.0.conv_state",
+        "past_key_values.0.recurrent_state",
+        "past_key_values.1.conv_state",
+        "past_key_values.1.recurrent_state",
+    }
+    assert all(pair["update"] == "replace" for pair in io["state_pairs"])
+    assert io["token_input"] == "input_ids"
+    assert io["logits_output"] == "logits"
+
+
+def test_graphless_decoder_without_disk_model_warns_and_skips(tmp_path, caplog):
+    # If the graph is unavailable in memory AND absent on disk, we must not ship
+    # thin metadata silently — emit a loud warning and leave the sidecar without
+    # the `io` block (downstream runtimes derive it from the graph at load).
+    import logging
+
+    pkg = _GraphlessPkg({"model": _GraphlessModel()})
+    with caplog.at_level(logging.WARNING):
+        arts = write_onnx_genai_config(pkg, str(tmp_path), config=_Cfg())
+
+    with open(arts["inference_metadata"]) as handle:
+        meta = yaml.safe_load(handle)
+    assert "io" not in meta.get("model", {})
+    assert any("model.io" in rec.message for rec in caplog.records)
+
+
+def test_in_memory_graph_is_not_reloaded_from_disk(tmp_path, monkeypatch):
+    # When `.graph` is present in memory, we must derive io directly and never
+    # touch the disk reload path (preserving existing fast-path behavior).
+    from mobius.integrations.onnx_genai import auto_export
+
+    def _boom(_model_path):
+        raise AssertionError("disk reload must not run when .graph is present")
+
+    monkeypatch.setattr(auto_export, "_load_graph_from_disk", _boom)
+
+    inputs = [
+        _ir_value("input_ids", ir.DataType.INT64, ["batch", "sequence"]),
+        _ir_value("attention_mask", ir.DataType.INT64, ["batch", "past_sequence + sequence"]),
+        _ir_value("position_ids", ir.DataType.INT64, ["batch", "sequence"]),
+        _ir_value(
+            "past_key_values.0.key", ir.DataType.FLOAT, ["batch", 4, "past_sequence", 256]
+        ),
+        _ir_value(
+            "past_key_values.0.value", ir.DataType.FLOAT, ["batch", 4, "past_sequence", 256]
+        ),
+    ]
+    output_specs = [
+        ("logits", ir.DataType.FLOAT, ["batch", "sequence", 128]),
+        ("present.0.key", ir.DataType.FLOAT, ["batch", 4, "total_sequence", 256]),
+        ("present.0.value", ir.DataType.FLOAT, ["batch", 4, "total_sequence", 256]),
+    ]
+    pkg = _GraphlessPkg({"model": _ir_decoder_model(inputs, output_specs)})
+
+    arts = write_onnx_genai_config(pkg, str(tmp_path), config=_Cfg())
+    with open(arts["inference_metadata"]) as handle:
+        meta = yaml.safe_load(handle)
+    assert meta["model"]["io"]["kv_inputs"] == [
+        "past_key_values.0.key",
+        "past_key_values.0.value",
+    ]
