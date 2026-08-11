@@ -30,11 +30,7 @@ _AUDIO_PATH = Path(__file__).parent.parent / "testdata" / "652-129742-0006.flac"
 
 
 def test_moonshine_l5_generation_reference_is_declared_and_valid():
-    cases = [
-        case
-        for case in discover_test_cases(level="L5")
-        if case.model_id == _MODEL_ID
-    ]
+    cases = [case for case in discover_test_cases(level="L5") if case.model_id == _MODEL_ID]
     assert len(cases) == 1
     case = cases[0]
     generation_path = generation_json_path_for_case(case)
