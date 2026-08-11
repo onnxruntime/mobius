@@ -88,6 +88,21 @@ def _synthetic_feeds(config: WeatherNextConfig) -> dict[str, np.ndarray]:
     }
 
 
+def _numpy_dtype(dtype: ir.DataType) -> type[np.float32] | type[np.float16]:
+    if dtype == ir.DataType.FLOAT:
+        return np.float32
+    if dtype == ir.DataType.FLOAT16:
+        return np.float16
+    raise ValueError(f"Unsupported WeatherNext feed dtype: {dtype}")
+
+
+def _cast_feeds_to_dtype(
+    feeds: dict[str, np.ndarray], dtype: ir.DataType
+) -> dict[str, np.ndarray]:
+    feed_dtype = _numpy_dtype(dtype)
+    return {name: np.asarray(value, dtype=feed_dtype) for name, value in feeds.items()}
+
+
 def _config_from_args(
     args: argparse.Namespace, feeds: dict[str, np.ndarray] | None
 ) -> WeatherNextConfig:
@@ -119,7 +134,9 @@ def _config_from_args(
     )
 
 
-def _run_with_ort(output_dir: str, feeds: dict[str, np.ndarray]) -> None:
+def _run_with_ort(
+    output_dir: str, feeds: dict[str, np.ndarray], dtype: ir.DataType
+) -> None:
     try:
         import onnxruntime as ort
     except ImportError:
@@ -128,7 +145,7 @@ def _run_with_ort(output_dir: str, feeds: dict[str, np.ndarray]) -> None:
 
     model_path = os.path.join(output_dir, "model.onnx")
     sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
-    (next_state,) = sess.run(["next_state"], feeds)
+    (next_state,) = sess.run(["next_state"], _cast_feeds_to_dtype(feeds, dtype))
     print(f"Inference output next_state shape: {next_state.shape}")
     print(f"Inference output range: [{next_state.min():.6f}, {next_state.max():.6f}]")
 
@@ -216,7 +233,9 @@ def main() -> None:
 
     if args.run or args.validate:
         _run_with_ort(
-            args.output_dir, feeds if feeds is not None else _synthetic_feeds(config)
+            args.output_dir,
+            feeds if feeds is not None else _synthetic_feeds(config),
+            config.dtype,
         )
 
 
