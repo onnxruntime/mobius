@@ -24,6 +24,7 @@ Run::
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import functools
 import os
@@ -109,7 +110,11 @@ def _get_test_device_kwargs() -> dict[str, str]:
 _IN_CI = os.environ.get("GITHUB_ACTIONS") == "true"
 
 
-def _load_suppress_token_ids(model_id: str, trust_remote_code: bool = False) -> list[int]:
+def _load_suppress_token_ids(
+    model_id: str,
+    revision: str | None = None,
+    trust_remote_code: bool = False,
+) -> list[int]:
     """Return ``generation_config.suppress_tokens`` for a model (empty if none).
 
     Mirrors HuggingFace ``generate()``: tokens in ``suppress_tokens`` are forced
@@ -124,7 +129,9 @@ def _load_suppress_token_ids(model_id: str, trust_remote_code: bool = False) -> 
 
     try:
         gen_config = transformers.GenerationConfig.from_pretrained(
-            model_id, trust_remote_code=trust_remote_code
+            model_id,
+            revision=revision,
+            trust_remote_code=trust_remote_code,
         )
     except Exception:
         return []
@@ -408,6 +415,23 @@ _L5_CASES = _discover_cases("L5", xfails=_L5_ONLY_XFAIL_REASONS)
 # ---------------------------------------------------------------------------
 
 
+def test_huggingface_artifact_loads_are_revision_pinned():
+    """Every Hub-backed test artifact must resolve from the case revision."""
+    tree = ast.parse(Path(__file__).read_text())
+    unpinned_lines = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "from_pretrained"
+        and not any(keyword.arg == "revision" for keyword in node.keywords)
+    ]
+
+    assert not unpinned_lines, (
+        f"from_pretrained calls missing revision= at lines {unpinned_lines}"
+    )
+
+
 def _build_model_package(case: GoldenTestCase) -> ModelPackage:
     """Build an ONNX ModelPackage with real weights from HuggingFace."""
     module_class = None
@@ -651,7 +675,9 @@ def _prepare_vision_feeds(
     from PIL import Image
 
     processor = transformers.AutoImageProcessor.from_pretrained(
-        case.model_id, trust_remote_code=case.trust_remote_code
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
     )
     image = Image.open(_TESTDATA_DIR / case.images[0])
     proc_kwargs: dict = {"images": image, "return_tensors": "np"}
@@ -674,7 +700,9 @@ def _detection_forced_size(case: GoldenTestCase) -> dict | None:
     import transformers
 
     config = transformers.AutoConfig.from_pretrained(
-        case.model_id, trust_remote_code=case.trust_remote_code
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
     )
     image_size = getattr(config, "image_size", None)
     if isinstance(image_size, (list, tuple)) and len(image_size) == 2:
@@ -698,11 +726,15 @@ def _prepare_audio_feeds(
     # Fall back to AutoFeatureExtractor for models without a tokenizer
     try:
         processor = transformers.AutoProcessor.from_pretrained(
-            case.model_id, trust_remote_code=case.trust_remote_code
+            case.model_id,
+            revision=case.revision,
+            trust_remote_code=case.trust_remote_code,
         )
     except (TypeError, OSError):
         processor = transformers.AutoFeatureExtractor.from_pretrained(
-            case.model_id, trust_remote_code=case.trust_remote_code
+            case.model_id,
+            revision=case.revision,
+            trust_remote_code=case.trust_remote_code,
         )
     audio_path = _TESTDATA_DIR / case.audio[0]
     audio_array, _sr = librosa.load(str(audio_path), sr=16000)
@@ -910,7 +942,9 @@ def _run_vision_language_prefill(
 
     # --- Step 0: Preprocess image with HF processor ---
     processor = transformers.AutoProcessor.from_pretrained(
-        case.model_id, trust_remote_code=case.trust_remote_code
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
     )
     image = Image.open(_TESTDATA_DIR / case.images[0])
 
@@ -1075,12 +1109,18 @@ def _run_vl_generation(
 
     # --- Step 0: prepare multimodal inputs ---
     processor = transformers.AutoProcessor.from_pretrained(
-        case.model_id, trust_remote_code=case.trust_remote_code
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
     )
     image = Image.open(_TESTDATA_DIR / case.images[0])
 
     prompt_text = _build_mm_prompt(processor, case.prompts[0], case.images, "image")
-    suppress_ids = _load_suppress_token_ids(case.model_id, case.trust_remote_code)
+    suppress_ids = _load_suppress_token_ids(
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
+    )
 
     processed_pt = processor(text=prompt_text, images=[image], return_tensors="pt")
     processed: dict[str, np.ndarray] = {
@@ -1267,7 +1307,9 @@ def _run_speech_to_text_prefill(
 
     # Load audio and extract features
     processor = transformers.AutoProcessor.from_pretrained(
-        case.model_id, trust_remote_code=case.trust_remote_code
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
     )
     audio_path = _TESTDATA_DIR / case.audio[0]
     audio_array, _sr = librosa.load(str(audio_path), sr=16000)
@@ -1419,7 +1461,9 @@ def _run_phi4mm_multimodal_prefill(
         from PIL import Image
 
         processor = transformers.AutoProcessor.from_pretrained(
-            case.model_id, trust_remote_code=True
+            case.model_id,
+            revision=case.revision,
+            trust_remote_code=True,
         )
         images = [Image.open(_TESTDATA_DIR / img_path) for img_path in case.images]
         img_inputs = processor.image_processor(images=images, return_tensors="np")
@@ -1463,7 +1507,9 @@ def _run_phi4mm_multimodal_prefill(
         import librosa
 
         processor = transformers.AutoProcessor.from_pretrained(
-            case.model_id, trust_remote_code=True
+            case.model_id,
+            revision=case.revision,
+            trust_remote_code=True,
         )
         audios = []
         for audio_path in case.audio:
@@ -1557,7 +1603,9 @@ def _run_speech_language_prefill(
 
     # Load audio and extract features
     processor = transformers.AutoProcessor.from_pretrained(
-        case.model_id, trust_remote_code=case.trust_remote_code
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
     )
     audio_path = _TESTDATA_DIR / case.audio[0]
     audio_array, _sr = librosa.load(str(audio_path), sr=16000)
@@ -1569,7 +1617,10 @@ def _run_speech_language_prefill(
     # actually uses under the hood.
     fe = getattr(processor, "feature_extractor", None)
     if fe is None or not hasattr(fe, "sampling_rate"):
-        fe = transformers.WhisperFeatureExtractor.from_pretrained(case.model_id)
+        fe = transformers.WhisperFeatureExtractor.from_pretrained(
+            case.model_id,
+            revision=case.revision,
+        )
     audio_processed = fe(
         [audio_array],
         sampling_rate=16000,
@@ -2097,7 +2148,11 @@ def _run_multimodel_text_generation(
     encoder, using 1D position IDs.  Returns newly generated token IDs
     (prompt excluded).
     """
-    suppress_ids = _load_suppress_token_ids(case.model_id, case.trust_remote_code)
+    suppress_ids = _load_suppress_token_ids(
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
+    )
     device_kwargs = _get_test_device_kwargs()
 
     dec_key = "decoder" if "decoder" in pkg else "model"
@@ -2254,6 +2309,7 @@ def _run_speech_to_text_generation(
     # Load audio and extract features (same as L4 prefill)
     processor = transformers.AutoProcessor.from_pretrained(
         case.model_id,
+        revision=case.revision,
         trust_remote_code=case.trust_remote_code,
     )
     audio_path = _TESTDATA_DIR / case.audio[0]
@@ -2353,14 +2409,19 @@ def _run_speech_language_generation(
 
     # --- Load audio and extract features ---
     processor = transformers.AutoProcessor.from_pretrained(
-        case.model_id, trust_remote_code=case.trust_remote_code
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
     )
     audio_path = _TESTDATA_DIR / case.audio[0]
     audio_array, _sr = librosa.load(str(audio_path), sr=16000)
 
     fe = getattr(processor, "feature_extractor", None)
     if fe is None or not hasattr(fe, "sampling_rate"):
-        fe = transformers.WhisperFeatureExtractor.from_pretrained(case.model_id)
+        fe = transformers.WhisperFeatureExtractor.from_pretrained(
+            case.model_id,
+            revision=case.revision,
+        )
     audio_processed = fe(
         [audio_array],
         sampling_rate=16000,
@@ -2369,7 +2430,11 @@ def _run_speech_language_generation(
     )
 
     # --- Step 1: audio encoder ---
-    suppress_ids = _load_suppress_token_ids(case.model_id, case.trust_remote_code)
+    suppress_ids = _load_suppress_token_ids(
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
+    )
     audio_session = OnnxModelSession(pkg["audio_encoder"], **device_kwargs)
     try:
         audio_feeds: dict[str, np.ndarray] = {}

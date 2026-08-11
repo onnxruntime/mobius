@@ -12,6 +12,7 @@ import numpy as np
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
+from mobius.components._activations import get_activation
 from mobius.components._common import LayerNorm, Linear
 from mobius.components._conv import BatchNorm1d, Conv2d
 from mobius.components._whisper import Conv1d
@@ -181,7 +182,7 @@ class _ParakeetRelativePositionEncoding(nn.Module):
 
 
 class _ParakeetFeedForward(nn.Module):
-    """Macaron feed-forward projection with SiLU activation."""
+    """Macaron feed-forward projection with the configured activation."""
 
     def __init__(self, config: ParakeetCTCConfig):
         super().__init__()
@@ -195,9 +196,10 @@ class _ParakeetFeedForward(nn.Module):
             config.hidden_size,
             bias=config.attention_bias,
         )
+        self.act_fn = get_activation(config.hidden_act)
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
-        return self.linear2(op, op.Swish(self.linear1(op, hidden_states)))
+        return self.linear2(op, self.act_fn(op, self.linear1(op, hidden_states)))
 
 
 class _ParakeetAttention(nn.Module):
@@ -349,6 +351,7 @@ class _ParakeetConvolution(nn.Module):
             bias=config.convolution_bias,
         )
         self.norm = BatchNorm1d(hidden_size)
+        self.act_fn = get_activation(config.hidden_act)
         self.pointwise_conv2 = Conv1d(
             hidden_size,
             hidden_size,
@@ -374,7 +377,7 @@ class _ParakeetConvolution(nn.Module):
         )
         hidden_states = self.depthwise_conv(op, hidden_states)
         hidden_states = self.norm(op, hidden_states)
-        hidden_states = op.Swish(hidden_states)
+        hidden_states = self.act_fn(op, hidden_states)
         hidden_states = self.pointwise_conv2(op, hidden_states)
         return op.Transpose(hidden_states, perm=[0, 2, 1])
 

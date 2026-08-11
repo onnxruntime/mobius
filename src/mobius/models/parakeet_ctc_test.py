@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 import onnx_ir as ir
 import pytest
@@ -100,6 +102,23 @@ def test_parakeet_graph_io_and_hf_weight_names_align():
     }
     assert set(processed) == parameter_names
     assert not any(name.endswith(".num_batches_tracked") for name in processed)
+
+
+def test_parakeet_honors_non_silu_activation_in_ffn_and_convolution():
+    hf_config = _hf_config()
+    config = dataclasses.replace(
+        ParakeetCTCConfig.from_transformers(hf_config),
+        hidden_act="relu",
+        dtype=ir.DataType.FLOAT,
+    )
+    module = ParakeetForCTCModel(config)
+    model = build_from_module(module, config, task=FeatureCTCAsrTask())["model"]
+
+    op_types = [node.op_type for node in model.graph]
+    # The three configurable activations are the two Macaron FFNs and the
+    # convolution module. Subsampling contributes three fixed ReLUs.
+    assert op_types.count("Relu") == 6
+    assert "Swish" not in op_types
 
 
 def test_parakeet_synthetic_parity_with_padding():

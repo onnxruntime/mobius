@@ -538,6 +538,7 @@ def build(
             # Not a model we support — try diffusers pipeline
             return build_diffusers_pipeline(
                 model_id,
+                revision=revision,
                 dtype=dtype,
                 load_weights=load_weights,
             )

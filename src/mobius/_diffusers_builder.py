@@ -108,7 +108,9 @@ def _init_diffusers_class_map() -> None:
     )
 
 
-def _load_diffusers_pipeline_index(model_id: str) -> dict | None:
+def _load_diffusers_pipeline_index(
+    model_id: str, *, revision: str | None = None
+) -> dict | None:
     """Try to load a diffusers ``model_index.json`` from HuggingFace.
 
     Returns the parsed JSON dict, or ``None`` if not found.
@@ -116,7 +118,11 @@ def _load_diffusers_pipeline_index(model_id: str) -> dict | None:
     from huggingface_hub import hf_hub_download
 
     try:
-        path = hf_hub_download(repo_id=model_id, filename="model_index.json")
+        path = hf_hub_download(
+            repo_id=model_id,
+            filename="model_index.json",
+            revision=revision,
+        )
     except (OSError, ValueError) as e:
         logger.debug("Failed to download model_index.json for %s: %s", model_id, e)
         return None
@@ -126,7 +132,10 @@ def _load_diffusers_pipeline_index(model_id: str) -> dict | None:
 
 
 def _download_diffusers_component_weights(
-    model_id: str, component_name: str
+    model_id: str,
+    component_name: str,
+    *,
+    revision: str | None = None,
 ) -> dict[str, torch.Tensor]:
     """Download weights for a specific component of a diffusers pipeline.
 
@@ -153,6 +162,7 @@ def _download_diffusers_component_weights(
                 index_path = hf_hub_download(
                     repo_id=model_id,
                     filename=f"{prefix}{basename}.{ext}.index.json",
+                    revision=revision,
                 )
                 with open(index_path) as f:
                     index = json.load(f)
@@ -165,7 +175,11 @@ def _download_diffusers_component_weights(
         # Single-file weights.
         for basename in weight_basenames:
             try:
-                hf_hub_download(repo_id=model_id, filename=f"{prefix}{basename}.{ext}")
+                hf_hub_download(
+                    repo_id=model_id,
+                    filename=f"{prefix}{basename}.{ext}",
+                    revision=revision,
+                )
                 all_files = [f"{basename}.{ext}"]
                 break
             except EntryNotFoundError:
@@ -182,6 +196,7 @@ def _download_diffusers_component_weights(
     paths = _parallel_download(
         model_id,
         [f"{prefix}{f}" for f in all_files],
+        revision=revision,
         desc=f"{component_name} weights",
     )
 
@@ -194,11 +209,20 @@ def _download_diffusers_component_weights(
     return state_dict
 
 
-def _load_diffusers_component_config(model_id: str, component_name: str) -> dict:
+def _load_diffusers_component_config(
+    model_id: str,
+    component_name: str,
+    *,
+    revision: str | None = None,
+) -> dict:
     """Load the config.json for a specific diffusers pipeline component."""
     from huggingface_hub import hf_hub_download
 
-    path = hf_hub_download(repo_id=model_id, filename=f"{component_name}/config.json")
+    path = hf_hub_download(
+        repo_id=model_id,
+        filename=f"{component_name}/config.json",
+        revision=revision,
+    )
     with open(path) as f:
         return json.load(f)
 
@@ -233,6 +257,7 @@ def _prepare_unet_loras(unet_loras: dict) -> tuple[tuple, dict]:
 def build_diffusers_pipeline(
     model_id: str,
     *,
+    revision: str | None = None,
     dtype: str | ir.DataType | None = None,
     load_weights: bool = True,
     unet_loras: dict | None = None,
@@ -248,6 +273,7 @@ def build_diffusers_pipeline(
 
     Args:
         model_id: HuggingFace model repository ID for a diffusers pipeline.
+        revision: Optional Hugging Face revision used for all pipeline artifacts.
         dtype: Override the model dtype.
         load_weights: Whether to download and apply weights.
         unet_loras: Optional ``{adapter_name: lora.safetensors}`` map. Each LoRA
@@ -264,7 +290,7 @@ def build_diffusers_pipeline(
     """
     _init_diffusers_class_map()
 
-    pipeline_index = _load_diffusers_pipeline_index(model_id)
+    pipeline_index = _load_diffusers_pipeline_index(model_id, revision=revision)
     if pipeline_index is None:
         raise ValueError(
             f"'{model_id}' does not appear to be a diffusers pipeline "
@@ -299,7 +325,11 @@ def build_diffusers_pipeline(
             class_name,
         )
 
-        component_config_dict = _load_diffusers_component_config(model_id, component_name)
+        component_config_dict = _load_diffusers_component_config(
+            model_id,
+            component_name,
+            revision=revision,
+        )
         config = config_class.from_diffusers(component_config_dict)
 
         if dtype is not None and hasattr(config, "dtype"):
@@ -330,7 +360,11 @@ def build_diffusers_pipeline(
                 package[f"{component_name}_{sub_name}"] = sub_model
 
         if load_weights:
-            state_dict = _download_diffusers_component_weights(model_id, component_name)
+            state_dict = _download_diffusers_component_weights(
+                model_id,
+                component_name,
+                revision=revision,
+            )
             if hasattr(model_module, "preprocess_weights"):
                 state_dict = model_module.preprocess_weights(state_dict)
             if lora_weights:
