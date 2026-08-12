@@ -24,6 +24,7 @@ from mobius.generation import (
     build_effectful_identity,
     build_euler_model_input,
     build_euler_solver_step,
+    build_greedy_sampler,
     build_integer_increment,
     build_last_token_logits,
     build_model_token_cast,
@@ -31,6 +32,9 @@ from mobius.generation import (
     build_schedule_lookup,
     build_speculative_state_rollback,
     build_token_block_identity,
+    build_token_to_slot,
+    build_tts_decoder_state_initializer,
+    build_tts_decoder_step_update,
     build_tts_state_initializer,
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
@@ -197,8 +201,970 @@ def write_audio_codec_workflow_metadata(pkg: Any, output_dir: str) -> str:
     return path
 
 
+def _model_cache_pairs(model: ir.Model) -> list[tuple[ir.Value, ir.Value]]:
+    outputs = {value.name: value for value in model.graph.outputs}
+    pairs = []
+    for past in model.graph.inputs:
+        present = next(
+            (
+                outputs.get(name)
+                for name in (
+                    past.name.replace("past_key_values", "present"),
+                    past.name.replace("past.", "present."),
+                )
+                if name in outputs
+            ),
+            None,
+        )
+        if present is not None:
+            pairs.append((past, present))
+    return pairs
+
+
+def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
+    """Build the weight-bearing Qwen3-TTS talker/predictor/codec workflow."""
+    talker = pkg["talker"]
+    predictor = pkg["code_predictor"]
+    prefill_embedder = pkg["talker_prefill_embedder"]
+    predictor_indices = pkg["code_predictor_indices"]
+    codec_name = next(
+        (name for name in ("codec", "vocoder", "decoder") if name in pkg),
+        None,
+    )
+    if codec_name is None:
+        raise ValueError("real TTS workflow requires a merged codec/vocoder decoder component")
+    codec = pkg[codec_name]
+    num_groups = int(getattr(getattr(config, "tts", config), "num_code_groups", 16))
+    if num_groups < 2:
+        raise ValueError("real TTS workflow requires at least two code groups")
+
+    prompt = next(iter(prefill_embedder.graph.inputs))
+    prefill = _find_port(prefill_embedder.graph.outputs, "prefill")
+    trailing = _find_port(prefill_embedder.graph.outputs, "trailing")
+    talker_embed = _find_port(talker.graph.inputs, "inputs_embeds")
+    talker_mask = _find_port(talker.graph.inputs, "attention_mask")
+    talker_position = _find_port(talker.graph.inputs, "position_ids")
+    talker_logits = _find_port(talker.graph.outputs, "logits")
+    talker_hidden = _find_port(talker.graph.outputs, "hidden")
+    predictor_embed = _find_port(predictor.graph.inputs, "inputs_embeds")
+    predictor_step = _find_port(predictor.graph.inputs, "step_index")
+    predictor_mask = _find_port(predictor.graph.inputs, "attention_mask")
+    predictor_position = _find_port(predictor.graph.inputs, "position_ids")
+    predictor_logits = _find_port(predictor.graph.outputs, "logits")
+    codec_embeddings = _find_port(predictor.graph.outputs, "codec_embeddings")
+    codec_input = next(iter(codec.graph.inputs), None)
+    waveform = next(iter(codec.graph.outputs), None)
+    required_ports = (
+        prefill,
+        trailing,
+        talker_embed,
+        talker_mask,
+        talker_position,
+        talker_logits,
+        talker_hidden,
+        predictor_embed,
+        predictor_step,
+        predictor_mask,
+        predictor_position,
+        predictor_logits,
+        codec_embeddings,
+        codec_input,
+        waveform,
+    )
+    if any(value is None for value in required_ports):
+        raise ValueError("real TTS package is missing a required typed transition port")
+    assert prefill is not None and trailing is not None
+    assert talker_embed is not None and talker_mask is not None
+    assert talker_position is not None and talker_logits is not None
+    assert talker_hidden is not None and predictor_embed is not None
+    assert predictor_step is not None and predictor_mask is not None
+    assert predictor_position is not None and predictor_logits is not None
+    assert codec_embeddings is not None and codec_input is not None and waveform is not None
+
+    talker_caches = _model_cache_pairs(talker)
+    predictor_caches = _model_cache_pairs(predictor)
+    attach_policy_components(pkg, PolicyCapabilities())
+    pkg.add_policy_component("last_token_logits", build_last_token_logits())
+    pkg.add_policy_component(
+        "setup_talker_sampler", build_greedy_sampler(effect="setup_talker_sample")
+    )
+    pkg.add_policy_component(
+        "setup_predictor_sampler",
+        build_greedy_sampler(effect="setup_predictor_sample"),
+    )
+    pkg.add_policy_component("talker_sampler", build_greedy_sampler(effect="talker_sample"))
+    pkg.add_policy_component(
+        "predictor_prefill_sampler",
+        build_greedy_sampler(effect="predictor_prefill_sample"),
+    )
+    pkg.add_policy_component(
+        "predictor_body_sampler",
+        build_greedy_sampler(effect="predictor_body_sample"),
+    )
+    pkg.add_policy_component("continue_predicate", build_boolean_not())
+    pkg.add_policy_component("tts_state_initializer", build_tts_state_initializer(num_groups))
+    pkg.add_policy_component("token_to_slot", build_token_to_slot())
+    pkg.add_policy_component(
+        "code_frame_update", build_code_frame_update(num_groups, scalar_index=True)
+    )
+    pkg.add_policy_component("code_history_append", build_code_history_append(num_groups))
+    pkg.add_policy_component(
+        "talker_state_initializer",
+        build_tts_decoder_state_initializer(
+            talker,
+            graph_name="talker_state_initializer",
+            embedding_input=talker_embed.name,
+            attention_mask_input=talker_mask.name,
+            position_ids_input=talker_position.name,
+            cache_inputs=[past.name for past, _ in talker_caches],
+        ),
+    )
+    pkg.add_policy_component(
+        "predictor_state_initializer",
+        build_tts_decoder_state_initializer(
+            predictor,
+            graph_name="predictor_state_initializer",
+            embedding_input=predictor_embed.name,
+            attention_mask_input=predictor_mask.name,
+            position_ids_input=predictor_position.name,
+            cache_inputs=[past.name for past, _ in predictor_caches],
+        ),
+    )
+    pkg.add_policy_component(
+        "talker_step_update",
+        build_tts_decoder_step_update(
+            graph_name="talker_step_update",
+            attention_dtype=talker_mask.dtype,
+            position_dtype=talker_position.dtype,
+            position_rank=len(talker_position.shape or []),
+        ),
+    )
+    pkg.add_policy_component(
+        "predictor_step_update",
+        build_tts_decoder_step_update(
+            graph_name="predictor_step_update",
+            attention_dtype=predictor_mask.dtype,
+            position_dtype=predictor_position.dtype,
+            position_rank=len(predictor_position.shape or []),
+        ),
+    )
+    codec_group_major = (
+        codec_input.shape is not None
+        and len(codec_input.shape) == 3
+        and str(list(codec_input.shape)[1]) == str(num_groups)
+    )
+    if codec_group_major:
+        pkg.add_policy_component("codec_layout", build_codec_layout_transpose(num_groups))
+
+    batch = _contract(prompt)["shape"][0]
+    batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
+    batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch]}
+    inputs = {
+        "request.prompt_tokens": {
+            "contract": _contract(prompt),
+            "role": {"kind": "runtime", "version": "1.0", "role": "prompt_tokens"},
+            "source": {"kind": "request", "field": "prompt_tokens"},
+            "required": True,
+        },
+        "request.max_iterations": {
+            "contract": batch_int,
+            "role": {"kind": "runtime", "version": "1.0", "role": "max_output_tokens"},
+            "source": {"kind": "request", "field": "max_output_tokens"},
+            "required": True,
+        },
+        "package.false": {
+            "contract": batch_bool,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": False,
+        },
+        "package.zero_scalar": {
+            "contract": {"dtype": "int64", "rank": 0, "shape": []},
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 0,
+        },
+        "package.one_scalar": {
+            "contract": {"dtype": "int64", "rank": 0, "shape": []},
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 1,
+        },
+        "package.remaining_groups": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": num_groups - 2,
+        },
+        "package.predictor_context_limit": {
+            "contract": {"dtype": "int64", "rank": 0, "shape": []},
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": num_groups,
+        },
+        "package.predictor_mask_limit": {
+            "contract": {"dtype": "int64", "rank": 0, "shape": []},
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": num_groups + 1,
+        },
+        "package.talker_context_limit": {
+            "contract": {"dtype": "int64", "rank": 0, "shape": []},
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": int(getattr(config, "max_position_embeddings", 4096)),
+        },
+    }
+    for iteration in range(num_groups - 2):
+        inputs[f"package.setup_predictor_iteration_{iteration}"] = {
+            "contract": {"dtype": "int64", "rank": 0, "shape": []},
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": iteration,
+        }
+
+    talker_setup_inputs = {
+        talker_embed.name: "tts.prefill_embeds",
+        talker_mask.name: f"talker.initializer.{talker_mask.name}",
+        talker_position.name: f"talker.initializer.{talker_position.name}",
+        **{past.name: f"talker.initializer.{past.name}" for past, _ in talker_caches},
+    }
+    talker_body_inputs = {
+        talker_embed.name: "talker.step_embeds",
+        talker_mask.name: "state.talker_mask.body",
+        talker_position.name: "state.talker_position.body",
+        **{
+            past.name: f"state.talker_cache_{i}.body"
+            for i, (past, _) in enumerate(talker_caches)
+        },
+    }
+    talker_setup_outputs = {
+        talker_logits.name: "talker.setup.logits",
+        talker_hidden.name: "talker.setup.hidden",
+        **{present.name: f"talker.setup.{present.name}" for _, present in talker_caches},
+    }
+    talker_body_outputs = {
+        talker_logits.name: "talker.body.logits",
+        talker_hidden.name: "talker.body.hidden",
+        **{present.name: f"talker.body.{present.name}" for _, present in talker_caches},
+    }
+
+    def predictor_outputs(prefix: str) -> dict[str, str]:
+        return {
+            predictor_logits.name: f"{prefix}.logits",
+            codec_embeddings.name: f"{prefix}.codec_embeddings",
+            **{present.name: f"{prefix}.{present.name}" for _, present in predictor_caches},
+        }
+
+    predictor_body_inputs = {
+        predictor_embed.name: "predictor.body.inputs_embeds",
+        predictor_step.name: "predictor.body.step_index",
+        predictor_mask.name: "state.predictor_mask.inner",
+        predictor_position.name: "state.predictor_position.inner",
+        **{
+            past.name: f"state.predictor_cache_{i}.inner"
+            for i, (past, _) in enumerate(predictor_caches)
+        },
+    }
+
+    def frame_generation_nodes(prefix: str, hidden: str, logits: str) -> list[dict[str, Any]]:
+        if prefix == "setup":
+            talker_sampler = "setup_talker_sampler"
+            talker_effect = "setup_talker_sample"
+            predictor_sampler = "setup_predictor_sampler"
+            predictor_effect = "setup_predictor_sample"
+        else:
+            talker_sampler = "talker_sampler"
+            talker_effect = "talker_sample"
+            predictor_sampler = "predictor_prefill_sampler"
+            predictor_effect = "predictor_prefill_sample"
+        initializer = f"{prefix}.predictor.initializer"
+        return [
+            _invoke(
+                "last_token_logits",
+                {"logits": logits},
+                {"last_logits": f"{prefix}.group0_logits"},
+            ),
+            _invoke(
+                talker_sampler,
+                {"logits": f"{prefix}.group0_logits"},
+                {"token": f"{prefix}.group0"},
+                {talker_effect: _effect(f"{talker_effect}.0", f"{talker_effect}.1")},
+            ),
+            _invoke(
+                "token_to_slot",
+                {
+                    "token": f"{prefix}.group0",
+                },
+                {"slot": f"{prefix}.group0_slot"},
+            ),
+            _invoke(
+                "embedding",
+                {
+                    "text_ids": "request.prompt_tokens",
+                    "codec_ids": f"{prefix}.group0_slot",
+                },
+                {
+                    "text_embeds": f"{prefix}.unused_text_embeds",
+                    "codec_embeds": f"{prefix}.group0_embed",
+                },
+            ),
+            _invoke(
+                "code_predictor_prefill",
+                {
+                    "talker_hidden": hidden,
+                    "group_0_embed": f"{prefix}.group0_embed",
+                },
+                {"inputs_embeds": f"{prefix}.predictor_prefill"},
+            ),
+            _invoke(
+                "predictor_state_initializer",
+                {"prefill_embeds": f"{prefix}.predictor_prefill"},
+                {
+                    predictor_mask.name: f"{initializer}.{predictor_mask.name}",
+                    predictor_position.name: f"{initializer}.{predictor_position.name}",
+                    "body_attention_mask": f"{initializer}.body_attention_mask",
+                    "body_position_ids": f"{initializer}.body_position_ids",
+                    **{
+                        past.name: f"{initializer}.{past.name}" for past, _ in predictor_caches
+                    },
+                },
+            ),
+            _invoke(
+                "code_predictor",
+                {
+                    predictor_embed.name: f"{prefix}.predictor_prefill",
+                    predictor_step.name: "package.zero_scalar",
+                    predictor_mask.name: f"{initializer}.{predictor_mask.name}",
+                    predictor_position.name: f"{initializer}.{predictor_position.name}",
+                    **{
+                        past.name: f"{initializer}.{past.name}" for past, _ in predictor_caches
+                    },
+                },
+                predictor_outputs(f"{prefix}.predictor"),
+            ),
+            _invoke(
+                "last_token_logits",
+                {"logits": f"{prefix}.predictor.logits"},
+                {"last_logits": f"{prefix}.group1_logits"},
+            ),
+            _invoke(
+                predictor_sampler,
+                {"logits": f"{prefix}.group1_logits"},
+                {"token": f"{prefix}.group1"},
+                {
+                    predictor_effect: _effect(
+                        f"{predictor_effect}.0",
+                        f"{predictor_effect}.1",
+                    )
+                },
+            ),
+            _invoke(
+                "code_frame_update",
+                {
+                    "frame_codes": "initializer.frame_codes",
+                    "token": f"{prefix}.group0",
+                    "index": "package.zero_scalar",
+                },
+                {"next_frame": f"{prefix}.frame_group0"},
+            ),
+            _invoke(
+                "code_frame_update",
+                {
+                    "frame_codes": f"{prefix}.frame_group0",
+                    "token": f"{prefix}.group1",
+                    "index": "package.one_scalar",
+                },
+                {"next_frame": f"{prefix}.frame_prefill"},
+            ),
+        ]
+
+    setup_completion_nodes: list[dict[str, Any]] = []
+    setup_frame = "setup.frame_prefill"
+    setup_token = "setup.group1"
+    setup_mask = "setup.predictor.initializer.body_attention_mask"
+    setup_position = "setup.predictor.initializer.body_position_ids"
+    setup_caches = [f"setup.predictor.{present.name}" for _, present in predictor_caches]
+    for iteration in range(num_groups - 2):
+        prefix = f"setup.predictor.remaining_{iteration}"
+        setup_completion_nodes.extend(
+            [
+                _invoke(
+                    "code_predictor_indices",
+                    {"iteration": (f"package.setup_predictor_iteration_{iteration}")},
+                    {
+                        "embedding_index": f"{prefix}.embedding_index",
+                        "step_index": f"{prefix}.step_index",
+                        "frame_index": f"{prefix}.frame_index",
+                    },
+                ),
+                _invoke(
+                    "code_predictor_step_embedder",
+                    {
+                        "codec_embeddings": "setup.predictor.codec_embeddings",
+                        "token": setup_token,
+                        "embedding_index": f"{prefix}.embedding_index",
+                    },
+                    {"inputs_embeds": f"{prefix}.inputs_embeds"},
+                ),
+                _invoke(
+                    "code_predictor",
+                    {
+                        predictor_embed.name: f"{prefix}.inputs_embeds",
+                        predictor_step.name: f"{prefix}.step_index",
+                        predictor_mask.name: setup_mask,
+                        predictor_position.name: setup_position,
+                        **{
+                            past.name: setup_caches[index]
+                            for index, (past, _) in enumerate(predictor_caches)
+                        },
+                    },
+                    predictor_outputs(prefix),
+                ),
+                _invoke(
+                    "last_token_logits",
+                    {"logits": f"{prefix}.logits"},
+                    {"last_logits": f"{prefix}.last_logits"},
+                ),
+                _invoke(
+                    "predictor_body_sampler",
+                    {"logits": f"{prefix}.last_logits"},
+                    {"token": f"{prefix}.token"},
+                    {
+                        "predictor_body_sample": _effect(
+                            f"predictor_body_sample.{iteration}",
+                            f"predictor_body_sample.{iteration + 1}",
+                        )
+                    },
+                ),
+                _invoke(
+                    "code_frame_update",
+                    {
+                        "frame_codes": setup_frame,
+                        "token": f"{prefix}.token",
+                        "index": f"{prefix}.frame_index",
+                    },
+                    {"next_frame": f"{prefix}.frame"},
+                ),
+                _invoke(
+                    "predictor_step_update",
+                    {
+                        "attention_mask": setup_mask,
+                        "position_ids": setup_position,
+                    },
+                    {
+                        "next_attention_mask": f"{prefix}.mask",
+                        "next_position_ids": f"{prefix}.position",
+                    },
+                ),
+            ]
+        )
+        setup_frame = f"{prefix}.frame"
+        setup_token = f"{prefix}.token"
+        setup_mask = f"{prefix}.mask"
+        setup_position = f"{prefix}.position"
+        setup_caches = [f"{prefix}.{present.name}" for _, present in predictor_caches]
+
+    inner_body = {
+        "kind": "sequence",
+        "nodes": [
+            _invoke(
+                "code_predictor_indices",
+                {"iteration": "code.iteration"},
+                {
+                    "embedding_index": "predictor.body.embedding_index",
+                    "step_index": "predictor.body.step_index",
+                    "frame_index": "predictor.body.frame_index",
+                },
+            ),
+            _invoke(
+                "code_predictor_step_embedder",
+                {
+                    "codec_embeddings": "frame.predictor.codec_embeddings",
+                    "token": "state.code_token.inner",
+                    "embedding_index": "predictor.body.embedding_index",
+                },
+                {"inputs_embeds": "predictor.body.inputs_embeds"},
+            ),
+            _invoke(
+                "code_predictor", predictor_body_inputs, predictor_outputs("predictor.body")
+            ),
+            _invoke(
+                "last_token_logits",
+                {"logits": "predictor.body.logits"},
+                {"last_logits": "predictor.body.last_logits"},
+            ),
+            _invoke(
+                "predictor_body_sampler",
+                {"logits": "predictor.body.last_logits"},
+                {"token": "code.token"},
+                {
+                    "predictor_body_sample": _effect(
+                        f"predictor_body_sample.{num_groups - 2}",
+                        f"predictor_body_sample.{num_groups - 1}",
+                    )
+                },
+            ),
+            _invoke(
+                "code_frame_update",
+                {
+                    "frame_codes": "state.frame.inner",
+                    "token": "code.token",
+                    "index": "predictor.body.frame_index",
+                },
+                {"next_frame": "frame.inner"},
+            ),
+            _invoke(
+                "predictor_step_update",
+                {
+                    "attention_mask": "state.predictor_mask.inner",
+                    "position_ids": "state.predictor_position.inner",
+                },
+                {
+                    "next_attention_mask": "predictor.mask.inner",
+                    "next_position_ids": "predictor.position.inner",
+                },
+            ),
+            _invoke(
+                "continue_predicate",
+                {"done": "package.false"},
+                {"continue": "code.continue"},
+            ),
+        ],
+    }
+    inner_carried = [
+        {
+            "cell": "frame",
+            "current": "frame.frame_prefill",
+            "body_input": "state.frame.inner",
+            "body_output": "frame.inner",
+            "next": "frame.completed",
+            "read_effect": _effect("state:frame.0", "state:frame.read"),
+            "write_effect": _effect("state:frame.read", "state:frame.1"),
+        },
+        {
+            "cell": "code_token",
+            "current": "frame.group1",
+            "body_input": "state.code_token.inner",
+            "body_output": "code.token",
+            "next": "code_token.final",
+            "read_effect": _effect("state:code_token.0", "state:code_token.read"),
+            "write_effect": _effect("state:code_token.read", "state:code_token.1"),
+        },
+        {
+            "cell": "predictor_mask",
+            "current": "frame.predictor.initializer.body_attention_mask",
+            "body_input": "state.predictor_mask.inner",
+            "body_output": "predictor.mask.inner",
+            "next": "predictor.mask.final",
+            "read_effect": _effect("state:predictor_mask.0", "state:predictor_mask.read"),
+            "write_effect": _effect("state:predictor_mask.read", "state:predictor_mask.1"),
+        },
+        {
+            "cell": "predictor_position",
+            "current": "frame.predictor.initializer.body_position_ids",
+            "body_input": "state.predictor_position.inner",
+            "body_output": "predictor.position.inner",
+            "next": "predictor.position.final",
+            "read_effect": _effect(
+                "state:predictor_position.0", "state:predictor_position.read"
+            ),
+            "write_effect": _effect(
+                "state:predictor_position.read", "state:predictor_position.1"
+            ),
+        },
+    ]
+    for index, (_, present) in enumerate(predictor_caches):
+        inner_carried.append(
+            {
+                "cell": f"predictor_cache_{index}",
+                "current": f"frame.predictor.{present.name}",
+                "body_input": f"state.predictor_cache_{index}.inner",
+                "body_output": f"predictor.body.{present.name}",
+                "next": f"predictor.cache_{index}.final",
+                "read_effect": _effect(
+                    f"state:predictor_cache_{index}.0", f"state:predictor_cache_{index}.read"
+                ),
+                "write_effect": _effect(
+                    f"state:predictor_cache_{index}.read", f"state:predictor_cache_{index}.1"
+                ),
+            }
+        )
+    inner_loop = {
+        "kind": "loop",
+        "setup": {
+            "kind": "sequence",
+            "nodes": [
+                _invoke(
+                    "continue_predicate",
+                    {"done": "package.false"},
+                    {"continue": "code.setup.continue"},
+                )
+            ],
+        },
+        "body": inner_body,
+        "condition": "code.continue",
+        "max_iterations": "package.remaining_groups",
+        "iteration": {
+            "value": "code.iteration",
+            "contract": _contract(next(iter(predictor_indices.graph.inputs))),
+        },
+        "carried": inner_carried,
+    }
+
+    outer_body_nodes = [
+        _invoke(
+            "talker_text_step",
+            {
+                "trailing_text_embeds": "tts.trailing_text_embeds",
+                "iteration": "talker.iteration",
+            },
+            {"text_embed": "talker.text_embed"},
+        ),
+        _invoke(
+            "talker_step_embedder",
+            {
+                "frame_codes": "state.last_frame.outer",
+                "text_embed": "talker.text_embed",
+            },
+            {"inputs_embeds": "talker.step_embeds"},
+        ),
+        _invoke("talker", talker_body_inputs, talker_body_outputs),
+        *frame_generation_nodes("frame", "talker.body.hidden", "talker.body.logits"),
+        inner_loop,
+        _invoke(
+            "code_history_append",
+            {"history": "state.history.outer", "frame": "frame.completed"},
+            {"next_history": "history.outer"},
+        ),
+        _invoke(
+            "talker_step_update",
+            {
+                "attention_mask": "state.talker_mask.body",
+                "position_ids": "state.talker_position.body",
+            },
+            {
+                "next_attention_mask": "talker.mask.body",
+                "next_position_ids": "talker.position.body",
+            },
+        ),
+        _invoke(
+            "continue_predicate",
+            {"done": "package.false"},
+            {"continue": "talker.continue"},
+        ),
+    ]
+
+    setup_nodes = [
+        _invoke(
+            "tts_state_initializer",
+            {"prompt_tokens": "request.prompt_tokens"},
+            {
+                "frame_codes": "initializer.frame_codes",
+                "token_slot": "initializer.token_slot",
+                "code_history": "initializer.code_history",
+            },
+        ),
+        _invoke(
+            "talker_prefill_embedder",
+            {prompt.name: "request.prompt_tokens"},
+            {
+                prefill.name: "tts.prefill_embeds",
+                trailing.name: "tts.trailing_text_embeds",
+            },
+        ),
+        _invoke(
+            "talker_state_initializer",
+            {"prefill_embeds": "tts.prefill_embeds"},
+            {
+                talker_mask.name: f"talker.initializer.{talker_mask.name}",
+                talker_position.name: f"talker.initializer.{talker_position.name}",
+                "body_attention_mask": "talker.initializer.body_attention_mask",
+                "body_position_ids": "talker.initializer.body_position_ids",
+                **{past.name: f"talker.initializer.{past.name}" for past, _ in talker_caches},
+            },
+        ),
+        _invoke("talker", talker_setup_inputs, talker_setup_outputs),
+        *frame_generation_nodes("setup", "talker.setup.hidden", "talker.setup.logits"),
+        *setup_completion_nodes,
+        _invoke(
+            "code_history_append",
+            {"history": "initializer.code_history", "frame": setup_frame},
+            {"next_history": "history.setup"},
+        ),
+        _invoke(
+            "continue_predicate",
+            {"done": "package.false"},
+            {"continue": "talker.setup.continue"},
+        ),
+    ]
+
+    state = {
+        "last_frame": {
+            "contract": {"dtype": "int64", "rank": 2, "shape": [batch, num_groups]},
+            "scope": "invocation",
+            "initializer": setup_frame,
+            "recurrence": {"kind": "invariant"},
+        },
+        "history": {
+            "contract": {"dtype": "int64", "rank": 3, "shape": [batch, "frames", num_groups]},
+            "scope": "invocation",
+            "initializer": "history.setup",
+            "recurrence": {
+                "kind": "growing",
+                "axis": 1,
+                "increment": "package.one_scalar",
+                "max": "package.talker_context_limit",
+            },
+        },
+        "talker_mask": {
+            "contract": {
+                "dtype": _contract(talker_mask)["dtype"],
+                "rank": 2,
+                "shape": [batch, "talker_context"],
+            },
+            "scope": "invocation",
+            "initializer": "talker.initializer.body_attention_mask",
+            "recurrence": {
+                "kind": "growing",
+                "axis": 1,
+                "increment": "package.one_scalar",
+                "max": "package.talker_context_limit",
+            },
+        },
+        "talker_position": {
+            "contract": _contract(
+                next(
+                    value
+                    for value in pkg.policy_components[
+                        "talker_state_initializer"
+                    ].model.graph.outputs
+                    if value.name == "body_position_ids"
+                )
+            ),
+            "scope": "invocation",
+            "initializer": "talker.initializer.body_position_ids",
+            "recurrence": {"kind": "invariant"},
+        },
+        "frame": {
+            "contract": {"dtype": "int64", "rank": 2, "shape": [batch, num_groups]},
+            "scope": "invocation",
+            "initializer": "frame.frame_prefill",
+            "recurrence": {"kind": "invariant"},
+        },
+        "code_token": {
+            "contract": batch_int,
+            "scope": "invocation",
+            "initializer": "frame.group1",
+            "recurrence": {"kind": "invariant"},
+        },
+        "predictor_mask": {
+            "contract": {
+                "dtype": _contract(predictor_mask)["dtype"],
+                "rank": 2,
+                "shape": [batch, "predictor_context"],
+            },
+            "scope": "invocation",
+            "initializer": "frame.predictor.initializer.body_attention_mask",
+            "recurrence": {
+                "kind": "growing",
+                "axis": 1,
+                "increment": "package.one_scalar",
+                "max": "package.predictor_mask_limit",
+            },
+        },
+        "predictor_position": {
+            "contract": _contract(
+                next(
+                    value
+                    for value in pkg.policy_components[
+                        "predictor_state_initializer"
+                    ].model.graph.outputs
+                    if value.name == "body_position_ids"
+                )
+            ),
+            "scope": "invocation",
+            "initializer": "frame.predictor.initializer.body_position_ids",
+            "recurrence": {"kind": "invariant"},
+        },
+    }
+    for index, (past, present) in enumerate(talker_caches):
+        state[f"talker_cache_{index}"] = {
+            "contract": _contract(past),
+            "scope": "invocation",
+            "initializer": f"talker.setup.{present.name}",
+            "recurrence": {
+                "kind": "growing",
+                "axis": 2,
+                "increment": "package.one_scalar",
+                "max": "package.talker_context_limit",
+            },
+        }
+    for index, (past, present) in enumerate(predictor_caches):
+        state[f"predictor_cache_{index}"] = {
+            "contract": _contract(past),
+            "scope": "invocation",
+            "initializer": f"frame.predictor.{present.name}",
+            "recurrence": {
+                "kind": "growing",
+                "axis": 2,
+                "increment": "package.one_scalar",
+                "max": "package.predictor_context_limit",
+            },
+        }
+
+    outer_carried = [
+        {
+            "cell": "last_frame",
+            "current": "setup.frame_prefill",
+            "body_input": "state.last_frame.outer",
+            "body_output": "frame.completed",
+            "next": "last_frame.final",
+            "read_effect": _effect("state:last_frame.0", "state:last_frame.read"),
+            "write_effect": _effect("state:last_frame.read", "state:last_frame.1"),
+        },
+        {
+            "cell": "history",
+            "current": "history.setup",
+            "body_input": "state.history.outer",
+            "body_output": "history.outer",
+            "next": "history.final",
+            "read_effect": _effect("state:history.0", "state:history.read"),
+            "write_effect": _effect("state:history.read", "state:history.1"),
+        },
+        {
+            "cell": "talker_mask",
+            "current": "talker.initializer.body_attention_mask",
+            "body_input": "state.talker_mask.body",
+            "body_output": "talker.mask.body",
+            "next": "talker.mask.final",
+            "read_effect": _effect("state:talker_mask.0", "state:talker_mask.read"),
+            "write_effect": _effect("state:talker_mask.read", "state:talker_mask.1"),
+        },
+        {
+            "cell": "talker_position",
+            "current": "talker.initializer.body_position_ids",
+            "body_input": "state.talker_position.body",
+            "body_output": "talker.position.body",
+            "next": "talker.position.final",
+            "read_effect": _effect("state:talker_position.0", "state:talker_position.read"),
+            "write_effect": _effect("state:talker_position.read", "state:talker_position.1"),
+        },
+    ]
+    for index, (_, present) in enumerate(talker_caches):
+        outer_carried.append(
+            {
+                "cell": f"talker_cache_{index}",
+                "current": f"talker.setup.{present.name}",
+                "body_input": f"state.talker_cache_{index}.body",
+                "body_output": f"talker.body.{present.name}",
+                "next": f"talker.cache_{index}.final",
+                "read_effect": _effect(
+                    f"state:talker_cache_{index}.0", f"state:talker_cache_{index}.read"
+                ),
+                "write_effect": _effect(
+                    f"state:talker_cache_{index}.read", f"state:talker_cache_{index}.1"
+                ),
+            }
+        )
+    initial_effects = {
+        "setup_talker_sample": "setup_talker_sample.0",
+        "setup_predictor_sample": "setup_predictor_sample.0",
+        "talker_sample": "talker_sample.0",
+        "predictor_prefill_sample": "predictor_prefill_sample.0",
+        "predictor_body_sample": "predictor_body_sample.0",
+        "emit": "emit.0",
+    }
+    for cell in state:
+        initial_effects[f"state:{cell}"] = f"state:{cell}.0"
+
+    codec_value = "history.final"
+    final_nodes: list[dict[str, Any]] = []
+    if codec_group_major:
+        final_nodes.append(
+            _invoke("codec_layout", {"history": "history.final"}, {"codes": "codec.codes"})
+        )
+        codec_value = "codec.codes"
+    final_nodes.extend(
+        [
+            _invoke(
+                codec_name, {codec_input.name: codec_value}, {waveform.name: "tts.waveform"}
+            ),
+            {
+                "kind": "emit",
+                "value": "tts.waveform",
+                "output": "waveform",
+                "mode": "replace",
+                "effect_name": "emit",
+                "effect": _effect("emit.0", "emit.1"),
+            },
+        ]
+    )
+    workflow = {
+        "manifest": {
+            "ir_version": "1.0",
+            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
+            "capabilities": [
+                "workflow_ssa",
+                "linear_effects",
+                "nested_control_flow",
+                "loop_induction_values",
+                "typed_emit",
+            ],
+        },
+        "inputs": inputs,
+        "outputs": {
+            "waveform": {
+                "contract": _contract(waveform),
+                "role": "audio",
+                "stage": "post_adapter",
+            }
+        },
+        "components": {
+            name: _component(model, _artifact(name, len(pkg))) for name, model in pkg.items()
+        },
+        "state": state,
+        "initial_effects": initial_effects,
+        "graph": {
+            "kind": "sequence",
+            "nodes": [
+                {
+                    "kind": "loop",
+                    "setup": {"kind": "sequence", "nodes": setup_nodes},
+                    "body": {"kind": "sequence", "nodes": outer_body_nodes},
+                    "condition": "talker.continue",
+                    "max_iterations": "request.max_iterations",
+                    "iteration": {"value": "talker.iteration", "contract": batch_int},
+                    "carried": outer_carried,
+                },
+                *final_nodes,
+            ],
+        },
+    }
+    metadata = {"schema_version": "v1", "pipeline": {"workflow": workflow}}
+    add_policy_components_to_workflow(metadata, pkg)
+    return metadata
+
+
 def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
     """Build nested talker/code-predictor loops with lexical induction SSA."""
+    real_transition_components = {
+        "embedding",
+        "code_predictor_prefill",
+        "code_predictor_step_embedder",
+        "code_predictor_indices",
+        "talker_text_step",
+    }
+    if real_transition_components <= set(pkg.keys()):
+        return _build_real_tts_workflow_metadata(pkg, config)
     required = {
         "talker",
         "code_predictor",
@@ -351,9 +1317,7 @@ def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             result[value.name] = name
         return result
 
-    def bind_outputs(
-        values: Any, bound: dict[str, str], prefix: str
-    ) -> dict[str, str]:
+    def bind_outputs(values: Any, bound: dict[str, str], prefix: str) -> dict[str, str]:
         result = dict(bound)
         for value in values:
             result.setdefault(value.name, f"{prefix}.{value.name}")
@@ -759,9 +1723,7 @@ def build_diffusion_workflow_metadata(
         )
 
     attach_policy_components(pkg, PolicyCapabilities())
-    pkg.add_policy_component(
-        "euler_model_input", build_euler_model_input(sample_input.dtype)
-    )
+    pkg.add_policy_component("euler_model_input", build_euler_model_input(sample_input.dtype))
     pkg.add_policy_component("solver_step", build_euler_solver_step(sample_input.dtype))
     pkg.add_policy_component("continue_predicate", build_boolean_not())
     schedule_values = schedule or [
@@ -769,7 +1731,9 @@ def build_diffusion_workflow_metadata(
     ]
     timestep_values = timesteps or schedule_values[:-1]
     if len(schedule_values) != num_inference_steps + 1:
-        raise ValueError("diffusion solver schedule must contain num_inference_steps + 1 values")
+        raise ValueError(
+            "diffusion solver schedule must contain num_inference_steps + 1 values"
+        )
     if len(timestep_values) != num_inference_steps:
         raise ValueError("diffusion timesteps must contain num_inference_steps values")
     pkg.add_policy_component("diffusion_schedule", build_schedule_constant(schedule_values))

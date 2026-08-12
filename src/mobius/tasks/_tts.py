@@ -10,6 +10,10 @@ Builds separate ONNX models (five required + one optional speaker encoder):
 4. **talker_step_embedder**: frame_codes + text_embed → inputs_embeds
 5. **talker_prefill_embedder**: text_ids → prefill_embeds + trailing_text_embeds
 6. **speaker_encoder**: mel_input → speaker_embedding
+7. **code_predictor_prefill**: talker hidden + group-0 embedding → predictor input
+8. **code_predictor_step_embedder**: prior code + predictor tables → next input
+9. **talker_text_step**: trailing text embeddings + loop index → one text embedding
+10. **code_predictor_indices**: inner induction → embedding/head/frame indices
 
 Used by Qwen3TTSForConditionalGeneration.
 """
@@ -86,12 +90,91 @@ class TTSTask(ModelTask):
         models["talker_prefill_embedder"] = self._build_talker_prefill_embedder(
             module.talker_prefill_embedder, config
         )
+        models["code_predictor_prefill"] = self._build_code_predictor_prefill(config)
+        models["code_predictor_step_embedder"] = self._build_code_predictor_step_embedder(
+            config
+        )
+        models["code_predictor_indices"] = self._build_code_predictor_indices()
+        models["talker_text_step"] = self._build_talker_text_step(config)
         if module.speaker_encoder is not None:
             models["speaker_encoder"] = self._build_speaker_encoder(
                 module.speaker_encoder, config
             )
 
         return ModelPackage(models, config=config)
+
+    def _build_code_predictor_prefill(self, config: ArchitectureConfig) -> ir.Model:
+        """Build the trained group-0 transition input for code-predictor prefill."""
+        graph, builder = _make_graph(name="code_predictor_prefill")
+        talker_hidden = builder.input(
+            "talker_hidden",
+            dtype=config.dtype,
+            shape=["batch", 1, config.hidden_size],
+        )
+        group_0_embed = builder.input(
+            "group_0_embed",
+            dtype=config.dtype,
+            shape=["batch", 1, config.hidden_size],
+        )
+        inputs_embeds = builder.op.Concat(talker_hidden, group_0_embed, axis=1)
+        inputs_embeds.shape = ir.Shape(["batch", 2, config.hidden_size])
+        builder.add_output(inputs_embeds, "inputs_embeds")
+        return _make_model(graph)
+
+    def _build_code_predictor_step_embedder(self, config: ArchitectureConfig) -> ir.Model:
+        """Gather the trained predictor embedding for the previously sampled code."""
+        tts = config.tts
+        cp = tts.code_predictor if tts else None
+        num_groups = tts.num_code_groups if tts else 16
+        cp_vocab = cp.vocab_size if cp else 2048
+        graph, builder = _make_graph(name="code_predictor_step_embedder")
+        codec_embeddings = builder.input(
+            "codec_embeddings",
+            dtype=config.dtype,
+            shape=[num_groups - 1, cp_vocab, config.hidden_size],
+        )
+        token = builder.input("token", dtype=ir.DataType.INT64, shape=["batch"])
+        embedding_index = builder.input("embedding_index", dtype=ir.DataType.INT64, shape=[])
+        table = builder.op.Gather(codec_embeddings, embedding_index, axis=0)
+        inputs_embeds = builder.op.Gather(table, token, axis=0)
+        inputs_embeds = builder.op.Unsqueeze(inputs_embeds, [1])
+        inputs_embeds.shape = ir.Shape(["batch", 1, config.hidden_size])
+        builder.add_output(inputs_embeds, "inputs_embeds")
+        return _make_model(graph)
+
+    def _build_talker_text_step(self, config: ArchitectureConfig) -> ir.Model:
+        """Select one trailing-text embedding for the outer talker iteration."""
+        graph, builder = _make_graph(name="talker_text_step")
+        trailing = builder.input(
+            "trailing_text_embeds",
+            dtype=config.dtype,
+            shape=["batch", "trailing_sequence", config.hidden_size],
+        )
+        iteration = builder.input("iteration", dtype=ir.DataType.INT64, shape=["batch"])
+        sequence_length = builder.op.Shape(trailing, start=1, end=2)
+        index = builder.op.Min(
+            builder.op.Gather(iteration, 0, axis=0),
+            builder.op.Sub(
+                builder.op.Squeeze(sequence_length, [0]),
+                builder.op.Constant(value_int=1),
+            ),
+        )
+        text_embed = builder.op.Gather(trailing, index, axis=1)
+        text_embed = builder.op.Unsqueeze(text_embed, [1])
+        text_embed.shape = ir.Shape(["batch", 1, config.hidden_size])
+        builder.add_output(text_embed, "text_embed")
+        return _make_model(graph)
+
+    def _build_code_predictor_indices(self) -> ir.Model:
+        """Derive predictor/table/frame indices from the zero-based inner loop."""
+        graph, builder = _make_graph(name="code_predictor_indices")
+        iteration = builder.input("iteration", dtype=ir.DataType.INT64, shape=[])
+        step_index = builder.op.Add(iteration, builder.op.Constant(value_int=1))
+        frame_index = builder.op.Add(iteration, builder.op.Constant(value_int=2))
+        builder.add_output(builder.op.Identity(iteration), "embedding_index")
+        builder.add_output(step_index, "step_index")
+        builder.add_output(frame_index, "frame_index")
+        return _make_model(graph)
 
     def _build_talker(
         self,
@@ -142,6 +225,13 @@ class TTSTask(ModelTask):
             position_ids=position_ids,
             past_key_values=past_key_values,
         )
+        for present in present_key_values:
+            present[0].shape = ir.Shape(
+                [batch, config.num_key_value_heads, "total_sequence_len", config.head_dim]
+            )
+            present[1].shape = ir.Shape(
+                [batch, config.num_key_value_heads, "total_sequence_len", config.head_dim]
+            )
 
         builder.add_output(logits, "logits")
         builder.add_output(last_hidden_state, "last_hidden_state")
@@ -224,6 +314,13 @@ class TTSTask(ModelTask):
             position_ids=position_ids,
             past_key_values=past_key_values,
         )
+        for present in present_key_values:
+            present[0].shape = ir.Shape(
+                [batch, cp_num_key_value_heads, "total_sequence_len", cp_head_dim]
+            )
+            present[1].shape = ir.Shape(
+                [batch, cp_num_key_value_heads, "total_sequence_len", cp_head_dim]
+            )
 
         builder.add_output(logits, "logits")
         # Expose stacked codec embeddings for generation loop to extract.
@@ -339,6 +436,10 @@ class TTSTask(ModelTask):
         prefill_embeds, trailing_text_embeds = talker_prefill_embedder(
             builder.op,
             text_ids=text_ids,
+        )
+        prefill_embeds.shape = ir.Shape([batch, "prefill_sequence_len", config.hidden_size])
+        trailing_text_embeds.shape = ir.Shape(
+            [batch, "trailing_sequence_len", config.hidden_size]
         )
 
         builder.add_output(prefill_embeds, "prefill_embeds")

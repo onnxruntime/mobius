@@ -22,6 +22,9 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     build_tts_workflow_metadata,
     write_audio_codec_workflow_metadata,
 )
+from mobius.models.qwen3_tts import Qwen3TTSForConditionalGeneration
+from mobius.models.qwen3_tts_test import _TINY_CONFIG
+from mobius.tasks import TTSTask
 
 
 def _codec_package() -> ModelPackage:
@@ -160,3 +163,41 @@ def test_tts_uses_nested_lexical_loop_induction_and_codec():
     assert inner["body"]["nodes"][0]["inputs"]["step_index"] == "code.iteration"
     assert workflow["graph"]["nodes"][-2]["component"] == "codec"
     assert workflow["outputs"]["waveform"]["stage"] == "post_adapter"
+
+
+def test_real_qwen3_tts_workflow_carries_trained_transitions_and_kv_state():
+    package = TTSTask().build(Qwen3TTSForConditionalGeneration(_TINY_CONFIG), _TINY_CONFIG)
+    package["codec"] = _model(
+        "codec",
+        [_value("codes", ir.DataType.INT64, ["batch", 4, "frames"])],
+        [("waveform", ir.DataType.FLOAT, ["batch", 1, "samples"])],
+    )
+
+    workflow = build_tts_workflow_metadata(package, _TINY_CONFIG)["pipeline"]["workflow"]
+
+    assert {
+        "code_predictor_prefill",
+        "code_predictor_step_embedder",
+        "talker_text_step",
+    }.issubset(workflow["components"])
+    assert workflow["state"]["talker_cache_0"]["recurrence"]["kind"] == "growing"
+    assert workflow["state"]["predictor_cache_0"]["scope"] == "invocation"
+    assert (
+        workflow["state"]["predictor_cache_0"]["recurrence"]["max"]
+        == "package.predictor_context_limit"
+    )
+    outer = workflow["graph"]["nodes"][0]
+    setup_history = next(
+        node
+        for node in outer["setup"]["nodes"]
+        if node.get("component") == "code_history_append"
+    )
+    assert setup_history["inputs"]["frame"].startswith("setup.predictor.remaining_")
+
+    assert outer["kind"] == "loop"
+    inner = next(node for node in outer["body"]["nodes"] if node["kind"] == "loop")
+    assert inner["iteration"]["value"] == "code.iteration"
+    assert any(
+        node.get("component") == "code_predictor_step_embedder"
+        for node in inner["body"]["nodes"]
+    )

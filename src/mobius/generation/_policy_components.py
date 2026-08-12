@@ -134,7 +134,7 @@ def _make_graph(name: str) -> tuple[ir.Graph, GraphBuilder]:
     return graph, GraphBuilder(graph)
 
 
-def build_greedy_sampler() -> PolicyComponent:
+def build_greedy_sampler(*, effect: str = "sample") -> PolicyComponent:
     """Build ``logits -> token_ids`` greedy sampling over the final axis."""
     graph, builder = _make_graph("greedy_sampler")
     logits = builder.input(
@@ -152,9 +152,9 @@ def build_greedy_sampler() -> PolicyComponent:
             "mode": "greedy",
             "logits": "logits",
             "token": "token",
-            "effect": "sample",
+            "effect": effect,
         },
-        "sample",
+        effect,
     )
 
 
@@ -240,11 +240,159 @@ def build_tts_state_initializer(num_code_groups: int) -> PolicyComponent:
     frame_shape = op.Concat(batch, op.Constant(value_ints=[num_code_groups]), axis=0)
     history_shape = op.Concat(batch, op.Constant(value_ints=[0, num_code_groups]), axis=0)
     frame = op.ConstantOfShape(frame_shape, value=ir.tensor([0], dtype=ir.DataType.INT64))
+    token_slot = op.ConstantOfShape(
+        op.Concat(batch, op.Constant(value_ints=[1]), axis=0),
+        value=ir.tensor([0], dtype=ir.DataType.INT64),
+    )
     history = op.ConstantOfShape(history_shape, value=ir.tensor([0], dtype=ir.DataType.INT64))
     frame.shape = ir.Shape(["batch", num_code_groups])
+    token_slot.shape = ir.Shape(["batch", 1])
     history.shape = ir.Shape(["batch", 0, num_code_groups])
     builder.add_output(frame, "frame_codes")
+    builder.add_output(token_slot, "token_slot")
     builder.add_output(history, "code_history")
+    return _component(PolicyRole.AUXILIARY, graph, {})
+
+
+def build_tts_decoder_state_initializer(
+    decoder: ir.Model,
+    *,
+    graph_name: str,
+    embedding_input: str,
+    attention_mask_input: str,
+    position_ids_input: str,
+    cache_inputs: list[str],
+) -> PolicyComponent:
+    """Initialize masks, positions, and empty KV state from prefill embeddings."""
+    graph, builder = _make_graph(graph_name)
+    op = builder.op
+    inputs = {value.name: value for value in decoder.graph.inputs}
+    embedding = inputs[embedding_input]
+    prompt = builder.input(
+        "prefill_embeds",
+        embedding.dtype,
+        ["batch", "prefill_sequence", list(embedding.shape)[-1]],
+    )
+    batch_shape = op.Shape(prompt, start=0, end=1)
+    sequence_shape = op.Shape(prompt, start=1, end=2)
+    mask_shape = op.Concat(batch_shape, sequence_shape, axis=0)
+    attention_value = inputs[attention_mask_input]
+    attention = op.Cast(
+        op.ConstantOfShape(mask_shape, value=ir.tensor([1])),
+        to=attention_value.dtype,
+    )
+    attention.shape = attention_value.shape
+    body_attention = op.Concat(
+        attention,
+        op.Cast(
+            op.ConstantOfShape(
+                op.Concat(batch_shape, op.Constant(value_ints=[1]), axis=0),
+                value=ir.tensor([1]),
+            ),
+            to=attention_value.dtype,
+        ),
+        axis=1,
+    )
+    body_attention.shape = ir.Shape(["batch", "prefill_sequence + 1"])
+
+    position_value = inputs[position_ids_input]
+    position_rank = len(position_value.shape or [])
+    position_range = op.Range(
+        op.Constant(value_int=0),
+        op.Squeeze(sequence_shape, [0]),
+        op.Constant(value_int=1),
+    )
+    if position_rank == 2:
+        position_shape = mask_shape
+        positions = op.Expand(op.Unsqueeze(position_range, [0]), position_shape)
+        body_position = op.Expand(
+            op.Cast(sequence_shape, to=position_value.dtype),
+            op.Concat(batch_shape, op.Constant(value_ints=[1]), axis=0),
+        )
+        body_position.shape = ir.Shape(["batch", 1])
+    elif position_rank == 3:
+        position_shape = op.Concat(
+            op.Constant(value_ints=[3]), batch_shape, sequence_shape, axis=0
+        )
+        positions = op.Expand(op.Unsqueeze(position_range, [0, 1]), position_shape)
+        body_position = op.Expand(
+            op.Reshape(
+                op.Cast(sequence_shape, to=position_value.dtype),
+                op.Constant(value_ints=[1, 1, 1]),
+            ),
+            op.Concat(
+                op.Constant(value_ints=[3]),
+                batch_shape,
+                op.Constant(value_ints=[1]),
+                axis=0,
+            ),
+        )
+        body_position.shape = ir.Shape([3, "batch", 1])
+    else:
+        raise ValueError("TTS decoder position_ids must be rank 2 or 3")
+    positions = op.Cast(positions, to=position_value.dtype)
+    positions.shape = position_value.shape
+
+    builder.add_output(attention, attention_mask_input)
+    builder.add_output(positions, position_ids_input)
+    builder.add_output(body_attention, "body_attention_mask")
+    builder.add_output(body_position, "body_position_ids")
+    for name in cache_inputs:
+        value = inputs[name]
+        dimensions = list(value.shape or [])
+        shape_parts = []
+        for axis, dimension in enumerate(dimensions):
+            text = str(getattr(dimension, "value", dimension))
+            if axis == 0:
+                shape_parts.append(batch_shape)
+            elif "sequence" in text:
+                shape_parts.append(op.Constant(value_ints=[0]))
+            elif isinstance(dimension, int):
+                shape_parts.append(op.Constant(value_ints=[dimension]))
+            else:
+                raise ValueError(f"cache input {name!r} has unsupported dimension {text!r}")
+        empty = op.ConstantOfShape(
+            op.Concat(*shape_parts, axis=0),
+            value=ir.tensor(
+                [0.0 if value.dtype.is_floating_point else 0],
+                dtype=value.dtype,
+            ),
+        )
+        empty.shape = value.shape
+        builder.add_output(empty, name)
+    return _component(PolicyRole.AUXILIARY, graph, {})
+
+
+def build_tts_decoder_step_update(
+    *,
+    graph_name: str,
+    attention_dtype: ir.DataType,
+    position_dtype: ir.DataType,
+    position_rank: int,
+) -> PolicyComponent:
+    """Append one decoder mask slot and increment rank-2 or rank-3 positions."""
+    graph, builder = _make_graph(graph_name)
+    op = builder.op
+    attention = builder.input("attention_mask", attention_dtype, ["batch", "context"])
+    one_shape = op.Concat(
+        op.Shape(attention, start=0, end=1),
+        op.Constant(value_ints=[1]),
+        axis=0,
+    )
+    one = op.CastLike(op.ConstantOfShape(one_shape, value=ir.tensor([1])), attention)
+    next_attention = op.Concat(attention, one, axis=1)
+    next_attention.shape = ir.Shape(["batch", "context + 1"])
+    if position_rank == 2:
+        position_shape: list[int | str] = ["batch", 1]
+    elif position_rank == 3:
+        position_shape = [3, "batch", 1]
+    else:
+        raise ValueError("TTS decoder position_ids must be rank 2 or 3")
+    position = builder.input("position_ids", position_dtype, position_shape)
+    next_position = op.Add(position, op.CastLike(op.Constant(value_int=1), position))
+    next_position.shape = position.shape
+    builder.add_output(next_attention, "next_attention_mask")
+    builder.add_output(next_position, "next_position_ids")
     return _component(PolicyRole.AUXILIARY, graph, {})
 
 
@@ -416,7 +564,8 @@ def build_decoder_state_initializer(
                 shape_parts.append(op.Constant(value_ints=[dimension]))
             else:
                 raise ValueError(
-                    f"cache input {name!r} has unsupported symbolic dimension {dimension_text!r}"
+                    f"cache input {name!r} has unsupported symbolic "
+                    f"dimension {dimension_text!r}"
                 )
         cache_shape = op.Concat(*shape_parts, axis=0)
         zero = 0.0 if value.dtype.is_floating_point else 0
@@ -601,9 +750,7 @@ def build_euler_model_input(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyCom
     """Scale a latent for the Euler denoiser input at the current sigma."""
     graph, builder = _make_graph("euler_model_input")
     op = builder.op
-    sample = builder.input(
-        "sample", dtype, ["batch", "channels", "height", "width"]
-    )
+    sample = builder.input("sample", dtype, ["batch", "channels", "height", "width"])
     step = builder.input("step", ir.DataType.INT64, ["batch"])
     schedule = builder.input("schedule", ir.DataType.FLOAT, ["schedule_length"])
     sigma = op.Gather(schedule, step, axis=0)
@@ -818,9 +965,7 @@ def build_speculative_acceptance() -> PolicyComponent:
     # shortest verified prefix so every row can share the same rollback point.
     synchronized_len = op.ReduceMin(accepted_count, axes=[0], keepdims=1)
     accepted_count = op.Expand(synchronized_len, op.Shape(accepted_count))
-    synchronized_done = op.ReduceMin(
-        op.Cast(done, to=ir.DataType.INT64), axes=[0], keepdims=1
-    )
+    synchronized_done = op.ReduceMin(op.Cast(done, to=ir.DataType.INT64), axes=[0], keepdims=1)
     done = op.Expand(
         op.Cast(synchronized_done, to=ir.DataType.BOOL),
         op.Shape(done),
@@ -947,3 +1092,13 @@ def build_token_state_update() -> PolicyComponent:
         },
         "state",
     )
+
+
+def build_token_to_slot() -> PolicyComponent:
+    """Convert a canonical sampled token vector to a one-token ID tensor."""
+    graph, builder = _make_graph("token_to_slot")
+    token = builder.input("token", ir.DataType.INT64, ["batch"])
+    slot = builder.op.Unsqueeze(token, [-1])
+    slot.shape = ir.Shape(["batch", 1])
+    builder.add_output(slot, "slot")
+    return _component(PolicyRole.AUXILIARY, graph, {})

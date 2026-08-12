@@ -33,6 +33,9 @@ from mobius.generation._policy_components import (
     build_speculative_state_rollback,
     build_token_block_identity,
     build_token_state_update,
+    build_token_to_slot,
+    build_tts_decoder_state_initializer,
+    build_tts_decoder_step_update,
     build_tts_state_initializer,
 )
 
@@ -64,5 +67,8 @@ __all__ = [
     "build_speculative_state_rollback",
     "build_token_state_update",
     "build_token_block_identity",
+    "build_token_to_slot",
+    "build_tts_decoder_state_initializer",
+    "build_tts_decoder_step_update",
     "build_tts_state_initializer",
 ]
