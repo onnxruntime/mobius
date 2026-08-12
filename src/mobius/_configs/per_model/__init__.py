@@ -29,6 +29,7 @@ from mobius._configs.per_model import (  # noqa: F401
     _gemma4_unified_vision,
     _hunyuan_vl_mot_vision,
     _internvl_vision,
+    _muse_glimmer_vision,
     _phi4mm_audio,
     _phi4mm_vision,
     _phi_vision,

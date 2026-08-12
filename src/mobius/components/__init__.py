@@ -47,6 +47,7 @@ __all__ = [
     "LoRALinear",
     "MLP",
     "MLPMultiModalProjector",
+    "MuseGlimmerVisionModel",
     "Cosmos3EdgeMultiModalProjector",
     "MoELayer",
     "OffsetRMSNorm",
@@ -158,7 +159,9 @@ from mobius.components._encoder_decoder_attention import (
 from mobius.components._gated_deltanet import GatedDeltaNet
 from mobius.components._gemma4_audio import ClippableLinear
 from mobius.components._gemma4_audio import Gemma4AudioEncoder as Gemma4AudioEncoder
-from mobius.components._lightning_attention import LightningAttention as LightningAttention
+from mobius.components._lightning_attention import (
+    LightningAttention as LightningAttention,
+)
 from mobius.components._lora import LoRALinear
 from mobius.components._mamba_block import Mamba2Block as Mamba2Block
 from mobius.components._mamba_block import MambaBlock as MambaBlock
@@ -181,6 +184,7 @@ from mobius.components._multimodal import (
     LinearMultiModalProjector,
     MLPMultiModalProjector,
 )
+from mobius.components._muse_glimmer_vision import MuseGlimmerVisionModel
 from mobius.components._pixtral_vision import (
     Mistral3MultiModalProjector as Mistral3MultiModalProjector,
 )

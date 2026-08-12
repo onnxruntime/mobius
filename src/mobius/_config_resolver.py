@@ -114,6 +114,15 @@ def _dict_to_pretrained_config(d: dict):
     works correctly.
     """
     import transformers
+    from huggingface_hub import errors as hub_errors
+
+    # Introduced in newer huggingface_hub releases. Older supported versions
+    # can still construct these configs and should not fail on the import.
+    strict_validation_error = getattr(
+        hub_errors,
+        "StrictDataclassClassValidationError",
+        TypeError,
+    )
 
     # Composite configs (e.g. configs with text_config/thinker_config) may
     # duplicate rope_scaling at the top level.  PretrainedConfig's rope
@@ -143,21 +152,30 @@ def _dict_to_pretrained_config(d: dict):
 
     try:
         config = transformers.PretrainedConfig(**d)
-    except (AttributeError, KeyError, TypeError) as e:
+    except (
+        AttributeError,
+        KeyError,
+        TypeError,
+        strict_validation_error,
+    ) as e:
         # Newer transformers may crash during rope standardization
         # (e.g. Phi4-MM longrope format where PretrainedConfig doesn't
-        # set max_position_embeddings before accessing it).  Strip rope
-        # fields, construct the config, then restore them as attributes
-        # so _extract_rope_config can still read them.
+        # set max_position_embeddings before accessing it), or reject a
+        # model-specific layer type that is newer than the installed
+        # transformers (e.g. Muse Glimmer's ``window_attention``). Strip
+        # only the fields validated by PretrainedConfig, construct the
+        # attribute container, then restore their authoritative raw values.
         logger.warning(
-            "Retrying %s config without rope fields after PretrainedConfig init failure: %s",
+            "Retrying %s config without validated model-specific fields after "
+            "PretrainedConfig init failure: %s",
             d.get("model_type", "unknown"),
             e,
         )
-        saved_rope = {k: d[k] for k in rope_keys if k in d}
-        d_clean = {k: v for k, v in d.items() if k not in rope_keys}
+        retry_keys = (*rope_keys, "layer_types")
+        saved_fields = {k: d[k] for k in retry_keys if k in d}
+        d_clean = {k: v for k, v in d.items() if k not in retry_keys}
         config = transformers.PretrainedConfig(**d_clean)
-        for k, v in saved_rope.items():
+        for k, v in saved_fields.items():
             setattr(config, k, v)
 
     # Recursively convert known nested config keys

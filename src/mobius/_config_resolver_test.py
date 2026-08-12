@@ -434,6 +434,21 @@ class TestWhisperEncoderDecoder:
 class TestDictToPretrainedConfig:
     """Tests for dict → PretrainedConfig conversion with nested configs."""
 
+    def test_older_hub_without_strict_validation_error(self, monkeypatch):
+        import transformers
+        from huggingface_hub import errors as hub_errors
+
+        # Resolve the lazy Transformers import before simulating an older,
+        # mutually compatible huggingface_hub release.
+        assert transformers.PretrainedConfig is not None
+        monkeypatch.delattr(
+            hub_errors,
+            "StrictDataclassClassValidationError",
+            raising=False,
+        )
+        config = _dict_to_pretrained_config({"model_type": "llama", "hidden_size": 64})
+        assert config.hidden_size == 64
+
     def test_flat_dict(self):
         d = {"model_type": "llama", "hidden_size": 4096, "vocab_size": 32000}
         config = _dict_to_pretrained_config(d)

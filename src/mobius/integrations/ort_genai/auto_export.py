@@ -114,6 +114,8 @@ _GEMMA3_MODEL_TYPES = frozenset({"gemma3", "gemma3_text"})
 _PIXTRAL_MODEL_TYPES = frozenset({"mistral3"})
 _QWEN_VL_MODEL_TYPES = frozenset(
     {
+        "muse_glimmer",
+        "muse_glimmer_text",
         "qwen2_vl",
         "qwen2_5_vl",
         "qwen3_vl",

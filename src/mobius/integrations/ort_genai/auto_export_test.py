@@ -242,6 +242,43 @@ class TestWriteProcessorConfig:
         permute = transforms[5]["operation"]["attrs"]
         assert permute["dims"] == [2, 0, 1]
 
+    def test_muse_glimmer_uses_packed_qwen_image_pipeline(self, tmp_path):
+        """Muse vision consumes flattened patches and image grid dimensions."""
+        vision = mock.MagicMock()
+        vision.image_size = 448
+        vision.patch_size = 14
+        vision.spatial_merge_size = 2
+        vision.model_type = "muse_glimmer_vision"
+        config = mock.MagicMock()
+        config.vision = vision
+        # Composite builds unwrap to the text config before processor export.
+        config.model_type = "muse_glimmer_text"
+        config.spatial_merge_size = 2
+        config.temporal_patch_size = 2
+
+        path = _write_vision_processor_config(config, str(tmp_path))
+        assert path is not None
+        with open(path) as f:
+            data = json.load(f)
+
+        proc = data["processor"]
+        assert proc["name"] == "qwen2_5_image_processor"
+        transforms = proc["transforms"]
+        assert [t["operation"]["type"] for t in transforms] == [
+            "DecodeImage",
+            "ConvertRGB",
+            "Resize",
+            "Rescale",
+            "Normalize",
+            "PatchImage",
+        ]
+        assert transforms[4]["operation"]["attrs"]["qwen2_5_vl"] == 1
+        assert transforms[5]["operation"]["attrs"] == {
+            "patch_size": 14,
+            "temporal_patch_size": 2,
+            "merge_size": 2,
+        }
+
     def test_gemma3_vision_config(self, tmp_path):
         """Gemma3 gets a fixed-size resize + Permute3D (not the generic branch).
 

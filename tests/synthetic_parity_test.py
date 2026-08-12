@@ -470,6 +470,26 @@ _HF_MODEL_TYPE_OVERRIDES: dict[str, str] = {
 }
 
 
+def _adapt_muse_glimmer_text_config(hf_kwargs: dict) -> None:
+    """Translate the shared tiny config fields to Muse Glimmer's HF schema."""
+    hf_kwargs["head_dim"] = TINY_HEAD_DIM
+    hf_kwargs.setdefault("hidden_activation", hf_kwargs.get("hidden_act", "silu"))
+    hf_kwargs.pop("hidden_act", None)
+    hf_kwargs["attention_bias"] = False
+    hf_kwargs["rope_parameters"] = {
+        "rope_type": "default",
+        "rope_theta": hf_kwargs.pop("rope_theta", 10_000.0),
+    }
+    hf_kwargs.pop("rope_type", None)
+    hf_kwargs.pop("attn_qk_norm", None)
+    hf_kwargs.pop("no_rope_layers", None)
+
+
+_HF_CONFIG_ADAPTERS = {
+    "muse_glimmer_text": _adapt_muse_glimmer_text_config,
+}
+
+
 def _create_hf_config(model_type: str, config_overrides: dict):
     """Create a HuggingFace config for the given model type.
 
@@ -505,6 +525,9 @@ def _create_hf_config(model_type: str, config_overrides: dict):
     # Apply model-specific HF extras
     if model_type in _HF_EXTRA_CONFIG:
         hf_kwargs.update(_HF_EXTRA_CONFIG[model_type])
+
+    if adapter := _HF_CONFIG_ADAPTERS.get(hf_model_type):
+        adapter(hf_kwargs)
 
     # Convert layer_types to attn_layer_indices for hybrid Mamba models
     # Bamba uses attn_layer_indices (computed property layers_block_type)
@@ -667,13 +690,44 @@ def _create_hf_config(model_type: str, config_overrides: dict):
     return hf_config
 
 
+def _create_softcapped_backbone_causal_lm(hf_config):
+    """Wrap an HF backbone with the checkpoint's scaled, softcapped LM head."""
+    from transformers import AutoModel
+
+    class _SoftcappedBackboneCausalLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = AutoModel.from_config(hf_config)
+            self.lm_head = torch.nn.Linear(
+                hf_config.hidden_size,
+                hf_config.vocab_size,
+                bias=False,
+            )
+
+        def forward(self, **kwargs):
+            hidden_states = self.model(**kwargs).last_hidden_state
+            logits = self.lm_head(hidden_states) * hf_config.output_multiplier
+            cap = hf_config.final_logit_softcapping
+            if cap:
+                logits = cap * torch.tanh(logits / cap)
+            return type("CausalLMOutput", (), {"logits": logits})()
+
+    return _SoftcappedBackboneCausalLM()
+
+
+_HF_MODEL_FACTORIES = {
+    "muse_glimmer_text": _create_softcapped_backbone_causal_lm,
+}
+
+
 def _create_hf_model(model_type: str, hf_config, seed: int):
     """Create a HuggingFace model from config with deterministic init."""
     from transformers import AutoModelForCausalLM
 
     torch.manual_seed(seed)
     try:
-        hf_model = AutoModelForCausalLM.from_config(hf_config)
+        factory = _HF_MODEL_FACTORIES.get(model_type, AutoModelForCausalLM.from_config)
+        hf_model = factory(hf_config)
     except Exception as e:
         pytest.skip(f"Cannot create HF model for {model_type}: {type(e).__name__}: {e}")
 

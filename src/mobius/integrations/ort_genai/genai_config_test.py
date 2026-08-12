@@ -502,6 +502,47 @@ class TestGenaiConfigFromConfig:
         assert config["model"]["context_length"] == 4096
 
 
+def test_cuda_enables_decoder_graph_capture_only():
+    gen = GenaiConfigGenerator(
+        "qwen2_5_vl",
+        vocab_size=202048,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+    ).with_vision(image_token_id=200092)
+
+    config = gen.generate()
+
+    decoder_options = config["model"]["decoder"]["session_options"]["provider_options"]
+    vision_options = config["model"]["vision"]["session_options"]["provider_options"]
+    embedding_options = config["model"]["embedding"]["session_options"]["provider_options"]
+    assert decoder_options[0]["cuda"]["enable_cuda_graph"] == "1"
+    assert vision_options[0]["cuda"]["enable_cuda_graph"] == "0"
+    assert embedding_options[0]["cuda"]["enable_cuda_graph"] == "0"
+
+
+def test_cuda_decoder_graph_capture_can_be_disabled():
+    gen = GenaiConfigGenerator(
+        "test_model",
+        vocab_size=1000,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+        decoder_graph_capture=False,
+    )
+
+    config = gen.generate()
+    decoder_options = config["model"]["decoder"]["session_options"]["provider_options"]
+
+    assert decoder_options[0]["cuda"]["enable_cuda_graph"] == "0"
+
+
 class TestGenaiConfigWrite:
     """Test writing genai_config.json to disk."""
 
