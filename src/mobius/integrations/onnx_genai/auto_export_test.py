@@ -14,7 +14,11 @@ import yaml
 from mobius._configs import QuantizationConfig
 from mobius._model_package import ModelPackage
 from mobius.integrations.onnx_genai import write_onnx_genai_config
-from mobius.integrations.onnx_genai.inference_metadata_test import _decoder_model
+from mobius.integrations.onnx_genai.inference_metadata_test import (
+    _decoder_model,
+    _model,
+    _value,
+)
 
 
 @dataclasses.dataclass
@@ -349,39 +353,28 @@ def test_dispatch_speech_to_text_pipeline(tmp_path):
 
 
 def test_dispatch_audio_codec_pipeline(tmp_path):
-    # A neural codec: encoder outputs codes consumed by a single-pass decoder,
-    # with no cross-attention. It is a pure tensor pipeline (no decoder config).
-    pkg = _EncoderDecoderPkg(
-        {
-            "encoder": _FakeModel(["waveform"], ["codes"]),
-            "decoder": _FakeModel(["codes"], ["waveform"]),
-        }
+    encoder = _model(
+        "encoder",
+        [_value("waveform", ir.DataType.FLOAT, ["batch", 1, "audio_samples"])],
+        [("codes", ir.DataType.INT64, ["batch", 16, "frames"])],
     )
+    decoder = _model(
+        "decoder",
+        [_value("codes", ir.DataType.INT64, ["batch", 16, "frames"])],
+        [("waveform", ir.DataType.FLOAT, ["batch", 1, "audio_samples"])],
+    )
+    pkg = ModelPackage({"encoder": encoder, "decoder": decoder})
     artifacts = write_onnx_genai_config(pkg, str(tmp_path))
 
     with open(artifacts["inference_metadata"]) as handle:
         metadata = yaml.safe_load(handle)
 
-    # No decoder capabilities (produces tensors, not tokens).
     assert "model" not in metadata
-    pipeline = metadata["pipeline"]
-    assert pipeline["models"] == {
-        "encoder": {"filename": "encoder/model.onnx", "type": "audio_encoder"},
-        "decoder": {"filename": "decoder/model.onnx", "type": "vocoder"},
-    }
-    assert pipeline["dataflow"] == [
-        {
-            "from": "encoder.codes",
-            "to": "decoder.codes",
-            "dtype": "int64",
-            "device_transfer": False,
-        }
-    ]
-    stages = pipeline["strategy"]["stages"]
-    assert [stage["strategy"]["kind"] for stage in stages] == [
-        "single_pass",
-        "single_pass",
-    ]
+    assert not {"models", "dataflow", "strategy", "phases"}.intersection(metadata["pipeline"])
+    workflow = metadata["pipeline"]["workflow"]
+    assert workflow["graph"]["nodes"][0]["outputs"] == {"codes": "codec.codes"}
+    assert workflow["graph"]["nodes"][1]["inputs"] == {"codes": "codec.codes"}
+    assert workflow["outputs"]["waveform"]["stage"] == "post_adapter"
 
 
 def test_multi_decoder_tts_without_pre_embedder_raises_precise_not_implemented(tmp_path):
@@ -394,7 +387,7 @@ def test_multi_decoder_tts_without_pre_embedder_raises_precise_not_implemented(t
             "embedding": _FakeModel(["text_ids"]),
         }
     )
-    with pytest.raises(NotImplementedError, match="nested_autoregressive"):
+    with pytest.raises(NotImplementedError, match="nested generic workflow loops"):
         write_onnx_genai_config(pkg, str(tmp_path))
 
 
@@ -413,9 +406,6 @@ class _TTSPkg(dict):
 
 
 def test_dispatch_multi_decoder_tts_with_pre_embedder(tmp_path):
-    # The real Qwen3-TTS shape: talker + code_predictor + talker_step_embedder
-    # (+ talker_prefill_embedder) emits the pre_embedder/prefill-driven
-    # nested_autoregressive contract.
     pkg = _TTSPkg(
         {
             "talker": _FakeModel(["inputs_embeds"], ["logits", "last_hidden_state"]),
@@ -427,31 +417,8 @@ def test_dispatch_multi_decoder_tts_with_pre_embedder(tmp_path):
             "embedding": _FakeModel(["text_ids"]),
         }
     )
-    artifacts = write_onnx_genai_config(pkg, str(tmp_path))
-
-    with open(artifacts["inference_metadata"]) as handle:
-        metadata = yaml.safe_load(handle)
-
-    pipeline = metadata["pipeline"]
-    assert set(pipeline["models"]) == {
-        "talker",
-        "talker_step_embedder",
-        "code_predictor",
-        "talker_prefill_embedder",
-    }
-    stage = pipeline["strategy"]["stages"][0]["strategy"]
-    assert stage["kind"] == "nested_autoregressive"
-    assert stage["inner_embedding_output"] == "codec_embeddings"
-    assert stage["pre_embedder"]["component"] == "talker_step_embedder"
-    assert stage["prefill_embedder"]["component"] == "talker_prefill_embedder"
-    assert stage["num_code_groups"] == 16
-    assert pipeline["phases"]["talker_prefill_embedder"]["run_on"] == "prompt_only"
-    assert {
-        "from": "talker_step_embedder.inputs_embeds",
-        "to": "talker.inputs_embeds",
-        "dtype": "fp32",
-        "device_transfer": False,
-    } in pipeline["dataflow"]
+    with pytest.raises(NotImplementedError, match="nested-loop induction SSA value"):
+        write_onnx_genai_config(pkg, str(tmp_path))
 
 
 def test_unrecognized_multi_component_package_fails_loudly(tmp_path):

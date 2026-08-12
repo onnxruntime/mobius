@@ -15,9 +15,10 @@ model families Mobius builds:
   composite encoder/fusion/autoregressive-decoder pipeline.
 * **Speech-to-text (ASR)** — :func:`write_speech_to_text_pipeline_metadata` emits
   a Whisper-style cross-attention encode→decode pipeline.
-* **Audio codec / multi-decoder TTS** — :func:`write_audio_codec_pipeline_metadata`
-  and :func:`write_tts_pipeline_metadata` emit audio-to-audio and
-  ``pre_embedder``-driven ``nested_autoregressive`` (Qwen3-TTS) pipelines.
+* **Audio codec / multi-decoder TTS** —
+  :func:`write_audio_codec_workflow_metadata` emits typed codec SSA, while
+  :func:`write_tts_workflow_metadata` reports the current nested-loop induction
+  contract blocker precisely.
 * **Diffusion pipelines** — :func:`write_diffusion_pipeline_metadata` emits an
   iterative pipeline for a denoiser plus optional VAE / text encoder.
 
@@ -51,22 +52,22 @@ from mobius.integrations.onnx_genai.decoder_metadata import (
 from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
     add_policy_components_to_workflow,
-    build_audio_codec_pipeline_metadata,
     build_diffusion_pipeline_metadata,
     build_language_diffusion_pipeline_metadata,
     build_multimodal_pipeline_metadata,
     build_speech_to_text_pipeline_metadata,
-    build_tts_pipeline_metadata,
     load_diffusers_scheduler_config,
-    write_audio_codec_pipeline_metadata,
     write_diffusion_pipeline_metadata,
     write_multimodal_pipeline_metadata,
     write_speech_to_text_pipeline_metadata,
-    write_tts_pipeline_metadata,
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
+    build_audio_codec_workflow_metadata,
     build_decoder_workflow_metadata,
+    build_tts_workflow_metadata,
+    write_audio_codec_workflow_metadata,
     write_decoder_workflow_metadata,
+    write_tts_workflow_metadata,
 )
 
 __all__ = [
@@ -78,11 +79,11 @@ __all__ = [
     "build_decoder_workflow_metadata",
     "build_diffusion_pipeline_metadata",
     "build_language_diffusion_pipeline_metadata",
-    "build_audio_codec_pipeline_metadata",
+    "build_audio_codec_workflow_metadata",
     "build_multimodal_pipeline_metadata",
     "build_pipeline_metadata_for_workflow",
     "build_speech_to_text_pipeline_metadata",
-    "build_tts_pipeline_metadata",
+    "build_tts_workflow_metadata",
     "convert_comfyui_workflow",
     "decoder_metadata_from_config",
     "moe_metadata_from_config",
@@ -94,9 +95,9 @@ __all__ = [
     "write_decoder_metadata",
     "write_decoder_workflow_metadata",
     "write_diffusion_pipeline_metadata",
-    "write_audio_codec_pipeline_metadata",
+    "write_audio_codec_workflow_metadata",
     "write_multimodal_pipeline_metadata",
     "write_speech_to_text_pipeline_metadata",
-    "write_tts_pipeline_metadata",
+    "write_tts_workflow_metadata",
     "write_onnx_genai_config",
 ]

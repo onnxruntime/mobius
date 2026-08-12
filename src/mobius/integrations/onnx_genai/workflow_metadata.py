@@ -35,14 +35,22 @@ def _contract(value: ir.Value) -> dict[str, Any]:
     }
 
 
-def _component(model: ir.Model, artifact: str) -> dict[str, Any]:
-    return {
+def _component(
+    model: ir.Model,
+    artifact: str,
+    *,
+    effects: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    component = {
         "implementation": {"kind": "onnx", "artifact": artifact},
         "ports": {
             "inputs": {value.name: _contract(value) for value in model.graph.inputs},
             "outputs": {value.name: _contract(value) for value in model.graph.outputs},
         },
     }
+    if effects:
+        component["effects"] = list(effects)
+    return component
 
 
 def _effect(consumes: str, produces: str) -> dict[str, str]:
@@ -62,6 +70,152 @@ def _invoke(
         "outputs": outputs,
         "effects": effects or {},
     }
+
+
+def build_audio_codec_workflow_metadata(pkg: Any) -> dict[str, Any]:
+    """Build typed SSA metadata for a waveform-to-codes-to-waveform codec."""
+    names = set(pkg.keys())
+    if names != {"encoder", "decoder"}:
+        raise ValueError(
+            "audio codec workflow requires exactly encoder and decoder components"
+        )
+    encoder = pkg["encoder"]
+    decoder = pkg["decoder"]
+    if len(encoder.graph.inputs) != 1 or len(encoder.graph.outputs) != 1:
+        raise ValueError("codec encoder requires exactly one input and one output")
+    if len(decoder.graph.inputs) != 1 or len(decoder.graph.outputs) != 1:
+        raise ValueError("codec decoder requires exactly one input and one output")
+
+    waveform_input = encoder.graph.inputs[0]
+    codes_output = encoder.graph.outputs[0]
+    codes_input = decoder.graph.inputs[0]
+    waveform_output = decoder.graph.outputs[0]
+    if codes_output.dtype != codes_input.dtype:
+        raise ValueError("codec encoder output and decoder input dtypes must match")
+    if _contract(codes_output) != _contract(codes_input):
+        raise ValueError("codec encoder output and decoder input contracts must match")
+
+    encode_effect = "codec_encode"
+    decode_effect = "codec_decode"
+    emit_effect = "audio_emit"
+    workflow = {
+        "manifest": {
+            "ir_version": "1.0",
+            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
+            "capabilities": [
+                "workflow_ssa",
+                "linear_effects",
+                "typed_emit",
+            ],
+        },
+        "inputs": {
+            "request.waveform": {
+                "contract": _contract(waveform_input),
+                "role": {"kind": "runtime", "version": "1.0", "role": "media"},
+                "source": {"kind": "request", "field": "media"},
+                "required": True,
+            }
+        },
+        "outputs": {
+            "waveform": {
+                "contract": _contract(waveform_output),
+                "role": "audio",
+                "stage": "post_adapter",
+            }
+        },
+        "components": {
+            "encoder": _component(
+                encoder,
+                "encoder/model.onnx",
+                effects=(encode_effect,),
+            ),
+            "decoder": _component(
+                decoder,
+                "decoder/model.onnx",
+                effects=(decode_effect,),
+            ),
+        },
+        "initial_effects": {
+            encode_effect: f"{encode_effect}.0",
+            decode_effect: f"{decode_effect}.0",
+            emit_effect: f"{emit_effect}.0",
+        },
+        "graph": {
+            "kind": "sequence",
+            "nodes": [
+                _invoke(
+                    "encoder",
+                    {waveform_input.name: "request.waveform"},
+                    {codes_output.name: "codec.codes"},
+                    {encode_effect: _effect(f"{encode_effect}.0", f"{encode_effect}.1")},
+                ),
+                _invoke(
+                    "decoder",
+                    {codes_input.name: "codec.codes"},
+                    {waveform_output.name: "codec.waveform"},
+                    {decode_effect: _effect(f"{decode_effect}.0", f"{decode_effect}.1")},
+                ),
+                {
+                    "kind": "emit",
+                    "value": "codec.waveform",
+                    "output": "waveform",
+                    "mode": "replace",
+                    "effect_name": emit_effect,
+                    "effect": _effect(f"{emit_effect}.0", f"{emit_effect}.1"),
+                },
+            ],
+        },
+    }
+    return {"schema_version": "v1", "pipeline": {"workflow": workflow}}
+
+
+def write_audio_codec_workflow_metadata(pkg: Any, output_dir: str) -> str:
+    """Write typed SSA metadata for an audio codec package."""
+    os.makedirs(output_dir, exist_ok=True)
+    metadata = build_audio_codec_workflow_metadata(pkg)
+    path = os.path.join(output_dir, "inference_metadata.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(metadata, handle, sort_keys=False)
+    return path
+
+
+def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
+    """Reject TTS until the generic nested-loop contract exposes induction SSA.
+
+    Qwen3-TTS needs the inner loop index as the code predictor ``step_index`` and
+    to select the next code embedding. The workflow ``loop`` node at producer
+    commit 4c3c4b6 only accepts a condition and maximum value; it defines no
+    iteration SSA value. Consequently the existing prefill and per-frame
+    embedder artifacts can be invoked, but the code-predictor loop cannot be
+    expressed without host preprocessing or a model-specific counter component.
+    """
+    required = {
+        "talker",
+        "code_predictor",
+        "talker_step_embedder",
+    }
+    missing = sorted(required.difference(pkg.keys()))
+    if missing:
+        raise ValueError(f"TTS workflow is missing required components: {missing}")
+    del config
+    raise NotImplementedError(
+        "generic TTS workflow requires a nested-loop induction SSA value: "
+        "ONNX GenAI workflow Loop at producer commit 4c3c4b6 exposes neither an "
+        "iteration output nor fixed-loop index, so code_predictor.step_index, "
+        "position_ids, and per-group code embedding selection cannot be wired "
+        "from the existing prefill/step embedder artifacts without host "
+        "preprocessing"
+    )
+
+
+def write_tts_workflow_metadata(pkg: Any, output_dir: str, config: Any) -> str:
+    """Build TTS workflow metadata, failing precisely on the producer defect."""
+    metadata = build_tts_workflow_metadata(pkg, config)
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, "inference_metadata.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(metadata, handle, sort_keys=False)
+    return path
 
 
 def build_decoder_workflow_metadata(
