@@ -315,6 +315,7 @@ def _register_builtins() -> None:
             provider_options={
                 "enable_skip_layer_norm_strict_mode": "1",
             },
+            enable_graph_capture=True,
             supports_past_present_share_buffer=True,
             # Only CUDA ships the FP8 (E4M3) GroupQueryAttention KV-cache kernel
             # (SM89+ Ada/Hopper/Blackwell).
