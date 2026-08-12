@@ -553,6 +553,7 @@ def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
                 "workflow_ssa",
                 "linear_effects",
                 "nested_control_flow",
+                "loop_induction_values",
                 "typed_emit",
             ],
         },
@@ -618,6 +619,22 @@ def _find_port(values: Any, *fragments: str) -> ir.Value | None:
     return next(
         (value for value in values if any(part in value.name.lower() for part in fragments)),
         None,
+    )
+
+
+def _contracts_compatible(left: ir.Value, right: ir.Value) -> bool:
+    """Return whether symbolic tensor contracts can unify by dtype and fixed dims."""
+    if left.dtype != right.dtype or left.shape is None or right.shape is None:
+        return False
+    left_dims = list(left.shape)
+    right_dims = list(right.shape)
+    if len(left_dims) != len(right_dims):
+        return False
+    return all(
+        not isinstance(left_dim, int)
+        or not isinstance(right_dim, int)
+        or left_dim == right_dim
+        for left_dim, right_dim in zip(left_dims, right_dims)
     )
 
 
@@ -819,6 +836,7 @@ def build_diffusion_workflow_metadata(
                 "workflow_ssa",
                 "linear_effects",
                 "nested_control_flow",
+                "loop_induction_values",
                 "typed_emit",
             ],
         },
@@ -945,7 +963,7 @@ def build_vlm_workflow_metadata(
                 value
                 for value in decoder.graph.inputs
                 if embedding_output is not None
-                and _contract(value) == _contract(embedding_output)
+                and _contracts_compatible(value, embedding_output)
             ),
             None,
         )
@@ -959,6 +977,12 @@ def build_vlm_workflow_metadata(
     assert embedding_output is not None
     assert decoder_embed_input is not None
     assert logits_output is not None
+    embedding_output.shape = decoder_embed_input.shape
+    embedding_inputs_by_name = {value.name: value for value in embedding.graph.inputs}
+    for value in vision.graph.outputs:
+        target = embedding_inputs_by_name.get(value.name)
+        if target is not None and _contracts_compatible(value, target):
+            value.shape = target.shape
 
     decoder_outputs = {value.name: value for value in decoder.graph.outputs}
     cache_pairs: list[tuple[ir.Value, ir.Value]] = []
@@ -975,6 +999,8 @@ def build_vlm_workflow_metadata(
             None,
         )
         if present is not None:
+            if present.shape is None:
+                present.shape = value.shape
             cache_pairs.append((value, present))
     cache_names = {value.name for value, _ in cache_pairs}
     rank2_integer = [
@@ -1410,6 +1436,7 @@ def build_vlm_workflow_metadata(
                 "workflow_ssa",
                 "linear_effects",
                 "nested_control_flow",
+                "loop_induction_values",
                 "typed_emit",
             ],
         },
@@ -1759,6 +1786,7 @@ def build_speculative_workflow_metadata(pkg: Any) -> dict[str, Any]:
                 "workflow_ssa",
                 "linear_effects",
                 "nested_control_flow",
+                "loop_induction_values",
                 "typed_emit",
             ],
         },

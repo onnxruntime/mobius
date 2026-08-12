@@ -413,6 +413,41 @@ def _match_area_grid(ports: list[_Port], values: dict[str, Any]) -> _ImageProgra
     )
 
 
+def _max_token_grid_transforms(config: Any, values: dict[str, Any]) -> list[dict[str, Any]]:
+    patch_size = int(values["patch_size"])
+    merge_size = int(values["merge_size"])
+    token_pixels = (patch_size * merge_size) ** 2
+    declared = dict(values)
+    declared["size"] = {
+        "shortest_edge": token_pixels,
+        "longest_edge": int(values["max_image_tokens"]) * token_pixels,
+    }
+    return _area_grid_transforms(config, declared)
+
+
+def _match_max_token_grid(
+    ports: list[_Port], values: dict[str, Any]
+) -> _ImageProgram | None:
+    bindings = _match_packed_grid(ports)
+    if bindings is None or not all(
+        isinstance(values.get(key), int)
+        for key in (
+            "patch_size",
+            "temporal_patch_size",
+            "merge_size",
+            "max_image_tokens",
+        )
+    ):
+        return None
+    return _ImageProgram(
+        name="max_token_packed_grid",
+        bindings=bindings,
+        transforms=_max_token_grid_transforms,
+        token_count_source="from_grid",
+        summary_contents=("grid_dimensions",),
+    )
+
+
 def _match_patch_budget(ports: list[_Port], values: dict[str, Any]) -> _ImageProgram | None:
     bindings = _match_packed_coordinates(ports)
     if (
@@ -459,6 +494,7 @@ _IMAGE_PROCESSOR_REGISTRY: tuple[
     Callable[[list[_Port], dict[str, Any]], _ImageProgram | None], ...
 ] = (
     _match_area_grid,
+    _match_max_token_grid,
     _match_patch_budget,
     _match_dynamic_hd,
 )

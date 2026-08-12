@@ -26,6 +26,7 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
     _decoder_io,
     _input_source_map,
+    _match_max_token_grid,
     _port,
     add_explicit_package_io,
     add_policy_components_to_workflow,
@@ -38,6 +39,35 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     write_diffusion_pipeline_metadata,
     write_native_vlm_package_metadata,
 )
+
+
+def test_max_token_packed_grid_derives_pixel_area_bounds():
+    program = _match_max_token_grid(
+        [
+            _port(_value("pixel_values", ir.DataType.FLOAT, ["patches", 1176])),
+            _port(_value("image_grid_thw", ir.DataType.INT64, ["images", 3])),
+        ],
+        {
+            "patch_size": 14,
+            "temporal_patch_size": 2,
+            "merge_size": 2,
+            "max_image_tokens": 4096,
+        },
+    )
+
+    assert program is not None
+    resize = next(
+        transform
+        for transform in program.transforms(None, {
+            "patch_size": 14,
+            "temporal_patch_size": 2,
+            "merge_size": 2,
+            "max_image_tokens": 4096,
+        })
+        if transform["op"] == "resize"
+    )
+    assert resize["min_pixels"] == 784
+    assert resize["max_pixels"] == 3_211_264
 
 
 def test_workflow_policy_components_reference_saved_onnx_artifacts(tmp_path):
