@@ -33,6 +33,8 @@ class PolicyRole(StrEnum):
     SOLVER_STEP = "solver_step"
     MASKED_UPDATE = "masked_update"
     SPECULATIVE_ACCEPTANCE = "speculative_verifier"
+    GRAMMAR_GUIDANCE = "grammar_guidance"
+    ADAPTIVE_K = "adaptive_k"
     STATE_UPDATE = "state_update"
     AUXILIARY = "auxiliary"
 
@@ -71,6 +73,8 @@ class PolicyCapabilities:
     solver: str | None = None
     masked_update: bool = False
     speculative_acceptance: bool = False
+    grammar_guidance: bool = False
+    adaptive_k_max: int | None = None
     token_state_update: bool = False
 
 
@@ -104,6 +108,15 @@ def attach_policy_components(
         selected.append(("masked_update", build_masked_token_update()))
     if capabilities.speculative_acceptance:
         selected.append(("speculative_acceptance", build_speculative_acceptance()))
+    if capabilities.grammar_guidance:
+        selected.append(("grammar_guidance", build_grammar_logits_processor()))
+    if capabilities.adaptive_k_max is not None:
+        selected.append(
+            (
+                "adaptive_k",
+                build_adaptive_k_policy(max_k=capabilities.adaptive_k_max),
+            )
+        )
     if capabilities.token_state_update:
         selected.append(("token_state_update", build_token_state_update()))
 
@@ -189,6 +202,33 @@ def build_integer_increment() -> PolicyComponent:
     next_value = builder.op.Add(value, builder.op.Constant(value_int=1))
     next_value.shape = ir.Shape(["batch"])
     builder.add_output(next_value, "next_value")
+    return _component(PolicyRole.AUXILIARY, graph, {})
+
+
+def build_integer_minimum() -> PolicyComponent:
+    """Compute the per-batch minimum of two integer lengths."""
+    graph, builder = _make_graph("integer_minimum")
+    left = builder.input("left", ir.DataType.INT64, ["batch"])
+    right = builder.input("right", ir.DataType.INT64, ["batch"])
+    minimum = builder.op.Min(left, right)
+    minimum.shape = ir.Shape(["batch"])
+    builder.add_output(minimum, "minimum")
+    return _component(PolicyRole.AUXILIARY, graph, {})
+
+
+def build_proposal_metrics() -> PolicyComponent:
+    """Derive evaluated width and budget fullness from a dense proposal."""
+    graph, builder = _make_graph("proposal_metrics")
+    op = builder.op
+    tokens = builder.input("proposed_tokens", ir.DataType.INT64, ["batch", "proposal"])
+    requested_k = builder.input("requested_k", ir.DataType.INT64, ["batch"])
+    batch = op.Shape(tokens, start=0, end=1)
+    length = op.Expand(op.Shape(tokens, start=1, end=2), batch)
+    filled = op.Equal(length, requested_k)
+    length.shape = ir.Shape(["batch"])
+    filled.shape = ir.Shape(["batch"])
+    builder.add_output(length, "evaluated")
+    builder.add_output(filled, "filled_proposal_budget")
     return _component(PolicyRole.AUXILIARY, graph, {})
 
 
@@ -608,6 +648,287 @@ def build_decoder_step_update(
         next_position.shape = ir.Shape(["batch", 1])
         builder.add_output(next_position, "next_position_ids")
     return _component(PolicyRole.AUXILIARY, graph, {})
+
+
+def build_grammar_logits_processor() -> PolicyComponent:
+    """Apply a grammar adapter's mask and return a forced or sampled token."""
+    graph, builder = _make_graph("grammar_guided_sampler")
+    op = builder.op
+    logits = builder.input("logits", ir.DataType.FLOAT, ["batch", "vocabulary"])
+    logits_mask = builder.input("logits_mask", ir.DataType.BOOL, ["batch", "vocabulary"])
+    forced_tokens = builder.input("forced_tokens", ir.DataType.INT64, ["batch", 1])
+    forced_length = builder.input("forced_length", ir.DataType.INT64, ["batch"])
+    blocked = op.CastLike(op.Constant(value_float=-3.4028235e38), logits)
+    masked_logits = op.Where(logits_mask, logits, blocked)
+    sampled = op.ArgMax(masked_logits, axis=-1, keepdims=1)
+    token = op.Where(
+        op.Unsqueeze(op.Greater(forced_length, op.Constant(value_int=0)), [-1]),
+        forced_tokens,
+        sampled,
+    )
+    token.shape = ir.Shape(["batch", 1])
+    builder.add_output(token, "token")
+    return _component(PolicyRole.GRAMMAR_GUIDANCE, graph, {})
+
+
+def build_adaptive_k_policy(*, max_k: int = 16, min_k: int = 1) -> PolicyComponent:
+    """Build the advisory adjacent-probe adaptive-K controller from ORT GenAI."""
+    if not 1 <= min_k <= max_k:
+        raise ValueError("adaptive K requires 1 <= min_k <= max_k")
+    graph, builder = _make_graph("adaptive_k_policy")
+    op = builder.op
+    k_slots = max_k + 1
+    estimate_slots = 4 * k_slots + 4
+
+    current_k = builder.input("current_k", ir.DataType.INT64, ["batch"])
+    accepted = builder.input("accepted", ir.DataType.INT64, ["batch"])
+    evaluated = builder.input("evaluated", ir.DataType.INT64, ["batch"])
+    committed_tokens = builder.input("committed_tokens", ir.DataType.INT64, ["batch"])
+    filled_proposal_budget = builder.input(
+        "filled_proposal_budget", ir.DataType.BOOL, ["batch"]
+    )
+    draft_ms = builder.input("draft_ms", ir.DataType.FLOAT, ["batch"])
+    target_ms = builder.input("target_ms", ir.DataType.FLOAT, ["batch"])
+    estimates = builder.input("estimates", ir.DataType.FLOAT, ["batch", estimate_slots])
+
+    def section(start: int, end: int):
+        return op.Slice(
+            estimates,
+            op.Constant(value_ints=[start]),
+            op.Constant(value_ints=[end]),
+            op.Constant(value_ints=[1]),
+        )
+
+    token_estimates = section(0, k_slots)
+    millisecond_estimates = section(k_slots, 2 * k_slots)
+    acceptance_estimates = section(2 * k_slots, 3 * k_slots)
+    sample_counts = section(3 * k_slots, 4 * k_slots)
+    controller = section(4 * k_slots, estimate_slots)
+    probe_origin_k = op.Clip(
+        op.Cast(op.Slice(controller, [0], [1], [1]), to=ir.DataType.INT64),
+        op.Constant(value_int=0),
+        op.Constant(value_int=max_k),
+    )
+    probe_observations = op.Cast(op.Slice(controller, [1], [2], [1]), to=ir.DataType.INT64)
+    stable_observations = op.Cast(op.Slice(controller, [2], [3], [1]), to=ir.DataType.INT64)
+    probe_cooldown = op.Cast(op.Slice(controller, [3], [4], [1]), to=ir.DataType.INT64)
+
+    index = op.Unsqueeze(current_k, [-1])
+    zero_i = op.Constant(value_int=0)
+    one_i = op.Constant(value_int=1)
+    two_i = op.Constant(value_int=2)
+    total_ms = op.Add(draft_ms, target_ms)
+    finite_time = op.Not(op.Or(op.IsNaN(total_ms), op.IsInf(total_ms)))
+    valid = op.And(
+        op.Greater(evaluated, zero_i),
+        op.And(
+            op.Greater(committed_tokens, zero_i),
+            op.And(
+                filled_proposal_budget,
+                op.And(op.Greater(total_ms, op.Constant(value_float=0.0)), finite_time),
+            ),
+        ),
+    )
+    valid_col = op.Unsqueeze(valid, [-1])
+
+    old_tokens = op.GatherElements(token_estimates, index, axis=1)
+    old_ms = op.GatherElements(millisecond_estimates, index, axis=1)
+    old_acceptance = op.GatherElements(acceptance_estimates, index, axis=1)
+    old_samples = op.GatherElements(sample_counts, index, axis=1)
+    sample_tokens = op.Unsqueeze(op.Cast(committed_tokens, to=ir.DataType.FLOAT), [-1])
+    sample_acceptance = op.Unsqueeze(
+        op.Div(
+            op.Cast(accepted, to=ir.DataType.FLOAT),
+            op.Cast(evaluated, to=ir.DataType.FLOAT),
+        ),
+        [-1],
+    )
+    sample_ms = op.Unsqueeze(total_ms, [-1])
+    first_sample = op.Equal(old_samples, op.Constant(value_float=0.0))
+    alpha = op.Constant(value_float=0.25)
+
+    def ewma(old, sample):
+        return op.Where(
+            first_sample,
+            sample,
+            op.Add(old, op.Mul(alpha, op.Sub(sample, old))),
+        )
+
+    updated_tokens = op.Where(valid_col, ewma(old_tokens, sample_tokens), old_tokens)
+    updated_ms = op.Where(valid_col, ewma(old_ms, sample_ms), old_ms)
+    updated_acceptance = op.Where(
+        valid_col, ewma(old_acceptance, sample_acceptance), old_acceptance
+    )
+    updated_samples = op.Where(
+        valid_col,
+        op.Add(old_samples, op.Constant(value_float=1.0)),
+        old_samples,
+    )
+    next_tokens = op.ScatterElements(token_estimates, index, updated_tokens, axis=1)
+    next_ms = op.ScatterElements(millisecond_estimates, index, updated_ms, axis=1)
+    next_acceptance = op.ScatterElements(
+        acceptance_estimates, index, updated_acceptance, axis=1
+    )
+    next_samples = op.ScatterElements(sample_counts, index, updated_samples, axis=1)
+
+    current_throughput = op.Div(
+        updated_tokens,
+        op.Max(updated_ms, op.Constant(value_float=1e-12)),
+    )
+    origin_index = probe_origin_k
+    origin_tokens = op.GatherElements(token_estimates, origin_index, axis=1)
+    origin_ms = op.GatherElements(millisecond_estimates, origin_index, axis=1)
+    origin_throughput = op.Div(
+        origin_tokens,
+        op.Max(origin_ms, op.Constant(value_float=1e-12)),
+    )
+    current_col = index
+    in_probe = op.Greater(probe_origin_k, zero_i)
+    next_probe_count = op.Add(probe_observations, one_i)
+    probing_up = op.Greater(current_col, probe_origin_k)
+    severe_regression = op.And(
+        valid_col,
+        op.And(
+            in_probe,
+            op.And(
+                op.Greater(origin_throughput, op.Constant(value_float=0.0)),
+                op.Less(
+                    current_throughput,
+                    op.Mul(origin_throughput, op.Constant(value_float=0.8)),
+                ),
+            ),
+        ),
+    )
+    probe_ready = op.And(
+        valid_col,
+        op.And(
+            in_probe,
+            op.And(
+                op.Not(severe_regression),
+                op.GreaterOrEqual(next_probe_count, two_i),
+            ),
+        ),
+    )
+    throughput_safe = op.Or(
+        op.LessOrEqual(origin_throughput, op.Constant(value_float=0.0)),
+        op.GreaterOrEqual(
+            current_throughput,
+            op.Mul(origin_throughput, op.Constant(value_float=0.97)),
+        ),
+    )
+    acceptance_safe = op.Or(
+        op.Not(probing_up),
+        op.GreaterOrEqual(updated_acceptance, op.Constant(value_float=0.75)),
+    )
+    keep_probe = op.And(probe_ready, op.And(throughput_safe, acceptance_safe))
+    finish_probe = op.Or(severe_regression, probe_ready)
+    probe_k = op.Where(
+        finish_probe,
+        op.Where(keep_probe, current_col, probe_origin_k),
+        current_col,
+    )
+    probe_origin = op.Where(finish_probe, zero_i, probe_origin_k)
+    probe_count = op.Where(
+        finish_probe,
+        zero_i,
+        op.Where(valid_col, next_probe_count, probe_observations),
+    )
+    probe_stable = op.Where(finish_probe, zero_i, stable_observations)
+    probe_next_cooldown = op.Where(
+        finish_probe,
+        op.Where(keep_probe, one_i, op.Constant(value_int=6)),
+        probe_cooldown,
+    )
+
+    stable_count = op.Where(valid_col, op.Add(stable_observations, one_i), stable_observations)
+    cooling = op.And(valid_col, op.Greater(probe_cooldown, zero_i))
+    stable_cooldown = op.Where(cooling, op.Sub(probe_cooldown, one_i), probe_cooldown)
+    can_probe = op.And(
+        valid_col,
+        op.And(
+            op.Equal(probe_cooldown, zero_i),
+            op.GreaterOrEqual(updated_samples, op.Constant(value_float=2.0)),
+        ),
+    )
+    probe_down = op.And(
+        can_probe,
+        op.And(
+            op.Less(updated_acceptance, op.Constant(value_float=0.5)),
+            op.Greater(current_col, op.Constant(value_int=min_k)),
+        ),
+    )
+    probe_up = op.And(
+        can_probe,
+        op.And(
+            op.GreaterOrEqual(updated_acceptance, op.Constant(value_float=0.75)),
+            op.And(
+                op.Less(current_col, op.Constant(value_int=max_k)),
+                op.GreaterOrEqual(stable_count, two_i),
+            ),
+        ),
+    )
+    start_probe = op.Or(probe_down, probe_up)
+    candidate_k = op.Where(
+        probe_down,
+        op.Sub(current_col, one_i),
+        op.Add(current_col, one_i),
+    )
+    stable_k = op.Where(start_probe, candidate_k, current_col)
+    stable_origin = op.Where(start_probe, current_col, probe_origin_k)
+    stable_count = op.Where(start_probe, zero_i, stable_count)
+
+    computed_k = op.Squeeze(op.Where(in_probe, probe_k, stable_k), [-1])
+    next_probe_origin = op.Where(in_probe, probe_origin, stable_origin)
+    next_probe_observations = op.Where(
+        in_probe,
+        probe_count,
+        op.Where(start_probe, zero_i, probe_observations),
+    )
+    next_stable_observations = op.Where(in_probe, probe_stable, stable_count)
+    next_probe_cooldown = op.Where(in_probe, probe_next_cooldown, stable_cooldown)
+    next_controller = op.Cast(
+        op.Concat(
+            next_probe_origin,
+            next_probe_observations,
+            next_stable_observations,
+            next_probe_cooldown,
+            axis=1,
+        ),
+        to=ir.DataType.FLOAT,
+    )
+    computed_estimates = op.Concat(
+        next_tokens,
+        next_ms,
+        next_acceptance,
+        next_samples,
+        next_controller,
+        axis=1,
+    )
+    next_k = op.Where(valid, computed_k, current_k)
+    next_estimates = op.Where(valid_col, computed_estimates, estimates)
+    next_k.shape = ir.Shape(["batch"])
+    next_estimates.shape = ir.Shape(["batch", estimate_slots])
+    builder.add_output(next_k, "next_k")
+    builder.add_output(next_estimates, "next_estimates")
+    return _component(
+        PolicyRole.ADAPTIVE_K,
+        graph,
+        {
+            "role": "adaptive_proposal_budget",
+            "current_k": "current_k",
+            "accepted": "accepted",
+            "evaluated": "evaluated",
+            "committed_tokens": "committed_tokens",
+            "filled_proposal_budget": "filled_proposal_budget",
+            "draft_ms": "draft_ms",
+            "target_ms": "target_ms",
+            "estimates": "estimates",
+            "next_k": "next_k",
+            "next_estimates": "next_estimates",
+            "effect": "adaptive",
+        },
+        "adaptive",
+    )
 
 
 def build_seeded_categorical_sampler() -> PolicyComponent:

@@ -12,6 +12,7 @@ from mobius.generation import (
     PolicyCapabilities,
     PolicyRole,
     attach_policy_components,
+    build_adaptive_k_policy,
     build_boolean_not,
     build_code_frame_update,
     build_decoder_state_initializer,
@@ -19,10 +20,13 @@ from mobius.generation import (
     build_eos_termination,
     build_euler_model_input,
     build_euler_solver_step,
+    build_grammar_logits_processor,
     build_greedy_sampler,
+    build_integer_minimum,
     build_last_token_logits,
     build_masked_token_update,
     build_model_token_cast,
+    build_proposal_metrics,
     build_seeded_categorical_sampler,
     build_speculative_acceptance,
     build_speculative_state_rollback,
@@ -43,6 +47,99 @@ def _run_model(model, tmp_path, feeds):
     ir.save(model, path)
     session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
     return session.run(None, feeds)
+
+
+def test_grammar_logits_processor_applies_mask_and_forced_tokens(tmp_path):
+    logits = np.array([[1.0, 4.0, 3.0], [5.0, 2.0, 1.0]], np.float32)
+    (tokens,) = _run(
+        build_grammar_logits_processor(),
+        tmp_path,
+        {
+            "logits": logits,
+            "logits_mask": np.array([[True, False, True], [True, True, True]], np.bool_),
+            "forced_tokens": np.array([[0], [2]], np.int64),
+            "forced_length": np.array([0, 1], np.int64),
+        },
+    )
+    np.testing.assert_array_equal(tokens, [[2], [2]])
+
+
+def test_adaptive_k_policy_probes_and_keeps_faster_adjacent_width(tmp_path):
+    max_k = 4
+    k_slots = max_k + 1
+    current_k = np.array([2], np.int64)
+    estimates = np.zeros((1, 4 * k_slots + 4), np.float32)
+
+    def observe(*, evaluated, accepted, committed, draft_ms, target_ms):
+        nonlocal current_k, estimates
+        current_k, estimates = _run(
+            build_adaptive_k_policy(max_k=max_k),
+            tmp_path,
+            {
+                "current_k": current_k,
+                "accepted": np.array([accepted], np.int64),
+                "evaluated": np.array([evaluated], np.int64),
+                "committed_tokens": np.array([committed], np.int64),
+                "filled_proposal_budget": np.array([True], np.bool_),
+                "draft_ms": np.array([draft_ms], np.float32),
+                "target_ms": np.array([target_ms], np.float32),
+                "estimates": estimates,
+            },
+        )
+
+    observe(evaluated=2, accepted=2, committed=3, draft_ms=1.0, target_ms=2.0)
+    observe(evaluated=2, accepted=2, committed=3, draft_ms=1.0, target_ms=2.0)
+    np.testing.assert_array_equal(current_k, [3])
+    np.testing.assert_array_equal(estimates[:, 4 * k_slots], [2.0])
+
+    observe(evaluated=3, accepted=3, committed=4, draft_ms=1.0, target_ms=2.0)
+    observe(evaluated=3, accepted=3, committed=4, draft_ms=1.0, target_ms=2.0)
+    np.testing.assert_array_equal(current_k, [3])
+    np.testing.assert_array_equal(estimates[:, 4 * k_slots], [0.0])
+    np.testing.assert_array_equal(estimates[:, 4 * k_slots + 3], [1.0])
+    assert estimates[0, 3] / estimates[0, k_slots + 3] > 1.0
+
+
+def test_speculative_guidance_length_and_budget_math(tmp_path):
+    (minimum,) = _run(
+        build_integer_minimum(),
+        tmp_path,
+        {
+            "left": np.array([3, 1], np.int64),
+            "right": np.array([2, 4], np.int64),
+        },
+    )
+    evaluated, filled = _run(
+        build_proposal_metrics(),
+        tmp_path,
+        {
+            "proposed_tokens": np.zeros((2, 3), np.int64),
+            "requested_k": np.array([3, 2], np.int64),
+        },
+    )
+    np.testing.assert_array_equal(minimum, [2, 1])
+    np.testing.assert_array_equal(evaluated, [3, 3])
+    np.testing.assert_array_equal(filled, [True, False])
+
+
+def test_adaptive_k_ignores_invalid_telemetry_per_batch(tmp_path):
+    estimates = np.arange(48, dtype=np.float32).reshape(2, 24)
+    next_k, next_estimates = _run(
+        build_adaptive_k_policy(max_k=4),
+        tmp_path,
+        {
+            "current_k": np.array([2, 3], np.int64),
+            "accepted": np.array([2, 2], np.int64),
+            "evaluated": np.array([0, 3], np.int64),
+            "committed_tokens": np.array([3, 0], np.int64),
+            "filled_proposal_budget": np.array([True, True], np.bool_),
+            "draft_ms": np.array([1.0, np.nan], np.float32),
+            "target_ms": np.array([2.0, 2.0], np.float32),
+            "estimates": estimates,
+        },
+    )
+    np.testing.assert_array_equal(next_k, [2, 3])
+    np.testing.assert_array_equal(next_estimates, estimates)
 
 
 def test_greedy_sampler_runtime(tmp_path):
