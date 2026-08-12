@@ -39,7 +39,7 @@ class MuseGlimmerScaleFreeRMSNorm(nn.Module):
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
         return op.RMSNormalization(
             hidden_states,
-            1.0,
+            op.CastLike(1.0, hidden_states),
             epsilon=self._eps,
             stash_type=1,
             axis=-1,
