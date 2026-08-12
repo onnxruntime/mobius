@@ -566,6 +566,7 @@ def _processor_values(
         "temporal_patch_size",
         "spatial_merge_size",
         "image_crop_size",
+        "size",
     ):
         value = getattr(vision, name, None)
         if value is None:

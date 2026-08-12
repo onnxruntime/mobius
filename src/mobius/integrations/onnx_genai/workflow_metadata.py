@@ -28,6 +28,7 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     _port,
     _shape_metadata,
     add_policy_components_to_workflow,
+    build_native_vlm_package_metadata,
 )
 
 
@@ -517,6 +518,553 @@ def write_diffusion_workflow_metadata(
 ) -> str:
     os.makedirs(output_dir, exist_ok=True)
     metadata = build_diffusion_workflow_metadata(pkg, num_inference_steps=num_inference_steps)
+    path = os.path.join(output_dir, "inference_metadata.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(metadata, handle, sort_keys=False)
+    return path
+
+
+def build_vlm_workflow_metadata(
+    pkg: Any,
+    config: Any,
+    *,
+    source: str | None = None,
+) -> dict[str, Any]:
+    """Build a vision/audio-encoder to embedding to decoder SSA workflow."""
+    required = {"vision_encoder", "embedding", "decoder"}
+    missing = sorted(required.difference(pkg.keys()))
+    if missing:
+        raise ValueError(f"VLM workflow is missing required components: {missing}")
+    vision = pkg["vision_encoder"]
+    embedding = pkg["embedding"]
+    decoder = pkg["decoder"]
+    token_input = next(
+        (
+            value
+            for value in embedding.graph.inputs
+            if value.dtype in {ir.DataType.INT32, ir.DataType.INT64}
+            and value.shape is not None
+            and len(value.shape) == 2
+        ),
+        None,
+    )
+    embedding_output = next(
+        (
+            value
+            for value in embedding.graph.outputs
+            if value.shape is not None and len(value.shape) == 3
+        ),
+        None,
+    )
+    decoder_embed_input = (
+        next(
+            (
+                value
+                for value in decoder.graph.inputs
+                if embedding_output is not None
+                and _contract(value) == _contract(embedding_output)
+            ),
+            None,
+        )
+        if embedding_output is not None
+        else None
+    )
+    logits_output = _find_port(decoder.graph.outputs, "logits")
+    if None in (token_input, embedding_output, decoder_embed_input, logits_output):
+        raise ValueError("VLM workflow requires token->embedding->decoder logits ports")
+    assert token_input is not None
+    assert embedding_output is not None
+    assert decoder_embed_input is not None
+    assert logits_output is not None
+
+    decoder_outputs = {value.name: value for value in decoder.graph.outputs}
+    cache_pairs: list[tuple[ir.Value, ir.Value]] = []
+    for value in decoder.graph.inputs:
+        present = next(
+            (
+                decoder_outputs.get(name)
+                for name in (
+                    value.name.replace("past_key_values", "present"),
+                    value.name.replace("past.", "present."),
+                )
+                if name in decoder_outputs
+            ),
+            None,
+        )
+        if present is not None:
+            cache_pairs.append((value, present))
+    cache_names = {value.name for value, _ in cache_pairs}
+    rank2_integer = [
+        value
+        for value in decoder.graph.inputs
+        if value.name not in cache_names
+        and value.dtype in {ir.DataType.INT32, ir.DataType.INT64}
+        and value.shape is not None
+        and len(value.shape) == 2
+    ]
+    attention_input = _find_port(rank2_integer, "mask")
+    position_input = _find_port(rank2_integer, "position")
+    if attention_input is None:
+        raise ValueError("VLM decoder requires an attention-mask input")
+
+    legacy = build_native_vlm_package_metadata(pkg, config=config, source=source)
+    preprocessing = legacy.get("preprocessing")
+    if not preprocessing or "image" not in preprocessing:
+        raise ValueError("VLM workflow requires declared image preprocessing")
+    image_outputs = preprocessing["image"]["outputs"]
+    vision_inputs = {value.name: value for value in vision.graph.inputs}
+    adapter_outputs: dict[str, Any] = {}
+    preprocessing_values: dict[str, str] = {}
+    for output in image_outputs:
+        endpoint = output["name"]
+        port_name = endpoint.split(".", 1)[-1]
+        if port_name not in vision_inputs:
+            raise ValueError(f"preprocessing output {endpoint!r} has no vision input")
+        output["contract"] = _contract(vision_inputs[port_name])
+        output["dtype"] = output["contract"]["dtype"]
+        output["source"] = output["content"]
+        output["name"] = f"image.{port_name}"
+        adapter_outputs[port_name] = output["contract"]
+        preprocessing_values[port_name] = output["name"]
+
+    attach_policy_components(
+        pkg,
+        PolicyCapabilities(
+            sampler="greedy",
+            eos_termination=True,
+            token_state_update=True,
+        ),
+    )
+    pkg.add_policy_component("last_token_logits", build_last_token_logits())
+    pkg.add_policy_component("continue_predicate", build_boolean_not())
+    pkg.add_policy_component(
+        "decoder_state_initializer",
+        build_decoder_state_initializer(
+            decoder,
+            token_input=None,
+            prompt_dtype=token_input.dtype,
+            attention_mask_input=attention_input.name,
+            position_ids_input=position_input.name if position_input is not None else None,
+            cache_inputs=sorted(cache_names),
+        ),
+    )
+    pkg.add_policy_component(
+        "decoder_step_update",
+        build_decoder_step_update(
+            attention_dtype=attention_input.dtype,
+            position_dtype=position_input.dtype if position_input is not None else None,
+        ),
+    )
+
+    batch = _contract(token_input)["shape"][0]
+    batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
+    eos = getattr(config, "eos_token_id", 0)
+    if isinstance(eos, list):
+        eos = eos[0] if eos else 0
+    inputs: dict[str, Any] = {
+        "request.prompt_tokens": {
+            "contract": _contract(token_input),
+            "role": {"kind": "runtime", "version": "1.0", "role": "prompt_tokens"},
+            "source": {"kind": "request", "field": "prompt_tokens"},
+            "required": True,
+        },
+        "request.image": {
+            "contract": {"dtype": "uint8", "rank": 1, "shape": ["encoded_bytes"]},
+            "role": {"kind": "runtime", "version": "1.0", "role": "media"},
+            "source": {"kind": "request", "field": "media"},
+            "required": True,
+        },
+        "request.max_iterations": {
+            "contract": batch_int,
+            "role": {
+                "kind": "runtime",
+                "version": "1.0",
+                "role": "max_output_tokens",
+            },
+            "source": {"kind": "request", "field": "max_output_tokens"},
+            "required": True,
+        },
+        "package.eos_ids": {
+            "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": int(eos or 0),
+        },
+        "package.max_context": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": int(getattr(config, "max_position_embeddings", 4096)),
+        },
+        "package.one": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 1,
+        },
+    }
+    vision_invoke_inputs = {
+        name: preprocessing_values[name]
+        for name in vision_inputs
+        if name in preprocessing_values
+    }
+    vision_outputs = {value.name: f"vision.{value.name}" for value in vision.graph.outputs}
+    audio_setup_nodes: list[dict[str, Any]] = []
+    audio_outputs: dict[str, str] = {}
+    if "audio_encoder" in pkg:
+        audio = pkg["audio_encoder"]
+        audio_inputs = {}
+        for value in audio.graph.inputs:
+            name = f"request.audio.{value.name}"
+            inputs[name] = {
+                "contract": _contract(value),
+                "role": {"kind": "opaque"},
+                "source": {"kind": "application", "name": f"audio.{value.name}"},
+                "required": True,
+            }
+            audio_inputs[value.name] = name
+        audio_outputs = {value.name: f"audio.{value.name}" for value in audio.graph.outputs}
+        audio_setup_nodes.append(_invoke("audio_encoder", audio_inputs, audio_outputs))
+    embedding_setup_inputs: dict[str, str] = {token_input.name: "request.prompt_tokens"}
+    embedding_body_inputs: dict[str, str] = {token_input.name: "token.body"}
+    produced_features = {value.name: f"vision.{value.name}" for value in vision.graph.outputs}
+    produced_features.update(audio_outputs)
+    for value in embedding.graph.inputs:
+        if value is token_input:
+            continue
+        if value.name in produced_features:
+            embedding_setup_inputs[value.name] = produced_features[value.name]
+            embedding_body_inputs[value.name] = produced_features[value.name]
+        else:
+            name = f"request.{value.name}"
+            inputs[name] = {
+                "contract": _contract(value),
+                "role": {"kind": "opaque"},
+                "source": {"kind": "application", "name": value.name},
+                "required": True,
+            }
+            embedding_setup_inputs[value.name] = name
+            embedding_body_inputs[value.name] = name
+
+    setup_decoder_inputs = {
+        decoder_embed_input.name: "embedding.setup.embeds",
+        attention_input.name: f"initializer.{attention_input.name}",
+    }
+    body_decoder_inputs = {
+        decoder_embed_input.name: "embedding.body.embeds",
+        attention_input.name: "state.attention_mask.body",
+    }
+    if position_input is not None:
+        setup_decoder_inputs[position_input.name] = f"initializer.{position_input.name}"
+        body_decoder_inputs[position_input.name] = "state.position_ids.body"
+    for past, _ in cache_pairs:
+        setup_decoder_inputs[past.name] = f"initializer.{past.name}"
+        body_decoder_inputs[past.name] = f"state.{past.name}.body"
+
+    setup_decoder_outputs = {logits_output.name: "decoder.setup.logits"}
+    body_decoder_outputs = {logits_output.name: "decoder.body.logits"}
+    state: dict[str, Any] = {
+        "token": {
+            "contract": {"dtype": "int64", "rank": 2, "shape": [batch, 1]},
+            "scope": "invocation",
+            "initializer": "initializer.token_slot",
+            "recurrence": {"kind": "invariant"},
+        },
+        "logits": {
+            "contract": _contract(logits_output),
+            "scope": "invocation",
+            "initializer": "decoder.setup.logits",
+            "recurrence": {"kind": "invariant"},
+        },
+        "attention_mask": {
+            "contract": {
+                "dtype": _contract(attention_input)["dtype"],
+                "rank": 2,
+                "shape": [batch, "context"],
+            },
+            "scope": "invocation",
+            "initializer": "initializer.body_attention_mask",
+            "recurrence": {
+                "kind": "growing",
+                "axis": 1,
+                "increment": "package.one",
+                "max": "package.max_context",
+            },
+        },
+    }
+    state_specs = [
+        (
+            "token",
+            "initializer.token_slot",
+            "state.token.body",
+            "token.body",
+            "state.token.final",
+        ),
+        (
+            "logits",
+            "decoder.setup.logits",
+            "state.logits.body",
+            "decoder.body.logits",
+            "state.logits.final",
+        ),
+        (
+            "attention_mask",
+            "initializer.body_attention_mask",
+            "state.attention_mask.body",
+            "decoder_step.body_attention_mask",
+            "state.attention_mask.final",
+        ),
+    ]
+    if position_input is not None:
+        state["position_ids"] = {
+            "contract": {
+                "dtype": _contract(position_input)["dtype"],
+                "rank": 2,
+                "shape": [batch, 1],
+            },
+            "scope": "invocation",
+            "initializer": "initializer.body_position_ids",
+            "recurrence": {"kind": "invariant"},
+        }
+        state_specs.append(
+            (
+                "position_ids",
+                "initializer.body_position_ids",
+                "state.position_ids.body",
+                "decoder_step.body_position_ids",
+                "state.position_ids.final",
+            )
+        )
+    for index, (past, present) in enumerate(cache_pairs):
+        cell = f"cache_{index}"
+        state[cell] = {
+            "contract": _contract(past),
+            "scope": "invocation",
+            "initializer": f"decoder.setup.{present.name}",
+            "recurrence": {
+                "kind": "growing",
+                "axis": next(
+                    (
+                        axis
+                        for axis, dimension in enumerate(_contract(past)["shape"])
+                        if "sequence" in str(dimension)
+                    ),
+                    2,
+                ),
+                "increment": "package.one",
+                "max": "package.max_context",
+            },
+        }
+        setup_decoder_outputs[present.name] = f"decoder.setup.{present.name}"
+        body_decoder_outputs[present.name] = f"decoder.body.{present.name}"
+        state_specs.append(
+            (
+                cell,
+                f"decoder.setup.{present.name}",
+                f"state.{past.name}.body",
+                f"decoder.body.{present.name}",
+                f"state.{past.name}.final",
+            )
+        )
+    carried = []
+    initial_effects = {
+        "sample": "sample.0",
+        "termination": "termination.0",
+        "state": "state.0",
+        "emit": "emit.0",
+    }
+    for cell, current, body_input, body_output, final in state_specs:
+        effect = f"state:{cell}"
+        initial_effects[effect] = f"{effect}.0"
+        carried.append(
+            {
+                "cell": cell,
+                "current": current,
+                "body_input": body_input,
+                "body_output": body_output,
+                "next": final,
+                "read_effect": _effect(f"{effect}.0", f"{effect}.read"),
+                "write_effect": _effect(f"{effect}.read", f"{effect}.1"),
+            }
+        )
+
+    setup = {
+        "kind": "sequence",
+        "nodes": [
+            _invoke(
+                "image_preprocess",
+                {"encoded": "request.image"},
+                dict(preprocessing_values),
+            ),
+            _invoke("vision_encoder", vision_invoke_inputs, vision_outputs),
+            *audio_setup_nodes,
+            _invoke(
+                "decoder_state_initializer",
+                {"prompt_tokens": "request.prompt_tokens"},
+                {
+                    attention_input.name: f"initializer.{attention_input.name}",
+                    "body_attention_mask": "initializer.body_attention_mask",
+                    "token_slot": "initializer.token_slot",
+                    **(
+                        {
+                            position_input.name: f"initializer.{position_input.name}",
+                            "body_position_ids": "initializer.body_position_ids",
+                        }
+                        if position_input is not None
+                        else {}
+                    ),
+                    **{name: f"initializer.{name}" for name in sorted(cache_names)},
+                },
+            ),
+            _invoke(
+                "embedding",
+                embedding_setup_inputs,
+                {embedding_output.name: "embedding.setup.embeds"},
+            ),
+            _invoke("decoder", setup_decoder_inputs, setup_decoder_outputs),
+        ],
+    }
+    body = {
+        "kind": "sequence",
+        "nodes": [
+            _invoke(
+                "last_token_logits",
+                {"logits": "state.logits.body"},
+                {"last_logits": "decoder.body.last_logits"},
+            ),
+            _invoke(
+                "token_sampler",
+                {"logits": "decoder.body.last_logits"},
+                {"token": "sample.body"},
+                {"sample": _effect("sample.0", "sample.1")},
+            ),
+            _invoke(
+                "termination",
+                {
+                    "token_ids": "sample.body",
+                    "eos_ids": "package.eos_ids",
+                    "iteration": "loop.iteration",
+                    "max_iterations": "request.max_iterations",
+                },
+                {"done": "loop.done"},
+                {"termination": _effect("termination.0", "termination.1")},
+            ),
+            _invoke(
+                "continue_predicate",
+                {"done": "loop.done"},
+                {"continue": "loop.continue"},
+            ),
+            {
+                "kind": "emit",
+                "value": "sample.body",
+                "output": "tokens",
+                "mode": "append",
+                "effect_name": "emit",
+                "effect": _effect("emit.0", "emit.1"),
+            },
+            _invoke(
+                "token_state_update",
+                {"current": "state.token.body", "update": "sample.body"},
+                {"next": "token.body"},
+                {"state": _effect("state.0", "state.1")},
+            ),
+            _invoke(
+                "embedding",
+                embedding_body_inputs,
+                {embedding_output.name: "embedding.body.embeds"},
+            ),
+            _invoke("decoder", body_decoder_inputs, body_decoder_outputs),
+            _invoke(
+                "decoder_step_update",
+                {
+                    "attention_mask": "state.attention_mask.body",
+                    **(
+                        {"position_ids": "state.position_ids.body"}
+                        if position_input is not None
+                        else {}
+                    ),
+                },
+                {
+                    "next_attention_mask": "decoder_step.body_attention_mask",
+                    **(
+                        {"next_position_ids": "decoder_step.body_position_ids"}
+                        if position_input is not None
+                        else {}
+                    ),
+                },
+            ),
+        ],
+    }
+    components = {
+        name: _component(model, _artifact(name, len(pkg))) for name, model in pkg.items()
+    }
+    components["image_preprocess"] = {
+        "implementation": {
+            "kind": "adapter",
+            "abi": "onnx-genai.image-preprocess",
+            "version": "1",
+        },
+        "ports": {
+            "inputs": {
+                "encoded": {
+                    "dtype": "uint8",
+                    "rank": 1,
+                    "shape": ["encoded_bytes"],
+                }
+            },
+            "outputs": adapter_outputs,
+        },
+    }
+    workflow = {
+        "manifest": {
+            "ir_version": "1.0",
+            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
+            "adapter_abis": {"onnx-genai.image-preprocess": "1"},
+            "capabilities": [
+                "workflow_ssa",
+                "linear_effects",
+                "nested_control_flow",
+                "typed_emit",
+            ],
+        },
+        "inputs": inputs,
+        "outputs": {
+            "tokens": {"contract": batch_int, "role": "tokens", "stage": "pre_adapter"}
+        },
+        "components": components,
+        "state": state,
+        "initial_effects": initial_effects,
+        "graph": {
+            "kind": "loop",
+            "setup": setup,
+            "body": body,
+            "condition": "loop.continue",
+            "max_iterations": "request.max_iterations",
+            "iteration": {"value": "loop.iteration", "contract": batch_int},
+            "carried": carried,
+        },
+    }
+    metadata = {
+        "schema_version": "v1",
+        "preprocessing": preprocessing,
+        "pipeline": {"workflow": workflow},
+    }
+    add_policy_components_to_workflow(metadata, pkg)
+    return metadata
+
+
+def write_vlm_workflow_metadata(
+    pkg: Any,
+    output_dir: str,
+    config: Any,
+    *,
+    source: str | None = None,
+) -> str:
+    os.makedirs(output_dir, exist_ok=True)
+    metadata = build_vlm_workflow_metadata(pkg, config, source=source)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(metadata, handle, sort_keys=False)

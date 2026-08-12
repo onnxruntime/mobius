@@ -66,11 +66,13 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     build_diffusion_workflow_metadata,
     build_language_diffusion_pipeline_metadata,
     build_tts_workflow_metadata,
+    build_vlm_workflow_metadata,
     write_audio_codec_workflow_metadata,
     write_decoder_workflow_metadata,
     write_diffusion_workflow_metadata,
     write_language_diffusion_workflow_metadata,
     write_tts_workflow_metadata,
+    write_vlm_workflow_metadata,
 )
 
 __all__ = [
@@ -88,6 +90,7 @@ __all__ = [
     "build_pipeline_metadata_for_workflow",
     "build_speech_to_text_pipeline_metadata",
     "build_tts_workflow_metadata",
+    "build_vlm_workflow_metadata",
     "convert_comfyui_workflow",
     "decoder_metadata_from_config",
     "moe_metadata_from_config",
@@ -105,5 +108,6 @@ __all__ = [
     "write_multimodal_pipeline_metadata",
     "write_speech_to_text_pipeline_metadata",
     "write_tts_workflow_metadata",
+    "write_vlm_workflow_metadata",
     "write_onnx_genai_config",
 ]

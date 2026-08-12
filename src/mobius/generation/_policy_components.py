@@ -228,7 +228,8 @@ def build_model_token_cast(dtype: ir.DataType) -> PolicyComponent:
 def build_decoder_state_initializer(
     decoder: ir.Model,
     *,
-    token_input: str,
+    token_input: str | None,
+    prompt_dtype: ir.DataType | None = None,
     attention_mask_input: str,
     position_ids_input: str | None,
     cache_inputs: list[str],
@@ -237,10 +238,13 @@ def build_decoder_state_initializer(
     graph, builder = _make_graph("decoder_state_initializer")
     op = builder.op
     decoder_inputs = {value.name: value for value in decoder.graph.inputs}
-    token_value = decoder_inputs[token_input]
+    if prompt_dtype is None:
+        if token_input is None:
+            raise ValueError("token_input or prompt_dtype is required")
+        prompt_dtype = decoder_inputs[token_input].dtype
     prompt = builder.input(
         "prompt_tokens",
-        dtype=token_value.dtype,
+        dtype=prompt_dtype,
         shape=["batch", "prompt_sequence"],
     )
     prompt_shape = op.Shape(prompt)

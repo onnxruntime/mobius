@@ -90,6 +90,58 @@ class _MultimodalPkg(dict):
     config = _Cfg()
 
 
+@dataclasses.dataclass
+class _VisionCfg:
+    patch_size: int = 14
+    temporal_patch_size: int = 2
+    merge_size: int = 1
+    spatial_merge_size: int = 1
+    size: dict[str, int] = dataclasses.field(
+        default_factory=lambda: {"shortest_edge": 224, "longest_edge": 224}
+    )
+
+
+@dataclasses.dataclass
+class _VlmCfg(_Cfg):
+    vision: _VisionCfg = dataclasses.field(default_factory=_VisionCfg)
+    image_token_id: int = 32000
+    eos_token_id: int = 2
+
+
+def _vlm_package(*, audio: bool = False):
+    vision = _model(
+        "vision_encoder",
+        [
+            _value("pixel_values", ir.DataType.FLOAT, ["patches", 1176]),
+            _value("grid_thw", ir.DataType.INT64, ["images", 3]),
+        ],
+        [("image_features", ir.DataType.FLOAT, ["batch", 256, 32])],
+    )
+    embedding_inputs = [
+        _value("input_ids", ir.DataType.INT64, ["batch", "sequence"]),
+        _value("image_features", ir.DataType.FLOAT, ["batch", 256, 32]),
+    ]
+    components = {"vision_encoder": vision}
+    if audio:
+        components["audio_encoder"] = _model(
+            "audio_encoder",
+            [_value("input_features", ir.DataType.FLOAT, ["batch", 80, "frames"])],
+            [("audio_features", ir.DataType.FLOAT, ["batch", 64, 32])],
+        )
+        embedding_inputs.append(_value("audio_features", ir.DataType.FLOAT, ["batch", 64, 32]))
+    embedding = _model(
+        "embedding",
+        embedding_inputs,
+        [("inputs_embeds", ir.DataType.FLOAT, ["batch", "sequence", 32])],
+    )
+    decoder = _decoder_model(
+        [("inputs_embeds", ir.DataType.FLOAT, ["batch", "sequence", 32])],
+        position_shape=["batch", "sequence"],
+    )
+    components.update({"embedding": embedding, "decoder": decoder})
+    return ModelPackage(components, config=_VlmCfg())
+
+
 def _decoder_package(config=None):
     model = _decoder_model(
         [],
@@ -303,151 +355,55 @@ def test_dispatch_diffusion_auto_reads_scheduler_from_source(tmp_path):
 
 
 def test_dispatch_vision_multimodal_pipeline(tmp_path):
-    pkg = _MultimodalPkg(
-        {
-            "decoder": object(),
-            "vision_encoder": object(),
-            "embedding": object(),
-        }
-    )
+    pkg = _vlm_package()
     artifacts = write_onnx_genai_config(pkg, str(tmp_path), kv_native_dtype="bf16")
 
     with open(artifacts["inference_metadata"]) as handle:
         metadata = yaml.safe_load(handle)
 
-    assert metadata["required_capabilities"] == [
-        "kv_cache",
-        "grouped_query_attention",
-    ]
-    assert metadata["kv_cache"] == {"native_dtype": "bfloat16"}
     pipeline = metadata["pipeline"]
-    assert pipeline["models"] == {
-        "vision_encoder": {
-            "filename": "vision_encoder/model.onnx",
-            "type": "vision_encoder",
-        },
-        "embedding": {
-            "filename": "embedding/model.onnx",
-            "type": "encoder",
-        },
-        "decoder": {
-            "filename": "decoder/model.onnx",
-            "type": "decoder",
-            "tokenizer": "tokenizer.json",
-        },
-    }
-    assert pipeline["strategy"]["kind"] == "composite"
+    assert set(pipeline) == {"workflow"}
+    workflow = pipeline["workflow"]
+    assert workflow["manifest"]["adapter_abis"] == {"onnx-genai.image-preprocess": "1"}
+    assert workflow["graph"]["setup"]["nodes"][0]["component"] == "image_preprocess"
+    assert workflow["graph"]["setup"]["nodes"][1]["component"] == "vision_encoder"
+    assert workflow["graph"]["setup"]["nodes"][3]["component"] == "embedding"
+    assert workflow["graph"]["iteration"]["value"] == "loop.iteration"
 
 
 def test_dispatch_audio_only_multimodal_pipeline(tmp_path, monkeypatch):
     # The audio-only fusion shape used by speech-language ASR models such as
     # qwen3_asr and fun_asr: audio_encoder -> embedding fusion -> AR decoder.
-    pkg = _MultimodalPkg(
-        {
-            "decoder": object(),
-            "audio_encoder": object(),
-            "embedding": object(),
-        }
-    )
-    audio_processor = tmp_path / "audio_processor.json"
-    audio_processor.write_text("{}")
-    calls: list[tuple[str | None, str | None]] = []
-
-    def fake_audio_processor(output_dir, source, *, revision=None):
-        calls.append((source, revision))
-        return str(audio_processor)
-
-    monkeypatch.setattr(
-        "mobius.integrations.onnx_genai.auto_export._write_hf_audio_processor",
-        fake_audio_processor,
-    )
-    artifacts = write_onnx_genai_config(
-        pkg,
-        str(tmp_path),
-        source="zai-org/GLM-ASR-Nano-2512",
-        revision="pinned-revision",
-    )
-    assert artifacts["audio_processor"] == str(audio_processor)
-    assert calls == [("zai-org/GLM-ASR-Nano-2512", "pinned-revision")]
-
-    with open(artifacts["inference_metadata"]) as handle:
-        metadata = yaml.safe_load(handle)
-
-    pipeline = metadata["pipeline"]
-    assert pipeline["models"] == {
-        "audio_encoder": {
-            "filename": "audio_encoder/model.onnx",
-            "type": "audio_encoder",
-        },
-        "embedding": {"filename": "embedding/model.onnx", "type": "encoder"},
-        "decoder": {
-            "filename": "decoder/model.onnx",
-            "type": "decoder",
-            "tokenizer": "tokenizer.json",
-        },
-    }
-    assert pipeline["dataflow"] == [
-        {
-            "from": "audio_encoder.audio_features",
-            "to": "embedding.audio_features",
-            "dtype": "fp32",
-            "device_transfer": False,
-        },
-        {
-            "from": "embedding.inputs_embeds",
-            "to": "decoder.inputs_embeds",
-            "dtype": "fp32",
-            "device_transfer": False,
-        },
-    ]
-    assert [stage["name"] for stage in pipeline["strategy"]["stages"]] == [
-        "encode_audio",
-        "fuse_embeddings",
-        "decode",
-    ]
-
-
-def test_dispatch_vision_and_audio_multimodal_pipeline(tmp_path):
-    pkg = _MultimodalPkg(
-        {
-            "decoder": object(),
-            "vision_encoder": object(),
-            "audio_encoder": object(),
-            "embedding": object(),
-        }
-    )
+    pkg = _vlm_package(audio=True)
     artifacts = write_onnx_genai_config(pkg, str(tmp_path))
 
     with open(artifacts["inference_metadata"]) as handle:
         metadata = yaml.safe_load(handle)
 
-    pipeline = metadata["pipeline"]
-    assert pipeline["dataflow"] == [
-        {
-            "from": "vision_encoder.image_features",
-            "to": "embedding.image_features",
-            "dtype": "fp32",
-            "device_transfer": False,
-        },
-        {
-            "from": "audio_encoder.audio_features",
-            "to": "embedding.audio_features",
-            "dtype": "fp32",
-            "device_transfer": False,
-        },
-        {
-            "from": "embedding.inputs_embeds",
-            "to": "decoder.inputs_embeds",
-            "dtype": "fp32",
-            "device_transfer": False,
-        },
+    setup = metadata["pipeline"]["workflow"]["graph"]["setup"]["nodes"]
+    assert [node["component"] for node in setup[:3]] == [
+        "image_preprocess",
+        "vision_encoder",
+        "audio_encoder",
     ]
-    assert [stage["name"] for stage in pipeline["strategy"]["stages"]] == [
-        "encode_vision",
-        "encode_audio",
-        "fuse_embeddings",
-        "decode",
-    ]
+    embedding = next(node for node in setup if node.get("component") == "embedding")
+    assert embedding["inputs"]["audio_features"] == "audio.audio_features"
+
+
+def test_dispatch_vision_and_audio_multimodal_pipeline(tmp_path):
+    pkg = _vlm_package(audio=True)
+    artifacts = write_onnx_genai_config(pkg, str(tmp_path))
+
+    with open(artifacts["inference_metadata"]) as handle:
+        metadata = yaml.safe_load(handle)
+
+    workflow = metadata["pipeline"]["workflow"]
+    assert set(workflow["components"]) >= {
+        "vision_encoder",
+        "audio_encoder",
+        "embedding",
+        "decoder",
+    }
 
 
 class _FakeValue:

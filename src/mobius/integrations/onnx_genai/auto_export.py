@@ -27,7 +27,6 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     add_explicit_package_io,
     add_policy_components_to_workflow,
     load_diffusers_scheduler_config,
-    write_multimodal_pipeline_metadata,
     write_speech_to_text_pipeline_metadata,
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
@@ -36,6 +35,7 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     write_diffusion_workflow_metadata,
     write_language_diffusion_workflow_metadata,
     write_tts_workflow_metadata,
+    write_vlm_workflow_metadata,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -491,19 +491,12 @@ def write_onnx_genai_config(
             "or a package carrying `.config`)"
         )
     if _looks_like_multimodal(pkg):
-        derived = _multimodal_component_kwargs(pkg)
-        for name, value in derived.items():
-            kwargs.setdefault(name, value)
-        decoder_metadata = decoder_metadata_from_config(
-            resolved_config, kv_native_dtype=kv_native_dtype
-        )
-        path = write_multimodal_pipeline_metadata(
+        path = write_vlm_workflow_metadata(
+            pkg,
             output_dir,
-            decoder_metadata=decoder_metadata,
-            activation_dtype=_activation_dtype_tag(resolved_config),
-            **kwargs,
+            resolved_config,
+            source=source,
         )
-        _add_explicit_io_to_file(path, pkg, resolved_config)
         artifacts = {"inference_metadata": path}
         tokenizer_path = _write_hf_tokenizer(output_dir, source, revision=revision)
         if tokenizer_path is not None:
