@@ -5784,6 +5784,56 @@
         }
       ]
     },
+    "WorkflowBranchEffectMerge": {
+      "additionalProperties": false,
+      "properties": {
+        "cases": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "default": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "incoming": {
+          "type": "string"
+        },
+        "produces": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "incoming",
+        "cases",
+        "produces"
+      ],
+      "type": "object"
+    },
+    "WorkflowBranchOutput": {
+      "additionalProperties": false,
+      "properties": {
+        "cases": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "default": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "cases"
+      ],
+      "type": "object"
+    },
     "WorkflowComponent": {
       "additionalProperties": false,
       "properties": {
@@ -6140,9 +6190,23 @@
                 }
               ]
             },
+            "effects": {
+              "additionalProperties": {
+                "$ref": "#/$defs/WorkflowBranchEffectMerge"
+              },
+              "default": {},
+              "type": "object"
+            },
             "kind": {
               "const": "branch",
               "type": "string"
+            },
+            "outputs": {
+              "additionalProperties": {
+                "$ref": "#/$defs/WorkflowBranchOutput"
+              },
+              "default": {},
+              "type": "object"
             },
             "predicate": {
               "type": "string"

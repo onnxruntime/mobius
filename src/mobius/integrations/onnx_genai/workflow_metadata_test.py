@@ -66,17 +66,16 @@ def test_language_diffusion_uses_exclusive_ssa_workflow():
     assert graph["kind"] == "loop"
     assert graph["condition"] == "denoiser.body.continue"
     assert graph["max_iterations"] == "request.max_iterations"
-    assert [node["component"] for node in graph["setup"]["nodes"]] == [
-        "model",
-        "masked_update",
-    ]
+    assert [node["component"] for node in graph["setup"]["nodes"]] == ["model"]
     assert [node["kind"] for node in graph["body"]["nodes"]] == [
         "invoke",
         "invoke",
         "invoke",
         "emit",
+        "invoke",
     ]
-    assert graph["body"]["nodes"][-1]["mode"] == "replace"
+    assert graph["body"]["nodes"][0]["inputs"]["total_steps"] == "package.num_steps"
+    assert graph["body"]["nodes"][-2]["mode"] == "replace"
 
 
 def test_language_diffusion_rejects_zero_steps():

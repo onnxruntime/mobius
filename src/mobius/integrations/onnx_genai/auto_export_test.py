@@ -69,6 +69,18 @@ def test_dispatch_decoder(tmp_path):
     assert workflow["components"]["token_sampler"]["policy"]["role"] == "token_sampler"
     assert workflow["components"]["termination"]["policy"]["role"] == ("termination_predicate")
     assert workflow["graph"]["kind"] == "loop"
+    assert all(
+        value["source"]["kind"] != "application" for value in workflow["inputs"].values()
+    )
+    assert [node["component"] for node in workflow["graph"]["setup"]["nodes"]] == [
+        "decoder_state_initializer",
+        "model",
+    ]
+    body = workflow["graph"]["body"]["nodes"]
+    assert [node["kind"] for node in body].count("emit") == 1
+    assert next(node for node in body if node["kind"] == "emit")["value"] == "sample.body"
+    assert workflow["state"]["iteration"]["initializer"] == "package.zero_iteration"
+    assert workflow["state"]["token"]["initializer"] == "initializer.token_slot"
     assert (tmp_path / "policies" / "token_sampler.onnx").is_file()
 
 

@@ -182,6 +182,161 @@ def build_boolean_not() -> PolicyComponent:
     return _component(PolicyRole.AUXILIARY, graph, {})
 
 
+def build_integer_increment() -> PolicyComponent:
+    """Build an explicit per-batch loop-counter increment."""
+    graph, builder = _make_graph("integer_increment")
+    value = builder.input("value", dtype=ir.DataType.INT64, shape=["batch"])
+    next_value = builder.op.Add(value, builder.op.Constant(value_int=1))
+    next_value.shape = ir.Shape(["batch"])
+    builder.add_output(next_value, "next_value")
+    return _component(PolicyRole.AUXILIARY, graph, {})
+
+
+def build_model_token_cast(dtype: ir.DataType) -> PolicyComponent:
+    """Cast the canonical int64 token state to a decoder's integer dtype."""
+    graph, builder = _make_graph("model_token_cast")
+    token = builder.input("token", dtype=ir.DataType.INT64, shape=["batch", 1])
+    model_token = builder.op.Cast(token, to=dtype)
+    model_token.shape = ir.Shape(["batch", 1])
+    builder.add_output(model_token, "model_token")
+    return _component(PolicyRole.AUXILIARY, graph, {})
+
+
+def build_decoder_state_initializer(
+    decoder: ir.Model,
+    *,
+    token_input: str,
+    attention_mask_input: str,
+    position_ids_input: str | None,
+    cache_inputs: list[str],
+) -> PolicyComponent:
+    """Build prompt-derived mask, position, token-slot, and empty-cache tensors."""
+    graph, builder = _make_graph("decoder_state_initializer")
+    op = builder.op
+    decoder_inputs = {value.name: value for value in decoder.graph.inputs}
+    token_value = decoder_inputs[token_input]
+    prompt = builder.input(
+        "prompt_tokens",
+        dtype=token_value.dtype,
+        shape=["batch", "prompt_sequence"],
+    )
+    prompt_shape = op.Shape(prompt)
+    batch_shape = op.Shape(prompt, start=0, end=1)
+    sequence_shape = op.Shape(prompt, start=1, end=2)
+
+    attention_value = decoder_inputs[attention_mask_input]
+    attention = op.Cast(
+        op.ConstantOfShape(prompt_shape, value=ir.tensor([1])),
+        to=attention_value.dtype,
+    )
+    attention.shape = attention_value.shape
+    body_attention = op.Concat(
+        attention,
+        op.Cast(
+            op.ConstantOfShape(
+                op.Concat(batch_shape, op.Constant(value_ints=[1]), axis=0),
+                value=ir.tensor([1]),
+            ),
+            to=attention_value.dtype,
+        ),
+        axis=1,
+    )
+    body_attention.shape = ir.Shape(["batch", "prompt_sequence + 1"])
+    token_slot = op.ConstantOfShape(
+        op.Concat(batch_shape, op.Constant(value_ints=[1]), axis=0),
+        value=ir.tensor([0], dtype=ir.DataType.INT64),
+    )
+    token_slot.shape = ir.Shape(["batch", 1])
+
+    positions = None
+    body_position = None
+    if position_ids_input is not None:
+        position_value = decoder_inputs[position_ids_input]
+        positions = op.Range(
+            op.Constant(value_int=0),
+            op.Squeeze(sequence_shape, op.Constant(value_ints=[0])),
+            op.Constant(value_int=1),
+        )
+        positions = op.Expand(
+            op.Unsqueeze(positions, op.Constant(value_ints=[0])), prompt_shape
+        )
+        positions = op.Cast(positions, to=position_value.dtype)
+        positions.shape = position_value.shape
+        body_position = op.Expand(
+            op.Cast(sequence_shape, to=position_value.dtype),
+            op.Concat(batch_shape, op.Constant(value_ints=[1]), axis=0),
+        )
+        body_position.shape = ir.Shape(["batch", 1])
+    builder.add_output(attention, attention_mask_input)
+    if position_ids_input is not None:
+        assert positions is not None and body_position is not None
+        builder.add_output(positions, position_ids_input)
+    builder.add_output(body_attention, "body_attention_mask")
+    if position_ids_input is not None:
+        builder.add_output(body_position, "body_position_ids")
+    builder.add_output(token_slot, "token_slot")
+
+    for name in cache_inputs:
+        value = decoder_inputs[name]
+        if value.shape is None:
+            raise ValueError(f"cache input {name!r} must declare a shape")
+        dimensions = list(value.shape)
+        shape_parts = []
+        for axis, dimension in enumerate(dimensions):
+            dimension_text = str(getattr(dimension, "value", dimension))
+            if axis == 0:
+                shape_parts.append(batch_shape)
+            elif "sequence" in dimension_text:
+                shape_parts.append(op.Constant(value_ints=[0]))
+            elif isinstance(dimension, int):
+                shape_parts.append(op.Constant(value_ints=[dimension]))
+            else:
+                raise ValueError(
+                    f"cache input {name!r} has unsupported symbolic dimension {dimension_text!r}"
+                )
+        cache_shape = op.Concat(*shape_parts, axis=0)
+        zero = 0.0 if value.dtype.is_floating_point else 0
+        empty = op.ConstantOfShape(
+            cache_shape,
+            value=ir.tensor([zero], dtype=value.dtype),
+        )
+        empty.shape = value.shape
+        builder.add_output(empty, name)
+
+    return _component(PolicyRole.AUXILIARY, graph, {})
+
+
+def build_decoder_step_update(
+    *,
+    attention_dtype: ir.DataType,
+    position_dtype: ir.DataType | None,
+) -> PolicyComponent:
+    """Build one-token attention-mask append and position increment."""
+    graph, builder = _make_graph("decoder_step_update")
+    op = builder.op
+    attention = builder.input(
+        "attention_mask",
+        dtype=attention_dtype,
+        shape=["batch", "context"],
+    )
+    batch_shape = op.Shape(attention, start=0, end=1)
+    one_shape = op.Concat(batch_shape, op.Constant(value_ints=[1]), axis=0)
+    one = op.CastLike(op.ConstantOfShape(one_shape, value=ir.tensor([1])), attention)
+    next_attention = op.Concat(attention, one, axis=1)
+    next_attention.shape = ir.Shape(["batch", "context + 1"])
+    builder.add_output(next_attention, "next_attention_mask")
+    if position_dtype is not None:
+        position = builder.input(
+            "position_ids",
+            dtype=position_dtype,
+            shape=["batch", 1],
+        )
+        next_position = op.Add(position, op.CastLike(op.Constant(value_int=1), position))
+        next_position.shape = ir.Shape(["batch", 1])
+        builder.add_output(next_position, "next_position_ids")
+    return _component(PolicyRole.AUXILIARY, graph, {})
+
+
 def build_seeded_categorical_sampler() -> PolicyComponent:
     """Build deterministic categorical sampling with explicit seed and offset.
 
@@ -364,8 +519,14 @@ def build_masked_token_update() -> PolicyComponent:
     op = builder.op
     current = builder.input("current_tokens", ir.DataType.INT64, ["batch", "sequence"])
     proposed = builder.input("proposed_tokens", ir.DataType.INT64, ["batch", "sequence"])
+    logits = builder.input(
+        "logits",
+        ir.DataType.FLOAT,
+        ["batch", "sequence", "vocabulary"],
+    )
     masked = builder.input("masked", ir.DataType.BOOL, ["batch", "sequence"])
     step = builder.input("step", ir.DataType.INT64, ["batch"])
+    total_steps = builder.input("total_steps", ir.DataType.INT64, ["batch"])
     seed = builder.input("seed", ir.DataType.INT64, ["batch"])
     offset = builder.input("offset", ir.DataType.INT64, ["batch"])
     sequence_length = op.Shape(masked, start=1, end=2)
@@ -378,19 +539,50 @@ def build_masked_token_update() -> PolicyComponent:
     stream = op.Add(
         positions,
         op.Unsqueeze(
-            seed,
+            op.Add(op.Add(seed, offset), op.Mul(step, op.Constant(value_int=17))),
             op.Constant(value_ints=[-1]),
         ),
     )
-    bucket = op.Mod(stream, op.Constant(value_int=8), fmod=0)
-    scheduled = op.Less(
-        bucket,
-        op.Unsqueeze(
-            op.Min(op.Add(step, op.Constant(value_int=1)), op.Constant(value_int=8)),
-            op.Constant(value_ints=[-1]),
-        ),
+    tie_noise = op.Div(
+        op.Cast(op.Mod(stream, op.Constant(value_int=997), fmod=0), to=ir.DataType.FLOAT),
+        op.Constant(value_float=997_000_000.0),
     )
-    committed = op.And(masked, scheduled)
+    probabilities = op.Softmax(logits, axis=-1)
+    confidence = op.Squeeze(
+        op.GatherElements(
+            probabilities,
+            op.Unsqueeze(proposed, op.Constant(value_ints=[-1])),
+            axis=-1,
+        ),
+        op.Constant(value_ints=[-1]),
+    )
+    confidence = op.Add(confidence, tie_noise)
+    negative = op.CastLike(op.Constant(value_float=-1.0), confidence)
+    ranked_scores = op.Where(masked, confidence, negative)
+    left = op.Unsqueeze(ranked_scores, op.Constant(value_ints=[-1]))
+    right = op.Unsqueeze(ranked_scores, op.Constant(value_ints=[-2]))
+    rank = op.ReduceSum(
+        op.Cast(op.Greater(right, left), to=ir.DataType.INT64),
+        axes=[-1],
+        keepdims=0,
+    )
+    remaining_before = op.ReduceSum(
+        op.Cast(masked, to=ir.DataType.INT64),
+        axes=[-1],
+        keepdims=0,
+    )
+    steps_left = op.Max(
+        op.Constant(value_int=1),
+        op.Sub(total_steps, step),
+    )
+    quota = op.Div(
+        op.Add(op.Sub(remaining_before, op.Constant(value_int=1)), steps_left),
+        steps_left,
+    )
+    committed = op.And(
+        masked,
+        op.Less(rank, op.Unsqueeze(quota, op.Constant(value_ints=[-1]))),
+    )
     updated = op.Where(committed, proposed, current)
     updated.shape = ir.Shape(["batch", "sequence"])
     remaining = op.And(masked, op.Not(committed))
