@@ -22,12 +22,14 @@ from mobius._pipeline_contract import (
     declare_component_presence,
     declare_optional_input,
 )
+from mobius.generation import build_greedy_sampler
 from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
     _decoder_io,
     _input_source_map,
     _port,
     add_explicit_package_io,
+    add_policy_components_to_workflow,
     build_diffusion_pipeline_metadata,
     build_language_diffusion_pipeline_metadata,
     build_multimodal_pipeline_metadata,
@@ -40,6 +42,32 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     write_native_vlm_package_metadata,
     write_tts_pipeline_metadata,
 )
+
+
+def test_workflow_policy_components_reference_saved_onnx_artifacts(tmp_path):
+    package = ModelPackage({"model": _model("model", [], [])})
+    package.add_policy_component("sample", build_greedy_sampler())
+    package.save(str(tmp_path))
+    metadata = {
+        "pipeline": {
+            "workflow": {
+                "manifest": {"ir_version": "1.0"},
+                "components": {},
+                "graph": {"kind": "sequence", "nodes": []},
+            }
+        }
+    }
+
+    add_policy_components_to_workflow(metadata, package)
+
+    component = metadata["pipeline"]["workflow"]["components"]["sample"]
+    assert component["implementation"] == {
+        "kind": "onnx",
+        "artifact": "policies/sample.onnx",
+    }
+    assert set(component["ports"]["inputs"]) == {"logits"}
+    assert set(component["ports"]["outputs"]) == {"token_ids"}
+    assert (tmp_path / component["implementation"]["artifact"]).is_file()
 
 
 def _onnx_genai_schema_path() -> str | None:

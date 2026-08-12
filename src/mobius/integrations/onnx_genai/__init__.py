@@ -50,6 +50,7 @@ from mobius.integrations.onnx_genai.decoder_metadata import (
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
+    add_policy_components_to_workflow,
     build_audio_codec_pipeline_metadata,
     build_diffusion_pipeline_metadata,
     build_language_diffusion_pipeline_metadata,
@@ -68,6 +69,7 @@ __all__ = [
     "ComfyUIWorkflow",
     "ConversionResult",
     "SchedulerConfig",
+    "add_policy_components_to_workflow",
     "build_decoder_metadata",
     "build_diffusion_pipeline_metadata",
     "build_language_diffusion_pipeline_metadata",
