@@ -56,13 +56,14 @@ def test_muse_glimmer_uses_fused_rms_normalization():
         rope_type="default",
         rope_theta=500_000.0,
         rms_norm_eps=1e-5,
+        dtype=ir.DataType.BFLOAT16,
     )
     module = MuseGlimmerTextCausalLMModel(config)
     model = build_from_module(module, config, execution_provider="cuda")["model"]
     counts = Counter(node.op_type for node in model.graph)
 
-    assert counts["RMSNormalization"] == 18
-    assert counts["SkipSimplifiedLayerNormalization"] == 8
+    assert counts["RMSNormalization"] == 25
+    assert counts["SkipSimplifiedLayerNormalization"] == 1
     assert counts["ReduceMean"] == 0
     assert counts["Pow"] == 0
 
