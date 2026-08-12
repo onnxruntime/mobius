@@ -217,6 +217,8 @@ def test_dispatch_diffusion(tmp_path):
     assert workflow["graph"]["nodes"][0]["iteration"]["value"] == "loop.iteration"
     assert workflow["graph"]["nodes"][1]["component"] == "vae_decoder"
     assert "strategy" not in meta["pipeline"]
+    assert (tmp_path / "policies" / "solver_step.onnx").is_file()
+    assert (tmp_path / "policies" / "schedule_lookup.onnx").is_file()
 
 
 def test_single_diffusion_component_uses_flat_model_path(tmp_path):
@@ -369,6 +371,7 @@ def test_dispatch_vision_multimodal_pipeline(tmp_path):
     assert workflow["graph"]["setup"]["nodes"][1]["component"] == "vision_encoder"
     assert workflow["graph"]["setup"]["nodes"][3]["component"] == "embedding"
     assert workflow["graph"]["iteration"]["value"] == "loop.iteration"
+    assert (tmp_path / "policies" / "token_sampler.onnx").is_file()
 
 
 def test_dispatch_audio_only_multimodal_pipeline(tmp_path, monkeypatch):
@@ -592,6 +595,7 @@ def test_dispatch_multi_decoder_tts_with_pre_embedder(tmp_path):
     outer = workflow["graph"]["nodes"][0]
     assert outer["iteration"]["value"] == "talker.iteration"
     assert outer["body"]["nodes"][2]["iteration"]["value"] == "code.iteration"
+    assert (tmp_path / "policies" / "code_frame_update.onnx").is_file()
 
 
 def test_unrecognized_multi_component_package_fails_loudly(tmp_path):

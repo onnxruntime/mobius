@@ -13,9 +13,11 @@ from mobius.generation import (
     PolicyRole,
     attach_policy_components,
     build_boolean_not,
+    build_code_frame_update,
     build_decoder_state_initializer,
     build_decoder_step_update,
     build_eos_termination,
+    build_euler_model_input,
     build_euler_solver_step,
     build_greedy_sampler,
     build_last_token_logits,
@@ -322,10 +324,36 @@ def test_speculative_acceptance_prefix_runtime(tmp_path):
             "offset": np.array([8], np.int64),
         },
     )
-    np.testing.assert_array_equal(accepted_tokens, [[1, 0, 0, 0]])
-    np.testing.assert_array_equal(count, [2])
+    np.testing.assert_array_equal(accepted_tokens, [[1, 0, 1, 0]])
+    np.testing.assert_array_equal(count, [3])
     np.testing.assert_array_equal(done, [False])
     np.testing.assert_array_equal(next_offset, [12])
+
+
+def test_euler_model_input_scales_by_sigma(tmp_path):
+    (scaled,) = _run(
+        build_euler_model_input(),
+        tmp_path,
+        {
+            "sample": np.full((1, 1, 1, 1), 10.0, np.float32),
+            "step": np.array([0], np.int64),
+            "schedule": np.array([2.0, 0.0], np.float32),
+        },
+    )
+    np.testing.assert_allclose(scaled, 10.0 / np.sqrt(5.0), rtol=1e-6)
+
+
+def test_code_frame_update_accepts_scalar_loop_index(tmp_path):
+    (updated,) = _run(
+        build_code_frame_update(4, scalar_index=True),
+        tmp_path,
+        {
+            "frame_codes": np.zeros((2, 4), np.int64),
+            "token": np.array([5, 7], np.int64),
+            "index": np.array(2, np.int64),
+        },
+    )
+    np.testing.assert_array_equal(updated, [[0, 0, 5, 0], [0, 0, 7, 0]])
 
 
 def test_token_state_update_runtime(tmp_path):

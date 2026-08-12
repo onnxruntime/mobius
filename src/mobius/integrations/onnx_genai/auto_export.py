@@ -16,6 +16,7 @@ import logging
 import os
 from typing import Any
 
+import numpy as np
 import onnx_ir as ir
 import yaml
 
@@ -40,6 +41,54 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _euler_schedule(
+    scheduler: SchedulerConfig, num_inference_steps: int
+) -> tuple[list[float], list[float]]:
+    """Materialize diffusers-compatible Euler timesteps and sigma values."""
+    if scheduler.kind != "euler" or scheduler.prediction_type != "epsilon":
+        raise ValueError(
+            "workflow diffusion currently supports deterministic Euler epsilon "
+            f"schedulers, got kind={scheduler.kind!r}, "
+            f"prediction_type={scheduler.prediction_type!r}"
+        )
+    if scheduler.use_karras_sigmas or scheduler.use_exponential_sigmas:
+        raise ValueError(
+            "workflow diffusion does not yet materialize Karras or exponential sigmas"
+        )
+    if scheduler.beta_schedule == "scaled_linear":
+        betas = np.linspace(
+            np.sqrt(scheduler.beta_start),
+            np.sqrt(scheduler.beta_end),
+            scheduler.num_train_timesteps,
+            dtype=np.float64,
+        ) ** 2
+    elif scheduler.beta_schedule == "linear":
+        betas = np.linspace(
+            scheduler.beta_start,
+            scheduler.beta_end,
+            scheduler.num_train_timesteps,
+            dtype=np.float64,
+        )
+    else:
+        raise ValueError(
+            f"workflow diffusion does not support beta schedule "
+            f"{scheduler.beta_schedule!r}"
+        )
+    training_sigmas = np.sqrt((1.0 - np.cumprod(1.0 - betas)) / np.cumprod(1.0 - betas))
+    timesteps = np.linspace(
+        scheduler.num_train_timesteps - 1,
+        0,
+        num_inference_steps,
+        dtype=np.float64,
+    )
+    sigmas = np.interp(
+        timesteps,
+        np.arange(scheduler.num_train_timesteps, dtype=np.float64),
+        training_sigmas,
+    )
+    return timesteps.tolist(), [*sigmas.tolist(), 0.0]
 
 _DENOISER_KEYS = ("denoiser", "transformer", "unet")
 
@@ -468,14 +517,21 @@ def write_onnx_genai_config(
         derived = _diffusion_component_kwargs(pkg)
         for name, value in derived.items():
             kwargs.setdefault(name, value)
-        # Classic text-conditioned diffusion (a text encoder is present) uses
-        # classifier-free guidance by default; SD's canonical scale is 7.5.
-        if guidance_scale is None and "text_encoder_filename" in kwargs:
-            guidance_scale = 7.5
+        if guidance_scale is not None and not np.isclose(guidance_scale, 1.0):
+            raise ValueError(
+                "workflow diffusion requires an explicit classifier-free guidance "
+                "component before guidance_scale can differ from 1.0"
+            )
+        resolved_scheduler = scheduler or SchedulerConfig(kind="euler")
+        timesteps, sigma_schedule = _euler_schedule(
+            resolved_scheduler, num_inference_steps
+        )
         path = write_diffusion_workflow_metadata(
             pkg,
             output_dir,
             num_inference_steps=num_inference_steps,
+            schedule=sigma_schedule,
+            timesteps=timesteps,
         )
         artifacts = {"inference_metadata": path}
         # Emit the CLIP tokenizer.json for text-conditioned pipelines so the

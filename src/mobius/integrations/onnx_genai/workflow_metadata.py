@@ -21,11 +21,13 @@ from mobius.generation import (
     build_codec_layout_transpose,
     build_decoder_state_initializer,
     build_decoder_step_update,
+    build_euler_model_input,
+    build_euler_solver_step,
     build_integer_increment,
-    build_iteration_cast,
     build_last_token_logits,
     build_model_token_cast,
     build_schedule_constant,
+    build_schedule_lookup,
     build_token_block_identity,
     build_tts_state_initializer,
 )
@@ -250,6 +252,13 @@ def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
     assert predictor_logits is not None
     if predictor_logits.shape is None or len(predictor_logits.shape) != 2:
         raise ValueError("TTS code predictor logits must be rank 2")
+    predictor_step_contract = _contract(predictor_step_input)
+    scalar_code_index = predictor_step_contract["rank"] == 0
+    if predictor_step_contract["dtype"] != "int64" or predictor_step_contract["rank"] not in {
+        0,
+        1,
+    }:
+        raise ValueError("TTS code predictor step index must be scalar or batch int64")
 
     codec_name = next(
         (name for name in ("codec", "vocoder", "decoder") if name in pkg),
@@ -264,7 +273,10 @@ def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
     attach_policy_components(pkg, PolicyCapabilities(sampler="greedy"))
     pkg.add_policy_component("continue_predicate", build_boolean_not())
     pkg.add_policy_component("tts_state_initializer", build_tts_state_initializer(num_groups))
-    pkg.add_policy_component("code_frame_update", build_code_frame_update(num_groups))
+    pkg.add_policy_component(
+        "code_frame_update",
+        build_code_frame_update(num_groups, scalar_index=scalar_code_index),
+    )
     pkg.add_policy_component("code_history_append", build_code_history_append(num_groups))
     codec_group_major = (
         codec_input.shape is not None
@@ -337,6 +349,14 @@ def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             result[value.name] = name
         return result
 
+    def bind_outputs(
+        values: Any, bound: dict[str, str], prefix: str
+    ) -> dict[str, str]:
+        result = dict(bound)
+        for value in values:
+            result.setdefault(value.name, f"{prefix}.{value.name}")
+        return result
+
     prefill_inputs = bind_remaining(
         "talker_prefill_embedder",
         prefill_embedder.graph.inputs,
@@ -401,7 +421,11 @@ def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
                 _invoke(
                     "code_predictor",
                     predictor_inputs,
-                    {predictor_logits.name: "code.logits"},
+                    bind_outputs(
+                        predictor.graph.outputs,
+                        {predictor_logits.name: "code.logits"},
+                        "code_predictor.body",
+                    ),
                 ),
                 _invoke(
                     "token_sampler",
@@ -427,7 +451,10 @@ def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
         },
         "condition": "code.continue",
         "max_iterations": "package.code_groups",
-        "iteration": {"value": "code.iteration", "contract": batch_int},
+        "iteration": {
+            "value": "code.iteration",
+            "contract": predictor_step_contract,
+        },
         "carried": [
             {
                 "cell": "frame",
@@ -446,12 +473,20 @@ def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             _invoke(
                 "talker_step_embedder",
                 step_inputs,
-                {step_output.name: "talker.step_embeds"},
+                bind_outputs(
+                    step_embedder.graph.outputs,
+                    {step_output.name: "talker.step_embeds"},
+                    "talker_step_embedder.body",
+                ),
             ),
             _invoke(
                 "talker",
                 talker_body_inputs,
-                {talker_hidden.name: "talker.body.hidden"},
+                bind_outputs(
+                    talker.graph.outputs,
+                    {talker_hidden.name: "talker.body.hidden"},
+                    "talker.body",
+                ),
             ),
             inner_loop,
             _invoke(
@@ -469,9 +504,17 @@ def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             ),
         ],
     }
-    setup_outputs = {prefill_output.name: "talker.prefill_embeds"}
+    setup_outputs = bind_outputs(
+        prefill_embedder.graph.outputs,
+        {prefill_output.name: "talker.prefill_embeds"},
+        "talker_prefill_embedder.setup",
+    )
     if talker_hidden.name in {value.name for value in talker.graph.outputs}:
-        talker_setup_outputs = {talker_hidden.name: "talker.prefill.hidden"}
+        talker_setup_outputs = bind_outputs(
+            talker.graph.outputs,
+            {talker_hidden.name: "talker.prefill.hidden"},
+            "talker.setup",
+        )
     else:
         talker_setup_outputs = {}
     outer_loop = {
@@ -533,7 +576,11 @@ def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             _invoke(
                 codec_name,
                 {codec_input.name: codec_value},
-                {waveform_output.name: "tts.waveform"},
+                bind_outputs(
+                    codec.graph.outputs,
+                    {waveform_output.name: "tts.waveform"},
+                    "codec.final",
+                ),
             ),
             {
                 "kind": "emit",
@@ -602,9 +649,10 @@ def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
 
 
 def write_tts_workflow_metadata(pkg: Any, output_dir: str, config: Any) -> str:
-    """Build TTS workflow metadata, failing precisely on the producer defect."""
+    """Build and save an executable TTS workflow package."""
     metadata = build_tts_workflow_metadata(pkg, config)
     os.makedirs(output_dir, exist_ok=True)
+    pkg.save_policy_components(output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(metadata, handle, sort_keys=False)
@@ -643,6 +691,7 @@ def build_diffusion_workflow_metadata(
     *,
     num_inference_steps: int,
     schedule: list[float] | None = None,
+    timesteps: list[float] | None = None,
 ) -> dict[str, Any]:
     """Build a fixed-schedule diffusion workflow with explicit latent state."""
     if num_inference_steps < 1:
@@ -707,14 +756,23 @@ def build_diffusion_workflow_metadata(
             next(iter(text_encoder.graph.outputs), None),
         )
 
-    attach_policy_components(pkg, PolicyCapabilities(solver="euler"))
+    attach_policy_components(pkg, PolicyCapabilities())
+    pkg.add_policy_component(
+        "euler_model_input", build_euler_model_input(sample_input.dtype)
+    )
+    pkg.add_policy_component("solver_step", build_euler_solver_step(sample_input.dtype))
     pkg.add_policy_component("continue_predicate", build_boolean_not())
     schedule_values = schedule or [
         1.0 - index / num_inference_steps for index in range(num_inference_steps + 1)
     ]
+    timestep_values = timesteps or schedule_values[:-1]
+    if len(schedule_values) != num_inference_steps + 1:
+        raise ValueError("diffusion solver schedule must contain num_inference_steps + 1 values")
+    if len(timestep_values) != num_inference_steps:
+        raise ValueError("diffusion timesteps must contain num_inference_steps values")
     pkg.add_policy_component("diffusion_schedule", build_schedule_constant(schedule_values))
-    if timestep_input.dtype != ir.DataType.INT64:
-        pkg.add_policy_component("iteration_cast", build_iteration_cast(timestep_input.dtype))
+    pkg.add_policy_component("diffusion_timesteps", build_schedule_constant(timestep_values))
+    pkg.add_policy_component("schedule_lookup", build_schedule_lookup(timestep_input.dtype))
 
     batch = _contract(sample_input)["shape"][0]
     batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
@@ -742,7 +800,8 @@ def build_diffusion_workflow_metadata(
         },
     }
     setup_nodes: list[dict[str, Any]] = [
-        _invoke("diffusion_schedule", {}, {"schedule": "diffusion.schedule"})
+        _invoke("diffusion_schedule", {}, {"schedule": "diffusion.schedule"}),
+        _invoke("diffusion_timesteps", {}, {"schedule": "diffusion.timesteps"}),
     ]
     conditioning_value = None
     if text_encoder is not None and conditioning_output is not None:
@@ -784,24 +843,33 @@ def build_diffusion_workflow_metadata(
     )
 
     denoiser_inputs = {
-        sample_input.name: "state.latent.body",
-        timestep_input.name: (
-            "diffusion.timestep"
-            if timestep_input.dtype != ir.DataType.INT64
-            else "loop.iteration"
-        ),
+        sample_input.name: "diffusion.model_input",
+        timestep_input.name: "diffusion.timestep",
     }
     if conditioning_input is not None and conditioning_value is not None:
         denoiser_inputs[conditioning_input.name] = conditioning_value
     body_nodes: list[dict[str, Any]] = []
-    if timestep_input.dtype != ir.DataType.INT64:
-        body_nodes.append(
-            _invoke(
-                "iteration_cast",
-                {"iteration": "loop.iteration"},
-                {"timestep": "diffusion.timestep"},
-            )
+    body_nodes.append(
+        _invoke(
+            "schedule_lookup",
+            {
+                "schedule": "diffusion.timesteps",
+                "step": "loop.iteration",
+            },
+            {"timestep": "diffusion.timestep"},
         )
+    )
+    body_nodes.append(
+        _invoke(
+            "euler_model_input",
+            {
+                "sample": "state.latent.body",
+                "step": "loop.iteration",
+                "schedule": "diffusion.schedule",
+            },
+            {"model_input": "diffusion.model_input"},
+        )
+    )
     body_nodes.extend(
         [
             _invoke(
@@ -916,9 +984,17 @@ def write_diffusion_workflow_metadata(
     output_dir: str,
     *,
     num_inference_steps: int,
+    schedule: list[float] | None = None,
+    timesteps: list[float] | None = None,
 ) -> str:
     os.makedirs(output_dir, exist_ok=True)
-    metadata = build_diffusion_workflow_metadata(pkg, num_inference_steps=num_inference_steps)
+    metadata = build_diffusion_workflow_metadata(
+        pkg,
+        num_inference_steps=num_inference_steps,
+        schedule=schedule,
+        timesteps=timesteps,
+    )
+    pkg.save_policy_components(output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(metadata, handle, sort_keys=False)
@@ -1475,6 +1551,7 @@ def write_vlm_workflow_metadata(
 ) -> str:
     os.makedirs(output_dir, exist_ok=True)
     metadata = build_vlm_workflow_metadata(pkg, config, source=source)
+    pkg.save_policy_components(output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(metadata, handle, sort_keys=False)
@@ -1645,7 +1722,7 @@ def build_speculative_workflow_metadata(pkg: Any) -> dict[str, Any]:
             ),
             "false": _invoke(
                 "branch_state",
-                {"tokens": "proposal.tokens"},
+                {"tokens": "acceptance.tokens"},
                 {"next_tokens": "branch.corrected"},
                 {"state": _effect("branch.state.in", "branch.state.corrected")},
             ),
@@ -1830,6 +1907,7 @@ def build_speculative_workflow_metadata(pkg: Any) -> dict[str, Any]:
 def write_speculative_workflow_metadata(pkg: Any, output_dir: str) -> str:
     os.makedirs(output_dir, exist_ok=True)
     metadata = build_speculative_workflow_metadata(pkg)
+    pkg.save_policy_components(output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(metadata, handle, sort_keys=False)

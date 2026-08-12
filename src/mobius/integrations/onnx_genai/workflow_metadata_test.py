@@ -14,7 +14,14 @@ from mobius._model_package import ModelPackage
 from mobius.integrations.onnx_genai.workflow_metadata import (
     build_language_diffusion_pipeline_metadata,
     build_speculative_workflow_metadata,
+    write_speculative_workflow_metadata,
 )
+
+
+def test_speculative_writer_saves_policy_artifacts(tmp_path):
+    write_speculative_workflow_metadata(_speculative_package(), str(tmp_path))
+    assert (tmp_path / "policies" / "speculative_acceptance.onnx").is_file()
+    assert (tmp_path / "policies" / "branch_state.onnx").is_file()
 
 
 def _value(name: str, dtype: ir.DataType, shape: list[int | str]) -> ir.Value:

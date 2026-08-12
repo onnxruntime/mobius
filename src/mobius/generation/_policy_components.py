@@ -215,6 +215,18 @@ def build_schedule_constant(values: list[float]) -> PolicyComponent:
     return _component(PolicyRole.AUXILIARY, graph, {})
 
 
+def build_schedule_lookup(dtype: ir.DataType) -> PolicyComponent:
+    """Gather the current schedule value and cast it for a model timestep port."""
+    graph, builder = _make_graph("schedule_lookup")
+    op = builder.op
+    schedule = builder.input("schedule", ir.DataType.FLOAT, ["schedule_length"])
+    step = builder.input("step", ir.DataType.INT64, ["batch"])
+    timestep = op.Cast(op.Gather(schedule, step, axis=0), to=dtype)
+    timestep.shape = ir.Shape(["batch"])
+    builder.add_output(timestep, "timestep")
+    return _component(PolicyRole.AUXILIARY, graph, {})
+
+
 def build_tts_state_initializer(num_code_groups: int) -> PolicyComponent:
     """Create an empty codec history and zeroed current frame from prompt batch."""
     if num_code_groups < 1:
@@ -236,7 +248,9 @@ def build_tts_state_initializer(num_code_groups: int) -> PolicyComponent:
     return _component(PolicyRole.AUXILIARY, graph, {})
 
 
-def build_code_frame_update(num_code_groups: int) -> PolicyComponent:
+def build_code_frame_update(
+    num_code_groups: int, *, scalar_index: bool = False
+) -> PolicyComponent:
     """Scatter one predicted code into the current codec frame."""
     graph, builder = _make_graph("code_frame_update")
     op = builder.op
@@ -246,7 +260,13 @@ def build_code_frame_update(num_code_groups: int) -> PolicyComponent:
         shape=["batch", num_code_groups],
     )
     token = builder.input("token", dtype=ir.DataType.INT64, shape=["batch"])
-    index = builder.input("index", dtype=ir.DataType.INT64, shape=["batch"])
+    index = builder.input(
+        "index",
+        dtype=ir.DataType.INT64,
+        shape=[] if scalar_index else ["batch"],
+    )
+    if scalar_index:
+        index = op.Expand(index, op.Shape(token))
     updated = op.ScatterElements(
         frame,
         op.Unsqueeze(index, op.Constant(value_ints=[-1])),
@@ -577,18 +597,39 @@ def build_eos_termination() -> PolicyComponent:
     )
 
 
-def build_euler_solver_step() -> PolicyComponent:
+def build_euler_model_input(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponent:
+    """Scale a latent for the Euler denoiser input at the current sigma."""
+    graph, builder = _make_graph("euler_model_input")
+    op = builder.op
+    sample = builder.input(
+        "sample", dtype, ["batch", "channels", "height", "width"]
+    )
+    step = builder.input("step", ir.DataType.INT64, ["batch"])
+    schedule = builder.input("schedule", ir.DataType.FLOAT, ["schedule_length"])
+    sigma = op.Gather(schedule, step, axis=0)
+    scale = op.Sqrt(op.Add(op.Mul(sigma, sigma), op.Constant(value_float=1.0)))
+    scale = op.Cast(scale, to=dtype)
+    scale = op.Unsqueeze(scale, op.Constant(value_ints=[1, 2, 3]))
+    model_input = op.Div(sample, scale)
+    model_input.shape = sample.shape
+    builder.add_output(model_input, "model_input")
+    return _component(PolicyRole.AUXILIARY, graph, {})
+
+
+def build_euler_solver_step(
+    dtype: ir.DataType = ir.DataType.FLOAT,
+) -> PolicyComponent:
     """Build the generic Euler update ``x_next = x + dx * (sigma_next-sigma)``."""
     graph, builder = _make_graph("euler_solver_step")
     op = builder.op
     sample = builder.input(
         "sample",
-        ir.DataType.FLOAT,
+        dtype,
         ["batch", "channels", "height", "width"],
     )
     derivative = builder.input(
         "derivative",
-        ir.DataType.FLOAT,
+        dtype,
         ["batch", "channels", "height", "width"],
     )
     step = builder.input("step", ir.DataType.INT64, ["batch"])
@@ -598,6 +639,7 @@ def build_euler_solver_step() -> PolicyComponent:
     sigma = op.Gather(schedule, step, axis=0)
     sigma_next = op.Gather(schedule, next_step, axis=0)
     delta = op.Sub(sigma_next, sigma)
+    delta = op.Cast(delta, to=dtype)
     delta = op.Unsqueeze(delta, op.Constant(value_ints=[1, 2, 3]))
     next_sample = op.Add(sample, op.Mul(derivative, delta))
     builder.add_output(next_sample, "next_state")
@@ -750,17 +792,28 @@ def build_speculative_acceptance() -> PolicyComponent:
         to=ir.DataType.INT64,
     )
     accepted_count = op.ReduceSum(prefix, axes=[-1], keepdims=0)
+    first_rejection = op.And(
+        op.Cast(rejected, to=ir.DataType.BOOL),
+        op.Equal(rejection_count, op.Constant(value_int=1)),
+    )
+    zeros = op.ConstantOfShape(
+        op.Shape(proposed_tokens),
+        value=ir.tensor([0], dtype=ir.DataType.INT64),
+    )
+    # Publish the verified prefix plus the verifier's correction at the first
+    # mismatch. Trailing slots remain zero and are bounded by accepted_len.
     accepted_tokens = op.Where(
         op.Cast(prefix, to=ir.DataType.BOOL),
         proposed_tokens,
-        op.ConstantOfShape(
-            op.Shape(proposed_tokens),
-            value=ir.tensor([0], dtype=ir.DataType.INT64),
-        ),
+        op.Where(first_rejection, target_tokens, zeros),
     )
     accepted_tokens.shape = ir.Shape(["batch", "draft_sequence"])
     draft_length = op.Shape(proposed_tokens, start=1, end=2)
     done = op.Equal(accepted_count, draft_length)
+    accepted_count = op.Min(
+        op.Add(accepted_count, op.Cast(op.Not(done), to=ir.DataType.INT64)),
+        draft_length,
+    )
     next_offset = op.Add(
         offset,
         op.Squeeze(draft_length, op.Constant(value_ints=[0])),
