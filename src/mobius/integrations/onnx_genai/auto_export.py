@@ -20,7 +20,6 @@ import yaml
 
 from mobius.integrations.onnx_genai.decoder_metadata import (
     decoder_metadata_from_config,
-    write_decoder_metadata,
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
@@ -32,6 +31,9 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     write_multimodal_pipeline_metadata,
     write_speech_to_text_pipeline_metadata,
     write_tts_pipeline_metadata,
+)
+from mobius.integrations.onnx_genai.workflow_metadata import (
+    write_decoder_workflow_metadata,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -625,10 +627,7 @@ def write_onnx_genai_config(
             "Multi-decoder pipelines such as TTS require a dedicated emitter."
         )
 
-    path = write_decoder_metadata(
-        output_dir, config=resolved_config, kv_native_dtype=kv_native_dtype
-    )
-    _add_explicit_io_to_file(path, pkg, resolved_config)
+    path = write_decoder_workflow_metadata(pkg, output_dir, resolved_config)
     artifacts = {"inference_metadata": path}
     tokenizer_path = _write_hf_tokenizer(output_dir, source, revision=revision)
     if tokenizer_path is not None:

@@ -10,6 +10,7 @@ workflow IR just like neural ONNX components.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
@@ -20,16 +21,18 @@ from onnxscript import GraphBuilder
 from mobius._constants import OPSET_VERSION
 
 _POLICY_ROLE_METADATA = "mobius.generation.policy_role"
+_POLICY_CONTRACT_METADATA = "mobius.generation.policy_contract"
+_POLICY_EFFECTS_METADATA = "mobius.generation.policy_effects"
 
 
 class PolicyRole(StrEnum):
     """Architecture-neutral role performed by a policy component."""
 
     TOKEN_SAMPLER = "token_sampler"
-    TERMINATION = "termination"
+    TERMINATION = "termination_predicate"
     SOLVER_STEP = "solver_step"
     MASKED_UPDATE = "masked_update"
-    SPECULATIVE_ACCEPTANCE = "speculative_acceptance"
+    SPECULATIVE_ACCEPTANCE = "speculative_verifier"
     STATE_UPDATE = "state_update"
 
 
@@ -39,9 +42,13 @@ class PolicyComponent:
 
     role: PolicyRole
     model: ir.Model
+    contract: dict[str, object]
+    effects: tuple[str, ...]
 
     def __post_init__(self) -> None:
         self.model.graph.metadata_props[_POLICY_ROLE_METADATA] = self.role.value
+        self.model.graph.metadata_props[_POLICY_CONTRACT_METADATA] = json.dumps(self.contract)
+        self.model.graph.metadata_props[_POLICY_EFFECTS_METADATA] = json.dumps(self.effects)
 
     @classmethod
     def from_model(cls, model: ir.Model) -> PolicyComponent:
@@ -49,7 +56,9 @@ class PolicyComponent:
         role = model.graph.metadata_props.get(_POLICY_ROLE_METADATA)
         if role is None:
             raise ValueError("ONNX policy component is missing its Mobius policy role")
-        return cls(PolicyRole(role), model)
+        contract = json.loads(model.graph.metadata_props[_POLICY_CONTRACT_METADATA])
+        effects = tuple(json.loads(model.graph.metadata_props[_POLICY_EFFECTS_METADATA]))
+        return cls(PolicyRole(role), model, contract, effects)
 
 
 @dataclass(frozen=True)
@@ -102,10 +111,15 @@ def attach_policy_components(
     return {name: f"policies/{name}.onnx" for name, _ in selected}
 
 
-def _component(role: PolicyRole, graph: ir.Graph) -> PolicyComponent:
+def _component(
+    role: PolicyRole,
+    graph: ir.Graph,
+    contract: dict[str, object],
+    *effects: str,
+) -> PolicyComponent:
     model = ir.Model(graph, ir_version=11)
     model.producer_name = "mobius"
-    return PolicyComponent(role, model)
+    return PolicyComponent(role, model, contract, effects)
 
 
 def _make_graph(name: str) -> tuple[ir.Graph, GraphBuilder]:
@@ -128,55 +142,116 @@ def build_greedy_sampler() -> PolicyComponent:
         shape=["batch", "vocabulary"],
     )
     token_ids = builder.op.ArgMax(logits, axis=-1, keepdims=0)
-    builder.add_output(token_ids, "token_ids")
-    return _component(PolicyRole.TOKEN_SAMPLER, graph)
+    builder.add_output(token_ids, "token")
+    return _component(
+        PolicyRole.TOKEN_SAMPLER,
+        graph,
+        {
+            "role": "token_sampler",
+            "mode": "greedy",
+            "logits": "logits",
+            "token": "token",
+            "effect": "sample",
+        },
+        "sample",
+    )
 
 
 def build_seeded_categorical_sampler() -> PolicyComponent:
-    """Build deterministic categorical sampling with explicit seed and counter.
+    """Build deterministic categorical sampling with explicit seed and offset.
 
-    The integer hash is counter based: the same ``(seed, counter, logits,
-    temperature)`` inputs always produce the same token. The updated counter is
+    Threefry is counter based: the same ``(seed, offset, logits, temperature)``
+    inputs always produce the same token. The updated offset is
     an explicit output, so no random or hidden mutable state exists in the graph.
     """
     graph, builder = _make_graph("seeded_categorical_sampler")
     op = builder.op
     logits = builder.input("logits", ir.DataType.FLOAT, ["batch", "vocabulary"])
-    temperature = builder.input("temperature", ir.DataType.FLOAT, [])
-    seed = builder.input("seed", ir.DataType.INT64, [])
-    counter = builder.input("counter", ir.DataType.INT64, [])
+    temperature = builder.input("temperature", ir.DataType.FLOAT, ["batch"])
+    seed = builder.input("seed", ir.DataType.INT64, ["batch"])
+    offset = builder.input("offset", ir.DataType.INT64, ["batch"])
 
-    # A compact LCG-style integer hash. Constants remain below signed-int64
-    # limits, and the prime modulus keeps the result in a precisely castable range.
-    multiplier = op.Constant(value_int=1_103_515_245)
-    stream_multiplier = op.Constant(value_int=12_345)
-    increment = op.Constant(value_int=1_013_904_223)
-    modulus = op.Constant(value_int=2_147_483_647)
-    hashed = op.Add(
-        op.Add(op.Mul(seed, multiplier), op.Mul(counter, stream_multiplier)),
-        increment,
+    # Threefry2x64: a counter-based Random123 generator with no hidden state.
+    # Unsigned arithmetic gives the specified modulo-2^64 round behavior.
+    k0 = op.Cast(seed, to=ir.DataType.UINT64)
+    k1 = op.Constant(value_int=0)
+    k1 = op.Cast(k1, to=ir.DataType.UINT64)
+    parity = op.Cast(op.Constant(value_int=0x1BD11BDAA9FC1A22), to=ir.DataType.UINT64)
+    k2 = op.BitwiseXor(op.BitwiseXor(k0, k1), parity)
+    keys = [k0, k1, k2]
+    x0 = op.Add(op.Cast(offset, to=ir.DataType.UINT64), k0)
+    x1 = op.Add(k1, op.Cast(op.Constant(value_int=0), to=ir.DataType.UINT64))
+    rotations = [16, 42, 12, 31, 16, 32, 24, 21]
+    for round_index in range(20):
+        x0 = op.Add(x0, x1)
+        rotation = rotations[round_index % len(rotations)]
+        left = op.BitShift(
+            x1,
+            op.Cast(op.Constant(value_int=rotation), to=ir.DataType.UINT64),
+            direction="LEFT",
+        )
+        right = op.BitShift(
+            x1,
+            op.Cast(op.Constant(value_int=64 - rotation), to=ir.DataType.UINT64),
+            direction="RIGHT",
+        )
+        x1 = op.BitwiseXor(op.BitwiseOr(left, right), x0)
+        if (round_index + 1) % 4 == 0:
+            injection = (round_index + 1) // 4
+            x0 = op.Add(x0, keys[injection % 3])
+            x1 = op.Add(
+                op.Add(x1, keys[(injection + 1) % 3]),
+                op.Cast(op.Constant(value_int=injection), to=ir.DataType.UINT64),
+            )
+    mantissa = op.BitShift(
+        x0,
+        op.Cast(op.Constant(value_int=11), to=ir.DataType.UINT64),
+        direction="RIGHT",
     )
-    hashed = op.Mod(hashed, modulus, fmod=0)
     uniform = op.Div(
-        op.Add(op.Cast(hashed, to=ir.DataType.FLOAT), op.Constant(value_float=0.5)),
-        op.Constant(value_float=2_147_483_647.0),
+        op.Cast(mantissa, to=ir.DataType.DOUBLE),
+        op.Cast(
+            op.Constant(value_float=9_007_199_254_740_992.0),
+            to=ir.DataType.DOUBLE,
+        ),
     )
+    uniform = op.Cast(uniform, to=ir.DataType.FLOAT)
 
-    scaled_logits = op.Div(logits, temperature)
+    scaled_logits = op.Div(
+        logits,
+        op.Unsqueeze(temperature, op.Constant(value_ints=[-1])),
+    )
     probabilities = op.Softmax(scaled_logits, axis=-1)
     axis = op.Constant(value_int=-1)
     cumulative = op.CumSum(probabilities, axis)
-    uniform = op.Unsqueeze(uniform, op.Constant(value_ints=[0]))
+    uniform = op.Unsqueeze(uniform, op.Constant(value_ints=[-1]))
     candidates = op.GreaterOrEqual(cumulative, uniform)
     token_ids = op.ArgMax(
         op.Cast(candidates, to=ir.DataType.INT64),
         axis=-1,
         keepdims=0,
     )
-    next_counter = op.Add(counter, op.Constant(value_int=1))
-    builder.add_output(token_ids, "token_ids")
-    builder.add_output(next_counter, "next_counter")
-    return _component(PolicyRole.TOKEN_SAMPLER, graph)
+    next_offset = op.Add(offset, op.Constant(value_int=1))
+    builder.add_output(token_ids, "token")
+    builder.add_output(next_offset, "next_offset")
+    return _component(
+        PolicyRole.TOKEN_SAMPLER,
+        graph,
+        {
+            "role": "token_sampler",
+            "mode": "seeded_stochastic",
+            "logits": "logits",
+            "token": "token",
+            "temperature": "temperature",
+            "rng": {
+                "seed": "seed",
+                "offset": "offset",
+                "next_offset": "next_offset",
+            },
+            "effect": "rng",
+        },
+        "rng",
+    )
 
 
 def build_eos_termination() -> PolicyComponent:
@@ -184,18 +259,38 @@ def build_eos_termination() -> PolicyComponent:
     graph, builder = _make_graph("eos_termination")
     op = builder.op
     token_ids = builder.input("token_ids", ir.DataType.INT64, ["batch"])
-    eos_token_ids = builder.input("eos_token_ids", ir.DataType.INT64, ["num_eos"])
+    eos_ids = builder.input("eos_ids", ir.DataType.INT64, ["num_eos"])
+    iteration = builder.input("iteration", ir.DataType.INT64, ["batch"])
+    max_iterations = builder.input("max_iterations", ir.DataType.INT64, ["batch"])
     tokens = op.Unsqueeze(token_ids, op.Constant(value_ints=[-1]))
-    eos = op.Unsqueeze(eos_token_ids, op.Constant(value_ints=[0]))
+    eos = op.Unsqueeze(eos_ids, op.Constant(value_ints=[0]))
     matches = op.Equal(tokens, eos)
     match_count = op.ReduceSum(
         op.Cast(matches, to=ir.DataType.INT64),
         axes=[-1],
         keepdims=0,
     )
-    terminated = op.Greater(match_count, op.Constant(value_int=0))
-    builder.add_output(terminated, "terminated")
-    return _component(PolicyRole.TERMINATION, graph)
+    hit_eos = op.Greater(match_count, op.Constant(value_int=0))
+    hit_limit = op.GreaterOrEqual(
+        op.Add(iteration, op.Constant(value_int=1)),
+        max_iterations,
+    )
+    done = op.Or(hit_eos, hit_limit)
+    builder.add_output(done, "done")
+    return _component(
+        PolicyRole.TERMINATION,
+        graph,
+        {
+            "role": "termination_predicate",
+            "tokens": "token_ids",
+            "eos_ids": "eos_ids",
+            "iteration": "iteration",
+            "max_iterations": "max_iterations",
+            "done": "done",
+            "effect": "termination",
+        },
+        "termination",
+    )
 
 
 def build_euler_solver_step() -> PolicyComponent:
@@ -212,44 +307,76 @@ def build_euler_solver_step() -> PolicyComponent:
         ir.DataType.FLOAT,
         ["batch", "channels", "height", "width"],
     )
-    sigma = builder.input("sigma", ir.DataType.FLOAT, [])
-    sigma_next = builder.input("sigma_next", ir.DataType.FLOAT, [])
-    next_sample = op.Add(sample, op.Mul(derivative, op.Sub(sigma_next, sigma)))
-    builder.add_output(next_sample, "next_sample")
-    return _component(PolicyRole.SOLVER_STEP, graph)
+    step = builder.input("step", ir.DataType.INT64, ["batch"])
+    schedule = builder.input("schedule", ir.DataType.FLOAT, ["schedule_length"])
+    final_index = op.Sub(op.Shape(schedule, start=0, end=1), op.Constant(value_ints=[1]))
+    next_step = op.Min(op.Add(step, op.Constant(value_int=1)), final_index)
+    sigma = op.Gather(schedule, step, axis=0)
+    sigma_next = op.Gather(schedule, next_step, axis=0)
+    delta = op.Sub(sigma_next, sigma)
+    delta = op.Unsqueeze(delta, op.Constant(value_ints=[1, 2, 3]))
+    next_sample = op.Add(sample, op.Mul(derivative, delta))
+    builder.add_output(next_sample, "next_state")
+    return _component(
+        PolicyRole.SOLVER_STEP,
+        graph,
+        {
+            "role": "solver_step",
+            "state": "sample",
+            "estimate": "derivative",
+            "step": "step",
+            "schedule": "schedule",
+            "next_state": "next_state",
+            "effect": "solver",
+        },
+        "solver",
+    )
 
 
 def build_masked_token_update() -> PolicyComponent:
-    """Build confidence-thresholded replacement for masked token positions."""
+    """Build deterministic replacement of currently masked token positions."""
     graph, builder = _make_graph("masked_token_update")
     op = builder.op
     current = builder.input("current_tokens", ir.DataType.INT64, ["batch", "sequence"])
     proposed = builder.input("proposed_tokens", ir.DataType.INT64, ["batch", "sequence"])
-    confidence = builder.input("confidence", ir.DataType.FLOAT, ["batch", "sequence"])
     masked = builder.input("masked", ir.DataType.BOOL, ["batch", "sequence"])
-    threshold = builder.input("threshold", ir.DataType.FLOAT, [])
-    accepted = op.And(masked, op.GreaterOrEqual(confidence, threshold))
-    updated = op.Where(accepted, proposed, current)
-    remaining = op.And(masked, op.Not(accepted))
-    builder.add_output(updated, "updated_tokens")
-    builder.add_output(remaining, "remaining_mask")
-    return _component(PolicyRole.MASKED_UPDATE, graph)
+    step = builder.input("step", ir.DataType.INT64, ["batch"])
+    updated = op.Where(masked, proposed, current)
+    # Consume the declared step without changing values; schedules that remask
+    # tokens can be expressed by a richer artifact with the same semantic ports.
+    updated = op.Add(updated, op.Unsqueeze(op.Mul(step, 0), op.Constant(value_ints=[-1])))
+    remaining = op.ConstantOfShape(op.Shape(masked), value=ir.tensor([False]))
+    builder.add_output(updated, "next_state")
+    builder.add_output(remaining, "next_mask")
+    return _component(
+        PolicyRole.MASKED_UPDATE,
+        graph,
+        {
+            "role": "masked_update",
+            "state": "current_tokens",
+            "proposal": "proposed_tokens",
+            "mask": "masked",
+            "step": "step",
+            "next_state": "next_state",
+            "next_mask": "next_mask",
+            "effect": "update",
+        },
+        "update",
+    )
 
 
 def build_speculative_acceptance() -> PolicyComponent:
     """Build per-token speculative acceptance and accepted-prefix length."""
     graph, builder = _make_graph("speculative_acceptance")
     op = builder.op
-    target_probability = builder.input(
-        "target_probability", ir.DataType.FLOAT, ["batch", "draft_sequence"]
+    target_scores = builder.input(
+        "target_scores", ir.DataType.FLOAT, ["batch", "draft_sequence", "vocabulary"]
     )
-    draft_probability = builder.input(
-        "draft_probability", ir.DataType.FLOAT, ["batch", "draft_sequence"]
+    proposed_tokens = builder.input(
+        "proposed_tokens", ir.DataType.INT64, ["batch", "draft_sequence"]
     )
-    uniform = builder.input("uniform", ir.DataType.FLOAT, ["batch", "draft_sequence"])
-    ratio = op.Div(target_probability, draft_probability)
-    probability = op.Min(ratio, op.Constant(value_float=1.0))
-    accepted = op.LessOrEqual(uniform, probability)
+    target_tokens = op.ArgMax(target_scores, axis=-1, keepdims=0)
+    accepted = op.Equal(target_tokens, proposed_tokens)
     rejected = op.Cast(op.Not(accepted), to=ir.DataType.INT64)
     rejection_count = op.CumSum(rejected, op.Constant(value_int=-1))
     prefix = op.Cast(
@@ -257,24 +384,55 @@ def build_speculative_acceptance() -> PolicyComponent:
         to=ir.DataType.INT64,
     )
     accepted_count = op.ReduceSum(prefix, axes=[-1], keepdims=0)
-    builder.add_output(accepted, "accepted")
-    builder.add_output(accepted_count, "accepted_count")
-    return _component(PolicyRole.SPECULATIVE_ACCEPTANCE, graph)
+    accepted_tokens = op.Where(
+        op.Cast(prefix, to=ir.DataType.BOOL),
+        proposed_tokens,
+        op.ConstantOfShape(
+            op.Shape(proposed_tokens),
+            value=ir.tensor([0], dtype=ir.DataType.INT64),
+        ),
+    )
+    draft_length = op.Shape(proposed_tokens, start=1, end=2)
+    done = op.Equal(accepted_count, draft_length)
+    builder.add_output(accepted_tokens, "accepted_tokens")
+    builder.add_output(accepted_count, "accepted_len")
+    builder.add_output(done, "done")
+    return _component(
+        PolicyRole.SPECULATIVE_ACCEPTANCE,
+        graph,
+        {
+            "role": "speculative_verifier",
+            "target_scores": "target_scores",
+            "proposed_tokens": "proposed_tokens",
+            "accepted_tokens": "accepted_tokens",
+            "accepted_len": "accepted_len",
+            "done": "done",
+            "effect": "verify",
+        },
+        "verify",
+    )
 
 
 def build_token_state_update() -> PolicyComponent:
     """Build explicit token-history append and sequence-length update math."""
     graph, builder = _make_graph("token_state_update")
     op = builder.op
-    tokens = builder.input("tokens", ir.DataType.INT64, ["batch", "sequence"])
-    next_token = builder.input("next_token", ir.DataType.INT64, ["batch"])
-    sequence_length = builder.input("sequence_length", ir.DataType.INT64, [])
-    appended = op.Concat(
-        tokens,
-        op.Unsqueeze(next_token, op.Constant(value_ints=[-1])),
-        axis=-1,
+    current = builder.input("current", ir.DataType.INT64, ["batch", 1])
+    update = builder.input("update", ir.DataType.INT64, ["batch"])
+    next_state = op.Add(
+        op.Mul(current, op.Constant(value_int=0)),
+        op.Unsqueeze(update, op.Constant(value_ints=[-1])),
     )
-    next_length = op.Add(sequence_length, op.Constant(value_int=1))
-    builder.add_output(appended, "updated_tokens")
-    builder.add_output(next_length, "updated_sequence_length")
-    return _component(PolicyRole.STATE_UPDATE, graph)
+    builder.add_output(next_state, "next")
+    return _component(
+        PolicyRole.STATE_UPDATE,
+        graph,
+        {
+            "role": "state_update",
+            "current": "current",
+            "update": "update",
+            "next": "next",
+            "effect": "state",
+        },
+        "state",
+    )

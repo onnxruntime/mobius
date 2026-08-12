@@ -42,14 +42,14 @@ def test_seeded_sampler_is_counter_based_and_reproducible(tmp_path):
     component = build_seeded_categorical_sampler()
     feeds = {
         "logits": np.array([[0.0, 0.0, 0.0, 0.0]], np.float32),
-        "temperature": np.array(1.0, np.float32),
-        "seed": np.array(7, np.int64),
-        "counter": np.array(11, np.int64),
+        "temperature": np.array([1.0], np.float32),
+        "seed": np.array([7], np.int64),
+        "offset": np.array([11], np.int64),
     }
     first = _run(component, tmp_path, feeds)
     second = _run(component, tmp_path, feeds)
     np.testing.assert_array_equal(first[0], second[0])
-    assert first[1] == 12
+    np.testing.assert_array_equal(first[1], [12])
 
 
 def test_eos_termination_runtime(tmp_path):
@@ -58,10 +58,12 @@ def test_eos_termination_runtime(tmp_path):
         tmp_path,
         {
             "token_ids": np.array([2, 8, 9], np.int64),
-            "eos_token_ids": np.array([2, 9], np.int64),
+            "eos_ids": np.array([2, 9], np.int64),
+            "iteration": np.array([0, 4, 1], np.int64),
+            "max_iterations": np.array([5, 5, 2], np.int64),
         },
     )
-    np.testing.assert_array_equal(terminated, [True, False, True])
+    np.testing.assert_array_equal(terminated, [True, True, True])
 
 
 def test_euler_solver_runtime_parity(tmp_path):
@@ -73,8 +75,8 @@ def test_euler_solver_runtime_parity(tmp_path):
         {
             "sample": sample,
             "derivative": derivative,
-            "sigma": np.array(1.5, np.float32),
-            "sigma_next": np.array(0.5, np.float32),
+            "step": np.array([0], np.int64),
+            "schedule": np.array([1.5, 0.5], np.float32),
         },
     )
     np.testing.assert_allclose(actual, sample - derivative)
@@ -87,41 +89,41 @@ def test_masked_update_runtime_parity(tmp_path):
         {
             "current_tokens": np.array([[1, 99, 99]], np.int64),
             "proposed_tokens": np.array([[4, 5, 6]], np.int64),
-            "confidence": np.array([[0.9, 0.8, 0.2]], np.float32),
             "masked": np.array([[False, True, True]]),
-            "threshold": np.array(0.5, np.float32),
+            "step": np.array([0], np.int64),
         },
     )
-    np.testing.assert_array_equal(outputs[0], [[1, 5, 99]])
-    np.testing.assert_array_equal(outputs[1], [[False, False, True]])
+    np.testing.assert_array_equal(outputs[0], [[1, 5, 6]])
+    np.testing.assert_array_equal(outputs[1], [[False, False, False]])
 
 
 def test_speculative_acceptance_prefix_runtime(tmp_path):
-    accepted, count = _run(
+    accepted_tokens, count, done = _run(
         build_speculative_acceptance(),
         tmp_path,
         {
-            "target_probability": np.array([[0.9, 0.5, 0.1, 0.9]], np.float32),
-            "draft_probability": np.array([[0.8, 0.5, 0.8, 0.8]], np.float32),
-            "uniform": np.array([[0.5, 0.5, 0.5, 0.5]], np.float32),
+            "target_scores": np.array(
+                [[[0, 1], [1, 0], [0, 1], [1, 0]]],
+                np.float32,
+            ),
+            "proposed_tokens": np.array([[1, 0, 0, 0]], np.int64),
         },
     )
-    np.testing.assert_array_equal(accepted, [[True, True, False, True]])
+    np.testing.assert_array_equal(accepted_tokens, [[1, 0, 0, 0]])
     np.testing.assert_array_equal(count, [2])
+    np.testing.assert_array_equal(done, [False])
 
 
 def test_token_state_update_runtime(tmp_path):
-    tokens, length = _run(
+    (next_state,) = _run(
         build_token_state_update(),
         tmp_path,
         {
-            "tokens": np.array([[1, 2], [3, 4]], np.int64),
-            "next_token": np.array([5, 6], np.int64),
-            "sequence_length": np.array(2, np.int64),
+            "current": np.array([[1], [3]], np.int64),
+            "update": np.array([5, 7], np.int64),
         },
     )
-    np.testing.assert_array_equal(tokens, [[1, 2, 5], [3, 4, 6]])
-    assert length == 3
+    np.testing.assert_array_equal(next_state, [[5], [7]])
 
 
 def test_capability_driven_attachment_is_model_agnostic():

@@ -66,7 +66,15 @@ def test_workflow_policy_components_reference_saved_onnx_artifacts(tmp_path):
         "artifact": "policies/sample.onnx",
     }
     assert set(component["ports"]["inputs"]) == {"logits"}
-    assert set(component["ports"]["outputs"]) == {"token_ids"}
+    assert set(component["ports"]["outputs"]) == {"token"}
+    assert component["policy"] == {
+        "role": "token_sampler",
+        "mode": "greedy",
+        "logits": "logits",
+        "token": "token",
+        "effect": "sample",
+    }
+    assert component["effects"] == ["sample"]
     assert (tmp_path / component["implementation"]["artifact"]).is_file()
 
 

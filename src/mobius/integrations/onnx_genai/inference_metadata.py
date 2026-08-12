@@ -1344,6 +1344,7 @@ def add_policy_components_to_workflow(
     if not isinstance(workflow, dict):
         return metadata
     components = workflow.setdefault("components", {})
+    workflow_dtypes = {"fp16": "float16", "bf16": "bfloat16", "fp32": "float32"}
     for name, component in policy_components.items():
         model = component.model
         components[name] = {
@@ -1354,7 +1355,7 @@ def add_policy_components_to_workflow(
             "ports": {
                 "inputs": {
                     value.name: {
-                        "dtype": _port(value).dtype,
+                        "dtype": workflow_dtypes.get(_port(value).dtype, _port(value).dtype),
                         "rank": _port(value).rank,
                         **(
                             {"shape": _shape_metadata(_port(value))}
@@ -1366,7 +1367,7 @@ def add_policy_components_to_workflow(
                 },
                 "outputs": {
                     value.name: {
-                        "dtype": _port(value).dtype,
+                        "dtype": workflow_dtypes.get(_port(value).dtype, _port(value).dtype),
                         "rank": _port(value).rank,
                         **(
                             {"shape": _shape_metadata(_port(value))}
@@ -1377,6 +1378,8 @@ def add_policy_components_to_workflow(
                     for value in model.graph.outputs
                 },
             },
+            "policy": component.contract,
+            "effects": list(component.effects),
         }
     return metadata
 

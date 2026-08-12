@@ -14,7 +14,9 @@ import pytest
 import yaml
 
 from mobius._configs import QuantizationConfig
+from mobius._model_package import ModelPackage
 from mobius.integrations.onnx_genai import write_onnx_genai_config
+from mobius.integrations.onnx_genai.inference_metadata_test import _decoder_model
 
 
 @dataclasses.dataclass
@@ -44,12 +46,26 @@ class _MultimodalPkg(dict):
     config = _Cfg()
 
 
+def _decoder_package(config=None):
+    model = _decoder_model(
+        [],
+        position_shape=["batch", "sequence"],
+        raw_token_input=True,
+    )
+    return ModelPackage({"model": model}, config=config or _Cfg())
+
+
 def test_dispatch_decoder(tmp_path):
-    arts = write_onnx_genai_config(object(), str(tmp_path), config=_Int4Cfg())
+    package = _decoder_package(_Int4Cfg())
+    arts = write_onnx_genai_config(package, str(tmp_path), config=_Int4Cfg())
     with open(arts["inference_metadata"]) as handle:
         meta = yaml.safe_load(handle)
-    assert meta["model"]["attention"]["type"] == "grouped_query_attention"
-    assert meta["kv_cache"]["native_dtype"] == "float16"
+    workflow = meta["pipeline"]["workflow"]
+    assert workflow["manifest"]["ir_version"] == "1.0"
+    assert workflow["components"]["token_sampler"]["policy"]["role"] == "token_sampler"
+    assert workflow["components"]["termination"]["policy"]["role"] == ("termination_predicate")
+    assert workflow["graph"]["kind"] == "loop"
+    assert (tmp_path / "policies" / "token_sampler.onnx").is_file()
 
 
 def test_dispatch_diffusion(tmp_path):
@@ -580,7 +596,7 @@ def test_decoder_emits_tokenizer_from_source(tmp_path):
 
     with mock.patch.dict("sys.modules", {"transformers": fake_tf}):
         artifacts = write_onnx_genai_config(
-            object(), str(tmp_path), config=_Cfg(), source="some/model-id"
+            _decoder_package(), str(tmp_path), config=_Cfg(), source="some/model-id"
         )
 
     assert artifacts.get("tokenizer") == str(tmp_path / "tokenizer.json")
@@ -589,6 +605,6 @@ def test_decoder_emits_tokenizer_from_source(tmp_path):
 
 
 def test_decoder_without_source_skips_tokenizer(tmp_path):
-    artifacts = write_onnx_genai_config(object(), str(tmp_path), config=_Cfg())
+    artifacts = write_onnx_genai_config(_decoder_package(), str(tmp_path), config=_Cfg())
     assert "tokenizer" not in artifacts
     assert not (tmp_path / "tokenizer.json").exists()
