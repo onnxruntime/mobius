@@ -765,25 +765,7 @@ class TestNativeVlmPackageMetadata:
             "run_on": "prompt_only",
             "when_present": "audio",
         }
-        vision_stage = next(
-            stage
-            for stage in metadata["pipeline"]["strategy"]["stages"]
-            if stage["strategy"].get("model") == "vision_encoder"
-        )
-        assert vision_stage["run_on"] == "prompt_only"
-        audio_stage = next(
-            stage
-            for stage in metadata["pipeline"]["strategy"]["stages"]
-            if stage["strategy"].get("model") == "audio_encoder"
-        )
-        assert audio_stage["run_on"] == "prompt_only"
         assert metadata["pipeline"]["phases"]["embedding"] == {"run_on": "every_step"}
-        embedding_stage = next(
-            stage
-            for stage in metadata["pipeline"]["strategy"]["stages"]
-            if stage["strategy"].get("model") == "embedding"
-        )
-        assert embedding_stage["run_on"] == "every_step"
         assert metadata["pipeline"]["models"]["embedding"]["io"]["token_input"] == "input_ids"
         assert metadata["pipeline"]["vision"]["token_count_source"] == "from_coordinates"
         assert metadata["pipeline"]["vision"]["token_pooling_factor"] == 9
@@ -803,13 +785,15 @@ class TestNativeVlmPackageMetadata:
             == 2520
         )
         assert not any(transform["op"] == "normalize" for transform in transforms)
-        assert metadata["model"]["io"]["token_input"] == "input_ids"
-        assert metadata["model"]["io"]["kv_inputs"] == [
+        assert "model" not in metadata or "io" not in metadata["model"]
+        decoder_io = metadata["pipeline"]["models"]["decoder"]["io"]
+        assert decoder_io["token_input"] == "input_ids"
+        assert decoder_io["kv_inputs"] == [
             f"past_key_values.{layer}.{role}"
             for layer in range(3)
             for role in ("key", "value")
         ]
-        assert metadata["model"]["io"]["kv_outputs"] == [
+        assert decoder_io["kv_outputs"] == [
             f"present.{layer}.{role}" for layer in range(3) for role in ("key", "value")
         ]
         kv_inputs = {
@@ -948,7 +932,7 @@ class TestNativeVlmPackageMetadata:
             "sections": [16, 24, 24],
             "processor_summaries": ["vision_encoder.image_grid_thw"],
         }
-        io = metadata["model"]["io"]
+        io = metadata["pipeline"]["models"]["decoder"]["io"]
         assert io["kv_inputs"] == [
             "past_key_values.0.key",
             "past_key_values.0.value",
@@ -1130,7 +1114,7 @@ class TestNativeVlmPackageMetadata:
         metadata = build_native_vlm_package_metadata(
             package, config=config, source=str(source)
         )
-        io = metadata["model"]["io"]
+        io = metadata["pipeline"]["models"]["decoder"]["io"]
         assert io["kv_update"] == "append"
         assert io["kv_inputs"] == [
             "past_key_values.0.key",
@@ -1821,7 +1805,6 @@ class TestBuildMultimodalPipelineMetadata:
                                 "kind": "single_pass",
                                 "model": "vision_encoder",
                             },
-                            "run_on": "prompt_only",
                         },
                         {
                             "name": "fuse_embeddings",
@@ -1829,7 +1812,6 @@ class TestBuildMultimodalPipelineMetadata:
                                 "kind": "single_pass",
                                 "model": "embedding",
                             },
-                            "run_on": "prompt_only",
                         },
                         {
                             "name": "decode",
@@ -1837,7 +1819,6 @@ class TestBuildMultimodalPipelineMetadata:
                                 "kind": "autoregressive",
                                 "decoder": "decoder",
                             },
-                            "run_on": "every_step",
                         },
                     ],
                 },
@@ -1896,22 +1877,18 @@ class TestBuildMultimodalPipelineMetadata:
             {
                 "name": "encode_vision",
                 "strategy": {"kind": "single_pass", "model": "vision_encoder"},
-                "run_on": "prompt_only",
             },
             {
                 "name": "encode_audio",
                 "strategy": {"kind": "single_pass", "model": "audio_encoder"},
-                "run_on": "prompt_only",
             },
             {
                 "name": "fuse_embeddings",
                 "strategy": {"kind": "single_pass", "model": "embedding"},
-                "run_on": "prompt_only",
             },
             {
                 "name": "decode",
                 "strategy": {"kind": "autoregressive", "decoder": "decoder"},
-                "run_on": "every_step",
             },
         ]
 
