@@ -233,7 +233,7 @@ def test_speculative_workflow_uses_branch_phi_effect_join_and_rng():
     assert acceptance["inputs"]["offset"] == "state.rng_offset.body"
     assert acceptance["outputs"]["next_offset"] == "rng_offset.body"
     rollback = next(node for node in body if node.get("component") == "rollback_cache_0")
-    assert rollback["inputs"]["accepted_len"] == "acceptance.synchronized_length"
+    assert rollback["inputs"]["accepted_len"] == "acceptance.rollback_length"
     assert branch["outputs"]["cache_0.next"]["cases"] == {
         "true": "branch.accepted.cache_0",
         "false": "branch.corrected.cache_0",

@@ -938,7 +938,7 @@ def build_speculative_acceptance() -> PolicyComponent:
         op.Equal(rejection_count, op.Constant(value_int=0)),
         to=ir.DataType.INT64,
     )
-    accepted_count = op.ReduceSum(prefix, axes=[-1], keepdims=0)
+    verified_count = op.ReduceSum(prefix, axes=[-1], keepdims=0)
     first_rejection = op.And(
         op.Cast(rejected, to=ir.DataType.BOOL),
         op.Equal(rejection_count, op.Constant(value_int=1)),
@@ -956,14 +956,15 @@ def build_speculative_acceptance() -> PolicyComponent:
     )
     accepted_tokens.shape = ir.Shape(["batch", "draft_sequence"])
     draft_length = op.Shape(proposed_tokens, start=1, end=2)
-    done = op.Equal(accepted_count, draft_length)
+    done = op.Equal(verified_count, draft_length)
     accepted_count = op.Min(
-        op.Add(accepted_count, op.Cast(op.Not(done), to=ir.DataType.INT64)),
+        op.Add(verified_count, op.Cast(op.Not(done), to=ir.DataType.INT64)),
         draft_length,
     )
     # Dense batched state has one physical sequence length. Synchronize to the
     # shortest verified prefix so every row can share the same rollback point.
     synchronized_len = op.ReduceMin(accepted_count, axes=[0], keepdims=1)
+    rollback_len = op.ReduceMin(verified_count, axes=[0], keepdims=1)
     accepted_count = op.Expand(synchronized_len, op.Shape(accepted_count))
     synchronized_done = op.Cast(
         op.ReduceMin(op.Cast(done, to=ir.DataType.INT64), axes=[0], keepdims=1),
@@ -989,6 +990,7 @@ def build_speculative_acceptance() -> PolicyComponent:
     accepted_count.shape = ir.Shape(["batch"])
     done.shape = ir.Shape(["batch"])
     synchronized_len.shape = ir.Shape([1])
+    rollback_len.shape = ir.Shape([1])
     synchronized_done.shape = ir.Shape([1])
     next_offset.shape = ir.Shape(["batch"])
     builder.add_output(accepted_tokens, "accepted_tokens")
@@ -997,6 +999,7 @@ def build_speculative_acceptance() -> PolicyComponent:
     builder.add_output(next_offset, "next_offset")
     builder.add_output(synchronized_len, "synchronized_len")
     builder.add_output(synchronized_done, "synchronized_done")
+    builder.add_output(rollback_len, "rollback_len")
     return _component(
         PolicyRole.SPECULATIVE_ACCEPTANCE,
         graph,

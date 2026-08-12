@@ -517,6 +517,12 @@ def write_onnx_genai_config(
         derived = _diffusion_component_kwargs(pkg)
         for name, value in derived.items():
             kwargs.setdefault(name, value)
+        if "text_encoder_filename" in kwargs and guidance_scale is None:
+            raise ValueError(
+                "text-conditioned workflow diffusion does not implement "
+                "classifier-free guidance; pass guidance_scale=1.0 explicitly "
+                "to request unguided generation"
+            )
         if guidance_scale is not None and not np.isclose(guidance_scale, 1.0):
             raise ValueError(
                 "workflow diffusion requires an explicit classifier-free guidance "
@@ -549,6 +555,11 @@ def write_onnx_genai_config(
         return {"inference_metadata": path}
 
     if _looks_like_speculative(pkg):
+        if kv_native_dtype is not None:
+            raise ValueError(
+                "workflow speculative export derives KV state dtype from ONNX ports; "
+                "kv_native_dtype overrides are unsupported"
+            )
         path = write_speculative_workflow_metadata(pkg, output_dir)
         return {"inference_metadata": path}
 
@@ -559,6 +570,11 @@ def write_onnx_genai_config(
             "or a package carrying `.config`)"
         )
     if _looks_like_multimodal(pkg):
+        if kv_native_dtype is not None:
+            raise ValueError(
+                "workflow VLM export derives KV state dtype from ONNX ports; "
+                "kv_native_dtype overrides are unsupported"
+            )
         path = write_vlm_workflow_metadata(
             pkg,
             output_dir,
@@ -615,6 +631,11 @@ def write_onnx_genai_config(
     # per-group embedding selection without host preprocessing, so the workflow
     # writer reports that exact contract defect.
     if _looks_like_multi_decoder_tts(pkg):
+        if kv_native_dtype is not None:
+            raise ValueError(
+                "workflow TTS export derives KV state dtype from ONNX ports; "
+                "kv_native_dtype overrides are unsupported"
+            )
         if not _has_tts_pre_embedder(pkg):
             raise NotImplementedError(
                 "Multi-decoder TTS packages (talker + code_predictor, e.g. Qwen3-TTS) "
@@ -641,6 +662,11 @@ def write_onnx_genai_config(
             "Multi-decoder pipelines such as TTS require a dedicated emitter."
         )
 
+    if kv_native_dtype is not None:
+        raise ValueError(
+            "workflow decoder export derives KV state dtype from ONNX ports; "
+            "kv_native_dtype overrides are unsupported"
+        )
     path = write_decoder_workflow_metadata(pkg, output_dir, resolved_config)
     artifacts = {"inference_metadata": path}
     tokenizer_path = _write_hf_tokenizer(output_dir, source, revision=revision)

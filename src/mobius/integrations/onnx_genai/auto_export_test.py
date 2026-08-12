@@ -312,6 +312,7 @@ def test_dispatch_diffusion_emits_clip_tokenizer(tmp_path, monkeypatch):
         vae_filename="vae.onnx",
         text_encoder_filename="text_encoder.onnx",
         source="fake/model",
+        guidance_scale=1.0,
     )
     assert "tokenizer" in arts
     assert os.path.basename(arts["tokenizer"]) == "tokenizer.json"
@@ -336,6 +337,7 @@ def test_dispatch_diffusion_tokenizer_skip_is_non_fatal(tmp_path, monkeypatch):
         num_inference_steps=20,
         text_encoder_filename="text_encoder.onnx",
         source="fake/model",
+        guidance_scale=1.0,
     )
     assert "inference_metadata" in arts
     assert "tokenizer" not in arts
@@ -365,7 +367,7 @@ def test_dispatch_diffusion_auto_reads_scheduler_from_source(tmp_path):
 
 def test_dispatch_vision_multimodal_pipeline(tmp_path):
     pkg = _vlm_package()
-    artifacts = write_onnx_genai_config(pkg, str(tmp_path), kv_native_dtype="bf16")
+    artifacts = write_onnx_genai_config(pkg, str(tmp_path))
 
     with open(artifacts["inference_metadata"]) as handle:
         metadata = yaml.safe_load(handle)
@@ -387,7 +389,24 @@ def test_dispatch_vision_multimodal_pipeline(tmp_path):
     assert (tmp_path / "policies" / "token_sampler.onnx").is_file()
 
 
-def test_dispatch_audio_only_multimodal_pipeline(tmp_path, monkeypatch):
+def test_workflow_vlm_rejects_kv_dtype_override(tmp_path):
+    with pytest.raises(ValueError, match="kv_native_dtype overrides are unsupported"):
+        write_onnx_genai_config(
+            _vlm_package(),
+            str(tmp_path),
+            kv_native_dtype="bf16",
+        )
+
+
+def test_text_diffusion_requires_explicit_unguided_mode(tmp_path):
+    with pytest.raises(ValueError, match=r"pass guidance_scale=1\.0 explicitly"):
+        write_onnx_genai_config(
+            _diffusion_package(text=True),
+            str(tmp_path),
+        )
+
+
+def test_dispatch_audio_only_multimodal_pipeline(tmp_path):
     # The audio-only fusion shape used by speech-language ASR models such as
     # qwen3_asr and fun_asr: audio_encoder -> embedding fusion -> AR decoder.
     pkg = _vlm_package(audio=True)

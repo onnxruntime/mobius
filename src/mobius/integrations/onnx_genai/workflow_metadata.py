@@ -2825,7 +2825,7 @@ def build_speculative_workflow_metadata(
                 {
                     "past_state": f"state.{cache_name}.body",
                     "tentative_state": f"verifier.{present.name}",
-                    "accepted_len": "acceptance.synchronized_length",
+                    "accepted_len": "acceptance.rollback_length",
                 },
                 {"corrected_state": f"rollback.{cache_name}"},
                 {
@@ -2899,6 +2899,7 @@ def build_speculative_workflow_metadata(
                 "next_offset": "rng_offset.body",
                 "synchronized_len": "acceptance.synchronized_length",
                 "synchronized_done": "acceptance.synchronized_done",
+                "rollback_len": "acceptance.rollback_length",
             },
             {"verify": _effect("verify.0", "verify.1")},
         ),
