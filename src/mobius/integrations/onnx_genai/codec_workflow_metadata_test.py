@@ -105,5 +105,5 @@ def test_tts_reports_missing_nested_loop_induction_value():
         "talker_step_embedder": object(),
         "talker_prefill_embedder": object(),
     }
-    with pytest.raises(NotImplementedError, match="code_predictor.step_index"):
+    with pytest.raises(NotImplementedError, match=r"code_predictor\.step_index"):
         build_tts_workflow_metadata(package, object())
