@@ -1,6 +1,5 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
-
 """Tests for onnx-genai diffusion inference_metadata generation."""
 
 from __future__ import annotations
@@ -33,13 +32,11 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     build_diffusion_pipeline_metadata,
     build_multimodal_pipeline_metadata,
     build_native_vlm_package_metadata,
-    build_tts_pipeline_metadata,
     is_native_vlm_package,
     load_diffusers_scheduler_config,
     validate_executable_closure,
     write_diffusion_pipeline_metadata,
     write_native_vlm_package_metadata,
-    write_tts_pipeline_metadata,
 )
 
 
@@ -851,7 +848,6 @@ class TestNativeVlmPackageMetadata:
                 "pad_value": -1,
             },
         ]
-
         broken = copy.deepcopy(metadata)
         broken["pipeline"]["dataflow"] = [
             edge
@@ -1877,86 +1873,3 @@ class TestBuildMultimodalPipelineMetadata:
                 "strategy": {"kind": "autoregressive", "decoder": "decoder"},
             },
         ]
-
-
-class TestBuildTTSPipelineMetadata:
-    """Pre-embedder-driven multi-decoder TTS (Qwen3-TTS) metadata."""
-
-    def test_minimal_nested_autoregressive_with_pre_embedder(self):
-        meta = build_tts_pipeline_metadata(
-            num_code_groups=16, max_frames=1000, prefill_embedder_filename=None
-        )
-        pipe = meta["pipeline"]
-        assert set(pipe["models"]) == {"talker", "talker_step_embedder", "code_predictor"}
-        assert pipe["models"]["talker"]["type"] == "decoder"
-        assert pipe["models"]["talker"]["tokenizer"] == "tokenizer.json"
-        assert pipe["models"]["talker_step_embedder"]["type"] == "embedding"
-
-        stage = pipe["strategy"]["stages"][0]["strategy"]
-        assert stage["kind"] == "nested_autoregressive"
-        assert stage["outer"] == "talker"
-        assert stage["inner"] == "code_predictor"
-        assert stage["inner_embedding_output"] == "codec_embeddings"
-        assert stage["pre_embedder"]["component"] == "talker_step_embedder"
-        assert stage["pre_embedder"]["frame_codes_input"] == "frame_codes"
-        assert "prefill_embedder" not in stage
-        assert stage["num_code_groups"] == 16
-        assert stage["max_tokens"] == 1000
-
-        # Required pre-embedder feed edge + inner seed edge.
-        assert {
-            "from": "talker_step_embedder.inputs_embeds",
-            "to": "talker.inputs_embeds",
-            "dtype": "fp32",
-            "device_transfer": False,
-        } in pipe["dataflow"]
-        assert {
-            "from": "talker.last_hidden_state",
-            "to": "code_predictor.inputs_embeds",
-            "dtype": "fp32",
-            "device_transfer": False,
-        } in pipe["dataflow"]
-        # No in-package vocoder.
-        assert "vocoder" not in pipe["models"]
-        # Pre-embedder is a loop-internal on_demand component.
-        assert pipe["phases"]["talker_step_embedder"]["run_on"] == "on_demand"
-
-    def test_with_prefill_embedder(self):
-        # Default emits the prefill/trailing-text component (prompt phase).
-        meta = build_tts_pipeline_metadata(num_code_groups=16)
-        pipe = meta["pipeline"]
-        assert "talker_prefill_embedder" in pipe["models"]
-        assert pipe["models"]["talker_prefill_embedder"]["type"] == "embedding"
-        stage = pipe["strategy"]["stages"][0]["strategy"]
-        assert stage["prefill_embedder"]["component"] == "talker_prefill_embedder"
-        assert stage["prefill_embedder"]["prompt_input"] == "text_ids"
-        assert stage["prefill_embedder"]["prefill_output"] == "prefill_embeds"
-        assert stage["prefill_embedder"]["trailing_output"] == "trailing_text_embeds"
-        assert pipe["phases"]["talker_prefill_embedder"]["run_on"] == "prompt_only"
-
-    def test_rejects_invalid_code_groups(self):
-        with pytest.raises(ValueError, match="num_code_groups"):
-            build_tts_pipeline_metadata(num_code_groups=0)
-
-    def test_write_roundtrip(self, tmp_path):
-        path = write_tts_pipeline_metadata(str(tmp_path), num_code_groups=8)
-        with open(path) as handle:
-            loaded = yaml.safe_load(handle)
-        stage = loaded["pipeline"]["strategy"]["stages"][0]["strategy"]
-        assert stage["pre_embedder"]["component"] == "talker_step_embedder"
-        assert stage["pre_embedder"]["frame_codes_input"] == "frame_codes"
-        assert stage["num_code_groups"] == 8
-
-    def test_matches_onnx_genai_json_schema(self):
-        """Emitted TTS metadata validates against onnx-genai's published schema."""
-        schema_path = _onnx_genai_schema_path()
-        if schema_path is None:
-            pytest.skip("onnx-genai schema not found (set ONNX_GENAI_SCHEMA)")
-        import json
-
-        import jsonschema
-
-        with open(schema_path) as handle:
-            schema = json.load(handle)
-        meta = build_tts_pipeline_metadata(num_code_groups=16, max_frames=2000)
-        jsonschema.validate(instance=meta, schema=schema)

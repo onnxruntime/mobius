@@ -27,15 +27,15 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     add_explicit_package_io,
     add_policy_components_to_workflow,
     load_diffusers_scheduler_config,
-    write_audio_codec_pipeline_metadata,
     write_diffusion_pipeline_metadata,
     write_multimodal_pipeline_metadata,
     write_speech_to_text_pipeline_metadata,
-    write_tts_pipeline_metadata,
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
+    write_audio_codec_workflow_metadata,
     write_decoder_workflow_metadata,
     write_language_diffusion_workflow_metadata,
+    write_tts_workflow_metadata,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -303,33 +303,8 @@ def _looks_like_audio_codec(pkg: Any) -> bool:
     )
 
 
-def _audio_codec_codes_dtype(pkg: Any) -> str:
-    """Return the metadata dtype of the codec ``codes`` tensor (default int64)."""
-    # ONNX elem-type names -> onnx-genai metadata dtype tags. Float codes keep
-    # their precision (fp16/bf16/fp32) so the runtime binds the right buffer type.
-    float_dtypes = {"FLOAT": "fp32", "FLOAT16": "fp16", "BFLOAT16": "bf16"}
-    try:
-        for value in pkg["decoder"].graph.inputs:
-            if value.name == "codes" and value.dtype is not None:
-                return float_dtypes.get(value.dtype.name, "int64")
-    except (AttributeError, KeyError):
-        # Missing/partial codec structure: fall back to the documented default.
-        return "int64"
-    return "int64"
-
-
 def _looks_like_multi_decoder_tts(pkg: Any) -> bool:
-    """Detect a nested multi-decoder TTS package (e.g. Qwen3-TTS).
-
-    The defining signal is a ``talker`` plus a ``code_predictor`` decoder — a
-    dual, nested autoregressive shape (the code_predictor expands each talker
-    frame's residual codebooks). When the package also carries the
-    ``talker_step_embedder`` pre-embedder (see :func:`_has_tts_pre_embedder`),
-    the dispatcher emits a runnable ``pre_embedder``-driven
-    ``nested_autoregressive`` contract; without it the component graph is not yet
-    mappable, so detection triggers a precise, actionable error rather than
-    mis-emitting (see DESIGN.md §20.3).
-    """
+    """Detect a nested multi-decoder TTS package (e.g. Qwen3-TTS)."""
     try:
         names = set(pkg.keys())
     except AttributeError:
@@ -341,9 +316,8 @@ def _has_tts_pre_embedder(pkg: Any) -> bool:
     """True when a multi-decoder TTS package carries the pre-embedder component.
 
     The ``talker_step_embedder`` materializes the talker's per-step
-    ``inputs_embeds`` (``frame_codes [+ text_embed] -> inputs_embeds``); its
-    presence is what makes the package emittable to the ``pre_embedder``-driven
-    ``nested_autoregressive`` contract.
+    ``inputs_embeds`` (``frame_codes [+ text_embed] -> inputs_embeds``). It is
+    necessary, but not sufficient until generic loops expose induction SSA.
     """
     try:
         names = set(pkg.keys())
@@ -352,44 +326,8 @@ def _has_tts_pre_embedder(pkg: Any) -> bool:
     return "talker_step_embedder" in names
 
 
-def _tts_component_kwargs(pkg: Any, config: Any) -> dict[str, Any]:
-    """Derive pre-embedder-driven TTS metadata kwargs from a package + config.
-
-    Mobius saves each component into ``<component>/model.onnx``. ``num_code_groups``
-    comes from the TTS config (the RVQ residual count per frame).
-    """
-    tts = getattr(config, "tts", None)
-    num_code_groups = getattr(tts, "num_code_groups", None) if tts is not None else None
-    if not num_code_groups:
-        raise ValueError(
-            "TTS metadata requires config.tts.num_code_groups (RVQ codes per frame)"
-        )
-    kwargs: dict[str, Any] = {
-        "num_code_groups": num_code_groups,
-        "talker_filename": "talker/model.onnx",
-        "code_predictor_filename": "code_predictor/model.onnx",
-        "pre_embedder_filename": "talker_step_embedder/model.onnx",
-    }
-    # Emit the prefill/trailing-text component only when the package carries it;
-    # otherwise the prefill-less shape (talker frame 0 + zero text_embed) is used.
-    try:
-        names = set(pkg.keys())
-    except (AttributeError, TypeError):
-        names = set()
-    kwargs["prefill_embedder_filename"] = (
-        "talker_prefill_embedder/model.onnx" if "talker_prefill_embedder" in names else None
-    )
-    kwargs["activation_dtype"] = _activation_dtype_tag(config)
-    return kwargs
-
-
 def _activation_dtype_tag(config: Any) -> str:
-    """Map a model config's activation dtype to the metadata dtype tag.
-
-    The composite dataflow edges (inputs_embeds, encoder_hidden_states, …) carry
-    the model's activation dtype, so metadata must reflect it (fp16/bf16 builds
-    would otherwise be mislabeled fp32).
-    """
+    """Map a model config's activation dtype to the metadata dtype tag."""
     dtype = getattr(config, "dtype", None)
     name = getattr(dtype, "name", "") or ""
     return {"FLOAT16": "fp16", "BFLOAT16": "bf16"}.get(name.upper(), "fp32")
@@ -472,7 +410,7 @@ def write_onnx_genai_config(
     Pipeline shape        Structural signal (detector)                 Emitted ``strategy``
     ===================== ============================================ =================================
     Diffusion             denoiser / VAE present                       ``iterative``
-    Audio codec           encoder→``codes``→decoder, no cross-attn     ``composite`` (two single_pass)
+    Audio codec           encoder→``codes``→decoder, no cross-attn     typed SSA workflow
     Multimodal VLM        decoder + vision/audio encoder + fusion      ``composite`` (encoders→fuse→AR)
     Speech-to-text (ASR)  decoder consumes ``encoder_hidden_states``   ``composite`` (encode→AR)
     Decoder LM            fallback (a config is required)              bare decoder (``kv_cache`` + attn)
@@ -545,9 +483,7 @@ def write_onnx_genai_config(
     if _looks_like_audio_codec(pkg):
         # A neural codec produces tensors (waveform), not tokens, so it needs no
         # decoder config — emit before the config requirement below.
-        path = write_audio_codec_pipeline_metadata(
-            output_dir, codes_dtype=_audio_codec_codes_dtype(pkg)
-        )
+        path = write_audio_codec_workflow_metadata(pkg, output_dir)
         return {"inference_metadata": path}
 
     resolved_config = config if config is not None else getattr(pkg, "config", None)
@@ -615,34 +551,20 @@ def write_onnx_genai_config(
             artifacts["audio_processor"] = audio_processor_path
         return artifacts
 
-    # A nested multi-decoder TTS stack (talker + code_predictor) uses the
-    # nested_autoregressive strategy. When the package also carries the
-    # `talker_step_embedder` pre-embedder (the real Qwen3-TTS shape), emit the
-    # pre-embedder-driven contract the onnx-genai runtime executes; otherwise the
-    # component graph is not yet mappable, so fail with a precise, actionable error.
+    # A nested multi-decoder TTS stack requires the generic workflow loop to expose
+    # its induction value. The current producer contract cannot wire step_index or
+    # per-group embedding selection without host preprocessing, so the workflow
+    # writer reports that exact contract defect.
     if _looks_like_multi_decoder_tts(pkg):
         if not _has_tts_pre_embedder(pkg):
             raise NotImplementedError(
                 "Multi-decoder TTS packages (talker + code_predictor, e.g. Qwen3-TTS) "
-                "use the nested_autoregressive strategy. This package lacks the "
+                "require nested generic workflow loops. This package lacks the "
                 "`talker_step_embedder` pre-embedder that materializes the talker "
-                "inputs_embeds, so it cannot yet be mapped to the runtime contract — "
-                "see onnx-genai docs/DESIGN.md §20.3 'Multi-decoder TTS'."
+                "inputs_embeds, so it cannot be mapped to the workflow contract."
             )
-        decoder_metadata = decoder_metadata_from_config(
-            resolved_config, kv_native_dtype=kv_native_dtype
-        )
-        path = write_tts_pipeline_metadata(
-            output_dir,
-            decoder_metadata=decoder_metadata,
-            **_tts_component_kwargs(pkg, resolved_config),
-        )
-        _add_explicit_io_to_file(path, pkg, resolved_config)
-        artifacts = {"inference_metadata": path}
-        tokenizer_path = _write_hf_tokenizer(output_dir, source, revision=revision)
-        if tokenizer_path is not None:
-            artifacts["tokenizer"] = tokenizer_path
-        return artifacts
+        path = write_tts_workflow_metadata(pkg, output_dir, resolved_config)
+        return {"inference_metadata": path}
 
     # Fallback: a single-component decoder language model. A multi-component
     # package that matched none of the composite shapes above would be silently
