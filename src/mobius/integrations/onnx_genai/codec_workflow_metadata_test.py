@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 
@@ -98,12 +99,64 @@ def test_codec_workflow_matches_producer_schema():
     jsonschema.validate(build_audio_codec_workflow_metadata(_codec_package()), schema)
 
 
-def test_tts_reports_missing_nested_loop_induction_value():
-    package = {
-        "talker": object(),
-        "code_predictor": object(),
-        "talker_step_embedder": object(),
-        "talker_prefill_embedder": object(),
-    }
-    with pytest.raises(NotImplementedError, match=r"code_predictor\.step_index"):
-        build_tts_workflow_metadata(package, object())
+@dataclasses.dataclass
+class _TtsSubConfig:
+    num_code_groups: int = 4
+
+
+@dataclasses.dataclass
+class _TtsConfig:
+    tts: _TtsSubConfig = dataclasses.field(default_factory=_TtsSubConfig)
+
+
+def _tts_package() -> ModelPackage:
+    talker = _model(
+        "talker",
+        [_value("inputs_embeds", ir.DataType.FLOAT, ["batch", "sequence", 16])],
+        [("last_hidden_state", ir.DataType.FLOAT, ["batch", 16])],
+    )
+    predictor = _model(
+        "code_predictor",
+        [
+            _value("last_hidden_state", ir.DataType.FLOAT, ["batch", 16]),
+            _value("step_index", ir.DataType.INT64, ["batch"]),
+        ],
+        [("logits", ir.DataType.FLOAT, ["batch", 64])],
+    )
+    step = _model(
+        "talker_step_embedder",
+        [_value("frame_codes", ir.DataType.INT64, ["batch", 4])],
+        [("inputs_embeds", ir.DataType.FLOAT, ["batch", 1, 16])],
+    )
+    prefill = _model(
+        "talker_prefill_embedder",
+        [_value("text_ids", ir.DataType.INT64, ["batch", "sequence"])],
+        [("prefill_embeds", ir.DataType.FLOAT, ["batch", "sequence", 16])],
+    )
+    codec = _model(
+        "codec",
+        [_value("codes", ir.DataType.INT64, ["batch", 4, "frames"])],
+        [("waveform", ir.DataType.FLOAT, ["batch", 1, "samples"])],
+    )
+    return ModelPackage(
+        {
+            "talker": talker,
+            "code_predictor": predictor,
+            "talker_step_embedder": step,
+            "talker_prefill_embedder": prefill,
+            "codec": codec,
+        }
+    )
+
+
+def test_tts_uses_nested_lexical_loop_induction_and_codec():
+    workflow = build_tts_workflow_metadata(_tts_package(), _TtsConfig())["pipeline"][
+        "workflow"
+    ]
+    outer = workflow["graph"]["nodes"][0]
+    inner = outer["body"]["nodes"][2]
+    assert outer["iteration"]["value"] == "talker.iteration"
+    assert inner["iteration"]["value"] == "code.iteration"
+    assert inner["body"]["nodes"][0]["inputs"]["step_index"] == "code.iteration"
+    assert workflow["graph"]["nodes"][-2]["component"] == "codec"
+    assert workflow["outputs"]["waveform"]["stage"] == "post_adapter"

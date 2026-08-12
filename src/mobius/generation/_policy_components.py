@@ -215,6 +215,83 @@ def build_schedule_constant(values: list[float]) -> PolicyComponent:
     return _component(PolicyRole.AUXILIARY, graph, {})
 
 
+def build_tts_state_initializer(num_code_groups: int) -> PolicyComponent:
+    """Create an empty codec history and zeroed current frame from prompt batch."""
+    if num_code_groups < 1:
+        raise ValueError("num_code_groups must be positive")
+    graph, builder = _make_graph("tts_state_initializer")
+    op = builder.op
+    prompt = builder.input(
+        "prompt_tokens", dtype=ir.DataType.INT64, shape=["batch", "sequence"]
+    )
+    batch = op.Shape(prompt, start=0, end=1)
+    frame_shape = op.Concat(batch, op.Constant(value_ints=[num_code_groups]), axis=0)
+    history_shape = op.Concat(batch, op.Constant(value_ints=[0, num_code_groups]), axis=0)
+    frame = op.ConstantOfShape(frame_shape, value=ir.tensor([0], dtype=ir.DataType.INT64))
+    history = op.ConstantOfShape(history_shape, value=ir.tensor([0], dtype=ir.DataType.INT64))
+    frame.shape = ir.Shape(["batch", num_code_groups])
+    history.shape = ir.Shape(["batch", 0, num_code_groups])
+    builder.add_output(frame, "frame_codes")
+    builder.add_output(history, "code_history")
+    return _component(PolicyRole.AUXILIARY, graph, {})
+
+
+def build_code_frame_update(num_code_groups: int) -> PolicyComponent:
+    """Scatter one predicted code into the current codec frame."""
+    graph, builder = _make_graph("code_frame_update")
+    op = builder.op
+    frame = builder.input(
+        "frame_codes",
+        dtype=ir.DataType.INT64,
+        shape=["batch", num_code_groups],
+    )
+    token = builder.input("token", dtype=ir.DataType.INT64, shape=["batch"])
+    index = builder.input("index", dtype=ir.DataType.INT64, shape=["batch"])
+    updated = op.ScatterElements(
+        frame,
+        op.Unsqueeze(index, op.Constant(value_ints=[-1])),
+        op.Unsqueeze(token, op.Constant(value_ints=[-1])),
+        axis=1,
+    )
+    updated.shape = frame.shape
+    builder.add_output(updated, "next_frame")
+    return _component(PolicyRole.AUXILIARY, graph, {})
+
+
+def build_code_history_append(num_code_groups: int) -> PolicyComponent:
+    """Append a completed codec frame to a growing frame history."""
+    graph, builder = _make_graph("code_history_append")
+    op = builder.op
+    history = builder.input(
+        "history",
+        dtype=ir.DataType.INT64,
+        shape=["batch", "frames", num_code_groups],
+    )
+    frame = builder.input("frame", dtype=ir.DataType.INT64, shape=["batch", num_code_groups])
+    next_history = op.Concat(
+        history,
+        op.Unsqueeze(frame, op.Constant(value_ints=[1])),
+        axis=1,
+    )
+    next_history.shape = ir.Shape(["batch", "frames + 1", num_code_groups])
+    builder.add_output(next_history, "next_history")
+    return _component(PolicyRole.AUXILIARY, graph, {})
+
+
+def build_codec_layout_transpose(num_code_groups: int) -> PolicyComponent:
+    """Convert frame-major ``[B,F,G]`` history to codec-major ``[B,G,F]``."""
+    graph, builder = _make_graph("codec_layout_transpose")
+    history = builder.input(
+        "history",
+        dtype=ir.DataType.INT64,
+        shape=["batch", "frames", num_code_groups],
+    )
+    codes = builder.op.Transpose(history, perm=[0, 2, 1])
+    codes.shape = ir.Shape(["batch", num_code_groups, "frames"])
+    builder.add_output(codes, "codes")
+    return _component(PolicyRole.AUXILIARY, graph, {})
+
+
 def build_model_token_cast(dtype: ir.DataType) -> PolicyComponent:
     """Cast the canonical int64 token state to a decoder's integer dtype."""
     graph, builder = _make_graph("model_token_cast")

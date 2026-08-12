@@ -553,19 +553,45 @@ class _TTSPkg(dict):
 
 
 def test_dispatch_multi_decoder_tts_with_pre_embedder(tmp_path):
-    pkg = _TTSPkg(
+    pkg = ModelPackage(
         {
-            "talker": _FakeModel(["inputs_embeds"], ["logits", "last_hidden_state"]),
-            "code_predictor": _FakeModel(["inputs_embeds"], ["logits", "codec_embeddings"]),
-            "talker_step_embedder": _FakeModel(["frame_codes"], ["inputs_embeds"]),
-            "talker_prefill_embedder": _FakeModel(
-                ["text_ids"], ["prefill_embeds", "trailing_text_embeds"]
+            "talker": _model(
+                "talker",
+                [_value("inputs_embeds", ir.DataType.FLOAT, ["batch", "sequence", 16])],
+                [("last_hidden_state", ir.DataType.FLOAT, ["batch", 16])],
             ),
-            "embedding": _FakeModel(["text_ids"]),
-        }
+            "code_predictor": _model(
+                "code_predictor",
+                [
+                    _value("last_hidden_state", ir.DataType.FLOAT, ["batch", 16]),
+                    _value("step_index", ir.DataType.INT64, ["batch"]),
+                ],
+                [("logits", ir.DataType.FLOAT, ["batch", 64])],
+            ),
+            "talker_step_embedder": _model(
+                "talker_step_embedder",
+                [_value("frame_codes", ir.DataType.INT64, ["batch", 16])],
+                [("inputs_embeds", ir.DataType.FLOAT, ["batch", 1, 16])],
+            ),
+            "talker_prefill_embedder": _model(
+                "talker_prefill_embedder",
+                [_value("text_ids", ir.DataType.INT64, ["batch", "sequence"])],
+                [("prefill_embeds", ir.DataType.FLOAT, ["batch", "sequence", 16])],
+            ),
+            "codec": _model(
+                "codec",
+                [_value("codes", ir.DataType.INT64, ["batch", 16, "frames"])],
+                [("waveform", ir.DataType.FLOAT, ["batch", 1, "samples"])],
+            ),
+        },
+        config=_TTSCfg(),
     )
-    with pytest.raises(NotImplementedError, match="nested-loop induction SSA value"):
-        write_onnx_genai_config(pkg, str(tmp_path))
+    artifacts = write_onnx_genai_config(pkg, str(tmp_path))
+    with open(artifacts["inference_metadata"]) as handle:
+        workflow = yaml.safe_load(handle)["pipeline"]["workflow"]
+    outer = workflow["graph"]["nodes"][0]
+    assert outer["iteration"]["value"] == "talker.iteration"
+    assert outer["body"]["nodes"][2]["iteration"]["value"] == "code.iteration"
 
 
 def test_unrecognized_multi_component_package_fails_loudly(tmp_path):

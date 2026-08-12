@@ -16,6 +16,9 @@ from mobius.generation import (
     PolicyCapabilities,
     attach_policy_components,
     build_boolean_not,
+    build_code_frame_update,
+    build_code_history_append,
+    build_codec_layout_transpose,
     build_decoder_state_initializer,
     build_decoder_step_update,
     build_integer_increment,
@@ -23,6 +26,7 @@ from mobius.generation import (
     build_last_token_logits,
     build_model_token_cast,
     build_schedule_constant,
+    build_tts_state_initializer,
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
     _port,
@@ -189,32 +193,410 @@ def write_audio_codec_workflow_metadata(pkg: Any, output_dir: str) -> str:
 
 
 def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
-    """Reject TTS until the generic nested-loop contract exposes induction SSA.
-
-    Qwen3-TTS needs the inner loop index as the code predictor ``step_index`` and
-    to select the next code embedding. The workflow ``loop`` node at producer
-    commit 4c3c4b6 only accepts a condition and maximum value; it defines no
-    iteration SSA value. Consequently the existing prefill and per-frame
-    embedder artifacts can be invoked, but the code-predictor loop cannot be
-    expressed without host preprocessing or a model-specific counter component.
-    """
+    """Build nested talker/code-predictor loops with lexical induction SSA."""
     required = {
         "talker",
         "code_predictor",
         "talker_step_embedder",
+        "talker_prefill_embedder",
     }
     missing = sorted(required.difference(pkg.keys()))
     if missing:
         raise ValueError(f"TTS workflow is missing required components: {missing}")
-    del config
-    raise NotImplementedError(
-        "generic TTS workflow requires a nested-loop induction SSA value: "
-        "ONNX GenAI workflow Loop at producer commit 4c3c4b6 exposes neither an "
-        "iteration output nor fixed-loop index, so code_predictor.step_index, "
-        "position_ids, and per-group code embedding selection cannot be wired "
-        "from the existing prefill/step embedder artifacts without host "
-        "preprocessing"
+    talker = pkg["talker"]
+    predictor = pkg["code_predictor"]
+    step_embedder = pkg["talker_step_embedder"]
+    prefill_embedder = pkg["talker_prefill_embedder"]
+    num_groups = int(getattr(getattr(config, "tts", config), "num_code_groups", 16))
+    prompt_input = next(
+        (
+            value
+            for value in prefill_embedder.graph.inputs
+            if value.dtype in {ir.DataType.INT32, ir.DataType.INT64}
+            and value.shape is not None
+            and len(value.shape) == 2
+        ),
+        None,
     )
+    prefill_output = _find_port(prefill_embedder.graph.outputs, "prefill", "embeds")
+    step_frame_input = _find_port(step_embedder.graph.inputs, "frame", "codes")
+    step_output = _find_port(step_embedder.graph.outputs, "embeds")
+    talker_embed_input = _find_port(talker.graph.inputs, "embeds")
+    talker_hidden = _find_port(talker.graph.outputs, "hidden")
+    predictor_hidden_input = _find_port(predictor.graph.inputs, "hidden", "embeds")
+    predictor_step_input = _find_port(predictor.graph.inputs, "step", "index")
+    predictor_logits = _find_port(predictor.graph.outputs, "logits")
+    if None in (
+        prompt_input,
+        prefill_output,
+        step_frame_input,
+        step_output,
+        talker_embed_input,
+        talker_hidden,
+        predictor_hidden_input,
+        predictor_step_input,
+        predictor_logits,
+    ):
+        raise ValueError("TTS components do not expose the required typed ports")
+    assert prompt_input is not None
+    assert prefill_output is not None
+    assert step_frame_input is not None
+    assert step_output is not None
+    assert talker_embed_input is not None
+    assert talker_hidden is not None
+    assert predictor_hidden_input is not None
+    assert predictor_step_input is not None
+    assert predictor_logits is not None
+    if predictor_logits.shape is None or len(predictor_logits.shape) != 2:
+        raise ValueError("TTS code predictor logits must be rank 2")
+
+    codec_name = next(
+        (name for name in ("codec", "vocoder", "decoder") if name in pkg),
+        None,
+    )
+    codec = pkg[codec_name] if codec_name is not None else None
+    codec_input = next(iter(codec.graph.inputs), None) if codec is not None else None
+    waveform_output = next(iter(codec.graph.outputs), None) if codec is not None else None
+    if codec is None or codec_input is None or waveform_output is None:
+        raise ValueError("TTS workflow requires a codec or vocoder component")
+
+    attach_policy_components(pkg, PolicyCapabilities(sampler="greedy"))
+    pkg.add_policy_component("continue_predicate", build_boolean_not())
+    pkg.add_policy_component("tts_state_initializer", build_tts_state_initializer(num_groups))
+    pkg.add_policy_component("code_frame_update", build_code_frame_update(num_groups))
+    pkg.add_policy_component("code_history_append", build_code_history_append(num_groups))
+    codec_group_major = (
+        codec_input.shape is not None
+        and len(codec_input.shape) == 3
+        and str(getattr(list(codec_input.shape)[1], "value", list(codec_input.shape)[1]))
+        == str(num_groups)
+    )
+    if codec_group_major:
+        pkg.add_policy_component("codec_layout", build_codec_layout_transpose(num_groups))
+
+    batch = _contract(prompt_input)["shape"][0]
+    batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
+    batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch]}
+    inputs: dict[str, Any] = {
+        "request.prompt_tokens": {
+            "contract": _contract(prompt_input),
+            "role": {"kind": "runtime", "version": "1.0", "role": "prompt_tokens"},
+            "source": {"kind": "request", "field": "prompt_tokens"},
+            "required": True,
+        },
+        "request.max_iterations": {
+            "contract": batch_int,
+            "role": {
+                "kind": "runtime",
+                "version": "1.0",
+                "role": "max_output_tokens",
+            },
+            "source": {"kind": "request", "field": "max_output_tokens"},
+            "required": True,
+        },
+        "package.code_groups": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": num_groups,
+        },
+        "package.false": {
+            "contract": batch_bool,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": False,
+        },
+        "package.one": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 1,
+        },
+    }
+
+    def bind_remaining(
+        component: str,
+        values: Any,
+        known: dict[str, str],
+    ) -> dict[str, str]:
+        result = dict(known)
+        for value in values:
+            if value.name in result:
+                continue
+            name = f"request.{component}.{value.name}"
+            inputs[name] = {
+                "contract": _contract(value),
+                "role": {"kind": "opaque"},
+                "source": {"kind": "application", "name": f"{component}.{value.name}"},
+                "required": True,
+            }
+            result[value.name] = name
+        return result
+
+    prefill_inputs = bind_remaining(
+        "talker_prefill_embedder",
+        prefill_embedder.graph.inputs,
+        {prompt_input.name: "request.prompt_tokens"},
+    )
+    talker_setup_inputs = bind_remaining(
+        "talker",
+        talker.graph.inputs,
+        {talker_embed_input.name: "talker.prefill_embeds"},
+    )
+    step_inputs = bind_remaining(
+        "talker_step_embedder",
+        step_embedder.graph.inputs,
+        {step_frame_input.name: "state.last_frame.outer"},
+    )
+    talker_body_inputs = bind_remaining(
+        "talker",
+        talker.graph.inputs,
+        {talker_embed_input.name: "talker.step_embeds"},
+    )
+    predictor_inputs = bind_remaining(
+        "code_predictor",
+        predictor.graph.inputs,
+        {
+            predictor_hidden_input.name: "talker.body.hidden",
+            predictor_step_input.name: "code.iteration",
+        },
+    )
+
+    frame_contract = {
+        "dtype": "int64",
+        "rank": 2,
+        "shape": [batch, num_groups],
+    }
+    history_contract = {
+        "dtype": "int64",
+        "rank": 3,
+        "shape": [batch, "frames", num_groups],
+    }
+    initial_effects = {
+        "sample": "sample.0",
+        "emit": "emit.0",
+        "state:last_frame": "state:last_frame.0",
+        "state:frame": "state:frame.0",
+        "state:history": "state:history.0",
+    }
+    inner_loop = {
+        "kind": "loop",
+        "setup": {
+            "kind": "sequence",
+            "nodes": [
+                _invoke(
+                    "continue_predicate",
+                    {"done": "package.false"},
+                    {"continue": "code.setup.continue"},
+                )
+            ],
+        },
+        "body": {
+            "kind": "sequence",
+            "nodes": [
+                _invoke(
+                    "code_predictor",
+                    predictor_inputs,
+                    {predictor_logits.name: "code.logits"},
+                ),
+                _invoke(
+                    "token_sampler",
+                    {"logits": "code.logits"},
+                    {"token": "code.token"},
+                    {"sample": _effect("sample.0", "sample.1")},
+                ),
+                _invoke(
+                    "code_frame_update",
+                    {
+                        "frame_codes": "state.frame.inner",
+                        "token": "code.token",
+                        "index": "code.iteration",
+                    },
+                    {"next_frame": "frame.inner"},
+                ),
+                _invoke(
+                    "continue_predicate",
+                    {"done": "package.false"},
+                    {"continue": "code.continue"},
+                ),
+            ],
+        },
+        "condition": "code.continue",
+        "max_iterations": "package.code_groups",
+        "iteration": {"value": "code.iteration", "contract": batch_int},
+        "carried": [
+            {
+                "cell": "frame",
+                "current": "initializer.frame_codes",
+                "body_input": "state.frame.inner",
+                "body_output": "frame.inner",
+                "next": "frame.completed",
+                "read_effect": _effect("state:frame.0", "state:frame.read"),
+                "write_effect": _effect("state:frame.read", "state:frame.1"),
+            }
+        ],
+    }
+    outer_body = {
+        "kind": "sequence",
+        "nodes": [
+            _invoke(
+                "talker_step_embedder",
+                step_inputs,
+                {step_output.name: "talker.step_embeds"},
+            ),
+            _invoke(
+                "talker",
+                talker_body_inputs,
+                {talker_hidden.name: "talker.body.hidden"},
+            ),
+            inner_loop,
+            _invoke(
+                "code_history_append",
+                {
+                    "history": "state.history.outer",
+                    "frame": "frame.completed",
+                },
+                {"next_history": "history.outer"},
+            ),
+            _invoke(
+                "continue_predicate",
+                {"done": "package.false"},
+                {"continue": "talker.continue"},
+            ),
+        ],
+    }
+    setup_outputs = {prefill_output.name: "talker.prefill_embeds"}
+    if talker_hidden.name in {value.name for value in talker.graph.outputs}:
+        talker_setup_outputs = {talker_hidden.name: "talker.prefill.hidden"}
+    else:
+        talker_setup_outputs = {}
+    outer_loop = {
+        "kind": "loop",
+        "setup": {
+            "kind": "sequence",
+            "nodes": [
+                _invoke(
+                    "tts_state_initializer",
+                    {"prompt_tokens": "request.prompt_tokens"},
+                    {
+                        "frame_codes": "initializer.frame_codes",
+                        "code_history": "initializer.code_history",
+                    },
+                ),
+                _invoke("talker_prefill_embedder", prefill_inputs, setup_outputs),
+                _invoke("talker", talker_setup_inputs, talker_setup_outputs),
+            ],
+        },
+        "body": outer_body,
+        "condition": "talker.continue",
+        "max_iterations": "request.max_iterations",
+        "iteration": {"value": "talker.iteration", "contract": batch_int},
+        "carried": [
+            {
+                "cell": "last_frame",
+                "current": "initializer.frame_codes",
+                "body_input": "state.last_frame.outer",
+                "body_output": "frame.completed",
+                "next": "state.last_frame.final",
+                "read_effect": _effect("state:last_frame.0", "state:last_frame.read"),
+                "write_effect": _effect("state:last_frame.read", "state:last_frame.1"),
+            },
+            {
+                "cell": "history",
+                "current": "initializer.code_history",
+                "body_input": "state.history.outer",
+                "body_output": "history.outer",
+                "next": "history.final",
+                "read_effect": _effect("state:history.0", "state:history.read"),
+                "write_effect": _effect("state:history.read", "state:history.1"),
+            },
+        ],
+    }
+    codec_value = "codec.codes"
+    post_nodes: list[dict[str, Any]] = [outer_loop]
+    if codec_group_major:
+        post_nodes.append(
+            _invoke(
+                "codec_layout",
+                {"history": "history.final"},
+                {"codes": codec_value},
+            )
+        )
+    else:
+        codec_value = "history.final"
+    post_nodes.extend(
+        [
+            _invoke(
+                codec_name,
+                {codec_input.name: codec_value},
+                {waveform_output.name: "tts.waveform"},
+            ),
+            {
+                "kind": "emit",
+                "value": "tts.waveform",
+                "output": "waveform",
+                "mode": "replace",
+                "effect_name": "emit",
+                "effect": _effect("emit.0", "emit.1"),
+            },
+        ]
+    )
+    workflow = {
+        "manifest": {
+            "ir_version": "1.0",
+            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
+            "capabilities": [
+                "workflow_ssa",
+                "linear_effects",
+                "nested_control_flow",
+                "typed_emit",
+            ],
+        },
+        "inputs": inputs,
+        "outputs": {
+            "waveform": {
+                "contract": _contract(waveform_output),
+                "role": "audio",
+                "stage": "post_adapter",
+            }
+        },
+        "components": {
+            name: _component(model, _artifact(name, len(pkg))) for name, model in pkg.items()
+        },
+        "state": {
+            "last_frame": {
+                "contract": frame_contract,
+                "scope": "invocation",
+                "initializer": "initializer.frame_codes",
+                "recurrence": {"kind": "invariant"},
+            },
+            "frame": {
+                "contract": frame_contract,
+                "scope": "invocation",
+                "initializer": "initializer.frame_codes",
+                "recurrence": {"kind": "invariant"},
+            },
+            "history": {
+                "contract": history_contract,
+                "scope": "invocation",
+                "initializer": "initializer.code_history",
+                "recurrence": {
+                    "kind": "growing",
+                    "axis": 1,
+                    "increment": "package.one",
+                    "max": "request.max_iterations",
+                },
+            },
+        },
+        "initial_effects": initial_effects,
+        "graph": {"kind": "sequence", "nodes": post_nodes},
+    }
+    metadata = {"schema_version": "v1", "pipeline": {"workflow": workflow}}
+    add_policy_components_to_workflow(metadata, pkg)
+    return metadata
 
 
 def write_tts_workflow_metadata(pkg: Any, output_dir: str, config: Any) -> str:
