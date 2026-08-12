@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 
 import onnx_ir as ir
+import pytest
 import torch
 
 from mobius._builder import build_from_module
@@ -36,6 +37,14 @@ class TestModelPackageDict:
         m = _make_simple_model()
         pkg["new"] = m
         assert pkg["new"] is m
+
+    def test_rejects_component_without_graph(self):
+        with pytest.raises(TypeError, match="must be an ir.Model with a graph"):
+            ModelPackage({"invalid": object()})  # type: ignore[arg-type]
+
+        pkg = ModelPackage()
+        with pytest.raises(TypeError, match="must be an ir.Model with a graph"):
+            pkg["invalid"] = object()  # type: ignore[assignment]
 
     def test_delitem(self):
         pkg = ModelPackage({"a": _make_simple_model()})
@@ -99,6 +108,7 @@ class TestModelPackageSaveLoad:
 
         assert len(loaded) == 1
         assert "model" in loaded
+        assert pkg["model"].graph is not None
         assert loaded["model"].graph.num_nodes() == pkg["model"].graph.num_nodes()
 
     def test_load_multiple(self, tmp_path):

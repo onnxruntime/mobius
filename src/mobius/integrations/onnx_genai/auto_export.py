@@ -16,7 +16,6 @@ import logging
 import os
 from typing import Any
 
-import onnx_ir as ir
 import yaml
 
 from mobius.integrations.onnx_genai.decoder_metadata import (
@@ -25,7 +24,6 @@ from mobius.integrations.onnx_genai.decoder_metadata import (
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
-    _component_filenames,
     add_explicit_package_io,
     load_diffusers_scheduler_config,
     write_audio_codec_pipeline_metadata,
@@ -41,76 +39,18 @@ _DENOISER_KEYS = ("denoiser", "transformer", "unet")
 
 
 def _add_explicit_io_to_file(path: str, pkg: Any, config: Any) -> None:
-    """Augment an emitted sidecar with roles derived from the actual ONNX ports.
-
-    Port roles (``kv_inputs``/``kv_outputs``/``state_pairs`` etc.) are derived
-    from each component's ONNX graph ports. Normally the built in-memory package
-    still holds the ``ir.Model`` objects, so ``model.graph`` is available. But a
-    large decoder built with external-data / streamed weights may not retain its
-    graph in memory, in which case we reload the graph from the ``model.onnx``
-    file already written next to the sidecar. Only when a component's graph is
-    truly unavailable (missing in memory *and* on disk) do we skip it — and then
-    loudly, never silently shipping thin metadata.
-    """
+    """Augment an emitted sidecar with roles derived from the actual ONNX ports."""
     try:
-        component_names = list(pkg.keys())
+        models = list(pkg.values())
     except AttributeError:
         return
-    if not component_names:
+    if not models or any(not hasattr(model, "graph") for model in models):
         return
-
-    output_dir = os.path.dirname(path)
-    filenames = _component_filenames(pkg)
-    resolved: dict[str, Any] = {}
-    for name in component_names:
-        model = pkg[name]
-        if hasattr(model, "graph") and model.graph is not None:
-            resolved[name] = model
-            continue
-        model_path = os.path.join(output_dir, filenames[name])
-        graph_model = _load_graph_from_disk(model_path)
-        if graph_model is None:
-            _LOGGER.warning(
-                "onnx-genai: skipping explicit 'model.io' port contract for "
-                "component %r in %s — its ONNX graph is not available in memory "
-                "and could not be reloaded from %s. The sidecar will ship without "
-                "the derived 'io' block (kv_inputs/kv_outputs/state_pairs); "
-                "downstream runtimes must derive ports from the graph at load.",
-                name,
-                path,
-                model_path,
-            )
-            return
-        resolved[name] = graph_model
-
     with open(path, encoding="utf-8") as handle:
         metadata = yaml.safe_load(handle)
-    add_explicit_package_io(metadata, resolved, config)
+    add_explicit_package_io(metadata, pkg, config)
     with open(path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(metadata, handle, sort_keys=False)
-
-
-def _load_graph_from_disk(model_path: str) -> Any | None:
-    """Reload an ONNX model (with external data) for graph-port derivation.
-
-    Returns the loaded ``ir.Model`` (a drop-in for the in-memory model's
-    ``.graph`` access), or ``None`` if the file is absent or cannot be parsed.
-    External data resolves relative to *model_path*, so the sidecar-adjacent
-    ``model.onnx`` + ``model.onnx.data`` load without materializing weights we
-    do not need for port inspection.
-    """
-    if not os.path.isfile(model_path):
-        return None
-    try:
-        return ir.load(model_path)
-    except Exception:
-        _LOGGER.warning(
-            "onnx-genai: failed to reload ONNX graph from %s for explicit "
-            "model.io derivation.",
-            model_path,
-            exc_info=True,
-        )
-        return None
 
 
 def _write_clip_tokenizer(output_dir: str, source: str | None) -> str | None:

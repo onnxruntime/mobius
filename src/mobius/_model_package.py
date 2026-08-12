@@ -55,6 +55,12 @@ class ModelPackage(UserDict[str, ir.Model]):
         names = ", ".join(repr(k) for k in self.data)
         return f"ModelPackage({{{names}}})"
 
+    def __setitem__(self, name: str, model: ir.Model) -> None:
+        """Store a component whose ONNX graph is available for downstream tooling."""
+        if not isinstance(model, ir.Model) or model.graph is None:
+            raise TypeError(f"ModelPackage component {name!r} must be an ir.Model with a graph")
+        super().__setitem__(name, model)
+
     # -- Persistence -------------------------------------------------------
 
     def save(
