@@ -1315,6 +1315,60 @@ def add_explicit_package_io(
     return metadata
 
 
+def add_policy_components_to_workflow(
+    metadata: dict[str, Any],
+    pkg: Any,
+) -> dict[str, Any]:
+    """Reference attached ONNX policy artifacts from an existing workflow.
+
+    This helper intentionally does not synthesize a workflow or guess bindings.
+    It only adds schema-defined component declarations when a producer has
+    already emitted the exact workflow contract.
+    """
+    policy_components = getattr(pkg, "policy_components", {})
+    if not policy_components:
+        return metadata
+    workflow = metadata.get("pipeline", {}).get("workflow")
+    if not isinstance(workflow, dict):
+        return metadata
+    components = workflow.setdefault("components", {})
+    for name, component in policy_components.items():
+        model = component.model
+        components[name] = {
+            "implementation": {
+                "kind": "onnx",
+                "artifact": f"policies/{name}.onnx",
+            },
+            "ports": {
+                "inputs": {
+                    value.name: {
+                        "dtype": _port(value).dtype,
+                        "rank": _port(value).rank,
+                        **(
+                            {"shape": _shape_metadata(_port(value))}
+                            if value.shape is not None
+                            else {}
+                        ),
+                    }
+                    for value in model.graph.inputs
+                },
+                "outputs": {
+                    value.name: {
+                        "dtype": _port(value).dtype,
+                        "rank": _port(value).rank,
+                        **(
+                            {"shape": _shape_metadata(_port(value))}
+                            if value.shape is not None
+                            else {}
+                        ),
+                    }
+                    for value in model.graph.outputs
+                },
+            },
+        }
+    return metadata
+
+
 def _topological_order(
     names: Iterable[str],
     edges: list[dict[str, Any]],

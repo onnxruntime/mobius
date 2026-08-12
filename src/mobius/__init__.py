@@ -45,6 +45,7 @@ __all__ = [
     "ep_registry",
     "get_build_dtype",
     "get_ep",
+    "generation",
     "models",
     "optimize_model",
     "register_ep",
@@ -54,7 +55,7 @@ __all__ = [
 
 __version__ = "0.1.0"
 
-from mobius import components, models, tasks
+from mobius import components, generation, models, tasks
 from mobius._build_context import build_context, ep_capabilities, get_build_dtype
 from mobius._builder import (
     build,

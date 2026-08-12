@@ -31,6 +31,7 @@ import tqdm
 
 from mobius._optimizations import fold_initializers_after_weights
 from mobius._weight_loading import _assign_weight
+from mobius.generation import PolicyComponent
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +48,11 @@ class ModelPackage(UserDict[str, ir.Model]):
         self,
         models: dict[str, ir.Model] | None = None,
         config: object | None = None,
+        policy_components: dict[str, PolicyComponent] | None = None,
     ) -> None:
         super().__init__(models or {})
         self.config = config
+        self.policy_components = dict(policy_components or {})
 
     def __repr__(self) -> str:
         names = ", ".join(repr(k) for k in self.data)
@@ -66,6 +69,7 @@ class ModelPackage(UserDict[str, ir.Model]):
         components: Callable[[str], bool] | None = None,
         progress_bar: bool = True,
         check_weights: bool = True,
+        include_policy_components: bool = True,
     ) -> None:
         """Save all component models to a directory.
 
@@ -111,6 +115,8 @@ class ModelPackage(UserDict[str, ir.Model]):
             check_weights: Whether to verify that all initializers have
                 weight data before saving.  Defaults to ``True``.
                 Set to ``False`` when saving skeleton models without weights.
+            include_policy_components: Save attached generation-policy ONNX
+                components under ``policies/``. Defaults to ``True``.
 
         Raises:
             ValueError: If *external_data* is not ``"onnx"`` or
@@ -151,6 +157,35 @@ class ModelPackage(UserDict[str, ir.Model]):
             else:
                 ir.save(model, path, external_data="model.onnx.data", callback=callback)
 
+        if include_policy_components:
+            self.save_policy_components(directory, check_weights=check_weights)
+
+    def add_policy_component(self, name: str, component: PolicyComponent) -> None:
+        """Attach a reusable generation-policy graph to this package."""
+        if not name or "/" in name or "\\" in name:
+            raise ValueError("Policy component name must be a non-empty path segment")
+        self.policy_components[name] = component
+
+    def save_policy_components(
+        self,
+        directory: str,
+        *,
+        check_weights: bool = True,
+    ) -> dict[str, str]:
+        """Save attached policy graphs and return package-relative artifact paths."""
+        if not self.policy_components:
+            return {}
+        policy_dir = os.path.join(directory, "policies")
+        os.makedirs(policy_dir, exist_ok=True)
+        artifacts: dict[str, str] = {}
+        for name, component in self.policy_components.items():
+            if check_weights:
+                _check_weights(name, component.model)
+            relative_path = f"policies/{name}.onnx"
+            ir.save(component.model, os.path.join(directory, relative_path))
+            artifacts[name] = relative_path
+        return artifacts
+
     @classmethod
     def load(cls, directory: str) -> ModelPackage:
         """Load all ``.onnx`` files from a directory into a package.
@@ -176,13 +211,29 @@ class ModelPackage(UserDict[str, ir.Model]):
             if os.path.isdir(subdir) and os.path.isfile(model_path):
                 models[entry] = ir.load(model_path)
         if models:
-            return cls(models)
+            package = cls(models)
+            package._load_policy_components(directory)
+            return package
         # Fall back to flat layout
         for filename in sorted(os.listdir(directory)):
             if filename.endswith(".onnx"):
                 name = filename.removesuffix(".onnx")
                 models[name] = ir.load(os.path.join(directory, filename))
-        return cls(models)
+        package = cls(models)
+        package._load_policy_components(directory)
+        return package
+
+    def _load_policy_components(self, directory: str) -> None:
+        policy_dir = os.path.join(directory, "policies")
+        if not os.path.isdir(policy_dir):
+            return
+        for filename in sorted(os.listdir(policy_dir)):
+            if not filename.endswith(".onnx"):
+                continue
+            model = ir.load(os.path.join(policy_dir, filename))
+            self.policy_components[filename.removesuffix(".onnx")] = (
+                PolicyComponent.from_model(model)
+            )
 
     # -- Weight application ------------------------------------------------
 

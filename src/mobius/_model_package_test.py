@@ -14,6 +14,7 @@ from mobius._builder import build_from_module
 from mobius._configs import VisionConfig
 from mobius._model_package import ModelPackage
 from mobius._testing import make_config
+from mobius.generation import PolicyRole, build_greedy_sampler
 from mobius.models.base import CausalLMModel
 from mobius.models.gemma3 import Gemma3MultiModalModel
 from mobius.tasks import CausalLMTask, VisionLanguageTask
@@ -117,6 +118,15 @@ class TestModelPackageSaveLoad:
         pkg = ModelPackage({"m": _make_simple_model()})
         pkg.save(str(outdir))
         assert (outdir / "model.onnx").exists()
+
+    def test_policy_components_roundtrip(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.add_policy_component("sample", build_greedy_sampler())
+        pkg.save(str(tmp_path))
+
+        assert (tmp_path / "policies" / "sample.onnx").exists()
+        loaded = ModelPackage.load(str(tmp_path))
+        assert loaded.policy_components["sample"].role is PolicyRole.TOKEN_SAMPLER
 
 
 class TestModelPackageApplyWeights:
