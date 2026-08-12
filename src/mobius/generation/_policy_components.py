@@ -334,20 +334,38 @@ def build_euler_solver_step() -> PolicyComponent:
 
 
 def build_masked_token_update() -> PolicyComponent:
-    """Build deterministic replacement of currently masked token positions."""
+    """Build replacement of masked positions with explicit RNG-counter threading."""
     graph, builder = _make_graph("masked_token_update")
     op = builder.op
     current = builder.input("current_tokens", ir.DataType.INT64, ["batch", "sequence"])
     proposed = builder.input("proposed_tokens", ir.DataType.INT64, ["batch", "sequence"])
     masked = builder.input("masked", ir.DataType.BOOL, ["batch", "sequence"])
     step = builder.input("step", ir.DataType.INT64, ["batch"])
+    seed = builder.input("seed", ir.DataType.INT64, ["batch"])
+    offset = builder.input("offset", ir.DataType.INT64, ["batch"])
     updated = op.Where(masked, proposed, current)
     # Consume the declared step without changing values; schedules that remask
     # tokens can be expressed by a richer artifact with the same semantic ports.
     updated = op.Add(updated, op.Unsqueeze(op.Mul(step, 0), op.Constant(value_ints=[-1])))
+    updated.shape = ir.Shape(["batch", "sequence"])
     remaining = op.ConstantOfShape(op.Shape(masked), value=ir.tensor([False]))
+    remaining.shape = ir.Shape(["batch", "sequence"])
+    remaining_count = op.ReduceSum(
+        op.Cast(remaining, to=ir.DataType.INT64),
+        axes=[-1],
+        keepdims=0,
+    )
+    done = op.Equal(remaining_count, op.Constant(value_int=0))
+    done.shape = ir.Shape(["batch"])
+    next_offset = op.Add(
+        op.Add(offset, op.Constant(value_int=1)),
+        op.Mul(seed, op.Constant(value_int=0)),
+    )
+    next_offset.shape = ir.Shape(["batch"])
     builder.add_output(updated, "next_state")
     builder.add_output(remaining, "next_mask")
+    builder.add_output(next_offset, "next_offset")
+    builder.add_output(done, "done")
     return _component(
         PolicyRole.MASKED_UPDATE,
         graph,
@@ -359,6 +377,11 @@ def build_masked_token_update() -> PolicyComponent:
             "step": "step",
             "next_state": "next_state",
             "next_mask": "next_mask",
+            "rng": {
+                "seed": "seed",
+                "offset": "offset",
+                "next_offset": "next_offset",
+            },
             "effect": "update",
         },
         "update",

@@ -14,7 +14,11 @@ import yaml
 from mobius._configs import QuantizationConfig
 from mobius._model_package import ModelPackage
 from mobius.integrations.onnx_genai import write_onnx_genai_config
-from mobius.integrations.onnx_genai.inference_metadata_test import _decoder_model
+from mobius.integrations.onnx_genai.inference_metadata_test import (
+    _decoder_model,
+    _model,
+    _value,
+)
 
 
 @dataclasses.dataclass
@@ -64,6 +68,33 @@ def test_dispatch_decoder(tmp_path):
     assert workflow["components"]["termination"]["policy"]["role"] == ("termination_predicate")
     assert workflow["graph"]["kind"] == "loop"
     assert (tmp_path / "policies" / "token_sampler.onnx").is_file()
+
+
+def test_dispatch_language_diffusion(tmp_path):
+    package = ModelPackage(
+        {
+            "model": _model(
+                "masked_denoiser",
+                [_value("input_ids", ir.DataType.INT64, ["batch", "sequence"])],
+                [
+                    ("logits", ir.DataType.FLOAT, ["batch", "sequence", 128]),
+                    ("proposed_tokens", ir.DataType.INT64, ["batch", "sequence"]),
+                ],
+            )
+        },
+        config=_Cfg(model_type="llada"),
+    )
+    artifacts = write_onnx_genai_config(
+        package,
+        str(tmp_path),
+        num_inference_steps=12,
+    )
+    with open(artifacts["inference_metadata"]) as handle:
+        metadata = yaml.safe_load(handle)
+    pipeline = metadata["pipeline"]
+    assert set(pipeline) == {"workflow"}
+    assert pipeline["workflow"]["inputs"]["request.max_iterations"]["default"] == 12
+    assert (tmp_path / "policies" / "masked_update.onnx").is_file()
 
 
 def test_dispatch_diffusion(tmp_path):
