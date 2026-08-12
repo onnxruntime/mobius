@@ -16,6 +16,7 @@ import logging
 import os
 from typing import Any
 
+import onnx_ir as ir
 import yaml
 
 from mobius.integrations.onnx_genai.decoder_metadata import (
@@ -34,6 +35,7 @@ from mobius.integrations.onnx_genai.inference_metadata import (
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
     write_decoder_workflow_metadata,
+    write_language_diffusion_workflow_metadata,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -215,6 +217,25 @@ def _looks_like_diffusion(pkg: Any) -> bool:
         return False
     return any(k in names for k in _DENOISER_KEYS) or any(
         k in names for k in ("vae", "vae_decoder", "vae_encoder")
+    )
+
+
+def _looks_like_language_diffusion(pkg: Any) -> bool:
+    """Detect a full-sequence token denoiser with an executable proposal output."""
+    try:
+        if len(pkg) != 1:
+            return False
+        model = next(iter(pkg.values()))
+        inputs = list(model.graph.inputs)
+        outputs = list(model.graph.outputs)
+    except (AttributeError, TypeError):
+        return False
+    return (
+        len(inputs) == 1
+        and inputs[0].dtype in {ir.DataType.INT32, ir.DataType.INT64}
+        and inputs[0].shape is not None
+        and len(inputs[0].shape) == 2
+        and {"logits", "proposed_tokens"} <= {value.name for value in outputs}
     )
 
 
@@ -470,6 +491,18 @@ def write_onnx_genai_config(
     ``scheduler`` / ``guidance_scale`` set the loop.
     """
     os.makedirs(output_dir, exist_ok=True)
+    if _looks_like_language_diffusion(pkg):
+        path = write_language_diffusion_workflow_metadata(
+            pkg,
+            output_dir,
+            num_inference_steps=num_inference_steps,
+        )
+        artifacts = {"inference_metadata": path}
+        tokenizer_path = _write_hf_tokenizer(output_dir, source)
+        if tokenizer_path is not None:
+            artifacts["tokenizer"] = tokenizer_path
+        return artifacts
+
     if _looks_like_diffusion(pkg):
         is_qwen_image_edit = getattr(getattr(pkg, "config", None), "model_type", None) == (
             "qwen_image_edit"

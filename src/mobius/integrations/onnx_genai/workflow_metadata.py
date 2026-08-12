@@ -352,6 +352,248 @@ def build_decoder_workflow_metadata(
     return metadata
 
 
+def build_language_diffusion_pipeline_metadata(
+    pkg: Any,
+    *,
+    num_inference_steps: int,
+) -> dict[str, Any]:
+    """Build a generic SSA workflow for a masked language-diffusion model."""
+    if num_inference_steps < 1:
+        raise ValueError("num_inference_steps must be >= 1")
+    if len(pkg) != 1:
+        raise ValueError("language-diffusion workflow requires exactly one neural component")
+    denoiser_name, denoiser = next(iter(pkg.items()))
+    if len(denoiser.graph.inputs) != 1:
+        raise ValueError("language-diffusion denoiser requires exactly one token input")
+
+    token_input = denoiser.graph.inputs[0]
+    logits_output = next(
+        (value for value in denoiser.graph.outputs if value.name == "logits"),
+        None,
+    )
+    proposal_output = next(
+        (value for value in denoiser.graph.outputs if value.name == "proposed_tokens"),
+        None,
+    )
+    if (
+        token_input.dtype not in {ir.DataType.INT32, ir.DataType.INT64}
+        or token_input.shape is None
+        or len(token_input.shape) != 2
+        or logits_output is None
+        or logits_output.shape is None
+        or len(logits_output.shape) != 3
+        or proposal_output is None
+        or proposal_output.shape is None
+        or len(proposal_output.shape) != 2
+    ):
+        raise ValueError(
+            "language-diffusion workflow requires token [B,T], logits [B,T,V], "
+            "and proposed_tokens [B,T] ports"
+        )
+
+    attach_policy_components(pkg, PolicyCapabilities(masked_update=True))
+
+    token_contract = _contract(token_input)
+    mask_contract = {
+        "dtype": "bool",
+        "rank": 2,
+        "shape": token_contract["shape"],
+    }
+    batch_dimension = token_contract["shape"][0]
+    batch_int = {"dtype": "int64", "rank": 1, "shape": [batch_dimension]}
+    inputs = {
+        "request.input_ids": {
+            "contract": token_contract,
+            "role": {
+                "kind": "runtime",
+                "version": "1.0",
+                "role": "prompt_tokens",
+            },
+            "source": {"kind": "request", "field": "prompt_tokens"},
+            "required": True,
+        },
+        "request.mask": {
+            "contract": mask_contract,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "application", "name": "masked_positions"},
+            "required": True,
+        },
+        "request.seed": {
+            "contract": batch_int,
+            "role": {
+                "kind": "runtime",
+                "version": "1.0",
+                "role": "seed",
+            },
+            "source": {"kind": "request", "field": "seed"},
+            "required": False,
+            "default": 0,
+        },
+        "request.rng_offset": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "application", "name": "rng_offset"},
+            "required": False,
+            "default": 0,
+        },
+        "request.max_iterations": {
+            "contract": batch_int,
+            "role": {
+                "kind": "runtime",
+                "version": "1.0",
+                "role": "max_iterations",
+            },
+            "source": {"kind": "request", "field": "max_iterations"},
+            "required": False,
+            "default": num_inference_steps,
+        },
+        "loop.iteration": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "application", "name": "iteration"},
+            "required": True,
+        },
+    }
+
+    def denoiser_invoke(tokens: str, prefix: str) -> dict[str, Any]:
+        return _invoke(
+            denoiser_name,
+            {token_input.name: tokens},
+            {
+                logits_output.name: f"{prefix}.logits",
+                proposal_output.name: f"{prefix}.proposal",
+            },
+        )
+
+    def update_invoke(
+        tokens: str,
+        mask: str,
+        offset: str,
+        prefix: str,
+        effect_in: str,
+        effect_out: str,
+    ) -> dict[str, Any]:
+        return _invoke(
+            "masked_update",
+            {
+                "current_tokens": tokens,
+                "proposed_tokens": f"{prefix}.proposal",
+                "masked": mask,
+                "step": "loop.iteration",
+                "seed": "request.seed",
+                "offset": offset,
+            },
+            {
+                "next_state": f"{prefix}.tokens",
+                "next_mask": f"{prefix}.mask",
+                "next_offset": f"{prefix}.rng_offset",
+                "done": f"{prefix}.done",
+            },
+            {"update": _effect(effect_in, effect_out)},
+        )
+
+    setup = {
+        "kind": "sequence",
+        "nodes": [
+            denoiser_invoke("request.input_ids", "denoiser.setup"),
+            update_invoke(
+                "request.input_ids",
+                "request.mask",
+                "request.rng_offset",
+                "denoiser.setup",
+                "update.0",
+                "update.1",
+            ),
+        ],
+    }
+    body = {
+        "kind": "sequence",
+        "nodes": [
+            denoiser_invoke("state.tokens.body", "denoiser.body"),
+            update_invoke(
+                "state.tokens.body",
+                "state.mask.body",
+                "state.rng_offset.body",
+                "denoiser.body",
+                "update.1",
+                "update.2",
+            ),
+            {
+                "kind": "emit",
+                "value": "denoiser.body.tokens",
+                "output": "tokens",
+                "mode": "replace",
+                "effect_name": "emit",
+                "effect": _effect("emit.0", "emit.1"),
+            },
+        ],
+    }
+
+    state_specs = {
+        "tokens": (token_contract, "request.input_ids", "denoiser.setup.tokens"),
+        "mask": (mask_contract, "request.mask", "denoiser.setup.mask"),
+        "rng_offset": (batch_int, "request.rng_offset", "denoiser.setup.rng_offset"),
+    }
+    state: dict[str, Any] = {}
+    carried: list[dict[str, Any]] = []
+    initial_effects = {"update": "update.0", "emit": "emit.0"}
+    for name, (contract, initializer, current) in state_specs.items():
+        effect_name = f"state:{name}"
+        initial_effects[effect_name] = f"{effect_name}.0"
+        state[name] = {
+            "contract": contract,
+            "scope": "invocation",
+            "initializer": initializer,
+            "recurrence": {"kind": "invariant"},
+        }
+        carried.append(
+            {
+                "cell": name,
+                "current": current,
+                "body_input": f"state.{name}.body",
+                "body_output": f"denoiser.body.{name}",
+                "next": f"state.{name}.final",
+                "read_effect": _effect(f"{effect_name}.0", f"{effect_name}.read"),
+                "write_effect": _effect(f"{effect_name}.read", f"{effect_name}.1"),
+            }
+        )
+
+    workflow = {
+        "manifest": {
+            "ir_version": "1.0",
+            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
+            "capabilities": [
+                "workflow_ssa",
+                "linear_effects",
+                "nested_control_flow",
+                "typed_emit",
+            ],
+        },
+        "inputs": inputs,
+        "outputs": {
+            "tokens": {
+                "contract": token_contract,
+                "role": "tokens",
+                "stage": "pre_adapter",
+            }
+        },
+        "components": {denoiser_name: _component(denoiser, "model.onnx")},
+        "state": state,
+        "initial_effects": initial_effects,
+        "graph": {
+            "kind": "loop",
+            "setup": setup,
+            "body": body,
+            "condition": "denoiser.body.done",
+            "max_iterations": "request.max_iterations",
+            "carried": carried,
+        },
+    }
+    metadata = {"schema_version": "1.0", "pipeline": {"workflow": workflow}}
+    add_policy_components_to_workflow(metadata, pkg)
+    return metadata
+
+
 def write_decoder_workflow_metadata(
     pkg: Any,
     output_dir: str,
@@ -360,6 +602,25 @@ def write_decoder_workflow_metadata(
     """Write decoder workflow metadata and policy artifacts."""
     os.makedirs(output_dir, exist_ok=True)
     metadata = build_decoder_workflow_metadata(pkg, config)
+    pkg.save_policy_components(output_dir)
+    path = os.path.join(output_dir, "inference_metadata.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(metadata, handle, sort_keys=False)
+    return path
+
+
+def write_language_diffusion_workflow_metadata(
+    pkg: Any,
+    output_dir: str,
+    *,
+    num_inference_steps: int,
+) -> str:
+    """Write masked language-diffusion workflow metadata and policy artifacts."""
+    os.makedirs(output_dir, exist_ok=True)
+    metadata = build_language_diffusion_pipeline_metadata(
+        pkg,
+        num_inference_steps=num_inference_steps,
+    )
     pkg.save_policy_components(output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:

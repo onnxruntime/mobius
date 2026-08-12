@@ -91,10 +91,14 @@ def test_masked_update_runtime_parity(tmp_path):
             "proposed_tokens": np.array([[4, 5, 6]], np.int64),
             "masked": np.array([[False, True, True]]),
             "step": np.array([0], np.int64),
+            "seed": np.array([7], np.int64),
+            "offset": np.array([11], np.int64),
         },
     )
     np.testing.assert_array_equal(outputs[0], [[1, 5, 6]])
     np.testing.assert_array_equal(outputs[1], [[False, False, False]])
+    np.testing.assert_array_equal(outputs[2], [12])
+    np.testing.assert_array_equal(outputs[3], [True])
 
 
 def test_speculative_acceptance_prefix_runtime(tmp_path):
