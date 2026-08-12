@@ -25,6 +25,7 @@ from mobius.generation import (
     build_model_token_cast,
     build_seeded_categorical_sampler,
     build_speculative_acceptance,
+    build_speculative_state_rollback,
     build_token_state_update,
 )
 from mobius.generation._policy_components import _make_graph
@@ -328,6 +329,48 @@ def test_speculative_acceptance_prefix_runtime(tmp_path):
     np.testing.assert_array_equal(count, [3])
     np.testing.assert_array_equal(done, [False])
     np.testing.assert_array_equal(next_offset, [12])
+
+
+def test_speculative_acceptance_synchronizes_batched_prefixes(tmp_path):
+    accepted_tokens, count, done, _ = _run(
+        build_speculative_acceptance(),
+        tmp_path,
+        {
+            "target_scores": np.array(
+                [
+                    [[0, 1], [1, 0], [0, 1], [1, 0]],
+                    [[0, 1], [1, 0], [0, 1], [1, 0]],
+                ],
+                np.float32,
+            ),
+            "proposed_tokens": np.array([[1, 1, 0, 0], [1, 0, 1, 0]], np.int64),
+            "seed": np.array([3, 4], np.int64),
+            "offset": np.array([0, 0], np.int64),
+        },
+    )
+    np.testing.assert_array_equal(count, [2, 2])
+    np.testing.assert_array_equal(accepted_tokens, [[1, 0, 0, 0], [1, 0, 0, 0]])
+    np.testing.assert_array_equal(done, [False, False])
+
+
+def test_speculative_state_rollback_trims_tentative_cache(tmp_path):
+    past = np.arange(4, dtype=np.float32).reshape(1, 1, 2, 2)
+    tentative = np.arange(12, dtype=np.float32).reshape(1, 1, 6, 2)
+    (corrected,) = _run(
+        build_speculative_state_rollback(
+            ir.DataType.FLOAT,
+            ["batch", 1, "past_sequence", 2],
+            sequence_axis=2,
+        ),
+        tmp_path,
+        {
+            "past_state": past,
+            "tentative_state": tentative,
+            "accepted_len": np.array([2], np.int64),
+        },
+    )
+    assert corrected.shape == (1, 1, 4, 2)
+    np.testing.assert_array_equal(corrected, tentative[:, :, :4, :])
 
 
 def test_euler_model_input_scales_by_sigma(tmp_path):

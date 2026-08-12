@@ -21,6 +21,7 @@ from mobius.generation import (
     build_codec_layout_transpose,
     build_decoder_state_initializer,
     build_decoder_step_update,
+    build_effectful_identity,
     build_euler_model_input,
     build_euler_solver_step,
     build_integer_increment,
@@ -28,6 +29,7 @@ from mobius.generation import (
     build_model_token_cast,
     build_schedule_constant,
     build_schedule_lookup,
+    build_speculative_state_rollback,
     build_token_block_identity,
     build_tts_state_initializer,
 )
@@ -1721,41 +1723,142 @@ def build_speculative_workflow_metadata(pkg: Any) -> dict[str, Any]:
     }
     if proposal_scores is not None:
         proposal_outputs[proposal_scores.name] = "proposal.scores"
+    rollback_nodes: list[dict[str, Any]] = []
+    accepted_case_nodes = [
+        _invoke(
+            "branch_state",
+            {"tokens": "acceptance.tokens"},
+            {"next_tokens": "branch.accepted"},
+            {"state": _effect("branch.state.in", "branch.state.accepted")},
+        )
+    ]
+    corrected_case_nodes = [
+        _invoke(
+            "branch_state",
+            {"tokens": "acceptance.tokens"},
+            {"next_tokens": "branch.corrected"},
+            {"state": _effect("branch.state.in", "branch.state.corrected")},
+        )
+    ]
+    branch_outputs: dict[str, Any] = {
+        "tokens.next": {
+            "cases": {
+                "true": "branch.accepted",
+                "false": "branch.corrected",
+            }
+        }
+    }
+    branch_effects: dict[str, Any] = {
+        "state": {
+            "incoming": "branch.state.in",
+            "cases": {
+                "true": "branch.state.accepted",
+                "false": "branch.state.corrected",
+            },
+            "produces": "branch.state.out",
+        }
+    }
+    for index, (past, present) in enumerate(cache_pairs):
+        cache_name = f"cache_{index}"
+        cache_contract = _contract(past)
+        sequence_axis = next(
+            (
+                axis
+                for axis, dimension in enumerate(cache_contract["shape"])
+                if "sequence" in str(dimension)
+            ),
+            2,
+        )
+        rollback_name = f"rollback_{cache_name}"
+        publisher_name = f"publish_{cache_name}"
+        branch_effect = f"branch:{cache_name}"
+        pkg.add_policy_component(
+            rollback_name,
+            build_speculative_state_rollback(
+                past.dtype,
+                cache_contract["shape"],
+                sequence_axis=sequence_axis,
+                effect=rollback_name,
+            ),
+        )
+        pkg.add_policy_component(
+            publisher_name,
+            build_effectful_identity(
+                publisher_name,
+                past.dtype,
+                [
+                    "branch_sequence" if axis == sequence_axis else dimension
+                    for axis, dimension in enumerate(cache_contract["shape"])
+                ],
+                effect=branch_effect,
+            ),
+        )
+        rollback_nodes.append(
+            _invoke(
+                rollback_name,
+                {
+                    "past_state": f"state.{cache_name}.body",
+                    "tentative_state": f"verifier.{present.name}",
+                    "accepted_len": "acceptance.length",
+                },
+                {"corrected_state": f"rollback.{cache_name}"},
+                {
+                    rollback_name: _effect(
+                        f"rollback.{cache_name}.0",
+                        f"rollback.{cache_name}.1",
+                    )
+                },
+            )
+        )
+        accepted_case_nodes.append(
+            _invoke(
+                publisher_name,
+                {"value": f"verifier.{present.name}"},
+                {"next_value": f"branch.accepted.{cache_name}"},
+                {
+                    branch_effect: _effect(
+                        f"branch.{cache_name}.in",
+                        f"branch.{cache_name}.accepted",
+                    )
+                },
+            )
+        )
+        corrected_case_nodes.append(
+            _invoke(
+                publisher_name,
+                {"value": f"rollback.{cache_name}"},
+                {"next_value": f"branch.corrected.{cache_name}"},
+                {
+                    branch_effect: _effect(
+                        f"branch.{cache_name}.in",
+                        f"branch.{cache_name}.corrected",
+                    )
+                },
+            )
+        )
+        branch_outputs[f"{cache_name}.next"] = {
+            "cases": {
+                "true": f"branch.accepted.{cache_name}",
+                "false": f"branch.corrected.{cache_name}",
+            }
+        }
+        branch_effects[branch_effect] = {
+            "incoming": f"branch.{cache_name}.in",
+            "cases": {
+                "true": f"branch.{cache_name}.accepted",
+                "false": f"branch.{cache_name}.corrected",
+            },
+            "produces": f"branch.{cache_name}.out",
+        }
     branch = {
         "kind": "branch",
         "predicate": "acceptance.done",
         "cases": {
-            "true": _invoke(
-                "branch_state",
-                {"tokens": "acceptance.tokens"},
-                {"next_tokens": "branch.accepted"},
-                {"state": _effect("branch.state.in", "branch.state.accepted")},
-            ),
-            "false": _invoke(
-                "branch_state",
-                {"tokens": "acceptance.tokens"},
-                {"next_tokens": "branch.corrected"},
-                {"state": _effect("branch.state.in", "branch.state.corrected")},
-            ),
+            "true": {"kind": "sequence", "nodes": accepted_case_nodes},
+            "false": {"kind": "sequence", "nodes": corrected_case_nodes},
         },
-        "outputs": {
-            "tokens.next": {
-                "cases": {
-                    "true": "branch.accepted",
-                    "false": "branch.corrected",
-                }
-            }
-        },
-        "effects": {
-            "state": {
-                "incoming": "branch.state.in",
-                "cases": {
-                    "true": "branch.state.accepted",
-                    "false": "branch.state.corrected",
-                },
-                "produces": "branch.state.out",
-            }
-        },
+        "outputs": branch_outputs,
+        "effects": branch_effects,
     }
     body_nodes = [
         _invoke("proposer", proposer_inputs, proposal_outputs),
@@ -1771,6 +1874,7 @@ def build_speculative_workflow_metadata(pkg: Any) -> dict[str, Any]:
             },
             {"verify": _effect("verify.0", "verify.1")},
         ),
+        *rollback_nodes,
         branch,
         _invoke(
             "continue_predicate",
@@ -1816,7 +1920,7 @@ def build_speculative_workflow_metadata(pkg: Any) -> dict[str, Any]:
             "state.rng_offset.final",
         ),
     ]
-    for index, (past, present) in enumerate(cache_pairs):
+    for index, (past, _present) in enumerate(cache_pairs):
         cell = f"cache_{index}"
         initializer = f"request.verifier.{past.name}"
         state[cell] = {
@@ -1842,7 +1946,7 @@ def build_speculative_workflow_metadata(pkg: Any) -> dict[str, Any]:
                 cell,
                 initializer,
                 f"state.{cell}.body",
-                f"verifier.{present.name}",
+                f"{cell}.next",
                 f"state.{cell}.final",
             )
         )
@@ -1851,6 +1955,9 @@ def build_speculative_workflow_metadata(pkg: Any) -> dict[str, Any]:
         "emit": "emit.0",
         "state": "branch.state.in",
     }
+    for index in range(len(cache_pairs)):
+        initial_effects[f"rollback_cache_{index}"] = f"rollback.cache_{index}.0"
+        initial_effects[f"branch:cache_{index}"] = f"branch.cache_{index}.in"
     carried = []
     for cell, current, body_input, body_output, final in state_specs:
         effect = f"state:{cell}"

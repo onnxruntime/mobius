@@ -160,7 +160,7 @@ def test_speculative_workflow_uses_branch_phi_effect_join_and_rng():
         "workflow"
     ]
     body = workflow["graph"]["body"]["nodes"]
-    branch = body[3]
+    branch = next(node for node in body if node["kind"] == "branch")
     assert branch["kind"] == "branch"
     assert branch["outputs"]["tokens.next"]["cases"] == {
         "true": "branch.accepted",
@@ -170,4 +170,13 @@ def test_speculative_workflow_uses_branch_phi_effect_join_and_rng():
     acceptance = body[2]
     assert acceptance["inputs"]["offset"] == "state.rng_offset.body"
     assert acceptance["outputs"]["next_offset"] == "rng_offset.body"
+    rollback = next(
+        node for node in body if node.get("component") == "rollback_cache_0"
+    )
+    assert rollback["inputs"]["accepted_len"] == "acceptance.length"
+    assert branch["outputs"]["cache_0.next"]["cases"] == {
+        "true": "branch.accepted.cache_0",
+        "false": "branch.corrected.cache_0",
+    }
+    assert branch["effects"]["branch:cache_0"]["produces"] == "branch.cache_0.out"
     assert any(item["cell"].startswith("cache_") for item in workflow["graph"]["carried"])

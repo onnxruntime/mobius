@@ -814,6 +814,27 @@ def build_speculative_acceptance() -> PolicyComponent:
         op.Add(accepted_count, op.Cast(op.Not(done), to=ir.DataType.INT64)),
         draft_length,
     )
+    # Dense batched state has one physical sequence length. Synchronize to the
+    # shortest verified prefix so every row can share the same rollback point.
+    synchronized_len = op.ReduceMin(accepted_count, axes=[0], keepdims=1)
+    accepted_count = op.Expand(synchronized_len, op.Shape(accepted_count))
+    synchronized_done = op.ReduceMin(
+        op.Cast(done, to=ir.DataType.INT64), axes=[0], keepdims=1
+    )
+    done = op.Expand(
+        op.Cast(synchronized_done, to=ir.DataType.BOOL),
+        op.Shape(done),
+    )
+    positions = op.Range(
+        op.Constant(value_int=0),
+        op.Squeeze(draft_length, op.Constant(value_ints=[0])),
+        op.Constant(value_int=1),
+    )
+    valid = op.Less(
+        op.Unsqueeze(positions, op.Constant(value_ints=[0])),
+        op.Unsqueeze(accepted_count, op.Constant(value_ints=[-1])),
+    )
+    accepted_tokens = op.Where(valid, accepted_tokens, zeros)
     next_offset = op.Add(
         offset,
         op.Squeeze(draft_length, op.Constant(value_ints=[0])),
@@ -845,6 +866,54 @@ def build_speculative_acceptance() -> PolicyComponent:
         },
         "verify",
     )
+
+
+def build_speculative_state_rollback(
+    dtype: ir.DataType,
+    shape: list[int | str],
+    *,
+    sequence_axis: int,
+    effect: str = "rollback",
+) -> PolicyComponent:
+    """Trim tentative recurrent state to ``past_length + accepted_length``."""
+    if not 0 <= sequence_axis < len(shape):
+        raise ValueError("sequence_axis must index the state shape")
+    graph, builder = _make_graph("speculative_state_rollback")
+    op = builder.op
+    past = builder.input("past_state", dtype, shape)
+    tentative_shape = list(shape)
+    tentative_shape[sequence_axis] = "tentative_sequence"
+    tentative = builder.input("tentative_state", dtype, tentative_shape)
+    accepted_len = builder.input("accepted_len", ir.DataType.INT64, ["batch"])
+    past_len = op.Shape(past, start=sequence_axis, end=sequence_axis + 1)
+    synchronized_len = op.ReduceMin(accepted_len, axes=[0], keepdims=1)
+    end = op.Add(past_len, synchronized_len)
+    corrected = op.Slice(
+        tentative,
+        op.Constant(value_ints=[0]),
+        end,
+        op.Constant(value_ints=[sequence_axis]),
+        op.Constant(value_ints=[1]),
+    )
+    corrected_shape = list(shape)
+    corrected_shape[sequence_axis] = "accepted_sequence"
+    corrected.shape = ir.Shape(corrected_shape)
+    builder.add_output(corrected, "corrected_state")
+    return _component(PolicyRole.AUXILIARY, graph, {}, effect)
+
+
+def build_effectful_identity(
+    name: str,
+    dtype: ir.DataType,
+    shape: list[int | str],
+    *,
+    effect: str,
+) -> PolicyComponent:
+    """Publish a typed branch-local state value with a linear effect."""
+    graph, builder = _make_graph(name)
+    value = builder.input("value", dtype, shape)
+    builder.add_output(builder.op.Identity(value), "next_value")
+    return _component(PolicyRole.AUXILIARY, graph, {}, effect)
 
 
 def build_token_block_identity() -> PolicyComponent:
