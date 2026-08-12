@@ -2103,12 +2103,18 @@ class Gemma4TextModel(nn.Module):
                 op.Sub(reduce_sum, one_i32),
                 to=ir.DataType.INT32,
             )
-            # Graph capture requires batch=1, so the first reduced sequence
-            # length is also the scalar total sequence length expected by GQA.
-            total_seq_len = op.Gather(
-                op.Cast(reduce_sum, to=ir.DataType.INT32),
-                op.Constant(value_int=0),
-            )
+            if caps.requires_graph_capture_rewrite:
+                # Graph capture requires batch=1, so the first reduced sequence
+                # length is also the scalar total sequence length expected by GQA.
+                total_seq_len = op.Gather(
+                    op.Cast(reduce_sum, to=ir.DataType.INT32),
+                    op.Constant(value_int=0),
+                )
+            else:
+                total_seq_len = op.Cast(
+                    op.Gather(op.Shape(attention_mask), 1),
+                    to=ir.DataType.INT32,
+                )
 
             # Per-layer-type GQA contexts with appropriate cos/sin caches
             # and local_window_size for sliding layers.

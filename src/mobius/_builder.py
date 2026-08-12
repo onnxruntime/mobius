@@ -221,9 +221,10 @@ def build_from_module(
             per-tensor FP8 scales (from offline calibration), used only when
             ``fp8_kv_cache`` is ``True``. Layers absent from the map use a unit
             scale of ``1.0``.
-        prune_prefill_prefix: When ``True``, discard prefill token positions
-            before the final token from the remaining decoder computation and
-            logits. Only supported by causal generation tasks.
+        prune_prefill_prefix: When ``True``, retain only the final sequence position
+            before the LM head so ``logits`` is shaped ``[B, 1, vocab]``. Some
+            models (e.g. Gemma 4) additionally prune decoder suffix computation
+            during prefill. Only supported by causal generation tasks.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
