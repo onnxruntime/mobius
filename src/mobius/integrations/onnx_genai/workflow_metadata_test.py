@@ -64,13 +64,14 @@ def test_language_diffusion_uses_exclusive_ssa_workflow():
 
     graph = workflow["graph"]
     assert graph["kind"] == "loop"
-    assert graph["condition"] == "denoiser.body.done"
+    assert graph["condition"] == "denoiser.body.continue"
     assert graph["max_iterations"] == "request.max_iterations"
     assert [node["component"] for node in graph["setup"]["nodes"]] == [
         "model",
         "masked_update",
     ]
     assert [node["kind"] for node in graph["body"]["nodes"]] == [
+        "invoke",
         "invoke",
         "invoke",
         "emit",

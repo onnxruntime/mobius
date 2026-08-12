@@ -1347,7 +1347,7 @@ def add_policy_components_to_workflow(
     workflow_dtypes = {"fp16": "float16", "bf16": "bfloat16", "fp32": "float32"}
     for name, component in policy_components.items():
         model = component.model
-        components[name] = {
+        declaration = {
             "implementation": {
                 "kind": "onnx",
                 "artifact": f"policies/{name}.onnx",
@@ -1378,9 +1378,11 @@ def add_policy_components_to_workflow(
                     for value in model.graph.outputs
                 },
             },
-            "policy": component.contract,
             "effects": list(component.effects),
         }
+        if component.contract:
+            declaration["policy"] = component.contract
+        components[name] = declaration
     return metadata
 
 
@@ -1649,7 +1651,6 @@ def build_native_vlm_package_metadata(
         "models": models,
         "dataflow": dataflow,
         "strategy": {"kind": "composite", "stages": stages},
-        "phases": phases,
         "vision": vision_config,
     }
     if positions is not None:
@@ -1994,7 +1995,7 @@ def build_diffusion_pipeline_metadata(
             "to": f"denoiser.{denoiser_sample_input}",
         },
     ]
-    phases: dict[str, Any] = {"denoiser": {"run_on": "every_step"}}
+    phases: dict[str, Any] = {}
 
     if text_encoder_filename is not None:
         models["text_encoder"] = {
@@ -2170,7 +2171,6 @@ def build_multimodal_pipeline_metadata(
         "models": models,
         "dataflow": dataflow,
         "strategy": {"kind": "composite", "stages": stages},
-        "phases": phases,
     }
     return metadata
 
@@ -2261,10 +2261,6 @@ def build_speech_to_text_pipeline_metadata(
                     "strategy": {"kind": "autoregressive", "decoder": "decoder"},
                 },
             ],
-        },
-        "phases": {
-            "encoder": {"run_on": "prompt_only"},
-            "decoder": {"run_on": "every_step"},
         },
     }
     return metadata

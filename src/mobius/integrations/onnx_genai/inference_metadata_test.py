@@ -789,15 +789,8 @@ class TestNativeVlmPackageMetadata:
                 "absent": {"kind": "zeros", "shape": [0, 64]},
             },
         }
-        assert emitted_yaml["pipeline"]["phases"]["vision_encoder"] == {
-            "run_on": "prompt_only",
-            "when_present": "image",
-        }
-        assert emitted_yaml["pipeline"]["phases"]["audio_encoder"] == {
-            "run_on": "prompt_only",
-            "when_present": "audio",
-        }
-        assert metadata["pipeline"]["phases"]["embedding"] == {"run_on": "every_step"}
+        assert "phases" not in emitted_yaml["pipeline"]
+        assert "phases" not in metadata["pipeline"]
         assert metadata["pipeline"]["models"]["embedding"]["io"]["token_input"] == "input_ids"
         assert metadata["pipeline"]["vision"]["token_count_source"] == "from_coordinates"
         assert metadata["pipeline"]["vision"]["token_pooling_factor"] == 9
@@ -1803,11 +1796,6 @@ class TestBuildMultimodalPipelineMetadata:
                             },
                         },
                     ],
-                },
-                "phases": {
-                    "vision_encoder": {"run_on": "prompt_only"},
-                    "embedding": {"run_on": "prompt_only"},
-                    "decoder": {"run_on": "every_step"},
                 },
             }
         }

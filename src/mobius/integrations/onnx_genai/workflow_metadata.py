@@ -15,6 +15,8 @@ from mobius._constants import OPSET_VERSION
 from mobius.generation import (
     PolicyCapabilities,
     attach_policy_components,
+    build_boolean_not,
+    build_last_token_logits,
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
     _port,
@@ -236,6 +238,8 @@ def build_decoder_workflow_metadata(
             token_state_update=True,
         ),
     )
+    pkg.add_policy_component("last_token_logits", build_last_token_logits())
+    pkg.add_policy_component("continue_predicate", build_boolean_not())
 
     inputs = list(decoder.graph.inputs)
     outputs = list(decoder.graph.outputs)
@@ -296,6 +300,10 @@ def build_decoder_workflow_metadata(
 
     batch_dimension = _shape_metadata(_port(token_input))[0]
     batch_int = {"dtype": "int64", "rank": 1, "shape": [batch_dimension]}
+    eos_token_id = getattr(config, "eos_token_id", 0)
+    if isinstance(eos_token_id, list):
+        eos_token_id = eos_token_id[0] if eos_token_id else 0
+    eos_token_id = int(eos_token_id or 0)
     workflow_inputs.update(
         {
             "request.max_iterations": {
@@ -311,14 +319,16 @@ def build_decoder_workflow_metadata(
             "package.eos_ids": {
                 "contract": {"dtype": "int64", "rank": 1, "shape": ["E"]},
                 "role": {"kind": "opaque"},
-                "source": {"kind": "application", "name": "eos_token_ids"},
+                "source": {"kind": "literal"},
                 "required": True,
+                "default": eos_token_id,
             },
             "loop.iteration": {
                 "contract": batch_int,
                 "role": {"kind": "opaque"},
-                "source": {"kind": "application", "name": "iteration"},
-                "required": True,
+                "source": {"kind": "literal"},
+                "required": False,
+                "default": 0,
             },
             "loop.token_slot": {
                 "contract": {
@@ -327,8 +337,23 @@ def build_decoder_workflow_metadata(
                     "shape": [batch_dimension, 1],
                 },
                 "role": {"kind": "opaque"},
-                "source": {"kind": "application", "name": "token_slot"},
-                "required": True,
+                "source": {"kind": "literal"},
+                "required": False,
+                "default": 0,
+            },
+            "package.one_token": {
+                "contract": batch_int,
+                "role": {"kind": "opaque"},
+                "source": {"kind": "literal"},
+                "required": False,
+                "default": 1,
+            },
+            "package.max_context": {
+                "contract": batch_int,
+                "role": {"kind": "opaque"},
+                "source": {"kind": "literal"},
+                "required": False,
+                "default": int(getattr(config, "max_position_embeddings", 4096)),
             },
         }
     )
@@ -393,7 +418,19 @@ def build_decoder_workflow_metadata(
             "contract": _contract(past),
             "scope": "invocation",
             "initializer": setup_value,
-            "recurrence": {"kind": "invariant"},
+            "recurrence": {
+                "kind": "growing",
+                "axis": next(
+                    (
+                        index
+                        for index, dimension in enumerate(_contract(past)["shape"])
+                        if "sequence" in str(dimension)
+                    ),
+                    2,
+                ),
+                "increment": "package.one_token",
+                "max": "package.max_context",
+            },
         }
         effect_name = f"state:{cell}"
         initial_effects[effect_name] = f"{effect_name}.0"
@@ -414,11 +451,40 @@ def build_decoder_workflow_metadata(
         "nodes": [
             _invoke(decoder_name, setup_decoder_inputs, setup_decoder_outputs),
             _invoke(
-                "token_sampler",
+                "last_token_logits",
                 {"logits": "decoder.setup.logits"},
+                {"last_logits": "decoder.setup.last_logits"},
+            ),
+            _invoke(
+                "token_sampler",
+                {"logits": "decoder.setup.last_logits"},
                 {"token": "sample.setup"},
                 {"sample": _effect("sample.0", "sample.1")},
             ),
+            _invoke(
+                "termination",
+                {
+                    "token_ids": "sample.setup",
+                    "eos_ids": "package.eos_ids",
+                    "iteration": "loop.iteration",
+                    "max_iterations": "request.max_iterations",
+                },
+                {"done": "setup.done"},
+                {"termination": _effect("termination.0", "termination.1")},
+            ),
+            _invoke(
+                "continue_predicate",
+                {"done": "setup.done"},
+                {"continue": "setup.continue"},
+            ),
+            {
+                "kind": "emit",
+                "value": "sample.setup",
+                "output": "tokens",
+                "mode": "append",
+                "effect_name": "emit",
+                "effect": _effect("emit.0", "emit.1"),
+            },
             _invoke(
                 "token_state_update",
                 {
@@ -435,8 +501,13 @@ def build_decoder_workflow_metadata(
         "nodes": [
             _invoke(decoder_name, body_decoder_inputs, body_decoder_outputs),
             _invoke(
-                "token_sampler",
+                "last_token_logits",
                 {"logits": "decoder.body.logits"},
+                {"last_logits": "decoder.body.last_logits"},
+            ),
+            _invoke(
+                "token_sampler",
+                {"logits": "decoder.body.last_logits"},
                 {"token": "sample.body"},
                 {"sample": _effect("sample.1", "sample.2")},
             ),
@@ -455,7 +526,12 @@ def build_decoder_workflow_metadata(
                     "max_iterations": "request.max_iterations",
                 },
                 {"done": "loop.done"},
-                {"termination": _effect("termination.0", "termination.1")},
+                {"termination": _effect("termination.1", "termination.2")},
+            ),
+            _invoke(
+                "continue_predicate",
+                {"done": "loop.done"},
+                {"continue": "loop.continue"},
             ),
             {
                 "kind": "emit",
@@ -463,7 +539,7 @@ def build_decoder_workflow_metadata(
                 "output": "tokens",
                 "mode": "append",
                 "effect_name": "emit",
-                "effect": _effect("emit.0", "emit.1"),
+                "effect": _effect("emit.1", "emit.2"),
             },
         ],
     }
@@ -496,7 +572,7 @@ def build_decoder_workflow_metadata(
             "kind": "loop",
             "setup": setup,
             "body": body,
-            "condition": "loop.done",
+            "condition": "loop.continue",
             "max_iterations": "request.max_iterations",
             "carried": carried,
         },
@@ -546,6 +622,7 @@ def build_language_diffusion_pipeline_metadata(
         )
 
     attach_policy_components(pkg, PolicyCapabilities(masked_update=True))
+    pkg.add_policy_component("continue_predicate", build_boolean_not())
 
     token_contract = _contract(token_input)
     mask_contract = {
@@ -601,12 +678,6 @@ def build_language_diffusion_pipeline_metadata(
             "required": False,
             "default": num_inference_steps,
         },
-        "loop.iteration": {
-            "contract": batch_int,
-            "role": {"kind": "opaque"},
-            "source": {"kind": "application", "name": "iteration"},
-            "required": True,
-        },
     }
 
     def denoiser_invoke(tokens: str, prefix: str) -> dict[str, Any]:
@@ -633,7 +704,7 @@ def build_language_diffusion_pipeline_metadata(
                 "current_tokens": tokens,
                 "proposed_tokens": f"{prefix}.proposal",
                 "masked": mask,
-                "step": "loop.iteration",
+                "step": offset,
                 "seed": "request.seed",
                 "offset": offset,
             },
@@ -671,6 +742,11 @@ def build_language_diffusion_pipeline_metadata(
                 "denoiser.body",
                 "update.1",
                 "update.2",
+            ),
+            _invoke(
+                "continue_predicate",
+                {"done": "denoiser.body.done"},
+                {"continue": "denoiser.body.continue"},
             ),
             {
                 "kind": "emit",
@@ -738,7 +814,7 @@ def build_language_diffusion_pipeline_metadata(
             "kind": "loop",
             "setup": setup,
             "body": body,
-            "condition": "denoiser.body.done",
+            "condition": "denoiser.body.continue",
             "max_iterations": "request.max_iterations",
             "carried": carried,
         },

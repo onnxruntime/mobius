@@ -12,9 +12,11 @@ from mobius.generation import (
     PolicyCapabilities,
     PolicyRole,
     attach_policy_components,
+    build_boolean_not,
     build_eos_termination,
     build_euler_solver_step,
     build_greedy_sampler,
+    build_last_token_logits,
     build_masked_token_update,
     build_seeded_categorical_sampler,
     build_speculative_acceptance,
@@ -36,6 +38,19 @@ def test_greedy_sampler_runtime(tmp_path):
         {"logits": np.array([[0.2, 0.7, 0.1], [2.0, 1.0, 3.0]], np.float32)},
     )
     np.testing.assert_array_equal(tokens, [1, 2])
+
+
+def test_last_token_logits_and_continue_predicate_runtime(tmp_path):
+    logits = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+    (last,) = _run(build_last_token_logits(), tmp_path, {"logits": logits})
+    np.testing.assert_array_equal(last, logits[:, -1, :])
+
+    (continued,) = _run(
+        build_boolean_not(),
+        tmp_path,
+        {"done": np.array([True, False])},
+    )
+    np.testing.assert_array_equal(continued, [False, True])
 
 
 def test_seeded_sampler_is_counter_based_and_reproducible(tmp_path):
@@ -95,10 +110,26 @@ def test_masked_update_runtime_parity(tmp_path):
             "offset": np.array([11], np.int64),
         },
     )
-    np.testing.assert_array_equal(outputs[0], [[1, 5, 6]])
-    np.testing.assert_array_equal(outputs[1], [[False, False, False]])
-    np.testing.assert_array_equal(outputs[2], [12])
-    np.testing.assert_array_equal(outputs[3], [True])
+    np.testing.assert_array_equal(outputs[0], [[1, 5, 99]])
+    np.testing.assert_array_equal(outputs[1], [[False, False, True]])
+    np.testing.assert_array_equal(outputs[2], [14])
+    np.testing.assert_array_equal(outputs[3], [False])
+
+    final = _run(
+        build_masked_token_update(),
+        tmp_path,
+        {
+            "current_tokens": outputs[0],
+            "proposed_tokens": np.array([[4, 5, 6]], np.int64),
+            "masked": outputs[1],
+            "step": outputs[2],
+            "seed": np.array([7], np.int64),
+            "offset": outputs[2],
+        },
+    )
+    np.testing.assert_array_equal(final[0], [[1, 5, 6]])
+    np.testing.assert_array_equal(final[1], [[False, False, False]])
+    np.testing.assert_array_equal(final[3], [True])
 
 
 def test_speculative_acceptance_prefix_runtime(tmp_path):

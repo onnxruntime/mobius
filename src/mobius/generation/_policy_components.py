@@ -34,6 +34,7 @@ class PolicyRole(StrEnum):
     MASKED_UPDATE = "masked_update"
     SPECULATIVE_ACCEPTANCE = "speculative_verifier"
     STATE_UPDATE = "state_update"
+    AUXILIARY = "auxiliary"
 
 
 @dataclass(frozen=True)
@@ -155,6 +156,30 @@ def build_greedy_sampler() -> PolicyComponent:
         },
         "sample",
     )
+
+
+def build_last_token_logits() -> PolicyComponent:
+    """Build ``[B,T,V] -> [B,V]`` selection for decoder sampling."""
+    graph, builder = _make_graph("last_token_logits")
+    logits = builder.input(
+        "logits",
+        dtype=ir.DataType.FLOAT,
+        shape=["batch", "sequence", "vocabulary"],
+    )
+    selected = builder.op.Gather(logits, builder.op.Constant(value_int=-1), axis=1)
+    selected.shape = ir.Shape(["batch", "vocabulary"])
+    builder.add_output(selected, "last_logits")
+    return _component(PolicyRole.AUXILIARY, graph, {})
+
+
+def build_boolean_not() -> PolicyComponent:
+    """Build an explicit ``continue = Not(done)`` predicate transform."""
+    graph, builder = _make_graph("boolean_not")
+    done = builder.input("done", dtype=ir.DataType.BOOL, shape=["batch"])
+    continued = builder.op.Not(done)
+    continued.shape = ir.Shape(["batch"])
+    builder.add_output(continued, "continue")
+    return _component(PolicyRole.AUXILIARY, graph, {})
 
 
 def build_seeded_categorical_sampler() -> PolicyComponent:
@@ -343,12 +368,32 @@ def build_masked_token_update() -> PolicyComponent:
     step = builder.input("step", ir.DataType.INT64, ["batch"])
     seed = builder.input("seed", ir.DataType.INT64, ["batch"])
     offset = builder.input("offset", ir.DataType.INT64, ["batch"])
-    updated = op.Where(masked, proposed, current)
-    # Consume the declared step without changing values; schedules that remask
-    # tokens can be expressed by a richer artifact with the same semantic ports.
-    updated = op.Add(updated, op.Unsqueeze(op.Mul(step, 0), op.Constant(value_ints=[-1])))
+    sequence_length = op.Shape(masked, start=1, end=2)
+    positions = op.Range(
+        op.Constant(value_int=0),
+        op.Squeeze(sequence_length, op.Constant(value_ints=[0])),
+        op.Constant(value_int=1),
+    )
+    positions = op.Unsqueeze(positions, op.Constant(value_ints=[0]))
+    stream = op.Add(
+        positions,
+        op.Unsqueeze(
+            seed,
+            op.Constant(value_ints=[-1]),
+        ),
+    )
+    bucket = op.Mod(stream, op.Constant(value_int=8), fmod=0)
+    scheduled = op.Less(
+        bucket,
+        op.Unsqueeze(
+            op.Min(op.Add(step, op.Constant(value_int=1)), op.Constant(value_int=8)),
+            op.Constant(value_ints=[-1]),
+        ),
+    )
+    committed = op.And(masked, scheduled)
+    updated = op.Where(committed, proposed, current)
     updated.shape = ir.Shape(["batch", "sequence"])
-    remaining = op.ConstantOfShape(op.Shape(masked), value=ir.tensor([False]))
+    remaining = op.And(masked, op.Not(committed))
     remaining.shape = ir.Shape(["batch", "sequence"])
     remaining_count = op.ReduceSum(
         op.Cast(remaining, to=ir.DataType.INT64),
@@ -358,7 +403,7 @@ def build_masked_token_update() -> PolicyComponent:
     done = op.Equal(remaining_count, op.Constant(value_int=0))
     done.shape = ir.Shape(["batch"])
     next_offset = op.Add(
-        op.Add(offset, op.Constant(value_int=1)),
+        op.Add(offset, op.Squeeze(sequence_length, op.Constant(value_ints=[0]))),
         op.Mul(seed, op.Constant(value_int=0)),
     )
     next_offset.shape = ir.Shape(["batch"])
