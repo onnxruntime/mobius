@@ -31,15 +31,18 @@ from mobius.components._rotary_embedding import apply_rotary_pos_emb
 class MuseGlimmerScaleFreeRMSNorm(nn.Module):
     """RMSNorm with no learned scale, evaluated in float32."""
 
-    def __init__(self, eps: float):
+    def __init__(self, normalized_size: int, eps: float):
         super().__init__()
+        # ONNX RMSNormalization requires a 1-D scale matching the normalized
+        # axis. A scalar happens to work on CPU but is invalid for CUDA kernels.
+        self._scale = [1.0] * normalized_size
         self._eps = eps
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
         hidden_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
         normalized = op.RMSNormalization(
             hidden_f32,
-            1.0,
+            op.Constant(value_floats=self._scale),
             epsilon=self._eps,
             stash_type=1,
             axis=-1,
@@ -106,7 +109,7 @@ class MuseGlimmerTextAttention(nn.Module):
             config.num_attention_heads * config.head_dim,
             bias=False,
         )
-        self.qk_norm = MuseGlimmerScaleFreeRMSNorm(config.rms_norm_eps)
+        self.qk_norm = MuseGlimmerScaleFreeRMSNorm(config.head_dim, config.rms_norm_eps)
 
     def forward(
         self,
@@ -261,7 +264,7 @@ class MuseGlimmerTextModel(nn.Module):
             config.hidden_size,
             config.pad_token_id,
         )
-        self.embed_norm = MuseGlimmerScaleFreeRMSNorm(config.rms_norm_eps)
+        self.embed_norm = MuseGlimmerScaleFreeRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.layers = nn.ModuleList(
             [MuseGlimmerTextDecoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
@@ -462,7 +465,9 @@ class MuseGlimmerVisionEncoderModel(nn.Module):
             config.hidden_size,
             bias=False,
         )
-        self.perception_emb_norm = MuseGlimmerScaleFreeRMSNorm(config.rms_norm_eps)
+        self.perception_emb_norm = MuseGlimmerScaleFreeRMSNorm(
+            config.hidden_size, config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -490,7 +495,7 @@ class MuseGlimmerEmbeddingModel(nn.Module):
             config.hidden_size,
             config.pad_token_id,
         )
-        self.embed_norm = MuseGlimmerScaleFreeRMSNorm(config.rms_norm_eps)
+        self.embed_norm = MuseGlimmerScaleFreeRMSNorm(config.hidden_size, config.rms_norm_eps)
         self._hidden_size = config.hidden_size
         self._image_token_id = config.image_token_id or 200092
         self._video_token_id = getattr(config, "video_token_id", 200091)

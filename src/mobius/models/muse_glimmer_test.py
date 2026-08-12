@@ -28,9 +28,11 @@ def test_scale_free_rms_norm_preserves_input_dtype(dtype):
     builder, op, _ = create_test_builder()
     hidden_states = create_test_input(builder, "hidden_states", [2, 3, 16], dtype)
 
-    output = MuseGlimmerScaleFreeRMSNorm(1e-5)(op, hidden_states)
+    output = MuseGlimmerScaleFreeRMSNorm(16, 1e-5)(op, hidden_states)
 
     assert output.dtype == dtype
+    rms_node = next(node for node in builder.graph if node.op_type == "RMSNormalization")
+    assert rms_node.inputs[1].shape == ir.Shape([16])
 
 
 def test_muse_glimmer_uses_fused_rms_normalization():
