@@ -1324,12 +1324,6 @@ def add_explicit_package_io(
     strategy = pipeline.get("strategy")
     if isinstance(strategy, dict):
         annotate_strategy(strategy)
-    if "model" in metadata:
-        decoder_names = [
-            name for name, model in models.items() if model.get("type") == "decoder"
-        ]
-        if decoder_names:
-            metadata["model"]["io"] = component_ios[decoder_names[0]]
     return metadata
 
 
@@ -1551,7 +1545,6 @@ def build_native_vlm_package_metadata(
             {
                 "name": f"run_{name}",
                 "strategy": strategy,
-                "run_on": phases[name]["run_on"],
             }
         )
 
@@ -1589,7 +1582,6 @@ def build_native_vlm_package_metadata(
     if decoder_io.get("token_input") and decoder_io.get("inputs_embeds_input"):
         capabilities.append("dual_sequence_inputs")
     metadata["required_capabilities"] = capabilities
-    metadata.setdefault("model", {})["io"] = decoder_io
     metadata["preprocessing"] = {
         "image": {
             "transforms": image_program.transforms(config, processor_values),
@@ -2015,7 +2007,7 @@ def build_diffusion_pipeline_metadata(
             "to": f"denoiser.{denoiser_sample_input}",
         },
     ]
-    phases: dict[str, Any] = {}
+    phases: dict[str, Any] = {"denoiser": {"run_on": "every_step"}}
 
     if text_encoder_filename is not None:
         models["text_encoder"] = {
@@ -2136,7 +2128,6 @@ def build_multimodal_pipeline_metadata(
             {
                 "name": stage_name,
                 "strategy": {"kind": "single_pass", "model": name},
-                "run_on": "prompt_only",
             }
         )
         phases[name] = {"run_on": "prompt_only"}
@@ -2177,12 +2168,10 @@ def build_multimodal_pipeline_metadata(
             {
                 "name": "fuse_embeddings",
                 "strategy": {"kind": "single_pass", "model": "embedding"},
-                "run_on": "prompt_only",
             },
             {
                 "name": "decode",
                 "strategy": {"kind": "autoregressive", "decoder": "decoder"},
-                "run_on": "every_step",
             },
         ]
     )
@@ -2279,12 +2268,10 @@ def build_speech_to_text_pipeline_metadata(
                 {
                     "name": "encode_audio",
                     "strategy": {"kind": "single_pass", "model": "encoder"},
-                    "run_on": "prompt_only",
                 },
                 {
                     "name": "decode_transcript",
                     "strategy": {"kind": "autoregressive", "decoder": "decoder"},
-                    "run_on": "every_step",
                 },
             ],
         },
@@ -2355,12 +2342,10 @@ def build_audio_codec_pipeline_metadata(
                     {
                         "name": "encode_waveform",
                         "strategy": {"kind": "single_pass", "model": "encoder"},
-                        "run_on": "prompt_only",
                     },
                     {
                         "name": "decode_waveform",
                         "strategy": {"kind": "single_pass", "model": "decoder"},
-                        "run_on": "prompt_only",
                     },
                 ],
             },
@@ -2522,7 +2507,6 @@ def build_tts_pipeline_metadata(
                 {
                     "name": "generate_codes",
                     "strategy": stage_strategy,
-                    "run_on": "every_step",
                 },
             ],
         },
