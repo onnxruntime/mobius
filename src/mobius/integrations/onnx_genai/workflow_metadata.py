@@ -79,6 +79,57 @@ def _effect(consumes: str, produces: str) -> dict[str, str]:
     return {"consumes": consumes, "produces": produces}
 
 
+def _name_image_preprocessing_program(image: dict[str, Any]) -> None:
+    """Convert structural preprocessing transforms into explicit typed SSA values."""
+    transforms = image["transforms"]
+    current: str | None = None
+    decoded: str | None = None
+    for index, transform in enumerate(transforms):
+        name = f"image.transform_{index}"
+        if transform["op"] in {"decode", "decode_rgb"}:
+            transform.pop("inputs", None)
+            decoded = name
+        else:
+            if current is None:
+                raise ValueError("image preprocessing must decode before transforming")
+            transform["inputs"] = [current]
+        transform["outputs"] = [name]
+        current = name
+    if current is None:
+        raise ValueError("image preprocessing must declare at least one transform")
+
+    derived_ops = {
+        "original_size": ("emit_original_size", decoded),
+        "transformed_size": ("emit_transformed_size", current),
+        "validity_mask": ("emit_validity_mask", current),
+        "patch_coordinates": ("emit_patch_coordinates", current),
+        "grid_dimensions": ("emit_grid_coordinates", current),
+    }
+    for output in image["outputs"]:
+        content = output["content"]
+        if content == "pixels":
+            output["source"] = current
+            continue
+        if content not in derived_ops:
+            raise ValueError(
+                f"image preprocessing output content {content!r} has no typed SSA producer"
+            )
+        operation, source = derived_ops[content]
+        if source is None:
+            raise ValueError(
+                f"image preprocessing output content {content!r} requires a decoded image"
+            )
+        name = f"image.output_{content}"
+        transforms.append(
+            {
+                "op": operation,
+                "inputs": [source],
+                "outputs": [name],
+            }
+        )
+        output["source"] = name
+
+
 def _invoke(
     component: str,
     inputs: dict[str, str],
@@ -2062,6 +2113,7 @@ def build_vlm_workflow_metadata(
     preprocessing = legacy.get("preprocessing")
     if not preprocessing or "image" not in preprocessing:
         raise ValueError("VLM workflow requires declared image preprocessing")
+    _name_image_preprocessing_program(preprocessing["image"])
     image_outputs = preprocessing["image"]["outputs"]
     vision_inputs = {value.name: value for value in vision.graph.inputs}
     adapter_outputs: dict[str, Any] = {}
@@ -2073,7 +2125,6 @@ def build_vlm_workflow_metadata(
             raise ValueError(f"preprocessing output {endpoint!r} has no vision input")
         output["contract"] = _contract(vision_inputs[port_name])
         output["dtype"] = output["contract"]["dtype"]
-        output["source"] = output["content"]
         output["name"] = f"image.{port_name}"
         adapter_outputs[port_name] = output["contract"]
         preprocessing_values[port_name] = output["name"]

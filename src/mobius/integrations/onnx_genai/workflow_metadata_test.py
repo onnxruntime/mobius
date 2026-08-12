@@ -11,9 +11,15 @@ import onnx_ir as ir
 import pytest
 
 from mobius._model_package import ModelPackage
+from mobius.integrations.onnx_genai.inference_metadata_test import (
+    _model,
+    _native_package,
+    _VlmConfig,
+)
 from mobius.integrations.onnx_genai.workflow_metadata import (
     build_language_diffusion_pipeline_metadata,
     build_speculative_workflow_metadata,
+    build_vlm_workflow_metadata,
     write_speculative_workflow_metadata,
 )
 
@@ -26,6 +32,46 @@ def test_speculative_writer_saves_policy_artifacts(tmp_path):
 
 def _value(name: str, dtype: ir.DataType, shape: list[int | str]) -> ir.Value:
     return ir.Value(name=name, type=ir.TensorType(dtype), shape=ir.Shape(shape))
+
+
+def test_vlm_preprocessing_is_explicit_typed_ssa(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text(
+        json.dumps({"use_hd_transform": True}), encoding="utf-8"
+    )
+    (source / "preprocessor_config.json").write_text(
+        json.dumps(
+            {
+                "dynamic_hd": 1,
+                "crop_size": 16,
+                "include_thumbnail": False,
+                "thumbnail_order": "none",
+                "mask_patch_size": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    vision = _model(
+        "vision_encoder",
+        [
+            _value("pixel_values", ir.DataType.FLOAT, [1, 3, 16, 16]),
+            _value("image_sizes", ir.DataType.INT64, [1, 2]),
+            _value("image_attention_mask", ir.DataType.FLOAT, [1, 16, 16]),
+        ],
+        [("image_features", ir.DataType.FLOAT, [1, 64])],
+    )
+
+    metadata = build_vlm_workflow_metadata(
+        _native_package(vision, _VlmConfig()),
+        _VlmConfig(),
+        source=str(source),
+    )
+    image = metadata["preprocessing"]["image"]
+    declared = {name for transform in image["transforms"] for name in transform["outputs"]}
+    assert "inputs" not in image["transforms"][0]
+    assert all("outputs" in transform for transform in image["transforms"])
+    assert all(output["source"] in declared for output in image["outputs"])
 
 
 def _masked_denoiser_package() -> ModelPackage:
@@ -170,9 +216,7 @@ def test_speculative_workflow_uses_branch_phi_effect_join_and_rng():
     acceptance = body[2]
     assert acceptance["inputs"]["offset"] == "state.rng_offset.body"
     assert acceptance["outputs"]["next_offset"] == "rng_offset.body"
-    rollback = next(
-        node for node in body if node.get("component") == "rollback_cache_0"
-    )
+    rollback = next(node for node in body if node.get("component") == "rollback_cache_0")
     assert rollback["inputs"]["accepted_len"] == "acceptance.length"
     assert branch["outputs"]["cache_0.next"]["cases"] == {
         "true": "branch.accepted.cache_0",
