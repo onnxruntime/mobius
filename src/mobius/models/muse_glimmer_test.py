@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+from collections import Counter
+
 import numpy as np
 import onnx_ir as ir
 import pytest
 import torch
 
+from mobius import build_from_module
 from mobius._configs import MuseGlimmerConfig
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius._weight_loading import apply_weights
@@ -16,6 +19,40 @@ from mobius.models.muse_glimmer import (
     MuseGlimmerTextCausalLMModel,
 )
 from mobius.tasks import MuseGlimmerVLTask
+
+
+def test_muse_glimmer_uses_fused_rms_normalization():
+    config = MuseGlimmerConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        num_hidden_layers=4,
+        vocab_size=256,
+        max_position_embeddings=128,
+        hidden_act="silu",
+        layer_types=[
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
+        ],
+        layer_rope_theta=[500_000.0, 500_000.0, 500_000.0, 0],
+        sliding_window=8,
+        pad_token_id=0,
+        rope_type="default",
+        rope_theta=500_000.0,
+        rms_norm_eps=1e-5,
+    )
+    module = MuseGlimmerTextCausalLMModel(config)
+    model = build_from_module(module, config, execution_provider="cuda")["model"]
+    counts = Counter(node.op_type for node in model.graph)
+
+    assert counts["RMSNormalization"] == 18
+    assert counts["SkipSimplifiedLayerNormalization"] == 8
+    assert counts["ReduceMean"] == 0
+    assert counts["Pow"] == 0
 
 
 def _hf_tiny_muse_glimmer():

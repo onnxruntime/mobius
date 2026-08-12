@@ -20,6 +20,7 @@ from mobius.components import (
     Embedding,
     Linear,
     MuseGlimmerVisionModel,
+    OffsetRMSNorm,
     RMSNorm,
     create_attention_bias,
     initialize_rope,
@@ -36,43 +37,17 @@ class MuseGlimmerScaleFreeRMSNorm(nn.Module):
         self._eps = eps
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
-        hidden_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
-        variance = op.ReduceMean(
-            op.Mul(hidden_f32, hidden_f32),
-            [-1],
-            keepdims=1,
+        return op.RMSNormalization(
+            hidden_states,
+            1.0,
+            epsilon=self._eps,
+            stash_type=1,
+            axis=-1,
         )
-        normalized = op.Mul(
-            hidden_f32,
-            op.Pow(op.Add(variance, self._eps), -0.5),
-        )
-        return op.CastLike(normalized, hidden_states)
 
 
-class MuseGlimmerCenteredRMSNorm(nn.Module):
+class MuseGlimmerCenteredRMSNorm(OffsetRMSNorm):
     """Centered RMSNorm whose checkpoint multiplier is stored as ``weight + 1``."""
-
-    def __init__(self, hidden_size: int, eps: float):
-        super().__init__()
-        self.weight = nn.Parameter([hidden_size])
-        self._eps = eps
-
-    def forward(self, op: OpBuilder, hidden_states: ir.Value):
-        hidden_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
-        variance = op.ReduceMean(
-            op.Mul(hidden_f32, hidden_f32),
-            [-1],
-            keepdims=1,
-        )
-        normalized = op.Mul(
-            hidden_f32,
-            op.Pow(op.Add(variance, self._eps), -0.5),
-        )
-        normalized = op.Mul(
-            normalized,
-            op.Add(op.Cast(self.weight, to=ir.DataType.FLOAT), 1.0),
-        )
-        return op.CastLike(normalized, hidden_states)
 
 
 class MuseGlimmerTextAttention(nn.Module):
