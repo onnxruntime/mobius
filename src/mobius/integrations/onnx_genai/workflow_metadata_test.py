@@ -30,6 +30,22 @@ def test_speculative_writer_saves_policy_artifacts(tmp_path):
     assert (tmp_path / "policies" / "branch_state.onnx").is_file()
 
 
+def test_speculative_emit_uses_accepted_prefix_length():
+    workflow = build_speculative_workflow_metadata(_speculative_package())["pipeline"][
+        "workflow"
+    ]
+    emit = next(node for node in workflow["graph"]["body"]["nodes"] if node["kind"] == "emit")
+    assert emit["valid_length"] == "acceptance.synchronized_length"
+    assert "emit_valid_length" in workflow["manifest"]["capabilities"]
+    assert workflow["outputs"]["tokens"]["contract"]["shape"][-1] == "accepted_sequence"
+    assert workflow["state"]["cache_0"]["recurrence"] == {
+        "kind": "bounded",
+        "axis": 2,
+        "max": "package.max_context",
+    }
+    assert workflow["inputs"]["package.max_context"]["default"] == 4096
+
+
 def _value(name: str, dtype: ir.DataType, shape: list[int | str]) -> ir.Value:
     return ir.Value(name=name, type=ir.TensorType(dtype), shape=ir.Shape(shape))
 
@@ -217,7 +233,7 @@ def test_speculative_workflow_uses_branch_phi_effect_join_and_rng():
     assert acceptance["inputs"]["offset"] == "state.rng_offset.body"
     assert acceptance["outputs"]["next_offset"] == "rng_offset.body"
     rollback = next(node for node in body if node.get("component") == "rollback_cache_0")
-    assert rollback["inputs"]["accepted_len"] == "acceptance.length"
+    assert rollback["inputs"]["accepted_len"] == "acceptance.synchronized_length"
     assert branch["outputs"]["cache_0.next"]["cases"] == {
         "true": "branch.accepted.cache_0",
         "false": "branch.corrected.cache_0",

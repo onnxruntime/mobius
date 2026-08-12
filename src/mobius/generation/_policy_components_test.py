@@ -312,7 +312,7 @@ def test_masked_update_runtime_parity(tmp_path):
 
 
 def test_speculative_acceptance_prefix_runtime(tmp_path):
-    accepted_tokens, count, done, next_offset = _run(
+    accepted_tokens, count, done, next_offset, synchronized_len, synchronized_done = _run(
         build_speculative_acceptance(),
         tmp_path,
         {
@@ -329,10 +329,12 @@ def test_speculative_acceptance_prefix_runtime(tmp_path):
     np.testing.assert_array_equal(count, [3])
     np.testing.assert_array_equal(done, [False])
     np.testing.assert_array_equal(next_offset, [12])
+    np.testing.assert_array_equal(synchronized_len, [3])
+    np.testing.assert_array_equal(synchronized_done, [False])
 
 
 def test_speculative_acceptance_synchronizes_batched_prefixes(tmp_path):
-    accepted_tokens, count, done, _ = _run(
+    accepted_tokens, count, done, _, synchronized_len, synchronized_done = _run(
         build_speculative_acceptance(),
         tmp_path,
         {
@@ -351,6 +353,8 @@ def test_speculative_acceptance_synchronizes_batched_prefixes(tmp_path):
     np.testing.assert_array_equal(count, [2, 2])
     np.testing.assert_array_equal(accepted_tokens, [[1, 0, 0, 0], [1, 0, 0, 0]])
     np.testing.assert_array_equal(done, [False, False])
+    np.testing.assert_array_equal(synchronized_len, [2])
+    np.testing.assert_array_equal(synchronized_done, [False])
 
 
 def test_speculative_state_rollback_trims_tentative_cache(tmp_path):

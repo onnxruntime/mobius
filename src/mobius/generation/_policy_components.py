@@ -965,11 +965,11 @@ def build_speculative_acceptance() -> PolicyComponent:
     # shortest verified prefix so every row can share the same rollback point.
     synchronized_len = op.ReduceMin(accepted_count, axes=[0], keepdims=1)
     accepted_count = op.Expand(synchronized_len, op.Shape(accepted_count))
-    synchronized_done = op.ReduceMin(op.Cast(done, to=ir.DataType.INT64), axes=[0], keepdims=1)
-    done = op.Expand(
-        op.Cast(synchronized_done, to=ir.DataType.BOOL),
-        op.Shape(done),
+    synchronized_done = op.Cast(
+        op.ReduceMin(op.Cast(done, to=ir.DataType.INT64), axes=[0], keepdims=1),
+        to=ir.DataType.BOOL,
     )
+    done = op.Expand(synchronized_done, op.Shape(done))
     positions = op.Range(
         op.Constant(value_int=0),
         op.Squeeze(draft_length, op.Constant(value_ints=[0])),
@@ -980,6 +980,7 @@ def build_speculative_acceptance() -> PolicyComponent:
         op.Unsqueeze(accepted_count, op.Constant(value_ints=[-1])),
     )
     accepted_tokens = op.Where(valid, accepted_tokens, zeros)
+    accepted_tokens.shape = ir.Shape(["batch", "draft_sequence"])
     next_offset = op.Add(
         offset,
         op.Squeeze(draft_length, op.Constant(value_ints=[0])),
@@ -987,11 +988,15 @@ def build_speculative_acceptance() -> PolicyComponent:
     next_offset = op.Add(next_offset, op.Mul(seed, op.Constant(value_int=0)))
     accepted_count.shape = ir.Shape(["batch"])
     done.shape = ir.Shape(["batch"])
+    synchronized_len.shape = ir.Shape([1])
+    synchronized_done.shape = ir.Shape([1])
     next_offset.shape = ir.Shape(["batch"])
     builder.add_output(accepted_tokens, "accepted_tokens")
     builder.add_output(accepted_count, "accepted_len")
     builder.add_output(done, "done")
     builder.add_output(next_offset, "next_offset")
+    builder.add_output(synchronized_len, "synchronized_len")
+    builder.add_output(synchronized_done, "synchronized_done")
     return _component(
         PolicyRole.SPECULATIVE_ACCEPTANCE,
         graph,
@@ -1029,10 +1034,9 @@ def build_speculative_state_rollback(
     tentative_shape = list(shape)
     tentative_shape[sequence_axis] = "tentative_sequence"
     tentative = builder.input("tentative_state", dtype, tentative_shape)
-    accepted_len = builder.input("accepted_len", ir.DataType.INT64, ["batch"])
+    accepted_len = builder.input("accepted_len", ir.DataType.INT64, [1])
     past_len = op.Shape(past, start=sequence_axis, end=sequence_axis + 1)
-    synchronized_len = op.ReduceMin(accepted_len, axes=[0], keepdims=1)
-    end = op.Add(past_len, synchronized_len)
+    end = op.Add(past_len, accepted_len)
     corrected = op.Slice(
         tentative,
         op.Constant(value_ints=[0]),

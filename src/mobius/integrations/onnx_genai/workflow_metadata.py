@@ -2586,8 +2586,12 @@ def write_vlm_workflow_metadata(
     return path
 
 
-def build_speculative_workflow_metadata(pkg: Any) -> dict[str, Any]:
+def build_speculative_workflow_metadata(
+    pkg: Any,
+    config: Any | None = None,
+) -> dict[str, Any]:
     """Build proposer/verifier workflow with branch phi and effect joins."""
+    config = config or getattr(pkg, "config", None)
     if not {"proposer", "verifier"} <= set(pkg.keys()):
         raise ValueError("speculative workflow requires proposer and verifier")
     proposer = pkg["proposer"]
@@ -2667,6 +2671,13 @@ def build_speculative_workflow_metadata(pkg: Any) -> dict[str, Any]:
             "source": {"kind": "literal"},
             "required": False,
             "default": 1,
+        },
+        "package.max_context": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": int(getattr(config, "max_position_embeddings", 4096)),
         },
         "package.false": {
             "contract": batch_bool,
@@ -2814,7 +2825,7 @@ def build_speculative_workflow_metadata(pkg: Any) -> dict[str, Any]:
                 {
                     "past_state": f"state.{cache_name}.body",
                     "tentative_state": f"verifier.{present.name}",
-                    "accepted_len": "acceptance.length",
+                    "accepted_len": "acceptance.synchronized_length",
                 },
                 {"corrected_state": f"rollback.{cache_name}"},
                 {
@@ -2867,7 +2878,7 @@ def build_speculative_workflow_metadata(pkg: Any) -> dict[str, Any]:
         }
     branch = {
         "kind": "branch",
-        "predicate": "acceptance.done",
+        "predicate": "acceptance.synchronized_done",
         "cases": {
             "true": {"kind": "sequence", "nodes": accepted_case_nodes},
             "false": {"kind": "sequence", "nodes": corrected_case_nodes},
@@ -2886,6 +2897,8 @@ def build_speculative_workflow_metadata(pkg: Any) -> dict[str, Any]:
                 "accepted_len": "acceptance.length",
                 "done": "acceptance.done",
                 "next_offset": "rng_offset.body",
+                "synchronized_len": "acceptance.synchronized_length",
+                "synchronized_done": "acceptance.synchronized_done",
             },
             {"verify": _effect("verify.0", "verify.1")},
         ),
@@ -2899,6 +2912,7 @@ def build_speculative_workflow_metadata(pkg: Any) -> dict[str, Any]:
         {
             "kind": "emit",
             "value": "tokens.next",
+            "valid_length": "acceptance.synchronized_length",
             "output": "tokens",
             "mode": "append",
             "effect_name": "emit",
@@ -2943,7 +2957,7 @@ def build_speculative_workflow_metadata(pkg: Any) -> dict[str, Any]:
             "scope": "invocation",
             "initializer": initializer,
             "recurrence": {
-                "kind": "growing",
+                "kind": "bounded",
                 "axis": next(
                     (
                         axis
@@ -2952,8 +2966,7 @@ def build_speculative_workflow_metadata(pkg: Any) -> dict[str, Any]:
                     ),
                     2,
                 ),
-                "increment": "package.one",
-                "max": "request.max_iterations",
+                "max": "package.max_context",
             },
         }
         state_specs.append(
@@ -2998,12 +3011,20 @@ def build_speculative_workflow_metadata(pkg: Any) -> dict[str, Any]:
                 "nested_control_flow",
                 "loop_induction_values",
                 "typed_emit",
+                "emit_valid_length",
+                "bounded_state_recurrence",
             ],
         },
         "inputs": inputs,
         "outputs": {
             "tokens": {
-                "contract": _contract(proposed_tokens),
+                "contract": {
+                    **_contract(proposed_tokens),
+                    "shape": [
+                        *_contract(proposed_tokens)["shape"][:-1],
+                        "accepted_sequence",
+                    ],
+                },
                 "role": "tokens",
                 "stage": "pre_adapter",
             }
