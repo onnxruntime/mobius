@@ -1251,6 +1251,12 @@ def build_vlm_workflow_metadata(
 
     setup_decoder_outputs = {logits_output.name: "decoder.setup.logits"}
     body_decoder_outputs = {logits_output.name: "decoder.body.logits"}
+    logits_contract = _contract(logits_output)
+    last_logits_contract = {
+        "dtype": logits_contract["dtype"],
+        "rank": 2,
+        "shape": [logits_contract["shape"][0], logits_contract["shape"][-1]],
+    }
     state: dict[str, Any] = {
         "token": {
             "contract": {"dtype": "int64", "rank": 2, "shape": [batch, 1]},
@@ -1259,9 +1265,9 @@ def build_vlm_workflow_metadata(
             "recurrence": {"kind": "invariant"},
         },
         "logits": {
-            "contract": _contract(logits_output),
+            "contract": last_logits_contract,
             "scope": "invocation",
-            "initializer": "decoder.setup.logits",
+            "initializer": "decoder.setup.last_logits",
             "recurrence": {"kind": "invariant"},
         },
         "attention_mask": {
@@ -1290,9 +1296,9 @@ def build_vlm_workflow_metadata(
         ),
         (
             "logits",
-            "decoder.setup.logits",
+            "decoder.setup.last_logits",
             "state.logits.body",
-            "decoder.body.logits",
+            "decoder.body.last_logits",
             "state.logits.final",
         ),
         (
@@ -1410,19 +1416,19 @@ def build_vlm_workflow_metadata(
                 {embedding_output.name: "embedding.setup.embeds"},
             ),
             _invoke("decoder", setup_decoder_inputs, setup_decoder_outputs),
+            _invoke(
+                "last_token_logits",
+                {"logits": "decoder.setup.logits"},
+                {"last_logits": "decoder.setup.last_logits"},
+            ),
         ],
     }
     body = {
         "kind": "sequence",
         "nodes": [
             _invoke(
-                "last_token_logits",
-                {"logits": "state.logits.body"},
-                {"last_logits": "decoder.body.last_logits"},
-            ),
-            _invoke(
                 "token_sampler",
-                {"logits": "decoder.body.last_logits"},
+                {"logits": "state.logits.body"},
                 {"token": "sample.body"},
                 {"sample": _effect("sample.0", "sample.1")},
             ),
@@ -1462,6 +1468,11 @@ def build_vlm_workflow_metadata(
                 {embedding_output.name: "embedding.body.embeds"},
             ),
             _invoke("decoder", body_decoder_inputs, body_decoder_outputs),
+            _invoke(
+                "last_token_logits",
+                {"logits": "decoder.body.logits"},
+                {"last_logits": "decoder.body.last_logits"},
+            ),
             _invoke(
                 "decoder_step_update",
                 {
@@ -2146,6 +2157,12 @@ def build_decoder_workflow_metadata(
 
     setup_decoder_outputs = {logits_output.name: "decoder.setup.logits"}
     body_decoder_outputs = {logits_output.name: "decoder.body.logits"}
+    logits_contract = _contract(logits_output)
+    last_logits_contract = {
+        "dtype": logits_contract["dtype"],
+        "rank": 2,
+        "shape": [logits_contract["shape"][0], logits_contract["shape"][-1]],
+    }
     state: dict[str, Any] = {
         "token": {
             "contract": {
@@ -2164,9 +2181,9 @@ def build_decoder_workflow_metadata(
             "recurrence": {"kind": "invariant"},
         },
         "logits": {
-            "contract": _contract(logits_output),
+            "contract": last_logits_contract,
             "scope": "invocation",
-            "initializer": "decoder.setup.logits",
+            "initializer": "decoder.setup.last_logits",
             "recurrence": {"kind": "invariant"},
         },
     }
@@ -2203,9 +2220,9 @@ def build_decoder_workflow_metadata(
             },
             {
                 "cell": "logits",
-                "current": "decoder.setup.logits",
+                "current": "decoder.setup.last_logits",
                 "body_input": "state.logits.body",
-                "body_output": "decoder.body.logits",
+                "body_output": "decoder.body.last_logits",
                 "next": "state.logits.final",
                 "read_effect": _effect("state:logits.0", "state:logits.read"),
                 "write_effect": _effect("state:logits.read", "state:logits.1"),
@@ -2320,19 +2337,19 @@ def build_decoder_workflow_metadata(
                 },
             ),
             _invoke(decoder_name, setup_decoder_inputs, setup_decoder_outputs),
+            _invoke(
+                "last_token_logits",
+                {"logits": "decoder.setup.logits"},
+                {"last_logits": "decoder.setup.last_logits"},
+            ),
         ],
     }
     body = {
         "kind": "sequence",
         "nodes": [
             _invoke(
-                "last_token_logits",
-                {"logits": "state.logits.body"},
-                {"last_logits": "decoder.body.last_logits"},
-            ),
-            _invoke(
                 "token_sampler",
-                {"logits": "decoder.body.last_logits"},
+                {"logits": "state.logits.body"},
                 {"token": "sample.body"},
                 {"sample": _effect("sample.0", "sample.1")},
             ),
@@ -2383,6 +2400,11 @@ def build_decoder_workflow_metadata(
                 {"next_value": "iteration.body"},
             ),
             _invoke(decoder_name, body_decoder_inputs, body_decoder_outputs),
+            _invoke(
+                "last_token_logits",
+                {"logits": "decoder.body.logits"},
+                {"last_logits": "decoder.body.last_logits"},
+            ),
             _invoke(
                 "decoder_step_update",
                 {

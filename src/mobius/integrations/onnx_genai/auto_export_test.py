@@ -167,12 +167,19 @@ def test_dispatch_decoder(tmp_path):
     assert [node["component"] for node in workflow["graph"]["setup"]["nodes"]] == [
         "decoder_state_initializer",
         "model",
+        "last_token_logits",
     ]
     body = workflow["graph"]["body"]["nodes"]
     assert [node["kind"] for node in body].count("emit") == 1
     assert next(node for node in body if node["kind"] == "emit")["value"] == "sample.body"
     assert workflow["state"]["iteration"]["initializer"] == "package.zero_iteration"
     assert workflow["state"]["token"]["initializer"] == "initializer.token_slot"
+    assert workflow["state"]["logits"] == {
+        "contract": {"dtype": "float32", "rank": 2, "shape": ["batch", 128]},
+        "scope": "invocation",
+        "initializer": "decoder.setup.last_logits",
+        "recurrence": {"kind": "invariant"},
+    }
     assert (tmp_path / "policies" / "token_sampler.onnx").is_file()
 
 
@@ -371,6 +378,12 @@ def test_dispatch_vision_multimodal_pipeline(tmp_path):
     assert workflow["graph"]["setup"]["nodes"][1]["component"] == "vision_encoder"
     assert workflow["graph"]["setup"]["nodes"][3]["component"] == "embedding"
     assert workflow["graph"]["iteration"]["value"] == "loop.iteration"
+    assert workflow["state"]["logits"]["contract"] == {
+        "dtype": "float32",
+        "rank": 2,
+        "shape": ["batch", 128],
+    }
+    assert workflow["state"]["logits"]["initializer"] == "decoder.setup.last_logits"
     assert (tmp_path / "policies" / "token_sampler.onnx").is_file()
 
 
