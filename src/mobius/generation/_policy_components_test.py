@@ -309,7 +309,7 @@ def test_masked_update_runtime_parity(tmp_path):
 
 
 def test_speculative_acceptance_prefix_runtime(tmp_path):
-    accepted_tokens, count, done = _run(
+    accepted_tokens, count, done, next_offset = _run(
         build_speculative_acceptance(),
         tmp_path,
         {
@@ -318,11 +318,14 @@ def test_speculative_acceptance_prefix_runtime(tmp_path):
                 np.float32,
             ),
             "proposed_tokens": np.array([[1, 0, 0, 0]], np.int64),
+            "seed": np.array([3], np.int64),
+            "offset": np.array([8], np.int64),
         },
     )
     np.testing.assert_array_equal(accepted_tokens, [[1, 0, 0, 0]])
     np.testing.assert_array_equal(count, [2])
     np.testing.assert_array_equal(done, [False])
+    np.testing.assert_array_equal(next_offset, [12])
 
 
 def test_token_state_update_runtime(tmp_path):

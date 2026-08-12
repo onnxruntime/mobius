@@ -34,6 +34,7 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     write_decoder_workflow_metadata,
     write_diffusion_workflow_metadata,
     write_language_diffusion_workflow_metadata,
+    write_speculative_workflow_metadata,
     write_tts_workflow_metadata,
     write_vlm_workflow_metadata,
 )
@@ -312,6 +313,13 @@ def _looks_like_multi_decoder_tts(pkg: Any) -> bool:
     return {"talker", "code_predictor"} <= names
 
 
+def _looks_like_speculative(pkg: Any) -> bool:
+    try:
+        return {"proposer", "verifier"} <= set(pkg.keys())
+    except AttributeError:
+        return False
+
+
 def _has_tts_pre_embedder(pkg: Any) -> bool:
     """True when a multi-decoder TTS package carries the pre-embedder component.
 
@@ -482,6 +490,10 @@ def write_onnx_genai_config(
         # A neural codec produces tensors (waveform), not tokens, so it needs no
         # decoder config — emit before the config requirement below.
         path = write_audio_codec_workflow_metadata(pkg, output_dir)
+        return {"inference_metadata": path}
+
+    if _looks_like_speculative(pkg):
+        path = write_speculative_workflow_metadata(pkg, output_dir)
         return {"inference_metadata": path}
 
     resolved_config = config if config is not None else getattr(pkg, "config", None)

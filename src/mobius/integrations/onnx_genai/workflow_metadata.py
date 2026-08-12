@@ -26,6 +26,7 @@ from mobius.generation import (
     build_last_token_logits,
     build_model_token_cast,
     build_schedule_constant,
+    build_token_block_identity,
     build_tts_state_initializer,
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
@@ -1447,6 +1448,360 @@ def write_vlm_workflow_metadata(
 ) -> str:
     os.makedirs(output_dir, exist_ok=True)
     metadata = build_vlm_workflow_metadata(pkg, config, source=source)
+    path = os.path.join(output_dir, "inference_metadata.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(metadata, handle, sort_keys=False)
+    return path
+
+
+def build_speculative_workflow_metadata(pkg: Any) -> dict[str, Any]:
+    """Build proposer/verifier workflow with branch phi and effect joins."""
+    if not {"proposer", "verifier"} <= set(pkg.keys()):
+        raise ValueError("speculative workflow requires proposer and verifier")
+    proposer = pkg["proposer"]
+    verifier = pkg["verifier"]
+    proposer_input = next(
+        (
+            value
+            for value in proposer.graph.inputs
+            if value.dtype in {ir.DataType.INT32, ir.DataType.INT64}
+            and value.shape is not None
+            and len(value.shape) == 2
+        ),
+        None,
+    )
+    proposed_tokens = _find_port(proposer.graph.outputs, "proposed", "tokens")
+    proposal_scores = _find_port(proposer.graph.outputs, "scores", "logits")
+    verifier_token_input = next(
+        (
+            value
+            for value in verifier.graph.inputs
+            if proposed_tokens is not None and _contract(value) == _contract(proposed_tokens)
+        ),
+        None,
+    )
+    target_scores = _find_port(verifier.graph.outputs, "scores", "logits")
+    if None in (proposer_input, proposed_tokens, verifier_token_input, target_scores):
+        raise ValueError("speculative components do not expose compatible token/score ports")
+    assert proposer_input is not None
+    assert proposed_tokens is not None
+    assert verifier_token_input is not None
+    assert target_scores is not None
+    if _contract(proposer_input) != _contract(proposed_tokens):
+        raise ValueError(
+            "representative speculative workflow requires fixed token-block shape"
+        )
+
+    attach_policy_components(pkg, PolicyCapabilities(speculative_acceptance=True))
+    pkg.add_policy_component("continue_predicate", build_boolean_not())
+    pkg.add_policy_component("branch_state", build_token_block_identity())
+    batch = _contract(proposer_input)["shape"][0]
+    batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
+    batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch]}
+    inputs: dict[str, Any] = {
+        "request.tokens": {
+            "contract": _contract(proposer_input),
+            "role": {"kind": "runtime", "version": "1.0", "role": "prompt_tokens"},
+            "source": {"kind": "request", "field": "prompt_tokens"},
+            "required": True,
+        },
+        "request.seed": {
+            "contract": batch_int,
+            "role": {"kind": "runtime", "version": "1.0", "role": "seed"},
+            "source": {"kind": "request", "field": "seed"},
+            "required": False,
+            "default": 0,
+        },
+        "request.max_iterations": {
+            "contract": batch_int,
+            "role": {
+                "kind": "runtime",
+                "version": "1.0",
+                "role": "max_output_tokens",
+            },
+            "source": {"kind": "request", "field": "max_output_tokens"},
+            "required": True,
+        },
+        "package.zero": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 0,
+        },
+        "package.one": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 1,
+        },
+        "package.false": {
+            "contract": batch_bool,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": False,
+        },
+    }
+
+    proposer_inputs = {proposer_input.name: "state.tokens.body"}
+    for value in proposer.graph.inputs:
+        if value is proposer_input:
+            continue
+        name = f"request.proposer.{value.name}"
+        inputs[name] = {
+            "contract": _contract(value),
+            "role": {"kind": "opaque"},
+            "source": {"kind": "application", "name": f"proposer.{value.name}"},
+            "required": True,
+        }
+        proposer_inputs[value.name] = name
+    verifier_inputs = {verifier_token_input.name: "proposal.tokens"}
+    verifier_outputs = {target_scores.name: "target.scores"}
+    cache_pairs: list[tuple[ir.Value, ir.Value]] = []
+    verifier_output_map = {value.name: value for value in verifier.graph.outputs}
+    for value in verifier.graph.inputs:
+        if value is verifier_token_input:
+            continue
+        present = next(
+            (
+                verifier_output_map.get(name)
+                for name in (
+                    value.name.replace("past_key_values", "present"),
+                    value.name.replace("past.", "present."),
+                )
+                if name in verifier_output_map
+            ),
+            None,
+        )
+        if present is not None:
+            cell = f"cache_{len(cache_pairs)}"
+            cache_pairs.append((value, present))
+            name = f"request.verifier.{value.name}"
+            inputs[name] = {
+                "contract": _contract(value),
+                "role": {"kind": "opaque"},
+                "source": {"kind": "application", "name": f"verifier.{value.name}"},
+                "required": True,
+            }
+            verifier_inputs[value.name] = f"state.{cell}.body"
+            verifier_outputs[present.name] = f"verifier.{present.name}"
+        else:
+            name = f"request.verifier.{value.name}"
+            inputs[name] = {
+                "contract": _contract(value),
+                "role": {"kind": "opaque"},
+                "source": {"kind": "application", "name": f"verifier.{value.name}"},
+                "required": True,
+            }
+            verifier_inputs[value.name] = name
+
+    proposal_outputs = {proposed_tokens.name: "proposal.tokens"}
+    acceptance_inputs = {
+        "target_scores": "target.scores",
+        "proposed_tokens": "proposal.tokens",
+        "seed": "request.seed",
+        "offset": "state.rng_offset.body",
+    }
+    if proposal_scores is not None:
+        proposal_outputs[proposal_scores.name] = "proposal.scores"
+    branch = {
+        "kind": "branch",
+        "predicate": "acceptance.done",
+        "cases": {
+            "true": _invoke(
+                "branch_state",
+                {"tokens": "acceptance.tokens"},
+                {"next_tokens": "branch.accepted"},
+                {"state": _effect("branch.state.in", "branch.state.accepted")},
+            ),
+            "false": _invoke(
+                "branch_state",
+                {"tokens": "proposal.tokens"},
+                {"next_tokens": "branch.corrected"},
+                {"state": _effect("branch.state.in", "branch.state.corrected")},
+            ),
+        },
+        "outputs": {
+            "tokens.next": {
+                "cases": {
+                    "true": "branch.accepted",
+                    "false": "branch.corrected",
+                }
+            }
+        },
+        "effects": {
+            "state": {
+                "incoming": "branch.state.in",
+                "cases": {
+                    "true": "branch.state.accepted",
+                    "false": "branch.state.corrected",
+                },
+                "produces": "branch.state.out",
+            }
+        },
+    }
+    body_nodes = [
+        _invoke("proposer", proposer_inputs, proposal_outputs),
+        _invoke("verifier", verifier_inputs, verifier_outputs),
+        _invoke(
+            "speculative_acceptance",
+            acceptance_inputs,
+            {
+                "accepted_tokens": "acceptance.tokens",
+                "accepted_len": "acceptance.length",
+                "done": "acceptance.done",
+                "next_offset": "rng_offset.body",
+            },
+            {"verify": _effect("verify.0", "verify.1")},
+        ),
+        branch,
+        _invoke(
+            "continue_predicate",
+            {"done": "package.false"},
+            {"continue": "speculative.continue"},
+        ),
+        {
+            "kind": "emit",
+            "value": "tokens.next",
+            "output": "tokens",
+            "mode": "append",
+            "effect_name": "emit",
+            "effect": _effect("emit.0", "emit.1"),
+        },
+    ]
+    state = {
+        "tokens": {
+            "contract": _contract(proposer_input),
+            "scope": "invocation",
+            "initializer": "request.tokens",
+            "recurrence": {"kind": "invariant"},
+        },
+        "rng_offset": {
+            "contract": batch_int,
+            "scope": "invocation",
+            "initializer": "package.zero",
+            "recurrence": {"kind": "invariant"},
+        },
+    }
+    state_specs = [
+        (
+            "tokens",
+            "request.tokens",
+            "state.tokens.body",
+            "tokens.next",
+            "state.tokens.final",
+        ),
+        (
+            "rng_offset",
+            "package.zero",
+            "state.rng_offset.body",
+            "rng_offset.body",
+            "state.rng_offset.final",
+        ),
+    ]
+    for index, (past, present) in enumerate(cache_pairs):
+        cell = f"cache_{index}"
+        initializer = f"request.verifier.{past.name}"
+        state[cell] = {
+            "contract": _contract(past),
+            "scope": "invocation",
+            "initializer": initializer,
+            "recurrence": {
+                "kind": "growing",
+                "axis": next(
+                    (
+                        axis
+                        for axis, dimension in enumerate(_contract(past)["shape"])
+                        if "sequence" in str(dimension)
+                    ),
+                    2,
+                ),
+                "increment": "package.one",
+                "max": "request.max_iterations",
+            },
+        }
+        state_specs.append(
+            (
+                cell,
+                initializer,
+                f"state.{cell}.body",
+                f"verifier.{present.name}",
+                f"state.{cell}.final",
+            )
+        )
+    initial_effects = {
+        "verify": "verify.0",
+        "emit": "emit.0",
+        "state": "branch.state.in",
+    }
+    carried = []
+    for cell, current, body_input, body_output, final in state_specs:
+        effect = f"state:{cell}"
+        initial_effects[effect] = f"{effect}.0"
+        carried.append(
+            {
+                "cell": cell,
+                "current": current,
+                "body_input": body_input,
+                "body_output": body_output,
+                "next": final,
+                "read_effect": _effect(f"{effect}.0", f"{effect}.read"),
+                "write_effect": _effect(f"{effect}.read", f"{effect}.1"),
+            }
+        )
+    workflow = {
+        "manifest": {
+            "ir_version": "1.0",
+            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
+            "capabilities": [
+                "workflow_ssa",
+                "linear_effects",
+                "nested_control_flow",
+                "typed_emit",
+            ],
+        },
+        "inputs": inputs,
+        "outputs": {
+            "tokens": {
+                "contract": _contract(proposed_tokens),
+                "role": "tokens",
+                "stage": "pre_adapter",
+            }
+        },
+        "components": {
+            name: _component(model, _artifact(name, len(pkg))) for name, model in pkg.items()
+        },
+        "state": state,
+        "initial_effects": initial_effects,
+        "graph": {
+            "kind": "loop",
+            "setup": {
+                "kind": "sequence",
+                "nodes": [
+                    _invoke(
+                        "continue_predicate",
+                        {"done": "package.false"},
+                        {"continue": "speculative.setup.continue"},
+                    )
+                ],
+            },
+            "body": {"kind": "sequence", "nodes": body_nodes},
+            "condition": "speculative.continue",
+            "max_iterations": "request.max_iterations",
+            "iteration": {"value": "speculative.iteration", "contract": batch_int},
+            "carried": carried,
+        },
+    }
+    metadata = {"schema_version": "v1", "pipeline": {"workflow": workflow}}
+    add_policy_components_to_workflow(metadata, pkg)
+    return metadata
+
+
+def write_speculative_workflow_metadata(pkg: Any, output_dir: str) -> str:
+    os.makedirs(output_dir, exist_ok=True)
+    metadata = build_speculative_workflow_metadata(pkg)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(metadata, handle, sort_keys=False)

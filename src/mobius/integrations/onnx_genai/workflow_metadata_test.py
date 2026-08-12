@@ -13,6 +13,7 @@ import pytest
 from mobius._model_package import ModelPackage
 from mobius.integrations.onnx_genai.workflow_metadata import (
     build_language_diffusion_pipeline_metadata,
+    build_speculative_workflow_metadata,
 )
 
 
@@ -97,3 +98,69 @@ def test_language_diffusion_matches_pr_828_schema():
         num_inference_steps=8,
     )
     jsonschema.validate(instance=metadata, schema=schema)
+
+
+def _graph_model(
+    name: str,
+    inputs: list[ir.Value],
+    outputs: list[ir.Value],
+) -> ir.Model:
+    return ir.Model(
+        ir.Graph(
+            inputs=inputs,
+            outputs=outputs,
+            nodes=[],
+            name=name,
+            opset_imports={"": 24},
+        ),
+        ir_version=11,
+    )
+
+
+def _speculative_package() -> ModelPackage:
+    proposer = _graph_model(
+        "proposer",
+        [_value("tokens", ir.DataType.INT64, ["batch", 4])],
+        [
+            _value("proposed_tokens", ir.DataType.INT64, ["batch", 4]),
+            _value("proposal_scores", ir.DataType.FLOAT, ["batch", 4, 32]),
+        ],
+    )
+    verifier = _graph_model(
+        "verifier",
+        [
+            _value("proposed_tokens", ir.DataType.INT64, ["batch", 4]),
+            _value(
+                "past_key_values.0.key",
+                ir.DataType.FLOAT,
+                ["batch", 2, "past_sequence", 8],
+            ),
+        ],
+        [
+            _value("target_scores", ir.DataType.FLOAT, ["batch", 4, 32]),
+            _value(
+                "present.0.key",
+                ir.DataType.FLOAT,
+                ["batch", 2, "past_sequence + 4", 8],
+            ),
+        ],
+    )
+    return ModelPackage({"proposer": proposer, "verifier": verifier})
+
+
+def test_speculative_workflow_uses_branch_phi_effect_join_and_rng():
+    workflow = build_speculative_workflow_metadata(_speculative_package())["pipeline"][
+        "workflow"
+    ]
+    body = workflow["graph"]["body"]["nodes"]
+    branch = body[3]
+    assert branch["kind"] == "branch"
+    assert branch["outputs"]["tokens.next"]["cases"] == {
+        "true": "branch.accepted",
+        "false": "branch.corrected",
+    }
+    assert branch["effects"]["state"]["produces"] == "branch.state.out"
+    acceptance = body[2]
+    assert acceptance["inputs"]["offset"] == "state.rng_offset.body"
+    assert acceptance["outputs"]["next_offset"] == "rng_offset.body"
+    assert any(item["cell"].startswith("cache_") for item in workflow["graph"]["carried"])

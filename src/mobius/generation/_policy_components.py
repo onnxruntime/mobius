@@ -739,6 +739,8 @@ def build_speculative_acceptance() -> PolicyComponent:
     proposed_tokens = builder.input(
         "proposed_tokens", ir.DataType.INT64, ["batch", "draft_sequence"]
     )
+    seed = builder.input("seed", ir.DataType.INT64, ["batch"])
+    offset = builder.input("offset", ir.DataType.INT64, ["batch"])
     target_tokens = op.ArgMax(target_scores, axis=-1, keepdims=0)
     accepted = op.Equal(target_tokens, proposed_tokens)
     rejected = op.Cast(op.Not(accepted), to=ir.DataType.INT64)
@@ -756,11 +758,21 @@ def build_speculative_acceptance() -> PolicyComponent:
             value=ir.tensor([0], dtype=ir.DataType.INT64),
         ),
     )
+    accepted_tokens.shape = ir.Shape(["batch", "draft_sequence"])
     draft_length = op.Shape(proposed_tokens, start=1, end=2)
     done = op.Equal(accepted_count, draft_length)
+    next_offset = op.Add(
+        offset,
+        op.Squeeze(draft_length, op.Constant(value_ints=[0])),
+    )
+    next_offset = op.Add(next_offset, op.Mul(seed, op.Constant(value_int=0)))
+    accepted_count.shape = ir.Shape(["batch"])
+    done.shape = ir.Shape(["batch"])
+    next_offset.shape = ir.Shape(["batch"])
     builder.add_output(accepted_tokens, "accepted_tokens")
     builder.add_output(accepted_count, "accepted_len")
     builder.add_output(done, "done")
+    builder.add_output(next_offset, "next_offset")
     return _component(
         PolicyRole.SPECULATIVE_ACCEPTANCE,
         graph,
@@ -771,10 +783,23 @@ def build_speculative_acceptance() -> PolicyComponent:
             "accepted_tokens": "accepted_tokens",
             "accepted_len": "accepted_len",
             "done": "done",
+            "rng": {
+                "seed": "seed",
+                "offset": "offset",
+                "next_offset": "next_offset",
+            },
             "effect": "verify",
         },
         "verify",
     )
+
+
+def build_token_block_identity() -> PolicyComponent:
+    """Publish a branch-local speculative token block with a linear effect."""
+    graph, builder = _make_graph("token_block_identity")
+    tokens = builder.input("tokens", ir.DataType.INT64, ["batch", "draft_sequence"])
+    builder.add_output(builder.op.Identity(tokens), "next_tokens")
+    return _component(PolicyRole.AUXILIARY, graph, {}, "state")
 
 
 def build_token_state_update() -> PolicyComponent:

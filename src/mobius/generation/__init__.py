@@ -27,6 +27,7 @@ from mobius.generation._policy_components import (
     build_schedule_constant,
     build_seeded_categorical_sampler,
     build_speculative_acceptance,
+    build_token_block_identity,
     build_token_state_update,
     build_tts_state_initializer,
 )
@@ -54,5 +55,6 @@ __all__ = [
     "build_seeded_categorical_sampler",
     "build_speculative_acceptance",
     "build_token_state_update",
+    "build_token_block_identity",
     "build_tts_state_initializer",
 ]
