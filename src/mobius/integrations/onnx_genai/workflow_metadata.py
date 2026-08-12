@@ -19,8 +19,10 @@ from mobius.generation import (
     build_decoder_state_initializer,
     build_decoder_step_update,
     build_integer_increment,
+    build_iteration_cast,
     build_last_token_logits,
     build_model_token_cast,
+    build_schedule_constant,
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
     _port,
@@ -218,6 +220,303 @@ def write_tts_workflow_metadata(pkg: Any, output_dir: str, config: Any) -> str:
     """Build TTS workflow metadata, failing precisely on the producer defect."""
     metadata = build_tts_workflow_metadata(pkg, config)
     os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, "inference_metadata.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(metadata, handle, sort_keys=False)
+    return path
+
+
+def _artifact(name: str, package_size: int) -> str:
+    return f"{name}/model.onnx" if package_size > 1 else "model.onnx"
+
+
+def _find_port(values: Any, *fragments: str) -> ir.Value | None:
+    return next(
+        (value for value in values if any(part in value.name.lower() for part in fragments)),
+        None,
+    )
+
+
+def build_diffusion_workflow_metadata(
+    pkg: Any,
+    *,
+    num_inference_steps: int,
+    schedule: list[float] | None = None,
+) -> dict[str, Any]:
+    """Build a fixed-schedule diffusion workflow with explicit latent state."""
+    if num_inference_steps < 1:
+        raise ValueError("num_inference_steps must be >= 1")
+    names = set(pkg.keys())
+    denoiser_name = next(
+        (name for name in ("denoiser", "transformer", "unet") if name in names),
+        None,
+    )
+    vae_name = next(
+        (name for name in ("vae_decoder", "decoder", "vae") if name in names),
+        None,
+    )
+    if denoiser_name is None or vae_name is None or denoiser_name == vae_name:
+        raise ValueError("diffusion workflow requires distinct denoiser and VAE decoder")
+    denoiser = pkg[denoiser_name]
+    vae = pkg[vae_name]
+    sample_input = _find_port(denoiser.graph.inputs, "sample", "latent", "hidden_states")
+    timestep_input = _find_port(denoiser.graph.inputs, "timestep", "time")
+    estimate_output = next(iter(denoiser.graph.outputs), None)
+    vae_input = _find_port(vae.graph.inputs, "latent", "sample")
+    vae_output = next(iter(vae.graph.outputs), None)
+    if None in (sample_input, timestep_input, estimate_output, vae_input, vae_output):
+        raise ValueError(
+            "diffusion components do not expose sample/timestep/estimate/VAE ports"
+        )
+    assert sample_input is not None
+    assert timestep_input is not None
+    assert estimate_output is not None
+    assert vae_input is not None
+    assert vae_output is not None
+    if len(sample_input.shape or []) != 4 or _contract(sample_input) != _contract(
+        estimate_output
+    ):
+        raise ValueError("Euler diffusion workflow requires matching rank-4 latent/estimate")
+    if _contract(vae_input) != _contract(sample_input):
+        raise ValueError("VAE latent input must match the solver latent contract")
+
+    text_name = next(
+        (name for name in ("text_encoder", "text_encoder_2") if name in names),
+        None,
+    )
+    text_encoder = pkg[text_name] if text_name is not None else None
+    conditioning_input = next(
+        (
+            value
+            for value in denoiser.graph.inputs
+            if value is not sample_input
+            and value is not timestep_input
+            and ("encoder" in value.name or "context" in value.name)
+        ),
+        None,
+    )
+    conditioning_output = None
+    if text_encoder is not None and conditioning_input is not None:
+        conditioning_output = next(
+            (
+                value
+                for value in text_encoder.graph.outputs
+                if _contract(value) == _contract(conditioning_input)
+            ),
+            next(iter(text_encoder.graph.outputs), None),
+        )
+
+    attach_policy_components(pkg, PolicyCapabilities(solver="euler"))
+    pkg.add_policy_component("continue_predicate", build_boolean_not())
+    schedule_values = schedule or [
+        1.0 - index / num_inference_steps for index in range(num_inference_steps + 1)
+    ]
+    pkg.add_policy_component("diffusion_schedule", build_schedule_constant(schedule_values))
+    if timestep_input.dtype != ir.DataType.INT64:
+        pkg.add_policy_component("iteration_cast", build_iteration_cast(timestep_input.dtype))
+
+    batch = _contract(sample_input)["shape"][0]
+    batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
+    batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch]}
+    inputs: dict[str, Any] = {
+        "request.latent": {
+            "contract": _contract(sample_input),
+            "role": {"kind": "opaque"},
+            "source": {"kind": "application", "name": "latent"},
+            "required": True,
+        },
+        "request.max_iterations": {
+            "contract": batch_int,
+            "role": {"kind": "runtime", "version": "1.0", "role": "max_iterations"},
+            "source": {"kind": "request", "field": "max_iterations"},
+            "required": False,
+            "default": num_inference_steps,
+        },
+        "package.false": {
+            "contract": batch_bool,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": False,
+        },
+    }
+    setup_nodes: list[dict[str, Any]] = [
+        _invoke("diffusion_schedule", {}, {"schedule": "diffusion.schedule"})
+    ]
+    conditioning_value = None
+    if text_encoder is not None and conditioning_output is not None:
+        text_inputs = {}
+        for index, value in enumerate(text_encoder.graph.inputs):
+            name = f"request.{value.name}"
+            inputs[name] = {
+                "contract": _contract(value),
+                "role": (
+                    {"kind": "runtime", "version": "1.0", "role": "prompt_tokens"}
+                    if index == 0
+                    else {"kind": "opaque"}
+                ),
+                "source": {
+                    "kind": "request" if index == 0 else "application",
+                    "field": "prompt_tokens" if index == 0 else None,
+                    "name": value.name if index else None,
+                },
+                "required": True,
+            }
+            inputs[name]["source"] = {
+                key: item for key, item in inputs[name]["source"].items() if item is not None
+            }
+            text_inputs[value.name] = name
+        conditioning_value = "conditioning.hidden_states"
+        setup_nodes.append(
+            _invoke(
+                text_name,
+                text_inputs,
+                {conditioning_output.name: conditioning_value},
+            )
+        )
+    setup_nodes.append(
+        _invoke(
+            "continue_predicate",
+            {"done": "package.false"},
+            {"continue": "setup.continue"},
+        )
+    )
+
+    denoiser_inputs = {
+        sample_input.name: "state.latent.body",
+        timestep_input.name: (
+            "diffusion.timestep"
+            if timestep_input.dtype != ir.DataType.INT64
+            else "loop.iteration"
+        ),
+    }
+    if conditioning_input is not None and conditioning_value is not None:
+        denoiser_inputs[conditioning_input.name] = conditioning_value
+    body_nodes: list[dict[str, Any]] = []
+    if timestep_input.dtype != ir.DataType.INT64:
+        body_nodes.append(
+            _invoke(
+                "iteration_cast",
+                {"iteration": "loop.iteration"},
+                {"timestep": "diffusion.timestep"},
+            )
+        )
+    body_nodes.extend(
+        [
+            _invoke(
+                denoiser_name,
+                denoiser_inputs,
+                {estimate_output.name: "denoiser.estimate"},
+            ),
+            _invoke(
+                "solver_step",
+                {
+                    "sample": "state.latent.body",
+                    "derivative": "denoiser.estimate",
+                    "step": "loop.iteration",
+                    "schedule": "diffusion.schedule",
+                },
+                {"next_state": "latent.body"},
+                {"solver": _effect("solver.0", "solver.1")},
+            ),
+            _invoke(
+                "continue_predicate",
+                {"done": "package.false"},
+                {"continue": "loop.continue"},
+            ),
+        ]
+    )
+    latent_effect = "state:latent"
+    workflow = {
+        "manifest": {
+            "ir_version": "1.0",
+            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
+            "capabilities": [
+                "workflow_ssa",
+                "linear_effects",
+                "nested_control_flow",
+                "typed_emit",
+            ],
+        },
+        "inputs": inputs,
+        "outputs": {
+            "image": {
+                "contract": _contract(vae_output),
+                "role": "image",
+                "stage": "pre_adapter",
+            }
+        },
+        "components": {
+            name: _component(model, _artifact(name, len(pkg))) for name, model in pkg.items()
+        },
+        "state": {
+            "latent": {
+                "contract": _contract(sample_input),
+                "scope": "invocation",
+                "initializer": "request.latent",
+                "recurrence": {"kind": "invariant"},
+            }
+        },
+        "initial_effects": {
+            "solver": "solver.0",
+            latent_effect: f"{latent_effect}.0",
+            "emit": "emit.0",
+        },
+        "graph": {
+            "kind": "sequence",
+            "nodes": [
+                {
+                    "kind": "loop",
+                    "setup": {"kind": "sequence", "nodes": setup_nodes},
+                    "body": {"kind": "sequence", "nodes": body_nodes},
+                    "condition": "loop.continue",
+                    "max_iterations": "request.max_iterations",
+                    "iteration": {"value": "loop.iteration", "contract": batch_int},
+                    "carried": [
+                        {
+                            "cell": "latent",
+                            "current": "request.latent",
+                            "body_input": "state.latent.body",
+                            "body_output": "latent.body",
+                            "next": "latent.final",
+                            "read_effect": _effect(
+                                f"{latent_effect}.0", f"{latent_effect}.read"
+                            ),
+                            "write_effect": _effect(
+                                f"{latent_effect}.read", f"{latent_effect}.1"
+                            ),
+                        }
+                    ],
+                },
+                _invoke(
+                    vae_name,
+                    {vae_input.name: "latent.final"},
+                    {vae_output.name: "vae.image"},
+                ),
+                {
+                    "kind": "emit",
+                    "value": "vae.image",
+                    "output": "image",
+                    "mode": "replace",
+                    "effect_name": "emit",
+                    "effect": _effect("emit.0", "emit.1"),
+                },
+            ],
+        },
+    }
+    metadata = {"schema_version": "v1", "pipeline": {"workflow": workflow}}
+    add_policy_components_to_workflow(metadata, pkg)
+    return metadata
+
+
+def write_diffusion_workflow_metadata(
+    pkg: Any,
+    output_dir: str,
+    *,
+    num_inference_steps: int,
+) -> str:
+    os.makedirs(output_dir, exist_ok=True)
+    metadata = build_diffusion_workflow_metadata(pkg, num_inference_steps=num_inference_steps)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(metadata, handle, sort_keys=False)

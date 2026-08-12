@@ -192,6 +192,29 @@ def build_integer_increment() -> PolicyComponent:
     return _component(PolicyRole.AUXILIARY, graph, {})
 
 
+def build_iteration_cast(dtype: ir.DataType) -> PolicyComponent:
+    """Cast the generic int64 loop induction value for a model timestep port."""
+    graph, builder = _make_graph("iteration_cast")
+    iteration = builder.input("iteration", dtype=ir.DataType.INT64, shape=["batch"])
+    timestep = builder.op.Cast(iteration, to=dtype)
+    timestep.shape = ir.Shape(["batch"])
+    builder.add_output(timestep, "timestep")
+    return _component(PolicyRole.AUXILIARY, graph, {})
+
+
+def build_schedule_constant(values: list[float]) -> PolicyComponent:
+    """Materialize a producer-selected diffusion schedule inside ONNX."""
+    if len(values) < 2:
+        raise ValueError("a diffusion schedule requires at least two values")
+    graph, builder = _make_graph("diffusion_schedule")
+    schedule = builder.op.Constant(
+        value=ir.tensor(values, dtype=ir.DataType.FLOAT),
+    )
+    schedule.shape = ir.Shape([len(values)])
+    builder.add_output(schedule, "schedule")
+    return _component(PolicyRole.AUXILIARY, graph, {})
+
+
 def build_model_token_cast(dtype: ir.DataType) -> PolicyComponent:
     """Cast the canonical int64 token state to a decoder's integer dtype."""
     graph, builder = _make_graph("model_token_cast")

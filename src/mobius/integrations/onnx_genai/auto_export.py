@@ -27,13 +27,13 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     add_explicit_package_io,
     add_policy_components_to_workflow,
     load_diffusers_scheduler_config,
-    write_diffusion_pipeline_metadata,
     write_multimodal_pipeline_metadata,
     write_speech_to_text_pipeline_metadata,
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
     write_audio_codec_workflow_metadata,
     write_decoder_workflow_metadata,
+    write_diffusion_workflow_metadata,
     write_language_diffusion_workflow_metadata,
     write_tts_workflow_metadata,
 )
@@ -464,12 +464,10 @@ def write_onnx_genai_config(
         # classifier-free guidance by default; SD's canonical scale is 7.5.
         if guidance_scale is None and "text_encoder_filename" in kwargs:
             guidance_scale = 7.5
-        path = write_diffusion_pipeline_metadata(
+        path = write_diffusion_workflow_metadata(
+            pkg,
             output_dir,
             num_inference_steps=num_inference_steps,
-            scheduler=scheduler,
-            guidance_scale=guidance_scale,
-            **kwargs,
         )
         artifacts = {"inference_metadata": path}
         # Emit the CLIP tokenizer.json for text-conditioned pipelines so the

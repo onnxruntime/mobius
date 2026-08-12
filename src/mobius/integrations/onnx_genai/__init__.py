@@ -63,10 +63,12 @@ from mobius.integrations.onnx_genai.inference_metadata import (
 from mobius.integrations.onnx_genai.workflow_metadata import (
     build_audio_codec_workflow_metadata,
     build_decoder_workflow_metadata,
+    build_diffusion_workflow_metadata,
     build_language_diffusion_pipeline_metadata,
     build_tts_workflow_metadata,
     write_audio_codec_workflow_metadata,
     write_decoder_workflow_metadata,
+    write_diffusion_workflow_metadata,
     write_language_diffusion_workflow_metadata,
     write_tts_workflow_metadata,
 )
@@ -78,6 +80,7 @@ __all__ = [
     "add_policy_components_to_workflow",
     "build_decoder_metadata",
     "build_decoder_workflow_metadata",
+    "build_diffusion_workflow_metadata",
     "build_diffusion_pipeline_metadata",
     "build_language_diffusion_pipeline_metadata",
     "build_audio_codec_workflow_metadata",
@@ -95,6 +98,7 @@ __all__ = [
     "translate_comfyui_workflow_file",
     "write_decoder_metadata",
     "write_decoder_workflow_metadata",
+    "write_diffusion_workflow_metadata",
     "write_language_diffusion_workflow_metadata",
     "write_diffusion_pipeline_metadata",
     "write_audio_codec_workflow_metadata",

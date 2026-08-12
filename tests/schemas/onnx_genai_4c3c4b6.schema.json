@@ -871,20 +871,31 @@
       "type": "string"
     },
     "ImageOutputBinding": {
-      "description": "One named tensor output produced by an image preprocessing program.\n\nThe output binds a generic content role to an ARBITRARY endpoint name with a\nDECLARED dtype. Neither the name nor the content role is inferred from a model\nidentity, and the dtype is always explicit rather than derived from the model.",
+      "description": "One named tensor output produced by an image preprocessing program.\n\nThe output binds a processor-local value to a typed workflow SSA name.\nNeither the name nor the content role is inferred from a model identity.",
       "properties": {
         "content": {
           "$ref": "#/$defs/ImageOutputContent",
           "description": "Generic content role this tensor carries (pixels, coordinates, grid,\noriginal size, or validity mask) — never a model-family label."
+        },
+        "contract": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TensorContract"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Full workflow tensor contract. Required when `pipeline.workflow` is present."
         },
         "dtype": {
           "$ref": "#/$defs/TensorDType",
           "description": "Declared output dtype. Always explicit; never inferred from the model."
         },
         "name": {
-          "description": "Arbitrary pipeline endpoint name this tensor is bound to (model DATA).",
+          "description": "Workflow SSA value produced by the preprocessing adapter invocation.",
           "examples": [
-            "vision_encoder.pixel_values"
+            "image.pixel_values"
           ],
           "minLength": 1,
           "type": "string"
@@ -905,15 +916,13 @@
           ]
         },
         "source": {
-          "description": "Named value produced by a transform.\n\nAbsent preserves the legacy content-derived binding behavior.",
+          "description": "Named processor-local value produced by a transform.",
           "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         }
       },
       "required": [
+        "source",
         "name",
         "content",
         "dtype"
@@ -952,10 +961,10 @@
       "type": "string"
     },
     "ImagePreprocessingProgram": {
-      "description": "Generic image preprocessing program: an ordered transform pipeline plus the\nnamed tensor outputs it emits.\n\nThe program is expressed entirely as parameterized, architecture-neutral\ndata. Transform operations are generic (decode, resize, rescale, normalize,\ntile, patchify, pad); outputs bind a produced tensor to an ARBITRARY pipeline\nendpoint name with a DECLARED dtype. A model may name an output\n`pixel_position_ids`, `image_grid_thw`, or anything else — that string is\ndata carried in the model's metadata, never a branch in the runtime.",
+      "description": "Generic image preprocessing program: an ordered transform pipeline plus the\nnamed workflow SSA tensor outputs it emits.\n\nThe program is expressed entirely as parameterized, architecture-neutral\ndata. Transform operations are generic (decode, resize, rescale, normalize,\ntile, patchify, pad). In workflow metadata, outputs are materialized by a\nmanifest-pinned preprocessing adapter invocation and bind processor-local\nvalues to typed SSA names. A package may name an output `pixel_position_ids`,\n`image_grid_thw`, or anything else without introducing runtime model-family\ndispatch.",
       "properties": {
         "outputs": {
-          "description": "Named tensor outputs the program emits, each bound to a pipeline endpoint.",
+          "description": "Named tensor outputs the program emits, each bound to a workflow SSA value.",
           "items": {
             "$ref": "#/$defs/ImageOutputBinding"
           },
@@ -6023,6 +6032,24 @@
       ],
       "type": "object"
     },
+    "WorkflowLoopIteration": {
+      "additionalProperties": false,
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/TensorContract",
+          "description": "`int64` scalar or rank-one broadcast contract."
+        },
+        "value": {
+          "description": "SSA value containing the current zero-based iteration.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "value",
+        "contract"
+      ],
+      "type": "object"
+    },
     "WorkflowManifest": {
       "additionalProperties": false,
       "properties": {
@@ -6150,6 +6177,17 @@
             },
             "condition": {
               "type": "string"
+            },
+            "iteration": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WorkflowLoopIteration"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional zero-based induction value, scoped to this loop's body and condition."
             },
             "kind": {
               "const": "loop",

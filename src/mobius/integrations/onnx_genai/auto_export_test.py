@@ -46,6 +46,46 @@ class _DiffusionPkg(dict):
     pass
 
 
+def _diffusion_package(*, text: bool = False):
+    latent = ["batch", 4, "height", "width"]
+    denoiser_inputs = [
+        _value("sample", ir.DataType.FLOAT, latent),
+        _value("timestep", ir.DataType.FLOAT, ["batch"]),
+    ]
+    components = {}
+    if text:
+        denoiser_inputs.append(
+            _value(
+                "encoder_hidden_states",
+                ir.DataType.FLOAT,
+                ["batch", "prompt_sequence", 32],
+            )
+        )
+        components["text_encoder"] = _model(
+            "text_encoder",
+            [_value("input_ids", ir.DataType.INT64, ["batch", "prompt_sequence"])],
+            [
+                (
+                    "encoder_hidden_states",
+                    ir.DataType.FLOAT,
+                    ["batch", "prompt_sequence", 32],
+                )
+            ],
+        )
+    denoiser = _model(
+        "denoiser",
+        denoiser_inputs,
+        [("noise_pred", ir.DataType.FLOAT, latent)],
+    )
+    vae = _model(
+        "vae_decoder",
+        [_value("latent", ir.DataType.FLOAT, latent)],
+        [("image", ir.DataType.FLOAT, ["batch", 3, "image_height", "image_width"])],
+    )
+    components.update({"denoiser": denoiser, "vae_decoder": vae})
+    return ModelPackage(components)
+
+
 class _MultimodalPkg(dict):
     config = _Cfg()
 
@@ -112,7 +152,7 @@ def test_dispatch_language_diffusion(tmp_path):
 
 
 def test_dispatch_diffusion(tmp_path):
-    pkg = _DiffusionPkg({"denoiser": object(), "vae": object()})
+    pkg = _diffusion_package()
     arts = write_onnx_genai_config(
         pkg,
         str(tmp_path),
@@ -121,8 +161,10 @@ def test_dispatch_diffusion(tmp_path):
     )
     with open(arts["inference_metadata"]) as handle:
         meta = yaml.safe_load(handle)
-    assert meta["pipeline"]["strategy"]["kind"] == "iterative"
-    assert "vae" in meta["pipeline"]["models"]
+    workflow = meta["pipeline"]["workflow"]
+    assert workflow["graph"]["nodes"][0]["iteration"]["value"] == "loop.iteration"
+    assert workflow["graph"]["nodes"][1]["component"] == "vae_decoder"
+    assert "strategy" not in meta["pipeline"]
 
 
 def test_single_diffusion_component_uses_flat_model_path(tmp_path):
@@ -201,7 +243,7 @@ def test_dispatch_diffusion_emits_clip_tokenizer(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "transformers.AutoTokenizer.from_pretrained", lambda *args, **kwargs: _Tokenizer()
     )
-    pkg = _DiffusionPkg({"denoiser": object(), "text_encoder": object(), "vae": object()})
+    pkg = _diffusion_package(text=True)
     arts = write_onnx_genai_config(
         pkg,
         str(tmp_path),
@@ -226,7 +268,7 @@ def test_dispatch_diffusion_tokenizer_skip_is_non_fatal(tmp_path, monkeypatch):
         raise OSError("no tokenizer here")
 
     monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", _boom)
-    pkg = _DiffusionPkg({"denoiser": object(), "text_encoder": object()})
+    pkg = _diffusion_package(text=True)
     arts = write_onnx_genai_config(
         pkg,
         str(tmp_path),
@@ -247,7 +289,7 @@ def test_dispatch_diffusion_auto_reads_scheduler_from_source(tmp_path):
         json.dumps({"_class_name": "EulerDiscreteScheduler", "beta_schedule": "scaled_linear"})
     )
     out = tmp_path / "out"
-    pkg = _DiffusionPkg({"denoiser": object()})
+    pkg = _diffusion_package()
     arts = write_onnx_genai_config(
         pkg,
         str(out),
@@ -256,7 +298,8 @@ def test_dispatch_diffusion_auto_reads_scheduler_from_source(tmp_path):
     )
     with open(arts["inference_metadata"]) as handle:
         meta = yaml.safe_load(handle)
-    assert meta["pipeline"]["strategy"]["scheduler_config"]["kind"] == "euler"
+    components = meta["pipeline"]["workflow"]["components"]
+    assert components["diffusion_schedule"]["ports"]["outputs"]["schedule"]["shape"] == [16]
 
 
 def test_dispatch_vision_multimodal_pipeline(tmp_path):
