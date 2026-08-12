@@ -232,6 +232,27 @@ class TestGenaiConfigGeneratorLLM:
         assert webgpu["enableGraphCapture"] == "1"
         assert webgpu["validationMode"] == "disabled"
 
+    def test_webgpu_graph_capture_is_decoder_only_for_multimodal(self):
+        gen = GenaiConfigGenerator(
+            "gemma4",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+            ep="webgpu",
+        )
+        config = gen.with_vision(image_token_id=255999).with_audio().generate()
+
+        model = config["model"]
+        decoder_webgpu = model["decoder"]["session_options"]["provider_options"][0]["webgpu"]
+        assert decoder_webgpu["enableGraphCapture"] == "1"
+        for component in ("vision", "embedding", "speech"):
+            webgpu = model[component]["session_options"]["provider_options"][0]["webgpu"]
+            assert webgpu["enableGraphCapture"] == "0"
+            assert webgpu["validationMode"] == "basic"
+
     def test_search_params_custom_ep_with_share_buffer(self):
         """A custom EP registered with supports_past_present_share_buffer=True gets the flag set.
 
