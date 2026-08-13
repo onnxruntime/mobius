@@ -2572,7 +2572,7 @@ def build_vlm_workflow_metadata(
             token_state_update=True,
         ),
     )
-    pkg.add_policy_component("last_token_logits", build_last_token_logits())
+    pkg.add_policy_component("last_token_logits", build_last_token_logits(logits_output.dtype))
     pkg.add_policy_component(
         "decoder_state_initializer",
         build_decoder_state_initializer(
@@ -2736,7 +2736,7 @@ def build_vlm_workflow_metadata(
     body_decoder_outputs = {logits_output.name: "decoder.body.logits"}
     logits_contract = _contract(logits_output)
     last_logits_contract = {
-        "dtype": logits_contract["dtype"],
+        "dtype": "float32",
         "rank": 2,
         "shape": [logits_contract["shape"][0], logits_contract["shape"][-1]],
     }
@@ -4000,16 +4000,6 @@ def build_decoder_workflow_metadata(
     if len(pkg) != 1:
         raise ValueError("decoder workflow requires exactly one neural component")
     decoder_name, decoder = next(iter(pkg.items()))
-    attach_policy_components(
-        pkg,
-        PolicyCapabilities(
-            sampler=sampler,
-            eos_termination=True,
-            token_state_update=True,
-        ),
-    )
-    pkg.add_policy_component("last_token_logits", build_last_token_logits())
-
     inputs = list(decoder.graph.inputs)
     outputs = list(decoder.graph.outputs)
     token_input = next(
@@ -4052,6 +4042,15 @@ def build_decoder_workflow_metadata(
         raise ValueError(
             "decoder workflow requires rank-2 token input and rank-3 logits output"
         )
+    attach_policy_components(
+        pkg,
+        PolicyCapabilities(
+            sampler=sampler,
+            eos_termination=True,
+            token_state_update=True,
+        ),
+    )
+    pkg.add_policy_component("last_token_logits", build_last_token_logits(logits_output.dtype))
 
     output_by_suffix = {value.name: value for value in outputs}
     cache_pairs: list[tuple[ir.Value, ir.Value]] = []
@@ -4344,7 +4343,7 @@ def build_decoder_workflow_metadata(
     body_decoder_outputs = {logits_output.name: "decoder.body.logits"}
     logits_contract = _contract(logits_output)
     last_logits_contract = {
-        "dtype": logits_contract["dtype"],
+        "dtype": "float32",
         "rank": 2,
         "shape": [logits_contract["shape"][0], logits_contract["shape"][-1]],
     }

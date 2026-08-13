@@ -159,15 +159,19 @@ def build_greedy_sampler(*, effect: str = "sample") -> PolicyComponent:
     )
 
 
-def build_last_token_logits() -> PolicyComponent:
-    """Build ``[B,T,V] -> [B,V]`` selection for decoder sampling."""
+def build_last_token_logits(
+    input_dtype: ir.DataType = ir.DataType.FLOAT,
+) -> PolicyComponent:
+    """Build ``[B,T,V] -> [B,V]`` selection and normalize logits to float32."""
     graph, builder = _make_graph("last_token_logits")
     logits = builder.input(
         "logits",
-        dtype=ir.DataType.FLOAT,
+        dtype=input_dtype,
         shape=["batch", "sequence", "vocabulary"],
     )
     selected = builder.op.Gather(logits, builder.op.Constant(value_int=-1), axis=1)
+    if input_dtype != ir.DataType.FLOAT:
+        selected = builder.op.Cast(selected, to=ir.DataType.FLOAT)
     selected.shape = ir.Shape(["batch", "vocabulary"])
     builder.add_output(selected, "last_logits")
     return _component("mobius.policy.auxiliary@1", graph, {})

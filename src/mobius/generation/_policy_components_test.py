@@ -162,6 +162,15 @@ def test_last_token_logits_and_continue_predicate_runtime(tmp_path):
     (last,) = _run(build_last_token_logits(), tmp_path, {"logits": logits})
     np.testing.assert_array_equal(last, logits[:, -1, :])
 
+    half_logits = logits.astype(np.float16)
+    (last_float,) = _run(
+        build_last_token_logits(ir.DataType.FLOAT16),
+        tmp_path,
+        {"logits": half_logits},
+    )
+    assert last_float.dtype == np.float32
+    np.testing.assert_array_equal(last_float, logits[:, -1, :])
+
     (continued,) = _run(
         build_boolean_not(),
         tmp_path,
