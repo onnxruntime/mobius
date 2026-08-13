@@ -26,7 +26,6 @@ from mobius.generation import (
     build_euler_model_input,
     build_euler_solver_step,
     build_greedy_sampler,
-    build_integer_increment,
     build_integer_minimum,
     build_last_token_logits,
     build_model_token_cast,
@@ -123,7 +122,7 @@ def _effect(consumes: str, produces: str) -> dict[str, str]:
 
 
 def _publish_workflow_v1(workflow: dict[str, Any]) -> dict[str, Any]:
-    """Lower the producer's explicit-effect graph into the public v1 step IR."""
+    """Publish structured steps and logical carries without compiler bookkeeping."""
     graph = workflow.pop("graph")
     workflow.pop("initial_effects", None)
     substitutions: dict[str, str] = {}
@@ -294,14 +293,13 @@ def _invoke(
     component: str,
     inputs: dict[str, str],
     outputs: dict[str, str],
-    effects: dict[str, dict[str, str]] | None = None,
+    _effects: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     return {
         "kind": "invoke",
         "component": component,
         "inputs": inputs,
         "outputs": outputs,
-        "effects": effects or {},
     }
 
 
@@ -3621,7 +3619,6 @@ def build_decoder_workflow_metadata(
     )
     pkg.add_policy_component("last_token_logits", build_last_token_logits())
     pkg.add_policy_component("continue_predicate", build_boolean_not())
-    pkg.add_policy_component("iteration_increment", build_integer_increment())
 
     inputs = list(decoder.graph.inputs)
     outputs = list(decoder.graph.outputs)
@@ -3792,13 +3789,6 @@ def build_decoder_workflow_metadata(
                 "required": True,
                 "default": eos_token_id,
             },
-            "package.zero_iteration": {
-                "contract": batch_int,
-                "role": {"kind": "opaque"},
-                "source": {"kind": "literal"},
-                "required": False,
-                "default": 0,
-            },
             "package.one_token": {
                 "contract": batch_int,
                 "role": {"kind": "opaque"},
@@ -3936,12 +3926,6 @@ def build_decoder_workflow_metadata(
             "initializer": "initializer.token_slot",
             "recurrence": {"kind": "invariant"},
         },
-        "iteration": {
-            "contract": batch_int,
-            "scope": "invocation",
-            "initializer": "package.zero_iteration",
-            "recurrence": {"kind": "invariant"},
-        },
         "logits": {
             "contract": last_logits_contract,
             "scope": "invocation",
@@ -3955,7 +3939,6 @@ def build_decoder_workflow_metadata(
         "state": "state.0",
         "emit": "emit.0",
         "state:token": "state:token.0",
-        "state:iteration": "state:iteration.0",
         "state:logits": "state:logits.0",
     }
     carried = [
@@ -3971,15 +3954,6 @@ def build_decoder_workflow_metadata(
     ]
     carried.extend(
         [
-            {
-                "cell": "iteration",
-                "current": "package.zero_iteration",
-                "body_input": "state.iteration.body",
-                "body_output": "iteration.body",
-                "next": "state.iteration.final",
-                "read_effect": _effect("state:iteration.0", "state:iteration.read"),
-                "write_effect": _effect("state:iteration.read", "state:iteration.1"),
-            },
             {
                 "cell": "logits",
                 "current": "decoder.setup.last_logits",
@@ -4175,7 +4149,7 @@ def build_decoder_workflow_metadata(
                 {
                     "token_ids": "sample.body",
                     "eos_ids": "package.eos_ids",
-                    "iteration": "state.iteration.body",
+                    "iteration": "loop.iteration",
                     "max_iterations": "request.max_iterations",
                 },
                 {"done": "loop.done"},
@@ -4194,11 +4168,6 @@ def build_decoder_workflow_metadata(
                 "effect_name": "emit",
                 "effect": _effect("emit.0", "emit.1"),
             },
-            _invoke(
-                "iteration_increment",
-                {"value": "state.iteration.body"},
-                {"next_value": "iteration.body"},
-            ),
             _invoke(decoder_name, body_decoder_inputs, body_decoder_outputs),
             _invoke(
                 "last_token_logits",
@@ -4257,6 +4226,10 @@ def build_decoder_workflow_metadata(
             "body": body,
             "condition": "loop.continue",
             "max_iterations": "request.max_iterations",
+            "iteration": {
+                "value": "loop.iteration",
+                "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+            },
             "carried": carried,
         },
     }
@@ -4309,7 +4282,6 @@ def build_language_diffusion_pipeline_metadata(
 
     attach_policy_components(pkg, PolicyCapabilities(masked_update=True))
     pkg.add_policy_component("continue_predicate", build_boolean_not())
-    pkg.add_policy_component("iteration_increment", build_integer_increment())
 
     token_contract = _contract(token_input)
     mask_contract = {
@@ -4364,13 +4336,6 @@ def build_language_diffusion_pipeline_metadata(
             "source": {"kind": "request", "field": "max_iterations"},
             "required": False,
             "default": num_inference_steps,
-        },
-        "package.zero_iteration": {
-            "contract": batch_int,
-            "role": {"kind": "opaque"},
-            "source": {"kind": "literal"},
-            "required": False,
-            "default": 0,
         },
         "package.num_steps": {
             "contract": batch_int,
@@ -4433,7 +4398,7 @@ def build_language_diffusion_pipeline_metadata(
             update_invoke(
                 "state.tokens.body",
                 "state.mask.body",
-                "state.iteration.body",
+                "loop.iteration",
                 "state.rng_offset.body",
                 "state.logits.body",
                 "state.proposal.body",
@@ -4445,11 +4410,6 @@ def build_language_diffusion_pipeline_metadata(
                 "continue_predicate",
                 {"done": "denoiser.body.done"},
                 {"continue": "denoiser.body.continue"},
-            ),
-            _invoke(
-                "iteration_increment",
-                {"value": "state.iteration.body"},
-                {"next_value": "denoiser.body.iteration"},
             ),
             {
                 "kind": "emit",
@@ -4467,7 +4427,6 @@ def build_language_diffusion_pipeline_metadata(
         "tokens": (token_contract, "request.input_ids", "request.input_ids"),
         "mask": (mask_contract, "request.mask", "request.mask"),
         "rng_offset": (batch_int, "request.rng_offset", "request.rng_offset"),
-        "iteration": (batch_int, "package.zero_iteration", "package.zero_iteration"),
         "logits": (
             _contract(logits_output),
             "denoiser.setup.logits",
@@ -4531,6 +4490,10 @@ def build_language_diffusion_pipeline_metadata(
             "body": body,
             "condition": "denoiser.body.continue",
             "max_iterations": "request.max_iterations",
+            "iteration": {
+                "value": "loop.iteration",
+                "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+            },
             "carried": carried,
         },
     }

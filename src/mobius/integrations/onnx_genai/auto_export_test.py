@@ -179,7 +179,17 @@ def test_dispatch_decoder(tmp_path):
     body = workflow["steps"][0]["steps"]
     assert [node["kind"] for node in body].count("emit") == 1
     assert next(node for node in body if node["kind"] == "emit")["value"] == "sample.body"
-    assert workflow["state"]["iteration"]["initializer"] == "package.zero_iteration"
+    assert workflow["steps"][0]["iteration"] == {
+        "value": "loop.iteration",
+        "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+    }
+    assert "iteration" not in workflow["state"]
+    serialized = yaml.safe_dump(workflow)
+    assert "initial_effects" not in serialized
+    assert "read_effect" not in serialized
+    assert "write_effect" not in serialized
+    assert ".read" not in serialized
+    assert "iteration_increment" not in workflow["components"]
     assert workflow["state"]["token"]["initializer"] == "initializer.token_slot"
     assert workflow["state"]["logits"] == {
         "contract": {"dtype": "float32", "rank": 2, "shape": ["batch", 128]},

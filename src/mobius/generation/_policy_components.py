@@ -187,16 +187,6 @@ def build_boolean_not() -> PolicyComponent:
     return _component("mobius.policy.auxiliary@1", graph, {})
 
 
-def build_integer_increment() -> PolicyComponent:
-    """Build an explicit per-batch loop-counter increment."""
-    graph, builder = _make_graph("integer_increment")
-    value = builder.input("value", dtype=ir.DataType.INT64, shape=["batch"])
-    next_value = builder.op.Add(value, builder.op.Constant(value_int=1))
-    next_value.shape = ir.Shape(["batch"])
-    builder.add_output(next_value, "next_value")
-    return _component("mobius.policy.auxiliary@1", graph, {})
-
-
 def build_integer_minimum() -> PolicyComponent:
     """Compute the per-batch minimum of two integer lengths."""
     graph, builder = _make_graph("integer_minimum")

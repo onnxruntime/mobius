@@ -155,12 +155,12 @@ def test_language_diffusion_uses_exclusive_ssa_workflow():
     assert [node["kind"] for node in graph["steps"]] == [
         "invoke",
         "invoke",
-        "invoke",
         "emit",
         "invoke",
     ]
+    assert graph["iteration"]["value"] == "loop.iteration"
     assert graph["steps"][0]["inputs"]["total_steps"] == "package.num_steps"
-    assert graph["steps"][-2]["mode"] == "replace"
+    assert graph["steps"][2]["mode"] == "replace"
 
 
 def test_language_diffusion_rejects_zero_steps():
