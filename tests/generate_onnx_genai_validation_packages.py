@@ -23,11 +23,11 @@ from mobius.models.qwen3_tts_test import _TINY_CONFIG
 from mobius.tasks import TTSTask
 
 
-def _zero_unresolved_initializers(package: ModelPackage) -> None:
-    """Give real tiny producer graphs deterministic synthetic test weights."""
+def _materialize_deterministic_initializers(package: ModelPackage) -> None:
+    """Give real tiny producer graphs environment-independent synthetic weights."""
     for model in package.values():
         for value in model.graph.initializers.values():
-            if value.const_value is not None:
+            if value.const_value is not None and not value.dtype.is_floating_point():
                 continue
             shape = [int(dimension) for dimension in value.shape]
             value.const_value = ir.tensor(np.zeros(shape, dtype=value.dtype.numpy()))
@@ -38,7 +38,7 @@ def _tts_package() -> ModelPackage:
         Qwen3TTSForConditionalGeneration(_TINY_CONFIG),
         _TINY_CONFIG,
     )
-    _zero_unresolved_initializers(package)
+    _materialize_deterministic_initializers(package)
     graph, builder = _graph("codec")
     codes = builder.input("codes", ir.DataType.INT64, ["batch", 4, "frames"])
     waveform = builder.op.Cast(
