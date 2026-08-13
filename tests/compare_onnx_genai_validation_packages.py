@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -36,33 +37,8 @@ def _tensor(tensor: ir.TensorProtocol) -> dict[str, Any]:
     }
 
 
-def _attribute(value: Any) -> Any:
-    if isinstance(value, ir.TensorProtocol):
-        return _tensor(value)
-    if isinstance(value, (list, tuple)):
-        return [_attribute(item) for item in value]
-    if isinstance(value, ir.Graph):
-        return _graph(value)
-    return value
-
-
 def _graph(graph: ir.Graph) -> dict[str, Any]:
-    nodes = []
-    for node in graph:
-        nodes.append(
-            {
-                "domain": node.domain,
-                "op_type": node.op_type,
-                "overload": node.overload,
-                "attributes": {
-                    name: {
-                        "type": str(attribute.type),
-                        "value": _attribute(attribute.value),
-                    }
-                    for name, attribute in sorted(node.attributes.items())
-                },
-            }
-        )
+    operators = Counter((node.domain, node.op_type, node.overload) for node in graph)
     return {
         "name": graph.name,
         "inputs": [_value(value) for value in graph.inputs],
@@ -72,7 +48,9 @@ def _graph(graph: ir.Graph) -> dict[str, Any]:
             for name, value in sorted(graph.initializers.items())
             if value.const_value is not None
         },
-        "nodes": nodes,
+        "operators": {
+            "|".join(operator): count for operator, count in sorted(operators.items())
+        },
     }
 
 
