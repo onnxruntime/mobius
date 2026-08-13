@@ -3662,6 +3662,7 @@ def build_speculative_workflow_metadata(
             {
                 "kind": "emit",
                 "value": "grammar.token",
+                "valid_length": "grammar.forced_length",
                 "output": "tokens",
                 "mode": "append",
                 "effect_name": "emit",

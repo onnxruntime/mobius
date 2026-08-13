@@ -272,6 +272,12 @@ def test_speculative_grammar_and_adaptive_k_use_typed_state_contracts():
         node for node in workflow["steps"][0]["steps"] if node.get("component") == "proposer"
     )
     assert proposer["inputs"]["proposal_budget"] == "proposal_k"
+    grammar_emit = next(
+        node
+        for node in workflow["steps"][0]["steps"]
+        if node.get("kind") == "emit" and node.get("value") == "grammar.token"
+    )
+    assert grammar_emit["valid_length"] == "grammar.forced_length"
     assert all("initial" not in carry for carry in workflow["steps"][0]["carried"])
 
 
