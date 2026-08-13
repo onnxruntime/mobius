@@ -29,6 +29,11 @@ def main() -> int:
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--runner", required=True, type=Path)
     parser.add_argument(
+        "--runtime-repo",
+        type=Path,
+        default=Path(".contract-schema-latest"),
+    )
+    parser.add_argument(
         "--config",
         type=Path,
         default=Path("benchmarks/muse_workflow_h200.json"),
@@ -39,6 +44,37 @@ def main() -> int:
     config: dict[str, Any] = json.loads(args.config.read_text())
     workload = config["workload"]
     sampling = config["sampling"]
+    runtime_head = subprocess.run(
+        ["git", "-C", str(args.runtime_repo), "rev-parse", "HEAD"],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    expected_head = config["runtime"]["onnxruntime_genai_commit"]
+    if runtime_head != expected_head:
+        raise ValueError(
+            f"runtime source is {runtime_head}, paired benchmark requires {expected_head}"
+        )
+    git_index = Path(
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(args.runtime_repo),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "index",
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+    )
+    if args.runner.stat().st_mtime < git_index.stat().st_mtime:
+        raise ValueError(
+            "runner predates the pinned runtime checkout; rebuild it before benchmarking"
+        )
     if config["runtime"]["cudnn_flash_attention"]:
         raise ValueError("paired Muse benchmark requires cuDNN Flash Attention disabled")
     prompt_ids_path = Path(workload["prompt_ids_file"])
@@ -110,6 +146,7 @@ def main() -> int:
             "metadata_sha256": _sha256(args.model / "inference_metadata.yaml"),
             "genai_config_sha256": _sha256(args.model / "genai_config.json"),
         },
+        "runtime_source_head": runtime_head,
         "metrics": {
             "ttft_ms": float(median.group(1)),
             "decode_ms_per_token": float(median.group(2)),
