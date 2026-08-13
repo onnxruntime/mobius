@@ -178,7 +178,11 @@ def test_dispatch_decoder(tmp_path):
     ]
     body = workflow["steps"][0]["steps"]
     assert [node["kind"] for node in body].count("emit") == 1
-    assert next(node for node in body if node["kind"] == "emit")["value"] == "sample.body"
+    assert next(node for node in body if node["kind"] == "emit")["value"] == "token.body"
+    assert workflow["outputs"]["tokens"]["contract"]["shape"] == [
+        "batch",
+        "generated_sequence",
+    ]
     assert workflow["steps"][0]["iteration"] == {
         "value": "loop.iteration",
         "contract": {"dtype": "int64", "rank": 1, "shape": [1]},

@@ -1,0 +1,64 @@
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      ir_version: '1.0'
+      onnx_opsets:
+        ai.onnx: 24
+      capabilities:
+      - workflow_ssa
+      - linear_effects
+      - typed_emit
+    inputs:
+      request.waveform:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - batch
+          - 1
+          - audio_samples
+        role:
+          kind: runtime
+          version: '1.0'
+          role: media
+        source:
+          kind: request
+        required: true
+    outputs:
+      waveform:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - batch
+          - 1
+          - audio_samples
+        role: audio
+        stage: post_adapter
+    components:
+      encoder:
+        implementation:
+          kind: onnx
+          artifact: encoder/model.onnx
+      decoder:
+        implementation:
+          kind: onnx
+          artifact: decoder/model.onnx
+    steps:
+    - kind: invoke
+      component: encoder
+      inputs:
+        waveform: request.waveform
+      outputs:
+        codes: codec.codes
+    - kind: invoke
+      component: decoder
+      inputs:
+        codes: codec.codes
+      outputs:
+        waveform: codec.waveform
+    - kind: emit
+      value: codec.waveform
+      output: waveform
+      mode: replace

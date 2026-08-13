@@ -23,7 +23,7 @@ jobs:
     - uses: actions/checkout@v7
       with:
         repository: justinchuby/onnx-genai
-        ref: 8215649100a0a27be15b04045fddde777c8248fc
+        ref: c9bddd6e
         path: validation/onnx-genai
     - uses: actions/setup-python@v7
       with:
@@ -35,10 +35,15 @@ jobs:
         pip install onnxruntime
         pip install -e '.[testing]'
     - name: Generate representative packages
-      run: PYTHONPATH=src python tests/generate_onnx_genai_validation_packages.py validation/packages
+      run: |
+        PYTHONPATH=src python tests/generate_onnx_genai_validation_packages.py \
+          validation/generated
+        diff --recursive --brief \
+          tests/fixtures/onnx_genai_workflows validation/generated
     - name: Validate package semantics
       run: |
-        for package in validation/packages/*; do
+        for package in tests/fixtures/onnx_genai_workflows/*; do
+          [ -f "$package/inference_metadata.yaml" ] || continue
           cargo run --quiet \
             --manifest-path validation/onnx-genai/Cargo.toml \
             -p onnx-genai-metadata --bin validate_metadata -- "$package"

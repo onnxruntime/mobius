@@ -1,0 +1,433 @@
+schema_version: '1.0'
+pipeline:
+  workflow:
+    manifest:
+      ir_version: '1.0'
+      onnx_opsets:
+        ai.onnx: 24
+      capabilities:
+      - workflow_ssa
+      - linear_effects
+      - nested_control_flow
+      - typed_emit
+      - loop_induction_values
+      - serving_service_contract
+      - bounded_state_recurrence
+    inputs:
+      request.input_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - sequence
+        role:
+          kind: runtime
+          version: '1.0'
+          role: prompt_tokens
+        source:
+          kind: request
+        required: true
+      request.max_iterations:
+        contract: &id001
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: runtime
+          version: '1.0'
+          role: max_output_tokens
+        source:
+          kind: request
+        required: true
+      package.eos_ids:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - E
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: true
+        default: 127
+      package.one_token:
+        contract: *id001
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 1
+      package.max_context:
+        contract: *id001
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 8192
+      package.active:
+        contract: &id002
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+      package.not_done:
+        contract: *id002
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: false
+      package.slot_ids:
+        contract: &id003
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0
+      package.cache_lengths:
+        contract: *id003
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0
+      package.zero_batch:
+        contract: *id003
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0
+    outputs:
+      tokens:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - generated_sequence
+        role: tokens
+        stage: pre_adapter
+    components:
+      model:
+        implementation:
+          kind: onnx
+          artifact: model.onnx
+      token_sampler:
+        implementation:
+          kind: onnx
+          artifact: policies/token_sampler.onnx
+        contract:
+          id: onnx-genai.token-sampler
+          version: '1'
+          bindings:
+            logits: logits
+            token: token
+          parameters:
+            mode: greedy
+        application_overridable: true
+      termination:
+        implementation:
+          kind: onnx
+          artifact: policies/termination.onnx
+        contract:
+          id: onnx-genai.termination-predicate
+          version: '1'
+          bindings:
+            tokens: token_ids
+            eos_ids: eos_ids
+            iteration: iteration
+            max_iterations: max_iterations
+            done: done
+            continue: continue
+      token_state_update:
+        implementation:
+          kind: onnx
+          artifact: policies/token_state_update.onnx
+        contract:
+          id: onnx-genai.state-update
+          version: '1'
+          bindings:
+            current: current
+            update: update
+            next: next
+      last_token_logits:
+        implementation:
+          kind: onnx
+          artifact: policies/last_token_logits.onnx
+      decoder_state_initializer:
+        implementation:
+          kind: onnx
+          artifact: policies/decoder_state_initializer.onnx
+      decoder_step_update:
+        implementation:
+          kind: onnx
+          artifact: policies/decoder_step_update.onnx
+      cache_length_update:
+        implementation:
+          kind: onnx
+          artifact: policies/cache_length_update.onnx
+    state:
+      token:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - 1
+        scope: invocation
+        initializer: initializer.token_slot
+        recurrence:
+          kind: invariant
+      logits:
+        contract:
+          dtype: float32
+          rank: 2
+          shape:
+          - batch
+          - 128
+        scope: invocation
+        initializer: decoder.setup.last_logits
+        recurrence:
+          kind: invariant
+      active:
+        contract: *id002
+        class: semantic
+        scope: invocation
+        initializer: package.active
+        recurrence:
+          kind: invariant
+      done:
+        contract: *id002
+        class: semantic
+        scope: invocation
+        initializer: package.not_done
+        recurrence:
+          kind: invariant
+      accepted_len:
+        contract: *id003
+        class: semantic
+        scope: invocation
+        initializer: package.zero_batch
+        recurrence:
+          kind: invariant
+      slot_ids:
+        contract: *id003
+        class: semantic
+        scope: invocation
+        initializer: package.slot_ids
+        recurrence:
+          kind: invariant
+      cache_lengths:
+        contract: *id003
+        class: semantic
+        scope: invocation
+        initializer: package.cache_lengths
+        recurrence:
+          kind: invariant
+      attention_mask:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - context
+        scope: invocation
+        initializer: initializer.body_attention_mask
+        recurrence:
+          kind: growing
+          axis: 1
+          increment: package.one_token
+          max: package.max_context
+      position_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - 1
+        scope: invocation
+        initializer: initializer.body_position_ids
+        recurrence:
+          kind: invariant
+      cache_9:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 2
+          - past_sequence
+          - 8
+        scope: invocation
+        initializer: decoder.setup.present.0.key
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.max_context
+        service_group: decoder_cache
+    serving:
+      active: active
+      done: done
+      accepted_len: accepted_len
+      slot_ids: slot_ids
+      kv_service:
+        paging: paged
+        allocation: runtime
+        compaction: true
+        groups:
+          decoder_cache:
+            sequence_axis: 2
+            layout: bnsh
+            logical_lengths: cache_lengths
+            storage: paged
+            ports:
+              model:
+                cache_9:
+                  input: past_key_values.0.key
+                  output: present.0.key
+    steps:
+    - kind: loop
+      setup:
+      - kind: invoke
+        component: decoder_state_initializer
+        inputs:
+          prompt_tokens: request.input_ids
+        outputs:
+          attention_mask: initializer.attention_mask
+          body_attention_mask: initializer.body_attention_mask
+          token_slot: initializer.token_slot
+          position_ids: initializer.position_ids
+          body_position_ids: initializer.body_position_ids
+          past_key_values.0.key: initializer.past_key_values.0.key
+      - kind: invoke
+        component: model
+        inputs:
+          input_ids: request.input_ids
+          past_key_values.0.key: initializer.past_key_values.0.key
+          attention_mask: initializer.attention_mask
+          position_ids: initializer.position_ids
+        outputs:
+          logits: decoder.setup.logits
+          present.0.key: decoder.setup.present.0.key
+      - kind: invoke
+        component: last_token_logits
+        inputs:
+          logits: decoder.setup.logits
+        outputs:
+          last_logits: decoder.setup.last_logits
+      steps:
+      - kind: invoke
+        component: token_sampler
+        inputs:
+          logits: logits
+        outputs:
+          token: sample.body
+      - kind: invoke
+        component: token_state_update
+        inputs:
+          current: token
+          update: sample.body
+        outputs:
+          next: token.body
+      - kind: invoke
+        component: termination
+        inputs:
+          token_ids: sample.body
+          eos_ids: package.eos_ids
+          iteration: loop.iteration
+          max_iterations: request.max_iterations
+        outputs:
+          done: loop.done
+          continue: loop.continue
+      - kind: invoke
+        component: cache_length_update
+        inputs:
+          left: cache_lengths
+          right: package.one_token
+        outputs:
+          total: cache_lengths.next
+      - kind: invoke
+        component: cache_length_update
+        inputs:
+          left: package.zero_batch
+          right: package.one_token
+        outputs:
+          total: accepted_len.next
+      - kind: emit
+        value: token.body
+        output: tokens
+        mode: append
+      - kind: invoke
+        component: model
+        inputs:
+          input_ids: token.body
+          past_key_values.0.key: cache_9
+          attention_mask: attention_mask
+          position_ids: position_ids
+        outputs:
+          logits: decoder.body.logits
+          present.0.key: decoder.body.present.0.key
+      - kind: invoke
+        component: last_token_logits
+        inputs:
+          logits: decoder.body.logits
+        outputs:
+          last_logits: decoder.body.last_logits
+      - kind: invoke
+        component: decoder_step_update
+        inputs:
+          attention_mask: attention_mask
+          position_ids: position_ids
+        outputs:
+          next_attention_mask: decoder_step.body_attention_mask
+          next_position_ids: decoder_step.body_position_ids
+      continue_when: active
+      max_iterations: request.max_iterations
+      carried:
+      - cell: token
+        next: token.body
+      - cell: logits
+        next: decoder.body.last_logits
+      - cell: active
+        next: loop.continue
+      - cell: done
+        next: loop.done
+      - cell: cache_lengths
+        next: cache_lengths.next
+      - cell: accepted_len
+        next: accepted_len.next
+      - cell: slot_ids
+        next: slot_ids
+      - cell: attention_mask
+        next: decoder_step.body_attention_mask
+      - cell: position_ids
+        next: decoder_step.body_position_ids
+      - cell: cache_9
+        next: decoder.body.present.0.key
+      iteration:
+        value: loop.iteration
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1

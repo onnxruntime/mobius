@@ -1,0 +1,251 @@
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      ir_version: '1.0'
+      onnx_opsets:
+        ai.onnx: 24
+      capabilities:
+      - workflow_ssa
+      - linear_effects
+      - nested_control_flow
+      - loop_induction_values
+      - typed_emit
+    inputs:
+      request.latent:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 4
+          - height
+          - width
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: latent
+        required: true
+      request.max_iterations:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: runtime
+          version: '1.0'
+          role: max_iterations
+        source:
+          kind: request
+        required: false
+        default: 30
+      package.false:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: false
+      request.input_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - prompt_sequence
+        role:
+          kind: runtime
+          version: '1.0'
+          role: prompt_tokens
+        source:
+          kind: request
+        required: true
+      package.loop_0_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+    outputs:
+      image:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 3
+          - image_height
+          - image_width
+        role: image
+        stage: pre_adapter
+    components:
+      text_encoder:
+        implementation:
+          kind: onnx
+          artifact: text_encoder/model.onnx
+      denoiser:
+        implementation:
+          kind: onnx
+          artifact: denoiser/model.onnx
+      vae_decoder:
+        implementation:
+          kind: onnx
+          artifact: vae_decoder/model.onnx
+      euler_model_input:
+        implementation:
+          kind: onnx
+          artifact: policies/euler_model_input.onnx
+      solver_step:
+        implementation:
+          kind: onnx
+          artifact: policies/solver_step.onnx
+        contract:
+          id: onnx-genai.solver-step
+          version: '1'
+          bindings:
+            state: sample
+            estimate: derivative
+            step: step
+            schedule: schedule
+            next_state: next_state
+      continue_predicate:
+        implementation:
+          kind: onnx
+          artifact: policies/continue_predicate.onnx
+      diffusion_schedule:
+        implementation:
+          kind: onnx
+          artifact: policies/diffusion_schedule.onnx
+      diffusion_timesteps:
+        implementation:
+          kind: onnx
+          artifact: policies/diffusion_timesteps.onnx
+      schedule_lookup:
+        implementation:
+          kind: onnx
+          artifact: policies/schedule_lookup.onnx
+    state:
+      latent:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 4
+          - height
+          - width
+        scope: invocation
+        initializer: request.latent
+        recurrence:
+          kind: invariant
+      loop_0_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        scope: invocation
+        initializer: package.loop_0_active
+        recurrence:
+          kind: invariant
+    steps:
+    - kind: loop
+      setup:
+      - kind: invoke
+        component: diffusion_schedule
+        inputs: {}
+        outputs:
+          schedule: diffusion.schedule
+      - kind: invoke
+        component: diffusion_timesteps
+        inputs: {}
+        outputs:
+          schedule: diffusion.timesteps
+      - kind: invoke
+        component: text_encoder
+        inputs:
+          input_ids: request.input_ids
+        outputs:
+          encoder_hidden_states: conditioning.hidden_states
+      - kind: invoke
+        component: continue_predicate
+        inputs:
+          done: package.false
+        outputs:
+          continue: setup.continue
+      steps:
+      - kind: invoke
+        component: schedule_lookup
+        inputs:
+          schedule: diffusion.timesteps
+          step: loop.iteration
+        outputs:
+          timestep: diffusion.timestep
+      - kind: invoke
+        component: euler_model_input
+        inputs:
+          sample: latent
+          step: loop.iteration
+          schedule: diffusion.schedule
+        outputs:
+          model_input: diffusion.model_input
+      - kind: invoke
+        component: denoiser
+        inputs:
+          sample: diffusion.model_input
+          timestep: diffusion.timestep
+          encoder_hidden_states: conditioning.hidden_states
+        outputs:
+          noise_pred: denoiser.estimate
+      - kind: invoke
+        component: solver_step
+        inputs:
+          sample: latent
+          derivative: denoiser.estimate
+          step: loop.iteration
+          schedule: diffusion.schedule
+        outputs:
+          next_state: latent.body
+      - kind: invoke
+        component: continue_predicate
+        inputs:
+          done: package.false
+        outputs:
+          continue: loop.continue
+      continue_when: loop_0_active
+      max_iterations: request.max_iterations
+      carried:
+      - cell: latent
+        next: latent.body
+      - cell: loop_0_active
+        next: loop.continue
+      iteration:
+        value: loop.iteration
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+    - kind: invoke
+      component: vae_decoder
+      inputs:
+        latent: latent
+      outputs:
+        image: vae.image
+    - kind: emit
+      value: vae.image
+      output: image
+      mode: replace

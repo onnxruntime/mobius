@@ -1,0 +1,333 @@
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      ir_version: '1.0'
+      onnx_opsets:
+        ai.onnx: 24
+      capabilities:
+      - workflow_ssa
+      - linear_effects
+      - nested_control_flow
+      - loop_induction_values
+      - typed_emit
+      - emit_valid_length
+      - bounded_state_recurrence
+      - serving_service_contract
+    inputs:
+      request.tokens:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - 4
+        role:
+          kind: runtime
+          version: '1.0'
+          role: prompt_tokens
+        source:
+          kind: request
+        required: true
+      request.seed:
+        contract: &id001
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: runtime
+          version: '1.0'
+          role: seed
+        source:
+          kind: request
+        required: false
+        default: 0
+      request.max_iterations:
+        contract: &id002
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: runtime
+          version: '1.0'
+          role: max_output_tokens
+        source:
+          kind: request
+        required: true
+      package.zero:
+        contract: *id001
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0
+      package.one:
+        contract: *id001
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 1
+      package.max_context:
+        contract: *id002
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 4096
+      package.false:
+        contract: &id003
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: false
+      package.active:
+        contract: *id003
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+      request.slot_ids:
+        contract: *id001
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: serving.slot_ids
+        required: true
+      request.cache_lengths:
+        contract: *id001
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: serving.cache_lengths
+        required: false
+        default: 0
+      request.verifier.past_key_values.0.key:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 2
+          - past_sequence
+          - 8
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: verifier.past_key_values.0.key
+        required: true
+    outputs:
+      tokens:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - accepted_sequence
+        role: tokens
+        stage: pre_adapter
+    components:
+      proposer:
+        implementation:
+          kind: onnx
+          artifact: proposer/model.onnx
+      verifier:
+        implementation:
+          kind: onnx
+          artifact: verifier/model.onnx
+      speculative_acceptance:
+        implementation:
+          kind: onnx
+          artifact: policies/speculative_acceptance.onnx
+        contract:
+          id: onnx-genai.speculative-verifier
+          version: '1'
+          bindings:
+            target_scores: target_scores
+            proposed_tokens: proposed_tokens
+            accepted_tokens: accepted_tokens
+            accepted_len: accepted_len
+            done: done
+            continue: continue
+            seed: seed
+            offset: offset
+            next_offset: next_offset
+      cache_length_update:
+        implementation:
+          kind: onnx
+          artifact: policies/cache_length_update.onnx
+    state:
+      tokens_state:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - 4
+        class: semantic
+        scope: invocation
+        initializer: request.tokens
+        recurrence:
+          kind: invariant
+      rng_offset:
+        contract: *id001
+        class: semantic
+        scope: invocation
+        initializer: package.zero
+        recurrence:
+          kind: invariant
+      active:
+        contract: *id003
+        class: semantic
+        scope: invocation
+        initializer: package.active
+        recurrence:
+          kind: invariant
+      done:
+        contract: *id003
+        class: semantic
+        scope: invocation
+        initializer: package.false
+        recurrence:
+          kind: invariant
+      accepted_len:
+        contract: *id001
+        class: semantic
+        scope: invocation
+        initializer: package.zero
+        recurrence:
+          kind: invariant
+      slot_ids:
+        contract: *id001
+        class: semantic
+        scope: invocation
+        initializer: request.slot_ids
+        recurrence:
+          kind: invariant
+      cache_lengths:
+        contract: *id001
+        class: semantic
+        scope: invocation
+        initializer: request.cache_lengths
+        recurrence:
+          kind: invariant
+      cache_0:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 2
+          - past_sequence
+          - 8
+        class: semantic
+        scope: invocation
+        initializer: request.verifier.past_key_values.0.key
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.max_context
+        service_group: verifier_cache
+    serving:
+      active: active
+      done: done
+      accepted_len: accepted_len
+      slot_ids: slot_ids
+      kv_service:
+        paging: paged
+        allocation: runtime
+        compaction: true
+        groups:
+          verifier_cache:
+            sequence_axis: 2
+            layout: bnsh
+            logical_lengths: cache_lengths
+            storage: paged
+            ports:
+              verifier:
+                cache_0:
+                  input: past_key_values.0.key
+                  output: present.0.key
+    steps:
+    - kind: loop
+      setup: []
+      steps:
+      - kind: invoke
+        component: proposer
+        inputs:
+          tokens: tokens_state
+        outputs:
+          proposed_tokens: proposal.tokens
+          proposal_scores: proposal.scores
+      - kind: invoke
+        component: verifier
+        inputs:
+          proposed_tokens: proposal.tokens
+          past_key_values.0.key: cache_0
+        outputs:
+          target_scores: target.scores
+          present.0.key: verifier.present.0.key
+      - kind: invoke
+        component: speculative_acceptance
+        inputs:
+          target_scores: target.scores
+          proposed_tokens: proposal.tokens
+          seed: request.seed
+          offset: rng_offset
+        outputs:
+          accepted_tokens: acceptance.tokens
+          accepted_len: acceptance.length
+          done: acceptance.done
+          continue: acceptance.continue
+          next_offset: rng_offset.body
+          rollback_len: acceptance.rollback_length
+      - kind: invoke
+        component: cache_length_update
+        inputs:
+          left: cache_lengths
+          right: acceptance.length
+        outputs:
+          total: cache_lengths.next
+      - kind: emit
+        value: acceptance.tokens
+        output: tokens
+        mode: append
+        valid_length: acceptance.length
+      continue_when: active
+      max_iterations: request.max_iterations
+      carried:
+      - cell: tokens_state
+        next: acceptance.tokens
+      - cell: rng_offset
+        next: rng_offset.body
+      - cell: active
+        next: acceptance.continue
+      - cell: done
+        next: acceptance.done
+      - cell: accepted_len
+        next: acceptance.length
+      - cell: slot_ids
+        next: slot_ids
+      - cell: cache_lengths
+        next: cache_lengths.next
+      - cell: cache_0
+        next: verifier.present.0.key
+      iteration:
+        value: speculative.iteration
+        contract: *id001

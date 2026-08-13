@@ -212,6 +212,8 @@ __marimo__/
 *.onnx
 *.onnx.data
 *.gguf
+!tests/fixtures/onnx_genai_workflows/**/*.onnx
+!tests/fixtures/onnx_genai_workflows/**/*.onnx.data
 
 # Common test dirs
 output/**

@@ -1,0 +1,1455 @@
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      ir_version: '1.0'
+      onnx_opsets:
+        ai.onnx: 24
+      capabilities:
+      - workflow_ssa
+      - linear_effects
+      - nested_control_flow
+      - loop_induction_values
+      - typed_emit
+      - serving_service_contract
+      - bounded_state_recurrence
+    inputs:
+      request.prompt_tokens:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - text_sequence_len
+        role:
+          kind: runtime
+          version: '1.0'
+          role: prompt_tokens
+        source:
+          kind: request
+        required: true
+      request.max_iterations:
+        contract: &id001
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: runtime
+          version: '1.0'
+          role: max_output_tokens
+        source:
+          kind: request
+        required: true
+      package.false:
+        contract: &id003
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: false
+      package.zero_scalar:
+        contract:
+          dtype: int64
+          rank: 0
+          shape: []
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0
+      package.one_scalar:
+        contract:
+          dtype: int64
+          rank: 0
+          shape: []
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 1
+      package.remaining_groups:
+        contract: *id001
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 2
+      package.predictor_context_limit:
+        contract: *id001
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 4
+      package.predictor_mask_limit:
+        contract: *id001
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 5
+      package.talker_context_limit:
+        contract: *id001
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 128
+      package.one_control:
+        contract: *id001
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 1
+      package.zero_batch:
+        contract: &id002
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0
+      package.one_batch:
+        contract: *id002
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 1
+      package.true:
+        contract: *id003
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+      package.slot_ids:
+        contract: *id002
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0
+      package.setup_predictor_iteration_0:
+        contract:
+          dtype: int64
+          rank: 0
+          shape: []
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0
+      package.setup_predictor_iteration_1:
+        contract:
+          dtype: int64
+          rank: 0
+          shape: []
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 1
+      package.loop_1_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+      package.loop_0_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+    outputs:
+      waveform:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - batch
+          - 1
+          - samples
+        role: audio
+        stage: post_adapter
+    components:
+      talker:
+        implementation:
+          kind: onnx
+          artifact: talker/model.onnx
+      code_predictor:
+        implementation:
+          kind: onnx
+          artifact: code_predictor/model.onnx
+      embedding:
+        implementation:
+          kind: onnx
+          artifact: embedding/model.onnx
+      talker_step_embedder:
+        implementation:
+          kind: onnx
+          artifact: talker_step_embedder/model.onnx
+      talker_prefill_embedder:
+        implementation:
+          kind: onnx
+          artifact: talker_prefill_embedder/model.onnx
+      code_predictor_prefill:
+        implementation:
+          kind: onnx
+          artifact: code_predictor_prefill/model.onnx
+      code_predictor_step_embedder:
+        implementation:
+          kind: onnx
+          artifact: code_predictor_step_embedder/model.onnx
+      code_predictor_indices:
+        implementation:
+          kind: onnx
+          artifact: code_predictor_indices/model.onnx
+      talker_text_step:
+        implementation:
+          kind: onnx
+          artifact: talker_text_step/model.onnx
+      codec:
+        implementation:
+          kind: onnx
+          artifact: codec/model.onnx
+      last_token_logits:
+        implementation:
+          kind: onnx
+          artifact: policies/last_token_logits.onnx
+      setup_talker_sampler:
+        implementation:
+          kind: onnx
+          artifact: policies/setup_talker_sampler.onnx
+        contract:
+          id: onnx-genai.token-sampler
+          version: '1'
+          bindings:
+            logits: logits
+            token: token
+          parameters:
+            mode: greedy
+        application_overridable: true
+      setup_predictor_sampler:
+        implementation:
+          kind: onnx
+          artifact: policies/setup_predictor_sampler.onnx
+        contract:
+          id: onnx-genai.token-sampler
+          version: '1'
+          bindings:
+            logits: logits
+            token: token
+          parameters:
+            mode: greedy
+        application_overridable: true
+      talker_sampler:
+        implementation:
+          kind: onnx
+          artifact: policies/talker_sampler.onnx
+        contract:
+          id: onnx-genai.token-sampler
+          version: '1'
+          bindings:
+            logits: logits
+            token: token
+          parameters:
+            mode: greedy
+        application_overridable: true
+      predictor_prefill_sampler:
+        implementation:
+          kind: onnx
+          artifact: policies/predictor_prefill_sampler.onnx
+        contract:
+          id: onnx-genai.token-sampler
+          version: '1'
+          bindings:
+            logits: logits
+            token: token
+          parameters:
+            mode: greedy
+        application_overridable: true
+      predictor_body_sampler:
+        implementation:
+          kind: onnx
+          artifact: policies/predictor_body_sampler.onnx
+        contract:
+          id: onnx-genai.token-sampler
+          version: '1'
+          bindings:
+            logits: logits
+            token: token
+          parameters:
+            mode: greedy
+        application_overridable: true
+      continue_predicate:
+        implementation:
+          kind: onnx
+          artifact: policies/continue_predicate.onnx
+      tts_state_initializer:
+        implementation:
+          kind: onnx
+          artifact: policies/tts_state_initializer.onnx
+      token_to_slot:
+        implementation:
+          kind: onnx
+          artifact: policies/token_to_slot.onnx
+      code_frame_update:
+        implementation:
+          kind: onnx
+          artifact: policies/code_frame_update.onnx
+      code_history_append:
+        implementation:
+          kind: onnx
+          artifact: policies/code_history_append.onnx
+      cache_length_update:
+        implementation:
+          kind: onnx
+          artifact: policies/cache_length_update.onnx
+      talker_state_initializer:
+        implementation:
+          kind: onnx
+          artifact: policies/talker_state_initializer.onnx
+      predictor_state_initializer:
+        implementation:
+          kind: onnx
+          artifact: policies/predictor_state_initializer.onnx
+      talker_step_update:
+        implementation:
+          kind: onnx
+          artifact: policies/talker_step_update.onnx
+      predictor_step_update:
+        implementation:
+          kind: onnx
+          artifact: policies/predictor_step_update.onnx
+      codec_layout:
+        implementation:
+          kind: onnx
+          artifact: policies/codec_layout.onnx
+    state:
+      last_frame:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - 4
+        scope: invocation
+        initializer: setup.predictor.remaining_1.frame
+        recurrence:
+          kind: invariant
+      history:
+        contract:
+          dtype: int64
+          rank: 3
+          shape:
+          - batch
+          - frames
+          - 4
+        scope: invocation
+        initializer: history.setup
+        recurrence:
+          kind: growing
+          axis: 1
+          increment: package.one_control
+          max: package.talker_context_limit
+      talker_mask:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - talker_context
+        scope: invocation
+        initializer: talker.initializer.body_attention_mask
+        recurrence:
+          kind: growing
+          axis: 1
+          increment: package.one_control
+          max: package.talker_context_limit
+      talker_position:
+        contract:
+          dtype: int64
+          rank: 3
+          shape:
+          - 3
+          - batch
+          - 1
+        scope: invocation
+        initializer: talker.initializer.body_position_ids
+        recurrence:
+          kind: invariant
+      frame:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - 4
+        scope: invocation
+        initializer: frame.frame_prefill
+        recurrence:
+          kind: invariant
+      code_token:
+        contract: *id002
+        scope: invocation
+        initializer: frame.group1
+        recurrence:
+          kind: invariant
+      predictor_mask:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - predictor_context
+        scope: invocation
+        initializer: frame.predictor.initializer.body_attention_mask
+        recurrence:
+          kind: growing
+          axis: 1
+          increment: package.one_control
+          max: package.predictor_mask_limit
+      predictor_position:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - 1
+        scope: invocation
+        initializer: frame.predictor.initializer.body_position_ids
+        recurrence:
+          kind: invariant
+      active:
+        contract: *id003
+        class: semantic
+        scope: invocation
+        initializer: package.true
+        recurrence:
+          kind: invariant
+      done:
+        contract: *id003
+        class: semantic
+        scope: invocation
+        initializer: package.false
+        recurrence:
+          kind: invariant
+      accepted_len:
+        contract: *id002
+        class: semantic
+        scope: invocation
+        initializer: package.zero_batch
+        recurrence:
+          kind: invariant
+      slot_ids:
+        contract: *id002
+        class: semantic
+        scope: invocation
+        initializer: package.slot_ids
+        recurrence:
+          kind: invariant
+      talker_cache_lengths:
+        contract: *id002
+        class: semantic
+        scope: invocation
+        initializer: package.zero_batch
+        recurrence:
+          kind: invariant
+      predictor_cache_lengths:
+        contract: *id002
+        class: semantic
+        scope: invocation
+        initializer: package.zero_batch
+        recurrence:
+          kind: invariant
+      talker_cache_0:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 1
+          - past_sequence_len
+          - 4
+        class: semantic
+        scope: invocation
+        initializer: talker.setup.present.0.key
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.talker_context_limit
+        service_group: talker_cache
+      talker_cache_1:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 1
+          - past_sequence_len
+          - 4
+        class: semantic
+        scope: invocation
+        initializer: talker.setup.present.0.value
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.talker_context_limit
+        service_group: talker_cache
+      predictor_cache_0:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 8
+          - past_sequence_len
+          - 128
+        class: semantic
+        scope: invocation
+        initializer: frame.predictor.present.0.key
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.predictor_context_limit
+        service_group: predictor_cache
+      predictor_cache_1:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 8
+          - past_sequence_len
+          - 128
+        class: semantic
+        scope: invocation
+        initializer: frame.predictor.present.0.value
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.predictor_context_limit
+        service_group: predictor_cache
+      predictor_cache_2:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 8
+          - past_sequence_len
+          - 128
+        class: semantic
+        scope: invocation
+        initializer: frame.predictor.present.1.key
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.predictor_context_limit
+        service_group: predictor_cache
+      predictor_cache_3:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 8
+          - past_sequence_len
+          - 128
+        class: semantic
+        scope: invocation
+        initializer: frame.predictor.present.1.value
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.predictor_context_limit
+        service_group: predictor_cache
+      predictor_cache_4:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 8
+          - past_sequence_len
+          - 128
+        class: semantic
+        scope: invocation
+        initializer: frame.predictor.present.2.key
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.predictor_context_limit
+        service_group: predictor_cache
+      predictor_cache_5:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 8
+          - past_sequence_len
+          - 128
+        class: semantic
+        scope: invocation
+        initializer: frame.predictor.present.2.value
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.predictor_context_limit
+        service_group: predictor_cache
+      predictor_cache_6:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 8
+          - past_sequence_len
+          - 128
+        class: semantic
+        scope: invocation
+        initializer: frame.predictor.present.3.key
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.predictor_context_limit
+        service_group: predictor_cache
+      predictor_cache_7:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 8
+          - past_sequence_len
+          - 128
+        class: semantic
+        scope: invocation
+        initializer: frame.predictor.present.3.value
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.predictor_context_limit
+        service_group: predictor_cache
+      predictor_cache_8:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 8
+          - past_sequence_len
+          - 128
+        class: semantic
+        scope: invocation
+        initializer: frame.predictor.present.4.key
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.predictor_context_limit
+        service_group: predictor_cache
+      predictor_cache_9:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 8
+          - past_sequence_len
+          - 128
+        class: semantic
+        scope: invocation
+        initializer: frame.predictor.present.4.value
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.predictor_context_limit
+        service_group: predictor_cache
+      loop_1_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        scope: invocation
+        initializer: package.loop_1_active
+        recurrence:
+          kind: invariant
+      loop_0_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        scope: invocation
+        initializer: package.loop_0_active
+        recurrence:
+          kind: invariant
+    serving:
+      active: active
+      done: done
+      accepted_len: accepted_len
+      slot_ids: slot_ids
+      kv_service:
+        paging: paged
+        allocation: runtime
+        compaction: true
+        groups:
+          talker_cache:
+            sequence_axis: 2
+            layout: bnsh
+            logical_lengths: talker_cache_lengths
+            storage: paged
+            ports:
+              talker:
+                talker_cache_0:
+                  input: past_key_values.0.key
+                  output: present.0.key
+                talker_cache_1:
+                  input: past_key_values.0.value
+                  output: present.0.value
+          predictor_cache:
+            sequence_axis: 2
+            layout: bnsh
+            logical_lengths: predictor_cache_lengths
+            storage: paged
+            ports:
+              code_predictor:
+                predictor_cache_0:
+                  input: past_key_values.0.key
+                  output: present.0.key
+                predictor_cache_1:
+                  input: past_key_values.0.value
+                  output: present.0.value
+                predictor_cache_2:
+                  input: past_key_values.1.key
+                  output: present.1.key
+                predictor_cache_3:
+                  input: past_key_values.1.value
+                  output: present.1.value
+                predictor_cache_4:
+                  input: past_key_values.2.key
+                  output: present.2.key
+                predictor_cache_5:
+                  input: past_key_values.2.value
+                  output: present.2.value
+                predictor_cache_6:
+                  input: past_key_values.3.key
+                  output: present.3.key
+                predictor_cache_7:
+                  input: past_key_values.3.value
+                  output: present.3.value
+                predictor_cache_8:
+                  input: past_key_values.4.key
+                  output: present.4.key
+                predictor_cache_9:
+                  input: past_key_values.4.value
+                  output: present.4.value
+    steps:
+    - kind: loop
+      setup:
+      - kind: invoke
+        component: tts_state_initializer
+        inputs:
+          prompt_tokens: request.prompt_tokens
+        outputs:
+          frame_codes: initializer.frame_codes
+          token_slot: initializer.token_slot
+          code_history: initializer.code_history
+      - kind: invoke
+        component: talker_prefill_embedder
+        inputs:
+          text_ids: request.prompt_tokens
+        outputs:
+          prefill_embeds: tts.prefill_embeds
+          trailing_text_embeds: tts.trailing_text_embeds
+      - kind: invoke
+        component: talker_state_initializer
+        inputs:
+          prefill_embeds: tts.prefill_embeds
+        outputs:
+          attention_mask: talker.initializer.attention_mask
+          position_ids: talker.initializer.position_ids
+          body_attention_mask: talker.initializer.body_attention_mask
+          body_position_ids: talker.initializer.body_position_ids
+          past_key_values.0.key: talker.initializer.past_key_values.0.key
+          past_key_values.0.value: talker.initializer.past_key_values.0.value
+      - kind: invoke
+        component: talker
+        inputs:
+          inputs_embeds: tts.prefill_embeds
+          attention_mask: talker.initializer.attention_mask
+          position_ids: talker.initializer.position_ids
+          past_key_values.0.key: talker.initializer.past_key_values.0.key
+          past_key_values.0.value: talker.initializer.past_key_values.0.value
+        outputs:
+          logits: talker.setup.logits
+          last_hidden_state: talker.setup.hidden
+          present.0.key: talker.setup.present.0.key
+          present.0.value: talker.setup.present.0.value
+      - kind: invoke
+        component: last_token_logits
+        inputs:
+          logits: talker.setup.logits
+        outputs:
+          last_logits: setup.group0_logits
+      - kind: invoke
+        component: setup_talker_sampler
+        inputs:
+          logits: setup.group0_logits
+        outputs:
+          token: setup.group0
+      - kind: invoke
+        component: token_to_slot
+        inputs:
+          token: setup.group0
+        outputs:
+          slot: setup.group0_slot
+      - kind: invoke
+        component: embedding
+        inputs:
+          text_ids: request.prompt_tokens
+          codec_ids: setup.group0_slot
+        outputs:
+          text_embeds: setup.unused_text_embeds
+          codec_embeds: setup.group0_embed
+      - kind: invoke
+        component: code_predictor_prefill
+        inputs:
+          talker_hidden: talker.setup.hidden
+          group_0_embed: setup.group0_embed
+        outputs:
+          inputs_embeds: setup.predictor_prefill
+      - kind: invoke
+        component: predictor_state_initializer
+        inputs:
+          prefill_embeds: setup.predictor_prefill
+        outputs:
+          attention_mask: setup.predictor.initializer.attention_mask
+          position_ids: setup.predictor.initializer.position_ids
+          body_attention_mask: setup.predictor.initializer.body_attention_mask
+          body_position_ids: setup.predictor.initializer.body_position_ids
+          past_key_values.0.key: setup.predictor.initializer.past_key_values.0.key
+          past_key_values.0.value: setup.predictor.initializer.past_key_values.0.value
+          past_key_values.1.key: setup.predictor.initializer.past_key_values.1.key
+          past_key_values.1.value: setup.predictor.initializer.past_key_values.1.value
+          past_key_values.2.key: setup.predictor.initializer.past_key_values.2.key
+          past_key_values.2.value: setup.predictor.initializer.past_key_values.2.value
+          past_key_values.3.key: setup.predictor.initializer.past_key_values.3.key
+          past_key_values.3.value: setup.predictor.initializer.past_key_values.3.value
+          past_key_values.4.key: setup.predictor.initializer.past_key_values.4.key
+          past_key_values.4.value: setup.predictor.initializer.past_key_values.4.value
+      - kind: invoke
+        component: code_predictor
+        inputs:
+          inputs_embeds: setup.predictor_prefill
+          step_index: package.zero_scalar
+          attention_mask: setup.predictor.initializer.attention_mask
+          position_ids: setup.predictor.initializer.position_ids
+          past_key_values.0.key: setup.predictor.initializer.past_key_values.0.key
+          past_key_values.0.value: setup.predictor.initializer.past_key_values.0.value
+          past_key_values.1.key: setup.predictor.initializer.past_key_values.1.key
+          past_key_values.1.value: setup.predictor.initializer.past_key_values.1.value
+          past_key_values.2.key: setup.predictor.initializer.past_key_values.2.key
+          past_key_values.2.value: setup.predictor.initializer.past_key_values.2.value
+          past_key_values.3.key: setup.predictor.initializer.past_key_values.3.key
+          past_key_values.3.value: setup.predictor.initializer.past_key_values.3.value
+          past_key_values.4.key: setup.predictor.initializer.past_key_values.4.key
+          past_key_values.4.value: setup.predictor.initializer.past_key_values.4.value
+        outputs:
+          logits: setup.predictor.logits
+          codec_embeddings: setup.predictor.codec_embeddings
+          present.0.key: setup.predictor.present.0.key
+          present.0.value: setup.predictor.present.0.value
+          present.1.key: setup.predictor.present.1.key
+          present.1.value: setup.predictor.present.1.value
+          present.2.key: setup.predictor.present.2.key
+          present.2.value: setup.predictor.present.2.value
+          present.3.key: setup.predictor.present.3.key
+          present.3.value: setup.predictor.present.3.value
+          present.4.key: setup.predictor.present.4.key
+          present.4.value: setup.predictor.present.4.value
+      - kind: invoke
+        component: last_token_logits
+        inputs:
+          logits: setup.predictor.logits
+        outputs:
+          last_logits: setup.group1_logits
+      - kind: invoke
+        component: setup_predictor_sampler
+        inputs:
+          logits: setup.group1_logits
+        outputs:
+          token: setup.group1
+      - kind: invoke
+        component: code_frame_update
+        inputs:
+          frame_codes: initializer.frame_codes
+          token: setup.group0
+          index: package.zero_scalar
+        outputs:
+          next_frame: setup.frame_group0
+      - kind: invoke
+        component: code_frame_update
+        inputs:
+          frame_codes: setup.frame_group0
+          token: setup.group1
+          index: package.one_scalar
+        outputs:
+          next_frame: setup.frame_prefill
+      - kind: invoke
+        component: code_predictor_indices
+        inputs:
+          iteration: package.setup_predictor_iteration_0
+        outputs:
+          embedding_index: setup.predictor.remaining_0.embedding_index
+          step_index: setup.predictor.remaining_0.step_index
+          frame_index: setup.predictor.remaining_0.frame_index
+      - kind: invoke
+        component: code_predictor_step_embedder
+        inputs:
+          codec_embeddings: setup.predictor.codec_embeddings
+          token: setup.group1
+          embedding_index: setup.predictor.remaining_0.embedding_index
+        outputs:
+          inputs_embeds: setup.predictor.remaining_0.inputs_embeds
+      - kind: invoke
+        component: code_predictor
+        inputs:
+          inputs_embeds: setup.predictor.remaining_0.inputs_embeds
+          step_index: setup.predictor.remaining_0.step_index
+          attention_mask: setup.predictor.initializer.body_attention_mask
+          position_ids: setup.predictor.initializer.body_position_ids
+          past_key_values.0.key: setup.predictor.present.0.key
+          past_key_values.0.value: setup.predictor.present.0.value
+          past_key_values.1.key: setup.predictor.present.1.key
+          past_key_values.1.value: setup.predictor.present.1.value
+          past_key_values.2.key: setup.predictor.present.2.key
+          past_key_values.2.value: setup.predictor.present.2.value
+          past_key_values.3.key: setup.predictor.present.3.key
+          past_key_values.3.value: setup.predictor.present.3.value
+          past_key_values.4.key: setup.predictor.present.4.key
+          past_key_values.4.value: setup.predictor.present.4.value
+        outputs:
+          logits: setup.predictor.remaining_0.logits
+          codec_embeddings: setup.predictor.remaining_0.codec_embeddings
+          present.0.key: setup.predictor.remaining_0.present.0.key
+          present.0.value: setup.predictor.remaining_0.present.0.value
+          present.1.key: setup.predictor.remaining_0.present.1.key
+          present.1.value: setup.predictor.remaining_0.present.1.value
+          present.2.key: setup.predictor.remaining_0.present.2.key
+          present.2.value: setup.predictor.remaining_0.present.2.value
+          present.3.key: setup.predictor.remaining_0.present.3.key
+          present.3.value: setup.predictor.remaining_0.present.3.value
+          present.4.key: setup.predictor.remaining_0.present.4.key
+          present.4.value: setup.predictor.remaining_0.present.4.value
+      - kind: invoke
+        component: last_token_logits
+        inputs:
+          logits: setup.predictor.remaining_0.logits
+        outputs:
+          last_logits: setup.predictor.remaining_0.last_logits
+      - kind: invoke
+        component: predictor_body_sampler
+        inputs:
+          logits: setup.predictor.remaining_0.last_logits
+        outputs:
+          token: setup.predictor.remaining_0.token
+      - kind: invoke
+        component: code_frame_update
+        inputs:
+          frame_codes: setup.frame_prefill
+          token: setup.predictor.remaining_0.token
+          index: setup.predictor.remaining_0.frame_index
+        outputs:
+          next_frame: setup.predictor.remaining_0.frame
+      - kind: invoke
+        component: predictor_step_update
+        inputs:
+          attention_mask: setup.predictor.initializer.body_attention_mask
+          position_ids: setup.predictor.initializer.body_position_ids
+        outputs:
+          next_attention_mask: setup.predictor.remaining_0.mask
+          next_position_ids: setup.predictor.remaining_0.position
+      - kind: invoke
+        component: code_predictor_indices
+        inputs:
+          iteration: package.setup_predictor_iteration_1
+        outputs:
+          embedding_index: setup.predictor.remaining_1.embedding_index
+          step_index: setup.predictor.remaining_1.step_index
+          frame_index: setup.predictor.remaining_1.frame_index
+      - kind: invoke
+        component: code_predictor_step_embedder
+        inputs:
+          codec_embeddings: setup.predictor.codec_embeddings
+          token: setup.predictor.remaining_0.token
+          embedding_index: setup.predictor.remaining_1.embedding_index
+        outputs:
+          inputs_embeds: setup.predictor.remaining_1.inputs_embeds
+      - kind: invoke
+        component: code_predictor
+        inputs:
+          inputs_embeds: setup.predictor.remaining_1.inputs_embeds
+          step_index: setup.predictor.remaining_1.step_index
+          attention_mask: setup.predictor.remaining_0.mask
+          position_ids: setup.predictor.remaining_0.position
+          past_key_values.0.key: setup.predictor.remaining_0.present.0.key
+          past_key_values.0.value: setup.predictor.remaining_0.present.0.value
+          past_key_values.1.key: setup.predictor.remaining_0.present.1.key
+          past_key_values.1.value: setup.predictor.remaining_0.present.1.value
+          past_key_values.2.key: setup.predictor.remaining_0.present.2.key
+          past_key_values.2.value: setup.predictor.remaining_0.present.2.value
+          past_key_values.3.key: setup.predictor.remaining_0.present.3.key
+          past_key_values.3.value: setup.predictor.remaining_0.present.3.value
+          past_key_values.4.key: setup.predictor.remaining_0.present.4.key
+          past_key_values.4.value: setup.predictor.remaining_0.present.4.value
+        outputs:
+          logits: setup.predictor.remaining_1.logits
+          codec_embeddings: setup.predictor.remaining_1.codec_embeddings
+          present.0.key: setup.predictor.remaining_1.present.0.key
+          present.0.value: setup.predictor.remaining_1.present.0.value
+          present.1.key: setup.predictor.remaining_1.present.1.key
+          present.1.value: setup.predictor.remaining_1.present.1.value
+          present.2.key: setup.predictor.remaining_1.present.2.key
+          present.2.value: setup.predictor.remaining_1.present.2.value
+          present.3.key: setup.predictor.remaining_1.present.3.key
+          present.3.value: setup.predictor.remaining_1.present.3.value
+          present.4.key: setup.predictor.remaining_1.present.4.key
+          present.4.value: setup.predictor.remaining_1.present.4.value
+      - kind: invoke
+        component: last_token_logits
+        inputs:
+          logits: setup.predictor.remaining_1.logits
+        outputs:
+          last_logits: setup.predictor.remaining_1.last_logits
+      - kind: invoke
+        component: predictor_body_sampler
+        inputs:
+          logits: setup.predictor.remaining_1.last_logits
+        outputs:
+          token: setup.predictor.remaining_1.token
+      - kind: invoke
+        component: code_frame_update
+        inputs:
+          frame_codes: setup.predictor.remaining_0.frame
+          token: setup.predictor.remaining_1.token
+          index: setup.predictor.remaining_1.frame_index
+        outputs:
+          next_frame: setup.predictor.remaining_1.frame
+      - kind: invoke
+        component: predictor_step_update
+        inputs:
+          attention_mask: setup.predictor.remaining_0.mask
+          position_ids: setup.predictor.remaining_0.position
+        outputs:
+          next_attention_mask: setup.predictor.remaining_1.mask
+          next_position_ids: setup.predictor.remaining_1.position
+      - kind: invoke
+        component: code_history_append
+        inputs:
+          history: initializer.code_history
+          frame: setup.predictor.remaining_1.frame
+        outputs:
+          next_history: history.setup
+      - kind: invoke
+        component: continue_predicate
+        inputs:
+          done: package.false
+        outputs:
+          continue: talker.setup.continue
+      steps:
+      - kind: invoke
+        component: talker_text_step
+        inputs:
+          trailing_text_embeds: tts.trailing_text_embeds
+          iteration: talker.iteration
+        outputs:
+          text_embed: talker.text_embed
+      - kind: invoke
+        component: talker_step_embedder
+        inputs:
+          frame_codes: last_frame
+          text_embed: talker.text_embed
+        outputs:
+          inputs_embeds: talker.step_embeds
+      - kind: invoke
+        component: talker
+        inputs:
+          inputs_embeds: talker.step_embeds
+          attention_mask: talker_mask
+          position_ids: talker_position
+          past_key_values.0.key: talker_cache_0
+          past_key_values.0.value: talker_cache_1
+        outputs:
+          logits: talker.body.logits
+          last_hidden_state: talker.body.hidden
+          present.0.key: talker.body.present.0.key
+          present.0.value: talker.body.present.0.value
+      - kind: invoke
+        component: last_token_logits
+        inputs:
+          logits: talker.body.logits
+        outputs:
+          last_logits: frame.group0_logits
+      - kind: invoke
+        component: talker_sampler
+        inputs:
+          logits: frame.group0_logits
+        outputs:
+          token: frame.group0
+      - kind: invoke
+        component: token_to_slot
+        inputs:
+          token: frame.group0
+        outputs:
+          slot: frame.group0_slot
+      - kind: invoke
+        component: embedding
+        inputs:
+          text_ids: request.prompt_tokens
+          codec_ids: frame.group0_slot
+        outputs:
+          text_embeds: frame.unused_text_embeds
+          codec_embeds: frame.group0_embed
+      - kind: invoke
+        component: code_predictor_prefill
+        inputs:
+          talker_hidden: talker.body.hidden
+          group_0_embed: frame.group0_embed
+        outputs:
+          inputs_embeds: frame.predictor_prefill
+      - kind: invoke
+        component: predictor_state_initializer
+        inputs:
+          prefill_embeds: frame.predictor_prefill
+        outputs:
+          attention_mask: frame.predictor.initializer.attention_mask
+          position_ids: frame.predictor.initializer.position_ids
+          body_attention_mask: frame.predictor.initializer.body_attention_mask
+          body_position_ids: frame.predictor.initializer.body_position_ids
+          past_key_values.0.key: frame.predictor.initializer.past_key_values.0.key
+          past_key_values.0.value: frame.predictor.initializer.past_key_values.0.value
+          past_key_values.1.key: frame.predictor.initializer.past_key_values.1.key
+          past_key_values.1.value: frame.predictor.initializer.past_key_values.1.value
+          past_key_values.2.key: frame.predictor.initializer.past_key_values.2.key
+          past_key_values.2.value: frame.predictor.initializer.past_key_values.2.value
+          past_key_values.3.key: frame.predictor.initializer.past_key_values.3.key
+          past_key_values.3.value: frame.predictor.initializer.past_key_values.3.value
+          past_key_values.4.key: frame.predictor.initializer.past_key_values.4.key
+          past_key_values.4.value: frame.predictor.initializer.past_key_values.4.value
+      - kind: invoke
+        component: code_predictor
+        inputs:
+          inputs_embeds: frame.predictor_prefill
+          step_index: package.zero_scalar
+          attention_mask: frame.predictor.initializer.attention_mask
+          position_ids: frame.predictor.initializer.position_ids
+          past_key_values.0.key: frame.predictor.initializer.past_key_values.0.key
+          past_key_values.0.value: frame.predictor.initializer.past_key_values.0.value
+          past_key_values.1.key: frame.predictor.initializer.past_key_values.1.key
+          past_key_values.1.value: frame.predictor.initializer.past_key_values.1.value
+          past_key_values.2.key: frame.predictor.initializer.past_key_values.2.key
+          past_key_values.2.value: frame.predictor.initializer.past_key_values.2.value
+          past_key_values.3.key: frame.predictor.initializer.past_key_values.3.key
+          past_key_values.3.value: frame.predictor.initializer.past_key_values.3.value
+          past_key_values.4.key: frame.predictor.initializer.past_key_values.4.key
+          past_key_values.4.value: frame.predictor.initializer.past_key_values.4.value
+        outputs:
+          logits: frame.predictor.logits
+          codec_embeddings: frame.predictor.codec_embeddings
+          present.0.key: frame.predictor.present.0.key
+          present.0.value: frame.predictor.present.0.value
+          present.1.key: frame.predictor.present.1.key
+          present.1.value: frame.predictor.present.1.value
+          present.2.key: frame.predictor.present.2.key
+          present.2.value: frame.predictor.present.2.value
+          present.3.key: frame.predictor.present.3.key
+          present.3.value: frame.predictor.present.3.value
+          present.4.key: frame.predictor.present.4.key
+          present.4.value: frame.predictor.present.4.value
+      - kind: invoke
+        component: last_token_logits
+        inputs:
+          logits: frame.predictor.logits
+        outputs:
+          last_logits: frame.group1_logits
+      - kind: invoke
+        component: predictor_prefill_sampler
+        inputs:
+          logits: frame.group1_logits
+        outputs:
+          token: frame.group1
+      - kind: invoke
+        component: code_frame_update
+        inputs:
+          frame_codes: initializer.frame_codes
+          token: frame.group0
+          index: package.zero_scalar
+        outputs:
+          next_frame: frame.frame_group0
+      - kind: invoke
+        component: code_frame_update
+        inputs:
+          frame_codes: frame.frame_group0
+          token: frame.group1
+          index: package.one_scalar
+        outputs:
+          next_frame: frame.frame_prefill
+      - kind: loop
+        setup:
+        - kind: invoke
+          component: continue_predicate
+          inputs:
+            done: package.false
+          outputs:
+            continue: code.setup.continue
+        steps:
+        - kind: invoke
+          component: code_predictor_indices
+          inputs:
+            iteration: code.iteration
+          outputs:
+            embedding_index: predictor.body.embedding_index
+            step_index: predictor.body.step_index
+            frame_index: predictor.body.frame_index
+        - kind: invoke
+          component: cache_length_update
+          inputs:
+            left: predictor_cache_lengths
+            right: package.one_batch
+          outputs:
+            total: predictor_cache_lengths.next
+        - kind: invoke
+          component: code_predictor_step_embedder
+          inputs:
+            codec_embeddings: frame.predictor.codec_embeddings
+            token: code_token
+            embedding_index: predictor.body.embedding_index
+          outputs:
+            inputs_embeds: predictor.body.inputs_embeds
+        - kind: invoke
+          component: code_predictor
+          inputs:
+            inputs_embeds: predictor.body.inputs_embeds
+            step_index: predictor.body.step_index
+            attention_mask: predictor_mask
+            position_ids: predictor_position
+            past_key_values.0.key: predictor_cache_0
+            past_key_values.0.value: predictor_cache_1
+            past_key_values.1.key: predictor_cache_2
+            past_key_values.1.value: predictor_cache_3
+            past_key_values.2.key: predictor_cache_4
+            past_key_values.2.value: predictor_cache_5
+            past_key_values.3.key: predictor_cache_6
+            past_key_values.3.value: predictor_cache_7
+            past_key_values.4.key: predictor_cache_8
+            past_key_values.4.value: predictor_cache_9
+          outputs:
+            logits: predictor.body.logits
+            codec_embeddings: predictor.body.codec_embeddings
+            present.0.key: predictor.body.present.0.key
+            present.0.value: predictor.body.present.0.value
+            present.1.key: predictor.body.present.1.key
+            present.1.value: predictor.body.present.1.value
+            present.2.key: predictor.body.present.2.key
+            present.2.value: predictor.body.present.2.value
+            present.3.key: predictor.body.present.3.key
+            present.3.value: predictor.body.present.3.value
+            present.4.key: predictor.body.present.4.key
+            present.4.value: predictor.body.present.4.value
+        - kind: invoke
+          component: last_token_logits
+          inputs:
+            logits: predictor.body.logits
+          outputs:
+            last_logits: predictor.body.last_logits
+        - kind: invoke
+          component: predictor_body_sampler
+          inputs:
+            logits: predictor.body.last_logits
+          outputs:
+            token: code.token
+        - kind: invoke
+          component: code_frame_update
+          inputs:
+            frame_codes: frame
+            token: code.token
+            index: predictor.body.frame_index
+          outputs:
+            next_frame: frame.inner
+        - kind: invoke
+          component: predictor_step_update
+          inputs:
+            attention_mask: predictor_mask
+            position_ids: predictor_position
+          outputs:
+            next_attention_mask: predictor.mask.inner
+            next_position_ids: predictor.position.inner
+        - kind: invoke
+          component: continue_predicate
+          inputs:
+            done: package.false
+          outputs:
+            continue: code.continue
+        continue_when: loop_1_active
+        max_iterations: package.remaining_groups
+        carried:
+        - cell: frame
+          next: frame.inner
+        - cell: code_token
+          next: code.token
+        - cell: predictor_mask
+          next: predictor.mask.inner
+        - cell: predictor_position
+          next: predictor.position.inner
+        - cell: predictor_cache_lengths
+          next: predictor_cache_lengths.next
+        - cell: predictor_cache_0
+          next: predictor.body.present.0.key
+        - cell: predictor_cache_1
+          next: predictor.body.present.0.value
+        - cell: predictor_cache_2
+          next: predictor.body.present.1.key
+        - cell: predictor_cache_3
+          next: predictor.body.present.1.value
+        - cell: predictor_cache_4
+          next: predictor.body.present.2.key
+        - cell: predictor_cache_5
+          next: predictor.body.present.2.value
+        - cell: predictor_cache_6
+          next: predictor.body.present.3.key
+        - cell: predictor_cache_7
+          next: predictor.body.present.3.value
+        - cell: predictor_cache_8
+          next: predictor.body.present.4.key
+        - cell: predictor_cache_9
+          next: predictor.body.present.4.value
+        - cell: loop_1_active
+          next: code.continue
+        iteration:
+          value: code.iteration
+          contract:
+            dtype: int64
+            rank: 0
+            shape: []
+      - kind: invoke
+        component: code_history_append
+        inputs:
+          history: history
+          frame: frame
+        outputs:
+          next_history: history.outer
+      - kind: invoke
+        component: talker_step_update
+        inputs:
+          attention_mask: talker_mask
+          position_ids: talker_position
+        outputs:
+          next_attention_mask: talker.mask.body
+          next_position_ids: talker.position.body
+      - kind: invoke
+        component: cache_length_update
+        inputs:
+          left: talker_cache_lengths
+          right: package.one_batch
+        outputs:
+          total: talker_cache_lengths.next
+      - kind: invoke
+        component: cache_length_update
+        inputs:
+          left: package.zero_batch
+          right: package.one_batch
+        outputs:
+          total: accepted_len.next
+      - kind: invoke
+        component: continue_predicate
+        inputs:
+          done: package.false
+        outputs:
+          continue: talker.continue
+      continue_when: loop_0_active
+      max_iterations: request.max_iterations
+      carried:
+      - cell: active
+        next: active
+      - cell: done
+        next: done
+      - cell: accepted_len
+        next: accepted_len.next
+      - cell: slot_ids
+        next: slot_ids
+      - cell: talker_cache_lengths
+        next: talker_cache_lengths.next
+      - cell: last_frame
+        next: frame
+        initial: setup.frame_prefill
+      - cell: history
+        next: history.outer
+      - cell: talker_mask
+        next: talker.mask.body
+      - cell: talker_position
+        next: talker.position.body
+      - cell: talker_cache_0
+        next: talker.body.present.0.key
+      - cell: talker_cache_1
+        next: talker.body.present.0.value
+      - cell: loop_0_active
+        next: talker.continue
+      iteration:
+        value: talker.iteration
+        contract: *id002
+    - kind: invoke
+      component: codec_layout
+      inputs:
+        history: history
+      outputs:
+        codes: codec.codes
+    - kind: invoke
+      component: codec
+      inputs:
+        codes: codec.codes
+      outputs:
+        waveform: tts.waveform
+    - kind: emit
+      value: tts.waveform
+      output: waveform
+      mode: replace

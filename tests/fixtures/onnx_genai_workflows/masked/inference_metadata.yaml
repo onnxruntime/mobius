@@ -1,0 +1,237 @@
+schema_version: '1.0'
+pipeline:
+  workflow:
+    manifest:
+      ir_version: '1.0'
+      onnx_opsets:
+        ai.onnx: 24
+      capabilities:
+      - workflow_ssa
+      - linear_effects
+      - nested_control_flow
+      - typed_emit
+      - loop_induction_values
+    inputs:
+      request.input_ids:
+        contract: &id003
+          dtype: int64
+          rank: 2
+          shape: &id001
+          - batch
+          - sequence
+        role:
+          kind: runtime
+          version: '1.0'
+          role: prompt_tokens
+        source:
+          kind: request
+        required: true
+      request.mask:
+        contract: &id004
+          dtype: bool
+          rank: 2
+          shape: *id001
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: masked_positions
+        required: true
+      request.seed:
+        contract: &id002
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: runtime
+          version: '1.0'
+          role: seed
+        source:
+          kind: request
+        required: false
+        default: 0
+      request.rng_offset:
+        contract: *id002
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: rng_offset
+        required: false
+        default: 0
+      request.max_iterations:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: runtime
+          version: '1.0'
+          role: max_iterations
+        source:
+          kind: request
+        required: false
+        default: 8
+      package.num_steps:
+        contract: *id002
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 8
+      package.loop_0_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+    outputs:
+      tokens:
+        contract: *id003
+        role: tokens
+        stage: pre_adapter
+    components:
+      model:
+        implementation:
+          kind: onnx
+          artifact: model.onnx
+      masked_update:
+        implementation:
+          kind: onnx
+          artifact: policies/masked_update.onnx
+        contract:
+          id: onnx-genai.masked-update
+          version: '1'
+          bindings:
+            state: current_tokens
+            proposal: proposed_tokens
+            mask: masked
+            step: step
+            next_state: next_state
+            next_mask: next_mask
+            continue: continue
+            seed: seed
+            offset: offset
+            next_offset: next_offset
+    state:
+      tokens_state:
+        contract: *id003
+        scope: invocation
+        initializer: request.input_ids
+        recurrence:
+          kind: invariant
+      mask:
+        contract: *id004
+        scope: invocation
+        initializer: request.mask
+        recurrence:
+          kind: invariant
+      rng_offset:
+        contract: *id002
+        scope: invocation
+        initializer: request.rng_offset
+        recurrence:
+          kind: invariant
+      logits:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - batch
+          - sequence
+          - 128
+        scope: invocation
+        initializer: denoiser.setup.logits
+        recurrence:
+          kind: invariant
+      proposal:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - sequence
+        scope: invocation
+        initializer: denoiser.setup.proposal
+        recurrence:
+          kind: invariant
+      loop_0_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        scope: invocation
+        initializer: package.loop_0_active
+        recurrence:
+          kind: invariant
+    steps:
+    - kind: loop
+      setup:
+      - kind: invoke
+        component: model
+        inputs:
+          input_ids: request.input_ids
+        outputs:
+          logits: denoiser.setup.logits
+          proposed_tokens: denoiser.setup.proposal
+      steps:
+      - kind: invoke
+        component: masked_update
+        inputs:
+          current_tokens: tokens_state
+          proposed_tokens: proposal
+          logits: logits
+          masked: mask
+          step: loop.iteration
+          total_steps: package.num_steps
+          seed: request.seed
+          offset: rng_offset
+        outputs:
+          next_state: denoiser.body.tokens
+          next_mask: denoiser.body.mask
+          next_offset: denoiser.body.rng_offset
+          done: denoiser.body.done
+          continue: denoiser.body.continue
+      - kind: emit
+        value: denoiser.body.tokens
+        output: tokens
+        mode: replace
+      - kind: invoke
+        component: model
+        inputs:
+          input_ids: denoiser.body.tokens
+        outputs:
+          logits: denoiser.body.logits
+          proposed_tokens: denoiser.body.proposal
+      continue_when: loop_0_active
+      max_iterations: request.max_iterations
+      carried:
+      - cell: tokens_state
+        next: denoiser.body.tokens
+      - cell: mask
+        next: denoiser.body.mask
+      - cell: rng_offset
+        next: denoiser.body.rng_offset
+      - cell: logits
+        next: denoiser.body.logits
+      - cell: proposal
+        next: denoiser.body.proposal
+      - cell: loop_0_active
+        next: denoiser.body.continue
+      iteration:
+        value: loop.iteration
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1

@@ -1,0 +1,608 @@
+schema_version: v1
+preprocessing:
+  image:
+    transforms:
+    - op: decode_rgb
+      outputs:
+      - image.transform_0
+    - op: resize
+      mode: pixel_area
+      interpolation: bicubic
+      min_pixels: 224
+      max_pixels: 224
+      size_multiple: 14
+      inputs:
+      - image.transform_0
+      outputs:
+      - image.transform_1
+    - op: rescale
+      scale: 0.00392156862745098
+      inputs:
+      - image.transform_1
+      outputs:
+      - image.transform_2
+    - op: normalize
+      mean:
+      - 0.5
+      - 0.5
+      - 0.5
+      std:
+      - 0.5
+      - 0.5
+      - 0.5
+      inputs:
+      - image.transform_2
+      outputs:
+      - image.transform_3
+    - op: patchify
+      patch_size: 14
+      flatten: true
+      temporal_patch_size: 2
+      merge_size: 1
+      channel_order: channels_first
+      inputs:
+      - image.transform_3
+      outputs:
+      - image.transform_4
+    - op: emit_grid_coordinates
+      inputs:
+      - image.transform_4
+      outputs:
+      - image.output_grid_dimensions
+    outputs:
+    - name: image.pixel_values
+      content: pixels
+      dtype: float32
+      source: image.transform_4
+      contract: &id004
+        dtype: float32
+        rank: 2
+        shape:
+        - patches
+        - 1176
+    - name: image.grid_thw
+      content: grid_dimensions
+      dtype: int64
+      source: image.output_grid_dimensions
+      contract: &id005
+        dtype: int64
+        rank: 2
+        shape:
+        - images
+        - 3
+pipeline:
+  workflow:
+    manifest:
+      ir_version: '1.0'
+      onnx_opsets:
+        ai.onnx: 24
+      adapter_abis:
+        onnx-genai.image-preprocess: '1'
+      capabilities:
+      - workflow_ssa
+      - linear_effects
+      - nested_control_flow
+      - loop_induction_values
+      - typed_emit
+      - serving_service_contract
+      - bounded_state_recurrence
+    inputs:
+      request.prompt_tokens:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - sequence
+        role:
+          kind: runtime
+          version: '1.0'
+          role: prompt_tokens
+        source:
+          kind: request
+        required: true
+      request.image:
+        contract:
+          dtype: uint8
+          rank: 1
+          shape:
+          - encoded_bytes
+        role:
+          kind: runtime
+          version: '1.0'
+          role: media
+        source:
+          kind: request
+        required: true
+      request.max_iterations:
+        contract: &id001
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: runtime
+          version: '1.0'
+          role: max_output_tokens
+        source:
+          kind: request
+        required: true
+      package.eos_ids:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 2
+      package.max_context:
+        contract: *id001
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 8192
+      package.one:
+        contract: *id001
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 1
+      package.active:
+        contract: &id002
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+      package.false:
+        contract: *id002
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: false
+      package.zero_batch:
+        contract: &id003
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0
+      package.slot_ids:
+        contract: *id003
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0
+      package.loop_0_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+    outputs:
+      tokens:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - generated_sequence
+        role: tokens
+        stage: pre_adapter
+    components:
+      vision_encoder:
+        implementation:
+          kind: onnx
+          artifact: vision_encoder/model.onnx
+      embedding:
+        implementation:
+          kind: onnx
+          artifact: embedding/model.onnx
+      decoder:
+        implementation:
+          kind: onnx
+          artifact: decoder/model.onnx
+      image_preprocess:
+        implementation:
+          kind: adapter
+          abi: onnx-genai.image-preprocess
+          version: '1'
+        ports:
+          inputs:
+            encoded:
+              dtype: uint8
+              rank: 1
+              shape:
+              - encoded_bytes
+          outputs:
+            pixel_values: *id004
+            grid_thw: *id005
+      token_sampler:
+        implementation:
+          kind: onnx
+          artifact: policies/token_sampler.onnx
+        contract:
+          id: onnx-genai.token-sampler
+          version: '1'
+          bindings:
+            logits: logits
+            token: token
+          parameters:
+            mode: greedy
+        application_overridable: true
+      termination:
+        implementation:
+          kind: onnx
+          artifact: policies/termination.onnx
+        contract:
+          id: onnx-genai.termination-predicate
+          version: '1'
+          bindings:
+            tokens: token_ids
+            eos_ids: eos_ids
+            iteration: iteration
+            max_iterations: max_iterations
+            done: done
+            continue: continue
+      token_state_update:
+        implementation:
+          kind: onnx
+          artifact: policies/token_state_update.onnx
+        contract:
+          id: onnx-genai.state-update
+          version: '1'
+          bindings:
+            current: current
+            update: update
+            next: next
+      last_token_logits:
+        implementation:
+          kind: onnx
+          artifact: policies/last_token_logits.onnx
+      decoder_state_initializer:
+        implementation:
+          kind: onnx
+          artifact: policies/decoder_state_initializer.onnx
+      decoder_step_update:
+        implementation:
+          kind: onnx
+          artifact: policies/decoder_step_update.onnx
+      cache_length_update:
+        implementation:
+          kind: onnx
+          artifact: policies/cache_length_update.onnx
+    state:
+      token:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - 1
+        scope: invocation
+        initializer: initializer.token_slot
+        recurrence:
+          kind: invariant
+      logits:
+        contract:
+          dtype: float32
+          rank: 2
+          shape:
+          - batch
+          - 128
+        scope: invocation
+        initializer: decoder.setup.last_logits
+        recurrence:
+          kind: invariant
+      attention_mask:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - context
+        scope: invocation
+        initializer: initializer.body_attention_mask
+        recurrence:
+          kind: growing
+          axis: 1
+          increment: package.one
+          max: package.max_context
+      active:
+        contract: *id002
+        class: semantic
+        scope: invocation
+        initializer: package.active
+        recurrence:
+          kind: invariant
+      done:
+        contract: *id002
+        class: semantic
+        scope: invocation
+        initializer: package.false
+        recurrence:
+          kind: invariant
+      accepted_len:
+        contract: *id003
+        class: semantic
+        scope: invocation
+        initializer: package.zero_batch
+        recurrence:
+          kind: invariant
+      slot_ids:
+        contract: *id003
+        class: semantic
+        scope: invocation
+        initializer: package.slot_ids
+        recurrence:
+          kind: invariant
+      cache_lengths:
+        contract: *id003
+        class: semantic
+        scope: invocation
+        initializer: package.zero_batch
+        recurrence:
+          kind: invariant
+      position_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - 1
+        scope: invocation
+        initializer: initializer.body_position_ids
+        recurrence:
+          kind: invariant
+      cache_0:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 2
+          - past_sequence
+          - 8
+        scope: invocation
+        initializer: decoder.setup.present.0.key
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.max_context
+        service_group: decoder_cache
+      cache_1:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 2
+          - past_sequence
+          - 8
+        scope: invocation
+        initializer: decoder.setup.present.0.value
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.max_context
+        service_group: decoder_cache
+      loop_0_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        scope: invocation
+        initializer: package.loop_0_active
+        recurrence:
+          kind: invariant
+    serving:
+      active: active
+      done: done
+      accepted_len: accepted_len
+      slot_ids: slot_ids
+      kv_service:
+        paging: paged
+        allocation: runtime
+        compaction: true
+        groups:
+          decoder_cache:
+            sequence_axis: 2
+            layout: bnsh
+            logical_lengths: cache_lengths
+            storage: paged
+            ports:
+              decoder:
+                cache_0:
+                  input: past_key_values.0.key
+                  output: present.0.key
+                cache_1:
+                  input: past_key_values.0.value
+                  output: present.0.value
+    steps:
+    - kind: loop
+      setup:
+      - kind: invoke
+        component: image_preprocess
+        inputs:
+          encoded: request.image
+        outputs:
+          pixel_values: image.pixel_values
+          grid_thw: image.grid_thw
+      - kind: invoke
+        component: vision_encoder
+        inputs:
+          pixel_values: image.pixel_values
+          grid_thw: image.grid_thw
+        outputs:
+          image_features: vision.image_features
+      - kind: invoke
+        component: decoder_state_initializer
+        inputs:
+          prompt_tokens: request.prompt_tokens
+        outputs:
+          attention_mask: initializer.attention_mask
+          body_attention_mask: initializer.body_attention_mask
+          token_slot: initializer.token_slot
+          position_ids: initializer.position_ids
+          body_position_ids: initializer.body_position_ids
+          past_key_values.0.key: initializer.past_key_values.0.key
+          past_key_values.0.value: initializer.past_key_values.0.value
+      - kind: invoke
+        component: embedding
+        inputs:
+          input_ids: request.prompt_tokens
+          image_features: vision.image_features
+        outputs:
+          inputs_embeds: embedding.setup.embeds
+      - kind: invoke
+        component: decoder
+        inputs:
+          inputs_embeds: embedding.setup.embeds
+          attention_mask: initializer.attention_mask
+          position_ids: initializer.position_ids
+          past_key_values.0.key: initializer.past_key_values.0.key
+          past_key_values.0.value: initializer.past_key_values.0.value
+        outputs:
+          logits: decoder.setup.logits
+          present.0.key: decoder.setup.present.0.key
+          present.0.value: decoder.setup.present.0.value
+      - kind: invoke
+        component: last_token_logits
+        inputs:
+          logits: decoder.setup.logits
+        outputs:
+          last_logits: decoder.setup.last_logits
+      steps:
+      - kind: invoke
+        component: token_sampler
+        inputs:
+          logits: logits
+        outputs:
+          token: sample.body
+      - kind: invoke
+        component: termination
+        inputs:
+          token_ids: sample.body
+          eos_ids: package.eos_ids
+          iteration: loop.iteration
+          max_iterations: request.max_iterations
+        outputs:
+          done: loop.done
+          continue: loop.continue
+      - kind: invoke
+        component: cache_length_update
+        inputs:
+          left: cache_lengths
+          right: package.one
+        outputs:
+          total: cache_lengths.next
+      - kind: invoke
+        component: cache_length_update
+        inputs:
+          left: package.zero_batch
+          right: package.one
+        outputs:
+          total: accepted_len.next
+      - kind: invoke
+        component: token_state_update
+        inputs:
+          current: token
+          update: sample.body
+        outputs:
+          next: token.body
+      - kind: emit
+        value: token.body
+        output: tokens
+        mode: append
+      - kind: invoke
+        component: embedding
+        inputs:
+          input_ids: token.body
+          image_features: vision.image_features
+        outputs:
+          inputs_embeds: embedding.body.embeds
+      - kind: invoke
+        component: decoder
+        inputs:
+          inputs_embeds: embedding.body.embeds
+          attention_mask: attention_mask
+          position_ids: position_ids
+          past_key_values.0.key: cache_0
+          past_key_values.0.value: cache_1
+        outputs:
+          logits: decoder.body.logits
+          present.0.key: decoder.body.present.0.key
+          present.0.value: decoder.body.present.0.value
+      - kind: invoke
+        component: last_token_logits
+        inputs:
+          logits: decoder.body.logits
+        outputs:
+          last_logits: decoder.body.last_logits
+      - kind: invoke
+        component: decoder_step_update
+        inputs:
+          attention_mask: attention_mask
+          position_ids: position_ids
+        outputs:
+          next_attention_mask: decoder_step.body_attention_mask
+          next_position_ids: decoder_step.body_position_ids
+      continue_when: loop_0_active
+      max_iterations: request.max_iterations
+      carried:
+      - cell: token
+        next: token.body
+      - cell: logits
+        next: decoder.body.last_logits
+      - cell: attention_mask
+        next: decoder_step.body_attention_mask
+      - cell: active
+        next: loop.continue
+      - cell: done
+        next: loop.done
+      - cell: accepted_len
+        next: accepted_len.next
+      - cell: slot_ids
+        next: slot_ids
+      - cell: cache_lengths
+        next: cache_lengths.next
+      - cell: position_ids
+        next: decoder_step.body_position_ids
+      - cell: cache_0
+        next: decoder.body.present.0.key
+      - cell: cache_1
+        next: decoder.body.present.0.value
+      - cell: loop_0_active
+        next: loop.continue
+      iteration:
+        value: loop.iteration
+        contract: *id003

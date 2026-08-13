@@ -3009,20 +3009,20 @@ def build_vlm_workflow_metadata(
                 if cache_pairs
                 else []
             ),
-            {
-                "kind": "emit",
-                "value": "sample.body",
-                "output": "tokens",
-                "mode": "append",
-                "effect_name": "emit",
-                "effect": _effect("emit.0", "emit.1"),
-            },
             _invoke(
                 "token_state_update",
                 {"current": "state.token.body", "update": "sample.body"},
                 {"next": "token.body"},
                 {"state": _effect("state.0", "state.1")},
             ),
+            {
+                "kind": "emit",
+                "value": "token.body",
+                "output": "tokens",
+                "mode": "append",
+                "effect_name": "emit",
+                "effect": _effect("emit.0", "emit.1"),
+            },
             _invoke(
                 "embedding",
                 embedding_body_inputs,
@@ -3095,7 +3095,15 @@ def build_vlm_workflow_metadata(
         },
         "inputs": inputs,
         "outputs": {
-            "tokens": {"contract": batch_int, "role": "tokens", "stage": "pre_adapter"}
+            "tokens": {
+                "contract": {
+                    "dtype": "int64",
+                    "rank": 2,
+                    "shape": [batch, "generated_sequence"],
+                },
+                "role": "tokens",
+                "stage": "pre_adapter",
+            }
         },
         "components": components,
         "state": state,
@@ -4687,7 +4695,7 @@ def build_decoder_workflow_metadata(
             ),
             {
                 "kind": "emit",
-                "value": "sample.body",
+                "value": "token.body",
                 "output": "tokens",
                 "mode": "append",
                 "effect_name": "emit",
@@ -4740,7 +4748,11 @@ def build_decoder_workflow_metadata(
         "inputs": workflow_inputs,
         "outputs": {
             "tokens": {
-                "contract": batch_int,
+                "contract": {
+                    "dtype": "int64",
+                    "rank": 2,
+                    "shape": [batch_dimension, "generated_sequence"],
+                },
                 "role": "tokens",
                 "stage": "pre_adapter",
             }
@@ -4845,6 +4857,7 @@ def build_language_diffusion_pipeline_metadata(
     }
     batch_dimension = token_contract["shape"][0]
     batch_int = {"dtype": "int64", "rank": 1, "shape": [batch_dimension]}
+    control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
     inputs = {
         "request.input_ids": {
             "contract": token_contract,
@@ -4881,7 +4894,7 @@ def build_language_diffusion_pipeline_metadata(
             "default": 0,
         },
         "request.max_iterations": {
-            "contract": batch_int,
+            "contract": control_int,
             "role": {
                 "kind": "runtime",
                 "version": "1.0",
@@ -5021,6 +5034,7 @@ def build_language_diffusion_pipeline_metadata(
                 "linear_effects",
                 "nested_control_flow",
                 "typed_emit",
+                "loop_induction_values",
             ],
         },
         "inputs": inputs,
