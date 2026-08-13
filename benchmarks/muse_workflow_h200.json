@@ -25,6 +25,7 @@
   "workload": {
     "prompt": "Briefly explain why the sky appears blue during the day.",
     "rendered_prompt": "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-08-13.\n\nReasoning strength: high.\n\n# Valid recipients: \"self\", \"user\".<|eot|><|start|>user<|message|>Briefly explain why the sky appears blue during the day.<|eot|><|start|>assistant",
+    "prompt_ids_file": "benchmarks/muse_prompt_ids.json",
     "prompt_tokens": 68,
     "image": null,
     "workflow_media_binding": "omit_optional_request_image",

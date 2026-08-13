@@ -38,6 +38,10 @@ def main() -> int:
     config: dict[str, Any] = json.loads(args.config.read_text())
     workload = config["workload"]
     sampling = config["sampling"]
+    prompt_ids_path = Path(workload["prompt_ids_file"])
+    prompt_ids = json.loads(prompt_ids_path.read_text())
+    if len(prompt_ids) != int(workload["prompt_tokens"]):
+        raise ValueError("prompt_ids_file length must equal prompt_tokens")
     if int(workload["prompt_tokens"]) + int(workload["max_new_tokens"]) != int(
         workload["request_max_length"]
     ):
@@ -70,8 +74,8 @@ def main() -> int:
         str(workload["runs"]),
         "--decode-skip",
         str(workload["decode_skip"]),
-        "--prompt",
-        workload["rendered_prompt"],
+        "--prompt-ids",
+        str(prompt_ids_path),
     ]
     if workload["image"]:
         command.extend(["--image", workload["image"]])
