@@ -358,67 +358,68 @@ class MageVLVisionPretrainedModel(nn.Module):
         )
 
     def _attention_metadata(self, op: OpBuilder, grid_thw: Value, hidden_states: Value):
-        # Map each flattened patch to its visual sample and four-frame chunk.
+        # Build per-window lengths directly from (T, H, W). The processor emits
+        # one row per image/video frame, while custom callers may pack T>1 into a
+        # row; padding to max_windows keeps this O(num_visuals * max_windows)
+        # instead of materializing an O(total_patches * num_visuals) table.
+        temporal = op.Gather(grid_thw, op.Constant(value_int=0), axis=1)
+        spatial = op.Mul(
+            op.Gather(grid_thw, op.Constant(value_int=1), axis=1),
+            op.Gather(grid_thw, op.Constant(value_int=2), axis=1),
+        )
+        window = op.Constant(value_int=self.frame_windows_size)
+        window_counts = op.Div(op.Add(temporal, self.frame_windows_size - 1), window)
+        max_windows = op.Squeeze(op.ReduceMax(window_counts), [0])
+        window_ids = op.Range(
+            op.Constant(value_int=0),
+            max_windows,
+            op.Constant(value_int=1),
+        )
+        valid_windows = op.Less(
+            op.Unsqueeze(window_ids, [0]),
+            op.Unsqueeze(window_counts, [1]),
+        )
+        remaining_frames = op.Sub(
+            op.Unsqueeze(temporal, [1]),
+            op.Mul(op.Unsqueeze(window_ids, [0]), window),
+        )
+        window_frames = op.Min(remaining_frames, window)
+        window_lengths = op.Mul(window_frames, op.Unsqueeze(spatial, [1]))
+        lengths = op.Compress(
+            op.Reshape(window_lengths, op.Constant(value_ints=[-1])),
+            op.Reshape(valid_windows, op.Constant(value_ints=[-1])),
+        )
+        cu_seqlens = op.Concat(
+            op.Constant(value_ints=[0]),
+            op.CumSum(lengths, op.Constant(value_int=0)),
+            axis=0,
+        )
+        if ep_capabilities().supports_packed_multi_head_attention:
+            return None, cu_seqlens
+
+        # Portable ONNX Attention needs an explicit block-diagonal mask.
         total = op.Shape(hidden_states, start=1, end=2)
         patch_ids = op.Range(
             op.Constant(value_int=0),
             op.Squeeze(total, [0]),
             op.Constant(value_int=1),
         )
-        sample_lengths = op.ReduceProd(grid_thw, axes=[1], keepdims=0)
-        sample_ends = op.CumSum(sample_lengths, op.Constant(value_int=0))
-        sample_ids = op.ReduceSum(
+        segment_ends = op.Slice(
+            cu_seqlens,
+            starts=[1],
+            ends=[9223372036854775807],
+            axes=[0],
+        )
+        segment_ids = op.ReduceSum(
             op.Cast(
                 op.GreaterOrEqual(
                     op.Unsqueeze(patch_ids, [1]),
-                    op.Unsqueeze(sample_ends, [0]),
+                    op.Unsqueeze(segment_ends, [0]),
                 ),
                 to=ir.DataType.INT64,
             ),
             axes=[1],
             keepdims=0,
-        )
-        sample_starts = op.Concat(
-            op.Constant(value_ints=[0]),
-            op.Slice(sample_ends, starts=[0], ends=[-1], axes=[0]),
-            axis=0,
-        )
-        local_ids = op.Sub(patch_ids, op.Gather(sample_starts, sample_ids))
-        spatial_sizes = op.Mul(
-            op.Gather(grid_thw, op.Constant(value_int=1), axis=1),
-            op.Gather(grid_thw, op.Constant(value_int=2), axis=1),
-        )
-        window_sizes = op.Mul(
-            op.Gather(spatial_sizes, sample_ids),
-            op.Constant(value_int=self.frame_windows_size),
-        )
-        window_ids = op.Div(local_ids, window_sizes)
-        same_as_previous = op.And(
-            op.Equal(
-                op.Slice(sample_ids, starts=[1], ends=[9223372036854775807], axes=[0]),
-                op.Slice(sample_ids, starts=[0], ends=[-1], axes=[0]),
-            ),
-            op.Equal(
-                op.Slice(window_ids, starts=[1], ends=[9223372036854775807], axes=[0]),
-                op.Slice(window_ids, starts=[0], ends=[-1], axes=[0]),
-            ),
-        )
-        segment_starts = op.Concat(
-            op.Cast(op.Constant(value_ints=[1]), to=ir.DataType.BOOL),
-            op.Not(same_as_previous),
-            axis=0,
-        )
-        cu_seqlens = op.Concat(
-            op.Compress(patch_ids, segment_starts),
-            total,
-            axis=0,
-        )
-        if ep_capabilities().supports_packed_multi_head_attention:
-            return None, cu_seqlens
-
-        segment_ids = op.CumSum(
-            op.Cast(segment_starts, to=ir.DataType.INT64),
-            op.Constant(value_int=0),
         )
         attention_mask = op.Equal(
             op.Unsqueeze(segment_ids, [1]),
@@ -433,6 +434,8 @@ class MageVLVisionPretrainedModel(nn.Module):
         grid_thw: Value,
         patch_positions: Value,
     ):
+        if get_build_dtype() != ir.DataType.FLOAT:
+            hidden_state = op.Cast(hidden_state, to=get_build_dtype())
         hidden_states = self.embeddings(op, hidden_state)
         cos, sin = self.video_rope(op, patch_positions)
         attention_mask, cu_seqlens = self._attention_metadata(op, grid_thw, hidden_states)

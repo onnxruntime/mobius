@@ -48,7 +48,11 @@ def _reference_vision(
 ) -> torch.Tensor:
     prefix = "vision_encoder.visual"
     patch_weight = state[f"{prefix}.embeddings.patch_embedding.weight"]
-    hidden = functional.conv2d(pixel_values.reshape(-1, 3, 4, 4), patch_weight, stride=4)
+    hidden = functional.conv2d(
+        pixel_values.to(patch_weight.dtype).reshape(-1, 3, 4, 4),
+        patch_weight,
+        stride=4,
+    )
     hidden = hidden.reshape(1, -1, 64)
 
     # Mage-VL uses independent frequency scales for its 4:6:6 T/H/W split.
@@ -111,8 +115,26 @@ def _reference_vision(
         (ir.DataType.FLOAT16, torch.float16, 1e-2),
     ],
 )
-def test_mage_vl_synthetic_video_parity(tmp_path, dtype, torch_dtype, atol):
-    """A nonzero five-frame clip matches PyTorch across the four-frame boundary."""
+@pytest.mark.parametrize(
+    ("grid_thw", "frame_positions"),
+    [
+        (torch.tensor([[5, 2, 2]], dtype=torch.int64), (0, 3, 7, 12, 18)),
+        (
+            torch.tensor([[1, 2, 2]] * 6, dtype=torch.int64),
+            (0, 0, 180, 360, 539, 719),
+        ),
+    ],
+    ids=["packed-five-frame", "processor-image-plus-five-frames"],
+)
+def test_mage_vl_synthetic_video_parity(
+    tmp_path,
+    dtype,
+    torch_dtype,
+    atol,
+    grid_thw,
+    frame_positions,
+):
+    """Nonzero packed and processor-shaped media match PyTorch window boundaries."""
     overrides = next(overrides for mt, overrides, _ in VL_CONFIGS if mt == "mage_vl")
     config = dataclasses.replace(_base_config(**overrides), dtype=dtype)
     package = build_from_module(
@@ -128,12 +150,11 @@ def test_mage_vl_synthetic_video_parity(tmp_path, dtype, torch_dtype, atol):
         for name, value in vision.graph.initializers.items()
         if value.const_value is None
     }
-    pixel_values = torch.randn((20, 48), generator=generator).to(torch_dtype)
-    grid_thw = torch.tensor([[5, 2, 2]], dtype=torch.int64)
+    pixel_values = torch.randn((len(frame_positions) * 4, 48), generator=generator)
     patch_positions = torch.tensor(
         [
             (frame, height, width)
-            for frame in (0, 3, 7, 12, 18)
+            for frame in frame_positions
             for height in range(2)
             for width in range(2)
         ],
@@ -183,20 +204,36 @@ def test_mage_vl_decode_embedding_accepts_no_new_media(tmp_path):
     )
 
 
-def test_mage_vl_cuda_uses_packed_attention():
-    """CUDA builds preserve four-frame segments without a quadratic dense mask."""
+def test_mage_vl_cuda_graph_is_fused_and_post_weight_optimized():
+    """FP16 CUDA builds fuse hot paths and fold weight transposes after loading."""
     overrides = next(overrides for mt, overrides, _ in VL_CONFIGS if mt == "mage_vl")
-    config = _base_config(**overrides)
+    config = dataclasses.replace(_base_config(**overrides), dtype=ir.DataType.FLOAT16)
     package = build_from_module(
         registry.get("mage_vl")(config),
         config,
         task="mage-vl",
         execution_provider="cuda",
     )
+    decoder = package["decoder"]
     vision = package["vision_encoder"]
 
+    assert count_op_type(decoder.graph, "GroupQueryAttention") == 2
+    assert count_op_type(decoder.graph, "Attention") == 0
+    assert count_op_type(decoder.graph, "Swish") == 2
+    assert count_op_type(decoder.graph, "SkipSimplifiedLayerNormalization") == 4
     assert count_op_type(vision.graph, "PackedMultiHeadAttention") == 2
     assert count_op_type(vision.graph, "Attention") == 0
+    assert count_op_type(vision.graph, "SkipLayerNormalization") == 4
+    assert count_op_type(vision.graph, "GreaterOrEqual") == 0
+
+    for model in (decoder, vision):
+        state = {
+            name: torch.randn(tuple(value.shape), dtype=torch.float32)
+            for name, value in model.graph.initializers.items()
+            if value.const_value is None
+        }
+        apply_weights(model, state)
+        assert count_op_type(model.graph, "Transpose") == 0
 
 
 def test_mage_vl_embedding_uses_global_media_order_across_batch(tmp_path):

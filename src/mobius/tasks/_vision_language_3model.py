@@ -257,7 +257,7 @@ class MageVLTask(VisionLanguageTask):
         graph, builder = _make_graph(name="vision_encoder")
         pixel_values = builder.input(
             "pixel_values",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[total_patches, pixel_dim],
         )
         image_grid_thw = builder.input(
