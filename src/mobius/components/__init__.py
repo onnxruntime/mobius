@@ -84,6 +84,7 @@ __all__ = [
     "VisionEncoderLayer",
     "VisionModel",
     "apply_rms_norm",
+    "apply_rotary_pos_emb",
     "create_attention_bias",
     "create_decoder_layer",
     "create_padding_mask",
@@ -279,7 +280,7 @@ from mobius.components._rms_norm import (
     ScaleFreeRMSNorm,
     apply_rms_norm,
 )
-from mobius.components._rotary_embedding import initialize_rope
+from mobius.components._rotary_embedding import apply_rotary_pos_emb, initialize_rope
 from mobius.components._sanm_attention import (
     SANMFFN as SANMFFN,
 )
