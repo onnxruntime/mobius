@@ -7,6 +7,7 @@ import json
 
 import onnx_ir as ir
 import pytest
+import yaml
 
 from mobius._model_package import ModelPackage
 from mobius.integrations.onnx_genai.inference_metadata_test import (
@@ -19,6 +20,7 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     build_speculative_workflow_metadata,
     build_vlm_workflow_metadata,
     write_speculative_workflow_metadata,
+    write_vlm_workflow_metadata,
 )
 
 
@@ -99,6 +101,132 @@ def test_vlm_preprocessing_is_explicit_typed_ssa(tmp_path):
     assert "inputs" not in image["transforms"][0]
     assert all("outputs" in transform for transform in image["transforms"])
     assert all(output["source"] in declared for output in image["outputs"])
+
+
+def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text(
+        json.dumps({"use_hd_transform": True}), encoding="utf-8"
+    )
+    (source / "preprocessor_config.json").write_text(
+        json.dumps(
+            {
+                "dynamic_hd": 1,
+                "crop_size": 16,
+                "include_thumbnail": False,
+                "thumbnail_order": "none",
+                "mask_patch_size": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    decoder_inputs = [
+        _value("inputs_embeds", ir.DataType.BFLOAT16, ["batch", "sequence", 6656]),
+        _value(
+            "attention_mask",
+            ir.DataType.INT64,
+            ["batch", "past_sequence + sequence"],
+        ),
+    ]
+    decoder_outputs = [("logits", ir.DataType.BFLOAT16, ["batch", "sequence", 202048])]
+    for layer in range(52):
+        cache_shape = ["batch", 2, "past_sequence", 128]
+        present_shape = ["batch", 2, "total_sequence", 128]
+        for kind in ("key", "value"):
+            decoder_inputs.append(
+                _value(
+                    f"past_key_values.{layer}.{kind}",
+                    ir.DataType.BFLOAT16,
+                    cache_shape,
+                )
+            )
+            decoder_outputs.append(
+                (
+                    f"present.{layer}.{kind}",
+                    ir.DataType.BFLOAT16,
+                    present_shape,
+                )
+            )
+    decoder = _model("decoder", decoder_inputs, decoder_outputs)
+    vision = _model(
+        "vision_encoder",
+        [
+            _value("pixel_values", ir.DataType.FLOAT, [1, 3, 16, 16]),
+            _value("image_sizes", ir.DataType.INT64, [1, 2]),
+            _value("image_attention_mask", ir.DataType.FLOAT, [1, 16, 16]),
+        ],
+        [("image_features", ir.DataType.BFLOAT16, ["image_tokens", 6656])],
+    )
+    embedding = _model(
+        "embedding",
+        [
+            _value("input_ids", ir.DataType.INT64, ["batch", "sequence"]),
+            _value(
+                "image_features",
+                ir.DataType.BFLOAT16,
+                ["image_tokens", 6656],
+            ),
+        ],
+        [("inputs_embeds", ir.DataType.BFLOAT16, ["batch", "sequence", 6656])],
+    )
+    package = ModelPackage(
+        {"decoder": decoder, "vision_encoder": vision, "embedding": embedding}
+    )
+
+    # Deliberately tiny config values must never override admitted artifact I/O.
+    path = write_vlm_workflow_metadata(
+        package,
+        str(tmp_path / "package"),
+        _VlmConfig(),
+        source=str(source),
+    )
+    with open(path, encoding="utf-8") as handle:
+        workflow = yaml.safe_load(handle)["pipeline"]["workflow"]
+    decoder_invokes = []
+
+    def collect_decoder_invokes(node):
+        if isinstance(node, dict):
+            if node.get("kind") == "invoke" and node.get("component") == "decoder":
+                decoder_invokes.append(node)
+            for value in node.values():
+                collect_decoder_invokes(value)
+        elif isinstance(node, list):
+            for value in node:
+                collect_decoder_invokes(value)
+
+    collect_decoder_invokes(workflow["steps"])
+    assert len(decoder.graph.inputs) == 106
+    assert len(decoder.graph.outputs) == 105
+    assert len(decoder_invokes) == 2
+    assert all(
+        set(invoke["inputs"]) == {value.name for value in decoder.graph.inputs}
+        for invoke in decoder_invokes
+    )
+    assert all("position_ids" not in invoke["inputs"] for invoke in decoder_invokes)
+    assert (
+        len([name for name in workflow["state"] if name.removeprefix("cache_").isdigit()])
+        == 104
+    )
+    assert workflow["inputs"]["package.max_context"]["default"] == 4096
+    assert workflow["state"]["cache_103"]["contract"] == {
+        "dtype": "bfloat16",
+        "rank": 4,
+        "shape": ["batch", 2, "past_sequence", 128],
+    }
+    assert workflow["state"]["logits"]["contract"] == {
+        "dtype": "float32",
+        "rank": 2,
+        "shape": ["batch", 202048],
+    }
+    kv_ports = workflow["serving"]["kv_service"]["groups"]["decoder_cache"]["ports"]["decoder"]
+    assert len(kv_ports) == 104
+    assert kv_ports["cache_103"] == {
+        "input": "past_key_values.51.value",
+        "output": "present.51.value",
+    }
+    assert (tmp_path / "package" / "policies" / "last_token_logits.onnx").is_file()
 
 
 def _masked_denoiser_package() -> ModelPackage:
