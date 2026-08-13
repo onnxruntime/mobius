@@ -3553,6 +3553,11 @@
     "WorkflowComponent": {
       "additionalProperties": false,
       "properties": {
+        "application_overridable": {
+          "default": false,
+          "description": "Allow an application to select another declared component with the same\nversioned contract ABI for this invocation.",
+          "type": "boolean"
+        },
         "contract": {
           "anyOf": [
             {

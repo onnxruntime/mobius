@@ -129,11 +129,12 @@ def _component(
     role: PolicyRole,
     graph: ir.Graph,
     contract: dict[str, object],
-    *effects: str,
+    *_effects: str,
 ) -> PolicyComponent:
+    # ONNX policy components are pure: RNG and state are explicit tensor data.
     model = ir.Model(graph, ir_version=11)
     model.producer_name = "mobius"
-    return PolicyComponent(role, model, contract, effects)
+    return PolicyComponent(role, model, contract, ())
 
 
 def _make_graph(name: str) -> tuple[ir.Graph, GraphBuilder]:

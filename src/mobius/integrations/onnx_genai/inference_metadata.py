@@ -1379,7 +1379,6 @@ def add_policy_components_to_workflow(
     if not isinstance(workflow, dict):
         return metadata
     components = workflow.setdefault("components", {})
-    workflow_dtypes = {"fp16": "float16", "bf16": "bfloat16", "fp32": "float32"}
 
     def semantic_contract(contract: dict[str, Any]) -> dict[str, Any]:
         role = str(contract["role"]).replace("_", "-")
@@ -1404,39 +1403,11 @@ def add_policy_components_to_workflow(
         return declaration
 
     for name, component in policy_components.items():
-        model = component.model
         declaration = {
             "implementation": {
                 "kind": "onnx",
                 "artifact": f"policies/{name}.onnx",
             },
-            "ports": {
-                "inputs": {
-                    value.name: {
-                        "dtype": workflow_dtypes.get(_port(value).dtype, _port(value).dtype),
-                        "rank": _port(value).rank,
-                        **(
-                            {"shape": _shape_metadata(_port(value))}
-                            if value.shape is not None
-                            else {}
-                        ),
-                    }
-                    for value in model.graph.inputs
-                },
-                "outputs": {
-                    value.name: {
-                        "dtype": workflow_dtypes.get(_port(value).dtype, _port(value).dtype),
-                        "rank": _port(value).rank,
-                        **(
-                            {"shape": _shape_metadata(_port(value))}
-                            if value.shape is not None
-                            else {}
-                        ),
-                    }
-                    for value in model.graph.outputs
-                },
-            },
-            "effects": list(component.effects),
         }
         if component.contract:
             declaration["contract"] = semantic_contract(component.contract)

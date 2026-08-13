@@ -67,16 +67,8 @@ def _component(
     *,
     effects: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    component = {
-        "implementation": {"kind": "onnx", "artifact": artifact},
-        "ports": {
-            "inputs": {value.name: _contract(value) for value in model.graph.inputs},
-            "outputs": {value.name: _contract(value) for value in model.graph.outputs},
-        },
-    }
-    if effects:
-        component["effects"] = list(effects)
-    return component
+    del model, effects
+    return {"implementation": {"kind": "onnx", "artifact": artifact}}
 
 
 def _grammar_adapter_component(action: str) -> dict[str, Any]:
@@ -217,20 +209,24 @@ def _publish_workflow_v1(workflow: dict[str, Any]) -> dict[str, Any]:
                 if body["kind"] == "sequence"
                 else [convert(body)]
             )
+            carried = []
+            for carry in node.get("carried", []):
+                cell = cell_aliases.get(carry["cell"], carry["cell"])
+                published_carry = {
+                    "cell": cell,
+                    "next": rewrite(carry["body_output"]),
+                }
+                initial = rewrite(carry["current"])
+                if workflow["state"][cell]["initializer"] != initial:
+                    published_carry["initial"] = initial
+                carried.append(published_carry)
             result = {
                 "kind": "loop",
                 "setup": setup_steps,
                 "steps": body_steps,
                 "condition": rewrite(node["condition"]),
                 "max_iterations": rewrite(node["max_iterations"]),
-                "carried": [
-                    {
-                        "cell": cell_aliases.get(carry["cell"], carry["cell"]),
-                        "initial": rewrite(carry["current"]),
-                        "next": rewrite(carry["body_output"]),
-                    }
-                    for carry in node.get("carried", [])
-                ],
+                "carried": carried,
             }
             if "iteration" in node:
                 result["iteration"] = node["iteration"]

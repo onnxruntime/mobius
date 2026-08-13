@@ -366,7 +366,9 @@ def test_dispatch_diffusion_auto_reads_scheduler_from_source(tmp_path):
     with open(arts["inference_metadata"]) as handle:
         meta = yaml.safe_load(handle)
     components = meta["pipeline"]["workflow"]["components"]
-    assert components["diffusion_schedule"]["ports"]["outputs"]["schedule"]["shape"] == [16]
+    assert "ports" not in components["diffusion_schedule"]
+    schedule = ir.load(out / "policies" / "diffusion_schedule.onnx")
+    assert list(schedule.graph.outputs[0].shape) == [16]
 
 
 def test_dispatch_vision_multimodal_pipeline(tmp_path):

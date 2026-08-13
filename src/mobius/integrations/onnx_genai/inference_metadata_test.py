@@ -94,15 +94,14 @@ def test_workflow_policy_components_reference_saved_onnx_artifacts(tmp_path):
         "kind": "onnx",
         "artifact": "policies/sample.onnx",
     }
-    assert set(component["ports"]["inputs"]) == {"logits"}
-    assert set(component["ports"]["outputs"]) == {"token"}
+    assert "ports" not in component
     assert component["contract"] == {
         "id": "onnx-genai.token-sampler",
         "version": "1",
         "bindings": {"logits": "logits", "token": "token"},
         "parameters": {"mode": "greedy"},
     }
-    assert component["effects"] == ["sample"]
+    assert "effects" not in component
     assert (tmp_path / component["implementation"]["artifact"]).is_file()
 
 

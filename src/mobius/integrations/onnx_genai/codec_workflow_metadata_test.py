@@ -52,13 +52,9 @@ def test_codec_workflow_has_typed_ssa_and_audio_emit():
         "rank": 3,
         "shape": ["batch", 1, "audio_samples"],
     }
-    assert workflow["components"]["encoder"]["ports"]["outputs"]["codes"] == {
-        "dtype": "int64",
-        "rank": 3,
-        "shape": ["batch", 16, "frames"],
-    }
-    assert workflow["components"]["encoder"]["effects"] == ["codec_encode"]
-    assert workflow["components"]["decoder"]["effects"] == ["codec_decode"]
+    assert "ports" not in workflow["components"]["encoder"]
+    assert "effects" not in workflow["components"]["encoder"]
+    assert "effects" not in workflow["components"]["decoder"]
 
     encode, decode, emit = workflow["steps"]
     assert encode["outputs"] == {"codes": "codec.codes"}

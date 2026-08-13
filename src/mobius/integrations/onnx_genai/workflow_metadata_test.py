@@ -173,7 +173,7 @@ def test_language_diffusion_rejects_zero_steps():
 
 def test_language_diffusion_matches_pr_828_schema():
     schema_path = (
-        Path(__file__).parents[4] / "tests" / "schemas" / "onnx_genai_b90d949.schema.json"
+        Path(__file__).parents[4] / "tests" / "schemas" / "onnx_genai_c553a16.schema.json"
     )
     with schema_path.open(encoding="utf-8") as handle:
         schema = json.load(handle)
@@ -276,12 +276,19 @@ def test_speculative_grammar_and_adaptive_k_use_typed_state_contracts():
     assert workflow["state"]["grammar"]["class"] == "semantic"
     assert workflow["state"]["proposal_k"]["class"] == "advisory"
     assert workflow["state"]["adaptive_estimates"]["class"] == "advisory"
+    assert all(
+        "ports" not in component and "effects" not in component
+        for component in workflow["components"].values()
+        if component["implementation"]["kind"] == "onnx"
+    )
+    assert "ports" in workflow["components"]["grammar_commit"]
     proposer = next(
         node for node in workflow["steps"][0]["steps"] if node.get("component") == "proposer"
     )
     assert proposer["inputs"]["proposal_budget"] == "proposal_k"
+    assert all("initial" not in carry for carry in workflow["steps"][0]["carried"])
     schema_path = (
-        Path(__file__).parents[4] / "tests" / "schemas" / "onnx_genai_b90d949.schema.json"
+        Path(__file__).parents[4] / "tests" / "schemas" / "onnx_genai_c553a16.schema.json"
     )
     with schema_path.open(encoding="utf-8") as handle:
         jsonschema.validate(instance=metadata, schema=json.load(handle))
