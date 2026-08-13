@@ -220,7 +220,12 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
         "rank": 2,
         "shape": ["batch", 202048],
     }
-    kv_ports = workflow["serving"]["kv_service"]["groups"]["decoder_cache"]["ports"]["decoder"]
+    kv_service = workflow["serving"]["kv_service"]
+    assert kv_service["paging"] == "none"
+    assert kv_service["compaction"] is False
+    decoder_cache = kv_service["groups"]["decoder_cache"]
+    assert decoder_cache["storage"] == "shared_buffer"
+    kv_ports = decoder_cache["ports"]["decoder"]
     assert len(kv_ports) == 104
     assert kv_ports["cache_103"] == {
         "input": "past_key_values.51.value",

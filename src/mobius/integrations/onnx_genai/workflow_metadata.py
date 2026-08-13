@@ -458,6 +458,21 @@ def _model_cache_pairs(model: ir.Model) -> list[tuple[ir.Value, ir.Value]]:
     return pairs
 
 
+def _kv_storage_contract(model: ir.Model) -> dict[str, Any]:
+    """Derive physical KV storage from the admitted model interface."""
+    input_names = {value.name.lower() for value in model.graph.inputs}
+    paged = any(
+        marker in name
+        for name in input_names
+        for marker in ("block_table", "block_tables", "page_table", "page_tables")
+    )
+    return {
+        "paging": "paged" if paged else "none",
+        "compaction": paged,
+        "storage": "paged" if paged else "shared_buffer",
+    }
+
+
 def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
     """Build the weight-bearing Qwen3-TTS talker/predictor/codec workflow."""
     talker = pkg["talker"]
@@ -520,6 +535,8 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
 
     talker_caches = _model_cache_pairs(talker)
     predictor_caches = _model_cache_pairs(predictor)
+    talker_kv = _kv_storage_contract(talker)
+    predictor_kv = _kv_storage_contract(predictor)
     attach_policy_components(pkg, PolicyCapabilities())
     pkg.add_policy_component("last_token_logits", build_last_token_logits())
     pkg.add_policy_component(
@@ -1550,9 +1567,14 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
                     "accepted_len": "accepted_len",
                     "slot_ids": "slot_ids",
                     "kv_service": {
-                        "paging": "paged",
+                        "paging": (
+                            "paged"
+                            if talker_kv["paging"] == "paged"
+                            or predictor_kv["paging"] == "paged"
+                            else "none"
+                        ),
                         "allocation": "runtime",
-                        "compaction": True,
+                        "compaction": talker_kv["compaction"] or predictor_kv["compaction"],
                         "groups": {
                             **(
                                 {
@@ -1560,7 +1582,7 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
                                         "sequence_axis": 2,
                                         "layout": "bnsh",
                                         "logical_lengths": "talker_cache_lengths",
-                                        "storage": "paged",
+                                        "storage": talker_kv["storage"],
                                         "ports": {
                                             "talker": {
                                                 f"talker_cache_{index}": {
@@ -1583,7 +1605,7 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
                                         "sequence_axis": 2,
                                         "layout": "bnsh",
                                         "logical_lengths": "predictor_cache_lengths",
-                                        "storage": "paged",
+                                        "storage": predictor_kv["storage"],
                                         "ports": {
                                             "code_predictor": {
                                                 f"predictor_cache_{index}": {
@@ -2531,6 +2553,7 @@ def build_vlm_workflow_metadata(
                 present.shape = value.shape
             cache_pairs.append((value, present))
     cache_names = {value.name for value, _ in cache_pairs}
+    decoder_kv = _kv_storage_contract(decoder)
     rank2_integer = [
         value
         for value in decoder.graph.inputs
@@ -3115,9 +3138,9 @@ def build_vlm_workflow_metadata(
                     "accepted_len": "accepted_len",
                     "slot_ids": "slot_ids",
                     "kv_service": {
-                        "paging": "paged",
+                        "paging": decoder_kv["paging"],
                         "allocation": "runtime",
-                        "compaction": True,
+                        "compaction": decoder_kv["compaction"],
                         "groups": {
                             "decoder_cache": {
                                 "sequence_axis": next(
@@ -3132,7 +3155,7 @@ def build_vlm_workflow_metadata(
                                 ),
                                 "layout": "bnsh",
                                 "logical_lengths": "cache_lengths",
-                                "storage": "paged",
+                                "storage": decoder_kv["storage"],
                                 "ports": {
                                     "decoder": {
                                         f"cache_{index}": {
@@ -3199,6 +3222,7 @@ def build_speculative_workflow_metadata(
         raise ValueError("speculative workflow requires proposer and verifier")
     proposer = pkg["proposer"]
     verifier = pkg["verifier"]
+    verifier_kv = _kv_storage_contract(verifier)
     proposer_input = next(
         (
             value
@@ -3922,15 +3946,15 @@ def build_speculative_workflow_metadata(
             "accepted_len": "accepted_len",
             "slot_ids": "slot_ids",
             "kv_service": {
-                "paging": "paged",
+                "paging": verifier_kv["paging"],
                 "allocation": "runtime",
-                "compaction": True,
+                "compaction": verifier_kv["compaction"],
                 "groups": {
                     "verifier_cache": {
                         "sequence_axis": kv_sequence_axis,
                         "layout": "bnsh",
                         "logical_lengths": "cache_lengths",
-                        "storage": "paged",
+                        "storage": verifier_kv["storage"],
                         "ports": {"verifier": kv_ports},
                     }
                 },
@@ -4002,6 +4026,7 @@ def build_decoder_workflow_metadata(
     decoder_name, decoder = next(iter(pkg.items()))
     inputs = list(decoder.graph.inputs)
     outputs = list(decoder.graph.outputs)
+    decoder_kv_contract = _kv_storage_contract(decoder)
     token_input = next(
         (
             value
@@ -4767,15 +4792,15 @@ def build_decoder_workflow_metadata(
                     "accepted_len": "accepted_len",
                     "slot_ids": "slot_ids",
                     "kv_service": {
-                        "paging": "paged",
+                        "paging": decoder_kv_contract["paging"],
                         "allocation": "runtime",
-                        "compaction": True,
+                        "compaction": decoder_kv_contract["compaction"],
                         "groups": {
                             "decoder_cache": {
                                 "sequence_axis": decoder_kv_axis,
                                 "layout": "bnsh",
                                 "logical_lengths": "cache_lengths",
-                                "storage": "paged",
+                                "storage": decoder_kv_contract["storage"],
                                 "ports": {decoder_name: decoder_kv_ports},
                             }
                         },
