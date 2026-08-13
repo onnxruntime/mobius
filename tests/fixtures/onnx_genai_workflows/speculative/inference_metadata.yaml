@@ -677,7 +677,7 @@ pipeline:
             sequence_axis: 2
             layout: bnsh
             logical_lengths: cache_lengths
-            storage: shared_buffer
+            storage: separate
             ports:
               verifier:
                 cache_0:

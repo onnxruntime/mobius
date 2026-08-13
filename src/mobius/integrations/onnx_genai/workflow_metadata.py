@@ -509,10 +509,28 @@ def _kv_storage_contract(model: ir.Model) -> dict[str, Any]:
         for name in input_names
         for marker in ("block_table", "block_tables", "page_table", "page_tables")
     )
+    cache_pairs = _model_cache_pairs(model)
+    shared_buffer = bool(cache_pairs) and all(
+        past.shape is not None
+        and present.shape is not None
+        and len(past.shape) == len(present.shape)
+        and all(
+            str(getattr(past_dim, "value", past_dim))
+            == str(getattr(present_dim, "value", present_dim))
+            for past_dim, present_dim in zip(past.shape, present.shape)
+        )
+        for past, present in cache_pairs
+    )
+    if paged:
+        storage = "paged"
+    elif shared_buffer:
+        storage = "shared_buffer"
+    else:
+        storage = "separate"
     return {
         "paging": "paged" if paged else "none",
         "compaction": paged,
-        "storage": "paged" if paged else "shared_buffer",
+        "storage": storage,
     }
 
 
@@ -2897,9 +2915,7 @@ def build_vlm_workflow_metadata(
             "contract": batch_int,
             "class": "semantic",
             "scope": "invocation",
-            "initializer": (
-                "initializer.cache_lengths" if fixed_capacity else "package.zero_batch"
-            ),
+            "initializer": "initializer.cache_lengths",
             "recurrence": {"kind": "invariant"},
         },
     }
@@ -2949,7 +2965,7 @@ def build_vlm_workflow_metadata(
         ),
         (
             "cache_lengths",
-            "initializer.cache_lengths" if fixed_capacity else "package.zero_batch",
+            "initializer.cache_lengths",
             "state.cache_lengths.body",
             "cache_lengths.next",
             "state.cache_lengths.final",
@@ -3094,11 +3110,7 @@ def build_vlm_workflow_metadata(
                     attention_input.name: f"initializer.{attention_input.name}",
                     "body_attention_mask": "initializer.body_attention_mask",
                     "token_slot": "initializer.token_slot",
-                    **(
-                        {"cache_lengths": "initializer.cache_lengths"}
-                        if fixed_capacity
-                        else {}
-                    ),
+                    "cache_lengths": "initializer.cache_lengths",
                     **(
                         {
                             position_input.name: f"initializer.{position_input.name}",
@@ -4468,13 +4480,6 @@ def build_decoder_workflow_metadata(
                     "required": False,
                     "default": 0,
                 },
-                "package.cache_lengths": {
-                    "contract": batch_int,
-                    "role": {"kind": "opaque"},
-                    "source": {"kind": "literal"},
-                    "required": False,
-                    "default": 0,
-                },
                 "package.zero_batch": {
                     "contract": batch_int,
                     "role": {"kind": "opaque"},
@@ -4561,11 +4566,7 @@ def build_decoder_workflow_metadata(
                     "contract": batch_int,
                     "class": "semantic",
                     "scope": "invocation",
-                    "initializer": (
-                        "initializer.cache_lengths"
-                        if fixed_capacity
-                        else "package.cache_lengths"
-                    ),
+                    "initializer": "initializer.cache_lengths",
                     "recurrence": {"kind": "invariant"},
                 },
             }
@@ -4621,11 +4622,7 @@ def build_decoder_workflow_metadata(
                 },
                 {
                     "cell": "cache_lengths",
-                    "current": (
-                        "initializer.cache_lengths"
-                        if fixed_capacity
-                        else "package.cache_lengths"
-                    ),
+                    "current": "initializer.cache_lengths",
                     "body_input": "state.cache_lengths.body",
                     "body_output": "cache_lengths.next",
                     "next": "state.cache_lengths.final",
@@ -4773,11 +4770,7 @@ def build_decoder_workflow_metadata(
                     attention_input.name: f"initializer.{attention_input.name}",
                     "body_attention_mask": "initializer.body_attention_mask",
                     "token_slot": "initializer.token_slot",
-                    **(
-                        {"cache_lengths": "initializer.cache_lengths"}
-                        if fixed_capacity
-                        else {}
-                    ),
+                    "cache_lengths": "initializer.cache_lengths",
                     **(
                         {
                             position_input.name: f"initializer.{position_input.name}",

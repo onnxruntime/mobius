@@ -659,13 +659,12 @@ def build_decoder_state_initializer(
     if position_ids_input is not None:
         builder.add_output(body_position, "body_position_ids")
     builder.add_output(token_slot, "token_slot")
-    if fixed_capacity:
-        cache_lengths = op.Expand(
-            op.Unsqueeze(sequence_length, op.Constant(value_ints=[0])),
-            batch_shape,
-        )
-        cache_lengths.shape = ir.Shape(["batch"])
-        builder.add_output(cache_lengths, "cache_lengths")
+    cache_lengths = op.Expand(
+        op.Unsqueeze(sequence_length, op.Constant(value_ints=[0])),
+        batch_shape,
+    )
+    cache_lengths.shape = ir.Shape(["batch"])
+    builder.add_output(cache_lengths, "cache_lengths")
 
     for name in cache_inputs:
         value = decoder_inputs[name]

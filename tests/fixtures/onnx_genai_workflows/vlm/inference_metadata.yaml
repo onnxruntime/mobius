@@ -358,7 +358,10 @@ pipeline:
         scope: invocation
         initializer: initializer.body_attention_mask
         recurrence:
-          kind: invariant
+          kind: growing
+          axis: 1
+          increment: package.one
+          max: package.max_context
       active:
         contract:
           dtype: bool
@@ -481,7 +484,7 @@ pipeline:
             sequence_axis: 2
             layout: bnsh
             logical_lengths: cache_lengths
-            storage: shared_buffer
+            storage: separate
             ports:
               decoder:
                 cache_0:
@@ -511,7 +514,6 @@ pipeline:
         component: decoder_state_initializer
         inputs:
           prompt_tokens: request.prompt_tokens
-          max_iterations: request.max_iterations
         outputs:
           attention_mask: initializer.attention_mask
           body_attention_mask: initializer.body_attention_mask
@@ -617,7 +619,6 @@ pipeline:
         component: decoder_step_update
         inputs:
           attention_mask: attention_mask
-          logical_length: cache_lengths.next
           position_ids: position_ids
         outputs:
           next_attention_mask: decoder_step.body_attention_mask
