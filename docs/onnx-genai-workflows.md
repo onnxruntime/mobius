@@ -88,6 +88,9 @@ to ordinary island execution without changing workflow semantics. Diagnostics sh
 the island's component list and device, eligibility decision, capture/replay counters, and exact
 fallback reason.
 
+Release benchmarking and the native-equivalence acceptance gate are defined in
+[`onnx-genai-performance-conformance.md`](onnx-genai-performance-conformance.md).
+
 ### Decoder KV boundary
 
 Normal decode carries each decoder `present` tensor directly to the corresponding
