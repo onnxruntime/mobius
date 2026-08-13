@@ -221,6 +221,68 @@ _MODELS = [
 
 @pytest.mark.integration
 @pytest.mark.integration_slow
+def test_lfm2_text_generation(tmp_path):
+    """Build LFM2.5, load it in ORT GenAI, and run deterministic generation."""
+    from mobius import build
+    from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+    model_id = "LiquidAI/LFM2.5-230M"
+    pkg = build(model_id, dtype="f32", load_weights=True)
+    output_dir = str(tmp_path / "lfm2")
+    pkg.save(output_dir)
+    write_ort_genai_config(pkg, output_dir, hf_model_id=model_id)
+
+    with open(os.path.join(output_dir, "genai_config.json"), encoding="utf-8") as f:
+        config = json.load(f)
+    decoder = config["model"]["decoder"]
+    assert decoder["layer_types"] == pkg.config.layer_types
+    assert decoder["inputs"]["past_conv_names"] == "past_key_values.%d.conv_state"
+
+    model = ort_genai.Model(output_dir)
+    tokenizer = ort_genai.Tokenizer(model)
+    input_ids = [pkg.config.bos_token_id, *tokenizer.encode("Here is my poem:")]
+    params = ort_genai.GeneratorParams(model)
+    params.set_search_options(
+        max_length=len(input_ids) + 20,
+        do_sample=False,
+    )
+    generator = ort_genai.Generator(model, params)
+    generator.append_tokens(input_ids)
+
+    generated_tokens = list(input_ids)
+    for _ in range(20):
+        if generator.is_done():
+            break
+        generator.generate_next_token()
+        generated_tokens.append(generator.get_next_tokens()[0])
+
+    assert generated_tokens[len(input_ids) :] == [
+        509,
+        1098,
+        4979,
+        27870,
+        521,
+        768,
+        20480,
+        14559,
+        521,
+        3604,
+        41429,
+        2793,
+        53306,
+        884,
+        779,
+        2031,
+        521,
+        3604,
+        542,
+        2829,
+    ]
+    assert tokenizer.decode(generated_tokens).strip()
+
+
+@pytest.mark.integration
+@pytest.mark.integration_slow
 @pytest.mark.parametrize("model_id", _MODELS)
 class TestOrtGenaiQwen25VL:
     """End-to-end tests with onnxruntime-genai for Qwen2.5-VL."""

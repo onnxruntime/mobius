@@ -137,10 +137,10 @@ class TestBuildFromModule:
         assert isinstance(model, ir.Model)
         assert model.graph.num_nodes() > 0
 
-    def test_build_with_prune_lm_head_feature(self):
+    def test_build_with_prune_prefill_prefix_feature(self):
         config = make_config()
         module = CausalLMModel(config)
-        model = build_from_module(module, config, prune_lm_head=True)["model"]
+        model = build_from_module(module, config, prune_prefill_prefix=True)["model"]
 
         logits = next(v for v in model.graph.outputs if v.name == "logits")
         assert len(logits.shape) == 3
@@ -191,23 +191,23 @@ class TestTextModelOutputHiddenStates:
         assert model.output_layer_indices == [0, 3]
 
 
-class TestPruneLmHead:
-    """Tests for the ``prune_lm_head`` option in :class:`CausalLMTask`.
+class TestPrunePrefillPrefix:
+    """Tests for the ``prune_prefill_prefix`` option in :class:`CausalLMTask`.
 
     When ``True``, a ``Gather + Unsqueeze`` is inserted after the LM head
     so logits are produced for only the last sequence position.
-    Mirrors onnxruntime-genai Model Builder's ``prune_lm_head`` opt-in.
+    The generic causal task applies the optimization immediately before the LM head.
     """
 
-    def _build(self, prune_lm_head: bool = False) -> ir.Model:
+    def _build(self, prune_prefill_prefix: bool = False) -> ir.Model:
         config = make_config()
         module = CausalLMModel(config)
-        task = CausalLMTask(prune_lm_head=prune_lm_head)
+        task = CausalLMTask(prune_prefill_prefix=prune_prefill_prefix)
         return build_from_module(module, config, task=task)["model"]
 
-    def test_default_emits_no_lm_head_pruning(self):
-        """Default (prune_lm_head=False): graph emits full [B, S, vocab] logits."""
-        model = self._build(prune_lm_head=False)
+    def test_default_emits_no_prefill_prefix_pruning(self):
+        """Default graph emits full [B, S, vocab] logits."""
+        model = self._build(prune_prefill_prefix=False)
 
         logits = next(v for v in model.graph.outputs if v.name == "logits")
         # Logits must remain rank-3 [B, S, vocab]
@@ -226,7 +226,7 @@ class TestPruneLmHead:
 
     def test_prune_emits_gather_on_logits(self):
         """Pruning selects the final hidden state before the LM-head MatMul."""
-        model = self._build(prune_lm_head=True)
+        model = self._build(prune_prefill_prefix=True)
 
         logits = next(v for v in model.graph.outputs if v.name == "logits")
         # Logits must still be rank-3 [B, 1, vocab] (NOT rank-4 [B, 1, 1, V])
@@ -253,7 +253,7 @@ class TestPruneLmHead:
         input_ids still has dynamic sequence_length
         so the model accepts arbitrary prompts.
         """
-        model = self._build(prune_lm_head=True)
+        model = self._build(prune_prefill_prefix=True)
 
         input_ids = next(v for v in model.graph.inputs if v.name == "input_ids")
         # input dim 1 (sequence_length) should still be dynamic, not 1
@@ -279,8 +279,8 @@ class TestPruneLmHead:
                 return self.lm_head(op, hidden_states), present
 
         config = make_config()
-        with pytest.raises(ValueError, match="does not support prune_lm_head"):
-            build_from_module(UnsupportedCausalLM(config), config, prune_lm_head=True)
+        with pytest.raises(ValueError, match="does not support prune_prefill_prefix"):
+            build_from_module(UnsupportedCausalLM(config), config, prune_prefill_prefix=True)
 
 
 class TestDeepStackCaptureOrdering:

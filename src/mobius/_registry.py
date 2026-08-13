@@ -25,9 +25,12 @@ from onnxscript import nn
 from mobius._configs import (
     BaseModelConfig,
     Eagle3Config,
+    Gemma3nMultiModalConfig,
     Gemma4AssistantConfig,
     Gemma4Config,
+    Lfm2Config,
     MMSConfig,
+    MuseGlimmerConfig,
     NemotronParseConfig,
     WhisperConfig,
 )
@@ -69,6 +72,7 @@ from mobius.models import (
     HunYuanVLMoTModel,
     InternLM2CausalLMModel,
     LayerNormCausalLMModel,
+    Lfm2CausalLMModel,
     LLaDAModel,
     Llama4CausalLMModel,
     MoECausalLMModel,
@@ -114,9 +118,13 @@ from mobius.models.cohere import CohereCausalLMModel
 from mobius.models.ctrl import CTRLCausalLMModel
 from mobius.models.depth_anything import DepthAnythingForDepthEstimation
 from mobius.models.distilbert import DistilBertModel
-from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel, MPTCausalLMModel
+from mobius.models.falcon import (
+    BloomCausalLMModel,
+    FalconCausalLMModel,
+    MPTCausalLMModel,
+)
 from mobius.models.fun_asr import FunASRForConditionalGeneration
-from mobius.models.gemma3n import Gemma3nCausalLMModel
+from mobius.models.gemma3n import Gemma3nCausalLMModel, Gemma3nMultiModalModel
 from mobius.models.gpt2 import GPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
 from mobius.models.gptj_codegen import CodeGenCausalLMModel, GPTJCausalLMModel
@@ -131,6 +139,10 @@ from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
 from mobius.models.minimax import MiniMaxCausalLMModel
 from mobius.models.mllama import MllamaCausalLMModel
 from mobius.models.modernbert import ModernBertDecoderModel, ModernBertModel
+from mobius.models.muse_glimmer import (
+    MuseGlimmerForConditionalGeneration,
+    MuseGlimmerTextCausalLMModel,
+)
 from mobius.models.nemotron_h import NemotronHCausalLMModel
 from mobius.models.opt import OPTCausalLMModel
 from mobius.models.persimmon import PersimmonCausalLMModel
@@ -418,7 +430,6 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "gemma2": ModelRegistration(Gemma2CausalLMModel),
     "gemma3": ModelRegistration(Gemma3MultiModalModel, task="vision-language"),
     "gemma3_text": ModelRegistration(Gemma3CausalLMModel),
-    "gemma3n": ModelRegistration(Gemma3nCausalLMModel),
     "gemma3n_text": ModelRegistration(Gemma3nCausalLMModel),
     "gemma4_text": ModelRegistration(Gemma4CausalLMModel, config_class=Gemma4Config),
     "gemma4_unified_text": ModelRegistration(Gemma4CausalLMModel, config_class=Gemma4Config),
@@ -465,6 +476,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "hunyuan_v1_dense": ModelRegistration(HunYuanV1DenseCausalLMModel),
     "internlm2": ModelRegistration(InternLM2CausalLMModel),
     "llama4_text": ModelRegistration(Llama4CausalLMModel),
+    "lfm2": ModelRegistration(Lfm2CausalLMModel, config_class=Lfm2Config),
     "llada": ModelRegistration(LLaDAModel, task="masked-diffusion"),
     "modernbert-decoder": ModelRegistration(ModernBertDecoderModel),
     "mpt": ModelRegistration(MPTCausalLMModel),
@@ -582,6 +594,9 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "deepseek_vl_hybrid": ModelRegistration(LLaVAModel, task="vision-language"),
     "florence2": ModelRegistration(LLaVAModel, task="vision-language"),
     "fuyu": ModelRegistration(LLaVAModel, task="vision-language"),
+    "gemma3n": ModelRegistration(
+        Gemma3nMultiModalModel, task="gemma3n", config_class=Gemma3nMultiModalConfig
+    ),
     "gemma4": ModelRegistration(Gemma4Model, task="gemma4", config_class=Gemma4Config),
     "gemma4_unified": ModelRegistration(
         Gemma4UnifiedModel, task="gemma4-unified", config_class=Gemma4Config
@@ -606,6 +621,16 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "llava_onevision": ModelRegistration(LLaVAModel, task="vision-language"),
     "mistral3": ModelRegistration(LLaVAModel, task="pixtral-vl"),
     "mllama": ModelRegistration(MllamaCausalLMModel, task="mllama-vision-language"),
+    "muse_glimmer": ModelRegistration(
+        MuseGlimmerForConditionalGeneration,
+        task="muse-glimmer-vl",
+        config_class=MuseGlimmerConfig,
+        test_model_id="meta-models/Muse-Glimmer-30B",
+    ),
+    "muse_glimmer_text": ModelRegistration(
+        MuseGlimmerTextCausalLMModel,
+        config_class=MuseGlimmerConfig,
+    ),
     "molmo": ModelRegistration(LLaVAModel, task="vision-language"),
     "ovis2": ModelRegistration(LLaVAModel, task="vision-language"),
     "paligemma": ModelRegistration(LLaVAModel, task="vision-language"),
@@ -813,6 +838,10 @@ def _create_default_registry() -> ModelRegistry:
 # idempotent: a text-only model_type maps to itself so ``text_only=True`` is a
 # no-op when the resolved type is already text-only.
 _TEXT_ONLY_MODEL_TYPE: dict[str, str] = {
+    "muse_glimmer": "muse_glimmer_text",
+    "muse_glimmer_text": "muse_glimmer_text",
+    "gemma3n": "gemma3n_text",
+    "gemma3n_text": "gemma3n_text",
     "gemma4_unified": "gemma4_unified_text",
     "gemma4_unified_text": "gemma4_unified_text",
     # Qwen3.5-MoE-VL (Qwen3.6-35B-A3B): export just the hybrid MoE text
@@ -883,8 +912,10 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "gemma2": "google/gemma-2-2b",
     "gemma3": "google/gemma-3-4b-it",
     "gemma3_text": "google/gemma-3-1b-pt",
-    "gemma3n": "google/gemma-3n-E2B-pt",
-    "gemma3n_text": "google/gemma-3n-E2B-pt",
+    # No text-only gemma3n checkpoint was ever published; the -it releases are
+    # multimodal, and "gemma3n_text" reaches the text path via _TEXT_ONLY_MODEL_TYPE.
+    "gemma3n": "google/gemma-3n-E4B-it",
+    "gemma3n_text": "google/gemma-3n-E2B-it",
     "gemma4_text": "google/gemma-4-E2B-it",
     "granite": "ibm-granite/granite-3.3-2b-instruct",
     "internlm2": "internlm/internlm2_5-7b-chat",
@@ -959,6 +990,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     # --- Hybrid SSM+Attention ---
     "jamba": "ai21labs/Jamba-v0.1",
     "bamba": "ibm-fms/Bamba-9B",
+    "lfm2": "LiquidAI/LFM2.5-230M",
 
     # --- Multimodal ---
     "qwen2_vl": "Qwen/Qwen2-VL-2B-Instruct",
@@ -971,6 +1003,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "llava": "llava-hf/llava-1.5-7b-hf",
     "llava_next": "llava-hf/llava-v1.6-mistral-7b-hf",
     "mllama": "meta-llama/Llama-3.2-11B-Vision-Instruct",
+    "muse_glimmer": "meta-models/Muse-Glimmer-30B",
+    "muse_glimmer_text": "meta-models/Muse-Glimmer-30B",
     "gemma4": "google/gemma-4-E2B-it",
     "gemma4_unified": "google/gemma-4-12B",
     "gemma4_unified_text": "google/gemma-4-12B",
@@ -1207,6 +1241,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "llama": "llama",
     "code_llama": "llama",
     "llama4_text": "llama",
+    "lfm2": "lfm",
     "mllama": "llama",
     "mistral": "mistral",
     "mistral3": "mistral",
@@ -1278,6 +1313,7 @@ _VARIANT_LABELS: dict[str, str] = {
     "falcon_mamba": "ssm",
     "jamba": "hybrid-ssm+attn",
     "bamba": "hybrid-mamba2+attn",
+    "lfm2": "hybrid-conv+attn",
     "qwen3_next": "moe+linear-attn",
 }
 

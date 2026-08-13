@@ -108,6 +108,10 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # dispatch, plus Mamba1 SSM single-token decode FP path differences.
     # Argmax correct, cosine=0.998 — model is functionally correct.
     "jamba": 0.04,
+    # Bamba's hybrid Mamba2 + attention path differs slightly in FP accumulation
+    # order from HuggingFace. Both deterministic seeds keep the same argmax and
+    # cosine >= 0.999996 with max absolute error below 0.0017.
+    "bamba": 0.002,
     # ModernBERT decoder has a 3-component LM head (dense→norm→decoder) whose
     # FP accumulation differs from PyTorch → ~0.043 max diff.
     # Argmax correct, cosine=0.996 — model is functionally correct.
@@ -150,8 +154,9 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # Gemma3n: AltUp magnitude normalization (target_mag/new_mag ratio) amplifies
     # FP differences between ORT and PyTorch, especially with random weight init.
     # Argmax correct (near-tie), cosine≥0.995, top10_jaccard=1.0 — functionally correct.
-    "gemma3n_text": 0.1,  # ~0.094 max diff worst-case (AltUp magnitude ratio)
-    "gemma3n": 0.1,  # same architecture
+    # Only the text entry appears here: the "gemma3n" key builds the multimodal
+    # model, which this causal-LM suite does not cover.
+    "gemma3n_text": 0.05,  # ~0.026 max diff worst-case (AltUp magnitude ratio)
     # Gemma3 VL: same QK-norm FP accumulation as gemma3_text (~0.045 max diff).
     # argmax_match=True (near-tie), cosine=0.996 — functionally correct.
     "gemma3": 0.05,
@@ -260,18 +265,13 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     "gemma": {"head_dim": TINY_HEAD_DIM},
     # Gemma3/Gemma3n: head_dim is an explicit param in HF (default 256); pass tiny value.
     "gemma3_text": {"head_dim": TINY_HEAD_DIM, "query_pre_attn_scalar": TINY_HEAD_DIM},
-    # num_kv_shared_layers default is 15; with TINY_LAYERS=2 this makes all layers
-    # "shared", causing prev_layers[:-13]=[] and a ValueError on index lookup. Set to 0.
+    # num_kv_shared_layers is threaded through from the tiny config (HF defaults
+    # to 15, which with TINY_LAYERS=2 would make every layer "shared" and leave
+    # no source layer to borrow K,V from), so it is set explicitly per entry in
+    # _test_configs.py rather than pinned to 0 here.
     "gemma3n_text": {
         "query_pre_attn_scalar": TINY_HEAD_DIM,
         "head_dim": TINY_HEAD_DIM,
-        "num_kv_shared_layers": 0,
-        "hidden_activation": "gelu_pytorch_tanh",
-    },
-    "gemma3n": {
-        "query_pre_attn_scalar": TINY_HEAD_DIM,
-        "head_dim": TINY_HEAD_DIM,
-        "num_kv_shared_layers": 0,
         "hidden_activation": "gelu_pytorch_tanh",
     },
     "gemma3": {"query_pre_attn_scalar": TINY_HEAD_DIM, "head_dim": TINY_HEAD_DIM},
@@ -453,8 +453,6 @@ _HF_MODEL_TYPE_OVERRIDES: dict[str, str] = {
     # Gemma3Config wraps Gemma3TextConfig; tiny kwargs go to the outer config
     # but the actual model is built from text_config which retains HF defaults.
     "gemma3": "gemma3_text",
-    # Gemma3nConfig is the multimodal wrapper; text-only parity uses Gemma3nTextConfig.
-    "gemma3n": "gemma3n_text",
     # Qwen3.5-MoE outer config wraps text_config; use the text-only model type
     # so tiny kwargs (num_experts, moe_intermediate_size, etc.) apply directly.
     "qwen3_5_moe": "qwen3_5_moe_text",
@@ -463,6 +461,26 @@ _HF_MODEL_TYPE_OVERRIDES: dict[str, str] = {
     # VL text sub-models: use the base text model type for CausalLM parity testing.
     "qwen3_vl_moe": "qwen3_moe",
     "qwen3_omni_moe": "qwen3_moe",
+}
+
+
+def _adapt_muse_glimmer_text_config(hf_kwargs: dict) -> None:
+    """Translate the shared tiny config fields to Muse Glimmer's HF schema."""
+    hf_kwargs["head_dim"] = TINY_HEAD_DIM
+    hf_kwargs.setdefault("hidden_activation", hf_kwargs.get("hidden_act", "silu"))
+    hf_kwargs.pop("hidden_act", None)
+    hf_kwargs["attention_bias"] = False
+    hf_kwargs["rope_parameters"] = {
+        "rope_type": "default",
+        "rope_theta": hf_kwargs.pop("rope_theta", 10_000.0),
+    }
+    hf_kwargs.pop("rope_type", None)
+    hf_kwargs.pop("attn_qk_norm", None)
+    hf_kwargs.pop("no_rope_layers", None)
+
+
+_HF_CONFIG_ADAPTERS = {
+    "muse_glimmer_text": _adapt_muse_glimmer_text_config,
 }
 
 
@@ -502,6 +520,9 @@ def _create_hf_config(model_type: str, config_overrides: dict):
     if model_type in _HF_EXTRA_CONFIG:
         hf_kwargs.update(_HF_EXTRA_CONFIG[model_type])
 
+    if adapter := _HF_CONFIG_ADAPTERS.get(hf_model_type):
+        adapter(hf_kwargs)
+
     # Convert layer_types to attn_layer_indices for hybrid Mamba models
     # Bamba uses attn_layer_indices (computed property layers_block_type)
     if hf_model_type in ("bamba",) and "layer_types" in hf_kwargs:
@@ -509,6 +530,15 @@ def _create_hf_config(model_type: str, config_overrides: dict):
         hf_kwargs["attn_layer_indices"] = [
             i for i, lt in enumerate(layer_types) if lt in ("full_attention", "attention")
         ]
+
+    if hf_model_type == "lfm2":
+        hf_kwargs["conv_L_cache"] = hf_kwargs.pop("short_conv_kernel", 3)
+        hf_kwargs["conv_bias"] = hf_kwargs.pop("short_conv_bias", False)
+        hf_kwargs["norm_eps"] = hf_kwargs.pop("rms_norm_eps")
+        hf_kwargs["rope_parameters"] = {
+            "rope_type": "default",
+            "rope_theta": 10_000.0,
+        }
 
     # Jamba uses attn_layer_offset/attn_layer_period
     if hf_model_type in ("jamba",) and "layer_types" in hf_kwargs:
@@ -648,6 +678,8 @@ def _create_hf_config(model_type: str, config_overrides: dict):
         "attn_qk_norm",
         "attn_qk_norm_full",
         "post_feedforward_norm",
+        "short_conv_kernel",
+        "short_conv_bias",
         # dual_ln is a mobius-only flag for Falcon/Bloom parallel attention;
         # HF controls this behavior via new_decoder_architecture=True.
         "dual_ln",
@@ -663,13 +695,44 @@ def _create_hf_config(model_type: str, config_overrides: dict):
     return hf_config
 
 
+def _create_softcapped_backbone_causal_lm(hf_config):
+    """Wrap an HF backbone with the checkpoint's scaled, softcapped LM head."""
+    from transformers import AutoModel
+
+    class _SoftcappedBackboneCausalLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = AutoModel.from_config(hf_config)
+            self.lm_head = torch.nn.Linear(
+                hf_config.hidden_size,
+                hf_config.vocab_size,
+                bias=False,
+            )
+
+        def forward(self, **kwargs):
+            hidden_states = self.model(**kwargs).last_hidden_state
+            logits = self.lm_head(hidden_states) * hf_config.output_multiplier
+            cap = hf_config.final_logit_softcapping
+            if cap:
+                logits = cap * torch.tanh(logits / cap)
+            return type("CausalLMOutput", (), {"logits": logits})()
+
+    return _SoftcappedBackboneCausalLM()
+
+
+_HF_MODEL_FACTORIES = {
+    "muse_glimmer_text": _create_softcapped_backbone_causal_lm,
+}
+
+
 def _create_hf_model(model_type: str, hf_config, seed: int):
     """Create a HuggingFace model from config with deterministic init."""
     from transformers import AutoModelForCausalLM
 
     torch.manual_seed(seed)
     try:
-        hf_model = AutoModelForCausalLM.from_config(hf_config)
+        factory = _HF_MODEL_FACTORIES.get(model_type, AutoModelForCausalLM.from_config)
+        hf_model = factory(hf_config)
     except Exception as e:
         pytest.skip(f"Cannot create HF model for {model_type}: {type(e).__name__}: {e}")
 

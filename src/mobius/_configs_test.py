@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import dataclasses
+from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
@@ -14,6 +15,7 @@ from mobius._configs import (
     DEFAULT_INT,
     ArchitectureConfig,
     AudioConfig,
+    MuseGlimmerConfig,
     QuantizationConfig,
     VisionConfig,
     _extract_audio_config,
@@ -114,6 +116,90 @@ class TestArchitectureConfig:
         config = ArchitectureConfig.from_transformers(FakeConfig())
         assert config.vocab_size == 1000
         assert config.hidden_size == 256
+
+    def test_from_transformers_muse_glimmer(self):
+        text_config = SimpleNamespace(
+            model_type="muse_glimmer_text",
+            vocab_size=202048,
+            hidden_size=6656,
+            intermediate_size=19968,
+            num_hidden_layers=4,
+            num_attention_heads=32,
+            num_key_value_heads=2,
+            head_dim=128,
+            hidden_activation="silu",
+            max_position_embeddings=131072,
+            rms_norm_eps=1e-5,
+            post_norm_eps=1e-8,
+            rope_parameters={"rope_type": "default", "rope_theta": 500000.0},
+            sliding_window=2048,
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            layer_rope_theta=[500000.0, 500000.0, 500000.0, 0],
+            qk_scale_factor=3.87,
+            output_multiplier=0.19611613513818404,
+            final_logit_softcapping=20.0,
+            attention_bias=False,
+            tie_word_embeddings=False,
+            pad_token_id=None,
+        )
+        parent_config = SimpleNamespace(
+            model_type="muse_glimmer",
+            text_config=text_config,
+            vision_config={
+                "model_type": "muse_glimmer_vision",
+                "hidden_size": 1536,
+                "intermediate_size": 8960,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 16,
+                "hidden_act": "gelu",
+                "layer_norm_eps": 1e-5,
+                "patch_size": 14,
+                "patch_temporal": 2,
+                "merge_size": 2,
+                "pos_emb_height": 32,
+                "pos_emb_width": 32,
+                "layer_types": [
+                    "window_attention",
+                    "window_attention",
+                    "window_attention",
+                    "full_attention",
+                ],
+            },
+            projector_hidden_size=4096,
+            out_hidden_size=6144,
+            image_token_id=200092,
+            video_token_id=200091,
+        )
+
+        config = MuseGlimmerConfig.from_transformers(text_config, parent_config=parent_config)
+
+        assert config.model_type == "muse_glimmer_text"
+        assert config.hidden_size == 6656
+        assert config.layer_types[-1] == "full_attention"
+        assert config.layer_rope_theta == [500000.0, 500000.0, 500000.0, 0]
+        assert config.no_rope_layers == [3]
+        assert config.qk_scale_factor == pytest.approx(3.87)
+        assert config.attn_qk_norm is True
+        assert config.output_multiplier == pytest.approx(0.19611613513818404)
+        assert config.final_logit_softcapping == pytest.approx(20.0)
+        assert config.post_norm_eps == pytest.approx(1e-8)
+        assert config.image_token_id == 200092
+        assert config.video_token_id == 200091
+        assert config.vision is not None
+        assert config.vision.hidden_size == 1536
+        assert config.vision.head_dim == 96
+        assert config.vision.position_embedding_height == 32
+        assert config.vision.position_embedding_width == 32
+        assert config.vision.num_position_embeddings == 1024
+        assert config.vision.fullatt_block_indexes == [3]
+        assert config.vision.window_size == 448
+        assert config.vision.projector_intermediate_size == 4096
+        assert config.vision.out_hidden_size == 6144
 
     def test_from_transformers_llama(self):
         class FakeLlamaConfig:

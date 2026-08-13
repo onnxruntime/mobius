@@ -115,7 +115,7 @@ class LightningAttention(nn.Module):
         # Fused QKV: project then apply SiLU before split (matches HF)
         # qkv: (B, T, 3 * num_heads * head_dim)
         qkv = self.qkv_proj(op, hidden_states)
-        qkv = op.Mul(qkv, op.Sigmoid(qkv))  # SiLU: x * sigmoid(x)
+        qkv = op.Swish(qkv)
 
         # Split into Q, K, V: each (B, T, num_heads * head_dim)
         head_total = self.num_heads * self.head_dim

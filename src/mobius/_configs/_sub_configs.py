@@ -70,6 +70,9 @@ class VisionConfig:
     use_clipped_linears: bool = False
     # Gemma4 SigLIP patch position embedding table size (HF: position_embedding_size)
     position_embedding_size: int | None = None
+    # Learned 2D position-embedding grid dimensions.
+    position_embedding_height: int | None = None
+    position_embedding_width: int | None = None
     # Gemma4 VisionPooler spatial average pooling kernel size (3 → 3x3 pooling, N→N/9 tokens)
     pooling_kernel_size: int | None = None
     # MLP activation for vision encoder layers (e.g. "gelu_pytorch_tanh" for Gemma4 SigLIP)
@@ -82,6 +85,19 @@ class VisionConfig:
     # (HuggingFace convention, e.g. -2 for Phi-3.5-Vision). ``None`` means use
     # the final hidden state (all layers + post_layernorm).
     feature_layer: int | None = None
+    # Gemma3n multimodal embedder: the vision "vocabulary" occupies token ids
+    # [vocab_offset, vocab_offset + vocab_size). Gemma3nMultimodalEmbedder uses
+    # the offset to rebase hard token ids into its own 128-entry table.
+    vocab_offset: int | None = None
+    vocab_size: int | None = None
+    # timm architecture name for towers that are not SigLIP/CLIP transformers
+    # (HF ``Gemma3nVisionConfig.architecture``, e.g. "mobilenetv5_300m_enc").
+    architecture: str | None = None
+    # Whether the tower applies its final global pooling. Gemma3n sets False:
+    # it needs the 16x16 spatial map, not a single pooled vector.
+    do_pooling: bool = True
+    # RMSNorm epsilon for the vision tower (may differ from the text decoder's).
+    rms_norm_eps: float | None = None
 
 
 @dataclasses.dataclass
@@ -251,3 +267,48 @@ class Gemma4AudioConfig(AudioConfig):
     subsampling_conv_channels: list[int] | None = None
     use_causal_chunked_attn: bool = False
     output_proj_dims: int | None = None
+
+
+@dataclasses.dataclass
+class Gemma3nAudioConfig(AudioConfig):
+    """Configuration for the Gemma 3n USM Conformer audio encoder.
+
+    Field names mirror HF ``Gemma3nAudioConfig`` so the extractor is a
+    straight copy.  The encoder is a stack of ``conf_num_hidden_layers``
+    Conformer blocks fed by a two-stage strided 2D convolutional subsampler
+    ("SSCP"), which reduces the ``input_feat_size``-bin mel frames by
+    ``conf_reduction_factor`` in time.
+
+    Attention is causal and chunked for streaming: each query attends to its
+    own ``conf_attention_chunk_size`` chunk plus ``conf_attention_context_left``
+    frames of history and ``conf_attention_context_right`` of lookahead
+    (0 for E4B, i.e. strictly causal).  ``conf_attention_logit_cap`` tanh-caps
+    the QK logits.
+
+    Differences from :class:`Gemma4AudioConfig`, which the components reuse
+    heavily: the SSCP blocks normalise with a *cumulative* group norm over the
+    time axis (``sscp_conv_group_norm_eps``) rather than a plain LayerNorm,
+    and attention carries an explicit relative-position bias projection.
+
+    ``vocab_offset``/``vocab_size`` describe the audio soft-token id range
+    ([262272, 262400) for E4B) used by the multimodal embedder.
+    """
+
+    hidden_size: int = 1536
+    conf_num_hidden_layers: int = 12
+    conf_num_attention_heads: int = 8
+    conf_attention_chunk_size: int = 12
+    conf_attention_context_left: int = 13
+    conf_attention_context_right: int = 0
+    conf_attention_logit_cap: float = 50.0
+    conf_conv_kernel_size: int = 5
+    conf_reduction_factor: int = 4
+    conf_residual_weight: float = 0.5
+    input_feat_size: int = 128
+    sscp_conv_channel_size: list[int] | None = None
+    sscp_conv_kernel_size: list[list[int]] | None = None
+    sscp_conv_stride_size: list[list[int]] | None = None
+    sscp_conv_group_norm_eps: float = 1e-3
+    gradient_clipping: float = 1e10
+    vocab_offset: int | None = None
+    vocab_size: int | None = None

@@ -219,6 +219,27 @@ class QwenVLTask(VisionLanguageTask):
         return _make_model(graph)
 
 
+class MuseGlimmerVLTask(QwenVLTask):
+    """Muse Glimmer packed vision pipeline with standard 1D text RoPE."""
+
+    def build(
+        self,
+        module: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ModelPackage:
+        self._validate_components(module)
+        models: dict[str, ir.Model] = {}
+        models["decoder"] = build_decoder_from_embeds(module.decoder, config)
+        models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
+        models["embedding"] = build_embedding_from_features(
+            module.embedding,
+            config,
+            feature_name="image_features",
+            feature_dim=config.hidden_size,
+        )
+        return ModelPackage(models, config=config)
+
+
 class HybridQwenVLTask(QwenVLTask):
     """Qwen VL 3-model split with hybrid KV + DeltaNet cache.
 

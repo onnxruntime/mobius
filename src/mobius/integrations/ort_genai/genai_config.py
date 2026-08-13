@@ -104,7 +104,11 @@ def _default_search_params(
     }
 
 
-def _make_session_options(ep: str) -> dict[str, Any]:
+def _make_session_options(
+    ep: str,
+    *,
+    enable_graph_capture: bool | None = None,
+) -> dict[str, Any]:
     """Return session options with EP-specific provider_options.
 
     Args:
@@ -115,7 +119,10 @@ def _make_session_options(ep: str) -> dict[str, Any]:
 
     return {
         "log_id": "onnxruntime-genai",
-        "provider_options": make_provider_options(ep),
+        "provider_options": make_provider_options(
+            ep,
+            enable_graph_capture=enable_graph_capture,
+        ),
     }
 
 
@@ -169,6 +176,9 @@ class GenaiConfigGenerator:
         decoder_inputs: dict[str, str] | None = None,
         decoder_filename: str | None = None,
         supports_in_place_kv_cache: bool | None = None,
+        decoder_graph_capture: bool | None = None,
+        layer_types: list[str] | None = None,
+        conv_cache_size: int | None = None,
     ):
         self.model_type = model_type
         self.vocab_size = vocab_size
@@ -193,6 +203,9 @@ class GenaiConfigGenerator:
         # to the EP capability flag, preserving existing behaviour for callers
         # that don't introspect the graph.
         self._supports_in_place_kv_cache = supports_in_place_kv_cache
+        self._decoder_graph_capture = decoder_graph_capture
+        self._layer_types = layer_types
+        self._conv_cache_size = conv_cache_size
 
         # Optional VLM fields (set via with_vision())
         self._vision: dict[str, Any] | None = None
@@ -219,6 +232,7 @@ class GenaiConfigGenerator:
         decoder_inputs: dict[str, str] | None = None,
         decoder_filename: str | None = None,
         supports_in_place_kv_cache: bool | None = None,
+        num_cache_layer_slots: int | None = None,
     ) -> GenaiConfigGenerator:
         """Create a generator from a BaseModelConfig-like dataclass.
 
@@ -226,6 +240,15 @@ class GenaiConfigGenerator:
         ``num_attention_heads``, ``num_key_value_heads``, and ``head_dim``
         from the config object. Token IDs and context_length can be
         overridden since they are often not on the model config.
+
+        Args:
+            num_cache_layer_slots: Number of globally indexed cache slots the
+                exported decoder graph requires. Overrides
+                ``config.num_hidden_layers`` for the ``num_hidden_layers``
+                field written to ``genai_config.json``. This is smaller than
+                the architecture count for KV-sharing models and retains global
+                indices for hybrid KV/recurrent-cache models. ``None`` uses the
+                config value.
         """
         pad = pad_token_id
         if pad is None:
@@ -241,7 +264,11 @@ class GenaiConfigGenerator:
             model_type,
             vocab_size=config.vocab_size,
             hidden_size=config.hidden_size,
-            num_hidden_layers=config.num_hidden_layers,
+            num_hidden_layers=(
+                num_cache_layer_slots
+                if num_cache_layer_slots is not None
+                else config.num_hidden_layers
+            ),
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
             head_dim=config.head_dim,
@@ -253,6 +280,12 @@ class GenaiConfigGenerator:
             decoder_inputs=decoder_inputs,
             decoder_filename=decoder_filename,
             supports_in_place_kv_cache=supports_in_place_kv_cache,
+            layer_types=getattr(config, "layer_types", None),
+            conv_cache_size=(
+                getattr(config, "short_conv_kernel", 1) - 1
+                if hasattr(config, "short_conv_kernel")
+                else None
+            ),
         )
 
     def with_vision(
@@ -322,7 +355,10 @@ class GenaiConfigGenerator:
             "config_filename": config_filename,
             "inputs": input_names,
             "outputs": output_names,
-            "session_options": _make_session_options(self.ep),
+            "session_options": _make_session_options(
+                self.ep,
+                enable_graph_capture=False,
+            ),
         }
         if spatial_merge_size is not None:
             self._vision["spatial_merge_size"] = spatial_merge_size
@@ -341,7 +377,10 @@ class GenaiConfigGenerator:
             else {
                 "inputs_embeds": "inputs_embeds",
             },
-            "session_options": _make_session_options(self.ep),
+            "session_options": _make_session_options(
+                self.ep,
+                enable_graph_capture=False,
+            ),
         }
         self._vlm_token_ids["image_token_id"] = image_token_id
         if vision_start_token_id is not None:
@@ -366,7 +405,13 @@ class GenaiConfigGenerator:
             audio_token_id: Token ID for audio placeholders.
             boa_token_id: Beginning-of-audio token ID.
             filename: Audio ONNX model filename.
-            config_filename: Audio processor config filename.
+            config_filename: Audio processor config filename. Must name a file
+                that is actually written: ORT-GenAI loads it through
+                ``OrtxCreateSpeechFeatureExtractor``, and rejects a speech
+                section that sets ``filename`` without ``config_filename``.
+                Note this is a *separate* file from the vision
+                ``config_filename`` — the two are parsed by different APIs with
+                different schemas and cannot be merged.
             input_names: Override audio model input name mapping.
                 Defaults to audio_embeds + audio_sizes +
                 audio_projection_mode.
@@ -391,7 +436,10 @@ class GenaiConfigGenerator:
             "config_filename": config_filename,
             "inputs": input_names,
             "outputs": output_names,
-            "session_options": _make_session_options(self.ep),
+            "session_options": _make_session_options(
+                self.ep,
+                enable_graph_capture=False,
+            ),
         }
 
         if audio_token_id is not None:
@@ -413,7 +461,10 @@ class GenaiConfigGenerator:
             decoder_inputs = _default_decoder_inputs(is_vlm=is_multimodal)
         decoder_filename = "decoder/model.onnx" if is_multimodal else "model.onnx"
         decoder: dict[str, Any] = {
-            "session_options": _make_session_options(self.ep),
+            "session_options": _make_session_options(
+                self.ep,
+                enable_graph_capture=self._decoder_graph_capture,
+            ),
             "filename": self._decoder_filename or decoder_filename,
             "head_size": self.head_dim,
             "hidden_size": self.hidden_size,
@@ -423,6 +474,13 @@ class GenaiConfigGenerator:
             "num_hidden_layers": self.num_hidden_layers,
             "num_key_value_heads": self.num_key_value_heads,
         }
+        if self.model_type == "lfm2":
+            decoder["layer_types"] = self._layer_types or []
+            decoder["conv_cache_size"] = (
+                self._conv_cache_size if self._conv_cache_size is not None else 3
+            )
+            decoder["inputs"]["past_conv_names"] = "past_key_values.%d.conv_state"
+            decoder["outputs"]["present_conv_names"] = "present.%d.conv_state"
 
         # Model section
         model: dict[str, Any] = {
@@ -458,6 +516,10 @@ class GenaiConfigGenerator:
             context_length=self.context_length,
             supports_in_place_kv_cache=self._supports_in_place_kv_cache,
         )
+        if self.model_type == "lfm2":
+            # ORT GenAI's LFM2 cache mixes fixed convolution windows with
+            # dynamic attention KV; shared in-place KV buffers are unsupported.
+            search["past_present_share_buffer"] = False
         search.update(self._search_overrides)
 
         return {
