@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
@@ -137,6 +138,38 @@ class GatedRMSNorm(nn.Module):
                 axis=-1,
             )
         return op.CastLike(normed, hidden_states)
+
+
+class ScaleFreeRMSNorm(nn.Module):
+    """RMSNorm with a constant all-ones scale (no learnable parameter).
+
+    Matches HuggingFace's ``Gemma4RMSNorm`` / ``Gemma3nRMSNorm`` constructed
+    with ``with_scale=False``: the checkpoint ships no ``weight`` for these,
+    so the scale is materialized here as a constant initializer instead.
+
+    Used by Gemma 4 (vision V norms, vision/audio projector pre-norms) and by
+    Gemma 3n's ``embedding_post_projection_norm``.
+
+    ``stash_type=1`` accumulates the variance in float32, which matters at
+    f16 where squaring values above 256 overflows the 65504 maximum.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.Parameter([dim], data=ir.Tensor(np.ones(dim, dtype=np.float32)))
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
+        # CastLike keeps the constant scale in the input's dtype.
+        scale = op.CastLike(self.weight, hidden_states)
+        return op.RMSNormalization(
+            hidden_states,
+            scale,
+            axis=-1,
+            epsilon=self.eps,
+            stash_type=1,
+        )
 
 
 class PostGatedRMSNorm(nn.Module):

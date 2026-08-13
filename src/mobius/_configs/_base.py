@@ -682,7 +682,7 @@ class ArchitectureConfig(BaseModelConfig):
                 or 0
             ),
             hidden_size=_as_int(hidden_size),
-            intermediate_size=(
+            intermediate_size=_as_int(
                 getattr(config, "intermediate_size", None)
                 or getattr(config, "mlp_hidden_size", None)
                 or getattr(config, "n_inner", None)
@@ -792,6 +792,8 @@ class ArchitectureConfig(BaseModelConfig):
                 model_type
                 in (
                     "gemma3_text",
+                    "gemma3n",
+                    "gemma3n_text",
                     "flex_olmo",
                     "olmoe",
                     "olmo2",
@@ -1542,6 +1544,21 @@ class Gemma3nConfig(CausalLMConfig):
 
     Adds AltUp prediction/correction parameters and per-layer input
     dimension fields used exclusively by :mod:`models.gemma3n`.
+
+    ``num_kv_shared_layers`` mirrors the Gemma4 field of the same name: the
+    last N decoder layers borrow K,V from the last non-shared layer of the
+    same attention type instead of projecting their own, so they own no KV
+    cache entry.  E4B ships 15 (of 35 layers), i.e. layers 20..34 are shared.
+
+    ``activation_sparsity_pattern`` holds a per-layer target sparsity for the
+    MLP gate branch.  Where it is non-zero the gate activations below a
+    Gaussian quantile cutoff are zeroed (see
+    :class:`~mobius.models.gemma3n.Gemma3nMLP`).  E4B ships 0.95 for layers
+    0..9 and 0.0 for the rest; ``None`` disables sparsity everywhere.
+
+    ``final_logit_softcapping`` tanh-caps the LM head output as in Gemma2
+    (``cap * tanh(logits / cap)``).  Every published Gemma 3n config ships
+    30.0; ``0.0`` disables it.
     """
 
     altup_num_inputs: int = 4
@@ -1550,10 +1567,14 @@ class Gemma3nConfig(CausalLMConfig):
     laurel_rank: int = 64
     hidden_size_per_layer_input: int = 256
     vocab_size_per_layer_input: int = 262_144
+    num_kv_shared_layers: int = 0
+    activation_sparsity_pattern: list[float] | None = None
+    final_logit_softcapping: float = 0.0
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Gemma3nConfig:
         base = ArchitectureConfig.from_transformers(config, parent_config)
+        sparsity = getattr(config, "activation_sparsity_pattern", None)
         return cls(
             **_shallow_fields(base),
             altup_num_inputs=getattr(config, "altup_num_inputs", 4),
@@ -1562,6 +1583,66 @@ class Gemma3nConfig(CausalLMConfig):
             laurel_rank=getattr(config, "laurel_rank", 64),
             hidden_size_per_layer_input=getattr(config, "hidden_size_per_layer_input", 256),
             vocab_size_per_layer_input=getattr(config, "vocab_size_per_layer_input", 262_144),
+            num_kv_shared_layers=getattr(config, "num_kv_shared_layers", 0) or 0,
+            activation_sparsity_pattern=(
+                [float(s) for s in sparsity] if sparsity is not None else None
+            ),
+            final_logit_softcapping=(getattr(config, "final_logit_softcapping", 0.0) or 0.0),
+        )
+
+
+@dataclasses.dataclass
+class Gemma3nMultiModalConfig(Gemma3nConfig):
+    """Configuration for the full Gemma 3n image + audio + text model.
+
+    Carries the same text-decoder fields as :class:`Gemma3nConfig` (from which
+    it inherits, since the decoder is unchanged) plus the multimodal wiring.
+    The towers live in the inherited ``vision`` (:class:`VisionConfig`, a
+    MobileNet-V5 encoder rather than SigLIP) and ``audio``
+    (:class:`Gemma3nAudioConfig`, a USM Conformer) sub-configs, populated by
+    the ``gemma3n`` extractor hooks.
+
+    Both modalities are projected into the decoder's embedding space and
+    spliced in at their placeholder token positions, so each needs its token
+    id and its fixed soft-token count.  The token ids come from the inherited
+    ``image_token_id`` / ``audio_token_id`` (262145 and 262273 for E4B, also
+    mirrored on the sub-configs per the Gemma4 convention); the per-image
+    counts are fixed because both towers emit a fixed-size feature map:
+
+    - ``vision_soft_tokens_per_image``: 256 — a 768x768 image becomes a 16x16
+      grid.
+    - ``audio_soft_tokens_per_image``: 188.
+
+    Audio is optional: checkpoints without an ``audio_config`` leave ``audio``
+    as ``None`` and the exported package omits the audio encoder.
+    """
+
+    vision_soft_tokens_per_image: int = 256
+    audio_soft_tokens_per_image: int = 188
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Gemma3nMultiModalConfig:
+        # The HF Gemma3nConfig wraps a text_config while the multimodal token
+        # ids and soft-token counts live on the outer config.  build() may hand
+        # us either one, so resolve in both directions.
+        text_config = getattr(config, "text_config", None) or config
+        composite = parent_config if parent_config is not None else config
+        base = Gemma3nConfig.from_transformers(text_config, composite)
+        # audio_token_id is an ArchitectureConfig field that no generic
+        # extractor populates for gemma3n (the audio hook puts it on the
+        # sub-config); lift it so tasks can read it at the top level.
+        if base.audio_token_id is None:
+            base = dataclasses.replace(
+                base, audio_token_id=getattr(composite, "audio_token_id", None)
+            )
+        return cls(
+            **_shallow_fields(base),
+            vision_soft_tokens_per_image=int(
+                getattr(composite, "vision_soft_tokens_per_image", 256) or 256
+            ),
+            audio_soft_tokens_per_image=int(
+                getattr(composite, "audio_soft_tokens_per_image", 188) or 188
+            ),
         )
 
 

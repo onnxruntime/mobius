@@ -43,6 +43,7 @@ from mobius.components import (
     Linear,
     QuantizedEmbedding,
     RMSNorm,
+    ScaleFreeRMSNorm,
     create_attention_bias,
     initialize_rope,
     make_quantized_linear_factory,
@@ -292,43 +293,6 @@ def _remap_moe_expert_weights(
 
 
 # ---------------------------------------------------------------------------
-# Scale-free RMSNorm (Gemma4RMSNorm with with_scale=False)
-# ---------------------------------------------------------------------------
-
-
-class _Gemma4ScaleFreeRMSNorm(nn.Module):
-    """RMSNorm with a constant all-ones scale (no learnable parameter).
-
-    Matches ``Gemma4RMSNorm(with_scale=False)`` in HuggingFace.
-    Used for V norms in the vision encoder, the vision projector pre-norm,
-    and the audio pre-projection norm.
-
-    Uses ``op.RMSNormalization`` with ``stash_type=1`` (float32 accumulation)
-    to handle FP16 overflow: values > 256 squared exceed the FP16 max (65504).
-    """
-
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-        # Constant all-ones scale (not a learnable parameter from HF).
-        self.weight = nn.Parameter([dim], data=ir.Tensor(np.ones(dim, dtype=np.float32)))
-
-    def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
-        # stash_type=1 means accumulate variance in float32, avoiding
-        # FP16 overflow when squaring large values.
-        # CastLike ensures the weight matches the input dtype.
-        scale = op.CastLike(self.weight, hidden_states)
-        return op.RMSNormalization(
-            hidden_states,
-            scale,
-            axis=-1,
-            epsilon=self.eps,
-            stash_type=1,
-        )
-
-
-# ---------------------------------------------------------------------------
 # Gemma4 vision encoder
 # ---------------------------------------------------------------------------
 
@@ -367,7 +331,7 @@ class Gemma4VisionSelfAttention(nn.Module):
         self.o_proj = linear_class(num_heads * self.head_dim, hidden_size, bias=False)
         self.q_norm = RMSNorm(self.head_dim, eps=norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=norm_eps)
-        self.v_norm = _Gemma4ScaleFreeRMSNorm(self.head_dim, eps=norm_eps)
+        self.v_norm = ScaleFreeRMSNorm(self.head_dim, eps=norm_eps)
 
         # Precompute 2D RoPE cos/sin lookup tables: shape [max_position, head_dim//2].
         # HF computes inv_freq over the *spatial half* (head_dim//2) as the denominator,
@@ -2469,7 +2433,7 @@ class _Gemma4VisionEncoderModel(nn.Module):
         # Gemma4VisionPooler: 3x3 spatial average pooling + sqrt(hidden) scaling.
         # Reduces N patches to N/9 before projection.
         self.pooler = Gemma4VisionPooler(vc.hidden_size, vc.pooling_kernel_size or 3)
-        self.projector_norm = _Gemma4ScaleFreeRMSNorm(vc.hidden_size, eps=vc.norm_eps)
+        self.projector_norm = ScaleFreeRMSNorm(vc.hidden_size, eps=vc.norm_eps)
         self.projector = Linear(vc.hidden_size, config.hidden_size, bias=False)
 
     def forward(
@@ -2914,7 +2878,7 @@ class _Gemma4UnifiedVisionEmbedderModel(nn.Module):
             "gemma4_unified vision projector expects output_proj_dims == "
             f"mm_embed_dim, got {out_proj_dim} != {mm_embed_dim}"
         )
-        self.projector_norm = _Gemma4ScaleFreeRMSNorm(mm_embed_dim, eps=eps)
+        self.projector_norm = ScaleFreeRMSNorm(mm_embed_dim, eps=eps)
         # HF embed_vision.multimodal_embedder.embedding_projection (no bias).
         self.projector = Linear(mm_embed_dim, config.hidden_size, bias=False)
 
@@ -3015,7 +2979,7 @@ class _Gemma4UnifiedAudioEmbedderModel(nn.Module):
         eps = (ac.rms_norm_eps if ac else None) or config.rms_norm_eps or 1e-6
         self._text_hidden_size = config.hidden_size
         # HF embed_audio.embedding_pre_projection_norm (scale-free RMSNorm).
-        self.projector_norm = _Gemma4ScaleFreeRMSNorm(audio_embed_dim, eps=eps)
+        self.projector_norm = ScaleFreeRMSNorm(audio_embed_dim, eps=eps)
         # HF embed_audio.embedding_projection (no bias).
         self.projector = Linear(audio_embed_dim, config.hidden_size, bias=False)
 

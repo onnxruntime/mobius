@@ -25,7 +25,9 @@ from mobius._configs import (
     CodecEncoderConfig,
     DepthAnythingConfig,
     Gemma2Config,
+    Gemma3nAudioConfig,
     Gemma3nConfig,
+    Gemma3nMultiModalConfig,
     Gemma4Config,
     GraniteMoeHybridConfig,
     JambaConfig,
@@ -408,26 +410,19 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "laurel_rank": 16,
             "hidden_size_per_layer_input": 32,
             "vocab_size_per_layer_input": 256,
+            # Mixed layer_types with TINY_LAYERS=2 leaves no same-type source
+            # layer to borrow K,V from; sharing is covered by the
+            # all-full-attention gemma3n_text entry below.
+            "num_kv_shared_layers": 0,
+            # Layer 0 sparse, layer 1 dense: covers both branches of the
+            # activation-sparsity fork in Gemma3nMLP.
+            "activation_sparsity_pattern": [0.95, 0.0],
         },
         True,
     ),
-    (
-        "gemma3n",
-        {
-            "_config_cls": Gemma3nConfig,
-            "attn_qk_norm": True,
-            "hidden_act": "gelu_pytorch_tanh",
-            "rope_local_base_freq": 10_000.0,
-            "layer_types": ["full_attention", "sliding_attention"],
-            "altup_num_inputs": 2,
-            "altup_active_idx": 0,
-            "altup_correct_scale": True,
-            "laurel_rank": 16,
-            "hidden_size_per_layer_input": 32,
-            "vocab_size_per_layer_input": 256,
-        },
-        False,
-    ),
+    # NOTE: the "gemma3n" registry key builds the *multimodal* model
+    # (Gemma3nMultiModalModel), so its entry lives in VL_CONFIGS.  The text
+    # decoder is covered by the two "gemma3n_text" entries.
     ("granite", {}, True),
     ("olmo", {}, False),
     ("internlm2", {"attn_qkv_bias": True}, True),
@@ -1335,7 +1330,10 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         True,
     ),
-    # gemma3n_text: all full attention (no sliding window)
+    # gemma3n_text: all full attention (no sliding window) + KV layer sharing.
+    # With num_kv_shared_layers=1 the last layer borrows K,V from layer 0, so
+    # the graph owns TINY_LAYERS - 1 cache entries and layer 1 has no
+    # k_proj/v_proj/k_norm weights.
     (
         "gemma3n_text",
         {
@@ -1350,6 +1348,44 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "laurel_rank": 16,
             "hidden_size_per_layer_input": 32,
             "vocab_size_per_layer_input": 256,
+            "num_kv_shared_layers": 1,
+        },
+        False,
+    ),
+    # gemma3n_text: mixed layer types *together with* KV sharing, which is what
+    # the real E4B checkpoint has (35 layers, num_kv_shared_layers=15) and which
+    # neither entry above reaches -- one has mixed types with sharing off, the
+    # other has sharing on but a single layer type. Only this combination
+    # exercises HF's per-type source selection, where a sliding shared layer and
+    # a full-attention shared layer must borrow K,V from *different* source
+    # layers. Getting that wrong still produces a loadable graph with plausible
+    # attention, so a shape-only test would not catch it.
+    #
+    # 4 layers with num_kv_shared_layers=2 gives prev_layers = [sliding, full]:
+    # layer 2 (sliding) borrows from layer 0, layer 3 (full) borrows from layer 1.
+    # Also keeps activation sparsity on for a subset of layers.
+    (
+        "gemma3n_text",
+        {
+            "_config_cls": Gemma3nConfig,
+            "attn_qk_norm": True,
+            "hidden_act": "gelu_pytorch_tanh",
+            "rope_local_base_freq": 10_000.0,
+            "num_hidden_layers": 4,
+            "layer_types": [
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            "altup_num_inputs": 2,
+            "altup_active_idx": 0,
+            "altup_correct_scale": True,
+            "laurel_rank": 16,
+            "hidden_size_per_layer_input": 32,
+            "vocab_size_per_layer_input": 256,
+            "num_kv_shared_layers": 2,
+            "activation_sparsity_pattern": [0.95, 0.95, 0.0, 0.0],
         },
         False,
     ),
@@ -2268,6 +2304,67 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         False,
     ),
+    # --- Gemma3n multimodal (4-model split: decoder + vision + audio + embedding) ---
+    # The MobileNet-V5 tower's 84-block spec and MSFA channel widths are
+    # hard-coded from ``mobilenetv5_300m_enc`` (there is no config source for
+    # them), so only ``hidden_size`` and ``image_size`` shrink here — the tower
+    # still builds all 548 tensors.  ``image_size`` must satisfy
+    # ``size % 32 == 0`` and ``(size // 16) % 16 == 0``, making 256 the
+    # smallest legal value; the tower always emits a 16x16 grid, hence
+    # ``vision_soft_tokens_per_image=256``.
+    (
+        "gemma3n",
+        {
+            "_config_cls": Gemma3nMultiModalConfig,
+            "attn_qk_norm": True,
+            "hidden_act": "gelu_pytorch_tanh",
+            "rope_local_base_freq": 10_000.0,
+            "layer_types": ["full_attention", "sliding_attention"],
+            "altup_num_inputs": 2,
+            "altup_active_idx": 0,
+            "altup_correct_scale": True,
+            "laurel_rank": 16,
+            "hidden_size_per_layer_input": 32,
+            "vocab_size_per_layer_input": 256,
+            # Mixed layer_types with TINY_LAYERS=2 leaves no same-type source
+            # layer to borrow K,V from; sharing is covered by gemma3n_text.
+            "num_kv_shared_layers": 0,
+            # Layer 0 sparse, layer 1 dense: covers both branches of the
+            # activation-sparsity fork in Gemma3nMLP.
+            "activation_sparsity_pattern": [0.95, 0.0],
+            # Reserved-id layout mirrors E4B: the vision soft-token range is
+            # immediately followed by the audio one, and each modality's
+            # placeholder token sits just past its own range.
+            "image_token_id": 216,
+            "audio_token_id": 217,
+            "vision_soft_tokens_per_image": 256,
+            "audio_soft_tokens_per_image": 8,
+            "vision": VisionConfig(
+                hidden_size=32,
+                image_size=256,
+                norm_eps=1e-6,
+                rms_norm_eps=1e-6,
+                vocab_offset=200,
+                vocab_size=8,
+                architecture="mobilenetv5_300m_enc",
+                do_pooling=False,
+            ),
+            "audio": Gemma3nAudioConfig(
+                hidden_size=32,
+                conf_num_attention_heads=4,
+                conf_num_hidden_layers=1,
+                conf_attention_chunk_size=4,
+                conf_attention_context_left=5,
+                conf_attention_context_right=0,
+                conf_reduction_factor=2,
+                input_feat_size=16,
+                sscp_conv_channel_size=[8, 4],
+                vocab_offset=208,
+                vocab_size=8,
+            ),
+        },
+        True,
+    ),
     # --- Gemma4 Any-to-Any (4-model split: decoder + vision + speech + embedding) ---
     # Tested directly in test_gemma4_any_to_any_graph; omitted from parametrized suite
     # because it uses the unified "gemma4" registry key, same as the VL-only config above.
@@ -2462,6 +2559,20 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
         False,
     ),
 ]
+
+
+def vl_overrides(model_type: str) -> dict:
+    """Return a *copy* of a ``VL_CONFIGS`` entry's overrides.
+
+    Lets a dedicated test build the same tiny config the parametrized suite
+    uses (and mutate it for a variant) without the two drifting apart.  The
+    copy is shallow: sub-configs such as :class:`VisionConfig` are shared, so
+    replace them wholesale rather than mutating them in place.
+    """
+    for mt, overrides, _rep in VL_CONFIGS:
+        if mt == model_type:
+            return dict(overrides)
+    raise KeyError(f"No VL_CONFIGS entry for model_type {model_type!r}")
 
 
 # ---------------------------------------------------------------------------

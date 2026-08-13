@@ -32,6 +32,8 @@ __all__ = [
     "GatedDeltaNet",
     "GatedMLP",
     "GatedRMSNorm",
+    "Gemma3nAudioEncoder",
+    "Gemma3nMultimodalEmbedder",
     "ClippableLinear",
     "GroupNorm",
     "GQAContext",
@@ -49,6 +51,7 @@ __all__ = [
     "MLPMultiModalProjector",
     "MuseGlimmerVisionModel",
     "Cosmos3EdgeMultiModalProjector",
+    "MobileNetV5Encoder",
     "MoELayer",
     "OffsetRMSNorm",
     "PatchEmbed",
@@ -58,6 +61,8 @@ __all__ = [
     "QuantizedEmbedding",
     "QuantizedLinear",
     "RMSNorm",
+    "RmsNorm2d",
+    "ScaleFreeRMSNorm",
     "SelectiveScan",
     "SiLU",
     "SigmoidTopKGate",
@@ -132,6 +137,7 @@ from mobius.components._conv import (
     Conv2d,
     Conv2dNoBias,
     ConvTranspose2d,
+    RmsNorm2d,
 )
 from mobius.components._decoder import (
     DecoderLayer,
@@ -157,6 +163,8 @@ from mobius.components._encoder_decoder_attention import (
     EncoderDecoderAttention,
 )
 from mobius.components._gated_deltanet import GatedDeltaNet
+from mobius.components._gemma3n_audio import Gemma3nAudioEncoder
+from mobius.components._gemma3n_embedder import Gemma3nMultimodalEmbedder
 from mobius.components._gemma4_audio import ClippableLinear
 from mobius.components._gemma4_audio import Gemma4AudioEncoder as Gemma4AudioEncoder
 from mobius.components._lightning_attention import (
@@ -166,6 +174,7 @@ from mobius.components._lora import LoRALinear
 from mobius.components._mamba_block import Mamba2Block as Mamba2Block
 from mobius.components._mamba_block import MambaBlock as MambaBlock
 from mobius.components._mlp import FCMLP, MLP, FusedGateUpMLP, GatedMLP
+from mobius.components._mobilenetv5 import MobileNetV5Encoder
 from mobius.components._moe import (
     MoELayer,
     SigmoidTopKGate,
@@ -260,6 +269,7 @@ from mobius.components._rms_norm import (
     OffsetRMSNorm,
     PostGatedRMSNorm,
     RMSNorm,
+    ScaleFreeRMSNorm,
     apply_rms_norm,
 )
 from mobius.components._rotary_embedding import initialize_rope
