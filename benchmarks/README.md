@@ -6,6 +6,8 @@ paths use the same rendered 68-token prompt, greedy parameters, token budget,
 warmups, and steady-decode window. `request_max_length` is prompt tokens plus
 new tokens (68 + 128 = 196); `model_max_context` is the independent 131072-token
 artifact admission ceiling.
+For the text-only VLM path, bind `request.image` to an empty `uint8[0]` tensor
+and `request.has_media` to `false`; the false branch supplies empty image features.
 
 Run the native ORT GenAI path:
 

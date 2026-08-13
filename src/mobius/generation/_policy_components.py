@@ -531,6 +531,18 @@ def build_model_token_cast(dtype: ir.DataType) -> PolicyComponent:
     return _component("mobius.policy.auxiliary@1", graph, {})
 
 
+def build_empty_features(dtype: ir.DataType, feature_size: int) -> PolicyComponent:
+    """Build the empty feature matrix used by multimodal text-only requests."""
+    graph, builder = _make_graph("empty_features")
+    features = builder.op.ConstantOfShape(
+        builder.op.Constant(value_ints=[0, feature_size]),
+        value=ir.tensor([0.0], dtype=dtype),
+    )
+    features.shape = ir.Shape([0, feature_size])
+    builder.add_output(features, "features")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
 def build_decoder_state_initializer(
     decoder: ir.Model,
     *,

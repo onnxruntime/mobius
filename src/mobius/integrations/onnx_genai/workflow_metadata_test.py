@@ -237,6 +237,12 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     assert policy_invokes["decoder_step_update"]["inputs"]["logical_length"] == (
         "cache_lengths.next"
     )
+    assert workflow["inputs"]["request.image"]["required"] is True
+    assert workflow["inputs"]["request.has_media"]["default"] is False
+    media_branch = workflow["steps"][0]["setup"][0]
+    assert media_branch["kind"] == "branch"
+    assert set(media_branch["cases"]) == {"true", "false"}
+    assert media_branch["cases"]["false"]["component"] == "empty_image_features"
     kv_service = workflow["serving"]["kv_service"]
     assert kv_service["paging"] == "none"
     assert kv_service["compaction"] is False
@@ -249,6 +255,7 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
         "output": "present.51.value",
     }
     assert (tmp_path / "package" / "policies" / "last_token_logits.onnx").is_file()
+    assert (tmp_path / "package" / "policies" / "empty_image_features.onnx").is_file()
 
 
 def _masked_denoiser_package() -> ModelPackage:

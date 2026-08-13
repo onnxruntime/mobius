@@ -17,6 +17,7 @@ from mobius.generation import (
     build_code_frame_update,
     build_decoder_state_initializer,
     build_decoder_step_update,
+    build_empty_features,
     build_eos_termination,
     build_euler_model_input,
     build_euler_solver_step,
@@ -297,6 +298,16 @@ def test_decoder_fixed_capacity_state_matches_native_capture_layout(tmp_path):
         },
     )
     np.testing.assert_array_equal(next_attention, [[1, 1, 1, 1, 1]])
+
+
+def test_empty_features_runtime(tmp_path):
+    (features,) = _run(
+        build_empty_features(ir.DataType.FLOAT16, 64),
+        tmp_path,
+        {},
+    )
+    assert features.dtype == np.float16
+    assert features.shape == (0, 64)
 
 
 def test_decoder_policy_chain_generates_multiple_tokens_from_prompt_only(tmp_path):

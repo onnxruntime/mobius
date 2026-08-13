@@ -21,6 +21,7 @@ from mobius.generation import (
     build_codec_layout_transpose,
     build_decoder_state_initializer,
     build_decoder_step_update,
+    build_empty_features,
     build_euler_model_input,
     build_euler_solver_step,
     build_greedy_sampler,
@@ -2596,6 +2597,15 @@ def build_vlm_workflow_metadata(
         output["name"] = f"image.{port_name}"
         adapter_outputs[port_name] = output["contract"]
         preprocessing_values[port_name] = output["name"]
+    vision_feature_outputs = [
+        value
+        for value in vision.graph.outputs
+        if value.name in embedding_inputs_by_name
+        and value.shape is not None
+        and len(value.shape) == 2
+        and isinstance(list(value.shape)[-1], int)
+    ]
+    text_only_vision = vision_feature_outputs[0] if len(vision_feature_outputs) == 1 else None
 
     attach_policy_components(
         pkg,
@@ -2606,6 +2616,14 @@ def build_vlm_workflow_metadata(
         ),
     )
     pkg.add_policy_component("last_token_logits", build_last_token_logits(logits_output.dtype))
+    if text_only_vision is not None:
+        pkg.add_policy_component(
+            "empty_image_features",
+            build_empty_features(
+                text_only_vision.dtype,
+                int(list(text_only_vision.shape)[-1]),
+            ),
+        )
     pkg.add_policy_component(
         "decoder_state_initializer",
         build_decoder_state_initializer(
@@ -2647,6 +2665,8 @@ def build_vlm_workflow_metadata(
             "contract": {"dtype": "uint8", "rank": 1, "shape": ["encoded_bytes"]},
             "role": {"kind": "runtime", "version": "1.0", "role": "media"},
             "source": {"kind": "request", "field": "media"},
+            # The frozen contract forbids optional tensors without literal defaults.
+            # Text-only callers bind an empty uint8 tensor and leave has_media=false.
             "required": True,
         },
         "request.max_iterations": {
@@ -2709,6 +2729,14 @@ def build_vlm_workflow_metadata(
             "default": 0,
         },
     }
+    if text_only_vision is not None:
+        inputs["request.has_media"] = {
+            "contract": {"dtype": "bool", "rank": 1, "shape": [1]},
+            "role": {"kind": "opaque"},
+            "source": {"kind": "application", "name": "has_media"},
+            "required": False,
+            "default": False,
+        }
     vision_invoke_inputs = {
         name: preprocessing_values[name]
         for name in vision_inputs
@@ -2974,15 +3002,62 @@ def build_vlm_workflow_metadata(
             }
         )
 
+    if text_only_vision is not None:
+        feature_name = text_only_vision.name
+        vision_setup: dict[str, Any] = {
+            "kind": "branch",
+            "predicate": "request.has_media",
+            "cases": {
+                "true": {
+                    "kind": "sequence",
+                    "nodes": [
+                        _invoke(
+                            "image_preprocess",
+                            {"encoded": "request.image"},
+                            dict(preprocessing_values),
+                        ),
+                        _invoke(
+                            "vision_encoder",
+                            vision_invoke_inputs,
+                            {
+                                **vision_outputs,
+                                feature_name: f"vision.with_media.{feature_name}",
+                            },
+                        ),
+                    ],
+                },
+                "false": _invoke(
+                    "empty_image_features",
+                    {},
+                    {"features": f"vision.empty.{feature_name}"},
+                ),
+            },
+            "outputs": {
+                f"vision.{feature_name}": {
+                    "cases": {
+                        "true": f"vision.with_media.{feature_name}",
+                        "false": f"vision.empty.{feature_name}",
+                    }
+                }
+            },
+        }
+    else:
+        vision_setup = {
+            "kind": "sequence",
+            "nodes": [
+                _invoke(
+                    "image_preprocess",
+                    {"encoded": "request.image"},
+                    dict(preprocessing_values),
+                ),
+                _invoke("vision_encoder", vision_invoke_inputs, vision_outputs),
+            ],
+        }
+
     setup = {
         "kind": "sequence",
         "nodes": [
-            _invoke(
-                "image_preprocess",
-                {"encoded": "request.image"},
-                dict(preprocessing_values),
-            ),
-            _invoke("vision_encoder", vision_invoke_inputs, vision_outputs),
+            vision_setup,
             *audio_setup_nodes,
             _invoke(
                 "decoder_state_initializer",
