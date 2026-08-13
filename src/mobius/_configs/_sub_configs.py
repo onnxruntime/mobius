@@ -47,6 +47,7 @@ class VisionConfig:
     norm_eps: float = 1e-6
     mm_tokens_per_image: int | None = None
     image_token_id: int | None = None
+    video_token_id: int | None = None
     # Pixtral / Mistral-3 vision fields
     model_type: str | None = None
     head_dim: int | None = None

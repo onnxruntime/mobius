@@ -57,6 +57,8 @@ __all__ = [
     "PostNormDecoderLayer",
     "QuantizedEmbedding",
     "QuantizedLinear",
+    "Qwen25OmniAudioAttention",
+    "Qwen25OmniAudioEncoderLayer",
     "RMSNorm",
     "SelectiveScan",
     "SiLU",
@@ -230,6 +232,10 @@ from mobius.components._qwen3_vl_vision import (
 )
 from mobius.components._qwen3_vl_vision import (
     Qwen3VLVisionRotaryEmbedding as Qwen3VLVisionRotaryEmbedding,
+)
+from mobius.components._qwen25_omni_audio import (
+    Qwen25OmniAudioAttention,
+    Qwen25OmniAudioEncoderLayer,
 )
 from mobius.components._qwen25_vl_vision import (
     Qwen2VLVisionBlock as Qwen2VLVisionBlock,
