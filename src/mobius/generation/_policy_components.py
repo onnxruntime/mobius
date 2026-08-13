@@ -598,8 +598,13 @@ def build_decoder_state_initializer(
 
     attention_value = decoder_inputs[attention_mask_input]
     if fixed_capacity:
-        attention = op.Cast(op.Less(offsets, sequence_length), to=attention_value.dtype)
-        attention.shape = ir.Shape(["batch", "capacity"])
+        # Prefill remains eager at the prompt width. Only decode uses a fixed
+        # capacity mask so its shape and address are stable for CUDA Graph replay.
+        attention = op.Cast(
+            op.ConstantOfShape(prompt_shape, value=ir.tensor([1])),
+            to=attention_value.dtype,
+        )
+        attention.shape = ir.Shape(["batch", "prompt_sequence"])
         body_attention = op.Cast(
             op.Less(
                 offsets,

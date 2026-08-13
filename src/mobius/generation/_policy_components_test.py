@@ -263,6 +263,7 @@ def test_decoder_fixed_capacity_state_matches_native_capture_layout(tmp_path):
         ),
     ]
     decoder = ir.Model(ir.Graph(inputs, [], nodes=[], name="decoder"), ir_version=11)
+    prompt = np.arange(68, dtype=np.int64).reshape(1, 68)
     outputs = _run(
         build_decoder_state_initializer(
             decoder,
@@ -274,16 +275,18 @@ def test_decoder_fixed_capacity_state_matches_native_capture_layout(tmp_path):
         ),
         tmp_path,
         {
-            "prompt_tokens": np.array([[3, 4, 5]], np.int64),
-            "max_iterations": np.array([2], np.int64),
+            "prompt_tokens": prompt,
+            "max_iterations": np.array([128], np.int64),
         },
     )
     attention, body_attention, token, cache_lengths, cache = outputs
-    np.testing.assert_array_equal(attention, [[1, 1, 1, 0, 0]])
-    np.testing.assert_array_equal(body_attention, [[1, 1, 1, 1, 0]])
+    np.testing.assert_array_equal(attention, np.ones((1, 68), np.int64))
+    expected_body_attention = np.zeros((1, 196), np.int64)
+    expected_body_attention[:, :69] = 1
+    np.testing.assert_array_equal(body_attention, expected_body_attention)
     np.testing.assert_array_equal(token, [[0]])
-    np.testing.assert_array_equal(cache_lengths, [3])
-    assert cache.shape == (1, 2, 5, 4)
+    np.testing.assert_array_equal(cache_lengths, [68])
+    assert cache.shape == (1, 2, 196, 4)
 
     (next_attention,) = _run(
         build_decoder_step_update(
@@ -294,10 +297,11 @@ def test_decoder_fixed_capacity_state_matches_native_capture_layout(tmp_path):
         tmp_path,
         {
             "attention_mask": body_attention,
-            "logical_length": np.array([4], np.int64),
+            "logical_length": np.array([69], np.int64),
         },
     )
-    np.testing.assert_array_equal(next_attention, [[1, 1, 1, 1, 1]])
+    expected_body_attention[:, :70] = 1
+    np.testing.assert_array_equal(next_attention, expected_body_attention)
 
 
 def test_empty_features_runtime(tmp_path):
