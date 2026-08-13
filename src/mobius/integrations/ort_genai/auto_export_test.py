@@ -951,6 +951,29 @@ class TestExportForOrtGenai:
         assert "model" in data
         assert data["model"]["type"] == "qwen2"
 
+    def test_rejects_generic_vision_encoder_decoder_package(self, tmp_path):
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "nemotron_parse"
+
+        pkg = ModelPackage(
+            {
+                "vision_encoder": mock.MagicMock(),
+                "decoder": mock.MagicMock(),
+            },
+            config=FakeConfig(),
+        )
+        with pytest.raises(
+            NotImplementedError,
+            match="does not support generic vision encoder-decoder",
+        ):
+            write_ort_genai_config(pkg, str(tmp_path))
+        assert not (tmp_path / "genai_config.json").exists()
+
     def test_processor_config_written_with_vision(self, tmp_path):
         """image_processor.json is written when pkg.config.vision is set."""
         import dataclasses

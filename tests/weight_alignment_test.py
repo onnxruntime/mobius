@@ -33,6 +33,7 @@ from _test_configs import (
     ENCODER_CONFIGS,
     SEQ2SEQ_CONFIGS,
     VISION_CONFIGS,
+    VL_CONFIGS,
     _base_config,
 )
 
@@ -218,6 +219,23 @@ class TestVisionWeightAlignment:
     """Verify preprocess_weights() preserves all parameter names for vision models."""
 
     def test_identity_state_dict_roundtrip(self, model_type: str, config_overrides: dict):
+        _assert_identity_roundtrip(model_type, config_overrides)
+
+
+@pytest.mark.parametrize(
+    "model_type,config_overrides",
+    [
+        pytest.param(model_type, overrides, id=model_type)
+        for model_type, overrides, _ in VL_CONFIGS
+        if model_type == "nemotron_parse"
+    ],
+)
+class TestNemotronParseWeightAlignment:
+    """Verify the two-model package preserves every aligned parameter."""
+
+    def test_identity_state_dict_roundtrip(
+        self, model_type: str, config_overrides: dict
+    ) -> None:
         _assert_identity_roundtrip(model_type, config_overrides)
 
 

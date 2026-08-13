@@ -5873,6 +5873,7 @@ _VL_MODEL_PARAMS = _make_params(VL_CONFIGS)
 
 # VL models that produce a single "model" key instead of 3-model split
 _VL_SINGLE_MODEL_TASKS = {"qwen3-vl-vision-language"}
+_VL_TWO_MODEL_TASKS = {"vision-encoder-decoder"}
 
 
 @pytest.mark.parametrize("model_type,config_overrides", _VL_MODEL_PARAMS)
@@ -5894,6 +5895,14 @@ class TestBuildVLGraph:
             assert model.graph is not None
             output_names = {o.name for o in model.graph.outputs}
             assert "logits" in output_names
+        elif task_name in _VL_TWO_MODEL_TASKS:
+            assert set(pkg) == {"decoder", "vision_encoder"}
+            decoder = pkg["decoder"]
+            assert "encoder_hidden_states" in {i.name for i in decoder.graph.inputs}
+            assert "logits" in {o.name for o in decoder.graph.outputs}
+            vision = pkg["vision_encoder"]
+            pixel_values = next(i for i in vision.graph.inputs if i.name == "pixel_values")
+            assert pixel_values.dtype == ir.DataType.FLOAT
         else:
             assert "decoder" in pkg, f"{model_type} should produce 'decoder'"
             assert "vision_encoder" in pkg, f"{model_type} should produce 'vision_encoder'"
@@ -5904,7 +5913,8 @@ class TestBuildVLGraph:
             assert "logits" in {o.name for o in decoder.graph.outputs}
 
             vision = pkg["vision_encoder"]
-            assert "pixel_values" in {i.name for i in vision.graph.inputs}
+            pixel_values = next(i for i in vision.graph.inputs if i.name == "pixel_values")
+            assert pixel_values.dtype == ir.DataType.FLOAT
 
     def test_has_initializers(self, model_type: str, config_overrides: dict):
         """Verify all sub-models have non-empty initializers."""

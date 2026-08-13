@@ -1282,6 +1282,101 @@ class VisionLanguageConfig(CausalLMConfig):
     """
 
 
+@dataclasses.dataclass
+class NemotronParseConfig(ArchitectureConfig):
+    """Configuration for NVIDIA Nemotron Parse image-to-text models."""
+
+    image_height: int = 2048
+    image_width: int = 1664
+    vision_max_grid_size: int = 128
+    num_summary_tokens: int = 3
+    decoder_start_token_id: int = 2
+    scale_embedding: bool = True
+    add_final_layer_norm: bool = True
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> NemotronParseConfig:
+        del parent_config
+        import types
+
+        def _namespace(value):
+            if isinstance(value, dict):
+                return types.SimpleNamespace(
+                    **{key: _namespace(item) for key, item in value.items()}
+                )
+            if isinstance(value, list):
+                return [_namespace(item) for item in value]
+            return value
+
+        decoder = _namespace(getattr(config, "decoder", None))
+        if decoder is None:
+            raise ValueError("Nemotron Parse config is missing its decoder sub-config")
+        base = ArchitectureConfig.from_transformers(decoder, parent_config=config)
+        fields = _shallow_fields(base)
+        num_attention_heads = int(
+            getattr(decoder, "decoder_attention_heads", None)
+            or getattr(decoder, "num_attention_heads", fields["num_attention_heads"])
+        )
+        hidden_size = int(fields["hidden_size"])
+        if hidden_size % num_attention_heads:
+            raise ValueError(
+                "Nemotron Parse decoder hidden size must be divisible by its attention heads"
+            )
+        fields.update(
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_attention_heads,
+            head_dim=hidden_size // num_attention_heads,
+        )
+
+        raw_image_size = getattr(config, "image_size", (2048, 1664))
+        if isinstance(raw_image_size, int):
+            image_height = image_width = raw_image_size
+        else:
+            image_height, image_width = (int(raw_image_size[0]), int(raw_image_size[1]))
+
+        encoder = _namespace(getattr(config, "encoder", None))
+        patch_size = int(getattr(encoder, "patch_size", 16))
+        max_resolution = int(
+            getattr(encoder, "max_resolution", max(image_height, image_width))
+        )
+        fields.update(
+            model_type="nemotron_parse",
+            bos_token_id=getattr(config, "bos_token_id", fields.get("bos_token_id")),
+            eos_token_id=getattr(config, "eos_token_id", fields.get("eos_token_id")),
+            pad_token_id=getattr(config, "pad_token_id", fields["pad_token_id"]),
+            tie_word_embeddings=getattr(config, "tie_word_embeddings", True),
+            max_position_embeddings=(
+                getattr(config, "max_sequence_length", None)
+                or fields["max_position_embeddings"]
+            ),
+            vision=VisionConfig(
+                hidden_size=1280,
+                intermediate_size=5120,
+                num_hidden_layers=32,
+                num_attention_heads=16,
+                image_size=max_resolution,
+                patch_size=patch_size,
+                norm_eps=1e-6,
+                model_type="radio_v2.5-h",
+                in_channels=3,
+            ),
+        )
+        resolved_dtype = _resolve_dtype(config)
+        if resolved_dtype is not None:
+            fields["dtype"] = resolved_dtype
+
+        return cls(
+            **fields,
+            image_height=image_height,
+            image_width=image_width,
+            vision_max_grid_size=max_resolution // patch_size,
+            num_summary_tokens=3,
+            decoder_start_token_id=int(getattr(config, "decoder_start_token_id", 2)),
+            scale_embedding=bool(getattr(decoder, "scale_embedding", True)),
+            add_final_layer_norm=bool(getattr(decoder, "add_final_layer_norm", True)),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Model-family subclasses — add model-specific fields
 # ---------------------------------------------------------------------------

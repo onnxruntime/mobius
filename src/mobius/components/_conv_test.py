@@ -100,6 +100,18 @@ class TestConv2d:
         conv(op, x)
         assert count_op_type(graph, "Conv") >= 1
 
+    def test_asymmetric_kernel_stride_and_padding(self):
+        conv = Conv2d(
+            3,
+            16,
+            kernel_size=(1, 4),
+            stride=(1, 4),
+            padding=(0, 2, 0, 2),
+        )
+        assert list(conv.weight.shape) == [16, 3, 1, 4]
+        assert conv._strides == (1, 4)
+        assert conv._pads == [0, 2, 0, 2]
+
 
 class TestConv2dNoBias:
     """Tests for 2D convolution without bias."""
@@ -121,6 +133,11 @@ class TestConv2dNoBias:
         result = conv(op, x)
         builder._adapt_outputs([result], "")
         assert count_op_type(graph, "Conv") >= 1
+
+    def test_asymmetric_kernel_and_stride(self):
+        conv = Conv2dNoBias(3, 16, kernel_size=(1, 4), stride=(1, 4))
+        assert list(conv.weight.shape) == [16, 3, 1, 4]
+        assert conv._strides == (1, 4)
 
 
 class TestBatchNorm2d:

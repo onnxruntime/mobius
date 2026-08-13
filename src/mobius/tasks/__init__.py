@@ -69,6 +69,7 @@ __all__ = [
     "VAETask",
     "VideoDenoisingTask",
     "VisionLanguageTask",
+    "VisionEncoderDecoderTask",
     "WorldModelTask",
     "build_decoder_from_embeds",
     "build_embedding_from_features",
@@ -123,6 +124,7 @@ from mobius.tasks._ssm_causal_lm import SSM2CausalLMTask, SSMCausalLMTask
 from mobius.tasks._tts import TTSTask
 from mobius.tasks._vae import VAETask
 from mobius.tasks._video_denoising import VideoDenoisingTask
+from mobius.tasks._vision_encoder_decoder import VisionEncoderDecoderTask
 from mobius.tasks._vision_language import Qwen3VLVisionLanguageTask
 from mobius.tasks._vision_language_3model import (
     Cosmos3EdgeVLTask,
@@ -164,6 +166,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "vae": VAETask,
     "qwen-image-vae": QwenImageVAETask,
     "vision-language": VisionLanguageTask,
+    "vision-encoder-decoder": VisionEncoderDecoderTask,
     "cosmos3-edge-vl": Cosmos3EdgeVLTask,
     "pixtral-vl": PixtralVLTask,
     "mllama-vision-language": MllamaVisionLanguageTask,

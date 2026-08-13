@@ -40,6 +40,7 @@ from mobius._configs import (
     MuseGlimmerConfig,
     NanoChatConfig,
     NemotronHConfig,
+    NemotronParseConfig,
     Sam2Config,
     SegformerConfig,
     VisionConfig,
@@ -2201,6 +2202,30 @@ _TINY_MUSE_GLIMMER_VISION = VisionConfig(
 # The test parametrization in build_graph_test.py uses specialised test
 # methods that invoke the correct task and assert the right output models.
 VL_CONFIGS: list[tuple[str, dict, bool]] = [
+    # --- Nemotron Parse (C-RADIO + feature neck + cross-attentive decoder) ---
+    (
+        "nemotron_parse",
+        {
+            "_config_cls": NemotronParseConfig,
+            "hidden_act": "gelu",
+            "num_decoder_layers": 1,
+            "num_key_value_heads": TINY_HEADS,
+            "image_height": 32,
+            "image_width": 64,
+            "vision_max_grid_size": 4,
+            "num_summary_tokens": 3,
+            "vision": VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=4,
+                image_size=64,
+                patch_size=16,
+                norm_eps=1e-6,
+            ),
+        },
+        True,
+    ),
     # --- LLaVA family (vision-language, 3-model split) ---
     ("llava", {"vision": _TINY_VISION, "image_token_id": 32000}, True),
     (
