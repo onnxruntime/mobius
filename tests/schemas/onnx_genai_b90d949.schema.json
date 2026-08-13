@@ -173,32 +173,6 @@
       ],
       "type": "string"
     },
-    "BatchingContract": {
-      "additionalProperties": false,
-      "properties": {
-        "batch_axis": {
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "continuous": {
-          "default": false,
-          "type": "boolean"
-        },
-        "max_batch_size": {
-          "format": "uint",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "batch_axis"
-      ],
-      "type": "object"
-    },
     "ChunkedPrefillConfig": {
       "description": "Runtime chunked-prefill preference.",
       "properties": {
@@ -212,6 +186,39 @@
           ]
         }
       },
+      "type": "object"
+    },
+    "ComponentContract": {
+      "additionalProperties": false,
+      "properties": {
+        "bindings": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Semantic role to concrete component port name.",
+          "type": "object"
+        },
+        "id": {
+          "description": "Versioned semantic capability identifier. It never selects execution behavior.",
+          "type": "string"
+        },
+        "parameters": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ScalarValue"
+          },
+          "default": {},
+          "description": "Contract parameters that are not tensor ports, such as adapter actions.",
+          "type": "object"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "version"
+      ],
       "type": "object"
     },
     "ComponentImplementation": {
@@ -303,126 +310,6 @@
       },
       "type": "object"
     },
-    "ControlFlow": {
-      "description": "Generic package control-flow algebra.",
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "sequence",
-              "type": "string"
-            },
-            "steps": {
-              "items": {
-                "$ref": "#/$defs/ControlFlow"
-              },
-              "type": "array"
-            }
-          },
-          "required": [
-            "kind",
-            "steps"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "component": {
-              "type": "string"
-            },
-            "kind": {
-              "const": "invoke",
-              "type": "string"
-            },
-            "when": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Predicate"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            }
-          },
-          "required": [
-            "kind",
-            "component"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "body": {
-              "$ref": "#/$defs/ControlFlow"
-            },
-            "carried": {
-              "default": [],
-              "items": {
-                "$ref": "#/$defs/LoopCarry"
-              },
-              "type": "array"
-            },
-            "kind": {
-              "const": "loop",
-              "type": "string"
-            },
-            "step_program": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "termination": {
-              "$ref": "#/$defs/Termination"
-            }
-          },
-          "required": [
-            "kind",
-            "body",
-            "termination"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "cases": {
-              "additionalProperties": {
-                "$ref": "#/$defs/ControlFlow"
-              },
-              "type": "object"
-            },
-            "default": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/ControlFlow"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "kind": {
-              "const": "branch",
-              "type": "string"
-            },
-            "predicate": {
-              "$ref": "#/$defs/Predicate"
-            }
-          },
-          "required": [
-            "kind",
-            "predicate",
-            "cases"
-          ],
-          "type": "object"
-        }
-      ]
-    },
     "DType": {
       "description": "Scalar dtype vocabulary with common ONNX and runtime aliases.",
       "oneOf": [
@@ -476,50 +363,6 @@
       ],
       "type": "string"
     },
-    "DataflowEdge": {
-      "description": "Directed connection between two pipeline component ports.",
-      "properties": {
-        "device_transfer": {
-          "description": "Whether the runtime must move the value between execution devices.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "dtype": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TensorDType"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Scalar or logical data type at the component boundary."
-        },
-        "from": {
-          "description": "Source package input or endpoint in `component.output_name` form.",
-          "examples": [
-            "encoder.hidden_states"
-          ],
-          "pattern": "^[^.]+(?:\\.[^.]+)?$",
-          "type": "string"
-        },
-        "to": {
-          "description": "Destination package output or endpoint in `component.input_name` form.",
-          "examples": [
-            "decoder.encoder_hidden_states"
-          ],
-          "pattern": "^[^.]+(?:\\.[^.]+)?$",
-          "type": "string"
-        }
-      },
-      "required": [
-        "from",
-        "to"
-      ],
-      "type": "object"
-    },
     "DeviceKind": {
       "enum": [
         "cpu",
@@ -528,41 +371,6 @@
         "core_ml",
         "web_gpu",
         "npu"
-      ],
-      "type": "string"
-    },
-    "DevicePreference": {
-      "description": "Execution-device preference vocabulary.",
-      "oneOf": [
-        {
-          "enum": [
-            "auto",
-            "cpu",
-            "cuda",
-            "rocm",
-            "directml",
-            "coreml",
-            "webgpu",
-            "npu"
-          ],
-          "title": "Known standard value"
-        },
-        {
-          "not": {
-            "enum": [
-              "auto",
-              "cpu",
-              "cuda",
-              "rocm",
-              "directml",
-              "coreml",
-              "webgpu",
-              "npu"
-            ]
-          },
-          "title": "Forward-compatible extension value",
-          "type": "string"
-        }
       ],
       "type": "string"
     },
@@ -631,22 +439,6 @@
         }
       ],
       "type": "string"
-    },
-    "EffectTransition": {
-      "additionalProperties": false,
-      "properties": {
-        "consumes": {
-          "type": "string"
-        },
-        "produces": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "consumes",
-        "produces"
-      ],
-      "type": "object"
     },
     "ForkPrecisionPolicy": {
       "description": "KV fork-precision policy vocabulary.",
@@ -847,29 +639,6 @@
       },
       "type": "object"
     },
-    "ImageCorrespondence": {
-      "description": "Prompt-placeholder to image correspondence vocabulary.",
-      "oneOf": [
-        {
-          "enum": [
-            "prompt_order",
-            "explicit_indices"
-          ],
-          "title": "Known standard value"
-        },
-        {
-          "not": {
-            "enum": [
-              "prompt_order",
-              "explicit_indices"
-            ]
-          },
-          "title": "Forward-compatible extension value",
-          "type": "string"
-        }
-      ],
-      "type": "string"
-    },
     "ImageOutputBinding": {
       "description": "One named tensor output produced by an image preprocessing program.\n\nThe output binds a processor-local value to a typed workflow SSA name.\nNeither the name nor the content role is inferred from a model identity.",
       "properties": {
@@ -1016,31 +785,6 @@
         }
       ],
       "description": "A square size or an explicit width/height for an image transform."
-    },
-    "ImageTokenCountSource": {
-      "description": "Image token-count source vocabulary.",
-      "oneOf": [
-        {
-          "enum": [
-            "per_tile",
-            "per_patch",
-            "from_grid"
-          ],
-          "title": "Known standard value"
-        },
-        {
-          "not": {
-            "enum": [
-              "per_tile",
-              "per_patch",
-              "from_grid"
-            ]
-          },
-          "title": "Forward-compatible extension value",
-          "type": "string"
-        }
-      ],
-      "type": "string"
     },
     "ImageTransform": {
       "description": "One generic image transform operation.\n\n`op` selects the operation from a generic vocabulary; the remaining fields\nare the parameters that operation reads (only the relevant ones are set).\nEvery parameter is model DATA — concrete sizes, patch sizes, means, and so on\nlive in a model's fixture, never as constants baked into this schema.",
@@ -1724,26 +1468,6 @@
       ],
       "type": "object"
     },
-    "LoopCarry": {
-      "additionalProperties": false,
-      "properties": {
-        "from": {
-          "type": "string"
-        },
-        "state": {
-          "type": "string"
-        },
-        "to": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "state",
-        "from",
-        "to"
-      ],
-      "type": "object"
-    },
     "LoopStatePair": {
       "description": "One fixed-shape loop-carried recurrent-state port pair.\n\nGeneric and architecture-neutral: the runtime zero/other-initializes `input`\non the first step, runs the graph, and copies `output` back into `input` for\nthe next step (`replace` update). This models any fixed recurrent tensor\n(convolution state, linear-attention recurrent state, and so on) without\nreferencing a model family. It is intentionally distinct from growing or\nshared-buffer KV cache, which is declared through `kv_inputs`/`kv_outputs`\nand `kv_update`.",
       "properties": {
@@ -2385,1172 +2109,17 @@
       },
       "type": "object"
     },
-    "PhaseConfig": {
-      "description": "Phase gate for one pipeline component.",
-      "properties": {
-        "run_on": {
-          "$ref": "#/$defs/PhaseRunOn",
-          "description": "Pipeline phase in which the component runs."
-        },
-        "when_present": {
-          "description": "Opaque presence key required for this component to run.",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "run_on"
-      ],
-      "type": "object"
-    },
-    "PhaseRunOn": {
-      "description": "Pipeline phase gate.\n\nKnown values are enumerated while future strings remain valid.",
-      "oneOf": [
-        {
-          "enum": [
-            "prompt_only",
-            "every_step",
-            "always",
-            "final_only",
-            "on_demand"
-          ],
-          "title": "Known standard value"
-        },
-        {
-          "not": {
-            "enum": [
-              "prompt_only",
-              "every_step",
-              "always",
-              "final_only",
-              "on_demand"
-            ]
-          },
-          "title": "Forward-compatible extension value",
-          "type": "string"
-        }
-      ],
-      "type": "string"
-    },
-    "PipelineAudioConfig": {
-      "description": "Waveform contract for a pipeline stage that emits audio.\n\nArchitecture-neutral: the endpoint is an arbitrary `component.output` name\ncarried in the package's metadata, and the sample rate is a declared number.\nNeither is inferred from a model or vendor name.",
-      "properties": {
-        "channels": {
-          "description": "Number of interleaved channels in the waveform. Defaults to 1 (mono).",
-          "format": "uint16",
-          "maximum": 65535,
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "output": {
-          "description": "Endpoint carrying the waveform, in `component.output` form.\n\nWhen absent, the runtime uses the sole output of the final-phase\ncomponent, which is unambiguous for the common single-vocoder shape.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "sample_rate": {
-          "description": "Sample rate, in hertz, of the waveform the pipeline emits.",
-          "format": "uint32",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
-    "PipelineComponentSpec": {
-      "description": "One executable ONNX model in a pipeline.",
-      "properties": {
-        "device_preference": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/DevicePreference"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Optional execution or device preference declared by the model package."
-        },
-        "filename": {
-          "description": "Non-empty ONNX filename relative to the model package root.",
-          "examples": [
-            "decoder.onnx"
-          ],
-          "minLength": 1,
-          "type": "string"
-        },
-        "io": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ModelIoSpec"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "description": "Explicit graph I/O port bindings for this pipeline component.\n\nThe runtime binds decode-step ports from the declared names. A port that\nis not declared is resolved ONLY from an unambiguous io-shape signal;\nwhen the shape is ambiguous the runtime fails with an actionable error\nnaming the key to declare, and never guesses from a tensor name."
-        },
-        "ports": {
-          "$ref": "#/$defs/ComponentPorts",
-          "default": {
-            "inputs": {},
-            "outputs": {}
-          },
-          "description": "Typed graph inputs and outputs exposed by this component."
-        },
-        "tokenizer": {
-          "description": "Tokenizer filename relative to the package root.\n\nIf absent, loaders may use a shared top-level `tokenizer.json`.",
-          "examples": [
-            "tokenizer.json"
-          ],
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "type": {
-          "$ref": "#/$defs/PipelineRole",
-          "description": "Component role, for example `encoder`, `decoder`, `draft`, `denoiser`, or `vocoder`."
-        }
-      },
-      "required": [
-        "filename",
-        "type"
-      ],
-      "type": "object"
-    },
-    "PipelineRole": {
-      "description": "Pipeline component-role vocabulary.",
-      "oneOf": [
-        {
-          "enum": [
-            "encoder",
-            "vision_encoder",
-            "audio_encoder",
-            "decoder",
-            "draft",
-            "denoiser",
-            "scheduler",
-            "vocoder",
-            "speech_synthesis"
-          ],
-          "title": "Known standard value"
-        },
-        {
-          "not": {
-            "enum": [
-              "encoder",
-              "vision_encoder",
-              "audio_encoder",
-              "decoder",
-              "draft",
-              "denoiser",
-              "scheduler",
-              "vocoder",
-              "speech_synthesis"
-            ]
-          },
-          "title": "Forward-compatible extension value",
-          "type": "string"
-        }
-      ],
-      "type": "string"
-    },
     "PipelineSpec": {
-      "description": "Multi-model pipeline represented as a directed acyclic dataflow graph.",
+      "additionalProperties": false,
+      "description": "Executable package described by the universal typed workflow IR.",
       "properties": {
-        "audio": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PipelineAudioConfig"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Waveform contract for a pipeline whose final stage emits audio.\n\nPresent for text-to-speech and any other package that produces sound.\nThe sample rate is model DATA: a runtime cannot infer it from a tensor,\nand guessing it silently changes playback pitch and duration."
-        },
-        "batching": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/BatchingContract"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Package batching contract."
-        },
-        "control": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ControlFlow"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Universal nested control-flow program."
-        },
-        "dataflow": {
-          "description": "Directed tensor or data edges between component ports.",
-          "items": {
-            "$ref": "#/$defs/DataflowEdge"
-          },
-          "type": "array"
-        },
-        "inputs": {
-          "additionalProperties": {
-            "$ref": "#/$defs/TensorContract"
-          },
-          "default": {},
-          "description": "Typed inputs exposed by the complete package.",
-          "type": "object"
-        },
-        "models": {
-          "additionalProperties": {
-            "$ref": "#/$defs/PipelineComponentSpec"
-          },
-          "description": "Named model components in the pipeline DAG; at least one component is required.",
-          "minProperties": 1,
-          "type": "object"
-        },
-        "outputs": {
-          "additionalProperties": {
-            "$ref": "#/$defs/TensorContract"
-          },
-          "default": {},
-          "description": "Typed outputs produced by the complete package.",
-          "type": "object"
-        },
-        "phases": {
-          "additionalProperties": {
-            "$ref": "#/$defs/PhaseConfig"
-          },
-          "default": {},
-          "description": "Auxiliary-component lifecycle scheduling, keyed by component name.\n\nModels referenced directly by strategy control-flow fields (`decoder`,\n`model`, `denoiser`, `outer`, or `inner`) must not appear here. Every\nother model must have exactly one phase entry.",
-          "type": "object"
-        },
-        "positions": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PositionProgram"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Declared position-id generation and prefill→decode continuation program.\n\nGeneric and architecture-neutral: parameterized by rank, axis labels, and\nsection sizes so it expresses both ordinary rank-2 linear positions and\nrank-N multimodal coordinates as data — never a model-family branch."
-        },
-        "postprocessing": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PostprocessingSpec"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Declarative output materialization."
-        },
-        "programs": {
-          "additionalProperties": {
-            "$ref": "#/$defs/Program"
-          },
-          "default": {},
-          "description": "Named data-only sampler, scheduler, solver, and tensor programs.",
-          "type": "object"
-        },
-        "reducers": {
-          "additionalProperties": {
-            "$ref": "#/$defs/ReducerSpec"
-          },
-          "default": {},
-          "description": "Explicit fan-in reducers keyed by destination endpoint.",
-          "type": "object"
-        },
-        "resources": {
-          "additionalProperties": {
-            "$ref": "#/$defs/ResourceContract"
-          },
-          "default": {},
-          "description": "Typed resource contracts for named components.",
-          "type": "object"
-        },
-        "states": {
-          "additionalProperties": {
-            "$ref": "#/$defs/StateDeclaration"
-          },
-          "default": {},
-          "description": "General tensor state, including loop-carried and persistent session state.",
-          "type": "object"
-        },
-        "strategy": {
-          "$ref": "#/$defs/PipelineStrategy",
-          "description": "Loop and execution strategy for the pipeline."
-        },
-        "vision": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PipelineVisionConfig"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Vision-language model token-expansion contract.\n\nWhen present, the engine uses these fields to replace each image\nplaceholder token in the prompt with the declared expanded image-token\nsequence before KV-cache allocation."
-        },
         "workflow": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/WorkflowSpec"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "North-star component-centric SSA workflow."
-        }
-      },
-      "type": "object"
-    },
-    "PipelineStrategy": {
-      "description": "Parameterized execution strategy for a pipeline or composite stage.",
-      "properties": {
-        "batching": {
-          "description": "Runtime-specific batching parameters."
-        },
-        "cfg_conditioning_input": {
-          "default": null,
-          "description": "Denoiser conditioning input port zeroed for the unconditional pass of\nclassifier-free guidance. Required when `guidance_scale` != 1.0.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "decoder": {
-          "description": "Autoregressive decoder component name.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "denoiser": {
-          "description": "Iterative or diffusion denoiser component name.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "guidance_scale": {
-          "description": "Classifier-free guidance scale or equivalent strategy-specific multiplier.",
-          "format": "float",
-          "minimum": 0.0,
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "inner": {
-          "default": null,
-          "description": "Inner autoregressive decoder for a `nested_autoregressive` stage.\n\nThe code_predictor: for each outer frame it runs a short inner AR loop of\n`num_code_groups` steps over the residual codebooks, seeded at inner step\n0 by the outer decoder's `last_hidden_state` (routed via a dataflow edge\n`outer.last_hidden_state -> inner.inputs_embeds`) and threading its own\nper-step code embedding on later steps.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "inner_embedding_output": {
-          "description": "Inner decoder output port threaded across inner steps for a\n`nested_autoregressive` stage.\n\nEach inner step consumes the previous step's per-code embedding as its\n`inputs_embeds` seed; this names the inner decoder OUTPUT port that\nproduces that embedding. It is declared explicitly because the port is\nshape-indistinguishable from other float outputs — the runtime must not\ninfer it by tensor name. Absent on a nested stage ⇒ actionable error\nnaming `pipeline.strategy.inner_embedding_output`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "kind": {
-          "$ref": "#/$defs/PipelineStrategyKind",
-          "description": "Strategy family; determines which strategy-specific fields are meaningful."
-        },
-        "kv_cache": {
-          "description": "Runtime-specific KV-cache strategy parameters."
-        },
-        "max_tokens": {
-          "description": "Maximum number of tokens generated by an autoregressive stage.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "model": {
-          "description": "Single-pass component name.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "num_code_groups": {
-          "default": null,
-          "description": "Inner-loop depth (RVQ residual codebook count) for a\n`nested_autoregressive` stage: the number of code tokens collected per\nouter frame. Must be at least 1.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "num_steps": {
-          "description": "Number of iterative or diffusion steps.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "outer": {
-          "default": null,
-          "description": "Outer autoregressive decoder for a `nested_autoregressive` stage.\n\nThe multi-decoder TTS shape: one outer step is one\naudio frame. The outer decoder (talker) produces a per-frame\n`last_hidden_state` that seeds the inner loop (see `inner`).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "pre_embedder": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PreEmbedderSpec"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Optional pre-embedder component driving the outer decoder (talker) of a\n`nested_autoregressive` stage through `inputs_embeds` instead of\n`input_ids`.\n\nA codec-driven TTS talker is not driven by token ids: each step's\n`inputs_embeds` is materialized from the PREVIOUS frame's codes as\n`codec_sum(+ text_embed)` (where\n`codec_sum = codec_embed(code_0) + Σ_i cp_codec_weights[i][codes[i+1]]`).\nWhen this field names such a component (inputs\n`frame_codes [batch, num_code_groups]` int64 `[+ text_embed [batch, 1,\nhidden]]` → output `inputs_embeds [batch, 1, hidden]`), the runtime builds\nthe outer decoder's per-step `inputs_embeds` through it, keeping the engine\ngeneric. Requires a dataflow edge\n`{pre_embedder}.inputs_embeds -> {outer}.inputs_embeds`.\n\nWhen absent the outer loop is `input_ids`-driven (backward compatible).\n\nAll graph-specific port bindings (the pre-embedder's `frame_codes` /\noptional `text_embed` inputs and the output feeding the outer decoder)\nare declared explicitly in [`PreEmbedderSpec`]; the runtime never guesses\nthem by tensor name or dtype."
-        },
-        "prefill_embedder": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PrefillEmbedderSpec"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Optional prefill embedder component that supplies the outer decoder\n(talker) with its real frame-0 PREFILL sequence and the per-frame\ntrailing-text conditioning of a `nested_autoregressive` stage.\n\nThe talker is prefilled with a multi-position embedding\nsequence built from the tokenized prompt, and each subsequent frame is\nconditioned on one trailing-text embedding. This component materializes\nboth from `text_ids`: inputs `text_ids [batch, text_len]` int64 → outputs\n`prefill_embeds [batch, prefill_len, hidden]` float (fed DIRECTLY to the\ntalker's `inputs_embeds` on frame 0) and `trailing_text_embeds [batch,\ntrailing_len, hidden]` float (one vector consumed per outer frame `k >= 1`\nas the pre-embedder's `text_embed`). It runs once in the prompt phase\n(`run_on: prompt_only`); its `text_ids` input is auto-seeded from the\ntokenized prompt.\n\nOnly meaningful together with [`Self::pre_embedder`] (the frame-`k >= 1`\npath feeds the trailing-text vectors through it). When absent, frame 0\nuses a zero seed and every `text_embed` is zero (backward compatible).\n\nAll graph-specific port bindings (the prompt input plus the prefill and\ntrailing-text outputs) are declared explicitly in [`PrefillEmbedderSpec`];\nthe runtime never guesses them by tensor name or dtype."
-        },
-        "scheduler": {
-          "description": "Scheduler identifier for iterative or diffusion execution.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "scheduler_config": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SchedulerSpec"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Optional diffusion scheduler applied to the denoiser's loop-carried\noutput (treating it as a noise prediction) each step."
-        },
-        "speculative": {
-          "description": "Runtime-specific speculative execution parameters."
-        },
-        "stages": {
-          "description": "Ordered child stages for a composite strategy.",
-          "items": {
-            "$ref": "#/$defs/PipelineStrategyStage"
-          },
-          "type": "array"
-        },
-        "start_step": {
-          "default": null,
-          "description": "First step index for a partial (img2img) denoise loop.\n\nWhen set, the iterative loop runs `start_step..num_steps` instead of the\nfull `0..num_steps`, and the seed (`denoiser` sample input) is expected to\nalready be the encoded image noised to `timesteps[start_step]`. Matches\ndiffusers' img2img `get_timesteps(num_steps, strength)` skip. Default 0.",
-          "format": "uint",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "state": {
-          "description": "Runtime-specific iterative state declaration."
-        },
-        "stop_conditions": {
-          "description": "Runtime-specific stop-condition declarations.",
-          "items": true,
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "timestep_input": {
-          "default": null,
-          "description": "Denoiser input port that receives the per-step timestep/sigma scalar.\n\nWhen set, the iterative loop feeds this input a rank-1 `float32` value\neach step (from `timesteps` when provided, otherwise the 0-based step\nindex), so a step-aware denoiser can condition on the current step.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "timesteps": {
-          "default": null,
-          "description": "Explicit per-step timestep/sigma schedule for an iterative strategy.\n\nWhen present its length must equal `num_steps`; when absent the loop\nuses the 0-based step index. Requires `timestep_input` to have any effect.",
-          "items": {
-            "format": "float",
-            "type": "number"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
+          "$ref": "#/$defs/WorkflowSpec",
+          "description": "Required component-centric SSA workflow."
         }
       },
       "required": [
-        "kind"
-      ],
-      "type": "object"
-    },
-    "PipelineStrategyKind": {
-      "description": "Pipeline execution strategy family.\n\nKnown values are enumerated while future strings remain valid.",
-      "oneOf": [
-        {
-          "enum": [
-            "autoregressive",
-            "iterative",
-            "diffusion_steps",
-            "diffusion-steps",
-            "single_pass",
-            "single-pass",
-            "composite",
-            "nested_autoregressive",
-            "nested-autoregressive"
-          ],
-          "title": "Known standard value"
-        },
-        {
-          "not": {
-            "enum": [
-              "autoregressive",
-              "iterative",
-              "diffusion_steps",
-              "diffusion-steps",
-              "single_pass",
-              "single-pass",
-              "composite",
-              "nested_autoregressive",
-              "nested-autoregressive"
-            ]
-          },
-          "title": "Forward-compatible extension value",
-          "type": "string"
-        }
-      ],
-      "type": "string"
-    },
-    "PipelineStrategyStage": {
-      "additionalProperties": false,
-      "description": "Named child stage of a composite pipeline strategy.",
-      "properties": {
-        "name": {
-          "description": "Non-empty stage name unique within its containing composite.",
-          "minLength": 1,
-          "type": "string"
-        },
-        "strategy": {
-          "$ref": "#/$defs/PipelineStrategy",
-          "description": "Execution strategy for this stage."
-        }
-      },
-      "required": [
-        "name",
-        "strategy"
-      ],
-      "type": "object"
-    },
-    "PipelineVisionConfig": {
-      "description": "Image placeholder token-expansion contract for encoder-free VLM pipelines.\n\nEvery field is optional and additive: legacy documents that declare only\n`image_placeholder_token_id` and `tokens_per_tile` keep working. The richer\nfields mirror the generic expansion the preprocessor already models\n(separate emitted image token, per-tile/per-patch count source, per-image\ncorrespondence, optional row/column separators, and thumbnail order). All of\nit is generic data — no field names or values reference a model family.",
-      "properties": {
-        "column_separator_token_id": {
-          "description": "Optional token ID emitted between columns within a grid row.",
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "correspondence_summary": {
-          "description": "Named preprocessing value containing explicit image correspondence data.",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "image_correspondence": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ImageCorrespondence"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "How prompt placeholders correspond to input images.\n\n`prompt_order` pairs each placeholder with the next input image.\n`explicit_indices` reads correspondence from `correspondence_summary`."
-        },
-        "image_placeholder_token_id": {
-          "description": "Token ID of the image placeholder in the tokenized prompt.\n\nThe engine replaces every occurrence of this token with the expanded\nimage token sequence before sequence-length and KV-cache sizing.",
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "image_token_id": {
-          "description": "Token ID emitted for each expanded image position.\n\nDistinct from `image_placeholder_token_id`: the placeholder marks WHERE\nto expand, while this is the token actually written into the expanded\nsequence. When absent, the placeholder token itself is repeated.",
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "placeholder_per_image": {
-          "description": "Whether each placeholder occurrence corresponds to one input image in\nprompt order. Absent means the historical one-placeholder-per-image rule.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "row_separator_token_id": {
-          "description": "Optional token ID emitted between rows of a tiled image grid.",
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "thumbnail_order": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ThumbnailOrder"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Order of the optional global thumbnail tile relative to the local grid."
-        },
-        "token_count_source": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ImageTokenCountSource"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Where the per-placeholder token count comes from (per tile, per patch, or\na declared grid). Generic selector, never a model-family branch."
-        },
-        "token_count_summary": {
-          "description": "Named preprocessing value that supplies per-image counts or grid\ndimensions when `token_count_source` is data-derived.\n\nThis is an arbitrary processor output name. A runtime resolves the name\nfrom the declared preprocessing program; it never dispatches on familiar\ntensor names.",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "tokens_per_patch": {
-          "description": "Number of image tokens each patch expands to, used when the count source\nis per patch. Declared data.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "tokens_per_tile": {
-          "description": "Number of image tokens each tile expands to.\n\nThe total per-tile expansion is `tokens_per_tile * num_tiles`.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
-    "PolicyComponentContract": {
-      "description": "Stable semantic roles for ONNX policy-math components.\n\nFields map semantic roles to concrete ONNX port names. The corresponding\ntensor contracts live in [`WorkflowComponent::ports`].",
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "properties": {
-            "effect": {
-              "type": "string"
-            },
-            "logits": {
-              "type": "string"
-            },
-            "mode": {
-              "$ref": "#/$defs/SamplingPolicyMode"
-            },
-            "rng": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/RngPortContract"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "role": {
-              "const": "token_sampler",
-              "type": "string"
-            },
-            "temperature": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "token": {
-              "type": "string"
-            },
-            "top_k": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "top_p": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "role",
-            "mode",
-            "logits",
-            "token",
-            "effect"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "done": {
-              "type": "string"
-            },
-            "effect": {
-              "type": "string"
-            },
-            "eos_ids": {
-              "type": "string"
-            },
-            "iteration": {
-              "type": "string"
-            },
-            "max_iterations": {
-              "type": "string"
-            },
-            "role": {
-              "const": "termination_predicate",
-              "type": "string"
-            },
-            "tokens": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "role",
-            "tokens",
-            "eos_ids",
-            "iteration",
-            "max_iterations",
-            "done",
-            "effect"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "effect": {
-              "type": "string"
-            },
-            "estimate": {
-              "type": "string"
-            },
-            "next_state": {
-              "type": "string"
-            },
-            "role": {
-              "const": "solver_step",
-              "type": "string"
-            },
-            "schedule": {
-              "type": "string"
-            },
-            "state": {
-              "type": "string"
-            },
-            "step": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "role",
-            "state",
-            "estimate",
-            "step",
-            "schedule",
-            "next_state",
-            "effect"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "effect": {
-              "type": "string"
-            },
-            "mask": {
-              "type": "string"
-            },
-            "next_mask": {
-              "type": "string"
-            },
-            "next_state": {
-              "type": "string"
-            },
-            "proposal": {
-              "type": "string"
-            },
-            "rng": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/RngPortContract"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "role": {
-              "const": "masked_update",
-              "type": "string"
-            },
-            "state": {
-              "type": "string"
-            },
-            "step": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "role",
-            "state",
-            "proposal",
-            "mask",
-            "step",
-            "next_state",
-            "next_mask",
-            "effect"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "accepted_len": {
-              "type": "string"
-            },
-            "accepted_tokens": {
-              "type": "string"
-            },
-            "done": {
-              "type": "string"
-            },
-            "effect": {
-              "type": "string"
-            },
-            "proposal_scores": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "proposed_tokens": {
-              "type": "string"
-            },
-            "rng": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/RngPortContract"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "role": {
-              "const": "speculative_verifier",
-              "type": "string"
-            },
-            "target_scores": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "role",
-            "target_scores",
-            "proposed_tokens",
-            "accepted_tokens",
-            "accepted_len",
-            "done",
-            "effect"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "current": {
-              "type": "string"
-            },
-            "effect": {
-              "type": "string"
-            },
-            "next": {
-              "type": "string"
-            },
-            "role": {
-              "const": "state_update",
-              "type": "string"
-            },
-            "update": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "role",
-            "current",
-            "update",
-            "next",
-            "effect"
-          ],
-          "type": "object"
-        }
-      ]
-    },
-    "PositionContinuation": {
-      "description": "Prefill→decode position-continuation vocabulary.",
-      "oneOf": [
-        {
-          "enum": [
-            "linear_increment",
-            "carry_max",
-            "from_grid"
-          ],
-          "title": "Known standard value"
-        },
-        {
-          "not": {
-            "enum": [
-              "linear_increment",
-              "carry_max",
-              "from_grid"
-            ]
-          },
-          "title": "Forward-compatible extension value",
-          "type": "string"
-        }
-      ],
-      "type": "string"
-    },
-    "PositionGeneration": {
-      "description": "Position-value generation vocabulary.",
-      "oneOf": [
-        {
-          "enum": [
-            "linear",
-            "processor_coordinates"
-          ],
-          "title": "Known standard value"
-        },
-        {
-          "not": {
-            "enum": [
-              "linear",
-              "processor_coordinates"
-            ]
-          },
-          "title": "Forward-compatible extension value",
-          "type": "string"
-        }
-      ],
-      "type": "string"
-    },
-    "PositionProgram": {
-      "description": "Declared position-id program for a decoder graph.\n\nThe runtime constructs the position tensor from these declared parameters\ninstead of assuming a fixed rank-2 layout. `rank` 1 (with a single axis)\nexpresses ordinary linear positions; `rank` N expresses multi-axis\nmultimodal coordinates. Axis labels and section sizes are opaque DATA — the\nruntime never infers them from a model name.",
-      "properties": {
-        "axes": {
-          "description": "Optional coordinate-stream labels, one per stream (DATA).",
-          "items": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "continuation": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PositionContinuation"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "How positions continue from the prompt (prefill) into per-token decode."
-        },
-        "dtype": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TensorDType"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Declared dtype of the position tensor."
-        },
-        "generation": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PositionGeneration"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "How the position values are generated for prefill.\n\n`linear` generates ordinary sequence positions. `processor_coordinates`\nconsumes the declared processor summaries to construct multi-axis\ncoordinates. Future generation programs remain extensible capability\nstrings rather than model-family branches."
-        },
-        "input": {
-          "description": "Graph input port that receives the position ids (arbitrary name, DATA).",
-          "minLength": 1,
-          "type": "string"
-        },
-        "processor_summaries": {
-          "description": "Optional processor-summary endpoints this program reads to compute\nmulti-axis coordinates (e.g. a declared grid-dimensions output). Each\nentry is an arbitrary endpoint name (DATA), never a model-family hint.",
-          "items": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "rank": {
-          "description": "Number of coordinate streams carried by the position tensor.\n\n`1` is an ordinary linear position stream; values `> 1` describe\nmulti-axis multimodal coordinates. The physical ONNX tensor rank is\ndeclared separately by `tensor_rank`.",
-          "format": "uint",
-          "minimum": 1,
-          "type": "integer"
-        },
-        "sections": {
-          "description": "Optional section sizes for sectioned rotary position embeddings.\n\nOpaque list of per-section widths; their meaning is model DATA, not a\nruntime branch.",
-          "items": {
-            "format": "uint",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "tensor_rank": {
-          "description": "Physical ONNX tensor rank.\n\nRank 2 declares a conventional `[batch, sequence]` linear input. Higher\nranks declare an explicit coordinate axis in addition to batch/sequence\naxes. Absent preserves the legacy mapping (`rank == 1` means tensor rank\n2; otherwise tensor rank 3).",
-          "format": "uint",
-          "minimum": 2,
-          "type": [
-            "integer",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "input",
-        "rank"
-      ],
-      "type": "object"
-    },
-    "PostprocessingSpec": {
-      "additionalProperties": false,
-      "properties": {
-        "outputs": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {},
-          "type": "object"
-        },
-        "program": {
-          "$ref": "#/$defs/Program"
-        }
-      },
-      "required": [
-        "program"
-      ],
-      "type": "object"
-    },
-    "PreEmbedderSpec": {
-      "description": "Structured binding for the optional pre-embedder that drives the outer\ndecoder (talker) of a `nested_autoregressive` stage via `inputs_embeds`.\n\nEvery graph-specific port the runtime touches is declared here, so the\nengine never infers a port by tensor name or dtype.",
-      "properties": {
-        "component": {
-          "description": "Declared model name of the pre-embedder component.",
-          "minLength": 1,
-          "type": "string"
-        },
-        "frame_codes_input": {
-          "description": "Pre-embedder input port receiving the previous frame's codes\n(`int64 [batch, num_code_groups]`).",
-          "minLength": 1,
-          "type": "string"
-        },
-        "text_embed_input": {
-          "description": "Optional pre-embedder input port receiving the per-frame trailing-text\nconditioning vector (`float [batch, 1, hidden]`). When absent, the\npre-embedder exposes no trailing-text input.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "component",
-        "frame_codes_input"
+        "workflow"
       ],
       "type": "object"
     },
@@ -3595,197 +2164,6 @@
       ],
       "type": "string"
     },
-    "Predicate": {
-      "description": "Data-only predicates for branch and loop termination.",
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "properties": {
-            "input": {
-              "type": "string"
-            },
-            "op": {
-              "const": "present",
-              "type": "string"
-            }
-          },
-          "required": [
-            "op",
-            "input"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "op": {
-              "const": "bool",
-              "type": "string"
-            },
-            "value": {
-              "type": "boolean"
-            }
-          },
-          "required": [
-            "op",
-            "value"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "op": {
-              "const": "not",
-              "type": "string"
-            },
-            "value": {
-              "$ref": "#/$defs/Predicate"
-            }
-          },
-          "required": [
-            "op",
-            "value"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "op": {
-              "const": "all",
-              "type": "string"
-            },
-            "values": {
-              "items": {
-                "$ref": "#/$defs/Predicate"
-              },
-              "type": "array"
-            }
-          },
-          "required": [
-            "op",
-            "values"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "op": {
-              "const": "any",
-              "type": "string"
-            },
-            "values": {
-              "items": {
-                "$ref": "#/$defs/Predicate"
-              },
-              "type": "array"
-            }
-          },
-          "required": [
-            "op",
-            "values"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "left": {
-              "$ref": "#/$defs/ScalarExpr"
-            },
-            "op": {
-              "const": "equal",
-              "type": "string"
-            },
-            "right": {
-              "$ref": "#/$defs/ScalarExpr"
-            }
-          },
-          "required": [
-            "op",
-            "left",
-            "right"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "left": {
-              "$ref": "#/$defs/ScalarExpr"
-            },
-            "op": {
-              "const": "less",
-              "type": "string"
-            },
-            "right": {
-              "$ref": "#/$defs/ScalarExpr"
-            }
-          },
-          "required": [
-            "op",
-            "left",
-            "right"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "left": {
-              "$ref": "#/$defs/ScalarExpr"
-            },
-            "op": {
-              "const": "less_equal",
-              "type": "string"
-            },
-            "right": {
-              "$ref": "#/$defs/ScalarExpr"
-            }
-          },
-          "required": [
-            "op",
-            "left",
-            "right"
-          ],
-          "type": "object"
-        }
-      ]
-    },
-    "PrefillEmbedderSpec": {
-      "description": "Structured binding for the optional prefill embedder that supplies the outer\ndecoder (talker) of a `nested_autoregressive` stage with its frame-0 PREFILL\nsequence and per-frame trailing-text conditioning.\n\nEvery graph-specific port the runtime touches is declared here, so the\nengine never infers a port by tensor name or dtype.",
-      "properties": {
-        "component": {
-          "description": "Declared model name of the (prompt-phase) prefill embedder component.",
-          "minLength": 1,
-          "type": "string"
-        },
-        "prefill_output": {
-          "description": "Prefill-embedder output port carrying the talker's frame-0 multi-position\nPREFILL sequence (`float [batch, prefill_len, hidden]`), fed DIRECTLY to\nthe outer decoder's `inputs_embeds` on frame 0.",
-          "minLength": 1,
-          "type": "string"
-        },
-        "prompt_input": {
-          "description": "Prefill-embedder input port receiving the tokenized prompt\n(`int64 [batch, text_len]`, e.g. `text_ids`).",
-          "minLength": 1,
-          "type": "string"
-        },
-        "trailing_output": {
-          "description": "Prefill-embedder output port carrying the per-frame trailing-text vectors\n(`float [batch, trailing_len, hidden]`), one sliced per outer frame\n`k >= 1` into the pre-embedder's `text_embed`.",
-          "minLength": 1,
-          "type": "string"
-        }
-      },
-      "required": [
-        "component",
-        "prompt_input",
-        "prefill_output",
-        "trailing_output"
-      ],
-      "type": "object"
-    },
     "PreprocessingSpec": {
       "description": "Declared, architecture-neutral input preprocessing programs.",
       "properties": {
@@ -3802,126 +2180,6 @@
         }
       },
       "type": "object"
-    },
-    "Program": {
-      "additionalProperties": false,
-      "description": "Generic tensor/scalar program executed between component invocations.",
-      "properties": {
-        "operations": {
-          "items": {
-            "$ref": "#/$defs/ProgramOperation"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "operations"
-      ],
-      "type": "object"
-    },
-    "ProgramOperation": {
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "properties": {
-            "from": {
-              "type": "string"
-            },
-            "op": {
-              "const": "copy",
-              "type": "string"
-            },
-            "to": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "op",
-            "from",
-            "to"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "dtype": {
-              "$ref": "#/$defs/TensorDType"
-            },
-            "input": {
-              "type": "string"
-            },
-            "op": {
-              "const": "cast",
-              "type": "string"
-            },
-            "output": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "op",
-            "input",
-            "output",
-            "dtype"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "logits": {
-              "type": "string"
-            },
-            "method": {
-              "$ref": "#/$defs/SamplingMethod"
-            },
-            "op": {
-              "const": "sample",
-              "type": "string"
-            },
-            "output": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "op",
-            "logits",
-            "output",
-            "method"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "estimate": {
-              "type": "string"
-            },
-            "op": {
-              "const": "solver_step",
-              "type": "string"
-            },
-            "output": {
-              "type": "string"
-            },
-            "solver": {
-              "$ref": "#/$defs/SolverSpec"
-            },
-            "state": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "op",
-            "estimate",
-            "state",
-            "output",
-            "solver"
-          ],
-          "type": "object"
-        }
-      ]
     },
     "ProposalTopology": {
       "description": "Speculative proposal-topology vocabulary.",
@@ -4071,93 +2329,6 @@
       ],
       "type": "object"
     },
-    "ReducerKind": {
-      "description": "How multiple dataflow values are combined at one destination.",
-      "enum": [
-        "first",
-        "last",
-        "sum",
-        "product",
-        "mean",
-        "min",
-        "max",
-        "concat",
-        "stack"
-      ],
-      "type": "string"
-    },
-    "ReducerSpec": {
-      "additionalProperties": false,
-      "properties": {
-        "axis": {
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "kind": {
-          "$ref": "#/$defs/ReducerKind"
-        }
-      },
-      "required": [
-        "kind"
-      ],
-      "type": "object"
-    },
-    "ResourceContract": {
-      "additionalProperties": false,
-      "properties": {
-        "device": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/DeviceKind"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "device_index": {
-          "format": "uint32",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "memory_bytes": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
-    "RngPortContract": {
-      "additionalProperties": false,
-      "description": "Counter-based RNG state. Producers should use Philox or Threefry inside ONNX.",
-      "properties": {
-        "next_offset": {
-          "type": "string"
-        },
-        "offset": {
-          "type": "string"
-        },
-        "seed": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "seed",
-        "offset",
-        "next_offset"
-      ],
-      "type": "object"
-    },
     "RuntimeConfigurable": {
       "description": "Features whose concrete settings may be selected by the runtime.",
       "properties": {
@@ -4233,114 +2404,6 @@
       ],
       "type": "object"
     },
-    "SamplingMethod": {
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "greedy",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "categorical",
-              "type": "string"
-            },
-            "temperature": {
-              "format": "float",
-              "type": "number"
-            },
-            "top_k": {
-              "format": "uint",
-              "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
-            },
-            "top_p": {
-              "format": "float",
-              "type": [
-                "number",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "kind",
-            "temperature"
-          ],
-          "type": "object"
-        }
-      ]
-    },
-    "SamplingPolicyMode": {
-      "enum": [
-        "greedy",
-        "seeded_stochastic"
-      ],
-      "type": "string"
-    },
-    "ScalarExpr": {
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "literal",
-              "type": "string"
-            },
-            "value": {
-              "$ref": "#/$defs/ScalarValue"
-            }
-          },
-          "required": [
-            "kind",
-            "value"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "value",
-              "type": "string"
-            },
-            "source": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "source"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "iteration",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
-        }
-      ]
-    },
     "ScalarValue": {
       "anyOf": [
         {
@@ -4358,115 +2421,6 @@
           "type": "string"
         }
       ]
-    },
-    "SchedulerSpec": {
-      "description": "Diffusion scheduler configuration for an iterative strategy.\n\nThe runtime treats the denoiser's loop-carried output as a noise prediction\n(or, for `flow_matching`, as a vector field and, for `masked_diffusion`, as\ntoken logits) and applies one scheduler step per iteration. Supported\n`kind`s: `ddpm`, `ddim`, `euler`, `euler_ancestral`, `dpmpp_2m`,\n`flow_matching`, and `masked_diffusion`.",
-      "properties": {
-        "beta_end": {
-          "description": "Linear beta-schedule end (default 0.012).",
-          "format": "float",
-          "minimum": 0.0,
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "beta_schedule": {
-          "description": "Beta schedule shape: `\"linear\"` (default) or `\"scaled_linear\"` (Stable\nDiffusion).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "beta_start": {
-          "description": "Linear beta-schedule start (default 0.00085).",
-          "format": "float",
-          "minimum": 0.0,
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "block_length": {
-          "description": "Semi-autoregressive block length for a `masked_diffusion` scheduler, in\ntokens. When set (and smaller than the masked generation region), each\nstep only commits tokens inside the current left-to-right block, matching\nLLaDA's semi-autoregressive remasking. Defaults to a single block\nspanning the whole masked region.",
-          "format": "uint",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "kind": {
-          "description": "Scheduler algorithm: `\"ddpm\"`, `\"ddim\"`, `\"euler\"`,\n`\"euler_ancestral\"`, `\"dpmpp_2m\"`, `\"flow_matching\"`, or\n`\"masked_diffusion\"`.",
-          "type": "string"
-        },
-        "mask_token_id": {
-          "description": "Mask token id for a `masked_diffusion` (language-diffusion) scheduler:\neach step commits the highest-confidence still-masked positions.",
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "num_train_timesteps": {
-          "description": "Training timesteps the noise schedule was defined over (default 1000).",
-          "format": "uint",
-          "minimum": 2,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "prediction_type": {
-          "description": "Model output parameterization: `\"epsilon\"` (default, noise prediction),\n`\"v_prediction\"` (velocity; SD 2.x, SDXL refiner, many fine-tunes), or\n`\"sample\"`/`\"x0\"` (the model predicts the clean sample directly). All\nbuilt-in diffusion schedulers (`ddpm`, `ddim`, `euler`,\n`euler_ancestral`, `dpmpp_2m`) support every parameterization.\n`flow_matching` instead consumes the model's velocity/vector-field output\ndirectly and accepts an omitted value or `\"flow\"`/`\"velocity\"`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "remasking": {
-          "description": "Unmasking strategy for a `masked_diffusion` scheduler:\n  * `\"low_confidence\"` (default) — LLaDA: each step commits the\n    highest-confidence still-masked positions (confidence-ranked). Best\n    for LLaDA checkpoints, but greedy/confidence-ranked decoding of other\n    masked-diffusion LMs (e.g. MDLM) collapses into repetitive text.\n  * `\"random\"` — MDLM-style ancestral: each still-masked position unmasks\n    independently with the schedule probability `1/(steps_remaining)`,\n    sampling its token from the model's categorical distribution (use\n    `temperature: 1.0` for a true categorical sample). This per-position\n    stochastic unmasking avoids the degenerate loops that confidence\n    ranking produces. The mask token is never emitted.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "shift": {
-          "description": "Static timestep shift for `flow_matching` (default `1.0`). The base\nrectified-flow sigma `s` is transformed to\n`shift * s / (1 + (shift - 1) * s)`.",
-          "format": "float",
-          "minimum": 0.0,
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "temperature": {
-          "description": "Sampling temperature for a `masked_diffusion` scheduler. `0` (default)\nselects each masked position's argmax token deterministically; a positive\nvalue applies Gumbel noise (`logits.exp() / (-log u)^temperature`) before\nthe argmax, matching LLaDA's `add_gumbel_noise`. Confidence used for\nremasking is always the clean-softmax probability of the chosen token.",
-          "format": "float",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "use_exponential_sigmas": {
-          "description": "Use the exponential sigma spacing (`exp(linspace(log σ_max, log σ_min))`)\ninstead of linspace. Applies to `euler`/`dpmpp_2m`. Mutually exclusive\nwith `use_karras_sigmas` (Karras takes precedence).",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "use_karras_sigmas": {
-          "description": "Use the Karras (arXiv:2206.00364, rho=7) sigma spacing instead of the\ndefault linspace spacing. Applies to sigma-space schedulers (`euler`,\n`dpmpp_2m`); the most popular ComfyUI scheduler for those samplers.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "kind"
-      ],
-      "type": "object"
     },
     "SemanticInputRole": {
       "oneOf": [
@@ -4631,6 +2585,30 @@
             "max"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The selected axis may grow or shrink between iterations, but never exceed `max`.",
+          "properties": {
+            "axis": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "bounded",
+              "type": "string"
+            },
+            "max": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "axis",
+            "max"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -4691,34 +2669,6 @@
         "runtime"
       ],
       "type": "string"
-    },
-    "SolverSpec": {
-      "additionalProperties": false,
-      "properties": {
-        "algorithm": {
-          "type": "string"
-        },
-        "parameters": {
-          "additionalProperties": {
-            "format": "double",
-            "type": "number"
-          },
-          "default": {},
-          "type": "object"
-        },
-        "schedule": {
-          "default": [],
-          "items": {
-            "format": "double",
-            "type": "number"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "algorithm"
-      ],
-      "type": "object"
     },
     "SpecialTokens": {
       "description": "Special / control token ids declared by a model author.\n\nEvery field is optional; `eos_token_id` is normalized to a list because\nonnxruntime-genai accepts either a scalar or an array for it.",
@@ -5079,111 +3029,6 @@
       },
       "type": "object"
     },
-    "StateDeclaration": {
-      "additionalProperties": false,
-      "properties": {
-        "init": {
-          "$ref": "#/$defs/StateInit"
-        },
-        "scope": {
-          "$ref": "#/$defs/StateScope"
-        },
-        "type": {
-          "$ref": "#/$defs/TensorContract"
-        },
-        "update": {
-          "$ref": "#/$defs/StateUpdate"
-        }
-      },
-      "required": [
-        "type",
-        "init",
-        "update",
-        "scope"
-      ],
-      "type": "object"
-    },
-    "StateInit": {
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "zeros",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "ones",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "input",
-              "type": "string"
-            },
-            "source": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "source"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "value",
-              "type": "string"
-            },
-            "source": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "source"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "scalar",
-              "type": "string"
-            },
-            "value": {
-              "$ref": "#/$defs/ScalarValue"
-            }
-          },
-          "required": [
-            "kind",
-            "value"
-          ],
-          "type": "object"
-        }
-      ]
-    },
     "StateInitKind": {
       "description": "Loop-carried state initialization vocabulary.",
       "oneOf": [
@@ -5204,85 +3049,6 @@
         }
       ],
       "type": "string"
-    },
-    "StateScope": {
-      "enum": [
-        "invocation",
-        "loop",
-        "request",
-        "session"
-      ],
-      "type": "string"
-    },
-    "StateUpdate": {
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "replace",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "axis": {
-              "format": "int64",
-              "type": "integer"
-            },
-            "kind": {
-              "const": "append",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "axis"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "axis": {
-              "format": "int64",
-              "type": "integer"
-            },
-            "indices": {
-              "type": "string"
-            },
-            "kind": {
-              "const": "scatter",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "axis",
-            "indices"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "accumulate",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
-        }
-      ]
     },
     "StateUpdateKind": {
       "description": "Loop-carried state update-semantics vocabulary.",
@@ -5618,58 +3384,6 @@
       ],
       "description": "One fixed or runtime-resolved tensor-shape dimension."
     },
-    "Termination": {
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "properties": {
-            "count": {
-              "format": "uint",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "kind": {
-              "const": "iterations",
-              "type": "string"
-            },
-            "start": {
-              "default": 0,
-              "format": "uint",
-              "minimum": 0,
-              "type": "integer"
-            }
-          },
-          "required": [
-            "kind",
-            "count"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "condition": {
-              "$ref": "#/$defs/Predicate"
-            },
-            "kind": {
-              "const": "predicate",
-              "type": "string"
-            },
-            "max_iterations": {
-              "format": "uint",
-              "minimum": 0,
-              "type": "integer"
-            }
-          },
-          "required": [
-            "kind",
-            "condition",
-            "max_iterations"
-          ],
-          "type": "object"
-        }
-      ]
-    },
     "ThumbnailOrder": {
       "description": "Optional-thumbnail ordering vocabulary.",
       "oneOf": [
@@ -5793,35 +3507,6 @@
         }
       ]
     },
-    "WorkflowBranchEffectMerge": {
-      "additionalProperties": false,
-      "properties": {
-        "cases": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "type": "object"
-        },
-        "default": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "incoming": {
-          "type": "string"
-        },
-        "produces": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "incoming",
-        "cases",
-        "produces"
-      ],
-      "type": "object"
-    },
     "WorkflowBranchOutput": {
       "additionalProperties": false,
       "properties": {
@@ -5843,9 +3528,41 @@
       ],
       "type": "object"
     },
+    "WorkflowCarry": {
+      "additionalProperties": false,
+      "properties": {
+        "cell": {
+          "type": "string"
+        },
+        "initial": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "next": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "cell",
+        "next"
+      ],
+      "type": "object"
+    },
     "WorkflowComponent": {
       "additionalProperties": false,
       "properties": {
+        "contract": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ComponentContract"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "effects": {
           "default": [],
           "items": {
@@ -5856,18 +3573,12 @@
         "implementation": {
           "$ref": "#/$defs/ComponentImplementation"
         },
-        "policy": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PolicyComponentContract"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "ports": {
-          "$ref": "#/$defs/ComponentPorts"
+          "$ref": "#/$defs/ComponentPorts",
+          "default": {
+            "inputs": {},
+            "outputs": {}
+          }
         },
         "resources": {
           "anyOf": [
@@ -5881,8 +3592,7 @@
         }
       },
       "required": [
-        "implementation",
-        "ports"
+        "implementation"
       ],
       "type": "object"
     },
@@ -5996,42 +3706,6 @@
         }
       ]
     },
-    "WorkflowLoopCarry": {
-      "additionalProperties": false,
-      "properties": {
-        "body_input": {
-          "type": "string"
-        },
-        "body_output": {
-          "type": "string"
-        },
-        "cell": {
-          "type": "string"
-        },
-        "current": {
-          "type": "string"
-        },
-        "next": {
-          "type": "string"
-        },
-        "read_effect": {
-          "$ref": "#/$defs/EffectTransition"
-        },
-        "write_effect": {
-          "$ref": "#/$defs/EffectTransition"
-        }
-      },
-      "required": [
-        "cell",
-        "current",
-        "body_input",
-        "body_output",
-        "next",
-        "read_effect",
-        "write_effect"
-      ],
-      "type": "object"
-    },
     "WorkflowLoopIteration": {
       "additionalProperties": false,
       "properties": {
@@ -6101,221 +3775,6 @@
         "pinned"
       ],
       "type": "string"
-    },
-    "WorkflowNode": {
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "sequence",
-              "type": "string"
-            },
-            "nodes": {
-              "items": {
-                "$ref": "#/$defs/WorkflowNode"
-              },
-              "type": "array"
-            }
-          },
-          "required": [
-            "kind",
-            "nodes"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "component": {
-              "type": "string"
-            },
-            "effects": {
-              "additionalProperties": {
-                "$ref": "#/$defs/EffectTransition"
-              },
-              "default": {},
-              "type": "object"
-            },
-            "inputs": {
-              "additionalProperties": {
-                "type": "string"
-              },
-              "default": {},
-              "type": "object"
-            },
-            "kind": {
-              "const": "invoke",
-              "type": "string"
-            },
-            "outputs": {
-              "additionalProperties": {
-                "type": "string"
-              },
-              "default": {},
-              "type": "object"
-            }
-          },
-          "required": [
-            "kind",
-            "component"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "body": {
-              "$ref": "#/$defs/WorkflowNode"
-            },
-            "carried": {
-              "default": [],
-              "items": {
-                "$ref": "#/$defs/WorkflowLoopCarry"
-              },
-              "type": "array"
-            },
-            "condition": {
-              "type": "string"
-            },
-            "iteration": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/WorkflowLoopIteration"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Optional zero-based induction value, scoped to this loop's body and condition."
-            },
-            "kind": {
-              "const": "loop",
-              "type": "string"
-            },
-            "max_iterations": {
-              "type": "string"
-            },
-            "setup": {
-              "$ref": "#/$defs/WorkflowNode"
-            }
-          },
-          "required": [
-            "kind",
-            "setup",
-            "body",
-            "condition",
-            "max_iterations"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "cases": {
-              "additionalProperties": {
-                "$ref": "#/$defs/WorkflowNode"
-              },
-              "type": "object"
-            },
-            "default": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/WorkflowNode"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "effects": {
-              "additionalProperties": {
-                "$ref": "#/$defs/WorkflowBranchEffectMerge"
-              },
-              "default": {},
-              "type": "object"
-            },
-            "kind": {
-              "const": "branch",
-              "type": "string"
-            },
-            "outputs": {
-              "additionalProperties": {
-                "$ref": "#/$defs/WorkflowBranchOutput"
-              },
-              "default": {},
-              "type": "object"
-            },
-            "predicate": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "predicate",
-            "cases"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "effect": {
-              "$ref": "#/$defs/EffectTransition"
-            },
-            "effect_name": {
-              "type": "string"
-            },
-            "kind": {
-              "const": "emit",
-              "type": "string"
-            },
-            "mode": {
-              "$ref": "#/$defs/WorkflowEmitMode"
-            },
-            "output": {
-              "type": "string"
-            },
-            "value": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "value",
-            "output",
-            "mode",
-            "effect_name",
-            "effect"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "device": {
-              "$ref": "#/$defs/DeviceKind"
-            },
-            "input": {
-              "type": "string"
-            },
-            "kind": {
-              "const": "transfer",
-              "type": "string"
-            },
-            "output": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "input",
-            "output",
-            "device"
-          ],
-          "type": "object"
-        }
-      ]
     },
     "WorkflowOutput": {
       "additionalProperties": false,
@@ -6399,16 +3858,6 @@
           },
           "type": "object"
         },
-        "graph": {
-          "$ref": "#/$defs/WorkflowNode"
-        },
-        "initial_effects": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {},
-          "type": "object"
-        },
         "inputs": {
           "additionalProperties": {
             "$ref": "#/$defs/WorkflowInput"
@@ -6442,18 +3891,28 @@
           },
           "default": {},
           "type": "object"
+        },
+        "steps": {
+          "items": {
+            "$ref": "#/$defs/WorkflowStep"
+          },
+          "type": "array"
         }
       },
       "required": [
         "manifest",
         "components",
-        "graph"
+        "steps"
       ],
       "type": "object"
     },
     "WorkflowStateCell": {
       "additionalProperties": false,
       "properties": {
+        "class": {
+          "$ref": "#/$defs/WorkflowStateClass",
+          "default": "semantic"
+        },
         "contract": {
           "$ref": "#/$defs/TensorContract"
         },
@@ -6485,12 +3944,198 @@
       ],
       "type": "object"
     },
+    "WorkflowStateClass": {
+      "enum": [
+        "semantic",
+        "advisory"
+      ],
+      "type": "string"
+    },
     "WorkflowStateScope": {
       "enum": [
         "invocation",
         "session"
       ],
       "type": "string"
+    },
+    "WorkflowStep": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "sequence",
+              "type": "string"
+            },
+            "steps": {
+              "items": {
+                "$ref": "#/$defs/WorkflowStep"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "steps"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "component": {
+              "type": "string"
+            },
+            "inputs": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "type": "object"
+            },
+            "kind": {
+              "const": "invoke",
+              "type": "string"
+            },
+            "outputs": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "type": "object"
+            }
+          },
+          "required": [
+            "kind",
+            "component"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "carried": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/WorkflowCarry"
+              },
+              "type": "array"
+            },
+            "condition": {
+              "type": "string"
+            },
+            "iteration": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WorkflowLoopIteration"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "const": "loop",
+              "type": "string"
+            },
+            "max_iterations": {
+              "type": "string"
+            },
+            "setup": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/WorkflowStep"
+              },
+              "type": "array"
+            },
+            "steps": {
+              "items": {
+                "$ref": "#/$defs/WorkflowStep"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "steps",
+            "condition",
+            "max_iterations"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "cases": {
+              "additionalProperties": {
+                "$ref": "#/$defs/WorkflowStep"
+              },
+              "type": "object"
+            },
+            "default": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WorkflowStep"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "const": "branch",
+              "type": "string"
+            },
+            "outputs": {
+              "additionalProperties": {
+                "$ref": "#/$defs/WorkflowBranchOutput"
+              },
+              "default": {},
+              "type": "object"
+            },
+            "predicate": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "predicate",
+            "cases"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "emit",
+              "type": "string"
+            },
+            "mode": {
+              "$ref": "#/$defs/WorkflowEmitMode"
+            },
+            "output": {
+              "type": "string"
+            },
+            "valid_length": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value",
+            "output",
+            "mode"
+          ],
+          "type": "object"
+        }
+      ]
     }
   },
   "$id": "https://github.com/onnx/onnx/issues/8184",

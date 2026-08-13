@@ -41,7 +41,7 @@ def _codec_package() -> ModelPackage:
     return ModelPackage({"encoder": encoder, "decoder": decoder})
 
 
-def test_codec_workflow_has_typed_ssa_effects_and_audio_emit():
+def test_codec_workflow_has_typed_ssa_and_audio_emit():
     metadata = build_audio_codec_workflow_metadata(_codec_package())
     pipeline = metadata["pipeline"]
     assert not {"models", "dataflow", "strategy", "phases"}.intersection(pipeline)
@@ -60,7 +60,7 @@ def test_codec_workflow_has_typed_ssa_effects_and_audio_emit():
     assert workflow["components"]["encoder"]["effects"] == ["codec_encode"]
     assert workflow["components"]["decoder"]["effects"] == ["codec_decode"]
 
-    encode, decode, emit = workflow["graph"]["nodes"]
+    encode, decode, emit = workflow["steps"]
     assert encode["outputs"] == {"codes": "codec.codes"}
     assert decode["inputs"] == {"codes": "codec.codes"}
     assert emit == {
@@ -68,8 +68,6 @@ def test_codec_workflow_has_typed_ssa_effects_and_audio_emit():
         "value": "codec.waveform",
         "output": "waveform",
         "mode": "replace",
-        "effect_name": "audio_emit",
-        "effect": {"consumes": "audio_emit.0", "produces": "audio_emit.1"},
     }
     assert workflow["outputs"]["waveform"]["role"] == "audio"
     assert workflow["outputs"]["waveform"]["stage"] == "post_adapter"
@@ -156,12 +154,12 @@ def test_tts_uses_nested_lexical_loop_induction_and_codec():
     workflow = build_tts_workflow_metadata(_tts_package(), _TtsConfig())["pipeline"][
         "workflow"
     ]
-    outer = workflow["graph"]["nodes"][0]
-    inner = outer["body"]["nodes"][2]
+    outer = workflow["steps"][0]
+    inner = outer["steps"][2]
     assert outer["iteration"]["value"] == "talker.iteration"
     assert inner["iteration"]["value"] == "code.iteration"
-    assert inner["body"]["nodes"][0]["inputs"]["step_index"] == "code.iteration"
-    assert workflow["graph"]["nodes"][-2]["component"] == "codec"
+    assert inner["steps"][0]["inputs"]["step_index"] == "code.iteration"
+    assert workflow["steps"][-2]["component"] == "codec"
     assert workflow["outputs"]["waveform"]["stage"] == "post_adapter"
 
 
@@ -186,18 +184,15 @@ def test_real_qwen3_tts_workflow_carries_trained_transitions_and_kv_state():
         workflow["state"]["predictor_cache_0"]["recurrence"]["max"]
         == "package.predictor_context_limit"
     )
-    outer = workflow["graph"]["nodes"][0]
+    outer = workflow["steps"][0]
     setup_history = next(
-        node
-        for node in outer["setup"]["nodes"]
-        if node.get("component") == "code_history_append"
+        node for node in outer["setup"] if node.get("component") == "code_history_append"
     )
     assert setup_history["inputs"]["frame"].startswith("setup.predictor.remaining_")
 
     assert outer["kind"] == "loop"
-    inner = next(node for node in outer["body"]["nodes"] if node["kind"] == "loop")
+    inner = next(node for node in outer["steps"] if node["kind"] == "loop")
     assert inner["iteration"]["value"] == "code.iteration"
     assert any(
-        node.get("component") == "code_predictor_step_embedder"
-        for node in inner["body"]["nodes"]
+        node.get("component") == "code_predictor_step_embedder" for node in inner["steps"]
     )

@@ -34,7 +34,7 @@ class PolicyRole(StrEnum):
     MASKED_UPDATE = "masked_update"
     SPECULATIVE_ACCEPTANCE = "speculative_verifier"
     GRAMMAR_GUIDANCE = "grammar_guidance"
-    ADAPTIVE_K = "adaptive_k"
+    ADAPTIVE_K = "adaptive_proposal_budget"
     STATE_UPDATE = "state_update"
     AUXILIARY = "auxiliary"
 
@@ -186,11 +186,15 @@ def build_last_token_logits() -> PolicyComponent:
 
 
 def build_boolean_not() -> PolicyComponent:
-    """Build an explicit ``continue = Not(done)`` predicate transform."""
+    """Build one synchronized ``continue = Not(Any(done))`` predicate."""
     graph, builder = _make_graph("boolean_not")
     done = builder.input("done", dtype=ir.DataType.BOOL, shape=["batch"])
-    continued = builder.op.Not(done)
-    continued.shape = ir.Shape(["batch"])
+    any_done = builder.op.ReduceMax(
+        builder.op.Cast(done, to=ir.DataType.INT64),
+        keepdims=1,
+    )
+    continued = builder.op.Equal(any_done, builder.op.Constant(value_int=0))
+    continued.shape = ir.Shape([1])
     builder.add_output(continued, "continue")
     return _component(PolicyRole.AUXILIARY, graph, {})
 
@@ -216,6 +220,16 @@ def build_integer_minimum() -> PolicyComponent:
     return _component(PolicyRole.AUXILIARY, graph, {})
 
 
+def build_batch_minimum() -> PolicyComponent:
+    """Synchronize a per-batch integer length to one conservative scalar."""
+    graph, builder = _make_graph("batch_minimum")
+    values = builder.input("values", ir.DataType.INT64, ["batch"])
+    minimum = builder.op.ReduceMin(values, keepdims=1)
+    minimum.shape = ir.Shape([1])
+    builder.add_output(minimum, "minimum")
+    return _component(PolicyRole.AUXILIARY, graph, {})
+
+
 def build_proposal_metrics() -> PolicyComponent:
     """Derive evaluated width and budget fullness from a dense proposal."""
     graph, builder = _make_graph("proposal_metrics")
@@ -229,6 +243,20 @@ def build_proposal_metrics() -> PolicyComponent:
     filled.shape = ir.Shape(["batch"])
     builder.add_output(length, "evaluated")
     builder.add_output(filled, "filled_proposal_budget")
+    return _component(PolicyRole.AUXILIARY, graph, {})
+
+
+def build_sequence_length() -> PolicyComponent:
+    """Expand a dense rank-2 token block's sequence width per batch."""
+    graph, builder = _make_graph("sequence_length")
+    op = builder.op
+    tokens = builder.input("tokens", ir.DataType.INT64, ["batch", "sequence"])
+    length = op.Expand(
+        op.Shape(tokens, start=1, end=2),
+        op.Shape(tokens, start=0, end=1),
+    )
+    length.shape = ir.Shape(["batch"])
+    builder.add_output(length, "length")
     return _component(PolicyRole.AUXILIARY, graph, {})
 
 

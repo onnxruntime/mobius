@@ -425,9 +425,7 @@ def _max_token_grid_transforms(config: Any, values: dict[str, Any]) -> list[dict
     return _area_grid_transforms(config, declared)
 
 
-def _match_max_token_grid(
-    ports: list[_Port], values: dict[str, Any]
-) -> _ImageProgram | None:
+def _match_max_token_grid(ports: list[_Port], values: dict[str, Any]) -> _ImageProgram | None:
     bindings = _match_packed_grid(ports)
     if bindings is None or not all(
         isinstance(values.get(key), int)
@@ -1382,6 +1380,29 @@ def add_policy_components_to_workflow(
         return metadata
     components = workflow.setdefault("components", {})
     workflow_dtypes = {"fp16": "float16", "bf16": "bfloat16", "fp32": "float32"}
+
+    def semantic_contract(contract: dict[str, Any]) -> dict[str, Any]:
+        role = str(contract["role"]).replace("_", "-")
+        bindings = {
+            key: value
+            for key, value in contract.items()
+            if key not in {"role", "mode", "effect", "rng", "state_class"}
+            and isinstance(value, str)
+        }
+        rng = contract.get("rng")
+        if isinstance(rng, dict):
+            bindings.update(
+                {key: value for key, value in rng.items() if isinstance(value, str)}
+            )
+        declaration: dict[str, Any] = {
+            "id": f"onnx-genai.{role}",
+            "version": "1",
+            "bindings": bindings,
+        }
+        if "mode" in contract:
+            declaration["parameters"] = {"mode": contract["mode"]}
+        return declaration
+
     for name, component in policy_components.items():
         model = component.model
         declaration = {
@@ -1418,7 +1439,7 @@ def add_policy_components_to_workflow(
             "effects": list(component.effects),
         }
         if component.contract:
-            declaration["policy"] = component.contract
+            declaration["contract"] = semantic_contract(component.contract)
         components[name] = declaration
     return metadata
 

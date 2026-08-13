@@ -58,12 +58,15 @@ def _euler_schedule(
             "workflow diffusion does not yet materialize Karras or exponential sigmas"
         )
     if scheduler.beta_schedule == "scaled_linear":
-        betas = np.linspace(
-            np.sqrt(scheduler.beta_start),
-            np.sqrt(scheduler.beta_end),
-            scheduler.num_train_timesteps,
-            dtype=np.float64,
-        ) ** 2
+        betas = (
+            np.linspace(
+                np.sqrt(scheduler.beta_start),
+                np.sqrt(scheduler.beta_end),
+                scheduler.num_train_timesteps,
+                dtype=np.float64,
+            )
+            ** 2
+        )
     elif scheduler.beta_schedule == "linear":
         betas = np.linspace(
             scheduler.beta_start,
@@ -73,8 +76,7 @@ def _euler_schedule(
         )
     else:
         raise ValueError(
-            f"workflow diffusion does not support beta schedule "
-            f"{scheduler.beta_schedule!r}"
+            f"workflow diffusion does not support beta schedule {scheduler.beta_schedule!r}"
         )
     training_sigmas = np.sqrt((1.0 - np.cumprod(1.0 - betas)) / np.cumprod(1.0 - betas))
     timesteps = np.linspace(
@@ -89,6 +91,7 @@ def _euler_schedule(
         training_sigmas,
     )
     return timesteps.tolist(), [*sigmas.tolist(), 0.0]
+
 
 _DENOISER_KEYS = ("denoiser", "transformer", "unet")
 
@@ -454,7 +457,8 @@ def write_onnx_genai_config(
     scheduler: SchedulerConfig | None = None,
     guidance_scale: float | None = None,
     source: str | None = None,
-    revision: str | None = None,
+    grammar_guidance: bool = False,
+    adaptive_k_max: int | None = None,
     **kwargs: Any,
 ) -> dict[str, str]:
     """Write ``inference_metadata.yaml`` into ``output_dir`` and return its path.
@@ -529,9 +533,7 @@ def write_onnx_genai_config(
                 "component before guidance_scale can differ from 1.0"
             )
         resolved_scheduler = scheduler or SchedulerConfig(kind="euler")
-        timesteps, sigma_schedule = _euler_schedule(
-            resolved_scheduler, num_inference_steps
-        )
+        timesteps, sigma_schedule = _euler_schedule(resolved_scheduler, num_inference_steps)
         path = write_diffusion_workflow_metadata(
             pkg,
             output_dir,
@@ -560,7 +562,12 @@ def write_onnx_genai_config(
                 "workflow speculative export derives KV state dtype from ONNX ports; "
                 "kv_native_dtype overrides are unsupported"
             )
-        path = write_speculative_workflow_metadata(pkg, output_dir)
+        path = write_speculative_workflow_metadata(
+            pkg,
+            output_dir,
+            grammar_guidance=grammar_guidance,
+            adaptive_k_max=adaptive_k_max,
+        )
         return {"inference_metadata": path}
 
     resolved_config = config if config is not None else getattr(pkg, "config", None)

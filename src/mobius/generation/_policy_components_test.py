@@ -13,6 +13,7 @@ from mobius.generation import (
     PolicyRole,
     attach_policy_components,
     build_adaptive_k_policy,
+    build_batch_minimum,
     build_boolean_not,
     build_code_frame_update,
     build_decoder_state_initializer,
@@ -120,6 +121,12 @@ def test_speculative_guidance_length_and_budget_math(tmp_path):
     np.testing.assert_array_equal(minimum, [2, 1])
     np.testing.assert_array_equal(evaluated, [3, 3])
     np.testing.assert_array_equal(filled, [True, False])
+    (synchronized,) = _run(
+        build_batch_minimum(),
+        tmp_path,
+        {"values": np.array([2, 1, 3], np.int64)},
+    )
+    np.testing.assert_array_equal(synchronized, [1])
 
 
 def test_adaptive_k_ignores_invalid_telemetry_per_batch(tmp_path):
@@ -161,7 +168,7 @@ def test_last_token_logits_and_continue_predicate_runtime(tmp_path):
         tmp_path,
         {"done": np.array([True, False])},
     )
-    np.testing.assert_array_equal(continued, [False, True])
+    np.testing.assert_array_equal(continued, [False])
 
 
 def test_decoder_state_initializer_and_step_update_runtime(tmp_path):

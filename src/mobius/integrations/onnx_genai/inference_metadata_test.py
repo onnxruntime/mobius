@@ -58,12 +58,15 @@ def test_max_token_packed_grid_derives_pixel_area_bounds():
     assert program is not None
     resize = next(
         transform
-        for transform in program.transforms(None, {
-            "patch_size": 14,
-            "temporal_patch_size": 2,
-            "merge_size": 2,
-            "max_image_tokens": 4096,
-        })
+        for transform in program.transforms(
+            None,
+            {
+                "patch_size": 14,
+                "temporal_patch_size": 2,
+                "merge_size": 2,
+                "max_image_tokens": 4096,
+            },
+        )
         if transform["op"] == "resize"
     )
     assert resize["min_pixels"] == 784
@@ -93,12 +96,11 @@ def test_workflow_policy_components_reference_saved_onnx_artifacts(tmp_path):
     }
     assert set(component["ports"]["inputs"]) == {"logits"}
     assert set(component["ports"]["outputs"]) == {"token"}
-    assert component["policy"] == {
-        "role": "token_sampler",
-        "mode": "greedy",
-        "logits": "logits",
-        "token": "token",
-        "effect": "sample",
+    assert component["contract"] == {
+        "id": "onnx-genai.token-sampler",
+        "version": "1",
+        "bindings": {"logits": "logits", "token": "token"},
+        "parameters": {"mode": "greedy"},
     }
     assert component["effects"] == ["sample"]
     assert (tmp_path / component["implementation"]["artifact"]).is_file()

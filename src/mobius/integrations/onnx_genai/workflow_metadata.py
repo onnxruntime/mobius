@@ -15,6 +15,7 @@ from mobius._constants import OPSET_VERSION
 from mobius.generation import (
     PolicyCapabilities,
     attach_policy_components,
+    build_batch_minimum,
     build_boolean_not,
     build_code_frame_update,
     build_code_history_append,
@@ -26,10 +27,13 @@ from mobius.generation import (
     build_euler_solver_step,
     build_greedy_sampler,
     build_integer_increment,
+    build_integer_minimum,
     build_last_token_logits,
     build_model_token_cast,
+    build_proposal_metrics,
     build_schedule_constant,
     build_schedule_lookup,
+    build_sequence_length,
     build_speculative_state_rollback,
     build_token_block_identity,
     build_token_to_slot,
@@ -75,8 +79,168 @@ def _component(
     return component
 
 
+def _grammar_adapter_component(action: str) -> dict[str, Any]:
+    """Declare one action of the versioned grammar-guidance adapter ABI."""
+
+    def port(dtype: str, shape: list[int | str]) -> dict[str, Any]:
+        return {"dtype": dtype, "rank": len(shape), "shape": shape}
+
+    return {
+        "implementation": {
+            "kind": "adapter",
+            "abi": "onnx-genai.grammar-guidance",
+            "version": "1",
+        },
+        "ports": {
+            "inputs": {
+                "state": port("int64", ["batch"]),
+                "tokens": port("int64", ["batch", "proposal"]),
+                "valid_length": port("int64", ["batch"]),
+                "transition_table": port("int64", ["grammar_states", "vocabulary"]),
+            },
+            "outputs": {
+                "next_state": port("int64", ["batch"]),
+                "consumed_length": port("int64", ["batch"]),
+                "logits_mask": port("bool", ["batch", "vocabulary"]),
+                "forced_tokens": port("int64", ["batch", 1]),
+                "forced_length": port("int64", ["batch"]),
+            },
+        },
+        "contract": {
+            "id": "onnx-genai.grammar-guidance",
+            "version": "1",
+            "bindings": {
+                "state": "state",
+                "tokens": "tokens",
+                "valid_length": "valid_length",
+                "transition_table": "transition_table",
+                "next_state": "next_state",
+                "consumed_length": "consumed_length",
+                "logits_mask": "logits_mask",
+                "forced_tokens": "forced_tokens",
+                "forced_length": "forced_length",
+            },
+            "parameters": {"action": action},
+        },
+        "effects": ["grammar"],
+    }
+
+
 def _effect(consumes: str, produces: str) -> dict[str, str]:
     return {"consumes": consumes, "produces": produces}
+
+
+def _publish_workflow_v1(workflow: dict[str, Any]) -> dict[str, Any]:
+    """Lower the producer's explicit-effect graph into the public v1 step IR."""
+    graph = workflow.pop("graph")
+    workflow.pop("initial_effects", None)
+    substitutions: dict[str, str] = {}
+    cell_aliases = {
+        cell: f"{cell}_state" if cell in workflow.get("outputs", {}) else cell
+        for cell in workflow.get("state", {})
+    }
+    if any(cell != alias for cell, alias in cell_aliases.items()):
+        workflow["state"] = {
+            cell_aliases[cell]: declaration for cell, declaration in workflow["state"].items()
+        }
+
+    def collect_carried(node: dict[str, Any]) -> None:
+        if node["kind"] == "loop":
+            for carry in node.get("carried", []):
+                alias = cell_aliases.get(carry["cell"], carry["cell"])
+                substitutions[carry["body_input"]] = alias
+                substitutions[carry["next"]] = alias
+            collect_carried(node["setup"])
+            collect_carried(node["body"])
+        elif node["kind"] == "sequence":
+            for child in node["nodes"]:
+                collect_carried(child)
+        elif node["kind"] == "branch":
+            for case in node["cases"].values():
+                collect_carried(case)
+            if "default" in node:
+                collect_carried(node["default"])
+
+    def rewrite(value: Any) -> Any:
+        if isinstance(value, str):
+            return substitutions.get(value, value)
+        if isinstance(value, list):
+            return [rewrite(item) for item in value]
+        if isinstance(value, dict):
+            return {key: rewrite(item) for key, item in value.items()}
+        return value
+
+    def convert(node: dict[str, Any]) -> dict[str, Any]:
+        kind = node["kind"]
+        if kind == "sequence":
+            return {
+                "kind": "sequence",
+                "steps": [convert(child) for child in node["nodes"]],
+            }
+        if kind == "invoke":
+            return {
+                "kind": "invoke",
+                "component": node["component"],
+                "inputs": rewrite(node.get("inputs", {})),
+                "outputs": rewrite(node.get("outputs", {})),
+            }
+        if kind == "emit":
+            result = {
+                "kind": "emit",
+                "value": rewrite(node["value"]),
+                "output": node["output"],
+                "mode": node["mode"],
+            }
+            if "valid_length" in node:
+                result["valid_length"] = rewrite(node["valid_length"])
+            return result
+        if kind == "branch":
+            result = {
+                "kind": "branch",
+                "predicate": rewrite(node["predicate"]),
+                "cases": {name: convert(case) for name, case in node["cases"].items()},
+                "outputs": rewrite(node.get("outputs", {})),
+            }
+            if "default" in node:
+                result["default"] = convert(node["default"])
+            return result
+        if kind == "loop":
+            setup = node["setup"]
+            body = node["body"]
+            setup_steps = (
+                [convert(child) for child in setup["nodes"]]
+                if setup["kind"] == "sequence"
+                else [convert(setup)]
+            )
+            body_steps = (
+                [convert(child) for child in body["nodes"]]
+                if body["kind"] == "sequence"
+                else [convert(body)]
+            )
+            result = {
+                "kind": "loop",
+                "setup": setup_steps,
+                "steps": body_steps,
+                "condition": rewrite(node["condition"]),
+                "max_iterations": rewrite(node["max_iterations"]),
+                "carried": [
+                    {
+                        "cell": cell_aliases.get(carry["cell"], carry["cell"]),
+                        "initial": rewrite(carry["current"]),
+                        "next": rewrite(carry["body_output"]),
+                    }
+                    for carry in node.get("carried", [])
+                ],
+            }
+            if "iteration" in node:
+                result["iteration"] = node["iteration"]
+            return result
+        raise ValueError(f"unsupported workflow node kind {kind!r}")
+
+    collect_carried(graph)
+    published = convert(graph)
+    workflow["steps"] = published["steps"] if published["kind"] == "sequence" else [published]
+    return workflow
 
 
 def _name_image_preprocessing_program(image: dict[str, Any]) -> None:
@@ -239,7 +403,7 @@ def build_audio_codec_workflow_metadata(pkg: Any) -> dict[str, Any]:
             ],
         },
     }
-    return {"schema_version": "v1", "pipeline": {"workflow": workflow}}
+    return {"schema_version": "v1", "pipeline": {"workflow": _publish_workflow_v1(workflow)}}
 
 
 def write_audio_codec_workflow_metadata(pkg: Any, output_dir: str) -> str:
@@ -1200,7 +1364,10 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             ],
         },
     }
-    metadata = {"schema_version": "v1", "pipeline": {"workflow": workflow}}
+    metadata = {
+        "schema_version": "v1",
+        "pipeline": {"workflow": _publish_workflow_v1(workflow)},
+    }
     add_policy_components_to_workflow(metadata, pkg)
     return metadata
 
@@ -1660,7 +1827,10 @@ def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
         "initial_effects": initial_effects,
         "graph": {"kind": "sequence", "nodes": post_nodes},
     }
-    metadata = {"schema_version": "v1", "pipeline": {"workflow": workflow}}
+    metadata = {
+        "schema_version": "v1",
+        "pipeline": {"workflow": _publish_workflow_v1(workflow)},
+    }
     add_policy_components_to_workflow(metadata, pkg)
     return metadata
 
@@ -1991,7 +2161,10 @@ def build_diffusion_workflow_metadata(
             ],
         },
     }
-    metadata = {"schema_version": "v1", "pipeline": {"workflow": workflow}}
+    metadata = {
+        "schema_version": "v1",
+        "pipeline": {"workflow": _publish_workflow_v1(workflow)},
+    }
     add_policy_components_to_workflow(metadata, pkg)
     return metadata
 
@@ -2100,7 +2273,7 @@ def build_vlm_workflow_metadata(
         value
         for value in decoder.graph.inputs
         if value.name not in cache_names
-        and value.dtype in {ir.DataType.INT32, ir.DataType.INT64}
+        and value.dtype == ir.DataType.INT64
         and value.shape is not None
         and len(value.shape) == 2
     ]
@@ -2564,7 +2737,7 @@ def build_vlm_workflow_metadata(
     metadata = {
         "schema_version": "v1",
         "preprocessing": preprocessing,
-        "pipeline": {"workflow": workflow},
+        "pipeline": {"workflow": _publish_workflow_v1(workflow)},
     }
     add_policy_components_to_workflow(metadata, pkg)
     return metadata
@@ -2589,6 +2762,9 @@ def write_vlm_workflow_metadata(
 def build_speculative_workflow_metadata(
     pkg: Any,
     config: Any | None = None,
+    *,
+    grammar_guidance: bool = False,
+    adaptive_k_max: int | None = None,
 ) -> dict[str, Any]:
     """Build proposer/verifier workflow with branch phi and effect joins."""
     config = config or getattr(pkg, "config", None)
@@ -2623,17 +2799,50 @@ def build_speculative_workflow_metadata(
     assert proposed_tokens is not None
     assert verifier_token_input is not None
     assert target_scores is not None
+    proposal_budget_input = next(
+        (
+            value
+            for value in proposer.graph.inputs
+            if value is not proposer_input
+            and value.dtype == ir.DataType.INT64
+            and value.shape is not None
+            and len(value.shape) == 1
+            and any(term in value.name.lower() for term in ("budget", "proposal_k", "draft_k"))
+        ),
+        None,
+    )
+    if adaptive_k_max is not None and proposal_budget_input is None:
+        raise ValueError(
+            "adaptive speculative workflow requires a rank-1 proposer budget input"
+        )
     if _contract(proposer_input) != _contract(proposed_tokens):
         raise ValueError(
             "representative speculative workflow requires fixed token-block shape"
         )
 
-    attach_policy_components(pkg, PolicyCapabilities(speculative_acceptance=True))
+    attach_policy_components(
+        pkg,
+        PolicyCapabilities(
+            speculative_acceptance=True,
+            grammar_guidance=grammar_guidance,
+            adaptive_k_max=adaptive_k_max,
+        ),
+    )
     pkg.add_policy_component("continue_predicate", build_boolean_not())
     pkg.add_policy_component("branch_state", build_token_block_identity())
+    if grammar_guidance:
+        pkg.add_policy_component("grammar_length", build_integer_minimum())
+        pkg.add_policy_component("grammar_emit_length", build_batch_minimum())
+        pkg.add_policy_component("grammar_rollback_length", build_integer_minimum())
+        pkg.add_policy_component("grammar_sampler_logits", build_last_token_logits())
+        if adaptive_k_max is None:
+            pkg.add_policy_component("proposal_length", build_sequence_length())
+    if adaptive_k_max is not None:
+        pkg.add_policy_component("proposal_metrics", build_proposal_metrics())
     batch = _contract(proposer_input)["shape"][0]
     batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
-    batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch]}
+    control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
+    control_bool = {"dtype": "bool", "rank": 1, "shape": [1]}
     inputs: dict[str, Any] = {
         "request.tokens": {
             "contract": _contract(proposer_input),
@@ -2649,7 +2858,7 @@ def build_speculative_workflow_metadata(
             "default": 0,
         },
         "request.max_iterations": {
-            "contract": batch_int,
+            "contract": control_int,
             "role": {
                 "kind": "runtime",
                 "version": "1.0",
@@ -2673,24 +2882,101 @@ def build_speculative_workflow_metadata(
             "default": 1,
         },
         "package.max_context": {
-            "contract": batch_int,
+            "contract": control_int,
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
             "default": int(getattr(config, "max_position_embeddings", 4096)),
         },
         "package.false": {
-            "contract": batch_bool,
+            "contract": control_bool,
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
             "default": False,
         },
     }
+    if grammar_guidance:
+        inputs.update(
+            {
+                "request.grammar_state": {
+                    "contract": batch_int,
+                    "role": {"kind": "opaque"},
+                    "source": {
+                        "kind": "application",
+                        "name": "grammar.initial_state",
+                    },
+                    "required": True,
+                },
+                "request.grammar_transition_table": {
+                    "contract": {
+                        "dtype": "int64",
+                        "rank": 2,
+                        "shape": ["grammar_states", "vocabulary"],
+                    },
+                    "role": {"kind": "opaque"},
+                    "source": {
+                        "kind": "application",
+                        "name": "grammar.transition_table",
+                    },
+                    "required": True,
+                },
+            }
+        )
+    if adaptive_k_max is not None:
+        estimate_slots = 4 * (adaptive_k_max + 1) + 4
+        inputs.update(
+            {
+                "request.adaptive_k": {
+                    "contract": batch_int,
+                    "role": {"kind": "opaque"},
+                    "source": {"kind": "application", "name": "adaptive.current_k"},
+                    "required": False,
+                    "default": 1,
+                },
+                "request.adaptive_estimates": {
+                    "contract": {
+                        "dtype": "float32",
+                        "rank": 2,
+                        "shape": [batch, estimate_slots],
+                    },
+                    "role": {"kind": "opaque"},
+                    "source": {
+                        "kind": "application",
+                        "name": "adaptive.estimates",
+                    },
+                    "required": False,
+                    "default": 0.0,
+                },
+                "request.draft_ms": {
+                    "contract": {
+                        "dtype": "float32",
+                        "rank": 1,
+                        "shape": [batch],
+                    },
+                    "role": {"kind": "opaque"},
+                    "source": {"kind": "application", "name": "telemetry.draft_ms"},
+                    "required": True,
+                },
+                "request.target_ms": {
+                    "contract": {
+                        "dtype": "float32",
+                        "rank": 1,
+                        "shape": [batch],
+                    },
+                    "role": {"kind": "opaque"},
+                    "source": {"kind": "application", "name": "telemetry.target_ms"},
+                    "required": True,
+                },
+            }
+        )
 
     proposer_inputs = {proposer_input.name: "state.tokens.body"}
     for value in proposer.graph.inputs:
         if value is proposer_input:
+            continue
+        if value is proposal_budget_input:
+            proposer_inputs[value.name] = "state.proposal_k.body"
             continue
         name = f"request.proposer.{value.name}"
         inputs[name] = {
@@ -2749,6 +3035,157 @@ def build_speculative_workflow_metadata(
     }
     if proposal_scores is not None:
         proposal_outputs[proposal_scores.name] = "proposal.scores"
+    proposal_measure_nodes: list[dict[str, Any]] = []
+    if adaptive_k_max is not None:
+        proposal_measure_nodes.append(
+            _invoke(
+                "proposal_metrics",
+                {
+                    "proposed_tokens": "proposal.tokens",
+                    "requested_k": "state.proposal_k.body",
+                },
+                {
+                    "evaluated": "proposal.evaluated",
+                    "filled_proposal_budget": "proposal.filled_budget",
+                },
+            )
+        )
+    elif grammar_guidance:
+        proposal_measure_nodes.append(
+            _invoke(
+                "proposal_length",
+                {"tokens": "proposal.tokens"},
+                {"length": "proposal.evaluated"},
+            )
+        )
+    grammar_pre_nodes: list[dict[str, Any]] = []
+    if grammar_guidance:
+        grammar_pre_nodes.extend(
+            [
+                _invoke(
+                    "grammar_clone",
+                    {
+                        "state": "state.grammar.body",
+                        "tokens": "proposal.tokens",
+                        "valid_length": "package.zero",
+                        "transition_table": "request.grammar_transition_table",
+                    },
+                    {
+                        "next_state": "grammar.clone.state",
+                        "consumed_length": "grammar.clone.consumed",
+                        "logits_mask": "grammar.clone.mask",
+                        "forced_tokens": "grammar.clone.forced",
+                        "forced_length": "grammar.clone.forced_length",
+                    },
+                    {"grammar": _effect("grammar.0", "grammar.clone")},
+                ),
+                _invoke(
+                    "grammar_lookahead",
+                    {
+                        "state": "grammar.clone.state",
+                        "tokens": "proposal.tokens",
+                        "valid_length": "proposal.evaluated",
+                        "transition_table": "request.grammar_transition_table",
+                    },
+                    {
+                        "next_state": "grammar.lookahead.state",
+                        "consumed_length": "grammar.valid_length",
+                        "logits_mask": "grammar.lookahead.mask",
+                        "forced_tokens": "grammar.lookahead.forced",
+                        "forced_length": "grammar.lookahead.forced_length",
+                    },
+                    {"grammar": _effect("grammar.clone", "grammar.lookahead")},
+                ),
+            ]
+        )
+    emit_length = "acceptance.synchronized_length"
+    cache_rollback_length = "acceptance.rollback_length"
+    grammar_post_nodes: list[dict[str, Any]] = []
+    if grammar_guidance:
+        emit_length = "grammar.synchronized_length"
+        cache_rollback_length = "grammar.rollback_length"
+        grammar_post_nodes.extend(
+            [
+                _invoke(
+                    "grammar_length",
+                    {
+                        "left": "acceptance.length",
+                        "right": "grammar.valid_length",
+                    },
+                    {"minimum": "grammar.committed_length"},
+                ),
+                _invoke(
+                    "grammar_rollback_length",
+                    {
+                        "left": "acceptance.rollback_length",
+                        "right": "grammar.valid_length",
+                    },
+                    {"minimum": "grammar.rollback_length"},
+                ),
+                _invoke(
+                    "grammar_emit_length",
+                    {"values": "grammar.committed_length"},
+                    {"minimum": "grammar.synchronized_length"},
+                ),
+                _invoke(
+                    "grammar_commit",
+                    {
+                        "state": "state.grammar.body",
+                        "tokens": "acceptance.tokens",
+                        "valid_length": "grammar.committed_length",
+                        "transition_table": "request.grammar_transition_table",
+                    },
+                    {
+                        "next_state": "grammar.next",
+                        "consumed_length": "grammar.committed",
+                        "logits_mask": "grammar.mask",
+                        "forced_tokens": "grammar.forced",
+                        "forced_length": "grammar.forced_length",
+                    },
+                    {"grammar": _effect("grammar.lookahead", "grammar.commit")},
+                ),
+                _invoke(
+                    "grammar_sampler_logits",
+                    {"logits": "target.scores"},
+                    {"last_logits": "grammar.sampler_logits"},
+                ),
+                _invoke(
+                    "grammar_guidance",
+                    {
+                        "logits": "grammar.sampler_logits",
+                        "logits_mask": "grammar.mask",
+                        "forced_tokens": "grammar.forced",
+                        "forced_length": "grammar.forced_length",
+                    },
+                    {"token": "grammar.token"},
+                ),
+            ]
+        )
+    adaptive_nodes: list[dict[str, Any]] = []
+    if adaptive_k_max is not None:
+        committed_metric = (
+            "grammar.committed_length" if grammar_guidance else "acceptance.length"
+        )
+        adaptive_nodes.append(
+            _invoke(
+                "adaptive_k",
+                {
+                    "current_k": "state.proposal_k.body",
+                    "accepted": committed_metric,
+                    "evaluated": "proposal.evaluated",
+                    "committed_tokens": committed_metric,
+                    "filled_proposal_budget": "proposal.filled_budget",
+                    "draft_ms": "request.draft_ms",
+                    "target_ms": "request.target_ms",
+                    "estimates": "state.adaptive_estimates.body",
+                },
+                {
+                    "next_k": "adaptive.next_k",
+                    "next_estimates": "adaptive.next_estimates",
+                },
+                {"adaptive": _effect("adaptive.0", "adaptive.1")},
+            )
+        )
     rollback_nodes: list[dict[str, Any]] = []
     accepted_case_nodes = [
         _invoke(
@@ -2825,7 +3262,7 @@ def build_speculative_workflow_metadata(
                 {
                     "past_state": f"state.{cache_name}.body",
                     "tentative_state": f"verifier.{present.name}",
-                    "accepted_len": "acceptance.rollback_length",
+                    "accepted_len": cache_rollback_length,
                 },
                 {"corrected_state": f"rollback.{cache_name}"},
                 {
@@ -2888,6 +3325,8 @@ def build_speculative_workflow_metadata(
     }
     body_nodes = [
         _invoke("proposer", proposer_inputs, proposal_outputs),
+        *proposal_measure_nodes,
+        *grammar_pre_nodes,
         _invoke("verifier", verifier_inputs, verifier_outputs),
         _invoke(
             "speculative_acceptance",
@@ -2903,6 +3342,8 @@ def build_speculative_workflow_metadata(
             },
             {"verify": _effect("verify.0", "verify.1")},
         ),
+        *grammar_post_nodes,
+        *adaptive_nodes,
         *rollback_nodes,
         branch,
         _invoke(
@@ -2913,22 +3354,35 @@ def build_speculative_workflow_metadata(
         {
             "kind": "emit",
             "value": "tokens.next",
-            "valid_length": "acceptance.synchronized_length",
+            "valid_length": emit_length,
             "output": "tokens",
             "mode": "append",
             "effect_name": "emit",
             "effect": _effect("emit.0", "emit.1"),
         },
     ]
+    if grammar_guidance:
+        body_nodes.append(
+            {
+                "kind": "emit",
+                "value": "grammar.token",
+                "output": "tokens",
+                "mode": "append",
+                "effect_name": "emit",
+                "effect": _effect("emit.1", "emit.2"),
+            }
+        )
     state = {
         "tokens": {
             "contract": _contract(proposer_input),
+            "class": "semantic",
             "scope": "invocation",
             "initializer": "request.tokens",
             "recurrence": {"kind": "invariant"},
         },
         "rng_offset": {
             "contract": batch_int,
+            "class": "semantic",
             "scope": "invocation",
             "initializer": "package.zero",
             "recurrence": {"kind": "invariant"},
@@ -2950,11 +3404,62 @@ def build_speculative_workflow_metadata(
             "state.rng_offset.final",
         ),
     ]
+    if grammar_guidance:
+        state["grammar"] = {
+            "contract": batch_int,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": "request.grammar_state",
+            "recurrence": {"kind": "invariant"},
+        }
+        state_specs.append(
+            (
+                "grammar",
+                "request.grammar_state",
+                "state.grammar.body",
+                "grammar.next",
+                "state.grammar.final",
+            )
+        )
+    if adaptive_k_max is not None:
+        state["proposal_k"] = {
+            "contract": batch_int,
+            "class": "advisory",
+            "scope": "invocation",
+            "initializer": "request.adaptive_k",
+            "recurrence": {"kind": "invariant"},
+        }
+        state["adaptive_estimates"] = {
+            "contract": inputs["request.adaptive_estimates"]["contract"],
+            "class": "advisory",
+            "scope": "invocation",
+            "initializer": "request.adaptive_estimates",
+            "recurrence": {"kind": "invariant"},
+        }
+        state_specs.extend(
+            [
+                (
+                    "proposal_k",
+                    "request.adaptive_k",
+                    "state.proposal_k.body",
+                    "adaptive.next_k",
+                    "state.proposal_k.final",
+                ),
+                (
+                    "adaptive_estimates",
+                    "request.adaptive_estimates",
+                    "state.adaptive_estimates.body",
+                    "adaptive.next_estimates",
+                    "state.adaptive_estimates.final",
+                ),
+            ]
+        )
     for index, (past, _present) in enumerate(cache_pairs):
         cell = f"cache_{index}"
         initializer = f"request.verifier.{past.name}"
         state[cell] = {
             "contract": _contract(past),
+            "class": "semantic",
             "scope": "invocation",
             "initializer": initializer,
             "recurrence": {
@@ -2984,6 +3489,10 @@ def build_speculative_workflow_metadata(
         "emit": "emit.0",
         "state": "branch.state.in",
     }
+    if grammar_guidance:
+        initial_effects["grammar"] = "grammar.0"
+    if adaptive_k_max is not None:
+        initial_effects["adaptive"] = "adaptive.0"
     for index in range(len(cache_pairs)):
         initial_effects[f"rollback_cache_{index}"] = f"rollback.cache_{index}.0"
         initial_effects[f"branch:cache_{index}"] = f"branch.cache_{index}.in"
@@ -3028,7 +3537,7 @@ def build_speculative_workflow_metadata(
                 },
                 "role": "tokens",
                 "stage": "pre_adapter",
-            }
+            },
         },
         "components": {
             name: _component(model, _artifact(name, len(pkg))) for name, model in pkg.items()
@@ -3054,14 +3563,41 @@ def build_speculative_workflow_metadata(
             "carried": carried,
         },
     }
-    metadata = {"schema_version": "v1", "pipeline": {"workflow": workflow}}
+    if grammar_guidance:
+        workflow["manifest"]["adapter_abis"] = {"onnx-genai.grammar-guidance": "1"}
+        workflow["manifest"]["capabilities"].append("grammar_guidance_adapter")
+        workflow["components"].update(
+            {
+                "grammar_clone": _grammar_adapter_component("clone"),
+                "grammar_lookahead": _grammar_adapter_component("lookahead"),
+                "grammar_commit": _grammar_adapter_component("commit"),
+            }
+        )
+    if adaptive_k_max is not None:
+        workflow["manifest"]["capabilities"].extend(
+            ["adaptive_proposal_budget", "advisory_state"]
+        )
+    metadata = {
+        "schema_version": "v1",
+        "pipeline": {"workflow": _publish_workflow_v1(workflow)},
+    }
     add_policy_components_to_workflow(metadata, pkg)
     return metadata
 
 
-def write_speculative_workflow_metadata(pkg: Any, output_dir: str) -> str:
+def write_speculative_workflow_metadata(
+    pkg: Any,
+    output_dir: str,
+    *,
+    grammar_guidance: bool = False,
+    adaptive_k_max: int | None = None,
+) -> str:
     os.makedirs(output_dir, exist_ok=True)
-    metadata = build_speculative_workflow_metadata(pkg)
+    metadata = build_speculative_workflow_metadata(
+        pkg,
+        grammar_guidance=grammar_guidance,
+        adaptive_k_max=adaptive_k_max,
+    )
     pkg.save_policy_components(output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
@@ -3604,7 +4140,10 @@ def build_decoder_workflow_metadata(
             "carried": carried,
         },
     }
-    metadata = {"schema_version": "1.0", "pipeline": {"workflow": workflow}}
+    metadata = {
+        "schema_version": "1.0",
+        "pipeline": {"workflow": _publish_workflow_v1(workflow)},
+    }
     add_policy_components_to_workflow(metadata, pkg)
     return metadata
 
@@ -3875,7 +4414,10 @@ def build_language_diffusion_pipeline_metadata(
             "carried": carried,
         },
     }
-    metadata = {"schema_version": "1.0", "pipeline": {"workflow": workflow}}
+    metadata = {
+        "schema_version": "1.0",
+        "pipeline": {"workflow": _publish_workflow_v1(workflow)},
+    }
     add_policy_components_to_workflow(metadata, pkg)
     return metadata
 

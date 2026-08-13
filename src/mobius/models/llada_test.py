@@ -261,5 +261,7 @@ def test_llada_export_signature_matches_masked_diffusion_metadata():
     )
     workflow = meta["pipeline"]["workflow"]
     assert "strategy" not in meta["pipeline"]
-    assert workflow["graph"]["kind"] == "loop"
-    assert workflow["components"]["masked_update"]["policy"]["role"] == "masked_update"
+    assert workflow["steps"][0]["kind"] == "loop"
+    assert workflow["components"]["masked_update"]["contract"]["id"] == (
+        "onnx-genai.masked-update"
+    )

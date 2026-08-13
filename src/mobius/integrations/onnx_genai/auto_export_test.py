@@ -158,18 +158,22 @@ def test_dispatch_decoder(tmp_path):
         meta = yaml.safe_load(handle)
     workflow = meta["pipeline"]["workflow"]
     assert workflow["manifest"]["ir_version"] == "1.0"
-    assert workflow["components"]["token_sampler"]["policy"]["role"] == "token_sampler"
-    assert workflow["components"]["termination"]["policy"]["role"] == ("termination_predicate")
-    assert workflow["graph"]["kind"] == "loop"
+    assert workflow["components"]["token_sampler"]["contract"]["id"] == (
+        "onnx-genai.token-sampler"
+    )
+    assert workflow["components"]["termination"]["contract"]["id"] == (
+        "onnx-genai.termination-predicate"
+    )
+    assert workflow["steps"][0]["kind"] == "loop"
     assert all(
         value["source"]["kind"] != "application" for value in workflow["inputs"].values()
     )
-    assert [node["component"] for node in workflow["graph"]["setup"]["nodes"]] == [
+    assert [node["component"] for node in workflow["steps"][0]["setup"]] == [
         "decoder_state_initializer",
         "model",
         "last_token_logits",
     ]
-    body = workflow["graph"]["body"]["nodes"]
+    body = workflow["steps"][0]["steps"]
     assert [node["kind"] for node in body].count("emit") == 1
     assert next(node for node in body if node["kind"] == "emit")["value"] == "sample.body"
     assert workflow["state"]["iteration"]["initializer"] == "package.zero_iteration"
@@ -221,8 +225,8 @@ def test_dispatch_diffusion(tmp_path):
     with open(arts["inference_metadata"]) as handle:
         meta = yaml.safe_load(handle)
     workflow = meta["pipeline"]["workflow"]
-    assert workflow["graph"]["nodes"][0]["iteration"]["value"] == "loop.iteration"
-    assert workflow["graph"]["nodes"][1]["component"] == "vae_decoder"
+    assert workflow["steps"][0]["iteration"]["value"] == "loop.iteration"
+    assert workflow["steps"][1]["component"] == "vae_decoder"
     assert "strategy" not in meta["pipeline"]
     assert (tmp_path / "policies" / "solver_step.onnx").is_file()
     assert (tmp_path / "policies" / "schedule_lookup.onnx").is_file()
@@ -376,10 +380,10 @@ def test_dispatch_vision_multimodal_pipeline(tmp_path):
     assert set(pipeline) == {"workflow"}
     workflow = pipeline["workflow"]
     assert workflow["manifest"]["adapter_abis"] == {"onnx-genai.image-preprocess": "1"}
-    assert workflow["graph"]["setup"]["nodes"][0]["component"] == "image_preprocess"
-    assert workflow["graph"]["setup"]["nodes"][1]["component"] == "vision_encoder"
-    assert workflow["graph"]["setup"]["nodes"][3]["component"] == "embedding"
-    assert workflow["graph"]["iteration"]["value"] == "loop.iteration"
+    assert workflow["steps"][0]["setup"][0]["component"] == "image_preprocess"
+    assert workflow["steps"][0]["setup"][1]["component"] == "vision_encoder"
+    assert workflow["steps"][0]["setup"][3]["component"] == "embedding"
+    assert workflow["steps"][0]["iteration"]["value"] == "loop.iteration"
     assert workflow["state"]["logits"]["contract"] == {
         "dtype": "float32",
         "rank": 2,
@@ -415,7 +419,7 @@ def test_dispatch_audio_only_multimodal_pipeline(tmp_path):
     with open(artifacts["inference_metadata"]) as handle:
         metadata = yaml.safe_load(handle)
 
-    setup = metadata["pipeline"]["workflow"]["graph"]["setup"]["nodes"]
+    setup = metadata["pipeline"]["workflow"]["steps"][0]["setup"]
     assert [node["component"] for node in setup[:3]] == [
         "image_preprocess",
         "vision_encoder",
@@ -554,8 +558,8 @@ def test_dispatch_audio_codec_pipeline(tmp_path):
     assert "model" not in metadata
     assert not {"models", "dataflow", "strategy", "phases"}.intersection(metadata["pipeline"])
     workflow = metadata["pipeline"]["workflow"]
-    assert workflow["graph"]["nodes"][0]["outputs"] == {"codes": "codec.codes"}
-    assert workflow["graph"]["nodes"][1]["inputs"] == {"codes": "codec.codes"}
+    assert workflow["steps"][0]["outputs"] == {"codes": "codec.codes"}
+    assert workflow["steps"][1]["inputs"] == {"codes": "codec.codes"}
     assert workflow["outputs"]["waveform"]["stage"] == "post_adapter"
 
 
@@ -624,9 +628,9 @@ def test_dispatch_multi_decoder_tts_with_pre_embedder(tmp_path):
     artifacts = write_onnx_genai_config(pkg, str(tmp_path))
     with open(artifacts["inference_metadata"]) as handle:
         workflow = yaml.safe_load(handle)["pipeline"]["workflow"]
-    outer = workflow["graph"]["nodes"][0]
+    outer = workflow["steps"][0]
     assert outer["iteration"]["value"] == "talker.iteration"
-    assert outer["body"]["nodes"][2]["iteration"]["value"] == "code.iteration"
+    assert outer["steps"][2]["iteration"]["value"] == "code.iteration"
     assert (tmp_path / "policies" / "code_frame_update.onnx").is_file()
 
 
