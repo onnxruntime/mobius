@@ -122,7 +122,11 @@ def main() -> int:
         if image is not None
         else workload["rendered_prompt"]
     )
-    prompt_tokens = len(tokenizer.encode(prompt))
+    encoded_prompt = tokenizer.encode(prompt)
+    prompt_ids = json.loads(Path(workload["prompt_ids_file"]).read_text())
+    if encoded_prompt != prompt_ids:
+        raise RuntimeError("native tokenizer output differs from the canonical prompt IDs")
+    prompt_tokens = len(encoded_prompt)
     if prompt_tokens != int(workload["prompt_tokens"]):
         raise RuntimeError(
             f"prompt token count mismatch: {prompt_tokens} != {workload['prompt_tokens']}"
