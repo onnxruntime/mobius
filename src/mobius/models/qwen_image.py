@@ -51,7 +51,7 @@ class _TimestepMLP(nn.Module):
 
     def forward(self, op: OpBuilder, sample: ir.Value):
         sample = self.linear_1(op, sample)
-        sample = op.Mul(sample, op.Sigmoid(sample))  # SiLU
+        sample = op.Swish(sample)
         sample = self.linear_2(op, sample)
         return sample
 
@@ -82,7 +82,7 @@ class _AdaLayerNormOutput(nn.Module):
         self.linear = _Linear(hidden_size, hidden_size * 2)
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value, timestep_emb: ir.Value):
-        emb = op.Mul(timestep_emb, op.Sigmoid(timestep_emb))  # SiLU
+        emb = op.Swish(timestep_emb)
         emb = self.linear(op, emb)
         shift, scale = op.Split(emb, num_outputs=2, axis=-1, _outputs=2)
         one = 1.0

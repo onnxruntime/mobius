@@ -1605,9 +1605,8 @@ class Gemma4DecoderLayer(nn.Module):
             half = op.Shape(fc2, start=1, end=2)  # [moe_inter]
             gate = op.Slice(proj, [0], half, [1])  # [T, moe_inter] first half
             up = op.Slice(proj, half, op.Shape(proj, start=1, end=2), [1])  # second half
-            # SiLU(gate) = gate * sigmoid(gate)
             expert_out = op.MatMul(
-                op.Mul(op.Mul(gate, op.Sigmoid(gate)), up),  # [T, moe_inter]
+                op.Mul(op.Swish(gate), up),  # [T, moe_inter]
                 op.Transpose(fc2),  # → [T, H]
             )
 

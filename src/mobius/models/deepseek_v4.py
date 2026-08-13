@@ -199,7 +199,7 @@ class _DeepSeekV4Expert(nn.Module):
         if self.limit > 0:
             gate = op.Clip(gate, None, self.limit)
             up = op.Clip(up, -self.limit, self.limit)
-        return self.down_proj(op, op.Mul(op.Mul(gate, op.Sigmoid(gate)), up))
+        return self.down_proj(op, op.Mul(op.Swish(gate), up))
 
 
 class DeepSeekV4MoE(nn.Module):
