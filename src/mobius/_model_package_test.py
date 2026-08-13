@@ -15,7 +15,11 @@ import torch
 
 from mobius._builder import build_from_module
 from mobius._configs import VisionConfig
-from mobius._model_package import ModelPackage, _make_progress_callback
+from mobius._model_package import (
+    ModelPackage,
+    _make_progress_callback,
+    _namespaced_symbolic_dimensions,
+)
 from mobius._testing import make_config
 from mobius.generation import build_greedy_sampler
 from mobius.models.base import CausalLMModel
@@ -374,6 +378,116 @@ class TestModelPackageSaveLoad:
         assert (tmp_path / "policies" / "sample.onnx").exists()
         loaded = ModelPackage.load(str(tmp_path))
         assert loaded.policy_components["sample"].contract_id == "onnx-genai.token-sampler@1"
+
+    def test_save_namespaces_component_symbols_without_mutating_package(self, tmp_path):
+        input_value = ir.Value(
+            name="input",
+            type=ir.TensorType(ir.DataType.FLOAT),
+            shape=ir.Shape(["batch", "sequence"]),
+        )
+        input_value.shape.set_denotation(0, "DATA_BATCH")
+        intermediate = ir.Value(
+            name="intermediate",
+            type=ir.TensorType(ir.DataType.FLOAT),
+            shape=ir.Shape(["batch", "sequence"]),
+        )
+        output_value = ir.Value(
+            name="output",
+            type=ir.TensorType(ir.DataType.FLOAT),
+            shape=ir.Shape(["batch", "sequence"]),
+        )
+        model = ir.Model(
+            ir.Graph(
+                [input_value],
+                [output_value],
+                nodes=[
+                    ir.Node("", "Identity", [input_value], outputs=[intermediate]),
+                    ir.Node("", "Identity", [intermediate], outputs=[output_value]),
+                ],
+                name="symbolic",
+            ),
+            ir_version=10,
+        )
+        pkg = ModelPackage({"decoder": model})
+
+        pkg.save(str(tmp_path))
+
+        saved = ir.load(tmp_path / "model.onnx")
+        assert [str(dimension) for dimension in saved.graph.inputs[0].shape] == [
+            "component.decoder.batch",
+            "component.decoder.sequence",
+        ]
+        assert saved.graph.inputs[0].shape.get_denotation(0) == "DATA_BATCH"
+        assert all(
+            dimension.value is None for dimension in next(iter(saved.graph)).outputs[0].shape
+        )
+        assert [str(dimension) for dimension in model.graph.inputs[0].shape] == [
+            "batch",
+            "sequence",
+        ]
+
+    def test_save_anonymizes_nested_graph_intermediate_symbols(self):
+        condition = ir.Value(
+            name="condition",
+            type=ir.TensorType(ir.DataType.BOOL),
+            shape=ir.Shape([]),
+        )
+        data = ir.Value(
+            name="data",
+            type=ir.TensorType(ir.DataType.FLOAT),
+            shape=ir.Shape(["batch", "sequence"]),
+        )
+        branch_output = ir.Value(
+            name="branch_output",
+            type=ir.TensorType(ir.DataType.FLOAT),
+            shape=ir.Shape(["batch", "branch_sequence"]),
+        )
+        branch = ir.Graph(
+            [],
+            [branch_output],
+            nodes=[ir.Node("", "Identity", [data], outputs=[branch_output])],
+        )
+        output = ir.Value(
+            name="output",
+            type=ir.TensorType(ir.DataType.FLOAT),
+            shape=ir.Shape(["batch", "sequence"]),
+        )
+        model = ir.Model(
+            ir.Graph(
+                [condition, data],
+                [output],
+                nodes=[
+                    ir.Node(
+                        "",
+                        "If",
+                        [condition],
+                        attributes={
+                            "then_branch": ir.AttrGraph("then_branch", branch),
+                            "else_branch": ir.AttrGraph("else_branch", branch),
+                        },
+                        outputs=[output],
+                    )
+                ],
+            ),
+            ir_version=10,
+        )
+
+        with _namespaced_symbolic_dimensions(model, "component.decoder"):
+            assert all(dimension.value is None for dimension in branch_output.shape)
+
+        assert str(branch_output.shape[1]) == "branch_sequence"
+
+    def test_save_namespaces_policy_symbols(self, tmp_path):
+        sampler = build_greedy_sampler()
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.add_policy_component("sample", sampler)
+
+        pkg.save(str(tmp_path))
+
+        saved = ir.load(tmp_path / "policies" / "sample.onnx")
+        assert str(saved.graph.inputs[0].shape[0]) == "policy.sample.batch"
+        assert str(saved.graph.inputs[0].shape[1]) == "policy.sample.vocabulary"
+        assert str(sampler.model.graph.inputs[0].shape[0]) == "batch"
 
 
 class TestModelPackageApplyWeights:

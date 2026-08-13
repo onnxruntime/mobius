@@ -25,7 +25,8 @@ import logging
 import os
 import threading
 from collections import UserDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import onnx_ir as ir
@@ -167,22 +168,23 @@ class ModelPackage(UserDict[str, ir.Model]):
             else:
                 model_dir = directory
             path = os.path.join(model_dir, "model.onnx")
-            if external_data == "safetensors":
-                ir.save_safetensors(
-                    model,
-                    path,
-                    max_shard_size_bytes=max_shard_size_bytes,
-                    callback=callback,
-                )
-            else:
-                save_kwargs: dict[str, Any] = {
-                    "external_data": "model.onnx.data",
-                    "max_shard_size_bytes": max_shard_size_bytes,
-                    "callback": callback,
-                }
-                if "max_workers" in inspect.signature(ir.save).parameters:
-                    save_kwargs["max_workers"] = max_workers
-                ir.save(model, path, **save_kwargs)
+            with _namespaced_symbolic_dimensions(model, f"component.{name}") as saved_model:
+                if external_data == "safetensors":
+                    ir.save_safetensors(
+                        saved_model,
+                        path,
+                        max_shard_size_bytes=max_shard_size_bytes,
+                        callback=callback,
+                    )
+                else:
+                    save_kwargs: dict[str, Any] = {
+                        "external_data": "model.onnx.data",
+                        "max_shard_size_bytes": max_shard_size_bytes,
+                        "callback": callback,
+                    }
+                    if "max_workers" in inspect.signature(ir.save).parameters:
+                        save_kwargs["max_workers"] = max_workers
+                    ir.save(saved_model, path, **save_kwargs)
 
         if include_policy_components:
             self.save_policy_components(directory, check_weights=check_weights)
@@ -209,7 +211,11 @@ class ModelPackage(UserDict[str, ir.Model]):
             if check_weights:
                 _check_weights(name, component.model)
             relative_path = f"policies/{name}.onnx"
-            ir.save(component.model, os.path.join(directory, relative_path))
+            with _namespaced_symbolic_dimensions(
+                component.model,
+                f"policy.{name}",
+            ) as saved_model:
+                ir.save(saved_model, os.path.join(directory, relative_path))
             artifacts[name] = relative_path
         return artifacts
 
@@ -334,6 +340,58 @@ class ModelPackage(UserDict[str, ir.Model]):
         # be constant-folded once the weight tensors carry their const_value.
         for model in self.data.values():
             fold_initializers_after_weights(model)
+
+
+@contextmanager
+def _namespaced_symbolic_dimensions(
+    model: ir.Model,
+    namespace: str,
+) -> Iterator[ir.Model]:
+    """Namespace interface symbols and discard non-contractual intermediate aliases."""
+    interface_values = {id(value) for value in (*model.graph.inputs, *model.graph.outputs)}
+    values: dict[int, ir.Value] = {}
+    graphs: list[ir.GraphProtocol] = []
+    nodes = ir.traversal.RecursiveGraphIterator(model.graph, enter_graph=graphs.append)
+    for node in nodes:
+        for value in (*node.inputs, *node.outputs):
+            if value is not None:
+                values[id(value)] = value
+    for graph in graphs:
+        for value in (*graph.inputs, *graph.outputs, *graph.initializers.values()):
+            values[id(value)] = value
+
+    originals: list[tuple[ir.Value, ir.Shape]] = []
+    symbols: dict[str, str] = {}
+    try:
+        for value in values.values():
+            if value.shape is None:
+                continue
+            dimensions: list[int | str | ir.SymbolicDim] = []
+            changed = False
+            for dimension in value.shape:
+                if isinstance(dimension, int):
+                    dimensions.append(dimension)
+                    continue
+                if dimension.value is None:
+                    dimensions.append(dimension)
+                    continue
+                if id(value) not in interface_values:
+                    dimensions.append(ir.SymbolicDim(None))
+                    changed = True
+                    continue
+                text = str(dimension)
+                dimensions.append(symbols.setdefault(text, f"{namespace}.{text}"))
+                changed = True
+            if changed:
+                originals.append((value, value.shape))
+                denotations = [
+                    value.shape.get_denotation(index) for index in range(len(value.shape))
+                ]
+                value.shape = ir.Shape(dimensions, denotations)
+        yield model
+    finally:
+        for value, shape in originals:
+            value.shape = shape
 
 
 def _make_progress_callback():
