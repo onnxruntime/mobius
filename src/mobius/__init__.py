@@ -30,6 +30,9 @@ __all__ = [
     "VisionConfig",
     "VisionLanguageConfig",
     "WhisperConfig",
+    "WeatherNextConfig",
+    "WeatherNextForecastTask",
+    "WeatherNextModel",
     "WorldModelConfig",
     "WorldModelTask",
     "YolosConfig",
@@ -78,6 +81,7 @@ from mobius._configs import (
     SegformerConfig,
     VisionConfig,
     VisionLanguageConfig,
+    WeatherNextConfig,
     WhisperConfig,
     WorldModelConfig,
     YolosConfig,
@@ -95,5 +99,5 @@ from mobius._registry import (
 from mobius._weight_loading import apply_weights
 from mobius.integrations.gguf import build_from_gguf
 from mobius.integrations.nemo import build_from_nemo
-from mobius.models import MLPWorldModel
-from mobius.tasks import CausalLMTask, ModelTask, WorldModelTask
+from mobius.models import MLPWorldModel, WeatherNextModel
+from mobius.tasks import CausalLMTask, ModelTask, WeatherNextForecastTask, WorldModelTask

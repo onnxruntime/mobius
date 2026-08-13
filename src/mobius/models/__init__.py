@@ -150,6 +150,7 @@ __all__ = [
     "VideoAutoencoderModel",
     "Wav2Vec2ForCTCModel",
     "Wav2Vec2Model",
+    "WeatherNextModel",
     "WhisperForConditionalGeneration",
     "MLPWorldModel",
     "XLMCausalLMModel",
@@ -323,6 +324,7 @@ from mobius.models.video_vae import VideoAutoencoderModel
 from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
 from mobius.models.wav2vec2_ctc import Wav2Vec2ForCTCModel
+from mobius.models.weathernext import WeatherNextModel
 from mobius.models.whisper import WhisperForConditionalGeneration
 from mobius.models.world_model import MLPWorldModel
 from mobius.models.xlm import XLMCausalLMModel
