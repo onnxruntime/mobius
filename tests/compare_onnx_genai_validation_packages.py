@@ -47,28 +47,13 @@ def _attribute(value: Any) -> Any:
 
 
 def _graph(graph: ir.Graph) -> dict[str, Any]:
-    value_ids = {value.name: f"input:{value.name}" for value in graph.inputs}
-    value_ids.update({name: f"initializer:{name}" for name in graph.initializers})
     nodes = []
-    for node_index, node in enumerate(graph):
-        inputs = [
-            value_ids.get(value.name, f"external:{value.name}")
-            if value is not None
-            else None
-            for value in node.inputs
-        ]
-        outputs = []
-        for output_index, value in enumerate(node.outputs):
-            value_id = f"value:{node_index}:{output_index}"
-            value_ids[value.name] = value_id
-            outputs.append(value_id)
+    for node in graph:
         nodes.append(
             {
                 "domain": node.domain,
                 "op_type": node.op_type,
                 "overload": node.overload,
-                "inputs": inputs,
-                "outputs": outputs,
                 "attributes": {
                     name: {
                         "type": str(attribute.type),
@@ -81,13 +66,7 @@ def _graph(graph: ir.Graph) -> dict[str, Any]:
     return {
         "name": graph.name,
         "inputs": [_value(value) for value in graph.inputs],
-        "outputs": [
-            {
-                **_value(value),
-                "source": value_ids.get(value.name, f"external:{value.name}"),
-            }
-            for value in graph.outputs
-        ],
+        "outputs": [_value(value) for value in graph.outputs],
         "initializers": {
             name: _tensor(value.const_value)
             for name, value in sorted(graph.initializers.items())
