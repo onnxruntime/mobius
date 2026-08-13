@@ -15,17 +15,16 @@ from mobius._constants import OPSET_VERSION
 from mobius.generation import (
     PolicyCapabilities,
     attach_policy_components,
-    build_batch_minimum,
     build_boolean_not,
     build_code_frame_update,
     build_code_history_append,
     build_codec_layout_transpose,
     build_decoder_state_initializer,
     build_decoder_step_update,
-    build_effectful_identity,
     build_euler_model_input,
     build_euler_solver_step,
     build_greedy_sampler,
+    build_integer_add,
     build_integer_minimum,
     build_last_token_logits,
     build_model_token_cast,
@@ -33,8 +32,6 @@ from mobius.generation import (
     build_schedule_constant,
     build_schedule_lookup,
     build_sequence_length,
-    build_speculative_state_rollback,
-    build_token_block_identity,
     build_token_to_slot,
     build_tts_decoder_state_initializer,
     build_tts_decoder_step_update,
@@ -125,7 +122,12 @@ def _publish_workflow_v1(workflow: dict[str, Any]) -> dict[str, Any]:
     """Publish structured steps and logical carries without compiler bookkeeping."""
     graph = workflow.pop("graph")
     workflow.pop("initial_effects", None)
+    for declaration in workflow.get("inputs", {}).values():
+        source = declaration.get("source")
+        if isinstance(source, dict) and source.get("kind") == "request":
+            source.pop("field", None)
     substitutions: dict[str, str] = {}
+    loop_index = 0
     cell_aliases = {
         cell: f"{cell}_state" if cell in workflow.get("outputs", {}) else cell
         for cell in workflow.get("state", {})
@@ -162,6 +164,7 @@ def _publish_workflow_v1(workflow: dict[str, Any]) -> dict[str, Any]:
         return value
 
     def convert(node: dict[str, Any]) -> dict[str, Any]:
+        nonlocal loop_index
         kind = node["kind"]
         if kind == "sequence":
             return {
@@ -196,6 +199,8 @@ def _publish_workflow_v1(workflow: dict[str, Any]) -> dict[str, Any]:
                 result["default"] = convert(node["default"])
             return result
         if kind == "loop":
+            current_loop = loop_index
+            loop_index += 1
             setup = node["setup"]
             body = node["body"]
             setup_steps = (
@@ -219,11 +224,34 @@ def _publish_workflow_v1(workflow: dict[str, Any]) -> dict[str, Any]:
                 if workflow["state"][cell]["initializer"] != initial:
                     published_carry["initial"] = initial
                 carried.append(published_carry)
+            active_cell = node.get("active_cell")
+            if active_cell is None:
+                active_cell = f"loop_{current_loop}_active"
+                active_initializer = f"package.{active_cell}"
+                workflow["inputs"][active_initializer] = {
+                    "contract": {"dtype": "bool", "rank": 1, "shape": [1]},
+                    "role": {"kind": "opaque"},
+                    "source": {"kind": "literal"},
+                    "required": False,
+                    "default": True,
+                }
+                workflow["state"][active_cell] = {
+                    "contract": {"dtype": "bool", "rank": 1, "shape": [1]},
+                    "scope": "invocation",
+                    "initializer": active_initializer,
+                    "recurrence": {"kind": "invariant"},
+                }
+                carried.append(
+                    {
+                        "cell": active_cell,
+                        "next": rewrite(node["condition"]),
+                    }
+                )
             result = {
                 "kind": "loop",
                 "setup": setup_steps,
                 "steps": body_steps,
-                "condition": rewrite(node["condition"]),
+                "continue_when": active_cell,
                 "max_iterations": rewrite(node["max_iterations"]),
                 "carried": carried,
             }
@@ -568,6 +596,7 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
     batch = _contract(prompt)["shape"][0]
     batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
     batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch]}
+    control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
     inputs = {
         "request.prompt_tokens": {
             "contract": _contract(prompt),
@@ -576,7 +605,7 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             "required": True,
         },
         "request.max_iterations": {
-            "contract": batch_int,
+            "contract": control_int,
             "role": {"kind": "runtime", "version": "1.0", "role": "max_output_tokens"},
             "source": {"kind": "request", "field": "max_output_tokens"},
             "required": True,
@@ -603,32 +632,39 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             "default": 1,
         },
         "package.remaining_groups": {
-            "contract": batch_int,
+            "contract": control_int,
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
             "default": num_groups - 2,
         },
         "package.predictor_context_limit": {
-            "contract": {"dtype": "int64", "rank": 0, "shape": []},
+            "contract": control_int,
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
             "default": num_groups,
         },
         "package.predictor_mask_limit": {
-            "contract": {"dtype": "int64", "rank": 0, "shape": []},
+            "contract": control_int,
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
             "default": num_groups + 1,
         },
         "package.talker_context_limit": {
-            "contract": {"dtype": "int64", "rank": 0, "shape": []},
+            "contract": control_int,
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
             "default": int(getattr(config, "max_position_embeddings", 4096)),
+        },
+        "package.one_control": {
+            "contract": control_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 1,
         },
     }
     for iteration in range(num_groups - 2):
@@ -1130,7 +1166,7 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             "recurrence": {
                 "kind": "growing",
                 "axis": 1,
-                "increment": "package.one_scalar",
+                "increment": "package.one_control",
                 "max": "package.talker_context_limit",
             },
         },
@@ -1145,7 +1181,7 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             "recurrence": {
                 "kind": "growing",
                 "axis": 1,
-                "increment": "package.one_scalar",
+                "increment": "package.one_control",
                 "max": "package.talker_context_limit",
             },
         },
@@ -1186,7 +1222,7 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             "recurrence": {
                 "kind": "growing",
                 "axis": 1,
-                "increment": "package.one_scalar",
+                "increment": "package.one_control",
                 "max": "package.predictor_mask_limit",
             },
         },
@@ -1213,7 +1249,7 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             "recurrence": {
                 "kind": "growing",
                 "axis": 2,
-                "increment": "package.one_scalar",
+                "increment": "package.one_control",
                 "max": "package.talker_context_limit",
             },
         }
@@ -1225,7 +1261,7 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             "recurrence": {
                 "kind": "growing",
                 "axis": 2,
-                "increment": "package.one_scalar",
+                "increment": "package.one_control",
                 "max": "package.predictor_context_limit",
             },
         }
@@ -1470,6 +1506,7 @@ def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
     batch = _contract(prompt_input)["shape"][0]
     batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
     batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch]}
+    control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
     inputs: dict[str, Any] = {
         "request.prompt_tokens": {
             "contract": _contract(prompt_input),
@@ -1478,7 +1515,7 @@ def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             "required": True,
         },
         "request.max_iterations": {
-            "contract": batch_int,
+            "contract": control_int,
             "role": {
                 "kind": "runtime",
                 "version": "1.0",
@@ -1488,7 +1525,7 @@ def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             "required": True,
         },
         "package.code_groups": {
-            "contract": batch_int,
+            "contract": control_int,
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
@@ -1502,7 +1539,7 @@ def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             "default": False,
         },
         "package.one": {
-            "contract": batch_int,
+            "contract": control_int,
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
@@ -1958,6 +1995,7 @@ def build_diffusion_workflow_metadata(
     batch = _contract(sample_input)["shape"][0]
     batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
     batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch]}
+    control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
     inputs: dict[str, Any] = {
         "request.latent": {
             "contract": _contract(sample_input),
@@ -1966,7 +2004,7 @@ def build_diffusion_workflow_metadata(
             "required": True,
         },
         "request.max_iterations": {
-            "contract": batch_int,
+            "contract": control_int,
             "role": {"kind": "runtime", "version": "1.0", "role": "max_iterations"},
             "source": {"kind": "request", "field": "max_iterations"},
             "required": False,
@@ -2305,7 +2343,6 @@ def build_vlm_workflow_metadata(
         ),
     )
     pkg.add_policy_component("last_token_logits", build_last_token_logits())
-    pkg.add_policy_component("continue_predicate", build_boolean_not())
     pkg.add_policy_component(
         "decoder_state_initializer",
         build_decoder_state_initializer(
@@ -2324,9 +2361,13 @@ def build_vlm_workflow_metadata(
             position_dtype=position_input.dtype if position_input is not None else None,
         ),
     )
+    if cache_pairs:
+        pkg.add_policy_component("cache_length_update", build_integer_add())
 
     batch = _contract(token_input)["shape"][0]
     batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
+    batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch]}
+    control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
     eos = getattr(config, "eos_token_id", 0)
     if isinstance(eos, list):
         eos = eos[0] if eos else 0
@@ -2344,7 +2385,7 @@ def build_vlm_workflow_metadata(
             "required": True,
         },
         "request.max_iterations": {
-            "contract": batch_int,
+            "contract": control_int,
             "role": {
                 "kind": "runtime",
                 "version": "1.0",
@@ -2361,18 +2402,46 @@ def build_vlm_workflow_metadata(
             "default": int(eos or 0),
         },
         "package.max_context": {
-            "contract": batch_int,
+            "contract": control_int,
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
             "default": int(getattr(config, "max_position_embeddings", 4096)),
         },
         "package.one": {
-            "contract": batch_int,
+            "contract": control_int,
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
             "default": 1,
+        },
+        "package.active": {
+            "contract": batch_bool,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": True,
+        },
+        "package.false": {
+            "contract": batch_bool,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": False,
+        },
+        "package.zero_batch": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 0,
+        },
+        "package.slot_ids": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 0,
         },
     }
     vision_invoke_inputs = {
@@ -2469,6 +2538,41 @@ def build_vlm_workflow_metadata(
                 "max": "package.max_context",
             },
         },
+        "active": {
+            "contract": batch_bool,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": "package.active",
+            "recurrence": {"kind": "invariant"},
+        },
+        "done": {
+            "contract": batch_bool,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": "package.false",
+            "recurrence": {"kind": "invariant"},
+        },
+        "accepted_len": {
+            "contract": batch_int,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": "package.zero_batch",
+            "recurrence": {"kind": "invariant"},
+        },
+        "slot_ids": {
+            "contract": batch_int,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": "package.slot_ids",
+            "recurrence": {"kind": "invariant"},
+        },
+        "cache_lengths": {
+            "contract": batch_int,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": "package.zero_batch",
+            "recurrence": {"kind": "invariant"},
+        },
     }
     state_specs = [
         (
@@ -2491,6 +2595,35 @@ def build_vlm_workflow_metadata(
             "state.attention_mask.body",
             "decoder_step.body_attention_mask",
             "state.attention_mask.final",
+        ),
+        (
+            "active",
+            "package.active",
+            "state.active.body",
+            "loop.continue",
+            "state.active.final",
+        ),
+        ("done", "package.false", "state.done.body", "loop.done", "state.done.final"),
+        (
+            "accepted_len",
+            "package.zero_batch",
+            "state.accepted_len.body",
+            "accepted_len.next",
+            "state.accepted_len.final",
+        ),
+        (
+            "slot_ids",
+            "package.slot_ids",
+            "state.slot_ids.body",
+            "state.slot_ids.body",
+            "state.slot_ids.final",
+        ),
+        (
+            "cache_lengths",
+            "package.zero_batch",
+            "state.cache_lengths.body",
+            "cache_lengths.next",
+            "state.cache_lengths.final",
         ),
     ]
     if position_input is not None:
@@ -2520,7 +2653,7 @@ def build_vlm_workflow_metadata(
             "scope": "invocation",
             "initializer": f"decoder.setup.{present.name}",
             "recurrence": {
-                "kind": "growing",
+                "kind": "bounded",
                 "axis": next(
                     (
                         axis
@@ -2529,9 +2662,9 @@ def build_vlm_workflow_metadata(
                     ),
                     2,
                 ),
-                "increment": "package.one",
                 "max": "package.max_context",
             },
+            "service_group": "decoder_cache",
         }
         setup_decoder_outputs[present.name] = f"decoder.setup.{present.name}"
         body_decoder_outputs[present.name] = f"decoder.body.{present.name}"
@@ -2624,13 +2757,27 @@ def build_vlm_workflow_metadata(
                     "iteration": "loop.iteration",
                     "max_iterations": "request.max_iterations",
                 },
-                {"done": "loop.done"},
+                {"done": "loop.done", "continue": "loop.continue"},
                 {"termination": _effect("termination.0", "termination.1")},
             ),
-            _invoke(
-                "continue_predicate",
-                {"done": "loop.done"},
-                {"continue": "loop.continue"},
+            *(
+                [
+                    _invoke(
+                        "cache_length_update",
+                        {
+                            "left": "state.cache_lengths.body",
+                            "right": "package.one",
+                        },
+                        {"total": "cache_lengths.next"},
+                    ),
+                    _invoke(
+                        "cache_length_update",
+                        {"left": "package.zero_batch", "right": "package.one"},
+                        {"total": "accepted_len.next"},
+                    ),
+                ]
+                if cache_pairs
+                else []
             ),
             {
                 "kind": "emit",
@@ -2709,6 +2856,11 @@ def build_vlm_workflow_metadata(
                 "nested_control_flow",
                 "loop_induction_values",
                 "typed_emit",
+                *(
+                    ["serving_service_contract", "bounded_state_recurrence"]
+                    if cache_pairs
+                    else []
+                ),
             ],
         },
         "inputs": inputs,
@@ -2717,6 +2869,49 @@ def build_vlm_workflow_metadata(
         },
         "components": components,
         "state": state,
+        **(
+            {
+                "serving": {
+                    "active": "active",
+                    "done": "done",
+                    "accepted_len": "accepted_len",
+                    "slot_ids": "slot_ids",
+                    "kv_service": {
+                        "paging": "paged",
+                        "allocation": "runtime",
+                        "compaction": True,
+                        "groups": {
+                            "decoder_cache": {
+                                "sequence_axis": next(
+                                    (
+                                        axis
+                                        for axis, dimension in enumerate(
+                                            _contract(cache_pairs[0][0])["shape"]
+                                        )
+                                        if "sequence" in str(dimension)
+                                    ),
+                                    2,
+                                ),
+                                "layout": "bnsh",
+                                "logical_lengths": "cache_lengths",
+                                "storage": "paged",
+                                "ports": {
+                                    "decoder": {
+                                        f"cache_{index}": {
+                                            "input": past.name,
+                                            "output": present.name,
+                                        }
+                                        for index, (past, present) in enumerate(cache_pairs)
+                                    }
+                                },
+                            }
+                        },
+                    },
+                }
+            }
+            if cache_pairs
+            else {}
+        ),
         "initial_effects": initial_effects,
         "graph": {
             "kind": "loop",
@@ -2822,21 +3017,18 @@ def build_speculative_workflow_metadata(
             adaptive_k_max=adaptive_k_max,
         ),
     )
-    pkg.add_policy_component("continue_predicate", build_boolean_not())
-    pkg.add_policy_component("branch_state", build_token_block_identity())
     if grammar_guidance:
         pkg.add_policy_component("grammar_length", build_integer_minimum())
-        pkg.add_policy_component("grammar_emit_length", build_batch_minimum())
-        pkg.add_policy_component("grammar_rollback_length", build_integer_minimum())
         pkg.add_policy_component("grammar_sampler_logits", build_last_token_logits())
         if adaptive_k_max is None:
             pkg.add_policy_component("proposal_length", build_sequence_length())
     if adaptive_k_max is not None:
         pkg.add_policy_component("proposal_metrics", build_proposal_metrics())
+    pkg.add_policy_component("cache_length_update", build_integer_add())
     batch = _contract(proposer_input)["shape"][0]
     batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
+    batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch]}
     control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
-    control_bool = {"dtype": "bool", "rank": 1, "shape": [1]}
     inputs: dict[str, Any] = {
         "request.tokens": {
             "contract": _contract(proposer_input),
@@ -2883,11 +3075,31 @@ def build_speculative_workflow_metadata(
             "default": int(getattr(config, "max_position_embeddings", 4096)),
         },
         "package.false": {
-            "contract": control_bool,
+            "contract": batch_bool,
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
             "default": False,
+        },
+        "package.active": {
+            "contract": batch_bool,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": True,
+        },
+        "request.slot_ids": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "application", "name": "serving.slot_ids"},
+            "required": True,
+        },
+        "request.cache_lengths": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "application", "name": "serving.cache_lengths"},
+            "required": False,
+            "default": 0,
         },
     }
     if grammar_guidance:
@@ -3092,12 +3304,10 @@ def build_speculative_workflow_metadata(
                 ),
             ]
         )
-    emit_length = "acceptance.synchronized_length"
-    cache_rollback_length = "acceptance.rollback_length"
+    emit_length = "acceptance.length"
     grammar_post_nodes: list[dict[str, Any]] = []
     if grammar_guidance:
-        emit_length = "grammar.synchronized_length"
-        cache_rollback_length = "grammar.rollback_length"
+        emit_length = "grammar.committed_length"
         grammar_post_nodes.extend(
             [
                 _invoke(
@@ -3107,19 +3317,6 @@ def build_speculative_workflow_metadata(
                         "right": "grammar.valid_length",
                     },
                     {"minimum": "grammar.committed_length"},
-                ),
-                _invoke(
-                    "grammar_rollback_length",
-                    {
-                        "left": "acceptance.rollback_length",
-                        "right": "grammar.valid_length",
-                    },
-                    {"minimum": "grammar.rollback_length"},
-                ),
-                _invoke(
-                    "grammar_emit_length",
-                    {"values": "grammar.committed_length"},
-                    {"minimum": "grammar.synchronized_length"},
                 ),
                 _invoke(
                     "grammar_commit",
@@ -3180,142 +3377,9 @@ def build_speculative_workflow_metadata(
                 {"adaptive": _effect("adaptive.0", "adaptive.1")},
             )
         )
-    rollback_nodes: list[dict[str, Any]] = []
-    accepted_case_nodes = [
-        _invoke(
-            "branch_state",
-            {"tokens": "acceptance.tokens"},
-            {"next_tokens": "branch.accepted"},
-            {"state": _effect("branch.state.in", "branch.state.accepted")},
-        )
-    ]
-    corrected_case_nodes = [
-        _invoke(
-            "branch_state",
-            {"tokens": "acceptance.tokens"},
-            {"next_tokens": "branch.corrected"},
-            {"state": _effect("branch.state.in", "branch.state.corrected")},
-        )
-    ]
-    branch_outputs: dict[str, Any] = {
-        "tokens.next": {
-            "cases": {
-                "true": "branch.accepted",
-                "false": "branch.corrected",
-            }
-        }
-    }
-    branch_effects: dict[str, Any] = {
-        "state": {
-            "incoming": "branch.state.in",
-            "cases": {
-                "true": "branch.state.accepted",
-                "false": "branch.state.corrected",
-            },
-            "produces": "branch.state.out",
-        }
-    }
-    for index, (past, present) in enumerate(cache_pairs):
-        cache_name = f"cache_{index}"
-        cache_contract = _contract(past)
-        sequence_axis = next(
-            (
-                axis
-                for axis, dimension in enumerate(cache_contract["shape"])
-                if "sequence" in str(dimension)
-            ),
-            2,
-        )
-        rollback_name = f"rollback_{cache_name}"
-        publisher_name = f"publish_{cache_name}"
-        branch_effect = f"branch:{cache_name}"
-        pkg.add_policy_component(
-            rollback_name,
-            build_speculative_state_rollback(
-                past.dtype,
-                cache_contract["shape"],
-                sequence_axis=sequence_axis,
-                effect=rollback_name,
-            ),
-        )
-        pkg.add_policy_component(
-            publisher_name,
-            build_effectful_identity(
-                publisher_name,
-                past.dtype,
-                [
-                    "branch_sequence" if axis == sequence_axis else dimension
-                    for axis, dimension in enumerate(cache_contract["shape"])
-                ],
-                effect=branch_effect,
-            ),
-        )
-        rollback_nodes.append(
-            _invoke(
-                rollback_name,
-                {
-                    "past_state": f"state.{cache_name}.body",
-                    "tentative_state": f"verifier.{present.name}",
-                    "accepted_len": cache_rollback_length,
-                },
-                {"corrected_state": f"rollback.{cache_name}"},
-                {
-                    rollback_name: _effect(
-                        f"rollback.{cache_name}.0",
-                        f"rollback.{cache_name}.1",
-                    )
-                },
-            )
-        )
-        accepted_case_nodes.append(
-            _invoke(
-                publisher_name,
-                {"value": f"verifier.{present.name}"},
-                {"next_value": f"branch.accepted.{cache_name}"},
-                {
-                    branch_effect: _effect(
-                        f"branch.{cache_name}.in",
-                        f"branch.{cache_name}.accepted",
-                    )
-                },
-            )
-        )
-        corrected_case_nodes.append(
-            _invoke(
-                publisher_name,
-                {"value": f"rollback.{cache_name}"},
-                {"next_value": f"branch.corrected.{cache_name}"},
-                {
-                    branch_effect: _effect(
-                        f"branch.{cache_name}.in",
-                        f"branch.{cache_name}.corrected",
-                    )
-                },
-            )
-        )
-        branch_outputs[f"{cache_name}.next"] = {
-            "cases": {
-                "true": f"branch.accepted.{cache_name}",
-                "false": f"branch.corrected.{cache_name}",
-            }
-        }
-        branch_effects[branch_effect] = {
-            "incoming": f"branch.{cache_name}.in",
-            "cases": {
-                "true": f"branch.{cache_name}.accepted",
-                "false": f"branch.{cache_name}.corrected",
-            },
-            "produces": f"branch.{cache_name}.out",
-        }
-    branch = {
-        "kind": "branch",
-        "predicate": "acceptance.synchronized_done",
-        "cases": {
-            "true": {"kind": "sequence", "nodes": accepted_case_nodes},
-            "false": {"kind": "sequence", "nodes": corrected_case_nodes},
-        },
-        "outputs": branch_outputs,
-        "effects": branch_effects,
+    cache_next_outputs = {
+        f"cache_{index}.next": f"verifier.{present.name}"
+        for index, (_past, present) in enumerate(cache_pairs)
     }
     body_nodes = [
         _invoke("proposer", proposer_inputs, proposal_outputs),
@@ -3329,25 +3393,25 @@ def build_speculative_workflow_metadata(
                 "accepted_tokens": "acceptance.tokens",
                 "accepted_len": "acceptance.length",
                 "done": "acceptance.done",
+                "continue": "acceptance.continue",
                 "next_offset": "rng_offset.body",
-                "synchronized_len": "acceptance.synchronized_length",
-                "synchronized_done": "acceptance.synchronized_done",
                 "rollback_len": "acceptance.rollback_length",
             },
             {"verify": _effect("verify.0", "verify.1")},
         ),
         *grammar_post_nodes,
-        *adaptive_nodes,
-        *rollback_nodes,
-        branch,
         _invoke(
-            "continue_predicate",
-            {"done": "package.false"},
-            {"continue": "speculative.continue"},
+            "cache_length_update",
+            {
+                "left": "state.cache_lengths.body",
+                "right": emit_length,
+            },
+            {"total": "cache_lengths.next"},
         ),
+        *adaptive_nodes,
         {
             "kind": "emit",
-            "value": "tokens.next",
+            "value": "acceptance.tokens",
             "valid_length": emit_length,
             "output": "tokens",
             "mode": "append",
@@ -3381,13 +3445,48 @@ def build_speculative_workflow_metadata(
             "initializer": "package.zero",
             "recurrence": {"kind": "invariant"},
         },
+        "active": {
+            "contract": batch_bool,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": "package.active",
+            "recurrence": {"kind": "invariant"},
+        },
+        "done": {
+            "contract": batch_bool,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": "package.false",
+            "recurrence": {"kind": "invariant"},
+        },
+        "accepted_len": {
+            "contract": batch_int,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": "package.zero",
+            "recurrence": {"kind": "invariant"},
+        },
+        "slot_ids": {
+            "contract": batch_int,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": "request.slot_ids",
+            "recurrence": {"kind": "invariant"},
+        },
+        "cache_lengths": {
+            "contract": batch_int,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": "request.cache_lengths",
+            "recurrence": {"kind": "invariant"},
+        },
     }
     state_specs = [
         (
             "tokens",
             "request.tokens",
             "state.tokens.body",
-            "tokens.next",
+            "acceptance.tokens",
             "state.tokens.final",
         ),
         (
@@ -3396,6 +3495,41 @@ def build_speculative_workflow_metadata(
             "state.rng_offset.body",
             "rng_offset.body",
             "state.rng_offset.final",
+        ),
+        (
+            "active",
+            "package.active",
+            "state.active.body",
+            "acceptance.continue",
+            "state.active.final",
+        ),
+        (
+            "done",
+            "package.false",
+            "state.done.body",
+            "acceptance.done",
+            "state.done.final",
+        ),
+        (
+            "accepted_len",
+            "package.zero",
+            "state.accepted_len.body",
+            emit_length,
+            "state.accepted_len.final",
+        ),
+        (
+            "slot_ids",
+            "request.slot_ids",
+            "state.slot_ids.body",
+            "state.slot_ids.body",
+            "state.slot_ids.final",
+        ),
+        (
+            "cache_lengths",
+            "request.cache_lengths",
+            "state.cache_lengths.body",
+            "cache_lengths.next",
+            "state.cache_lengths.final",
         ),
     ]
     if grammar_guidance:
@@ -3448,9 +3582,19 @@ def build_speculative_workflow_metadata(
                 ),
             ]
         )
-    for index, (past, _present) in enumerate(cache_pairs):
+    kv_ports: dict[str, Any] = {}
+    kv_sequence_axis = 2
+    for index, (past, present) in enumerate(cache_pairs):
         cell = f"cache_{index}"
         initializer = f"request.verifier.{past.name}"
+        kv_sequence_axis = next(
+            (
+                axis
+                for axis, dimension in enumerate(_contract(past)["shape"])
+                if "sequence" in str(dimension)
+            ),
+            2,
+        )
         state[cell] = {
             "contract": _contract(past),
             "class": "semantic",
@@ -3458,23 +3602,18 @@ def build_speculative_workflow_metadata(
             "initializer": initializer,
             "recurrence": {
                 "kind": "bounded",
-                "axis": next(
-                    (
-                        axis
-                        for axis, dimension in enumerate(_contract(past)["shape"])
-                        if "sequence" in str(dimension)
-                    ),
-                    2,
-                ),
+                "axis": kv_sequence_axis,
                 "max": "package.max_context",
             },
+            "service_group": "verifier_cache",
         }
+        kv_ports[cell] = {"input": past.name, "output": present.name}
         state_specs.append(
             (
                 cell,
                 initializer,
                 f"state.{cell}.body",
-                f"{cell}.next",
+                cache_next_outputs[f"{cell}.next"],
                 f"state.{cell}.final",
             )
         )
@@ -3517,6 +3656,7 @@ def build_speculative_workflow_metadata(
                 "typed_emit",
                 "emit_valid_length",
                 "bounded_state_recurrence",
+                "serving_service_contract",
             ],
         },
         "inputs": inputs,
@@ -3537,21 +3677,33 @@ def build_speculative_workflow_metadata(
             name: _component(model, _artifact(name, len(pkg))) for name, model in pkg.items()
         },
         "state": state,
+        "serving": {
+            "active": "active",
+            "done": "done",
+            "accepted_len": "accepted_len",
+            "slot_ids": "slot_ids",
+            "kv_service": {
+                "paging": "paged",
+                "allocation": "runtime",
+                "compaction": True,
+                "groups": {
+                    "verifier_cache": {
+                        "sequence_axis": kv_sequence_axis,
+                        "layout": "bnsh",
+                        "logical_lengths": "cache_lengths",
+                        "storage": "paged",
+                        "ports": {"verifier": kv_ports},
+                    }
+                },
+            },
+        },
         "initial_effects": initial_effects,
         "graph": {
             "kind": "loop",
-            "setup": {
-                "kind": "sequence",
-                "nodes": [
-                    _invoke(
-                        "continue_predicate",
-                        {"done": "package.false"},
-                        {"continue": "speculative.setup.continue"},
-                    )
-                ],
-            },
+            "setup": {"kind": "sequence", "nodes": []},
             "body": {"kind": "sequence", "nodes": body_nodes},
-            "condition": "speculative.continue",
+            "condition": "acceptance.continue",
+            "active_cell": "active",
             "max_iterations": "request.max_iterations",
             "iteration": {"value": "speculative.iteration", "contract": batch_int},
             "carried": carried,
@@ -3618,7 +3770,6 @@ def build_decoder_workflow_metadata(
         ),
     )
     pkg.add_policy_component("last_token_logits", build_last_token_logits())
-    pkg.add_policy_component("continue_predicate", build_boolean_not())
 
     inputs = list(decoder.graph.inputs)
     outputs = list(decoder.graph.outputs)
@@ -3766,6 +3917,8 @@ def build_decoder_workflow_metadata(
 
     batch_dimension = _shape_metadata(_port(token_input))[0]
     batch_int = {"dtype": "int64", "rank": 1, "shape": [batch_dimension]}
+    batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch_dimension]}
+    control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
     eos_token_id = getattr(config, "eos_token_id", 0)
     if isinstance(eos_token_id, list):
         eos_token_id = eos_token_id[0] if eos_token_id else 0
@@ -3773,7 +3926,7 @@ def build_decoder_workflow_metadata(
     workflow_inputs.update(
         {
             "request.max_iterations": {
-                "contract": batch_int,
+                "contract": control_int,
                 "role": {
                     "kind": "runtime",
                     "version": "1.0",
@@ -3790,14 +3943,14 @@ def build_decoder_workflow_metadata(
                 "default": eos_token_id,
             },
             "package.one_token": {
-                "contract": batch_int,
+                "contract": control_int,
                 "role": {"kind": "opaque"},
                 "source": {"kind": "literal"},
                 "required": False,
                 "default": 1,
             },
             "package.max_context": {
-                "contract": batch_int,
+                "contract": control_int,
                 "role": {"kind": "opaque"},
                 "source": {"kind": "literal"},
                 "required": False,
@@ -3891,6 +4044,47 @@ def build_decoder_workflow_metadata(
                 },
             }
         )
+    if cache_pairs:
+        pkg.add_policy_component("cache_length_update", build_integer_add())
+        workflow_inputs.update(
+            {
+                "package.active": {
+                    "contract": batch_bool,
+                    "role": {"kind": "opaque"},
+                    "source": {"kind": "literal"},
+                    "required": False,
+                    "default": True,
+                },
+                "package.not_done": {
+                    "contract": batch_bool,
+                    "role": {"kind": "opaque"},
+                    "source": {"kind": "literal"},
+                    "required": False,
+                    "default": False,
+                },
+                "package.slot_ids": {
+                    "contract": batch_int,
+                    "role": {"kind": "opaque"},
+                    "source": {"kind": "literal"},
+                    "required": False,
+                    "default": 0,
+                },
+                "package.cache_lengths": {
+                    "contract": batch_int,
+                    "role": {"kind": "opaque"},
+                    "source": {"kind": "literal"},
+                    "required": False,
+                    "default": 0,
+                },
+                "package.zero_batch": {
+                    "contract": batch_int,
+                    "role": {"kind": "opaque"},
+                    "source": {"kind": "literal"},
+                    "required": False,
+                    "default": 0,
+                },
+            }
+        )
 
     for value in inputs:
         if value is token_input:
@@ -3933,6 +4127,46 @@ def build_decoder_workflow_metadata(
             "recurrence": {"kind": "invariant"},
         },
     }
+    if cache_pairs:
+        state.update(
+            {
+                "active": {
+                    "contract": batch_bool,
+                    "class": "semantic",
+                    "scope": "invocation",
+                    "initializer": "package.active",
+                    "recurrence": {"kind": "invariant"},
+                },
+                "done": {
+                    "contract": batch_bool,
+                    "class": "semantic",
+                    "scope": "invocation",
+                    "initializer": "package.not_done",
+                    "recurrence": {"kind": "invariant"},
+                },
+                "accepted_len": {
+                    "contract": batch_int,
+                    "class": "semantic",
+                    "scope": "invocation",
+                    "initializer": "package.zero_batch",
+                    "recurrence": {"kind": "invariant"},
+                },
+                "slot_ids": {
+                    "contract": batch_int,
+                    "class": "semantic",
+                    "scope": "invocation",
+                    "initializer": "package.slot_ids",
+                    "recurrence": {"kind": "invariant"},
+                },
+                "cache_lengths": {
+                    "contract": batch_int,
+                    "class": "semantic",
+                    "scope": "invocation",
+                    "initializer": "package.cache_lengths",
+                    "recurrence": {"kind": "invariant"},
+                },
+            }
+        )
     initial_effects = {
         "sample": "sample.0",
         "termination": "termination.0",
@@ -3965,6 +4199,46 @@ def build_decoder_workflow_metadata(
             },
         ]
     )
+    if cache_pairs:
+        carried.extend(
+            [
+                {
+                    "cell": "active",
+                    "current": "package.active",
+                    "body_input": "state.active.body",
+                    "body_output": "loop.continue",
+                    "next": "state.active.final",
+                },
+                {
+                    "cell": "done",
+                    "current": "package.not_done",
+                    "body_input": "state.done.body",
+                    "body_output": "loop.done",
+                    "next": "state.done.final",
+                },
+                {
+                    "cell": "cache_lengths",
+                    "current": "package.cache_lengths",
+                    "body_input": "state.cache_lengths.body",
+                    "body_output": "cache_lengths.next",
+                    "next": "state.cache_lengths.final",
+                },
+                {
+                    "cell": "accepted_len",
+                    "current": "package.zero_batch",
+                    "body_input": "state.accepted_len.body",
+                    "body_output": "accepted_len.next",
+                    "next": "state.accepted_len.final",
+                },
+                {
+                    "cell": "slot_ids",
+                    "current": "package.slot_ids",
+                    "body_input": "state.slot_ids.body",
+                    "body_output": "state.slot_ids.body",
+                    "next": "state.slot_ids.final",
+                },
+            ]
+        )
     if stochastic_sampler:
         state["rng_offset"] = {
             "contract": batch_int,
@@ -4033,30 +4307,34 @@ def build_decoder_workflow_metadata(
                 "write_effect": _effect(f"{effect_name}.read", f"{effect_name}.1"),
             }
         )
+    decoder_kv_ports: dict[str, Any] = {}
+    decoder_kv_axis = 2
     for past, present in cache_pairs:
         cell = f"cache_{len(carried)}"
         setup_value = f"decoder.setup.{present.name}"
         body_value = f"decoder.body.{present.name}"
         setup_decoder_outputs[present.name] = setup_value
         body_decoder_outputs[present.name] = body_value
+        decoder_kv_axis = next(
+            (
+                index
+                for index, dimension in enumerate(_contract(past)["shape"])
+                if "sequence" in str(dimension)
+            ),
+            2,
+        )
         state[cell] = {
             "contract": _contract(past),
             "scope": "invocation",
             "initializer": setup_value,
             "recurrence": {
-                "kind": "growing",
-                "axis": next(
-                    (
-                        index
-                        for index, dimension in enumerate(_contract(past)["shape"])
-                        if "sequence" in str(dimension)
-                    ),
-                    2,
-                ),
-                "increment": "package.one_token",
+                "kind": "bounded",
+                "axis": decoder_kv_axis,
                 "max": "package.max_context",
             },
+            "service_group": "decoder_cache",
         }
+        decoder_kv_ports[cell] = {"input": past.name, "output": present.name}
         effect_name = f"state:{cell}"
         initial_effects[effect_name] = f"{effect_name}.0"
         carried.append(
@@ -4152,13 +4430,30 @@ def build_decoder_workflow_metadata(
                     "iteration": "loop.iteration",
                     "max_iterations": "request.max_iterations",
                 },
-                {"done": "loop.done"},
+                {"done": "loop.done", "continue": "loop.continue"},
                 {"termination": _effect("termination.0", "termination.1")},
             ),
-            _invoke(
-                "continue_predicate",
-                {"done": "loop.done"},
-                {"continue": "loop.continue"},
+            *(
+                [
+                    _invoke(
+                        "cache_length_update",
+                        {
+                            "left": "state.cache_lengths.body",
+                            "right": "package.one_token",
+                        },
+                        {"total": "cache_lengths.next"},
+                    ),
+                    _invoke(
+                        "cache_length_update",
+                        {
+                            "left": "package.zero_batch",
+                            "right": "package.one_token",
+                        },
+                        {"total": "accepted_len.next"},
+                    ),
+                ]
+                if cache_pairs
+                else []
             ),
             {
                 "kind": "emit",
@@ -4207,6 +4502,9 @@ def build_decoder_workflow_metadata(
                 "linear_effects",
                 "nested_control_flow",
                 "typed_emit",
+                "loop_induction_values",
+                *(["serving_service_contract"] if cache_pairs else []),
+                *(["bounded_state_recurrence"] if cache_pairs else []),
             ],
         },
         "inputs": workflow_inputs,
@@ -4219,12 +4517,39 @@ def build_decoder_workflow_metadata(
         },
         "components": {decoder_name: _component(decoder, artifact)},
         "state": state,
+        **(
+            {
+                "serving": {
+                    "active": "active",
+                    "done": "done",
+                    "accepted_len": "accepted_len",
+                    "slot_ids": "slot_ids",
+                    "kv_service": {
+                        "paging": "paged",
+                        "allocation": "runtime",
+                        "compaction": True,
+                        "groups": {
+                            "decoder_cache": {
+                                "sequence_axis": decoder_kv_axis,
+                                "layout": "bnsh",
+                                "logical_lengths": "cache_lengths",
+                                "storage": "paged",
+                                "ports": {decoder_name: decoder_kv_ports},
+                            }
+                        },
+                    },
+                }
+            }
+            if cache_pairs
+            else {}
+        ),
         "initial_effects": initial_effects,
         "graph": {
             "kind": "loop",
             "setup": setup,
             "body": body,
             "condition": "loop.continue",
+            **({"active_cell": "active"} if cache_pairs else {}),
             "max_iterations": "request.max_iterations",
             "iteration": {
                 "value": "loop.iteration",
@@ -4281,7 +4606,6 @@ def build_language_diffusion_pipeline_metadata(
         )
 
     attach_policy_components(pkg, PolicyCapabilities(masked_update=True))
-    pkg.add_policy_component("continue_predicate", build_boolean_not())
 
     token_contract = _contract(token_input)
     mask_contract = {
@@ -4384,6 +4708,7 @@ def build_language_diffusion_pipeline_metadata(
                 "next_mask": f"{prefix}.mask",
                 "next_offset": f"{prefix}.rng_offset",
                 "done": f"{prefix}.done",
+                "continue": f"{prefix}.continue",
             },
             {"update": _effect(effect_in, effect_out)},
         )
@@ -4405,11 +4730,6 @@ def build_language_diffusion_pipeline_metadata(
                 "denoiser.body",
                 "update.0",
                 "update.1",
-            ),
-            _invoke(
-                "continue_predicate",
-                {"done": "denoiser.body.done"},
-                {"continue": "denoiser.body.continue"},
             ),
             {
                 "kind": "emit",

@@ -285,7 +285,7 @@ def test_decoder_policy_chain_generates_multiple_tokens_from_prompt_only(tmp_pat
         (last,) = _run(build_last_token_logits(), tmp_path, {"logits": logits})
         (sample,) = _run(build_greedy_sampler(), tmp_path, {"logits": last})
         emitted.append(int(sample[0]))
-        (done,) = _run(
+        done, _continue = _run(
             build_eos_termination(),
             tmp_path,
             {
@@ -402,7 +402,7 @@ def test_seeded_sampler_applies_request_min_p_in_logit_space(tmp_path):
 
 
 def test_eos_termination_runtime(tmp_path):
-    (terminated,) = _run(
+    terminated, continued = _run(
         build_eos_termination(),
         tmp_path,
         {
@@ -413,6 +413,7 @@ def test_eos_termination_runtime(tmp_path):
         },
     )
     np.testing.assert_array_equal(terminated, [True, True, True])
+    np.testing.assert_array_equal(continued, [False])
 
 
 def test_euler_solver_runtime_parity(tmp_path):
@@ -453,6 +454,7 @@ def test_masked_update_runtime_parity(tmp_path):
     np.testing.assert_array_equal(outputs[1], [[False, True, False]])
     np.testing.assert_array_equal(outputs[2], [14])
     np.testing.assert_array_equal(outputs[3], [False])
+    np.testing.assert_array_equal(outputs[4], [True])
 
     final = _run(
         build_masked_token_update(),
@@ -471,6 +473,7 @@ def test_masked_update_runtime_parity(tmp_path):
     np.testing.assert_array_equal(final[0], [[1, 5, 6]])
     np.testing.assert_array_equal(final[1], [[False, False, False]])
     np.testing.assert_array_equal(final[3], [True])
+    np.testing.assert_array_equal(final[4], [False])
 
 
 def test_speculative_acceptance_prefix_runtime(tmp_path):
@@ -479,9 +482,8 @@ def test_speculative_acceptance_prefix_runtime(tmp_path):
         count,
         done,
         next_offset,
-        synchronized_len,
-        synchronized_done,
         rollback_len,
+        continued,
     ) = _run(
         build_speculative_acceptance(),
         tmp_path,
@@ -499,9 +501,8 @@ def test_speculative_acceptance_prefix_runtime(tmp_path):
     np.testing.assert_array_equal(count, [3])
     np.testing.assert_array_equal(done, [False])
     np.testing.assert_array_equal(next_offset, [12])
-    np.testing.assert_array_equal(synchronized_len, [3])
-    np.testing.assert_array_equal(synchronized_done, [False])
     np.testing.assert_array_equal(rollback_len, [2])
+    np.testing.assert_array_equal(continued, [True])
     (corrected_cache,) = _run(
         build_speculative_state_rollback(
             ir.DataType.FLOAT,
@@ -518,15 +519,14 @@ def test_speculative_acceptance_prefix_runtime(tmp_path):
     assert corrected_cache.shape[2] == 4
 
 
-def test_speculative_acceptance_synchronizes_batched_prefixes(tmp_path):
+def test_speculative_acceptance_preserves_per_row_prefixes(tmp_path):
     (
         accepted_tokens,
         count,
         done,
         _,
-        synchronized_len,
-        synchronized_done,
         rollback_len,
+        continued,
     ) = _run(
         build_speculative_acceptance(),
         tmp_path,
@@ -543,12 +543,14 @@ def test_speculative_acceptance_synchronizes_batched_prefixes(tmp_path):
             "offset": np.array([0, 0], np.int64),
         },
     )
-    np.testing.assert_array_equal(count, [2, 2])
-    np.testing.assert_array_equal(accepted_tokens, [[1, 0, 0, 0], [1, 0, 0, 0]])
-    np.testing.assert_array_equal(done, [False, False])
-    np.testing.assert_array_equal(synchronized_len, [2])
-    np.testing.assert_array_equal(synchronized_done, [False])
-    np.testing.assert_array_equal(rollback_len, [1])
+    np.testing.assert_array_equal(count, [2, 4])
+    np.testing.assert_array_equal(
+        accepted_tokens,
+        [[1, 0, 0, 0], [1, 0, 1, 0]],
+    )
+    np.testing.assert_array_equal(done, [False, True])
+    np.testing.assert_array_equal(rollback_len, [1, 4])
+    np.testing.assert_array_equal(continued, [True, False])
 
 
 def test_speculative_state_rollback_trims_tentative_cache(tmp_path):

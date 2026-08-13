@@ -4,9 +4,7 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
-import jsonschema
 import onnx_ir as ir
 import pytest
 
@@ -27,7 +25,7 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
 def test_speculative_writer_saves_policy_artifacts(tmp_path):
     write_speculative_workflow_metadata(_speculative_package(), str(tmp_path))
     assert (tmp_path / "policies" / "speculative_acceptance.onnx").is_file()
-    assert (tmp_path / "policies" / "branch_state.onnx").is_file()
+    assert (tmp_path / "policies" / "cache_length_update.onnx").is_file()
 
 
 def test_speculative_writer_saves_guidance_and_adaptive_artifacts(tmp_path):
@@ -39,7 +37,6 @@ def test_speculative_writer_saves_guidance_and_adaptive_artifacts(tmp_path):
     )
     assert (tmp_path / "policies" / "grammar_guidance.onnx").is_file()
     assert (tmp_path / "policies" / "adaptive_k.onnx").is_file()
-    assert (tmp_path / "policies" / "grammar_emit_length.onnx").is_file()
 
 
 def test_speculative_emit_uses_accepted_prefix_length():
@@ -47,7 +44,7 @@ def test_speculative_emit_uses_accepted_prefix_length():
         "workflow"
     ]
     emit = next(node for node in workflow["steps"][0]["steps"] if node["kind"] == "emit")
-    assert emit["valid_length"] == "acceptance.synchronized_length"
+    assert emit["valid_length"] == "acceptance.length"
     assert "emit_valid_length" in workflow["manifest"]["capabilities"]
     assert workflow["outputs"]["tokens"]["contract"]["shape"][-1] == "accepted_sequence"
     assert workflow["state"]["cache_0"]["recurrence"] == {
@@ -55,6 +52,8 @@ def test_speculative_emit_uses_accepted_prefix_length():
         "axis": 2,
         "max": "package.max_context",
     }
+    assert workflow["state"]["cache_0"]["service_group"] == "verifier_cache"
+    assert workflow["serving"]["accepted_len"] == "accepted_len"
     assert workflow["inputs"]["package.max_context"]["default"] == 4096
 
 
@@ -144,23 +143,23 @@ def test_language_diffusion_uses_exclusive_ssa_workflow():
             "seed": "seed",
             "offset": "offset",
             "next_offset": "next_offset",
+            "continue": "continue",
         },
     }
 
     graph = workflow["steps"][0]
     assert graph["kind"] == "loop"
-    assert graph["condition"] == "denoiser.body.continue"
+    assert graph["continue_when"] == "loop_0_active"
     assert graph["max_iterations"] == "request.max_iterations"
     assert [node["component"] for node in graph["setup"]] == ["model"]
     assert [node["kind"] for node in graph["steps"]] == [
-        "invoke",
         "invoke",
         "emit",
         "invoke",
     ]
     assert graph["iteration"]["value"] == "loop.iteration"
     assert graph["steps"][0]["inputs"]["total_steps"] == "package.num_steps"
-    assert graph["steps"][2]["mode"] == "replace"
+    assert graph["steps"][1]["mode"] == "replace"
 
 
 def test_language_diffusion_rejects_zero_steps():
@@ -169,19 +168,6 @@ def test_language_diffusion_rejects_zero_steps():
             _masked_denoiser_package(),
             num_inference_steps=0,
         )
-
-
-def test_language_diffusion_matches_pr_828_schema():
-    schema_path = (
-        Path(__file__).parents[4] / "tests" / "schemas" / "onnx_genai_b2157a2.schema.json"
-    )
-    with schema_path.open(encoding="utf-8") as handle:
-        schema = json.load(handle)
-    metadata = build_language_diffusion_pipeline_metadata(
-        _masked_denoiser_package(),
-        num_inference_steps=8,
-    )
-    jsonschema.validate(instance=metadata, schema=schema)
 
 
 def _graph_model(
@@ -287,31 +273,26 @@ def test_speculative_grammar_and_adaptive_k_use_typed_state_contracts():
     )
     assert proposer["inputs"]["proposal_budget"] == "proposal_k"
     assert all("initial" not in carry for carry in workflow["steps"][0]["carried"])
-    schema_path = (
-        Path(__file__).parents[4] / "tests" / "schemas" / "onnx_genai_b2157a2.schema.json"
-    )
-    with schema_path.open(encoding="utf-8") as handle:
-        jsonschema.validate(instance=metadata, schema=json.load(handle))
 
 
-def test_speculative_workflow_uses_branch_phi_and_rng():
+def test_speculative_workflow_uses_per_row_ragged_state_and_rng():
     workflow = build_speculative_workflow_metadata(_speculative_package())["pipeline"][
         "workflow"
     ]
     body = workflow["steps"][0]["steps"]
-    branch = next(node for node in body if node["kind"] == "branch")
-    assert branch["kind"] == "branch"
-    assert branch["outputs"]["tokens.next"]["cases"] == {
-        "true": "branch.accepted",
-        "false": "branch.corrected",
-    }
     acceptance = body[2]
     assert acceptance["inputs"]["offset"] == "rng_offset"
     assert acceptance["outputs"]["next_offset"] == "rng_offset.body"
-    rollback = next(node for node in body if node.get("component") == "rollback_cache_0")
-    assert rollback["inputs"]["accepted_len"] == "acceptance.rollback_length"
-    assert branch["outputs"]["cache_0.next"]["cases"] == {
-        "true": "branch.accepted.cache_0",
-        "false": "branch.corrected.cache_0",
+    assert acceptance["outputs"]["accepted_len"] == "acceptance.length"
+    emit = next(node for node in body if node["kind"] == "emit")
+    assert emit["valid_length"] == "acceptance.length"
+    assert not any(node["kind"] == "branch" for node in body)
+    assert workflow["serving"]["active"] == "active"
+    assert workflow["serving"]["done"] == "done"
+    assert workflow["serving"]["kv_service"]["groups"]["verifier_cache"]["ports"]["verifier"][
+        "cache_0"
+    ] == {
+        "input": "past_key_values.0.key",
+        "output": "present.0.key",
     }
     assert any(item["cell"].startswith("cache_") for item in workflow["steps"][0]["carried"])

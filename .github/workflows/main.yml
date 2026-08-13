@@ -15,6 +15,35 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  onnx-genai-metadata:
+    name: ONNX GenAI metadata
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - uses: actions/checkout@v7
+      with:
+        repository: justinchuby/onnx-genai
+        ref: 8215649100a0a27be15b04045fddde777c8248fc
+        path: validation/onnx-genai
+    - uses: actions/setup-python@v7
+      with:
+        python-version: "3.12"
+    - name: Install dependencies
+      run: |
+        pip install torch --index-url https://download.pytorch.org/whl/cpu
+        pip install -r requirements/ci/requirements.txt
+        pip install onnxruntime
+        pip install -e '.[testing]'
+    - name: Generate representative packages
+      run: PYTHONPATH=src python tests/generate_onnx_genai_validation_packages.py validation/packages
+    - name: Validate package semantics
+      run: |
+        for package in validation/packages/*; do
+          cargo run --quiet \
+            --manifest-path validation/onnx-genai/Cargo.toml \
+            -p onnx-genai-metadata --bin validate_metadata -- "$package"
+        done
+
   lint:
     name: Lint
     runs-on: ubuntu-latest

@@ -198,6 +198,17 @@ def build_integer_minimum() -> PolicyComponent:
     return _component("mobius.policy.auxiliary@1", graph, {})
 
 
+def build_integer_add() -> PolicyComponent:
+    """Add two per-row integer state values."""
+    graph, builder = _make_graph("integer_add")
+    left = builder.input("left", ir.DataType.INT64, ["batch"])
+    right = builder.input("right", ir.DataType.INT64, ["batch"])
+    total = builder.op.Add(left, right)
+    total.shape = ir.Shape(["batch"])
+    builder.add_output(total, "total")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
 def build_batch_minimum() -> PolicyComponent:
     """Synchronize a per-batch integer length to one conservative scalar."""
     graph, builder = _make_graph("batch_minimum")
@@ -1167,7 +1178,13 @@ def build_eos_termination() -> PolicyComponent:
         max_iterations,
     )
     done = op.Or(hit_eos, hit_limit)
+    continued = op.Equal(
+        op.ReduceMax(op.Cast(done, to=ir.DataType.INT64), keepdims=1),
+        op.Constant(value_int=0),
+    )
+    continued.shape = ir.Shape([1])
     builder.add_output(done, "done")
+    builder.add_output(continued, "continue")
     return _component(
         "onnx-genai.termination-predicate@1",
         graph,
@@ -1178,6 +1195,7 @@ def build_eos_termination() -> PolicyComponent:
             "iteration": "iteration",
             "max_iterations": "max_iterations",
             "done": "done",
+            "continue": "continue",
             "effect": "termination",
         },
         "termination",
@@ -1325,6 +1343,11 @@ def build_masked_token_update() -> PolicyComponent:
     )
     done = op.Equal(remaining_count, op.Constant(value_int=0))
     done.shape = ir.Shape(["batch"])
+    continued = op.Equal(
+        op.ReduceMax(op.Cast(done, to=ir.DataType.INT64), keepdims=1),
+        op.Constant(value_int=0),
+    )
+    continued.shape = ir.Shape([1])
     next_offset = op.Add(
         op.Add(offset, op.Squeeze(sequence_length, op.Constant(value_ints=[0]))),
         op.Mul(seed, op.Constant(value_int=0)),
@@ -1334,6 +1357,7 @@ def build_masked_token_update() -> PolicyComponent:
     builder.add_output(remaining, "next_mask")
     builder.add_output(next_offset, "next_offset")
     builder.add_output(done, "done")
+    builder.add_output(continued, "continue")
     return _component(
         "onnx-genai.masked-update@1",
         graph,
@@ -1345,6 +1369,7 @@ def build_masked_token_update() -> PolicyComponent:
             "step": "step",
             "next_state": "next_state",
             "next_mask": "next_mask",
+            "continue": "continue",
             "rng": {
                 "seed": "seed",
                 "offset": "offset",
@@ -1399,16 +1424,7 @@ def build_speculative_acceptance() -> PolicyComponent:
         op.Add(verified_count, op.Cast(op.Not(done), to=ir.DataType.INT64)),
         draft_length,
     )
-    # Dense batched state has one physical sequence length. Synchronize to the
-    # shortest verified prefix so every row can share the same rollback point.
-    synchronized_len = op.ReduceMin(accepted_count, axes=[0], keepdims=1)
-    rollback_len = op.ReduceMin(verified_count, axes=[0], keepdims=1)
-    accepted_count = op.Expand(synchronized_len, op.Shape(accepted_count))
-    synchronized_done = op.Cast(
-        op.ReduceMin(op.Cast(done, to=ir.DataType.INT64), axes=[0], keepdims=1),
-        to=ir.DataType.BOOL,
-    )
-    done = op.Expand(synchronized_done, op.Shape(done))
+    continued = op.Not(done)
     positions = op.Range(
         op.Constant(value_int=0),
         op.Squeeze(draft_length, op.Constant(value_ints=[0])),
@@ -1427,17 +1443,15 @@ def build_speculative_acceptance() -> PolicyComponent:
     next_offset = op.Add(next_offset, op.Mul(seed, op.Constant(value_int=0)))
     accepted_count.shape = ir.Shape(["batch"])
     done.shape = ir.Shape(["batch"])
-    synchronized_len.shape = ir.Shape([1])
-    rollback_len.shape = ir.Shape([1])
-    synchronized_done.shape = ir.Shape([1])
+    verified_count.shape = ir.Shape(["batch"])
+    continued.shape = ir.Shape(["batch"])
     next_offset.shape = ir.Shape(["batch"])
     builder.add_output(accepted_tokens, "accepted_tokens")
     builder.add_output(accepted_count, "accepted_len")
     builder.add_output(done, "done")
     builder.add_output(next_offset, "next_offset")
-    builder.add_output(synchronized_len, "synchronized_len")
-    builder.add_output(synchronized_done, "synchronized_done")
-    builder.add_output(rollback_len, "rollback_len")
+    builder.add_output(verified_count, "rollback_len")
+    builder.add_output(continued, "continue")
     return _component(
         "onnx-genai.speculative-verifier@1",
         graph,
@@ -1448,6 +1462,7 @@ def build_speculative_acceptance() -> PolicyComponent:
             "accepted_tokens": "accepted_tokens",
             "accepted_len": "accepted_len",
             "done": "done",
+            "continue": "continue",
             "rng": {
                 "seed": "seed",
                 "offset": "offset",
