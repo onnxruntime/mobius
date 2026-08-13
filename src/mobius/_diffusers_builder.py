@@ -22,6 +22,7 @@ import tqdm
 
 from mobius._builder import build_from_module, resolve_dtype
 from mobius._model_package import ModelPackage
+from mobius._optimizations import fold_initializers_after_weights
 from mobius._weight_loading import _parallel_download, apply_weights
 
 logger = logging.getLogger(__name__)
@@ -424,6 +425,7 @@ def build_diffusers_pipeline(
                 state_dict = {**state_dict, **lora_weights}
             for model in sub_pkg.values():
                 apply_weights(model, state_dict)
+                fold_initializers_after_weights(model)
 
     if not package:
         raise ValueError(

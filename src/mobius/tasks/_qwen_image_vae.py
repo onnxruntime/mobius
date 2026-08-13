@@ -22,7 +22,10 @@ from mobius.tasks._base import ComponentSpec, ModelTask, _make_graph, _make_mode
 class QwenImageVAETask(ModelTask):
     """Build 3D causal VAE encoder and decoder ONNX graphs."""
 
-    model_roles: ClassVar[dict[str, str]] = {"encoder": "encoder", "decoder": "decoder"}
+    # Both graphs are bidirectional convolution/attention networks. The
+    # "decoder" name describes reconstruction direction, not an autoregressive
+    # decoder role eligible for causal GQA/KV-cache fusion.
+    model_roles: ClassVar[dict[str, str]] = {"encoder": "encoder", "decoder": "encoder"}
     components: ClassVar[ComponentSpec] = ComponentSpec(encoder="encoder", decoder="decoder")
 
     def build(

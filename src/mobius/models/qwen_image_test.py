@@ -242,6 +242,58 @@ def test_all_supported_dtypes_build(dtype: ir.DataType):
     assert not any(node.op_type == "Identity" for node in model.graph)
 
 
+def test_transformer_graph_is_fused_and_post_weight_optimized():
+    from collections import Counter
+
+    from mobius import build_from_module
+    from mobius._optimizations import fold_initializers_after_weights
+
+    config = QwenImageConfig(
+        in_channels=16,
+        out_channels=4,
+        patch_size=2,
+        num_layers=2,
+        attention_head_dim=8,
+        num_attention_heads=2,
+        joint_attention_dim=8,
+        cross_attention_dim=8,
+        axes_dims_rope=(2, 2, 4),
+        dtype=ir.DataType.FLOAT16,
+    )
+    model = build_from_module(
+        QwenImageTransformer2DModel(config),
+        config,
+        task="qwen-image-denoising",
+        execution_provider="cuda",
+    )["model"]
+    counts = Counter(node.op_type for node in model.graph.all_nodes())
+
+    # Main's fused-Swish path plus CSE shares the common timestep modulation
+    # across image/text streams and transformer blocks.
+    assert counts["Swish"] == 2
+    assert counts["Sigmoid"] == 0
+    assert counts["SkipLayerNormalization"] == 6
+    assert counts["Gelu"] == 3
+    assert counts["Identity"] == 0
+    assert counts["Attention"] == config.num_layers
+
+    rng = np.random.default_rng(17)
+    for initializer in model.graph.initializers.values():
+        if initializer.const_value is None:
+            initializer.const_value = ir.tensor(
+                rng.standard_normal(list(initializer.shape)).astype(initializer.dtype.numpy())
+            )
+    transpose_count = counts["Transpose"]
+    fold_initializers_after_weights(model)
+    optimized_counts = Counter(node.op_type for node in model.graph.all_nodes())
+
+    # All per-weight Linear transposes fold into the initializers; only dynamic
+    # data-layout transposes for RoPE/attention remain.
+    assert transpose_count == 39
+    assert optimized_counts["Transpose"] == 8
+    assert sum(optimized_counts.values()) < sum(counts.values())
+
+
 @pytest.mark.integration
 @pytest.mark.integration_fast
 def test_edit_vae_matches_diffusers_on_real_source_image():

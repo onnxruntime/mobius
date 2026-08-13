@@ -575,6 +575,7 @@ class TestBuildDiffusersPipelineSuccess:
 class TestBuildDiffusersPipelineWeights:
     """Tests for weight loading paths in build_diffusers_pipeline."""
 
+    @patch("mobius._diffusers_builder.fold_initializers_after_weights")
     @patch("mobius._diffusers_builder.apply_weights")
     @patch(
         "mobius._diffusers_builder._download_diffusers_component_weights",
@@ -593,6 +594,7 @@ class TestBuildDiffusersPipelineWeights:
         mock_build_from_module,
         mock_download_weights,
         mock_apply_weights,
+        mock_fold_initializers,
     ):
         """When load_weights=True, weights are downloaded and applied."""
         mock_load_index.return_value = _fake_pipeline_index(
@@ -608,6 +610,7 @@ class TestBuildDiffusersPipelineWeights:
 
         mock_download_weights.assert_called_once_with("fake/model", "vae", revision=None)
         mock_apply_weights.assert_called_once()
+        mock_fold_initializers.assert_called_once_with(model)
 
     @patch(
         "mobius._diffusers_builder._download_diffusers_component_weights",
