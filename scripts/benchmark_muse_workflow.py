@@ -146,7 +146,11 @@ def main() -> int:
             "metadata_sha256": _sha256(args.model / "inference_metadata.yaml"),
             "genai_config_sha256": _sha256(args.model / "genai_config.json"),
         },
-        "runtime_source_head": runtime_head,
+        "runtime": {
+            "source_head": runtime_head,
+            "runner": str(args.runner.resolve()),
+            "runner_sha256": _sha256(args.runner),
+        },
         "metrics": {
             "ttft_ms": float(median.group(1)),
             "decode_ms_per_token": float(median.group(2)),
