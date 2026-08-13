@@ -499,8 +499,12 @@ class ArchitectureConfig(BaseModelConfig):
     mm_tokens_per_image: int | None = None
     image_token_id: int | None = None
     video_token_id: int | None = None
+    vision_start_token_id: int | None = None
+    vision_end_token_id: int | None = None
     spatial_merge_size: int = 2
     temporal_patch_size: int = 2
+    frame_windows_size: int = 4
+    tokens_per_second: float = 1.0
     deepstack_visual_indexes: list[int] | None = None
     fullatt_block_indexes: list[int] | None = None
     window_size: int = 112
@@ -997,6 +1001,8 @@ class ArchitectureConfig(BaseModelConfig):
 
         # Vision config (from multimodal models)
         options.update(_extract_vision_config(config, parent_config, model_type))
+        if getattr(parent_config, "model_type", None) == "mage_vl":
+            options["model_type"] = "mage_vl"
 
         # Audio config
         options.update(_extract_audio_config(config, parent_config, model_type))

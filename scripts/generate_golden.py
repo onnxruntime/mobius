@@ -50,6 +50,41 @@ if TYPE_CHECKING:
 
 import numpy as np
 
+_MISSING_ATTRIBUTE = object()
+
+
+@contextlib.contextmanager
+def _temporary_processor_max_pixels(processor: object, max_pixels: int | None):
+    """Temporarily override processor pixel limits and restore their exact state."""
+    if max_pixels is None:
+        yield
+        return
+
+    saved_attributes: list[tuple[object, str, object]] = []
+
+    def override(obj: object | None, name: str) -> None:
+        if obj is None:
+            return
+        saved_attributes.append((obj, name, getattr(obj, name, _MISSING_ATTRIBUTE)))
+        setattr(obj, name, max_pixels)
+
+    image_processor = getattr(processor, "image_processor", None)
+    video_processor = getattr(processor, "video_processor", None)
+    override(image_processor, "max_pixels")
+    image_size = getattr(image_processor, "size", None)
+    if image_size is not None and hasattr(image_size, "longest_edge"):
+        override(image_size, "longest_edge")
+    override(video_processor, "max_pixels")
+
+    try:
+        yield
+    finally:
+        for obj, name, previous in reversed(saved_attributes):
+            if previous is _MISSING_ATTRIBUTE:
+                delattr(obj, name)
+            else:
+                setattr(obj, name, previous)
+
 
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
@@ -379,7 +414,7 @@ def _generate_seq2seq(case: TestCase, json_path: Path, device: str) -> None:
             input_ids=torch.from_numpy(input_ids).to(torch_device),
             decoder_input_ids=torch.from_numpy(decoder_start).to(torch_device),
         )
-    last_logits = outputs.logits[0, -1, :].cpu().numpy()
+    last_logits = outputs.logits[0, -1, :].float().cpu().numpy()
     golden = _extract_logits_golden(last_logits)
 
     # L5: greedy generation
@@ -439,8 +474,9 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
         case.model_id, dtype=torch_dtype, device=device
     )
 
-    # Load images from testdata/
+    # Load real image/video media from testdata/.
     images = [Image.open(Path("testdata") / img_path) for img_path in case.images]
+    videos = [str(Path("testdata") / video_path) for video_path in case.videos]
 
     # Build a chat-formatted prompt when a usable template is available.
     # Phi-3 Vision exposes its template on the underlying tokenizer rather
@@ -451,6 +487,8 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
         content: list[dict[str, str]] = []
         for img_path in case.images:
             content.append({"type": "image", "image": str(Path("testdata") / img_path)})
+        for video_path in case.videos:
+            content.append({"type": "video", "video": str(Path("testdata") / video_path)})
         content.append({"type": "text", "text": prompt_text})
         messages = [{"role": "user", "content": content}]
         try:
@@ -477,11 +515,17 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
             prompt_text = processor.image_token * len(case.images) + prompt_text
 
     # Process multimodal inputs through the HF processor
-    processed = processor(
-        text=prompt_text,
-        images=images if images else None,
-        return_tensors="pt",
-    )
+    with _temporary_processor_max_pixels(processor, case.media_max_pixels):
+        processor_kwargs: dict[str, object] = {
+            "text": prompt_text,
+            "return_tensors": "pt",
+        }
+        if images:
+            processor_kwargs["images"] = images
+        if videos:
+            processor_kwargs["videos"] = videos
+            processor_kwargs["num_frames"] = case.video_num_frames
+        processed = processor(**processor_kwargs)
 
     # Normalize the CLI/device-map selection to a concrete runtime device
     # before moving any tensors. `device="auto"` is handled by Transformers/

@@ -25,6 +25,7 @@ Run::
 from __future__ import annotations
 
 import ast
+import contextlib
 import dataclasses
 import functools
 import os
@@ -67,6 +68,40 @@ def _load_phi3_vision_projector_weights_cached(model_id: str):
 
 # Root of test data (images, audio, etc.)
 _TESTDATA_DIR = Path(__file__).resolve().parent.parent / "testdata"
+_MISSING_ATTRIBUTE = object()
+
+
+@contextlib.contextmanager
+def _temporary_processor_max_pixels(processor: object, max_pixels: int | None):
+    """Temporarily override processor pixel limits and restore their exact state."""
+    if max_pixels is None:
+        yield
+        return
+
+    saved_attributes: list[tuple[object, str, object]] = []
+
+    def override(obj: object | None, name: str) -> None:
+        if obj is None:
+            return
+        saved_attributes.append((obj, name, getattr(obj, name, _MISSING_ATTRIBUTE)))
+        setattr(obj, name, max_pixels)
+
+    image_processor = getattr(processor, "image_processor", None)
+    video_processor = getattr(processor, "video_processor", None)
+    override(image_processor, "max_pixels")
+    image_size = getattr(image_processor, "size", None)
+    if image_size is not None and hasattr(image_size, "longest_edge"):
+        override(image_size, "longest_edge")
+    override(video_processor, "max_pixels")
+
+    try:
+        yield
+    finally:
+        for obj, name, previous in reversed(saved_attributes):
+            if previous is _MISSING_ATTRIBUTE:
+                delattr(obj, name)
+            else:
+                setattr(obj, name, previous)
 
 
 def _get_test_build_ep() -> str:
@@ -233,6 +268,29 @@ def test_phi3_vision_projector_weights_are_cached():
         assert _load_phi3_vision_projector_weights_cached("model-id") is weights
     load.assert_called_once_with("model-id")
     _load_phi3_vision_projector_weights_cached.cache_clear()
+
+
+def test_temporary_processor_max_pixels_restores_none_and_missing_attributes():
+    class ProcessorPart:
+        pass
+
+    image_processor = ProcessorPart()
+    image_processor.max_pixels = None
+    image_processor.size = ProcessorPart()
+    image_processor.size.longest_edge = None
+    video_processor = ProcessorPart()
+    processor = ProcessorPart()
+    processor.image_processor = image_processor
+    processor.video_processor = video_processor
+
+    with _temporary_processor_max_pixels(processor, 1234):
+        assert image_processor.max_pixels == 1234
+        assert image_processor.size.longest_edge == 1234
+        assert video_processor.max_pixels == 1234
+
+    assert image_processor.max_pixels is None
+    assert image_processor.size.longest_edge is None
+    assert not hasattr(video_processor, "max_pixels")
 
 
 def _make_empty_kv_cache(
@@ -955,13 +1013,25 @@ def _run_vl_vision_to_image_features(
         for name in vis_session.input_names:
             if name in processed:
                 val = processed[name]
-                vis_feeds[name] = val if isinstance(val, np.ndarray) else np.array(val)
+                array = val if isinstance(val, np.ndarray) else np.array(val)
+                target_dtype = vis_session.get_input_dtype(name)
+                vis_feeds[name] = (
+                    array.astype(target_dtype)
+                    if target_dtype is not None and array.dtype != target_dtype
+                    else array
+                )
             else:
                 # Handle HF↔ONNX name mismatches (e.g. HF "image_position_ids"
                 # vs ONNX "pixel_position_ids").
                 for hf_key, val in processed.items():
                     if hf_key.replace("image_", "pixel_") == name:
-                        vis_feeds[name] = val if isinstance(val, np.ndarray) else np.array(val)
+                        array = val if isinstance(val, np.ndarray) else np.array(val)
+                        target_dtype = vis_session.get_input_dtype(name)
+                        vis_feeds[name] = (
+                            array.astype(target_dtype)
+                            if target_dtype is not None and array.dtype != target_dtype
+                            else array
+                        )
                         break
         for name, value in vis_feeds.items():
             input_dtype = vis_session.get_input_dtype(name)
@@ -971,6 +1041,46 @@ def _run_vl_vision_to_image_features(
         return vis_out, vis_out[next(iter(vis_out))]
     finally:
         vis_session.close()
+
+
+def _prepare_vl_inputs(
+    case: GoldenTestCase,
+    processor: object,
+) -> dict[str, np.ndarray]:
+    """Apply an HF multimodal processor to the case's ordered image/video media."""
+    from PIL import Image
+
+    images = [Image.open(_TESTDATA_DIR / path) for path in case.images]
+    videos = [str(_TESTDATA_DIR / path) for path in case.videos]
+    prompt_text = case.prompts[0]
+    if videos:
+        content: list[dict[str, str]] = [
+            *[{"type": "image", "image": str(_TESTDATA_DIR / path)} for path in case.images],
+            *[{"type": "video", "video": str(_TESTDATA_DIR / path)} for path in case.videos],
+            {"type": "text", "text": prompt_text},
+        ]
+        prompt_text = processor.apply_chat_template(
+            [{"role": "user", "content": content}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    else:
+        prompt_text = _build_mm_prompt(processor, prompt_text, case.images, "image")
+
+    kwargs: dict[str, object] = {
+        "text": prompt_text,
+        "images": images or None,
+        "return_tensors": "pt",
+    }
+    if videos:
+        kwargs["videos"] = videos
+        kwargs["num_frames"] = case.video_num_frames
+    with _temporary_processor_max_pixels(processor, case.media_max_pixels):
+        processed_pt = processor(**kwargs)
+    return {
+        key: value.numpy() if hasattr(value, "numpy") else np.array(value)
+        for key, value in processed_pt.items()
+    }
 
 
 def _run_vision_language_prefill(
@@ -989,24 +1099,14 @@ def _run_vision_language_prefill(
     golden generation.
     """
     import transformers
-    from PIL import Image
 
-    # --- Step 0: Preprocess image with HF processor ---
+    # --- Step 0: Preprocess image/video media with the HF processor ---
     processor = transformers.AutoProcessor.from_pretrained(
         case.model_id,
         revision=case.revision,
         trust_remote_code=case.trust_remote_code,
     )
-    image = Image.open(_TESTDATA_DIR / case.images[0])
-
-    # Build the prompt (chat template when available, else manual placeholder).
-    prompt_text = _build_mm_prompt(processor, case.prompts[0], case.images, "image")
-
-    # Use PyTorch tensors then convert — some processors don't support np
-    processed_pt = processor(text=prompt_text, images=[image], return_tensors="pt")
-    processed: dict[str, np.ndarray] = {
-        k: v.numpy() if hasattr(v, "numpy") else np.array(v) for k, v in processed_pt.items()
-    }
+    processed = _prepare_vl_inputs(case, processor)
 
     # --- Step 1: Run vision encoder (+ host-side projector where required) ---
     vis_out, image_features = _run_vl_vision_to_image_features(pkg, case, processed)
@@ -1159,7 +1259,6 @@ def _run_vl_generation(
     Returns newly generated token IDs (prompt excluded).
     """
     import transformers
-    from PIL import Image
 
     # --- Step 0: prepare multimodal inputs ---
     processor = transformers.AutoProcessor.from_pretrained(
@@ -1167,19 +1266,12 @@ def _run_vl_generation(
         revision=case.revision,
         trust_remote_code=case.trust_remote_code,
     )
-    image = Image.open(_TESTDATA_DIR / case.images[0])
-
-    prompt_text = _build_mm_prompt(processor, case.prompts[0], case.images, "image")
     suppress_ids = _load_suppress_token_ids(
         case.model_id,
         revision=case.revision,
         trust_remote_code=case.trust_remote_code,
     )
-
-    processed_pt = processor(text=prompt_text, images=[image], return_tensors="pt")
-    processed: dict[str, np.ndarray] = {
-        k: v.numpy() if hasattr(v, "numpy") else np.array(v) for k, v in processed_pt.items()
-    }
+    processed = _prepare_vl_inputs(case, processor)
 
     # --- Step 1: vision encoder (+ host-side projector where required) ---
     _vis_out, image_features = _run_vl_vision_to_image_features(pkg, case, processed)

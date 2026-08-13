@@ -5,12 +5,50 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
+from pathlib import Path
 
 import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _mage_vl_optional_streammind_import(model_id: str):
+    """Treat StreamMind's mamba-ssm dependency as optional for base Mage-VL.
+
+    The remote ``modeling_mage_vl.py`` imports ``streammind_gate`` only inside
+    StreamMind-specific methods, but Transformers recursively validates that
+    sibling module and otherwise requires mamba-ssm even for ordinary
+    image/video generation. mamba-ssm has no Windows wheel and is not used by
+    the base checkpoint path exercised here.
+    """
+    if model_id.lower() != "microsoft/mage-vl":
+        yield
+        return
+
+    import transformers.dynamic_module_utils as dynamic_module_utils
+
+    original_get_imports = dynamic_module_utils.get_imports
+
+    def _get_imports(filename):
+        imports = original_get_imports(filename)
+        if Path(filename).name == "streammind_gate.py":
+            return [name for name in imports if name != "mamba_ssm"]
+        return imports
+
+    dynamic_module_utils.get_imports = _get_imports
+    try:
+        yield
+    finally:
+        dynamic_module_utils.get_imports = original_get_imports
+
+
+def _load_mage_compatible(model_id: str, loader, *args, **kwargs):
+    with _mage_vl_optional_streammind_import(model_id):
+        return loader(*args, **kwargs)
 
 
 def _install_dynamic_cache_legacy_shims() -> None:
@@ -229,8 +267,18 @@ def load_torch_multimodal_model(
     """
     import transformers
 
-    tokenizer = transformers.AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    processor = transformers.AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+    tokenizer = _load_mage_compatible(
+        model_id,
+        transformers.AutoTokenizer.from_pretrained,
+        model_id,
+        trust_remote_code=True,
+    )
+    processor = _load_mage_compatible(
+        model_id,
+        transformers.AutoProcessor.from_pretrained,
+        model_id,
+        trust_remote_code=True,
+    )
 
     # Shim: transformers 5.x removed DynamicCache.from_legacy_cache and
     # DynamicCache.get_usable_length, but some trust_remote_code models
@@ -241,7 +289,12 @@ def load_torch_multimodal_model(
     # Some models (e.g. Phi-3.5-vision-instruct) hardcode flash_attention_2
     # in their config.json, which causes an ImportError when flash_attn is
     # not installed.
-    config = transformers.AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    config = _load_mage_compatible(
+        model_id,
+        transformers.AutoConfig.from_pretrained,
+        model_id,
+        trust_remote_code=True,
+    )
     config._attn_implementation = "eager"
 
     # Some trust_remote_code VLMs (e.g. Phi-3-Vision) are registered as
@@ -255,9 +308,21 @@ def load_torch_multimodal_model(
 
     def _load_from_pretrained(auto_cls):
         try:
-            return auto_cls.from_pretrained(model_id, dtype=dtype, **base_kwargs)
+            return _load_mage_compatible(
+                model_id,
+                auto_cls.from_pretrained,
+                model_id,
+                dtype=dtype,
+                **base_kwargs,
+            )
         except TypeError:
-            return auto_cls.from_pretrained(model_id, torch_dtype=dtype, **base_kwargs)
+            return _load_mage_compatible(
+                model_id,
+                auto_cls.from_pretrained,
+                model_id,
+                torch_dtype=dtype,
+                **base_kwargs,
+            )
 
     try:
         image_text_to_text_cls = transformers.AutoModelForImageTextToText

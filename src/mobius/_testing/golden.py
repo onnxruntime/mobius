@@ -88,6 +88,15 @@ class GoldenTestCase:
     images: list[str]
     """Image paths relative to ``testdata/`` (VL tasks)."""
 
+    videos: list[str]
+    """Video paths relative to ``testdata/`` (video-language tasks)."""
+
+    video_num_frames: int | None
+    """Optional deterministic number of frames sampled from each video."""
+
+    media_max_pixels: int | None
+    """Optional deterministic pixel budget applied to each image/video frame."""
+
     audio: list[str]
     """Audio paths relative to ``testdata/`` (speech tasks)."""
 
@@ -238,6 +247,9 @@ def load_test_case(yaml_path: Path) -> GoldenTestCase:
         level=data["level"],
         prompts=inputs.get("prompts", []) or [],
         images=inputs.get("images", []) or [],
+        videos=inputs.get("videos", []) or [],
+        video_num_frames=inputs.get("video_num_frames"),
+        media_max_pixels=inputs.get("media_max_pixels"),
         audio=inputs.get("audio", []) or [],
         decoder_prompt=inputs.get("decoder_prompt", "") or "",
         generation_params=generation,

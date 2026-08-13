@@ -353,6 +353,17 @@ def _save_package(
     pkg, output_dir: str, args, optimize: str | None, component_filter: str | None
 ) -> None:
     """Save a ModelPackage to disk, applying optimizations and runtime configs."""
+    runtime = getattr(args, "runtime", None)
+    if runtime == "ort-genai":
+        from mobius.integrations.ort_genai.auto_export import (
+            _validate_ort_genai_compatibility,
+        )
+
+        try:
+            _validate_ort_genai_compatibility(pkg)
+        except ValueError as error:
+            raise SystemExit(f"Error: {error}") from error
+
     components = (lambda name: name == component_filter) if component_filter else None
     for name, model in pkg.items():
         if components is not None and not components(name):
@@ -384,7 +395,6 @@ def _save_package(
             path = os.path.join(output_dir, "model.onnx")
         print(f"Saved {name} to {path}")
 
-    runtime = getattr(args, "runtime", None)
     if runtime == "ort-genai":
         from mobius.integrations.ort_genai import write_ort_genai_config
 
@@ -399,6 +409,7 @@ def _save_package(
             hf_model_id=hf_model_id,
             ep=ep,
             local_config_dir=local_config_dir,
+            trust_remote_code=getattr(args, "trust_remote_code", False),
         )
         for name, path in artifacts.items():
             print(f"  {name}: {path}")

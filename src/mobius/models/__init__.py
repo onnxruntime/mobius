@@ -70,6 +70,7 @@ __all__ = [
     "IPAdapterModel",
     "InternLM2CausalLMModel",
     "InternVL2Model",
+    "MageVLForConditionalGeneration",
     "JambaCausalLMModel",
     "JetMoeCausalLMModel",
     "Llama4CausalLMModel",
@@ -231,6 +232,7 @@ from mobius.models.llada import LLaDAModel
 from mobius.models.llama4 import Llama4CausalLMModel
 from mobius.models.llava import LLaVAModel
 from mobius.models.longcat_flash import LongcatFlashCausalLMModel
+from mobius.models.mage_vl import MageVLForConditionalGeneration
 from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
 from mobius.models.mimi import MimiModel, mimi_default_config
 from mobius.models.minimax import MiniMaxCausalLMModel
