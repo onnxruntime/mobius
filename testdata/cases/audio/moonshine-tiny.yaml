@@ -1,0 +1,18 @@
+model_id: "moonshine-ai/moonshine-tiny"
+model_type: "moonshine"
+revision: "390624ed33d594443aa4aa221f5b9f283b545b5a"
+task_type: "speech-to-text"
+dtype: "float32"
+
+inputs:
+  audio:
+    - "652-129742-0006.flac"
+
+generation:
+  max_new_tokens: 50
+  do_sample: false
+  eos_token_id: 2
+
+level: "L4+L5"
+
+notes: "Moonshine tiny raw-waveform RoPE encoder-decoder ASR."

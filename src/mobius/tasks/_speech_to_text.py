@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Speech-to-text task for encoder-decoder models (e.g. Whisper)."""
+"""Build configurable encoder and cached-decoder graphs for speech-to-text models."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import ClassVar
 import onnx_ir as ir
 from onnxscript import nn
 
-from mobius._configs import BaseModelConfig, WhisperConfig
+from mobius._configs import BaseModelConfig, SpeechToTextConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
     ComponentSpec,
@@ -25,17 +25,25 @@ from mobius.tasks._cache_utils import (
 
 
 class SpeechToTextTask(ModelTask):
-    """Encoder-decoder speech-to-text task (e.g. Whisper).
+    """Encoder-decoder task shared by Whisper- and Moonshine-style ASR models.
 
     This task builds **two** separate ONNX models via :meth:`build`:
 
-    - **encoder**: ``input_features`` → ``encoder_hidden_states``
+    - **encoder**: the audio input named by
+      :attr:`SpeechToTextConfig.encoder_input_name` and, when
+      :attr:`SpeechToTextConfig.encoder_uses_attention_mask` is true, an
+      ``attention_mask``. It returns ``encoder_hidden_states`` and, for masked
+      encoders such as Moonshine, ``encoder_attention_mask``.
     - **decoder**: ``decoder_input_ids``, ``encoder_hidden_states``,
-      ``attention_mask``, ``position_ids``, ``past_key_values``
-      → ``logits``, ``present_key_values``
+      ``position_ids``, and ``past_key_values``. When
+      :attr:`SpeechToTextConfig.decoder_uses_encoder_attention_mask` is true,
+      the encoder's mask is also routed to the decoder. It returns ``logits``
+      and ``present_key_values``.
 
     The module must expose ``model.encoder`` and ``model.decoder`` sub-modules
-    (matching the :class:`WhisperForConditionalGeneration` layout).
+    following this configurable contract. Whisper uses ``input_features``
+    without an encoder mask; Moonshine uses ``input_values`` and routes its
+    downsampled encoder mask into cross-attention.
     """
 
     model_roles: ClassVar[dict[str, str]] = {"encoder": "encoder", "decoder": "decoder"}
@@ -49,9 +57,9 @@ class SpeechToTextTask(ModelTask):
         config: BaseModelConfig,
     ) -> ModelPackage:
         self._validate_components(module)
-        if not isinstance(config, WhisperConfig):
+        if not isinstance(config, SpeechToTextConfig):
             raise TypeError(
-                f"SpeechToTextTask requires WhisperConfig, got {type(config).__name__}"
+                f"SpeechToTextTask requires SpeechToTextConfig, got {type(config).__name__}"
             )
 
         encoder_model = self._build_encoder(module.model.encoder, config)
@@ -64,21 +72,40 @@ class SpeechToTextTask(ModelTask):
     def _build_encoder(
         self,
         encoder: nn.Module,
-        config: WhisperConfig,
+        config: SpeechToTextConfig,
     ) -> ir.Model:
+        """Build the encoder graph from the configured audio input and mask contract."""
         batch = ir.SymbolicDim("batch")
         audio_seq_len = ir.SymbolicDim("audio_seq_len")
 
         graph, builder = _make_graph(name="encoder")
         op = builder.op
 
-        input_features = builder.input(
-            "input_features",
-            dtype=ir.DataType.FLOAT,
-            shape=[batch, config.num_mel_bins, audio_seq_len],
+        input_shape = [batch, audio_seq_len]
+        if config.encoder_input_channels is not None:
+            input_shape.insert(1, config.encoder_input_channels)
+        encoder_input = builder.input(
+            config.encoder_input_name,
+            dtype=config.dtype,
+            shape=input_shape,
         )
 
-        encoder_hidden_states = encoder(op, input_features=input_features)
+        if config.encoder_uses_attention_mask:
+            attention_mask = builder.input(
+                "attention_mask",
+                dtype=ir.DataType.INT64,
+                shape=[batch, audio_seq_len],
+            )
+            encoder_hidden_states, encoder_attention_mask = encoder(
+                op,
+                **{
+                    config.encoder_input_name: encoder_input,
+                    "attention_mask": attention_mask,
+                },
+            )
+            builder.add_output(encoder_attention_mask, "encoder_attention_mask")
+        else:
+            encoder_hidden_states = encoder(op, **{config.encoder_input_name: encoder_input})
 
         builder.add_output(encoder_hidden_states, "encoder_hidden_states")
 
@@ -87,8 +114,9 @@ class SpeechToTextTask(ModelTask):
     def _build_decoder(
         self,
         decoder: nn.Module,
-        config: WhisperConfig,
+        config: SpeechToTextConfig,
     ) -> ir.Model:
+        """Build the cached decoder, routing the encoder mask only when configured."""
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
         past_seq_len = ir.SymbolicDim("past_sequence_len")
@@ -123,13 +151,19 @@ class SpeechToTextTask(ModelTask):
             past_seq_len,
         )
 
-        logits, present_key_values = decoder(
-            op,
-            decoder_input_ids=decoder_input_ids,
-            encoder_hidden_states=encoder_hidden_states,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-        )
+        decoder_kwargs = {
+            "decoder_input_ids": decoder_input_ids,
+            "encoder_hidden_states": encoder_hidden_states,
+            "position_ids": position_ids,
+            "past_key_values": past_key_values,
+        }
+        if config.decoder_uses_encoder_attention_mask:
+            decoder_kwargs["encoder_attention_mask"] = builder.input(
+                "encoder_attention_mask",
+                dtype=ir.DataType.INT64,
+                shape=[batch, encoder_seq_len],
+            )
+        logits, present_key_values = decoder(op, **decoder_kwargs)
 
         builder.add_output(logits, "logits")
         _register_kv_cache_outputs(builder, present_key_values)

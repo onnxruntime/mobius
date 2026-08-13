@@ -32,10 +32,11 @@ class Conv1d(nn.Module):
         kernel_size: int,
         stride: int = 1,
         padding: int = 0,
+        bias: bool = True,
     ):
         super().__init__()
         self.weight = nn.Parameter([out_channels, in_channels, kernel_size])
-        self.bias = nn.Parameter([out_channels])
+        self.bias = nn.Parameter([out_channels]) if bias else None
         self._kernel_shape = [kernel_size]
         self._strides = [stride]
         self._pads = [padding, padding]

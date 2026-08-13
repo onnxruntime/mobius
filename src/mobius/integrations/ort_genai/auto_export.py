@@ -1199,6 +1199,13 @@ def write_ort_genai_config(
             "artifact that the runtime cannot load."
         )
 
+    if getattr(config, "model_type", None) == "moonshine":
+        raise NotImplementedError(
+            "onnxruntime-genai does not support Moonshine's variable-length raw-waveform "
+            "encoder. Run the exported encoder and cached decoder directly with "
+            "ONNX Runtime."
+        )
+
     os.makedirs(directory, exist_ok=True)
 
     # Normalize EP: 'default' and 'onnx-standard' are portable-ONNX modes

@@ -2773,7 +2773,7 @@ class TestBuildGraphMultiModal:
 class TestBuildGraphWhisper:
     """Verify Whisper encoder-decoder builds with SpeechToTextTask."""
 
-    def _whisper_config(self):
+    def _whisper_config(self, *, num_mel_bins=16):
         from mobius._configs import WhisperConfig
 
         return WhisperConfig(
@@ -2792,7 +2792,7 @@ class TestBuildGraphWhisper:
             encoder_layers=TINY_LAYERS,
             encoder_attention_heads=TINY_HEADS,
             encoder_ffn_dim=TINY_INTERMEDIATE,
-            num_mel_bins=16,
+            num_mel_bins=num_mel_bins,
             max_source_positions=100,
             max_target_positions=50,
             scale_embedding=True,
@@ -2827,6 +2827,22 @@ class TestBuildGraphWhisper:
         output_names = {out.name for out in encoder.graph.outputs}
         assert "input_features" in input_names
         assert "encoder_hidden_states" in output_names
+
+    def test_whisper_128_mel_encoder_input_shape(self):
+        """Whisper large-v3/turbo graphs use their configured 128 mel channels."""
+        from mobius._builder import build_from_module
+        from mobius.models.whisper import WhisperForConditionalGeneration
+        from mobius.tasks import SpeechToTextTask
+
+        config = self._whisper_config(num_mel_bins=128)
+        module = WhisperForConditionalGeneration(config)
+        encoder = build_from_module(module, config, task=SpeechToTextTask())["encoder"]
+        input_features = next(
+            value for value in encoder.graph.inputs if value.name == "input_features"
+        )
+
+        assert config.encoder_input_channels == 128
+        assert input_features.shape[1] == 128
 
     def test_whisper_decoder_io(self):
         """Verify decoder inputs/outputs including KV cache."""
@@ -2897,6 +2913,93 @@ class TestBuildGraphWhisper:
         from mobius.models.whisper import WhisperForConditionalGeneration
 
         assert model_cls is WhisperForConditionalGeneration
+
+
+class TestBuildGraphMoonshine:
+    """Verify Moonshine raw-audio encoder and cached decoder graphs."""
+
+    def _moonshine_config(self):
+        from mobius._configs import MoonshineConfig
+
+        return MoonshineConfig(
+            vocab_size=512,
+            hidden_size=TINY_HIDDEN,
+            intermediate_size=TINY_INTERMEDIATE,
+            num_hidden_layers=TINY_LAYERS,
+            num_attention_heads=TINY_HEADS,
+            num_key_value_heads=TINY_HEADS,
+            head_dim=TINY_HIDDEN // TINY_HEADS,
+            hidden_act="silu",
+            pad_token_id=2,
+            tie_word_embeddings=True,
+            max_position_embeddings=194,
+            rope_type="default",
+            rope_theta=10_000.0,
+            partial_rotary_factor=0.75,
+            rope_interleave=True,
+            encoder_num_hidden_layers=TINY_LAYERS,
+            encoder_num_attention_heads=TINY_HEADS,
+            encoder_num_key_value_heads=TINY_HEADS,
+        )
+
+    def test_moonshine_package_and_io(self):
+        from mobius._builder import build_from_module
+        from mobius.models import MoonshineForConditionalGeneration
+        from mobius.tasks import SpeechToTextTask
+
+        config = self._moonshine_config()
+        package = build_from_module(
+            MoonshineForConditionalGeneration(config),
+            config,
+            task=SpeechToTextTask(),
+        )
+
+        assert set(package) == {"encoder", "decoder"}
+        encoder_inputs = {value.name for value in package["encoder"].graph.inputs}
+        encoder_outputs = {value.name for value in package["encoder"].graph.outputs}
+        decoder_inputs = {value.name for value in package["decoder"].graph.inputs}
+        assert encoder_inputs == {"input_values", "attention_mask"}
+        assert encoder_outputs == {
+            "encoder_hidden_states",
+            "encoder_attention_mask",
+        }
+        assert "encoder_attention_mask" in decoder_inputs
+        assert "position_ids" in decoder_inputs
+        for layer_idx in range(TINY_LAYERS):
+            assert f"past_key_values.{layer_idx}.key" in decoder_inputs
+
+    def test_moonshine_architecture_initializers(self):
+        from mobius._builder import build_from_module
+        from mobius.models import MoonshineForConditionalGeneration
+        from mobius.tasks import SpeechToTextTask
+
+        config = self._moonshine_config()
+        package = build_from_module(
+            MoonshineForConditionalGeneration(config),
+            config,
+            task=SpeechToTextTask(),
+        )
+        encoder_initializers = set(package["encoder"].graph.initializers)
+        decoder_initializers = set(package["decoder"].graph.initializers)
+
+        assert "encoder.conv1.weight" in encoder_initializers
+        assert "encoder.conv1.bias" not in encoder_initializers
+        assert "encoder.groupnorm.weight" in encoder_initializers
+        assert "encoder.layers.0.input_layernorm.weight" in encoder_initializers
+        assert "encoder.layers.0.input_layernorm.bias" not in encoder_initializers
+        assert "encoder.layers.0.self_attn.q_proj.weight" in encoder_initializers
+        assert "encoder.layers.0.self_attn.q_proj.bias" not in encoder_initializers
+        assert "encoder.layers.0.mlp.fc1.bias" in encoder_initializers
+        assert "encoder.layers.0.encoder_attn.q_proj.weight" not in encoder_initializers
+
+        assert "decoder.embed_tokens.weight" in decoder_initializers
+        assert "decoder.layers.0.encoder_attn.q_proj.weight" in decoder_initializers
+        assert "decoder.layers.0.mlp.fc1.weight" in decoder_initializers
+        assert "decoder.proj_out.weight" in decoder_initializers
+        assert "GroupNormalization" in {node.op_type for node in package["encoder"].graph}
+        decoder_ops = [node.op_type for node in package["decoder"].graph]
+        assert decoder_ops.count("Swish") == TINY_LAYERS
+        assert "Sigmoid" not in decoder_ops
 
 
 class TestBuildGraphQwen3ASR:

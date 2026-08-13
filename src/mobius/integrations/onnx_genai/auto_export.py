@@ -158,6 +158,32 @@ def _write_hf_tokenizer(output_dir: str, source: str | None) -> str | None:
     return path
 
 
+def _write_hf_audio_processor(output_dir: str, source: str | None) -> str | None:
+    """Emit the Hugging Face audio feature-extractor contract for ASR packages."""
+    if not source:
+        return None
+    try:
+        from transformers import AutoFeatureExtractor
+    except ImportError:
+        _LOGGER.warning(
+            "transformers is not available; skipping audio_processor.json emission."
+        )
+        return None
+    try:
+        feature_extractor = AutoFeatureExtractor.from_pretrained(source)
+    except Exception as error:
+        _LOGGER.warning(
+            "Could not load an audio processor from %r: %s; "
+            "skipping audio_processor.json emission.",
+            source,
+            error,
+        )
+        return None
+    path = os.path.join(output_dir, "audio_processor.json")
+    feature_extractor.to_json_file(path)
+    return path
+
+
 def _looks_like_diffusion(pkg: Any) -> bool:
     try:
         names = set(pkg.keys())
@@ -477,6 +503,13 @@ def write_onnx_genai_config(
         return artifacts
 
     if _looks_like_speech_to_text(pkg):
+        encoder_outputs = {value.name for value in pkg["encoder"].graph.outputs}
+        decoder_inputs = {value.name for value in pkg["decoder"].graph.inputs}
+        kwargs.setdefault(
+            "encoder_attention_mask",
+            "encoder_attention_mask" in encoder_outputs
+            and "encoder_attention_mask" in decoder_inputs,
+        )
         decoder_metadata = decoder_metadata_from_config(
             resolved_config, kv_native_dtype=kv_native_dtype
         )
@@ -491,6 +524,9 @@ def write_onnx_genai_config(
         tokenizer_path = _write_hf_tokenizer(output_dir, source)
         if tokenizer_path is not None:
             artifacts["tokenizer"] = tokenizer_path
+        audio_processor_path = _write_hf_audio_processor(output_dir, source)
+        if audio_processor_path is not None:
+            artifacts["audio_processor"] = audio_processor_path
         return artifacts
 
     # A nested multi-decoder TTS stack (talker + code_predictor) uses the

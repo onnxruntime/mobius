@@ -2121,6 +2121,7 @@ def build_speech_to_text_pipeline_metadata(
     decoder_filename: str = "decoder/model.onnx",
     tokenizer_filename: str = "tokenizer.json",
     activation_dtype: str = "fp32",
+    encoder_attention_mask: bool = False,
     decoder_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build metadata for a cross-attention encoder-decoder ASR pipeline.
@@ -2139,11 +2140,30 @@ def build_speech_to_text_pipeline_metadata(
         decoder_metadata: Optional output from
             :func:`decoder_metadata_from_config`; its decoder capabilities are
             retained at the document top level.
+        encoder_attention_mask: Whether to route the encoder's downsampled
+            attention mask into decoder cross-attention.
 
     Returns:
         A dict with a top-level ``pipeline`` key and any decoder capabilities.
     """
     metadata = dict(decoder_metadata or {})
+    dataflow = [
+        {
+            "from": "encoder.encoder_hidden_states",
+            "to": "decoder.encoder_hidden_states",
+            "dtype": activation_dtype,
+            "device_transfer": False,
+        }
+    ]
+    if encoder_attention_mask:
+        dataflow.append(
+            {
+                "from": "encoder.encoder_attention_mask",
+                "to": "decoder.encoder_attention_mask",
+                "dtype": "int64",
+                "device_transfer": False,
+            }
+        )
     metadata["pipeline"] = {
         "models": {
             "encoder": {"filename": encoder_filename, "type": "encoder"},
@@ -2153,14 +2173,7 @@ def build_speech_to_text_pipeline_metadata(
                 "tokenizer": tokenizer_filename,
             },
         },
-        "dataflow": [
-            {
-                "from": "encoder.encoder_hidden_states",
-                "to": "decoder.encoder_hidden_states",
-                "dtype": activation_dtype,
-                "device_transfer": False,
-            }
-        ],
+        "dataflow": dataflow,
         "strategy": {
             "kind": "composite",
             "stages": [
