@@ -77,7 +77,7 @@ class GatedRMSNorm(nn.Module):
         # SiLU gating in fp32 for precision, matching HF.
         h_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
         g_f32 = op.Cast(gate, to=ir.DataType.FLOAT)
-        gate_activated = op.Mul(g_f32, op.Sigmoid(g_f32))
+        gate_activated = op.Swish(g_f32)
         gated = op.Mul(h_f32, gate_activated)
 
         if self.group_size is not None and self.group_size < self.hidden_size:
@@ -204,7 +204,7 @@ class PostGatedRMSNorm(nn.Module):
         # Apply gate in fp32: normed * SiLU(gate), then cast back.
         # Matches HF Qwen3_5RMSNormGated which does gate.to(float32).
         g_f32 = op.Cast(gate, to=ir.DataType.FLOAT)
-        gate_activated = op.Mul(g_f32, op.Sigmoid(g_f32))
+        gate_activated = op.Swish(g_f32)
         result = op.Mul(op.Cast(normed, to=ir.DataType.FLOAT), gate_activated)
         return op.CastLike(result, hidden_states)
 

@@ -27,8 +27,8 @@ if TYPE_CHECKING:
 
 
 def _swish(op: OpBuilder, x):
-    """Swish activation: x * sigmoid(x)."""
-    return op.Mul(x, op.Sigmoid(x))
+    """Swish activation."""
+    return op.Swish(x)
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +40,7 @@ class _SwishModule(nn.Module):
     """Swish activation as an nn.Module (no parameters)."""
 
     def forward(self, op: OpBuilder, x: ir.Value):
-        return op.Mul(x, op.Sigmoid(x))
+        return op.Swish(x)
 
 
 class _ReLUModule(nn.Module):

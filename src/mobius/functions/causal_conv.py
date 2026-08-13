@@ -128,7 +128,7 @@ def causal_conv_nd_with_state(
 
         # Step 5: Apply activation.
         if activation in ("silu", "swish"):
-            output = op.Mul(conv_out, op.Sigmoid(conv_out))
+            output = op.Swish(conv_out)
         elif activation == "none":
             output = conv_out
         else:

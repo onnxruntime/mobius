@@ -223,12 +223,7 @@ def _build_dense_graph() -> tuple[ir.Model, dict[str, _Quant], np.ndarray]:
 
         gate = _matmulnbits(f"expert{e}.gate_proj", hidden, q(f"g{e}", INTER, H), graph)
         nodes.append(gate.producer())
-        sig = ir.node("Sigmoid", inputs=[gate], num_outputs=1, name=f"expert{e}.sigmoid")
-        sig.outputs[0].name = f"expert{e}.sigmoid.out"
-        nodes.append(sig)
-        silu = ir.node(
-            "Mul", inputs=[gate, sig.outputs[0]], num_outputs=1, name=f"expert{e}.silu"
-        )
+        silu = ir.node("Swish", inputs=[gate], num_outputs=1, name=f"expert{e}.silu")
         silu.outputs[0].name = f"expert{e}.silu.out"
         nodes.append(silu)
         up = _matmulnbits(f"expert{e}.up_proj", hidden, q(f"u{e}", INTER, H), graph)

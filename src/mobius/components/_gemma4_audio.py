@@ -73,8 +73,8 @@ def _glu(op: OpBuilder, x: ir.Value) -> ir.Value:
 
 
 def _swish(op: OpBuilder, x: ir.Value) -> ir.Value:
-    """SiLU/Swish activation: x * sigmoid(x)."""
-    return op.Mul(x, op.Sigmoid(x))
+    """SiLU/Swish activation."""
+    return op.Swish(x)
 
 
 # ---------------------------------------------------------------------------

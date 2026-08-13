@@ -32,8 +32,9 @@ class TestActivations:
         x = create_test_input(builder, "x", [2, 3, 64])
         result = silu(op, x)
         assert result is not None
-        assert count_op_type(graph, "Sigmoid") >= 1
-        assert count_op_type(graph, "Mul") >= 1
+        assert count_op_type(graph, "Swish") == 1
+        assert count_op_type(graph, "Sigmoid") == 0
+        assert count_op_type(graph, "Mul") == 0
 
     def test_relu(self):
         builder, op, graph = create_test_builder()
