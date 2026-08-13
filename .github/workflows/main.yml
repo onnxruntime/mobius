@@ -38,7 +38,7 @@ jobs:
       run: |
         PYTHONPATH=src python tests/generate_onnx_genai_validation_packages.py \
           validation/generated
-        diff --recursive --brief \
+        PYTHONPATH=src python tests/compare_onnx_genai_validation_packages.py \
           tests/fixtures/onnx_genai_workflows validation/generated
     - name: Validate package semantics
       run: |
