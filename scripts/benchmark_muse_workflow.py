@@ -49,6 +49,8 @@ def main() -> int:
         workload["request_max_length"]
     ):
         raise ValueError("request_max_length must equal prompt_tokens + max_new_tokens")
+    if workload["stop_on_eos"] is not False:
+        raise ValueError("paired Muse benchmark requires stop_on_eos=false")
     if sampling != {
         "algorithm": "greedy",
         "do_sample": False,
