@@ -3,7 +3,9 @@
 `muse_workflow_h200.json` is the shared workload for a paired native and
 metadata-workflow benchmark of the published Muse Glimmer INT4 package. Both
 paths use the same rendered 68-token prompt, greedy parameters, token budget,
-warmups, and steady-decode window.
+warmups, and steady-decode window. `request_max_length` is prompt tokens plus
+new tokens (68 + 128 = 196); `model_max_context` is the independent 131072-token
+artifact admission ceiling.
 
 Run the native ORT GenAI path:
 

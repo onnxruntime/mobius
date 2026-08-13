@@ -243,6 +243,62 @@ def test_decoder_state_initializer_and_step_update_runtime(tmp_path):
     np.testing.assert_array_equal(cast_token, [[8]])
 
 
+def test_decoder_fixed_capacity_state_matches_native_capture_layout(tmp_path):
+    inputs = [
+        ir.Value(
+            name="input_ids",
+            type=ir.TensorType(ir.DataType.INT64),
+            shape=ir.Shape(["batch", "sequence"]),
+        ),
+        ir.Value(
+            name="attention_mask",
+            type=ir.TensorType(ir.DataType.INT64),
+            shape=ir.Shape(["batch", "past_sequence + sequence"]),
+        ),
+        ir.Value(
+            name="past_key_values.0.key",
+            type=ir.TensorType(ir.DataType.FLOAT16),
+            shape=ir.Shape(["batch", 2, "past_sequence", 4]),
+        ),
+    ]
+    decoder = ir.Model(ir.Graph(inputs, [], nodes=[], name="decoder"), ir_version=11)
+    outputs = _run(
+        build_decoder_state_initializer(
+            decoder,
+            token_input="input_ids",
+            attention_mask_input="attention_mask",
+            position_ids_input=None,
+            cache_inputs=["past_key_values.0.key"],
+            fixed_capacity=True,
+        ),
+        tmp_path,
+        {
+            "prompt_tokens": np.array([[3, 4, 5]], np.int64),
+            "max_iterations": np.array([2], np.int64),
+        },
+    )
+    attention, body_attention, token, cache_lengths, cache = outputs
+    np.testing.assert_array_equal(attention, [[1, 1, 1, 0, 0]])
+    np.testing.assert_array_equal(body_attention, [[1, 1, 1, 1, 0]])
+    np.testing.assert_array_equal(token, [[0]])
+    np.testing.assert_array_equal(cache_lengths, [3])
+    assert cache.shape == (1, 2, 5, 4)
+
+    (next_attention,) = _run(
+        build_decoder_step_update(
+            attention_dtype=ir.DataType.INT64,
+            position_dtype=None,
+            fixed_capacity=True,
+        ),
+        tmp_path,
+        {
+            "attention_mask": body_attention,
+            "logical_length": np.array([4], np.int64),
+        },
+    )
+    np.testing.assert_array_equal(next_attention, [[1, 1, 1, 1, 1]])
+
+
 def test_decoder_policy_chain_generates_multiple_tokens_from_prompt_only(tmp_path):
     graph, builder = _make_graph("decoder_stub")
     op = builder.op

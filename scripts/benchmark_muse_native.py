@@ -127,6 +127,12 @@ def main() -> int:
         raise RuntimeError(
             f"prompt token count mismatch: {prompt_tokens} != {workload['prompt_tokens']}"
         )
+    request_max_length = prompt_tokens + int(workload["max_new_tokens"])
+    if request_max_length != int(workload["request_max_length"]):
+        raise RuntimeError(
+            "request max length mismatch: "
+            f"{request_max_length} != {workload['request_max_length']}"
+        )
 
     for _ in range(int(workload["warmups"])):
         _run_once(

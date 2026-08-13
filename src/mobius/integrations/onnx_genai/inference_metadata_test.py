@@ -28,6 +28,7 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     _input_source_map,
     _match_max_token_grid,
     _port,
+    _processor_values,
     add_explicit_package_io,
     add_policy_components_to_workflow,
     build_diffusion_pipeline_metadata,
@@ -39,6 +40,61 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     write_diffusion_pipeline_metadata,
     write_native_vlm_package_metadata,
 )
+
+
+def test_ort_extensions_processor_config_supplies_structural_values(tmp_path):
+    (tmp_path / "processor_config.json").write_text(
+        json.dumps(
+            {
+                "processor": {
+                    "transforms": [
+                        {
+                            "operation": {
+                                "type": "Resize",
+                                "attrs": {
+                                    "min_pixels": 784,
+                                    "max_pixels": 2371600,
+                                    "patch_size": 14,
+                                    "merge_size": 2,
+                                },
+                            }
+                        },
+                        {
+                            "operation": {
+                                "type": "Rescale",
+                                "attrs": {"rescale_factor": 1 / 255},
+                            }
+                        },
+                        {
+                            "operation": {
+                                "type": "Normalize",
+                                "attrs": {
+                                    "mean": [0.5, 0.5, 0.5],
+                                    "std": [0.5, 0.5, 0.5],
+                                },
+                            }
+                        },
+                        {
+                            "operation": {
+                                "type": "PatchImage",
+                                "attrs": {"temporal_patch_size": 2},
+                            }
+                        },
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    values = _processor_values(str(tmp_path), object())
+
+    assert values["size"] == {"shortest_edge": 784, "longest_edge": 2371600}
+    assert values["patch_size"] == 14
+    assert values["merge_size"] == 2
+    assert values["temporal_patch_size"] == 2
+    assert values["image_mean"] == [0.5, 0.5, 0.5]
+    assert values["image_std"] == [0.5, 0.5, 0.5]
 
 
 def test_max_token_packed_grid_derives_pixel_area_bounds():

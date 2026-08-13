@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import onnx_ir as ir
 import pytest
@@ -182,14 +183,20 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
         _VlmConfig(),
         source=str(source),
     )
+    serialized = Path(path).read_text(encoding="utf-8")
+    assert "&id" not in serialized
+    assert "*id" not in serialized
     with open(path, encoding="utf-8") as handle:
         workflow = yaml.safe_load(handle)["pipeline"]["workflow"]
     decoder_invokes = []
+    policy_invokes = {}
 
     def collect_decoder_invokes(node):
         if isinstance(node, dict):
             if node.get("kind") == "invoke" and node.get("component") == "decoder":
                 decoder_invokes.append(node)
+            elif node.get("kind") == "invoke":
+                policy_invokes[node["component"]] = node
             for value in node.values():
                 collect_decoder_invokes(value)
         elif isinstance(node, list):
@@ -220,6 +227,16 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
         "rank": 2,
         "shape": ["batch", 202048],
     }
+    assert workflow["state"]["attention_mask"]["recurrence"] == {"kind": "invariant"}
+    assert workflow["state"]["cache_103"]["recurrence"] == {"kind": "invariant"}
+    assert workflow["state"]["cache_lengths"]["initializer"] == "initializer.cache_lengths"
+    assert policy_invokes["decoder_state_initializer"]["inputs"] == {
+        "prompt_tokens": "request.prompt_tokens",
+        "max_iterations": "request.max_iterations",
+    }
+    assert policy_invokes["decoder_step_update"]["inputs"]["logical_length"] == (
+        "cache_lengths.next"
+    )
     kv_service = workflow["serving"]["kv_service"]
     assert kv_service["paging"] == "none"
     assert kv_service["compaction"] is False

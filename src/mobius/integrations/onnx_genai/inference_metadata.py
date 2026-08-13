@@ -587,6 +587,33 @@ def _processor_values(
     image_processor = values.get("image_processor")
     if isinstance(image_processor, dict):
         values.update(image_processor)
+    processor = values.get("processor")
+    if isinstance(processor, dict):
+        for transform in processor.get("transforms", []):
+            operation = transform.get("operation", {}) if isinstance(transform, dict) else {}
+            operation_type = operation.get("type")
+            attrs = operation.get("attrs", {})
+            if not isinstance(attrs, dict):
+                continue
+            for key, value in attrs.items():
+                values.setdefault(key, value)
+            if operation_type == "Resize":
+                values.setdefault("do_resize", True)
+                if "min_pixels" in attrs and "max_pixels" in attrs:
+                    values.setdefault(
+                        "size",
+                        {
+                            "shortest_edge": attrs["min_pixels"],
+                            "longest_edge": attrs["max_pixels"],
+                        },
+                    )
+            elif operation_type == "Rescale":
+                values.setdefault("do_rescale", True)
+                values.setdefault("rescale_factor", attrs.get("rescale_factor"))
+            elif operation_type == "Normalize":
+                values.setdefault("do_normalize", True)
+                values.setdefault("image_mean", attrs.get("mean"))
+                values.setdefault("image_std", attrs.get("std"))
 
     embedding = values.get("embd_layer")
     if isinstance(embedding, dict):

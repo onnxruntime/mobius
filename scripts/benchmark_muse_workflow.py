@@ -38,6 +38,10 @@ def main() -> int:
     config: dict[str, Any] = json.loads(args.config.read_text())
     workload = config["workload"]
     sampling = config["sampling"]
+    if int(workload["prompt_tokens"]) + int(workload["max_new_tokens"]) != int(
+        workload["request_max_length"]
+    ):
+        raise ValueError("request_max_length must equal prompt_tokens + max_new_tokens")
     if sampling != {
         "algorithm": "greedy",
         "do_sample": False,

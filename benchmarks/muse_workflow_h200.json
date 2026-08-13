@@ -28,6 +28,8 @@
     "prompt_tokens": 68,
     "image": null,
     "max_new_tokens": 128,
+    "request_max_length": 196,
+    "model_max_context": 131072,
     "stop_on_eos": false,
     "warmups": 1,
     "runs": 3,

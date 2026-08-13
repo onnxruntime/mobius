@@ -45,6 +45,15 @@ from mobius.integrations.onnx_genai.inference_metadata import (
 )
 
 
+class _NoAliasSafeDumper(yaml.SafeDumper):
+    def ignore_aliases(self, data: Any) -> bool:
+        return True
+
+
+def _dump_yaml(metadata: dict[str, Any], handle: Any) -> None:
+    yaml.dump(metadata, handle, Dumper=_NoAliasSafeDumper, sort_keys=False)
+
+
 def _contract(value: ir.Value) -> dict[str, Any]:
     port = _port(value)
     dtype = {"fp16": "float16", "bf16": "bfloat16", "fp32": "float32"}.get(
@@ -434,7 +443,7 @@ def write_audio_codec_workflow_metadata(pkg: Any, output_dir: str) -> str:
     metadata = build_audio_codec_workflow_metadata(pkg)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(metadata, handle, sort_keys=False)
+        _dump_yaml(metadata, handle)
     return path
 
 
@@ -2125,7 +2134,7 @@ def write_tts_workflow_metadata(pkg: Any, output_dir: str, config: Any) -> str:
     pkg.save_policy_components(output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(metadata, handle, sort_keys=False)
+        _dump_yaml(metadata, handle)
     return path
 
 
@@ -2471,7 +2480,7 @@ def write_diffusion_workflow_metadata(
     pkg.save_policy_components(output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(metadata, handle, sort_keys=False)
+        _dump_yaml(metadata, handle)
     return path
 
 
@@ -2566,6 +2575,7 @@ def build_vlm_workflow_metadata(
     position_input = _find_port(rank2_integer, "position")
     if attention_input is None:
         raise ValueError("VLM decoder requires an attention-mask input")
+    fixed_capacity = bool(cache_pairs) and decoder_kv["storage"] == "shared_buffer"
 
     legacy = build_native_vlm_package_metadata(pkg, config=config, source=source)
     preprocessing = legacy.get("preprocessing")
@@ -2605,6 +2615,7 @@ def build_vlm_workflow_metadata(
             attention_mask_input=attention_input.name,
             position_ids_input=position_input.name if position_input is not None else None,
             cache_inputs=sorted(cache_names),
+            fixed_capacity=fixed_capacity,
         ),
     )
     pkg.add_policy_component(
@@ -2612,6 +2623,7 @@ def build_vlm_workflow_metadata(
         build_decoder_step_update(
             attention_dtype=attention_input.dtype,
             position_dtype=position_input.dtype if position_input is not None else None,
+            fixed_capacity=fixed_capacity,
         ),
     )
     if cache_pairs:
@@ -2784,12 +2796,16 @@ def build_vlm_workflow_metadata(
             },
             "scope": "invocation",
             "initializer": "initializer.body_attention_mask",
-            "recurrence": {
-                "kind": "growing",
-                "axis": 1,
-                "increment": "package.one",
-                "max": "package.max_context",
-            },
+            "recurrence": (
+                {"kind": "invariant"}
+                if fixed_capacity
+                else {
+                    "kind": "growing",
+                    "axis": 1,
+                    "increment": "package.one",
+                    "max": "package.max_context",
+                }
+            ),
         },
         "active": {
             "contract": batch_bool,
@@ -2823,7 +2839,9 @@ def build_vlm_workflow_metadata(
             "contract": batch_int,
             "class": "semantic",
             "scope": "invocation",
-            "initializer": "package.zero_batch",
+            "initializer": (
+                "initializer.cache_lengths" if fixed_capacity else "package.zero_batch"
+            ),
             "recurrence": {"kind": "invariant"},
         },
     }
@@ -2873,7 +2891,7 @@ def build_vlm_workflow_metadata(
         ),
         (
             "cache_lengths",
-            "package.zero_batch",
+            "initializer.cache_lengths" if fixed_capacity else "package.zero_batch",
             "state.cache_lengths.body",
             "cache_lengths.next",
             "state.cache_lengths.final",
@@ -2905,18 +2923,22 @@ def build_vlm_workflow_metadata(
             "contract": _contract(past),
             "scope": "invocation",
             "initializer": f"decoder.setup.{present.name}",
-            "recurrence": {
-                "kind": "bounded",
-                "axis": next(
-                    (
-                        axis
-                        for axis, dimension in enumerate(_contract(past)["shape"])
-                        if "sequence" in str(dimension)
+            "recurrence": (
+                {"kind": "invariant"}
+                if fixed_capacity
+                else {
+                    "kind": "bounded",
+                    "axis": next(
+                        (
+                            axis
+                            for axis, dimension in enumerate(_contract(past)["shape"])
+                            if "sequence" in str(dimension)
+                        ),
+                        2,
                     ),
-                    2,
-                ),
-                "max": "package.max_context",
-            },
+                    "max": "package.max_context",
+                }
+            ),
             "service_group": "decoder_cache",
         }
         setup_decoder_outputs[present.name] = f"decoder.setup.{present.name}"
@@ -2964,11 +2986,19 @@ def build_vlm_workflow_metadata(
             *audio_setup_nodes,
             _invoke(
                 "decoder_state_initializer",
-                {"prompt_tokens": "request.prompt_tokens"},
+                {
+                    "prompt_tokens": "request.prompt_tokens",
+                    **({"max_iterations": "request.max_iterations"} if fixed_capacity else {}),
+                },
                 {
                     attention_input.name: f"initializer.{attention_input.name}",
                     "body_attention_mask": "initializer.body_attention_mask",
                     "token_slot": "initializer.token_slot",
+                    **(
+                        {"cache_lengths": "initializer.cache_lengths"}
+                        if fixed_capacity
+                        else {}
+                    ),
                     **(
                         {
                             position_input.name: f"initializer.{position_input.name}",
@@ -3061,6 +3091,7 @@ def build_vlm_workflow_metadata(
                 "decoder_step_update",
                 {
                     "attention_mask": "state.attention_mask.body",
+                    **({"logical_length": "cache_lengths.next"} if fixed_capacity else {}),
                     **(
                         {"position_ids": "state.position_ids.body"}
                         if position_input is not None
@@ -3205,7 +3236,7 @@ def write_vlm_workflow_metadata(
     pkg.save_policy_components(output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(metadata, handle, sort_keys=False)
+        _dump_yaml(metadata, handle)
     return path
 
 
@@ -4010,7 +4041,7 @@ def write_speculative_workflow_metadata(
     pkg.save_policy_components(output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(metadata, handle, sort_keys=False)
+        _dump_yaml(metadata, handle)
     return path
 
 
@@ -4131,6 +4162,7 @@ def build_decoder_workflow_metadata(
     ]
     if unsupported:
         raise ValueError(f"decoder workflow has unsupported non-request inputs: {unsupported}")
+    fixed_capacity = bool(cache_pairs) and decoder_kv_contract["storage"] == "shared_buffer"
     pkg.add_policy_component(
         "decoder_state_initializer",
         build_decoder_state_initializer(
@@ -4139,6 +4171,7 @@ def build_decoder_workflow_metadata(
             attention_mask_input=attention_input.name,
             position_ids_input=position_input.name if position_input is not None else None,
             cache_inputs=sorted(cache_names),
+            fixed_capacity=fixed_capacity,
         ),
     )
     pkg.add_policy_component(
@@ -4146,6 +4179,7 @@ def build_decoder_workflow_metadata(
         build_decoder_step_update(
             attention_dtype=attention_input.dtype,
             position_dtype=position_input.dtype if position_input is not None else None,
+            fixed_capacity=fixed_capacity,
         ),
     )
     needs_token_cast = token_input.dtype != ir.DataType.INT64
@@ -4425,7 +4459,11 @@ def build_decoder_workflow_metadata(
                     "contract": batch_int,
                     "class": "semantic",
                     "scope": "invocation",
-                    "initializer": "package.cache_lengths",
+                    "initializer": (
+                        "initializer.cache_lengths"
+                        if fixed_capacity
+                        else "package.cache_lengths"
+                    ),
                     "recurrence": {"kind": "invariant"},
                 },
             }
@@ -4481,7 +4519,11 @@ def build_decoder_workflow_metadata(
                 },
                 {
                     "cell": "cache_lengths",
-                    "current": "package.cache_lengths",
+                    "current": (
+                        "initializer.cache_lengths"
+                        if fixed_capacity
+                        else "package.cache_lengths"
+                    ),
                     "body_input": "state.cache_lengths.body",
                     "body_output": "cache_lengths.next",
                     "next": "state.cache_lengths.final",
@@ -4531,12 +4573,16 @@ def build_decoder_workflow_metadata(
             },
             "initializer.body_attention_mask",
             "decoder_step.body_attention_mask",
-            {
-                "kind": "growing",
-                "axis": 1,
-                "increment": "package.one_token",
-                "max": "package.max_context",
-            },
+            (
+                {"kind": "invariant"}
+                if fixed_capacity
+                else {
+                    "kind": "growing",
+                    "axis": 1,
+                    "increment": "package.one_token",
+                    "max": "package.max_context",
+                }
+            ),
         ),
     }
     if position_input is not None:
@@ -4590,11 +4636,15 @@ def build_decoder_workflow_metadata(
             "contract": _contract(past),
             "scope": "invocation",
             "initializer": setup_value,
-            "recurrence": {
-                "kind": "bounded",
-                "axis": decoder_kv_axis,
-                "max": "package.max_context",
-            },
+            "recurrence": (
+                {"kind": "invariant"}
+                if fixed_capacity
+                else {
+                    "kind": "bounded",
+                    "axis": decoder_kv_axis,
+                    "max": "package.max_context",
+                }
+            ),
             "service_group": "decoder_cache",
         }
         decoder_kv_ports[cell] = {"input": past.name, "output": present.name}
@@ -4617,11 +4667,19 @@ def build_decoder_workflow_metadata(
         "nodes": [
             _invoke(
                 "decoder_state_initializer",
-                {"prompt_tokens": f"request.{token_input.name}"},
+                {
+                    "prompt_tokens": f"request.{token_input.name}",
+                    **({"max_iterations": "request.max_iterations"} if fixed_capacity else {}),
+                },
                 {
                     attention_input.name: f"initializer.{attention_input.name}",
                     "body_attention_mask": "initializer.body_attention_mask",
                     "token_slot": "initializer.token_slot",
+                    **(
+                        {"cache_lengths": "initializer.cache_lengths"}
+                        if fixed_capacity
+                        else {}
+                    ),
                     **(
                         {
                             position_input.name: f"initializer.{position_input.name}",
@@ -4736,6 +4794,7 @@ def build_decoder_workflow_metadata(
                 "decoder_step_update",
                 {
                     "attention_mask": "state.attention_mask.body",
+                    **({"logical_length": "cache_lengths.next"} if fixed_capacity else {}),
                     **(
                         {"position_ids": "state.position_ids.body"}
                         if position_input is not None
@@ -5107,7 +5166,7 @@ def write_decoder_workflow_metadata(
     pkg.save_policy_components(output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(metadata, handle, sort_keys=False)
+        _dump_yaml(metadata, handle)
     return path
 
 
@@ -5126,5 +5185,5 @@ def write_language_diffusion_workflow_metadata(
     pkg.save_policy_components(output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(metadata, handle, sort_keys=False)
+        _dump_yaml(metadata, handle)
     return path
