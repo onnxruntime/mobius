@@ -3004,60 +3004,59 @@ def build_vlm_workflow_metadata(
 
     if text_only_vision is not None:
         feature_name = text_only_vision.name
-        vision_setup: dict[str, Any] = {
-            "kind": "branch",
-            "predicate": "request.has_media",
-            "cases": {
-                "true": {
-                    "kind": "sequence",
-                    "nodes": [
-                        _invoke(
-                            "image_preprocess",
-                            {"encoded": "request.image"},
-                            dict(preprocessing_values),
-                        ),
-                        _invoke(
-                            "vision_encoder",
-                            vision_invoke_inputs,
-                            {
-                                **vision_outputs,
-                                feature_name: f"vision.with_media.{feature_name}",
-                            },
-                        ),
-                    ],
+        vision_setup_nodes: list[dict[str, Any]] = [
+            {
+                "kind": "branch",
+                "predicate": "request.has_media",
+                "cases": {
+                    "true": {
+                        "kind": "sequence",
+                        "nodes": [
+                            _invoke(
+                                "image_preprocess",
+                                {"encoded": "request.image"},
+                                dict(preprocessing_values),
+                            ),
+                            _invoke(
+                                "vision_encoder",
+                                vision_invoke_inputs,
+                                {
+                                    **vision_outputs,
+                                    feature_name: f"vision.with_media.{feature_name}",
+                                },
+                            ),
+                        ],
+                    },
+                    "false": _invoke(
+                        "empty_image_features",
+                        {},
+                        {"features": f"vision.empty.{feature_name}"},
+                    ),
                 },
-                "false": _invoke(
-                    "empty_image_features",
-                    {},
-                    {"features": f"vision.empty.{feature_name}"},
-                ),
-            },
-            "outputs": {
-                f"vision.{feature_name}": {
-                    "cases": {
-                        "true": f"vision.with_media.{feature_name}",
-                        "false": f"vision.empty.{feature_name}",
+                "outputs": {
+                    f"vision.{feature_name}": {
+                        "cases": {
+                            "true": f"vision.with_media.{feature_name}",
+                            "false": f"vision.empty.{feature_name}",
+                        }
                     }
-                }
-            },
-        }
+                },
+            }
+        ]
     else:
-        vision_setup = {
-            "kind": "sequence",
-            "nodes": [
-                _invoke(
-                    "image_preprocess",
-                    {"encoded": "request.image"},
-                    dict(preprocessing_values),
-                ),
-                _invoke("vision_encoder", vision_invoke_inputs, vision_outputs),
-            ],
-        }
+        vision_setup_nodes = [
+            _invoke(
+                "image_preprocess",
+                {"encoded": "request.image"},
+                dict(preprocessing_values),
+            ),
+            _invoke("vision_encoder", vision_invoke_inputs, vision_outputs),
+        ]
 
     setup = {
         "kind": "sequence",
         "nodes": [
-            vision_setup,
+            *vision_setup_nodes,
             *audio_setup_nodes,
             _invoke(
                 "decoder_state_initializer",

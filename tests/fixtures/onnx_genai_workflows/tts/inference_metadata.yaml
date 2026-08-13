@@ -29,7 +29,7 @@ pipeline:
           kind: request
         required: true
       request.max_iterations:
-        contract: &id001
+        contract:
           dtype: int64
           rank: 1
           shape:
@@ -42,7 +42,7 @@ pipeline:
           kind: request
         required: true
       package.false:
-        contract: &id003
+        contract:
           dtype: bool
           rank: 1
           shape:
@@ -76,7 +76,11 @@ pipeline:
         required: false
         default: 1
       package.remaining_groups:
-        contract: *id001
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
         role:
           kind: opaque
         source:
@@ -84,7 +88,11 @@ pipeline:
         required: false
         default: 2
       package.predictor_context_limit:
-        contract: *id001
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
         role:
           kind: opaque
         source:
@@ -92,7 +100,11 @@ pipeline:
         required: false
         default: 4
       package.predictor_mask_limit:
-        contract: *id001
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
         role:
           kind: opaque
         source:
@@ -100,7 +112,11 @@ pipeline:
         required: false
         default: 5
       package.talker_context_limit:
-        contract: *id001
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
         role:
           kind: opaque
         source:
@@ -108,7 +124,11 @@ pipeline:
         required: false
         default: 128
       package.one_control:
-        contract: *id001
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
         role:
           kind: opaque
         source:
@@ -116,7 +136,7 @@ pipeline:
         required: false
         default: 1
       package.zero_batch:
-        contract: &id002
+        contract:
           dtype: int64
           rank: 1
           shape:
@@ -128,7 +148,11 @@ pipeline:
         required: false
         default: 0
       package.one_batch:
-        contract: *id002
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         role:
           kind: opaque
         source:
@@ -136,7 +160,11 @@ pipeline:
         required: false
         default: 1
       package.true:
-        contract: *id003
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
         role:
           kind: opaque
         source:
@@ -144,7 +172,11 @@ pipeline:
         required: false
         default: true
       package.slot_ids:
-        contract: *id002
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         role:
           kind: opaque
         source:
@@ -427,7 +459,11 @@ pipeline:
         recurrence:
           kind: invariant
       code_token:
-        contract: *id002
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         scope: invocation
         initializer: frame.group1
         recurrence:
@@ -458,42 +494,66 @@ pipeline:
         recurrence:
           kind: invariant
       active:
-        contract: *id003
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: package.true
         recurrence:
           kind: invariant
       done:
-        contract: *id003
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: package.false
         recurrence:
           kind: invariant
       accepted_len:
-        contract: *id002
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: package.zero_batch
         recurrence:
           kind: invariant
       slot_ids:
-        contract: *id002
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: package.slot_ids
         recurrence:
           kind: invariant
       talker_cache_lengths:
-        contract: *id002
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: package.zero_batch
         recurrence:
           kind: invariant
       predictor_cache_lengths:
-        contract: *id002
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: package.zero_batch
@@ -729,15 +789,15 @@ pipeline:
       accepted_len: accepted_len
       slot_ids: slot_ids
       kv_service:
-        paging: paged
+        paging: none
         allocation: runtime
-        compaction: true
+        compaction: false
         groups:
           talker_cache:
             sequence_axis: 2
             layout: bnsh
             logical_lengths: talker_cache_lengths
-            storage: paged
+            storage: shared_buffer
             ports:
               talker:
                 talker_cache_0:
@@ -750,7 +810,7 @@ pipeline:
             sequence_axis: 2
             layout: bnsh
             logical_lengths: predictor_cache_lengths
-            storage: paged
+            storage: shared_buffer
             ports:
               code_predictor:
                 predictor_cache_0:
@@ -1436,7 +1496,11 @@ pipeline:
         next: talker.continue
       iteration:
         value: talker.iteration
-        contract: *id002
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
     - kind: invoke
       component: codec_layout
       inputs:

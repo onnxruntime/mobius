@@ -29,7 +29,7 @@ pipeline:
           kind: request
         required: true
       request.max_iterations:
-        contract: &id001
+        contract:
           dtype: int64
           rank: 1
           shape:
@@ -54,7 +54,11 @@ pipeline:
         required: true
         default: 127
       package.one_token:
-        contract: *id001
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
         role:
           kind: opaque
         source:
@@ -62,7 +66,11 @@ pipeline:
         required: false
         default: 1
       package.max_context:
-        contract: *id001
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
         role:
           kind: opaque
         source:
@@ -70,7 +78,7 @@ pipeline:
         required: false
         default: 8192
       package.active:
-        contract: &id002
+        contract:
           dtype: bool
           rank: 1
           shape:
@@ -82,7 +90,11 @@ pipeline:
         required: false
         default: true
       package.not_done:
-        contract: *id002
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
         role:
           kind: opaque
         source:
@@ -90,7 +102,7 @@ pipeline:
         required: false
         default: false
       package.slot_ids:
-        contract: &id003
+        contract:
           dtype: int64
           rank: 1
           shape:
@@ -102,7 +114,11 @@ pipeline:
         required: false
         default: 0
       package.cache_lengths:
-        contract: *id003
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         role:
           kind: opaque
         source:
@@ -110,7 +126,11 @@ pipeline:
         required: false
         default: 0
       package.zero_batch:
-        contract: *id003
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         role:
           kind: opaque
         source:
@@ -210,38 +230,58 @@ pipeline:
         recurrence:
           kind: invariant
       active:
-        contract: *id002
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: package.active
         recurrence:
           kind: invariant
       done:
-        contract: *id002
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: package.not_done
         recurrence:
           kind: invariant
       accepted_len:
-        contract: *id003
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: package.zero_batch
         recurrence:
           kind: invariant
       slot_ids:
-        contract: *id003
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: package.slot_ids
         recurrence:
           kind: invariant
       cache_lengths:
-        contract: *id003
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
-        initializer: package.cache_lengths
+        initializer: initializer.cache_lengths
         recurrence:
           kind: invariant
       attention_mask:
@@ -254,10 +294,7 @@ pipeline:
         scope: invocation
         initializer: initializer.body_attention_mask
         recurrence:
-          kind: growing
-          axis: 1
-          increment: package.one_token
-          max: package.max_context
+          kind: invariant
       position_ids:
         contract:
           dtype: int64
@@ -281,9 +318,7 @@ pipeline:
         scope: invocation
         initializer: decoder.setup.present.0.key
         recurrence:
-          kind: bounded
-          axis: 2
-          max: package.max_context
+          kind: invariant
         service_group: decoder_cache
     serving:
       active: active
@@ -291,15 +326,15 @@ pipeline:
       accepted_len: accepted_len
       slot_ids: slot_ids
       kv_service:
-        paging: paged
+        paging: none
         allocation: runtime
-        compaction: true
+        compaction: false
         groups:
           decoder_cache:
             sequence_axis: 2
             layout: bnsh
             logical_lengths: cache_lengths
-            storage: paged
+            storage: shared_buffer
             ports:
               model:
                 cache_9:
@@ -312,10 +347,12 @@ pipeline:
         component: decoder_state_initializer
         inputs:
           prompt_tokens: request.input_ids
+          max_iterations: request.max_iterations
         outputs:
           attention_mask: initializer.attention_mask
           body_attention_mask: initializer.body_attention_mask
           token_slot: initializer.token_slot
+          cache_lengths: initializer.cache_lengths
           position_ids: initializer.position_ids
           body_position_ids: initializer.body_position_ids
           past_key_values.0.key: initializer.past_key_values.0.key
@@ -397,6 +434,7 @@ pipeline:
         component: decoder_step_update
         inputs:
           attention_mask: attention_mask
+          logical_length: cache_lengths.next
           position_ids: position_ids
         outputs:
           next_attention_mask: decoder_step.body_attention_mask

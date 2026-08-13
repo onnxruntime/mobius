@@ -35,7 +35,7 @@ pipeline:
           kind: request
         required: true
       request.seed:
-        contract: &id001
+        contract:
           dtype: int64
           rank: 1
           shape:
@@ -49,7 +49,7 @@ pipeline:
         required: false
         default: 0
       request.max_iterations:
-        contract: &id002
+        contract:
           dtype: int64
           rank: 1
           shape:
@@ -62,7 +62,11 @@ pipeline:
           kind: request
         required: true
       package.zero:
-        contract: *id001
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         role:
           kind: opaque
         source:
@@ -70,7 +74,11 @@ pipeline:
         required: false
         default: 0
       package.one:
-        contract: *id001
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         role:
           kind: opaque
         source:
@@ -78,7 +86,11 @@ pipeline:
         required: false
         default: 1
       package.max_context:
-        contract: *id002
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
         role:
           kind: opaque
         source:
@@ -86,7 +98,7 @@ pipeline:
         required: false
         default: 4096
       package.false:
-        contract: &id003
+        contract:
           dtype: bool
           rank: 1
           shape:
@@ -98,7 +110,11 @@ pipeline:
         required: false
         default: false
       package.active:
-        contract: *id003
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
         role:
           kind: opaque
         source:
@@ -106,7 +122,11 @@ pipeline:
         required: false
         default: true
       request.slot_ids:
-        contract: *id001
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         role:
           kind: opaque
         source:
@@ -114,7 +134,11 @@ pipeline:
           name: serving.slot_ids
         required: true
       request.cache_lengths:
-        contract: *id001
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         role:
           kind: opaque
         source:
@@ -123,7 +147,11 @@ pipeline:
         required: false
         default: 0
       request.grammar_state:
-        contract: *id001
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         role:
           kind: opaque
         source:
@@ -144,7 +172,11 @@ pipeline:
           name: grammar.transition_table
         required: true
       request.adaptive_k:
-        contract: *id001
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         role:
           kind: opaque
         source:
@@ -153,7 +185,7 @@ pipeline:
         required: false
         default: 1
       request.adaptive_estimates:
-        contract: &id004
+        contract:
           dtype: float32
           rank: 2
           shape:
@@ -515,63 +547,100 @@ pipeline:
         recurrence:
           kind: invariant
       rng_offset:
-        contract: *id001
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: package.zero
         recurrence:
           kind: invariant
       active:
-        contract: *id003
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: package.active
         recurrence:
           kind: invariant
       done:
-        contract: *id003
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: package.false
         recurrence:
           kind: invariant
       accepted_len:
-        contract: *id001
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: package.zero
         recurrence:
           kind: invariant
       slot_ids:
-        contract: *id001
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: request.slot_ids
         recurrence:
           kind: invariant
       cache_lengths:
-        contract: *id001
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: request.cache_lengths
         recurrence:
           kind: invariant
       grammar:
-        contract: *id001
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: request.grammar_state
         recurrence:
           kind: invariant
       proposal_k:
-        contract: *id001
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         class: advisory
         scope: invocation
         initializer: request.adaptive_k
         recurrence:
           kind: invariant
       adaptive_estimates:
-        contract: *id004
+        contract:
+          dtype: float32
+          rank: 2
+          shape:
+          - batch
+          - 24
         class: advisory
         scope: invocation
         initializer: request.adaptive_estimates
@@ -600,15 +669,15 @@ pipeline:
       accepted_len: accepted_len
       slot_ids: slot_ids
       kv_service:
-        paging: paged
+        paging: none
         allocation: runtime
-        compaction: true
+        compaction: false
         groups:
           verifier_cache:
             sequence_axis: 2
             layout: bnsh
             logical_lengths: cache_lengths
-            storage: paged
+            storage: shared_buffer
             ports:
               verifier:
                 cache_0:
@@ -775,4 +844,8 @@ pipeline:
         next: verifier.present.0.key
       iteration:
         value: speculative.iteration
-        contract: *id001
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch

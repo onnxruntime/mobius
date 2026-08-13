@@ -54,7 +54,7 @@ preprocessing:
       content: pixels
       dtype: float32
       source: image.transform_4
-      contract: &id004
+      contract:
         dtype: float32
         rank: 2
         shape:
@@ -64,7 +64,7 @@ preprocessing:
       content: grid_dimensions
       dtype: int64
       source: image.output_grid_dimensions
-      contract: &id005
+      contract:
         dtype: int64
         rank: 2
         shape:
@@ -115,7 +115,7 @@ pipeline:
           kind: request
         required: true
       request.max_iterations:
-        contract: &id001
+        contract:
           dtype: int64
           rank: 1
           shape:
@@ -140,7 +140,11 @@ pipeline:
         required: false
         default: 2
       package.max_context:
-        contract: *id001
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
         role:
           kind: opaque
         source:
@@ -148,7 +152,11 @@ pipeline:
         required: false
         default: 8192
       package.one:
-        contract: *id001
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
         role:
           kind: opaque
         source:
@@ -156,7 +164,7 @@ pipeline:
         required: false
         default: 1
       package.active:
-        contract: &id002
+        contract:
           dtype: bool
           rank: 1
           shape:
@@ -168,7 +176,11 @@ pipeline:
         required: false
         default: true
       package.false:
-        contract: *id002
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
         role:
           kind: opaque
         source:
@@ -176,7 +188,7 @@ pipeline:
         required: false
         default: false
       package.zero_batch:
-        contract: &id003
+        contract:
           dtype: int64
           rank: 1
           shape:
@@ -188,7 +200,11 @@ pipeline:
         required: false
         default: 0
       package.slot_ids:
-        contract: *id003
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         role:
           kind: opaque
         source:
@@ -243,8 +259,18 @@ pipeline:
               shape:
               - encoded_bytes
           outputs:
-            pixel_values: *id004
-            grid_thw: *id005
+            pixel_values:
+              dtype: float32
+              rank: 2
+              shape:
+              - 4
+              - 1176
+            grid_thw:
+              dtype: int64
+              rank: 2
+              shape:
+              - 1
+              - 3
       token_sampler:
         implementation:
           kind: onnx
@@ -332,43 +358,60 @@ pipeline:
         scope: invocation
         initializer: initializer.body_attention_mask
         recurrence:
-          kind: growing
-          axis: 1
-          increment: package.one
-          max: package.max_context
+          kind: invariant
       active:
-        contract: *id002
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: package.active
         recurrence:
           kind: invariant
       done:
-        contract: *id002
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: package.false
         recurrence:
           kind: invariant
       accepted_len:
-        contract: *id003
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: package.zero_batch
         recurrence:
           kind: invariant
       slot_ids:
-        contract: *id003
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: package.slot_ids
         recurrence:
           kind: invariant
       cache_lengths:
-        contract: *id003
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
-        initializer: package.zero_batch
+        initializer: initializer.cache_lengths
         recurrence:
           kind: invariant
       position_ids:
@@ -394,9 +437,7 @@ pipeline:
         scope: invocation
         initializer: decoder.setup.present.0.key
         recurrence:
-          kind: bounded
-          axis: 2
-          max: package.max_context
+          kind: invariant
         service_group: decoder_cache
       cache_1:
         contract:
@@ -410,9 +451,7 @@ pipeline:
         scope: invocation
         initializer: decoder.setup.present.0.value
         recurrence:
-          kind: bounded
-          axis: 2
-          max: package.max_context
+          kind: invariant
         service_group: decoder_cache
       loop_0_active:
         contract:
@@ -430,15 +469,15 @@ pipeline:
       accepted_len: accepted_len
       slot_ids: slot_ids
       kv_service:
-        paging: paged
+        paging: none
         allocation: runtime
-        compaction: true
+        compaction: false
         groups:
           decoder_cache:
             sequence_axis: 2
             layout: bnsh
             logical_lengths: cache_lengths
-            storage: paged
+            storage: shared_buffer
             ports:
               decoder:
                 cache_0:
@@ -468,10 +507,12 @@ pipeline:
         component: decoder_state_initializer
         inputs:
           prompt_tokens: request.prompt_tokens
+          max_iterations: request.max_iterations
         outputs:
           attention_mask: initializer.attention_mask
           body_attention_mask: initializer.body_attention_mask
           token_slot: initializer.token_slot
+          cache_lengths: initializer.cache_lengths
           position_ids: initializer.position_ids
           body_position_ids: initializer.body_position_ids
           past_key_values.0.key: initializer.past_key_values.0.key
@@ -572,6 +613,7 @@ pipeline:
         component: decoder_step_update
         inputs:
           attention_mask: attention_mask
+          logical_length: cache_lengths.next
           position_ids: position_ids
         outputs:
           next_attention_mask: decoder_step.body_attention_mask
@@ -605,4 +647,8 @@ pipeline:
         next: loop.continue
       iteration:
         value: loop.iteration
-        contract: *id003
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch

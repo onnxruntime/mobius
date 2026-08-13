@@ -13,10 +13,10 @@ pipeline:
       - loop_induction_values
     inputs:
       request.input_ids:
-        contract: &id003
+        contract:
           dtype: int64
           rank: 2
-          shape: &id001
+          shape:
           - batch
           - sequence
         role:
@@ -27,10 +27,12 @@ pipeline:
           kind: request
         required: true
       request.mask:
-        contract: &id004
+        contract:
           dtype: bool
           rank: 2
-          shape: *id001
+          shape:
+          - batch
+          - sequence
         role:
           kind: opaque
         source:
@@ -38,7 +40,7 @@ pipeline:
           name: masked_positions
         required: true
       request.seed:
-        contract: &id002
+        contract:
           dtype: int64
           rank: 1
           shape:
@@ -52,7 +54,11 @@ pipeline:
         required: false
         default: 0
       request.rng_offset:
-        contract: *id002
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         role:
           kind: opaque
         source:
@@ -75,7 +81,11 @@ pipeline:
         required: false
         default: 8
       package.num_steps:
-        contract: *id002
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         role:
           kind: opaque
         source:
@@ -96,7 +106,12 @@ pipeline:
         default: true
     outputs:
       tokens:
-        contract: *id003
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - sequence
         role: tokens
         stage: pre_adapter
     components:
@@ -124,19 +139,33 @@ pipeline:
             next_offset: next_offset
     state:
       tokens_state:
-        contract: *id003
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - sequence
         scope: invocation
         initializer: request.input_ids
         recurrence:
           kind: invariant
       mask:
-        contract: *id004
+        contract:
+          dtype: bool
+          rank: 2
+          shape:
+          - batch
+          - sequence
         scope: invocation
         initializer: request.mask
         recurrence:
           kind: invariant
       rng_offset:
-        contract: *id002
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         scope: invocation
         initializer: request.rng_offset
         recurrence:
