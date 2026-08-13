@@ -26,11 +26,6 @@ if TYPE_CHECKING:
     import onnx_ir as ir
 
 
-def _swish(op: OpBuilder, x):
-    """Swish activation."""
-    return op.Swish(x)
-
-
 # ---------------------------------------------------------------------------
 # Private helper modules
 # ---------------------------------------------------------------------------
@@ -133,7 +128,7 @@ class _GLULinear(nn.Module):
     def forward(self, op: OpBuilder, x: ir.Value):
         x = self.linear(op, x)  # [B, T, output_dim * 2]
         first, second = op.Split(x, axis=-1, num_outputs=2, _outputs=2)
-        return op.Mul(first, _swish(op, second))
+        return op.Mul(first, op.Swish(second))
 
 
 class _GLUPointWiseConv(nn.Module):
@@ -155,7 +150,7 @@ class _GLUPointWiseConv(nn.Module):
         first, second = op.Split(glu_out, axis=1, num_outputs=2, _outputs=2)
         first = op.Add(first, self.b1)
         second = op.Add(second, self.b2)
-        return op.Mul(first, _swish(op, second))
+        return op.Mul(first, op.Swish(second))
 
 
 class _DepthwiseSepConv(nn.Module):
@@ -355,7 +350,7 @@ class ConformerConvModule(nn.Module):
         x = self.dw_sep_conv_1d(op, x)
 
         # Swish + final pointwise conv
-        x = _swish(op, x)
+        x = op.Swish(x)
         x = self.ext_pw_conv_1d(op, x)
 
         return op.Transpose(x, perm=[0, 2, 1])  # [B, T, C]

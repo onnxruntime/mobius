@@ -72,11 +72,6 @@ def _glu(op: OpBuilder, x: ir.Value) -> ir.Value:
     return op.Mul(a, op.Sigmoid(b))
 
 
-def _swish(op: OpBuilder, x: ir.Value) -> ir.Value:
-    """SiLU/Swish activation."""
-    return op.Swish(x)
-
-
 # ---------------------------------------------------------------------------
 # Public components
 # ---------------------------------------------------------------------------
@@ -311,7 +306,7 @@ class Gemma4FeedForward(nn.Module):
         x = _gradient_clip(op, x, self._gradient_clipping)
         x = self.pre_layer_norm(op, x)
         x = self.ffw_layer_1(op, x)  # [B, T, 4h]
-        x = _swish(op, x)
+        x = op.Swish(x)
         x = self.ffw_layer_2(op, x)  # [B, T, h]
         x = _gradient_clip(op, x, self._gradient_clipping)
         x = self.post_layer_norm(op, x)
@@ -374,7 +369,7 @@ class Gemma4LightConv1d(nn.Module):
 
         x = _gradient_clip(op, x, self._gradient_clipping)
         x = self.conv_norm(op, x)
-        x = _swish(op, x)
+        x = op.Swish(x)
         x = self.linear_end(op, x)  # [B, T, h]
         return op.Add(x, residual)
 
