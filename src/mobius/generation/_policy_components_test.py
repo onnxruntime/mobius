@@ -280,9 +280,9 @@ def test_decoder_fixed_capacity_state_matches_native_capture_layout(tmp_path):
         },
     )
     attention, body_attention, token, cache_lengths, cache = outputs
-    np.testing.assert_array_equal(attention, np.ones((1, 68), np.int64))
     expected_body_attention = np.zeros((1, 196), np.int64)
-    expected_body_attention[:, :69] = 1
+    expected_body_attention[:, :68] = 1
+    np.testing.assert_array_equal(attention, expected_body_attention)
     np.testing.assert_array_equal(body_attention, expected_body_attention)
     np.testing.assert_array_equal(token, [[0]])
     np.testing.assert_array_equal(cache_lengths, [68])
@@ -297,10 +297,10 @@ def test_decoder_fixed_capacity_state_matches_native_capture_layout(tmp_path):
         tmp_path,
         {
             "attention_mask": body_attention,
-            "logical_length": np.array([69], np.int64),
+            "logical_length": np.array([68], np.int64),
         },
     )
-    expected_body_attention[:, :70] = 1
+    expected_body_attention[:, :69] = 1
     np.testing.assert_array_equal(next_attention, expected_body_attention)
 
 

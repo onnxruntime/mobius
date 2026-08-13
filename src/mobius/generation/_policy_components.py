@@ -598,21 +598,12 @@ def build_decoder_state_initializer(
 
     attention_value = decoder_inputs[attention_mask_input]
     if fixed_capacity:
-        # Prefill remains eager at the prompt width. Only decode uses a fixed
-        # capacity mask so its shape and address are stable for CUDA Graph replay.
-        attention = op.Cast(
-            op.ConstantOfShape(prompt_shape, value=ir.tensor([1])),
-            to=attention_value.dtype,
-        )
-        attention.shape = ir.Shape(["batch", "prompt_sequence"])
-        body_attention = op.Cast(
-            op.Less(
-                offsets,
-                op.Add(sequence_length, op.Constant(value_int=1)),
-            ),
-            to=attention_value.dtype,
-        )
-        body_attention.shape = ir.Shape(["batch", "capacity"])
+        # Native ORT GenAI binds one persistent full-capacity mask for prefill
+        # and decode, then enables the next logical slot before each decode.
+        attention = op.Cast(op.Less(offsets, sequence_length), to=attention_value.dtype)
+        attention.shape = ir.Shape(["batch", "capacity"])
+        body_attention = op.Identity(attention)
+        body_attention.shape = attention.shape
     else:
         attention = op.Cast(
             op.ConstantOfShape(prompt_shape, value=ir.tensor([1])),

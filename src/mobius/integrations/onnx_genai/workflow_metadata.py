@@ -2820,7 +2820,11 @@ def build_vlm_workflow_metadata(
     }
     body_decoder_inputs = {
         decoder_embed_input.name: "embedding.body.embeds",
-        attention_input.name: "state.attention_mask.body",
+        attention_input.name: (
+            "decoder_step.body_attention_mask"
+            if fixed_capacity
+            else "state.attention_mask.body"
+        ),
     }
     if position_input is not None:
         setup_decoder_inputs[position_input.name] = f"initializer.{position_input.name}"
@@ -2857,7 +2861,11 @@ def build_vlm_workflow_metadata(
                 "shape": [batch, "context"],
             },
             "scope": "invocation",
-            "initializer": "initializer.body_attention_mask",
+            "initializer": (
+                f"initializer.{attention_input.name}"
+                if fixed_capacity
+                else "initializer.body_attention_mask"
+            ),
             "recurrence": (
                 {"kind": "invariant"}
                 if fixed_capacity
@@ -2924,7 +2932,11 @@ def build_vlm_workflow_metadata(
         ),
         (
             "attention_mask",
-            "initializer.body_attention_mask",
+            (
+                f"initializer.{attention_input.name}"
+                if fixed_capacity
+                else "initializer.body_attention_mask"
+            ),
             "state.attention_mask.body",
             "decoder_step.body_attention_mask",
             "state.attention_mask.final",
@@ -3127,6 +3139,30 @@ def build_vlm_workflow_metadata(
             ),
         ],
     }
+    decoder_step_invoke = _invoke(
+        "decoder_step_update",
+        {
+            "attention_mask": "state.attention_mask.body",
+            **(
+                {"logical_length": "state.cache_lengths.body"}
+                if fixed_capacity
+                else {}
+            ),
+            **(
+                {"position_ids": "state.position_ids.body"}
+                if position_input is not None
+                else {}
+            ),
+        },
+        {
+            "next_attention_mask": "decoder_step.body_attention_mask",
+            **(
+                {"next_position_ids": "decoder_step.body_position_ids"}
+                if position_input is not None
+                else {}
+            ),
+        },
+    )
     body = {
         "kind": "sequence",
         "nodes": [
@@ -3180,6 +3216,7 @@ def build_vlm_workflow_metadata(
                 "effect_name": "emit",
                 "effect": _effect("emit.0", "emit.1"),
             },
+            *([decoder_step_invoke] if fixed_capacity else []),
             _invoke(
                 "embedding",
                 embedding_body_inputs,
@@ -3191,26 +3228,7 @@ def build_vlm_workflow_metadata(
                 {"logits": "decoder.body.logits"},
                 {"last_logits": "decoder.body.last_logits"},
             ),
-            _invoke(
-                "decoder_step_update",
-                {
-                    "attention_mask": "state.attention_mask.body",
-                    **({"logical_length": "cache_lengths.next"} if fixed_capacity else {}),
-                    **(
-                        {"position_ids": "state.position_ids.body"}
-                        if position_input is not None
-                        else {}
-                    ),
-                },
-                {
-                    "next_attention_mask": "decoder_step.body_attention_mask",
-                    **(
-                        {"next_position_ids": "decoder_step.body_position_ids"}
-                        if position_input is not None
-                        else {}
-                    ),
-                },
-            ),
+            *([] if fixed_capacity else [decoder_step_invoke]),
         ],
     }
     components = {
@@ -4496,7 +4514,11 @@ def build_decoder_workflow_metadata(
             body_decoder_inputs[value.name] = f"state.{value.name}.body"
             setup_decoder_inputs[value.name] = f"initializer.{value.name}"
     setup_decoder_inputs[attention_input.name] = f"initializer.{attention_input.name}"
-    body_decoder_inputs[attention_input.name] = "state.attention_mask.body"
+    body_decoder_inputs[attention_input.name] = (
+        "decoder_step.body_attention_mask"
+        if fixed_capacity
+        else "state.attention_mask.body"
+    )
     if position_input is not None:
         setup_decoder_inputs[position_input.name] = f"initializer.{position_input.name}"
         body_decoder_inputs[position_input.name] = "state.position_ids.body"
@@ -4677,7 +4699,11 @@ def build_decoder_workflow_metadata(
                 "rank": 2,
                 "shape": [batch_dimension, "context"],
             },
-            "initializer.body_attention_mask",
+            (
+                f"initializer.{attention_input.name}"
+                if fixed_capacity
+                else "initializer.body_attention_mask"
+            ),
             "decoder_step.body_attention_mask",
             (
                 {"kind": "invariant"}
@@ -4801,6 +4827,30 @@ def build_decoder_workflow_metadata(
             ),
         ],
     }
+    decoder_step_invoke = _invoke(
+        "decoder_step_update",
+        {
+            "attention_mask": "state.attention_mask.body",
+            **(
+                {"logical_length": "state.cache_lengths.body"}
+                if fixed_capacity
+                else {}
+            ),
+            **(
+                {"position_ids": "state.position_ids.body"}
+                if position_input is not None
+                else {}
+            ),
+        },
+        {
+            "next_attention_mask": "decoder_step.body_attention_mask",
+            **(
+                {"next_position_ids": "decoder_step.body_position_ids"}
+                if position_input is not None
+                else {}
+            ),
+        },
+    )
     body = {
         "kind": "sequence",
         "nodes": [
@@ -4886,32 +4936,14 @@ def build_decoder_workflow_metadata(
                 "effect_name": "emit",
                 "effect": _effect("emit.0", "emit.1"),
             },
+            *([decoder_step_invoke] if fixed_capacity else []),
             _invoke(decoder_name, body_decoder_inputs, body_decoder_outputs),
             _invoke(
                 "last_token_logits",
                 {"logits": "decoder.body.logits"},
                 {"last_logits": "decoder.body.last_logits"},
             ),
-            _invoke(
-                "decoder_step_update",
-                {
-                    "attention_mask": "state.attention_mask.body",
-                    **({"logical_length": "cache_lengths.next"} if fixed_capacity else {}),
-                    **(
-                        {"position_ids": "state.position_ids.body"}
-                        if position_input is not None
-                        else {}
-                    ),
-                },
-                {
-                    "next_attention_mask": "decoder_step.body_attention_mask",
-                    **(
-                        {"next_position_ids": "decoder_step.body_position_ids"}
-                        if position_input is not None
-                        else {}
-                    ),
-                },
-            ),
+            *([] if fixed_capacity else [decoder_step_invoke]),
         ],
     }
 

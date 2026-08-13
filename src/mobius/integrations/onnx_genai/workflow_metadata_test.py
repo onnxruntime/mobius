@@ -250,8 +250,13 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
         "prompt_tokens": "request.prompt_tokens",
         "max_iterations": "request.max_iterations",
     }
-    assert policy_invokes["decoder_step_update"]["inputs"]["logical_length"] == (
-        "cache_lengths.next"
+    assert policy_invokes["decoder_step_update"]["inputs"]["logical_length"] == "cache_lengths"
+    assert workflow["state"]["attention_mask"]["initializer"] == (
+        "initializer.attention_mask"
+    )
+    assert any(
+        invoke["inputs"]["attention_mask"] == "decoder_step.body_attention_mask"
+        for invoke in decoder_invokes
     )
     assert workflow["inputs"]["request.image"]["required"] is False
     assert workflow["inputs"]["request.image"]["present_as"] == "request.image_present"
