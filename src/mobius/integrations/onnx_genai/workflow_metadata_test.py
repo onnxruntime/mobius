@@ -17,28 +17,12 @@ from mobius.integrations.onnx_genai.inference_metadata_test import (
     _VlmConfig,
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
-    _kv_storage_contract,
     build_language_diffusion_pipeline_metadata,
     build_speculative_workflow_metadata,
     build_vlm_workflow_metadata,
     write_speculative_workflow_metadata,
     write_vlm_workflow_metadata,
 )
-
-
-def test_kv_storage_is_derived_from_admitted_cache_shapes():
-    dynamic = _model(
-        "dynamic",
-        [_value("past_key_values.0.key", ir.DataType.FLOAT, ["batch", 2, "past", 8])],
-        [("present.0.key", ir.DataType.FLOAT, ["batch", 2, "total", 8])],
-    )
-    shared = _model(
-        "shared",
-        [_value("past_key_values.0.key", ir.DataType.FLOAT, ["batch", 2, "capacity", 8])],
-        [("present.0.key", ir.DataType.FLOAT, ["batch", 2, "capacity", 8])],
-    )
-    assert _kv_storage_contract(dynamic)["storage"] == "separate"
-    assert _kv_storage_contract(shared)["storage"] == "shared_buffer"
 
 
 def test_speculative_writer_saves_policy_artifacts(tmp_path):
@@ -250,12 +234,7 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
         "rank": 2,
         "shape": ["batch", 202048],
     }
-    assert workflow["state"]["attention_mask"]["recurrence"] == {
-        "kind": "growing",
-        "axis": 1,
-        "increment": "package.one",
-        "max": "package.max_context",
-    }
+    assert workflow["state"]["attention_mask"]["recurrence"] == {"kind": "invariant"}
     assert workflow["state"]["cache_103"]["recurrence"] == {
         "kind": "bounded",
         "axis": 2,
@@ -264,8 +243,11 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     assert workflow["state"]["cache_lengths"]["initializer"] == "initializer.cache_lengths"
     assert policy_invokes["decoder_state_initializer"]["inputs"] == {
         "prompt_tokens": "request.prompt_tokens",
+        "max_iterations": "request.max_iterations",
     }
-    assert "logical_length" not in policy_invokes["decoder_step_update"]["inputs"]
+    assert policy_invokes["decoder_step_update"]["inputs"]["logical_length"] == (
+        "cache_lengths.next"
+    )
     assert workflow["inputs"]["request.image"]["required"] is False
     assert workflow["inputs"]["request.image"]["present_as"] == "request.image_present"
     assert "request.has_media" not in workflow["inputs"]
@@ -280,7 +262,7 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     assert kv_service["paging"] == "none"
     assert kv_service["compaction"] is False
     decoder_cache = kv_service["groups"]["decoder_cache"]
-    assert decoder_cache["storage"] == "separate"
+    assert decoder_cache["storage"] == "shared_buffer"
     kv_ports = decoder_cache["ports"]["decoder"]
     assert len(kv_ports) == 104
     assert kv_ports["cache_103"] == {

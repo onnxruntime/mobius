@@ -113,6 +113,18 @@ pipeline:
           kind: literal
         required: false
         default: 0
+      package.cache_lengths:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0
       package.zero_batch:
         contract:
           dtype: int64
@@ -282,10 +294,7 @@ pipeline:
         scope: invocation
         initializer: initializer.body_attention_mask
         recurrence:
-          kind: growing
-          axis: 1
-          increment: package.one_token
-          max: package.max_context
+          kind: invariant
       position_ids:
         contract:
           dtype: int64
@@ -327,7 +336,7 @@ pipeline:
             sequence_axis: 2
             layout: bnsh
             logical_lengths: cache_lengths
-            storage: separate
+            storage: shared_buffer
             ports:
               model:
                 cache_9:
@@ -340,6 +349,7 @@ pipeline:
         component: decoder_state_initializer
         inputs:
           prompt_tokens: request.input_ids
+          max_iterations: request.max_iterations
         outputs:
           attention_mask: initializer.attention_mask
           body_attention_mask: initializer.body_attention_mask
@@ -426,6 +436,7 @@ pipeline:
         component: decoder_step_update
         inputs:
           attention_mask: attention_mask
+          logical_length: cache_lengths.next
           position_ids: position_ids
         outputs:
           next_attention_mask: decoder_step.body_attention_mask

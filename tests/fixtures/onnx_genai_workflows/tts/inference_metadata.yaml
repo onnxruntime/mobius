@@ -797,7 +797,7 @@ pipeline:
             sequence_axis: 2
             layout: bnsh
             logical_lengths: talker_cache_lengths
-            storage: separate
+            storage: shared_buffer
             ports:
               talker:
                 talker_cache_0:
@@ -810,7 +810,7 @@ pipeline:
             sequence_axis: 2
             layout: bnsh
             logical_lengths: predictor_cache_lengths
-            storage: separate
+            storage: shared_buffer
             ports:
               code_predictor:
                 predictor_cache_0:

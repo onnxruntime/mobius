@@ -15,9 +15,9 @@
     "onnxruntime": "1.28.0",
     "onnxruntime_genai_commit": "c885b71b3813fd652690e5ef5154bfc5535e5c1c",
     "execution_provider": "CUDAExecutionProvider",
-    "cuda_graph": false,
+    "cuda_graph": true,
     "cudnn_flash_attention": false,
-    "shared_kv": false
+    "shared_kv": true
   },
   "hardware": {
     "gpu": "NVIDIA H200",

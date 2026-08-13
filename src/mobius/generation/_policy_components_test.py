@@ -220,8 +220,7 @@ def test_decoder_state_initializer_and_step_update_runtime(tmp_path):
     np.testing.assert_array_equal(outputs[1], [[0, 1, 2]])
     np.testing.assert_array_equal(outputs[2], [[1, 1, 1, 1]])
     np.testing.assert_array_equal(outputs[3], [[3]])
-    np.testing.assert_array_equal(outputs[5], [3])
-    assert outputs[6].shape == (1, 2, 0, 4)
+    assert outputs[5].shape == (1, 2, 0, 4)
 
     updated = _run(
         build_decoder_step_update(
@@ -345,10 +344,7 @@ def test_decoder_policy_chain_generates_multiple_tokens_from_prompt_only(tmp_pat
         tmp_path,
         {"prompt_tokens": prompt},
     )
-    attention, positions, body_attention, body_position, token, cache_lengths, cache = (
-        initialized
-    )
-    np.testing.assert_array_equal(cache_lengths, [2])
+    attention, positions, body_attention, body_position, token, cache = initialized
     logits, cache = _run_model(
         decoder,
         tmp_path,
