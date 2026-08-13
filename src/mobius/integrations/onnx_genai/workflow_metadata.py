@@ -3143,11 +3143,7 @@ def build_vlm_workflow_metadata(
         "decoder_step_update",
         {
             "attention_mask": "state.attention_mask.body",
-            **(
-                {"logical_length": "state.cache_lengths.body"}
-                if fixed_capacity
-                else {}
-            ),
+            **({"logical_length": "state.cache_lengths.body"} if fixed_capacity else {}),
             **(
                 {"position_ids": "state.position_ids.body"}
                 if position_input is not None
@@ -4515,9 +4511,7 @@ def build_decoder_workflow_metadata(
             setup_decoder_inputs[value.name] = f"initializer.{value.name}"
     setup_decoder_inputs[attention_input.name] = f"initializer.{attention_input.name}"
     body_decoder_inputs[attention_input.name] = (
-        "decoder_step.body_attention_mask"
-        if fixed_capacity
-        else "state.attention_mask.body"
+        "decoder_step.body_attention_mask" if fixed_capacity else "state.attention_mask.body"
     )
     if position_input is not None:
         setup_decoder_inputs[position_input.name] = f"initializer.{position_input.name}"
@@ -4831,11 +4825,7 @@ def build_decoder_workflow_metadata(
         "decoder_step_update",
         {
             "attention_mask": "state.attention_mask.body",
-            **(
-                {"logical_length": "state.cache_lengths.body"}
-                if fixed_capacity
-                else {}
-            ),
+            **({"logical_length": "state.cache_lengths.body"} if fixed_capacity else {}),
             **(
                 {"position_ids": "state.position_ids.body"}
                 if position_input is not None
