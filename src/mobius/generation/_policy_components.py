@@ -961,16 +961,19 @@ def build_adaptive_k_policy(*, max_k: int = 16, min_k: int = 1) -> PolicyCompone
 
 
 def build_seeded_categorical_sampler() -> PolicyComponent:
-    """Build deterministic categorical sampling with explicit seed and offset.
+    """Build request-parameterized categorical sampling with explicit RNG state.
 
-    Threefry is counter based: the same ``(seed, offset, logits, temperature)``
-    inputs always produce the same token. The updated offset is
-    an explicit output, so no random or hidden mutable state exists in the graph.
+    Threefry is counter based: identical tensor inputs produce the same token.
+    Temperature, top-k, top-p, and grammar constraints remain request inputs;
+    changing ordinary generation options never regenerates this artifact.
     """
     graph, builder = _make_graph("seeded_categorical_sampler")
     op = builder.op
     logits = builder.input("logits", ir.DataType.FLOAT, ["batch", "vocabulary"])
-    temperature = builder.input("temperature", ir.DataType.FLOAT, ["batch"])
+    temperature = builder.input("temperature", ir.DataType.FLOAT, [1])
+    top_k = builder.input("top_k", ir.DataType.INT64, [1])
+    top_p = builder.input("top_p", ir.DataType.FLOAT, [1])
+    grammar_mask = builder.input("grammar_mask", ir.DataType.BOOL, ["batch", "vocabulary"])
     seed = builder.input("seed", ir.DataType.INT64, ["batch"])
     offset = builder.input("offset", ir.DataType.INT64, ["batch"])
 
@@ -1020,11 +1023,90 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
     )
     uniform = op.Cast(uniform, to=ir.DataType.FLOAT)
 
-    scaled_logits = op.Div(
-        logits,
-        op.Unsqueeze(temperature, op.Constant(value_ints=[-1])),
+    blocked = op.CastLike(op.Constant(value_float=-3.4028235e38), logits)
+    constrained_logits = op.Where(grammar_mask, logits, blocked)
+    safe_temperature = op.Max(temperature, op.Constant(value_float=1e-6))
+    scaled_logits = op.Div(constrained_logits, safe_temperature)
+
+    vocabulary = op.Shape(logits, start=1, end=2)
+    requested_k = op.Where(
+        op.Greater(top_k, op.Constant(value_int=0)),
+        top_k,
+        vocabulary,
     )
-    probabilities = op.Softmax(scaled_logits, axis=-1)
+    effective_k = op.Min(op.Max(requested_k, op.Constant(value_int=1)), vocabulary)
+    _, top_indices = op.TopK(
+        scaled_logits,
+        effective_k,
+        axis=-1,
+        largest=1,
+        sorted=0,
+        _outputs=2,
+    )
+    top_k_mask = op.Greater(
+        op.ScatterElements(
+            op.ConstantOfShape(
+                op.Shape(logits),
+                value=ir.tensor([0], dtype=ir.DataType.INT64),
+            ),
+            top_indices,
+            op.ConstantOfShape(
+                op.Shape(top_indices),
+                value=ir.tensor([1], dtype=ir.DataType.INT64),
+            ),
+            axis=1,
+        ),
+        op.Constant(value_int=0),
+    )
+    top_k_logits = op.Where(top_k_mask, scaled_logits, blocked)
+    probabilities = op.Softmax(top_k_logits, axis=-1)
+
+    _, sorted_indices = op.TopK(
+        probabilities,
+        vocabulary,
+        axis=-1,
+        largest=1,
+        sorted=1,
+        _outputs=2,
+    )
+    sorted_probabilities = op.GatherElements(probabilities, sorted_indices, axis=1)
+    cumulative_probabilities = op.CumSum(
+        sorted_probabilities,
+        op.Constant(value_int=1),
+    )
+    safe_top_p = op.Clip(
+        top_p,
+        op.Constant(value_float=1e-6),
+        op.Constant(value_float=1.0),
+    )
+    keep_sorted = op.Less(
+        op.Sub(cumulative_probabilities, sorted_probabilities),
+        safe_top_p,
+    )
+    top_p_mask = op.Greater(
+        op.ScatterElements(
+            op.ConstantOfShape(
+                op.Shape(logits),
+                value=ir.tensor([0], dtype=ir.DataType.INT64),
+            ),
+            sorted_indices,
+            op.Cast(keep_sorted, to=ir.DataType.INT64),
+            axis=1,
+        ),
+        op.Constant(value_int=0),
+    )
+    probabilities = op.Where(
+        top_p_mask,
+        probabilities,
+        op.CastLike(op.Constant(value_float=0.0), probabilities),
+    )
+    probabilities = op.Div(
+        probabilities,
+        op.Max(
+            op.ReduceSum(probabilities, axes=[-1], keepdims=1),
+            op.Constant(value_float=1e-20),
+        ),
+    )
     axis = op.Constant(value_int=-1)
     cumulative = op.CumSum(probabilities, axis)
     uniform = op.Unsqueeze(uniform, op.Constant(value_ints=[-1]))
@@ -1033,6 +1115,16 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
         op.Cast(candidates, to=ir.DataType.INT64),
         axis=-1,
         keepdims=0,
+    )
+    has_allowed_token = op.ReduceMax(
+        op.Cast(grammar_mask, to=ir.DataType.INT64),
+        axes=[-1],
+        keepdims=0,
+    )
+    token_ids = op.Where(
+        op.Greater(has_allowed_token, op.Constant(value_int=0)),
+        token_ids,
+        op.Constant(value_int=-1),
     )
     next_offset = op.Add(offset, op.Constant(value_int=1))
     builder.add_output(token_ids, "token")
@@ -1046,10 +1138,13 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
             "logits": "logits",
             "token": "token",
             "temperature": "temperature",
+            "top_k": "top_k",
+            "top_p": "top_p",
+            "grammar_mask": "grammar_mask",
             "rng": {
-                "seed": "seed",
-                "offset": "offset",
-                "next_offset": "next_offset",
+                "rng_seed": "seed",
+                "rng_offset": "offset",
+                "rng_next_offset": "next_offset",
             },
             "effect": "rng",
         },

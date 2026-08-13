@@ -1411,6 +1411,8 @@ def add_policy_components_to_workflow(
         }
         if component.contract:
             declaration["contract"] = semantic_contract(component.contract)
+            if component.contract.get("role") == "token_sampler":
+                declaration["application_overridable"] = True
         components[name] = declaration
     return metadata
 

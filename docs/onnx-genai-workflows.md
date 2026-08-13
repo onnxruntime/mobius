@@ -60,6 +60,23 @@ contract:
   parameters: { mode: greedy }
 ```
 
+### Decoder KV boundary
+
+Normal decode carries each decoder `present` tensor directly to the corresponding
+next-iteration `past` input. Mobius does not emit a generic `kv_update.onnx`. Physical
+shared/paged allocation, slots, append, compaction, and in-place mutation belong to the
+runtime's model-agnostic KV service. An ONNX state-update component is used only when
+semantic tensor math is required, such as accepted-prefix truncation, dense gather,
+rollback, or format conversion.
+
+### Request-parameterized sampling
+
+The stochastic sampler ABI accepts `temperature`, `top_k`, `top_p`, `seed`, RNG offset,
+and a grammar-allow mask as typed inputs. They are request/workflow values rather than
+artifact constants, so ordinary option changes do not rebuild the sampler. The generated
+component is marked `application_overridable`; an application may replace it with another
+implementation of the same versioned port ABI for fundamentally custom sampling.
+
 ## Compact examples
 
 ### Decoder

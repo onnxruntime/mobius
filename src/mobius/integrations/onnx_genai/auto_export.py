@@ -674,7 +674,12 @@ def write_onnx_genai_config(
             "workflow decoder export derives KV state dtype from ONNX ports; "
             "kv_native_dtype overrides are unsupported"
         )
-    path = write_decoder_workflow_metadata(pkg, output_dir, resolved_config)
+    path = write_decoder_workflow_metadata(
+        pkg,
+        output_dir,
+        resolved_config,
+        sampler=str(getattr(resolved_config, "workflow_sampler", "greedy")),
+    )
     artifacts = {"inference_metadata": path}
     tokenizer_path = _write_hf_tokenizer(output_dir, source, revision=revision)
     if tokenizer_path is not None:

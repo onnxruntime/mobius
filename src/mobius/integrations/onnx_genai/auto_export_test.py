@@ -21,6 +21,9 @@ from mobius.integrations.onnx_genai.inference_metadata_test import (
     _model,
     _value,
 )
+from mobius.integrations.onnx_genai.workflow_metadata import (
+    build_decoder_workflow_metadata,
+)
 
 
 @dataclasses.dataclass
@@ -185,6 +188,42 @@ def test_dispatch_decoder(tmp_path):
         "recurrence": {"kind": "invariant"},
     }
     assert (tmp_path / "policies" / "token_sampler.onnx").is_file()
+
+
+def test_seeded_decoder_sampler_uses_request_controls_and_direct_kv_carry():
+    workflow = build_decoder_workflow_metadata(
+        _decoder_package(), _Cfg(), sampler="seeded_categorical"
+    )["pipeline"]["workflow"]
+    sampler = workflow["components"]["token_sampler"]
+    assert sampler["application_overridable"] is True
+    assert sampler["contract"]["bindings"] == {
+        "logits": "logits",
+        "token": "token",
+        "temperature": "temperature",
+        "top_k": "top_k",
+        "top_p": "top_p",
+        "grammar_mask": "grammar_mask",
+        "rng_seed": "seed",
+        "rng_offset": "offset",
+        "rng_next_offset": "next_offset",
+    }
+    sampler_step = next(
+        step
+        for step in workflow["steps"][0]["steps"]
+        if step.get("component") == "token_sampler"
+    )
+    assert sampler_step["inputs"] == {
+        "logits": "logits",
+        "temperature": "request.temperature",
+        "top_k": "request.top_k",
+        "top_p": "request.top_p",
+        "grammar_mask": "request.grammar_mask",
+        "seed": "request.seed",
+        "offset": "rng_offset",
+    }
+    assert workflow["state"]["rng_offset"]["class"] == "semantic"
+    assert workflow["state"]["rng_offset"]["initializer"] == "request.rng_offset"
+    assert not any("kv_update" in name for name in workflow["components"])
 
 
 def test_dispatch_language_diffusion(tmp_path):

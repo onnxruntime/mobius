@@ -3815,6 +3815,78 @@ def build_decoder_workflow_metadata(
             },
         }
     )
+    stochastic_sampler = sampler != "greedy"
+    if stochastic_sampler:
+        workflow_inputs.update(
+            {
+                "request.temperature": {
+                    "contract": {"dtype": "float32", "rank": 1, "shape": [1]},
+                    "role": {
+                        "kind": "runtime",
+                        "version": "1.0",
+                        "role": "sampling_temperature",
+                    },
+                    "source": {
+                        "kind": "request",
+                        "field": "sampling_temperature",
+                    },
+                    "required": False,
+                    "default": 1.0,
+                },
+                "request.top_k": {
+                    "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+                    "role": {
+                        "kind": "runtime",
+                        "version": "1.0",
+                        "role": "sampling_top_k",
+                    },
+                    "source": {"kind": "request", "field": "sampling_top_k"},
+                    "required": False,
+                    "default": 0,
+                },
+                "request.top_p": {
+                    "contract": {"dtype": "float32", "rank": 1, "shape": [1]},
+                    "role": {
+                        "kind": "runtime",
+                        "version": "1.0",
+                        "role": "sampling_top_p",
+                    },
+                    "source": {"kind": "request", "field": "sampling_top_p"},
+                    "required": False,
+                    "default": 1.0,
+                },
+                "request.seed": {
+                    "contract": batch_int,
+                    "role": {
+                        "kind": "runtime",
+                        "version": "1.0",
+                        "role": "seed",
+                    },
+                    "source": {"kind": "request", "field": "seed"},
+                    "required": True,
+                },
+                "request.grammar_mask": {
+                    "contract": {
+                        "dtype": "bool",
+                        "rank": 2,
+                        "shape": [
+                            batch_dimension,
+                            _contract(logits_output)["shape"][-1],
+                        ],
+                    },
+                    "role": {"kind": "opaque"},
+                    "source": {"kind": "application", "name": "grammar_mask"},
+                    "required": True,
+                },
+                "request.rng_offset": {
+                    "contract": batch_int,
+                    "role": {"kind": "opaque"},
+                    "source": {"kind": "application", "name": "rng_offset"},
+                    "required": False,
+                    "default": 0,
+                },
+            }
+        )
 
     for value in inputs:
         if value is token_input:
@@ -3905,6 +3977,26 @@ def build_decoder_workflow_metadata(
             },
         ]
     )
+    if stochastic_sampler:
+        state["rng_offset"] = {
+            "contract": batch_int,
+            "scope": "invocation",
+            "class": "semantic",
+            "initializer": "request.rng_offset",
+            "recurrence": {"kind": "invariant"},
+        }
+        initial_effects["state:rng_offset"] = "state:rng_offset.0"
+        carried.append(
+            {
+                "cell": "rng_offset",
+                "current": "request.rng_offset",
+                "body_input": "state.rng_offset.body",
+                "body_output": "sample.next_offset",
+                "next": "state.rng_offset.final",
+                "read_effect": _effect("state:rng_offset.0", "state:rng_offset.read"),
+                "write_effect": _effect("state:rng_offset.read", "state:rng_offset.1"),
+            }
+        )
     decoder_state_specs = {
         "attention_mask": (
             {
@@ -4025,8 +4117,25 @@ def build_decoder_workflow_metadata(
         "nodes": [
             _invoke(
                 "token_sampler",
-                {"logits": "state.logits.body"},
-                {"token": "sample.body"},
+                {
+                    "logits": "state.logits.body",
+                    **(
+                        {
+                            "temperature": "request.temperature",
+                            "top_k": "request.top_k",
+                            "top_p": "request.top_p",
+                            "grammar_mask": "request.grammar_mask",
+                            "seed": "request.seed",
+                            "offset": "state.rng_offset.body",
+                        }
+                        if stochastic_sampler
+                        else {}
+                    ),
+                },
+                {
+                    "token": "sample.body",
+                    **({"next_offset": "sample.next_offset"} if stochastic_sampler else {}),
+                },
                 {"sample": _effect("sample.0", "sample.1")},
             ),
             _invoke(
@@ -4422,10 +4531,12 @@ def write_decoder_workflow_metadata(
     pkg: Any,
     output_dir: str,
     config: Any,
+    *,
+    sampler: str = "greedy",
 ) -> str:
     """Write decoder workflow metadata and policy artifacts."""
     os.makedirs(output_dir, exist_ok=True)
-    metadata = build_decoder_workflow_metadata(pkg, config)
+    metadata = build_decoder_workflow_metadata(pkg, config, sampler=sampler)
     pkg.save_policy_components(output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
