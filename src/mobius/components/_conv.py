@@ -22,10 +22,33 @@ def _resolve_pads(padding: int | tuple[int, int, int, int]) -> list[int]:
     TensorFlow-style ``SAME`` padding needs when the total pad is odd (the
     extra pixel goes on the end).  See
     :func:`mobius.components._mobilenetv5._same_padding`.
+
+    A PyTorch-style ``(h, w)`` 2-tuple is rejected rather than accepted and
+    reinterpreted: the sequence form here is ONNX order, so silently padding
+    it out would put the values on the wrong edges and only show up as a
+    numerical mismatch much later.
+
+    Raises:
+        ValueError: If ``padding`` is a sequence of any length other than 4.
+        TypeError: If ``padding`` is neither an int nor a sequence of ints.
     """
     if isinstance(padding, int):
         return [padding, padding, padding, padding]
-    return list(padding)
+    try:
+        pads = [int(p) for p in padding]
+    except TypeError as exc:
+        raise TypeError(
+            "padding must be an int or a sequence of 4 ints in ONNX order "
+            f"[top, left, bottom, right], got {padding!r}."
+        ) from exc
+    if len(pads) != 4:
+        raise ValueError(
+            "A sequence padding must have exactly 4 elements in ONNX order "
+            f"[top, left, bottom, right], got {len(pads)}: {padding!r}. "
+            "PyTorch-style (h, w) is not accepted -- pass an int for uniform "
+            "padding, or spell out all four edges."
+        )
+    return pads
 
 
 class Conv2d(nn.Module):
