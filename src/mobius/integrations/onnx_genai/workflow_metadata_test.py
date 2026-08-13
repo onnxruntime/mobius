@@ -110,6 +110,10 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     (source / "config.json").write_text(
         json.dumps({"use_hd_transform": True}), encoding="utf-8"
     )
+    (source / "genai_config.json").write_text(
+        json.dumps({"model": {"eos_token_id": 200001, "context_length": 131072}}),
+        encoding="utf-8",
+    )
     (source / "preprocessor_config.json").write_text(
         json.dumps(
             {
@@ -177,10 +181,12 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     )
 
     # Deliberately tiny config values must never override admitted artifact I/O.
+    config = _VlmConfig()
+    config.eos_token_id = 2
     path = write_vlm_workflow_metadata(
         package,
         str(tmp_path / "package"),
-        _VlmConfig(),
+        config,
         source=str(source),
     )
     serialized = Path(path).read_text(encoding="utf-8")
@@ -216,7 +222,8 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
         len([name for name in workflow["state"] if name.removeprefix("cache_").isdigit()])
         == 104
     )
-    assert workflow["inputs"]["package.max_context"]["default"] == 4096
+    assert workflow["inputs"]["package.max_context"]["default"] == 131072
+    assert workflow["inputs"]["package.eos_ids"]["default"] == 200001
     assert workflow["state"]["cache_103"]["contract"] == {
         "dtype": "bfloat16",
         "rank": 4,

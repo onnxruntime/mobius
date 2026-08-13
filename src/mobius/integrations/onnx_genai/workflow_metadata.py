@@ -55,6 +55,37 @@ def _dump_yaml(metadata: dict[str, Any], handle: Any) -> None:
     yaml.dump(metadata, handle, Dumper=_NoAliasSafeDumper, sort_keys=False)
 
 
+def _source_model_value(source: str | None, name: str, fallback: Any) -> Any:
+    """Resolve a value from packaged runtime metadata when available."""
+    candidates: list[tuple[str, tuple[str, ...]]] = []
+    if source and os.path.isdir(source):
+        candidates = [
+            (os.path.join(source, "genai_config.json"), ("model", name)),
+            (os.path.join(source, "tokenizer_config.json"), (name,)),
+        ]
+    for path, keys in candidates:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as handle:
+                value: Any = yaml.safe_load(handle)
+            for key in keys:
+                value = value[key]
+        except (OSError, TypeError, KeyError):
+            continue
+        fallback = value
+        break
+    return fallback
+
+
+def _source_token_id(source: str | None, name: str, fallback: Any) -> int:
+    """Resolve a generation token ID from packaged runtime metadata when available."""
+    fallback = _source_model_value(source, name, fallback)
+    if isinstance(fallback, list):
+        fallback = fallback[0] if fallback else 0
+    return int(fallback or 0)
+
+
 def _contract(value: ir.Value) -> dict[str, Any]:
     port = _port(value)
     dtype = {"fp16": "float16", "bf16": "bfloat16", "fp32": "float32"}.get(
@@ -2651,9 +2682,7 @@ def build_vlm_workflow_metadata(
     batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
     batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch]}
     control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
-    eos = getattr(config, "eos_token_id", 0)
-    if isinstance(eos, list):
-        eos = eos[0] if eos else 0
+    eos = _source_token_id(source, "eos_token_id", getattr(config, "eos_token_id", 0))
     inputs: dict[str, Any] = {
         "request.prompt_tokens": {
             "contract": _contract(token_input),
@@ -2685,14 +2714,20 @@ def build_vlm_workflow_metadata(
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
-            "default": int(eos or 0),
+            "default": eos,
         },
         "package.max_context": {
             "contract": control_int,
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
-            "default": int(getattr(config, "max_position_embeddings", 4096)),
+            "default": int(
+                _source_model_value(
+                    source,
+                    "context_length",
+                    getattr(config, "max_position_embeddings", 4096),
+                )
+            ),
         },
         "package.one": {
             "contract": control_int,
