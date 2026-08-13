@@ -89,16 +89,30 @@ class TestGenaiConfigGeneratorLLM:
             num_key_value_heads=8,
             head_dim=64,
             layer_types=["conv", "conv", "full_attention", "conv"],
-            conv_cache_size=3,
+            conv_cache_size=2,
         )
 
         decoder = gen.generate()["model"]["decoder"]
 
         assert decoder["layer_types"] == ["conv", "conv", "full_attention", "conv"]
-        assert decoder["conv_cache_size"] == 3
+        assert decoder["conv_cache_size"] == 2
         assert decoder["inputs"]["past_conv_names"] == "past_key_values.%d.conv_state"
         assert decoder["outputs"]["present_conv_names"] == "present.%d.conv_state"
         assert gen.generate()["search"]["past_present_share_buffer"] is False
+
+    def test_lfm2_kernel_one_preserves_zero_width_cache(self):
+        gen = GenaiConfigGenerator(
+            "lfm2",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            layer_types=["conv"],
+            conv_cache_size=0,
+        )
+        assert gen.generate()["model"]["decoder"]["conv_cache_size"] == 0
 
     def test_token_ids_included_when_set(self):
         """Token IDs are included in the model section."""
@@ -543,7 +557,7 @@ class TestGenaiConfigFromConfig:
         config = gen.generate()
         assert config["model"]["context_length"] == 4096
 
-    def test_num_kv_cache_layers_overrides_num_hidden_layers(self):
+    def test_num_cache_layer_slots_overrides_num_hidden_layers(self):
         """KV-sharing models report the graph's cache count, not the layer count.
 
         Gemma 3n / Gemma 4 trailing layers borrow K,V from an earlier layer and
@@ -561,15 +575,15 @@ class TestGenaiConfigFromConfig:
             head_dim: int = 128
 
         cfg = FakeConfig()
-        gen = GenaiConfigGenerator.from_config(cfg, "gemma3n", num_kv_cache_layers=20)
+        gen = GenaiConfigGenerator.from_config(cfg, "gemma3n", num_cache_layer_slots=20)
         assert gen.generate()["model"]["decoder"]["num_hidden_layers"] == 20
 
         # None falls back to the config value.
         gen = GenaiConfigGenerator.from_config(cfg, "gemma3n")
         assert gen.generate()["model"]["decoder"]["num_hidden_layers"] == 35
 
-    def test_lfm2_keeps_global_layer_count(self):
-        """LFM2 indexes attention and convolution caches by global layer id."""
+    def test_hybrid_cache_slots_keep_global_layer_count(self):
+        """Hybrid cache slots retain global layer indices without model checks."""
 
         @dataclasses.dataclass
         class FakeConfig:
@@ -586,12 +600,11 @@ class TestGenaiConfigFromConfig:
 
         gen = GenaiConfigGenerator.from_config(
             FakeConfig(),
-            "lfm2",
-            num_kv_cache_layers=6,
+            "custom_hybrid",
+            num_cache_layer_slots=14,
         )
         decoder = gen.generate()["model"]["decoder"]
         assert decoder["num_hidden_layers"] == 14
-        assert decoder["layer_types"] == FakeConfig().layer_types
 
 
 def test_cuda_enables_decoder_graph_capture_only():

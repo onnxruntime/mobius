@@ -232,7 +232,7 @@ class GenaiConfigGenerator:
         decoder_inputs: dict[str, str] | None = None,
         decoder_filename: str | None = None,
         supports_in_place_kv_cache: bool | None = None,
-        num_kv_cache_layers: int | None = None,
+        num_cache_layer_slots: int | None = None,
     ) -> GenaiConfigGenerator:
         """Create a generator from a BaseModelConfig-like dataclass.
 
@@ -242,16 +242,13 @@ class GenaiConfigGenerator:
         overridden since they are often not on the model config.
 
         Args:
-            num_kv_cache_layers: Number of KV cache entries the exported
-                decoder graph actually has. Overrides
+            num_cache_layer_slots: Number of globally indexed cache slots the
+                exported decoder graph requires. Overrides
                 ``config.num_hidden_layers`` for the ``num_hidden_layers``
-                field written to ``genai_config.json`` — ORT-GenAI uses that
-                field to decide how many ``past_key_values.%d.{key,value}``
-                bindings to create, so it must match the graph, not the
-                architecture. They differ for KV-layer-sharing models
-                (Gemma 3n / Gemma 4), where the last
-                ``num_kv_shared_layers`` layers borrow K,V from an earlier
-                layer and own no cache entry. ``None`` uses the config value.
+                field written to ``genai_config.json``. This is smaller than
+                the architecture count for KV-sharing models and retains global
+                indices for hybrid KV/recurrent-cache models. ``None`` uses the
+                config value.
         """
         pad = pad_token_id
         if pad is None:
@@ -268,13 +265,9 @@ class GenaiConfigGenerator:
             vocab_size=config.vocab_size,
             hidden_size=config.hidden_size,
             num_hidden_layers=(
-                config.num_hidden_layers
-                if model_type == "lfm2"
-                else (
-                    num_kv_cache_layers
-                    if num_kv_cache_layers is not None
-                    else config.num_hidden_layers
-                )
+                num_cache_layer_slots
+                if num_cache_layer_slots is not None
+                else config.num_hidden_layers
             ),
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
@@ -288,7 +281,11 @@ class GenaiConfigGenerator:
             decoder_filename=decoder_filename,
             supports_in_place_kv_cache=supports_in_place_kv_cache,
             layer_types=getattr(config, "layer_types", None),
-            conv_cache_size=getattr(config, "short_conv_kernel", None),
+            conv_cache_size=(
+                getattr(config, "short_conv_kernel", 1) - 1
+                if hasattr(config, "short_conv_kernel")
+                else None
+            ),
         )
 
     def with_vision(
@@ -479,7 +476,9 @@ class GenaiConfigGenerator:
         }
         if self.model_type == "lfm2":
             decoder["layer_types"] = self._layer_types or []
-            decoder["conv_cache_size"] = self._conv_cache_size or 3
+            decoder["conv_cache_size"] = (
+                self._conv_cache_size if self._conv_cache_size is not None else 3
+            )
             decoder["inputs"]["past_conv_names"] = "past_key_values.%d.conv_state"
             decoder["outputs"]["present_conv_names"] = "present.%d.conv_state"
 

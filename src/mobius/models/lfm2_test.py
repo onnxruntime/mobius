@@ -3,8 +3,12 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from types import SimpleNamespace
 
+import onnx_ir as ir
+
+from mobius import build_from_module
 from mobius._configs import Lfm2Config
 from mobius._registry import registry
 from mobius.models.lfm2 import Lfm2CausalLMModel
@@ -64,3 +68,40 @@ def test_model_uses_effective_intermediate_size():
     assert tuple(mlp.gate_proj.weight.shape) == (4608, 2048)
     assert tuple(mlp.up_proj.weight.shape) == (4608, 2048)
     assert tuple(mlp.down_proj.weight.shape) == (2048, 4608)
+
+
+def test_cuda_graph_uses_lfm2_fusions():
+    config = Lfm2Config.from_transformers(
+        _hf_config(
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_hidden_layers=2,
+            vocab_size=256,
+            head_dim=16,
+            layer_types=["conv", "full_attention"],
+            block_auto_adjust_ff_dim=False,
+            conv_L_cache=3,
+            conv_bias=False,
+        )
+    )
+    config.dtype = ir.DataType.FLOAT16
+    module = Lfm2CausalLMModel(config)
+    model = build_from_module(
+        module,
+        config,
+        task="hybrid-text-generation",
+        execution_provider="cuda",
+    )["model"]
+
+    counts = Counter((node.domain or "", node.op_type) for node in model.graph)
+    assert counts["", "Swish"] == 2
+    assert counts["com.microsoft", "CausalConvWithState"] == 1
+    assert counts["com.microsoft", "SkipSimplifiedLayerNormalization"] == 4
+
+    remaining_norms = [node for node in model.graph if node.op_type == "RMSNormalization"]
+    assert remaining_norms
+    assert all(
+        node.attributes.get_int("stash_type") == ir.DataType.FLOAT for node in remaining_norms
+    )

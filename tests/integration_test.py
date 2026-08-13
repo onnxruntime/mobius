@@ -199,7 +199,7 @@ def _make_prefill_feeds(config, input_ids, attention_mask, position_ids):
         layer_type = layer_types[i] if i < len(layer_types) else "full_attention"
         if layer_type == "conv":
             feeds[f"past_key_values.{i}.conv_state"] = np.zeros(
-                (1, config.hidden_size, config.short_conv_kernel),
+                (1, config.hidden_size, config.short_conv_kernel - 1),
                 dtype=np.float32,
             )
             continue

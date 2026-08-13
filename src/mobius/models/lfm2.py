@@ -28,18 +28,17 @@ class Lfm2RMSNorm(RMSNorm):
     """LFM2 RMSNorm with fp32 variance accumulation, matching Transformers."""
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
-        hidden_states_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
-        variance = op.ReduceMean(
-            op.Mul(hidden_states_f32, hidden_states_f32),
-            [-1],
-            keepdims=1,
+        # stash_type=FLOAT computes normalization in fp32, casts the normalized
+        # activation back to the input dtype, then applies gamma. This is the
+        # exact ordering used by Transformers' LlamaRMSNorm and also exposes the
+        # standard op to the residual SkipSimplifiedLayerNorm fusion.
+        return op.RMSNormalization(
+            hidden_states,
+            self.weight,
+            axis=-1,
+            epsilon=self.variance_epsilon,
+            stash_type=ir.DataType.FLOAT,
         )
-        normalized_f32 = op.Mul(
-            hidden_states_f32,
-            op.Reciprocal(op.Sqrt(op.Add(variance, self.variance_epsilon))),
-        )
-        # Transformers casts the normalized activation back before applying gamma.
-        return op.Mul(op.CastLike(normalized_f32, hidden_states), self.weight)
 
 
 class Lfm2DecoderLayer(nn.Module):

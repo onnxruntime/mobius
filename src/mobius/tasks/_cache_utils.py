@@ -279,12 +279,12 @@ def _make_hybrid_cache_inputs(
             pairs.append((conv_state, rec_state))
         elif ltype == "conv":
             # ShortConv layers: conv_state only (no SSM state)
-            # LFM2/ORT GenAI state: full K-wide pre-convolution window.
+            # Fused causal-conv state: the K-1 preceding input values.
             short_conv_kernel = getattr(config, "short_conv_kernel", 3)
             conv_state = builder.input(
                 f"{prefix}.{i}.conv_state",
                 dtype=dtype,
-                shape=[batch, config.hidden_size, short_conv_kernel],
+                shape=[batch, config.hidden_size, short_conv_kernel - 1],
             )
             pairs.append((conv_state,))  # 1-tuple: conv has no second state
         elif ltype in ("mlp", "moe"):
@@ -388,8 +388,9 @@ def _register_linear_attention_functions(
     has_deltanet = "linear_attention" in layer_types
     has_lightning = "lightning_attention" in layer_types
     has_mamba2 = "mamba2" in layer_types
+    has_short_conv = "conv" in layer_types
 
-    if not has_deltanet and not has_lightning and not has_mamba2:
+    if not has_deltanet and not has_lightning and not has_mamba2 and not has_short_conv:
         return
 
     from mobius.functions import (
@@ -454,6 +455,15 @@ def _register_linear_attention_functions(
         )
         model.functions[conv_func.identifier()] = conv_func
         model.functions[attn_func.identifier()] = attn_func
+
+    if has_short_conv:
+        conv_func = causal_conv_nd_with_state(
+            kernel_size=getattr(config, "short_conv_kernel", 3),
+            channels=config.hidden_size,
+            ndim=1,
+            activation="none",
+        )
+        model.functions[conv_func.identifier()] = conv_func
 
     model.graph.opset_imports[_FUNCTIONS_DOMAIN] = 1
 

@@ -16,7 +16,7 @@ import pytest
 from mobius.integrations.ort_genai.auto_export import (
     _copy_tokenizer_files,
     _copy_tokenizer_files_from_local,
-    _count_kv_cache_layers,
+    _count_cache_layer_slots,
     _fix_chat_template,
     _fix_tokenizer_config,
     _graph_input_names,
@@ -2129,8 +2129,8 @@ class TestIntrospectVisionOutputs:
         assert _introspect_outputs(pkg, "vision_encoder") is None
 
 
-class TestCountKvCacheLayers:
-    """Tests for _count_kv_cache_layers() helper."""
+class TestCountCacheLayerSlots:
+    """Tests for _count_cache_layer_slots() helper."""
 
     def test_counts_key_inputs(self):
         """Counts past_key_values.{i}.key inputs, not the value pairs."""
@@ -2144,15 +2144,26 @@ class TestCountKvCacheLayers:
                 "past_key_values.1.value",
             ]
         )
-        assert _count_kv_cache_layers(model) == 2
+        assert _count_cache_layer_slots(model) == 2
+
+    def test_uses_global_indices_across_hybrid_cache_types(self):
+        model = _mock_model_with_inputs(
+            [
+                "past_key_values.0.conv_state",
+                "past_key_values.1.key",
+                "past_key_values.1.value",
+                "past_key_values.3.recurrent_state",
+            ]
+        )
+        assert _count_cache_layer_slots(model) == 4
 
     def test_returns_none_without_kv_cache(self):
         """A static-cache export (key_cache.{i}) falls back to the config."""
         model = _mock_model_with_inputs(["input_ids", "key_cache.0", "value_cache.0"])
-        assert _count_kv_cache_layers(model) is None
+        assert _count_cache_layer_slots(model) is None
 
     def test_returns_none_for_missing_model(self):
-        assert _count_kv_cache_layers(None) is None
+        assert _count_cache_layer_slots(None) is None
 
 
 class TestGemma4RealModel:

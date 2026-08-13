@@ -16,14 +16,13 @@ if TYPE_CHECKING:
 
 
 class _DepthwiseShortConv1d(nn.Module):
-    """Depthwise Conv1D with a full-kernel recurrent cache."""
+    """Depthwise Conv1D backed by ``com.microsoft.CausalConvWithState``."""
 
     def __init__(self, channels: int, kernel_size: int, *, bias: bool):
         super().__init__()
         self.weight = nn.Parameter([channels, 1, kernel_size])
         self.bias = nn.Parameter([channels]) if bias else None
         self._channels = channels
-        self._kernel_size = kernel_size
 
     def forward(
         self,
@@ -31,38 +30,22 @@ class _DepthwiseShortConv1d(nn.Module):
         hidden_states: ir.Value,
         conv_state: ir.Value,
     ) -> tuple[ir.Value, ir.Value]:
-        # The cache contract is K-wide, but causal Conv only needs its newest
-        # K-1 values. Appending T inputs then produces exactly T outputs.
-        past = op.Slice(
+        bias = self.bias
+        if bias is None:
+            bias = op.Expand(
+                op.CastLike(op.Constant(value_float=0.0), self.weight),
+                op.Constant(value_ints=[self._channels]),
+            )
+        return op.CausalConvWithState(
+            hidden_states,
+            self.weight,
+            bias,
             conv_state,
-            op.Constant(value_ints=[1]),
-            op.Constant(value_ints=[INT64_MAX]),
-            op.Constant(value_ints=[2]),
+            activation="none",
+            ndim=1,
+            _domain="com.microsoft",
+            _outputs=2,
         )
-        conv_input = op.Concat(past, hidden_states, axis=2)
-        if self.bias is None:
-            conv_output = op.Conv(
-                conv_input,
-                self.weight,
-                kernel_shape=[self._kernel_size],
-                group=self._channels,
-            )
-        else:
-            conv_output = op.Conv(
-                conv_input,
-                self.weight,
-                self.bias,
-                kernel_shape=[self._kernel_size],
-                group=self._channels,
-            )
-
-        present_state = op.Slice(
-            conv_input,
-            op.Constant(value_ints=[-self._kernel_size]),
-            op.Constant(value_ints=[INT64_MAX]),
-            op.Constant(value_ints=[2]),
-        )
-        return conv_output, present_state
 
 
 class GatedShortConv(nn.Module):
@@ -90,8 +73,8 @@ class GatedShortConv(nn.Module):
 
         Args:
             hidden_states: Input activations shaped ``(batch, seq, hidden)``.
-            conv_state: Previous full convolution window shaped
-                ``(batch, hidden, kernel_size)``.
+            conv_state: Previous convolution history shaped
+                ``(batch, hidden, kernel_size - 1)``.
             attention_mask: Optional padding mask shaped
                 ``(batch, past_seq + seq)``.
         """

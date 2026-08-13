@@ -194,28 +194,28 @@ def _graph_input_names(model: ir.Model) -> list[str]:
     ]
 
 
-def _count_kv_cache_layers(model: ir.Model | None) -> int | None:
-    """Return the number of ``past_key_values.{i}.key`` inputs in *model*.
+def _count_cache_layer_slots(model: ir.Model | None) -> int | None:
+    """Return the number of globally indexed cache slots required by *model*.
 
-    ORT-GenAI binds ``num_hidden_layers`` KV cache pairs by name, so that
-    field must reflect the graph rather than the architecture. The two differ
-    for KV-layer-sharing models (Gemma 3n / Gemma 4), whose trailing layers
-    borrow K,V from an earlier layer and therefore own no cache entry.
+    ORT-GenAI binds cache inputs by ``past_key_values.{i}.*`` names, so
+    ``num_hidden_layers`` must cover the highest global layer index in the
+    graph. Counting only ``.key`` inputs undercounts hybrid models whose other
+    layers carry convolution or recurrent state; counting all inputs overcounts
+    key/value pairs. The required slot count is therefore ``max(i) + 1``.
 
-    Returns ``None`` when *model* is absent or has no such inputs (e.g. a
-    static-cache export, which uses ``key_cache.{i}`` instead), letting
-    callers fall back to the config value.
+    This also preserves the smaller graph-derived count for KV-sharing models
+    whose cache-owning layer indices form a shorter contiguous prefix. Returns
+    ``None`` when *model* is absent or has no dynamic-cache inputs (e.g. a
+    static-cache export using ``key_cache.{i}``).
     """
     if model is None:
         return None
-    count = sum(
-        1
-        for inp in model.graph.inputs
-        if inp.name is not None
-        and inp.name.startswith("past_key_values.")
-        and inp.name.endswith(".key")
-    )
-    return count or None
+    layer_indices: set[int] = set()
+    for inp in model.graph.inputs:
+        parts = inp.name.split(".") if inp.name is not None else []
+        if len(parts) >= 3 and parts[0] == "past_key_values" and parts[1].isdigit():
+            layer_indices.add(int(parts[1]))
+    return max(layer_indices) + 1 if layer_indices else None
 
 
 def _introspect_inputs(pkg: ModelPackage, key: str) -> dict[str, str] | None:
@@ -996,7 +996,7 @@ def _write_genai_config(
         decoder_inputs=decoder_inputs,
         decoder_filename=decoder_filename,
         supports_in_place_kv_cache=supports_in_place_kv_cache,
-        num_kv_cache_layers=_count_kv_cache_layers(decoder_model),
+        num_cache_layer_slots=_count_cache_layer_slots(decoder_model),
     )
 
     if is_vlm:
