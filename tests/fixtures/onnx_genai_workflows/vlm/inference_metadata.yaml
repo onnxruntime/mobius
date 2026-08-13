@@ -58,7 +58,7 @@ preprocessing:
         dtype: float32
         rank: 2
         shape:
-        - patches
+        - 4
         - 1176
     - name: image.grid_thw
       content: grid_dimensions
@@ -68,7 +68,7 @@ preprocessing:
         dtype: int64
         rank: 2
         shape:
-        - images
+        - 1
         - 3
 pipeline:
   workflow:

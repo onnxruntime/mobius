@@ -87,8 +87,8 @@ pipeline:
           shape:
           - batch
           - 3
-          - image_height
-          - image_width
+          - height
+          - width
         role: image
         stage: pre_adapter
     components:

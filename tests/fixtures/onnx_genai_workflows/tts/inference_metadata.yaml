@@ -205,7 +205,7 @@ pipeline:
           shape:
           - batch
           - 1
-          - samples
+          - frames
         role: audio
         stage: post_adapter
     components:
