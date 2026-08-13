@@ -494,6 +494,7 @@ class ArchitectureConfig(BaseModelConfig):
     # Vision shared fields (accessed as top-level config.X by tasks)
     mm_tokens_per_image: int | None = None
     image_token_id: int | None = None
+    video_token_id: int | None = None
     spatial_merge_size: int = 2
     temporal_patch_size: int = 2
     deepstack_visual_indexes: list[int] | None = None
@@ -710,6 +711,11 @@ class ArchitectureConfig(BaseModelConfig):
             model_type=model_type,
             bos_token_id=getattr(config, "bos_token_id", None),
             eos_token_id=getattr(config, "eos_token_id", None),
+            video_token_id=getattr(
+                parent_config or config,
+                "video_token_id",
+                getattr(config, "video_token_id", None),
+            ),
             rms_norm_eps=(
                 getattr(config, "rms_norm_eps", None)
                 or getattr(config, "layer_norm_eps", None)
@@ -1272,6 +1278,39 @@ class VisionLanguageConfig(CausalLMConfig):
 # ---------------------------------------------------------------------------
 # Model-family subclasses — add model-specific fields
 # ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class MuseGlimmerConfig(ArchitectureConfig):
+    """Configuration for Muse Glimmer text and vision-language models."""
+
+    qk_scale_factor: float = 3.87
+    output_multiplier: float = 0.19611613513818404
+    final_logit_softcapping: float = 20.0
+    post_norm_eps: float = 1e-8
+    layer_rope_theta: list[float | int] | None = None
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> MuseGlimmerConfig:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        layer_rope_theta = getattr(config, "layer_rope_theta", None)
+        if layer_rope_theta is not None:
+            layer_rope_theta = list(layer_rope_theta)
+            no_rope_layers = [
+                layer_idx
+                for layer_idx, rope_theta in enumerate(layer_rope_theta)
+                if rope_theta == 0
+            ]
+            base = dataclasses.replace(base, no_rope_layers=no_rope_layers)
+        base = dataclasses.replace(base, attn_qk_norm=True)
+        return cls(
+            **_shallow_fields(base),
+            qk_scale_factor=getattr(config, "qk_scale_factor", 3.87),
+            output_multiplier=getattr(config, "output_multiplier", 0.19611613513818404),
+            final_logit_softcapping=(getattr(config, "final_logit_softcapping", 20.0) or 0.0),
+            post_norm_eps=getattr(config, "post_norm_eps", 1e-8),
+            layer_rope_theta=layer_rope_theta,
+        )
 
 
 @dataclasses.dataclass

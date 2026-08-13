@@ -36,6 +36,7 @@ from mobius._configs import (
     Mamba2Config,
     MambaConfig,
     MllamaConfig,
+    MuseGlimmerConfig,
     NanoChatConfig,
     NemotronHConfig,
     Sam2Config,
@@ -58,6 +59,25 @@ TINY_LAYERS = 2
 TINY_VOCAB = 256
 
 LONGROPE_FACTORS = [1.0] * (int(TINY_HEAD_DIM * 0.5) // 2)
+
+_TINY_MUSE_GLIMMER_TEXT_OVERRIDES = {
+    "_config_cls": MuseGlimmerConfig,
+    "num_hidden_layers": 4,
+    "layer_types": [
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "full_attention",
+    ],
+    "layer_rope_theta": [500_000.0, 500_000.0, 500_000.0, 0],
+    "no_rope_layers": [3],
+    "sliding_window": 8,
+    "attn_qk_norm": True,
+    "qk_scale_factor": 3.87,
+    "output_multiplier": 0.19611613513818404,
+    "final_logit_softcapping": 20.0,
+    "post_norm_eps": 1e-8,
+}
 
 # NOTE (MLA models): Multi-head Latent Attention models (DeepSeek-V2/V3,
 # LongCat-Flash, ...) reconstruct full-head K/V from a shared latent, so they do
@@ -111,6 +131,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ("llama", {}, True),
     ("mistral", {}, False),
     ("qwen2", {}, True),
+    ("muse_glimmer_text", dict(_TINY_MUSE_GLIMMER_TEXT_OVERRIDES), True),
     ("cohere", {"tie_word_embeddings": True, "logit_scale": 0.0625}, True),
     ("cohere2", {"tie_word_embeddings": True, "logit_scale": 0.0625}, False),
     (
@@ -2139,6 +2160,27 @@ _TINY_COSMOS3_EDGE_VISION = VisionConfig(
     projector_intermediate_size=64,
 )
 
+_TINY_MUSE_GLIMMER_VISION = VisionConfig(
+    hidden_size=32,
+    intermediate_size=64,
+    num_hidden_layers=4,
+    num_attention_heads=4,
+    head_dim=8,
+    image_size=16,
+    patch_size=2,
+    norm_eps=1e-5,
+    hidden_act="gelu",
+    spatial_merge_size=2,
+    temporal_patch_size=2,
+    position_embedding_height=8,
+    position_embedding_width=8,
+    num_position_embeddings=64,
+    fullatt_block_indexes=[3],
+    window_size=16,
+    projector_intermediate_size=48,
+    out_hidden_size=TINY_HIDDEN,
+)
+
 
 # ---------------------------------------------------------------------------
 # Vision-Language configs  (task: vision-language and variants)
@@ -2149,6 +2191,16 @@ _TINY_COSMOS3_EDGE_VISION = VisionConfig(
 VL_CONFIGS: list[tuple[str, dict, bool]] = [
     # --- LLaVA family (vision-language, 3-model split) ---
     ("llava", {"vision": _TINY_VISION, "image_token_id": 32000}, True),
+    (
+        "muse_glimmer",
+        {
+            **_TINY_MUSE_GLIMMER_TEXT_OVERRIDES,
+            "vision": _TINY_MUSE_GLIMMER_VISION,
+            "image_token_id": 200092,
+            "video_token_id": 200091,
+        },
+        True,
+    ),
     (
         "cosmos3_edge",
         {

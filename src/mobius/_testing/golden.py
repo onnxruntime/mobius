@@ -100,6 +100,9 @@ class GoldenTestCase:
     trust_remote_code: bool
     """Whether the HF model requires ``trust_remote_code``."""
 
+    reference_loader: str
+    """HF reference loader kind: ``causal-lm`` or ``multimodal``."""
+
     skip_reason: str | None
     """If set, the test runner should skip with this message."""
 
@@ -239,6 +242,7 @@ def load_test_case(yaml_path: Path) -> GoldenTestCase:
         decoder_prompt=inputs.get("decoder_prompt", "") or "",
         generation_params=generation,
         trust_remote_code=data.get("trust_remote_code", False),
+        reference_loader=data.get("reference_loader", "causal-lm"),
         skip_reason=data.get("skip_reason"),
         ci_skip_reason=data.get("ci_skip_reason"),
         min_token_match_ratio=data.get("min_token_match_ratio"),

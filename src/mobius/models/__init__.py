@@ -81,6 +81,8 @@ __all__ = [
     "Mamba2CausalLMModel",
     "MambaCausalLMModel",
     "MiniMaxCausalLMModel",
+    "MuseGlimmerForConditionalGeneration",
+    "MuseGlimmerTextCausalLMModel",
     "MimiModel",
     "MoshiDepformerModel",
     "MoshiTemporalModel",
@@ -163,7 +165,11 @@ from mobius.models.apertus import ApertusCausalLMModel
 from mobius.models.arcee import ArceeCausalLMModel
 from mobius.models.bamba import BambaCausalLMModel
 from mobius.models.bart import BartForConditionalGeneration
-from mobius.models.base import CausalLMModel, FusedGateUpCausalLMModel, LayerNormCausalLMModel
+from mobius.models.base import (
+    CausalLMModel,
+    FusedGateUpCausalLMModel,
+    LayerNormCausalLMModel,
+)
 from mobius.models.bert import BertModel
 from mobius.models.blip2 import Blip2Model
 from mobius.models.chatglm import ChatGLMCausalLMModel
@@ -185,7 +191,11 @@ from mobius.models.doge import DogeCausalLMModel
 from mobius.models.eagle3 import Eagle3DraftModel
 from mobius.models.ernie import ErnieCausalLMModel
 from mobius.models.exaone4 import ExaOne4CausalLMModel
-from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel, MPTCausalLMModel
+from mobius.models.falcon import (
+    BloomCausalLMModel,
+    FalconCausalLMModel,
+    MPTCausalLMModel,
+)
 from mobius.models.flux_sd3 import FluxTransformer2DModel, SD3Transformer2DModel
 from mobius.models.fun_asr import FunASRForConditionalGeneration
 from mobius.models.gemma import Gemma2CausalLMModel, GemmaCausalLMModel
@@ -232,6 +242,10 @@ from mobius.models.moshi import (
     MoshiTemporalModel,
     moshi_depformer_config,
     moshi_temporal_config,
+)
+from mobius.models.muse_glimmer import (
+    MuseGlimmerForConditionalGeneration,
+    MuseGlimmerTextCausalLMModel,
 )
 from mobius.models.nanochat import NanoChatCausalLMModel
 from mobius.models.nemo_rnnt import EncDecRNNTModel

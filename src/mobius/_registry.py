@@ -29,6 +29,7 @@ from mobius._configs import (
     Gemma4AssistantConfig,
     Gemma4Config,
     MMSConfig,
+    MuseGlimmerConfig,
     WhisperConfig,
 )
 from mobius.models import (
@@ -113,7 +114,11 @@ from mobius.models.cohere import CohereCausalLMModel
 from mobius.models.ctrl import CTRLCausalLMModel
 from mobius.models.depth_anything import DepthAnythingForDepthEstimation
 from mobius.models.distilbert import DistilBertModel
-from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel, MPTCausalLMModel
+from mobius.models.falcon import (
+    BloomCausalLMModel,
+    FalconCausalLMModel,
+    MPTCausalLMModel,
+)
 from mobius.models.fun_asr import FunASRForConditionalGeneration
 from mobius.models.gemma3n import Gemma3nCausalLMModel, Gemma3nMultiModalModel
 from mobius.models.gpt2 import GPT2CausalLMModel
@@ -130,6 +135,10 @@ from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
 from mobius.models.minimax import MiniMaxCausalLMModel
 from mobius.models.mllama import MllamaCausalLMModel
 from mobius.models.modernbert import ModernBertDecoderModel, ModernBertModel
+from mobius.models.muse_glimmer import (
+    MuseGlimmerForConditionalGeneration,
+    MuseGlimmerTextCausalLMModel,
+)
 from mobius.models.nemotron_h import NemotronHCausalLMModel
 from mobius.models.opt import OPTCausalLMModel
 from mobius.models.persimmon import PersimmonCausalLMModel
@@ -602,6 +611,16 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "llava_onevision": ModelRegistration(LLaVAModel, task="vision-language"),
     "mistral3": ModelRegistration(LLaVAModel, task="pixtral-vl"),
     "mllama": ModelRegistration(MllamaCausalLMModel, task="mllama-vision-language"),
+    "muse_glimmer": ModelRegistration(
+        MuseGlimmerForConditionalGeneration,
+        task="muse-glimmer-vl",
+        config_class=MuseGlimmerConfig,
+        test_model_id="meta-models/Muse-Glimmer-30B",
+    ),
+    "muse_glimmer_text": ModelRegistration(
+        MuseGlimmerTextCausalLMModel,
+        config_class=MuseGlimmerConfig,
+    ),
     "molmo": ModelRegistration(LLaVAModel, task="vision-language"),
     "ovis2": ModelRegistration(LLaVAModel, task="vision-language"),
     "paligemma": ModelRegistration(LLaVAModel, task="vision-language"),
@@ -809,6 +828,8 @@ def _create_default_registry() -> ModelRegistry:
 # idempotent: a text-only model_type maps to itself so ``text_only=True`` is a
 # no-op when the resolved type is already text-only.
 _TEXT_ONLY_MODEL_TYPE: dict[str, str] = {
+    "muse_glimmer": "muse_glimmer_text",
+    "muse_glimmer_text": "muse_glimmer_text",
     "gemma3n": "gemma3n_text",
     "gemma3n_text": "gemma3n_text",
     "gemma4_unified": "gemma4_unified_text",
@@ -970,6 +991,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "llava": "llava-hf/llava-1.5-7b-hf",
     "llava_next": "llava-hf/llava-v1.6-mistral-7b-hf",
     "mllama": "meta-llama/Llama-3.2-11B-Vision-Instruct",
+    "muse_glimmer": "meta-models/Muse-Glimmer-30B",
+    "muse_glimmer_text": "meta-models/Muse-Glimmer-30B",
     "gemma4": "google/gemma-4-E2B-it",
     "gemma4_unified": "google/gemma-4-12B",
     "gemma4_unified_text": "google/gemma-4-12B",

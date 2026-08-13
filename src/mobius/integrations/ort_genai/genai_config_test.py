@@ -232,6 +232,27 @@ class TestGenaiConfigGeneratorLLM:
         assert webgpu["enableGraphCapture"] == "1"
         assert webgpu["validationMode"] == "disabled"
 
+    def test_webgpu_graph_capture_is_decoder_only_for_multimodal(self):
+        gen = GenaiConfigGenerator(
+            "gemma4",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+            ep="webgpu",
+        )
+        config = gen.with_vision(image_token_id=255999).with_audio().generate()
+
+        model = config["model"]
+        decoder_webgpu = model["decoder"]["session_options"]["provider_options"][0]["webgpu"]
+        assert decoder_webgpu["enableGraphCapture"] == "1"
+        for component in ("vision", "embedding", "speech"):
+            webgpu = model[component]["session_options"]["provider_options"][0]["webgpu"]
+            assert webgpu["enableGraphCapture"] == "0"
+            assert webgpu["validationMode"] == "basic"
+
     def test_search_params_custom_ep_with_share_buffer(self):
         """A custom EP registered with supports_past_present_share_buffer=True gets the flag set.
 
@@ -525,6 +546,47 @@ class TestGenaiConfigFromConfig:
         # None falls back to the config value.
         gen = GenaiConfigGenerator.from_config(cfg, "gemma3n")
         assert gen.generate()["model"]["decoder"]["num_hidden_layers"] == 35
+
+
+def test_cuda_enables_decoder_graph_capture_only():
+    gen = GenaiConfigGenerator(
+        "qwen2_5_vl",
+        vocab_size=202048,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+    ).with_vision(image_token_id=200092)
+
+    config = gen.generate()
+
+    decoder_options = config["model"]["decoder"]["session_options"]["provider_options"]
+    vision_options = config["model"]["vision"]["session_options"]["provider_options"]
+    embedding_options = config["model"]["embedding"]["session_options"]["provider_options"]
+    assert decoder_options[0]["cuda"]["enable_cuda_graph"] == "1"
+    assert vision_options[0]["cuda"]["enable_cuda_graph"] == "0"
+    assert embedding_options[0]["cuda"]["enable_cuda_graph"] == "0"
+
+
+def test_cuda_decoder_graph_capture_can_be_disabled():
+    gen = GenaiConfigGenerator(
+        "test_model",
+        vocab_size=1000,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+        decoder_graph_capture=False,
+    )
+
+    config = gen.generate()
+    decoder_options = config["model"]["decoder"]["session_options"]["provider_options"]
+
+    assert decoder_options[0]["cuda"]["enable_cuda_graph"] == "0"
 
 
 class TestGenaiConfigWrite:

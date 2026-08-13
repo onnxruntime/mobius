@@ -104,7 +104,11 @@ def _default_search_params(
     }
 
 
-def _make_session_options(ep: str) -> dict[str, Any]:
+def _make_session_options(
+    ep: str,
+    *,
+    enable_graph_capture: bool | None = None,
+) -> dict[str, Any]:
     """Return session options with EP-specific provider_options.
 
     Args:
@@ -115,7 +119,10 @@ def _make_session_options(ep: str) -> dict[str, Any]:
 
     return {
         "log_id": "onnxruntime-genai",
-        "provider_options": make_provider_options(ep),
+        "provider_options": make_provider_options(
+            ep,
+            enable_graph_capture=enable_graph_capture,
+        ),
     }
 
 
@@ -169,6 +176,7 @@ class GenaiConfigGenerator:
         decoder_inputs: dict[str, str] | None = None,
         decoder_filename: str | None = None,
         supports_in_place_kv_cache: bool | None = None,
+        decoder_graph_capture: bool | None = None,
     ):
         self.model_type = model_type
         self.vocab_size = vocab_size
@@ -193,6 +201,7 @@ class GenaiConfigGenerator:
         # to the EP capability flag, preserving existing behaviour for callers
         # that don't introspect the graph.
         self._supports_in_place_kv_cache = supports_in_place_kv_cache
+        self._decoder_graph_capture = decoder_graph_capture
 
         # Optional VLM fields (set via with_vision())
         self._vision: dict[str, Any] | None = None
@@ -339,7 +348,10 @@ class GenaiConfigGenerator:
             "config_filename": config_filename,
             "inputs": input_names,
             "outputs": output_names,
-            "session_options": _make_session_options(self.ep),
+            "session_options": _make_session_options(
+                self.ep,
+                enable_graph_capture=False,
+            ),
         }
         if spatial_merge_size is not None:
             self._vision["spatial_merge_size"] = spatial_merge_size
@@ -358,7 +370,10 @@ class GenaiConfigGenerator:
             else {
                 "inputs_embeds": "inputs_embeds",
             },
-            "session_options": _make_session_options(self.ep),
+            "session_options": _make_session_options(
+                self.ep,
+                enable_graph_capture=False,
+            ),
         }
         self._vlm_token_ids["image_token_id"] = image_token_id
         if vision_start_token_id is not None:
@@ -414,7 +429,10 @@ class GenaiConfigGenerator:
             "config_filename": config_filename,
             "inputs": input_names,
             "outputs": output_names,
-            "session_options": _make_session_options(self.ep),
+            "session_options": _make_session_options(
+                self.ep,
+                enable_graph_capture=False,
+            ),
         }
 
         if audio_token_id is not None:
@@ -436,7 +454,10 @@ class GenaiConfigGenerator:
             decoder_inputs = _default_decoder_inputs(is_vlm=is_multimodal)
         decoder_filename = "decoder/model.onnx" if is_multimodal else "model.onnx"
         decoder: dict[str, Any] = {
-            "session_options": _make_session_options(self.ep),
+            "session_options": _make_session_options(
+                self.ep,
+                enable_graph_capture=self._decoder_graph_capture,
+            ),
             "filename": self._decoder_filename or decoder_filename,
             "head_size": self.head_dim,
             "hidden_size": self.hidden_size,
