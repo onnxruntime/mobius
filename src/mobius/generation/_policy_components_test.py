@@ -336,6 +336,7 @@ def test_seeded_sampler_is_counter_based_and_reproducible(tmp_path):
         "temperature": np.array([1.0], np.float32),
         "top_k": np.array([0], np.int64),
         "top_p": np.array([1.0], np.float32),
+        "min_p": np.array([0.0], np.float32),
         "grammar_mask": np.array([[True, True, True, True]], np.bool_),
         "seed": np.array([7], np.int64),
         "offset": np.array([11], np.int64),
@@ -355,6 +356,7 @@ def test_seeded_sampler_applies_request_top_k_and_grammar_mask(tmp_path):
             "temperature": np.array([0.7], np.float32),
             "top_k": np.array([1], np.int64),
             "top_p": np.array([0.5], np.float32),
+            "min_p": np.array([0.0], np.float32),
             "grammar_mask": np.array([[False, True, True, True]], np.bool_),
             "seed": np.array([17], np.int64),
             "offset": np.array([0], np.int64),
@@ -372,12 +374,32 @@ def test_seeded_sampler_rejects_empty_grammar_vocabulary(tmp_path):
             "temperature": np.array([1.0], np.float32),
             "top_k": np.array([0], np.int64),
             "top_p": np.array([1.0], np.float32),
+            "min_p": np.array([0.0], np.float32),
             "grammar_mask": np.array([[False, False, False]], np.bool_),
             "seed": np.array([1], np.int64),
             "offset": np.array([0], np.int64),
         },
     )
     np.testing.assert_array_equal(token, [-1])
+
+
+def test_seeded_sampler_applies_request_min_p_in_logit_space(tmp_path):
+    (token, next_offset) = _run(
+        build_seeded_categorical_sampler(),
+        tmp_path,
+        {
+            "logits": np.array([[0.0, -0.1, -10.0]], np.float32),
+            "temperature": np.array([1.0], np.float32),
+            "top_k": np.array([0], np.int64),
+            "top_p": np.array([1.0], np.float32),
+            "min_p": np.array([0.95], np.float32),
+            "grammar_mask": np.array([[True, True, True]], np.bool_),
+            "seed": np.array([23], np.int64),
+            "offset": np.array([4], np.int64),
+        },
+    )
+    np.testing.assert_array_equal(token, [0])
+    np.testing.assert_array_equal(next_offset, [5])
 
 
 def test_eos_termination_runtime(tmp_path):

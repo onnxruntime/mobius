@@ -60,6 +60,34 @@ contract:
   parameters: { mode: greedy }
 ```
 
+## Execution islands and graph capture
+
+Serialized component boundaries preserve policy modularity; they do not require separate ORT
+sessions, kernel launches, host round trips, or CUDA Graphs. After artifact loading, override
+selection, validation, and SSA lowering, the generic planner may link adjacent pure ONNX invokes
+on the same device into an execution island (or equivalent linked composite session). Intermediate
+SSA values stay device-resident and optimizer-visible. Decoder logits processors, sampler,
+state-update math, and termination predicates can therefore execute as one island.
+
+Island formation is derived rather than serialized. It ends at structured host control, device
+changes, explicit external effects, or stateful host adapters such as grammar clone/commit.
+Application overrides are resolved before planning; a selected pure same-device ONNX replacement
+remains eligible under the same rules.
+
+CUDA Graph capture is evaluated per island and concrete shape signature. Eligibility requires:
+
+- static or bounded runtime-specialized shapes;
+- stable device-resident input, output, and state addresses;
+- no host data-dependent allocation or control;
+- execution-provider support for every selected kernel; and
+- explicit tensor-threaded counter RNG seed/offset state.
+
+The runtime should warm up bindings, capture an eligible equal-shape execution, and replay later
+matches. Shape changes, unsupported kernels, allocator instability, or capture errors fall back
+to ordinary island execution without changing workflow semantics. Diagnostics should identify
+the island's component list and device, eligibility decision, capture/replay counters, and exact
+fallback reason.
+
 ### Decoder KV boundary
 
 Normal decode carries each decoder `present` tensor directly to the corresponding
@@ -71,11 +99,15 @@ rollback, or format conversion.
 
 ### Request-parameterized sampling
 
-The stochastic sampler ABI accepts `temperature`, `top_k`, `top_p`, `seed`, RNG offset,
-and a grammar-allow mask as typed inputs. They are request/workflow values rather than
-artifact constants, so ordinary option changes do not rebuild the sampler. The generated
-component is marked `application_overridable`; an application may replace it with another
-implementation of the same versioned port ABI for fundamentally custom sampling.
+The stochastic sampler ABI accepts `temperature`, `top_k`, `top_p`, `min_p`, `seed`, RNG
+offset, and a grammar-allow mask as typed inputs. They are request/workflow values rather
+than artifact constants, so ordinary option changes do not rebuild the sampler. After grammar
+masking and temperature scaling, positive min-p is evaluated as
+`scaled_logit >= max_scaled_logit + log(min_p)`; a non-positive value disables the filter.
+This preserves fixed `[B,V]` shapes. The generated component is marked
+`application_overridable`; an application may
+replace it with another implementation of the same versioned port ABI for fundamentally
+custom sampling.
 
 ## Compact examples
 

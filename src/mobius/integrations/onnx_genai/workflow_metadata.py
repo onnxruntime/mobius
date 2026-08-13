@@ -3855,6 +3855,20 @@ def build_decoder_workflow_metadata(
                     "required": False,
                     "default": 1.0,
                 },
+                "request.min_p": {
+                    "contract": {"dtype": "float32", "rank": 1, "shape": [1]},
+                    "role": {
+                        "kind": "runtime",
+                        "version": "1.0",
+                        "role": "sampling_min_p",
+                    },
+                    "source": {
+                        "kind": "request",
+                        "field": "sampling_min_p",
+                    },
+                    "required": False,
+                    "default": 0.0,
+                },
                 "request.seed": {
                     "contract": batch_int,
                     "role": {
@@ -4124,6 +4138,7 @@ def build_decoder_workflow_metadata(
                             "temperature": "request.temperature",
                             "top_k": "request.top_k",
                             "top_p": "request.top_p",
+                            "min_p": "request.min_p",
                             "grammar_mask": "request.grammar_mask",
                             "seed": "request.seed",
                             "offset": "state.rng_offset.body",

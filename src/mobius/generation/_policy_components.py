@@ -973,6 +973,7 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
     temperature = builder.input("temperature", ir.DataType.FLOAT, [1])
     top_k = builder.input("top_k", ir.DataType.INT64, [1])
     top_p = builder.input("top_p", ir.DataType.FLOAT, [1])
+    min_p = builder.input("min_p", ir.DataType.FLOAT, [1])
     grammar_mask = builder.input("grammar_mask", ir.DataType.BOOL, ["batch", "vocabulary"])
     seed = builder.input("seed", ir.DataType.INT64, ["batch"])
     offset = builder.input("offset", ir.DataType.INT64, ["batch"])
@@ -1027,6 +1028,20 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
     constrained_logits = op.Where(grammar_mask, logits, blocked)
     safe_temperature = op.Max(temperature, op.Constant(value_float=1e-6))
     scaled_logits = op.Div(constrained_logits, safe_temperature)
+    safe_min_p = op.Clip(
+        min_p,
+        op.Constant(value_float=1e-20),
+        op.Constant(value_float=1.0),
+    )
+    min_p_threshold = op.Add(
+        op.ReduceMax(scaled_logits, axes=[-1], keepdims=1),
+        op.Log(safe_min_p),
+    )
+    min_p_mask = op.Or(
+        op.LessOrEqual(min_p, op.Constant(value_float=0.0)),
+        op.GreaterOrEqual(scaled_logits, min_p_threshold),
+    )
+    scaled_logits = op.Where(min_p_mask, scaled_logits, blocked)
 
     vocabulary = op.Shape(logits, start=1, end=2)
     requested_k = op.Where(
@@ -1140,6 +1155,7 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
             "temperature": "temperature",
             "top_k": "top_k",
             "top_p": "top_p",
+            "min_p": "min_p",
             "grammar_mask": "grammar_mask",
             "rng": {
                 "rng_seed": "seed",

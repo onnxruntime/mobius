@@ -2382,6 +2382,7 @@
         "sampling_temperature",
         "sampling_top_k",
         "sampling_top_p",
+        "sampling_min_p",
         "constraint",
         "session_id"
       ],

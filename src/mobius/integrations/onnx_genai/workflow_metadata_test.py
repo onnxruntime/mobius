@@ -173,7 +173,7 @@ def test_language_diffusion_rejects_zero_steps():
 
 def test_language_diffusion_matches_pr_828_schema():
     schema_path = (
-        Path(__file__).parents[4] / "tests" / "schemas" / "onnx_genai_c553a16.schema.json"
+        Path(__file__).parents[4] / "tests" / "schemas" / "onnx_genai_b2157a2.schema.json"
     )
     with schema_path.open(encoding="utf-8") as handle:
         schema = json.load(handle)
@@ -288,7 +288,7 @@ def test_speculative_grammar_and_adaptive_k_use_typed_state_contracts():
     assert proposer["inputs"]["proposal_budget"] == "proposal_k"
     assert all("initial" not in carry for carry in workflow["steps"][0]["carried"])
     schema_path = (
-        Path(__file__).parents[4] / "tests" / "schemas" / "onnx_genai_c553a16.schema.json"
+        Path(__file__).parents[4] / "tests" / "schemas" / "onnx_genai_b2157a2.schema.json"
     )
     with schema_path.open(encoding="utf-8") as handle:
         jsonschema.validate(instance=metadata, schema=json.load(handle))
