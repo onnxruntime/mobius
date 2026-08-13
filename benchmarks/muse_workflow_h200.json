@@ -3,7 +3,7 @@
   "package": {
     "repository": "justinchuby/Muse-Glimmer-30B-ONNX-INT4-CUDA",
     "weights_revision": "bf36a94a4519e14e3c48ad005c6ff1972ab44ccb",
-    "schema_head": "a341c463a0090298238102506796bc73d86b84fa",
+    "schema_head": "dbb5d0e55fe113248a082b5ac23d997e94b2b534",
     "artifacts": {
       "decoder": "decoder/model.onnx",
       "embedding": "embedding/model.onnx",
