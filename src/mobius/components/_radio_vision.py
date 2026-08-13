@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 from onnxscript import OpBuilder, nn
 
-from mobius.components import INT64_MAX, LayerNorm, Linear
+from mobius.components._common import INT64_MAX, LayerNorm, Linear
 
 if TYPE_CHECKING:
     import onnx_ir as ir
