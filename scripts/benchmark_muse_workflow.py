@@ -121,6 +121,7 @@ def main() -> int:
     if workload["image"]:
         command.extend(["--image", workload["image"]])
     environment = os.environ.copy()
+    environment["ONNX_GENAI_CUDA_GRAPH"] = "1"
     environment["ORT_ENABLE_CUDNN_FLASH_ATTENTION"] = "0"
     completed = subprocess.run(
         command,
@@ -150,6 +151,10 @@ def main() -> int:
             "source_head": runtime_head,
             "runner": str(args.runner.resolve()),
             "runner_sha256": _sha256(args.runner),
+            "environment": {
+                "ONNX_GENAI_CUDA_GRAPH": "1",
+                "ORT_ENABLE_CUDNN_FLASH_ATTENTION": "0",
+            },
         },
         "metrics": {
             "ttft_ms": float(median.group(1)),
