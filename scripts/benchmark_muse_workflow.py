@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -38,6 +39,8 @@ def main() -> int:
     config: dict[str, Any] = json.loads(args.config.read_text())
     workload = config["workload"]
     sampling = config["sampling"]
+    if config["runtime"]["cudnn_flash_attention"]:
+        raise ValueError("paired Muse benchmark requires cuDNN Flash Attention disabled")
     prompt_ids_path = Path(workload["prompt_ids_file"])
     prompt_ids = json.loads(prompt_ids_path.read_text())
     if len(prompt_ids) != int(workload["prompt_tokens"]):
@@ -79,7 +82,15 @@ def main() -> int:
     ]
     if workload["image"]:
         command.extend(["--image", workload["image"]])
-    completed = subprocess.run(command, check=True, text=True, capture_output=True)
+    environment = os.environ.copy()
+    environment["ORT_ENABLE_CUDNN_FLASH_ATTENTION"] = "0"
+    completed = subprocess.run(
+        command,
+        check=True,
+        text=True,
+        capture_output=True,
+        env=environment,
+    )
     output = completed.stdout + completed.stderr
     median = re.search(
         r"steady_median: prefill=([0-9.]+) ms decode=([0-9.]+) ms/token "

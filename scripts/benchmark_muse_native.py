@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-os.environ.setdefault("ORT_ENABLE_CUDNN_FLASH_ATTENTION", "0")
+os.environ["ORT_ENABLE_CUDNN_FLASH_ATTENTION"] = "0"
 
 import onnxruntime as ort
 import onnxruntime_genai as og
@@ -103,6 +103,8 @@ def main() -> int:
     config = json.loads(args.config.read_text())
     workload = config["workload"]
     sampling = config["sampling"]
+    if config["runtime"]["cudnn_flash_attention"]:
+        raise ValueError("paired Muse benchmark requires cuDNN Flash Attention disabled")
 
     if ort.__version__ != config["runtime"]["onnxruntime"]:
         raise RuntimeError(

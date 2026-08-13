@@ -5,6 +5,8 @@ metadata-workflow benchmark of the published Muse Glimmer INT4 package. Both
 paths use the exact 68 token IDs in `muse_prompt_ids.json`, greedy parameters,
 token budget, warmups, and steady-decode window. Passing token IDs avoids a
 tokenizer adding another beginning-of-text token to the already rendered prompt.
+Both runners set `ORT_ENABLE_CUDNN_FLASH_ATTENTION=0`; this matches the native
+baseline and avoids comparing different GQA attention kernels.
 `request_max_length` is prompt tokens plus new tokens (68 + 128 = 196);
 `model_max_context` is the independent 131072-token artifact admission ceiling.
 For the text-only VLM path, omit `request.image`. The runtime initializes

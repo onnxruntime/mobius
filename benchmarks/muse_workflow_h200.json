@@ -16,6 +16,7 @@
     "onnxruntime_genai_commit": "ede24ecc6a254ef33354bc0eb7bc90d1daa540bd",
     "execution_provider": "CUDAExecutionProvider",
     "cuda_graph": true,
+    "cudnn_flash_attention": false,
     "shared_kv": true
   },
   "hardware": {
