@@ -228,7 +228,11 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
         "shape": ["batch", 202048],
     }
     assert workflow["state"]["attention_mask"]["recurrence"] == {"kind": "invariant"}
-    assert workflow["state"]["cache_103"]["recurrence"] == {"kind": "invariant"}
+    assert workflow["state"]["cache_103"]["recurrence"] == {
+        "kind": "bounded",
+        "axis": 2,
+        "max": "package.max_context",
+    }
     assert workflow["state"]["cache_lengths"]["initializer"] == "initializer.cache_lengths"
     assert policy_invokes["decoder_state_initializer"]["inputs"] == {
         "prompt_tokens": "request.prompt_tokens",

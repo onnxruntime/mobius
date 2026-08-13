@@ -437,7 +437,9 @@ pipeline:
         scope: invocation
         initializer: decoder.setup.present.0.key
         recurrence:
-          kind: invariant
+          kind: bounded
+          axis: 2
+          max: package.max_context
         service_group: decoder_cache
       cache_1:
         contract:
@@ -451,7 +453,9 @@ pipeline:
         scope: invocation
         initializer: decoder.setup.present.0.value
         recurrence:
-          kind: invariant
+          kind: bounded
+          axis: 2
+          max: package.max_context
         service_group: decoder_cache
       loop_0_active:
         contract:

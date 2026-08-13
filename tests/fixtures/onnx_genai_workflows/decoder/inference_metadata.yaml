@@ -318,7 +318,9 @@ pipeline:
         scope: invocation
         initializer: decoder.setup.present.0.key
         recurrence:
-          kind: invariant
+          kind: bounded
+          axis: 2
+          max: package.max_context
         service_group: decoder_cache
     serving:
       active: active

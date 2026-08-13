@@ -2951,22 +2951,18 @@ def build_vlm_workflow_metadata(
             "contract": _contract(past),
             "scope": "invocation",
             "initializer": f"decoder.setup.{present.name}",
-            "recurrence": (
-                {"kind": "invariant"}
-                if fixed_capacity
-                else {
-                    "kind": "bounded",
-                    "axis": next(
-                        (
-                            axis
-                            for axis, dimension in enumerate(_contract(past)["shape"])
-                            if "sequence" in str(dimension)
-                        ),
-                        2,
+            "recurrence": {
+                "kind": "bounded",
+                "axis": next(
+                    (
+                        axis
+                        for axis, dimension in enumerate(_contract(past)["shape"])
+                        if "sequence" in str(dimension)
                     ),
-                    "max": "package.max_context",
-                }
-            ),
+                    2,
+                ),
+                "max": "package.max_context",
+            },
             "service_group": "decoder_cache",
         }
         setup_decoder_outputs[present.name] = f"decoder.setup.{present.name}"
@@ -4710,15 +4706,11 @@ def build_decoder_workflow_metadata(
             "contract": _contract(past),
             "scope": "invocation",
             "initializer": setup_value,
-            "recurrence": (
-                {"kind": "invariant"}
-                if fixed_capacity
-                else {
-                    "kind": "bounded",
-                    "axis": decoder_kv_axis,
-                    "max": "package.max_context",
-                }
-            ),
+            "recurrence": {
+                "kind": "bounded",
+                "axis": decoder_kv_axis,
+                "max": "package.max_context",
+            },
             "service_group": "decoder_cache",
         }
         decoder_kv_ports[cell] = {"input": past.name, "output": present.name}
