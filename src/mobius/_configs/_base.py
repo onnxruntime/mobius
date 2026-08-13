@@ -2930,3 +2930,51 @@ class MMSConfig(ArchitectureConfig):
             adapter_stride=getattr(config, "adapter_stride", 2),
             num_adapter_layers=getattr(config, "num_adapter_layers", 3),
         )
+
+
+@dataclasses.dataclass
+class ParakeetCTCConfig(ArchitectureConfig):
+    """Configuration for Hugging Face Parakeet FastConformer CTC models."""
+
+    num_mel_bins: int = 80
+    subsampling_factor: int = 8
+    subsampling_conv_channels: int = 256
+    subsampling_conv_kernel_size: int = 3
+    subsampling_conv_stride: int = 2
+    conv_kernel_size: int = 9
+    attention_bias: bool = True
+    convolution_bias: bool = True
+    scale_input: bool = True
+    layer_norm_eps: float = 1e-5
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> ParakeetCTCConfig:
+        """Extract the nested Parakeet encoder and parent CTC vocabulary fields."""
+        encoder = getattr(config, "encoder_config", config)
+        parent = config if encoder is not config else parent_config
+        base = ArchitectureConfig.from_transformers(encoder, parent_config=parent)
+        fields = _shallow_fields(base)
+        fields.update(
+            vocab_size=getattr(parent, "vocab_size", fields["vocab_size"]),
+            pad_token_id=getattr(parent, "pad_token_id", fields["pad_token_id"]),
+            model_type=getattr(parent, "model_type", fields["model_type"]),
+        )
+        resolved_dtype = _resolve_dtype(parent)
+        # ORT CUDA executes this architecture in bf16 but diverges enough to
+        # collapse real CTC output to blanks. The checkpoint weights are fp32,
+        # so keep the safe fp32 default; callers may explicitly select fp16.
+        if resolved_dtype is not None and resolved_dtype != ir.DataType.BFLOAT16:
+            fields["dtype"] = resolved_dtype
+        return cls(
+            **fields,
+            num_mel_bins=getattr(encoder, "num_mel_bins", 80),
+            subsampling_factor=getattr(encoder, "subsampling_factor", 8),
+            subsampling_conv_channels=getattr(encoder, "subsampling_conv_channels", 256),
+            subsampling_conv_kernel_size=getattr(encoder, "subsampling_conv_kernel_size", 3),
+            subsampling_conv_stride=getattr(encoder, "subsampling_conv_stride", 2),
+            conv_kernel_size=getattr(encoder, "conv_kernel_size", 9),
+            attention_bias=getattr(encoder, "attention_bias", True),
+            convolution_bias=getattr(encoder, "convolution_bias", True),
+            scale_input=getattr(encoder, "scale_input", True),
+            layer_norm_eps=getattr(encoder, "layer_norm_eps", 1e-5),
+        )

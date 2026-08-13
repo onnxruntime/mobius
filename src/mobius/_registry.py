@@ -33,6 +33,7 @@ from mobius._configs import (
     MoonshineConfig,
     MuseGlimmerConfig,
     NemotronParseConfig,
+    ParakeetCTCConfig,
     WhisperConfig,
 )
 from mobius.models import (
@@ -83,6 +84,7 @@ from mobius.models import (
     NemotronParseForConditionalGeneration,
     OLMo2CausalLMModel,
     OLMoCausalLMModel,
+    ParakeetForCTCModel,
     Phi3CausalLMModel,
     Phi3MoECausalLMModel,
     Phi3SmallCausalLMModel,
@@ -819,6 +821,11 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "wav2vec2-conformer": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
     "wavlm": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
     "mms": ModelRegistration(Wav2Vec2ForCTCModel, task="ctc-asr", config_class=MMSConfig),
+    "parakeet_ctc": ModelRegistration(
+        ParakeetForCTCModel,
+        task="feature-ctc-asr",
+        config_class=ParakeetCTCConfig,
+    ),
     "fastconformer_rnnt": ModelRegistration(EncDecRNNTModel, task="fastconformer-rnnt"),
     "sortformer": ModelRegistration(SortformerDiarizationModel, task="diarization"),
 }
@@ -1065,6 +1072,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "fun_asr": "justinchuby/Fun-ASR-Nano-2512",
     "sensevoice_small": "mlx-community/SenseVoiceSmall",
     "mms": "facebook/mms-300m",
+    "parakeet_ctc": "nvidia/parakeet-ctc-1.1b",
     "speecht5": "microsoft/speecht5_asr",
     "sew": "asapp/sew-tiny-100k",
     "sew-d": "asapp/sew-d-tiny-100k",

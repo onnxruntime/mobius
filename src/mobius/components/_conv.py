@@ -162,6 +162,28 @@ class BatchNorm2d(nn.Module):
         )
 
 
+class BatchNorm1d(nn.Module):
+    """1D batch normalization with frozen running statistics."""
+
+    def __init__(self, num_features: int, eps: float = 1e-5):
+        super().__init__()
+        self.weight = nn.Parameter((num_features,))
+        self.bias = nn.Parameter((num_features,))
+        self.running_mean = nn.Parameter((num_features,))
+        self.running_var = nn.Parameter((num_features,))
+        self._eps = eps
+
+    def forward(self, op: OpBuilder, x: ir.Value):
+        return op.BatchNormalization(
+            x,
+            self.weight,
+            self.bias,
+            self.running_mean,
+            self.running_var,
+            epsilon=self._eps,
+        )
+
+
 class RmsNorm2d(nn.Module):
     """Channel-axis RMS normalization for NCHW tensors, scale-only.
 

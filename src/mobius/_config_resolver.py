@@ -76,7 +76,7 @@ def _default_task_for_model(model_type: str) -> str:
     return getattr(cls, "default_task", "text-generation")
 
 
-def _try_load_config_json(model_id: str):
+def _try_load_config_json(model_id: str, revision: str | None = None):
     """Try to load config.json directly for models not in transformers.
 
     Returns a ``PretrainedConfig``-like object with attribute access,
@@ -87,7 +87,10 @@ def _try_load_config_json(model_id: str):
     from huggingface_hub import hf_hub_download
 
     try:
-        path = hf_hub_download(repo_id=model_id, filename="config.json")
+        kwargs = {"repo_id": model_id, "filename": "config.json"}
+        if revision is not None:
+            kwargs["revision"] = revision
+        path = hf_hub_download(**kwargs)
     except (OSError, ValueError) as e:
         logger.debug("Failed to download config.json for %s: %s", model_id, e)
         return None

@@ -14,6 +14,7 @@ from mobius._testing import (
 )
 from mobius.components._codec_conv import CausalConvNd
 from mobius.components._conv import (
+    BatchNorm1d,
     BatchNorm2d,
     Conv2d,
     Conv2dNoBias,
@@ -164,6 +165,21 @@ class TestBatchNorm2d:
         result = bn(op, x)
         builder._adapt_outputs([result], "")
         assert count_op_type(graph, "BatchNormalization") >= 1
+
+
+class TestBatchNorm1d:
+    """Tests for 1D batch normalization."""
+
+    def test_forward_uses_fused_op(self):
+        bn = BatchNorm1d(16)
+        builder, op, graph = create_test_builder()
+        x = create_test_input(builder, "x", [1, 16, 32])
+
+        result = bn(op, x)
+        builder._adapt_outputs([result], "")
+
+        assert count_op_type(graph, "BatchNormalization") == 1
+        assert count_op_type(graph, "Sqrt") == 0
 
 
 class TestConvTranspose2d:

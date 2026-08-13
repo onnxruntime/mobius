@@ -1190,6 +1190,11 @@ def write_ort_genai_config(
             "This is set automatically when building with mobius.build(). "
             "Diffusion models (which have no config) are not supported."
         )
+    if config.model_type == "parakeet_ctc":
+        raise ValueError(
+            "ORT GenAI does not define a feature-input CTC ASR pipeline; "
+            "export Parakeet CTC as ONNX and run it directly with ONNX Runtime."
+        )
     if {"vision_encoder", "decoder"}.issubset(pkg) and "embedding" not in pkg:
         model_type = getattr(config, "model_type", "unknown")
         raise NotImplementedError(

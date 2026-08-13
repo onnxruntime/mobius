@@ -33,13 +33,15 @@ class Conv1d(nn.Module):
         stride: int = 1,
         padding: int = 0,
         bias: bool = True,
+        groups: int = 1,
     ):
         super().__init__()
-        self.weight = nn.Parameter([out_channels, in_channels, kernel_size])
+        self.weight = nn.Parameter([out_channels, in_channels // groups, kernel_size])
         self.bias = nn.Parameter([out_channels]) if bias else None
         self._kernel_shape = [kernel_size]
         self._strides = [stride]
         self._pads = [padding, padding]
+        self._groups = groups
 
     def forward(self, op: OpBuilder, x: ir.Value):
         # x: [batch, in_channels, seq_len]
@@ -50,6 +52,7 @@ class Conv1d(nn.Module):
             kernel_shape=self._kernel_shape,
             strides=self._strides,
             pads=self._pads,
+            group=self._groups,
         )
 
 

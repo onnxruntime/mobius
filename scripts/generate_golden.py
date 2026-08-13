@@ -963,7 +963,7 @@ def _generate_audio_feature_extraction(case: TestCase, json_path: Path, device: 
 
 
 def _generate_ctc_asr(case: TestCase, json_path: Path, device: str) -> None:
-    """Generate golden data for CTC-based ASR (Wav2Vec2ForCTC / MMS).
+    """Generate golden data for raw-waveform or feature-input CTC ASR.
 
     The model output is per-frame logits over a vocabulary; we save the
     top-K over the final frame's logit vector (matching the existing
@@ -984,21 +984,29 @@ def _generate_ctc_asr(case: TestCase, json_path: Path, device: str) -> None:
 
     lang = case.generation_params.get("lang", "eng")
 
-    processor = transformers.AutoProcessor.from_pretrained(
-        case.model_id, trust_remote_code=case.trust_remote_code, target_lang=lang
-    )
-    model = transformers.Wav2Vec2ForCTC.from_pretrained(
-        case.model_id,
-        torch_dtype=torch.float32,
-        device_map=device,
-        trust_remote_code=case.trust_remote_code,
-        target_lang=lang,
-        ignore_mismatched_sizes=True,  # MMS lm_head shape changes per language
-    )
+    processor_kwargs: dict[str, object] = {
+        "revision": case.revision,
+        "trust_remote_code": case.trust_remote_code,
+    }
+    model_kwargs: dict[str, object] = {
+        "revision": case.revision,
+        "torch_dtype": torch.float32,
+        "device_map": device,
+        "trust_remote_code": case.trust_remote_code,
+    }
+    if case.model_type == "mms":
+        processor_kwargs["target_lang"] = lang
+        model_kwargs.update(
+            target_lang=lang,
+            ignore_mismatched_sizes=True,
+        )
+
+    processor = transformers.AutoProcessor.from_pretrained(case.model_id, **processor_kwargs)
+    model = transformers.AutoModelForCTC.from_pretrained(case.model_id, **model_kwargs)
     # For MMS, switching languages also requires loading the per-language adapter.
     # Non-MMS Wav2Vec2ForCTC checkpoints don't have language adapters;
     # the missing-adapter case is expected and harmless there.
-    if hasattr(model, "load_adapter"):
+    if case.model_type == "mms" and hasattr(model, "load_adapter"):
         with contextlib.suppress(ValueError, KeyError, OSError):
             model.load_adapter(lang)
     model.eval()
@@ -1771,6 +1779,7 @@ _GENERATORS = {
     "speech-language": _generate_speech_language,
     "audio-feature-extraction": _generate_audio_feature_extraction,
     "ctc-asr": _generate_ctc_asr,
+    "feature-ctc-asr": _generate_ctc_asr,
     # Vision tasks that produce last_hidden_state — reuse image classification.
     "depth-estimation": _generate_image_classification,
     "image-segmentation": _generate_image_classification,
