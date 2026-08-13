@@ -2665,9 +2665,10 @@ def build_vlm_workflow_metadata(
             "contract": {"dtype": "uint8", "rank": 1, "shape": ["encoded_bytes"]},
             "role": {"kind": "runtime", "version": "1.0", "role": "media"},
             "source": {"kind": "request", "field": "media"},
-            # The frozen contract forbids optional tensors without literal defaults.
-            # Text-only callers bind an empty uint8 tensor and leave has_media=false.
-            "required": True,
+            "required": text_only_vision is None,
+            **(
+                {"present_as": "request.image_present"} if text_only_vision is not None else {}
+            ),
         },
         "request.max_iterations": {
             "contract": control_int,
@@ -2729,14 +2730,6 @@ def build_vlm_workflow_metadata(
             "default": 0,
         },
     }
-    if text_only_vision is not None:
-        inputs["request.has_media"] = {
-            "contract": {"dtype": "bool", "rank": 1, "shape": [1]},
-            "role": {"kind": "opaque"},
-            "source": {"kind": "application", "name": "has_media"},
-            "required": False,
-            "default": False,
-        }
     vision_invoke_inputs = {
         name: preprocessing_values[name]
         for name in vision_inputs
@@ -3003,7 +2996,7 @@ def build_vlm_workflow_metadata(
         vision_setup_nodes: list[dict[str, Any]] = [
             {
                 "kind": "branch",
-                "predicate": "request.has_media",
+                "predicate": "request.image_present",
                 "cases": {
                     "true": {
                         "kind": "sequence",
@@ -3210,6 +3203,7 @@ def build_vlm_workflow_metadata(
                 "nested_control_flow",
                 "loop_induction_values",
                 "typed_emit",
+                *(["input_presence"] if text_only_vision is not None else []),
                 *(
                     ["serving_service_contract", "bounded_state_recurrence"]
                     if cache_pairs

@@ -241,10 +241,13 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     assert policy_invokes["decoder_step_update"]["inputs"]["logical_length"] == (
         "cache_lengths.next"
     )
-    assert workflow["inputs"]["request.image"]["required"] is True
-    assert workflow["inputs"]["request.has_media"]["default"] is False
+    assert workflow["inputs"]["request.image"]["required"] is False
+    assert workflow["inputs"]["request.image"]["present_as"] == "request.image_present"
+    assert "request.has_media" not in workflow["inputs"]
+    assert "input_presence" in workflow["manifest"]["capabilities"]
     media_branch = workflow["steps"][0]["setup"][0]
     assert media_branch["kind"] == "branch"
+    assert media_branch["predicate"] == "request.image_present"
     assert set(media_branch["cases"]) == {"true", "false"}
     assert media_branch["cases"]["false"]["component"] == "empty_image_features"
     kv_service = workflow["serving"]["kv_service"]
