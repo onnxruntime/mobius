@@ -17,7 +17,7 @@ from mobius._builder import build_from_module
 from mobius._configs import VisionConfig
 from mobius._model_package import ModelPackage, _make_progress_callback
 from mobius._testing import make_config
-from mobius.generation import PolicyRole, build_greedy_sampler
+from mobius.generation import build_greedy_sampler
 from mobius.models.base import CausalLMModel
 from mobius.models.gemma3 import Gemma3MultiModalModel
 from mobius.tasks import CausalLMTask, VisionLanguageTask
@@ -373,7 +373,7 @@ class TestModelPackageSaveLoad:
 
         assert (tmp_path / "policies" / "sample.onnx").exists()
         loaded = ModelPackage.load(str(tmp_path))
-        assert loaded.policy_components["sample"].role is PolicyRole.TOKEN_SAMPLER
+        assert loaded.policy_components["sample"].contract_id == "onnx-genai.token-sampler@1"
 
 
 class TestModelPackageApplyWeights:

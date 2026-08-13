@@ -8,7 +8,6 @@ from __future__ import annotations
 from mobius.generation._policy_components import (
     PolicyCapabilities,
     PolicyComponent,
-    PolicyRole,
     attach_policy_components,
     build_adaptive_k_policy,
     build_batch_minimum,
@@ -48,7 +47,6 @@ from mobius.generation._policy_components import (
 __all__ = [
     "PolicyComponent",
     "PolicyCapabilities",
-    "PolicyRole",
     "attach_policy_components",
     "build_adaptive_k_policy",
     "build_batch_minimum",

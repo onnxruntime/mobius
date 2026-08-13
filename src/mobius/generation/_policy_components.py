@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from enum import StrEnum
 from typing import Protocol
 
 import onnx_ir as ir
@@ -20,48 +19,36 @@ from onnxscript import GraphBuilder
 
 from mobius._constants import OPSET_VERSION
 
-_POLICY_ROLE_METADATA = "mobius.generation.policy_role"
+_POLICY_CONTRACT_ID_METADATA = "mobius.generation.policy_contract_id"
 _POLICY_CONTRACT_METADATA = "mobius.generation.policy_contract"
 _POLICY_EFFECTS_METADATA = "mobius.generation.policy_effects"
 
 
-class PolicyRole(StrEnum):
-    """Architecture-neutral role performed by a policy component."""
-
-    TOKEN_SAMPLER = "token_sampler"
-    TERMINATION = "termination_predicate"
-    SOLVER_STEP = "solver_step"
-    MASKED_UPDATE = "masked_update"
-    SPECULATIVE_ACCEPTANCE = "speculative_verifier"
-    GRAMMAR_GUIDANCE = "grammar_guidance"
-    ADAPTIVE_K = "adaptive_proposal_budget"
-    STATE_UPDATE = "state_update"
-    AUXILIARY = "auxiliary"
-
-
 @dataclass(frozen=True)
 class PolicyComponent:
-    """A named role and its executable ONNX model."""
+    """A versioned semantic contract and its executable ONNX model."""
 
-    role: PolicyRole
+    contract_id: str
     model: ir.Model
     contract: dict[str, object]
     effects: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        self.model.graph.metadata_props[_POLICY_ROLE_METADATA] = self.role.value
+        if "@" not in self.contract_id:
+            raise ValueError("policy contract_id must include a version")
+        self.model.graph.metadata_props[_POLICY_CONTRACT_ID_METADATA] = self.contract_id
         self.model.graph.metadata_props[_POLICY_CONTRACT_METADATA] = json.dumps(self.contract)
         self.model.graph.metadata_props[_POLICY_EFFECTS_METADATA] = json.dumps(self.effects)
 
     @classmethod
     def from_model(cls, model: ir.Model) -> PolicyComponent:
-        """Restore a component from role metadata embedded in its ONNX graph."""
-        role = model.graph.metadata_props.get(_POLICY_ROLE_METADATA)
-        if role is None:
-            raise ValueError("ONNX policy component is missing its Mobius policy role")
+        """Restore a component from contract metadata embedded in its ONNX graph."""
+        contract_id = model.graph.metadata_props.get(_POLICY_CONTRACT_ID_METADATA)
+        if contract_id is None:
+            raise ValueError("ONNX policy component is missing its versioned contract ID")
         contract = json.loads(model.graph.metadata_props[_POLICY_CONTRACT_METADATA])
         effects = tuple(json.loads(model.graph.metadata_props[_POLICY_EFFECTS_METADATA]))
-        return cls(PolicyRole(role), model, contract, effects)
+        return cls(contract_id, model, contract, effects)
 
 
 @dataclass(frozen=True)
@@ -126,7 +113,7 @@ def attach_policy_components(
 
 
 def _component(
-    role: PolicyRole,
+    contract_id: str,
     graph: ir.Graph,
     contract: dict[str, object],
     *_effects: str,
@@ -134,7 +121,7 @@ def _component(
     # ONNX policy components are pure: RNG and state are explicit tensor data.
     model = ir.Model(graph, ir_version=11)
     model.producer_name = "mobius"
-    return PolicyComponent(role, model, contract, ())
+    return PolicyComponent(contract_id, model, contract, ())
 
 
 def _make_graph(name: str) -> tuple[ir.Graph, GraphBuilder]:
@@ -159,7 +146,7 @@ def build_greedy_sampler(*, effect: str = "sample") -> PolicyComponent:
     token_ids = builder.op.ArgMax(logits, axis=-1, keepdims=0)
     builder.add_output(token_ids, "token")
     return _component(
-        PolicyRole.TOKEN_SAMPLER,
+        "onnx-genai.token-sampler@1",
         graph,
         {
             "role": "token_sampler",
@@ -183,7 +170,7 @@ def build_last_token_logits() -> PolicyComponent:
     selected = builder.op.Gather(logits, builder.op.Constant(value_int=-1), axis=1)
     selected.shape = ir.Shape(["batch", "vocabulary"])
     builder.add_output(selected, "last_logits")
-    return _component(PolicyRole.AUXILIARY, graph, {})
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 def build_boolean_not() -> PolicyComponent:
@@ -197,7 +184,7 @@ def build_boolean_not() -> PolicyComponent:
     continued = builder.op.Equal(any_done, builder.op.Constant(value_int=0))
     continued.shape = ir.Shape([1])
     builder.add_output(continued, "continue")
-    return _component(PolicyRole.AUXILIARY, graph, {})
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 def build_integer_increment() -> PolicyComponent:
@@ -207,7 +194,7 @@ def build_integer_increment() -> PolicyComponent:
     next_value = builder.op.Add(value, builder.op.Constant(value_int=1))
     next_value.shape = ir.Shape(["batch"])
     builder.add_output(next_value, "next_value")
-    return _component(PolicyRole.AUXILIARY, graph, {})
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 def build_integer_minimum() -> PolicyComponent:
@@ -218,7 +205,7 @@ def build_integer_minimum() -> PolicyComponent:
     minimum = builder.op.Min(left, right)
     minimum.shape = ir.Shape(["batch"])
     builder.add_output(minimum, "minimum")
-    return _component(PolicyRole.AUXILIARY, graph, {})
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 def build_batch_minimum() -> PolicyComponent:
@@ -228,7 +215,7 @@ def build_batch_minimum() -> PolicyComponent:
     minimum = builder.op.ReduceMin(values, keepdims=1)
     minimum.shape = ir.Shape([1])
     builder.add_output(minimum, "minimum")
-    return _component(PolicyRole.AUXILIARY, graph, {})
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 def build_proposal_metrics() -> PolicyComponent:
@@ -244,7 +231,7 @@ def build_proposal_metrics() -> PolicyComponent:
     filled.shape = ir.Shape(["batch"])
     builder.add_output(length, "evaluated")
     builder.add_output(filled, "filled_proposal_budget")
-    return _component(PolicyRole.AUXILIARY, graph, {})
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 def build_sequence_length() -> PolicyComponent:
@@ -258,7 +245,7 @@ def build_sequence_length() -> PolicyComponent:
     )
     length.shape = ir.Shape(["batch"])
     builder.add_output(length, "length")
-    return _component(PolicyRole.AUXILIARY, graph, {})
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 def build_iteration_cast(dtype: ir.DataType) -> PolicyComponent:
@@ -268,7 +255,7 @@ def build_iteration_cast(dtype: ir.DataType) -> PolicyComponent:
     timestep = builder.op.Cast(iteration, to=dtype)
     timestep.shape = ir.Shape(["batch"])
     builder.add_output(timestep, "timestep")
-    return _component(PolicyRole.AUXILIARY, graph, {})
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 def build_schedule_constant(values: list[float]) -> PolicyComponent:
@@ -281,7 +268,7 @@ def build_schedule_constant(values: list[float]) -> PolicyComponent:
     )
     schedule.shape = ir.Shape([len(values)])
     builder.add_output(schedule, "schedule")
-    return _component(PolicyRole.AUXILIARY, graph, {})
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 def build_schedule_lookup(dtype: ir.DataType) -> PolicyComponent:
@@ -293,7 +280,7 @@ def build_schedule_lookup(dtype: ir.DataType) -> PolicyComponent:
     timestep = op.Cast(op.Gather(schedule, step, axis=0), to=dtype)
     timestep.shape = ir.Shape(["batch"])
     builder.add_output(timestep, "timestep")
-    return _component(PolicyRole.AUXILIARY, graph, {})
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 def build_tts_state_initializer(num_code_groups: int) -> PolicyComponent:
@@ -320,7 +307,7 @@ def build_tts_state_initializer(num_code_groups: int) -> PolicyComponent:
     builder.add_output(frame, "frame_codes")
     builder.add_output(token_slot, "token_slot")
     builder.add_output(history, "code_history")
-    return _component(PolicyRole.AUXILIARY, graph, {})
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 def build_tts_decoder_state_initializer(
@@ -429,7 +416,7 @@ def build_tts_decoder_state_initializer(
         )
         empty.shape = value.shape
         builder.add_output(empty, name)
-    return _component(PolicyRole.AUXILIARY, graph, {})
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 def build_tts_decoder_step_update(
@@ -462,7 +449,7 @@ def build_tts_decoder_step_update(
     next_position.shape = position.shape
     builder.add_output(next_attention, "next_attention_mask")
     builder.add_output(next_position, "next_position_ids")
-    return _component(PolicyRole.AUXILIARY, graph, {})
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 def build_code_frame_update(
@@ -492,7 +479,7 @@ def build_code_frame_update(
     )
     updated.shape = frame.shape
     builder.add_output(updated, "next_frame")
-    return _component(PolicyRole.AUXILIARY, graph, {})
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 def build_code_history_append(num_code_groups: int) -> PolicyComponent:
@@ -512,7 +499,7 @@ def build_code_history_append(num_code_groups: int) -> PolicyComponent:
     )
     next_history.shape = ir.Shape(["batch", "frames + 1", num_code_groups])
     builder.add_output(next_history, "next_history")
-    return _component(PolicyRole.AUXILIARY, graph, {})
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 def build_codec_layout_transpose(num_code_groups: int) -> PolicyComponent:
@@ -526,7 +513,7 @@ def build_codec_layout_transpose(num_code_groups: int) -> PolicyComponent:
     codes = builder.op.Transpose(history, perm=[0, 2, 1])
     codes.shape = ir.Shape(["batch", num_code_groups, "frames"])
     builder.add_output(codes, "codes")
-    return _component(PolicyRole.AUXILIARY, graph, {})
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 def build_model_token_cast(dtype: ir.DataType) -> PolicyComponent:
@@ -536,7 +523,7 @@ def build_model_token_cast(dtype: ir.DataType) -> PolicyComponent:
     model_token = builder.op.Cast(token, to=dtype)
     model_token.shape = ir.Shape(["batch", 1])
     builder.add_output(model_token, "model_token")
-    return _component(PolicyRole.AUXILIARY, graph, {})
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 def build_decoder_state_initializer(
@@ -645,7 +632,7 @@ def build_decoder_state_initializer(
         empty.shape = value.shape
         builder.add_output(empty, name)
 
-    return _component(PolicyRole.AUXILIARY, graph, {})
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 def build_decoder_step_update(
@@ -676,7 +663,7 @@ def build_decoder_step_update(
         next_position = op.Add(position, op.CastLike(op.Constant(value_int=1), position))
         next_position.shape = ir.Shape(["batch", 1])
         builder.add_output(next_position, "next_position_ids")
-    return _component(PolicyRole.AUXILIARY, graph, {})
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 def build_grammar_logits_processor() -> PolicyComponent:
@@ -697,7 +684,7 @@ def build_grammar_logits_processor() -> PolicyComponent:
     )
     token.shape = ir.Shape(["batch", 1])
     builder.add_output(token, "token")
-    return _component(PolicyRole.GRAMMAR_GUIDANCE, graph, {})
+    return _component("onnx-genai.grammar-guidance@1", graph, {})
 
 
 def build_adaptive_k_policy(*, max_k: int = 16, min_k: int = 1) -> PolicyComponent:
@@ -940,7 +927,7 @@ def build_adaptive_k_policy(*, max_k: int = 16, min_k: int = 1) -> PolicyCompone
     builder.add_output(next_k, "next_k")
     builder.add_output(next_estimates, "next_estimates")
     return _component(
-        PolicyRole.ADAPTIVE_K,
+        "onnx-genai.adaptive-proposal-budget@1",
         graph,
         {
             "role": "adaptive_proposal_budget",
@@ -1145,7 +1132,7 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
     builder.add_output(token_ids, "token")
     builder.add_output(next_offset, "next_offset")
     return _component(
-        PolicyRole.TOKEN_SAMPLER,
+        "onnx-genai.token-sampler@1",
         graph,
         {
             "role": "token_sampler",
@@ -1192,7 +1179,7 @@ def build_eos_termination() -> PolicyComponent:
     done = op.Or(hit_eos, hit_limit)
     builder.add_output(done, "done")
     return _component(
-        PolicyRole.TERMINATION,
+        "onnx-genai.termination-predicate@1",
         graph,
         {
             "role": "termination_predicate",
@@ -1221,7 +1208,7 @@ def build_euler_model_input(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyCom
     model_input = op.Div(sample, scale)
     model_input.shape = sample.shape
     builder.add_output(model_input, "model_input")
-    return _component(PolicyRole.AUXILIARY, graph, {})
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 def build_euler_solver_step(
@@ -1252,7 +1239,7 @@ def build_euler_solver_step(
     next_sample = op.Add(sample, op.Mul(derivative, delta))
     builder.add_output(next_sample, "next_state")
     return _component(
-        PolicyRole.SOLVER_STEP,
+        "onnx-genai.solver-step@1",
         graph,
         {
             "role": "solver_step",
@@ -1358,7 +1345,7 @@ def build_masked_token_update() -> PolicyComponent:
     builder.add_output(next_offset, "next_offset")
     builder.add_output(done, "done")
     return _component(
-        PolicyRole.MASKED_UPDATE,
+        "onnx-genai.masked-update@1",
         graph,
         {
             "role": "masked_update",
@@ -1462,7 +1449,7 @@ def build_speculative_acceptance() -> PolicyComponent:
     builder.add_output(synchronized_done, "synchronized_done")
     builder.add_output(rollback_len, "rollback_len")
     return _component(
-        PolicyRole.SPECULATIVE_ACCEPTANCE,
+        "onnx-genai.speculative-verifier@1",
         graph,
         {
             "role": "speculative_verifier",
@@ -1512,7 +1499,7 @@ def build_speculative_state_rollback(
     corrected_shape[sequence_axis] = "accepted_sequence"
     corrected.shape = ir.Shape(corrected_shape)
     builder.add_output(corrected, "corrected_state")
-    return _component(PolicyRole.AUXILIARY, graph, {}, effect)
+    return _component("mobius.policy.auxiliary@1", graph, {}, effect)
 
 
 def build_effectful_identity(
@@ -1526,7 +1513,7 @@ def build_effectful_identity(
     graph, builder = _make_graph(name)
     value = builder.input("value", dtype, shape)
     builder.add_output(builder.op.Identity(value), "next_value")
-    return _component(PolicyRole.AUXILIARY, graph, {}, effect)
+    return _component("mobius.policy.auxiliary@1", graph, {}, effect)
 
 
 def build_token_block_identity() -> PolicyComponent:
@@ -1534,7 +1521,7 @@ def build_token_block_identity() -> PolicyComponent:
     graph, builder = _make_graph("token_block_identity")
     tokens = builder.input("tokens", ir.DataType.INT64, ["batch", "draft_sequence"])
     builder.add_output(builder.op.Identity(tokens), "next_tokens")
-    return _component(PolicyRole.AUXILIARY, graph, {}, "state")
+    return _component("mobius.policy.auxiliary@1", graph, {}, "state")
 
 
 def build_token_state_update() -> PolicyComponent:
@@ -1549,7 +1536,7 @@ def build_token_state_update() -> PolicyComponent:
     )
     builder.add_output(next_state, "next")
     return _component(
-        PolicyRole.STATE_UPDATE,
+        "onnx-genai.state-update@1",
         graph,
         {
             "role": "state_update",
@@ -1569,4 +1556,4 @@ def build_token_to_slot() -> PolicyComponent:
     slot = builder.op.Unsqueeze(token, [-1])
     slot.shape = ir.Shape(["batch", 1])
     builder.add_output(slot, "slot")
-    return _component(PolicyRole.AUXILIARY, graph, {})
+    return _component("mobius.policy.auxiliary@1", graph, {})

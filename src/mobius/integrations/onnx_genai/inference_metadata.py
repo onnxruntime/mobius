@@ -1380,8 +1380,9 @@ def add_policy_components_to_workflow(
         return metadata
     components = workflow.setdefault("components", {})
 
-    def semantic_contract(contract: dict[str, Any]) -> dict[str, Any]:
-        role = str(contract["role"]).replace("_", "-")
+    def semantic_contract(component: Any) -> dict[str, Any]:
+        contract = component.contract
+        contract_name, version = component.contract_id.rsplit("@", 1)
         bindings = {
             key: value
             for key, value in contract.items()
@@ -1394,8 +1395,8 @@ def add_policy_components_to_workflow(
                 {key: value for key, value in rng.items() if isinstance(value, str)}
             )
         declaration: dict[str, Any] = {
-            "id": f"onnx-genai.{role}",
-            "version": "1",
+            "id": contract_name,
+            "version": version,
             "bindings": bindings,
         }
         if "mode" in contract:
@@ -1410,7 +1411,7 @@ def add_policy_components_to_workflow(
             },
         }
         if component.contract:
-            declaration["contract"] = semantic_contract(component.contract)
+            declaration["contract"] = semantic_contract(component)
             if component.contract.get("role") == "token_sampler":
                 declaration["application_overridable"] = True
         components[name] = declaration

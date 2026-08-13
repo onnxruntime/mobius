@@ -10,7 +10,6 @@ import onnxruntime as ort
 from mobius._model_package import ModelPackage
 from mobius.generation import (
     PolicyCapabilities,
-    PolicyRole,
     attach_policy_components,
     build_adaptive_k_policy,
     build_batch_minimum,
@@ -632,11 +631,11 @@ def test_capability_driven_attachment_is_model_agnostic():
         "speculative_acceptance": "policies/speculative_acceptance.onnx",
         "token_state_update": "policies/token_state_update.onnx",
     }
-    assert {component.role for component in package.policy_components.values()} == {
-        PolicyRole.TOKEN_SAMPLER,
-        PolicyRole.TERMINATION,
-        PolicyRole.SOLVER_STEP,
-        PolicyRole.MASKED_UPDATE,
-        PolicyRole.SPECULATIVE_ACCEPTANCE,
-        PolicyRole.STATE_UPDATE,
+    assert {component.contract_id for component in package.policy_components.values()} == {
+        "onnx-genai.token-sampler@1",
+        "onnx-genai.termination-predicate@1",
+        "onnx-genai.solver-step@1",
+        "onnx-genai.masked-update@1",
+        "onnx-genai.speculative-verifier@1",
+        "onnx-genai.state-update@1",
     }
