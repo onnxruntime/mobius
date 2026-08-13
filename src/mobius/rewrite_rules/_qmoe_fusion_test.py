@@ -9,6 +9,7 @@ import numpy as np
 import onnx_ir as ir
 import pytest
 
+from mobius._constants import OPSET_VERSION
 from mobius.rewrite_rules import fuse_dense_moe_to_qmoe
 from mobius.rewrite_rules._qmoe_fusion import _qmoe_abi_supported
 
@@ -294,7 +295,7 @@ def _build_dense_graph() -> tuple[ir.Model, dict[str, _Quant], np.ndarray]:
     graph.outputs.append(final.outputs[0])
 
     model = ir.Model(graph, ir_version=10, producer_name="test")
-    model.opset_imports[""] = 21
+    model.opset_imports[""] = OPSET_VERSION
     model.opset_imports["com.microsoft"] = 1
     return model, quants, rng.standard_normal((5, H)).astype(np.float32)
 
