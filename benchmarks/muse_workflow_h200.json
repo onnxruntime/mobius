@@ -1,0 +1,44 @@
+{
+  "scenario": "muse-glimmer-30b-int4-workflow-vs-native",
+  "package": {
+    "repository": "justinchuby/Muse-Glimmer-30B-ONNX-INT4-CUDA",
+    "weights_revision": "bf36a94a4519e14e3c48ad005c6ff1972ab44ccb",
+    "schema_head": "a341c463a0090298238102506796bc73d86b84fa",
+    "artifacts": {
+      "decoder": "decoder/model.onnx",
+      "embedding": "embedding/model.onnx",
+      "vision_encoder": "vision_encoder/model.onnx",
+      "metadata": "inference_metadata.yaml"
+    }
+  },
+  "runtime": {
+    "onnxruntime": "1.28.0",
+    "onnxruntime_genai_commit": "ede24ecc6a254ef33354bc0eb7bc90d1daa540bd",
+    "execution_provider": "CUDAExecutionProvider",
+    "cuda_graph": true,
+    "shared_kv": true
+  },
+  "hardware": {
+    "gpu": "NVIDIA H200",
+    "batch_size": 1
+  },
+  "workload": {
+    "prompt": "Briefly explain why the sky appears blue during the day.",
+    "rendered_prompt": "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-08-13.\n\nReasoning strength: high.\n\n# Valid recipients: \"self\", \"user\".<|eot|><|start|>user<|message|>Briefly explain why the sky appears blue during the day.<|eot|><|start|>assistant",
+    "prompt_tokens": 68,
+    "image": null,
+    "max_new_tokens": 128,
+    "stop_on_eos": false,
+    "warmups": 1,
+    "runs": 3,
+    "decode_skip": 8
+  },
+  "sampling": {
+    "algorithm": "greedy",
+    "do_sample": false,
+    "temperature": 1.0,
+    "top_k": 1,
+    "top_p": 1.0,
+    "seed": 0
+  }
+}
