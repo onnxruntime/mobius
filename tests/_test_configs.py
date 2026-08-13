@@ -32,6 +32,7 @@ from mobius._configs import (
     GraniteMoeHybridConfig,
     JambaConfig,
     JetMoeConfig,
+    Lfm2Config,
     LongcatFlashConfig,
     Mamba2Config,
     MambaConfig,
@@ -129,6 +130,17 @@ def _base_config(config_cls=None, **overrides) -> ArchitectureConfig:
 CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     # === Text Generation (Llama-compatible) ===
     ("llama", {}, True),
+    (
+        "lfm2",
+        {
+            "_config_cls": Lfm2Config,
+            "layer_types": ["conv", "full_attention"],
+            "attn_qk_norm": True,
+            "short_conv_kernel": 3,
+            "short_conv_bias": False,
+        },
+        True,
+    ),
     ("mistral", {}, False),
     ("qwen2", {}, True),
     ("muse_glimmer_text", dict(_TINY_MUSE_GLIMMER_TEXT_OVERRIDES), True),

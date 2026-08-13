@@ -72,7 +72,7 @@ class TestClassifyFile:
         assert classify_file("tests/conftest.py") == "shared_infra"
 
     def test_test_infra_configs(self):
-        assert classify_file("tests/_test_configs.py") == "shared_infra"
+        assert classify_file("tests/_test_configs.py") == "test_config"
 
     def test_readme(self):
         assert classify_file("README.md") == "other"
@@ -199,6 +199,29 @@ class TestDetectAffectedModels:
         result = detect_affected_models(["src/mobius/_configs.py"])
         assert result["run_all"] is False
         assert result["affected"] == []
+
+    def test_test_configs_only_runs_all(self):
+        result = detect_affected_models(["tests/_test_configs.py"])
+        assert result == {"affected": [], "run_all": True}
+
+    def test_test_configs_with_model_uses_model_scope(self):
+        result = detect_affected_models(
+            [
+                "tests/_test_configs.py",
+                "src/mobius/models/lfm2.py",
+            ]
+        )
+        assert result["run_all"] is False
+        assert result["affected"] == ["lfm2"]
+
+    def test_test_configs_with_unmapped_task_still_runs_all(self):
+        result = detect_affected_models(
+            [
+                "tests/_test_configs.py",
+                "src/mobius/tasks/_causal_lm.py",
+            ]
+        )
+        assert result == {"affected": [], "run_all": True}
 
     def test_unrelated_file_no_affected(self):
         result = detect_affected_models(["README.md"])

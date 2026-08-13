@@ -34,6 +34,7 @@ __all__ = [
     "GatedRMSNorm",
     "Gemma3nAudioEncoder",
     "Gemma3nMultimodalEmbedder",
+    "GatedShortConv",
     "ClippableLinear",
     "GroupNorm",
     "GQAContext",
@@ -282,6 +283,7 @@ from mobius.components._sanm_attention import (
 from mobius.components._sanm_attention import (
     SANMEncoderLayer as SANMEncoderLayer,
 )
+from mobius.components._short_conv import GatedShortConv
 from mobius.components._ssm import (
     JambaSelectiveScan as JambaSelectiveScan,
 )

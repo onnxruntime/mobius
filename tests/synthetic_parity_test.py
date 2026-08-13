@@ -531,6 +531,15 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             i for i, lt in enumerate(layer_types) if lt in ("full_attention", "attention")
         ]
 
+    if hf_model_type == "lfm2":
+        hf_kwargs["conv_L_cache"] = hf_kwargs.pop("short_conv_kernel", 3)
+        hf_kwargs["conv_bias"] = hf_kwargs.pop("short_conv_bias", False)
+        hf_kwargs["norm_eps"] = hf_kwargs.pop("rms_norm_eps")
+        hf_kwargs["rope_parameters"] = {
+            "rope_type": "default",
+            "rope_theta": 10_000.0,
+        }
+
     # Jamba uses attn_layer_offset/attn_layer_period
     if hf_model_type in ("jamba",) and "layer_types" in hf_kwargs:
         layer_types = hf_kwargs.pop("layer_types")
@@ -669,6 +678,8 @@ def _create_hf_config(model_type: str, config_overrides: dict):
         "attn_qk_norm",
         "attn_qk_norm_full",
         "post_feedforward_norm",
+        "short_conv_kernel",
+        "short_conv_bias",
         # dual_ln is a mobius-only flag for Falcon/Bloom parallel attention;
         # HF controls this behavior via new_decoder_architecture=True.
         "dual_ln",

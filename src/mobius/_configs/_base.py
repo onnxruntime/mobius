@@ -65,7 +65,7 @@ def _resolve_hidden_act(config, model_type: str) -> str | None:
         or getattr(config, "afn", None)
         # LLaDA/OLMo expose the activation as ``activation_type`` (e.g. "silu").
         or getattr(config, "activation_type", None)
-        or ("silu" if model_type in ("qwen", "chatglm") else None)
+        or ("silu" if model_type in ("qwen", "chatglm", "lfm2") else None)
         # gelu_activation is a boolean (XLM) — must be after all string
         # attrs so it cannot override an explicit hidden_act.
         or ("gelu" if getattr(config, "gelu_activation", False) else None)
@@ -411,6 +411,10 @@ class ArchitectureConfig(BaseModelConfig):
     linear_num_key_heads: int | None = None
     linear_num_value_heads: int | None = None
 
+    # Double-gated short-convolution config (LFM2-style hybrid layers).
+    short_conv_kernel: int = 3
+    short_conv_bias: bool = False
+
     rms_norm_eps: float = 1e-6
 
     # Rotary embedding config.
@@ -707,6 +711,8 @@ class ArchitectureConfig(BaseModelConfig):
             linear_value_head_dim=(getattr(config, "linear_value_head_dim", None)),
             linear_num_key_heads=(getattr(config, "linear_num_key_heads", None)),
             linear_num_value_heads=(getattr(config, "linear_num_value_heads", None)),
+            short_conv_kernel=getattr(config, "conv_L_cache", 3),
+            short_conv_bias=getattr(config, "conv_bias", False),
             pad_token_id=(getattr(config, "pad_token_id", 0)),
             model_type=model_type,
             bos_token_id=getattr(config, "bos_token_id", None),
@@ -794,6 +800,7 @@ class ArchitectureConfig(BaseModelConfig):
                     "gemma3_text",
                     "gemma3n",
                     "gemma3n_text",
+                    "lfm2",
                     "flex_olmo",
                     "olmoe",
                     "olmo2",
@@ -1310,6 +1317,38 @@ class MuseGlimmerConfig(ArchitectureConfig):
             final_logit_softcapping=(getattr(config, "final_logit_softcapping", 20.0) or 0.0),
             post_norm_eps=getattr(config, "post_norm_eps", 1e-8),
             layer_rope_theta=layer_rope_theta,
+        )
+
+
+@dataclasses.dataclass
+class Lfm2Config(CausalLMConfig):
+    """Configuration for LFM2's automatically adjusted feed-forward width."""
+
+    block_multiple_of: int = 256
+    block_ffn_dim_multiplier: float | int | None = 1.0
+    block_auto_adjust_ff_dim: bool = True
+
+    @property
+    def effective_intermediate_size(self) -> int:
+        """The MLP width constructed by HuggingFace's ``Lfm2MLP``."""
+        intermediate_size = self.intermediate_size
+        if self.block_auto_adjust_ff_dim:
+            intermediate_size = int(2 * intermediate_size / 3)
+            if self.block_ffn_dim_multiplier is not None:
+                intermediate_size = int(self.block_ffn_dim_multiplier * intermediate_size)
+                intermediate_size = self.block_multiple_of * (
+                    (intermediate_size + self.block_multiple_of - 1) // self.block_multiple_of
+                )
+        return intermediate_size
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Lfm2Config:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        return cls(
+            **_shallow_fields(base),
+            block_multiple_of=getattr(config, "block_multiple_of", 256),
+            block_ffn_dim_multiplier=getattr(config, "block_ffn_dim_multiplier", 1.0),
+            block_auto_adjust_ff_dim=getattr(config, "block_auto_adjust_ff_dim", True),
         )
 
 

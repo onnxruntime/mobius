@@ -85,6 +85,7 @@ def _model_accessible(model_id: str) -> bool:
 _TEXT_MODELS = [
     # CausalLMModel (base: llama/mistral/qwen2 architecture)
     pytest.param("Qwen/Qwen2.5-0.5B", False, id="qwen2.5-0.5b"),
+    pytest.param("LiquidAI/LFM2.5-230M", False, id="lfm2.5-230m"),
     pytest.param("HuggingFaceTB/SmolLM-135M", False, id="smollm-135m"),
     # SmolLM3 (per-layer RoPE gating via no_rope_layers)
     pytest.param("HuggingFaceTB/SmolLM3-3B", False, id="smollm3-3b"),
@@ -194,6 +195,14 @@ def _make_prefill_feeds(config, input_ids, attention_mask, position_ids):
         "position_ids": position_ids,
     }
     for i in range(config.num_hidden_layers):
+        layer_types = config.layer_types or []
+        layer_type = layer_types[i] if i < len(layer_types) else "full_attention"
+        if layer_type == "conv":
+            feeds[f"past_key_values.{i}.conv_state"] = np.zeros(
+                (1, config.hidden_size, config.short_conv_kernel - 1),
+                dtype=np.float32,
+            )
+            continue
         feeds[f"past_key_values.{i}.key"] = np.zeros(
             (1, config.num_key_value_heads, 0, config.head_dim),
             dtype=np.float32,
@@ -215,6 +224,13 @@ def _make_decode_feeds(
         "position_ids": decode_position_ids,
     }
     for i in range(config.num_hidden_layers):
+        layer_types = config.layer_types or []
+        layer_type = layer_types[i] if i < len(layer_types) else "full_attention"
+        if layer_type == "conv":
+            feeds[f"past_key_values.{i}.conv_state"] = onnx_prefill_out[
+                f"present.{i}.conv_state"
+            ]
+            continue
         feeds[f"past_key_values.{i}.key"] = onnx_prefill_out[f"present.{i}.key"]
         feeds[f"past_key_values.{i}.value"] = onnx_prefill_out[f"present.{i}.value"]
     return feeds
