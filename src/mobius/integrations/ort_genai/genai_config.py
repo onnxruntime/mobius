@@ -268,9 +268,13 @@ class GenaiConfigGenerator:
             vocab_size=config.vocab_size,
             hidden_size=config.hidden_size,
             num_hidden_layers=(
-                num_kv_cache_layers
-                if num_kv_cache_layers is not None
-                else config.num_hidden_layers
+                config.num_hidden_layers
+                if model_type == "lfm2"
+                else (
+                    num_kv_cache_layers
+                    if num_kv_cache_layers is not None
+                    else config.num_hidden_layers
+                )
             ),
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,

@@ -568,6 +568,31 @@ class TestGenaiConfigFromConfig:
         gen = GenaiConfigGenerator.from_config(cfg, "gemma3n")
         assert gen.generate()["model"]["decoder"]["num_hidden_layers"] == 35
 
+    def test_lfm2_keeps_global_layer_count(self):
+        """LFM2 indexes attention and convolution caches by global layer id."""
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            vocab_size: int = 65536
+            hidden_size: int = 1024
+            num_hidden_layers: int = 14
+            num_attention_heads: int = 16
+            num_key_value_heads: int = 8
+            head_dim: int = 64
+            layer_types: list[str] = dataclasses.field(
+                default_factory=lambda: ["conv"] * 8 + ["full_attention"] * 6
+            )
+            short_conv_kernel: int = 3
+
+        gen = GenaiConfigGenerator.from_config(
+            FakeConfig(),
+            "lfm2",
+            num_kv_cache_layers=6,
+        )
+        decoder = gen.generate()["model"]["decoder"]
+        assert decoder["num_hidden_layers"] == 14
+        assert decoder["layer_types"] == FakeConfig().layer_types
+
 
 def test_cuda_enables_decoder_graph_capture_only():
     gen = GenaiConfigGenerator(
