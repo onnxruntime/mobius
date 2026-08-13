@@ -3,7 +3,7 @@
   "package": {
     "repository": "justinchuby/Muse-Glimmer-30B-ONNX-INT4-CUDA",
     "weights_revision": "bf36a94a4519e14e3c48ad005c6ff1972ab44ccb",
-    "schema_head": "dbb5d0e55fe113248a082b5ac23d997e94b2b534",
+    "schema_head": "c885b71b3813fd652690e5ef5154bfc5535e5c1c",
     "artifacts": {
       "decoder": "decoder/model.onnx",
       "embedding": "embedding/model.onnx",
@@ -13,11 +13,11 @@
   },
   "runtime": {
     "onnxruntime": "1.28.0",
-    "onnxruntime_genai_commit": "ede24ecc6a254ef33354bc0eb7bc90d1daa540bd",
+    "onnxruntime_genai_commit": "c885b71b3813fd652690e5ef5154bfc5535e5c1c",
     "execution_provider": "CUDAExecutionProvider",
-    "cuda_graph": true,
+    "cuda_graph": false,
     "cudnn_flash_attention": false,
-    "shared_kv": true
+    "shared_kv": false
   },
   "hardware": {
     "gpu": "NVIDIA H200",

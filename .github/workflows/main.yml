@@ -23,7 +23,7 @@ jobs:
     - uses: actions/checkout@v7
       with:
         repository: justinchuby/onnx-genai
-        ref: dbb5d0e55fe113248a082b5ac23d997e94b2b534
+        ref: c885b71b3813fd652690e5ef5154bfc5535e5c1c
         path: validation/onnx-genai
     - uses: actions/setup-python@v7
       with:
