@@ -288,8 +288,8 @@ def torch_forward(
     input_ids: np.ndarray,
     attention_mask: np.ndarray,
     position_ids: np.ndarray,
-    past_key_values: list[tuple[np.ndarray, np.ndarray]] | None = None,
-) -> tuple[np.ndarray, list[tuple[np.ndarray, np.ndarray]]]:
+    past_key_values: object | None = None,
+) -> tuple[np.ndarray, object]:
     """Run a single forward pass on a HuggingFace causal LM model.
 
     Args:
@@ -297,10 +297,12 @@ def torch_forward(
         input_ids: [batch, seq_len] int64 numpy array.
         attention_mask: [batch, total_seq_len] int64 numpy array.
         position_ids: [batch, seq_len] int64 numpy array.
-        past_key_values: Optional list of (key, value) numpy array tuples.
+        past_key_values: Optional list of (key, value) numpy array tuples, or
+            an opaque HuggingFace Cache for hybrid recurrent models.
 
     Returns:
-        Tuple of (logits as numpy, list of (key, value) numpy tuples).
+        Tuple of logits and either a list of KV numpy tuples or an opaque
+        HuggingFace Cache when model-specific recurrent state must be retained.
     """
     import inspect
 
@@ -323,16 +325,21 @@ def torch_forward(
         kwargs["position_ids"] = pos_t
 
     if past_key_values is not None:
-        from transformers.cache_utils import DynamicCache
+        from transformers.cache_utils import Cache, DynamicCache
 
-        cache = DynamicCache()
-        for layer_idx, (k, v) in enumerate(past_key_values):
-            cache.update(
-                torch.from_numpy(k).to(device=device, dtype=dtype),
-                torch.from_numpy(v).to(device=device, dtype=dtype),
-                layer_idx,
-            )
-        kwargs["past_key_values"] = cache
+        if isinstance(past_key_values, Cache):
+            # Hybrid caches carry model-specific recurrent state (for example
+            # LFM2 conv windows) that cannot be reconstructed from KV pairs.
+            kwargs["past_key_values"] = past_key_values
+        else:
+            cache = DynamicCache()
+            for layer_idx, (k, v) in enumerate(past_key_values):
+                cache.update(
+                    torch.from_numpy(k).to(device=device, dtype=dtype),
+                    torch.from_numpy(v).to(device=device, dtype=dtype),
+                    layer_idx,
+                )
+            kwargs["past_key_values"] = cache
 
     try:
         outputs = model(**kwargs)
@@ -351,6 +358,10 @@ def torch_forward(
     # Extract KV cache if available (Mamba models don't have it)
     present_kv: list[tuple[np.ndarray, np.ndarray]] = []
     cache = getattr(outputs, "past_key_values", None)
+    layer_types = getattr(model.config, "layer_types", None) or []
+    if "conv" in layer_types:
+        return logits, cache
+
     if cache is not None and hasattr(cache, "layers"):
         for layer_idx in range(len(cache.layers)):
             layer_cache = cache.layers[layer_idx]

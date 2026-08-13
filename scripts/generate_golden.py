@@ -211,12 +211,28 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
     from mobius._testing.golden import save_generation_json, save_golden_ref
     from mobius._testing.torch_reference import (
         load_torch_model,
+        load_torch_multimodal_model,
         torch_forward,
     )
 
-    model, tokenizer = load_torch_model(
-        case.model_id, device=device, trust_remote_code=case.trust_remote_code
-    )
+    uses_multimodal_reference = case.reference_loader == "multimodal"
+    if uses_multimodal_reference:
+        import torch
+
+        dtype_map = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }
+        model, tokenizer, _ = load_torch_multimodal_model(
+            case.model_id,
+            dtype=dtype_map[case.dtype],
+            device=device,
+        )
+    else:
+        model, tokenizer = load_torch_model(
+            case.model_id, device=device, trust_remote_code=case.trust_remote_code
+        )
 
     encoded = tokenizer(case.prompts[0], return_tensors="np", padding=False)
     input_ids = encoded["input_ids"]
@@ -225,7 +241,17 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
     position_ids = np.arange(seq_len).reshape(1, -1)
 
     # L4: single forward pass → last-token logits
-    logits, _ = torch_forward(model, input_ids, attention_mask, position_ids)
+    if uses_multimodal_reference:
+        with torch.no_grad():
+            outputs = model(
+                input_ids=torch.from_numpy(input_ids).to(model.device),
+                attention_mask=torch.from_numpy(attention_mask).to(model.device),
+                position_ids=torch.from_numpy(position_ids).to(model.device),
+                use_cache=False,
+            )
+        logits = outputs.logits.float().cpu().numpy()
+    else:
+        logits, _ = torch_forward(model, input_ids, attention_mask, position_ids)
     last_logits = logits[0, -1, :]  # (vocab_size,)
     golden = _extract_logits_golden(last_logits)
 
@@ -468,7 +494,9 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
     with torch.no_grad():
         outputs = model(**processed)
 
-    last_logits = outputs.logits[0, -1, :].cpu().numpy()
+    # NumPy has no native bfloat16 dtype; golden summaries are stored as
+    # float64, so normalize logits to float32 before crossing the boundary.
+    last_logits = outputs.logits[0, -1, :].float().cpu().numpy()
     golden = _extract_logits_golden(last_logits)
     input_ids_np = processed["input_ids"].cpu().numpy()
 
@@ -508,6 +536,86 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
             prompt=case.prompts[0],
             generated_tokens=generated_ids.tolist(),
             generated_text=generated_text,
+        )
+
+
+def _generate_image_to_text(case: TestCase, json_path: Path, device: str) -> None:
+    """Generate Nemotron Parse-style image-to-text reference data."""
+    import torch
+    from PIL import Image
+    from transformers import AutoModel, AutoProcessor
+
+    from mobius._testing.golden import save_generation_json, save_golden_ref
+
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    model = AutoModel.from_pretrained(
+        case.model_id,
+        revision=case.revision,
+        torch_dtype=dtype_map[case.dtype],
+        trust_remote_code=case.trust_remote_code,
+    ).to(device)
+    model.eval()
+    processor = AutoProcessor.from_pretrained(
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
+    )
+    images = [
+        Image.open(Path("testdata") / image_path).convert("RGB") for image_path in case.images
+    ]
+    processed = processor(
+        images=images,
+        text=case.decoder_prompt,
+        return_tensors="pt",
+        add_special_tokens=False,
+    ).to(device)
+    decoder_input_ids = processed["input_ids"]
+
+    with torch.no_grad():
+        outputs = model(
+            pixel_values=processed["pixel_values"],
+            decoder_input_ids=decoder_input_ids,
+        )
+    last_logits = outputs.logits[0, -1].float().cpu().numpy()
+    golden = _extract_logits_golden(last_logits)
+    input_ids = decoder_input_ids.cpu().numpy()
+
+    generated_ids = None
+    if "L5" in case.level:
+        with torch.no_grad():
+            generated = model.generate(
+                pixel_values=processed["pixel_values"],
+                decoder_input_ids=decoder_input_ids,
+                max_new_tokens=case.generation_params.get("max_new_tokens", 20),
+                do_sample=False,
+            )
+        generated_ids = generated[0, input_ids.shape[1] :].cpu().numpy()
+
+    save_golden_ref(
+        json_path,
+        top1_id=golden["top1_id"],
+        top2_id=golden["top2_id"],
+        top10_ids=golden["top10_ids"],
+        top10_logits=golden["top10_logits"],
+        logits_summary=golden["logits_summary"],
+        input_ids=input_ids,
+    )
+
+    if generated_ids is not None:
+        gen_path = json_path.with_name(json_path.stem + "_generation.json")
+        save_generation_json(
+            gen_path,
+            model_id=case.model_id,
+            prompt=case.decoder_prompt,
+            generated_tokens=generated_ids.tolist(),
+            generated_text=processor.decode(
+                generated_ids.tolist(),
+                skip_special_tokens=False,
+            ),
         )
 
 
@@ -1654,6 +1762,7 @@ _GENERATORS = {
     "feature-extraction": _generate_encoder,
     "seq2seq": _generate_seq2seq,
     "image-text-to-text": _generate_vision_language,
+    "image-to-text": _generate_image_to_text,
     "image-classification": _generate_image_classification,
     "speech-to-text": _generate_speech_to_text,
     "speech-language": _generate_speech_language,

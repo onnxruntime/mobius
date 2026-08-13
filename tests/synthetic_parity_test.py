@@ -108,6 +108,10 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # dispatch, plus Mamba1 SSM single-token decode FP path differences.
     # Argmax correct, cosine=0.998 — model is functionally correct.
     "jamba": 0.04,
+    # Bamba's hybrid Mamba2 + attention path differs slightly in FP accumulation
+    # order from HuggingFace. Both deterministic seeds keep the same argmax and
+    # cosine >= 0.999996 with max absolute error below 0.0017.
+    "bamba": 0.002,
     # ModernBERT decoder has a 3-component LM head (dense→norm→decoder) whose
     # FP accumulation differs from PyTorch → ~0.043 max diff.
     # Argmax correct, cosine=0.996 — model is functionally correct.
@@ -150,8 +154,9 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # Gemma3n: AltUp magnitude normalization (target_mag/new_mag ratio) amplifies
     # FP differences between ORT and PyTorch, especially with random weight init.
     # Argmax correct (near-tie), cosine≥0.995, top10_jaccard=1.0 — functionally correct.
-    "gemma3n_text": 0.1,  # ~0.094 max diff worst-case (AltUp magnitude ratio)
-    "gemma3n": 0.1,  # same architecture
+    # Only the text entry appears here: the "gemma3n" key builds the multimodal
+    # model, which this causal-LM suite does not cover.
+    "gemma3n_text": 0.05,  # ~0.026 max diff worst-case (AltUp magnitude ratio)
     # Gemma3 VL: same QK-norm FP accumulation as gemma3_text (~0.045 max diff).
     # argmax_match=True (near-tie), cosine=0.996 — functionally correct.
     "gemma3": 0.05,
@@ -260,18 +265,13 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     "gemma": {"head_dim": TINY_HEAD_DIM},
     # Gemma3/Gemma3n: head_dim is an explicit param in HF (default 256); pass tiny value.
     "gemma3_text": {"head_dim": TINY_HEAD_DIM, "query_pre_attn_scalar": TINY_HEAD_DIM},
-    # num_kv_shared_layers default is 15; with TINY_LAYERS=2 this makes all layers
-    # "shared", causing prev_layers[:-13]=[] and a ValueError on index lookup. Set to 0.
+    # num_kv_shared_layers is threaded through from the tiny config (HF defaults
+    # to 15, which with TINY_LAYERS=2 would make every layer "shared" and leave
+    # no source layer to borrow K,V from), so it is set explicitly per entry in
+    # _test_configs.py rather than pinned to 0 here.
     "gemma3n_text": {
         "query_pre_attn_scalar": TINY_HEAD_DIM,
         "head_dim": TINY_HEAD_DIM,
-        "num_kv_shared_layers": 0,
-        "hidden_activation": "gelu_pytorch_tanh",
-    },
-    "gemma3n": {
-        "query_pre_attn_scalar": TINY_HEAD_DIM,
-        "head_dim": TINY_HEAD_DIM,
-        "num_kv_shared_layers": 0,
         "hidden_activation": "gelu_pytorch_tanh",
     },
     "gemma3": {"query_pre_attn_scalar": TINY_HEAD_DIM, "head_dim": TINY_HEAD_DIM},
@@ -453,8 +453,6 @@ _HF_MODEL_TYPE_OVERRIDES: dict[str, str] = {
     # Gemma3Config wraps Gemma3TextConfig; tiny kwargs go to the outer config
     # but the actual model is built from text_config which retains HF defaults.
     "gemma3": "gemma3_text",
-    # Gemma3nConfig is the multimodal wrapper; text-only parity uses Gemma3nTextConfig.
-    "gemma3n": "gemma3n_text",
     # Qwen3.5-MoE outer config wraps text_config; use the text-only model type
     # so tiny kwargs (num_experts, moe_intermediate_size, etc.) apply directly.
     "qwen3_5_moe": "qwen3_5_moe_text",
@@ -463,6 +461,26 @@ _HF_MODEL_TYPE_OVERRIDES: dict[str, str] = {
     # VL text sub-models: use the base text model type for CausalLM parity testing.
     "qwen3_vl_moe": "qwen3_moe",
     "qwen3_omni_moe": "qwen3_moe",
+}
+
+
+def _adapt_muse_glimmer_text_config(hf_kwargs: dict) -> None:
+    """Translate the shared tiny config fields to Muse Glimmer's HF schema."""
+    hf_kwargs["head_dim"] = TINY_HEAD_DIM
+    hf_kwargs.setdefault("hidden_activation", hf_kwargs.get("hidden_act", "silu"))
+    hf_kwargs.pop("hidden_act", None)
+    hf_kwargs["attention_bias"] = False
+    hf_kwargs["rope_parameters"] = {
+        "rope_type": "default",
+        "rope_theta": hf_kwargs.pop("rope_theta", 10_000.0),
+    }
+    hf_kwargs.pop("rope_type", None)
+    hf_kwargs.pop("attn_qk_norm", None)
+    hf_kwargs.pop("no_rope_layers", None)
+
+
+_HF_CONFIG_ADAPTERS = {
+    "muse_glimmer_text": _adapt_muse_glimmer_text_config,
 }
 
 
@@ -502,6 +520,9 @@ def _create_hf_config(model_type: str, config_overrides: dict):
     if model_type in _HF_EXTRA_CONFIG:
         hf_kwargs.update(_HF_EXTRA_CONFIG[model_type])
 
+    if adapter := _HF_CONFIG_ADAPTERS.get(hf_model_type):
+        adapter(hf_kwargs)
+
     # Convert layer_types to attn_layer_indices for hybrid Mamba models
     # Bamba uses attn_layer_indices (computed property layers_block_type)
     if hf_model_type in ("bamba",) and "layer_types" in hf_kwargs:
@@ -509,6 +530,15 @@ def _create_hf_config(model_type: str, config_overrides: dict):
         hf_kwargs["attn_layer_indices"] = [
             i for i, lt in enumerate(layer_types) if lt in ("full_attention", "attention")
         ]
+
+    if hf_model_type == "lfm2":
+        hf_kwargs["conv_L_cache"] = hf_kwargs.pop("short_conv_kernel", 3)
+        hf_kwargs["conv_bias"] = hf_kwargs.pop("short_conv_bias", False)
+        hf_kwargs["norm_eps"] = hf_kwargs.pop("rms_norm_eps")
+        hf_kwargs["rope_parameters"] = {
+            "rope_type": "default",
+            "rope_theta": 10_000.0,
+        }
 
     # Jamba uses attn_layer_offset/attn_layer_period
     if hf_model_type in ("jamba",) and "layer_types" in hf_kwargs:
@@ -648,6 +678,8 @@ def _create_hf_config(model_type: str, config_overrides: dict):
         "attn_qk_norm",
         "attn_qk_norm_full",
         "post_feedforward_norm",
+        "short_conv_kernel",
+        "short_conv_bias",
         # dual_ln is a mobius-only flag for Falcon/Bloom parallel attention;
         # HF controls this behavior via new_decoder_architecture=True.
         "dual_ln",
@@ -663,13 +695,44 @@ def _create_hf_config(model_type: str, config_overrides: dict):
     return hf_config
 
 
+def _create_softcapped_backbone_causal_lm(hf_config):
+    """Wrap an HF backbone with the checkpoint's scaled, softcapped LM head."""
+    from transformers import AutoModel
+
+    class _SoftcappedBackboneCausalLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = AutoModel.from_config(hf_config)
+            self.lm_head = torch.nn.Linear(
+                hf_config.hidden_size,
+                hf_config.vocab_size,
+                bias=False,
+            )
+
+        def forward(self, **kwargs):
+            hidden_states = self.model(**kwargs).last_hidden_state
+            logits = self.lm_head(hidden_states) * hf_config.output_multiplier
+            cap = hf_config.final_logit_softcapping
+            if cap:
+                logits = cap * torch.tanh(logits / cap)
+            return type("CausalLMOutput", (), {"logits": logits})()
+
+    return _SoftcappedBackboneCausalLM()
+
+
+_HF_MODEL_FACTORIES = {
+    "muse_glimmer_text": _create_softcapped_backbone_causal_lm,
+}
+
+
 def _create_hf_model(model_type: str, hf_config, seed: int):
     """Create a HuggingFace model from config with deterministic init."""
     from transformers import AutoModelForCausalLM
 
     torch.manual_seed(seed)
     try:
-        hf_model = AutoModelForCausalLM.from_config(hf_config)
+        factory = _HF_MODEL_FACTORIES.get(model_type, AutoModelForCausalLM.from_config)
+        hf_model = factory(hf_config)
     except Exception as e:
         pytest.skip(f"Cannot create HF model for {model_type}: {type(e).__name__}: {e}")
 
@@ -705,6 +768,312 @@ def _fill_random_weights(model: ir.Model, rng: np.random.Generator) -> None:
         else:
             data = rng.standard_normal(shape).astype(np.float32) * 0.02
         init.const_value = ir.Tensor(data)
+
+
+def _nemotron_parse_torch_attention(
+    hidden_states: torch.Tensor,
+    weights: dict[str, torch.Tensor],
+    prefix: str,
+    *,
+    num_heads: int,
+    key_value_states: torch.Tensor | None = None,
+    causal: bool = False,
+) -> torch.Tensor:
+    """Evaluate one Nemotron Parse attention block with exported weights."""
+    source = hidden_states if key_value_states is None else key_value_states
+    query = torch.nn.functional.linear(
+        hidden_states,
+        weights[f"{prefix}.q_proj.weight"],
+        weights[f"{prefix}.q_proj.bias"],
+    )
+    key = torch.nn.functional.linear(
+        source,
+        weights[f"{prefix}.k_proj.weight"],
+        weights[f"{prefix}.k_proj.bias"],
+    )
+    value = torch.nn.functional.linear(
+        source,
+        weights[f"{prefix}.v_proj.weight"],
+        weights[f"{prefix}.v_proj.bias"],
+    )
+    batch, query_len, hidden_size = query.shape
+    key_len = key.shape[1]
+    head_dim = hidden_size // num_heads
+    query = query.reshape(batch, query_len, num_heads, head_dim).transpose(1, 2)
+    key = key.reshape(batch, key_len, num_heads, head_dim).transpose(1, 2)
+    value = value.reshape(batch, key_len, num_heads, head_dim).transpose(1, 2)
+    scores = query @ key.transpose(-1, -2) * head_dim**-0.5
+    if causal:
+        mask = torch.ones(query_len, key_len, dtype=torch.bool).tril()
+        scores = scores.masked_fill(~mask, float("-inf"))
+    output = torch.softmax(scores, dim=-1) @ value
+    output = output.transpose(1, 2).reshape(batch, query_len, hidden_size)
+    return torch.nn.functional.linear(
+        output,
+        weights[f"{prefix}.out_proj.weight"],
+        weights[f"{prefix}.out_proj.bias"],
+    )
+
+
+def _nemotron_parse_torch_vision(
+    pixel_values: torch.Tensor,
+    weights: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """Evaluate the tiny one-layer C-RADIO encoder and compression neck."""
+    prefix = "vision_encoder.model_encoder.radio_model.model"
+    patch_weight = weights[f"{prefix}.patch_generator.embedder.weight"].reshape(32, 3, 16, 16)
+    hidden = torch.nn.functional.conv2d(pixel_values, patch_weight, stride=16)
+    hidden = hidden.flatten(2).transpose(1, 2)
+    pos = weights[f"{prefix}.patch_generator.pos_embed"].reshape(1, 4, 4, 32)
+    hidden = hidden + pos[:, :2].reshape(1, 8, 32)
+    cls = weights[f"{prefix}.patch_generator.cls_token.token"].unsqueeze(0)
+    hidden = torch.cat((cls, hidden), dim=1)
+
+    block = f"{prefix}.blocks.0"
+    norm = torch.nn.functional.layer_norm(
+        hidden,
+        (32,),
+        weights[f"{block}.norm1.weight"],
+        weights[f"{block}.norm1.bias"],
+        1e-6,
+    )
+    qkv = torch.nn.functional.linear(
+        norm,
+        weights[f"{block}.attn.qkv.weight"],
+        weights[f"{block}.attn.qkv.bias"],
+    )
+    query, key, value = qkv.chunk(3, dim=-1)
+    batch, sequence, _ = query.shape
+    query = query.reshape(batch, sequence, 4, 8).transpose(1, 2)
+    key = key.reshape(batch, sequence, 4, 8).transpose(1, 2)
+    value = value.reshape(batch, sequence, 4, 8).transpose(1, 2)
+    attn = torch.softmax(query @ key.transpose(-1, -2) * 8**-0.5, dim=-1) @ value
+    attn = attn.transpose(1, 2).reshape(batch, sequence, 32)
+    attn = torch.nn.functional.linear(
+        attn,
+        weights[f"{block}.attn.proj.weight"],
+        weights[f"{block}.attn.proj.bias"],
+    )
+    hidden = hidden + attn
+    norm = torch.nn.functional.layer_norm(
+        hidden,
+        (32,),
+        weights[f"{block}.norm2.weight"],
+        weights[f"{block}.norm2.bias"],
+        1e-6,
+    )
+    mlp = torch.nn.functional.gelu(
+        torch.nn.functional.linear(
+            norm,
+            weights[f"{block}.mlp.fc1.weight"],
+            weights[f"{block}.mlp.fc1.bias"],
+        )
+    )
+    hidden = hidden + torch.nn.functional.linear(
+        mlp,
+        weights[f"{block}.mlp.fc2.weight"],
+        weights[f"{block}.mlp.fc2.bias"],
+    )
+
+    summary = hidden[:, [0, 1, 2]].reshape(batch, -1)
+    features = hidden[:, 8:]
+    features = torch.nn.functional.linear(
+        features,
+        weights["vision_encoder.conv1.weight"],
+        weights["vision_encoder.conv1.bias"],
+    )
+    features = torch.nn.functional.layer_norm(
+        features,
+        (64,),
+        weights["vision_encoder.layer_norm1.weight"],
+        weights["vision_encoder.layer_norm1.bias"],
+        1e-6,
+    )
+    features = features.reshape(batch, 2, 4, 64).permute(0, 3, 1, 2)
+    features = torch.nn.functional.conv2d(
+        features,
+        weights["vision_encoder.conv2.weight"],
+        stride=(1, 4),
+    )
+    features = features.permute(0, 2, 3, 1).reshape(batch, 2, 64)
+    features = torch.nn.functional.layer_norm(
+        features,
+        (64,),
+        weights["vision_encoder.layer_norm2.weight"],
+        weights["vision_encoder.layer_norm2.bias"],
+        1e-6,
+    )
+    summary = torch.nn.functional.linear(
+        summary,
+        weights["vision_encoder.sum_proj.weight"],
+        weights["vision_encoder.sum_proj.bias"],
+    )
+    summary = torch.nn.functional.layer_norm(
+        summary,
+        (64,),
+        weights["vision_encoder.layer_norm3.weight"],
+        weights["vision_encoder.layer_norm3.bias"],
+        1e-6,
+    )
+    return torch.cat((features, summary[:, None]), dim=1)
+
+
+def _nemotron_parse_torch_decoder(
+    input_ids: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    weights: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """Evaluate the tiny one-layer pre-norm mBART decoder."""
+    hidden = torch.nn.functional.embedding(input_ids, weights["decoder.embed_tokens.weight"])
+    hidden = hidden * 8.0
+    hidden = torch.nn.functional.layer_norm(
+        hidden,
+        (64,),
+        weights["decoder.layernorm_embedding.weight"],
+        weights["decoder.layernorm_embedding.bias"],
+    )
+    layer = "decoder.layers.0"
+    residual = hidden
+    norm = torch.nn.functional.layer_norm(
+        hidden,
+        (64,),
+        weights[f"{layer}.self_attn_layer_norm.weight"],
+        weights[f"{layer}.self_attn_layer_norm.bias"],
+    )
+    hidden = residual + _nemotron_parse_torch_attention(
+        norm,
+        weights,
+        f"{layer}.self_attn",
+        num_heads=4,
+        causal=True,
+    )
+    residual = hidden
+    norm = torch.nn.functional.layer_norm(
+        hidden,
+        (64,),
+        weights[f"{layer}.encoder_attn_layer_norm.weight"],
+        weights[f"{layer}.encoder_attn_layer_norm.bias"],
+    )
+    hidden = residual + _nemotron_parse_torch_attention(
+        norm,
+        weights,
+        f"{layer}.encoder_attn",
+        num_heads=4,
+        key_value_states=encoder_hidden_states,
+    )
+    residual = hidden
+    hidden = torch.nn.functional.layer_norm(
+        hidden,
+        (64,),
+        weights[f"{layer}.final_layer_norm.weight"],
+        weights[f"{layer}.final_layer_norm.bias"],
+    )
+    hidden = torch.nn.functional.gelu(
+        torch.nn.functional.linear(
+            hidden,
+            weights[f"{layer}.fc1.weight"],
+            weights[f"{layer}.fc1.bias"],
+        )
+    )
+    hidden = residual + torch.nn.functional.linear(
+        hidden,
+        weights[f"{layer}.fc2.weight"],
+        weights[f"{layer}.fc2.bias"],
+    )
+    hidden = torch.nn.functional.layer_norm(
+        hidden,
+        (64,),
+        weights["decoder.layer_norm.weight"],
+        weights["decoder.layer_norm.bias"],
+    )
+    return hidden @ weights["decoder.embed_tokens.weight"].T
+
+
+def test_nemotron_parse_synthetic_parity():
+    """L3 parity for the full tiny vision encoder and cross-attentive decoder."""
+    from _test_configs import VL_CONFIGS
+
+    from mobius._testing.ort_inference import OnnxModelSession
+
+    overrides = next(
+        overrides for model_type, overrides, _ in VL_CONFIGS if model_type == "nemotron_parse"
+    )
+    config = _base_config(**overrides)
+    _, pkg = _build_onnx_model("nemotron_parse", config)
+    decoder_layer_norms = [
+        node for node in pkg["decoder"].graph if node.op_type == "LayerNormalization"
+    ]
+    assert len(decoder_layer_norms) == 3 * config.num_decoder_layers + 2
+    assert all(
+        node.attributes["epsilon"].value == pytest.approx(1e-5) for node in decoder_layer_norms
+    )
+    rng = np.random.default_rng(42)
+    for model in pkg.values():
+        _fill_random_weights(model, rng)
+
+    weights: dict[str, torch.Tensor] = {}
+    for model in pkg.values():
+        for name, initializer in model.graph.initializers.items():
+            if initializer.const_value is not None and not name.startswith("const_"):
+                weights[name] = torch.from_numpy(initializer.const_value.numpy())
+
+    pixel_values = rng.standard_normal((1, 3, 32, 64)).astype(np.float32)
+    input_ids = np.array([[2, 7, 11]], dtype=np.int64)
+    torch_encoder = _nemotron_parse_torch_vision(torch.from_numpy(pixel_values), weights)
+    torch_logits = _nemotron_parse_torch_decoder(
+        torch.from_numpy(input_ids),
+        torch_encoder,
+        weights,
+    )
+
+    vision_session = OnnxModelSession(pkg["vision_encoder"])
+    decoder_session = OnnxModelSession(pkg["decoder"])
+    try:
+        onnx_encoder = vision_session.run({"pixel_values": pixel_values})["last_hidden_state"]
+        empty_cache = {
+            name: np.zeros((1, 4, 0, 16), dtype=np.float32)
+            for name in decoder_session.input_names
+            if name.startswith("past_key_values.")
+        }
+        onnx_logits = decoder_session.run(
+            {
+                "input_ids": input_ids,
+                "attention_mask": np.ones_like(input_ids, dtype=np.int64),
+                "encoder_hidden_states": onnx_encoder,
+                **empty_cache,
+            }
+        )["logits"]
+
+        unpadded_ids = np.array([[2, 7]], dtype=np.int64)
+        unpadded_logits = decoder_session.run(
+            {
+                "input_ids": unpadded_ids,
+                "attention_mask": np.ones_like(unpadded_ids, dtype=np.int64),
+                "encoder_hidden_states": onnx_encoder,
+                **empty_cache,
+            }
+        )["logits"]
+        padded_ids = np.array([[1, 1, 2, 7]], dtype=np.int64)
+        padded_logits = decoder_session.run(
+            {
+                "input_ids": padded_ids,
+                "attention_mask": np.array([[0, 0, 1, 1]], dtype=np.int64),
+                "encoder_hidden_states": onnx_encoder,
+                **empty_cache,
+            }
+        )["logits"]
+    finally:
+        vision_session.close()
+        decoder_session.close()
+
+    np.testing.assert_allclose(onnx_encoder, torch_encoder.numpy(), rtol=1e-3, atol=1e-3)
+    np.testing.assert_allclose(onnx_logits, torch_logits.numpy(), rtol=1e-3, atol=1e-3)
+    np.testing.assert_allclose(
+        unpadded_logits[:, -1],
+        padded_logits[:, -1],
+        rtol=1e-5,
+        atol=1e-5,
+    )
 
 
 # ---------------------------------------------------------------------------

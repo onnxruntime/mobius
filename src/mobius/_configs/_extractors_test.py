@@ -343,3 +343,154 @@ def test_hunyuan_vl_mot_image_token_id_survives_default_hook(loaded_vision_hooks
     out = _extractors.extract_vision_config(cfg, None, "hunyuan_vl_mot")
     assert out["vision"].image_token_id == 12
     assert out.get("image_token_id") == 12
+
+
+# ---------------------------------------------------------------------------
+# Gemma 3n hooks (MobileNet-V5 vision tower + USM Conformer audio tower)
+# ---------------------------------------------------------------------------
+
+
+def _gemma3n_hf_config(**overrides):
+    """Stand-in for the outer HF ``Gemma3nConfig``, with E4B's real values."""
+    vision = _FakeHFConfig(
+        model_type="gemma3n_vision",
+        architecture="mobilenetv5_300m_enc",
+        hidden_size=2048,
+        do_pooling=False,
+        rms_norm_eps=1e-6,
+        vocab_offset=262144,
+        vocab_size=128,
+    )
+    audio = _FakeHFConfig(
+        model_type="gemma3n_audio",
+        hidden_size=1536,
+        conf_num_hidden_layers=12,
+        conf_num_attention_heads=8,
+        conf_attention_chunk_size=12,
+        conf_attention_context_left=13,
+        conf_attention_context_right=0,
+        conf_attention_logit_cap=50.0,
+        conf_conv_kernel_size=5,
+        conf_reduction_factor=4,
+        conf_residual_weight=0.5,
+        input_feat_size=128,
+        sscp_conv_channel_size=[128, 32],
+        sscp_conv_kernel_size=[[3, 3], [3, 3]],
+        sscp_conv_stride_size=[[2, 2], [2, 2]],
+        sscp_conv_group_norm_eps=1e-3,
+        gradient_clipping=1e10,
+        rms_norm_eps=1e-6,
+        vocab_offset=262272,
+        vocab_size=128,
+    )
+    fields = dict(
+        vision_config=vision,
+        audio_config=audio,
+        image_token_id=262145,
+        audio_token_id=262273,
+        vision_soft_tokens_per_image=256,
+        audio_soft_tokens_per_image=188,
+    )
+    fields.update(overrides)
+    return _FakeHFConfig(model_type="gemma3n", **fields)
+
+
+def test_gemma3n_vision_maps_mobilenet_fields(loaded_vision_hooks):
+    """The tower is MobileNet-V5, so the timm spec name and 768x768 are pinned."""
+    out = _extractors.extract_vision_config(_gemma3n_hf_config(), None, "gemma3n")
+    vision = out["vision"]
+
+    assert vision.model_type == "gemma3n_vision"
+    assert vision.architecture == "mobilenetv5_300m_enc"
+    assert vision.hidden_size == 2048
+    # HF ships no image_size; MobileNet-V5 has no dynamic-resolution path and
+    # the processor resizes to a fixed 768x768 (16x16 grid = 256 soft tokens).
+    assert vision.image_size == 768
+    # Gemma3n needs the spatial feature map, not a pooled vector.
+    assert vision.do_pooling is False
+    assert (vision.vocab_offset, vision.vocab_size) == (262144, 128)
+    assert vision.image_token_id == 262145
+    assert vision.mm_tokens_per_image == 256
+
+
+def test_gemma3n_vision_fires_from_text_sub_config(loaded_vision_hooks):
+    """build() may resolve to the text sub-config; the parent still drives the hook."""
+    parent = _gemma3n_hf_config()
+    text = _FakeHFConfig(model_type="gemma3n_text")
+
+    out = _extractors.extract_vision_config(text, parent, "gemma3n_text")
+
+    assert out["vision"].architecture == "mobilenetv5_300m_enc"
+
+
+def test_gemma3n_vision_does_not_fire_for_unrelated_model(loaded_vision_hooks):
+    """A gemma3n-shaped vision_config must not leak into another model type.
+
+    Regression guard: reading the parent model_type off the
+    ``parent_config or config`` composite (rather than ``parent_config``)
+    made the hook fire for *any* dispatched model_type as long as the config
+    itself was a gemma3n one.
+    """
+    out = _extractors.extract_vision_config(_gemma3n_hf_config(), None, "llama")
+
+    assert out.get("vision") is None or out["vision"].architecture is None, (
+        f"gemma3n vision hook fired for model_type='llama': {out}"
+    )
+
+
+def test_gemma3n_audio_maps_usm_conformer_fields(loaded_hooks):
+    """The USM field names pass through verbatim onto Gemma3nAudioConfig."""
+    from mobius._configs._sub_configs import Gemma3nAudioConfig
+
+    out = _extractors.extract_audio_config(_gemma3n_hf_config(), None, "gemma3n")
+    audio = out["audio"]
+
+    assert isinstance(audio, Gemma3nAudioConfig)
+    assert audio.hidden_size == 1536
+    assert audio.conf_num_hidden_layers == 12
+    assert audio.conf_num_attention_heads == 8
+    assert audio.conf_attention_chunk_size == 12
+    assert audio.conf_attention_context_left == 13
+    assert audio.conf_attention_context_right == 0
+    assert audio.conf_attention_logit_cap == pytest.approx(50.0)
+    assert audio.conf_conv_kernel_size == 5
+    assert audio.conf_reduction_factor == 4
+    assert audio.conf_residual_weight == pytest.approx(0.5)
+    assert audio.input_feat_size == 128
+    assert audio.sscp_conv_channel_size == [128, 32]
+    assert audio.sscp_conv_kernel_size == [[3, 3], [3, 3]]
+    assert audio.sscp_conv_stride_size == [[2, 2], [2, 2]]
+    assert audio.sscp_conv_group_norm_eps == pytest.approx(1e-3)
+    assert (audio.vocab_offset, audio.vocab_size) == (262272, 128)
+    assert audio.audio_token_id == 262273
+
+
+def test_gemma3n_audio_fires_from_text_sub_config(loaded_hooks):
+    """Same parent-resolution path as the vision hook."""
+    parent = _gemma3n_hf_config()
+    text = _FakeHFConfig(model_type="gemma3n_text")
+
+    out = _extractors.extract_audio_config(text, parent, "gemma3n_text")
+
+    assert out["audio"].conf_num_hidden_layers == 12
+
+
+def test_gemma3n_audio_absent_without_audio_config(loaded_hooks):
+    """Audio is optional: no audio_config means no audio sub-config."""
+    cfg = _gemma3n_hf_config(audio_config=None)
+
+    assert _extractors.extract_audio_config(cfg, None, "gemma3n") == {}
+
+
+def test_gemma3n_audio_does_not_fire_for_unrelated_model(loaded_hooks):
+    """A gemma3n-shaped audio_config must not leak into another model type.
+
+    Same parent-resolution regression guard as the vision hook above.
+    """
+    from mobius._configs._sub_configs import Gemma3nAudioConfig
+
+    out = _extractors.extract_audio_config(_gemma3n_hf_config(), None, "llama")
+
+    assert not isinstance(out.get("audio"), Gemma3nAudioConfig), (
+        f"gemma3n audio hook fired for model_type='llama': {out}"
+    )

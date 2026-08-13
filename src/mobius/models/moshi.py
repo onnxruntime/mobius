@@ -314,7 +314,7 @@ class _DepformerLayer(nn.Module):
         h2 = self.norm2(op, x)
         gate_up = self.gating_in(op, h2, substep_index)  # (B, 1, 2 * hidden)
         gate, up = op.Split(gate_up, axis=-1, num_outputs=2, _outputs=2)
-        ff = op.Mul(op.Mul(gate, op.Sigmoid(gate)), up)  # silu(gate) * up
+        ff = op.Mul(op.Swish(gate), up)  # silu(gate) * up
         ff = self.gating_out(op, ff, substep_index)  # (B, 1, 1024)
         x = op.Add(x, ff)  # residual (no layer_scale)
         return x, present_key, present_value

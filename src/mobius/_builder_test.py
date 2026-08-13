@@ -14,6 +14,7 @@ import onnx_ir as ir
 import pytest
 
 from mobius._builder import (
+    _enable_prefill_prefix_pruning_task,
     _graph_requires_opset24,
     _maybe_apply_opset_lowering,
     build,
@@ -60,6 +61,16 @@ def _static_cache_nodes() -> list[ir.Node]:
 
 def _standard_nodes() -> list[ir.Node]:
     return [ir.Node("", "Reshape", inputs=[_make_value("x"), _make_value("shape")])]
+
+
+def test_prefill_prefix_pruning_error_lists_supported_tasks() -> None:
+    with pytest.raises(
+        ValueError,
+        match=(
+            "text-generation, hybrid-text-generation, gemma4-text-generation, and gemma4 tasks"
+        ),
+    ):
+        _enable_prefill_prefix_pruning_task("feature-extraction")
 
 
 def test_graph_requires_opset24_tensor_scatter() -> None:

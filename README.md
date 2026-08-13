@@ -29,7 +29,7 @@ multi-component export for pipelines.
 |---|---|
 | **Text Generation** | Llama 2/3/4, Mistral, Qwen 2/2.5/3/3.5/3.6, Phi-3/3.5, Gemma 1/2/3/4, Granite, GPT-2, OPT, OLMo, SmolLM3, and many more |
 | **Mixture of Experts** | PhiMoE, GPTOSS, Mixtral, OLMoE, DeepSeek-V2/V3, Qwen2-MoE, Qwen3-MoE, Qwen3-Next, GLM-4-MoE, Arctic, DBRX, Jamba |
-| **Multimodal** | Gemma 3/4, Phi-4MM (vision + audio + LoRA), LLaVA, InternVL2, Qwen2.5-VL, Qwen3-VL, Qwen3.5/3.6-VL, Pixtral |
+| **Multimodal** | Gemma 3/4, Phi-4MM (vision + audio + LoRA), Nemotron Parse, LLaVA, InternVL2, Qwen2.5-VL, Qwen3-VL, Qwen3.5/3.6-VL, Pixtral |
 | **Encoder-only** | BERT, RoBERTa, ALBERT, DeBERTa, DistilBERT, ELECTRA, XLNet |
 | **Encoder-Decoder** | BART, T5/mT5, Marian, M2M-100, Pegasus, BigBird-Pegasus |
 | **Speech-to-Text** | Whisper, FastConformer-RNNT, FunASR, Qwen3-ASR, SenseVoice |
@@ -113,12 +113,12 @@ mobius build --model openai/whisper-tiny output_dir/
 ```
 
 Build-mode toggles use the cargo-style `--features` option. Available features
-are `static-cache`, `fp8-kv-cache`, `prune-lm-head`, and `text-only`. Pass them
+are `static-cache`, `fp8-kv-cache`, `prune-prefill-prefix`, and `text-only`. Pass them
 as a comma-separated list or repeat the option:
 
 ```sh
 mobius build --model meta-llama/Llama-3.2-1B output_dir/ \
-    --features static-cache,prune-lm-head --max-seq-len 2048
+      --features static-cache,prune-prefill-prefix --max-seq-len 2048
 ```
 
 See the [CLI Reference](https://onnxruntime.github.io/mobius/cli_reference.html) for all subcommands and flags.

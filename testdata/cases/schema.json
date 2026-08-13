@@ -154,6 +154,15 @@
       "default": false,
       "description": "Whether the HuggingFace model requires trust_remote_code=True."
     },
+    "reference_loader": {
+      "type": "string",
+      "enum": [
+        "causal-lm",
+        "multimodal"
+      ],
+      "default": "causal-lm",
+      "description": "HuggingFace loader used to generate the reference. Use multimodal when a text-only export is sourced from a composite checkpoint."
+    },
     "skip_reason": {
       "type": [
         "string",

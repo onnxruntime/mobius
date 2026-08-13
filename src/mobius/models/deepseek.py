@@ -328,8 +328,7 @@ class _SharedExpertMLP(nn.Module):
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
         gate_out = self.gate_proj(op, hidden_states)
-        # SiLU = x * sigmoid(x)
-        gate = op.Mul(gate_out, op.Sigmoid(gate_out))
+        gate = op.Swish(gate_out)
         up = self.up_proj(op, hidden_states)
         return self.down_proj(op, op.Mul(gate, up))
 

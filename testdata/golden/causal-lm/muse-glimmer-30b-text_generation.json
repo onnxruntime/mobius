@@ -1,0 +1,27 @@
+{
+  "model_id": "meta-models/Muse-Glimmer-30B",
+  "prompt": "Here is my poem:",
+  "generated_tokens": [
+    7283,
+    442,
+    954,
+    13708,
+    323,
+    290,
+    24782,
+    23354,
+    20762,
+    954,
+    2954,
+    323,
+    290,
+    24782,
+    23354,
+    24,
+    262,
+    27301,
+    323,
+    7123
+  ],
+  "generated_text": " \n\n**The Last of the Mohicans**\n\nThe last of the Mohicans, a tale of love"
+}

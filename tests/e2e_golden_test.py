@@ -549,6 +549,53 @@ def _run_seq2seq_prefill(
     return outputs
 
 
+def _prepare_image_to_text_inputs(
+    case: GoldenTestCase,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply the checkpoint's processor to one real image and decoder prompt."""
+    import transformers
+    from PIL import Image
+
+    processor = transformers.AutoProcessor.from_pretrained(
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
+    )
+    images = [Image.open(_TESTDATA_DIR / path).convert("RGB") for path in case.images]
+    processed = processor(
+        images=images,
+        text=case.decoder_prompt,
+        return_tensors="pt",
+        add_special_tokens=False,
+    )
+    pixel_values = processed["pixel_values"].float().cpu().numpy()
+    return pixel_values, processed["input_ids"].cpu().numpy().astype(np.int64)
+
+
+def _run_image_to_text_prefill(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+    config: object,
+) -> dict[str, np.ndarray]:
+    """Run a real image through the vision encoder and decoder prefill."""
+    pixel_values, input_ids = _prepare_image_to_text_inputs(case)
+    device_kwargs = _get_test_device_kwargs()
+    enc_session = OnnxModelSession(pkg["vision_encoder"], **device_kwargs)
+    dec_session = OnnxModelSession(pkg["decoder"], **device_kwargs)
+    try:
+        encoder_hidden = enc_session.run({"pixel_values": pixel_values})["last_hidden_state"]
+        feeds: dict[str, np.ndarray] = {
+            "input_ids": input_ids,
+            "attention_mask": np.ones_like(input_ids, dtype=np.int64),
+            "encoder_hidden_states": encoder_hidden,
+        }
+        feeds.update(_make_empty_kv_cache(dec_session, config))
+        return dec_session.run(feeds)
+    finally:
+        enc_session.close()
+        dec_session.close()
+
+
 def _prepare_prefill_feeds(
     golden: GoldenRef,
     config: object,
@@ -916,6 +963,10 @@ def _run_vl_vision_to_image_features(
                     if hf_key.replace("image_", "pixel_") == name:
                         vis_feeds[name] = val if isinstance(val, np.ndarray) else np.array(val)
                         break
+        for name, value in vis_feeds.items():
+            input_dtype = vis_session.get_input_dtype(name)
+            if input_dtype is not None and value.dtype != input_dtype:
+                vis_feeds[name] = value.astype(input_dtype)
         vis_out = vis_session.run(vis_feeds)
         return vis_out, vis_out[next(iter(vis_out))]
     finally:
@@ -976,7 +1027,10 @@ def _run_vision_language_prefill(
                 # Provide empty tensor for unused modalities (e.g. audio_features)
                 shape = emb_session.get_input_shape(name) or []
                 static_shape = [d if isinstance(d, int) and d > 0 else 0 for d in shape]
-                emb_feeds[name] = np.zeros(static_shape, dtype=np.float32)
+                emb_feeds[name] = np.zeros(
+                    static_shape,
+                    dtype=emb_session.get_input_dtype(name) or np.float32,
+                )
         emb_out = emb_session.run(emb_feeds)
     finally:
         emb_session.close()
@@ -1153,7 +1207,10 @@ def _run_vl_generation(
             if name not in emb_feeds:
                 shape = emb_session.get_input_shape(name) or []
                 static_shape = [d if isinstance(d, int) and d > 0 else 0 for d in shape]
-                emb_feeds[name] = np.zeros(static_shape, dtype=np.float32)
+                emb_feeds[name] = np.zeros(
+                    static_shape,
+                    dtype=emb_session.get_input_dtype(name) or np.float32,
+                )
         emb_out = emb_session.run(emb_feeds)
         inputs_embeds = emb_out[next(iter(emb_out))]  # [1, seq_len, hidden_size]
 
@@ -1240,7 +1297,10 @@ def _run_vl_generation(
                 if name not in step_emb_feeds:
                     shape = emb_session.get_input_shape(name) or []
                     static_shape = [d if isinstance(d, int) and d > 0 else 0 for d in shape]
-                    step_emb_feeds[name] = np.zeros(static_shape, dtype=np.float32)
+                    step_emb_feeds[name] = np.zeros(
+                        static_shape,
+                        dtype=emb_session.get_input_dtype(name) or np.float32,
+                    )
             step_emb_out = emb_session.run(step_emb_feeds)
             step_embeds = step_emb_out[next(iter(step_emb_out))]  # [1, 1, hidden_size]
             if embeds_dtype is not None and step_embeds.dtype != embeds_dtype:
@@ -1953,6 +2013,8 @@ class TestL4CheckpointVerified:
             outputs = _run_speech_language_prefill(pkg, case, golden, config)
         elif case.task_type == "image-text-to-text":
             outputs = _run_vision_language_prefill(pkg, case, config)
+        elif case.task_type == "image-to-text":
+            outputs = _run_image_to_text_prefill(pkg, case, config)
         elif case.task_type == "phi4mm-multimodal":
             outputs = _run_phi4mm_multimodal_prefill(pkg, case, golden, config)
         elif case.task_type == "gemma4-assistant":
@@ -2046,6 +2108,7 @@ _GENERATION_SUPPORTED_TASKS = frozenset(
     {
         "text-generation",
         "image-text-to-text",
+        "image-to-text",
         "seq2seq",
         "speech-to-text",
         "speech-language",
@@ -2285,6 +2348,54 @@ def _run_seq2seq_generation(
     # Return the full decoder output including decoder_start_token,
     # matching HuggingFace model.generate() output format.
     return all_ids[0]
+
+
+def _run_image_to_text_generation(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+    config: object,
+) -> np.ndarray:
+    """Run greedy image-to-text generation through the two ONNX sessions."""
+    pixel_values, input_ids = _prepare_image_to_text_inputs(case)
+    device_kwargs = _get_test_device_kwargs()
+    enc_session = OnnxModelSession(pkg["vision_encoder"], **device_kwargs)
+    dec_session = OnnxModelSession(pkg["decoder"], **device_kwargs)
+    try:
+        encoder_hidden = enc_session.run({"pixel_values": pixel_values})["last_hidden_state"]
+        past_cache = _make_empty_kv_cache(dec_session, config)
+        generated: list[np.ndarray] = []
+        current_ids = input_ids
+        attention_mask = np.ones_like(input_ids, dtype=np.int64)
+        max_new_tokens = case.generation_params.get("max_new_tokens", 20)
+        eos_token_id = case.generation_params.get("eos_token_id")
+        for _ in range(max_new_tokens):
+            feeds: dict[str, np.ndarray] = {
+                "input_ids": current_ids,
+                "attention_mask": attention_mask,
+                "encoder_hidden_states": encoder_hidden,
+                **past_cache,
+            }
+            outputs = dec_session.run(feeds)
+            next_token = np.argmax(
+                outputs["logits"][:, -1],
+                axis=-1,
+                keepdims=True,
+            ).astype(np.int64)
+            generated.append(next_token)
+            for name in past_cache:
+                present_name = name.replace("past_key_values.", "present.")
+                past_cache[name] = outputs[present_name]
+            if eos_token_id is not None and np.all(next_token == eos_token_id):
+                break
+            current_ids = next_token
+            attention_mask = np.concatenate(
+                [attention_mask, np.ones_like(next_token, dtype=np.int64)],
+                axis=1,
+            )
+        return np.concatenate(generated, axis=1)[0]
+    finally:
+        enc_session.close()
+        dec_session.close()
 
 
 def _run_speech_to_text_generation(
@@ -2698,6 +2809,8 @@ class TestL5GenerationE2E:
                 max_new_tokens=case.generation_params.get("max_new_tokens", 30),
                 eos_token_id=case.generation_params.get("eos_token_id"),
             )
+        elif case.task_type == "image-to-text":
+            new_tokens = _run_image_to_text_generation(pkg, case, config)
         elif case.task_type == "gemma4-assistant":
             new_tokens = _run_gemma4_assistant_generation(pkg, case)
         elif case.task_type == "seq2seq":

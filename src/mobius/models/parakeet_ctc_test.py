@@ -104,6 +104,18 @@ def test_parakeet_graph_io_and_hf_weight_names_align():
     assert not any(name.endswith(".num_batches_tracked") for name in processed)
 
 
+def test_parakeet_graph_uses_fused_encoder_ops():
+    _, config, _, package = _build_tiny()
+    model = package["model"]
+    op_types = [node.op_type for node in model.graph.all_nodes()]
+
+    assert op_types.count("Attention") == config.num_hidden_layers
+    assert op_types.count("BatchNormalization") == config.num_hidden_layers
+    assert op_types.count("Swish") == 3 * config.num_hidden_layers
+    assert op_types.count("SkipLayerNormalization") == 4 * config.num_hidden_layers
+    assert "Sqrt" not in op_types
+
+
 def test_parakeet_honors_non_silu_activation_in_ffn_and_convolution():
     hf_config = _hf_config()
     config = dataclasses.replace(

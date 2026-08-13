@@ -8,7 +8,7 @@ from __future__ import annotations
 import onnx_ir as ir
 from onnxscript import GraphBuilder, nn
 
-from mobius._build_context import lm_head_pruning
+from mobius._build_context import prefill_prefix_pruning
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
 from mobius.components._attention import StaticCacheState
@@ -76,7 +76,7 @@ class CausalLMTask(ModelTask):
         max_seq_len: Maximum sequence length for static cache buffers.
             Only used when ``static_cache=True``.  Defaults to
             ``config.max_position_embeddings``.
-        prune_lm_head: If ``True``, insert ``Gather(axis=1, index=-1)``
+        prune_prefill_prefix: If ``True``, insert ``Gather(axis=1, index=-1)``
             before the LM head so only the last token's hidden state is
             projected to logits.  Output logits shape becomes ``[B, 1,
             vocab]`` instead of ``[B, S, vocab]``, reducing prefill cost
@@ -84,8 +84,7 @@ class CausalLMTask(ModelTask):
             runtime only needs the final token's logits (single-token
             autoregressive generation).  Breaks workflows that require
             per-token logits (logprob scoring, speculative decoding,
-            multi-token generation).  Mirrors the ``prune_lm_head`` extra
-            option in onnxruntime-genai's Model Builder.
+            multi-token generation).
     """
 
     def __init__(
@@ -93,11 +92,11 @@ class CausalLMTask(ModelTask):
         *,
         static_cache: bool = False,
         max_seq_len: int | None = None,
-        prune_lm_head: bool = False,
+        prune_prefill_prefix: bool = False,
     ):
         self._static_cache = static_cache
         self._max_seq_len = max_seq_len
-        self._prune_lm_head = prune_lm_head
+        self._prune_prefill_prefix = prune_prefill_prefix
 
     def build(
         self,
@@ -177,9 +176,15 @@ class CausalLMTask(ModelTask):
             ) or config.head_dim
             kv_value_head_dim = config.v_head_dim or config.head_dim
 
+            # Models whose trailing layers borrow K,V from an earlier layer
+            # (Gemma 3n's ``num_kv_shared_layers``) own fewer cache entries
+            # than they have layers; they report the count via this hook.
+            count_fn = getattr(module, "kv_cache_layer_count", None)
+            num_cache_layers = count_fn() if callable(count_fn) else config.num_hidden_layers
+
             past_key_values = _make_kv_cache_inputs(
                 builder,
-                config.num_hidden_layers,
+                num_cache_layers,
                 num_kv_cache_heads,
                 config.head_dim,
                 config.dtype,
@@ -189,7 +194,7 @@ class CausalLMTask(ModelTask):
                 value_head_dim=kv_value_head_dim,
             )
 
-        with lm_head_pruning(self._prune_lm_head):
+        with prefill_prefix_pruning(self._prune_prefill_prefix):
             result = module(
                 op,
                 input_ids=input_ids,
@@ -203,7 +208,7 @@ class CausalLMTask(ModelTask):
         else:
             logits, present_key_values = result
 
-        _validate_pruned_logits(logits, self._prune_lm_head, module)
+        _validate_pruned_logits(logits, self._prune_prefill_prefix, module)
 
         builder.add_output(logits, "logits")
 
@@ -258,13 +263,13 @@ class HybridCausalLMTask(ModelTask):
         - present.{i}.{key|value|conv_state|recurrent_state}: FLOAT
 
     Args:
-        prune_lm_head: If ``True``, insert ``Gather(axis=1, index=-1)``
+        prune_prefill_prefix: If ``True``, insert ``Gather(axis=1, index=-1)``
             before the LM head so only the last token's logits are emitted.
             See :class:`CausalLMTask` for full documentation.
     """
 
-    def __init__(self, *, prune_lm_head: bool = False):
-        self._prune_lm_head = prune_lm_head
+    def __init__(self, *, prune_prefill_prefix: bool = False):
+        self._prune_prefill_prefix = prune_prefill_prefix
 
     def build(
         self,
@@ -296,7 +301,7 @@ class HybridCausalLMTask(ModelTask):
             past_seq_len,
         )
 
-        with lm_head_pruning(self._prune_lm_head):
+        with prefill_prefix_pruning(self._prune_prefill_prefix):
             result = module(
                 op,
                 input_ids=input_ids,
@@ -310,7 +315,7 @@ class HybridCausalLMTask(ModelTask):
         else:
             logits, present_key_values = result
 
-        _validate_pruned_logits(logits, self._prune_lm_head, module)
+        _validate_pruned_logits(logits, self._prune_prefill_prefix, module)
 
         builder.add_output(logits, "logits")
         _register_hybrid_cache_outputs(
@@ -331,16 +336,16 @@ class HybridCausalLMTask(ModelTask):
 
 def _validate_pruned_logits(
     logits: ir.Value,
-    prune_lm_head: bool,
+    prune_prefill_prefix: bool,
     module: nn.Module,
 ) -> None:
     """Fail when a custom model forward ignores the task's pruning request."""
-    if not prune_lm_head:
+    if not prune_prefill_prefix:
         return
     shape = logits.shape
     if shape is None or len(shape) != 3 or shape[1] != 1:
         raise ValueError(
-            f"{type(module).__name__} does not support prune_lm_head. "
+            f"{type(module).__name__} does not support prune_prefill_prefix. "
             "The model must select the final hidden state before its LM-head projection."
         )
 

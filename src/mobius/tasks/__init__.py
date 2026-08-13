@@ -37,6 +37,7 @@ __all__ = [
     "DiarizationTask",
     "FeatureExtractionTask",
     "FunASRSpeechLanguageTask",
+    "Gemma3nTask",
     "Gemma4AssistantTask",
     "Gemma4Task",
     "Gemma4UnifiedTask",
@@ -47,6 +48,7 @@ __all__ = [
     "ImageClassificationTask",
     "ModelTask",
     "MllamaVisionLanguageTask",
+    "MuseGlimmerVLTask",
     "MaskedDiffusionTask",
     "MoshiDepformerTask",
     "MoshiTemporalTask",
@@ -68,6 +70,7 @@ __all__ = [
     "VAETask",
     "VideoDenoisingTask",
     "VisionLanguageTask",
+    "VisionEncoderDecoderTask",
     "WorldModelTask",
     "build_decoder_from_embeds",
     "build_embedding_from_features",
@@ -98,6 +101,7 @@ from mobius.tasks._diarization import DiarizationTask
 from mobius.tasks._eagle3 import Eagle3DraftTask
 from mobius.tasks._feature_extraction import FeatureExtractionTask
 from mobius.tasks._fun_asr_speech_language import FunASRSpeechLanguageTask
+from mobius.tasks._gemma3n import Gemma3nTask
 from mobius.tasks._gemma4 import (
     Gemma4Task,
     Gemma4TextCausalLMTask,
@@ -121,11 +125,13 @@ from mobius.tasks._ssm_causal_lm import SSM2CausalLMTask, SSMCausalLMTask
 from mobius.tasks._tts import TTSTask
 from mobius.tasks._vae import VAETask
 from mobius.tasks._video_denoising import VideoDenoisingTask
+from mobius.tasks._vision_encoder_decoder import VisionEncoderDecoderTask
 from mobius.tasks._vision_language import Qwen3VLVisionLanguageTask
 from mobius.tasks._vision_language_3model import (
     Cosmos3EdgeVLTask,
     HybridQwenVLTask,
     MllamaVisionLanguageTask,
+    MuseGlimmerVLTask,
     PixtralVLTask,
     QwenVLTask,
     VisionLanguageTask,
@@ -162,12 +168,15 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "vae": VAETask,
     "qwen-image-vae": QwenImageVAETask,
     "vision-language": VisionLanguageTask,
+    "vision-encoder-decoder": VisionEncoderDecoderTask,
     "cosmos3-edge-vl": Cosmos3EdgeVLTask,
     "pixtral-vl": PixtralVLTask,
     "mllama-vision-language": MllamaVisionLanguageTask,
+    "muse-glimmer-vl": MuseGlimmerVLTask,
     "qwen-vl": QwenVLTask,
     "hybrid-qwen-vl": HybridQwenVLTask,
     "qwen3-vl-vision-language": Qwen3VLVisionLanguageTask,
+    "gemma3n": Gemma3nTask,
     "gemma4": Gemma4Task,
     "gemma4-text-generation": Gemma4TextCausalLMTask,
     "gemma4-unified": Gemma4UnifiedTask,

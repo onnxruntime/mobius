@@ -99,8 +99,8 @@ class TestMambaBlock:
         # Two splits: in_proj (x/z) and SSM x_proj (dt/B/C)
         assert count_op_type(graph, "Split") >= 2
 
-    def test_silu_activation_via_sigmoid(self):
-        """SiLU (x * sigmoid(x)) produces Sigmoid + Mul ops."""
+    def test_silu_activation_uses_fused_swish(self):
+        """Both SiLU activations use the fused Swish op."""
         block = MambaBlock(d_model=32, d_inner=64, d_state=8)
         test_builder, op, graph = create_test_builder()
         hidden = create_test_input(test_builder, "hidden_states", [1, 1, 32])
@@ -109,8 +109,9 @@ class TestMambaBlock:
 
         block(op, hidden, conv_state, ssm_state)
 
-        # SiLU appears in conv path + z gating = at least 2 Sigmoid ops
-        assert count_op_type(graph, "Sigmoid") >= 2
+        # SiLU appears in the convolution path and output gate.
+        assert count_op_type(graph, "Swish") == 2
+        assert count_op_type(graph, "Sigmoid") == 0
 
     def test_matmul_ops_for_projections(self):
         """Graph contains MatMul ops for linear projections."""
