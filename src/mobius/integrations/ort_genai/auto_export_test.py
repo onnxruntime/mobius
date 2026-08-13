@@ -242,7 +242,12 @@ class TestWriteProcessorConfig:
         assert permute["dims"] == [2, 0, 1]
 
     def test_muse_glimmer_uses_packed_qwen_image_pipeline(self, tmp_path):
-        """Muse vision consumes flattened patches and image grid dimensions."""
+        """Muse vision consumes flattened patches and image grid dimensions.
+
+        No ``ConvertRGB``: it unconditionally swaps R and B, so pairing it with
+        ``DecodeImage(color_space="RGB")`` would hand the encoder BGR. The
+        ``qwen2_5_vl`` flag therefore lands on ``Normalize`` at index 3.
+        """
         vision = mock.MagicMock()
         vision.image_size = 448
         vision.patch_size = 14
@@ -265,14 +270,13 @@ class TestWriteProcessorConfig:
         transforms = proc["transforms"]
         assert [t["operation"]["type"] for t in transforms] == [
             "DecodeImage",
-            "ConvertRGB",
             "Resize",
             "Rescale",
             "Normalize",
             "PatchImage",
         ]
-        assert transforms[4]["operation"]["attrs"]["qwen2_5_vl"] == 1
-        assert transforms[5]["operation"]["attrs"] == {
+        assert transforms[3]["operation"]["attrs"]["qwen2_5_vl"] == 1
+        assert transforms[4]["operation"]["attrs"] == {
             "patch_size": 14,
             "temporal_patch_size": 2,
             "merge_size": 2,
