@@ -174,7 +174,12 @@ def test_real_qwen3_tts_workflow_carries_trained_transitions_and_kv_state():
         "code_predictor_step_embedder",
         "talker_text_step",
     }.issubset(workflow["components"])
-    assert workflow["state"]["talker_cache_0"]["recurrence"]["kind"] == "growing"
+    assert workflow["state"]["talker_cache_0"]["recurrence"]["kind"] == "bounded"
+    assert workflow["state"]["talker_cache_0"]["service_group"] == "talker_cache"
+    assert workflow["state"]["predictor_cache_0"]["service_group"] == "predictor_cache"
+    assert workflow["serving"]["kv_service"]["groups"]["talker_cache"]["ports"]["talker"][
+        "talker_cache_0"
+    ]["input"].startswith("past_key_values.")
     assert workflow["state"]["predictor_cache_0"]["scope"] == "invocation"
     assert (
         workflow["state"]["predictor_cache_0"]["recurrence"]["max"]

@@ -545,6 +545,8 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
         "code_frame_update", build_code_frame_update(num_groups, scalar_index=True)
     )
     pkg.add_policy_component("code_history_append", build_code_history_append(num_groups))
+    if talker_caches or predictor_caches:
+        pkg.add_policy_component("cache_length_update", build_integer_add())
     pkg.add_policy_component(
         "talker_state_initializer",
         build_tts_decoder_state_initializer(
@@ -665,6 +667,34 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             "source": {"kind": "literal"},
             "required": False,
             "default": 1,
+        },
+        "package.zero_batch": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 0,
+        },
+        "package.one_batch": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 1,
+        },
+        "package.true": {
+            "contract": batch_bool,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": True,
+        },
+        "package.slot_ids": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 0,
         },
     }
     for iteration in range(num_groups - 2):
@@ -930,6 +960,20 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
                     "frame_index": "predictor.body.frame_index",
                 },
             ),
+            *(
+                [
+                    _invoke(
+                        "cache_length_update",
+                        {
+                            "left": "state.predictor_cache_lengths.inner",
+                            "right": "package.one_batch",
+                        },
+                        {"total": "predictor_cache_lengths.next"},
+                    )
+                ]
+                if predictor_caches
+                else []
+            ),
             _invoke(
                 "code_predictor_step_embedder",
                 {
@@ -1027,6 +1071,16 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             ),
         },
     ]
+    if predictor_caches:
+        inner_carried.append(
+            {
+                "cell": "predictor_cache_lengths",
+                "current": "package.zero_batch",
+                "body_input": "state.predictor_cache_lengths.inner",
+                "body_output": "predictor_cache_lengths.next",
+                "next": "predictor_cache_lengths.final",
+            }
+        )
     for index, (_, present) in enumerate(predictor_caches):
         inner_carried.append(
             {
@@ -1100,6 +1154,25 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
                 "next_attention_mask": "talker.mask.body",
                 "next_position_ids": "talker.position.body",
             },
+        ),
+        *(
+            [
+                _invoke(
+                    "cache_length_update",
+                    {
+                        "left": "state.talker_cache_lengths.body",
+                        "right": "package.one_batch",
+                    },
+                    {"total": "talker_cache_lengths.next"},
+                ),
+                _invoke(
+                    "cache_length_update",
+                    {"left": "package.zero_batch", "right": "package.one_batch"},
+                    {"total": "accepted_len.next"},
+                ),
+            ]
+            if talker_caches or predictor_caches
+            else []
         ),
         _invoke(
             "continue_predicate",
@@ -1240,33 +1313,120 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             "initializer": "frame.predictor.initializer.body_position_ids",
             "recurrence": {"kind": "invariant"},
         },
+        "active": {
+            "contract": batch_bool,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": "package.true",
+            "recurrence": {"kind": "invariant"},
+        },
+        "done": {
+            "contract": batch_bool,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": "package.false",
+            "recurrence": {"kind": "invariant"},
+        },
+        "accepted_len": {
+            "contract": batch_int,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": "package.zero_batch",
+            "recurrence": {"kind": "invariant"},
+        },
+        "slot_ids": {
+            "contract": batch_int,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": "package.slot_ids",
+            "recurrence": {"kind": "invariant"},
+        },
+        "talker_cache_lengths": {
+            "contract": batch_int,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": "package.zero_batch",
+            "recurrence": {"kind": "invariant"},
+        },
+        "predictor_cache_lengths": {
+            "contract": batch_int,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": "package.zero_batch",
+            "recurrence": {"kind": "invariant"},
+        },
     }
     for index, (past, present) in enumerate(talker_caches):
         state[f"talker_cache_{index}"] = {
             "contract": _contract(past),
+            "class": "semantic",
             "scope": "invocation",
             "initializer": f"talker.setup.{present.name}",
             "recurrence": {
-                "kind": "growing",
+                "kind": "bounded",
                 "axis": 2,
-                "increment": "package.one_control",
                 "max": "package.talker_context_limit",
             },
+            "service_group": "talker_cache",
         }
     for index, (past, present) in enumerate(predictor_caches):
         state[f"predictor_cache_{index}"] = {
             "contract": _contract(past),
+            "class": "semantic",
             "scope": "invocation",
             "initializer": f"frame.predictor.{present.name}",
             "recurrence": {
-                "kind": "growing",
+                "kind": "bounded",
                 "axis": 2,
-                "increment": "package.one_control",
                 "max": "package.predictor_context_limit",
             },
+            "service_group": "predictor_cache",
         }
 
     outer_carried = [
+        {
+            "cell": "active",
+            "current": "package.true",
+            "body_input": "state.active.body",
+            "body_output": "state.active.body",
+            "next": "state.active.final",
+        },
+        {
+            "cell": "done",
+            "current": "package.false",
+            "body_input": "state.done.body",
+            "body_output": "state.done.body",
+            "next": "state.done.final",
+        },
+        {
+            "cell": "accepted_len",
+            "current": "package.zero_batch",
+            "body_input": "state.accepted_len.body",
+            "body_output": (
+                "accepted_len.next"
+                if talker_caches or predictor_caches
+                else "state.accepted_len.body"
+            ),
+            "next": "state.accepted_len.final",
+        },
+        {
+            "cell": "slot_ids",
+            "current": "package.slot_ids",
+            "body_input": "state.slot_ids.body",
+            "body_output": "state.slot_ids.body",
+            "next": "state.slot_ids.final",
+        },
+        {
+            "cell": "talker_cache_lengths",
+            "current": "package.zero_batch",
+            "body_input": "state.talker_cache_lengths.body",
+            "body_output": (
+                "talker_cache_lengths.next"
+                if talker_caches or predictor_caches
+                else "state.talker_cache_lengths.body"
+            ),
+            "next": "state.talker_cache_lengths.final",
+        },
         {
             "cell": "last_frame",
             "current": "setup.frame_prefill",
@@ -1363,6 +1523,11 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
                 "nested_control_flow",
                 "loop_induction_values",
                 "typed_emit",
+                *(
+                    ["serving_service_contract", "bounded_state_recurrence"]
+                    if talker_caches or predictor_caches
+                    else []
+                ),
             ],
         },
         "inputs": inputs,
@@ -1377,6 +1542,71 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             name: _component(model, _artifact(name, len(pkg))) for name, model in pkg.items()
         },
         "state": state,
+        **(
+            {
+                "serving": {
+                    "active": "active",
+                    "done": "done",
+                    "accepted_len": "accepted_len",
+                    "slot_ids": "slot_ids",
+                    "kv_service": {
+                        "paging": "paged",
+                        "allocation": "runtime",
+                        "compaction": True,
+                        "groups": {
+                            **(
+                                {
+                                    "talker_cache": {
+                                        "sequence_axis": 2,
+                                        "layout": "bnsh",
+                                        "logical_lengths": "talker_cache_lengths",
+                                        "storage": "paged",
+                                        "ports": {
+                                            "talker": {
+                                                f"talker_cache_{index}": {
+                                                    "input": past.name,
+                                                    "output": present.name,
+                                                }
+                                                for index, (past, present) in enumerate(
+                                                    talker_caches
+                                                )
+                                            }
+                                        },
+                                    }
+                                }
+                                if talker_caches
+                                else {}
+                            ),
+                            **(
+                                {
+                                    "predictor_cache": {
+                                        "sequence_axis": 2,
+                                        "layout": "bnsh",
+                                        "logical_lengths": "predictor_cache_lengths",
+                                        "storage": "paged",
+                                        "ports": {
+                                            "code_predictor": {
+                                                f"predictor_cache_{index}": {
+                                                    "input": past.name,
+                                                    "output": present.name,
+                                                }
+                                                for index, (past, present) in enumerate(
+                                                    predictor_caches
+                                                )
+                                            }
+                                        },
+                                    }
+                                }
+                                if predictor_caches
+                                else {}
+                            ),
+                        },
+                    },
+                }
+            }
+            if talker_caches or predictor_caches
+            else {}
+        ),
         "initial_effects": initial_effects,
         "graph": {
             "kind": "sequence",

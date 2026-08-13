@@ -12,7 +12,6 @@ from mobius.integrations.onnx_genai.auto_export_test import (
     _decoder_package,
     _diffusion_package,
     _model,
-    _TTSCfg,
     _value,
     _vlm_package,
 )
@@ -20,43 +19,22 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     write_speculative_workflow_metadata,
 )
 from mobius.integrations.onnx_genai.workflow_metadata_test import _speculative_package
+from mobius.models.qwen3_tts import Qwen3TTSForConditionalGeneration
+from mobius.models.qwen3_tts_test import _TINY_CONFIG
+from mobius.tasks import TTSTask
 
 
 def _tts_package() -> ModelPackage:
-    batch = "batch"
-    return ModelPackage(
-        {
-            "talker": _model(
-                "talker",
-                [_value("inputs_embeds", ir.DataType.FLOAT, [batch, "sequence", 16])],
-                [("last_hidden_state", ir.DataType.FLOAT, [batch, 16])],
-            ),
-            "code_predictor": _model(
-                "code_predictor",
-                [
-                    _value("last_hidden_state", ir.DataType.FLOAT, [batch, 16]),
-                    _value("step_index", ir.DataType.INT64, [batch]),
-                ],
-                [("logits", ir.DataType.FLOAT, [batch, 64])],
-            ),
-            "talker_step_embedder": _model(
-                "talker_step_embedder",
-                [_value("frame_codes", ir.DataType.INT64, [batch, 16])],
-                [("inputs_embeds", ir.DataType.FLOAT, [batch, 1, 16])],
-            ),
-            "talker_prefill_embedder": _model(
-                "talker_prefill_embedder",
-                [_value("text_ids", ir.DataType.INT64, [batch, "sequence"])],
-                [("prefill_embeds", ir.DataType.FLOAT, [batch, "sequence", 16])],
-            ),
-            "codec": _model(
-                "codec",
-                [_value("codes", ir.DataType.INT64, [batch, 16, "frames"])],
-                [("waveform", ir.DataType.FLOAT, [batch, 1, "samples"])],
-            ),
-        },
-        config=_TTSCfg(),
+    package = TTSTask().build(
+        Qwen3TTSForConditionalGeneration(_TINY_CONFIG),
+        _TINY_CONFIG,
     )
+    package["codec"] = _model(
+        "codec",
+        [_value("codes", ir.DataType.INT64, ["batch", 4, "frames"])],
+        [("waveform", ir.DataType.FLOAT, ["batch", 1, "samples"])],
+    )
+    return package
 
 
 def main() -> None:
