@@ -502,7 +502,11 @@ def _model_cache_pairs(model: ir.Model) -> list[tuple[ir.Value, ir.Value]]:
 
 
 def _kv_storage_contract(model: ir.Model) -> dict[str, Any]:
-    """Derive physical KV storage from the admitted model interface."""
+    """Derive physical KV storage from the admitted model interface.
+
+    Shared KV is a runtime I/O-binding contract: past and present ports bind the
+    same full-capacity OrtValue. It does not require an attention-node attribute.
+    """
     input_names = {value.name.lower() for value in model.graph.inputs}
     paged = any(
         marker in name

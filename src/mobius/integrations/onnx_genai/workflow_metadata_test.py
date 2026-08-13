@@ -111,7 +111,12 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
         json.dumps({"use_hd_transform": True}), encoding="utf-8"
     )
     (source / "genai_config.json").write_text(
-        json.dumps({"model": {"eos_token_id": 200001, "context_length": 131072}}),
+        json.dumps(
+            {
+                "model": {"eos_token_id": 200001, "context_length": 131072},
+                "search": {"past_present_share_buffer": True},
+            }
+        ),
         encoding="utf-8",
     )
     (source / "preprocessor_config.json").write_text(
@@ -262,6 +267,9 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     assert kv_service["paging"] == "none"
     assert kv_service["compaction"] is False
     decoder_cache = kv_service["groups"]["decoder_cache"]
+    # Shared buffering is expressed by the admitted cache ports and runtime I/O
+    # binding, even when the graph has no node-level share-buffer attribute.
+    assert all("past_present_share_buffer" not in node.attributes for node in decoder.graph)
     assert decoder_cache["storage"] == "shared_buffer"
     kv_ports = decoder_cache["ports"]["decoder"]
     assert len(kv_ports) == 104
