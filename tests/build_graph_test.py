@@ -2997,6 +2997,9 @@ class TestBuildGraphMoonshine:
         assert "decoder.layers.0.mlp.fc1.weight" in decoder_initializers
         assert "decoder.proj_out.weight" in decoder_initializers
         assert "GroupNormalization" in {node.op_type for node in package["encoder"].graph}
+        decoder_ops = [node.op_type for node in package["decoder"].graph]
+        assert decoder_ops.count("Swish") == TINY_LAYERS
+        assert "Sigmoid" not in decoder_ops
 
 
 class TestBuildGraphQwen3ASR:

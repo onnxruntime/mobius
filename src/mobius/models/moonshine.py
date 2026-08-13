@@ -21,14 +21,11 @@ from mobius.components import (
     GroupNorm,
     LayerNormNoBias,
     Linear,
+    SiLU,
     apply_rotary_pos_emb,
 )
 
 _INT64_MAX = 9223372036854775807
-
-
-def _silu(op: OpBuilder, x: ir.Value) -> ir.Value:
-    return op.Mul(x, op.Sigmoid(x))
 
 
 def _padding_attention_bias(
@@ -178,6 +175,7 @@ class MoonshineDecoderMLP(nn.Module):
         super().__init__()
         self.fc1 = Linear(config.hidden_size, 2 * config.intermediate_size, bias=True)
         self.fc2 = Linear(config.intermediate_size, config.hidden_size, bias=True)
+        self.activation = SiLU()
         self._intermediate_size = config.intermediate_size
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
@@ -188,7 +186,7 @@ class MoonshineDecoderMLP(nn.Module):
             axis=-1,
             _outputs=2,
         )
-        return self.fc2(op, op.Mul(data, _silu(op, gate)))
+        return self.fc2(op, op.Mul(data, self.activation(op, gate)))
 
 
 class MoonshineEncoderLayer(nn.Module):
