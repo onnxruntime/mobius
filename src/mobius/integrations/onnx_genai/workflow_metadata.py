@@ -296,6 +296,8 @@ def _publish_workflow_v1(workflow: dict[str, Any]) -> dict[str, Any]:
                 "max_iterations": rewrite(node["max_iterations"]),
                 "carried": carried,
             }
+            if "termination" in node:
+                result["termination"] = node["termination"]
             if "iteration" in node:
                 result["iteration"] = node["iteration"]
             return result
@@ -3309,6 +3311,7 @@ def build_vlm_workflow_metadata(
             "setup": setup,
             "body": body,
             "condition": "loop.continue",
+            "termination": "generation_eos",
             "max_iterations": "request.max_iterations",
             "iteration": {"value": "loop.iteration", "contract": batch_int},
             "carried": carried,
@@ -4970,6 +4973,7 @@ def build_decoder_workflow_metadata(
             "setup": setup,
             "body": body,
             "condition": "loop.continue",
+            "termination": "generation_eos",
             **({"active_cell": "active"} if cache_pairs else {}),
             "max_iterations": "request.max_iterations",
             "iteration": {

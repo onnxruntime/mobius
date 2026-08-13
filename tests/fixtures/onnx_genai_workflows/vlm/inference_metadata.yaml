@@ -649,6 +649,7 @@ pipeline:
         next: decoder.body.present.0.value
       - cell: loop_0_active
         next: loop.continue
+      termination: generation_eos
       iteration:
         value: loop.iteration
         contract:

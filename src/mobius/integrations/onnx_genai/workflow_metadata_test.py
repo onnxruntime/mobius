@@ -252,6 +252,7 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     assert workflow["inputs"]["request.image"]["present_as"] == "request.image_present"
     assert "request.has_media" not in workflow["inputs"]
     assert "input_presence" in workflow["manifest"]["capabilities"]
+    assert workflow["steps"][0]["termination"] == "generation_eos"
     media_branch = workflow["steps"][0]["setup"][0]
     assert media_branch["kind"] == "branch"
     assert media_branch["predicate"] == "request.image_present"

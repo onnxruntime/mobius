@@ -464,6 +464,7 @@ pipeline:
         next: decoder_step.body_position_ids
       - cell: cache_9
         next: decoder.body.present.0.key
+      termination: generation_eos
       iteration:
         value: loop.iteration
         contract:
