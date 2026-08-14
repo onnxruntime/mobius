@@ -501,6 +501,7 @@ class ArchitectureConfig(BaseModelConfig):
     video_token_id: int | None = None
     vision_start_token_id: int | None = None
     vision_end_token_id: int | None = None
+    downsample_mode: str = "16x"
     spatial_merge_size: int = 2
     temporal_patch_size: int = 2
     frame_windows_size: int = 4
