@@ -225,6 +225,7 @@ def test_build_threads_revision_to_diffusers_fallback(monkeypatch: pytest.Monkey
                 "revision": "pinned-revision",
                 "dtype": None,
                 "load_weights": False,
+                "execution_provider": "default",
             },
         )
     ]

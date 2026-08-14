@@ -11,6 +11,7 @@ import types
 from unittest import mock
 
 import numpy as np
+import onnx_ir as ir
 import pytest
 
 from mobius.integrations.ort_genai.auto_export import (
@@ -32,28 +33,27 @@ from mobius.integrations.ort_genai.auto_export import (
 )
 
 
-def _mock_model_with_inputs(names):
-    """Create a mock ir.Model whose graph.inputs have the given names."""
-    inputs = []
-    for n in names:
-        inp = mock.MagicMock()
-        inp.name = n
-        inputs.append(inp)
-    m = mock.MagicMock()
-    m.graph.inputs = inputs
-    return m
+def _mock_model(
+    *, inputs: list[str] | None = None, outputs: list[str] | None = None
+) -> ir.Model:
+    """Create a minimal ir.Model for package and graph-introspection tests."""
+    graph = ir.Graph(
+        inputs=[ir.Value(name=name) for name in inputs or []],
+        outputs=[ir.Value(name=name) for name in outputs or []],
+        nodes=[],
+        name="mock_model",
+    )
+    return ir.Model(graph, ir_version=10)
 
 
-def _mock_model_with_outputs(names):
-    """Create a mock ir.Model whose graph.outputs have the given names."""
-    outputs = []
-    for n in names:
-        out = mock.MagicMock()
-        out.name = n
-        outputs.append(out)
-    m = mock.MagicMock()
-    m.graph.outputs = outputs
-    return m
+def _mock_model_with_inputs(names: list[str]) -> ir.Model:
+    """Create a minimal ir.Model whose graph inputs have the given names."""
+    return _mock_model(inputs=names)
+
+
+def _mock_model_with_outputs(names: list[str]) -> ir.Model:
+    """Create a minimal ir.Model whose graph outputs have the given names."""
+    return _mock_model(outputs=names)
 
 
 def test_moonshine_native_runtime_is_rejected(tmp_path):
@@ -62,7 +62,7 @@ def test_moonshine_native_runtime_is_rejected(tmp_path):
     config = mock.MagicMock()
     config.model_type = "moonshine"
     package = ModelPackage(
-        {"encoder": mock.MagicMock(), "decoder": mock.MagicMock()},
+        {"encoder": _mock_model(), "decoder": _mock_model()},
         config=config,
     )
 
@@ -93,7 +93,7 @@ def _make_fake_llm_pkg(model_type: str = "qwen2"):
         max_position_embeddings: int = 128
 
     return ModelPackage(
-        {"model": mock.MagicMock()},
+        {"model": _mock_model()},
         config=FakeConfig(model_type=model_type),
     )
 
@@ -1053,8 +1053,8 @@ class TestExportForOrtGenai:
 
         pkg = ModelPackage(
             {
-                "vision_encoder": mock.MagicMock(),
-                "decoder": mock.MagicMock(),
+                "vision_encoder": _mock_model(),
+                "decoder": _mock_model(),
             },
             config=FakeConfig(),
         )
@@ -1093,9 +1093,9 @@ class TestExportForOrtGenai:
 
         pkg = ModelPackage(
             {
-                "model": mock.MagicMock(),
-                "vision_encoder": mock.MagicMock(),
-                "embedding": mock.MagicMock(),
+                "model": _mock_model(),
+                "vision_encoder": _mock_model(),
+                "embedding": _mock_model(),
             },
             config=FakeConfig(),
         )
@@ -1145,9 +1145,9 @@ class TestExportForOrtGenai:
 
         pkg = ModelPackage(
             {
-                "decoder": mock.MagicMock(),
-                "vision_encoder": mock.MagicMock(),
-                "embedding": mock.MagicMock(),
+                "decoder": _mock_model(),
+                "vision_encoder": _mock_model(),
+                "embedding": _mock_model(),
             },
             config=FakeConfig(),
         )
@@ -1191,9 +1191,9 @@ class TestExportForOrtGenai:
 
         pkg = ModelPackage(
             {
-                "decoder": mock.MagicMock(),
-                "vision_encoder": mock.MagicMock(),
-                "embedding": mock.MagicMock(),
+                "decoder": _mock_model(),
+                "vision_encoder": _mock_model(),
+                "embedding": _mock_model(),
             },
             config=FakeConfig(),
         )
@@ -1243,9 +1243,9 @@ class TestExportForOrtGenai:
 
         pkg = ModelPackage(
             {
-                "model": mock.MagicMock(),
-                "vision": mock.MagicMock(),
-                "embedding": mock.MagicMock(),
+                "model": _mock_model(),
+                "vision": _mock_model(),
+                "embedding": _mock_model(),
             },
             config=FakeConfig(),
         )
@@ -1303,9 +1303,9 @@ class TestExportForOrtGenai:
 
         pkg = ModelPackage(
             {
-                "model": mock.MagicMock(),
-                "audio_encoder": mock.MagicMock(),
-                "embedding": mock.MagicMock(),
+                "model": _mock_model(),
+                "audio_encoder": _mock_model(),
+                "embedding": _mock_model(),
             },
             config=FakeConfig(),
         )
@@ -1353,7 +1353,7 @@ class TestExportForOrtGenai:
             num_key_value_heads: int = 1
             head_dim: int = 256
 
-        pkg = ModelPackage({"model": mock.MagicMock()}, config=FakeConfig())
+        pkg = ModelPackage({"model": _mock_model()}, config=FakeConfig())
         result = write_ort_genai_config(pkg, str(tmp_path))
 
         assert "audio_processor" not in result
@@ -1385,9 +1385,9 @@ class TestExportForOrtGenai:
 
         pkg = ModelPackage(
             {
-                "model": mock.MagicMock(),
-                "audio_encoder": mock.MagicMock(),
-                "embedding": mock.MagicMock(),
+                "model": _mock_model(),
+                "audio_encoder": _mock_model(),
+                "embedding": _mock_model(),
             },
             config=FakeConfig(),
         )
@@ -1507,7 +1507,7 @@ class TestExportForOrtGenai:
         from mobius._model_package import ModelPackage
         from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
 
-        pkg = ModelPackage({"model": mock.MagicMock()}, config=None)
+        pkg = ModelPackage({"model": _mock_model()}, config=None)
         with pytest.raises(ValueError, match="config"):
             write_ort_genai_config(pkg, str(tmp_path))
 
@@ -1547,7 +1547,7 @@ class TestExportForOrtGenai:
             head_dim: int = 16
             max_position_embeddings: int = 128
 
-        pkg = ModelPackage({"model": mock.MagicMock()}, config=FakeConfig())
+        pkg = ModelPackage({"model": _mock_model()}, config=FakeConfig())
         result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
 
         with open(result["genai_config"]) as f:
@@ -1868,7 +1868,7 @@ class TestExportForOrtGenai:
             eos_token_id: int = 2
             pad_token_id: int = 0
 
-        pkg = ModelPackage({"model": mock.MagicMock()}, config=FakeConfig())
+        pkg = ModelPackage({"model": _mock_model()}, config=FakeConfig())
         result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
 
         with open(result["genai_config"]) as f:
@@ -1898,7 +1898,7 @@ class TestExportForOrtGenai:
             eos_token_id: list = dataclasses.field(default_factory=lambda: [1, 106])
             pad_token_id: int = 0
 
-        pkg = ModelPackage({"model": mock.MagicMock()}, config=FakeConfig())
+        pkg = ModelPackage({"model": _mock_model()}, config=FakeConfig())
         result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
 
         with open(result["genai_config"]) as f:
@@ -2001,7 +2001,7 @@ class TestExportPackage:
         from mobius._model_package import ModelPackage
         from mobius.integrations.ort_genai.auto_export import export_package
 
-        pkg = ModelPackage({"model": mock.MagicMock()}, config=None)
+        pkg = ModelPackage({"model": _mock_model()}, config=None)
         save_called = []
 
         def fake_save(self, *a, **kw):

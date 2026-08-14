@@ -39,11 +39,11 @@ class TestModelPackageDict:
         assert pkg["new"] is m
 
     def test_rejects_component_without_graph(self):
-        with pytest.raises(TypeError, match="must be an ir.Model with a graph"):
+        with pytest.raises(TypeError, match=r"must be an ir\.Model with a graph"):
             ModelPackage({"invalid": object()})  # type: ignore[arg-type]
 
         pkg = ModelPackage()
-        with pytest.raises(TypeError, match="must be an ir.Model with a graph"):
+        with pytest.raises(TypeError, match=r"must be an ir\.Model with a graph"):
             pkg["invalid"] = object()  # type: ignore[assignment]
 
     def test_delitem(self):
