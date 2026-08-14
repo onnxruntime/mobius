@@ -98,6 +98,27 @@ class TestMoELayer:
         layer = MoELayer(config)
         assert len(layer.experts) == 8
 
+    def test_moe_layer_linear_class_used_for_dense_expert_fallback(self):
+        # When the config doesn't match the native QMoE ABI (e.g. no
+        # quantization here), MoELayer falls back to per-expert dense MLPs.
+        # linear_class must be threaded through to that fallback, not just
+        # to the fused QMoE path -- otherwise quantized dense-fallback
+        # experts would silently lose quantization.
+        from mobius.components._common import Linear
+
+        created = []
+
+        class TrackingLinear(Linear):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                created.append(self)
+
+        config = make_config(num_local_experts=4, num_experts_per_tok=2)
+        layer = MoELayer(config, linear_class=TrackingLinear)
+        assert layer.experts is not None
+        assert len(created) > 0
+        assert all(isinstance(p, TrackingLinear) for p in created)
+
     def test_moe_layer_forward(self):
         config = make_config(num_local_experts=4, num_experts_per_tok=2)
         layer = MoELayer(config)

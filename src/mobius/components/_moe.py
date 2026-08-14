@@ -53,7 +53,6 @@ def _flatten_to_2d(op: OpBuilder, tensor: ir.Value) -> ir.Value:
     return op.Reshape(tensor, flat_shape)
 
 
-
 class TopKGate(nn.Module):
     """Standard top-k expert routing gate.
 
@@ -315,7 +314,12 @@ class MoELayer(nn.Module):
     and compatibility path, not the grouped-expert performance representation.
     """
 
-    def __init__(self, config: ArchitectureConfig, gate: nn.Module | None = None):
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        gate: nn.Module | None = None,
+        linear_class: type | None = None,
+    ):
         super().__init__()
         assert config.num_local_experts is not None
         assert config.num_experts_per_tok is not None
@@ -336,7 +340,17 @@ class MoELayer(nn.Module):
             self.experts = None
             self._init_qmoe_parameters(expert_config)
         else:
-            self.experts = nn.ModuleList([MLP(expert_config) for _ in range(self.num_experts)])
+            # ``linear_class`` also drives the dense loop-over-experts
+            # fallback (e.g. when the quantization config doesn't match the
+            # native QMoE ABI). Without threading it here, this fallback
+            # path would silently lose quantization for every per-expert
+            # MLP even though the caller requested a quantized linear_class.
+            self.experts = nn.ModuleList(
+                [
+                    MLP(expert_config, linear_class=linear_class)
+                    for _ in range(self.num_experts)
+                ]
+            )
 
     def _init_qmoe_parameters(self, expert_config: ArchitectureConfig) -> None:
         quantization = self._qmoe_quantization
@@ -402,7 +416,12 @@ class MoELayer(nn.Module):
         # sparse LM head in gemma4_assistant.py.
         op.builder.push_module(self.gate.name or "gate", type(self.gate).__qualname__)
         try:
-            for param in self.gate.parameters():
+            # ``recurse=False``: mirror ``Module.__call__``'s direct-only
+            # realization. Gate classes are currently leaf modules with no
+            # child modules, but recursing here would double-register any
+            # nested module's parameters under this pushed scope if one were
+            # ever added.
+            for param in self.gate.parameters(recurse=False):
                 param._realize(op.builder)  # pylint: disable=protected-access
             router_probs, router_weights, normalize, output_scale = self.gate.qmoe_routing(
                 op, hidden_states

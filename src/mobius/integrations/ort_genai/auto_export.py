@@ -1014,9 +1014,21 @@ def _write_genai_config(
     # e.g. Qwen3.5's GatedDeltaNet) is a separate, *mandatory* case: its
     # recurrent state requires ``past_present_share_buffer=True`` regardless
     # of whether any other layer uses GQA (ORT GenAI raises "RecurrentState
-    # requires past_present_share_buffer=true" otherwise). Hybrid models mix
-    # LinearAttention layers with standard (non-GQA) ``Attention`` layers, so
-    # this flag must win over the "no GQA" default-off heuristic above.
+    # requires past_present_share_buffer=true" otherwise).
+    #
+    # Hybrid models mix LinearAttention layers with full-attention layers,
+    # which may lower to GQA *or* to the standard (non-GQA) ``Attention`` op
+    # depending on EP/dtype (e.g. the CPU EP only lowers to GQA for fp32;
+    # fp16 falls back to standard Attention -- see ``_execution_providers.py``
+    # ``gqa_dtypes``). If a hybrid graph has LinearAttention but its
+    # full-attention layers are still standard (non-GQA) Attention, forcing
+    # ``past_present_share_buffer=True`` produces an unrunnable config: the
+    # recurrent state requires it, but standard Attention's dynamic-shape KV
+    # concat cannot honor a pre-allocated shared buffer, which fails at
+    # generation time with an ``attn_mask``/``total_sequence_length``
+    # mismatch rather than at load time. Rather than silently emit a broken
+    # config, raise a clear error so the caller picks an EP/dtype combination
+    # (e.g. fp32 on CPU) that lowers full attention to GQA.
     decoder_model = pkg.get(decoder_key)
     supports_in_place_kv_cache: bool | None = None
     if decoder_model is not None:
@@ -1028,6 +1040,21 @@ def _write_genai_config(
             node.op_type == "LinearAttention" and node.domain == "com.microsoft"
             for node in decoder_model.graph
         )
+        has_standard_attention = any(
+            node.op_type == "Attention" and node.domain in ("", "ai.onnx")
+            for node in decoder_model.graph
+        )
+        if has_recurrent_state and has_standard_attention and not has_gqa:
+            raise ValueError(
+                "This decoder graph mixes com.microsoft.LinearAttention "
+                "(recurrent state, requires past_present_share_buffer=True) "
+                "with standard (non-GQA) Attention (incompatible with "
+                "past_present_share_buffer=True), and no GroupQueryAttention "
+                "node was found. This EP/dtype combination cannot produce a "
+                "runnable genai_config -- pick an EP/dtype that lowers full "
+                "attention to GroupQueryAttention instead (e.g. fp32 on the "
+                "CPU EP)."
+            )
         supports_in_place_kv_cache = has_gqa or has_recurrent_state
 
     generator = GenaiConfigGenerator.from_config(

@@ -2234,6 +2234,93 @@ class TestPixtralGenaiConfig:
         assert data["model"]["image_token_id"] == 10
 
 
+class TestHybridAttentionShareBufferGuard:
+    """Tests for the LinearAttention/GQA past_present_share_buffer guard.
+
+    See the comment above ``supports_in_place_kv_cache`` in
+    ``_write_genai_config``: recurrent-state layers (LinearAttention)
+    mandate ``past_present_share_buffer=True``, but standard (non-GQA)
+    Attention is incompatible with it. A hybrid graph with both, and no
+    GQA node to lower the standard Attention layers to, must raise a clear
+    build-time error rather than silently emit a broken config.
+    """
+
+    @staticmethod
+    def _make_pkg(node_op_types: list[tuple[str, str]]):
+        """Build a fake decoder pkg whose graph has the given (op_type, domain) nodes."""
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "qwen35_moe"
+            vocab_size: int = 256
+            hidden_size: int = 64
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 4
+            num_key_value_heads: int = 2
+            head_dim: int = 16
+            max_position_embeddings: int = 128
+
+        nodes = [
+            ir.Node(op_type=op_type, domain=domain, inputs=[], num_outputs=1)
+            for op_type, domain in node_op_types
+        ]
+        graph = ir.Graph(
+            inputs=[ir.Value(name="input_ids")],
+            outputs=[ir.Value(name="logits")],
+            nodes=nodes,
+            name="decoder",
+        )
+        decoder = ir.Model(graph, ir_version=10)
+        return ModelPackage({"model": decoder}, config=FakeConfig())
+
+    def _write(self, pkg, tmp_path):
+        return _write_genai_config(
+            pkg.config,
+            str(tmp_path),
+            pkg=pkg,
+            ort_model_type="qwen35_moe",
+            ep="cpu",
+            context_length=4096,
+            bos_token_id=1,
+            eos_token_id=2,
+            pad_token_id=0,
+            is_vlm=False,
+            has_speech=False,
+        )
+
+    def test_recurrent_state_with_standard_attention_and_no_gqa_raises(self, tmp_path):
+        """LinearAttention + standard Attention + no GQA is an unrunnable config."""
+        pkg = self._make_pkg(
+            [("LinearAttention", "com.microsoft"), ("Attention", "")],
+        )
+        with pytest.raises(ValueError, match="past_present_share_buffer"):
+            self._write(pkg, tmp_path)
+
+    def test_recurrent_state_with_gqa_does_not_raise(self, tmp_path):
+        """LinearAttention + GQA (no standard Attention) is a valid hybrid config."""
+        pkg = self._make_pkg(
+            [
+                ("LinearAttention", "com.microsoft"),
+                ("GroupQueryAttention", "com.microsoft"),
+            ],
+        )
+        path = self._write(pkg, tmp_path)
+        with open(path) as f:
+            data = json.load(f)
+        assert data["search"]["past_present_share_buffer"] is True
+
+    def test_recurrent_state_only_does_not_raise(self, tmp_path):
+        """LinearAttention with no full-attention layers at all is unaffected."""
+        pkg = self._make_pkg([("LinearAttention", "com.microsoft")])
+        path = self._write(pkg, tmp_path)
+        with open(path) as f:
+            data = json.load(f)
+        assert data["search"]["past_present_share_buffer"] is True
+
+
 class TestGraphInputNames:
     """Tests for _graph_input_names() helper."""
 

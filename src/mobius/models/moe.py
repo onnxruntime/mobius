@@ -275,6 +275,13 @@ class Qwen2MoELayer(MoELayer):
 
     Forward: ``routing_output + sigmoid(shared_gate(h)) * shared_expert(h)``
 
+    ``linear_class``, when provided, is used for the shared expert's MLP and
+    gate, and is threaded through to :class:`MoELayer` so it also drives the
+    dense loop-over-experts fallback (used when the config doesn't match the
+    native QMoE ABI). It has no effect on the fused QMoE path, whose
+    quantized parameters are constructed directly by
+    :meth:`MoELayer._init_qmoe_parameters`.
+
     Replicates HuggingFace ``Qwen2MoeSparseMoeBlock``.
     """
 
@@ -284,7 +291,7 @@ class Qwen2MoELayer(MoELayer):
         gate: nn.Module | None = None,
         linear_class: type | None = None,
     ):
-        super().__init__(config, gate=gate)
+        super().__init__(config, gate=gate, linear_class=linear_class)
         assert config.shared_expert_intermediate_size is not None, (
             "Qwen2MoELayer requires config.shared_expert_intermediate_size"
         )
