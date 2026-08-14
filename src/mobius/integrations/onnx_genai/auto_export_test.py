@@ -178,6 +178,7 @@ def test_dispatch_decoder(tmp_path):
         "request.eos_ids",
         "request.eos_lengths",
         "request.row_max_iterations",
+        "request.row_ids",
         "request.grammar_mask",
         "request.rng_offset",
     }
@@ -269,6 +270,13 @@ def test_seeded_decoder_sampler_uses_request_controls_and_direct_kv_carry():
     ]
     assert workflow["state"]["rng_offset"]["class"] == "semantic"
     assert workflow["state"]["rng_offset"]["initializer"] == "request.rng_offset"
+    assert workflow["state"]["row_ids"]["initializer"] == "request.row_ids"
+    emit = next(node for node in workflow["steps"][0]["steps"] if node["kind"] == "emit")
+    assert emit["row_ids"] == "row_ids"
+    assert "emit_row_identity" in workflow["manifest"]["capabilities"]
+    assert set(
+        workflow["serving"]["kv_service"]["groups"]["decoder_cache"]["ports"]["model"]
+    ) == {"cache_0", "cache_1"}
     assert workflow["components"]["termination"]["contract"]["version"] == "2"
     assert workflow["components"]["termination"]["contract"]["parameters"] == {
         "batching": "per_row",

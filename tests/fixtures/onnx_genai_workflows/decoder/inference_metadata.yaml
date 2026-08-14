@@ -11,6 +11,7 @@ pipeline:
       - nested_control_flow
       - typed_emit
       - emit_valid_length
+      - emit_row_identity
       - loop_induction_values
       - serving_service_contract
       - bounded_state_recurrence
@@ -131,6 +132,18 @@ pipeline:
           name: row_max_iterations
         required: false
         default: -1
+      request.row_ids:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: row_ids
+        required: true
       request.temperature:
         contract:
           dtype: float32
@@ -470,6 +483,17 @@ pipeline:
         initializer: package.slot_ids
         recurrence:
           kind: invariant
+      row_ids:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+        class: semantic
+        scope: invocation
+        initializer: request.row_ids
+        recurrence:
+          kind: invariant
       cache_lengths:
         contract:
           dtype: int64
@@ -514,7 +538,7 @@ pipeline:
         initializer: initializer.body_position_ids
         recurrence:
           kind: invariant
-      cache_10:
+      cache_0:
         contract:
           dtype: float32
           rank: 4
@@ -547,7 +571,7 @@ pipeline:
             storage: shared_buffer
             ports:
               model:
-                cache_10:
+                cache_0:
                   input: past_key_values.0.key
                   output: present.0.key
     steps:
@@ -670,6 +694,7 @@ pipeline:
         mode: append
         valid_length: token.emitted_length
         when: active
+        row_ids: row_ids
       - kind: invoke
         component: decoder_step_update
         inputs:
@@ -683,7 +708,7 @@ pipeline:
         component: model
         inputs:
           input_ids: token.body
-          past_key_values.0.key: cache_10
+          past_key_values.0.key: cache_0
           attention_mask: decoder_step.body_attention_mask
           position_ids: position_ids
         outputs:
@@ -714,13 +739,15 @@ pipeline:
         next: accepted_len.next
       - cell: slot_ids
         next: slot_ids
+      - cell: row_ids
+        next: row_ids
       - cell: rng_offset
         next: sample.next_offset
       - cell: attention_mask
         next: decoder_step.body_attention_mask
       - cell: position_ids
         next: decoder_step.body_position_ids
-      - cell: cache_10
+      - cell: cache_0
         next: decoder.body.present.0.key
       termination: generation_eos
       iteration:

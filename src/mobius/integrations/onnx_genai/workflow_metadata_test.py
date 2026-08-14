@@ -48,7 +48,10 @@ def test_speculative_emit_uses_accepted_prefix_length():
     ]
     emit = next(node for node in workflow["steps"][0]["steps"] if node["kind"] == "emit")
     assert emit["valid_length"] == "acceptance.length"
+    assert emit["row_ids"] == "row_ids"
     assert "emit_valid_length" in workflow["manifest"]["capabilities"]
+    assert "emit_row_identity" in workflow["manifest"]["capabilities"]
+    assert workflow["inputs"]["request.row_ids"]["source"]["name"] == "serving.row_ids"
     assert workflow["outputs"]["tokens"]["contract"]["shape"][-1] == "accepted_sequence"
     assert workflow["state"]["cache_0"]["recurrence"] == {
         "kind": "bounded",
@@ -278,6 +281,9 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     )
     assert emit["when"] == "active"
     assert emit["valid_length"] == "token.emitted_length"
+    assert emit["row_ids"] == "row_ids"
+    assert workflow["state"]["row_ids"]["initializer"] == "request.row_ids"
+    assert "emit_row_identity" in workflow["manifest"]["capabilities"]
     assert policy_invokes["decoder_step_update"]["inputs"]["logical_length"] == "cache_lengths"
     assert workflow["state"]["attention_mask"]["initializer"] == ("initializer.attention_mask")
     assert any(
@@ -503,6 +509,7 @@ def test_speculative_workflow_uses_per_row_ragged_state_and_rng():
     assert acceptance["outputs"]["accepted_len"] == "acceptance.length"
     emit = next(node for node in body if node["kind"] == "emit")
     assert emit["valid_length"] == "acceptance.length"
+    assert emit["row_ids"] == "row_ids"
     assert not any(node["kind"] == "branch" for node in body)
     assert workflow["serving"]["active"] == "active"
     assert workflow["serving"]["done"] == "done"

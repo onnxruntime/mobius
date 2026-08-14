@@ -236,6 +236,8 @@ def _publish_workflow_v1(workflow: dict[str, Any]) -> dict[str, Any]:
                 result["valid_length"] = rewrite(node["valid_length"])
             if "when" in node:
                 result["when"] = rewrite(node["when"])
+            if "row_ids" in node:
+                result["row_ids"] = rewrite(node["row_ids"])
             return result
         if kind == "branch":
             result = {
@@ -2763,6 +2765,12 @@ def build_vlm_workflow_metadata(
             "required": False,
             "default": -1,
         },
+        "request.row_ids": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "application", "name": "row_ids"},
+            "required": True,
+        },
         "package.eos_ids": {
             "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
             "role": {"kind": "opaque"},
@@ -3033,6 +3041,13 @@ def build_vlm_workflow_metadata(
             "initializer": "package.slot_ids",
             "recurrence": {"kind": "invariant"},
         },
+        "row_ids": {
+            "contract": batch_int,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": "request.row_ids",
+            "recurrence": {"kind": "invariant"},
+        },
         "cache_lengths": {
             "contract": batch_int,
             "class": "semantic",
@@ -3111,6 +3126,13 @@ def build_vlm_workflow_metadata(
             "state.slot_ids.body",
             "state.slot_ids.body",
             "state.slot_ids.final",
+        ),
+        (
+            "row_ids",
+            "request.row_ids",
+            "state.row_ids.body",
+            "state.row_ids.body",
+            "state.row_ids.final",
         ),
         (
             "cache_lengths",
@@ -3417,6 +3439,7 @@ def build_vlm_workflow_metadata(
                 "mode": "append",
                 "when": "state.active.body",
                 "valid_length": "token.emitted_length",
+                "row_ids": "state.row_ids.body",
                 "effect_name": "emit",
                 "effect": _effect("emit.0", "emit.1"),
             },
@@ -3467,6 +3490,7 @@ def build_vlm_workflow_metadata(
                 "loop_induction_values",
                 "typed_emit",
                 "emit_valid_length",
+                "emit_row_identity",
                 *(["input_presence"] if text_only_vision is not None else []),
                 *(
                     ["serving_service_contract", "bounded_state_recurrence"]
@@ -3714,6 +3738,12 @@ def build_speculative_workflow_metadata(
             "contract": batch_int,
             "role": {"kind": "opaque"},
             "source": {"kind": "application", "name": "serving.slot_ids"},
+            "required": True,
+        },
+        "request.row_ids": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "application", "name": "serving.row_ids"},
             "required": True,
         },
         "request.cache_lengths": {
@@ -4037,6 +4067,7 @@ def build_speculative_workflow_metadata(
             "valid_length": emit_length,
             "output": "tokens",
             "mode": "append",
+            "row_ids": "state.row_ids.body",
             "effect_name": "emit",
             "effect": _effect("emit.0", "emit.1"),
         },
@@ -4049,6 +4080,7 @@ def build_speculative_workflow_metadata(
                 "valid_length": "grammar.forced_length",
                 "output": "tokens",
                 "mode": "append",
+                "row_ids": "state.row_ids.body",
                 "effect_name": "emit",
                 "effect": _effect("emit.1", "emit.2"),
             }
@@ -4094,6 +4126,13 @@ def build_speculative_workflow_metadata(
             "class": "semantic",
             "scope": "invocation",
             "initializer": "request.slot_ids",
+            "recurrence": {"kind": "invariant"},
+        },
+        "row_ids": {
+            "contract": batch_int,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": "request.row_ids",
             "recurrence": {"kind": "invariant"},
         },
         "cache_lengths": {
@@ -4146,6 +4185,13 @@ def build_speculative_workflow_metadata(
             "state.slot_ids.body",
             "state.slot_ids.body",
             "state.slot_ids.final",
+        ),
+        (
+            "row_ids",
+            "request.row_ids",
+            "state.row_ids.body",
+            "state.row_ids.body",
+            "state.row_ids.final",
         ),
         (
             "cache_lengths",
@@ -4278,6 +4324,7 @@ def build_speculative_workflow_metadata(
                 "loop_induction_values",
                 "typed_emit",
                 "emit_valid_length",
+                "emit_row_identity",
                 "bounded_state_recurrence",
                 "serving_service_contract",
             ],
@@ -4623,6 +4670,12 @@ def build_decoder_workflow_metadata(
                     "required": False,
                     "default": -1,
                 },
+                "request.row_ids": {
+                    "contract": batch_int,
+                    "role": {"kind": "opaque"},
+                    "source": {"kind": "application", "name": "row_ids"},
+                    "required": True,
+                },
             }
         )
     stochastic_sampler = sampler != "greedy"
@@ -4863,6 +4916,13 @@ def build_decoder_workflow_metadata(
                     "initializer": "package.slot_ids",
                     "recurrence": {"kind": "invariant"},
                 },
+                "row_ids": {
+                    "contract": batch_int,
+                    "class": "semantic",
+                    "scope": "invocation",
+                    "initializer": "request.row_ids",
+                    "recurrence": {"kind": "invariant"},
+                },
                 "cache_lengths": {
                     "contract": batch_int,
                     "class": "semantic",
@@ -4957,6 +5017,13 @@ def build_decoder_workflow_metadata(
                     "body_output": "state.slot_ids.body",
                     "next": "state.slot_ids.final",
                 },
+                {
+                    "cell": "row_ids",
+                    "current": "request.row_ids",
+                    "body_input": "state.row_ids.body",
+                    "body_output": "state.row_ids.body",
+                    "next": "state.row_ids.final",
+                },
             ]
         )
     if sampler_with_rng:
@@ -5037,10 +5104,10 @@ def build_decoder_workflow_metadata(
         )
     decoder_kv_ports: dict[str, Any] = {}
     decoder_kv_axis = 2
-    for past, present in cache_pairs:
+    for cache_index, (past, present) in enumerate(cache_pairs):
         # Generated-length state is orthogonal to the admitted cache ABI and
         # must not renumber stable cache service cells.
-        cell = f"cache_{len(carried) - 1}"
+        cell = f"cache_{cache_index}"
         setup_value = f"decoder.setup.{present.name}"
         body_value = f"decoder.body.{present.name}"
         setup_decoder_outputs[present.name] = setup_value
@@ -5311,6 +5378,7 @@ def build_decoder_workflow_metadata(
                     {
                         "when": "state.active.body",
                         "valid_length": "token.emitted_length",
+                        "row_ids": "state.row_ids.body",
                     }
                     if cache_pairs
                     else {}
@@ -5341,6 +5409,7 @@ def build_decoder_workflow_metadata(
                 "nested_control_flow",
                 "typed_emit",
                 "emit_valid_length",
+                *(["emit_row_identity"] if cache_pairs else []),
                 "loop_induction_values",
                 *(["serving_service_contract"] if cache_pairs else []),
                 *(["bounded_state_recurrence"] if cache_pairs else []),
