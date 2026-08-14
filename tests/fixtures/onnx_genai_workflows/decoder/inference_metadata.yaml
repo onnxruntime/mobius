@@ -292,7 +292,7 @@ pipeline:
           - batch
           - context
         scope: invocation
-        initializer: initializer.body_attention_mask
+        initializer: initializer.attention_mask
         recurrence:
           kind: invariant
       position_ids:
@@ -417,11 +417,20 @@ pipeline:
         output: tokens
         mode: append
       - kind: invoke
+        component: decoder_step_update
+        inputs:
+          attention_mask: attention_mask
+          logical_length: cache_lengths
+          position_ids: position_ids
+        outputs:
+          next_attention_mask: decoder_step.body_attention_mask
+          next_position_ids: decoder_step.body_position_ids
+      - kind: invoke
         component: model
         inputs:
           input_ids: token.body
           past_key_values.0.key: cache_9
-          attention_mask: attention_mask
+          attention_mask: decoder_step.body_attention_mask
           position_ids: position_ids
         outputs:
           logits: decoder.body.logits
@@ -432,15 +441,6 @@ pipeline:
           logits: decoder.body.logits
         outputs:
           last_logits: decoder.body.last_logits
-      - kind: invoke
-        component: decoder_step_update
-        inputs:
-          attention_mask: attention_mask
-          logical_length: cache_lengths.next
-          position_ids: position_ids
-        outputs:
-          next_attention_mask: decoder_step.body_attention_mask
-          next_position_ids: decoder_step.body_position_ids
       continue_when: active
       max_iterations: request.max_iterations
       carried:
