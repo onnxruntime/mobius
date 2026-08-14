@@ -71,6 +71,13 @@ def main() -> int:
     config: dict[str, Any] = json.loads(args.config.read_text())
     workload = config["workload"]
     sampling = config["sampling"]
+    if config["release_gate"] != {
+        "clean_landed_runtime": True,
+        "exact_token_parity": True,
+        "cuda_graph_required": True,
+        "min_throughput_ratio": 0.99,
+    }:
+        raise ValueError("paired Muse benchmark requires the 0.99x hard release gate")
     runtime_head = subprocess.run(
         ["git", "-C", str(args.runtime_repo), "rev-parse", "HEAD"],
         check=True,

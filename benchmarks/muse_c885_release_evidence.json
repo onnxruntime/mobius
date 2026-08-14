@@ -46,6 +46,7 @@
     "native_count": 128
   },
   "gate": {
+    "required_throughput_ratio": 0.99,
     "correctness": false,
     "paired_performance": false,
     "upload_allowed": false

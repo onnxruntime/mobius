@@ -60,6 +60,7 @@
     "native_count": 128
   },
   "gate": {
+    "required_throughput_ratio": 0.99,
     "real_multitoken_e2e": true,
     "paired_performance": false,
     "upload_allowed": false

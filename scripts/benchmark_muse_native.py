@@ -103,6 +103,13 @@ def main() -> int:
     config = json.loads(args.config.read_text())
     workload = config["workload"]
     sampling = config["sampling"]
+    if config["release_gate"] != {
+        "clean_landed_runtime": True,
+        "exact_token_parity": True,
+        "cuda_graph_required": True,
+        "min_throughput_ratio": 0.99,
+    }:
+        raise ValueError("paired Muse benchmark requires the 0.99x hard release gate")
     if config["runtime"]["cudnn_flash_attention"]:
         raise ValueError("paired Muse benchmark requires cuDNN Flash Attention disabled")
 

@@ -45,5 +45,11 @@
     "top_k": 1,
     "top_p": 1.0,
     "seed": 0
+  },
+  "release_gate": {
+    "clean_landed_runtime": true,
+    "exact_token_parity": true,
+    "cuda_graph_required": true,
+    "min_throughput_ratio": 0.99
   }
 }
