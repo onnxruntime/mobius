@@ -483,6 +483,63 @@ pipeline:
         implementation:
           kind: onnx
           artifact: policies/speculative_acceptance.onnx
+        ports:
+          inputs:
+            target_scores:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - draft_sequence
+              - vocabulary
+            proposed_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - draft_sequence
+            seed:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            offset:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+          outputs:
+            accepted_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - draft_sequence
+            accepted_len:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            done:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+            next_offset:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            rollback_len:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            continue:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
         contract:
           id: onnx-genai.speculative-verifier
           version: '1'
@@ -500,10 +557,97 @@ pipeline:
         implementation:
           kind: onnx
           artifact: policies/grammar_guidance.onnx
+        ports:
+          inputs:
+            logits:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - vocabulary
+            logits_mask:
+              dtype: bool
+              rank: 2
+              shape:
+              - batch
+              - vocabulary
+            forced_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+            forced_length:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+          outputs:
+            token:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
       adaptive_k:
         implementation:
           kind: onnx
           artifact: policies/adaptive_k.onnx
+        ports:
+          inputs:
+            current_k:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            accepted:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            evaluated:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            committed_tokens:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            filled_proposal_budget:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+            draft_ms:
+              dtype: float32
+              rank: 1
+              shape:
+              - batch
+            target_ms:
+              dtype: float32
+              rank: 1
+              shape:
+              - batch
+            estimates:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - 24
+          outputs:
+            next_k:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            next_estimates:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - 24
         contract:
           id: onnx-genai.adaptive-proposal-budget
           version: '1'
@@ -522,18 +666,94 @@ pipeline:
         implementation:
           kind: onnx
           artifact: policies/grammar_length.onnx
+        ports:
+          inputs:
+            left:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            right:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+          outputs:
+            minimum:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
       grammar_sampler_logits:
         implementation:
           kind: onnx
           artifact: policies/grammar_sampler_logits.onnx
+        ports:
+          inputs:
+            logits:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - sequence
+              - vocabulary
+          outputs:
+            last_logits:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - vocabulary
       proposal_metrics:
         implementation:
           kind: onnx
           artifact: policies/proposal_metrics.onnx
+        ports:
+          inputs:
+            proposed_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - proposal
+            requested_k:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+          outputs:
+            evaluated:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            filled_proposal_budget:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
       cache_length_update:
         implementation:
           kind: onnx
           artifact: policies/cache_length_update.onnx
+        ports:
+          inputs:
+            left:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            right:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+          outputs:
+            total:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
     state:
       tokens_state:
         contract:

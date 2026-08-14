@@ -7,7 +7,7 @@
 
 use onnx_genai_engine::{
     Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest,
-    PipelineGenerateRequest, pipeline::WorkflowOutputRole,
+    PipelineGenerateRequest, pipeline::{PipelineEngine, WorkflowOutputRole},
 };
 use onnx_genai_ort::{DataType, Value};
 use std::path::PathBuf;
@@ -27,6 +27,37 @@ fn options(max_new_tokens: usize) -> GenerateOptions {
     options.max_new_tokens = max_new_tokens;
     options.seed = Some(7);
     options
+}
+
+fn assert_batched_policy_super_island(engine: &PipelineEngine) {
+    let diagnostics = engine.execution_island_diagnostics();
+    let island = diagnostics
+        .iter()
+        .find(|island| {
+            ["token_sampler", "termination", "token_state_update"]
+                .iter()
+                .all(|component| island.components.iter().any(|item| item == component))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "sampler, termination, and state update must share one execution island: \
+                 {diagnostics:#?}"
+            )
+        });
+    assert!(island.runs > 0, "batched policy island must execute");
+    assert_eq!(island.session_runs, island.runs);
+    assert!(
+        island.component_boundaries_elided >= 2,
+        "the three policy components must execute as a fused island"
+    );
+    if island.device.starts_with("cuda:") {
+        assert_eq!(island.fallback_reason, None);
+    } else {
+        assert_eq!(
+            island.fallback_reason.as_deref(),
+            Some("island is not placed on CUDA")
+        );
+    }
 }
 
 fn decoder_batch_request(
@@ -127,6 +158,7 @@ fn mobius_decoder_workflow_executes() -> anyhow::Result<()> {
             .len(),
         3
     );
+    assert_batched_policy_super_island(&engine);
     Ok(())
 }
 
@@ -244,6 +276,7 @@ fn mobius_vlm_workflow_executes_complete_image_path() -> anyhow::Result<()> {
             .shape(),
         [1, 2]
     );
+    assert_batched_policy_super_island(&engine);
     Ok(())
 }
 

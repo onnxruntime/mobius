@@ -211,11 +211,10 @@ class ModelPackage(UserDict[str, ir.Model]):
             if check_weights:
                 _check_weights(name, component.model)
             relative_path = f"policies/{name}.onnx"
-            with _namespaced_symbolic_dimensions(
-                component.model,
-                f"policy.{name}",
-            ) as saved_model:
-                ir.save(saved_model, os.path.join(directory, relative_path))
+            # Policy components are separate ONNX artifacts with public ABI
+            # dimension names such as ``batch``. Namespacing those dimensions
+            # makes an otherwise exact semantic contract ineligible for runtime fusion.
+            ir.save(component.model, os.path.join(directory, relative_path))
             artifacts[name] = relative_path
         return artifacts
 

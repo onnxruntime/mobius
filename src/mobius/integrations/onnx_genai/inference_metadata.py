@@ -1444,11 +1444,34 @@ def add_policy_components_to_workflow(
             declaration["parameters"] = parameters
         return declaration
 
+    def tensor_contract(value: Any) -> dict[str, Any]:
+        port = _port(value)
+        dtype = {
+            "fp32": "float32",
+            "fp16": "float16",
+            "bf16": "bfloat16",
+        }.get(port.dtype, port.dtype)
+        return {
+            "dtype": dtype,
+            "rank": port.rank,
+            "shape": _shape_metadata(port),
+        }
+
     for name, component in policy_components.items():
         declaration = {
             "implementation": {
                 "kind": "onnx",
                 "artifact": f"policies/{name}.onnx",
+            },
+            "ports": {
+                "inputs": {
+                    value.name: tensor_contract(value)
+                    for value in component.model.graph.inputs
+                },
+                "outputs": {
+                    value.name: tensor_contract(value)
+                    for value in component.model.graph.outputs
+                },
             },
         }
         if component.contract:

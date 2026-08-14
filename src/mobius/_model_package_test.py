@@ -477,7 +477,7 @@ class TestModelPackageSaveLoad:
 
         assert str(branch_output.shape[1]) == "branch_sequence"
 
-    def test_save_namespaces_policy_symbols(self, tmp_path):
+    def test_save_preserves_public_policy_symbols(self, tmp_path):
         sampler = build_greedy_sampler()
         pkg = ModelPackage({"model": _make_simple_model()})
         pkg.add_policy_component("sample", sampler)
@@ -485,8 +485,8 @@ class TestModelPackageSaveLoad:
         pkg.save(str(tmp_path))
 
         saved = ir.load(tmp_path / "policies" / "sample.onnx")
-        assert str(saved.graph.inputs[0].shape[0]) == "policy.sample.batch"
-        assert str(saved.graph.inputs[0].shape[1]) == "policy.sample.vocabulary"
+        assert str(saved.graph.inputs[0].shape[0]) == "batch"
+        assert str(saved.graph.inputs[0].shape[1]) == "vocabulary"
         assert str(sampler.model.graph.inputs[0].shape[0]) == "batch"
 
 

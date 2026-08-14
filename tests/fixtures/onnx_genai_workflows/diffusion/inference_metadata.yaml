@@ -108,10 +108,76 @@ pipeline:
         implementation:
           kind: onnx
           artifact: policies/euler_model_input.onnx
+        ports:
+          inputs:
+            sample:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+            step:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            schedule:
+              dtype: float32
+              rank: 1
+              shape:
+              - schedule_length
+          outputs:
+            model_input:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
       solver_step:
         implementation:
           kind: onnx
           artifact: policies/solver_step.onnx
+        ports:
+          inputs:
+            sample:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+            derivative:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+            step:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            schedule:
+              dtype: float32
+              rank: 1
+              shape:
+              - schedule_length
+          outputs:
+            next_state:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
         contract:
           id: onnx-genai.solver-step
           version: '1'
@@ -125,18 +191,65 @@ pipeline:
         implementation:
           kind: onnx
           artifact: policies/continue_predicate.onnx
+        ports:
+          inputs:
+            done:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+          outputs:
+            continue:
+              dtype: bool
+              rank: 1
+              shape:
+              - 1
       diffusion_schedule:
         implementation:
           kind: onnx
           artifact: policies/diffusion_schedule.onnx
+        ports:
+          inputs: {}
+          outputs:
+            schedule:
+              dtype: float32
+              rank: 1
+              shape:
+              - 31
       diffusion_timesteps:
         implementation:
           kind: onnx
           artifact: policies/diffusion_timesteps.onnx
+        ports:
+          inputs: {}
+          outputs:
+            schedule:
+              dtype: float32
+              rank: 1
+              shape:
+              - 30
       schedule_lookup:
         implementation:
           kind: onnx
           artifact: policies/schedule_lookup.onnx
+        ports:
+          inputs:
+            schedule:
+              dtype: float32
+              rank: 1
+              shape:
+              - schedule_length
+            step:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+          outputs:
+            timestep:
+              dtype: float32
+              rank: 1
+              shape:
+              - batch
     state:
       latent:
         contract:

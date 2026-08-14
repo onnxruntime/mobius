@@ -294,6 +294,65 @@ pipeline:
         implementation:
           kind: onnx
           artifact: policies/token_sampler.onnx
+        ports:
+          inputs:
+            logits:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - vocabulary
+            temperature:
+              dtype: float32
+              rank: 1
+              shape:
+              - batch
+            top_k:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            top_p:
+              dtype: float32
+              rank: 1
+              shape:
+              - batch
+            min_p:
+              dtype: float32
+              rank: 1
+              shape:
+              - batch
+            seed:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            counter:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            active:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+            done:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+          outputs:
+            token:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            next_counter:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
         contract:
           id: onnx-genai.token-sampler
           version: '2'
@@ -318,6 +377,55 @@ pipeline:
         implementation:
           kind: onnx
           artifact: policies/termination.onnx
+        ports:
+          inputs:
+            tokens:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            eos_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - num_eos
+            eos_lengths:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            iteration:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
+            max_iterations:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            active:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+          outputs:
+            done:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+            next_active:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+            continue:
+              dtype: bool
+              rank: 1
+              shape:
+              - 1
         contract:
           id: onnx-genai.termination-predicate
           version: '2'
@@ -338,6 +446,37 @@ pipeline:
         implementation:
           kind: onnx
           artifact: policies/token_state_update.onnx
+        ports:
+          inputs:
+            current:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+            update:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+            active:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+            done:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+          outputs:
+            next:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
         contract:
           id: onnx-genai.state-update
           version: '2'
@@ -354,30 +493,260 @@ pipeline:
         implementation:
           kind: onnx
           artifact: policies/last_token_logits.onnx
+        ports:
+          inputs:
+            logits:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - sequence
+              - vocabulary
+          outputs:
+            last_logits:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - vocabulary
       decoder_state_initializer:
         implementation:
           kind: onnx
           artifact: policies/decoder_state_initializer.onnx
+        ports:
+          inputs:
+            prompt_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - prompt_sequence
+            prompt_lengths:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            max_iterations:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
+          outputs:
+            attention_mask:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - capacity
+            position_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - sequence
+            body_attention_mask:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - capacity
+            body_position_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+            token_slot:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+            generated_lengths:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            cache_lengths:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            past_key_values.0.key:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - 2
+              - capacity
+              - 8
       decoder_step_update:
         implementation:
           kind: onnx
           artifact: policies/decoder_step_update.onnx
+        ports:
+          inputs:
+            attention_mask:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - context
+            logical_length:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            position_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+          outputs:
+            next_attention_mask:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - context
+            next_position_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
       cache_length_update:
         implementation:
           kind: onnx
           artifact: policies/cache_length_update.onnx
+        ports:
+          inputs:
+            left:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            right:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            active:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+            done:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+          outputs:
+            total:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
       termination_batch_initializer:
         implementation:
           kind: onnx
           artifact: policies/termination_batch_initializer.onnx
+        ports:
+          inputs:
+            input_eos_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - num_eos
+            input_eos_lengths:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            input_max_iterations:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            fallback_max_iterations:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
+            active:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+          outputs:
+            row_eos_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - num_eos
+            eos_lengths:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            max_iterations:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
       token_to_slot:
         implementation:
           kind: onnx
           artifact: policies/token_to_slot.onnx
+        ports:
+          inputs:
+            token:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+          outputs:
+            slot:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
       generated_length_update:
         implementation:
           kind: onnx
           artifact: policies/generated_length_update.onnx
+        ports:
+          inputs:
+            left:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            right:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            active:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+            done:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+          outputs:
+            total:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
     state:
       token:
         contract:

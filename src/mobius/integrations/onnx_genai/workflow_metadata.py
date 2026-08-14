@@ -3541,7 +3541,10 @@ def build_vlm_workflow_metadata(
             "condition": "loop.continue",
             "termination": "generation_eos",
             "max_iterations": "request.max_iterations",
-            "iteration": {"value": "loop.iteration", "contract": batch_int},
+            "iteration": {
+                "value": "loop.iteration",
+                "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+            },
             "carried": carried,
         },
     }

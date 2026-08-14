@@ -241,6 +241,16 @@ def test_seeded_decoder_sampler_uses_request_controls_and_direct_kv_carry():
         "active": "active",
         "done": "done",
     }
+    assert sampler["ports"]["inputs"]["logits"] == {
+        "dtype": "float32",
+        "rank": 2,
+        "shape": ["batch", "vocabulary"],
+    }
+    assert sampler["ports"]["outputs"]["token"] == {
+        "dtype": "int64",
+        "rank": 1,
+        "shape": ["batch"],
+    }
     sampler_step = next(
         step
         for step in workflow["steps"][0]["steps"]
@@ -288,6 +298,11 @@ def test_seeded_decoder_sampler_uses_request_controls_and_direct_kv_carry():
         "done",
         "next_active",
         "continue",
+    }
+    assert workflow["components"]["termination"]["ports"]["inputs"]["iteration"] == {
+        "dtype": "int64",
+        "rank": 1,
+        "shape": [1],
     }
     assert workflow["components"]["token_state_update"]["contract"] == {
         "id": "onnx-genai.state-update",
@@ -487,7 +502,11 @@ def test_dispatch_diffusion_auto_reads_scheduler_from_source(tmp_path):
     with open(arts["inference_metadata"]) as handle:
         meta = yaml.safe_load(handle)
     components = meta["pipeline"]["workflow"]["components"]
-    assert "ports" not in components["diffusion_schedule"]
+    assert components["diffusion_schedule"]["ports"]["outputs"]["schedule"] == {
+        "dtype": "float32",
+        "rank": 1,
+        "shape": [16],
+    }
     schedule = ir.load(out / "policies" / "diffusion_schedule.onnx")
     assert list(schedule.graph.outputs[0].shape) == [16]
 

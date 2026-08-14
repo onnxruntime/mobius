@@ -285,10 +285,40 @@ pipeline:
         implementation:
           kind: onnx
           artifact: policies/last_token_logits.onnx
+        ports:
+          inputs:
+            logits:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - sequence
+              - vocabulary
+          outputs:
+            last_logits:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - vocabulary
       setup_talker_sampler:
         implementation:
           kind: onnx
           artifact: policies/setup_talker_sampler.onnx
+        ports:
+          inputs:
+            logits:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - vocabulary
+          outputs:
+            token:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
         contract:
           id: onnx-genai.token-sampler
           version: '1'
@@ -302,6 +332,20 @@ pipeline:
         implementation:
           kind: onnx
           artifact: policies/setup_predictor_sampler.onnx
+        ports:
+          inputs:
+            logits:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - vocabulary
+          outputs:
+            token:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
         contract:
           id: onnx-genai.token-sampler
           version: '1'
@@ -315,6 +359,20 @@ pipeline:
         implementation:
           kind: onnx
           artifact: policies/talker_sampler.onnx
+        ports:
+          inputs:
+            logits:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - vocabulary
+          outputs:
+            token:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
         contract:
           id: onnx-genai.token-sampler
           version: '1'
@@ -328,6 +386,20 @@ pipeline:
         implementation:
           kind: onnx
           artifact: policies/predictor_prefill_sampler.onnx
+        ports:
+          inputs:
+            logits:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - vocabulary
+          outputs:
+            token:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
         contract:
           id: onnx-genai.token-sampler
           version: '1'
@@ -341,6 +413,20 @@ pipeline:
         implementation:
           kind: onnx
           artifact: policies/predictor_body_sampler.onnx
+        ports:
+          inputs:
+            logits:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - vocabulary
+          outputs:
+            token:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
         contract:
           id: onnx-genai.token-sampler
           version: '1'
@@ -354,46 +440,405 @@ pipeline:
         implementation:
           kind: onnx
           artifact: policies/continue_predicate.onnx
+        ports:
+          inputs:
+            done:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+          outputs:
+            continue:
+              dtype: bool
+              rank: 1
+              shape:
+              - 1
       tts_state_initializer:
         implementation:
           kind: onnx
           artifact: policies/tts_state_initializer.onnx
+        ports:
+          inputs:
+            prompt_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - sequence
+          outputs:
+            frame_codes:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 4
+            token_slot:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+            code_history:
+              dtype: int64
+              rank: 3
+              shape:
+              - batch
+              - 0
+              - 4
       token_to_slot:
         implementation:
           kind: onnx
           artifact: policies/token_to_slot.onnx
+        ports:
+          inputs:
+            token:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+          outputs:
+            slot:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
       code_frame_update:
         implementation:
           kind: onnx
           artifact: policies/code_frame_update.onnx
+        ports:
+          inputs:
+            frame_codes:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 4
+            token:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            index:
+              dtype: int64
+              rank: 0
+              shape: []
+          outputs:
+            next_frame:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 4
       code_history_append:
         implementation:
           kind: onnx
           artifact: policies/code_history_append.onnx
+        ports:
+          inputs:
+            history:
+              dtype: int64
+              rank: 3
+              shape:
+              - batch
+              - frames
+              - 4
+            frame:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 4
+          outputs:
+            next_history:
+              dtype: int64
+              rank: 3
+              shape:
+              - batch
+              - frames + 1
+              - 4
       cache_length_update:
         implementation:
           kind: onnx
           artifact: policies/cache_length_update.onnx
+        ports:
+          inputs:
+            left:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            right:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+          outputs:
+            total:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
       talker_state_initializer:
         implementation:
           kind: onnx
           artifact: policies/talker_state_initializer.onnx
+        ports:
+          inputs:
+            prefill_embeds:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - prefill_sequence
+              - 8
+          outputs:
+            attention_mask:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - past_seq_len + seq_len
+            position_ids:
+              dtype: int64
+              rank: 3
+              shape:
+              - 3
+              - batch
+              - sequence_len
+            body_attention_mask:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - prefill_sequence + 1
+            body_position_ids:
+              dtype: int64
+              rank: 3
+              shape:
+              - 3
+              - batch
+              - 1
+            past_key_values.0.key:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - 1
+              - past_sequence_len
+              - 4
+            past_key_values.0.value:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - 1
+              - past_sequence_len
+              - 4
       predictor_state_initializer:
         implementation:
           kind: onnx
           artifact: policies/predictor_state_initializer.onnx
+        ports:
+          inputs:
+            prefill_embeds:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - prefill_sequence
+              - 8
+          outputs:
+            attention_mask:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - past_seq_len + seq_len
+            position_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - sequence_len
+            body_attention_mask:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - prefill_sequence + 1
+            body_position_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+            past_key_values.0.key:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - 8
+              - past_sequence_len
+              - 128
+            past_key_values.0.value:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - 8
+              - past_sequence_len
+              - 128
+            past_key_values.1.key:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - 8
+              - past_sequence_len
+              - 128
+            past_key_values.1.value:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - 8
+              - past_sequence_len
+              - 128
+            past_key_values.2.key:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - 8
+              - past_sequence_len
+              - 128
+            past_key_values.2.value:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - 8
+              - past_sequence_len
+              - 128
+            past_key_values.3.key:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - 8
+              - past_sequence_len
+              - 128
+            past_key_values.3.value:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - 8
+              - past_sequence_len
+              - 128
+            past_key_values.4.key:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - 8
+              - past_sequence_len
+              - 128
+            past_key_values.4.value:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - 8
+              - past_sequence_len
+              - 128
       talker_step_update:
         implementation:
           kind: onnx
           artifact: policies/talker_step_update.onnx
+        ports:
+          inputs:
+            attention_mask:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - context
+            position_ids:
+              dtype: int64
+              rank: 3
+              shape:
+              - 3
+              - batch
+              - 1
+          outputs:
+            next_attention_mask:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - context + 1
+            next_position_ids:
+              dtype: int64
+              rank: 3
+              shape:
+              - 3
+              - batch
+              - 1
       predictor_step_update:
         implementation:
           kind: onnx
           artifact: policies/predictor_step_update.onnx
+        ports:
+          inputs:
+            attention_mask:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - context
+            position_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+          outputs:
+            next_attention_mask:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - context + 1
+            next_position_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
       codec_layout:
         implementation:
           kind: onnx
           artifact: policies/codec_layout.onnx
+        ports:
+          inputs:
+            history:
+              dtype: int64
+              rank: 3
+              shape:
+              - batch
+              - frames
+              - 4
+          outputs:
+            codes:
+              dtype: int64
+              rank: 3
+              shape:
+              - batch
+              - 4
+              - frames
     state:
       last_frame:
         contract:

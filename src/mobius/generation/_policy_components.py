@@ -135,6 +135,11 @@ def _make_graph(name: str) -> tuple[ir.Graph, GraphBuilder]:
     return graph, GraphBuilder(graph)
 
 
+def _set_public_shape(value: ir.Value, shape: list[str | int]) -> None:
+    """Set ABI dimensions without GraphBuilder's graph-name qualification."""
+    value.shape = ir.Shape(shape)
+
+
 def build_greedy_sampler(
     *,
     effect: str = "sample",
@@ -1332,6 +1337,11 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
         op.Add(counter, op.Constant(value_int=1)),
         counter,
     )
+    _set_public_shape(logits, ["batch", "vocabulary"])
+    for value in (temperature, top_k, top_p, min_p, seed, counter, active, done):
+        _set_public_shape(value, ["batch"])
+    _set_public_shape(token_ids, ["batch"])
+    _set_public_shape(next_counter, ["batch"])
     builder.add_output(token_ids, "token")
     builder.add_output(next_counter, "next_counter")
     return _component(
@@ -1419,7 +1429,17 @@ def build_eos_termination(*, row_selective: bool = False) -> PolicyComponent:
         op.ReduceMax(op.Cast(next_active, to=ir.DataType.INT64), keepdims=1),
         op.Constant(value_int=0),
     )
-    continued.shape = ir.Shape([1])
+    if row_selective:
+        assert eos_lengths is not None
+        _set_public_shape(token_ids, ["batch"])
+        _set_public_shape(eos_ids, ["batch", "num_eos"])
+        _set_public_shape(eos_lengths, ["batch"])
+        _set_public_shape(iteration, [1])
+        _set_public_shape(max_iterations, ["batch"])
+        _set_public_shape(active, ["batch"])
+        _set_public_shape(done, ["batch"])
+        _set_public_shape(next_active, ["batch"])
+    _set_public_shape(continued, [1])
     builder.add_output(done, "done")
     if row_selective:
         builder.add_output(next_active, "next_active")
@@ -1804,7 +1824,12 @@ def build_token_state_update(*, row_selective: bool = False) -> PolicyComponent:
         )
     else:
         next_state = op.Unsqueeze(update, [-1])
-    next_state.shape = ir.Shape(["batch", 1])
+    if row_selective:
+        _set_public_shape(current, ["batch", 1])
+        _set_public_shape(update, ["batch", 1])
+        _set_public_shape(active, ["batch"])
+        _set_public_shape(done, ["batch"])
+    _set_public_shape(next_state, ["batch", 1])
     builder.add_output(next_state, "next")
     return _component(
         "onnx-genai.state-update@2" if row_selective else "onnx-genai.state-update@1",

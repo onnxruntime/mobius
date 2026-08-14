@@ -150,7 +150,22 @@ def test_workflow_policy_components_reference_saved_onnx_artifacts(tmp_path):
         "kind": "onnx",
         "artifact": "policies/sample.onnx",
     }
-    assert "ports" not in component
+    assert component["ports"] == {
+        "inputs": {
+            "logits": {
+                "dtype": "float32",
+                "rank": 2,
+                "shape": ["batch", "vocabulary"],
+            }
+        },
+        "outputs": {
+            "token": {
+                "dtype": "int64",
+                "rank": 1,
+                "shape": ["batch"],
+            }
+        },
+    }
     assert component["contract"] == {
         "id": "onnx-genai.token-sampler",
         "version": "1",

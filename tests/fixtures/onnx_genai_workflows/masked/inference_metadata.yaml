@@ -124,6 +124,81 @@ pipeline:
         implementation:
           kind: onnx
           artifact: policies/masked_update.onnx
+        ports:
+          inputs:
+            current_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - sequence
+            proposed_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - sequence
+            logits:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - sequence
+              - vocabulary
+            masked:
+              dtype: bool
+              rank: 2
+              shape:
+              - batch
+              - sequence
+            step:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            total_steps:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            seed:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            offset:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+          outputs:
+            next_state:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - sequence
+            next_mask:
+              dtype: bool
+              rank: 2
+              shape:
+              - batch
+              - sequence
+            next_offset:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+            done:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+            continue:
+              dtype: bool
+              rank: 1
+              shape:
+              - 1
         contract:
           id: onnx-genai.masked-update
           version: '1'

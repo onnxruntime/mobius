@@ -256,6 +256,11 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     }
     assert workflow["inputs"]["request.prompt_lengths"]["contract"]["shape"] == ["batch"]
     assert workflow["inputs"]["request.max_iterations"]["contract"]["shape"] == [1]
+    assert workflow["steps"][0]["iteration"]["contract"] == {
+        "dtype": "int64",
+        "rank": 1,
+        "shape": [1],
+    }
     assert workflow["inputs"]["package.one"]["contract"]["shape"] == ["batch"]
     assert workflow["state"]["generated_lengths"]["initializer"] == (
         "initializer.generated_lengths"
@@ -485,9 +490,9 @@ def test_speculative_grammar_and_adaptive_k_use_typed_state_contracts():
     assert workflow["state"]["proposal_k"]["class"] == "advisory"
     assert workflow["state"]["adaptive_estimates"]["class"] == "advisory"
     assert all(
-        "ports" not in component and "effects" not in component
+        "ports" in component and "effects" not in component
         for component in workflow["components"].values()
-        if component["implementation"]["kind"] == "onnx"
+        if component["implementation"]["kind"] == "onnx" and "contract" in component
     )
     assert "ports" in workflow["components"]["grammar_commit"]
     proposer = next(

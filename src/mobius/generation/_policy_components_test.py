@@ -512,6 +512,52 @@ def test_seeded_sampler_is_counter_based_and_reproducible(tmp_path):
     np.testing.assert_array_equal(first[1], [12])
 
 
+def test_batched_policy_v2_ports_use_exact_public_shapes():
+    components = {
+        "sampler": build_seeded_categorical_sampler(),
+        "termination": build_eos_termination(row_selective=True),
+        "state": build_token_state_update(row_selective=True),
+    }
+    expected = {
+        "sampler": {
+            "logits": ["batch", "vocabulary"],
+            "temperature": ["batch"],
+            "top_k": ["batch"],
+            "top_p": ["batch"],
+            "min_p": ["batch"],
+            "seed": ["batch"],
+            "counter": ["batch"],
+            "active": ["batch"],
+            "done": ["batch"],
+            "token": ["batch"],
+            "next_counter": ["batch"],
+        },
+        "termination": {
+            "tokens": ["batch"],
+            "eos_ids": ["batch", "num_eos"],
+            "eos_lengths": ["batch"],
+            "iteration": ["1"],
+            "max_iterations": ["batch"],
+            "active": ["batch"],
+            "done": ["batch"],
+            "next_active": ["batch"],
+            "continue": ["1"],
+        },
+        "state": {
+            "current": ["batch", "1"],
+            "update": ["batch", "1"],
+            "active": ["batch"],
+            "done": ["batch"],
+            "next": ["batch", "1"],
+        },
+    }
+    for name, component in components.items():
+        ports = [*component.model.graph.inputs, *component.model.graph.outputs]
+        assert {port.name: [str(dim) for dim in port.shape] for port in ports} == expected[
+            name
+        ]
+
+
 def test_seeded_sampler_applies_request_top_k(tmp_path):
     (token, _) = _run(
         build_seeded_categorical_sampler(),
