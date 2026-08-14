@@ -158,7 +158,7 @@ class TestMoELayer:
         qmoe = qmoe_nodes[0]
         assert qmoe.attributes["k"].value == 6
         assert qmoe.attributes["block_size"].value == 32
-        assert qmoe.attributes["swiglu_fusion"].value == 2
+        assert qmoe.attributes["swiglu_fusion"].value == 1
         assert qmoe.attributes["expert_weight_bits"].value == 4
         assert qmoe.attributes["quant_type"].value == "int"
         assert qmoe.attributes["weights_prepacked"].value == 0
@@ -210,7 +210,7 @@ class TestMoELayer:
         qmoe = qmoe_nodes[0]
         assert qmoe.attributes["k"].value == 6
         assert qmoe.attributes["block_size"].value == 32
-        assert qmoe.attributes["swiglu_fusion"].value == 2
+        assert qmoe.attributes["swiglu_fusion"].value == 1
         assert qmoe.attributes["quant_type"].value == "int"
         assert qmoe.attributes["weights_prepacked"].value == 0
         assert layer.fc1_experts_weights.shape == ir.Shape([64, 64, 32])
