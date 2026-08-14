@@ -173,11 +173,19 @@ def test_dispatch_decoder(tmp_path):
         for name, value in workflow["inputs"].items()
         if value["source"]["kind"] == "application"
     }
-    assert application_inputs == {"request.prompt_lengths"}
+    assert application_inputs == {
+        "request.prompt_lengths",
+        "request.eos_ids",
+        "request.eos_lengths",
+        "request.row_max_iterations",
+        "request.grammar_mask",
+        "request.rng_offset",
+    }
     assert workflow["inputs"]["request.prompt_lengths"]["default"] == -1
     assert [node["component"] for node in workflow["steps"][0]["setup"]] == [
         "decoder_state_initializer",
         "model",
+        "termination_batch_initializer",
         "last_token_logits",
     ]
     body = workflow["steps"][0]["steps"]
@@ -214,6 +222,12 @@ def test_seeded_decoder_sampler_uses_request_controls_and_direct_kv_carry():
     )["pipeline"]["workflow"]
     sampler = workflow["components"]["token_sampler"]
     assert sampler["application_overridable"] is True
+    assert sampler["contract"]["version"] == "2"
+    assert sampler["contract"]["parameters"] == {
+        "mode": "seeded_stochastic",
+        "batching": "per_row",
+        "inactive_rows": "preserve",
+    }
     assert sampler["contract"]["bindings"] == {
         "logits": "logits",
         "token": "token",
@@ -249,8 +263,18 @@ def test_seeded_decoder_sampler_uses_request_controls_and_direct_kv_carry():
         assert workflow["inputs"][f"request.{name}"]["contract"]["shape"] == ["batch"]
     assert workflow["inputs"]["request.prompt_lengths"]["contract"]["shape"] == ["batch"]
     assert workflow["inputs"]["request.max_iterations"]["contract"]["shape"] == [1]
+    assert workflow["inputs"]["request.eos_ids"]["contract"]["shape"] == [
+        "batch",
+        "num_eos",
+    ]
     assert workflow["state"]["rng_offset"]["class"] == "semantic"
     assert workflow["state"]["rng_offset"]["initializer"] == "request.rng_offset"
+    assert workflow["components"]["termination"]["contract"]["version"] == "2"
+    assert workflow["components"]["termination"]["contract"]["parameters"] == {
+        "batching": "per_row",
+        "inactive_rows": "preserve",
+    }
+    assert workflow["components"]["token_state_update"]["contract"]["version"] == "2"
     assert not any("kv_update" in name for name in workflow["components"])
 
 
@@ -451,7 +475,7 @@ def test_dispatch_vision_multimodal_pipeline(tmp_path):
     assert workflow["manifest"]["adapter_abis"] == {"onnx-genai.image-preprocess": "1"}
     assert workflow["steps"][0]["setup"][0]["component"] == "image_preprocess"
     assert workflow["steps"][0]["setup"][1]["component"] == "vision_encoder"
-    assert workflow["steps"][0]["setup"][3]["component"] == "embedding"
+    assert workflow["steps"][0]["setup"][4]["component"] == "embedding"
     assert workflow["steps"][0]["iteration"]["value"] == "loop.iteration"
     assert workflow["state"]["logits"]["contract"] == {
         "dtype": "float32",

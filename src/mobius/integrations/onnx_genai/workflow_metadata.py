@@ -27,17 +27,19 @@ from mobius.generation import (
     build_euler_solver_step,
     build_greedy_sampler,
     build_integer_add,
-    build_selective_integer_add,
     build_integer_minimum,
+    build_integer_row_broadcast,
     build_last_token_logits,
     build_model_token_cast,
     build_proposal_metrics,
     build_schedule_constant,
     build_schedule_lookup,
     build_seeded_categorical_sampler,
+    build_selective_integer_add,
     build_sequence_length,
-    build_token_to_slot,
+    build_termination_batch_initializer,
     build_token_state_update,
+    build_token_to_slot,
     build_tts_decoder_state_initializer,
     build_tts_decoder_step_update,
     build_tts_state_initializer,
@@ -2688,8 +2690,13 @@ def build_vlm_workflow_metadata(
             fixed_capacity=fixed_capacity,
         ),
     )
-    pkg.add_policy_component("token_sampler", build_greedy_sampler(row_selective=True))
+    pkg.add_policy_component("token_sampler", build_seeded_categorical_sampler())
     pkg.add_policy_component("termination", build_eos_termination(row_selective=True))
+    pkg.add_policy_component(
+        "termination_batch_initializer",
+        build_termination_batch_initializer(),
+    )
+    pkg.add_policy_component("iteration_broadcast", build_integer_row_broadcast())
     pkg.add_policy_component(
         "token_state_update",
         build_token_state_update(row_selective=True),
@@ -2732,6 +2739,27 @@ def build_vlm_workflow_metadata(
             "contract": batch_int,
             "role": {"kind": "opaque"},
             "source": {"kind": "application", "name": "prompt_lengths"},
+            "required": False,
+            "default": -1,
+        },
+        "request.eos_ids": {
+            "contract": {"dtype": "int64", "rank": 2, "shape": [batch, "num_eos"]},
+            "role": {"kind": "opaque"},
+            "source": {"kind": "application", "name": "eos_ids"},
+            "required": False,
+            "default": eos,
+        },
+        "request.eos_lengths": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "application", "name": "eos_lengths"},
+            "required": False,
+            "default": 1,
+        },
+        "request.row_max_iterations": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "application", "name": "row_max_iterations"},
             "required": False,
             "default": -1,
         },
@@ -2791,6 +2819,79 @@ def build_vlm_workflow_metadata(
             "default": 0,
         },
     }
+    inputs.update(
+        {
+            "request.temperature": {
+                "contract": {"dtype": "float32", "rank": 1, "shape": [batch]},
+                "role": {
+                    "kind": "runtime",
+                    "version": "1.0",
+                    "role": "sampling_temperature",
+                },
+                "source": {"kind": "request", "field": "sampling_temperature"},
+                "required": False,
+                "default": 1.0,
+            },
+            "request.top_k": {
+                "contract": batch_int,
+                "role": {
+                    "kind": "runtime",
+                    "version": "1.0",
+                    "role": "sampling_top_k",
+                },
+                "source": {"kind": "request", "field": "sampling_top_k"},
+                "required": False,
+                "default": 1,
+            },
+            "request.top_p": {
+                "contract": {"dtype": "float32", "rank": 1, "shape": [batch]},
+                "role": {
+                    "kind": "runtime",
+                    "version": "1.0",
+                    "role": "sampling_top_p",
+                },
+                "source": {"kind": "request", "field": "sampling_top_p"},
+                "required": False,
+                "default": 1.0,
+            },
+            "request.min_p": {
+                "contract": {"dtype": "float32", "rank": 1, "shape": [batch]},
+                "role": {
+                    "kind": "runtime",
+                    "version": "1.0",
+                    "role": "sampling_min_p",
+                },
+                "source": {"kind": "request", "field": "sampling_min_p"},
+                "required": False,
+                "default": 0.0,
+            },
+            "request.seed": {
+                "contract": batch_int,
+                "role": {"kind": "runtime", "version": "1.0", "role": "seed"},
+                "source": {"kind": "request", "field": "seed"},
+                "required": False,
+                "default": 0,
+            },
+            "request.grammar_mask": {
+                "contract": {
+                    "dtype": "bool",
+                    "rank": 2,
+                    "shape": [batch, _contract(logits_output)["shape"][-1]],
+                },
+                "role": {"kind": "opaque"},
+                "source": {"kind": "application", "name": "grammar_mask"},
+                "required": False,
+                "default": True,
+            },
+            "request.rng_offset": {
+                "contract": batch_int,
+                "role": {"kind": "opaque"},
+                "source": {"kind": "application", "name": "rng_offset"},
+                "required": False,
+                "default": 0,
+            },
+        }
+    )
     vision_invoke_inputs = {
         name: preprocessing_values[name]
         for name in vision_inputs
@@ -2941,6 +3042,13 @@ def build_vlm_workflow_metadata(
             ),
             "recurrence": {"kind": "invariant"},
         },
+        "rng_offset": {
+            "contract": batch_int,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": "request.rng_offset",
+            "recurrence": {"kind": "invariant"},
+        },
     }
     state_specs = [
         (
@@ -2974,6 +3082,13 @@ def build_vlm_workflow_metadata(
             "state.generated_lengths.body",
             "token.next_lengths",
             "state.generated_lengths.final",
+        ),
+        (
+            "rng_offset",
+            "request.rng_offset",
+            "state.rng_offset.body",
+            "sample.next_offset",
+            "state.rng_offset.final",
         ),
         (
             "active",
@@ -3163,6 +3278,21 @@ def build_vlm_workflow_metadata(
                 },
             ),
             _invoke(
+                "termination_batch_initializer",
+                {
+                    "input_eos_ids": "request.eos_ids",
+                    "input_eos_lengths": "request.eos_lengths",
+                    "input_max_iterations": "request.row_max_iterations",
+                    "fallback_max_iterations": "request.max_iterations",
+                    "active": "package.active",
+                },
+                {
+                    "row_eos_ids": "termination.eos_ids",
+                    "eos_lengths": "termination.eos_lengths",
+                    "max_iterations": "termination.max_iterations",
+                },
+            ),
+            _invoke(
                 "embedding",
                 embedding_setup_inputs,
                 {embedding_output.name: "embedding.setup.embeds"},
@@ -3199,22 +3329,35 @@ def build_vlm_workflow_metadata(
         "kind": "sequence",
         "nodes": [
             _invoke(
+                "iteration_broadcast",
+                {"value": "loop.iteration", "active": "state.active.body"},
+                {"rows": "loop.iteration_rows"},
+            ),
+            _invoke(
                 "token_sampler",
                 {
                     "logits": "state.logits.body",
+                    "temperature": "request.temperature",
+                    "top_k": "request.top_k",
+                    "top_p": "request.top_p",
+                    "min_p": "request.min_p",
+                    "grammar_mask": "request.grammar_mask",
+                    "seed": "request.seed",
+                    "offset": "state.rng_offset.body",
                     "active": "state.active.body",
                     "done": "state.done.body",
                 },
-                {"token": "sample.body"},
+                {"token": "sample.body", "next_offset": "sample.next_offset"},
                 {"sample": _effect("sample.0", "sample.1")},
             ),
             _invoke(
                 "termination",
                 {
                     "token_ids": "sample.body",
-                    "eos_ids": "package.eos_ids",
-                    "iteration": "loop.iteration",
-                    "max_iterations": "request.max_iterations",
+                    "eos_ids": "termination.eos_ids",
+                    "eos_lengths": "termination.eos_lengths",
+                    "iteration": "loop.iteration_rows",
+                    "max_iterations": "termination.max_iterations",
                     "active": "state.active.body",
                     "previous_done": "state.done.body",
                 },
@@ -4443,15 +4586,48 @@ def build_decoder_workflow_metadata(
         }
     )
     if cache_pairs:
-        workflow_inputs["request.prompt_lengths"] = {
-            "contract": batch_int,
-            "role": {"kind": "opaque"},
-            "source": {"kind": "application", "name": "prompt_lengths"},
-            "required": False,
-            "default": -1,
-        }
+        workflow_inputs.update(
+            {
+                "request.prompt_lengths": {
+                    "contract": batch_int,
+                    "role": {"kind": "opaque"},
+                    "source": {"kind": "application", "name": "prompt_lengths"},
+                    "required": False,
+                    "default": -1,
+                },
+                "request.eos_ids": {
+                    "contract": {
+                        "dtype": "int64",
+                        "rank": 2,
+                        "shape": [batch_dimension, "num_eos"],
+                    },
+                    "role": {"kind": "opaque"},
+                    "source": {"kind": "application", "name": "eos_ids"},
+                    "required": False,
+                    "default": eos_token_id,
+                },
+                "request.eos_lengths": {
+                    "contract": batch_int,
+                    "role": {"kind": "opaque"},
+                    "source": {"kind": "application", "name": "eos_lengths"},
+                    "required": False,
+                    "default": 1,
+                },
+                "request.row_max_iterations": {
+                    "contract": batch_int,
+                    "role": {"kind": "opaque"},
+                    "source": {
+                        "kind": "application",
+                        "name": "row_max_iterations",
+                    },
+                    "required": False,
+                    "default": -1,
+                },
+            }
+        )
     stochastic_sampler = sampler != "greedy"
-    if stochastic_sampler:
+    sampler_with_rng = stochastic_sampler or bool(cache_pairs)
+    if sampler_with_rng:
         workflow_inputs.update(
             {
                 "request.temperature": {
@@ -4481,7 +4657,7 @@ def build_decoder_workflow_metadata(
                     },
                     "source": {"kind": "request", "field": "sampling_top_k"},
                     "required": False,
-                    "default": 0,
+                    "default": 0 if stochastic_sampler else 1,
                 },
                 "request.top_p": {
                     "contract": {
@@ -4524,7 +4700,8 @@ def build_decoder_workflow_metadata(
                         "role": "seed",
                     },
                     "source": {"kind": "request", "field": "seed"},
-                    "required": True,
+                    "required": False,
+                    "default": 0,
                 },
                 "request.grammar_mask": {
                     "contract": {
@@ -4537,7 +4714,8 @@ def build_decoder_workflow_metadata(
                     },
                     "role": {"kind": "opaque"},
                     "source": {"kind": "application", "name": "grammar_mask"},
-                    "required": True,
+                    "required": False,
+                    "default": True,
                 },
                 "request.rng_offset": {
                     "contract": batch_int,
@@ -4552,13 +4730,14 @@ def build_decoder_workflow_metadata(
         pkg.add_policy_component("cache_length_update", build_selective_integer_add())
         pkg.add_policy_component(
             "token_sampler",
-            (
-                build_greedy_sampler(row_selective=True)
-                if not stochastic_sampler
-                else build_seeded_categorical_sampler()
-            ),
+            build_seeded_categorical_sampler(),
         )
         pkg.add_policy_component("termination", build_eos_termination(row_selective=True))
+        pkg.add_policy_component(
+            "termination_batch_initializer",
+            build_termination_batch_initializer(),
+        )
+        pkg.add_policy_component("iteration_broadcast", build_integer_row_broadcast())
         pkg.add_policy_component(
             "token_state_update",
             build_token_state_update(row_selective=True),
@@ -4780,7 +4959,7 @@ def build_decoder_workflow_metadata(
                 },
             ]
         )
-    if stochastic_sampler:
+    if sampler_with_rng:
         state["rng_offset"] = {
             "contract": batch_int,
             "scope": "invocation",
@@ -4936,6 +5115,27 @@ def build_decoder_workflow_metadata(
                 },
             ),
             _invoke(decoder_name, setup_decoder_inputs, setup_decoder_outputs),
+            *(
+                [
+                    _invoke(
+                        "termination_batch_initializer",
+                        {
+                            "input_eos_ids": "request.eos_ids",
+                            "input_eos_lengths": "request.eos_lengths",
+                            "input_max_iterations": "request.row_max_iterations",
+                            "fallback_max_iterations": "request.max_iterations",
+                            "active": "package.active",
+                        },
+                        {
+                            "row_eos_ids": "termination.eos_ids",
+                            "eos_lengths": "termination.eos_lengths",
+                            "max_iterations": "termination.max_iterations",
+                        },
+                    )
+                ]
+                if cache_pairs
+                else []
+            ),
             _invoke(
                 "last_token_logits",
                 {"logits": "decoder.setup.logits"},
@@ -4966,6 +5166,17 @@ def build_decoder_workflow_metadata(
     body = {
         "kind": "sequence",
         "nodes": [
+            *(
+                [
+                    _invoke(
+                        "iteration_broadcast",
+                        {"value": "loop.iteration", "active": "state.active.body"},
+                        {"rows": "loop.iteration_rows"},
+                    )
+                ]
+                if cache_pairs
+                else []
+            ),
             _invoke(
                 "token_sampler",
                 {
@@ -4980,7 +5191,7 @@ def build_decoder_workflow_metadata(
                             "seed": "request.seed",
                             "offset": "state.rng_offset.body",
                         }
-                        if stochastic_sampler
+                        if sampler_with_rng
                         else {}
                     ),
                     **(
@@ -4994,7 +5205,7 @@ def build_decoder_workflow_metadata(
                 },
                 {
                     "token": "sample.body",
-                    **({"next_offset": "sample.next_offset"} if stochastic_sampler else {}),
+                    **({"next_offset": "sample.next_offset"} if sampler_with_rng else {}),
                 },
                 {"sample": _effect("sample.0", "sample.1")},
             ),
@@ -5041,9 +5252,14 @@ def build_decoder_workflow_metadata(
                 "termination",
                 {
                     "token_ids": "sample.body",
-                    "eos_ids": "package.eos_ids",
-                    "iteration": "loop.iteration",
-                    "max_iterations": "request.max_iterations",
+                    "eos_ids": ("termination.eos_ids" if cache_pairs else "package.eos_ids"),
+                    **({"eos_lengths": "termination.eos_lengths"} if cache_pairs else {}),
+                    "iteration": ("loop.iteration_rows" if cache_pairs else "loop.iteration"),
+                    "max_iterations": (
+                        "termination.max_iterations"
+                        if cache_pairs
+                        else "request.max_iterations"
+                    ),
                     **(
                         {
                             "active": "state.active.body",

@@ -24,6 +24,7 @@ from mobius.generation import (
     build_grammar_logits_processor,
     build_greedy_sampler,
     build_integer_minimum,
+    build_integer_row_broadcast,
     build_last_token_logits,
     build_masked_token_update,
     build_model_token_cast,
@@ -31,6 +32,7 @@ from mobius.generation import (
     build_seeded_categorical_sampler,
     build_speculative_acceptance,
     build_speculative_state_rollback,
+    build_termination_batch_initializer,
     build_token_state_update,
 )
 from mobius.generation._policy_components import _make_graph
@@ -633,9 +635,10 @@ def test_row_selective_state_and_termination_preserve_inactive_rows(tmp_path):
         tmp_path,
         {
             "token_ids": np.array([2, 8, 9], np.int64),
-            "eos_ids": np.array([2, 9], np.int64),
-            "iteration": np.array([0], np.int64),
-            "max_iterations": np.array([5], np.int64),
+            "eos_ids": np.array([[2, 9], [2, 9], [2, 9]], np.int64),
+            "eos_lengths": np.array([2, 1, 2], np.int64),
+            "iteration": np.array([0, 0, 0], np.int64),
+            "max_iterations": np.array([5, 5, 5], np.int64),
             "active": np.array([True, False, True], np.bool_),
             "previous_done": np.array([False, False, True], np.bool_),
         },
@@ -643,6 +646,60 @@ def test_row_selective_state_and_termination_preserve_inactive_rows(tmp_path):
     np.testing.assert_array_equal(done, [True, False, True])
     np.testing.assert_array_equal(next_active, [False, False, False])
     np.testing.assert_array_equal(continued, [False])
+
+
+def test_row_selective_termination_heterogeneous_batch_matches_independent_rows(
+    tmp_path,
+):
+    component = build_eos_termination(row_selective=True)
+    feeds = {
+        "token_ids": np.array([2, 9, 5, 7], np.int64),
+        "eos_ids": np.array([[2, 99], [8, 9], [5, 6], [1, 2]], np.int64),
+        "eos_lengths": np.array([1, 1, 2, 2], np.int64),
+        "iteration": np.array([0, 1, 4, 2], np.int64),
+        "max_iterations": np.array([5, 5, 10, 3], np.int64),
+        "active": np.array([True, True, True, True], np.bool_),
+        "previous_done": np.array([False, False, False, False], np.bool_),
+    }
+    done, next_active, continued = _run(component, tmp_path, feeds)
+    np.testing.assert_array_equal(done, [True, False, True, True])
+    np.testing.assert_array_equal(next_active, [False, True, False, False])
+    np.testing.assert_array_equal(continued, [True])
+    for row in range(4):
+        row_outputs = _run(
+            component,
+            tmp_path,
+            {name: value[row : row + 1] for name, value in feeds.items()},
+        )
+        np.testing.assert_array_equal(done[row : row + 1], row_outputs[0])
+        np.testing.assert_array_equal(next_active[row : row + 1], row_outputs[1])
+
+
+def test_termination_batch_controls_initialize_dynamic_rows(tmp_path):
+    eos_ids, eos_lengths, max_iterations = _run(
+        build_termination_batch_initializer(),
+        tmp_path,
+        {
+            "input_eos_ids": np.array([[2, 3], [7, -1]], np.int64),
+            "input_eos_lengths": np.array([2, 1], np.int64),
+            "input_max_iterations": np.array([4, -1], np.int64),
+            "fallback_max_iterations": np.array([8], np.int64),
+            "active": np.array([True, False], np.bool_),
+        },
+    )
+    np.testing.assert_array_equal(eos_ids, [[2, 3], [7, -1]])
+    np.testing.assert_array_equal(eos_lengths, [2, 1])
+    np.testing.assert_array_equal(max_iterations, [4, 8])
+
+    (iteration_rows,) = _run(
+        build_integer_row_broadcast(),
+        tmp_path,
+        {
+            "value": np.array([3], np.int64),
+            "active": np.array([True, False], np.bool_),
+        },
+    )
+    np.testing.assert_array_equal(iteration_rows, [3, 3])
 
 
 def test_eos_termination_runtime(tmp_path):

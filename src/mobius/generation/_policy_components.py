@@ -158,11 +158,12 @@ def build_greedy_sampler(
         token_ids = sampled
     builder.add_output(token_ids, "token")
     return _component(
-        "onnx-genai.token-sampler@1",
+        "onnx-genai.token-sampler@2" if row_selective else "onnx-genai.token-sampler@1",
         graph,
         {
             "role": "token_sampler",
             "mode": "greedy",
+            **({"batching": "per_row", "inactive_rows": "preserve"} if row_selective else {}),
             "logits": "logits",
             **({"active": "active", "done": "done"} if row_selective else {}),
             "token": "token",
@@ -238,6 +239,45 @@ def build_selective_integer_add() -> PolicyComponent:
     total = op.Where(enabled, op.Add(left, right), left)
     total.shape = ir.Shape(["batch"])
     builder.add_output(total, "total")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_integer_row_broadcast() -> PolicyComponent:
+    """Broadcast one scalar loop control to the current dynamic batch."""
+    graph, builder = _make_graph("integer_row_broadcast")
+    op = builder.op
+    value = builder.input("value", ir.DataType.INT64, [1])
+    active = builder.input("active", ir.DataType.BOOL, ["batch"])
+    rows = op.Shape(active)
+    result = op.Expand(value, rows)
+    result.shape = ir.Shape(["batch"])
+    builder.add_output(result, "rows")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_termination_batch_initializer() -> PolicyComponent:
+    """Normalize explicit ragged EOS sets and per-row generation limits."""
+    graph, builder = _make_graph("termination_batch_initializer")
+    op = builder.op
+    eos_ids = builder.input("input_eos_ids", ir.DataType.INT64, ["batch", "num_eos"])
+    eos_lengths = builder.input("input_eos_lengths", ir.DataType.INT64, ["batch"])
+    max_iterations = builder.input("input_max_iterations", ir.DataType.INT64, ["batch"])
+    fallback_max_iterations = builder.input("fallback_max_iterations", ir.DataType.INT64, [1])
+    active = builder.input("active", ir.DataType.BOOL, ["batch"])
+    batch_shape = op.Shape(active)
+    row_max_iterations = op.Where(
+        op.Greater(max_iterations, op.Constant(value_int=0)),
+        max_iterations,
+        op.Expand(fallback_max_iterations, batch_shape),
+    )
+    row_eos_ids = op.Identity(eos_ids)
+    eos_count = op.Identity(eos_lengths)
+    row_eos_ids.shape = ir.Shape(["batch", "num_eos"])
+    eos_count.shape = ir.Shape(["batch"])
+    row_max_iterations.shape = ir.Shape(["batch"])
+    builder.add_output(row_eos_ids, "row_eos_ids")
+    builder.add_output(eos_count, "eos_lengths")
+    builder.add_output(row_max_iterations, "max_iterations")
     return _component("mobius.policy.auxiliary@1", graph, {})
 
 
@@ -1307,11 +1347,13 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
     builder.add_output(token_ids, "token")
     builder.add_output(next_offset, "next_offset")
     return _component(
-        "onnx-genai.token-sampler@1",
+        "onnx-genai.token-sampler@2",
         graph,
         {
             "role": "token_sampler",
             "mode": "seeded_stochastic",
+            "batching": "per_row",
+            "inactive_rows": "preserve",
             "logits": "logits",
             "token": "token",
             "temperature": "temperature",
@@ -1337,20 +1379,39 @@ def build_eos_termination(*, row_selective: bool = False) -> PolicyComponent:
     graph, builder = _make_graph("eos_termination")
     op = builder.op
     token_ids = builder.input("token_ids", ir.DataType.INT64, ["batch"])
-    eos_ids = builder.input("eos_ids", ir.DataType.INT64, ["num_eos"])
+    eos_ids = builder.input(
+        "eos_ids",
+        ir.DataType.INT64,
+        ["batch", "num_eos"] if row_selective else ["num_eos"],
+    )
+    eos_lengths = (
+        builder.input("eos_lengths", ir.DataType.INT64, ["batch"]) if row_selective else None
+    )
     iteration = builder.input(
         "iteration",
         ir.DataType.INT64,
-        [1] if row_selective else ["batch"],
+        ["batch"],
     )
     max_iterations = builder.input(
         "max_iterations",
         ir.DataType.INT64,
-        [1] if row_selective else ["batch"],
+        ["batch"],
     )
     tokens = op.Unsqueeze(token_ids, op.Constant(value_ints=[-1]))
-    eos = op.Unsqueeze(eos_ids, op.Constant(value_ints=[0]))
+    eos = eos_ids if row_selective else op.Unsqueeze(eos_ids, [0])
     matches = op.Equal(tokens, eos)
+    if row_selective:
+        assert eos_lengths is not None
+        eos_positions = op.Range(
+            op.Constant(value_int=0),
+            op.Squeeze(op.Shape(eos_ids, start=1, end=2), [0]),
+            op.Constant(value_int=1),
+        )
+        valid_eos = op.Less(
+            op.Unsqueeze(eos_positions, [0]),
+            op.Unsqueeze(eos_lengths, [-1]),
+        )
+        matches = op.And(matches, valid_eos)
     match_count = op.ReduceSum(
         op.Cast(matches, to=ir.DataType.INT64),
         axes=[-1],
@@ -1381,7 +1442,11 @@ def build_eos_termination(*, row_selective: bool = False) -> PolicyComponent:
         builder.add_output(next_active, "next_active")
     builder.add_output(continued, "continue")
     return _component(
-        "onnx-genai.termination-predicate@1",
+        (
+            "onnx-genai.termination-predicate@2"
+            if row_selective
+            else "onnx-genai.termination-predicate@1"
+        ),
         graph,
         {
             "role": "termination_predicate",
@@ -1390,7 +1455,15 @@ def build_eos_termination(*, row_selective: bool = False) -> PolicyComponent:
             "iteration": "iteration",
             "max_iterations": "max_iterations",
             **(
-                {"active": "active", "previous_done": "previous_done"} if row_selective else {}
+                {
+                    "eos_lengths": "eos_lengths",
+                    "active": "active",
+                    "previous_done": "previous_done",
+                    "batching": "per_row",
+                    "inactive_rows": "preserve",
+                }
+                if row_selective
+                else {}
             ),
             "done": "done",
             **({"next_active": "next_active"} if row_selective else {}),
@@ -1756,12 +1829,13 @@ def build_token_state_update(*, row_selective: bool = False) -> PolicyComponent:
         builder.add_output(next_lengths, "next_lengths")
         builder.add_output(emitted_length, "emitted_length")
     return _component(
-        "onnx-genai.state-update@1",
+        "onnx-genai.state-update@2" if row_selective else "onnx-genai.state-update@1",
         graph,
         {
             "role": "state_update",
             "current": "current",
             "update": "update",
+            **({"batching": "per_row", "inactive_rows": "preserve"} if row_selective else {}),
             **(
                 {"lengths": "lengths", "active": "active", "done": "done"}
                 if row_selective

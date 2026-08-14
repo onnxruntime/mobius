@@ -1413,7 +1413,16 @@ def add_policy_components_to_workflow(
         bindings = {
             key: value
             for key, value in contract.items()
-            if key not in {"role", "mode", "effect", "rng", "state_class"}
+            if key
+            not in {
+                "role",
+                "mode",
+                "effect",
+                "rng",
+                "state_class",
+                "batching",
+                "inactive_rows",
+            }
             and isinstance(value, str)
         }
         rng = contract.get("rng")
@@ -1426,8 +1435,13 @@ def add_policy_components_to_workflow(
             "version": version,
             "bindings": bindings,
         }
-        if "mode" in contract:
-            declaration["parameters"] = {"mode": contract["mode"]}
+        parameters = {
+            key: contract[key]
+            for key in ("mode", "batching", "inactive_rows")
+            if key in contract
+        }
+        if parameters:
+            declaration["parameters"] = parameters
         return declaration
 
     for name, component in policy_components.items():

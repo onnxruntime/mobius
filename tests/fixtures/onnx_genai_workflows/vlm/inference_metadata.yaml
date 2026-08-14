@@ -141,6 +141,46 @@ pipeline:
           name: prompt_lengths
         required: false
         default: -1
+      request.eos_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - num_eos
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: eos_ids
+        required: false
+        default: 2
+      request.eos_lengths:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: eos_lengths
+        required: false
+        default: 1
+      request.row_max_iterations:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: row_max_iterations
+        required: false
+        default: -1
       package.eos_ids:
         contract:
           dtype: int64
@@ -225,6 +265,103 @@ pipeline:
           kind: literal
         required: false
         default: 0
+      request.temperature:
+        contract:
+          dtype: float32
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: runtime
+          version: '1.0'
+          role: sampling_temperature
+        source:
+          kind: request
+        required: false
+        default: 1.0
+      request.top_k:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: runtime
+          version: '1.0'
+          role: sampling_top_k
+        source:
+          kind: request
+        required: false
+        default: 1
+      request.top_p:
+        contract:
+          dtype: float32
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: runtime
+          version: '1.0'
+          role: sampling_top_p
+        source:
+          kind: request
+        required: false
+        default: 1.0
+      request.min_p:
+        contract:
+          dtype: float32
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: runtime
+          version: '1.0'
+          role: sampling_min_p
+        source:
+          kind: request
+        required: false
+        default: 0.0
+      request.seed:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: runtime
+          version: '1.0'
+          role: seed
+        source:
+          kind: request
+        required: false
+        default: 0
+      request.grammar_mask:
+        contract:
+          dtype: bool
+          rank: 2
+          shape:
+          - batch
+          - 128
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: grammar_mask
+        required: false
+        default: true
+      request.rng_offset:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: rng_offset
+        required: false
+        default: 0
       package.loop_0_active:
         contract:
           dtype: bool
@@ -291,14 +428,24 @@ pipeline:
           artifact: policies/token_sampler.onnx
         contract:
           id: onnx-genai.token-sampler
-          version: '1'
+          version: '2'
           bindings:
             logits: logits
+            token: token
+            temperature: temperature
+            top_k: top_k
+            top_p: top_p
+            min_p: min_p
+            grammar_mask: grammar_mask
             active: active
             done: done
-            token: token
+            rng_seed: seed
+            rng_offset: offset
+            rng_next_offset: next_offset
           parameters:
-            mode: greedy
+            mode: seeded_stochastic
+            batching: per_row
+            inactive_rows: preserve
         application_overridable: true
       termination:
         implementation:
@@ -306,24 +453,28 @@ pipeline:
           artifact: policies/termination.onnx
         contract:
           id: onnx-genai.termination-predicate
-          version: '1'
+          version: '2'
           bindings:
             tokens: token_ids
             eos_ids: eos_ids
             iteration: iteration
             max_iterations: max_iterations
+            eos_lengths: eos_lengths
             active: active
             previous_done: previous_done
             done: done
             next_active: next_active
             continue: continue
+          parameters:
+            batching: per_row
+            inactive_rows: preserve
       token_state_update:
         implementation:
           kind: onnx
           artifact: policies/token_state_update.onnx
         contract:
           id: onnx-genai.state-update
-          version: '1'
+          version: '2'
           bindings:
             current: current
             update: update
@@ -333,6 +484,9 @@ pipeline:
             next: next
             next_lengths: next_lengths
             emitted_length: emitted_length
+          parameters:
+            batching: per_row
+            inactive_rows: preserve
       last_token_logits:
         implementation:
           kind: onnx
@@ -345,6 +499,14 @@ pipeline:
         implementation:
           kind: onnx
           artifact: policies/decoder_step_update.onnx
+      termination_batch_initializer:
+        implementation:
+          kind: onnx
+          artifact: policies/termination_batch_initializer.onnx
+      iteration_broadcast:
+        implementation:
+          kind: onnx
+          artifact: policies/iteration_broadcast.onnx
       cache_length_update:
         implementation:
           kind: onnx
@@ -447,6 +609,17 @@ pipeline:
         class: semantic
         scope: invocation
         initializer: initializer.cache_lengths
+        recurrence:
+          kind: invariant
+      rng_offset:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+        class: semantic
+        scope: invocation
+        initializer: request.rng_offset
         recurrence:
           kind: invariant
       position_ids:
@@ -559,6 +732,18 @@ pipeline:
           past_key_values.0.key: initializer.past_key_values.0.key
           past_key_values.0.value: initializer.past_key_values.0.value
       - kind: invoke
+        component: termination_batch_initializer
+        inputs:
+          input_eos_ids: request.eos_ids
+          input_eos_lengths: request.eos_lengths
+          input_max_iterations: request.row_max_iterations
+          fallback_max_iterations: request.max_iterations
+          active: package.active
+        outputs:
+          row_eos_ids: termination.eos_ids
+          eos_lengths: termination.eos_lengths
+          max_iterations: termination.max_iterations
+      - kind: invoke
         component: embedding
         inputs:
           input_ids: request.prompt_tokens
@@ -585,20 +770,36 @@ pipeline:
           last_logits: decoder.setup.last_logits
       steps:
       - kind: invoke
+        component: iteration_broadcast
+        inputs:
+          value: loop.iteration
+          active: active
+        outputs:
+          rows: loop.iteration_rows
+      - kind: invoke
         component: token_sampler
         inputs:
           logits: logits
+          temperature: request.temperature
+          top_k: request.top_k
+          top_p: request.top_p
+          min_p: request.min_p
+          grammar_mask: request.grammar_mask
+          seed: request.seed
+          offset: rng_offset
           active: active
           done: done
         outputs:
           token: sample.body
+          next_offset: sample.next_offset
       - kind: invoke
         component: termination
         inputs:
           token_ids: sample.body
-          eos_ids: package.eos_ids
-          iteration: loop.iteration
-          max_iterations: request.max_iterations
+          eos_ids: termination.eos_ids
+          eos_lengths: termination.eos_lengths
+          iteration: loop.iteration_rows
+          max_iterations: termination.max_iterations
           active: active
           previous_done: done
         outputs:
@@ -686,6 +887,8 @@ pipeline:
         next: decoder_step.body_attention_mask
       - cell: generated_lengths
         next: token.next_lengths
+      - cell: rng_offset
+        next: sample.next_offset
       - cell: active
         next: loop.next_active
       - cell: done
