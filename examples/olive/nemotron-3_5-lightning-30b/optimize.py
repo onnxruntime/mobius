@@ -158,8 +158,8 @@ def quantize_package(
     precision: str = "q4_k_m",
 ) -> Path:
     """Quantize model.onnx with a CPU-isolated Olive workflow."""
-    from olive.workflows import run as olive_run
     import olive.systems.local as olive_local
+    from olive.workflows import run as olive_run
 
     source = Path(source_dir)
     source_model = source / "model.onnx"

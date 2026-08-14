@@ -16,22 +16,20 @@ from pathlib import Path
 import numpy as np
 import torch
 from huggingface_hub import hf_hub_download
-from safetensors import safe_open
-from safetensors.torch import load_file, save_file
-
 from inference import (
     MODEL_ID,
     REVISION,
+    _as_numpy,
     _create_session,
     _initial_states,
-    _as_numpy,
     _run_session,
     _token_feeds,
-    _update_states,
     run_token_ids,
     summarize_profile,
 )
 from optimize import quantize_package
+from safetensors import safe_open
+from safetensors.torch import load_file, save_file
 
 _VOCAB_SIZE = 256
 _NUM_EXPERTS = 4
@@ -266,7 +264,9 @@ def _mobius_package(
         if value.const_value is None
     ]
     if unset:
-        raise ValueError(f"Weighted graph still has {len(unset)} unset parameters: {unset[:5]}")
+        raise ValueError(
+            f"Weighted graph still has {len(unset)} unset parameters: {unset[:5]}"
+        )
     return package
 
 
@@ -312,7 +312,9 @@ def _hf_generate(
             ids = torch.tensor([[token_id]], dtype=torch.long, device=device)
             outputs = model(
                 input_ids=ids,
-                attention_mask=torch.ones((1, past_length + 1), dtype=torch.long, device=device),
+                attention_mask=torch.ones(
+                    (1, past_length + 1), dtype=torch.long, device=device
+                ),
                 position_ids=torch.tensor([[past_length]], dtype=torch.long, device=device),
                 past_key_values=cache,
                 use_cache=True,
@@ -330,7 +332,9 @@ def _hf_generate(
             ids = torch.tensor([[token_id]], dtype=torch.long, device=device)
             outputs = model(
                 input_ids=ids,
-                attention_mask=torch.ones((1, past_length + 1), dtype=torch.long, device=device),
+                attention_mask=torch.ones(
+                    (1, past_length + 1), dtype=torch.long, device=device
+                ),
                 position_ids=torch.tensor([[past_length]], dtype=torch.long, device=device),
                 past_key_values=cache,
                 use_cache=True,
