@@ -242,6 +242,16 @@ pip install cupy-cuda12x
 # Olive auto-detects cupy and uses GPU when available
 ```
 
+### Isolate Olive from unrelated provider DLLs
+
+Olive 0.13 may auto-register every provider DLL bundled in an ORT GPU wheel
+even when a weight-only pass explicitly targets CPU. A missing TensorRT DLL can
+then abort K-quant before the pass starts. Keep the accelerator CPU-only and,
+for programmatic workflows, suppress `olive.systems.local` EP-library
+registration around `olive.workflows.run`; restore it immediately afterward.
+This is safe for `OnnxKQuantQuantization`, which does not create an inference
+session. Still load and execute the resulting package with the intended EP.
+
 ### Quantizing multi-model exports
 
 Quantize each sub-model independently. Typically only the decoder is

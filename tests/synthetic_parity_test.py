@@ -208,11 +208,6 @@ _XFAIL_REASONS: dict[str, str] = {
     # DeepSeek MLA: deepseek_v2_0 uses group_limited_greedy routing which hits a
     # HF transformers 5.3.0 bug (DeepseekV2Moe missing num_experts attr).
     "deepseek_v2_0": "HF transformers 5.3.0 bug: DeepseekV2Moe missing num_experts attr",
-    # Additional divergences (newly registered models)
-    # NemotronH Mamba2 layers diverge (cos=0.65): LinearAttention gated-SSM
-    # recurrence on CPU produces different results than HF's naive Mamba2.
-    # Attention-only layers match perfectly (cos=0.9999).
-    "nemotron_h": "Mamba2 SSM recurrence diverges on CPU (LinearAttention vs HF naive)",
 }
 
 # Fields that are properties in HF configs and cannot be set directly,
@@ -581,12 +576,18 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             for lt in layer_types
         ]
 
-    # NemotronH uses layers_block_type with HF values {"mamba", "attention", "moe"}.
-    # Convert our internal layer_types names (mamba2, full_attention, mlp) to HF names.
+    # NemotronH uses layers_block_type with current HF values
+    # {"linear_attention", "full_attention", "moe", "mlp"}.
+    # Convert our internal layer_types names to that vocabulary.
     # Also translate mobius Mamba field names to HF NemotronHConfig field names.
     if hf_model_type in ("nemotron_h",) and "layer_types" in hf_kwargs:
         layer_types = hf_kwargs.pop("layer_types")
-        _nemotron_type_map = {"mamba2": "mamba", "full_attention": "attention", "mlp": "moe"}
+        _nemotron_type_map = {
+            "mamba2": "linear_attention",
+            "full_attention": "full_attention",
+            "moe": "moe",
+            "mlp": "mlp",
+        }
         hf_kwargs["layers_block_type"] = [_nemotron_type_map.get(lt, lt) for lt in layer_types]
         # Mobius NemotronHConfig → HF NemotronHConfig field name mapping
         _nemotron_field_map = {
@@ -596,6 +597,7 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             "mamba_n_groups": "n_groups",
             "mamba_d_conv": "conv_kernel",
             "mamba_expand": "expand",
+            "shared_expert_intermediate_size": "moe_shared_expert_intermediate_size",
         }
         for old_name, new_name in _nemotron_field_map.items():
             if old_name in hf_kwargs:

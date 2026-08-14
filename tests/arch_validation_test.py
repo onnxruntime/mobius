@@ -26,19 +26,25 @@ They require network access to download config.json from HuggingFace.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 
 import pytest
 
+from mobius._builder import resolve_dtype
 from mobius._config_resolver import (
     _config_from_hf,
     _default_task_for_model,
     _try_load_config_json,
 )
 from mobius._registry import registry
+from mobius._testing.golden import discover_test_cases
 from mobius.tasks import get_task
 
 logger = logging.getLogger(__name__)
+
+_PINNED_REVISIONS = {case.model_id: case.revision for case in discover_test_cases()}
+_DECLARED_DTYPES = {case.model_id: case.dtype for case in discover_test_cases()}
 
 # Build parametrized test cases from registry entries that have a test_model_id.
 #
@@ -103,10 +109,39 @@ def _load_hf_config(model_id: str):
     """
     import transformers
 
+    revision = _PINNED_REVISIONS.get(model_id)
     try:
-        return transformers.AutoConfig.from_pretrained(model_id, trust_remote_code=False)
+        return transformers.AutoConfig.from_pretrained(
+            model_id,
+            revision=revision,
+            trust_remote_code=False,
+        )
     except (ValueError, OSError):
-        return _try_load_config_json(model_id)
+        return _try_load_config_json(model_id, revision=revision)
+
+
+def test_load_hf_config_forwards_yaml_revision(monkeypatch):
+    model_id = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
+    calls = []
+
+    def _from_pretrained(received_model_id, **kwargs):
+        calls.append((received_model_id, kwargs))
+        return object()
+
+    import transformers
+
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", _from_pretrained)
+    _load_hf_config(model_id)
+
+    assert calls == [
+        (
+            model_id,
+            {
+                "revision": "d468880b6ad3c6e0d21377ce7242adaea4cc884d",
+                "trust_remote_code": False,
+            },
+        )
+    ]
 
 
 def _resolve_hf_config(hf_config):
@@ -160,6 +195,11 @@ def _build_graph(model_type: str, model_id: str):
         parent_config=parent_config,
         module_class=registration.module_class,
     )
+    if model_type == "nemotron_h":
+        config = dataclasses.replace(
+            config,
+            dtype=resolve_dtype(_DECLARED_DTYPES[model_id]),
+        )
 
     module = registration.module_class(config)
     task_name = registration.task or _default_task_for_model(model_type)

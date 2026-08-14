@@ -507,6 +507,29 @@ class TestCLIBuildRuntime:
         save.assert_not_called()
         config_writer.assert_not_called()
 
+    def test_runtime_ort_genai_rejects_nemotron_h_before_build(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "transformers.AutoConfig.from_pretrained",
+                return_value=SimpleNamespace(model_type="nemotron_h"),
+            ),
+            mock.patch("mobius.__main__.build") as build_model,
+            pytest.raises(SystemExit, match=r"NemotronH.*mixed cache"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+                    tmpdir,
+                    "--runtime",
+                    "ort-genai",
+                ]
+            )
+
+        build_model.assert_not_called()
+
     def test_runtime_onnx_genai_uses_native_vlm_emitter(self):
         pkg = mock.MagicMock()
         pkg.items.return_value = []

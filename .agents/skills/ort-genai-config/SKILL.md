@@ -289,6 +289,12 @@ the exported contract. If the runtime cannot route required feature inputs,
 position-ID rank, cache state, scheduler, or multimodal metadata, reject export
 before writing artifacts and report the exact runtime version/limitation.
 
+NemotronH is one such unsupported contract in ORT GenAI 0.15.2: sparse global
+layer indices mix attention key/value caches with Mamba `conv_state` and
+`ssm_state`. The generic decoder schema cannot bind all three cache families.
+Reject `--runtime ort-genai` before creating output and direct users to a
+token-by-token ONNX Runtime loop until the runtime adds a dedicated model type.
+
 ### "input_ids size exceeds max length"
 
 For image prompts, the tokenized input_ids (including image_pad tokens) can

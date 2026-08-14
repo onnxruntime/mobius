@@ -16,6 +16,7 @@ from mobius._configs import (
     ArchitectureConfig,
     AudioConfig,
     MuseGlimmerConfig,
+    NemotronHConfig,
     QuantizationConfig,
     VisionConfig,
     _extract_audio_config,
@@ -401,6 +402,60 @@ class TestArchitectureConfig:
         assert config.original_max_position_embeddings is None
         # rope_interleave stays at its inert False default.
         assert config.rope_interleave is False
+
+
+class TestNemotronHConfig:
+    @staticmethod
+    def _fake_config(layer_types: list[str]) -> SimpleNamespace:
+        return SimpleNamespace(
+            model_type="nemotron_h",
+            layers_block_type=layer_types,
+            num_hidden_layers=len(layer_types),
+            vocab_size=131072,
+            hidden_size=2688,
+            intermediate_size=1856,
+            num_attention_heads=32,
+            num_key_value_heads=2,
+            head_dim=128,
+            max_position_embeddings=262144,
+            pad_token_id=0,
+            layer_norm_epsilon=1e-5,
+            mamba_num_heads=64,
+            mamba_head_dim=64,
+            ssm_state_size=128,
+            n_groups=8,
+            conv_kernel=4,
+            expand=2,
+            n_routed_experts=128,
+            num_experts_per_tok=6,
+            moe_intermediate_size=1856,
+            moe_shared_expert_intermediate_size=3712,
+            routed_scaling_factor=2.5,
+        )
+
+    @pytest.mark.parametrize(
+        "hf_layer_types",
+        [
+            ["mamba", "attention", "moe", "mlp"],
+            ["linear_attention", "full_attention", "moe", "mlp"],
+        ],
+        ids=["legacy-transformers", "current-transformers"],
+    )
+    def test_normalizes_transformers_layer_type_vocabularies(
+        self, hf_layer_types: list[str]
+    ) -> None:
+        config = NemotronHConfig.from_transformers(self._fake_config(hf_layer_types))
+
+        assert config.layer_types == ["mamba2", "full_attention", "moe", "mlp"]
+        assert config.num_hidden_layers == 4
+        assert config.num_local_experts == 128
+        assert config.num_experts_per_tok == 6
+        assert config.shared_expert_intermediate_size == 3712
+        assert config.mamba_ssm_cache_dtype.name == "FLOAT"
+
+    def test_rejects_unknown_layer_type(self) -> None:
+        with pytest.raises(ValueError, match="Unsupported NemotronH layer type"):
+            NemotronHConfig.from_transformers(self._fake_config(["linear_attention", "bogus"]))
 
     def test_from_transformers_legacy_rotary_dim_enables_rope(self):
         """GPT-J / CodeGen-style legacy configs use ``rotary_dim``."""

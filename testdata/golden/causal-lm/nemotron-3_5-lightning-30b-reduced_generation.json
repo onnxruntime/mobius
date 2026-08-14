@@ -1,0 +1,18 @@
+{
+  "model_id": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+  "revision": "d468880b6ad3c6e0d21377ce7242adaea4cc884d",
+  "fixture": "Independent HuggingFace NemotronHForCausalLM greedy decode using the pinned reduced-real-weight fixture.",
+  "input_ids": [
+    1,
+    42,
+    17
+  ],
+  "max_new_tokens": 4,
+  "do_sample": false,
+  "generated_tokens": [
+    12,
+    13,
+    12,
+    12
+  ]
+}

@@ -1303,6 +1303,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         "nemotron_h",
         {
             "hidden_act": "relu2",
+            "rms_norm_eps": 1e-5,
             "layer_types": ["mamba2", "mlp", "full_attention", "mamba2"],
             "_config_cls": NemotronHConfig,
             "num_hidden_layers": 4,
@@ -1320,6 +1321,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         "nemotron_h",
         {
             "hidden_act": "relu2",
+            "rms_norm_eps": 1e-5,
             "layer_types": [
                 "mamba2",
                 "moe",

@@ -1221,9 +1221,22 @@ def _write_genai_config(
     return generator.write(output_dir)
 
 
+def _validate_ort_genai_model_type(model_type: str | None) -> None:
+    """Reject model types whose runtime contract is known before graph build."""
+    if model_type == "nemotron_h":
+        raise ValueError(
+            "onnxruntime-genai does not currently support NemotronH's mixed cache "
+            "contract: Mamba layers require conv_state + ssm_state while full-attention "
+            "layers require key/value caches at sparse global layer indices. Export "
+            "without --runtime ort-genai and run the saved model directly with ONNX "
+            "Runtime (see examples/nemotron_3_nano_text_generation.py)."
+        )
+
+
 def _validate_ort_genai_compatibility(pkg: ModelPackage) -> None:
     """Reject packages whose required inputs cannot be supplied by ORT GenAI."""
     config = getattr(pkg, "config", None)
+    _validate_ort_genai_model_type(getattr(config, "model_type", None))
     if getattr(config, "model_type", None) == "parakeet_ctc":
         raise ValueError(
             "ORT GenAI does not define a feature-input CTC ASR pipeline; "

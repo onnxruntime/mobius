@@ -305,6 +305,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             config_path, trust_remote_code=trust_remote_code
         )
         model_type = hf_config.model_type
+        _preflight_ort_genai_runtime(args, model_type)
         parent_config = hf_config
         if hasattr(hf_config, "text_config"):
             hf_config = hf_config.text_config
@@ -335,6 +336,14 @@ def _cmd_build(args: argparse.Namespace) -> None:
             pkg.apply_weights(state_dict)
     else:
         model_id_or_path = args.model
+        if getattr(args, "runtime", None) == "ort-genai":
+            import transformers
+
+            runtime_config = transformers.AutoConfig.from_pretrained(
+                model_id_or_path,
+                trust_remote_code=trust_remote_code,
+            )
+            _preflight_ort_genai_runtime(args, runtime_config.model_type)
         if static_cache_params is not None:
             # Detect model type to resolve the correct static cache task.
             import transformers
@@ -358,6 +367,20 @@ def _cmd_build(args: argparse.Namespace) -> None:
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)
+
+
+def _preflight_ort_genai_runtime(args, model_type: str) -> None:
+    """Reject known unsupported ORT GenAI types before weights are downloaded."""
+    if getattr(args, "runtime", None) != "ort-genai":
+        return
+    from mobius.integrations.ort_genai.auto_export import (
+        _validate_ort_genai_model_type,
+    )
+
+    try:
+        _validate_ort_genai_model_type(model_type)
+    except ValueError as error:
+        raise SystemExit(f"Error: {error}") from error
 
 
 def _save_package(
