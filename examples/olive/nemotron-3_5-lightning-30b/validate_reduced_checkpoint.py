@@ -489,7 +489,7 @@ def _validate_variant(
     _hf_config().save_pretrained(variant_dir)
 
     profile = device == "cuda"
-    session = _create_session(variant_dir / "model.onnx", device, profile)
+    session = _create_session(variant_dir / "model.onnx", device, False)
     prompt_ids = [1, 42, 17]
     actual = _full_prefill(session, prompt_ids)
     hf_model = _hf_model(state, dtype=torch_dtype, device=device)
