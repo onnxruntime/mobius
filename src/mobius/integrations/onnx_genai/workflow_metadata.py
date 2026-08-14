@@ -22,18 +22,22 @@ from mobius.generation import (
     build_decoder_state_initializer,
     build_decoder_step_update,
     build_empty_features,
+    build_eos_termination,
     build_euler_model_input,
     build_euler_solver_step,
     build_greedy_sampler,
     build_integer_add,
+    build_selective_integer_add,
     build_integer_minimum,
     build_last_token_logits,
     build_model_token_cast,
     build_proposal_metrics,
     build_schedule_constant,
     build_schedule_lookup,
+    build_seeded_categorical_sampler,
     build_sequence_length,
     build_token_to_slot,
+    build_token_state_update,
     build_tts_decoder_state_initializer,
     build_tts_decoder_step_update,
     build_tts_state_initializer,
@@ -228,6 +232,8 @@ def _publish_workflow_v1(workflow: dict[str, Any]) -> dict[str, Any]:
             }
             if "valid_length" in node:
                 result["valid_length"] = rewrite(node["valid_length"])
+            if "when" in node:
+                result["when"] = rewrite(node["when"])
             return result
         if kind == "branch":
             result = {
@@ -2671,6 +2677,7 @@ def build_vlm_workflow_metadata(
             position_ids_input=position_input.name if position_input is not None else None,
             cache_inputs=sorted(cache_names),
             fixed_capacity=fixed_capacity,
+            ragged=True,
         ),
     )
     pkg.add_policy_component(
@@ -2681,8 +2688,14 @@ def build_vlm_workflow_metadata(
             fixed_capacity=fixed_capacity,
         ),
     )
+    pkg.add_policy_component("token_sampler", build_greedy_sampler(row_selective=True))
+    pkg.add_policy_component("termination", build_eos_termination(row_selective=True))
+    pkg.add_policy_component(
+        "token_state_update",
+        build_token_state_update(row_selective=True),
+    )
     if cache_pairs:
-        pkg.add_policy_component("cache_length_update", build_integer_add())
+        pkg.add_policy_component("cache_length_update", build_selective_integer_add())
 
     batch = _contract(token_input)["shape"][0]
     batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
@@ -2715,6 +2728,13 @@ def build_vlm_workflow_metadata(
             "source": {"kind": "request", "field": "max_output_tokens"},
             "required": True,
         },
+        "request.prompt_lengths": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "application", "name": "prompt_lengths"},
+            "required": False,
+            "default": -1,
+        },
         "package.eos_ids": {
             "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
             "role": {"kind": "opaque"},
@@ -2736,7 +2756,7 @@ def build_vlm_workflow_metadata(
             ),
         },
         "package.one": {
-            "contract": control_int,
+            "contract": batch_int,
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
@@ -2854,6 +2874,13 @@ def build_vlm_workflow_metadata(
             "initializer": "decoder.setup.last_logits",
             "recurrence": {"kind": "invariant"},
         },
+        "generated_lengths": {
+            "contract": batch_int,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": "initializer.generated_lengths",
+            "recurrence": {"kind": "invariant"},
+        },
         "attention_mask": {
             "contract": {
                 "dtype": _contract(attention_input)["dtype"],
@@ -2942,10 +2969,17 @@ def build_vlm_workflow_metadata(
             "state.attention_mask.final",
         ),
         (
+            "generated_lengths",
+            "initializer.generated_lengths",
+            "state.generated_lengths.body",
+            "token.next_lengths",
+            "state.generated_lengths.final",
+        ),
+        (
             "active",
             "package.active",
             "state.active.body",
-            "loop.continue",
+            "loop.next_active",
             "state.active.final",
         ),
         ("done", "package.false", "state.done.body", "loop.done", "state.done.final"),
@@ -3104,12 +3138,14 @@ def build_vlm_workflow_metadata(
                 "decoder_state_initializer",
                 {
                     "prompt_tokens": "request.prompt_tokens",
+                    "prompt_lengths": "request.prompt_lengths",
                     **({"max_iterations": "request.max_iterations"} if fixed_capacity else {}),
                 },
                 {
                     attention_input.name: f"initializer.{attention_input.name}",
                     "body_attention_mask": "initializer.body_attention_mask",
                     "token_slot": "initializer.token_slot",
+                    "generated_lengths": "initializer.generated_lengths",
                     **(
                         {"cache_lengths": "initializer.cache_lengths"}
                         if fixed_capacity
@@ -3164,7 +3200,11 @@ def build_vlm_workflow_metadata(
         "nodes": [
             _invoke(
                 "token_sampler",
-                {"logits": "state.logits.body"},
+                {
+                    "logits": "state.logits.body",
+                    "active": "state.active.body",
+                    "done": "state.done.body",
+                },
                 {"token": "sample.body"},
                 {"sample": _effect("sample.0", "sample.1")},
             ),
@@ -3175,8 +3215,14 @@ def build_vlm_workflow_metadata(
                     "eos_ids": "package.eos_ids",
                     "iteration": "loop.iteration",
                     "max_iterations": "request.max_iterations",
+                    "active": "state.active.body",
+                    "previous_done": "state.done.body",
                 },
-                {"done": "loop.done", "continue": "loop.continue"},
+                {
+                    "done": "loop.done",
+                    "next_active": "loop.next_active",
+                    "continue": "loop.continue",
+                },
                 {"termination": _effect("termination.0", "termination.1")},
             ),
             *(
@@ -3186,12 +3232,19 @@ def build_vlm_workflow_metadata(
                         {
                             "left": "state.cache_lengths.body",
                             "right": "package.one",
+                            "active": "state.active.body",
+                            "done": "state.done.body",
                         },
                         {"total": "cache_lengths.next"},
                     ),
                     _invoke(
                         "cache_length_update",
-                        {"left": "package.zero_batch", "right": "package.one"},
+                        {
+                            "left": "package.zero_batch",
+                            "right": "package.one",
+                            "active": "state.active.body",
+                            "done": "state.done.body",
+                        },
                         {"total": "accepted_len.next"},
                     ),
                 ]
@@ -3200,8 +3253,18 @@ def build_vlm_workflow_metadata(
             ),
             _invoke(
                 "token_state_update",
-                {"current": "state.token.body", "update": "sample.body"},
-                {"next": "token.body"},
+                {
+                    "current": "state.token.body",
+                    "update": "sample.body",
+                    "lengths": "state.generated_lengths.body",
+                    "active": "state.active.body",
+                    "done": "state.done.body",
+                },
+                {
+                    "next": "token.body",
+                    "next_lengths": "token.next_lengths",
+                    "emitted_length": "token.emitted_length",
+                },
                 {"state": _effect("state.0", "state.1")},
             ),
             {
@@ -3209,6 +3272,8 @@ def build_vlm_workflow_metadata(
                 "value": "token.body",
                 "output": "tokens",
                 "mode": "append",
+                "when": "state.active.body",
+                "valid_length": "token.emitted_length",
                 "effect_name": "emit",
                 "effect": _effect("emit.0", "emit.1"),
             },
@@ -3258,6 +3323,7 @@ def build_vlm_workflow_metadata(
                 "nested_control_flow",
                 "loop_induction_values",
                 "typed_emit",
+                "emit_valid_length",
                 *(["input_presence"] if text_only_vision is not None else []),
                 *(
                     ["serving_service_contract", "bounded_state_recurrence"]
@@ -4292,6 +4358,7 @@ def build_decoder_workflow_metadata(
             position_ids_input=position_input.name if position_input is not None else None,
             cache_inputs=sorted(cache_names),
             fixed_capacity=fixed_capacity,
+            ragged=bool(cache_pairs),
         ),
     )
     pkg.add_policy_component(
@@ -4360,7 +4427,7 @@ def build_decoder_workflow_metadata(
                 "default": eos_token_id,
             },
             "package.one_token": {
-                "contract": control_int,
+                "contract": batch_int,
                 "role": {"kind": "opaque"},
                 "source": {"kind": "literal"},
                 "required": False,
@@ -4375,12 +4442,24 @@ def build_decoder_workflow_metadata(
             },
         }
     )
+    if cache_pairs:
+        workflow_inputs["request.prompt_lengths"] = {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "application", "name": "prompt_lengths"},
+            "required": False,
+            "default": -1,
+        }
     stochastic_sampler = sampler != "greedy"
     if stochastic_sampler:
         workflow_inputs.update(
             {
                 "request.temperature": {
-                    "contract": {"dtype": "float32", "rank": 1, "shape": [1]},
+                    "contract": {
+                        "dtype": "float32",
+                        "rank": 1,
+                        "shape": [batch_dimension],
+                    },
                     "role": {
                         "kind": "runtime",
                         "version": "1.0",
@@ -4394,7 +4473,7 @@ def build_decoder_workflow_metadata(
                     "default": 1.0,
                 },
                 "request.top_k": {
-                    "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+                    "contract": batch_int,
                     "role": {
                         "kind": "runtime",
                         "version": "1.0",
@@ -4405,7 +4484,11 @@ def build_decoder_workflow_metadata(
                     "default": 0,
                 },
                 "request.top_p": {
-                    "contract": {"dtype": "float32", "rank": 1, "shape": [1]},
+                    "contract": {
+                        "dtype": "float32",
+                        "rank": 1,
+                        "shape": [batch_dimension],
+                    },
                     "role": {
                         "kind": "runtime",
                         "version": "1.0",
@@ -4416,7 +4499,11 @@ def build_decoder_workflow_metadata(
                     "default": 1.0,
                 },
                 "request.min_p": {
-                    "contract": {"dtype": "float32", "rank": 1, "shape": [1]},
+                    "contract": {
+                        "dtype": "float32",
+                        "rank": 1,
+                        "shape": [batch_dimension],
+                    },
                     "role": {
                         "kind": "runtime",
                         "version": "1.0",
@@ -4462,7 +4549,20 @@ def build_decoder_workflow_metadata(
             }
         )
     if cache_pairs:
-        pkg.add_policy_component("cache_length_update", build_integer_add())
+        pkg.add_policy_component("cache_length_update", build_selective_integer_add())
+        pkg.add_policy_component(
+            "token_sampler",
+            (
+                build_greedy_sampler(row_selective=True)
+                if not stochastic_sampler
+                else build_seeded_categorical_sampler()
+            ),
+        )
+        pkg.add_policy_component("termination", build_eos_termination(row_selective=True))
+        pkg.add_policy_component(
+            "token_state_update",
+            build_token_state_update(row_selective=True),
+        )
         workflow_inputs.update(
             {
                 "package.active": {
@@ -4549,6 +4649,13 @@ def build_decoder_workflow_metadata(
     if cache_pairs:
         state.update(
             {
+                "generated_lengths": {
+                    "contract": batch_int,
+                    "class": "semantic",
+                    "scope": "invocation",
+                    "initializer": "initializer.generated_lengths",
+                    "recurrence": {"kind": "invariant"},
+                },
                 "active": {
                     "contract": batch_bool,
                     "class": "semantic",
@@ -4626,10 +4733,17 @@ def build_decoder_workflow_metadata(
         carried.extend(
             [
                 {
+                    "cell": "generated_lengths",
+                    "current": "initializer.generated_lengths",
+                    "body_input": "state.generated_lengths.body",
+                    "body_output": "token.next_lengths",
+                    "next": "state.generated_lengths.final",
+                },
+                {
                     "cell": "active",
                     "current": "package.active",
                     "body_input": "state.active.body",
-                    "body_output": "loop.continue",
+                    "body_output": "loop.next_active",
                     "next": "state.active.final",
                 },
                 {
@@ -4745,7 +4859,9 @@ def build_decoder_workflow_metadata(
     decoder_kv_ports: dict[str, Any] = {}
     decoder_kv_axis = 2
     for past, present in cache_pairs:
-        cell = f"cache_{len(carried)}"
+        # Generated-length state is orthogonal to the admitted cache ABI and
+        # must not renumber stable cache service cells.
+        cell = f"cache_{len(carried) - 1}"
         setup_value = f"decoder.setup.{present.name}"
         body_value = f"decoder.body.{present.name}"
         setup_decoder_outputs[present.name] = setup_value
@@ -4791,12 +4907,18 @@ def build_decoder_workflow_metadata(
                 "decoder_state_initializer",
                 {
                     "prompt_tokens": f"request.{token_input.name}",
+                    **({"prompt_lengths": "request.prompt_lengths"} if cache_pairs else {}),
                     **({"max_iterations": "request.max_iterations"} if fixed_capacity else {}),
                 },
                 {
                     attention_input.name: f"initializer.{attention_input.name}",
                     "body_attention_mask": "initializer.body_attention_mask",
                     "token_slot": "initializer.token_slot",
+                    **(
+                        {"generated_lengths": "initializer.generated_lengths"}
+                        if cache_pairs
+                        else {}
+                    ),
                     **(
                         {"cache_lengths": "initializer.cache_lengths"}
                         if fixed_capacity
@@ -4861,6 +4983,14 @@ def build_decoder_workflow_metadata(
                         if stochastic_sampler
                         else {}
                     ),
+                    **(
+                        {
+                            "active": "state.active.body",
+                            "done": "state.done.body",
+                        }
+                        if cache_pairs
+                        else {}
+                    ),
                 },
                 {
                     "token": "sample.body",
@@ -4870,8 +5000,30 @@ def build_decoder_workflow_metadata(
             ),
             _invoke(
                 "token_state_update",
-                {"current": "state.token.body", "update": "sample.body"},
-                {"next": "token.body"},
+                {
+                    "current": "state.token.body",
+                    "update": "sample.body",
+                    **(
+                        {
+                            "lengths": "state.generated_lengths.body",
+                            "active": "state.active.body",
+                            "done": "state.done.body",
+                        }
+                        if cache_pairs
+                        else {}
+                    ),
+                },
+                {
+                    "next": "token.body",
+                    **(
+                        {
+                            "next_lengths": "token.next_lengths",
+                            "emitted_length": "token.emitted_length",
+                        }
+                        if cache_pairs
+                        else {}
+                    ),
+                },
                 {"state": _effect("state.0", "state.1")},
             ),
             *(
@@ -4892,8 +5044,20 @@ def build_decoder_workflow_metadata(
                     "eos_ids": "package.eos_ids",
                     "iteration": "loop.iteration",
                     "max_iterations": "request.max_iterations",
+                    **(
+                        {
+                            "active": "state.active.body",
+                            "previous_done": "state.done.body",
+                        }
+                        if cache_pairs
+                        else {}
+                    ),
                 },
-                {"done": "loop.done", "continue": "loop.continue"},
+                {
+                    "done": "loop.done",
+                    "continue": "loop.continue",
+                    **({"next_active": "loop.next_active"} if cache_pairs else {}),
+                },
                 {"termination": _effect("termination.0", "termination.1")},
             ),
             *(
@@ -4903,6 +5067,8 @@ def build_decoder_workflow_metadata(
                         {
                             "left": "state.cache_lengths.body",
                             "right": "package.one_token",
+                            "active": "state.active.body",
+                            "done": "state.done.body",
                         },
                         {"total": "cache_lengths.next"},
                     ),
@@ -4911,6 +5077,8 @@ def build_decoder_workflow_metadata(
                         {
                             "left": "package.zero_batch",
                             "right": "package.one_token",
+                            "active": "state.active.body",
+                            "done": "state.done.body",
                         },
                         {"total": "accepted_len.next"},
                     ),
@@ -4923,6 +5091,14 @@ def build_decoder_workflow_metadata(
                 "value": "token.body",
                 "output": "tokens",
                 "mode": "append",
+                **(
+                    {
+                        "when": "state.active.body",
+                        "valid_length": "token.emitted_length",
+                    }
+                    if cache_pairs
+                    else {}
+                ),
                 "effect_name": "emit",
                 "effect": _effect("emit.0", "emit.1"),
             },
@@ -4948,6 +5124,7 @@ def build_decoder_workflow_metadata(
                 "linear_effects",
                 "nested_control_flow",
                 "typed_emit",
+                "emit_valid_length",
                 "loop_induction_values",
                 *(["serving_service_contract"] if cache_pairs else []),
                 *(["bounded_state_recurrence"] if cache_pairs else []),
@@ -5243,6 +5420,7 @@ def build_language_diffusion_pipeline_metadata(
                 "linear_effects",
                 "nested_control_flow",
                 "typed_emit",
+                "emit_valid_length",
                 "loop_induction_values",
             ],
         },

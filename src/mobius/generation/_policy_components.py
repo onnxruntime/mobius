@@ -135,15 +135,27 @@ def _make_graph(name: str) -> tuple[ir.Graph, GraphBuilder]:
     return graph, GraphBuilder(graph)
 
 
-def build_greedy_sampler(*, effect: str = "sample") -> PolicyComponent:
-    """Build ``logits -> token_ids`` greedy sampling over the final axis."""
+def build_greedy_sampler(
+    *,
+    effect: str = "sample",
+    row_selective: bool = False,
+) -> PolicyComponent:
+    """Build row-selective greedy sampling over the final axis."""
     graph, builder = _make_graph("greedy_sampler")
+    op = builder.op
     logits = builder.input(
         "logits",
         dtype=ir.DataType.FLOAT,
         shape=["batch", "vocabulary"],
     )
-    token_ids = builder.op.ArgMax(logits, axis=-1, keepdims=0)
+    sampled = op.ArgMax(logits, axis=-1, keepdims=0)
+    if row_selective:
+        active = builder.input("active", dtype=ir.DataType.BOOL, shape=["batch"])
+        done = builder.input("done", dtype=ir.DataType.BOOL, shape=["batch"])
+        enabled = op.And(active, op.Not(done))
+        token_ids = op.Where(enabled, sampled, op.Constant(value_int=-1))
+    else:
+        token_ids = sampled
     builder.add_output(token_ids, "token")
     return _component(
         "onnx-genai.token-sampler@1",
@@ -152,6 +164,7 @@ def build_greedy_sampler(*, effect: str = "sample") -> PolicyComponent:
             "role": "token_sampler",
             "mode": "greedy",
             "logits": "logits",
+            **({"active": "active", "done": "done"} if row_selective else {}),
             "token": "token",
             "effect": effect,
         },
@@ -208,6 +221,21 @@ def build_integer_add() -> PolicyComponent:
     left = builder.input("left", ir.DataType.INT64, ["batch"])
     right = builder.input("right", ir.DataType.INT64, ["batch"])
     total = builder.op.Add(left, right)
+    total.shape = ir.Shape(["batch"])
+    builder.add_output(total, "total")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_selective_integer_add() -> PolicyComponent:
+    """Add per-row integer state only for active, unfinished rows."""
+    graph, builder = _make_graph("selective_integer_add")
+    op = builder.op
+    left = builder.input("left", ir.DataType.INT64, ["batch"])
+    right = builder.input("right", ir.DataType.INT64, ["batch"])
+    active = builder.input("active", ir.DataType.BOOL, ["batch"])
+    done = builder.input("done", ir.DataType.BOOL, ["batch"])
+    enabled = op.And(active, op.Not(done))
+    total = op.Where(enabled, op.Add(left, right), left)
     total.shape = ir.Shape(["batch"])
     builder.add_output(total, "total")
     return _component("mobius.policy.auxiliary@1", graph, {})
@@ -552,6 +580,7 @@ def build_decoder_state_initializer(
     position_ids_input: str | None,
     cache_inputs: list[str],
     fixed_capacity: bool = False,
+    ragged: bool = False,
 ) -> PolicyComponent:
     """Build prompt-derived decoder state, optionally with capture-stable storage."""
     graph, builder = _make_graph("decoder_state_initializer")
@@ -570,6 +599,23 @@ def build_decoder_state_initializer(
     batch_shape = op.Shape(prompt, start=0, end=1)
     sequence_shape = op.Shape(prompt, start=1, end=2)
     sequence_length = op.Squeeze(sequence_shape, op.Constant(value_ints=[0]))
+    if ragged:
+        provided_prompt_lengths = builder.input(
+            "prompt_lengths",
+            dtype=ir.DataType.INT64,
+            shape=["batch"],
+        )
+        full_prompt_lengths = op.Expand(
+            op.Unsqueeze(sequence_length, [0]),
+            batch_shape,
+        )
+        prompt_lengths = op.Where(
+            op.Greater(provided_prompt_lengths, op.Constant(value_int=0)),
+            provided_prompt_lengths,
+            full_prompt_lengths,
+        )
+    else:
+        prompt_lengths = op.Expand(op.Unsqueeze(sequence_length, [0]), batch_shape)
     capacity = None
     if fixed_capacity:
         max_iterations = builder.input(
@@ -579,7 +625,7 @@ def build_decoder_state_initializer(
         )
         capacity = op.Add(
             sequence_length,
-            op.Squeeze(max_iterations, op.Constant(value_ints=[0])),
+            op.Squeeze(max_iterations, [0]),
         )
         attention_shape = op.Concat(
             batch_shape,
@@ -600,13 +646,22 @@ def build_decoder_state_initializer(
     if fixed_capacity:
         # Native ORT GenAI binds one persistent full-capacity mask for prefill
         # and decode, then enables the next logical slot before each decode.
-        attention = op.Cast(op.Less(offsets, sequence_length), to=attention_value.dtype)
+        attention = op.Cast(
+            op.Less(offsets, op.Unsqueeze(prompt_lengths, [-1])),
+            to=attention_value.dtype,
+        )
         attention.shape = ir.Shape(["batch", "capacity"])
         body_attention = op.Identity(attention)
         body_attention.shape = attention.shape
     else:
+        offsets = op.Range(
+            op.Constant(value_int=0),
+            sequence_length,
+            op.Constant(value_int=1),
+        )
+        offsets = op.Expand(op.Unsqueeze(offsets, [0]), prompt_shape)
         attention = op.Cast(
-            op.ConstantOfShape(prompt_shape, value=ir.tensor([1])),
+            op.Less(offsets, op.Unsqueeze(prompt_lengths, [-1])),
             to=attention_value.dtype,
         )
         attention.shape = attention_value.shape
@@ -642,9 +697,9 @@ def build_decoder_state_initializer(
         )
         positions = op.Cast(positions, to=position_value.dtype)
         positions.shape = position_value.shape
-        body_position = op.Expand(
-            op.Cast(sequence_shape, to=position_value.dtype),
-            op.Concat(batch_shape, op.Constant(value_ints=[1]), axis=0),
+        body_position = op.Unsqueeze(
+            op.Cast(prompt_lengths, to=position_value.dtype),
+            [-1],
         )
         body_position.shape = ir.Shape(["batch", 1])
     builder.add_output(attention, attention_mask_input)
@@ -655,11 +710,15 @@ def build_decoder_state_initializer(
     if position_ids_input is not None:
         builder.add_output(body_position, "body_position_ids")
     builder.add_output(token_slot, "token_slot")
-    if fixed_capacity:
-        cache_lengths = op.Expand(
-            op.Unsqueeze(sequence_length, op.Constant(value_ints=[0])),
+    if ragged:
+        generated_lengths = op.ConstantOfShape(
             batch_shape,
+            value=ir.tensor([0], dtype=ir.DataType.INT64),
         )
+        generated_lengths.shape = ir.Shape(["batch"])
+        builder.add_output(generated_lengths, "generated_lengths")
+    if fixed_capacity:
+        cache_lengths = op.Identity(prompt_lengths)
         cache_lengths.shape = ir.Shape(["batch"])
         builder.add_output(cache_lengths, "cache_lengths")
 
@@ -1052,13 +1111,16 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
     graph, builder = _make_graph("seeded_categorical_sampler")
     op = builder.op
     logits = builder.input("logits", ir.DataType.FLOAT, ["batch", "vocabulary"])
-    temperature = builder.input("temperature", ir.DataType.FLOAT, [1])
-    top_k = builder.input("top_k", ir.DataType.INT64, [1])
-    top_p = builder.input("top_p", ir.DataType.FLOAT, [1])
-    min_p = builder.input("min_p", ir.DataType.FLOAT, [1])
+    temperature = builder.input("temperature", ir.DataType.FLOAT, ["batch"])
+    top_k = builder.input("top_k", ir.DataType.INT64, ["batch"])
+    top_p = builder.input("top_p", ir.DataType.FLOAT, ["batch"])
+    min_p = builder.input("min_p", ir.DataType.FLOAT, ["batch"])
     grammar_mask = builder.input("grammar_mask", ir.DataType.BOOL, ["batch", "vocabulary"])
     seed = builder.input("seed", ir.DataType.INT64, ["batch"])
     offset = builder.input("offset", ir.DataType.INT64, ["batch"])
+    active = builder.input("active", ir.DataType.BOOL, ["batch"])
+    done = builder.input("done", ir.DataType.BOOL, ["batch"])
+    enabled = op.And(active, op.Not(done))
 
     # Threefry2x64: a counter-based Random123 generator with no hidden state.
     # Unsigned arithmetic gives the specified modulo-2^64 round behavior.
@@ -1108,19 +1170,25 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
 
     blocked = op.CastLike(op.Constant(value_float=-3.4028235e38), logits)
     constrained_logits = op.Where(grammar_mask, logits, blocked)
-    safe_temperature = op.Max(temperature, op.Constant(value_float=1e-6))
+    safe_temperature = op.Unsqueeze(
+        op.Max(temperature, op.Constant(value_float=1e-6)),
+        [-1],
+    )
     scaled_logits = op.Div(constrained_logits, safe_temperature)
-    safe_min_p = op.Clip(
-        min_p,
-        op.Constant(value_float=1e-20),
-        op.Constant(value_float=1.0),
+    safe_min_p = op.Unsqueeze(
+        op.Clip(
+            min_p,
+            op.Constant(value_float=1e-20),
+            op.Constant(value_float=1.0),
+        ),
+        [-1],
     )
     min_p_threshold = op.Add(
         op.ReduceMax(scaled_logits, axes=[-1], keepdims=1),
         op.Log(safe_min_p),
     )
     min_p_mask = op.Or(
-        op.LessOrEqual(min_p, op.Constant(value_float=0.0)),
+        op.Unsqueeze(op.LessOrEqual(min_p, op.Constant(value_float=0.0)), [-1]),
         op.GreaterOrEqual(scaled_logits, min_p_threshold),
     )
     scaled_logits = op.Where(min_p_mask, scaled_logits, blocked)
@@ -1134,12 +1202,19 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
     effective_k = op.Min(op.Max(requested_k, op.Constant(value_int=1)), vocabulary)
     _, top_indices = op.TopK(
         scaled_logits,
-        effective_k,
+        vocabulary,
         axis=-1,
         largest=1,
-        sorted=0,
+        sorted=1,
         _outputs=2,
     )
+    ranks = op.Range(
+        op.Constant(value_int=0),
+        op.Squeeze(vocabulary, [0]),
+        op.Constant(value_int=1),
+    )
+    ranks = op.Expand(op.Unsqueeze(ranks, [0]), op.Shape(logits))
+    keep_top_k = op.Less(ranks, op.Unsqueeze(effective_k, [-1]))
     top_k_mask = op.Greater(
         op.ScatterElements(
             op.ConstantOfShape(
@@ -1147,10 +1222,7 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
                 value=ir.tensor([0], dtype=ir.DataType.INT64),
             ),
             top_indices,
-            op.ConstantOfShape(
-                op.Shape(top_indices),
-                value=ir.tensor([1], dtype=ir.DataType.INT64),
-            ),
+            op.Cast(keep_top_k, to=ir.DataType.INT64),
             axis=1,
         ),
         op.Constant(value_int=0),
@@ -1171,10 +1243,13 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
         sorted_probabilities,
         op.Constant(value_int=1),
     )
-    safe_top_p = op.Clip(
-        top_p,
-        op.Constant(value_float=1e-6),
-        op.Constant(value_float=1.0),
+    safe_top_p = op.Unsqueeze(
+        op.Clip(
+            top_p,
+            op.Constant(value_float=1e-6),
+            op.Constant(value_float=1.0),
+        ),
+        [-1],
     )
     keep_sorted = op.Less(
         op.Sub(cumulative_probabilities, sorted_probabilities),
@@ -1223,7 +1298,12 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
         token_ids,
         op.Constant(value_int=-1),
     )
-    next_offset = op.Add(offset, op.Constant(value_int=1))
+    token_ids = op.Where(enabled, token_ids, op.Constant(value_int=-1))
+    next_offset = op.Where(
+        enabled,
+        op.Add(offset, op.Constant(value_int=1)),
+        offset,
+    )
     builder.add_output(token_ids, "token")
     builder.add_output(next_offset, "next_offset")
     return _component(
@@ -1239,6 +1319,8 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
             "top_p": "top_p",
             "min_p": "min_p",
             "grammar_mask": "grammar_mask",
+            "active": "active",
+            "done": "done",
             "rng": {
                 "rng_seed": "seed",
                 "rng_offset": "offset",
@@ -1250,14 +1332,22 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
     )
 
 
-def build_eos_termination() -> PolicyComponent:
+def build_eos_termination(*, row_selective: bool = False) -> PolicyComponent:
     """Build an EOS predicate for batched current tokens and an EOS-id set."""
     graph, builder = _make_graph("eos_termination")
     op = builder.op
     token_ids = builder.input("token_ids", ir.DataType.INT64, ["batch"])
     eos_ids = builder.input("eos_ids", ir.DataType.INT64, ["num_eos"])
-    iteration = builder.input("iteration", ir.DataType.INT64, ["batch"])
-    max_iterations = builder.input("max_iterations", ir.DataType.INT64, ["batch"])
+    iteration = builder.input(
+        "iteration",
+        ir.DataType.INT64,
+        [1] if row_selective else ["batch"],
+    )
+    max_iterations = builder.input(
+        "max_iterations",
+        ir.DataType.INT64,
+        [1] if row_selective else ["batch"],
+    )
     tokens = op.Unsqueeze(token_ids, op.Constant(value_ints=[-1]))
     eos = op.Unsqueeze(eos_ids, op.Constant(value_ints=[0]))
     matches = op.Equal(tokens, eos)
@@ -1271,13 +1361,24 @@ def build_eos_termination() -> PolicyComponent:
         op.Add(iteration, op.Constant(value_int=1)),
         max_iterations,
     )
-    done = op.Or(hit_eos, hit_limit)
-    continued = op.Equal(
-        op.ReduceMax(op.Cast(done, to=ir.DataType.INT64), keepdims=1),
+    if row_selective:
+        active = builder.input("active", ir.DataType.BOOL, ["batch"])
+        previous_done = builder.input("previous_done", ir.DataType.BOOL, ["batch"])
+        enabled = op.And(active, op.Not(previous_done))
+        newly_done = op.And(enabled, op.Or(hit_eos, hit_limit))
+        done = op.Or(previous_done, newly_done)
+        next_active = op.And(enabled, op.Not(newly_done))
+    else:
+        done = op.Or(hit_eos, hit_limit)
+        next_active = op.Not(done)
+    continued = op.Greater(
+        op.ReduceMax(op.Cast(next_active, to=ir.DataType.INT64), keepdims=1),
         op.Constant(value_int=0),
     )
     continued.shape = ir.Shape([1])
     builder.add_output(done, "done")
+    if row_selective:
+        builder.add_output(next_active, "next_active")
     builder.add_output(continued, "continue")
     return _component(
         "onnx-genai.termination-predicate@1",
@@ -1288,7 +1389,11 @@ def build_eos_termination() -> PolicyComponent:
             "eos_ids": "eos_ids",
             "iteration": "iteration",
             "max_iterations": "max_iterations",
+            **(
+                {"active": "active", "previous_done": "previous_done"} if row_selective else {}
+            ),
             "done": "done",
+            **({"next_active": "next_active"} if row_selective else {}),
             "continue": "continue",
             "effect": "termination",
         },
@@ -1623,17 +1728,33 @@ def build_token_block_identity() -> PolicyComponent:
     return _component("mobius.policy.auxiliary@1", graph, {}, "state")
 
 
-def build_token_state_update() -> PolicyComponent:
-    """Build explicit token-history append and sequence-length update math."""
+def build_token_state_update(*, row_selective: bool = False) -> PolicyComponent:
+    """Selectively update token state and per-row generated lengths."""
     graph, builder = _make_graph("token_state_update")
     op = builder.op
     current = builder.input("current", ir.DataType.INT64, ["batch", 1])
     update = builder.input("update", ir.DataType.INT64, ["batch"])
-    next_state = op.Add(
-        op.Mul(current, op.Constant(value_int=0)),
-        op.Unsqueeze(update, op.Constant(value_ints=[-1])),
-    )
+    if row_selective:
+        lengths = builder.input("lengths", ir.DataType.INT64, ["batch"])
+        active = builder.input("active", ir.DataType.BOOL, ["batch"])
+        done = builder.input("done", ir.DataType.BOOL, ["batch"])
+        enabled = op.And(active, op.Not(done))
+        next_state = op.Where(
+            op.Unsqueeze(enabled, [-1]),
+            op.Unsqueeze(update, [-1]),
+            current,
+        )
+        emitted_length = op.Cast(enabled, to=ir.DataType.INT64)
+        next_lengths = op.Add(lengths, emitted_length)
+    else:
+        next_state = op.Unsqueeze(update, [-1])
+    next_state.shape = ir.Shape(["batch", 1])
     builder.add_output(next_state, "next")
+    if row_selective:
+        next_lengths.shape = ir.Shape(["batch"])
+        emitted_length.shape = ir.Shape(["batch"])
+        builder.add_output(next_lengths, "next_lengths")
+        builder.add_output(emitted_length, "emitted_length")
     return _component(
         "onnx-genai.state-update@1",
         graph,
@@ -1641,7 +1762,20 @@ def build_token_state_update() -> PolicyComponent:
             "role": "state_update",
             "current": "current",
             "update": "update",
+            **(
+                {"lengths": "lengths", "active": "active", "done": "done"}
+                if row_selective
+                else {}
+            ),
             "next": "next",
+            **(
+                {
+                    "next_lengths": "next_lengths",
+                    "emitted_length": "emitted_length",
+                }
+                if row_selective
+                else {}
+            ),
             "effect": "state",
         },
         "state",

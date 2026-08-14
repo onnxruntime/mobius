@@ -168,9 +168,13 @@ def test_dispatch_decoder(tmp_path):
         "onnx-genai.termination-predicate"
     )
     assert workflow["steps"][0]["kind"] == "loop"
-    assert all(
-        value["source"]["kind"] != "application" for value in workflow["inputs"].values()
-    )
+    application_inputs = {
+        name
+        for name, value in workflow["inputs"].items()
+        if value["source"]["kind"] == "application"
+    }
+    assert application_inputs == {"request.prompt_lengths"}
+    assert workflow["inputs"]["request.prompt_lengths"]["default"] == -1
     assert [node["component"] for node in workflow["steps"][0]["setup"]] == [
         "decoder_state_initializer",
         "model",
@@ -221,6 +225,8 @@ def test_seeded_decoder_sampler_uses_request_controls_and_direct_kv_carry():
         "rng_seed": "seed",
         "rng_offset": "offset",
         "rng_next_offset": "next_offset",
+        "active": "active",
+        "done": "done",
     }
     sampler_step = next(
         step
@@ -236,7 +242,13 @@ def test_seeded_decoder_sampler_uses_request_controls_and_direct_kv_carry():
         "grammar_mask": "request.grammar_mask",
         "seed": "request.seed",
         "offset": "rng_offset",
+        "active": "active",
+        "done": "done",
     }
+    for name in ("temperature", "top_k", "top_p", "min_p"):
+        assert workflow["inputs"][f"request.{name}"]["contract"]["shape"] == ["batch"]
+    assert workflow["inputs"]["request.prompt_lengths"]["contract"]["shape"] == ["batch"]
+    assert workflow["inputs"]["request.max_iterations"]["contract"]["shape"] == [1]
     assert workflow["state"]["rng_offset"]["class"] == "semantic"
     assert workflow["state"]["rng_offset"]["initializer"] == "request.rng_offset"
     assert not any("kv_update" in name for name in workflow["components"])

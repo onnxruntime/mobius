@@ -248,8 +248,36 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     assert workflow["state"]["cache_lengths"]["initializer"] == "initializer.cache_lengths"
     assert policy_invokes["decoder_state_initializer"]["inputs"] == {
         "prompt_tokens": "request.prompt_tokens",
+        "prompt_lengths": "request.prompt_lengths",
         "max_iterations": "request.max_iterations",
     }
+    assert workflow["inputs"]["request.prompt_lengths"]["contract"]["shape"] == ["batch"]
+    assert workflow["inputs"]["request.max_iterations"]["contract"]["shape"] == [1]
+    assert workflow["inputs"]["package.one"]["contract"]["shape"] == ["batch"]
+    assert workflow["state"]["generated_lengths"]["initializer"] == (
+        "initializer.generated_lengths"
+    )
+    assert policy_invokes["token_sampler"]["inputs"]["active"] == "active"
+    assert policy_invokes["token_sampler"]["inputs"]["done"] == "done"
+    assert policy_invokes["token_state_update"]["inputs"]["lengths"] == ("generated_lengths")
+    assert policy_invokes["token_state_update"]["outputs"]["next_lengths"] == (
+        "token.next_lengths"
+    )
+
+    def collect_emits(node):
+        if isinstance(node, dict):
+            return ([node] if node.get("kind") == "emit" else []) + [
+                emit for value in node.values() for emit in collect_emits(value)
+            ]
+        if isinstance(node, list):
+            return [emit for value in node for emit in collect_emits(value)]
+        return []
+
+    emit = next(
+        node for node in collect_emits(workflow["steps"]) if node["output"] == "tokens"
+    )
+    assert emit["when"] == "active"
+    assert emit["valid_length"] == "token.emitted_length"
     assert policy_invokes["decoder_step_update"]["inputs"]["logical_length"] == "cache_lengths"
     assert workflow["state"]["attention_mask"]["initializer"] == ("initializer.attention_mask")
     assert any(

@@ -10,6 +10,7 @@ pipeline:
       - linear_effects
       - nested_control_flow
       - typed_emit
+      - emit_valid_length
       - loop_induction_values
     inputs:
       request.input_ids:

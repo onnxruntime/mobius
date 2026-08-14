@@ -10,6 +10,7 @@ pipeline:
       - linear_effects
       - nested_control_flow
       - typed_emit
+      - emit_valid_length
       - loop_induction_values
       - serving_service_contract
       - bounded_state_recurrence
@@ -58,7 +59,7 @@ pipeline:
           dtype: int64
           rank: 1
           shape:
-          - 1
+          - batch
         role:
           kind: opaque
         source:
@@ -77,6 +78,19 @@ pipeline:
           kind: literal
         required: false
         default: 8192
+      request.prompt_lengths:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: prompt_lengths
+        required: false
+        default: -1
       package.active:
         contract:
           dtype: bool
@@ -161,6 +175,8 @@ pipeline:
           version: '1'
           bindings:
             logits: logits
+            active: active
+            done: done
             token: token
           parameters:
             mode: greedy
@@ -177,7 +193,10 @@ pipeline:
             eos_ids: eos_ids
             iteration: iteration
             max_iterations: max_iterations
+            active: active
+            previous_done: previous_done
             done: done
+            next_active: next_active
             continue: continue
       token_state_update:
         implementation:
@@ -189,7 +208,12 @@ pipeline:
           bindings:
             current: current
             update: update
+            lengths: lengths
+            active: active
+            done: done
             next: next
+            next_lengths: next_lengths
+            emitted_length: emitted_length
       last_token_logits:
         implementation:
           kind: onnx
@@ -227,6 +251,17 @@ pipeline:
           - 128
         scope: invocation
         initializer: decoder.setup.last_logits
+        recurrence:
+          kind: invariant
+      generated_lengths:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+        class: semantic
+        scope: invocation
+        initializer: initializer.generated_lengths
         recurrence:
           kind: invariant
       active:
@@ -349,11 +384,13 @@ pipeline:
         component: decoder_state_initializer
         inputs:
           prompt_tokens: request.input_ids
+          prompt_lengths: request.prompt_lengths
           max_iterations: request.max_iterations
         outputs:
           attention_mask: initializer.attention_mask
           body_attention_mask: initializer.body_attention_mask
           token_slot: initializer.token_slot
+          generated_lengths: initializer.generated_lengths
           cache_lengths: initializer.cache_lengths
           position_ids: initializer.position_ids
           body_position_ids: initializer.body_position_ids
@@ -379,6 +416,8 @@ pipeline:
         component: token_sampler
         inputs:
           logits: logits
+          active: active
+          done: done
         outputs:
           token: sample.body
       - kind: invoke
@@ -386,8 +425,13 @@ pipeline:
         inputs:
           current: token
           update: sample.body
+          lengths: generated_lengths
+          active: active
+          done: done
         outputs:
           next: token.body
+          next_lengths: token.next_lengths
+          emitted_length: token.emitted_length
       - kind: invoke
         component: termination
         inputs:
@@ -395,14 +439,19 @@ pipeline:
           eos_ids: package.eos_ids
           iteration: loop.iteration
           max_iterations: request.max_iterations
+          active: active
+          previous_done: done
         outputs:
           done: loop.done
           continue: loop.continue
+          next_active: loop.next_active
       - kind: invoke
         component: cache_length_update
         inputs:
           left: cache_lengths
           right: package.one_token
+          active: active
+          done: done
         outputs:
           total: cache_lengths.next
       - kind: invoke
@@ -410,12 +459,16 @@ pipeline:
         inputs:
           left: package.zero_batch
           right: package.one_token
+          active: active
+          done: done
         outputs:
           total: accepted_len.next
       - kind: emit
         value: token.body
         output: tokens
         mode: append
+        valid_length: token.emitted_length
+        when: active
       - kind: invoke
         component: decoder_step_update
         inputs:
@@ -448,8 +501,10 @@ pipeline:
         next: token.body
       - cell: logits
         next: decoder.body.last_logits
+      - cell: generated_lengths
+        next: token.next_lengths
       - cell: active
-        next: loop.continue
+        next: loop.next_active
       - cell: done
         next: loop.done
       - cell: cache_lengths

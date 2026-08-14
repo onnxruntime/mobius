@@ -158,6 +158,19 @@ def test_greedy_sampler_runtime(tmp_path):
     np.testing.assert_array_equal(tokens, [1, 2])
 
 
+def test_row_selective_greedy_sampler_suppresses_inactive_rows(tmp_path):
+    (tokens,) = _run(
+        build_greedy_sampler(row_selective=True),
+        tmp_path,
+        {
+            "logits": np.array([[0.0, 2.0], [3.0, 1.0], [1.0, 4.0]], np.float32),
+            "active": np.array([True, False, True], np.bool_),
+            "done": np.array([False, False, True], np.bool_),
+        },
+    )
+    np.testing.assert_array_equal(tokens, [1, -1, -1])
+
+
 def test_last_token_logits_and_continue_predicate_runtime(tmp_path):
     logits = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
     (last,) = _run(build_last_token_logits(), tmp_path, {"logits": logits})
@@ -304,6 +317,76 @@ def test_decoder_fixed_capacity_state_matches_native_capture_layout(tmp_path):
     np.testing.assert_array_equal(next_attention, expected_body_attention)
 
 
+def test_decoder_ragged_batch_uses_stable_capacity_and_independent_rows(tmp_path):
+    inputs = [
+        ir.Value(
+            name="input_ids",
+            type=ir.TensorType(ir.DataType.INT64),
+            shape=ir.Shape(["batch", "sequence"]),
+        ),
+        ir.Value(
+            name="attention_mask",
+            type=ir.TensorType(ir.DataType.INT64),
+            shape=ir.Shape(["batch", "past_sequence + sequence"]),
+        ),
+        ir.Value(
+            name="past_key_values.0.key",
+            type=ir.TensorType(ir.DataType.FLOAT16),
+            shape=ir.Shape(["batch", 2, "past_sequence", 4]),
+        ),
+    ]
+    decoder = ir.Model(ir.Graph(inputs, [], nodes=[], name="decoder"), ir_version=11)
+    component = build_decoder_state_initializer(
+        decoder,
+        token_input="input_ids",
+        attention_mask_input="attention_mask",
+        position_ids_input=None,
+        cache_inputs=["past_key_values.0.key"],
+        fixed_capacity=True,
+        ragged=True,
+    )
+    feeds = {
+        "prompt_tokens": np.arange(12, dtype=np.int64).reshape(3, 4),
+        "prompt_lengths": np.array([4, 2, 1], np.int64),
+        "max_iterations": np.array([5], np.int64),
+    }
+    attention, body_attention, token, generated, cache_lengths, cache = _run(
+        component, tmp_path, feeds
+    )
+    expected = np.array(
+        [
+            [1, 1, 1, 1, 0, 0, 0, 0, 0],
+            [1, 1, 0, 0, 0, 0, 0, 0, 0],
+            [1, 0, 0, 0, 0, 0, 0, 0, 0],
+        ],
+        np.int64,
+    )
+    np.testing.assert_array_equal(attention, expected)
+    np.testing.assert_array_equal(body_attention, expected)
+    np.testing.assert_array_equal(token, np.zeros((3, 1), np.int64))
+    np.testing.assert_array_equal(generated, [0, 0, 0])
+    np.testing.assert_array_equal(cache_lengths, [4, 2, 1])
+    assert cache.shape == (3, 2, 9, 4)
+
+    for row in range(3):
+        row_outputs = _run(
+            component,
+            tmp_path,
+            {
+                "prompt_tokens": feeds["prompt_tokens"][row : row + 1],
+                "prompt_lengths": feeds["prompt_lengths"][row : row + 1],
+                "max_iterations": feeds["max_iterations"],
+            },
+        )
+        for batched, independent in zip(
+            (attention, body_attention, token, generated, cache_lengths),
+            row_outputs[:-1],
+            strict=True,
+        ):
+            np.testing.assert_array_equal(batched[row : row + 1], independent)
+        assert row_outputs[-1].shape == (1, 2, 9, 4)
+
+
 def test_empty_features_runtime(tmp_path):
     (features,) = _run(
         build_empty_features(ir.DataType.FLOAT16, 64),
@@ -419,6 +502,8 @@ def test_seeded_sampler_is_counter_based_and_reproducible(tmp_path):
         "grammar_mask": np.array([[True, True, True, True]], np.bool_),
         "seed": np.array([7], np.int64),
         "offset": np.array([11], np.int64),
+        "active": np.array([True], np.bool_),
+        "done": np.array([False], np.bool_),
     }
     first = _run(component, tmp_path, feeds)
     second = _run(component, tmp_path, feeds)
@@ -439,6 +524,8 @@ def test_seeded_sampler_applies_request_top_k_and_grammar_mask(tmp_path):
             "grammar_mask": np.array([[False, True, True, True]], np.bool_),
             "seed": np.array([17], np.int64),
             "offset": np.array([0], np.int64),
+            "active": np.array([True], np.bool_),
+            "done": np.array([False], np.bool_),
         },
     )
     np.testing.assert_array_equal(token, [1])
@@ -457,6 +544,8 @@ def test_seeded_sampler_rejects_empty_grammar_vocabulary(tmp_path):
             "grammar_mask": np.array([[False, False, False]], np.bool_),
             "seed": np.array([1], np.int64),
             "offset": np.array([0], np.int64),
+            "active": np.array([True], np.bool_),
+            "done": np.array([False], np.bool_),
         },
     )
     np.testing.assert_array_equal(token, [-1])
@@ -475,10 +564,85 @@ def test_seeded_sampler_applies_request_min_p_in_logit_space(tmp_path):
             "grammar_mask": np.array([[True, True, True]], np.bool_),
             "seed": np.array([23], np.int64),
             "offset": np.array([4], np.int64),
+            "active": np.array([True], np.bool_),
+            "done": np.array([False], np.bool_),
         },
     )
     np.testing.assert_array_equal(token, [0])
     np.testing.assert_array_equal(next_offset, [5])
+
+
+def test_seeded_sampler_heterogeneous_batch_matches_independent_rows(tmp_path):
+    component = build_seeded_categorical_sampler()
+    feeds = {
+        "logits": np.array(
+            [
+                [2.0, 1.0, 0.5, -1.0, -2.0],
+                [0.0, 0.1, 0.2, 0.3, 0.4],
+                [4.0, 3.0, 2.0, 1.0, 0.0],
+                [-1.0, 0.0, 1.0, 2.0, 3.0],
+            ],
+            np.float32,
+        ),
+        "temperature": np.array([0.5, 1.5, 0.8, 2.0], np.float32),
+        "top_k": np.array([1, 3, 0, 2], np.int64),
+        "top_p": np.array([1.0, 0.8, 0.6, 0.9], np.float32),
+        "min_p": np.array([0.0, 0.05, 0.2, 0.1], np.float32),
+        "grammar_mask": np.array(
+            [
+                [True, True, True, True, True],
+                [True, False, True, True, True],
+                [True, True, True, False, False],
+                [True, True, True, True, True],
+            ],
+            np.bool_,
+        ),
+        "seed": np.array([3, 7, 11, 13], np.int64),
+        "offset": np.array([0, 5, 9, 12], np.int64),
+        "active": np.array([True, True, False, True], np.bool_),
+        "done": np.array([False, False, False, True], np.bool_),
+    }
+    batched_token, batched_offset = _run(component, tmp_path, feeds)
+    for row in range(4):
+        row_feeds = {name: value[row : row + 1] for name, value in feeds.items()}
+        row_token, row_offset = _run(component, tmp_path, row_feeds)
+        np.testing.assert_array_equal(batched_token[row : row + 1], row_token)
+        np.testing.assert_array_equal(batched_offset[row : row + 1], row_offset)
+    np.testing.assert_array_equal(batched_token[2:], [-1, -1])
+    np.testing.assert_array_equal(batched_offset, [1, 6, 9, 12])
+
+
+def test_row_selective_state_and_termination_preserve_inactive_rows(tmp_path):
+    next_state, next_lengths, emitted = _run(
+        build_token_state_update(row_selective=True),
+        tmp_path,
+        {
+            "current": np.array([[10], [20], [30]], np.int64),
+            "update": np.array([11, 21, 31], np.int64),
+            "lengths": np.array([2, 4, 6], np.int64),
+            "active": np.array([True, False, True], np.bool_),
+            "done": np.array([False, False, True], np.bool_),
+        },
+    )
+    np.testing.assert_array_equal(next_state, [[11], [20], [30]])
+    np.testing.assert_array_equal(next_lengths, [3, 4, 6])
+    np.testing.assert_array_equal(emitted, [1, 0, 0])
+
+    done, next_active, continued = _run(
+        build_eos_termination(row_selective=True),
+        tmp_path,
+        {
+            "token_ids": np.array([2, 8, 9], np.int64),
+            "eos_ids": np.array([2, 9], np.int64),
+            "iteration": np.array([0], np.int64),
+            "max_iterations": np.array([5], np.int64),
+            "active": np.array([True, False, True], np.bool_),
+            "previous_done": np.array([False, False, True], np.bool_),
+        },
+    )
+    np.testing.assert_array_equal(done, [True, False, True])
+    np.testing.assert_array_equal(next_active, [False, False, False])
+    np.testing.assert_array_equal(continued, [False])
 
 
 def test_eos_termination_runtime(tmp_path):
