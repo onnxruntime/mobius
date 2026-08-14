@@ -768,9 +768,8 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
         "package.slot_ids": {
             "contract": batch_int,
             "role": {"kind": "opaque"},
-            "source": {"kind": "literal"},
-            "required": False,
-            "default": 0,
+            "source": {"kind": "application", "name": "serving.slot_ids"},
+            "required": True,
         },
     }
     for iteration in range(num_groups - 2):

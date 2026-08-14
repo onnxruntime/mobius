@@ -178,6 +178,12 @@ def test_real_qwen3_tts_workflow_carries_trained_transitions_and_kv_state():
     assert workflow["state"]["talker_cache_0"]["service_group"] == "talker_cache"
     assert workflow["state"]["predictor_cache_0"]["service_group"] == "predictor_cache"
     assert workflow["serving"]["kv_service"]["compaction"] is True
+    assert workflow["inputs"]["package.slot_ids"] == {
+        "contract": {"dtype": "int64", "rank": 1, "shape": ["batch"]},
+        "role": {"kind": "opaque"},
+        "source": {"kind": "application", "name": "serving.slot_ids"},
+        "required": True,
+    }
     assert workflow["serving"]["kv_service"]["groups"]["talker_cache"]["ports"]["talker"][
         "talker_cache_0"
     ]["input"].startswith("past_key_values.")

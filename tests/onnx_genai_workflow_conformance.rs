@@ -388,15 +388,86 @@ fn mobius_codec_workflow_executes() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn tts_request(
+    prompt_tokens: &[i64],
+    batch: i64,
+    slot_ids: &[i64],
+) -> anyhow::Result<PipelineGenerateRequest> {
+    let rows = usize::try_from(batch)?;
+    assert_eq!(prompt_tokens.len(), rows * 2);
+    assert_eq!(slot_ids.len(), rows);
+    Ok(
+        PipelineGenerateRequest::new(GenerateRequest {
+            prompt: GeneratePrompt::TokenIds(vec![0]),
+            options: options(1),
+        })
+        .with_input(
+            "request.prompt_tokens",
+            Value::from_slice_i64(prompt_tokens, &[batch, 2])?,
+        )
+        .with_input(
+            "package.false",
+            Value::from_raw_bytes(vec![0; rows], &[batch], DataType::Bool)?,
+        )
+        .with_input(
+            "package.zero_batch",
+            Value::from_slice_i64(&vec![0; rows], &[batch])?,
+        )
+        .with_input(
+            "package.one_batch",
+            Value::from_slice_i64(&vec![1; rows], &[batch])?,
+        )
+        .with_input(
+            "package.true",
+            Value::from_raw_bytes(vec![1; rows], &[batch], DataType::Bool)?,
+        )
+        .with_input(
+            "package.slot_ids",
+            Value::from_slice_i64(slot_ids, &[batch])?,
+        ),
+    )
+}
+
 #[test]
 fn mobius_tts_workflow_executes_real_producer_graphs() -> anyhow::Result<()> {
     let mut engine = Engine::from_pipeline_dir(&root("tts")?, EngineConfig::default())?;
-    let output = engine.run_pipeline_outputs(PipelineGenerateRequest::new(GenerateRequest {
-        prompt: GeneratePrompt::TokenIds(vec![1, 2]),
-        options: options(1),
-    }))?;
+    let output = engine.run_pipeline_outputs(tts_request(&[1, 2], 1, &[0])?)?;
     assert_eq!(output["waveform"].shape()[..2], [1, 1]);
-    assert!(!output["waveform"].to_vec_f32()?.is_empty());
+    let first = output["waveform"].to_vec_f32()?;
+    assert!(!first.is_empty());
+
+    let mut independent = Engine::from_pipeline_dir(&root("tts")?, EngineConfig::default())?;
+    let second_output = independent.run_pipeline_outputs(tts_request(&[3, 4], 1, &[1])?)?;
+    let second = second_output["waveform"].to_vec_f32()?;
+
+    let batched = engine.run_pipeline_outputs(tts_request(&[1, 2, 3, 4], 2, &[0, 1])?)?;
+    let frames = first.len();
+    assert_eq!(batched["waveform"].shape(), [2, 1, i64::try_from(frames)?]);
+    let batched_waveform = batched["waveform"].to_vec_f32()?;
+    assert_eq!(&batched_waveform[..frames], first);
+    assert_eq!(&batched_waveform[frames..], second);
+
+    let stable_before = engine
+        .execution_island_diagnostics()
+        .iter()
+        .map(|island| island.stable_binding_runs)
+        .sum::<u64>();
+    let compacted = engine.run_pipeline_outputs(tts_request(&[3, 4, 1, 2], 2, &[1, 0])?)?;
+    let compacted_waveform = compacted["waveform"].to_vec_f32()?;
+    assert_eq!(&compacted_waveform[..frames], second);
+    assert_eq!(&compacted_waveform[frames..], first);
+    let stable_after = engine
+        .execution_island_diagnostics()
+        .iter()
+        .map(|island| island.stable_binding_runs)
+        .sum::<u64>();
+    assert!(
+        stable_after > stable_before,
+        "same-shape nested TTS compaction must preserve stable bindings"
+    );
+
+    let reused = engine.run_pipeline_outputs(tts_request(&[3, 4], 1, &[0])?)?;
+    assert_eq!(reused["waveform"].to_vec_f32()?, second);
     Ok(())
 }
 

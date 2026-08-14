@@ -180,9 +180,9 @@ pipeline:
         role:
           kind: opaque
         source:
-          kind: literal
-        required: false
-        default: 0
+          kind: application
+          name: serving.slot_ids
+        required: true
       package.setup_predictor_iteration_0:
         contract:
           dtype: int64
