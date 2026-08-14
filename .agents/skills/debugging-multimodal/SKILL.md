@@ -261,11 +261,11 @@ via `MOBIUS_ORT_LOWER_OPSET_FOR_EP=1`).  See `src/mobius/_flags.py`.
 
 ### Encoder input dtype alignment
 
-Encoder task inputs should be declared with `dtype=config.dtype` so
-entry tensors match the model compute dtype (float32/float16/bfloat16).
-In the current codebase, multimodal encoder task builders set encoder
-inputs directly to `config.dtype` (there is no `_cast_encoder_input()`
-helper in `src/mobius/tasks/_base.py`).
+Real vision/audio processors emit float32. Encoder graph inputs should
+therefore be float32 even for fp16/bf16 exports, with one Cast to
+`config.dtype` at graph entry. Verify this with an actual processor batch
+and a graph I/O dtype assertion; synthetic feeds can hide the mismatch.
+Some older task builders still use `config.dtype` and are not safe templates.
 
 ### GQA for KV-shared layers
 

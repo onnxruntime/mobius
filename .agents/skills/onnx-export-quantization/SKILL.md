@@ -322,6 +322,13 @@ FP32 when the model is BF16. Add `op.CastLike(result, input)` to
 ensure dtype consistency. See the `reusable-components` skill's
 section on precision behaviour.
 
+### 6. Attention rewrite schema mismatch
+
+Quantizers may rewrite Attention to a contrib op with fewer outputs or a
+different cache contract. Restrict the quantized op set when schemas do not
+match, then load and execute the result; successful conversion alone is not
+evidence. Document the narrowed recipe and unsupported rewrite explicitly.
+
 ## Testing quantized models
 
 ### L4: Golden data generation
