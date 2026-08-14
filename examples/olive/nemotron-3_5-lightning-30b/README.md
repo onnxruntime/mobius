@@ -21,9 +21,10 @@ The checkpoint is a real `nemotron_h` model, not an alias:
 
 ONNX Runtime GenAI 0.15.2 cannot bind this model's mixed cache: Mamba layers
 need `conv_state` plus `ssm_state`, while sparse full-attention layers need
-key/value caches at global layer indices. Mobius therefore rejects
-`--runtime ort-genai` before writing artifacts. The package uses direct ONNX
-Runtime generation through `inference.py`.
+key/value caches at global layer indices. Mobius still emits a structurally
+honest config rather than hard-coding a version-specific rejection, allowing
+future runtime releases to add support. This validated package uses direct
+ONNX Runtime generation through `inference.py`.
 
 ## Install
 
@@ -96,8 +97,9 @@ output/
     └── source_manifest.json
 ```
 
-No `genai_config.json` is emitted because that would claim unsupported ORT
-GenAI runtime compatibility.
+This recipe intentionally omits `genai_config.json`: direct ONNX Runtime is
+the validated runtime for ORT GenAI 0.15.2. Core Mobius config emission remains
+available for testing future runtime releases.
 
 ## Direct generation and profiling
 

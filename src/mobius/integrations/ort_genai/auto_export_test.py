@@ -1065,22 +1065,14 @@ class TestExportForOrtGenai:
             write_ort_genai_config(pkg, str(tmp_path))
         assert not (tmp_path / "genai_config.json").exists()
 
-    def test_rejects_nemotron_h_mixed_cache_before_writing(self, tmp_path):
-        import dataclasses
+    def test_nemotron_h_config_is_emitted_for_future_runtime_support(self, tmp_path):
+        pkg = _make_fake_llm_pkg("nemotron_h")
 
-        from mobius._model_package import ModelPackage
+        result = write_ort_genai_config(pkg, str(tmp_path))
 
-        @dataclasses.dataclass
-        class FakeConfig:
-            model_type: str = "nemotron_h"
-
-        pkg = ModelPackage(config=FakeConfig())
-        output_dir = tmp_path / "ort-genai"
-
-        with pytest.raises(ValueError, match=r"NemotronH.*conv_state \+ ssm_state.*key/value"):
-            write_ort_genai_config(pkg, str(output_dir))
-
-        assert not output_dir.exists()
+        with open(result["genai_config"], encoding="utf-8") as config_file:
+            generated = json.load(config_file)
+        assert generated["model"]["type"] == "nemotron_h"
 
     def test_processor_config_written_with_vision(self, tmp_path):
         """image_processor.json is written when pkg.config.vision is set."""

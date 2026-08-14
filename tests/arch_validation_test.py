@@ -43,8 +43,9 @@ from mobius.tasks import get_task
 
 logger = logging.getLogger(__name__)
 
-_PINNED_REVISIONS = {case.model_id: case.revision for case in discover_test_cases()}
-_DECLARED_DTYPES = {case.model_id: case.dtype for case in discover_test_cases()}
+_TEST_CASES = discover_test_cases()
+_PINNED_REVISIONS = {case.model_id: case.revision for case in _TEST_CASES}
+_DECLARED_DTYPES = {case.model_id: case.dtype for case in _TEST_CASES}
 
 # Build parametrized test cases from registry entries that have a test_model_id.
 #
