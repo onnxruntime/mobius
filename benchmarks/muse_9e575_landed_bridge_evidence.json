@@ -7,7 +7,9 @@
     "base_head": "b4422f5709fc41ea2545e1de46b849343ace9824",
     "dirty": true,
     "log_mtime": "2026-08-14T02:09:47Z",
-    "log_sha256": "d73e93f03086ff9408c12bb10c191678ed19a0f1650ecb738972911f0361d217"
+    "log_sha256": "d73e93f03086ff9408c12bb10c191678ed19a0f1650ecb738972911f0361d217",
+    "manifest_sha256": "940ccc975d87fe1920666e7ac86dad8d9ad4aafd03fa51ff36f066da3d200915",
+    "five_file_binary_patch_sha256": "53d5643611d760f7a685fa037e7ba7a99faeac35a719af46dbccec8ca6a9a03b"
   },
   "landed_runtime": {
     "head": "9e5757196b98542390ce11f4ff966a58ab3ef578",
@@ -23,6 +25,14 @@
     "decode_skip": 8,
     "stop_on_eos": false,
     "image": null
+  },
+  "environment": {
+    "onnxruntime": "1.28.0",
+    "onnxruntime_api_version": 27,
+    "onnxruntime_library_sha256": "018d05f615e96f6e0cfb95d2865f63915681d5d2688dd187f599822b245d27bc",
+    "prompt_ids_sha256": "eab7c0ee593ff2a6331e1678cefadb0969b65cce6f2fad5b75652b8c155399ee",
+    "ONNX_GENAI_CUDA_GRAPH": "1",
+    "ORT_ENABLE_CUDNN_FLASH_ATTENTION": "0"
   },
   "metrics": {
     "ttft_ms": 60.6,
