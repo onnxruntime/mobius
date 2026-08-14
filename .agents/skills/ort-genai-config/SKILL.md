@@ -244,6 +244,15 @@ decoder_inputs = {name: name for name in decoder_input_names}
 This means the genai config automatically adapts when `RemoveDeadGraphInputsPass`
 removes unused inputs (e.g. `position_ids` absorbed by GQA fusion).
 
+Hybrid cache metadata must preserve global layer indices across KV, convolution,
+and recurrent states. Derive slot count from the maximum
+`past_key_values.<index>.*` input index plus one; counting only `.key` inputs
+silently drops non-KV or sparsely indexed layers.
+
+CUDA Graph capture belongs on stable-shape autoregressive decoder sessions,
+not one-shot variable-shape vision/embedding stages. Keep an explicit decoder
+opt-out and validate capture together with shared KV buffers on the real model.
+
 > For the full generation flow, input routing, QwenImageProcessor output
 > tensors, and the multimodal processor factory, see
 > [`references/multimodal-pipeline.md`](references/multimodal-pipeline.md).
@@ -272,6 +281,13 @@ The vision ONNX model expects packed-attention inputs that the ORT GenAI
 processor doesn't provide. Either:
 1. Compute them externally and inject via NamedTensors, or
 2. Modify the vision model to compute them from `image_grid_thw` internally
+
+### Config writes successfully but runtime cannot execute
+
+Config/schema success is not runtime support. Run load plus generation through
+the exported contract. If the runtime cannot route required feature inputs,
+position-ID rank, cache state, scheduler, or multimodal metadata, reject export
+before writing artifacts and report the exact runtime version/limitation.
 
 ### "input_ids size exceeds max length"
 

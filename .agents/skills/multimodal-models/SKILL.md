@@ -97,6 +97,16 @@ convention), not `vision_encoder`/`audio_encoder`.
 The embedding model must handle `num_image_tokens=0` (text-only input) by
 zero-padding `image_features` before Gather so indices stay in-bounds.
 
+Input mixing must also:
+- compute feature offsets over the flattened batch, not restart per row;
+- preserve separate image/video streams or define and test an explicit packed
+  order; and
+- cover two-row mixed-media prompts with distinguishable feature sentinels.
+
+For cross-attentive decoders, export total-length padding masks and only caches
+that are actually reusable. Do not apply a generic seq2seq cross-cache contract
+to fixed encoder states without proving projection/cache semantics.
+
 ### Conditional 3-or-4-model task
 
 Some models come in two tiers (e.g. Gemma4): small variants include an
@@ -219,72 +229,35 @@ models this overflows ORT's CUDA Gather kernel. **Workaround:** Split into
 L separate `Embedding([V, D])` tables via `nn.ModuleList`, and use `Slice`
 instead of `Gather` for per-layer projection indexing.
 
-## Vision/audio encoder f32 input casting
+## Processor-to-graph contract
 
-> **This applies to ALL multimodal models and ALL inference paths** —
-> not just ORT GenAI, and not architecture-specific.
+Run the real processor before finalizing graph I/O. Record names, shapes,
+dtypes, media-row ordering, sampled frame positions, and empty-media behavior;
+synthetic packed video layouts often differ from processor-native rows.
 
-Image and audio preprocessing universally produces **float32** output.
-This is true across all frameworks and runtimes:
-
-- **PIL / torchvision:** Pixel normalization outputs f32
-- **torchaudio / librosa:** Mel spectrograms are f32
-- **ORT GenAI image_processor:** Resize, normalize, tile → f32
-- **ORT GenAI audio_processor:** Feature extraction → f32
-- **ORT Python API:** Custom preprocessing pipelines → typically f32
-- **Foundry Local:** Uses GenAI processors → f32
-
-This means vision and audio encoder ONNX graphs must accept f32 inputs
-even when the model is built in f16 or bf16. The encoder adds a
-`Cast(f32 → model_dtype)` at its graph entry point so that any runtime
-can feed it preprocessed data without worrying about the model's
-internal precision.
-
-### How it works
+Vision/audio preprocessors emit float32. Encoder graphs therefore accept
+float32 at the boundary and cast once to fp16/bf16 internally:
 
 ```
-Input (f32 from ANY preprocessor — PIL, torchaudio, GenAI, etc.)
-    ↓
-Cast(to=FLOAT16)    ← inserted automatically by mobius
-    ↓
-Vision/Audio encoder (weights in f16/bf16)
-    ↓
-Output (model_dtype)
+processor f32 -> Cast(model dtype) -> reduced-precision encoder
 ```
 
-Encoder weights still use the requested dtype (f16/bf16) for memory
-efficiency — only the graph inputs are f32. The Cast is a lightweight
-op with negligible overhead.
+Test image-only, video-only, mixed media, two-row batches, and decode with zero
+new media. Build kwargs conditionally; strict processors may reject video-only
+arguments on image-only calls.
 
-### Why f32 is the universal preprocessing dtype
+For composite checkpoints, generate processor assets from the parent config
+even if model construction exposes an unwrapped text sub-config; test both
+wrapped and unwrapped resolver forms.
 
-Preprocessing involves floating-point arithmetic (mean subtraction,
-std division, resampling interpolation) where f32 is the natural
-precision. Converting to f16/bf16 before these operations would lose
-precision in the preprocessing itself. The model's internal precision
-only matters after the preprocessed data enters the encoder.
+For variable-length media, audit symbolic complexity: packed-attention metadata
+must scale with rows/windows, not total-patches × media-count. Keep dense masks
+only as a portable fallback and assert optimized CUDA/DML graphs lack the
+quadratic construction.
 
-### What mobius does
-
-Mobius always builds encoder graphs with f32 inputs — this is the
-default behavior, not gated behind any flag. It works correctly
-regardless of the inference runtime:
-
-- `--runtime ort-genai` → f32 inputs (GenAI processors output f32)
-- No `--runtime` flag → f32 inputs (ORT Python API, custom runtimes)
-- Foundry Local → f32 inputs (uses GenAI internally)
-
-Without the Cast-at-input, ORT throws a type mismatch error:
-```
-Type Error: Type parameter (T) bound to different types
-(tensor(float) and tensor(float16))
-```
-
-### For model authors
-
-If you're adding a new multimodal model, you don't need to handle this
-manually — mobius inserts the Cast automatically for all encoder graphs.
-If the model dtype is already f32, no Cast is needed.
+Config generation is not runtime support. Execute real media through ORT GenAI;
+if it cannot supply a required encoder input or position-ID rank, reject export
+before writing artifacts and use the same evidence for any Foundry waiver.
 
 ## GQA for KV-shared layers (Gemma4)
 
