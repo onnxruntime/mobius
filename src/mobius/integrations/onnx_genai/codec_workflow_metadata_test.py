@@ -177,6 +177,7 @@ def test_real_qwen3_tts_workflow_carries_trained_transitions_and_kv_state():
     assert workflow["state"]["talker_cache_0"]["recurrence"]["kind"] == "bounded"
     assert workflow["state"]["talker_cache_0"]["service_group"] == "talker_cache"
     assert workflow["state"]["predictor_cache_0"]["service_group"] == "predictor_cache"
+    assert workflow["serving"]["kv_service"]["compaction"] is True
     assert workflow["serving"]["kv_service"]["groups"]["talker_cache"]["ports"]["talker"][
         "talker_cache_0"
     ]["input"].startswith("past_key_values.")
@@ -194,6 +195,7 @@ def test_real_qwen3_tts_workflow_carries_trained_transitions_and_kv_state():
     assert outer["kind"] == "loop"
     inner = next(node for node in outer["steps"] if node["kind"] == "loop")
     assert inner["iteration"]["value"] == "code.iteration"
+    assert all(carried["cell"] != "slot_ids" for carried in inner["carried"])
     assert any(
         node.get("component") == "code_predictor_step_embedder" for node in inner["steps"]
     )

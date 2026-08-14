@@ -1236,7 +1236,7 @@ pipeline:
       kv_service:
         paging: none
         allocation: runtime
-        compaction: false
+        compaction: true
         groups:
           talker_cache:
             sequence_axis: 2

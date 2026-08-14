@@ -1633,10 +1633,7 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
                             else "none"
                         ),
                         "allocation": "runtime",
-                        # The current workflow schema cannot represent an invariant
-                        # serving slot identity through the nested predictor loop
-                        # without redefining the outer SSA value.
-                        "compaction": False,
+                        "compaction": (talker_kv["compaction"] or predictor_kv["compaction"]),
                         "groups": {
                             **(
                                 {
