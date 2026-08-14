@@ -467,13 +467,23 @@ class Qwen35Attention(nn.Module):
     - Per-head Q/K RMSNorm with +1 offset (OffsetRMSNorm)
     - Partial RoPE (rotary_embedding_dim < head_dim)
     - Output gating: attn_output * sigmoid(gate)
+
+    Args:
+        config: Architecture configuration.
+        linear_class: Factory callable ``(in_features, out_features, bias=...)``
+            for creating projection layers. Defaults to ``Linear``. Pass a
+            quantized-linear factory (see ``make_quantized_linear_factory``)
+            to emit ``MatMulNBits`` for q/k/v/o projections instead.
     """
 
     def __init__(
         self,
         config: ArchitectureConfig,
+        linear_class: type | None = None,
     ):
         super().__init__()
+        if linear_class is None:
+            linear_class = Linear
         self.hidden_size = config.hidden_size
         self.head_dim = config.head_dim
         self.num_attention_heads = config.num_attention_heads
@@ -486,22 +496,22 @@ class Qwen35Attention(nn.Module):
         self._rope_interleave = config.rope_interleave
 
         q_dim = self.num_attention_heads * self.head_dim
-        self.q_proj = Linear(
+        self.q_proj = linear_class(
             self.hidden_size,
             q_dim * 2,
             bias=config.attn_qkv_bias,
         )
-        self.k_proj = Linear(
+        self.k_proj = linear_class(
             self.hidden_size,
             self.num_key_value_heads * self.head_dim,
             bias=config.attn_qkv_bias,
         )
-        self.v_proj = Linear(
+        self.v_proj = linear_class(
             self.hidden_size,
             self.num_key_value_heads * self.head_dim,
             bias=config.attn_qkv_bias,
         )
-        self.o_proj = Linear(
+        self.o_proj = linear_class(
             q_dim,
             self.hidden_size,
             bias=config.attn_o_bias,

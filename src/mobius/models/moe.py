@@ -278,16 +278,23 @@ class Qwen2MoELayer(MoELayer):
     Replicates HuggingFace ``Qwen2MoeSparseMoeBlock``.
     """
 
-    def __init__(self, config: ArchitectureConfig, gate: nn.Module | None = None):
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        gate: nn.Module | None = None,
+        linear_class: type | None = None,
+    ):
         super().__init__(config, gate=gate)
         assert config.shared_expert_intermediate_size is not None, (
             "Qwen2MoELayer requires config.shared_expert_intermediate_size"
         )
+        if linear_class is None:
+            linear_class = Linear
         shared_config = dataclasses.replace(
             config, intermediate_size=config.shared_expert_intermediate_size
         )
-        self.shared_expert = MLP(shared_config)
-        self.shared_expert_gate = Linear(config.hidden_size, 1, bias=False)
+        self.shared_expert = MLP(shared_config, linear_class=linear_class)
+        self.shared_expert_gate = linear_class(config.hidden_size, 1, bias=False)
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # Routing expert output: top-k weighted sum  [B, S, H]
