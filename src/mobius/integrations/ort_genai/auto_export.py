@@ -1009,13 +1009,26 @@ def _write_genai_config(
     # shared buffer. Introspect the graph: if there is at least one GQA
     # node, the model supports shared-buffer mode; otherwise force it off
     # regardless of the EP capability flag.
+    #
+    # ``com.microsoft.LinearAttention`` (linear/recurrent-attention layers,
+    # e.g. Qwen3.5's GatedDeltaNet) is a separate, *mandatory* case: its
+    # recurrent state requires ``past_present_share_buffer=True`` regardless
+    # of whether any other layer uses GQA (ORT GenAI raises "RecurrentState
+    # requires past_present_share_buffer=true" otherwise). Hybrid models mix
+    # LinearAttention layers with standard (non-GQA) ``Attention`` layers, so
+    # this flag must win over the "no GQA" default-off heuristic above.
     decoder_model = pkg.get(decoder_key)
     supports_in_place_kv_cache: bool | None = None
     if decoder_model is not None:
-        supports_in_place_kv_cache = any(
+        has_gqa = any(
             node.op_type == "GroupQueryAttention" and node.domain == "com.microsoft"
             for node in decoder_model.graph
         )
+        has_recurrent_state = any(
+            node.op_type == "LinearAttention" and node.domain == "com.microsoft"
+            for node in decoder_model.graph
+        )
+        supports_in_place_kv_cache = has_gqa or has_recurrent_state
 
     generator = GenaiConfigGenerator.from_config(
         config,
