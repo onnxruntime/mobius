@@ -301,12 +301,12 @@ class TestMoELayer:
         fc2_zp = torch.randint(0, 16, (num_experts, hidden_size, fc2_blocks))
 
         raw = {
-            "model.layers.1.mlp.experts.gate_up_proj.qweight": _to_olive_qweight(fc1_codes),
-            "model.layers.1.mlp.experts.gate_up_proj.scales": fc1_scales,
-            "model.layers.1.mlp.experts.gate_up_proj.qzeros": _to_olive_qzeros(fc1_zp),
-            "model.layers.1.mlp.experts.down_proj.qweight": _to_olive_qweight(fc2_codes),
-            "model.layers.1.mlp.experts.down_proj.scales": fc2_scales,
-            "model.layers.1.mlp.experts.down_proj.qzeros": _to_olive_qzeros(fc2_zp),
+            "model.layers.1.mlp.experts.gate_up_proj_qweight": _to_olive_qweight(fc1_codes),
+            "model.layers.1.mlp.experts.gate_up_proj_scales": fc1_scales,
+            "model.layers.1.mlp.experts.gate_up_proj_qzeros": _to_olive_qzeros(fc1_zp),
+            "model.layers.1.mlp.experts.down_proj_qweight": _to_olive_qweight(fc2_codes),
+            "model.layers.1.mlp.experts.down_proj_scales": fc2_scales,
+            "model.layers.1.mlp.experts.down_proj_qzeros": _to_olive_qzeros(fc2_zp),
         }
         packed = pack_qmoe_expert_weights(
             preprocess_olive_weights(raw, bits=4, group_size=block_size),
