@@ -352,12 +352,13 @@ def test_dispatch_diffusion(tmp_path):
     assert (tmp_path / "policies" / "schedule_lookup.onnx").is_file()
 
 
-def test_single_diffusion_component_uses_flat_model_path(tmp_path):
+def test_single_diffusion_component_requires_explicit_vae(tmp_path):
     pkg = _DiffusionPkg({"transformer": object()})
-    artifacts = write_onnx_genai_config(pkg, str(tmp_path), num_inference_steps=2)
-    with open(artifacts["inference_metadata"], encoding="utf-8") as handle:
-        metadata = yaml.safe_load(handle)
-    assert metadata["pipeline"]["models"]["denoiser"]["filename"] == "model.onnx"
+    with pytest.raises(
+        ValueError,
+        match="diffusion workflow requires distinct denoiser and VAE decoder",
+    ):
+        write_onnx_genai_config(pkg, str(tmp_path), num_inference_steps=2)
 
 
 def test_rejects_unsupported_qwen_image_edit_runtime_export(tmp_path):
