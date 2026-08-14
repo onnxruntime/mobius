@@ -170,6 +170,9 @@ def quantize_package(
 
     with tempfile.TemporaryDirectory(prefix="olive-nemotron-") as temp:
         olive_output = Path(temp) / "output"
+        config = _olive_config(source_model, olive_output, precision)
+        config["cache_dir"] = str(Path(temp) / "cache")
+        config["clean_cache"] = True
         # Olive 0.13 auto-registers every DLL bundled in a GPU ORT wheel,
         # even for a CPU-only target. That makes an unrelated TensorRT DLL
         # failure abort weight-only quantization. Suppress registration for
@@ -177,7 +180,7 @@ def quantize_package(
         register_ep_libraries = olive_local.maybe_register_ep_libraries
         olive_local.maybe_register_ep_libraries = lambda _paths: None
         try:
-            olive_run(_olive_config(source_model, olive_output, precision))
+            olive_run(config)
         finally:
             olive_local.maybe_register_ep_libraries = register_ep_libraries
         _copy_olive_model(_find_olive_model(olive_output), output)

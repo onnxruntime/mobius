@@ -37,7 +37,6 @@ _LAYER_REMAP = {0: 0, 1: 1, 5: 2}
 _DTYPES = {
     "f32": (torch.float32, "FLOAT"),
     "f16": (torch.float16, "FLOAT16"),
-    "bf16": (torch.bfloat16, "BFLOAT16"),
 }
 
 
@@ -270,6 +269,110 @@ def _mobius_package(
     return package
 
 
+def _bf16_rejection_evidence_package(state: dict[str, torch.Tensor]):
+    """Build a test-only BF16 graph without weakening the production guard."""
+    import dataclasses
+
+    import onnx_ir as ir
+    from onnxscript import OpBuilder, nn
+
+    from mobius import build_from_module
+    from mobius._configs import NemotronHConfig
+    from mobius._flags import override_flags
+    from mobius.components import Linear
+    from mobius.models.nemotron_h import (
+        NemotronHCausalLMModel,
+        _NemotronHTextModel,
+    )
+
+    config = NemotronHConfig.from_transformers(_hf_config())
+    config.dtype = ir.DataType.BFLOAT16
+
+    # Prove this evidence path has not weakened or bypassed the production API.
+    try:
+        NemotronHCausalLMModel(config)
+    except ValueError as error:
+        if "BF16 execution is not numerically supported" not in str(error):
+            raise
+    else:
+        raise AssertionError("Production NemotronH BF16 guard did not reject the model")
+
+    class _Bf16EvidenceCausalLM(nn.Module):
+        """Test-only wrapper around the production components."""
+
+        def __init__(self, evidence_config: NemotronHConfig):
+            super().__init__()
+            self.model = _NemotronHTextModel(evidence_config)
+            self.lm_head = Linear(
+                evidence_config.hidden_size,
+                evidence_config.vocab_size,
+                bias=False,
+            )
+
+        def forward(
+            self,
+            op: OpBuilder,
+            input_ids,
+            attention_mask,
+            position_ids,
+            past_key_values=None,
+        ):
+            hidden_states, present_key_values = self.model(
+                op,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+            )
+            return self.lm_head(op, hidden_states), present_key_values
+
+    module = _Bf16EvidenceCausalLM(config)
+    with override_flags(ort_cuda_grouped_rmsnorm_workaround=True):
+        package = build_from_module(
+            module,
+            config,
+            task="hybrid-text-generation",
+            execution_provider="onnx-standard",
+        )
+
+    preprocessing_config = dataclasses.replace(config, dtype=ir.DataType.FLOAT)
+    preprocessor = NemotronHCausalLMModel(preprocessing_config)
+    package.apply_weights(preprocessor.preprocess_weights(dict(state)))
+    unset = [
+        name
+        for name, value in package["model"].graph.initializers.items()
+        if value.const_value is None
+    ]
+    if unset:
+        raise ValueError(f"BF16 evidence graph has {len(unset)} unset parameters: {unset[:5]}")
+    return package
+
+
+def _measure_bf16_rejection(
+    state: dict[str, torch.Tensor],
+    output_root: Path,
+) -> float:
+    """Measure the rejected BF16 path on CUDA and return its maximum logit error."""
+    if not torch.cuda.is_available():
+        raise RuntimeError("BF16 rejection evidence requires CUDA")
+
+    package = _bf16_rejection_evidence_package(state)
+    evidence_dir = output_root / "bf16-rejection-evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    package.save(evidence_dir, external_data="onnx")
+
+    session = _create_session(evidence_dir / "model.onnx", "cuda", False)
+    prompt_ids = [1, 42, 17]
+    actual = _full_prefill(session, prompt_ids)
+    hf_model = _hf_model(state, dtype=torch.bfloat16, device="cuda")
+    expected = _hf_full_prefill(hf_model, prompt_ids, "cuda")
+    max_abs = float(np.max(np.abs(actual - expected)))
+    if not np.isfinite(max_abs):
+        raise AssertionError(f"BF16 rejection evidence is non-finite: {max_abs}")
+    print(f"BF16 rejection evidence: max_abs={max_abs:.6g} (limit=0.01)")
+    return max_abs
+
+
 def _full_prefill(session, token_ids: list[int]) -> np.ndarray:
     states = _initial_states(session)
     output_names = [output.name for output in session.get_outputs()]
@@ -425,6 +528,7 @@ def _validate_variant(
         print(f"{dtype_name}/{ep} provider placement: {placement}")
         if placement.get("CUDAExecutionProvider", 0) == 0:
             raise AssertionError(f"No CUDA nodes found in profile: {placement}")
+        Path(profile_path).unlink(missing_ok=True)
     del hf_model
     if device == "cuda":
         torch.cuda.empty_cache()
@@ -441,8 +545,16 @@ def main() -> None:
     parser.add_argument(
         "--matrix",
         nargs="+",
-        choices=["f32-cpu", "f16-cuda", "bf16-cuda"],
+        choices=["f32-cpu", "f16-cuda"],
         default=["f32-cpu", "f16-cuda"],
+    )
+    parser.add_argument(
+        "--bf16-rejection-evidence",
+        action="store_true",
+        help=(
+            "Measure the rejected BF16 CUDA path with a test-only component wrapper; "
+            "does not produce a supported package."
+        ),
     )
     parser.add_argument("--skip-quantization", action="store_true")
     args = parser.parse_args()
@@ -451,6 +563,14 @@ def main() -> None:
     print(f"Loaded {len(state)} reduced real-weight tensors from revision {REVISION}")
     output_root = Path(args.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
+    if args.bf16_rejection_evidence:
+        max_abs = _measure_bf16_rejection(state, output_root)
+        if max_abs <= 1e-2:
+            raise AssertionError(
+                f"BF16 now meets the 1e-2 gate ({max_abs}); revisit the production rejection"
+            )
+        return
+
     variants: dict[str, Path] = {}
     for variant in args.matrix:
         dtype_name, device = variant.split("-")

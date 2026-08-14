@@ -129,6 +129,14 @@ weights while retaining production dimensions:
 python validate_reduced_checkpoint.py
 ```
 
+The supported matrix is intentionally limited to FP32/CPU and FP16/CUDA.
+Reproduce the BF16 rejection evidence separately without creating a supported
+package or weakening the production guard:
+
+```powershell
+python validate_reduced_checkpoint.py --bf16-rejection-evidence
+```
+
 Validated results on ORT 1.28.0 / Olive 0.13.0:
 
 | Variant | Full-logit max abs | Generated IDs | Placement |

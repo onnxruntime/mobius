@@ -45,7 +45,7 @@ def _load_validator():
 
 
 @pytest.fixture(scope="module")
-def reduced_real_outputs(tmp_path_factory):
+def reduced_real_state(tmp_path_factory):
     validator = _load_validator()
     configured_cache = os.environ.get("MOBIUS_NEMOTRON_REDUCED_CACHE")
     cache = (
@@ -54,6 +54,12 @@ def reduced_real_outputs(tmp_path_factory):
         else tmp_path_factory.mktemp("nemotron-real") / "reduced.safetensors"
     )
     state = validator._build_reduced_state(cache)
+    return validator, state
+
+
+@pytest.fixture(scope="module")
+def reduced_real_outputs(reduced_real_state, tmp_path_factory):
+    validator, state = reduced_real_state
     package = validator._mobius_package(state, dtype_name="f32", ep="cpu")
     output_dir = tmp_path_factory.mktemp("nemotron-onnx")
     package.save(output_dir, external_data="onnx")
@@ -71,6 +77,33 @@ def reduced_real_outputs(tmp_path_factory):
     hf_logits = validator._hf_full_prefill(hf_model, prompt_ids, "cpu")
     hf_tokens, _hf_step_logits = validator._hf_generate(hf_model, prompt_ids, "cpu", 4)
     return onnx_logits, onnx_tokens, hf_logits, hf_tokens
+
+
+def _require_cuda() -> None:
+    if os.environ.get("MOBIUS_TEST_DEVICE") != "cuda":
+        pytest.skip("Set MOBIUS_TEST_DEVICE=cuda to run reduced-real CUDA coverage")
+    if not torch.cuda.is_available():
+        pytest.skip("PyTorch CUDA is unavailable")
+    import onnxruntime as ort
+
+    if hasattr(ort, "preload_dlls"):
+        ort.preload_dlls()
+    if "CUDAExecutionProvider" not in ort.get_available_providers():
+        pytest.skip("ONNX Runtime CUDAExecutionProvider is unavailable")
+
+
+@pytest.fixture(scope="module")
+def reduced_real_fp16_cuda(reduced_real_state, tmp_path_factory):
+    validator, state = reduced_real_state
+    _require_cuda()
+    output_root = tmp_path_factory.mktemp("nemotron-fp16-cuda")
+    package_dir = validator._validate_variant(
+        state,
+        output_root,
+        dtype_name="f16",
+        device="cuda",
+    )
+    return validator, state, package_dir
 
 
 @pytest.mark.integration
@@ -115,3 +148,80 @@ def test_nemotron_h_3_5_reduced_real_l5(reduced_real_outputs, model_type):
     assert len(hf_tokens) == golden["max_new_tokens"]
     assert hf_tokens == golden["generated_tokens"]
     assert onnx_tokens == golden["generated_tokens"]
+
+
+@pytest.mark.integration
+@pytest.mark.integration_slow
+@pytest.mark.golden
+@pytest.mark.parametrize("model_type", ["nemotron_h"])
+def test_nemotron_h_3_5_reduced_real_fp16_cuda(reduced_real_fp16_cuda, model_type):
+    del model_type
+    _validator, _state, package_dir = reduced_real_fp16_cuda
+
+    assert (package_dir / "model.onnx").is_file()
+    assert (package_dir / "model.onnx.data").is_file()
+
+
+@pytest.mark.integration
+@pytest.mark.integration_slow
+@pytest.mark.golden
+@pytest.mark.parametrize("model_type", ["nemotron_h"])
+def test_nemotron_h_3_5_bf16_rejection_evidence(
+    reduced_real_state,
+    tmp_path,
+    model_type,
+):
+    del model_type
+    validator, state = reduced_real_state
+    _require_cuda()
+
+    max_abs = validator._measure_bf16_rejection(state, tmp_path)
+
+    assert max_abs > 1e-2
+
+
+@pytest.mark.integration
+@pytest.mark.integration_slow
+@pytest.mark.generation
+@pytest.mark.quantization
+@pytest.mark.parametrize("model_type", ["nemotron_h"])
+def test_nemotron_h_3_5_olive_q4_final_package(
+    reduced_real_fp16_cuda,
+    tmp_path,
+    model_type,
+):
+    del model_type
+    import onnx_ir as ir
+
+    validator, _state, source_dir = reduced_real_fp16_cuda
+    quantized_dir = validator.quantize_package(source_dir, tmp_path / "q4_k_m-cuda")
+
+    assert (quantized_dir / "model.onnx").is_file()
+    assert (quantized_dir / "model.onnx.data").is_file()
+    assert (quantized_dir / "config.json").is_file()
+    assert sum(
+        path.stat().st_size for path in quantized_dir.iterdir() if path.is_file()
+    ) < sum(path.stat().st_size for path in source_dir.iterdir() if path.is_file())
+
+    quantized_model = ir.load(quantized_dir / "model.onnx")
+    assert (
+        sum(
+            node.domain == "com.microsoft" and node.op_type == "MatMulNBits"
+            for node in quantized_model.graph.all_nodes()
+        )
+        == 15
+    )
+
+    generated, logits, profile_path = validator.run_token_ids(
+        quantized_dir,
+        [1, 42, 17],
+        max_new_tokens=4,
+        device="cuda",
+        profile=True,
+    )
+
+    assert generated == [12, 13, 12, 12]
+    assert all(np.isfinite(step).all() for step in logits)
+    assert profile_path is not None
+    assert validator.summarize_profile(profile_path).get("CUDAExecutionProvider", 0) > 0
+    Path(profile_path).unlink(missing_ok=True)
