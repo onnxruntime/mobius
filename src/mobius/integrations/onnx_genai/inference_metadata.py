@@ -1684,20 +1684,51 @@ class SchedulerConfig:
     prediction_type: str = "epsilon"
     use_karras_sigmas: bool = False
     use_exponential_sigmas: bool = False
+    shift: float | None = None
+    base_image_seq_len: int | None = None
+    max_image_seq_len: int | None = None
+    base_shift: float | None = None
+    max_shift: float | None = None
+    shift_terminal: float | None = None
+    use_dynamic_shifting: bool = False
+    time_shift_type: str | None = None
+    invert_sigmas: bool = False
+    stochastic_sampling: bool = False
 
     def to_metadata(self) -> dict[str, Any]:
-        meta = {
+        meta: dict[str, Any] = {
             "kind": self.kind,
             "num_train_timesteps": self.num_train_timesteps,
-            "beta_start": self.beta_start,
-            "beta_end": self.beta_end,
-            "beta_schedule": self.beta_schedule,
             "prediction_type": self.prediction_type,
         }
+        if self.kind != "flow_match_euler":
+            meta.update(
+                beta_start=self.beta_start,
+                beta_end=self.beta_end,
+                beta_schedule=self.beta_schedule,
+            )
         if self.use_karras_sigmas:
             meta["use_karras_sigmas"] = True
         if self.use_exponential_sigmas:
             meta["use_exponential_sigmas"] = True
+        for name in (
+            "shift",
+            "base_image_seq_len",
+            "max_image_seq_len",
+            "base_shift",
+            "max_shift",
+            "shift_terminal",
+            "time_shift_type",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                meta[name] = value
+        if self.use_dynamic_shifting:
+            meta["use_dynamic_shifting"] = True
+        if self.invert_sigmas:
+            meta["invert_sigmas"] = True
+        if self.stochastic_sampling:
+            meta["stochastic_sampling"] = True
         return meta
 
     @classmethod
@@ -1718,7 +1749,9 @@ class SchedulerConfig:
         """
         raw_name = str(config.get("_class_name", ""))
         name = raw_name.lower()
-        if "eulerancestral" in name:
+        if "flowmatcheuler" in name:
+            kind = "flow_match_euler"
+        elif "eulerancestral" in name:
             kind = "euler_ancestral"
         elif "ancestral" in name or "sde" in name:
             raise ValueError(
@@ -1743,9 +1776,44 @@ class SchedulerConfig:
             beta_start=float(config.get("beta_start", 0.00085)),
             beta_end=float(config.get("beta_end", 0.012)),
             beta_schedule=str(config.get("beta_schedule", "scaled_linear")),
-            prediction_type=str(config.get("prediction_type", "epsilon")),
+            prediction_type=str(
+                config.get(
+                    "prediction_type",
+                    "flow_prediction" if kind == "flow_match_euler" else "epsilon",
+                )
+            ),
             use_karras_sigmas=bool(config.get("use_karras_sigmas")),
             use_exponential_sigmas=bool(config.get("use_exponential_sigmas")),
+            shift=float(config["shift"]) if config.get("shift") is not None else None,
+            base_image_seq_len=(
+                int(config["base_image_seq_len"])
+                if config.get("base_image_seq_len") is not None
+                else None
+            ),
+            max_image_seq_len=(
+                int(config["max_image_seq_len"])
+                if config.get("max_image_seq_len") is not None
+                else None
+            ),
+            base_shift=(
+                float(config["base_shift"]) if config.get("base_shift") is not None else None
+            ),
+            max_shift=(
+                float(config["max_shift"]) if config.get("max_shift") is not None else None
+            ),
+            shift_terminal=(
+                float(config["shift_terminal"])
+                if config.get("shift_terminal") is not None
+                else None
+            ),
+            use_dynamic_shifting=bool(config.get("use_dynamic_shifting")),
+            time_shift_type=(
+                str(config["time_shift_type"])
+                if config.get("time_shift_type") is not None
+                else None
+            ),
+            invert_sigmas=bool(config.get("invert_sigmas")),
+            stochastic_sampling=bool(config.get("stochastic_sampling")),
         )
 
 

@@ -385,17 +385,22 @@ def _diffusion_component_kwargs(pkg: Any) -> dict[str, Any]:
         return {}
 
     derived: dict[str, Any] = {}
+    single_component = len(names) == 1
+
+    def filename(key: str) -> str:
+        return "model.onnx" if single_component else f"{key}/model.onnx"
+
     for key in _DENOISER_KEYS:
         if key in names:
-            derived["denoiser_filename"] = f"{key}/model.onnx"
+            derived["denoiser_filename"] = filename(key)
             break
     if "text_encoder" in names:
-        derived["text_encoder_filename"] = "text_encoder/model.onnx"
+        derived["text_encoder_filename"] = filename("text_encoder")
     if "vae_decoder" in names:
-        derived["vae_filename"] = "vae_decoder/model.onnx"
+        derived["vae_filename"] = filename("vae_decoder")
         derived["vae_latent_input"] = "latent_sample"
     elif "vae" in names:
-        derived["vae_filename"] = "vae/model.onnx"
+        derived["vae_filename"] = filename("vae")
     return derived
 
 
@@ -441,6 +446,17 @@ def write_onnx_genai_config(
     """
     os.makedirs(output_dir, exist_ok=True)
     if _looks_like_diffusion(pkg):
+        is_qwen_image_edit = getattr(getattr(pkg, "config", None), "model_type", None) == (
+            "qwen_image_edit"
+        )
+        if is_qwen_image_edit:
+            raise ValueError(
+                "onnx-genai cannot execute Qwen Image Edit packages: the runtime "
+                "does not support source-latent packing, target/source token "
+                "concatenation, target-only denoiser outputs, or the required "
+                "Qwen true-CFG path. Export the ONNX components without "
+                "--runtime onnx-genai and orchestrate the pipeline directly."
+            )
         if scheduler is None:
             scheduler = load_diffusers_scheduler_config(source)
         # Fill in component filenames from the package layout, letting any
