@@ -30,8 +30,8 @@ HuggingFace reference: ``NemotronHForCausalLM``.
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING
 
+import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
@@ -46,9 +46,6 @@ from mobius.components import (
     RMSNorm,
     create_padding_mask,
 )
-
-if TYPE_CHECKING:
-    import onnx_ir as ir
 
 # ---------------------------------------------------------------------------
 # Decoder layers
@@ -233,6 +230,7 @@ class NemotronHMoEGate(nn.Module):
         self.weight = nn.Parameter([num_experts, hidden_size])
         # Correction bias for expert selection (loaded from checkpoint)
         self.e_score_correction_bias = nn.Parameter([num_experts])
+        self.e_score_correction_bias._keep_float32 = True
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # Cast to float32 for numerical stability (eps=1e-20 underflows
@@ -240,14 +238,17 @@ class NemotronHMoEGate(nn.Module):
         # in NemotronHTopkRouter.forward and never casts back.
         hidden_states = op.Cast(hidden_states, to=1)  # FLOAT32
 
-        weight_t = op.Transpose(self.weight, perm=[1, 0])
+        weight_t = op.Transpose(op.Cast(self.weight, to=1), perm=[1, 0])
         router_logits = op.MatMul(hidden_states, weight_t)
 
         # Sigmoid probabilities (these become the final routing weights)
         probs = op.Sigmoid(router_logits)
 
         # Add correction bias for expert selection only
-        choice_scores = op.Add(probs, self.e_score_correction_bias)
+        choice_scores = op.Add(
+            probs,
+            op.Cast(self.e_score_correction_bias, to=1),
+        )
 
         # Select top-k experts based on biased scores
         k = op.Constant(value_ints=[self.top_k])
@@ -374,11 +375,15 @@ class NemotronHMoEBlock(nn.Module):
             weighted = op.Mul(routing_weights, match_float)
             # Sum matched routing weights across top_k dim → per-token weight
             weight = op.ReduceSum(weighted, [-1], keepdims=True)
-            contribution = op.Mul(expert_output, weight)
+            # Match HF: accumulate routed expert contributions in the fp32
+            # routing-weight dtype, then cast the completed routed result once.
+            contribution = op.Mul(op.Cast(expert_output, to=1), weight)
             if result is None:
                 result = contribution
             else:
                 result = op.Add(result, contribution)
+
+        result = op.CastLike(result, hidden_states)
 
         # Optional latent projection back to hidden_size
         if self._has_latent:
@@ -504,6 +509,9 @@ class NemotronHCausalLMModel(nn.Module):
 
     Uses ``HybridCausalLMTask`` with mixed ``"mamba2"``,
     ``"full_attention"``, and ``"mlp"`` layer types for the cache.
+    The exported task is the base decoder used by
+    ``NemotronHForCausalLM.forward``; auxiliary ``mtp.*`` training heads are
+    outside that generation graph and are intentionally not loaded.
 
     HuggingFace reference: ``NemotronHForCausalLM``.
     """
@@ -514,6 +522,12 @@ class NemotronHCausalLMModel(nn.Module):
 
     def __init__(self, config: NemotronHConfig):
         super().__init__()
+        if config.dtype == ir.DataType.BFLOAT16:
+            raise ValueError(
+                "NemotronH BF16 execution is not numerically supported: reduced real-weight "
+                "CUDA parity exceeds the 1e-2 logit tolerance. Build the BF16 checkpoint "
+                "with dtype='f16' instead."
+            )
         self.config = config
         self.model = _NemotronHTextModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -554,6 +568,7 @@ class NemotronHCausalLMModel(nn.Module):
            - mlp: ``mixer.`` → ``mlp.``
            - moe: ``mixer.`` → ``moe.``
         6. MoE stacked 3D expert tensors split into per-expert 2D weights
+        7. Auxiliary ``mtp.*`` training heads omitted by NemotronHForCausalLM
         """
         layer_types = self.config.layer_types or []
 
@@ -572,6 +587,11 @@ class NemotronHCausalLMModel(nn.Module):
 
         new_state_dict: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
+            # The official Nemotron 3.5 checkpoint includes multi-token
+            # prediction heads, but the trusted NemotronHForCausalLM forward
+            # does not instantiate them and marks ``mtp.*`` as unexpected.
+            if key.startswith("mtp."):
+                continue
             new_key = _rename_nemotron_h_weight(key, layer_types)
             # Split stacked 3D expert tensors into per-expert 2D weights.
             # HF stores experts.up_proj as (num_experts, inter, input) and

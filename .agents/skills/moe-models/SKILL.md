@@ -476,6 +476,25 @@ config.norm_topk_prob                # Whether to normalize routing weights
 config.routed_scaling_factor         # Post-normalization scale
 ```
 
+Current Transformers exposes NemotronH layer types as
+`linear_attention` / `full_attention`; older configs use
+`mamba` / `attention`. Normalize both vocabularies to Mobius
+`mamba2` / `full_attention`, preserve `mlp` and `moe` distinctly, and reject
+unknown values. Never map `mlp` to `moe` in parity fixtures.
+
+### Reduced-precision routing
+
+ONNX has no implicit mixed-float type promotion. NemotronH routing computes in
+fp32, so keep the correction-bias initializer in fp32 and explicitly cast the
+gate weight to fp32. Cast each expert output up, multiply and accumulate all
+routed contributions in fp32, then cast the completed routed tensor back once.
+Graph construction alone may miss this; execute fp16 and bf16 MoE paths.
+
+Official Nemotron 3.5 checkpoints also contain auxiliary `mtp.*` tensors.
+The base `NemotronHForCausalLM` generation graph does not instantiate them and
+marks them unexpected. Filter only that prefix and prove weight alignment still
+populates every base-decoder initializer.
+
 ### com.microsoft.MoE compatibility
 
 **Not compatible with NemotronH.** Three blockers:

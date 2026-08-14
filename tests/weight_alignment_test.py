@@ -159,6 +159,58 @@ class TestCausalLMWeightAlignment:
         _assert_identity_roundtrip(model_type, config_overrides)
 
 
+def test_nemotron_h_filters_only_auxiliary_mtp_weights() -> None:
+    """Official MTP tensors are dropped without losing any decoder parameter."""
+    config_overrides = next(
+        overrides
+        for model_type, overrides, _ in ALL_CAUSAL_LM_CONFIGS
+        if model_type == "nemotron_h" and "moe" in overrides.get("layer_types", [])
+    )
+    config = _base_config(**config_overrides)
+    module = registry.get("nemotron_h")(config)
+    pkg = get_task(_default_task_for_model("nemotron_h")).build(module, config)
+    parameter_names = _collect_parameter_names(pkg)
+    state_dict = _build_identity_state_dict(pkg, parameter_names)
+
+    # The 3.5 checkpoint carries these auxiliary training heads, while the
+    # trusted NemotronHForCausalLM implementation intentionally ignores them.
+    state_dict["mtp.layers.0.eh_proj.weight"] = torch.ones(1)
+    state_dict["mtp.layers.1.mixer.experts.0.up_proj.weight"] = torch.ones(1)
+
+    aligned = module.preprocess_weights(state_dict)
+
+    assert not any(name.startswith("mtp.") for name in aligned)
+    assert parameter_names <= set(aligned)
+
+
+def test_nemotron_h_maps_per_expert_checkpoint_weights() -> None:
+    """The official 3.5 per-expert safetensor names map to MoE initializers."""
+    config_overrides = next(
+        overrides
+        for model_type, overrides, _ in ALL_CAUSAL_LM_CONFIGS
+        if model_type == "nemotron_h" and "moe" in overrides.get("layer_types", [])
+    )
+    config = _base_config(**config_overrides)
+    module = registry.get("nemotron_h")(config)
+    moe_layer = config.layer_types.index("moe")
+    state_dict = {
+        f"backbone.layers.{moe_layer}.mixer.experts.0.up_proj.weight": torch.ones(1),
+        f"backbone.layers.{moe_layer}.mixer.experts.0.down_proj.weight": torch.ones(1),
+        f"backbone.layers.{moe_layer}.mixer.gate.weight": torch.ones(1),
+        f"backbone.layers.{moe_layer}.mixer.gate.e_score_correction_bias": torch.ones(1),
+    }
+
+    aligned = module.preprocess_weights(state_dict)
+
+    prefix = f"model.layers.{moe_layer}.moe"
+    assert set(aligned) == {
+        f"{prefix}.experts.0.up_proj.weight",
+        f"{prefix}.experts.0.down_proj.weight",
+        f"{prefix}.gate.weight",
+        f"{prefix}.gate.e_score_correction_bias",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Encoder-only weight alignment
 # ---------------------------------------------------------------------------

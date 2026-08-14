@@ -919,7 +919,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "command_r": "CohereForAI/c4ai-command-r-v01",
     "csm": "sesame/csm-1b",
     "evolla": "westlake-repl/Evolla-10B-hf",
-    "nemotron_h": "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
+    "nemotron_h": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
     "nemotron_parse": "nvidia/NVIDIA-Nemotron-Parse-2.0",
     "open-llama": "openlm-research/open_llama_3b",
     "persimmon": "adept/persimmon-8b-base",
