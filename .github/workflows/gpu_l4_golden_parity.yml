@@ -86,7 +86,7 @@ jobs:
           AFFECTED='${{ inputs.affected_models }}'
           if [ -z "$AFFECTED" ] || [ "$AFFECTED" = "[]" ]; then
             echo "Running all L4 golden comparison tests"
-            pytest tests/e2e_golden_test.py tests/nemotron_h_real_weight_test.py \
+            pytest tests/e2e_golden_test.py tests/*_real_weight_test.py \
               -m golden \
               -v \
               --timeout=300 \
@@ -98,7 +98,7 @@ jobs:
             # Convert JSON array to comma-separated list for --models
             MODELS=$(echo "$AFFECTED" | python -c "import json, sys; print(','.join(json.load(sys.stdin)))")
             if [ -n "$MODELS" ]; then
-              pytest tests/e2e_golden_test.py tests/nemotron_h_real_weight_test.py \
+              pytest tests/e2e_golden_test.py tests/*_real_weight_test.py \
                 -m golden \
                 -v \
                 --models "$MODELS" \

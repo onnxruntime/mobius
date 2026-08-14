@@ -291,11 +291,12 @@ global cache-slot count. Preserve intrinsic schema/config validation, but do
 not gate or reject export based on the current GenAI model registry, runtime
 version, topology support, or cache executor capability.
 
-NemotronH is one such unsupported contract in ORT GenAI 0.15.2: sparse global
-layer indices mix attention key/value caches with Mamba `conv_state` and
-`ssm_state`. The generic decoder schema cannot bind all three cache families.
-Reject `--runtime ort-genai` before creating output and direct users to a
-token-by-token ONNX Runtime loop until the runtime adds a dedicated model type.
+NemotronH is unsupported in ORT GenAI 0.15.2 because sparse global layer
+indices mix attention key/value caches with Mamba `conv_state` and
+`ssm_state`. Do not hard-code a model-type rejection based only on that runtime
+version: emit a structurally honest config so downstream releases can evolve,
+record the tested-version waiver, and provide a direct ONNX Runtime loop for
+current users.
 
 ### "input_ids size exceeds max length"
 
