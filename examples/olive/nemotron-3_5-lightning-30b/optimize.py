@@ -12,7 +12,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from inference import MODEL_ID, REVISION, run_token_ids
+from inference import MODEL_ID, REVISION, load_eos_token_ids, run_token_ids
 
 _METADATA_FILES = {
     "added_tokens.json",
@@ -209,6 +209,7 @@ def smoke_test(model_dir: str | Path, *, device: str) -> list[int]:
         [1, 42, 17],
         max_new_tokens=4,
         device=device,
+        eos_token_ids=load_eos_token_ids(model_dir),
     )
     if len(generated) != 4 or any(not np.isfinite(step).all() for step in logits):
         raise RuntimeError(f"Quantized generation smoke test failed: {generated}")

@@ -53,6 +53,25 @@ _TRACEABLE_PREFIXES = (
     "src/mobius/tasks/",
 )
 
+# Model-specific examples whose integration tests depend on files outside src/.
+_MODEL_PATH_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("examples/olive/nemotron-3_5-lightning-30b/", ("nemotron_h",)),
+    ("testdata/cases/causal-lm/nemotron-3_5-lightning-30b.yaml", ("nemotron_h",)),
+    ("testdata/golden/causal-lm/nemotron-3_5-lightning-30b-", ("nemotron_h",)),
+)
+
+
+def _model_type_hints(path: str) -> set[str]:
+    """Infer targeted model types from real-weight tests and example assets."""
+    normalized = path.replace("\\", "/")
+    if normalized.startswith("tests/") and normalized.endswith("_real_weight_test.py"):
+        filename = normalized.rsplit("/", 1)[-1]
+        return {filename[: -len("_real_weight_test.py")]}
+    for prefix, model_types in _MODEL_PATH_HINTS:
+        if normalized.startswith(prefix):
+            return set(model_types)
+    return set()
+
 
 def classify_file(path: str) -> str:
     """Classify a changed file path.
@@ -435,6 +454,7 @@ def detect_affected_models(
     model_files: list[str] = []
     traceable_files: list[str] = []
     for path in changed_files:
+        affected.update(_model_type_hints(path))
         category = classify_file(path)
         if category == "shared_infra":
             run_all = True
@@ -462,7 +482,7 @@ def detect_affected_models(
         return {"affected": [], "run_all": True}
 
     if not model_files and not traceable_files:
-        return {"affected": [], "run_all": False}
+        return {"affected": sorted(affected), "run_all": False}
 
     # Build the registry map: source_module → [model_types]
     registry_map = _build_source_module_to_types()

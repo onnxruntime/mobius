@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections import Counter
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
@@ -153,6 +154,22 @@ def _create_session(model_path: Path, device: str, profile: bool):
     return session
 
 
+def load_eos_token_ids(model_dir: str | Path) -> set[int]:
+    """Load scalar or list EOS IDs from the assembled package metadata."""
+    model_dir = Path(model_dir)
+    eos_ids: set[int] = set()
+    for filename in ("generation_config.json", "config.json"):
+        path = model_dir / filename
+        if not path.is_file():
+            continue
+        raw_eos = json.loads(path.read_text(encoding="utf-8")).get("eos_token_id")
+        if isinstance(raw_eos, int):
+            eos_ids.add(raw_eos)
+        elif isinstance(raw_eos, list):
+            eos_ids.update(value for value in raw_eos if isinstance(value, int))
+    return eos_ids
+
+
 def run_token_ids(
     model_dir: str | Path,
     input_ids: list[int],
@@ -160,6 +177,7 @@ def run_token_ids(
     max_new_tokens: int,
     device: str,
     profile: bool = False,
+    eos_token_ids: Collection[int] | None = None,
 ) -> tuple[list[int], list[np.ndarray], str | None]:
     """Run token-by-token hybrid-cache generation and return IDs plus logits."""
     model_path = Path(model_dir) / "model.onnx"
@@ -190,10 +208,13 @@ def run_token_ids(
 
     assert outputs is not None
     logits = _as_numpy(outputs[output_names.index("logits")])[0, -1].astype(np.float32)
-    for _ in range(max_new_tokens):
+    eos_ids = set(eos_token_ids or ())
+    for token_index in range(max_new_tokens):
         logits_by_step.append(logits.copy())
         token_id = int(np.argmax(logits))
         generated.append(token_id)
+        if token_id in eos_ids or token_index + 1 == max_new_tokens:
+            break
         feeds = _token_feeds(
             session,
             np.array([[token_id]], dtype=np.int64),
@@ -265,6 +286,7 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
         device=args.device,
         profile=args.profile,
+        eos_token_ids=load_eos_token_ids(model_dir),
     )
     if not generated:
         raise RuntimeError("Generation produced no tokens")

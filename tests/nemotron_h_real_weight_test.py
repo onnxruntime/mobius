@@ -44,6 +44,63 @@ def _load_validator():
         sys.path.pop(0)
 
 
+def test_load_eos_token_ids_unions_generation_and_model_config(tmp_path):
+    validator = _load_validator()
+    (tmp_path / "generation_config.json").write_text(
+        json.dumps({"eos_token_id": [2, 11]}),
+        encoding="utf-8",
+    )
+    (tmp_path / "config.json").write_text(
+        json.dumps({"eos_token_id": 2}),
+        encoding="utf-8",
+    )
+
+    assert validator.load_eos_token_ids(tmp_path) == {2, 11}
+
+
+def test_run_token_ids_stops_on_eos_without_unused_forward(tmp_path, monkeypatch):
+    validator = _load_validator()
+    inference_globals = validator.run_token_ids.__globals__
+    (tmp_path / "model.onnx").touch()
+
+    class _Output:
+        name = "logits"
+
+    class _Session:
+        @staticmethod
+        def get_inputs():
+            return []
+
+        @staticmethod
+        def get_outputs():
+            return [_Output()]
+
+    calls = []
+
+    def _run_session(_session, _output_names, _feeds):
+        calls.append(1)
+        logits = np.zeros((1, 1, 16), dtype=np.float32)
+        logits[0, 0, 2] = 1.0
+        return [logits]
+
+    monkeypatch.setitem(inference_globals, "_create_session", lambda *_args: _Session())
+    monkeypatch.setitem(inference_globals, "_initial_states", lambda _session: {})
+    monkeypatch.setitem(inference_globals, "_run_session", _run_session)
+
+    generated, logits, profile = validator.run_token_ids(
+        tmp_path,
+        [1],
+        max_new_tokens=4,
+        device="cpu",
+        eos_token_ids={2},
+    )
+
+    assert generated == [2]
+    assert len(logits) == 1
+    assert len(calls) == 1
+    assert profile is None
+
+
 @pytest.fixture(scope="module")
 def reduced_real_state(tmp_path_factory):
     validator = _load_validator()
@@ -71,6 +128,7 @@ def reduced_real_outputs(reduced_real_state, tmp_path_factory):
         prompt_ids,
         max_new_tokens=4,
         device="cpu",
+        eos_token_ids=validator.load_eos_token_ids(output_dir),
     )
 
     hf_model = validator._hf_model(state, dtype=torch.float32, device="cpu")
@@ -218,6 +276,7 @@ def test_nemotron_h_3_5_olive_q4_final_package(
         max_new_tokens=4,
         device="cuda",
         profile=True,
+        eos_token_ids=validator.load_eos_token_ids(quantized_dir),
     )
 
     assert generated == [12, 13, 12, 12]
