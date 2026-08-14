@@ -3,7 +3,7 @@
   "package": {
     "repository": "justinchuby/Muse-Glimmer-30B-ONNX-INT4-CUDA",
     "weights_revision": "bf36a94a4519e14e3c48ad005c6ff1972ab44ccb",
-    "schema_head": "b4422f5709fc41ea2545e1de46b849343ace9824",
+    "schema_head": "9e5757196b98542390ce11f4ff966a58ab3ef578",
     "artifacts": {
       "decoder": "decoder/model.onnx",
       "embedding": "embedding/model.onnx",
@@ -13,7 +13,7 @@
   },
   "runtime": {
     "onnxruntime": "1.28.0",
-    "onnxruntime_genai_commit": "b4422f5709fc41ea2545e1de46b849343ace9824",
+    "onnxruntime_genai_commit": "9e5757196b98542390ce11f4ff966a58ab3ef578",
     "execution_provider": "CUDAExecutionProvider",
     "cuda_graph": true,
     "cudnn_flash_attention": false,
