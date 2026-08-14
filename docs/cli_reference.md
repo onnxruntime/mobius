@@ -311,9 +311,13 @@ mobius build-gguf GGUF_PATH [options]
 | Option | Description |
 |--------|-------------|
 | `--output DIR`, `-o DIR` | Output directory. Default: `<gguf_stem>_onnx/`. |
-| `--keep-quantized` | Preserve GGUF quantization as `MatMulNBits` (Q4_0/Q4_1/Q8_0). |
+| `--keep-quantized` | Preserve supported affine blocks as `MatMulNBits` and supported native IQ/MXFP4 blocks. Mixed presets may still require requantization. |
 | `--dtype DTYPE` | Target dtype for model weights: `f16`, `bf16`, `f32`. |
 | `--external-data FORMAT` | External data format: `onnx` (default) or `safetensors`. |
+| `--ep EP` | Target execution provider for EP-aware optimization. |
+| `--runtime RUNTIME` | `onnx-genai` emits supported runtime metadata. `ort-genai` is rejected until GGUF cache/tokenizer generation coverage exists. |
+| `--static-cache` | Build a fixed-width cache where supported. |
+| `--max-seq-len N` | Set the fixed cache length; requires `--static-cache`. |
 
 ### Examples
 
@@ -327,6 +331,12 @@ mobius build-gguf model.gguf --output output/ --keep-quantized
 # Convert with specific dtype
 mobius build-gguf model.gguf --output output/ --dtype f16
 ```
+
+Sharded GGUF inputs are rejected because a single shard has an incomplete
+tensor table. `nemotron_h_moe` is also rejected until its MTP block, Mamba2
+parity, mixed expert quantization, tokenizer provenance, and real ORT/ORT GenAI
+generation are validated. See
+[`build_from_gguf()`](api/build_from_gguf.md#nvidia-nemotron-35-lightning-waiver).
 
 ---
 

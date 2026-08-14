@@ -504,6 +504,15 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         )
         raise SystemExit(1)
 
+    if getattr(args, "runtime", None) == "ort-genai":
+        raise SystemExit(
+            "Error: mobius build-gguf does not yet support --runtime ort-genai. "
+            "The command cannot emit a valid genai_config.json until the selected "
+            "GGUF architecture's cache and tokenizer contracts have passed real "
+            "ORT GenAI generation. Use --runtime onnx-genai where supported, or "
+            "omit --runtime and run the ONNX model directly."
+        )
+
     mmproj_path = getattr(args, "mmproj", None)
 
     if args.keep_quantized:
@@ -862,8 +871,8 @@ def main(argv: list[str] | None = None) -> None:
             "Generate runtime-specific config files after building. "
             "'onnx-genai' writes inference_metadata.yaml plus a tokenizer.json "
             "reconstructed from the GGUF's embedded tokenizer metadata; "
-            "'ort-genai' writes genai_config.json + copies tokenizer files. "
-            "Either way the quantized model runs directly in the target runtime."
+            "'ort-genai' is currently rejected until GGUF cache/tokenizer "
+            "contracts have runtime generation coverage."
         ),
     )
     gguf_parser.add_argument(

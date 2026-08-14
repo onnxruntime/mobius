@@ -363,13 +363,17 @@ def build_gemma4_vlm_from_gguf(
     import dataclasses
 
     from mobius._builder import resolve_dtype
+    from mobius.integrations.gguf._builder import _validate_gguf_model
     from mobius.integrations.gguf._config_mapping import gguf_to_config
     from mobius.integrations.gguf._reader import GGUFModel
     from mobius.models.gemma4 import Gemma4Model
     from mobius.tasks._gemma4 import Gemma4Task
 
     text_gguf = GGUFModel(_resolve_local_path(text_gguf_path))
+    _validate_gguf_model(text_gguf, source=str(text_gguf_path))
+
     mmproj_gguf = GGUFModel(_resolve_local_path(mmproj_gguf_path))
+    _validate_gguf_model(mmproj_gguf, source=str(mmproj_gguf_path))
     if mmproj_gguf.architecture != "clip":
         raise ValueError(
             f"Expected a 'clip' mmproj GGUF, got architecture "

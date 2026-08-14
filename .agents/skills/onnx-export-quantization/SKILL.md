@@ -96,6 +96,36 @@ output/
 └── genai_config.json
 ```
 
+### Direct GGUF import acceptance
+
+Do not infer a GGUF's quantization from its filename. Presets such as
+`Q4_K_M`, `MXFP4_MOE`, and Unsloth Dynamic variants can contain large tensors
+in different per-tensor formats (for example Q5_0, Q5_1, Q8_0, and MXFP4).
+Before implementing or claiming a direct conversion:
+
+1. Pin the GGUF repository revision, filename, file size, and LFS SHA-256.
+2. Inspect the GGUF metadata and complete tensor table (names, logical shapes,
+   and quantization types) without downloading tensor payloads when range
+   requests are available.
+3. Compare the layer schedule and tensor shapes with a separately pinned
+   official config and safetensors headers. `block_count` may include auxiliary
+   MTP/draft blocks rather than decoder backbone layers.
+4. Classify every large tensor as byte-preserved native blocks, lossless affine
+   repacking, or dequantize/requantize. If any large tensor takes the third
+   path, the conversion does **not** preserve the source quantization.
+5. Reject split GGUF shards unless the importer explicitly assembles every
+   shard. Reading one shard can build a plausible but incomplete model.
+6. Compare embedded tokenizer special-token IDs and chat template with the
+   pinned upstream tokenizer. A self-contained package is invalid when padding,
+   EOS, or BOS semantics disagree.
+7. Require real-weight full-logit parity and deterministic multi-token
+   generation through both ONNX Runtime and the declared GenAI runtime. Graph,
+   config, and session creation are not acceptance evidence.
+
+Use Hub GGUF architecture metadata to fail before downloading multi-gigabyte
+unsupported files, then repeat the guard from the local GGUF header so local
+paths receive the same actionable error.
+
 ## Quantization with Olive
 
 ### Installation

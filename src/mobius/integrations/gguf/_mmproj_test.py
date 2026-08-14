@@ -11,6 +11,7 @@ encoder build+run path end-to-end on CPU.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -98,11 +99,65 @@ def _write_clip_mmproj_gguf(path: Path, *, with_audio: bool = True) -> None:
     writer.close()
 
 
+def _write_minimal_gguf(
+    path: Path,
+    architecture: str,
+    *,
+    split_count: int = 1,
+) -> None:
+    """Write only enough GGUF structure to exercise pre-config guards."""
+    from gguf import GGUFWriter
+
+    writer = GGUFWriter(str(path), architecture)
+    if split_count > 1:
+        writer.add_uint16("split.no", 0)
+        writer.add_uint16("split.count", split_count)
+        writer.add_uint64("split.tensors.count", 1)
+    writer.add_tensor("sentinel", np.zeros((1,), dtype=np.float32))
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
 @pytest.fixture
 def clip_mmproj_gguf(tmp_path: Path) -> Path:
     path = tmp_path / "mmproj.gguf"
     _write_clip_mmproj_gguf(path)
     return path
+
+
+class TestMultimodalPreflightGuards:
+    def test_rejects_unsupported_text_architecture_before_config(
+        self,
+        tmp_path: Path,
+    ):
+        from mobius.integrations.gguf._mmproj import build_gemma4_vlm_from_gguf
+
+        text_path = tmp_path / "nemotron-h-moe.gguf"
+        _write_minimal_gguf(text_path, "nemotron_h_moe")
+
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._mmproj._resolve_local_path",
+                side_effect=[str(text_path)],
+            ) as resolve,
+            pytest.raises(NotImplementedError, match="nemotron_h_moe"),
+        ):
+            build_gemma4_vlm_from_gguf(text_path, "owner/repo:mmproj.gguf")
+
+        assert resolve.call_count == 1
+
+    def test_rejects_split_mmproj_before_config(self, tmp_path: Path):
+        from mobius.integrations.gguf._mmproj import build_gemma4_vlm_from_gguf
+
+        text_path = tmp_path / "gemma4.gguf"
+        mmproj_path = tmp_path / "mmproj-00001-of-00002.gguf"
+        _write_minimal_gguf(text_path, "gemma4")
+        _write_minimal_gguf(mmproj_path, "clip", split_count=2)
+
+        with pytest.raises(NotImplementedError, match="cannot assemble split tensor tables"):
+            build_gemma4_vlm_from_gguf(text_path, mmproj_path)
 
 
 class TestReadVisionConfig:
