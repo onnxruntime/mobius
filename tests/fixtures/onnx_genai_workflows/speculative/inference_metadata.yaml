@@ -134,18 +134,6 @@ pipeline:
           kind: application
           name: serving.slot_ids
         required: true
-      request.row_ids:
-        contract:
-          dtype: int64
-          rank: 1
-          shape:
-          - batch
-        role:
-          kind: opaque
-        source:
-          kind: application
-          name: serving.row_ids
-        required: true
       request.cache_lengths:
         contract:
           dtype: int64
@@ -614,17 +602,6 @@ pipeline:
         initializer: request.slot_ids
         recurrence:
           kind: invariant
-      row_ids:
-        contract:
-          dtype: int64
-          rank: 1
-          shape:
-          - batch
-        class: semantic
-        scope: invocation
-        initializer: request.row_ids
-        recurrence:
-          kind: invariant
       cache_lengths:
         contract:
           dtype: int64
@@ -836,13 +813,13 @@ pipeline:
         output: tokens
         mode: append
         valid_length: grammar.committed_length
-        row_ids: row_ids
+        row_ids: slot_ids
       - kind: emit
         value: grammar.token
         output: tokens
         mode: append
         valid_length: grammar.forced_length
-        row_ids: row_ids
+        row_ids: slot_ids
       continue_when: active
       max_iterations: request.max_iterations
       carried:
@@ -858,8 +835,6 @@ pipeline:
         next: grammar.committed_length
       - cell: slot_ids
         next: slot_ids
-      - cell: row_ids
-        next: row_ids
       - cell: cache_lengths
         next: cache_lengths.next
       - cell: grammar

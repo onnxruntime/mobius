@@ -132,18 +132,6 @@ pipeline:
           name: row_max_iterations
         required: false
         default: -1
-      request.row_ids:
-        contract:
-          dtype: int64
-          rank: 1
-          shape:
-          - batch
-        role:
-          kind: opaque
-        source:
-          kind: application
-          name: row_ids
-        required: true
       request.temperature:
         contract:
           dtype: float32
@@ -274,9 +262,9 @@ pipeline:
         role:
           kind: opaque
         source:
-          kind: literal
-        required: false
-        default: 0
+          kind: application
+          name: serving.slot_ids
+        required: true
       package.cache_lengths:
         contract:
           dtype: int64
@@ -483,17 +471,6 @@ pipeline:
         initializer: package.slot_ids
         recurrence:
           kind: invariant
-      row_ids:
-        contract:
-          dtype: int64
-          rank: 1
-          shape:
-          - batch
-        class: semantic
-        scope: invocation
-        initializer: request.row_ids
-        recurrence:
-          kind: invariant
       cache_lengths:
         contract:
           dtype: int64
@@ -694,7 +671,7 @@ pipeline:
         mode: append
         valid_length: token.emitted_length
         when: active
-        row_ids: row_ids
+        row_ids: slot_ids
       - kind: invoke
         component: decoder_step_update
         inputs:
@@ -739,8 +716,6 @@ pipeline:
         next: accepted_len.next
       - cell: slot_ids
         next: slot_ids
-      - cell: row_ids
-        next: row_ids
       - cell: rng_offset
         next: sample.next_offset
       - cell: attention_mask

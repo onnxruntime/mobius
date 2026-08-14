@@ -2765,12 +2765,6 @@ def build_vlm_workflow_metadata(
             "required": False,
             "default": -1,
         },
-        "request.row_ids": {
-            "contract": batch_int,
-            "role": {"kind": "opaque"},
-            "source": {"kind": "application", "name": "row_ids"},
-            "required": True,
-        },
         "package.eos_ids": {
             "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
             "role": {"kind": "opaque"},
@@ -2822,9 +2816,8 @@ def build_vlm_workflow_metadata(
         "package.slot_ids": {
             "contract": batch_int,
             "role": {"kind": "opaque"},
-            "source": {"kind": "literal"},
-            "required": False,
-            "default": 0,
+            "source": {"kind": "application", "name": "serving.slot_ids"},
+            "required": True,
         },
     }
     inputs.update(
@@ -3041,13 +3034,6 @@ def build_vlm_workflow_metadata(
             "initializer": "package.slot_ids",
             "recurrence": {"kind": "invariant"},
         },
-        "row_ids": {
-            "contract": batch_int,
-            "class": "semantic",
-            "scope": "invocation",
-            "initializer": "request.row_ids",
-            "recurrence": {"kind": "invariant"},
-        },
         "cache_lengths": {
             "contract": batch_int,
             "class": "semantic",
@@ -3126,13 +3112,6 @@ def build_vlm_workflow_metadata(
             "state.slot_ids.body",
             "state.slot_ids.body",
             "state.slot_ids.final",
-        ),
-        (
-            "row_ids",
-            "request.row_ids",
-            "state.row_ids.body",
-            "state.row_ids.body",
-            "state.row_ids.final",
         ),
         (
             "cache_lengths",
@@ -3439,7 +3418,7 @@ def build_vlm_workflow_metadata(
                 "mode": "append",
                 "when": "state.active.body",
                 "valid_length": "token.emitted_length",
-                "row_ids": "state.row_ids.body",
+                "row_ids": "state.slot_ids.body",
                 "effect_name": "emit",
                 "effect": _effect("emit.0", "emit.1"),
             },
@@ -3738,12 +3717,6 @@ def build_speculative_workflow_metadata(
             "contract": batch_int,
             "role": {"kind": "opaque"},
             "source": {"kind": "application", "name": "serving.slot_ids"},
-            "required": True,
-        },
-        "request.row_ids": {
-            "contract": batch_int,
-            "role": {"kind": "opaque"},
-            "source": {"kind": "application", "name": "serving.row_ids"},
             "required": True,
         },
         "request.cache_lengths": {
@@ -4067,7 +4040,7 @@ def build_speculative_workflow_metadata(
             "valid_length": emit_length,
             "output": "tokens",
             "mode": "append",
-            "row_ids": "state.row_ids.body",
+            "row_ids": "state.slot_ids.body",
             "effect_name": "emit",
             "effect": _effect("emit.0", "emit.1"),
         },
@@ -4080,7 +4053,7 @@ def build_speculative_workflow_metadata(
                 "valid_length": "grammar.forced_length",
                 "output": "tokens",
                 "mode": "append",
-                "row_ids": "state.row_ids.body",
+                "row_ids": "state.slot_ids.body",
                 "effect_name": "emit",
                 "effect": _effect("emit.1", "emit.2"),
             }
@@ -4126,13 +4099,6 @@ def build_speculative_workflow_metadata(
             "class": "semantic",
             "scope": "invocation",
             "initializer": "request.slot_ids",
-            "recurrence": {"kind": "invariant"},
-        },
-        "row_ids": {
-            "contract": batch_int,
-            "class": "semantic",
-            "scope": "invocation",
-            "initializer": "request.row_ids",
             "recurrence": {"kind": "invariant"},
         },
         "cache_lengths": {
@@ -4185,13 +4151,6 @@ def build_speculative_workflow_metadata(
             "state.slot_ids.body",
             "state.slot_ids.body",
             "state.slot_ids.final",
-        ),
-        (
-            "row_ids",
-            "request.row_ids",
-            "state.row_ids.body",
-            "state.row_ids.body",
-            "state.row_ids.final",
         ),
         (
             "cache_lengths",
@@ -4670,12 +4629,6 @@ def build_decoder_workflow_metadata(
                     "required": False,
                     "default": -1,
                 },
-                "request.row_ids": {
-                    "contract": batch_int,
-                    "role": {"kind": "opaque"},
-                    "source": {"kind": "application", "name": "row_ids"},
-                    "required": True,
-                },
             }
         )
     stochastic_sampler = sampler != "greedy"
@@ -4814,9 +4767,8 @@ def build_decoder_workflow_metadata(
                 "package.slot_ids": {
                     "contract": batch_int,
                     "role": {"kind": "opaque"},
-                    "source": {"kind": "literal"},
-                    "required": False,
-                    "default": 0,
+                    "source": {"kind": "application", "name": "serving.slot_ids"},
+                    "required": True,
                 },
                 "package.cache_lengths": {
                     "contract": batch_int,
@@ -4916,13 +4868,6 @@ def build_decoder_workflow_metadata(
                     "initializer": "package.slot_ids",
                     "recurrence": {"kind": "invariant"},
                 },
-                "row_ids": {
-                    "contract": batch_int,
-                    "class": "semantic",
-                    "scope": "invocation",
-                    "initializer": "request.row_ids",
-                    "recurrence": {"kind": "invariant"},
-                },
                 "cache_lengths": {
                     "contract": batch_int,
                     "class": "semantic",
@@ -5016,13 +4961,6 @@ def build_decoder_workflow_metadata(
                     "body_input": "state.slot_ids.body",
                     "body_output": "state.slot_ids.body",
                     "next": "state.slot_ids.final",
-                },
-                {
-                    "cell": "row_ids",
-                    "current": "request.row_ids",
-                    "body_input": "state.row_ids.body",
-                    "body_output": "state.row_ids.body",
-                    "next": "state.row_ids.final",
                 },
             ]
         )
@@ -5378,7 +5316,7 @@ def build_decoder_workflow_metadata(
                     {
                         "when": "state.active.body",
                         "valid_length": "token.emitted_length",
-                        "row_ids": "state.row_ids.body",
+                        "row_ids": "state.slot_ids.body",
                     }
                     if cache_pairs
                     else {}
