@@ -1240,6 +1240,24 @@ def _write_genai_config(
 def _validate_ort_genai_compatibility(pkg: ModelPackage) -> None:
     """Reject packages whose required inputs cannot be supplied by ORT GenAI."""
     config = getattr(pkg, "config", None)
+    decoder_key = "decoder" if "decoder" in pkg else "model"
+    decoder_model = pkg.get(decoder_key)
+    if decoder_model is not None:
+        cache_suffixes = {
+            parts[2]
+            for model_input in decoder_model.graph.inputs
+            if model_input.name is not None
+            and len(parts := model_input.name.split(".")) == 3
+            and parts[0] == "past_key_values"
+            and parts[1].isdigit()
+        }
+        if "ssm_state" in cache_suffixes:
+            raise ValueError(
+                "ORT GenAI config generation cannot represent this decoder's cache "
+                f"inputs {sorted(cache_suffixes)}: no input/output template exists for "
+                "ssm_state. Export without --runtime ort-genai and run the ONNX model "
+                "directly until the config schema and runtime support this graph contract."
+            )
     if getattr(config, "model_type", None) == "parakeet_ctc":
         raise ValueError(
             "ORT GenAI does not define a feature-input CTC ASR pipeline; "
