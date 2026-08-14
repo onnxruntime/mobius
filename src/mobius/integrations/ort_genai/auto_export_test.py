@@ -1065,14 +1065,36 @@ class TestExportForOrtGenai:
             write_ort_genai_config(pkg, str(tmp_path))
         assert not (tmp_path / "genai_config.json").exists()
 
-    def test_nemotron_h_config_is_emitted_for_future_runtime_support(self, tmp_path):
-        pkg = _make_fake_llm_pkg("nemotron_h")
+    def test_rejects_unrepresentable_mixed_cache_graph_before_writing(self, tmp_path):
+        import dataclasses
 
-        result = write_ort_genai_config(pkg, str(tmp_path))
+        from mobius._model_package import ModelPackage
 
-        with open(result["genai_config"], encoding="utf-8") as config_file:
-            generated = json.load(config_file)
-        assert generated["model"]["type"] == "nemotron_h"
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "future_hybrid"
+
+        pkg = ModelPackage(
+            {
+                "model": _mock_model(
+                    inputs=[
+                        "input_ids",
+                        "attention_mask",
+                        "past_key_values.0.conv_state",
+                        "past_key_values.0.ssm_state",
+                        "past_key_values.2.key",
+                        "past_key_values.2.value",
+                    ]
+                )
+            },
+            config=FakeConfig(),
+        )
+        output_dir = tmp_path / "ort-genai"
+
+        with pytest.raises(ValueError, match=r"no input/output template.*ssm_state"):
+            write_ort_genai_config(pkg, str(output_dir))
+
+        assert not output_dir.exists()
 
     def test_processor_config_written_with_vision(self, tmp_path):
         """image_processor.json is written when pkg.config.vision is set."""

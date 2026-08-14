@@ -101,14 +101,102 @@ def test_run_token_ids_stops_on_eos_without_unused_forward(tmp_path, monkeypatch
     assert profile is None
 
 
+def test_pinned_range_fetch_retries_and_validates_headers(monkeypatch):
+    validator = _load_validator()
+
+    class _Response:
+        def __init__(self, status, headers, content=b""):
+            self.status_code = status
+            self.headers = headers
+            self.content = content
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class _Session:
+        def __init__(self):
+            self.responses = [
+                _Response(503, {}),
+                _Response(206, {"Content-Range": "bytes 1-4/10", "Content-Length": "4"}),
+                _Response(
+                    206, {"Content-Range": "bytes 0-3/10", "Content-Length": "4"}, b"data"
+                ),
+            ]
+            self.calls = 0
+
+        def get(self, *_args, **_kwargs):
+            self.calls += 1
+            return self.responses.pop(0)
+
+    reader = object.__new__(validator._PinnedSafetensors)
+    reader._session = _Session()
+    sleeps = []
+    monkeypatch.setattr(validator.time, "sleep", sleeps.append)
+
+    assert reader._range("model.safetensors", 0, 3) == b"data"
+    assert reader._session.calls == 3
+    assert sleeps == [1, 2]
+
+
+def test_pinned_range_fetch_fails_explicitly_after_retries(monkeypatch):
+    validator = _load_validator()
+
+    class _Response:
+        def __init__(self):
+            self.status_code = 503
+            self.headers = {}
+            self.content = b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class _Session:
+        calls = 0
+
+        def get(self, *_args, **_kwargs):
+            self.calls += 1
+            return _Response()
+
+    reader = object.__new__(validator._PinnedSafetensors)
+    reader._session = _Session()
+    monkeypatch.setattr(validator.time, "sleep", lambda _delay: None)
+
+    with pytest.raises(RuntimeError, match=r"failed after 3 attempts.*status=503"):
+        reader._range("model.safetensors", 0, 3)
+    assert reader._session.calls == 3
+
+
+def test_reduced_cache_rejects_stale_fixture_schema(tmp_path):
+    validator = _load_validator()
+    from safetensors.torch import save_file
+
+    cache_path = tmp_path / "stale.safetensors"
+    save_file(
+        {"placeholder": torch.zeros(1)},
+        cache_path,
+        metadata={
+            "model_id": validator.MODEL_ID,
+            "revision": validator.REVISION,
+            "fixture_schema": "0",
+        },
+    )
+
+    with pytest.raises(ValueError, match=r"fixture_schema.*Remove the stale cache"):
+        validator._build_reduced_state(cache_path)
+
+
 @pytest.fixture(scope="module")
-def reduced_real_state(tmp_path_factory):
+def reduced_real_state():
     validator = _load_validator()
     configured_cache = os.environ.get("MOBIUS_NEMOTRON_REDUCED_CACHE")
     cache = (
-        Path(configured_cache)
-        if configured_cache
-        else tmp_path_factory.mktemp("nemotron-real") / "reduced.safetensors"
+        Path(configured_cache) if configured_cache else validator.default_reduced_cache_path()
     )
     state = validator._build_reduced_state(cache)
     return validator, state

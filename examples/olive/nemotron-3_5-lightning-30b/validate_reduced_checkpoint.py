@@ -10,10 +10,12 @@ import argparse
 import json
 import math
 import struct
+import time
 from collections import Counter
 from pathlib import Path
 
 import numpy as np
+import requests
 import torch
 from huggingface_hub import hf_hub_download
 from inference import (
@@ -35,6 +37,8 @@ from safetensors.torch import load_file, save_file
 _VOCAB_SIZE = 256
 _NUM_EXPERTS = 4
 _LAYER_REMAP = {0: 0, 1: 1, 5: 2}
+FIXTURE_SCHEMA_VERSION = 1
+_RANGE_ATTEMPTS = 3
 _DTYPES = {
     "f32": (torch.float32, "FLOAT"),
     "f16": (torch.float16, "FLOAT16"),
@@ -45,8 +49,6 @@ class _PinnedSafetensors:
     """Read selected tensors via HTTP Range without downloading 65.8 GB."""
 
     def __init__(self) -> None:
-        import requests
-
         index_path = hf_hub_download(
             MODEL_ID,
             "model.safetensors.index.json",
@@ -61,18 +63,42 @@ class _PinnedSafetensors:
         return f"https://huggingface.co/{MODEL_ID}/resolve/{REVISION}/{shard}"
 
     def _range(self, shard: str, start: int, end: int) -> bytes:
-        response = self._session.get(
-            self._url(shard),
-            headers={"Range": f"bytes={start}-{end}"},
-            timeout=180,
-        )
         expected = end - start + 1
-        if response.status_code != 206 or len(response.content) != expected:
-            raise RuntimeError(
-                f"Range fetch failed for {shard} bytes {start}-{end}: "
-                f"status={response.status_code}, bytes={len(response.content)}"
-            )
-        return response.content
+        expected_range_prefix = f"bytes {start}-{end}/"
+        last_error = ""
+        for attempt in range(_RANGE_ATTEMPTS):
+            try:
+                with self._session.get(
+                    self._url(shard),
+                    headers={"Range": f"bytes={start}-{end}"},
+                    timeout=180,
+                    stream=True,
+                ) as response:
+                    content_range = response.headers.get("Content-Range", "")
+                    content_length = response.headers.get("Content-Length")
+                    if response.status_code != 206:
+                        last_error = f"status={response.status_code}"
+                    elif not content_range.startswith(expected_range_prefix):
+                        last_error = f"content-range={content_range!r}"
+                    elif content_length is not None and (
+                        not content_length.isdecimal() or int(content_length) != expected
+                    ):
+                        last_error = f"content-length={content_length}, expected={expected}"
+                    else:
+                        payload = response.content
+                        if len(payload) == expected:
+                            return payload
+                        last_error = f"bytes={len(payload)}, expected={expected}"
+            except requests.RequestException as error:
+                last_error = f"{type(error).__name__}: {error}"
+
+            if attempt + 1 < _RANGE_ATTEMPTS:
+                time.sleep(2**attempt)
+
+        raise RuntimeError(
+            f"Range fetch failed after {_RANGE_ATTEMPTS} attempts for "
+            f"{shard} bytes {start}-{end}: {last_error}"
+        )
 
     def _header(self, shard: str) -> tuple[int, dict]:
         if shard not in self._headers:
@@ -117,13 +143,32 @@ def _source_to_target(name: str) -> str:
     return ".".join(parts)
 
 
+def default_reduced_cache_path() -> Path:
+    """Return the persistent, revision-and-schema-keyed fixture cache path."""
+    return (
+        Path.home()
+        / ".cache"
+        / "mobius"
+        / "nemotron-3_5-lightning"
+        / f"reduced-{REVISION}-schema-v{FIXTURE_SCHEMA_VERSION}.safetensors"
+    )
+
+
 def _build_reduced_state(cache_path: Path) -> dict[str, torch.Tensor]:
     if cache_path.is_file():
         with safe_open(cache_path, framework="pt") as cached:
             metadata = cached.metadata() or {}
-        if metadata.get("revision") != REVISION:
+        expected_metadata = {
+            "model_id": MODEL_ID,
+            "revision": REVISION,
+            "fixture_schema": str(FIXTURE_SCHEMA_VERSION),
+        }
+        actual_metadata = {key: metadata.get(key) for key in expected_metadata}
+        if actual_metadata != expected_metadata:
             raise ValueError(
-                f"Reduced cache revision mismatch: {metadata.get('revision')} != {REVISION}"
+                "Reduced cache metadata mismatch: "
+                f"expected={expected_metadata}, actual={actual_metadata}. "
+                "Remove the stale cache file and retry."
             )
         return load_file(cache_path)
 
@@ -165,11 +210,18 @@ def _build_reduced_state(cache_path: Path) -> dict[str, torch.Tensor]:
         )
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = cache_path.with_name(f"{cache_path.name}.tmp")
+    temporary_path.unlink(missing_ok=True)
     save_file(
         {name: tensor.contiguous() for name, tensor in state.items()},
-        cache_path,
-        metadata={"model_id": MODEL_ID, "revision": REVISION},
+        temporary_path,
+        metadata={
+            "model_id": MODEL_ID,
+            "revision": REVISION,
+            "fixture_schema": str(FIXTURE_SCHEMA_VERSION),
+        },
     )
+    temporary_path.replace(cache_path)
     return state
 
 
@@ -543,7 +595,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--cache",
-        default="cache/nemotron-3_5-reduced-real.safetensors",
+        default=default_reduced_cache_path(),
     )
     parser.add_argument("--output-dir", default="output/reduced-validation")
     parser.add_argument(

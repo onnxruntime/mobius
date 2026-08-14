@@ -21,10 +21,11 @@ The checkpoint is a real `nemotron_h` model, not an alias:
 
 ONNX Runtime GenAI 0.15.2 cannot bind this model's mixed cache: Mamba layers
 need `conv_state` plus `ssm_state`, while sparse full-attention layers need
-key/value caches at global layer indices. Mobius still emits a structurally
-honest config rather than hard-coding a version-specific rejection, allowing
-future runtime releases to add support. This validated package uses direct
-ONNX Runtime generation through `inference.py`.
+key/value caches at global layer indices. Mobius rejects this graph contract
+structurally because `genai_config.json` has no `ssm_state` input/output
+template; it does not hard-code a NemotronH or runtime-version check. The guard
+can be removed when config emission represents that state. This validated
+package uses direct ONNX Runtime generation through `inference.py`.
 
 ## Install
 
@@ -98,8 +99,8 @@ output/
 ```
 
 This recipe intentionally omits `genai_config.json`: direct ONNX Runtime is
-the validated runtime for ORT GenAI 0.15.2. Core Mobius config emission remains
-available for testing future runtime releases.
+the validated runtime, and core Mobius rejects the currently unrepresentable
+SSM cache contract before creating runtime artifacts.
 
 ## Direct generation and profiling
 
@@ -130,6 +131,12 @@ weights while retaining production dimensions:
 ```powershell
 python validate_reduced_checkpoint.py
 ```
+
+The fixture is stored persistently under `~/.cache/mobius/` by default. Each
+range request validates status, `Content-Range`, declared length, and payload
+length, with three bounded attempts (1s then 2s backoff). The cache metadata
+must match the pinned model, revision, and fixture schema; writes are atomic.
+GPU CI restores the same revision/schema-keyed cache for L4 and L5.
 
 The supported matrix is intentionally limited to FP32/CPU and FP16/CUDA.
 Reproduce the BF16 rejection evidence separately without creating a supported

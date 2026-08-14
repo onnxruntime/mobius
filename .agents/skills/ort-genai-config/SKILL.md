@@ -291,10 +291,12 @@ before writing artifacts and report the exact runtime version/limitation.
 
 NemotronH is unsupported in ORT GenAI 0.15.2 because sparse global layer
 indices mix attention key/value caches with Mamba `conv_state` and
-`ssm_state`. Do not hard-code a model-type rejection based only on that runtime
-version: emit a structurally honest config so downstream releases can evolve,
-record the tested-version waiver, and provide a direct ONNX Runtime loop for
-current users.
+`ssm_state`. Do not hard-code a model-type or runtime-version rejection.
+Inspect the actual decoder graph and reject only when it requires cache inputs
+the generated config has no template for (currently `ssm_state`). This keeps
+the guard structural: remove it when config emission can represent that graph
+contract. Record the tested-version waiver and provide a direct ONNX Runtime
+loop for current users.
 
 ### "input_ids size exceeds max length"
 

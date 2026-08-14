@@ -42,6 +42,8 @@ jobs:
       - "1ES.Pool=onnxruntime-ep-mobius-github-linux-a10"
       - "JobId=gpu-l5-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}"
     timeout-minutes: 60
+    env:
+      MOBIUS_NEMOTRON_REDUCED_CACHE: ${{ runner.temp }}/mobius-nemotron-cache/reduced-d468880b6ad3c6e0d21377ce7242adaea4cc884d-schema-v1.safetensors
     steps:
       - uses: actions/checkout@v7
 
@@ -55,6 +57,12 @@ jobs:
         with:
           path: ~/.cache/huggingface
           key: hf-gpu-${{ hashFiles('testdata/cases/**/*.yaml') }}
+
+      - name: Cache reduced Nemotron fixture
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/mobius-nemotron-cache
+          key: nemotron-reduced-d468880b6ad3c6e0d21377ce7242adaea4cc884d-schema-v1
 
       - name: Install PyTorch (CUDA)
         run: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
