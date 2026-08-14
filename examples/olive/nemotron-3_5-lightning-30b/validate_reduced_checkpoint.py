@@ -460,6 +460,8 @@ def _assert_logits_close(
         / (np.linalg.norm(actual) * np.linalg.norm(expected))
     )
     print(f"{label}: max_abs={max_abs:.6g}, cosine={cosine:.9f}")
+    if max_abs > atol:
+        raise AssertionError(f"{label}: max_abs={max_abs:.6g} exceeds {atol=}")
     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=atol)
 
 
