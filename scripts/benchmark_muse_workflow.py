@@ -24,6 +24,32 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _runtime_worktree(repo: Path) -> dict[str, Any]:
+    status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=all"],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout
+    diff = subprocess.run(
+        ["git", "-C", str(repo), "diff", "--binary", "HEAD"],
+        check=True,
+        capture_output=True,
+    ).stdout
+    files = {}
+    for line in status.splitlines():
+        relative = line[3:].split(" -> ")[-1]
+        path = repo / relative
+        if path.is_file():
+            files[relative] = _sha256(path)
+    return {
+        "dirty": bool(status),
+        "status": status.splitlines(),
+        "diff_sha256": hashlib.sha256(diff).hexdigest(),
+        "file_sha256": files,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True, type=Path)
@@ -33,6 +59,7 @@ def main() -> int:
         type=Path,
         default=Path(".contract-schema-latest"),
     )
+    parser.add_argument("--allow-dirty-runtime", action="store_true")
     parser.add_argument(
         "--config",
         type=Path,
@@ -54,6 +81,12 @@ def main() -> int:
     if runtime_head != expected_head:
         raise ValueError(
             f"runtime source is {runtime_head}, paired benchmark requires {expected_head}"
+        )
+    runtime_worktree = _runtime_worktree(args.runtime_repo)
+    if runtime_worktree["dirty"] and not args.allow_dirty_runtime:
+        raise ValueError(
+            "runtime source has uncommitted changes; commit them or pass "
+            "--allow-dirty-runtime for diagnostic-only evidence"
         )
     git_index = Path(
         subprocess.run(
@@ -151,6 +184,7 @@ def main() -> int:
             "source_head": runtime_head,
             "runner": str(args.runner.resolve()),
             "runner_sha256": _sha256(args.runner),
+            "worktree": runtime_worktree,
             "environment": {
                 "ONNX_GENAI_CUDA_GRAPH": "1",
                 "ORT_ENABLE_CUDNN_FLASH_ATTENTION": "0",
