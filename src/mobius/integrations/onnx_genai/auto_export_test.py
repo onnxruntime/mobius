@@ -278,7 +278,32 @@ def test_seeded_decoder_sampler_uses_request_controls_and_direct_kv_carry():
         "batching": "per_row",
         "inactive_rows": "preserve",
     }
-    assert workflow["components"]["token_state_update"]["contract"]["version"] == "2"
+    assert set(workflow["components"]["termination"]["contract"]["bindings"]) == {
+        "tokens",
+        "active",
+        "eos_ids",
+        "eos_lengths",
+        "iteration",
+        "max_iterations",
+        "done",
+        "next_active",
+        "continue",
+    }
+    assert workflow["components"]["token_state_update"]["contract"] == {
+        "id": "onnx-genai.state-update",
+        "version": "2",
+        "bindings": {
+            "current": "current",
+            "update": "update",
+            "active": "active",
+            "done": "done",
+            "next": "next",
+        },
+        "parameters": {
+            "batching": "per_row",
+            "inactive_rows": "preserve",
+        },
+    }
     assert not any("kv_update" in name for name in workflow["components"])
 
 
