@@ -564,9 +564,7 @@ class TestBuildDiffusersPipelineSuccess:
         )
 
         assert set(result) == {"transformer"}
-        mock_load_config.assert_called_once_with(
-            "fake/filtered", "transformer", revision=None
-        )
+        mock_load_config.assert_called_once_with("fake/filtered", "transformer", revision=None)
 
 
 # ── build_diffusers_pipeline weight loading ──────────────────────────────
