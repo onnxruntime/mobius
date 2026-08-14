@@ -135,7 +135,8 @@ fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyh
     assert!(
         multi_row_error
             .to_string()
-            .contains("multi-row ragged output")
+            .contains("multi-row ragged output"),
+        "{multi_row_error:#}"
     );
 
     let batched = decoder_batch_request(&[4, 5, 6, 0], 2, 2, &[2, 1], &[true, true], 3)?;
