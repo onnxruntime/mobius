@@ -892,7 +892,7 @@ pipeline:
       kv_service:
         paging: none
         allocation: runtime
-        compaction: false
+        compaction: true
         groups:
           verifier_cache:
             sequence_axis: 2

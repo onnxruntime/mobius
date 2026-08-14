@@ -312,7 +312,21 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     assert media_branch["cases"]["false"]["component"] == "empty_image_features"
     kv_service = workflow["serving"]["kv_service"]
     assert kv_service["paging"] == "none"
-    assert kv_service["compaction"] is False
+    assert kv_service["compaction"] is True
+    carried = {item["cell"] for item in workflow["steps"][0]["carried"]}
+    assert {
+        "slot_ids",
+        "token",
+        "logits",
+        "generated_lengths",
+        "rng_counter",
+        "active",
+        "done",
+        "accepted_len",
+        "cache_lengths",
+        "attention_mask",
+        "cache_0",
+    } <= carried
     decoder_cache = kv_service["groups"]["decoder_cache"]
     # Shared buffering is expressed by the admitted cache ports and runtime I/O
     # binding, even when the graph has no node-level share-buffer attribute.

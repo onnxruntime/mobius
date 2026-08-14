@@ -522,9 +522,12 @@ def _kv_storage_contract(model: ir.Model) -> dict[str, Any]:
         for name in input_names
         for marker in ("block_table", "block_tables", "page_table", "page_tables")
     )
+    has_cache = bool(_model_cache_pairs(model))
     return {
         "paging": "paged" if paged else "none",
-        "compaction": paged,
+        # Row compaction is semantic for every batched KV layout: the runtime
+        # applies one row permutation to slot identity, KV, RNG, and loop state.
+        "compaction": has_cache,
         "storage": "paged" if paged else "shared_buffer",
     }
 
@@ -1630,7 +1633,10 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
                             else "none"
                         ),
                         "allocation": "runtime",
-                        "compaction": talker_kv["compaction"] or predictor_kv["compaction"],
+                        # The current workflow schema cannot represent an invariant
+                        # serving slot identity through the nested predictor loop
+                        # without redefining the outer SSA value.
+                        "compaction": False,
                         "groups": {
                             **(
                                 {

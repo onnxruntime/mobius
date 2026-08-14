@@ -68,13 +68,34 @@ fn decoder_batch_request(
     active: &[bool],
     max_new_tokens: usize,
 ) -> anyhow::Result<PipelineGenerateRequest> {
+    let slot_ids = (0..batch).collect::<Vec<_>>();
+    decoder_batch_request_with_slots(
+        input_ids,
+        batch,
+        sequence,
+        prompt_lengths,
+        active,
+        &slot_ids,
+        max_new_tokens,
+    )
+}
+
+fn decoder_batch_request_with_slots(
+    input_ids: &[i64],
+    batch: i64,
+    sequence: i64,
+    prompt_lengths: &[i64],
+    active: &[bool],
+    slot_ids: &[i64],
+    max_new_tokens: usize,
+) -> anyhow::Result<PipelineGenerateRequest> {
     let bool_bytes = active.iter().map(|value| u8::from(*value)).collect();
     let zeros = vec![0_i64; usize::try_from(batch)?];
     let ones = vec![1_i64; usize::try_from(batch)?];
     let negative_ones = vec![-1_i64; usize::try_from(batch)?];
     let floats_zero = vec![0.0_f32; usize::try_from(batch)?];
     let floats_one = vec![1.0_f32; usize::try_from(batch)?];
-    let slot_ids = (0..batch).collect::<Vec<_>>();
+    assert_eq!(slot_ids.len(), usize::try_from(batch)?);
     Ok(PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![0]),
         options: options(max_new_tokens),
@@ -98,7 +119,7 @@ fn decoder_batch_request(
     .with_input("package.one_token", Value::from_slice_i64(&ones, &[batch])?)
     .with_input(
         "package.slot_ids",
-        Value::from_slice_i64(&slot_ids, &[batch])?,
+        Value::from_slice_i64(slot_ids, &[batch])?,
     )
     .with_input(
         "request.eos_ids",
@@ -125,7 +146,7 @@ fn decoder_batch_request(
         "request.min_p",
         Value::from_slice_f32(&floats_zero, &[batch])?,
     )
-    .with_input("request.seed", Value::from_slice_i64(&slot_ids, &[batch])?)
+    .with_input("request.seed", Value::from_slice_i64(slot_ids, &[batch])?)
     .with_input(
         "request.rng_counter",
         Value::from_slice_i64(&zeros, &[batch])?,
@@ -216,6 +237,43 @@ fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyh
     assert_eq!(rows[1].0, 1);
     assert_eq!(rows[1].1.to_vec_i64()?, second_tokens);
 
+    let stable_before = engine
+        .execution_island_diagnostics()
+        .iter()
+        .map(|island| island.stable_binding_runs)
+        .sum::<u64>();
+    let compacted = decoder_batch_request_with_slots(
+        &[6, 0, 4, 5],
+        2,
+        2,
+        &[1, 2],
+        &[true, true],
+        &[1, 0],
+        3,
+    )?;
+    let compacted_output = engine.run_pipeline_outputs(compacted)?;
+    let compacted_rows =
+        engine.output_rows_for_role(&compacted_output, WorkflowOutputRole::Tokens);
+    let compacted_row = |semantic_id| {
+        compacted_rows
+            .iter()
+            .find(|(row_id, _)| *row_id == semantic_id)
+            .expect("compacted semantic row must be present")
+            .1
+            .to_vec_i64()
+    };
+    assert_eq!(compacted_row(0)?, first_tokens);
+    assert_eq!(compacted_row(1)?, second_tokens);
+    let stable_after = engine
+        .execution_island_diagnostics()
+        .iter()
+        .map(|island| island.stable_binding_runs)
+        .sum::<u64>();
+    assert!(
+        stable_after > stable_before,
+        "same-shape row compaction must reuse stable island bindings"
+    );
+
     let inactive = decoder_batch_request(&[4, 5, 6, 0], 2, 2, &[2, 1], &[true, false], 3)?;
     let inactive_output = engine.run_pipeline_outputs(inactive)?;
     let inactive_rows = engine.output_rows_for_role(&inactive_output, WorkflowOutputRole::Tokens);
@@ -238,14 +296,14 @@ fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyh
         second_tokens
     );
 
-    let replay = decoder_batch_request(&[4, 5], 1, 2, &[2], &[true], 3)?;
+    let replay = decoder_batch_request(&[6, 0], 1, 2, &[1], &[true], 3)?;
     let replay_output = engine.run_pipeline_outputs(replay)?;
     assert_eq!(
         engine
             .structured_output_for_role(&replay_output, WorkflowOutputRole::Tokens)
             .expect("batch-one replay must emit tokens")
             .to_vec_i64()?,
-        first_tokens
+        second_tokens
     );
     Ok(())
 }
