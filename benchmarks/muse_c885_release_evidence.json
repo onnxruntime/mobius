@@ -1,9 +1,11 @@
 {
   "kind": "workflow_release_diagnostic",
+  "producer_commit": "80acfc069f0959f9e6580785fad3172bcc4cc0aa",
   "runtime_source_head": "c885b71b3813fd652690e5ef5154bfc5535e5c1c",
   "runner_sha256": "69f22720f35a01b9df23e7e4c688e8a8e8d40b7113f2537e51dd2c3a13c1b015",
   "overlay_manifest_sha256": "adbfcdd752d8aedc87d264c0ae0d1082f1f6a615e5dd96688500505456291cc6",
   "metadata_sha256": "8727cb6ab44ff65a4e74b6281c5af9eadba336483f5fa1e6033996c3b99fcced",
+  "decoder_state_initializer_sha256": "77e4eae0e35cc618214476e0776af3c1b7930862924f431edb62724cadb97af7",
   "workload": {
     "prompt_tokens": 68,
     "generated_tokens": 128,
