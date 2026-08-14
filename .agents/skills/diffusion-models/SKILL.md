@@ -358,8 +358,7 @@ techniques from the **weight-name-alignment** skill to minimize
 A component graph or metadata file is not a runnable diffusion pipeline.
 Before advertising runtime support, execute the complete path:
 
-`image encoder/VAE -> latent packing -> denoiser loop + scheduler -> target
-token unpacking -> VAE decoder`.
+`image encoder/VAE -> latent packing -> denoiser loop + scheduler -> target token unpacking -> VAE decoder`
 
 Verify sample/output ranks, source-vs-target token slicing, CFG semantics, and
 the runtime's actual scheduler identifiers/equations. Reload final metadata and
