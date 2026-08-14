@@ -75,6 +75,7 @@ markers = [
     "arch_validation: L2 architecture validation tests that download real HF configs (no weights) and build full-size ONNX graphs (deselect with '-m \"not arch_validation\"')",
     "golden: L4 checkpoint-verified golden comparison tests (deselect with '-m \"not golden\"')",
     "generation: L5 generation end-to-end golden tests (deselect with '-m \"not generation\"')",
+    "quantization: quantized-package integration tests",
 ]
 
 [tool.mypy]
