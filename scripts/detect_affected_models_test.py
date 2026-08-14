@@ -26,6 +26,7 @@ from detect_affected_models import (  # noqa: E402
     _build_registry_class_to_types,
     _build_source_module_to_types,
     _find_reverse_dependents,
+    _model_type_hints,
     _parse_imports,
     classify_file,
     detect_affected_models,
@@ -82,6 +83,16 @@ class TestClassifyFile:
 
     def test_windows_paths(self):
         assert classify_file("src\\mobius\\models\\falcon.py") == "model"
+
+
+class TestModelTypeHints:
+    def test_real_weight_test_infers_model_type(self):
+        assert _model_type_hints("tests/nemotron_h_real_weight_test.py") == {"nemotron_h"}
+
+    def test_model_example_uses_explicit_mapping(self):
+        assert _model_type_hints("examples/olive/nemotron-3_5-lightning-30b/optimize.py") == {
+            "nemotron_h"
+        }
 
 
 # ----------------------------------------------------------------
@@ -232,6 +243,16 @@ class TestDetectAffectedModels:
         result = detect_affected_models(["tests/build_graph_test.py"])
         assert result["run_all"] is False
         assert result["affected"] == []
+
+    def test_real_weight_test_targets_its_model(self):
+        result = detect_affected_models(["tests/nemotron_h_real_weight_test.py"])
+        assert result == {"affected": ["nemotron_h"], "run_all": False}
+
+    def test_model_example_targets_its_integration_tests(self):
+        result = detect_affected_models(
+            ["examples/olive/nemotron-3_5-lightning-30b/inference.py"]
+        )
+        assert result == {"affected": ["nemotron_h"], "run_all": False}
 
     def test_falcon_model_file(self):
         result = detect_affected_models(["src/mobius/models/falcon.py"])

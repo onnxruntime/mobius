@@ -24,6 +24,7 @@ from inference import (
     _initial_states,
     _run_session,
     _token_feeds,
+    load_eos_token_ids,
     run_token_ids,
     summarize_profile,
 )
@@ -502,6 +503,7 @@ def _validate_variant(
         max_new_tokens=4,
         device=device,
         profile=profile,
+        eos_token_ids=load_eos_token_ids(variant_dir),
     )
     if len(generated) != 4 or any(not np.isfinite(step).all() for step in logits):
         raise AssertionError(f"Invalid generation for {dtype_name}/{ep}: {generated}")
@@ -596,6 +598,7 @@ def main() -> None:
             max_new_tokens=4,
             device="cuda",
             profile=False,
+            eos_token_ids=load_eos_token_ids(quantized),
         )
         if len(generated) != 4 or any(not np.isfinite(step).all() for step in logits):
             raise AssertionError(f"Quantized generation failed: {generated}")
