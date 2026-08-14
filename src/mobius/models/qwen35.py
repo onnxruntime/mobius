@@ -388,7 +388,7 @@ class Qwen35MoECausalLMModel(CausalLMModel):
 
             # Unpack fused float expert weights into per-expert tensors for the
             # dense fallback. When ``use_qmoe`` is set the fused quantized
-            # tensors arrive as ``.qweight``/``.scales``/``.qzeros`` (which do
+            # tensors arrive as ``_qweight``/``_scales``/``_qzeros`` (which do
             # not match these suffixes) and are kept expert-major for
             # ``pack_qmoe_expert_weights`` below.
             # HF format: [num_experts, fused_dim, hidden] with gate+up fused

@@ -41,21 +41,28 @@ def _moe_config(quantization: QuantizationConfig | None) -> object:
 
 
 def _olive_expert_state_dict() -> dict[str, torch.Tensor]:
-    """Synthetic HF-style fused Olive-quantized MoE expert tensors."""
+    """Synthetic HF-style fused Olive-quantized MoE expert tensors.
+
+    Olive's on-disk suffix convention is an *underscore* suffix directly on
+    the parameter name (``<pname>_qweight``/``_scales``/``_qzeros``), not a
+    dotted one -- see ``olive/common/quant/state_dict.py``. For a fused MoE
+    parameter like ``gate_up_proj`` (no nested ``nn.Linear``), this means
+    ``experts.gate_up_proj_qweight``, not ``experts.gate_up_proj.qweight``.
+    """
     p = "model.language_model.layers.0.mlp."
     return {
-        p + "experts.gate_up_proj.qweight": torch.randint(
+        p + "experts.gate_up_proj_qweight": torch.randint(
             0, 256, (_E, _FC1_OUT, _H * _BITS // 8), dtype=torch.uint8
         ),
-        p + "experts.gate_up_proj.scales": torch.rand(_E, _FC1_OUT, _H // _BLK),
-        p + "experts.gate_up_proj.qzeros": torch.randint(
+        p + "experts.gate_up_proj_scales": torch.rand(_E, _FC1_OUT, _H // _BLK),
+        p + "experts.gate_up_proj_qzeros": torch.randint(
             0, 256, (_E, _FC1_OUT, 1), dtype=torch.uint8
         ),
-        p + "experts.down_proj.qweight": torch.randint(
+        p + "experts.down_proj_qweight": torch.randint(
             0, 256, (_E, _H, _INT * _BITS // 8), dtype=torch.uint8
         ),
-        p + "experts.down_proj.scales": torch.rand(_E, _H, _INT // _BLK),
-        p + "experts.down_proj.qzeros": torch.randint(0, 256, (_E, _H, 1), dtype=torch.uint8),
+        p + "experts.down_proj_scales": torch.rand(_E, _H, _INT // _BLK),
+        p + "experts.down_proj_qzeros": torch.randint(0, 256, (_E, _H, 1), dtype=torch.uint8),
         p + "gate.weight": torch.rand(_E, _H),
     }
 
