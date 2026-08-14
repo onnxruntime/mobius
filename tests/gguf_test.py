@@ -508,3 +508,21 @@ class TestCLIBuildGGUF:
         path = _create_tiny_gguf(tmp_path / "test.gguf")
         with pytest.raises((SystemExit, ValueError)):
             main(["build-gguf", path, "--keep-quantized"])
+
+    def test_ort_genai_runtime_is_rejected_before_artifacts(self, tmp_path):
+        """build-gguf must not silently ignore an ORT GenAI runtime request."""
+        from mobius.__main__ import main
+
+        output_dir = tmp_path / "output"
+        with pytest.raises(SystemExit, match="does not yet support --runtime ort-genai"):
+            main(
+                [
+                    "build-gguf",
+                    str(tmp_path / "not-downloaded.gguf"),
+                    "--runtime",
+                    "ort-genai",
+                    "--output",
+                    str(output_dir),
+                ]
+            )
+        assert not output_dir.exists()

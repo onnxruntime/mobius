@@ -20,7 +20,9 @@ from __future__ import annotations
 __all__ = ["build_from_gguf"]
 
 import logging
+import re
 from collections import Counter
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -29,10 +31,167 @@ from huggingface_hub import HfApi, hf_hub_download
 
 from mobius._model_package import ModelPackage
 
+_HUB_PREFLIGHT_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (OSError,)
+try:
+    from httpx import TransportError as _HttpxTransportError
+except ImportError:
+    pass
+else:
+    _HUB_PREFLIGHT_TRANSPORT_ERRORS += (_HttpxTransportError,)
+
 if TYPE_CHECKING:
     from mobius.tasks import ModelTask
 
 logger = logging.getLogger(__name__)
+
+_GGUF_SHARD_FILENAME_RE = re.compile(
+    r"-(?P<index>\d{5})-of-(?P<count>\d{5})\.gguf$",
+    re.IGNORECASE,
+)
+_NEMOTRON_H_MOE_ARCHITECTURE = "nemotron_h_moe"
+
+
+def _summarize_nemotron_h_moe_layout(
+    tensor_names: Iterable[str],
+) -> tuple[Counter[str], tuple[int, ...], dict[int, frozenset[str]]]:
+    """Summarize base-layer and MTP mixer types from Nemotron-H GGUF names."""
+    layer_kinds: dict[int, set[str]] = {}
+    mtp_blocks: set[int] = set()
+    for name in tensor_names:
+        match = re.match(r"^blk\.(\d+)\.(.+)$", name)
+        if match is None:
+            continue
+        block_index = int(match.group(1))
+        suffix = match.group(2)
+        kinds = layer_kinds.setdefault(block_index, set())
+        if suffix.startswith("nextn."):
+            mtp_blocks.add(block_index)
+        elif suffix.startswith("ssm_"):
+            kinds.add("mamba")
+        elif suffix.startswith(("ffn_", "exp_probs_")):
+            kinds.add("moe")
+        elif suffix.startswith(("attn_q.", "attn_k.", "attn_v.", "attn_output.")):
+            kinds.add("attention")
+
+    base_counts: Counter[str] = Counter()
+    for block_index, kinds in layer_kinds.items():
+        if block_index not in mtp_blocks:
+            base_counts.update(kinds)
+    mtp_kinds = {
+        block_index: frozenset(layer_kinds.get(block_index, set()))
+        for block_index in sorted(mtp_blocks)
+    }
+    return base_counts, tuple(sorted(mtp_blocks)), mtp_kinds
+
+
+def _raise_for_unsupported_gguf_architecture(
+    architecture: str,
+    *,
+    source: str,
+    tensor_names: Iterable[str] | None = None,
+) -> None:
+    """Reject GGUF architectures that do not have semantic conversion evidence."""
+    if architecture != _NEMOTRON_H_MOE_ARCHITECTURE:
+        return
+
+    layout = ""
+    if tensor_names is not None:
+        counts, mtp_blocks, mtp_kinds = _summarize_nemotron_h_moe_layout(tensor_names)
+        mtp_kind_names = {index: sorted(kinds) for index, kinds in mtp_kinds.items()}
+        layout = (
+            " Detected base schedule: "
+            f"{counts['mamba']} Mamba + {counts['moe']} MoE + "
+            f"{counts['attention']} attention layers; auxiliary MTP blocks: "
+            f"{list(mtp_blocks)} with mixer types {mtp_kind_names}."
+        )
+
+    raise NotImplementedError(
+        "Direct GGUF conversion for architecture 'nemotron_h_moe' is intentionally "
+        f"disabled for {source!r}.{layout} GGUF block_count includes a combined "
+        "attention+MoE MTP auxiliary block, so aliasing it to the 52-layer "
+        "'nemotron_h' backbone would build the wrong graph. The current Nemotron-H "
+        "Mamba2 path also lacks passing full-logit/generation parity, and common "
+        "GGUF presets contain Q5_0/Q5_1 expert tensors that cannot be preserved by "
+        "MatMulNBits. No ONNX artifacts were emitted. Use llama.cpp/Unsloth to run "
+        "the GGUF without changing its quantization, or start from the official "
+        "pinned BF16 Hugging Face checkpoint and quantize the validated ONNX export "
+        "with Olive only after L4/L5 semantic generation passes. See "
+        "docs/api/build_from_gguf.md for the pinned recipe and waiver."
+    )
+
+
+def _raise_for_sharded_gguf(
+    *,
+    source: str,
+    filename: str | None = None,
+    split_count: int | None = None,
+) -> None:
+    """Reject one-shard inputs before they can produce an incomplete model."""
+    shard_index: int | None = None
+    if filename is not None:
+        match = _GGUF_SHARD_FILENAME_RE.search(filename)
+        if match is not None:
+            shard_index = int(match.group("index"))
+            split_count = int(match.group("count"))
+    if split_count is None or split_count <= 1:
+        return
+
+    shard_detail = f" shard {shard_index} of {split_count}" if shard_index else ""
+    raise NotImplementedError(
+        f"Sharded GGUF input is not supported: {source!r} is{shard_detail}. "
+        "The GGUF builder reads one file and cannot assemble split tensor tables; "
+        "continuing would emit an incomplete ONNX model. Select a single-file GGUF "
+        "variant, join the shards with a GGUF-aware tool, or build from the original "
+        "Hugging Face checkpoint."
+    )
+
+
+def _preflight_hf_gguf(api: HfApi, repo_id: str, filename: str) -> None:
+    """Use Hub metadata to reject known-bad inputs before a multi-GB download."""
+    source = f"{repo_id}:{filename}"
+    _raise_for_sharded_gguf(source=source, filename=filename)
+    try:
+        info = api.model_info(repo_id, expand=["gguf"])
+    except TypeError as error:
+        if "expand" not in str(error):
+            raise
+        logger.info(
+            "Skipping Hub GGUF architecture preflight for %s because this "
+            "huggingface_hub version has no model_info(expand=...) support; "
+            "the downloaded or cached local header will still be validated.",
+            source,
+        )
+        return
+    except _HUB_PREFLIGHT_TRANSPORT_ERRORS as error:
+        logger.warning(
+            "Hub GGUF architecture preflight failed for %s (%s); continuing to "
+            "hf_hub_download so an authenticated or cached file can still be used. "
+            "The local header will be validated before graph construction.",
+            source,
+            error,
+        )
+        return
+    gguf_metadata = getattr(info, "gguf", None)
+    if isinstance(gguf_metadata, Mapping):
+        architecture = gguf_metadata.get("architecture")
+    else:
+        architecture = getattr(gguf_metadata, "architecture", None)
+    if isinstance(architecture, str):
+        _raise_for_unsupported_gguf_architecture(
+            architecture,
+            source=source,
+        )
+
+
+def _validate_gguf_model(gguf_model, *, source: str) -> None:
+    """Validate a parsed GGUF before config extraction or graph construction."""
+    split_count = int(gguf_model.get_metadata("split.count", 1))
+    _raise_for_sharded_gguf(source=source, split_count=split_count)
+    _raise_for_unsupported_gguf_architecture(
+        gguf_model.architecture,
+        source=source,
+        tensor_names=gguf_model.tensor_names,
+    )
 
 
 def _looks_like_hf_repo_id(value: str) -> bool:
@@ -65,8 +224,9 @@ def _resolve_gguf_path(gguf_path: str | Path) -> str:
         # FileNotFoundError with the original path.
         return raw
 
+    api = HfApi()
     if not filename:
-        files = [f for f in HfApi().list_repo_files(repo_id) if f.endswith(".gguf")]
+        files = [f for f in api.list_repo_files(repo_id) if f.endswith(".gguf")]
         if not files:
             raise FileNotFoundError(f"No *.gguf files found in HF repo {repo_id!r}")
         if len(files) > 1:
@@ -76,6 +236,7 @@ def _resolve_gguf_path(gguf_path: str | Path) -> str:
             )
         filename = files[0]
 
+    _preflight_hf_gguf(api, repo_id, filename)
     logger.info("Downloading %s from %s", filename, repo_id)
     return hf_hub_download(repo_id=repo_id, filename=filename)
 
@@ -194,6 +355,7 @@ def build_from_gguf(
     # 1. Parse GGUF file (auto-download from HF Hub when given "owner/repo[:filename]")
     gguf_path = _resolve_gguf_path(gguf_path)
     gguf_model = GGUFModel(gguf_path)
+    _validate_gguf_model(gguf_model, source=str(gguf_path))
     gguf_arch = gguf_model.architecture
     logger.info("Loaded GGUF file: %s (arch=%s)", gguf_path, gguf_arch)
 
