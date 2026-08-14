@@ -454,7 +454,7 @@ def test_decoder_policy_chain_generates_multiple_tokens_from_prompt_only(tmp_pat
             build_eos_termination(),
             tmp_path,
             {
-                "token_ids": sample,
+                "tokens": sample,
                 "eos_ids": np.array([7], np.int64),
                 "iteration": np.array([iteration], np.int64),
                 "max_iterations": max_output_tokens,
@@ -501,9 +501,8 @@ def test_seeded_sampler_is_counter_based_and_reproducible(tmp_path):
         "top_k": np.array([0], np.int64),
         "top_p": np.array([1.0], np.float32),
         "min_p": np.array([0.0], np.float32),
-        "grammar_mask": np.array([[True, True, True, True]], np.bool_),
         "seed": np.array([7], np.int64),
-        "offset": np.array([11], np.int64),
+        "counter": np.array([11], np.int64),
         "active": np.array([True], np.bool_),
         "done": np.array([False], np.bool_),
     }
@@ -513,7 +512,7 @@ def test_seeded_sampler_is_counter_based_and_reproducible(tmp_path):
     np.testing.assert_array_equal(first[1], [12])
 
 
-def test_seeded_sampler_applies_request_top_k_and_grammar_mask(tmp_path):
+def test_seeded_sampler_applies_request_top_k(tmp_path):
     (token, _) = _run(
         build_seeded_categorical_sampler(),
         tmp_path,
@@ -523,38 +522,17 @@ def test_seeded_sampler_applies_request_top_k_and_grammar_mask(tmp_path):
             "top_k": np.array([1], np.int64),
             "top_p": np.array([0.5], np.float32),
             "min_p": np.array([0.0], np.float32),
-            "grammar_mask": np.array([[False, True, True, True]], np.bool_),
             "seed": np.array([17], np.int64),
-            "offset": np.array([0], np.int64),
+            "counter": np.array([0], np.int64),
             "active": np.array([True], np.bool_),
             "done": np.array([False], np.bool_),
         },
     )
-    np.testing.assert_array_equal(token, [1])
-
-
-def test_seeded_sampler_rejects_empty_grammar_vocabulary(tmp_path):
-    (token, _) = _run(
-        build_seeded_categorical_sampler(),
-        tmp_path,
-        {
-            "logits": np.array([[1.0, 2.0, 3.0]], np.float32),
-            "temperature": np.array([1.0], np.float32),
-            "top_k": np.array([0], np.int64),
-            "top_p": np.array([1.0], np.float32),
-            "min_p": np.array([0.0], np.float32),
-            "grammar_mask": np.array([[False, False, False]], np.bool_),
-            "seed": np.array([1], np.int64),
-            "offset": np.array([0], np.int64),
-            "active": np.array([True], np.bool_),
-            "done": np.array([False], np.bool_),
-        },
-    )
-    np.testing.assert_array_equal(token, [-1])
+    np.testing.assert_array_equal(token, [0])
 
 
 def test_seeded_sampler_applies_request_min_p_in_logit_space(tmp_path):
-    (token, next_offset) = _run(
+    (token, next_counter) = _run(
         build_seeded_categorical_sampler(),
         tmp_path,
         {
@@ -563,15 +541,14 @@ def test_seeded_sampler_applies_request_min_p_in_logit_space(tmp_path):
             "top_k": np.array([0], np.int64),
             "top_p": np.array([1.0], np.float32),
             "min_p": np.array([0.95], np.float32),
-            "grammar_mask": np.array([[True, True, True]], np.bool_),
             "seed": np.array([23], np.int64),
-            "offset": np.array([4], np.int64),
+            "counter": np.array([4], np.int64),
             "active": np.array([True], np.bool_),
             "done": np.array([False], np.bool_),
         },
     )
     np.testing.assert_array_equal(token, [0])
-    np.testing.assert_array_equal(next_offset, [5])
+    np.testing.assert_array_equal(next_counter, [5])
 
 
 def test_seeded_sampler_heterogeneous_batch_matches_independent_rows(tmp_path):
@@ -590,17 +567,8 @@ def test_seeded_sampler_heterogeneous_batch_matches_independent_rows(tmp_path):
         "top_k": np.array([1, 3, 0, 2], np.int64),
         "top_p": np.array([1.0, 0.8, 0.6, 0.9], np.float32),
         "min_p": np.array([0.0, 0.05, 0.2, 0.1], np.float32),
-        "grammar_mask": np.array(
-            [
-                [True, True, True, True, True],
-                [True, False, True, True, True],
-                [True, True, True, False, False],
-                [True, True, True, True, True],
-            ],
-            np.bool_,
-        ),
         "seed": np.array([3, 7, 11, 13], np.int64),
-        "offset": np.array([0, 5, 9, 12], np.int64),
+        "counter": np.array([0, 5, 9, 12], np.int64),
         "active": np.array([True, True, False, True], np.bool_),
         "done": np.array([False, False, False, True], np.bool_),
     }
@@ -615,35 +583,31 @@ def test_seeded_sampler_heterogeneous_batch_matches_independent_rows(tmp_path):
 
 
 def test_row_selective_state_and_termination_preserve_inactive_rows(tmp_path):
-    next_state, next_lengths, emitted = _run(
+    (next_state,) = _run(
         build_token_state_update(row_selective=True),
         tmp_path,
         {
             "current": np.array([[10], [20], [30]], np.int64),
-            "update": np.array([11, 21, 31], np.int64),
-            "lengths": np.array([2, 4, 6], np.int64),
+            "update": np.array([[11], [21], [31]], np.int64),
             "active": np.array([True, False, True], np.bool_),
             "done": np.array([False, False, True], np.bool_),
         },
     )
     np.testing.assert_array_equal(next_state, [[11], [20], [30]])
-    np.testing.assert_array_equal(next_lengths, [3, 4, 6])
-    np.testing.assert_array_equal(emitted, [1, 0, 0])
 
     done, next_active, continued = _run(
         build_eos_termination(row_selective=True),
         tmp_path,
         {
-            "token_ids": np.array([2, 8, 9], np.int64),
+            "tokens": np.array([2, 8, 9], np.int64),
             "eos_ids": np.array([[2, 9], [2, 9], [2, 9]], np.int64),
             "eos_lengths": np.array([2, 1, 2], np.int64),
-            "iteration": np.array([0, 0, 0], np.int64),
+            "iteration": np.array([0], np.int64),
             "max_iterations": np.array([5, 5, 5], np.int64),
             "active": np.array([True, False, True], np.bool_),
-            "previous_done": np.array([False, False, True], np.bool_),
         },
     )
-    np.testing.assert_array_equal(done, [True, False, True])
+    np.testing.assert_array_equal(done, [True, True, True])
     np.testing.assert_array_equal(next_active, [False, False, False])
     np.testing.assert_array_equal(continued, [False])
 
@@ -653,13 +617,12 @@ def test_row_selective_termination_heterogeneous_batch_matches_independent_rows(
 ):
     component = build_eos_termination(row_selective=True)
     feeds = {
-        "token_ids": np.array([2, 9, 5, 7], np.int64),
+        "tokens": np.array([2, 9, 5, 7], np.int64),
         "eos_ids": np.array([[2, 99], [8, 9], [5, 6], [1, 2]], np.int64),
         "eos_lengths": np.array([1, 1, 2, 2], np.int64),
-        "iteration": np.array([0, 1, 4, 2], np.int64),
+        "iteration": np.array([2], np.int64),
         "max_iterations": np.array([5, 5, 10, 3], np.int64),
         "active": np.array([True, True, True, True], np.bool_),
-        "previous_done": np.array([False, False, False, False], np.bool_),
     }
     done, next_active, continued = _run(component, tmp_path, feeds)
     np.testing.assert_array_equal(done, [True, False, True, True])
@@ -669,7 +632,10 @@ def test_row_selective_termination_heterogeneous_batch_matches_independent_rows(
         row_outputs = _run(
             component,
             tmp_path,
-            {name: value[row : row + 1] for name, value in feeds.items()},
+            {
+                name: value if name == "iteration" else value[row : row + 1]
+                for name, value in feeds.items()
+            },
         )
         np.testing.assert_array_equal(done[row : row + 1], row_outputs[0])
         np.testing.assert_array_equal(next_active[row : row + 1], row_outputs[1])
@@ -707,7 +673,7 @@ def test_eos_termination_runtime(tmp_path):
         build_eos_termination(),
         tmp_path,
         {
-            "token_ids": np.array([2, 8, 9], np.int64),
+            "tokens": np.array([2, 8, 9], np.int64),
             "eos_ids": np.array([2, 9], np.int64),
             "iteration": np.array([0, 4, 1], np.int64),
             "max_iterations": np.array([5, 5, 2], np.int64),

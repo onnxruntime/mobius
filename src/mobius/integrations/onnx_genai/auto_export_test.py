@@ -179,8 +179,7 @@ def test_dispatch_decoder(tmp_path):
         "request.eos_lengths",
         "request.row_max_iterations",
         "package.slot_ids",
-        "request.grammar_mask",
-        "request.rng_offset",
+        "request.rng_counter",
     }
     assert workflow["inputs"]["request.prompt_lengths"]["default"] == -1
     assert [node["component"] for node in workflow["steps"][0]["setup"]] == [
@@ -236,10 +235,9 @@ def test_seeded_decoder_sampler_uses_request_controls_and_direct_kv_carry():
         "top_k": "top_k",
         "top_p": "top_p",
         "min_p": "min_p",
-        "grammar_mask": "grammar_mask",
-        "rng_seed": "seed",
-        "rng_offset": "offset",
-        "rng_next_offset": "next_offset",
+        "seed": "seed",
+        "counter": "counter",
+        "next_counter": "next_counter",
         "active": "active",
         "done": "done",
     }
@@ -254,9 +252,8 @@ def test_seeded_decoder_sampler_uses_request_controls_and_direct_kv_carry():
         "top_k": "request.top_k",
         "top_p": "request.top_p",
         "min_p": "request.min_p",
-        "grammar_mask": "request.grammar_mask",
         "seed": "request.seed",
-        "offset": "rng_offset",
+        "counter": "rng_counter",
         "active": "active",
         "done": "done",
     }
@@ -268,8 +265,8 @@ def test_seeded_decoder_sampler_uses_request_controls_and_direct_kv_carry():
         "batch",
         "num_eos",
     ]
-    assert workflow["state"]["rng_offset"]["class"] == "semantic"
-    assert workflow["state"]["rng_offset"]["initializer"] == "request.rng_offset"
+    assert workflow["state"]["rng_counter"]["class"] == "semantic"
+    assert workflow["state"]["rng_counter"]["initializer"] == "request.rng_counter"
     emit = next(node for node in workflow["steps"][0]["steps"] if node["kind"] == "emit")
     assert emit["row_ids"] == "slot_ids"
     assert "emit_row_identity" in workflow["manifest"]["capabilities"]

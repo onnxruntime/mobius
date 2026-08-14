@@ -28,7 +28,6 @@ from mobius.generation import (
     build_greedy_sampler,
     build_integer_add,
     build_integer_minimum,
-    build_integer_row_broadcast,
     build_last_token_logits,
     build_model_token_cast,
     build_proposal_metrics,
@@ -2698,11 +2697,12 @@ def build_vlm_workflow_metadata(
         "termination_batch_initializer",
         build_termination_batch_initializer(),
     )
-    pkg.add_policy_component("iteration_broadcast", build_integer_row_broadcast())
     pkg.add_policy_component(
         "token_state_update",
         build_token_state_update(row_selective=True),
     )
+    pkg.add_policy_component("token_to_slot", build_token_to_slot())
+    pkg.add_policy_component("generated_length_update", build_selective_integer_add())
     if cache_pairs:
         pkg.add_policy_component("cache_length_update", build_selective_integer_add())
 
@@ -2873,21 +2873,10 @@ def build_vlm_workflow_metadata(
                 "required": False,
                 "default": 0,
             },
-            "request.grammar_mask": {
-                "contract": {
-                    "dtype": "bool",
-                    "rank": 2,
-                    "shape": [batch, _contract(logits_output)["shape"][-1]],
-                },
-                "role": {"kind": "opaque"},
-                "source": {"kind": "application", "name": "grammar_mask"},
-                "required": False,
-                "default": True,
-            },
-            "request.rng_offset": {
+            "request.rng_counter": {
                 "contract": batch_int,
                 "role": {"kind": "opaque"},
-                "source": {"kind": "application", "name": "rng_offset"},
+                "source": {"kind": "application", "name": "rng_counter"},
                 "required": False,
                 "default": 0,
             },
@@ -3043,11 +3032,11 @@ def build_vlm_workflow_metadata(
             ),
             "recurrence": {"kind": "invariant"},
         },
-        "rng_offset": {
+        "rng_counter": {
             "contract": batch_int,
             "class": "semantic",
             "scope": "invocation",
-            "initializer": "request.rng_offset",
+            "initializer": "request.rng_counter",
             "recurrence": {"kind": "invariant"},
         },
     }
@@ -3085,11 +3074,11 @@ def build_vlm_workflow_metadata(
             "state.generated_lengths.final",
         ),
         (
-            "rng_offset",
-            "request.rng_offset",
-            "state.rng_offset.body",
-            "sample.next_offset",
-            "state.rng_offset.final",
+            "rng_counter",
+            "request.rng_counter",
+            "state.rng_counter.body",
+            "sample.next_counter",
+            "state.rng_counter.final",
         ),
         (
             "active",
@@ -3330,11 +3319,6 @@ def build_vlm_workflow_metadata(
         "kind": "sequence",
         "nodes": [
             _invoke(
-                "iteration_broadcast",
-                {"value": "loop.iteration", "active": "state.active.body"},
-                {"rows": "loop.iteration_rows"},
-            ),
-            _invoke(
                 "token_sampler",
                 {
                     "logits": "state.logits.body",
@@ -3342,25 +3326,23 @@ def build_vlm_workflow_metadata(
                     "top_k": "request.top_k",
                     "top_p": "request.top_p",
                     "min_p": "request.min_p",
-                    "grammar_mask": "request.grammar_mask",
                     "seed": "request.seed",
-                    "offset": "state.rng_offset.body",
+                    "counter": "state.rng_counter.body",
                     "active": "state.active.body",
                     "done": "state.done.body",
                 },
-                {"token": "sample.body", "next_offset": "sample.next_offset"},
+                {"token": "sample.body", "next_counter": "sample.next_counter"},
                 {"sample": _effect("sample.0", "sample.1")},
             ),
             _invoke(
                 "termination",
                 {
-                    "token_ids": "sample.body",
+                    "tokens": "sample.body",
                     "eos_ids": "termination.eos_ids",
                     "eos_lengths": "termination.eos_lengths",
-                    "iteration": "loop.iteration_rows",
+                    "iteration": "loop.iteration",
                     "max_iterations": "termination.max_iterations",
                     "active": "state.active.body",
-                    "previous_done": "state.done.body",
                 },
                 {
                     "done": "loop.done",
@@ -3395,20 +3377,36 @@ def build_vlm_workflow_metadata(
                 if cache_pairs
                 else []
             ),
+            _invoke("token_to_slot", {"token": "sample.body"}, {"slot": "sample.slot"}),
+            _invoke(
+                "generated_length_update",
+                {
+                    "left": "state.generated_lengths.body",
+                    "right": "package.one",
+                    "active": "state.active.body",
+                    "done": "state.done.body",
+                },
+                {"total": "token.next_lengths"},
+            ),
+            _invoke(
+                "generated_length_update",
+                {
+                    "left": "package.zero_batch",
+                    "right": "package.one",
+                    "active": "state.active.body",
+                    "done": "state.done.body",
+                },
+                {"total": "token.emitted_length"},
+            ),
             _invoke(
                 "token_state_update",
                 {
                     "current": "state.token.body",
-                    "update": "sample.body",
-                    "lengths": "state.generated_lengths.body",
+                    "update": "sample.slot",
                     "active": "state.active.body",
                     "done": "state.done.body",
                 },
-                {
-                    "next": "token.body",
-                    "next_lengths": "token.next_lengths",
-                    "emitted_length": "token.emitted_length",
-                },
+                {"next": "token.body"},
                 {"state": _effect("state.0", "state.1")},
             ),
             {
@@ -4709,24 +4707,10 @@ def build_decoder_workflow_metadata(
                     "required": False,
                     "default": 0,
                 },
-                "request.grammar_mask": {
-                    "contract": {
-                        "dtype": "bool",
-                        "rank": 2,
-                        "shape": [
-                            batch_dimension,
-                            _contract(logits_output)["shape"][-1],
-                        ],
-                    },
-                    "role": {"kind": "opaque"},
-                    "source": {"kind": "application", "name": "grammar_mask"},
-                    "required": False,
-                    "default": True,
-                },
-                "request.rng_offset": {
+                "request.rng_counter": {
                     "contract": batch_int,
                     "role": {"kind": "opaque"},
-                    "source": {"kind": "application", "name": "rng_offset"},
+                    "source": {"kind": "application", "name": "rng_counter"},
                     "required": False,
                     "default": 0,
                 },
@@ -4743,11 +4727,12 @@ def build_decoder_workflow_metadata(
             "termination_batch_initializer",
             build_termination_batch_initializer(),
         )
-        pkg.add_policy_component("iteration_broadcast", build_integer_row_broadcast())
         pkg.add_policy_component(
             "token_state_update",
             build_token_state_update(row_selective=True),
         )
+        pkg.add_policy_component("token_to_slot", build_token_to_slot())
+        pkg.add_policy_component("generated_length_update", build_selective_integer_add())
         workflow_inputs.update(
             {
                 "package.active": {
@@ -4965,23 +4950,23 @@ def build_decoder_workflow_metadata(
             ]
         )
     if sampler_with_rng:
-        state["rng_offset"] = {
+        state["rng_counter"] = {
             "contract": batch_int,
             "scope": "invocation",
             "class": "semantic",
-            "initializer": "request.rng_offset",
+            "initializer": "request.rng_counter",
             "recurrence": {"kind": "invariant"},
         }
-        initial_effects["state:rng_offset"] = "state:rng_offset.0"
+        initial_effects["state:rng_counter"] = "state:rng_counter.0"
         carried.append(
             {
-                "cell": "rng_offset",
-                "current": "request.rng_offset",
-                "body_input": "state.rng_offset.body",
-                "body_output": "sample.next_offset",
-                "next": "state.rng_offset.final",
-                "read_effect": _effect("state:rng_offset.0", "state:rng_offset.read"),
-                "write_effect": _effect("state:rng_offset.read", "state:rng_offset.1"),
+                "cell": "rng_counter",
+                "current": "request.rng_counter",
+                "body_input": "state.rng_counter.body",
+                "body_output": "sample.next_counter",
+                "next": "state.rng_counter.final",
+                "read_effect": _effect("state:rng_counter.0", "state:rng_counter.read"),
+                "write_effect": _effect("state:rng_counter.read", "state:rng_counter.1"),
             }
         )
     decoder_state_specs = {
@@ -5171,17 +5156,6 @@ def build_decoder_workflow_metadata(
     body = {
         "kind": "sequence",
         "nodes": [
-            *(
-                [
-                    _invoke(
-                        "iteration_broadcast",
-                        {"value": "loop.iteration", "active": "state.active.body"},
-                        {"rows": "loop.iteration_rows"},
-                    )
-                ]
-                if cache_pairs
-                else []
-            ),
             _invoke(
                 "token_sampler",
                 {
@@ -5192,9 +5166,8 @@ def build_decoder_workflow_metadata(
                             "top_k": "request.top_k",
                             "top_p": "request.top_p",
                             "min_p": "request.min_p",
-                            "grammar_mask": "request.grammar_mask",
                             "seed": "request.seed",
-                            "offset": "state.rng_offset.body",
+                            "counter": "state.rng_counter.body",
                         }
                         if sampler_with_rng
                         else {}
@@ -5210,18 +5183,48 @@ def build_decoder_workflow_metadata(
                 },
                 {
                     "token": "sample.body",
-                    **({"next_offset": "sample.next_offset"} if sampler_with_rng else {}),
+                    **({"next_counter": "sample.next_counter"} if sampler_with_rng else {}),
                 },
                 {"sample": _effect("sample.0", "sample.1")},
+            ),
+            *(
+                [
+                    _invoke(
+                        "token_to_slot",
+                        {"token": "sample.body"},
+                        {"slot": "sample.slot"},
+                    ),
+                    _invoke(
+                        "generated_length_update",
+                        {
+                            "left": "state.generated_lengths.body",
+                            "right": "package.one_token",
+                            "active": "state.active.body",
+                            "done": "state.done.body",
+                        },
+                        {"total": "token.next_lengths"},
+                    ),
+                    _invoke(
+                        "generated_length_update",
+                        {
+                            "left": "package.zero_batch",
+                            "right": "package.one_token",
+                            "active": "state.active.body",
+                            "done": "state.done.body",
+                        },
+                        {"total": "token.emitted_length"},
+                    ),
+                ]
+                if cache_pairs
+                else []
             ),
             _invoke(
                 "token_state_update",
                 {
                     "current": "state.token.body",
-                    "update": "sample.body",
+                    "update": "sample.slot" if cache_pairs else "sample.body",
                     **(
                         {
-                            "lengths": "state.generated_lengths.body",
                             "active": "state.active.body",
                             "done": "state.done.body",
                         }
@@ -5229,17 +5232,7 @@ def build_decoder_workflow_metadata(
                         else {}
                     ),
                 },
-                {
-                    "next": "token.body",
-                    **(
-                        {
-                            "next_lengths": "token.next_lengths",
-                            "emitted_length": "token.emitted_length",
-                        }
-                        if cache_pairs
-                        else {}
-                    ),
-                },
+                {"next": "token.body"},
                 {"state": _effect("state.0", "state.1")},
             ),
             *(
@@ -5256,23 +5249,16 @@ def build_decoder_workflow_metadata(
             _invoke(
                 "termination",
                 {
-                    "token_ids": "sample.body",
+                    "tokens": "sample.body",
                     "eos_ids": ("termination.eos_ids" if cache_pairs else "package.eos_ids"),
                     **({"eos_lengths": "termination.eos_lengths"} if cache_pairs else {}),
-                    "iteration": ("loop.iteration_rows" if cache_pairs else "loop.iteration"),
+                    "iteration": "loop.iteration",
                     "max_iterations": (
                         "termination.max_iterations"
                         if cache_pairs
                         else "request.max_iterations"
                     ),
-                    **(
-                        {
-                            "active": "state.active.body",
-                            "previous_done": "state.done.body",
-                        }
-                        if cache_pairs
-                        else {}
-                    ),
+                    **({"active": "state.active.body"} if cache_pairs else {}),
                 },
                 {
                     "done": "loop.done",

@@ -1145,7 +1145,7 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
     """Build request-parameterized categorical sampling with explicit RNG state.
 
     Threefry is counter based: identical tensor inputs produce the same token.
-    Temperature, top-k, top-p, and grammar constraints remain request inputs;
+    Temperature, top-k, top-p, and min-p remain request inputs;
     changing ordinary generation options never regenerates this artifact.
     """
     graph, builder = _make_graph("seeded_categorical_sampler")
@@ -1155,9 +1155,8 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
     top_k = builder.input("top_k", ir.DataType.INT64, ["batch"])
     top_p = builder.input("top_p", ir.DataType.FLOAT, ["batch"])
     min_p = builder.input("min_p", ir.DataType.FLOAT, ["batch"])
-    grammar_mask = builder.input("grammar_mask", ir.DataType.BOOL, ["batch", "vocabulary"])
     seed = builder.input("seed", ir.DataType.INT64, ["batch"])
-    offset = builder.input("offset", ir.DataType.INT64, ["batch"])
+    counter = builder.input("counter", ir.DataType.INT64, ["batch"])
     active = builder.input("active", ir.DataType.BOOL, ["batch"])
     done = builder.input("done", ir.DataType.BOOL, ["batch"])
     enabled = op.And(active, op.Not(done))
@@ -1170,7 +1169,7 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
     parity = op.Cast(op.Constant(value_int=0x1BD11BDAA9FC1A22), to=ir.DataType.UINT64)
     k2 = op.BitwiseXor(op.BitwiseXor(k0, k1), parity)
     keys = [k0, k1, k2]
-    x0 = op.Add(op.Cast(offset, to=ir.DataType.UINT64), k0)
+    x0 = op.Add(op.Cast(counter, to=ir.DataType.UINT64), k0)
     x1 = op.Add(k1, op.Cast(op.Constant(value_int=0), to=ir.DataType.UINT64))
     rotations = [16, 42, 12, 31, 16, 32, 24, 21]
     for round_index in range(20):
@@ -1209,12 +1208,11 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
     uniform = op.Cast(uniform, to=ir.DataType.FLOAT)
 
     blocked = op.CastLike(op.Constant(value_float=-3.4028235e38), logits)
-    constrained_logits = op.Where(grammar_mask, logits, blocked)
     safe_temperature = op.Unsqueeze(
         op.Max(temperature, op.Constant(value_float=1e-6)),
         [-1],
     )
-    scaled_logits = op.Div(constrained_logits, safe_temperature)
+    scaled_logits = op.Div(logits, safe_temperature)
     safe_min_p = op.Unsqueeze(
         op.Clip(
             min_p,
@@ -1328,24 +1326,14 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
         axis=-1,
         keepdims=0,
     )
-    has_allowed_token = op.ReduceMax(
-        op.Cast(grammar_mask, to=ir.DataType.INT64),
-        axes=[-1],
-        keepdims=0,
-    )
-    token_ids = op.Where(
-        op.Greater(has_allowed_token, op.Constant(value_int=0)),
-        token_ids,
-        op.Constant(value_int=-1),
-    )
     token_ids = op.Where(enabled, token_ids, op.Constant(value_int=-1))
-    next_offset = op.Where(
+    next_counter = op.Where(
         enabled,
-        op.Add(offset, op.Constant(value_int=1)),
-        offset,
+        op.Add(counter, op.Constant(value_int=1)),
+        counter,
     )
     builder.add_output(token_ids, "token")
-    builder.add_output(next_offset, "next_offset")
+    builder.add_output(next_counter, "next_counter")
     return _component(
         "onnx-genai.token-sampler@2",
         graph,
@@ -1360,14 +1348,11 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
             "top_k": "top_k",
             "top_p": "top_p",
             "min_p": "min_p",
-            "grammar_mask": "grammar_mask",
             "active": "active",
             "done": "done",
-            "rng": {
-                "rng_seed": "seed",
-                "rng_offset": "offset",
-                "rng_next_offset": "next_offset",
-            },
+            "seed": "seed",
+            "counter": "counter",
+            "next_counter": "next_counter",
             "effect": "rng",
         },
         "rng",
@@ -1378,7 +1363,7 @@ def build_eos_termination(*, row_selective: bool = False) -> PolicyComponent:
     """Build an EOS predicate for batched current tokens and an EOS-id set."""
     graph, builder = _make_graph("eos_termination")
     op = builder.op
-    token_ids = builder.input("token_ids", ir.DataType.INT64, ["batch"])
+    token_ids = builder.input("tokens", ir.DataType.INT64, ["batch"])
     eos_ids = builder.input(
         "eos_ids",
         ir.DataType.INT64,
@@ -1390,7 +1375,7 @@ def build_eos_termination(*, row_selective: bool = False) -> PolicyComponent:
     iteration = builder.input(
         "iteration",
         ir.DataType.INT64,
-        ["batch"],
+        [1] if row_selective else ["batch"],
     )
     max_iterations = builder.input(
         "max_iterations",
@@ -1424,11 +1409,9 @@ def build_eos_termination(*, row_selective: bool = False) -> PolicyComponent:
     )
     if row_selective:
         active = builder.input("active", ir.DataType.BOOL, ["batch"])
-        previous_done = builder.input("previous_done", ir.DataType.BOOL, ["batch"])
-        enabled = op.And(active, op.Not(previous_done))
-        newly_done = op.And(enabled, op.Or(hit_eos, hit_limit))
-        done = op.Or(previous_done, newly_done)
-        next_active = op.And(enabled, op.Not(newly_done))
+        newly_done = op.And(active, op.Or(hit_eos, hit_limit))
+        next_active = op.And(active, op.Not(newly_done))
+        done = op.Not(next_active)
     else:
         done = op.Or(hit_eos, hit_limit)
         next_active = op.Not(done)
@@ -1450,7 +1433,7 @@ def build_eos_termination(*, row_selective: bool = False) -> PolicyComponent:
         graph,
         {
             "role": "termination_predicate",
-            "tokens": "token_ids",
+            "tokens": "tokens",
             "eos_ids": "eos_ids",
             "iteration": "iteration",
             "max_iterations": "max_iterations",
@@ -1458,7 +1441,6 @@ def build_eos_termination(*, row_selective: bool = False) -> PolicyComponent:
                 {
                     "eos_lengths": "eos_lengths",
                     "active": "active",
-                    "previous_done": "previous_done",
                     "batching": "per_row",
                     "inactive_rows": "preserve",
                 }
@@ -1802,32 +1784,28 @@ def build_token_block_identity() -> PolicyComponent:
 
 
 def build_token_state_update(*, row_selective: bool = False) -> PolicyComponent:
-    """Selectively update token state and per-row generated lengths."""
+    """Selectively update one-token state while preserving suppressed rows."""
     graph, builder = _make_graph("token_state_update")
     op = builder.op
     current = builder.input("current", ir.DataType.INT64, ["batch", 1])
-    update = builder.input("update", ir.DataType.INT64, ["batch"])
+    update = builder.input(
+        "update",
+        ir.DataType.INT64,
+        ["batch", 1] if row_selective else ["batch"],
+    )
     if row_selective:
-        lengths = builder.input("lengths", ir.DataType.INT64, ["batch"])
         active = builder.input("active", ir.DataType.BOOL, ["batch"])
         done = builder.input("done", ir.DataType.BOOL, ["batch"])
         enabled = op.And(active, op.Not(done))
         next_state = op.Where(
             op.Unsqueeze(enabled, [-1]),
-            op.Unsqueeze(update, [-1]),
+            update,
             current,
         )
-        emitted_length = op.Cast(enabled, to=ir.DataType.INT64)
-        next_lengths = op.Add(lengths, emitted_length)
     else:
         next_state = op.Unsqueeze(update, [-1])
     next_state.shape = ir.Shape(["batch", 1])
     builder.add_output(next_state, "next")
-    if row_selective:
-        next_lengths.shape = ir.Shape(["batch"])
-        emitted_length.shape = ir.Shape(["batch"])
-        builder.add_output(next_lengths, "next_lengths")
-        builder.add_output(emitted_length, "emitted_length")
     return _component(
         "onnx-genai.state-update@2" if row_selective else "onnx-genai.state-update@1",
         graph,
@@ -1836,20 +1814,8 @@ def build_token_state_update(*, row_selective: bool = False) -> PolicyComponent:
             "current": "current",
             "update": "update",
             **({"batching": "per_row", "inactive_rows": "preserve"} if row_selective else {}),
-            **(
-                {"lengths": "lengths", "active": "active", "done": "done"}
-                if row_selective
-                else {}
-            ),
+            **({"active": "active", "done": "done"} if row_selective else {}),
             "next": "next",
-            **(
-                {
-                    "next_lengths": "next_lengths",
-                    "emitted_length": "emitted_length",
-                }
-                if row_selective
-                else {}
-            ),
             "effect": "state",
         },
         "state",

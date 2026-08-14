@@ -336,21 +336,7 @@ pipeline:
           kind: request
         required: false
         default: 0
-      request.grammar_mask:
-        contract:
-          dtype: bool
-          rank: 2
-          shape:
-          - batch
-          - 128
-        role:
-          kind: opaque
-        source:
-          kind: application
-          name: grammar_mask
-        required: false
-        default: true
-      request.rng_offset:
+      request.rng_counter:
         contract:
           dtype: int64
           rank: 1
@@ -360,7 +346,7 @@ pipeline:
           kind: opaque
         source:
           kind: application
-          name: rng_offset
+          name: rng_counter
         required: false
         default: 0
       package.loop_0_active:
@@ -437,12 +423,11 @@ pipeline:
             top_k: top_k
             top_p: top_p
             min_p: min_p
-            grammar_mask: grammar_mask
             active: active
             done: done
-            rng_seed: seed
-            rng_offset: offset
-            rng_next_offset: next_offset
+            seed: seed
+            counter: counter
+            next_counter: next_counter
           parameters:
             mode: seeded_stochastic
             batching: per_row
@@ -456,13 +441,12 @@ pipeline:
           id: onnx-genai.termination-predicate
           version: '2'
           bindings:
-            tokens: token_ids
+            tokens: tokens
             eos_ids: eos_ids
             iteration: iteration
             max_iterations: max_iterations
             eos_lengths: eos_lengths
             active: active
-            previous_done: previous_done
             done: done
             next_active: next_active
             continue: continue
@@ -479,12 +463,9 @@ pipeline:
           bindings:
             current: current
             update: update
-            lengths: lengths
             active: active
             done: done
             next: next
-            next_lengths: next_lengths
-            emitted_length: emitted_length
           parameters:
             batching: per_row
             inactive_rows: preserve
@@ -504,10 +485,14 @@ pipeline:
         implementation:
           kind: onnx
           artifact: policies/termination_batch_initializer.onnx
-      iteration_broadcast:
+      token_to_slot:
         implementation:
           kind: onnx
-          artifact: policies/iteration_broadcast.onnx
+          artifact: policies/token_to_slot.onnx
+      generated_length_update:
+        implementation:
+          kind: onnx
+          artifact: policies/generated_length_update.onnx
       cache_length_update:
         implementation:
           kind: onnx
@@ -612,7 +597,7 @@ pipeline:
         initializer: initializer.cache_lengths
         recurrence:
           kind: invariant
-      rng_offset:
+      rng_counter:
         contract:
           dtype: int64
           rank: 1
@@ -620,7 +605,7 @@ pipeline:
           - batch
         class: semantic
         scope: invocation
-        initializer: request.rng_offset
+        initializer: request.rng_counter
         recurrence:
           kind: invariant
       position_ids:
@@ -771,13 +756,6 @@ pipeline:
           last_logits: decoder.setup.last_logits
       steps:
       - kind: invoke
-        component: iteration_broadcast
-        inputs:
-          value: loop.iteration
-          active: active
-        outputs:
-          rows: loop.iteration_rows
-      - kind: invoke
         component: token_sampler
         inputs:
           logits: logits
@@ -785,24 +763,22 @@ pipeline:
           top_k: request.top_k
           top_p: request.top_p
           min_p: request.min_p
-          grammar_mask: request.grammar_mask
           seed: request.seed
-          offset: rng_offset
+          counter: rng_counter
           active: active
           done: done
         outputs:
           token: sample.body
-          next_offset: sample.next_offset
+          next_counter: sample.next_counter
       - kind: invoke
         component: termination
         inputs:
-          token_ids: sample.body
+          tokens: sample.body
           eos_ids: termination.eos_ids
           eos_lengths: termination.eos_lengths
-          iteration: loop.iteration_rows
+          iteration: loop.iteration
           max_iterations: termination.max_iterations
           active: active
-          previous_done: done
         outputs:
           done: loop.done
           next_active: loop.next_active
@@ -826,17 +802,38 @@ pipeline:
         outputs:
           total: accepted_len.next
       - kind: invoke
+        component: token_to_slot
+        inputs:
+          token: sample.body
+        outputs:
+          slot: sample.slot
+      - kind: invoke
+        component: generated_length_update
+        inputs:
+          left: generated_lengths
+          right: package.one
+          active: active
+          done: done
+        outputs:
+          total: token.next_lengths
+      - kind: invoke
+        component: generated_length_update
+        inputs:
+          left: package.zero_batch
+          right: package.one
+          active: active
+          done: done
+        outputs:
+          total: token.emitted_length
+      - kind: invoke
         component: token_state_update
         inputs:
           current: token
-          update: sample.body
-          lengths: generated_lengths
+          update: sample.slot
           active: active
           done: done
         outputs:
           next: token.body
-          next_lengths: token.next_lengths
-          emitted_length: token.emitted_length
       - kind: emit
         value: token.body
         output: tokens
@@ -889,8 +886,8 @@ pipeline:
         next: decoder_step.body_attention_mask
       - cell: generated_lengths
         next: token.next_lengths
-      - cell: rng_offset
-        next: sample.next_offset
+      - cell: rng_counter
+        next: sample.next_counter
       - cell: active
         next: loop.next_active
       - cell: done

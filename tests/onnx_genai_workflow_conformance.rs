@@ -44,7 +44,6 @@ fn decoder_batch_request(
     let floats_zero = vec![0.0_f32; usize::try_from(batch)?];
     let floats_one = vec![1.0_f32; usize::try_from(batch)?];
     let slot_ids = (0..batch).collect::<Vec<_>>();
-    let grammar_mask = vec![1_u8; usize::try_from(batch * 128)?];
     Ok(PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![0]),
         options: options(max_new_tokens),
@@ -97,11 +96,7 @@ fn decoder_batch_request(
     )
     .with_input("request.seed", Value::from_slice_i64(&slot_ids, &[batch])?)
     .with_input(
-        "request.grammar_mask",
-        Value::from_raw_bytes(grammar_mask, &[batch, 128], DataType::Bool)?,
-    )
-    .with_input(
-        "request.rng_offset",
+        "request.rng_counter",
         Value::from_slice_i64(&zeros, &[batch])?,
     )
     .with_input(

@@ -262,10 +262,16 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     )
     assert policy_invokes["token_sampler"]["inputs"]["active"] == "active"
     assert policy_invokes["token_sampler"]["inputs"]["done"] == "done"
-    assert policy_invokes["token_state_update"]["inputs"]["lengths"] == ("generated_lengths")
-    assert policy_invokes["token_state_update"]["outputs"]["next_lengths"] == (
-        "token.next_lengths"
-    )
+    assert set(policy_invokes["token_state_update"]["inputs"]) == {
+        "current",
+        "update",
+        "active",
+        "done",
+    }
+    assert policy_invokes["token_state_update"]["outputs"] == {"next": "token.body"}
+    assert policy_invokes["generated_length_update"]["outputs"] == {
+        "total": "token.emitted_length"
+    }
 
     def collect_emits(node):
         if isinstance(node, dict):
