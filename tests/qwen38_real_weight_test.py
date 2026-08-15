@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -21,16 +22,38 @@ _L5 = _ROOT / "testdata" / "golden" / "vision-language" / "qwen3_8-27b-reduced_g
 
 
 def _load(name: str):
-    sys.path.insert(0, str(_EXAMPLE))
-    try:
-        path = _EXAMPLE / f"{name}.py"
-        spec = importlib.util.spec_from_file_location(f"qwen38_{name}", path)
+    def load_file(module_name: str, path: Path):
+        spec = importlib.util.spec_from_file_location(module_name, path)
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            raise
         return module
+
+    previous_inference = sys.modules.get("inference")
+    try:
+        inference = load_file("qwen38_inference", _EXAMPLE / "inference.py")
+        sys.modules["inference"] = inference
+        return load_file(f"qwen38_{name}", _EXAMPLE / f"{name}.py")
     finally:
-        sys.path.pop(0)
+        if previous_inference is None:
+            sys.modules.pop("inference", None)
+        else:
+            sys.modules["inference"] = previous_inference
+
+
+def test_loader_isolates_sibling_inference_modules(monkeypatch):
+    foreign_inference = types.ModuleType("inference")
+    monkeypatch.setitem(sys.modules, "inference", foreign_inference)
+
+    validator = _load("validate_reduced_checkpoint")
+
+    assert validator.MODEL_ID == "Qwen/Qwen3.8-27B"
+    assert sys.modules["inference"] is foreign_inference
 
 
 def test_reduced_config_preserves_hybrid_layers_and_remaps_media_ids():
