@@ -148,12 +148,6 @@ python examples/<model>_text_generation.py --compare-hf --dtype bf16
       opt-in via `MOBIUS_ORT_LOWER_OPSET_FOR_EP=1`)
 - [ ] Dead graph inputs removed after EP-aware optimization
       (`RemoveDeadGraphInputsPass` in Stage 4 of `optimize_model()`)
-- [ ] For models with dual head_dim (e.g. Gemma4: 256 for sliding,
-      512 for full attention), verify whether ORT GenAI requires
-      `search.past_present_share_buffer=false` because GenAI allocates
-      uniform KV cache shapes; if so, explicitly override the generated
-      `genai_config.json` before runtime validation rather than assuming
-      the default generated setting is correct
 - [ ] Vision/audio graph inputs match the real processor (normally float32);
       reduced-precision encoders cast once at graph entry
 - [ ] Representative graph evidence covers raw/post-Mobius/post-weight and
@@ -174,8 +168,14 @@ Optional downstream evidence:
 - [ ] If ORT GenAI load/generation is run, record the exact runtime version and
       result. Failures document limitations but never gate Mobius export based
       on the runtime registry, topology support, or cache executor capability.
+- [ ] If ORT GenAI validation is run for a model with dual head dimensions,
+      determine whether that runtime requires
+      `search.past_present_share_buffer=false` for its uniform KV-cache
+      allocation, and override the generated config only for that probe.
 - [ ] Add an ORT GenAI integration test when useful, but do not require one for
       export acceptance.
+
+Omitting these downstream probes requires no waiver or TODO.
 
 Optional ORT GenAI integration probe:
 
