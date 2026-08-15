@@ -28,20 +28,6 @@ body:
     validations:
       required: true
 
-  - type: textarea
-    id: architecture
-    attributes:
-      label: Architecture details
-      description: |
-        Include the Hugging Face `model_type`, architecture class, and any relevant
-        details such as MoE, multimodal inputs, or custom code requirements.
-      placeholder: |
-        model_type: ...
-        architectures: ...
-        Additional details: ...
-    validations:
-      required: true
-
   - type: dropdown
     id: task
     attributes:
@@ -55,8 +41,6 @@ body:
         - Vision-language or multimodal generation
         - Diffusion or image generation
         - Other
-    validations:
-      required: true
 
   - type: textarea
     id: use-case
@@ -75,7 +59,9 @@ body:
       options:
         - label: CPU
         - label: CUDA
-        - label: DirectML
+        - label: QNN
+        - label: OpenVINO
+        - label: MIGraphX
         - label: Other
     validations:
       required: true
@@ -88,11 +74,11 @@ body:
       placeholder: e.g. NVIDIA RTX 4090 with 24 GB VRAM, or laptop CPU
 
   - type: textarea
-    id: alternatives
+    id: quantization
     attributes:
-      label: Alternatives considered
-      description: Are there already-supported models that could meet your needs?
-      placeholder: Describe any alternatives and why they are insufficient.
+      label: Quantization requirements
+      description: What quantization format or precision do you need, if any?
+      placeholder: e.g. No quantization, INT4, INT8, FP16, or a specific format such as GPTQ
 
   - type: checkboxes
     id: contribution
