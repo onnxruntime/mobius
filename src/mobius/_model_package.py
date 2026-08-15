@@ -31,12 +31,10 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
 
-import numpy as np
 import onnx_ir as ir
 import rfc8785
 import torch
 import tqdm
-from safetensors.numpy import save_file as save_safetensors_file
 
 from mobius._optimizations import fold_initializers_after_weights
 from mobius.adapters import (
@@ -266,7 +264,7 @@ class ModelPackage(UserDict[str, ir.Model]):
             artifact.validate_base(
                 self.data,
                 fingerprint_targets=(
-                    tuple(self.adapter_target_manifest.bindings)
+                    self.adapter_target_manifest.targets
                     if self.adapter_target_manifest is not None
                     else None
                 ),
@@ -300,6 +298,9 @@ class ModelPackage(UserDict[str, ir.Model]):
             descriptor.target: descriptor
             for descriptor in self.adapter_target_manifest.targets
         }
+        manifest_target_ids = {
+            target["id"] for target in self.adapter_target_manifest_metadata()["targets"]
+        }
         catalog: dict[str, dict[str, object]] = {}
         identities: set[tuple[str, str]] = set()
         for artifact_index, (alias, artifact) in enumerate(
@@ -312,92 +313,119 @@ class ModelPackage(UserDict[str, ir.Model]):
                     f"{identity_version[1]} must be unique"
                 )
             identities.add(identity_version)
-            ranks = {weight.rank for weight in artifact.weights}
-            alphas = {weight.alpha for weight in artifact.weights}
+            ordered_weights = sorted(
+                artifact.weights,
+                key=lambda item: (
+                    item.target.component,
+                    item.target.parameter,
+                    item.target_id or "",
+                ),
+            )
             dtypes = {weight.dtype for weight in artifact.weights}
-            if len(ranks) != 1 or len(alphas) != 1 or len(dtypes) != 1:
+            if len(dtypes) != 1:
                 raise ValueError(
-                    f"adapter {alias!r} has heterogeneous target rank/alpha/dtype, "
+                    f"adapter {alias!r} has heterogeneous target dtypes, "
                     "which the ONNX GenAI artifact contract cannot represent"
                 )
-            rank = ranks.pop()
-            alpha = alphas.pop()
+            rank = ordered_weights[0].rank
+            alpha = ordered_weights[0].alpha
             dtype = _adapter_dtype_name(dtypes.pop())
-            if (
-                self.adapter_service_options.preserve_source_format
-                and artifact.source.format == "onnx_adapter"
-                and alpha != rank
-            ):
-                raise ValueError(
-                    f"adapter {alias!r} imports .onnx_adapter weights with baked scale; "
-                    "alpha must equal rank"
-                )
-            targets: list[dict[str, object]] = []
+            bindings: list[dict[str, object]] = []
             portable_targets: dict[str, dict[str, list[float]]] = {}
-            portable_safetensors: dict[str, np.ndarray] = {}
-            native_parameters = {
-                target: {"a": a, "b": b} for target, a, b in artifact.source.native_parameters
-            }
-            for weight in sorted(
-                artifact.weights,
-                key=lambda item: (item.target.component, item.target.parameter),
-            ):
+            for weight in ordered_weights:
                 descriptor = descriptors[weight.target]
-                weight_key = descriptor.semantic_name
-                target_entry: dict[str, object] = {
-                    "component": weight.target.component,
-                    "parameter": weight.target.parameter,
+                target_id = weight.target_id or descriptor.semantic_name
+                if target_id not in manifest_target_ids:
+                    raise ValueError(
+                        f"adapter {alias!r} references target ID {target_id!r} "
+                        "outside the authoritative manifest"
+                    )
+                weight_key = weight.weight_key or descriptor.semantic_name
+                binding: dict[str, object] = {
+                    "target": target_id,
                     "weight_key": weight_key,
-                    "input_features": descriptor.input_size,
-                    "output_features": descriptor.output_size,
                 }
-                if (
-                    self.adapter_service_options.preserve_source_format
-                    and artifact.source.format == "onnx_adapter"
-                ):
-                    try:
-                        target_entry["native_parameters"] = native_parameters[weight.target]
-                    except KeyError as error:
-                        raise ValueError(
-                            f"adapter {alias!r} must declare exact native A/B parameter "
-                            f"names for {weight.target.component}.{weight.target.parameter}"
-                        ) from error
-                targets.append(target_entry)
+                if weight.rank != rank:
+                    binding["rank"] = weight.rank
+                if weight.alpha != alpha:
+                    binding["alpha"] = weight.alpha
+                bindings.append(binding)
                 portable_targets[weight_key] = {
                     "a": weight.a.numpy().reshape(-1).astype("float32").tolist(),
                     "b": weight.b.numpy().reshape(-1).astype("float32").tolist(),
                 }
-                portable_safetensors[f"{weight_key}.a"] = weight.a.numpy()
-                portable_safetensors[f"{weight_key}.b"] = weight.b.numpy()
 
             artifact_dir = os.path.join(directory, "adapters", alias)
             os.makedirs(artifact_dir, exist_ok=True)
-            if self.adapter_service_options.preserve_source_format:
-                if artifact.source.format == "onnx_adapter":
-                    source_path = _adapter_source_file(artifact)
-                    weight_format = "ort_genai"
-                    relative_location = f"adapters/{alias}/adapter.onnx_adapter"
-                    destination = os.path.join(directory, relative_location)
-                    shutil.copyfile(source_path, destination)
-                elif artifact.source.format == "peft_safetensors":
-                    weight_format = "safetensors"
-                    relative_location = f"adapters/{alias}/adapter.safetensors"
-                    destination = os.path.join(directory, relative_location)
-                    save_safetensors_file(portable_safetensors, destination)
-                else:
-                    raise ValueError(
-                        f"adapter {alias!r} source format {artifact.source.format!r} "
-                        "cannot be preserved"
-                    )
-                with open(destination, "rb") as handle:
-                    payload = handle.read()
-            else:
+            weight_artifacts: list[dict[str, object]] = []
+            if self.adapter_service_options.portable_fallback:
                 relative_location = f"adapters/{alias}/adapter.json"
                 destination = os.path.join(directory, relative_location)
                 payload = rfc8785.dumps({"targets": portable_targets})
                 with open(destination, "wb") as handle:
                     handle.write(payload)
-                weight_format = "json"
+                weight_artifacts.append(
+                    {
+                        "location": relative_location,
+                        "loader_capability": "onnx-genai.adapters.json@1",
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                        "format": "json",
+                    }
+                )
+            if (
+                self.adapter_service_options.preserve_source_format
+                and artifact.source.format != "in_memory"
+            ):
+                if artifact.source.format == "onnx_adapter":
+                    source_path = _adapter_source_file(artifact)
+                    relative_location = f"adapters/{alias}/adapter.onnx_adapter"
+                    destination = os.path.join(directory, relative_location)
+                    shutil.copyfile(source_path, destination)
+                    with open(destination, "rb") as handle:
+                        payload = handle.read()
+                    weight_artifacts.append(
+                        {
+                            "location": relative_location,
+                            "loader_capability": "onnxruntime.lora-adapter@1",
+                            "sha256": hashlib.sha256(payload).hexdigest(),
+                            "format": "ort_genai",
+                        }
+                    )
+                elif artifact.source.format == "peft_safetensors":
+                    if artifact.source.path is None:
+                        raise ValueError(f"adapter {alias!r} PEFT source path is absent")
+                    source_dir = artifact.source.path
+                    source_weights = os.path.join(source_dir, "adapter_model.safetensors")
+                    source_config = os.path.join(source_dir, "adapter_config.json")
+                    relative_location = f"adapters/{alias}/adapter_model.safetensors"
+                    relative_config = f"adapters/{alias}/adapter_config.json"
+                    destination = os.path.join(directory, relative_location)
+                    config_destination = os.path.join(directory, relative_config)
+                    shutil.copyfile(source_weights, destination)
+                    shutil.copyfile(source_config, config_destination)
+                    with open(destination, "rb") as handle:
+                        payload = handle.read()
+                    with open(config_destination, "rb") as handle:
+                        config_payload = handle.read()
+                    weight_artifacts.append(
+                        {
+                            "location": relative_location,
+                            "loader_capability": "onnx-genai.adapters.hf-peft@1",
+                            "sha256": hashlib.sha256(payload).hexdigest(),
+                            "config_location": relative_config,
+                            "config_sha256": hashlib.sha256(config_payload).hexdigest(),
+                            "format": "hf_peft",
+                        }
+                    )
+                else:
+                    raise ValueError(
+                        f"adapter {alias!r} source format {artifact.source.format!r} "
+                        "cannot be preserved"
+                    )
+            if not weight_artifacts:
+                raise ValueError(
+                    f"adapter {alias!r} must emit a portable or preserved source artifact"
+                )
             provenance_parts = [artifact.source.format]
             if artifact.source.base_model:
                 provenance_parts.append(f"base={artifact.source.base_model}")
@@ -414,16 +442,53 @@ class ModelPackage(UserDict[str, ir.Model]):
                 "alpha": alpha,
                 "dtype": dtype,
                 "provenance": ";".join(provenance_parts),
-                "weights": [
-                    {
-                        "location": relative_location,
-                        "sha256": hashlib.sha256(payload).hexdigest(),
-                        "format": weight_format,
-                    }
-                ],
-                "targets": targets,
+                "weights": weight_artifacts,
+                "bindings": bindings,
             }
         return catalog
+
+    def adapter_target_manifest_metadata(self) -> dict[str, object]:
+        """Serialize the authoritative generic LoRA target manifest."""
+        if self.adapter_target_manifest is None:
+            raise ValueError("adapter target manifest is not attached")
+        targets: list[dict[str, object]] = []
+        for descriptor in sorted(
+            self.adapter_target_manifest.targets,
+            key=lambda item: item.semantic_name,
+        ):
+            initializer = self.data[descriptor.target.component].graph.initializers[
+                descriptor.target.parameter
+            ]
+            activation_dtype = _adapter_dtype_name(
+                descriptor.activation_dtype or initializer.dtype
+            )
+            base: dict[str, object] = {
+                "id": descriptor.semantic_name,
+                "component": descriptor.target.component,
+                "parameter": descriptor.target.parameter,
+                "output_value": descriptor.output_name,
+                "activation_dtype": activation_dtype,
+                "input_features": descriptor.input_size,
+                "output_features": descriptor.output_size,
+            }
+            if descriptor.graph_input_a is not None:
+                graph_inputs = {
+                    "a": descriptor.graph_input_a,
+                    "b": descriptor.graph_input_b,
+                }
+                if descriptor.graph_input_scale is not None:
+                    graph_inputs["scale"] = descriptor.graph_input_scale
+                base["graph_inputs"] = graph_inputs
+            targets.append(base)
+            for target_slice in descriptor.slices:
+                sliced = dict(base)
+                sliced["id"] = f"{descriptor.semantic_name}.{target_slice.role}"
+                sliced["output_slice"] = {
+                    "offset": target_slice.offset,
+                    "width": target_slice.width,
+                }
+                targets.append(sliced)
+        return {"targets": targets}
 
     def save_policy_components(
         self,

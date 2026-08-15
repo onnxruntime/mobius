@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import json
+import shutil
 from pathlib import Path
 
 import numpy as np
 import onnx_ir as ir
 import yaml
 from onnxscript import GraphBuilder
+from safetensors.numpy import save_file
 
 from mobius._model_package import ModelPackage
+from mobius.adapter_io import load_peft_adapter
 from mobius.adapters import (
     AdapterArtifact,
     AdapterServiceOptions,
@@ -24,7 +28,7 @@ from mobius.integrations.onnx_genai.auto_export_test import (
     _VlmCfg,
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
-    add_adapter_service_to_workflow,
+    add_adapter_service_to_metadata,
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
     write_audio_codec_workflow_metadata,
@@ -474,7 +478,7 @@ def _executable_codec_package() -> ModelPackage:
     )
 
 
-def _adapter_package() -> ModelPackage:
+def _adapter_package(source_root: Path) -> ModelPackage:
     graph, builder = _graph("decoder")
     activations = builder.input("activations", ir.DataType.FLOAT, ["batch", 2])
     weight = ir.Value(
@@ -493,29 +497,30 @@ def _adapter_package() -> ModelPackage:
     )
     model = ir.Model(graph, ir_version=11)
     target = AdapterTarget("decoder", "projection")
-    fingerprint = fingerprint_model_weights({"decoder": model}, (target,))
-    manifest = AdapterTargetManifest(
-        fingerprint,
-        (
-            AdapterTargetDescriptor(
-                target,
-                semantic_name="projection",
-                node_name="projection",
-                output_name="projection.output",
-                input_size=2,
-                output_size=2,
-            ),
-        ),
+    descriptor = AdapterTargetDescriptor(
+        target,
+        semantic_name="projection",
+        node_name="projection",
+        output_name="projection.output",
+        input_size=2,
+        output_size=2,
+        activation_dtype=ir.DataType.FLOAT,
+        graph_input_a="lora.projection.a",
+        graph_input_b="lora.projection.b",
+        graph_input_scale="lora.projection.scale",
     )
+    fingerprint = fingerprint_model_weights({"decoder": model}, (descriptor,))
+    manifest = AdapterTargetManifest(fingerprint, (descriptor,))
     package = ModelPackage(
         {"decoder": model},
         adapter_target_manifest=manifest,
         adapter_service_options=AdapterServiceOptions(
-            row_ids="request.row_ids",
+            slot_ids="request.slot_ids",
             request_epochs="request.request_epochs",
             active="request.active",
             max_adapters=2,
             cache_max_entries=2,
+            preserve_source_format=True,
         ),
     )
     for name, a, b in (
@@ -544,6 +549,35 @@ def _adapter_package() -> ModelPackage:
                 version="1",
             )
         )
+    peft_source = source_root / "peft"
+    peft_source.mkdir(parents=True, exist_ok=True)
+    (peft_source / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "base_model_name_or_path": "synthetic/adapter-base",
+                "r": 1,
+                "lora_alpha": 1.0,
+                "target_modules": ["projection"],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    save_file(
+        {
+            "base_model.projection.lora_A.weight": np.array([[1.0, -1.0]], dtype=np.float32),
+            "base_model.projection.lora_B.weight": np.array([[0.5], [0.25]], dtype=np.float32),
+        },
+        peft_source / "adapter_model.safetensors",
+    )
+    package.add_adapter_artifact(
+        load_peft_adapter(
+            peft_source,
+            name="peft",
+            base_fingerprint=fingerprint,
+            target_bindings={"projection": target},
+        )
+    )
     return package
 
 
@@ -564,18 +598,17 @@ def _write_adapter_metadata(package: ModelPackage, directory: Path) -> None:
                     ],
                 },
                 "inputs": {
-                    "request.row_ids": {
+                    "request.slot_ids": {
                         "contract": {
                             "dtype": "int64",
                             "rank": 1,
                             "shape": ["batch"],
                         },
-                        "role": {
-                            "kind": "runtime",
-                            "version": "1.0",
-                            "role": "row_ids",
+                        "role": {"kind": "opaque"},
+                        "source": {
+                            "kind": "application",
+                            "name": "serving.slot_ids",
                         },
-                        "source": {"kind": "request"},
                     },
                     "request.active": {
                         "contract": {
@@ -684,7 +717,7 @@ def _write_adapter_metadata(package: ModelPackage, directory: Path) -> None:
             }
         },
     }
-    add_adapter_service_to_workflow(metadata, package, str(directory))
+    add_adapter_service_to_metadata(metadata, package, str(directory))
     with open(directory / "inference_metadata.yaml", "w", encoding="utf-8") as handle:
         yaml.safe_dump(metadata, handle, sort_keys=False)
 
@@ -732,16 +765,18 @@ def main() -> None:
     codec.save(str(directory), progress_bar=False, check_weights=False)
     write_audio_codec_workflow_metadata(codec, str(directory))
 
-    adapter = _adapter_package()
     directory = args.output / "adapter"
+    source_root = directory / ".sources"
+    adapter = _adapter_package(source_root)
     adapter.save(str(directory), progress_bar=False)
     _write_adapter_metadata(adapter, directory)
+    shutil.rmtree(source_root)
 
     (args.output / "README.md").write_text(
         """# ONNX GenAI workflow conformance fixtures
 
 Generated by `tests/generate_onnx_genai_validation_packages.py` for semantic
-validation and runtime conformance against `justinchuby/onnx-genai@21a935c2`.
+validation and runtime conformance against `justinchuby/onnx-genai@903a2d1a`.
 
 The decoder, VLM, diffusion, masked diffusion, speculative, and codec packages
 contain executable synthetic models. The TTS fixture uses the real tiny

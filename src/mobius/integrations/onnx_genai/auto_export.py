@@ -25,7 +25,7 @@ from mobius.integrations.onnx_genai.decoder_metadata import (
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
-    add_adapter_service_to_workflow,
+    add_adapter_service_to_metadata,
     add_explicit_package_io,
     add_policy_components_to_workflow,
     load_diffusers_scheduler_config,
@@ -109,7 +109,7 @@ def _add_explicit_io_to_file(path: str, pkg: Any, config: Any) -> None:
         metadata = yaml.safe_load(handle)
     add_explicit_package_io(metadata, pkg, config)
     add_policy_components_to_workflow(metadata, pkg)
-    add_adapter_service_to_workflow(metadata, pkg, os.path.dirname(path))
+    add_adapter_service_to_metadata(metadata, pkg, os.path.dirname(path))
     with open(path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(metadata, handle, sort_keys=False)
 

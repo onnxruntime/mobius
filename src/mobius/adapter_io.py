@@ -47,16 +47,18 @@ def _pattern_value(patterns: Mapping[str, object], module_key: str, default: obj
     return max(matches, key=lambda item: len(item[0]))[1]
 
 
-def _resolve_target(module_key: str, targets: Mapping[str, AdapterTarget]) -> AdapterTarget:
+def _resolve_target(
+    module_key: str, targets: Mapping[str, AdapterTarget]
+) -> tuple[str, AdapterTarget]:
     if module_key in targets:
-        return targets[module_key]
+        return module_key, targets[module_key]
     matches = [(name, target) for name, target in targets.items() if module_key.endswith(name)]
     if len(matches) != 1:
         raise ValueError(
             f"PEFT module {module_key!r} resolves to {len(matches)} producer targets; "
             "provide one exact or unique suffix binding"
         )
-    return matches[0][1]
+    return matches[0]
 
 
 def load_peft_adapter(
@@ -114,12 +116,14 @@ def load_peft_adapter(
                 f"PEFT module {module_key!r} factors must have shapes "
                 f"[rank,K]/[N,rank] for rank {rank}, got {a.shape}/{b.shape}"
             )
+        weight_key, target = _resolve_target(module_key, target_bindings)
         loaded_weights.append(
             AdapterWeights(
-                _resolve_target(module_key, target_bindings),
+                target,
                 ir.tensor(a),
                 ir.tensor(b),
                 alpha,
+                weight_key=weight_key,
             )
         )
 
@@ -140,8 +144,6 @@ def load_peft_adapter(
 
 def adapter_source_from_onnx_adapter(
     path: str | Path,
-    *,
-    native_parameters: Mapping[AdapterTarget, tuple[str, str]] | None = None,
 ) -> AdapterSource:
     """Declare an ORT FlatBuffers adapter source without making it mandatory."""
     path = Path(path)
@@ -152,11 +154,4 @@ def adapter_source_from_onnx_adapter(
         "onnx_adapter",
         path=str(path),
         checksum=f"sha256:{hashlib.sha256(payload).hexdigest()}",
-        native_parameters=tuple(
-            (target, names[0], names[1])
-            for target, names in sorted(
-                (native_parameters or {}).items(),
-                key=lambda item: (item[0].component, item[0].parameter),
-            )
-        ),
     )

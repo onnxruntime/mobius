@@ -46,7 +46,7 @@ from mobius.generation import (
 from mobius.integrations.onnx_genai.inference_metadata import (
     _port,
     _shape_metadata,
-    add_adapter_service_to_workflow,
+    add_adapter_service_to_metadata,
     add_policy_components_to_workflow,
     build_native_vlm_package_metadata,
 )
@@ -485,7 +485,7 @@ def write_audio_codec_workflow_metadata(pkg: Any, output_dir: str) -> str:
     """Write typed SSA metadata for an audio codec package."""
     os.makedirs(output_dir, exist_ok=True)
     metadata = build_audio_codec_workflow_metadata(pkg)
-    add_adapter_service_to_workflow(metadata, pkg, output_dir)
+    add_adapter_service_to_metadata(metadata, pkg, output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
         _dump_yaml(metadata, handle)
@@ -2183,7 +2183,7 @@ def write_tts_workflow_metadata(pkg: Any, output_dir: str, config: Any) -> str:
     metadata = build_tts_workflow_metadata(pkg, config)
     os.makedirs(output_dir, exist_ok=True)
     pkg.save_policy_components(output_dir)
-    add_adapter_service_to_workflow(metadata, pkg, output_dir)
+    add_adapter_service_to_metadata(metadata, pkg, output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
         _dump_yaml(metadata, handle)
@@ -2530,7 +2530,7 @@ def write_diffusion_workflow_metadata(
         timesteps=timesteps,
     )
     pkg.save_policy_components(output_dir)
-    add_adapter_service_to_workflow(metadata, pkg, output_dir)
+    add_adapter_service_to_metadata(metadata, pkg, output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
         _dump_yaml(metadata, handle)
@@ -3573,7 +3573,7 @@ def write_vlm_workflow_metadata(
     os.makedirs(output_dir, exist_ok=True)
     metadata = build_vlm_workflow_metadata(pkg, config, source=source)
     pkg.save_policy_components(output_dir)
-    add_adapter_service_to_workflow(metadata, pkg, output_dir)
+    add_adapter_service_to_metadata(metadata, pkg, output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
         _dump_yaml(metadata, handle)
@@ -4382,7 +4382,7 @@ def write_speculative_workflow_metadata(
         adaptive_k_max=adaptive_k_max,
     )
     pkg.save_policy_components(output_dir)
-    add_adapter_service_to_workflow(metadata, pkg, output_dir)
+    add_adapter_service_to_metadata(metadata, pkg, output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
         _dump_yaml(metadata, handle)
@@ -5687,7 +5687,7 @@ def write_decoder_workflow_metadata(
     os.makedirs(output_dir, exist_ok=True)
     metadata = build_decoder_workflow_metadata(pkg, config, sampler=sampler)
     pkg.save_policy_components(output_dir)
-    add_adapter_service_to_workflow(metadata, pkg, output_dir)
+    add_adapter_service_to_metadata(metadata, pkg, output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
         _dump_yaml(metadata, handle)
@@ -5707,7 +5707,7 @@ def write_language_diffusion_workflow_metadata(
         num_inference_steps=num_inference_steps,
     )
     pkg.save_policy_components(output_dir)
-    add_adapter_service_to_workflow(metadata, pkg, output_dir)
+    add_adapter_service_to_metadata(metadata, pkg, output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
         _dump_yaml(metadata, handle)

@@ -1482,7 +1482,7 @@ def add_policy_components_to_workflow(
     return metadata
 
 
-def add_adapter_service_to_workflow(
+def add_adapter_service_to_metadata(
     metadata: dict[str, Any],
     pkg: Any,
     output_dir: str,
@@ -1491,21 +1491,20 @@ def add_adapter_service_to_workflow(
     artifacts = getattr(pkg, "adapter_artifacts", {})
     if not artifacts:
         return metadata
-    workflow = metadata.get("pipeline", {}).get("workflow")
-    if not isinstance(workflow, dict):
-        raise TypeError("parameter adapters require pipeline.workflow metadata")
+    workflow_value = metadata.get("pipeline", {}).get("workflow")
+    workflow = workflow_value if isinstance(workflow_value, dict) else None
     manifest = getattr(pkg, "adapter_target_manifest", None)
     if manifest is None:
         raise ValueError("parameter adapters require an authoritative adapter target manifest")
     options = pkg.adapter_service_options
-    inputs = workflow.get("inputs", {})
+    inputs = workflow.setdefault("inputs", {}) if workflow is not None else {}
 
     def compatible_input(
         name: str,
         *,
         dtype: str,
         shape: list[str | int],
-        role: str,
+        role: str | None,
     ) -> bool:
         declaration = inputs.get(name)
         if not isinstance(declaration, dict):
@@ -1517,8 +1516,11 @@ def add_adapter_service_to_workflow(
             and contract.get("rank") == len(shape)
             and contract.get("shape") == shape
             and declaration.get("required", True)
-            and declaration.get("source") == {"kind": "request"}
-            and semantic_role == {"kind": "runtime", "version": "1.0", "role": role}
+            and declaration.get("source", {}).get("kind") in {"request", "application"}
+            and (
+                role is None
+                or semantic_role == {"kind": "runtime", "version": "1.0", "role": role}
+            )
         )
 
     def ensure_input(
@@ -1526,63 +1528,82 @@ def add_adapter_service_to_workflow(
         *,
         dtype: str,
         shape: list[str | int],
-        role: str,
+        role: str | None,
+        source: dict[str, str] | None = None,
     ) -> None:
         if name not in inputs:
             inputs[name] = {
                 "contract": {"dtype": dtype, "rank": len(shape), "shape": shape},
-                "role": {"kind": "runtime", "version": "1.0", "role": role},
-                "source": {"kind": "request"},
+                "role": (
+                    {"kind": "runtime", "version": "1.0", "role": role}
+                    if role is not None
+                    else {"kind": "opaque"}
+                ),
+                "source": source or {"kind": "request"},
             }
         if not compatible_input(name, dtype=dtype, shape=shape, role=role):
             raise ValueError(
-                f"adapter {role} must reference a required request-sourced "
+                f"adapter {role or 'slot_ids'} must reference a required "
+                "request/application-sourced "
                 f"{dtype}{shape} workflow input"
             )
 
-    row_ids = options.row_ids or "request.row_ids"
-    ensure_input(row_ids, dtype="int64", shape=["batch"], role="row_ids")
+    serving = workflow.get("serving") if workflow is not None else None
+    serving_slot_ids = serving.get("slot_ids") if isinstance(serving, dict) else None
+    slot_ids = options.slot_ids or serving_slot_ids or "request.slot_ids"
     request_epochs = options.request_epochs or "request.request_epochs"
-    ensure_input(
-        request_epochs,
-        dtype="int64",
-        shape=["batch"],
-        role="request_epochs",
-    )
-    ensure_input(
-        options.adapter_ids,
-        dtype="int64",
-        shape=["batch", options.max_adapters],
-        role="adapter_ids",
-    )
-    ensure_input(
-        options.adapter_counts,
-        dtype="int64",
-        shape=["batch"],
-        role="adapter_counts",
-    )
-    ensure_input(
-        options.scales,
-        dtype="float32",
-        shape=["batch", options.max_adapters],
-        role="adapter_scales",
-    )
     active = options.active
-    if active is not None:
+    if workflow is not None:
         ensure_input(
-            active,
-            dtype="bool",
+            slot_ids,
+            dtype="int64",
             shape=["batch"],
-            role="adapter_active",
+            role=None,
+            source={"kind": "application", "name": "serving.slot_ids"},
         )
+        ensure_input(
+            request_epochs,
+            dtype="int64",
+            shape=["batch"],
+            role="request_epochs",
+        )
+        ensure_input(
+            options.segments,
+            dtype="int64",
+            shape=["batch", options.max_adapters],
+            role="adapter_segments",
+        )
+        ensure_input(
+            options.adapter_counts,
+            dtype="int64",
+            shape=["batch"],
+            role="adapter_counts",
+        )
+        ensure_input(
+            options.scales,
+            dtype="float32",
+            shape=["batch", options.max_adapters],
+            role="adapter_scales",
+        )
+        if active is not None:
+            ensure_input(
+                active,
+                dtype="bool",
+                shape=["batch"],
+                role="adapter_active",
+            )
 
     catalog = pkg.save_adapter_artifacts(output_dir)
-    workflow["adapters"] = {
+    if workflow is not None:
+        workflow.pop("adapters", None)
+    metadata["adapters"] = {
         "base_model_fingerprint": manifest.base_fingerprint,
+        "target_manifest": pkg.adapter_target_manifest_metadata(),
+        "discovery_fallback": options.discovery_fallback,
         "selection": {
-            "row_ids": row_ids,
+            "slot_ids": slot_ids,
             "request_epochs": request_epochs,
-            "adapter_ids": options.adapter_ids,
+            "segments": options.segments,
             "adapter_counts": options.adapter_counts,
             "scales": options.scales,
             **({"active": active} if active is not None else {}),
@@ -1601,10 +1622,11 @@ def add_adapter_service_to_workflow(
         },
         "artifacts": catalog,
     }
-    capabilities = workflow.setdefault("manifest", {}).setdefault("capabilities", [])
-    for capability in ("parameter_adapters", "heterogeneous_adapter_batching"):
-        if capability not in capabilities:
-            capabilities.append(capability)
+    if workflow is not None:
+        capabilities = workflow.setdefault("manifest", {}).setdefault("capabilities", [])
+        for capability in ("parameter_adapters", "heterogeneous_adapter_batching"):
+            if capability not in capabilities:
+                capabilities.append(capability)
     return metadata
 
 

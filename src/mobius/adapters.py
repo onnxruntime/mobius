@@ -9,7 +9,7 @@ __all__ = [
     "AdapterApplication",
     "AdapterArtifact",
     "AdapterBatchSelection",
-    "AdapterRowSelection",
+    "AdapterSlotSelection",
     "AdapterSelectionTensors",
     "AdapterServiceOptions",
     "AdapterSource",
@@ -100,8 +100,13 @@ def _canonical_attribute_value(attribute: ir.Attr) -> object:
 
 def _target_fingerprint_record(
     models: Mapping[str, ir.Model],
-    target: AdapterTarget,
+    resolved_target: AdapterTarget | AdapterTargetDescriptor,
 ) -> dict[str, object]:
+    target = (
+        resolved_target.target
+        if isinstance(resolved_target, AdapterTargetDescriptor)
+        else resolved_target
+    )
     model = models.get(target.component)
     if model is None:
         raise ValueError(f"cannot fingerprint unknown component {target.component!r}")
@@ -132,7 +137,7 @@ def _target_fingerprint_record(
                     "op_type": node.op_type,
                 }
             )
-    return {
+    record: dict[str, object] = {
         "component": target.component,
         "consumers": consumers,
         "dtype": int(initializer.dtype),
@@ -140,11 +145,26 @@ def _target_fingerprint_record(
         "shape": [int(dimension) for dimension in initializer.shape],
         "tensor_sha256": hashlib.sha256(_tensor_bytes(initializer.const_value)).hexdigest(),
     }
+    if isinstance(resolved_target, AdapterTargetDescriptor):
+        record["id"] = resolved_target.semantic_name
+        record["output_value"] = resolved_target.output_name
+        record["activation_dtype"] = int(resolved_target.activation_dtype or initializer.dtype)
+        if resolved_target.graph_input_a is not None:
+            record["graph_inputs"] = {
+                "a": resolved_target.graph_input_a,
+                "b": resolved_target.graph_input_b,
+                **(
+                    {"scale": resolved_target.graph_input_scale}
+                    if resolved_target.graph_input_scale is not None
+                    else {}
+                ),
+            }
+    return record
 
 
 def fingerprint_model_weights(
     models: Mapping[str, ir.Model],
-    targets: Sequence[AdapterTarget] | None = None,
+    targets: Sequence[AdapterTarget | AdapterTargetDescriptor] | None = None,
 ) -> str:
     """Fingerprint the exact immutable base parameters targeted by adapters."""
     if targets is None:
@@ -153,15 +173,37 @@ def fingerprint_model_weights(
             for component, model in sorted(models.items())
             for parameter in sorted(model.graph.initializers)
         )
-    unique_targets = sorted(set(targets), key=lambda item: (item.component, item.parameter))
+    unique_targets = sorted(
+        targets,
+        key=lambda item: (
+            item.target.component
+            if isinstance(item, AdapterTargetDescriptor)
+            else item.component,
+            item.target.parameter
+            if isinstance(item, AdapterTargetDescriptor)
+            else item.parameter,
+            item.semantic_name if isinstance(item, AdapterTargetDescriptor) else "",
+        ),
+    )
     if not unique_targets:
         raise ValueError("adapter base fingerprint requires at least one target")
+    records: list[dict[str, object]] = []
+    for target in unique_targets:
+        record = _target_fingerprint_record(models, target)
+        records.append(record)
+        if isinstance(target, AdapterTargetDescriptor):
+            for target_slice in sorted(target.slices, key=lambda item: item.role):
+                sliced = dict(record)
+                sliced["id"] = f"{target.semantic_name}.{target_slice.role}"
+                sliced["output_slice"] = {
+                    "offset": target_slice.offset,
+                    "width": target_slice.width,
+                }
+                records.append(sliced)
     canonical = rfc8785.dumps(
         {
             "schema": "onnx-genai-targeted-base-v1",
-            "targets": [
-                _target_fingerprint_record(models, target) for target in unique_targets
-            ],
+            "targets": records,
         }
     )
     return f"onnx-genai-targeted-base-v1:sha256:{hashlib.sha256(canonical).hexdigest()}"
@@ -215,6 +257,10 @@ class AdapterTargetDescriptor:
     rank: int | None = None
     alpha: float | None = None
     slices: tuple[AdapterTargetSlice, ...] = ()
+    activation_dtype: ir.DataType | None = None
+    graph_input_a: str | None = None
+    graph_input_b: str | None = None
+    graph_input_scale: str | None = None
 
     def __post_init__(self) -> None:
         if not self.semantic_name or not self.node_name or not self.output_name:
@@ -236,6 +282,19 @@ class AdapterTargetDescriptor:
                 raise ValueError("adapter target slices must not overlap")
         if ordered and ordered[-1].offset + ordered[-1].width > self.output_size:
             raise ValueError("adapter target slice exceeds the projection output dimension")
+        if (self.graph_input_a is None) != (self.graph_input_b is None):
+            raise ValueError("adapter graph inputs must declare paired A/B names")
+        graph_inputs = [
+            name
+            for name in (self.graph_input_a, self.graph_input_b, self.graph_input_scale)
+            if name is not None
+        ]
+        if any(not name for name in graph_inputs) or len(graph_inputs) != len(
+            set(graph_inputs)
+        ):
+            raise ValueError(
+                "adapter graph inputs must contain distinct non-empty A/B/scale names"
+            )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -296,9 +355,7 @@ class AdapterTargetManifest:
                     f"adapter manifest node {descriptor.node_name!r} does not produce "
                     f"{descriptor.output_name!r}"
                 )
-        actual_fingerprint = fingerprint_model_weights(
-            models, tuple(descriptor.target for descriptor in self.targets)
-        )
+        actual_fingerprint = fingerprint_model_weights(models, self.targets)
         if actual_fingerprint != self.base_fingerprint:
             raise ValueError(
                 "adapter target manifest base fingerprint mismatch: "
@@ -320,20 +377,12 @@ class AdapterSource:
     checksum: str | None = None
     base_model: str | None = None
     revision: str | None = None
-    native_parameters: tuple[tuple[AdapterTarget, str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if self.format != "in_memory" and not self.path:
             raise ValueError(f"{self.format} adapter source requires a path")
         if self.checksum is not None and not self.checksum.startswith("sha256:"):
             raise ValueError("adapter source checksum must use sha256")
-        targets = [target for target, _, _ in self.native_parameters]
-        if len(targets) != len(set(targets)):
-            raise ValueError("adapter source contains duplicate native parameter bindings")
-        if any(not a or not b or a == b for _, a, b in self.native_parameters):
-            raise ValueError(
-                "adapter native parameters must contain distinct non-empty A/B names"
-            )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -344,6 +393,8 @@ class AdapterWeights:
     a: ir.Tensor
     b: ir.Tensor
     alpha: float
+    weight_key: str | None = None
+    target_id: str | None = None
 
     def __post_init__(self) -> None:
         if len(self.a.shape) != 2 or len(self.b.shape) != 2:
@@ -359,6 +410,10 @@ class AdapterWeights:
             raise ValueError("adapter A and B factors must have the same dtype")
         if not math.isfinite(self.alpha) or self.alpha <= 0.0:
             raise ValueError("adapter alpha must be finite and greater than zero")
+        if self.weight_key is not None and not self.weight_key:
+            raise ValueError("adapter weight key must be non-empty")
+        if self.target_id is not None and not self.target_id:
+            raise ValueError("adapter target ID must be non-empty")
 
     @property
     def rank(self) -> int:
@@ -433,9 +488,24 @@ class AdapterArtifact:
         self,
         models: Mapping[str, ir.Model],
         *,
-        fingerprint_targets: Sequence[AdapterTarget] | None = None,
+        fingerprint_targets: Sequence[AdapterTarget | AdapterTargetDescriptor] | None = None,
     ) -> None:
         """Validate fingerprint, target existence, dtype, and matrix dimensions."""
+        target_shapes: dict[str, tuple[AdapterTarget, int, int]] = {}
+        for resolved in fingerprint_targets or ():
+            if not isinstance(resolved, AdapterTargetDescriptor):
+                continue
+            target_shapes[resolved.semantic_name] = (
+                resolved.target,
+                resolved.input_size,
+                resolved.output_size,
+            )
+            for target_slice in resolved.slices:
+                target_shapes[f"{resolved.semantic_name}.{target_slice.role}"] = (
+                    resolved.target,
+                    resolved.input_size,
+                    target_slice.width,
+                )
         for weight in self.weights:
             model = models.get(weight.target.component)
             if model is None:
@@ -451,12 +521,41 @@ class AdapterArtifact:
                 )
             expected_shape = [int(weight.b.shape[0]), int(weight.a.shape[1])]
             actual_shape = [int(dimension) for dimension in initializer.shape]
-            if actual_shape != expected_shape:
+            resolved_shape = target_shapes.get(weight.target_id or "")
+            if weight.target_id is not None and resolved_shape is None:
+                raise ValueError(
+                    f"adapter target ID {weight.target_id!r} is absent from "
+                    "the authoritative target manifest"
+                )
+            if resolved_shape is None and actual_shape != expected_shape:
                 raise ValueError(
                     f"adapter target {weight.target.component!r}/"
                     f"{weight.target.parameter!r} has shape {actual_shape}, "
                     f"but B @ A has shape {expected_shape}"
                 )
+            if resolved_shape is not None:
+                resolved_target, input_features, output_features = resolved_shape
+                if resolved_target != weight.target:
+                    raise ValueError(
+                        f"adapter target ID {weight.target_id!r} resolves to "
+                        f"{resolved_target}, not {weight.target}"
+                    )
+                descriptor = next(
+                    item
+                    for item in fingerprint_targets or ()
+                    if isinstance(item, AdapterTargetDescriptor)
+                    and item.target == weight.target
+                )
+                base_shape = [descriptor.output_size, descriptor.input_size]
+                if actual_shape != base_shape or expected_shape != [
+                    output_features,
+                    input_features,
+                ]:
+                    raise ValueError(
+                        f"adapter target ID {weight.target_id!r} expects base/factor "
+                        f"shapes {base_shape}/[{output_features}, {input_features}], "
+                        f"got {actual_shape}/{expected_shape}"
+                    )
             if initializer.dtype != weight.dtype:
                 raise ValueError(
                     f"adapter target {weight.target.component!r}/"
@@ -509,9 +608,9 @@ class AdapterApplication:
 class AdapterServiceOptions:
     """Producer-neutral runtime lifecycle, planning, and artifact format options."""
 
-    row_ids: str | None = None
+    slot_ids: str | None = None
     request_epochs: str | None = None
-    adapter_ids: str = "request.adapter_ids"
+    segments: str = "request.adapter_segments"
     adapter_counts: str = "request.adapter_counts"
     scales: str = "request.adapter_scales"
     active: str | None = None
@@ -523,6 +622,7 @@ class AdapterServiceOptions:
     stable_buffers: bool = True
     invalidate_capture_on_eviction: bool = True
     preserve_source_format: bool = False
+    discovery_fallback: Literal["disabled", "tooling_only"] = "disabled"
 
     def __post_init__(self) -> None:
         if not self.application_capability:
@@ -531,18 +631,19 @@ class AdapterServiceOptions:
             raise ValueError("adapter cache max_entries must be greater than zero")
         if self.max_adapters <= 0:
             raise ValueError("adapter max_adapters must be greater than zero")
-        if self.portable_fallback and self.preserve_source_format:
+        if self.discovery_fallback not in {"disabled", "tooling_only"}:
+            raise ValueError("adapter discovery fallback must be disabled or tooling_only")
+        if not self.portable_fallback and not self.preserve_source_format:
             raise ValueError(
-                "portable fallback requires portable JSON artifacts; "
-                "source-format preservation requires a native adapter capability"
+                "adapter service must emit a portable fallback or preserved source format"
             )
 
 
 @dataclasses.dataclass(frozen=True)
-class AdapterRowSelection:
-    """Adapter composition for one stable semantic request row."""
+class AdapterSlotSelection:
+    """Adapter composition for one stable semantic serving slot."""
 
-    row_id: int
+    slot_id: int
     request_epoch: int
     adapters: tuple[AdapterApplication, ...] = ()
 
@@ -551,33 +652,33 @@ class AdapterRowSelection:
             raise ValueError("adapter request epoch must be non-negative")
         names = [application.adapter for application in self.adapters]
         if len(names) != len(set(names)):
-            raise ValueError("adapter row contains duplicate adapter")
+            raise ValueError("adapter slot contains duplicate adapter")
 
 
 @dataclasses.dataclass(frozen=True)
 class AdapterBatchSelection:
     """Fixed-shape, compaction-safe adapter state for a heterogeneous batch."""
 
-    rows: tuple[AdapterRowSelection, ...]
+    slots: tuple[AdapterSlotSelection, ...]
 
     def __post_init__(self) -> None:
-        row_ids = [row.row_id for row in self.rows]
-        if len(row_ids) != len(set(row_ids)):
-            raise ValueError("adapter batch row IDs must be unique")
+        slot_ids = [slot.slot_id for slot in self.slots]
+        if len(slot_ids) != len(set(slot_ids)):
+            raise ValueError("adapter batch slot IDs must be unique")
 
     def validate_catalog(self, artifacts: Mapping[str, AdapterArtifact]) -> None:
-        for row in self.rows:
-            for application in row.adapters:
+        for slot in self.slots:
+            for application in slot.adapters:
                 if application.adapter not in artifacts:
                     raise ValueError(
-                        f"row {row.row_id} selects unknown adapter {application.adapter!r}"
+                        f"slot {slot.slot_id} selects unknown adapter {application.adapter!r}"
                     )
 
     def compact(self, permutation: Sequence[int]) -> AdapterBatchSelection:
-        """Apply the same physical-row permutation used for all workflow state."""
-        if sorted(permutation) != list(range(len(self.rows))):
-            raise ValueError("adapter compaction must be a permutation of all batch rows")
-        return AdapterBatchSelection(tuple(self.rows[index] for index in permutation))
+        """Apply the same physical-slot permutation used for all workflow state."""
+        if sorted(permutation) != list(range(len(self.slots))):
+            raise ValueError("adapter compaction must be a permutation of all batch slots")
+        return AdapterBatchSelection(tuple(self.slots[index] for index in permutation))
 
     def to_tensors(
         self,
@@ -590,33 +691,33 @@ class AdapterBatchSelection:
         if max_adapters <= 0:
             raise ValueError("adapter max_adapters must be greater than zero")
         if active is None:
-            active = [True] * len(self.rows)
-        if len(active) != len(self.rows):
-            raise ValueError("adapter active rows must match the selection batch size")
+            active = [True] * len(self.slots)
+        if len(active) != len(self.slots):
+            raise ValueError("adapter active slots must match the selection batch size")
         self.validate_catalog(artifacts)
         aliases = tuple(sorted(artifacts))
         indices = {alias: index for index, alias in enumerate(aliases)}
-        adapter_ids = np.full((len(self.rows), max_adapters), -1, dtype=np.int64)
-        scales = np.zeros((len(self.rows), max_adapters), dtype=np.float32)
-        counts = np.zeros((len(self.rows),), dtype=np.int64)
-        for row_index, (row, is_active) in enumerate(zip(self.rows, active)):
+        segments = np.full((len(self.slots), max_adapters), -1, dtype=np.int64)
+        scales = np.zeros((len(self.slots), max_adapters), dtype=np.float32)
+        counts = np.zeros((len(self.slots),), dtype=np.int64)
+        for slot_index, (slot, is_active) in enumerate(zip(self.slots, active)):
             if not is_active:
                 continue
-            if len(row.adapters) > max_adapters:
+            if len(slot.adapters) > max_adapters:
                 raise ValueError(
-                    f"adapter row {row.row_id} selects {len(row.adapters)} adapters, "
+                    f"adapter slot {slot.slot_id} selects {len(slot.adapters)} adapters, "
                     f"exceeding max_adapters {max_adapters}"
                 )
-            counts[row_index] = len(row.adapters)
-            for slot, application in enumerate(row.adapters):
-                adapter_ids[row_index, slot] = indices[application.adapter]
-                scales[row_index, slot] = application.scale
+            counts[slot_index] = len(slot.adapters)
+            for composition_index, application in enumerate(slot.adapters):
+                segments[slot_index, composition_index] = indices[application.adapter]
+                scales[slot_index, composition_index] = application.scale
         return AdapterSelectionTensors(
-            row_ids=np.asarray([row.row_id for row in self.rows], dtype=np.int64),
+            slot_ids=np.asarray([slot.slot_id for slot in self.slots], dtype=np.int64),
             request_epochs=np.asarray(
-                [row.request_epoch for row in self.rows], dtype=np.int64
+                [slot.request_epoch for slot in self.slots], dtype=np.int64
             ),
-            adapter_ids=adapter_ids,
+            segments=segments,
             adapter_counts=counts,
             scales=scales,
             active=np.asarray(active, dtype=np.bool_),
@@ -627,7 +728,7 @@ class AdapterBatchSelection:
     def referenced_adapters(self) -> frozenset[str]:
         """Live adapter set that a paged runtime must pin against eviction."""
         return frozenset(
-            application.adapter for row in self.rows for application in row.adapters
+            application.adapter for slot in self.slots for application in slot.adapters
         )
 
 
@@ -635,9 +736,9 @@ class AdapterBatchSelection:
 class AdapterSelectionTensors:
     """Fixed-shape SSA request buffers for the ``onnx-genai.adapters@1`` ABI."""
 
-    row_ids: np.ndarray
+    slot_ids: np.ndarray
     request_epochs: np.ndarray
-    adapter_ids: np.ndarray
+    segments: np.ndarray
     adapter_counts: np.ndarray
     scales: np.ndarray
     active: np.ndarray
@@ -645,17 +746,17 @@ class AdapterSelectionTensors:
 
 
 def compose_adapter_deltas(
-    row: AdapterRowSelection,
+    slot: AdapterSlotSelection,
     artifacts: Mapping[str, AdapterArtifact],
 ) -> dict[AdapterTarget, np.ndarray]:
-    """Compose a row's selected adapters into reference parameter updates."""
+    """Compose a slot's selected adapters into reference parameter updates."""
     deltas: dict[AdapterTarget, np.ndarray] = {}
-    for application in row.adapters:
+    for application in slot.adapters:
         try:
             artifact = artifacts[application.adapter]
         except KeyError as error:
             raise ValueError(
-                f"row {row.row_id} selects unknown adapter {application.adapter!r}"
+                f"slot {slot.slot_id} selects unknown adapter {application.adapter!r}"
             ) from error
         for weight in artifact.weights:
             update = weight.delta() * application.scale

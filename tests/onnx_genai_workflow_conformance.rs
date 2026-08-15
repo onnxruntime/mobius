@@ -31,28 +31,28 @@ fn options(max_new_tokens: usize) -> GenerateOptions {
 }
 
 fn adapter_request(
-    row_ids: &[i64],
+    slot_ids: &[i64],
     request_epochs: &[i64],
     active: &[bool],
     values: &[f32],
     selection: AdapterSelection,
 ) -> anyhow::Result<PipelineGenerateRequest> {
-    let batch = i64::try_from(row_ids.len())?;
-    let mut adapter_ids = vec![-1i64; row_ids.len() * 2];
-    let mut adapter_counts = vec![0i64; row_ids.len()];
-    let mut adapter_scales = vec![0.0f32; row_ids.len() * 2];
-    for (row, (&row_id, &request_epoch)) in row_ids.iter().zip(request_epochs).enumerate() {
-        let identity = onnx_genai_engine::AdapterRowIdentity {
-            row_id,
+    let batch = i64::try_from(slot_ids.len())?;
+    let mut segments = vec![-1i64; slot_ids.len() * 2];
+    let mut adapter_counts = vec![0i64; slot_ids.len()];
+    let mut adapter_scales = vec![0.0f32; slot_ids.len() * 2];
+    for (row, (&slot_id, &request_epoch)) in slot_ids.iter().zip(request_epochs).enumerate() {
+        let identity = onnx_genai_engine::AdapterSlotIdentity {
+            slot_id,
             request_epoch,
         };
         if let Some(activations) = selection.rows.get(&identity) {
             adapter_counts[row] = i64::try_from(activations.len())?;
             for (slot, activation) in activations.iter().enumerate() {
-                adapter_ids[row * 2 + slot] = match activation.adapter.as_str() {
+                segments[row * 2 + slot] = match activation.adapter.as_str() {
                     "blue" => 0,
                     "green" => 1,
-                    "red" => 2,
+                    "red" => 3,
                     other => anyhow::bail!("unknown test adapter {other}"),
                 };
                 adapter_scales[row * 2 + slot] = activation.scale;
@@ -63,14 +63,14 @@ fn adapter_request(
         prompt: GeneratePrompt::TokenIds(vec![]),
         options: Default::default(),
     })
-    .with_input("request.row_ids", Value::from_slice_i64(row_ids, &[batch])?)
+    .with_input("request.slot_ids", Value::from_slice_i64(slot_ids, &[batch])?)
     .with_input(
         "request.request_epochs",
         Value::from_slice_i64(request_epochs, &[batch])?,
     )
     .with_input(
-        "request.adapter_ids",
-        Value::from_slice_i64(&adapter_ids, &[batch, 2])?,
+        "request.adapter_segments",
+        Value::from_slice_i64(&segments, &[batch, 2])?,
     )
     .with_input(
         "request.adapter_counts",
@@ -98,13 +98,13 @@ fn adapter_request(
 fn mobius_parameter_adapters_preserve_order_rows_compaction_and_epochs() -> anyhow::Result<()> {
     let mut engine = Engine::from_pipeline_dir(&root("adapter")?, EngineConfig::default())?;
     let selection = AdapterSelection::default()
-        .with_row(10, 0, [AdapterActivation::new("red", 1.0)])
-        .with_row(
+        .with_slot(10, 0, [AdapterActivation::new("red", 1.0)])
+        .with_slot(
             20,
             0,
             [AdapterActivation::new("blue", 1.0)],
         )
-        .with_row(
+        .with_slot(
             30,
             0,
             [
@@ -135,13 +135,13 @@ fn mobius_parameter_adapters_preserve_order_rows_compaction_and_epochs() -> anyh
         vec![25.5, 35.0, 2.0, 4.0]
     );
     let reused =
-        AdapterSelection::default().with_row(10, 1, [AdapterActivation::new("blue", 1.0)]);
+        AdapterSelection::default().with_slot(10, 1, [AdapterActivation::new("blue", 1.0)]);
     let stale = engine.run_pipeline(adapter_request(
         &[10],
         &[1],
         &[true],
         &[1.0, 2.0],
-        AdapterSelection::default().with_row(
+        AdapterSelection::default().with_slot(
             10,
             0,
             [AdapterActivation::new("red", 1.0)],
@@ -159,7 +159,7 @@ fn mobius_parameter_adapters_preserve_order_rows_compaction_and_epochs() -> anyh
         assert_eq!(output["result"].to_vec_f32()?, vec![7.0, 10.0]);
     }
     let green =
-        AdapterSelection::default().with_row(40, 0, [AdapterActivation::new("green", 1.0)]);
+        AdapterSelection::default().with_slot(40, 0, [AdapterActivation::new("green", 1.0)]);
     let output = engine.run_pipeline(adapter_request(
         &[40],
         &[0],
@@ -169,7 +169,7 @@ fn mobius_parameter_adapters_preserve_order_rows_compaction_and_epochs() -> anyh
     )?)?;
     assert_eq!(output["result"].to_vec_f32()?, vec![4.0, 5.0]);
     let red =
-        AdapterSelection::default().with_row(50, 0, [AdapterActivation::new("red", 1.0)]);
+        AdapterSelection::default().with_slot(50, 0, [AdapterActivation::new("red", 1.0)]);
     for _ in 0..2 {
         let output = engine.run_pipeline(adapter_request(
             &[50],

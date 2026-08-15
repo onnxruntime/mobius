@@ -20,8 +20,8 @@ from mobius import (
     AdapterApplication,
     AdapterArtifact,
     AdapterBatchSelection,
-    AdapterRowSelection,
     AdapterServiceOptions,
+    AdapterSlotSelection,
     AdapterSource,
     AdapterTarget,
     AdapterTargetDescriptor,
@@ -35,7 +35,7 @@ from mobius import (
     load_peft_adapter,
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
-    add_adapter_service_to_workflow,
+    add_adapter_service_to_metadata,
 )
 
 
@@ -72,6 +72,8 @@ def _weights(
     a: np.ndarray | None = None,
     b: np.ndarray | None = None,
     alpha: float = 4.0,
+    weight_key: str | None = None,
+    target_id: str | None = None,
 ) -> AdapterWeights:
     a_values = np.arange(8, dtype=np.float32).reshape(2, 4) / 10 if a is None else a
     b_values = np.arange(6, dtype=np.float32).reshape(3, 2) / 10 if b is None else b
@@ -80,6 +82,8 @@ def _weights(
         ir.tensor(a_values),
         ir.tensor(b_values),
         alpha,
+        weight_key=weight_key,
+        target_id=target_id,
     )
 
 
@@ -104,6 +108,10 @@ def _manifest(model: ir.Model, *, include_second: bool = False) -> AdapterTarget
             output_size=3,
             layer_index=0,
             slices=(AdapterTargetSlice("q", 0, 3, rank=2, alpha=4.0),),
+            activation_dtype=ir.DataType.FLOAT,
+            graph_input_a="lora.q_proj.a",
+            graph_input_b="lora.q_proj.b",
+            graph_input_scale="lora.q_proj.scale",
         )
     ]
     if include_second:
@@ -118,9 +126,7 @@ def _manifest(model: ir.Model, *, include_second: bool = False) -> AdapterTarget
             )
         )
     return AdapterTargetManifest(
-        fingerprint_model_weights(
-            {"decoder": model}, tuple(descriptor.target for descriptor in targets)
-        ),
+        fingerprint_model_weights({"decoder": model}, tuple(targets)),
         tuple(targets),
     )
 
@@ -222,7 +228,7 @@ def test_composed_delta_matches_scaled_sum() -> None:
         style.base_fingerprint,
         (_weights(alpha=2.0),),
     )
-    row = AdapterRowSelection(
+    row = AdapterSlotSelection(
         100,
         1,
         (
@@ -239,14 +245,14 @@ def test_composed_delta_matches_scaled_sum() -> None:
 def test_zero_one_and_composed_per_row_adapters() -> None:
     batch = AdapterBatchSelection(
         (
-            AdapterRowSelection(row_id=100, request_epoch=4),
-            AdapterRowSelection(
-                row_id=101,
+            AdapterSlotSelection(slot_id=100, request_epoch=4),
+            AdapterSlotSelection(
+                slot_id=101,
                 request_epoch=7,
                 adapters=(AdapterApplication("style", 0.5),),
             ),
-            AdapterRowSelection(
-                row_id=102,
+            AdapterSlotSelection(
+                slot_id=102,
                 request_epoch=2,
                 adapters=(
                     AdapterApplication("style", 0.25),
@@ -262,29 +268,29 @@ def test_zero_one_and_composed_per_row_adapters() -> None:
     }
     batch.validate_catalog(catalog)
 
-    assert batch.rows[0].adapters == ()
-    assert [item.adapter for item in batch.rows[2].adapters] == ["style", "speaker"]
+    assert batch.slots[0].adapters == ()
+    assert [item.adapter for item in batch.slots[2].adapters] == ["style", "speaker"]
 
 
 def test_compaction_preserves_semantic_rows_and_slot_reuse_uses_epoch() -> None:
     original = AdapterBatchSelection(
         (
-            AdapterRowSelection(100, 1, (AdapterApplication("style"),)),
-            AdapterRowSelection(101, 5, (AdapterApplication("speaker", 0.25),)),
+            AdapterSlotSelection(100, 1, (AdapterApplication("style"),)),
+            AdapterSlotSelection(101, 5, (AdapterApplication("speaker", 0.25),)),
         )
     )
     compacted = original.compact([1, 0])
-    assert [row.row_id for row in compacted.rows] == [101, 100]
-    assert compacted.rows[0].request_epoch == 5
+    assert [slot.slot_id for slot in compacted.slots] == [101, 100]
+    assert compacted.slots[0].request_epoch == 5
     assert compacted.compact([1, 0]) == original
     assert compacted.referenced_adapters == {"style", "speaker"}
 
-    reused_slot = AdapterRowSelection(
-        row_id=200,
+    reused_slot = AdapterSlotSelection(
+        slot_id=200,
         request_epoch=2,
         adapters=(AdapterApplication("speaker"),),
     )
-    assert reused_slot != original.rows[0]
+    assert reused_slot != original.slots[0]
 
 
 def test_selection_lowers_to_stable_fixed_shape_request_tensors() -> None:
@@ -292,7 +298,7 @@ def test_selection_lowers_to_stable_fixed_shape_request_tensors() -> None:
     artifact = _artifact(model)
     batch = AdapterBatchSelection(
         (
-            AdapterRowSelection(
+            AdapterSlotSelection(
                 100,
                 4,
                 (
@@ -300,7 +306,7 @@ def test_selection_lowers_to_stable_fixed_shape_request_tensors() -> None:
                     AdapterApplication("blue", -0.25),
                 ),
             ),
-            AdapterRowSelection(101, 5, (AdapterApplication("blue", 1.0),)),
+            AdapterSlotSelection(101, 5, (AdapterApplication("blue", 1.0),)),
         )
     )
     tensors = batch.to_tensors(
@@ -309,19 +315,19 @@ def test_selection_lowers_to_stable_fixed_shape_request_tensors() -> None:
         active=[True, False],
     )
     assert tensors.aliases == ("blue", "red")
-    np.testing.assert_array_equal(tensors.row_ids, [100, 101])
+    np.testing.assert_array_equal(tensors.slot_ids, [100, 101])
     np.testing.assert_array_equal(tensors.request_epochs, [4, 5])
-    np.testing.assert_array_equal(tensors.adapter_ids, [[1, 0, -1], [-1, -1, -1]])
+    np.testing.assert_array_equal(tensors.segments, [[1, 0, -1], [-1, -1, -1]])
     np.testing.assert_array_equal(tensors.adapter_counts, [2, 0])
     np.testing.assert_array_equal(tensors.scales, [[0.5, -0.25, 0.0], [0.0, 0.0, 0.0]])
-    assert tensors.adapter_ids.dtype == np.int64
+    assert tensors.segments.dtype == np.int64
     assert tensors.scales.dtype == np.float32
 
     compacted = batch.compact([1, 0]).to_tensors(
         {"blue": artifact, "red": artifact},
         max_adapters=3,
     )
-    np.testing.assert_array_equal(compacted.row_ids, [101, 100])
+    np.testing.assert_array_equal(compacted.slot_ids, [101, 100])
     np.testing.assert_array_equal(compacted.request_epochs, [5, 4])
     with pytest.raises(ValueError, match="exceeding max_adapters"):
         batch.to_tensors({"blue": artifact, "red": artifact}, max_adapters=1)
@@ -329,8 +335,9 @@ def test_selection_lowers_to_stable_fixed_shape_request_tensors() -> None:
 
 def test_model_package_catalog_validates_and_rejects_duplicates() -> None:
     model = _model()
-    artifact = _artifact(model)
-    package = ModelPackage({"decoder": model}, adapter_target_manifest=_manifest(model))
+    manifest = _manifest(model)
+    artifact = AdapterArtifact("style", manifest.base_fingerprint, (_weights(),))
+    package = ModelPackage({"decoder": model}, adapter_target_manifest=manifest)
     package.add_adapter_artifact(artifact)
     assert package.adapter_artifacts["style"] is artifact
     assert artifact.nbytes == 56
@@ -399,15 +406,16 @@ def test_peft_migration_source_preserves_rank_alpha_and_provenance() -> None:
             directory / "adapter_model.safetensors",
         )
         model = _model()
+        manifest = _manifest(model)
         artifact = load_peft_adapter(
             directory,
             name="peft-style",
-            base_fingerprint=fingerprint_model_weights({"decoder": model}),
+            base_fingerprint=manifest.base_fingerprint,
             target_bindings={
                 "layers.0.self_attn.q_proj": AdapterTarget("decoder", "projection.weight")
             },
         )
-        artifact.validate_base({"decoder": model})
+        artifact.validate_base({"decoder": model}, fingerprint_targets=manifest.targets)
         assert artifact.weights[0].rank == 2
         assert artifact.weights[0].alpha == pytest.approx(6.0)
         assert artifact.source.format == "peft_safetensors"
@@ -415,7 +423,7 @@ def test_peft_migration_source_preserves_rank_alpha_and_provenance() -> None:
         assert artifact.source.revision == "producer-fixture"
         package = ModelPackage(
             {"decoder": model},
-            adapter_target_manifest=_manifest(model),
+            adapter_target_manifest=manifest,
             adapter_service_options=AdapterServiceOptions(
                 portable_fallback=False,
                 preserve_source_format=True,
@@ -424,11 +432,17 @@ def test_peft_migration_source_preserves_rank_alpha_and_provenance() -> None:
         package.add_adapter_artifact(artifact)
         output = directory / "package"
         catalog = package.save_adapter_artifacts(str(output))
-        saved = load_file(output / catalog["peft-style"]["weights"][0]["location"])
+        declaration = catalog["peft-style"]["weights"][0]
+        assert declaration["format"] == "hf_peft"
+        assert declaration["loader_capability"] == "onnx-genai.adapters.hf-peft@1"
+        saved = load_file(output / declaration["location"])
         assert set(saved) == {
-            "layers.0.self_attn.q_proj.a",
-            "layers.0.self_attn.q_proj.b",
+            f"{module}.lora_A.weight",
+            f"{module}.lora_B.weight",
         }
+        assert (output / declaration["config_location"]).read_bytes() == (
+            directory / "adapter_config.json"
+        ).read_bytes()
         np.testing.assert_allclose(
             artifact.weights[0].delta(), b @ a * 3.0, rtol=1e-6, atol=1e-6
         )
@@ -466,9 +480,10 @@ def test_onnx_adapter_source_can_be_declared_for_native_capability() -> None:
         source_path = source_directory / "style.onnx_adapter"
         source_path.write_bytes(b"\x00\x00\x00\x00TORTsynthetic")
         model = _model()
+        manifest = _manifest(model)
         package = ModelPackage(
             {"decoder": model},
-            adapter_target_manifest=_manifest(model),
+            adapter_target_manifest=manifest,
             adapter_service_options=AdapterServiceOptions(
                 portable_fallback=False,
                 preserve_source_format=True,
@@ -477,29 +492,22 @@ def test_onnx_adapter_source_can_be_declared_for_native_capability() -> None:
         package.add_adapter_artifact(
             AdapterArtifact(
                 "style",
-                fingerprint_model_weights(
-                    {"decoder": model}, (AdapterTarget("decoder", "projection.weight"),)
-                ),
+                manifest.base_fingerprint,
                 (_weights(alpha=2.0),),
-                source=adapter_source_from_onnx_adapter(
-                    source_path,
-                    native_parameters={
-                        AdapterTarget("decoder", "projection.weight"): (
-                            "style.projection.a",
-                            "style.projection.b",
-                        )
-                    },
-                ),
+                source=adapter_source_from_onnx_adapter(source_path),
             )
         )
         catalog = package.save_adapter_artifacts(str(output_directory))
         declared = catalog["style"]["weights"][0]
         assert declared["format"] == "ort_genai"
+        assert declared["loader_capability"] == "onnxruntime.lora-adapter@1"
         assert declared["location"] == "adapters/style/adapter.onnx_adapter"
-        assert catalog["style"]["targets"][0]["native_parameters"] == {
-            "a": "style.projection.a",
-            "b": "style.projection.b",
-        }
+        assert catalog["style"]["bindings"] == [
+            {
+                "target": "layers.0.self_attn.q_proj",
+                "weight_key": "layers.0.self_attn.q_proj",
+            }
+        ]
         copied = output_directory / declared["location"]
         assert copied.read_bytes() == source_path.read_bytes()
         assert declared["sha256"] == hashlib.sha256(copied.read_bytes()).hexdigest()
@@ -517,11 +525,12 @@ def test_exact_onnx_genai_catalog_and_portable_bundle_serialization() -> None:
     directory.mkdir(parents=True)
     try:
         model = _model()
+        manifest = _manifest(model)
         package = ModelPackage(
             {"decoder": model},
-            adapter_target_manifest=_manifest(model),
+            adapter_target_manifest=manifest,
             adapter_service_options=AdapterServiceOptions(
-                row_ids="request.row_ids",
+                slot_ids="request.slot_ids",
                 active="request.active",
                 max_adapters=2,
                 cache_max_entries=2,
@@ -530,9 +539,7 @@ def test_exact_onnx_genai_catalog_and_portable_bundle_serialization() -> None:
         package.add_adapter_artifact(
             AdapterArtifact(
                 "red",
-                fingerprint_model_weights(
-                    {"decoder": model}, (AdapterTarget("decoder", "projection.weight"),)
-                ),
+                manifest.base_fingerprint,
                 (_weights(alpha=2.0),),
                 identity="style-red",
                 version="2026.08",
@@ -543,18 +550,17 @@ def test_exact_onnx_genai_catalog_and_portable_bundle_serialization() -> None:
                 "workflow": {
                     "manifest": {"capabilities": []},
                     "inputs": {
-                        "request.row_ids": {
+                        "request.slot_ids": {
                             "contract": {
                                 "dtype": "int64",
                                 "rank": 1,
                                 "shape": ["batch"],
                             },
-                            "role": {
-                                "kind": "runtime",
-                                "version": "1.0",
-                                "role": "row_ids",
+                            "role": {"kind": "opaque"},
+                            "source": {
+                                "kind": "application",
+                                "name": "serving.slot_ids",
                             },
-                            "source": {"kind": "request"},
                         },
                         "request.active": {
                             "contract": {
@@ -575,21 +581,42 @@ def test_exact_onnx_genai_catalog_and_portable_bundle_serialization() -> None:
                 }
             }
         }
-        add_adapter_service_to_workflow(metadata, package, str(directory))
-        service = metadata["pipeline"]["workflow"]["adapters"]
+        add_adapter_service_to_metadata(metadata, package, str(directory))
+        service = metadata["adapters"]
+        assert "adapters" not in metadata["pipeline"]["workflow"]
         assert service["base_model_fingerprint"].startswith(
             "onnx-genai-targeted-base-v1:sha256:"
         )
         assert service["selection"] == {
-            "row_ids": "request.row_ids",
+            "slot_ids": "request.slot_ids",
             "request_epochs": "request.request_epochs",
-            "adapter_ids": "request.adapter_ids",
+            "segments": "request.adapter_segments",
             "adapter_counts": "request.adapter_counts",
             "scales": "request.adapter_scales",
             "active": "request.active",
             "max_adapters": 2,
         }
         assert service["application_capability"] == "onnx-genai.adapters@1"
+        assert service["discovery_fallback"] == "disabled"
+        target = service["target_manifest"]["targets"][0]
+        assert target == {
+            "id": "layers.0.self_attn.q_proj",
+            "component": "decoder",
+            "parameter": "projection.weight",
+            "output_value": "projection.output",
+            "activation_dtype": "float32",
+            "input_features": 4,
+            "output_features": 3,
+            "graph_inputs": {
+                "a": "lora.q_proj.a",
+                "b": "lora.q_proj.b",
+                "scale": "lora.q_proj.scale",
+            },
+        }
+        assert service["target_manifest"]["targets"][1]["output_slice"] == {
+            "offset": 0,
+            "width": 3,
+        }
         assert service["cache"] == {"max_entries": 2, "eviction": "lru"}
         assert service["planning"] == {
             "bucket_by_adapter_set": True,
@@ -612,18 +639,16 @@ def test_exact_onnx_genai_catalog_and_portable_bundle_serialization() -> None:
         assert artifact["rank"] == 2
         assert artifact["alpha"] == pytest.approx(2.0)
         assert artifact["dtype"] == "float32"
-        assert artifact["targets"] == [
+        assert artifact["bindings"] == [
             {
-                "component": "decoder",
-                "parameter": "projection.weight",
+                "target": "layers.0.self_attn.q_proj",
                 "weight_key": "layers.0.self_attn.q_proj",
-                "input_features": 4,
-                "output_features": 3,
             }
         ]
         weight = artifact["weights"][0]
         payload = (directory / weight["location"]).read_bytes()
         assert weight["format"] == "json"
+        assert weight["loader_capability"] == "onnx-genai.adapters.json@1"
         assert weight["location"] == "adapters/red/adapter.json"
         assert len(weight["sha256"]) == 64
         assert weight["sha256"] == hashlib.sha256(payload).hexdigest()
@@ -635,7 +660,42 @@ def test_exact_onnx_genai_catalog_and_portable_bundle_serialization() -> None:
         shutil.rmtree(directory)
 
 
-def test_wire_contract_rejects_heterogeneous_target_rank() -> None:
+def test_top_level_adapter_metadata_supports_bare_model_package() -> None:
+    directory = Path("artifacts") / f"adapter-bare-test-{uuid.uuid4().hex}"
+    directory.mkdir(parents=True)
+    try:
+        model = _model()
+        target = AdapterTarget("model", "projection.weight")
+        descriptor = AdapterTargetDescriptor(
+            target,
+            semantic_name="projection",
+            node_name="projection",
+            output_name="projection.output",
+            input_size=4,
+            output_size=3,
+            activation_dtype=ir.DataType.FLOAT,
+        )
+        fingerprint = fingerprint_model_weights({"model": model}, (descriptor,))
+        package = ModelPackage(
+            {"model": model},
+            adapter_target_manifest=AdapterTargetManifest(fingerprint, (descriptor,)),
+        )
+        package.add_adapter_artifact(
+            AdapterArtifact(
+                "style",
+                fingerprint,
+                (_weights(component="model"),),
+            )
+        )
+        metadata: dict[str, object] = {"schema_version": "v1"}
+        add_adapter_service_to_metadata(metadata, package, str(directory))
+        assert metadata["adapters"]["target_manifest"]["targets"][0]["component"] == "model"
+        assert "pipeline" not in metadata
+    finally:
+        shutil.rmtree(directory)
+
+
+def test_wire_contract_emits_per_target_rank_override() -> None:
     model = _model()
     other = ir.Value(
         name="other.weight",
@@ -647,22 +707,14 @@ def test_wire_contract_rejects_heterogeneous_target_rank() -> None:
     node.outputs[0].name = "other.output"
     model.graph.append(node)
     model.graph.initializers.add(other)
-    package = ModelPackage(
-        {"decoder": model},
-        adapter_target_manifest=_manifest(model, include_second=True),
-    )
+    manifest = _manifest(model, include_second=True)
+    package = ModelPackage({"decoder": model}, adapter_target_manifest=manifest)
     package.add_adapter_artifact(
         AdapterArtifact(
             "mixed-rank",
-            fingerprint_model_weights(
-                {"decoder": model},
-                (
-                    AdapterTarget("decoder", "projection.weight"),
-                    AdapterTarget("decoder", "other.weight"),
-                ),
-            ),
+            manifest.base_fingerprint,
             (
-                _weights(),
+                _weights(target_id="layers.0.self_attn.q_proj.q"),
                 _weights(
                     parameter="other.weight",
                     a=np.ones((1, 4), dtype=np.float32),
@@ -674,8 +726,11 @@ def test_wire_contract_rejects_heterogeneous_target_rank() -> None:
     directory = Path("artifacts") / f"adapter-rank-test-{uuid.uuid4().hex}"
     directory.mkdir(parents=True)
     try:
-        with pytest.raises(ValueError, match="heterogeneous target rank"):
-            package.save_adapter_artifacts(str(directory))
+        artifact = package.save_adapter_artifacts(str(directory))["mixed-rank"]
+        assert artifact["rank"] == 1
+        bindings = {binding["target"]: binding for binding in artifact["bindings"]}
+        assert bindings["layers.0.self_attn.q_proj.q"]["rank"] == 2
+        assert "rank" not in bindings["layers.0.self_attn.v_proj"]
     finally:
         shutil.rmtree(directory)
 
@@ -688,12 +743,12 @@ def test_application_scale_matches_runtime_bound() -> None:
 def test_selection_rejects_duplicate_adapter() -> None:
     application = AdapterApplication("style")
     with pytest.raises(ValueError, match="contains duplicate adapter"):
-        AdapterRowSelection(100, 0, (application, application))
+        AdapterSlotSelection(100, 0, (application, application))
 
 
 def test_selection_rejects_unknown_adapter_and_invalid_permutation() -> None:
     batch = AdapterBatchSelection(
-        (AdapterRowSelection(100, 0, (AdapterApplication("missing"),)),)
+        (AdapterSlotSelection(100, 0, (AdapterApplication("missing"),)),)
     )
     with pytest.raises(ValueError, match="unknown adapter"):
         batch.validate_catalog({})
