@@ -268,6 +268,8 @@ def build_from_gguf(
     backbones normalize quantized projections to a common affine layout. GGUFs
     containing only F32, F16, or BF16 weights use the float path because there
     is no quantization to preserve.
+    Quantized files with no supported preservation target raise an actionable
+    error instead of silently falling back to a float model.
 
     Args:
         gguf_path: Path to the ``.gguf`` file, *or* a HuggingFace Hub
@@ -314,7 +316,8 @@ def build_from_gguf(
         ImportError: If the ``gguf`` package is not installed.
         FileNotFoundError: If the GGUF file does not exist.
         KeyError: If the GGUF architecture is not in the registry.
-        ValueError: If *static_cache* is combined with an explicit *task*.
+        ValueError: If *static_cache* is combined with an explicit *task*, or
+            if a quantized input has no supported preservation target.
     """
     import dataclasses
 
@@ -796,9 +799,13 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
             }
         )
         if not repackable_counts:
+            source_types = ", ".join(
+                sorted({getattr(qtype, "name", str(qtype)) for qtype in counts})
+            )
             raise ValueError(
-                "No repackable quantized tensors found in GGUF file. "
-                "Use keep_quantized=False for dequantized import."
+                "No supported quantized preservation target for GGUF weight "
+                f"types: {source_types}. Use keep_quantized=False (API) or "
+                "--dequantize (CLI) for explicit float import."
             )
         dominant = repackable_counts.most_common(1)[0][0]
     dominant_value = dominant.value if hasattr(dominant, "value") else dominant

@@ -77,6 +77,10 @@ mobius build-gguf llama-3.2-1b-q4_0.gguf --output output/llama/
 
 F32-, F16-, and BF16-only GGUFs use the normal float import path even though
 `keep_quantized=True` is the default: there is no quantization to preserve.
+Quantized GGUFs containing only qtypes with no supported preservation target
+(for example, pure Q6_K or Q5_K weights) fail with an actionable error rather
+than silently becoming float. Pass `keep_quantized=False` to request that float
+conversion explicitly.
 
 ## Supported GGUF Architectures
 

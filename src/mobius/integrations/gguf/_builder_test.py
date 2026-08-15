@@ -702,6 +702,31 @@ class TestBuildQuantizedGguf:
         bits, block_size, is_sym = _detect_quant_params(_MixedModel(), "llama")
         assert (bits, block_size, is_sym) == (4, 32, False)
 
+    def test_pure_q6_k_requires_explicit_dequantization(self):
+        """Unsupported quantized inputs fail instead of silently becoming float."""
+        from gguf import GGMLQuantizationType
+
+        from mobius.integrations.gguf._builder import _detect_quant_params
+
+        class _UnsupportedModel:
+            def tensor_items_raw(self):
+                yield (
+                    "blk.0.ffn_down.weight",
+                    np.empty(0, dtype=np.uint8),
+                    GGMLQuantizationType.Q6_K,
+                    (64, 128),
+                )
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                r"No supported quantized preservation target for GGUF weight "
+                r"types: Q6_K. Use keep_quantized=False \(API\) or "
+                r"--dequantize \(CLI\) for explicit float import."
+            ),
+        ):
+            _detect_quant_params(_UnsupportedModel(), "llama")
+
     def test_runtime_unsupported_format_does_not_select_native_op(self):
         """A GGUF type outside the runtime contract remains on the fallback."""
         from gguf import GGMLQuantizationType

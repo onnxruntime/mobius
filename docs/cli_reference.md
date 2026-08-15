@@ -338,6 +338,9 @@ mobius build-gguf model.gguf --output output/ --dtype f16
 
 F32-, F16-, and BF16-only files build normally as float models because they
 contain no quantization to preserve.
+Quantized files containing only qtypes with no supported preservation target
+(for example, pure Q6_K or Q5_K weights) fail instead of silently becoming
+float. Re-run with `--dequantize` to request explicit float conversion.
 
 Sharded GGUF inputs are rejected because a single shard has an incomplete
 tensor table. `nemotron_h_moe` is also rejected until its MTP block, Mamba2
