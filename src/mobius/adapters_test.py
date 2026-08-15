@@ -5,8 +5,8 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import shutil
 import uuid
 from pathlib import Path
@@ -336,7 +336,7 @@ def test_peft_migration_source_preserves_rank_alpha_and_provenance() -> None:
         )
         artifact.validate_base({"decoder": model})
         assert artifact.weights[0].rank == 2
-        assert artifact.weights[0].alpha == 6.0
+        assert artifact.weights[0].alpha == pytest.approx(6.0)
         assert artifact.source.format == "peft_safetensors"
         assert artifact.source.base_model == "synthetic/base"
         assert artifact.source.revision == "producer-fixture"
@@ -483,7 +483,7 @@ def test_exact_onnx_genai_catalog_and_portable_bundle_serialization() -> None:
         assert artifact["identity"] == "style-red"
         assert artifact["version"] == "2026.08"
         assert artifact["rank"] == 2
-        assert artifact["alpha"] == 2.0
+        assert artifact["alpha"] == pytest.approx(2.0)
         assert artifact["dtype"] == "float32"
         assert artifact["targets"] == [
             {

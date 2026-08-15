@@ -23,6 +23,7 @@ __all__ = [
 
 import dataclasses
 import hashlib
+import itertools
 import json
 import math
 from collections.abc import Mapping, Sequence
@@ -142,7 +143,7 @@ class AdapterTargetDescriptor:
         if len(roles) != len(set(roles)):
             raise ValueError("adapter target slice roles must be unique")
         ordered = sorted(self.slices, key=lambda item: item.offset)
-        for previous, current in zip(ordered, ordered[1:]):
+        for previous, current in itertools.pairwise(ordered):
             if previous.offset + previous.width > current.offset:
                 raise ValueError("adapter target slices must not overlap")
         if ordered and ordered[-1].offset + ordered[-1].width > self.output_size:
