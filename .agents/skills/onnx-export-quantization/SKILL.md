@@ -151,8 +151,11 @@ Before implementing or claiming a direct conversion:
    pinned upstream tokenizer. A self-contained package is invalid when padding,
    EOS, or BOS semantics disagree.
 7. Require real-weight full-logit parity and deterministic multi-token
-   generation through both ONNX Runtime and the declared GenAI runtime. Graph,
-   config, and session creation are not acceptance evidence.
+   generation directly through ONNX Runtime. Graph, config, and session creation
+   alone are not acceptance evidence.
+8. Optionally run the same generation through the declared GenAI runtime as
+   downstream evidence. Record its version and outcome, but do not gate direct
+   GGUF artifacts on its acceptance.
 
 Use Hub GGUF architecture metadata to fail before downloading multi-gigabyte
 unsupported files, then repeat the guard from the local GGUF header so local
@@ -241,6 +244,16 @@ pip install cupy-cuda12x
 
 # Olive auto-detects cupy and uses GPU when available
 ```
+
+### Isolate Olive from unrelated provider DLLs
+
+Olive 0.13 may auto-register every provider DLL bundled in an ORT GPU wheel
+even when a weight-only pass explicitly targets CPU. A missing TensorRT DLL can
+then abort K-quant before the pass starts. Keep the accelerator CPU-only and,
+for programmatic workflows, suppress `olive.systems.local` EP-library
+registration around `olive.workflows.run`; restore it immediately afterward.
+This is safe for `OnnxKQuantQuantization`, which does not create an inference
+session. Still load and execute the resulting package with the intended EP.
 
 ### Quantizing multi-model exports
 
@@ -425,9 +438,9 @@ compare_golden(
 )
 ```
 
-### L5: End-to-end smoke test
+### Optional ORT GenAI downstream smoke test
 
-Run inference with the quantized model through ORT GenAI:
+When useful, run inference with the quantized model through ORT GenAI:
 
 ```python
 import onnxruntime_genai as og
@@ -441,6 +454,10 @@ params.input_ids = tokenizer.encode("Hello, world!")
 output_ids = model.generate(params)
 print(tokenizer.decode(output_ids[0]))
 ```
+
+ORT GenAI acceptance is not a Mobius export gate. Always validate the final
+quantized ONNX package directly; treat ORT GenAI load/generation as optional
+downstream evidence and record its version/outcome without blocking export.
 
 ### Numerical parity verification
 

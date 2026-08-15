@@ -266,6 +266,20 @@ integration test alongside any new custom function or Scan op.**
   runner termination from a model assertion failure.
 - Reference goldens must come from an independently invoked upstream pipeline,
   never from the implementation under test or ad-hoc intermediate features.
+- When the checkpoint is too large, HTTP-range-read safetensors headers and the
+  exact tensors for a production-dimension reduced fixture. Cover every layer
+  family and cache contract, record the source layer/row derivation, and create
+  L4/L5 goldens from the independently invoked HuggingFace model. Treat this as
+  reduced real-weight evidence, not as a claim of full-checkpoint parity.
+- Before accepting an architecture xfail, verify config vocabulary, epsilon,
+  and layer-kind translation. A stale `mlp`->`moe` mapping can look like an SSM
+  numerical failure while loading the wrong weights entirely.
+- Compare full prefill and every token-by-token prompt/decode logit on the
+  target EP. Fused cache kernels can match multi-token prefill yet diverge on
+  the first reused-state step. If full-precision and quantized packages fail at
+  the same reused-state step, suspect source cache semantics rather than Olive.
+  Test the equivalent standard-ONNX cache graph before assigning blame; prefer
+  the portable graph when it restores the numeric gate.
 
 ### Recurrent state ≠ KV cache
 
