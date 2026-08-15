@@ -2028,6 +2028,9 @@ class TestQwenImageVAEDecoder:
 # Qwen3.5 hybrid (DeltaNet + full attention) — random-weight tests
 # ---------------------------------------------------------------------------
 
+_QWEN38_MODEL_ID = "Qwen/Qwen3.8-27B"
+_QWEN38_REVISION = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+
 
 def _build_and_compare_qwen35(hf_model, text_config, onnx_module_cls):
     """Shared helper: build ONNX model, load HF weights, compare logits."""
@@ -2104,7 +2107,10 @@ def test_qwen35_prefill_logits_match():
         Qwen3_5ForCausalLM,
     )
 
-    c = transformers.AutoConfig.from_pretrained("Qwen/Qwen3.5-27B")
+    c = transformers.AutoConfig.from_pretrained(
+        _QWEN38_MODEL_ID,
+        revision=_QWEN38_REVISION,
+    )
     tc = c.text_config
     tc.num_hidden_layers = 4
     tc.layer_types = [
@@ -3518,14 +3524,17 @@ def test_qwen35_vl_deltanet_state_carry():
 # ---------------------------------------------------------------------------
 
 
-def _make_tiny_qwen35_vl_config():
+def _make_tiny_qwen35_vl_config(*, keep_production_vocab: bool = False):
     """Create a tiny Qwen3.5-VL config for fast HF parity testing.
 
     Downloads the real Qwen3.5-27B config structure, then overrides all
     dimensions to be tiny. Also overrides rope_theta to float to avoid
     a pre-existing float64 rotary cache bug (int ** np.float32 → float64).
     """
-    c = transformers.AutoConfig.from_pretrained("Qwen/Qwen3.5-27B")
+    c = transformers.AutoConfig.from_pretrained(
+        _QWEN38_MODEL_ID,
+        revision=_QWEN38_REVISION,
+    )
     tc = c.text_config
 
     # Truncate layers: 3 DeltaNet + 1 full attention
@@ -3543,7 +3552,8 @@ def _make_tiny_qwen35_vl_config():
     tc.num_attention_heads = 4
     tc.num_key_value_heads = 2
     tc.head_dim = 16
-    tc.vocab_size = 256
+    if not keep_production_vocab:
+        tc.vocab_size = 256
     tc.linear_num_value_heads = 4
     tc.linear_num_key_heads = 4
     tc.linear_key_head_dim = 8
@@ -3745,7 +3755,8 @@ def test_qwen35_vl_vision_features_match():
 
     # Process real image (resized small for speed — 256 patches)
     processor = transformers.AutoProcessor.from_pretrained(
-        "Qwen/Qwen3.5-27B",
+        _QWEN38_MODEL_ID,
+        revision=_QWEN38_REVISION,
     )
     image = Image.open("testdata/pipeline-cat-chonk.jpeg").resize(
         (64, 64),
@@ -3813,6 +3824,181 @@ def test_qwen35_vl_vision_features_match():
         f"or spatial merge."
     )
     assert max_diff < 0.01, f"Vision features max_diff={max_diff:.6f} (expected < 0.01)"
+
+
+@pytest.mark.integration
+def test_qwen38_vl_image_video_mixed_pipeline_matches_huggingface():
+    """Pinned Qwen3.8 image/video processor contract matches the ONNX pipeline.
+
+    Runs image-only, video-only, and a two-row mixed batch whose rows use
+    opposite media placeholder order. Hugging Face scatters image and video
+    feature streams independently, so the ONNX embedding input packs all image
+    features first and all video features second.
+    """
+    import onnx_ir as ir
+    from transformers.models.qwen3_5.modeling_qwen3_5 import (
+        Qwen3_5ForConditionalGeneration,
+    )
+
+    from mobius import build_from_module
+    from mobius._weight_loading import apply_weights
+
+    hf_config = _make_tiny_qwen35_vl_config(keep_production_vocab=True)
+    arch_config = ArchitectureConfig.from_transformers(
+        hf_config.text_config,
+        parent_config=hf_config,
+    )
+    arch_config.dtype = ir.DataType.FLOAT
+    onnx_module = models.Qwen35VL3ModelCausalLMModel(arch_config)
+    package = build_from_module(
+        onnx_module,
+        arch_config,
+        task="hybrid-qwen-vl",
+    )
+
+    torch.manual_seed(1)
+    hf_model = (
+        Qwen3_5ForConditionalGeneration._from_config(
+            hf_config,
+            dtype=torch.float32,
+        )
+        .float()
+        .eval()
+    )
+    weights = onnx_module.preprocess_weights(dict(hf_model.state_dict()))
+    for model_name, model in package.items():
+        apply_weights(model, weights)
+        unset = [
+            name
+            for name, initializer in model.graph.initializers.items()
+            if initializer.const_value is None
+        ]
+        assert not unset, f"{model_name} has unset target parameters: {unset[:5]}"
+
+    processor = transformers.AutoProcessor.from_pretrained(
+        _QWEN38_MODEL_ID,
+        revision=_QWEN38_REVISION,
+    )
+    image_a = Image.open("testdata/pipeline-cat-chonk.jpeg").convert("RGB").resize((64, 64))
+    image_b = image_a.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+    video_a = np.stack(
+        [np.full((64, 64, 3), value, dtype=np.uint8) for value in (16, 64, 128, 224)]
+    )
+    video_b = np.flip(video_a, axis=0).copy()
+
+    cases = {
+        "image-only": {
+            "text": ["<|vision_start|><|image_pad|><|vision_end|> Describe."],
+            "images": [image_a],
+        },
+        "video-only": {
+            "text": ["<|vision_start|><|video_pad|><|vision_end|> Describe."],
+            "videos": [video_a],
+        },
+        "mixed-two-row": {
+            "text": [
+                (
+                    "<|vision_start|><|video_pad|><|vision_end|> Then "
+                    "<|vision_start|><|image_pad|><|vision_end|>."
+                ),
+                (
+                    "<|vision_start|><|image_pad|><|vision_end|> Then "
+                    "<|vision_start|><|video_pad|><|vision_end|>."
+                ),
+            ],
+            "images": [image_a, image_b],
+            "videos": [video_a, video_b],
+        },
+    }
+
+    vision_session = _make_session(package["vision_encoder"])
+    embedding_session = _make_session(package["embedding"])
+    decoder_session = _make_session(package["decoder"])
+    try:
+        for case_name, processor_inputs in cases.items():
+            hf_inputs = processor(
+                **processor_inputs,
+                padding=True,
+                return_tensors="pt",
+            )
+            with torch.no_grad():
+                hf_logits = hf_model(**hf_inputs).logits.numpy()
+                text_embeds = hf_model.model.language_model.embed_tokens(
+                    hf_inputs["input_ids"]
+                )
+                position_ids = hf_model.model.compute_3d_position_ids(
+                    input_ids=hf_inputs["input_ids"],
+                    inputs_embeds=text_embeds,
+                    image_grid_thw=hf_inputs.get("image_grid_thw"),
+                    video_grid_thw=hf_inputs.get("video_grid_thw"),
+                    attention_mask=hf_inputs["attention_mask"],
+                    past_key_values=None,
+                    mm_token_type_ids=hf_inputs["mm_token_type_ids"],
+                )
+
+            media_features = []
+            if "pixel_values" in hf_inputs:
+                media_features.append(
+                    vision_session.run(
+                        {
+                            "pixel_values": hf_inputs["pixel_values"].numpy(),
+                            "image_grid_thw": hf_inputs["image_grid_thw"].numpy(),
+                        }
+                    )["image_features"]
+                )
+            if "pixel_values_videos" in hf_inputs:
+                media_features.append(
+                    vision_session.run(
+                        {
+                            "pixel_values": hf_inputs["pixel_values_videos"].numpy(),
+                            "image_grid_thw": hf_inputs["video_grid_thw"].numpy(),
+                        }
+                    )["image_features"]
+                )
+            packed_features = np.concatenate(media_features, axis=0)
+            onnx_embeds = embedding_session.run(
+                {
+                    "input_ids": hf_inputs["input_ids"].numpy(),
+                    "image_features": packed_features,
+                }
+            )["inputs_embeds"]
+
+            feeds: dict[str, np.ndarray] = {
+                "inputs_embeds": onnx_embeds,
+                "attention_mask": hf_inputs["attention_mask"].numpy(),
+                "position_ids": position_ids.numpy(),
+            }
+            batch_size = hf_inputs["input_ids"].shape[0]
+            for graph_input in package["decoder"].graph.inputs:
+                if graph_input.name in feeds:
+                    continue
+                shape = tuple(
+                    dim if isinstance(dim, int) else batch_size if axis == 0 else 0
+                    for axis, dim in enumerate(graph_input.shape)
+                )
+                feeds[graph_input.name] = np.zeros(shape, dtype=np.float32)
+
+            onnx_logits = decoder_session.run(feeds)["logits"]
+            max_abs = float(np.max(np.abs(onnx_logits - hf_logits)))
+            cosine = float(
+                np.dot(onnx_logits.ravel(), hf_logits.ravel())
+                / (np.linalg.norm(onnx_logits) * np.linalg.norm(hf_logits))
+            )
+            print(f"Qwen3.8 {case_name}: max_abs={max_abs:.8f}, cosine={cosine:.9f}")
+            assert max_abs < 1e-2, case_name
+            assert cosine > 0.99999, case_name
+            assert_logits_close(onnx_logits, hf_logits, rtol=2e-2, atol=2e-2)
+
+            attention_mask = hf_inputs["attention_mask"].numpy()
+            for row in range(attention_mask.shape[0]):
+                last_index = np.flatnonzero(attention_mask[row])[-1]
+                assert np.argmax(onnx_logits[row, last_index]) == np.argmax(
+                    hf_logits[row, last_index]
+                ), case_name
+    finally:
+        decoder_session.close()
+        embedding_session.close()
+        vision_session.close()
 
 
 @pytest.mark.integration

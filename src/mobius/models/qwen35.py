@@ -223,9 +223,10 @@ class Qwen35CausalLMModel(CausalLMModel):
         - Stripping ``language_model.`` prefix from HF checkpoint keys
           (HF stores weights as ``model.language_model.*`` in safetensors)
         - Dropping visual encoder keys (``model.visual.*``)
-        - Dropping multi-token prediction (MTP) keys (``mtp*``):
-          MTP heads are auxiliary decoding heads used only during
-          HuggingFace training; they are not needed for inference.
+        - Dropping multi-token prediction (MTP) keys (``mtp*``). The target
+          model's normal forward path does not consume this optional
+          self-speculative drafter; it is packaged separately as
+          :class:`Qwen35MtpModel` when speculative decoding is requested.
         - Weight tying (``tie_word_embeddings``)
         """
         cleaned: dict[str, torch.Tensor] = {}
@@ -376,9 +377,9 @@ class Qwen35MoECausalLMModel(CausalLMModel):
         """Preprocess HuggingFace state dict for Qwen3.5-MoE.
 
         Handles:
-        - Dropping multi-token prediction (MTP) keys (``mtp_*``, ``mtp.*``):
-          MTP heads are auxiliary decoding heads used only during
-          HuggingFace training; they are not needed for inference.
+        - Dropping multi-token prediction (MTP) keys (``mtp_*``, ``mtp.*``).
+          The target model's normal forward path does not consume this optional
+          self-speculative drafter, which has a separate package contract.
         - Stripping ``language_model.`` prefix from HF checkpoint keys
           (HF stores weights as ``model.language_model.*`` in safetensors)
         - Dropping visual encoder keys (``model.visual.*``)
@@ -537,9 +538,8 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
         """
         renamed: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
-            # Drop multi-token prediction (MTP) keys: MTP heads are
-            # auxiliary decoding heads used only during HuggingFace
-            # training; they are not needed for inference.
+            # The standard target package excludes the optional
+            # self-speculative MTP drafter, which has a separate graph contract.
             if key.startswith(("mtp_", "mtp.")):
                 continue
 
@@ -611,7 +611,7 @@ class Qwen35VLDecoderModel(nn.Module):
         """Route language_model weights for standalone decoder build."""
         renamed: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
-            # Drop MTP heads (training-only auxiliary decoders)
+            # The optional self-speculative MTP drafter is packaged separately.
             if key.startswith(("mtp_", "mtp.")):
                 continue
             stripped = key

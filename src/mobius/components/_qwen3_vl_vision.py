@@ -28,11 +28,6 @@ from onnxscript import OpBuilder, nn
 from mobius._build_context import ep_capabilities, get_build_dtype
 from mobius.components._common import LayerNorm, Linear, build_packed_token_offset
 from mobius.components._mlp import FCMLP
-from mobius.components._scan_utils import (
-    compact_scan_output,
-    create_body_graph,
-    rename_subgraph_values,
-)
 
 
 class Qwen3VLPatchEmbed(nn.Module):
@@ -403,69 +398,6 @@ class Qwen3VLPatchMerger(nn.Module):
         return self.linear_fc2(op, x)
 
 
-def _qwen3_rotary_pos_ids_one_image(op, T, H, W, ms):  # noqa: N803
-    """Compute 2D rotary position IDs for one image (Qwen3-VL style).
-
-    Uses block_rows * ms + intra indexing for spatial-merge groups.
-    Works with any OpBuilder (main graph or Scan body graph).
-
-    Args:
-        op: OpBuilder instance.
-        T, H, W: Scalar INT64 values.
-        ms: Python int — spatial merge size.
-
-    Returns:
-        ``(T*H*W, 2)`` INT64 position IDs.
-    """
-    H_m = op.Div(H, op.Constant(value_int=ms))  # noqa: N806
-    W_m = op.Div(W, op.Constant(value_int=ms))  # noqa: N806
-
-    # Block row/col indices and intra-merge indices
-    block_rows = op.Range(
-        op.Constant(value_int=0),
-        H_m,
-        op.Constant(value_int=1),
-    )
-    block_cols = op.Range(
-        op.Constant(value_int=0),
-        W_m,
-        op.Constant(value_int=1),
-    )
-    intra = op.Range(
-        op.Constant(value_int=0),
-        op.Constant(value_int=ms),
-        op.Constant(value_int=1),
-    )
-
-    # row_idx = block_rows[:,None,None,None] * ms + intra[None,None,:,None]
-    br = op.Mul(op.Unsqueeze(block_rows, [1, 2, 3]), op.Constant(value_int=ms))
-    ir_row = op.Unsqueeze(intra, [0, 1, 3])
-    row_idx = op.Add(br, ir_row)
-
-    bc = op.Mul(op.Unsqueeze(block_cols, [0, 2, 3]), op.Constant(value_int=ms))
-    ir_col = op.Unsqueeze(intra, [0, 1, 2])
-    col_idx = op.Add(bc, ir_col)
-
-    # Expand to (H_m, W_m, ms, ms) and flatten
-    row_shape = op.Concat(
-        op.Reshape(H_m, [1]),
-        op.Reshape(W_m, [1]),
-        op.Constant(value_ints=[ms, ms]),
-        axis=0,
-    )
-    row_flat = op.Reshape(op.Expand(row_idx, row_shape), [-1])
-    col_flat = op.Reshape(op.Expand(col_idx, row_shape), [-1])
-
-    # Stack to (H*W, 2) and tile T times
-    pos_ids = op.Concat(
-        op.Unsqueeze(row_flat, [1]),
-        op.Unsqueeze(col_flat, [1]),
-        axis=1,
-    )
-    tile_t = op.Concat(op.Reshape(T, [1]), op.Constant(value_ints=[1]), axis=0)
-    return op.Tile(pos_ids, tile_t)  # (T*H*W, 2)
-
-
 class Qwen3VLVisionModel(nn.Module):
     """Full Qwen3-VL vision encoder with DeepStack outputs.
 
@@ -558,12 +490,65 @@ class Qwen3VLVisionModel(nn.Module):
             ]
         )
 
-    def _interpolate_pos_embed(self, op, grid_thw):
-        """Bilinear interpolation of learned position embeddings for all images.
+    def _flat_grid_coordinates(self, op, grid_thw):
+        """Map each packed patch to its media row and merge-permuted H/W coordinates.
 
-        Iterates over ``grid_thw`` via ONNX Scan, computing per-image
-        bilinear interpolation from the learned position grid and
-        concatenating results.
+        Qwen3-VL stores each media item's patches in
+        ``(T, H // ms, W // ms, ms, ms)`` order. Computing coordinates over
+        the concatenated patch stream avoids control-flow subgraphs while
+        preserving arbitrary image/video sizes and order.
+        """
+        ms = self.spatial_merge_size
+        T_col = op.Squeeze(op.Slice(grid_thw, [0], [1], [1], [1]), [1])  # noqa: N806
+        H_col = op.Squeeze(op.Slice(grid_thw, [1], [2], [1], [1]), [1])  # noqa: N806
+        W_col = op.Squeeze(op.Slice(grid_thw, [2], [3], [1], [1]), [1])  # noqa: N806
+        patches_per_media = op.Mul(T_col, op.Mul(H_col, W_col))
+        patch_ends = op.CumSum(patches_per_media, op.Constant(value_int=0))
+        patch_starts = op.Pad(
+            patch_ends,
+            op.Constant(value_ints=[1, 0]),
+            op.Constant(value_int=0),
+        )
+
+        total_patches = op.ReduceSum(patches_per_media, keepdims=False)
+        patch_ids = op.Range(
+            op.Constant(value_int=0),
+            total_patches,
+            op.Constant(value_int=1),
+        )
+        # The number of completed media ranges is the owning media row.
+        media_ids = op.ReduceSum(
+            op.Cast(
+                op.GreaterOrEqual(
+                    op.Unsqueeze(patch_ids, [1]),
+                    op.Unsqueeze(patch_ends, [0]),
+                ),
+                to=7,
+            ),
+            [1],
+            keepdims=False,
+        )
+        local_ids = op.Sub(patch_ids, op.Gather(patch_starts, media_ids))
+
+        H = op.Gather(H_col, media_ids)  # noqa: N806
+        W = op.Gather(W_col, media_ids)  # noqa: N806
+        patches_per_frame = op.Mul(H, W)
+        frame_local_ids = op.Mod(local_ids, patches_per_frame)
+
+        merge_area = op.Constant(value_int=ms * ms)
+        merge_block_ids = op.Div(frame_local_ids, merge_area)
+        intra_merge_ids = op.Mod(frame_local_ids, merge_area)
+        W_m = op.Div(W, op.Constant(value_int=ms))  # noqa: N806
+        block_rows = op.Div(merge_block_ids, W_m)
+        block_cols = op.Mod(merge_block_ids, W_m)
+        intra_rows = op.Div(intra_merge_ids, op.Constant(value_int=ms))
+        intra_cols = op.Mod(intra_merge_ids, op.Constant(value_int=ms))
+        rows = op.Add(op.Mul(block_rows, op.Constant(value_int=ms)), intra_rows)
+        cols = op.Add(op.Mul(block_cols, op.Constant(value_int=ms)), intra_cols)
+        return rows, cols, H, W
+
+    def _interpolate_pos_embed(self, op, grid_thw):
+        """Bilinearly interpolate learned positions for the packed media stream.
 
         Matches HuggingFace ``Qwen3VLVisionModel.fast_pos_embed_interpolate``.
 
@@ -575,273 +560,85 @@ class Qwen3VLVisionModel(nn.Module):
             Position embeddings ``(total_patches, hidden_size)``.
         """
         n = self.num_grid_per_side
-        ms = self.spatial_merge_size
-        hidden_size = self.hidden_size
-        n_minus_1 = float(n - 1)
+        rows, cols, H, W = self._flat_grid_coordinates(op, grid_thw)  # noqa: N806
+        rows_f = op.Cast(rows, to=1)
+        cols_f = op.Cast(cols, to=1)
+        H_f = op.Cast(H, to=1)  # noqa: N806
+        W_f = op.Cast(W, to=1)  # noqa: N806
+        rows_scaled = op.Div(op.Mul(rows_f, float(n - 1)), op.Sub(H_f, 1.0))
+        cols_scaled = op.Div(op.Mul(cols_f, float(n - 1)), op.Sub(W_f, 1.0))
 
-        # Per-image patch counts
-        T_col = op.Squeeze(op.Slice(grid_thw, [0], [1], [1], [1]), [1])  # noqa: N806
-        H_col = op.Squeeze(op.Slice(grid_thw, [1], [2], [1], [1]), [1])  # noqa: N806
-        W_col = op.Squeeze(op.Slice(grid_thw, [2], [3], [1], [1]), [1])  # noqa: N806
-        patches_per_image = op.Mul(T_col, op.Mul(H_col, W_col))
-        max_patches = op.ReduceMax(patches_per_image, keepdims=False)
+        row_floor = op.Cast(op.Floor(rows_scaled), to=7)
+        col_floor = op.Cast(op.Floor(cols_scaled), to=7)
+        clip_max = op.Constant(value_int=n - 1)
+        row_ceil = op.Min(op.Add(row_floor, op.Constant(value_int=1)), clip_max)
+        col_ceil = op.Min(op.Add(col_floor, op.Constant(value_int=1)), clip_max)
 
-        # --- Scan body: interpolate pos embeddings for one image ---
-        body_thw = ir.Value(
-            name="body_thw",
-            shape=ir.Shape([3]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
-        body_graph, body_builder = create_body_graph([], [body_thw])
-        body_op = body_builder.op
+        row_delta = op.Sub(rows_scaled, op.Cast(row_floor, to=1))
+        col_delta = op.Sub(cols_scaled, op.Cast(col_floor, to=1))
+        one_minus_row = op.Sub(1.0, row_delta)
+        one_minus_col = op.Sub(1.0, col_delta)
+        w_00 = op.Unsqueeze(op.Mul(one_minus_row, one_minus_col), [1])
+        w_01 = op.Unsqueeze(op.Mul(one_minus_row, col_delta), [1])
+        w_10 = op.Unsqueeze(op.Mul(row_delta, one_minus_col), [1])
+        w_11 = op.Unsqueeze(op.Mul(row_delta, col_delta), [1])
 
-        bT = body_op.Squeeze(body_op.Gather(body_thw, body_op.Constant(value_int=0)))  # noqa: N806
-        bH = body_op.Squeeze(body_op.Gather(body_thw, body_op.Constant(value_int=1)))  # noqa: N806
-        bW = body_op.Squeeze(body_op.Gather(body_thw, body_op.Constant(value_int=2)))  # noqa: N806
+        row_floor_base = op.Mul(row_floor, op.Constant(value_int=n))
+        row_ceil_base = op.Mul(row_ceil, op.Constant(value_int=n))
+        idx_00 = op.Add(row_floor_base, col_floor)
+        idx_01 = op.Add(row_floor_base, col_ceil)
+        idx_10 = op.Add(row_ceil_base, col_floor)
+        idx_11 = op.Add(row_ceil_base, col_ceil)
 
-        # linspace(0, n-1, H) and linspace(0, n-1, W)
-        H_f = body_op.Cast(bH, to=1)  # noqa: N806
-        W_f = body_op.Cast(bW, to=1)  # noqa: N806
-        h_range = body_op.Cast(
-            body_op.Range(
-                body_op.Constant(value_int=0),
-                bH,
-                body_op.Constant(value_int=1),
-            ),
-            to=1,
-        )
-        w_range = body_op.Cast(
-            body_op.Range(
-                body_op.Constant(value_int=0),
-                bW,
-                body_op.Constant(value_int=1),
-            ),
-            to=1,
-        )
-
-        h_idxs = body_op.Div(
-            body_op.Mul(h_range, n_minus_1),
-            body_op.Sub(H_f, 1.0),
-        )
-        w_idxs = body_op.Div(
-            body_op.Mul(w_range, n_minus_1),
-            body_op.Sub(W_f, 1.0),
-        )
-
-        # Floor/ceil indices
-        h_floor = body_op.Cast(body_op.Floor(h_idxs), to=7)
-        w_floor = body_op.Cast(body_op.Floor(w_idxs), to=7)
-        clip_max = body_op.Constant(value_int=n - 1)
-        h_ceil = body_op.Min(
-            body_op.Add(h_floor, body_op.Constant(value_int=1)),
-            clip_max,
-        )
-        w_ceil = body_op.Min(
-            body_op.Add(w_floor, body_op.Constant(value_int=1)),
-            clip_max,
-        )
-
-        # Bilinear weights
-        dh = body_op.Sub(h_idxs, body_op.Cast(h_floor, to=1))
-        dw = body_op.Sub(w_idxs, body_op.Cast(w_floor, to=1))
-
-        n_const = body_op.Constant(value_int=n)
-        base_h_floor = body_op.Mul(h_floor, n_const)
-        base_h_ceil = body_op.Mul(h_ceil, n_const)
-
-        bh_f2 = body_op.Unsqueeze(base_h_floor, [1])
-        bh_c2 = body_op.Unsqueeze(base_h_ceil, [1])
-        wf2 = body_op.Unsqueeze(w_floor, [0])
-        wc2 = body_op.Unsqueeze(w_ceil, [0])
-
-        idx_00 = body_op.Reshape(body_op.Add(bh_f2, wf2), [-1])
-        idx_01 = body_op.Reshape(body_op.Add(bh_f2, wc2), [-1])
-        idx_10 = body_op.Reshape(body_op.Add(bh_c2, wf2), [-1])
-        idx_11 = body_op.Reshape(body_op.Add(bh_c2, wc2), [-1])
-
-        one_minus_dh = body_op.Sub(1.0, dh)
-        one_minus_dw = body_op.Sub(1.0, dw)
-        dh2 = body_op.Unsqueeze(dh, [1])
-        omdh2 = body_op.Unsqueeze(one_minus_dh, [1])
-        dw2 = body_op.Unsqueeze(dw, [0])
-        omdw2 = body_op.Unsqueeze(one_minus_dw, [0])
-
-        w_00 = body_op.Reshape(body_op.Mul(omdh2, omdw2), [-1, 1])
-        w_01 = body_op.Reshape(body_op.Mul(omdh2, dw2), [-1, 1])
-        w_10 = body_op.Reshape(body_op.Mul(dh2, omdw2), [-1, 1])
-        w_11 = body_op.Reshape(body_op.Mul(dh2, dw2), [-1, 1])
-
-        # Gather from learned pos_embed (implicit input from parent graph).
-        # Cast to float32 for bilinear interpolation (pos_embed may be bf16/f16).
-        e_00 = body_op.Mul(body_op.Cast(body_op.Gather(self.pos_embed, idx_00), to=1), w_00)
-        e_01 = body_op.Mul(body_op.Cast(body_op.Gather(self.pos_embed, idx_01), to=1), w_01)
-        e_10 = body_op.Mul(body_op.Cast(body_op.Gather(self.pos_embed, idx_10), to=1), w_10)
-        e_11 = body_op.Mul(body_op.Cast(body_op.Gather(self.pos_embed, idx_11), to=1), w_11)
-        pos_embeds = body_op.Add(
-            body_op.Add(e_00, e_01),
-            body_op.Add(e_10, e_11),
-        )
-
-        # Tile T times: (H*W, D) → (T*H*W, D)
-        T_tile = body_op.Concat(  # noqa: N806
-            body_op.Reshape(bT, [1]),
-            body_op.Constant(value_ints=[1]),
-            axis=0,
-        )
-        pos_embeds = body_op.Tile(pos_embeds, T_tile)
-
-        # Spatial merge permutation:
-        # (T, H//ms, ms, W//ms, ms, D) → (T, H//ms, W//ms, ms, ms, D)
-        H_m = body_op.Div(bH, body_op.Constant(value_int=ms))  # noqa: N806
-        W_m = body_op.Div(bW, body_op.Constant(value_int=ms))  # noqa: N806
-        shape_6d = body_op.Concat(
-            body_op.Reshape(bT, [1]),
-            body_op.Reshape(H_m, [1]),
-            body_op.Constant(value_ints=[ms]),
-            body_op.Reshape(W_m, [1]),
-            body_op.Constant(value_ints=[ms]),
-            body_op.Constant(value_ints=[hidden_size]),
-            axis=0,
-        )
-        pos_embeds = body_op.Reshape(pos_embeds, shape_6d)
-        pos_embeds = body_op.Transpose(pos_embeds, perm=[0, 1, 3, 2, 4, 5])
-        pos_embeds = body_op.Reshape(pos_embeds, [-1, hidden_size])
-
-        # Pad to (max_patches, hidden_size) — implicit input from main graph
-        num_p = body_op.Mul(bT, body_op.Mul(bH, bW))
-        pad_len = body_op.Reshape(body_op.Sub(max_patches, num_p), [1])
-        pads = body_op.Concat(
-            body_op.Constant(value_ints=[0, 0]),
-            pad_len,
-            body_op.Constant(value_ints=[0]),
-            axis=0,
-        )
-        padded = body_op.Pad(pos_embeds, pads, 0.0)
-        padded.name = "padded_pos_embed"
-        body_graph.outputs.append(padded)
-
-        rename_subgraph_values(body_graph, "posemb_body_")
-
-        scan_result = op.Scan(
-            grid_thw,
-            body=body_graph,
-            num_scan_inputs=1,
-            _outputs=1,
-        )  # (num_images, max_patches, hidden_size)
-
-        return compact_scan_output(op, scan_result, patches_per_image)
+        # Interpolate in float32 even when the learned table is f16/bf16.
+        e_00 = op.Mul(op.Cast(op.Gather(self.pos_embed, idx_00), to=1), w_00)
+        e_01 = op.Mul(op.Cast(op.Gather(self.pos_embed, idx_01), to=1), w_01)
+        e_10 = op.Mul(op.Cast(op.Gather(self.pos_embed, idx_10), to=1), w_10)
+        e_11 = op.Mul(op.Cast(op.Gather(self.pos_embed, idx_11), to=1), w_11)
+        return op.Add(op.Add(e_00, e_01), op.Add(e_10, e_11))
 
     def _compute_rotary_pos_ids(self, op, grid_thw):
         """Compute 2D rotary position IDs for all images via ONNX Scan.
 
         Matches HF ``Qwen3VLVisionModel.rot_pos_emb()`` position indexing.
-        Iterates over ``grid_thw`` rows, computing per-image spatial-merge-
-        permuted position IDs and concatenating.
 
         Returns ``(total_patches, 2)`` INT64 with ``[h_pos, w_pos]`` per patch.
         """
-        ms = self.spatial_merge_size
-
-        # Per-image patch counts for padding/compaction
-        T_col = op.Squeeze(op.Slice(grid_thw, [0], [1], [1], [1]), [1])  # noqa: N806
-        H_col = op.Squeeze(op.Slice(grid_thw, [1], [2], [1], [1]), [1])  # noqa: N806
-        W_col = op.Squeeze(op.Slice(grid_thw, [2], [3], [1], [1]), [1])  # noqa: N806
-        patches_per_image = op.Mul(T_col, op.Mul(H_col, W_col))
-        max_patches = op.ReduceMax(patches_per_image, keepdims=False)
-
-        # --- Scan body: compute pos_ids for one image, pad to max_patches ---
-        body_thw = ir.Value(
-            name="body_thw",
-            shape=ir.Shape([3]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
-        body_graph, body_builder = create_body_graph([], [body_thw])
-        body_op = body_builder.op
-
-        bT = body_op.Squeeze(body_op.Gather(body_thw, body_op.Constant(value_int=0)))  # noqa: N806
-        bH = body_op.Squeeze(body_op.Gather(body_thw, body_op.Constant(value_int=1)))  # noqa: N806
-        bW = body_op.Squeeze(body_op.Gather(body_thw, body_op.Constant(value_int=2)))  # noqa: N806
-
-        pos_ids = _qwen3_rotary_pos_ids_one_image(body_op, bT, bH, bW, ms)
-
-        # Pad to (max_patches, 2) — implicit input from main graph
-        num_p = body_op.Mul(bT, body_op.Mul(bH, bW))
-        pad_len = body_op.Reshape(body_op.Sub(max_patches, num_p), [1])
-        pads = body_op.Concat(
-            body_op.Constant(value_ints=[0, 0]),
-            pad_len,
-            body_op.Constant(value_ints=[0]),
-            axis=0,
-        )
-        padded = body_op.Pad(pos_ids, pads, body_op.Constant(value_int=-1))
-        padded.name = "padded_pos_ids"
-        body_graph.outputs.append(padded)
-
-        rename_subgraph_values(body_graph, "q3_rotary_body_")
-
-        scan_result = op.Scan(
-            grid_thw,
-            body=body_graph,
-            num_scan_inputs=1,
-            _outputs=1,
-        )
-        return compact_scan_output(op, scan_result, patches_per_image)
+        rows, cols, _, _ = self._flat_grid_coordinates(op, grid_thw)
+        return op.Concat(op.Unsqueeze(rows, [1]), op.Unsqueeze(cols, [1]), axis=1)
 
     def _compute_cu_seqlens(self, op, grid_thw):
         """Compute full-attention cu_seqlens for all images.
 
-        Produces per-frame boundaries across all images using ONNX Scan
-        to handle per-image ``repeat_interleave(hw, T)`` + CumSum.
+        Produces per-frame boundaries across all images without a control-flow
+        subgraph, equivalent to ``repeat_interleave(H * W, T)`` + CumSum.
 
         Returns ``(total_frames + 1,)`` INT64.
         """
         T_col = op.Squeeze(op.Slice(grid_thw, [0], [1], [1], [1]), [1])  # noqa: N806
-        max_T = op.ReduceMax(T_col, keepdims=False)  # noqa: N806
-
-        # Scan body: for each image, output T copies of hw, padded to max_T
-        body_thw = ir.Value(
-            name="body_thw",
-            shape=ir.Shape([3]),
-            type=ir.TensorType(ir.DataType.INT64),
+        H_col = op.Squeeze(op.Slice(grid_thw, [1], [2], [1], [1]), [1])  # noqa: N806
+        W_col = op.Squeeze(op.Slice(grid_thw, [2], [3], [1], [1]), [1])  # noqa: N806
+        frame_ends = op.CumSum(T_col, op.Constant(value_int=0))
+        total_frames = op.ReduceSum(T_col, keepdims=False)
+        frame_ids = op.Range(
+            op.Constant(value_int=0),
+            total_frames,
+            op.Constant(value_int=1),
         )
-        body_graph, body_builder = create_body_graph([], [body_thw])
-        body_op = body_builder.op
-
-        bT = body_op.Squeeze(body_op.Gather(body_thw, body_op.Constant(value_int=0)))  # noqa: N806
-        bH = body_op.Squeeze(body_op.Gather(body_thw, body_op.Constant(value_int=1)))  # noqa: N806
-        bW = body_op.Squeeze(body_op.Gather(body_thw, body_op.Constant(value_int=2)))  # noqa: N806
-
-        hw = body_op.Mul(bH, bW)
-        ones = body_op.Expand(
-            body_op.Constant(value_int=1),
-            body_op.Reshape(bT, [1]),
+        media_ids = op.ReduceSum(
+            op.Cast(
+                op.GreaterOrEqual(
+                    op.Unsqueeze(frame_ids, [1]),
+                    op.Unsqueeze(frame_ends, [0]),
+                ),
+                to=7,
+            ),
+            [1],
+            keepdims=False,
         )
-        hw_repeated = body_op.Mul(ones, hw)
-
-        pad_len = body_op.Reshape(body_op.Sub(max_T, bT), [1])
-        pads = body_op.Concat(
-            body_op.Constant(value_ints=[0]),
-            pad_len,
-            axis=0,
-        )
-        padded = body_op.Pad(
-            hw_repeated,
-            pads,
-            body_op.Constant(value_int=0),
-        )
-        padded.name = "padded_hw"
-        body_graph.outputs.append(padded)
-
-        rename_subgraph_values(body_graph, "q3_cu_body_")
-
-        scan_hw = op.Scan(
-            grid_thw,
-            body=body_graph,
-            num_scan_inputs=1,
-            _outputs=1,
-        )
-        hw_flat = compact_scan_output(op, scan_hw, T_col)
-        cu = op.CumSum(hw_flat, op.Constant(value_int=0))
+        hw_per_media = op.Mul(H_col, W_col)
+        hw_per_frame = op.Gather(hw_per_media, media_ids)
+        cu = op.CumSum(hw_per_frame, op.Constant(value_int=0))
         return op.Pad(cu, op.Constant(value_ints=[1, 0]), op.Constant(value_int=0))
 
     def forward(
@@ -866,7 +663,7 @@ class Qwen3VLVisionModel(nn.Module):
         hidden_states = self.patch_embed(op, hidden_states)
 
         # Bilinear-interpolated position embeddings from learned grid.
-        # Cast to match hidden_states dtype (Scan body computes in float32).
+        # Cast to match hidden_states dtype (interpolation computes in float32).
         pos_embeds = self._interpolate_pos_embed(op, grid_thw)
         pos_embeds = op.CastLike(pos_embeds, hidden_states)
         hidden_states = op.Add(hidden_states, pos_embeds)

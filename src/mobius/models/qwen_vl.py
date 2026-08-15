@@ -995,12 +995,12 @@ class Qwen3VLVisionEncoderModel(nn.Module):
 class Qwen3VLEmbeddingModel(Qwen25VLEmbeddingModel):
     """Qwen3-VL embedding model for the 3-model split.
 
-    Scatters merged image features at image-token positions (like
-    Qwen2.5-VL) and, when the vision encoder produces DeepStack features,
-    also scatters each intermediate DeepStack map into a full-length
-    ``[batch, seq, hidden]`` tensor (zero at non-image positions).  The
-    stacked ``deepstack_embeds`` output is consumed by the decoder, which
-    adds them to the hidden states of its first ``D`` layers.
+    Scatters packed image-then-video features at their respective placeholder
+    positions. When the vision encoder produces DeepStack features, each
+    intermediate map is scattered with the same media ordering into a
+    full-length ``[batch, seq, hidden]`` tensor. The stacked
+    ``deepstack_embeds`` output is consumed by the decoder, which adds them to
+    the hidden states of its first ``D`` layers.
 
     Inputs:
         - input_ids: (batch, seq_len) INT64
@@ -1013,6 +1013,10 @@ class Qwen3VLEmbeddingModel(Qwen25VLEmbeddingModel):
           (only when DeepStack is active)
     """
 
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__(config)
+        self.video_token_id = config.video_token_id
+
     def forward(
         self,
         op: OpBuilder,
@@ -1022,21 +1026,44 @@ class Qwen3VLEmbeddingModel(Qwen25VLEmbeddingModel):
     ):
         text_embeds = self.embed_tokens(op, input_ids)
 
-        # Image-token positions and their running index into the packed
-        # feature tensors (shared by the main image scatter and every
-        # DeepStack scatter).
+        # Hugging Face scatters image and video streams independently. The
+        # package therefore packs every image feature first, then every video
+        # feature, regardless of placeholder order or batch row.
         image_mask = op.Equal(input_ids, op.Constant(value_int=self.image_token_id))
-        image_mask_3d = op.Unsqueeze(image_mask, [-1])
-        mask_int = op.Cast(image_mask, to=7)  # INT64
-        cumsum = op.CumSum(mask_int, op.Constant(value_int=1))
-        indices = op.Clip(
-            op.Sub(cumsum, op.Constant(value_int=1)),
-            op.Constant(value_int=0),
+        if self.video_token_id is None:
+            video_mask = op.CastLike(False, image_mask)
+        else:
+            video_mask = op.Equal(
+                input_ids,
+                op.Constant(value_int=self.video_token_id),
+            )
+        media_mask = op.Or(image_mask, video_mask)
+        media_mask_3d = op.Unsqueeze(media_mask, [-1])
+
+        flat_image_mask = op.Cast(op.Reshape(image_mask, [-1]), to=7)
+        flat_video_mask = op.Cast(op.Reshape(video_mask, [-1]), to=7)
+        image_indices = op.Sub(
+            op.CumSum(flat_image_mask, op.Constant(value_int=0)),
+            op.Constant(value_int=1),
         )
+        video_indices = op.Add(
+            op.Sub(
+                op.CumSum(flat_video_mask, op.Constant(value_int=0)),
+                op.Constant(value_int=1),
+            ),
+            op.ReduceSum(flat_image_mask, keepdims=0),
+        )
+        flat_indices = op.Where(
+            op.CastLike(flat_image_mask, image_mask),
+            image_indices,
+            video_indices,
+        )
+        flat_indices = op.Clip(flat_indices, op.Constant(value_int=0))
+        indices = op.Reshape(flat_indices, op.Shape(input_ids))
 
         def _scatter(features: ir.Value, fallback: ir.Value) -> ir.Value:
-            # Pad with one zero row so Gather stays in-bounds for text-only
-            # input (num_image_tokens == 0); the Where mask discards it.
+            # Keep Gather valid for text-only/decode calls with zero media rows;
+            # the Where mask discards the synthetic row.
             pad_row = op.Expand(
                 op.CastLike(0.0, features),
                 op.Concat(
@@ -1047,7 +1074,7 @@ class Qwen3VLEmbeddingModel(Qwen25VLEmbeddingModel):
             )
             padded = op.Concat(features, pad_row, axis=0)
             gathered = op.Gather(padded, indices, axis=0)
-            return op.Where(image_mask_3d, gathered, fallback)
+            return op.Where(media_mask_3d, gathered, fallback)
 
         inputs_embeds = _scatter(image_features, text_embeds)
 

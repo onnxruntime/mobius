@@ -1,0 +1,33 @@
+{
+  "model_id": "Qwen/Qwen3.8-27B",
+  "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "fixture_schema": 1,
+  "input_ids": [
+    1,
+    42,
+    17
+  ],
+  "max_new_tokens": 20,
+  "generated_tokens": [
+    134,
+    138,
+    167,
+    225,
+    94,
+    226,
+    103,
+    145,
+    114,
+    114,
+    114,
+    254,
+    101,
+    115,
+    254,
+    101,
+    115,
+    254,
+    101,
+    115
+  ]
+}
