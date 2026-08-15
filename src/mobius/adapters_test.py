@@ -435,6 +435,12 @@ def test_peft_migration_source_preserves_rank_alpha_and_provenance() -> None:
         declaration = catalog["peft-style"]["weights"][0]
         assert declaration["format"] == "hf_peft"
         assert declaration["loader_capability"] == "onnx-genai.adapters.hf-peft@1"
+        assert declaration["scale_encoding"] == "alpha_over_rank"
+        assert catalog["peft-style"]["provenance"] == {
+            "producer": "mobius",
+            "source": "synthetic/base",
+            "revision": "producer-fixture",
+        }
         saved = load_file(output / declaration["location"])
         assert set(saved) == {
             f"{module}.lora_A.weight",
@@ -501,6 +507,7 @@ def test_onnx_adapter_source_can_be_declared_for_native_capability() -> None:
         declared = catalog["style"]["weights"][0]
         assert declared["format"] == "ort_genai"
         assert declared["loader_capability"] == "onnxruntime.lora-adapter@1"
+        assert declared["scale_encoding"] == "baked"
         assert declared["location"] == "adapters/style/adapter.onnx_adapter"
         assert catalog["style"]["bindings"] == [
             {
@@ -603,7 +610,8 @@ def test_exact_onnx_genai_catalog_and_portable_bundle_serialization() -> None:
             "id": "layers.0.self_attn.q_proj",
             "component": "decoder",
             "parameter": "projection.weight",
-            "output_value": "projection.output",
+            "node_name": "projection",
+            "output_name": "projection.output",
             "activation_dtype": "float32",
             "input_features": 4,
             "output_features": 3,
@@ -614,6 +622,7 @@ def test_exact_onnx_genai_catalog_and_portable_bundle_serialization() -> None:
             },
         }
         assert service["target_manifest"]["targets"][1]["output_slice"] == {
+            "role": "q",
             "offset": 0,
             "width": 3,
         }
@@ -639,6 +648,7 @@ def test_exact_onnx_genai_catalog_and_portable_bundle_serialization() -> None:
         assert artifact["rank"] == 2
         assert artifact["alpha"] == pytest.approx(2.0)
         assert artifact["dtype"] == "float32"
+        assert artifact["provenance"] == {"producer": "mobius"}
         assert artifact["bindings"] == [
             {
                 "target": "layers.0.self_attn.q_proj",
@@ -649,6 +659,7 @@ def test_exact_onnx_genai_catalog_and_portable_bundle_serialization() -> None:
         payload = (directory / weight["location"]).read_bytes()
         assert weight["format"] == "json"
         assert weight["loader_capability"] == "onnx-genai.adapters.json@1"
+        assert weight["scale_encoding"] == "alpha_over_rank"
         assert weight["location"] == "adapters/red/adapter.json"
         assert len(weight["sha256"]) == 64
         assert weight["sha256"] == hashlib.sha256(payload).hexdigest()

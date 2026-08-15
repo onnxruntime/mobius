@@ -369,6 +369,7 @@ class ModelPackage(UserDict[str, ir.Model]):
                         "location": relative_location,
                         "loader_capability": "onnx-genai.adapters.json@1",
                         "sha256": hashlib.sha256(payload).hexdigest(),
+                        "scale_encoding": "alpha_over_rank",
                         "format": "json",
                     }
                 )
@@ -388,6 +389,7 @@ class ModelPackage(UserDict[str, ir.Model]):
                             "location": relative_location,
                             "loader_capability": "onnxruntime.lora-adapter@1",
                             "sha256": hashlib.sha256(payload).hexdigest(),
+                            "scale_encoding": "baked",
                             "format": "ort_genai",
                         }
                     )
@@ -414,6 +416,7 @@ class ModelPackage(UserDict[str, ir.Model]):
                             "sha256": hashlib.sha256(payload).hexdigest(),
                             "config_location": relative_config,
                             "config_sha256": hashlib.sha256(config_payload).hexdigest(),
+                            "scale_encoding": "alpha_over_rank",
                             "format": "hf_peft",
                         }
                     )
@@ -426,13 +429,11 @@ class ModelPackage(UserDict[str, ir.Model]):
                 raise ValueError(
                     f"adapter {alias!r} must emit a portable or preserved source artifact"
                 )
-            provenance_parts = [artifact.source.format]
+            provenance = {"producer": artifact.source.producer}
             if artifact.source.base_model:
-                provenance_parts.append(f"base={artifact.source.base_model}")
+                provenance["source"] = artifact.source.base_model
             if artifact.source.revision:
-                provenance_parts.append(f"revision={artifact.source.revision}")
-            if artifact.source.checksum:
-                provenance_parts.append(f"source_{artifact.source.checksum}")
+                provenance["revision"] = artifact.source.revision
             catalog[alias] = {
                 "index": artifact_index,
                 "identity": artifact.stable_identity,
@@ -441,7 +442,7 @@ class ModelPackage(UserDict[str, ir.Model]):
                 "rank": rank,
                 "alpha": alpha,
                 "dtype": dtype,
-                "provenance": ";".join(provenance_parts),
+                "provenance": provenance,
                 "weights": weight_artifacts,
                 "bindings": bindings,
             }
@@ -466,7 +467,8 @@ class ModelPackage(UserDict[str, ir.Model]):
                 "id": descriptor.semantic_name,
                 "component": descriptor.target.component,
                 "parameter": descriptor.target.parameter,
-                "output_value": descriptor.output_name,
+                "node_name": descriptor.node_name,
+                "output_name": descriptor.output_name,
                 "activation_dtype": activation_dtype,
                 "input_features": descriptor.input_size,
                 "output_features": descriptor.output_size,
@@ -484,6 +486,7 @@ class ModelPackage(UserDict[str, ir.Model]):
                 sliced = dict(base)
                 sliced["id"] = f"{descriptor.semantic_name}.{target_slice.role}"
                 sliced["output_slice"] = {
+                    "role": target_slice.role,
                     "offset": target_slice.offset,
                     "width": target_slice.width,
                 }

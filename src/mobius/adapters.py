@@ -147,7 +147,8 @@ def _target_fingerprint_record(
     }
     if isinstance(resolved_target, AdapterTargetDescriptor):
         record["id"] = resolved_target.semantic_name
-        record["output_value"] = resolved_target.output_name
+        record["node_name"] = resolved_target.node_name
+        record["output_name"] = resolved_target.output_name
         record["activation_dtype"] = int(resolved_target.activation_dtype or initializer.dtype)
         if resolved_target.graph_input_a is not None:
             record["graph_inputs"] = {
@@ -196,6 +197,7 @@ def fingerprint_model_weights(
                 sliced = dict(record)
                 sliced["id"] = f"{target.semantic_name}.{target_slice.role}"
                 sliced["output_slice"] = {
+                    "role": target_slice.role,
                     "offset": target_slice.offset,
                     "width": target_slice.width,
                 }
@@ -377,8 +379,11 @@ class AdapterSource:
     checksum: str | None = None
     base_model: str | None = None
     revision: str | None = None
+    producer: str = "mobius"
 
     def __post_init__(self) -> None:
+        if not self.producer:
+            raise ValueError("adapter source producer must be non-empty")
         if self.format != "in_memory" and not self.path:
             raise ValueError(f"{self.format} adapter source requires a path")
         if self.checksum is not None and not self.checksum.startswith("sha256:"):
