@@ -456,6 +456,90 @@ def test_peft_migration_source_preserves_rank_alpha_and_provenance() -> None:
         shutil.rmtree(directory)
 
 
+def test_peft_rank_and_alpha_patterns_emit_heterogeneous_binding_overrides() -> None:
+    directory = Path("artifacts") / f"adapter-peft-pattern-test-{uuid.uuid4().hex}"
+    source = directory / "source"
+    source.mkdir(parents=True)
+    try:
+        model = _model()
+        other = ir.Value(
+            name="other.weight",
+            const_value=ir.tensor(np.ones((3, 4), dtype=np.float32)),
+            type=ir.TensorType(ir.DataType.FLOAT),
+            shape=ir.Shape([3, 4]),
+        )
+        node = ir.Node("", "MatMul", [model.graph.inputs[0], other], name="other")
+        node.outputs[0].name = "other.output"
+        model.graph.append(node)
+        model.graph.initializers.add(other)
+        manifest = _manifest(model, include_second=True)
+
+        config = {
+            "r": 1,
+            "lora_alpha": 2.0,
+            "target_modules": ["q_proj", "v_proj"],
+            "rank_pattern": {"layers.0.self_attn.q_proj": 2},
+            "alpha_pattern": {"layers.0.self_attn.q_proj": 6.0},
+        }
+        (source / "adapter_config.json").write_text(json.dumps(config))
+        save_file(
+            {
+                "base_model.layers.0.self_attn.q_proj.lora_A.weight": np.ones(
+                    (2, 4), dtype=np.float32
+                ),
+                "base_model.layers.0.self_attn.q_proj.lora_B.weight": np.ones(
+                    (3, 2), dtype=np.float32
+                ),
+                "base_model.layers.0.self_attn.v_proj.lora_A.weight": np.ones(
+                    (1, 4), dtype=np.float32
+                ),
+                "base_model.layers.0.self_attn.v_proj.lora_B.weight": np.ones(
+                    (3, 1), dtype=np.float32
+                ),
+            },
+            source / "adapter_model.safetensors",
+        )
+        artifact = load_peft_adapter(
+            source,
+            name="heterogeneous",
+            base_fingerprint=manifest.base_fingerprint,
+            target_bindings={
+                "layers.0.self_attn.q_proj": AdapterTarget("decoder", "projection.weight"),
+                "layers.0.self_attn.v_proj": AdapterTarget("decoder", "other.weight"),
+            },
+        )
+        package = ModelPackage(
+            {"decoder": model},
+            adapter_target_manifest=manifest,
+            adapter_service_options=AdapterServiceOptions(
+                portable_fallback=False,
+                preserve_source_format=True,
+            ),
+        )
+        package.add_adapter_artifact(artifact)
+        catalog = package.save_adapter_artifacts(str(directory / "package"))
+
+        assert set(catalog) == {"heterogeneous"}
+        declaration = catalog["heterogeneous"]
+        assert declaration["rank"] == 1
+        assert declaration["alpha"] == pytest.approx(2.0)
+        bindings = {binding["target"]: binding for binding in declaration["bindings"]}
+        assert bindings["layers.0.self_attn.q_proj"] == {
+            "target": "layers.0.self_attn.q_proj",
+            "weight_key": "layers.0.self_attn.q_proj",
+            "rank": 2,
+            "alpha": 6.0,
+        }
+        assert bindings["layers.0.self_attn.v_proj"] == {
+            "target": "layers.0.self_attn.v_proj",
+            "weight_key": "layers.0.self_attn.v_proj",
+        }
+        assert len(declaration["weights"]) == 1
+        assert declaration["weights"][0]["format"] == "hf_peft"
+    finally:
+        shutil.rmtree(directory)
+
+
 def test_onnx_adapter_migration_source_is_optional_and_checksummed() -> None:
     directory = Path("artifacts") / f"adapter-ort-test-{uuid.uuid4().hex}"
     directory.mkdir(parents=True)
