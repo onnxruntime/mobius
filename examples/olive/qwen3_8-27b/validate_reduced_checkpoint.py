@@ -406,14 +406,17 @@ def _assert_logits_close(
 
 
 def _save_package_assets(package_dir: Path) -> None:
-    """Copy pinned tokenizer/processor metadata needed by a standalone package."""
-    from transformers import AutoProcessor, AutoTokenizer, GenerationConfig
+    """Copy pinned processor metadata for the reduced token-ID-only package."""
+    from transformers import AutoProcessor, GenerationConfig
 
     _reduced_hf_config().save_pretrained(package_dir)
-    AutoTokenizer.from_pretrained(MODEL_ID, revision=REVISION).save_pretrained(package_dir)
     GenerationConfig.from_pretrained(MODEL_ID, revision=REVISION).save_pretrained(package_dir)
     try:
-        AutoProcessor.from_pretrained(MODEL_ID, revision=REVISION).save_pretrained(package_dir)
+        processor = AutoProcessor.from_pretrained(MODEL_ID, revision=REVISION)
+        (package_dir / "processor_config.json").write_text(
+            json.dumps(processor.to_dict(), indent=2),
+            encoding="utf-8",
+        )
     except (ImportError, OSError, ValueError) as error:
         # The ONNX package remains directly runnable without the optional
         # processor serialization; retain the precise reason in its manifest.
@@ -425,6 +428,7 @@ def _save_package_assets(package_dir: Path) -> None:
                 "revision": REVISION,
                 "fixture_schema": FIXTURE_SCHEMA_VERSION,
                 "runtime": "onnxruntime-direct",
+                "text_input_contract": "token-ids-only",
                 "components": [
                     "decoder/model.onnx",
                     "embedding/model.onnx",

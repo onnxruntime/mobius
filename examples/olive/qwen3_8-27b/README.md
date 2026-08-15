@@ -6,6 +6,9 @@ The fixture has 4 decoder layers (three DeltaNet and one full attention),
 one vision block, remapped image/video IDs, and no MTP tensors because the
 standard target forward does not consume the optional self-speculative drafter.
 Mobius exposes that drafter through the separate `qwen35-mtp` package contract.
+The reduced package is token-ID-only and deliberately omits the production
+tokenizer because its vocabulary is remapped to 256 entries. It retains the
+pinned image and video processor metadata for media-contract validation.
 
 ```powershell
 python examples/olive/qwen3_8-27b/validate_reduced_checkpoint.py --matrix f32-cpu f16-cuda

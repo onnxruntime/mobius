@@ -223,10 +223,16 @@ def test_qwen38_reduced_olive_q4_package(tmp_path):
         path.stat().st_size for path in source.rglob("*") if path.is_file()
     )
     assert (result / "processor_config.json").read_bytes() == processor_config.read_bytes()
-    from transformers import AutoProcessor
+    from transformers import Qwen2VLImageProcessor, Qwen3VLVideoProcessor
 
-    processor = AutoProcessor.from_pretrained(result, local_files_only=True)
-    assert type(processor).__name__ == "Qwen3VLProcessor"
+    processor_data = json.loads((result / "processor_config.json").read_text())
+    assert type(
+        Qwen2VLImageProcessor.from_dict(processor_data["image_processor"])
+    ).__name__ == ("Qwen2VLImageProcessor")
+    assert type(
+        Qwen3VLVideoProcessor.from_dict(processor_data["video_processor"])
+    ).__name__ == ("Qwen3VLVideoProcessor")
+    assert not (result / "tokenizer.json").exists()
     for name in ("decoder", "embedding", "vision_encoder"):
         validator._create_session(result / name / "model.onnx", "cuda")
     ids, logits, _ = validator.run_token_ids(
