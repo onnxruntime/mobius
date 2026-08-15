@@ -499,9 +499,9 @@ class Qwen3VLVisionModel(nn.Module):
         preserving arbitrary image/video sizes and order.
         """
         ms = self.spatial_merge_size
-        T_col = op.Squeeze(op.Slice(grid_thw, [0], [1], [1], [1]), [1])  # noqa: N806
-        H_col = op.Squeeze(op.Slice(grid_thw, [1], [2], [1], [1]), [1])  # noqa: N806
-        W_col = op.Squeeze(op.Slice(grid_thw, [2], [3], [1], [1]), [1])  # noqa: N806
+        T_col = op.Gather(grid_thw, op.Constant(value_int=0), axis=1)  # noqa: N806
+        H_col = op.Gather(grid_thw, op.Constant(value_int=1), axis=1)  # noqa: N806
+        W_col = op.Gather(grid_thw, op.Constant(value_int=2), axis=1)  # noqa: N806
         patches_per_media = op.Mul(T_col, op.Mul(H_col, W_col))
         patch_ends = op.CumSum(patches_per_media, op.Constant(value_int=0))
         patch_starts = op.Pad(
@@ -516,18 +516,21 @@ class Qwen3VLVisionModel(nn.Module):
             total_patches,
             op.Constant(value_int=1),
         )
-        # The number of completed media ranges is the owning media row.
-        media_ids = op.ReduceSum(
-            op.Cast(
-                op.GreaterOrEqual(
-                    op.Unsqueeze(patch_ids, [1]),
-                    op.Unsqueeze(patch_ends, [0]),
-                ),
-                to=7,
-            ),
-            [1],
-            keepdims=False,
+        # Mark each nonzero media boundary, then prefix-sum the markers. This
+        # maps patches to media in O(total_patches + num_media) rather than
+        # materializing an O(total_patches * num_media) comparison matrix.
+        media_boundaries = op.Slice(patch_ends, [0], [-1])
+        boundary_updates = op.ConstantOfShape(
+            op.Shape(media_boundaries),
+            value=ir.tensor(np.array([1], dtype=np.int64)),
         )
+        boundary_markers = op.ScatterElements(
+            op.Mul(patch_ids, op.Constant(value_int=0)),
+            media_boundaries,
+            boundary_updates,
+            axis=0,
+        )
+        media_ids = op.CumSum(boundary_markers, op.Constant(value_int=0))
         local_ids = op.Sub(patch_ids, op.Gather(patch_starts, media_ids))
 
         H = op.Gather(H_col, media_ids)  # noqa: N806
@@ -545,22 +548,22 @@ class Qwen3VLVisionModel(nn.Module):
         intra_cols = op.Mod(intra_merge_ids, op.Constant(value_int=ms))
         rows = op.Add(op.Mul(block_rows, op.Constant(value_int=ms)), intra_rows)
         cols = op.Add(op.Mul(block_cols, op.Constant(value_int=ms)), intra_cols)
-        return rows, cols, H, W
+        return rows, cols, H, W, frame_local_ids, patch_ids, total_patches
 
-    def _interpolate_pos_embed(self, op, grid_thw):
+    def _interpolate_pos_embed(self, op, coordinates):
         """Bilinearly interpolate learned positions for the packed media stream.
 
         Matches HuggingFace ``Qwen3VLVisionModel.fast_pos_embed_interpolate``.
 
         Args:
             op: OpBuilder instance.
-            grid_thw: ``(num_images, 3)`` INT64 with ``[T, H, W]`` per image.
+            coordinates: Shared packed ``(rows, cols, H, W)`` coordinate values.
 
         Returns:
             Position embeddings ``(total_patches, hidden_size)``.
         """
         n = self.num_grid_per_side
-        rows, cols, H, W = self._flat_grid_coordinates(op, grid_thw)  # noqa: N806
+        rows, cols, H, W = coordinates  # noqa: N806
         rows_f = op.Cast(rows, to=1)
         cols_f = op.Cast(cols, to=1)
         H_f = op.Cast(H, to=1)  # noqa: N806
@@ -568,20 +571,16 @@ class Qwen3VLVisionModel(nn.Module):
         rows_scaled = op.Div(op.Mul(rows_f, float(n - 1)), op.Sub(H_f, 1.0))
         cols_scaled = op.Div(op.Mul(cols_f, float(n - 1)), op.Sub(W_f, 1.0))
 
-        row_floor = op.Cast(op.Floor(rows_scaled), to=7)
-        col_floor = op.Cast(op.Floor(cols_scaled), to=7)
+        row_floor_f = op.Floor(rows_scaled)
+        col_floor_f = op.Floor(cols_scaled)
+        row_floor = op.Cast(row_floor_f, to=7)
+        col_floor = op.Cast(col_floor_f, to=7)
         clip_max = op.Constant(value_int=n - 1)
         row_ceil = op.Min(op.Add(row_floor, op.Constant(value_int=1)), clip_max)
         col_ceil = op.Min(op.Add(col_floor, op.Constant(value_int=1)), clip_max)
 
-        row_delta = op.Sub(rows_scaled, op.Cast(row_floor, to=1))
-        col_delta = op.Sub(cols_scaled, op.Cast(col_floor, to=1))
-        one_minus_row = op.Sub(1.0, row_delta)
-        one_minus_col = op.Sub(1.0, col_delta)
-        w_00 = op.Unsqueeze(op.Mul(one_minus_row, one_minus_col), [1])
-        w_01 = op.Unsqueeze(op.Mul(one_minus_row, col_delta), [1])
-        w_10 = op.Unsqueeze(op.Mul(row_delta, one_minus_col), [1])
-        w_11 = op.Unsqueeze(op.Mul(row_delta, col_delta), [1])
+        row_delta = op.Unsqueeze(op.Sub(rows_scaled, row_floor_f), [1])
+        col_delta = op.Unsqueeze(op.Sub(cols_scaled, col_floor_f), [1])
 
         row_floor_base = op.Mul(row_floor, op.Constant(value_int=n))
         row_ceil_base = op.Mul(row_ceil, op.Constant(value_int=n))
@@ -591,55 +590,47 @@ class Qwen3VLVisionModel(nn.Module):
         idx_11 = op.Add(row_ceil_base, col_ceil)
 
         # Interpolate in float32 even when the learned table is f16/bf16.
-        e_00 = op.Mul(op.Cast(op.Gather(self.pos_embed, idx_00), to=1), w_00)
-        e_01 = op.Mul(op.Cast(op.Gather(self.pos_embed, idx_01), to=1), w_01)
-        e_10 = op.Mul(op.Cast(op.Gather(self.pos_embed, idx_10), to=1), w_10)
-        e_11 = op.Mul(op.Cast(op.Gather(self.pos_embed, idx_11), to=1), w_11)
-        return op.Add(op.Add(e_00, e_01), op.Add(e_10, e_11))
+        pos_embed_f = op.Cast(self.pos_embed, to=1)
+        e_00 = op.Gather(pos_embed_f, idx_00)
+        e_01 = op.Gather(pos_embed_f, idx_01)
+        e_10 = op.Gather(pos_embed_f, idx_10)
+        e_11 = op.Gather(pos_embed_f, idx_11)
 
-    def _compute_rotary_pos_ids(self, op, grid_thw):
-        """Compute 2D rotary position IDs for all images via ONNX Scan.
+        # Two horizontal lerps followed by one vertical lerp are equivalent to
+        # the four explicit bilinear weights with fewer graph operations.
+        top = op.Add(e_00, op.Mul(op.Sub(e_01, e_00), col_delta))
+        bottom = op.Add(e_10, op.Mul(op.Sub(e_11, e_10), col_delta))
+        return op.Add(top, op.Mul(op.Sub(bottom, top), row_delta))
+
+    def _compute_rotary_pos_ids(self, op, coordinates):
+        """Combine shared packed coordinates into 2D rotary position IDs.
 
         Matches HF ``Qwen3VLVisionModel.rot_pos_emb()`` position indexing.
 
         Returns ``(total_patches, 2)`` INT64 with ``[h_pos, w_pos]`` per patch.
         """
-        rows, cols, _, _ = self._flat_grid_coordinates(op, grid_thw)
+        rows, cols = coordinates
         return op.Concat(op.Unsqueeze(rows, [1]), op.Unsqueeze(cols, [1]), axis=1)
 
-    def _compute_cu_seqlens(self, op, grid_thw):
+    def _compute_cu_seqlens(self, op, frame_boundaries):
         """Compute full-attention cu_seqlens for all images.
 
-        Produces per-frame boundaries across all images without a control-flow
-        subgraph, equivalent to ``repeat_interleave(H * W, T)`` + CumSum.
+        Each packed frame starts where its frame-local patch index is zero.
+        Compacting those patch IDs and appending the total patch count produces
+        the same boundaries as ``repeat_interleave(H * W, T)`` + CumSum.
 
         Returns ``(total_frames + 1,)`` INT64.
         """
-        T_col = op.Squeeze(op.Slice(grid_thw, [0], [1], [1], [1]), [1])  # noqa: N806
-        H_col = op.Squeeze(op.Slice(grid_thw, [1], [2], [1], [1]), [1])  # noqa: N806
-        W_col = op.Squeeze(op.Slice(grid_thw, [2], [3], [1], [1]), [1])  # noqa: N806
-        frame_ends = op.CumSum(T_col, op.Constant(value_int=0))
-        total_frames = op.ReduceSum(T_col, keepdims=False)
-        frame_ids = op.Range(
-            op.Constant(value_int=0),
-            total_frames,
-            op.Constant(value_int=1),
+        frame_local_ids, patch_ids, total_patches = frame_boundaries
+        frame_starts = op.Compress(
+            patch_ids,
+            op.Equal(frame_local_ids, op.Constant(value_int=0)),
         )
-        media_ids = op.ReduceSum(
-            op.Cast(
-                op.GreaterOrEqual(
-                    op.Unsqueeze(frame_ids, [1]),
-                    op.Unsqueeze(frame_ends, [0]),
-                ),
-                to=7,
-            ),
-            [1],
-            keepdims=False,
+        return op.Concat(
+            frame_starts,
+            op.Unsqueeze(total_patches, [0]),
+            axis=0,
         )
-        hw_per_media = op.Mul(H_col, W_col)
-        hw_per_frame = op.Gather(hw_per_media, media_ids)
-        cu = op.CumSum(hw_per_frame, op.Constant(value_int=0))
-        return op.Pad(cu, op.Constant(value_ints=[1, 0]), op.Constant(value_int=0))
 
     def forward(
         self,
@@ -662,18 +653,22 @@ class Qwen3VLVisionModel(nn.Module):
         # Patch embedding
         hidden_states = self.patch_embed(op, hidden_states)
 
+        # Compute the packed patch coordinates once. Position interpolation,
+        # rotary IDs, and frame boundaries share these values.
+        coordinates = self._flat_grid_coordinates(op, grid_thw)
+
         # Bilinear-interpolated position embeddings from learned grid.
         # Cast to match hidden_states dtype (interpolation computes in float32).
-        pos_embeds = self._interpolate_pos_embed(op, grid_thw)
+        pos_embeds = self._interpolate_pos_embed(op, coordinates[:4])
         pos_embeds = op.CastLike(pos_embeds, hidden_states)
         hidden_states = op.Add(hidden_states, pos_embeds)
 
         # Compute rotary position IDs and embeddings from grid_thw
-        rotary_pos_ids = self._compute_rotary_pos_ids(op, grid_thw)
+        rotary_pos_ids = self._compute_rotary_pos_ids(op, coordinates[:2])
         position_embeddings = self.rotary_pos_emb(op, rotary_pos_ids)
 
         # Compute cu_seqlens from grid_thw
-        cu_seqlens = self._compute_cu_seqlens(op, grid_thw)
+        cu_seqlens = self._compute_cu_seqlens(op, coordinates[4:])
 
         # Transformer blocks
         deepstack_features = []
