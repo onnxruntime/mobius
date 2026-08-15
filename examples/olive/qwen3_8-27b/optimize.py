@@ -21,6 +21,8 @@ _ASSETS = {
     "special_tokens_map.json",
     "chat_template.jinja",
     "preprocessor_config.json",
+    "processor_config.json",
+    "image_processor.json",
 }
 
 

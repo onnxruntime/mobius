@@ -92,8 +92,8 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "qwen2_vl": "qwen2_5_vl",
     "qwen3_vl": "qwen3_vl",
     "qwen3_vl_text": "qwen3_vl",
-    "qwen3_5": "qwen2_5_vl",
-    "qwen3_5_vl": "qwen2_5_vl",
+    "qwen3_5": "qwen3_5",
+    "qwen3_5_vl": "qwen3_5",
     # MiniCPM uses standard 1D decoder position IDs (unlike Qwen-VL MRoPE).
     # The phi3v multimodal runtime provides that contract; callers supply
     # HF-preprocessed packed pixels through Generator.set_inputs().

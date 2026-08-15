@@ -209,6 +209,8 @@ def test_qwen38_reduced_olive_q4_package(tmp_path):
         dtype_name="f16",
         device="cuda",
     )
+    processor_config = source / "processor_config.json"
+    assert processor_config.is_file()
     result = optimize.quantize_package(source, output_root / "q4_k_m")
     import onnx_ir as ir
 
@@ -220,6 +222,11 @@ def test_qwen38_reduced_olive_q4_package(tmp_path):
     assert sum(path.stat().st_size for path in result.rglob("*") if path.is_file()) < sum(
         path.stat().st_size for path in source.rglob("*") if path.is_file()
     )
+    assert (result / "processor_config.json").read_bytes() == processor_config.read_bytes()
+    from transformers import AutoProcessor
+
+    processor = AutoProcessor.from_pretrained(result, local_files_only=True)
+    assert type(processor).__name__ == "Qwen3VLProcessor"
     for name in ("decoder", "embedding", "vision_encoder"):
         validator._create_session(result / name / "model.onnx", "cuda")
     ids, logits, _ = validator.run_token_ids(

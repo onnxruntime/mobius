@@ -22,6 +22,9 @@ cached generation; all larger decoder matrices remain eligible for
 `MatMulNBits`. All three Q4 package components are reloaded with CUDA enabled;
 the 20-token semantic run uses CPU because ORT 1.26's CUDA `MatMulNBits`
 execution is itself nondeterministic for this reduced hybrid fixture.
+`optimize.py` derives the recurrent-gate node exclusions from the exported
+decoder, so the validated package must be assembled through that script rather
+than a static Olive JSON recipe.
 
 BF16 export and package reload are valid Mobius outputs. The CUDA-12-compatible
 ORT 1.26 wheel used for this reduced-real run cannot initialize the BF16 hybrid
