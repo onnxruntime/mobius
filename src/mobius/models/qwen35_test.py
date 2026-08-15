@@ -126,3 +126,28 @@ class TestQwen35MoEQMoEExport:
             _INT,
         )
         assert not any("fc1_experts_weights" in k for k in out)
+
+    def test_unsupported_qmoe_quantization_with_packed_experts_raises(self):
+        """Packed quantized expert weights + an unsupported QMoE ABI must raise.
+
+        Regression test: ``group_size=24`` (not a power of two) makes
+        ``_supported_qmoe_quantization`` reject the config, so
+        ``preprocess_weights`` takes the dense-fallback branch. But that
+        branch's fused-tensor unfuser only knows how to split *unquantized*
+        float ``experts.gate_up_proj``/``experts.down_proj`` tensors -- there
+        is no code path that splits packed ``_qweight``/``_scales``/
+        ``_qzeros`` fused-expert tensors into per-expert quantized Linear
+        initializers. Previously this silently fell through to
+        ``cleaned[key] = value`` and produced a graph whose per-expert
+        Linear modules expect keys that were never generated.
+        """
+        config = _moe_config(
+            QuantizationConfig(bits=8, group_size=_BLK, quant_method="olive", sym=False)
+        )
+        model = Qwen35MoECausalLMModel(config)
+        try:
+            model.preprocess_weights(_olive_expert_state_dict())
+        except ValueError as e:
+            assert "QMoE ABI" in str(e)
+        else:
+            raise AssertionError("expected ValueError for unsupported QMoE + packed experts")

@@ -689,7 +689,9 @@ class TestPreprocessOliveWeights:
             )
         }
         with pytest.raises(ValueError, match="Olive embedding qweight must be uint8"):
-            preprocess_olive_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+            preprocess_olive_weights(
+                sd, bits=self.BITS, group_size=self.GROUP_SIZE, quantize_embeddings=True
+            )
 
     def test_embed_non_uint8_qzeros_raises(self):
         sd = {
@@ -698,7 +700,28 @@ class TestPreprocessOliveWeights:
             )
         }
         with pytest.raises(ValueError, match="Olive embedding qzeros must be uint8"):
-            preprocess_olive_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+            preprocess_olive_weights(
+                sd, bits=self.BITS, group_size=self.GROUP_SIZE, quantize_embeddings=True
+            )
+
+    def test_embed_qweight_with_quantize_embeddings_false_raises(self):
+        """quantize_embeddings=False must not silently accept a packed embedding key.
+
+        Regression test: previously this branch matched on key suffix alone
+        and ignored ``quantize_embeddings`` entirely, so a caller/config
+        mismatch (a packed embedding key present while the caller declares
+        the embedding float) would either sneak through unnoticed or, worse,
+        get incorrectly reshaped/renamed via the generic Linear branch.
+        """
+        sd = {
+            "model.embed_tokens.weight_qweight": torch.randint(
+                0, 255, (self.V, self.PACKED_K), dtype=torch.uint8
+            )
+        }
+        with pytest.raises(ValueError, match="quantize_embeddings=False"):
+            preprocess_olive_weights(
+                sd, bits=self.BITS, group_size=self.GROUP_SIZE, quantize_embeddings=False
+            )
 
     # --- Tied LM head synthesis ---
 

@@ -395,6 +395,40 @@ class Qwen35MoECausalLMModel(CausalLMModel):
         # instead of un-fusing into per-expert MLPs. Uses the same predicate
         # as MoELayer so the weights and the emitted graph never disagree.
         use_qmoe = _supported_qmoe_quantization(self.config.quantization) is not None
+        if not use_qmoe:
+            # The dense per-expert fallback (MoELayer.experts) only knows how
+            # to consume *unquantized* fused expert tensors -- the split
+            # below un-fuses a bare float [num_experts, ...] tensor into
+            # per-expert nn.Linear-shaped weights. If quantization produced
+            # packed Olive tensors here (suffixed "_qweight"/"_scales"/
+            # "_qzeros", see preprocess_olive_weights) but the quantization
+            # config doesn't match the native QMoE ABI, there is no code path
+            # that splits a *packed* fused expert tensor into per-expert
+            # quantized Linear initializers -- silently falling through would
+            # emit a graph whose per-expert Linear modules request
+            # "experts.N.{gate,up}_proj.weight_qweight" keys that were never
+            # produced, since the packed tensor stays fused under
+            # "experts.gate_up_proj_qweight" instead. Reject explicitly
+            # rather than emit an unloadable graph.
+            packed_expert_keys = [
+                key
+                for key in state_dict
+                if ".mlp.experts." in key
+                and any(key.endswith(suffix) for suffix in ("_qweight", "_scales", "_qzeros"))
+            ]
+            if packed_expert_keys:
+                raise ValueError(
+                    "Quantized MoE expert weights were found "
+                    f"(e.g. {packed_expert_keys[0]!r}) but this quantization "
+                    "config doesn't match the native QMoE ABI "
+                    "(_supported_qmoe_quantization returned None). The dense "
+                    "loop-over-experts fallback only supports unquantized "
+                    "fused expert tensors, not packed quantized ones -- "
+                    "there is no path to un-fuse a packed expert tensor into "
+                    "per-expert quantized Linear initializers. Use a "
+                    "QMoE-ABI-compatible quantization config (see "
+                    "_supported_qmoe_quantization) for MoE models instead."
+                )
         cleaned: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             if key.startswith(("mtp_", "mtp.")):

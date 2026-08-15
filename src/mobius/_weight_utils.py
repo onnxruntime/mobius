@@ -778,7 +778,25 @@ def preprocess_olive_weights(
         return f"{stem}.{dotted_name}"
 
     for key, value in state_dict.items():
-        if key.endswith("embed_tokens.weight_qweight"):
+        is_embed_qweight = key.endswith("embed_tokens.weight_qweight")
+        is_embed_qzeros = key.endswith("embed_tokens.weight_qzeros")
+        is_embed_scales = key.endswith("embed_tokens.weight_scales")
+        if (
+            is_embed_qweight or is_embed_qzeros or is_embed_scales
+        ) and not quantize_embeddings:
+            # These Olive keys only exist when the embedding table itself was
+            # quantized; ``quantize_embeddings=False`` means the caller
+            # expects a float embedding, so a packed embedding key showing up
+            # anyway indicates a caller/config mismatch rather than a case to
+            # silently reroute through the generic Linear renaming below
+            # (which would wrongly 3-D reshape ``qweight`` and break
+            # ``GatherBlockQuantized``'s 2-D contract).
+            raise ValueError(
+                f"Found packed embedding quantization key {key!r} but "
+                "quantize_embeddings=False; the caller's quantize_embeddings "
+                "flag doesn't match the state dict."
+            )
+        if is_embed_qweight and quantize_embeddings:
             # GatherBlockQuantized consumes the 2-D uint8 table directly, so
             # this keeps the ``qweight`` name (unlike MatMulNBits linears,
             # which rename to ``weight`` below).
@@ -792,13 +810,13 @@ def preprocess_olive_weights(
                     f"({value.shape[-1]}) must be divisible by blob_size ({blob_size})"
                 )
             result[key[: -len("weight_qweight")] + "qweight"] = value.contiguous()
-        elif key.endswith("embed_tokens.weight_qzeros"):
+        elif is_embed_qzeros and quantize_embeddings:
             if value.dtype != torch.uint8:
                 raise ValueError(
                     f"Olive embedding qzeros must be uint8 for {key}, got {value.dtype}"
                 )
             result[key[: -len("weight_qzeros")] + "zero_points"] = value.contiguous()
-        elif key.endswith("embed_tokens.weight_scales"):
+        elif is_embed_scales and quantize_embeddings:
             result[key[: -len("weight_scales")] + "scales"] = value
         elif key.endswith("_qweight"):
             if value.dtype != torch.uint8:
