@@ -407,10 +407,9 @@ def _assert_logits_close(
 
 def _save_package_assets(package_dir: Path) -> None:
     """Copy pinned processor metadata for the reduced token-ID-only package."""
-    from transformers import AutoProcessor, GenerationConfig
+    from transformers import AutoProcessor
 
     _reduced_hf_config().save_pretrained(package_dir)
-    GenerationConfig.from_pretrained(MODEL_ID, revision=REVISION).save_pretrained(package_dir)
     try:
         processor = AutoProcessor.from_pretrained(MODEL_ID, revision=REVISION)
         (package_dir / "processor_config.json").write_text(
@@ -497,6 +496,8 @@ def _save_variant(
         state, dtype_name=dtype_name, ep="cuda" if device == "cuda" else "cpu"
     )
     package_dir = output_root / f"{dtype_name}-{device}"
+    if package_dir.exists() and any(package_dir.iterdir()):
+        raise FileExistsError(f"Variant output must be empty: {package_dir}")
     package_dir.mkdir(parents=True, exist_ok=True)
     package.save(package_dir, external_data="onnx")
     _save_package_assets(package_dir)

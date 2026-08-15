@@ -7,8 +7,10 @@ one vision block, remapped image/video IDs, and no MTP tensors because the
 standard target forward does not consume the optional self-speculative drafter.
 Mobius exposes that drafter through the separate `qwen35-mtp` package contract.
 The reduced package is token-ID-only and deliberately omits the production
-tokenizer because its vocabulary is remapped to 256 entries. It retains the
-pinned image and video processor metadata for media-contract validation.
+tokenizer and generation config because its vocabulary and special-token IDs
+are remapped to 256 entries. It retains the pinned image and video processor
+metadata for media-contract validation. Each variant output directory must be
+empty so stale assets from an older recipe cannot enter the assembled package.
 
 ```powershell
 python examples/olive/qwen3_8-27b/validate_reduced_checkpoint.py --matrix f32-cpu f16-cuda
