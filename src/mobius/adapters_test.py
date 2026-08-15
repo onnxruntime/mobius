@@ -5,20 +5,32 @@
 
 from __future__ import annotations
 
+import json
+import shutil
+import uuid
+from pathlib import Path
+
 import numpy as np
 import onnx_ir as ir
 import pytest
+from safetensors.numpy import save_file
 
 from mobius import (
     AdapterApplication,
     AdapterArtifact,
     AdapterBatchSelection,
     AdapterRowSelection,
+    AdapterSource,
     AdapterTarget,
+    AdapterTargetDescriptor,
+    AdapterTargetManifest,
+    AdapterTargetSlice,
     AdapterWeights,
     ModelPackage,
+    adapter_source_from_onnx_adapter,
     compose_adapter_deltas,
     fingerprint_model_weights,
+    load_peft_adapter,
 )
 
 
@@ -30,7 +42,21 @@ def _model(weight: np.ndarray | None = None) -> ir.Model:
         type=ir.TensorType(ir.DataType.FLOAT),
         shape=ir.Shape(values.shape),
     )
-    graph = ir.Graph([], [], nodes=[], initializers=[initializer], name="adapter_test_model")
+    x = ir.val(
+        "hidden_states",
+        type=ir.TensorType(ir.DataType.FLOAT),
+        shape=ir.Shape([1, 4]),
+    )
+    projection = ir.Node("", "MatMul", [x, initializer], name="projection")
+    output = projection.outputs[0]
+    output.name = "projection.output"
+    graph = ir.Graph(
+        [x],
+        [output],
+        nodes=[projection],
+        initializers=[initializer],
+        name="adapter_test_model",
+    )
     return ir.Model(graph, ir_version=10)
 
 
@@ -61,6 +87,33 @@ def _artifact(model: ir.Model, name: str = "style") -> AdapterArtifact:
     )
 
 
+def _manifest(model: ir.Model, *, include_second: bool = False) -> AdapterTargetManifest:
+    targets = [
+        AdapterTargetDescriptor(
+            AdapterTarget("decoder", "projection.weight"),
+            semantic_name="layers.0.self_attn.q_proj",
+            node_name="projection",
+            output_name="projection.output",
+            input_size=4,
+            output_size=3,
+            layer_index=0,
+            slices=(AdapterTargetSlice("q", 0, 3, rank=2, alpha=4.0),),
+        )
+    ]
+    if include_second:
+        targets.append(
+            AdapterTargetDescriptor(
+                AdapterTarget("decoder", "other.weight"),
+                semantic_name="layers.0.self_attn.v_proj",
+                node_name="other",
+                output_name="other.output",
+                input_size=4,
+                output_size=3,
+            )
+        )
+    return AdapterTargetManifest(fingerprint_model_weights({"decoder": model}), tuple(targets))
+
+
 def test_artifact_validates_base_target_shape_dtype_and_checksum() -> None:
     model = _model()
     artifact = _artifact(model)
@@ -72,6 +125,29 @@ def test_artifact_validates_base_target_shape_dtype_and_checksum() -> None:
     changed = _model(np.ones((3, 4), dtype=np.float32))
     with pytest.raises(ValueError, match="base fingerprint mismatch"):
         artifact.validate_base({"decoder": changed})
+
+
+def test_authoritative_target_manifest_validates_exact_graph_binding() -> None:
+    model = _model()
+    manifest = _manifest(model)
+    manifest.validate({"decoder": model})
+    assert manifest.bindings == {AdapterTarget("decoder", "projection.weight")}
+
+    stale = AdapterTargetManifest(
+        manifest.base_fingerprint,
+        (
+            AdapterTargetDescriptor(
+                AdapterTarget("decoder", "projection.weight"),
+                "layers.0.self_attn.q_proj",
+                "projection",
+                "stale.output",
+                4,
+                3,
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="does not produce"):
+        stale.validate({"decoder": model})
 
 
 @pytest.mark.parametrize(
@@ -169,6 +245,7 @@ def test_compaction_preserves_semantic_rows_and_slot_reuse_uses_epoch() -> None:
     assert [row.row_id for row in compacted.rows] == [101, 100]
     assert compacted.rows[0].request_epoch == 5
     assert compacted.compact([1, 0]) == original
+    assert compacted.referenced_adapters == {"style", "speaker"}
 
     reused_slot = AdapterRowSelection(
         row_id=200,
@@ -181,15 +258,113 @@ def test_compaction_preserves_semantic_rows_and_slot_reuse_uses_epoch() -> None:
 def test_model_package_catalog_validates_and_rejects_duplicates() -> None:
     model = _model()
     artifact = _artifact(model)
-    package = ModelPackage({"decoder": model})
+    package = ModelPackage({"decoder": model}, adapter_target_manifest=_manifest(model))
     package.add_adapter_artifact(artifact)
     assert package.adapter_artifacts["style"] is artifact
+    assert artifact.nbytes == 56
 
     with pytest.raises(ValueError, match="already attached"):
         package.add_adapter_artifact(artifact)
 
     with pytest.raises(ValueError, match="checksum mismatch"):
         artifact.validate_checksum("sha256:" + "0" * 64)
+
+
+def test_model_package_requires_n_adapter_target_alignment() -> None:
+    model = _model()
+    other = ir.Value(
+        name="other.weight",
+        const_value=ir.tensor(np.ones((3, 4), dtype=np.float32)),
+        type=ir.TensorType(ir.DataType.FLOAT),
+        shape=ir.Shape([3, 4]),
+    )
+    x = model.graph.inputs[0]
+    node = ir.Node("", "MatMul", [x, other], name="other")
+    node.outputs[0].name = "other.output"
+    model.graph.append(node)
+    model.graph.initializers.add(other)
+    package = ModelPackage(
+        {"decoder": model}, adapter_target_manifest=_manifest(model, include_second=True)
+    )
+    package.add_adapter_artifact(_artifact(model, "style"))
+    second = AdapterArtifact(
+        "speaker",
+        fingerprint_model_weights({"decoder": model}),
+        (_weights(parameter="other.weight"),),
+    )
+    with pytest.raises(ValueError, match="does not align"):
+        package.add_adapter_artifact(second)
+
+
+def test_peft_migration_source_preserves_rank_alpha_and_provenance() -> None:
+    directory = Path("artifacts") / f"adapter-peft-test-{uuid.uuid4().hex}"
+    directory.mkdir(parents=True)
+    try:
+        config = {
+            "base_model_name_or_path": "synthetic/base",
+            "revision": "producer-fixture",
+            "r": 4,
+            "lora_alpha": 8.0,
+            "target_modules": ["q_proj"],
+            "rank_pattern": {"layers.0.self_attn.q_proj": 2},
+            "alpha_pattern": {"self_attn.q_proj": 6.0},
+        }
+        (directory / "adapter_config.json").write_text(json.dumps(config))
+        module = "base_model.model.layers.0.self_attn.q_proj"
+        a = np.arange(8, dtype=np.float32).reshape(2, 4)
+        b = np.arange(6, dtype=np.float32).reshape(3, 2)
+        save_file(
+            {
+                f"{module}.lora_A.weight": a,
+                f"{module}.lora_B.weight": b,
+            },
+            directory / "adapter_model.safetensors",
+        )
+        model = _model()
+        artifact = load_peft_adapter(
+            directory,
+            name="peft-style",
+            base_fingerprint=fingerprint_model_weights({"decoder": model}),
+            target_bindings={
+                "layers.0.self_attn.q_proj": AdapterTarget("decoder", "projection.weight")
+            },
+        )
+        artifact.validate_base({"decoder": model})
+        assert artifact.weights[0].rank == 2
+        assert artifact.weights[0].alpha == 6.0
+        assert artifact.source.format == "peft_safetensors"
+        assert artifact.source.base_model == "synthetic/base"
+        assert artifact.source.revision == "producer-fixture"
+        np.testing.assert_allclose(
+            artifact.weights[0].delta(), b @ a * 3.0, rtol=1e-6, atol=1e-6
+        )
+    finally:
+        shutil.rmtree(directory)
+
+
+def test_onnx_adapter_migration_source_is_optional_and_checksummed() -> None:
+    directory = Path("artifacts") / f"adapter-ort-test-{uuid.uuid4().hex}"
+    directory.mkdir(parents=True)
+    try:
+        path = directory / "style.onnx_adapter"
+        path.write_bytes(b"\x00\x00\x00\x00TORTsynthetic")
+        source = adapter_source_from_onnx_adapter(path)
+        assert source.format == "onnx_adapter"
+        assert source.checksum is not None
+        artifact = AdapterArtifact(
+            "style",
+            _artifact(_model()).base_fingerprint,
+            (_weights(),),
+            source=source,
+        )
+        assert artifact.source.path == str(path)
+    finally:
+        shutil.rmtree(directory)
+
+
+def test_adapter_source_rejects_unprovenanced_external_artifact() -> None:
+    with pytest.raises(ValueError, match="requires a path"):
+        AdapterSource("onnx_adapter")
 
 
 def test_selection_rejects_unknown_adapter_and_invalid_permutation() -> None:

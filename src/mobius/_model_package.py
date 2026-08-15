@@ -34,7 +34,7 @@ import torch
 import tqdm
 
 from mobius._optimizations import fold_initializers_after_weights
-from mobius.adapters import AdapterArtifact
+from mobius.adapters import AdapterArtifact, AdapterTargetManifest
 from mobius.generation import PolicyComponent
 from mobius.integrations._weight_loading import _assign_weight
 
@@ -55,10 +55,14 @@ class ModelPackage(UserDict[str, ir.Model]):
         config: object | None = None,
         policy_components: dict[str, PolicyComponent] | None = None,
         adapter_artifacts: dict[str, AdapterArtifact] | None = None,
+        adapter_target_manifest: AdapterTargetManifest | None = None,
     ) -> None:
         super().__init__(models or {})
         self.config = config
         self.policy_components = dict(policy_components or {})
+        self.adapter_target_manifest = adapter_target_manifest
+        if adapter_target_manifest is not None:
+            adapter_target_manifest.validate(self.data)
         self.adapter_artifacts: dict[str, AdapterArtifact] = {}
         for name, artifact in (adapter_artifacts or {}).items():
             if name != artifact.name:
@@ -217,6 +221,20 @@ class ModelPackage(UserDict[str, ir.Model]):
             raise ValueError(f"adapter artifact {artifact.name!r} is already attached")
         if validate_base:
             artifact.validate_base(self.data)
+        if self.adapter_target_manifest is not None:
+            missing = artifact.target_bindings - self.adapter_target_manifest.bindings
+            if missing:
+                raise ValueError(
+                    f"adapter artifact {artifact.name!r} contains targets outside "
+                    f"the authoritative manifest: {sorted(map(str, missing))}"
+                )
+            if self.adapter_artifacts:
+                expected = next(iter(self.adapter_artifacts.values())).target_bindings
+                if artifact.target_bindings != expected:
+                    raise ValueError(
+                        f"adapter artifact {artifact.name!r} target set does not align "
+                        "with the existing N-adapter catalog"
+                    )
         self.adapter_artifacts[artifact.name] = artifact
 
     def save_policy_components(
