@@ -69,16 +69,6 @@ __all__ = [
 __version__ = "0.1.0"
 
 from mobius import components, generation, models, tasks
-from mobius.adapters import (
-    AdapterApplication,
-    AdapterArtifact,
-    AdapterBatchSelection,
-    AdapterRowSelection,
-    AdapterTarget,
-    AdapterWeights,
-    compose_adapter_deltas,
-    fingerprint_model_weights,
-)
 from mobius._build_context import build_context, ep_capabilities, get_build_dtype
 from mobius._builder import build_from_module
 from mobius._configs import (
@@ -115,6 +105,16 @@ from mobius._registry import (
     ModelRegistration,
     ModelRegistry,
     registry,
+)
+from mobius.adapters import (
+    AdapterApplication,
+    AdapterArtifact,
+    AdapterBatchSelection,
+    AdapterRowSelection,
+    AdapterTarget,
+    AdapterWeights,
+    compose_adapter_deltas,
+    fingerprint_model_weights,
 )
 from mobius.integrations._weight_loading import apply_weights
 from mobius.integrations.diffusers import build_diffusers_pipeline

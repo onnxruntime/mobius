@@ -143,7 +143,7 @@ class AdapterArtifact:
 
     @property
     def checksum(self) -> str:
-        """Return a deterministic checksum covering bindings, metadata, and tensors."""
+        """Deterministic checksum covering bindings, metadata, and tensors."""
         digest = hashlib.sha256()
         digest.update(self.name.encode())
         digest.update(b"\0")
