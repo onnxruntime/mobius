@@ -96,6 +96,37 @@ output/
 └── genai_config.json
 ```
 
+### Direct GGUF import
+
+Direct GGUF conversion preserves supported quantization by default because the
+usual intent is a quantized ONNX model:
+
+```bash
+mobius build-gguf model.gguf --output output/
+```
+
+The equivalent API call is:
+
+```python
+from mobius import build_from_gguf
+
+package = build_from_gguf("model.gguf")
+```
+
+Use `mobius build-gguf model.gguf --dequantize` or
+`build_from_gguf("model.gguf", keep_quantized=False)` to request a fully float
+model. The older `--keep-quantized` CLI flag remains a compatibility alias for
+the default and must not be combined with `--dequantize`. F32-, F16-, and
+BF16-only GGUFs build through the float path because they have no quantized
+tensors to preserve.
+
+Preservation does not mean every source tensor remains byte-identical. In
+text-only builds, runtime-native IQ/MXFP4 projection blocks can retain their
+bytes. Supported affine blocks are repacked, but the conversion can be lossy
+for source types such as Q4_1 and Q4_K. Multimodal, mixed, or unsupported source
+qtypes may be dequantized and requantized or rejected. Apply the classification
+and acceptance checks below before making preservation claims.
+
 ### Direct GGUF import acceptance
 
 Do not infer a GGUF's quantization from its filename. Presets such as
@@ -110,9 +141,10 @@ Before implementing or claiming a direct conversion:
 3. Compare the layer schedule and tensor shapes with a separately pinned
    official config and safetensors headers. `block_count` may include auxiliary
    MTP/draft blocks rather than decoder backbone layers.
-4. Classify every large tensor as byte-preserved native blocks, lossless affine
-   repacking, or dequantize/requantize. If any large tensor takes the third
-   path, the conversion does **not** preserve the source quantization.
+4. Classify every large tensor as byte-preserved native blocks, affine
+   repacking (lossless or lossy, with numerical validation), or
+   dequantize/requantize. If any large tensor takes the third path, the
+   conversion does **not** preserve the source quantization.
 5. Reject split GGUF shards unless the importer explicitly assembles every
    shard. Reading one shard can build a plausible but incomplete model.
 6. Compare embedded tokenizer special-token IDs and chat template with the

@@ -514,12 +514,12 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         )
 
     mmproj_path = getattr(args, "mmproj", None)
+    keep_quantized = not args.dequantize
 
-    if args.keep_quantized:
-        print(
-            "Quantized mode: preserving GGUF quantization as "
-            "MatMulNBits/GatherBlockQuantized..."
-        )
+    if keep_quantized:
+        print("Preserving supported GGUF quantization (float-only inputs stay float)...")
+    else:
+        print("Dequantized mode: converting GGUF weights to float...")
 
     gguf_path = args.gguf_path
     output_dir = args.output or os.path.splitext(gguf_path)[0] + "_onnx"
@@ -536,7 +536,7 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         gguf_path,
         mmproj=mmproj_path,
         dtype=args.dtype,
-        keep_quantized=args.keep_quantized,
+        keep_quantized=keep_quantized,
         execution_provider=args.execution_provider,
         static_cache=args.static_cache,
         max_seq_len=args.max_seq_len,
@@ -831,12 +831,18 @@ def main(argv: list[str] | None = None) -> None:
             "Currently supports Gemma4 vision; audio is experimental."
         ),
     )
-    gguf_parser.add_argument(
+    quantization_group = gguf_parser.add_mutually_exclusive_group()
+    quantization_group.add_argument(
+        "--dequantize",
+        action="store_true",
+        help="Dequantize all GGUF weights to float instead of preserving quantization.",
+    )
+    quantization_group.add_argument(
         "--keep-quantized",
         action="store_true",
         help=(
-            "Preserve supported projection, output-head, and embedding "
-            "quantization via MatMulNBits/GatherBlockQuantized."
+            "Deprecated compatibility alias; supported GGUF quantization is "
+            "preserved by default."
         ),
     )
     gguf_parser.add_argument(

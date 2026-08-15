@@ -1,6 +1,6 @@
 # GGUF Support Proposal for mobius
 
-**Status**: Draft — awaiting go/no-go decision
+**Status**: Implemented; exploratory QDQ sections are retained as historical design context
 **Author**: Architect (Agent 029c7dd2)
 **Date**: 2026-02-27
 
@@ -13,13 +13,12 @@ Ollama, LM Studio, etc.). By supporting GGUF import, we let users bring
 quantized community models directly into the ONNX Runtime ecosystem without
 needing to find the original HuggingFace checkpoint.
 
-**Key insight**: We do NOT need to parse or dequantize GGUF weights
-ourselves. HuggingFace Transformers already has full GGUF loading support
-(`AutoModelForCausalLM.from_pretrained(repo, gguf_file=...)`) that
-dequantizes GGUF tensors to fp32 PyTorch state dicts. Our value-add is
-the **second path**: keeping weights quantized using either standard ONNX
-**QDQ** (DequantizeLinear + MatMul) for cross-runtime portability, or
-ORT's **MatMulNBits** for maximum ORT performance (see Section 8).
+**Implemented approach**: Mobius reads GGUF metadata and tensors directly.
+Supported affine weights are repacked for `MatMulNBits`; supported native
+IQ/MXFP4 blocks can remain byte-preserved in text-only builds; multimodal and
+mixed source qtypes can require dequantization/requantization. QDQ alternatives
+discussed in Section 8 are historical design exploration, not a currently
+selectable import format.
 
 ## 1. What is GGUF?
 
@@ -250,28 +249,20 @@ pkg.apply_weights(state_dict)
 
 #### 3.3.1 Quantization Format Mapping
 
-| GGUF Type | ORT Mapping | Approach |
-|-----------|-------------|----------|
-| `F32` | Standard `float32` | Direct copy |
-| `F16` | Standard `float16` | Direct copy |
-| `BF16` | Standard `bfloat16` | Direct copy |
-| `Q8_0` | `MatMulNBits(bits=8, block_size=32)` | Repack: extract scale + int8 data |
-| `Q4_0` | `MatMulNBits(bits=4, block_size=32)` | Repack: symmetric, no zero-point |
-| `Q4_1` | `MatMulNBits(bits=4, block_size=32)` | Repack: asymmetric, has zero-point |
-| `Q5_0` | Dequantize → `float16` | 5-bit not supported by MatMulNBits |
-| `Q5_1` | Dequantize → `float16` | 5-bit not supported by MatMulNBits |
-| `Q4_K` | `MatMulNBits(bits=4, block_size=32)` | Repack sub-blocks; super-block scale applied to sub-scales |
-| `Q5_K` | Dequantize → `float16` | 5-bit not supported |
-| `Q6_K` | Dequantize → `float16` | 6-bit not supported |
-| `Q2_K` | Dequantize → `float16` | 2-bit not supported |
-| `Q3_K` | Dequantize → `float16` | 3-bit not supported |
-| `IQ4_NL` | Dequantize → lookup → `MatMulNBits(4,32)` | Apply lookup table then repack |
-| `IQ4_XS` | Dequantize → lookup → `MatMulNBits(4,256)` | Apply lookup table then repack |
+| GGUF Type | Text-only default | Multimodal default |
+|-----------|-------------------|--------------------|
+| `F32`/`F16`/`BF16` | Float path (BF16 is decoded to float32) | Float path |
+| `Q8_0` | Exact affine repack to `MatMulNBits(8,32)` | Common affine target |
+| `Q4_0` | Exact affine repack to `MatMulNBits(4,32)` with explicit zero-point | Common affine target |
+| `Q4_1` | Affine repack with rounded integer zero-point (lossy) | Common affine target |
+| `Q4_K` | Dequantize/requantize to `MatMulNBits(4,32)` (lossy) | Common affine target |
+| `Q2_K`/`Q3_K`/`Q5_*`/`Q6_K` | Dequantize/requantize when the selected target is supported; otherwise reject | Dequantize/requantize to the common affine target |
+| Supported IQ/MXFP4 native blocks | Retain bytes for `BlockQuantizedMatMul` | Dequantize/requantize to the common affine target |
 
-**Key constraint**: ORT's `MatMulNBits` only supports 4-bit and 8-bit
-quantization. GGUF types that don't map cleanly (Q2_K, Q3_K, Q5_*,
-Q6_K) must be dequantized to fp16. This is a mixed-precision model —
-most layers at 4/8-bit, unsupported layers at fp16.
+**Key constraint**: preserving quantization does not imply preserving every
+source encoding. Only supported native blocks in text-only builds retain their
+bytes; other types are repacked, requantized, or rejected according to the
+selected common target.
 
 #### 3.3.2 Repacking Q4_0 to MatMulNBits
 
@@ -409,26 +400,25 @@ src/mobius/
 ### 4.2 Public API
 
 ```python
-# Phase 1: Dequantize path
 from mobius.integrations.gguf import build_from_gguf
 
+# Default: preserve supported quantization
 pkg = build_from_gguf("path/to/model.gguf")
-# Returns ModelPackage with fp32/fp16 ONNX model
+# Returns quantized ONNX ops when quantized tensors are present
 
-# Phase 2: Quantized path
-pkg = build_from_gguf("path/to/model.gguf", keep_quantized=True)
-# Returns ModelPackage with MatMulNBits ONNX model
+# Explicit float path
+pkg = build_from_gguf("path/to/model.gguf", keep_quantized=False)
+# Returns ModelPackage with fp32/fp16 ONNX model
 ```
 
 ### 4.3 CLI Integration
 
 ```bash
-# Phase 1
-mobius build --gguf path/to/model.gguf --output model.onnx
+# Default: preserve supported quantization
+mobius build-gguf path/to/model.gguf --output model-onnx/
 
-# Phase 2 (preserve quantization)
-mobius build --gguf path/to/model.gguf --keep-quantized \
-    --output model.onnx
+# Explicit float path
+mobius build-gguf path/to/model.gguf --dequantize --output model-float-onnx/
 ```
 
 ### 4.4 Integration with Existing Pipeline
@@ -796,9 +786,9 @@ the fp16/fp32 activation, `B` is the packed uint8 weight blob.
    control), AVX2/AVX512/VNNI CPU kernels. ORT's own quantization
    pipeline (GPTQ, AWQ, RTN) all target MatMulNBits.
 
-3. **Direct GGUF mapping**: Q4_0/Q4_1/Q8_0 block structure maps
-   directly to MatMulNBits' `(N, n_blocks, blob_size)` layout with
-   minimal repacking (extract scale, transpose, repack nibbles).
+3. **GGUF mapping**: Q4_0 and Q8_0 map exactly to MatMulNBits with
+   minimal repacking. Q4_1 uses the same target layout but rounds its
+   effective zero-point and is therefore lossy.
 
 4. **Proven in production**: mobius already uses
    `QuantizedLinear` (our existing component) which emits MatMulNBits.
@@ -821,34 +811,21 @@ the fp16/fp32 activation, `B` is the packed uint8 weight blob.
    runtime-specific checks.
 
 3. **Limited bit-widths**: Only 4 and 8-bit. No 2-bit, 3-bit, 5-bit,
-   6-bit. This means Q2_K, Q3_K, Q5_K, Q6_K GGUF types must all be
-   dequantized even in the "keep quantized" path.
+   6-bit. The importer can dequantize/requantize those source types into a
+   supported common target or reject an unsupported target.
 
 4. **No standard evolution path**: If ONNX standardizes a native fused
    quantized matmul op, MatMulNBits models won't benefit automatically.
    Migration would require graph rewriting.
 
-### 8.5 GGUF Type → ONNX Representation Mapping
+### 8.5 GGUF Type → Implemented ONNX Representation
 
-| GGUF Type | QDQ Mapping | MatMulNBits Mapping | Recommended |
-|---|---|---|---|
-| `F32`/`F16`/`BF16` | N/A (use as-is) | N/A (use as-is) | Standard fp ops |
-| **`Q4_0`** | DQ(int4, scale, block=32) sym | MMNB(bits=4, block=32) sym | **Both work cleanly** |
-| **`Q4_1`** | DQ(uint4, scale+zp, block=32) asym | MMNB(bits=4, block=32) + zp | **Both work cleanly** |
-| **`Q8_0`** | DQ(int8, scale, block=32) sym | MMNB(bits=8, block=32) sym | **Both work cleanly** |
-| `Q5_0`/`Q5_1` | DQ(int8, ...) with 5→8 padding | ❌ Must dequantize | QDQ with int8 or dequantize |
-| `Q4_K` | DQ(int4, flattened_scale, block=32) | MMNB(4,32) + flattened scale | Both lossy, QDQ preferred |
-| `Q5_K` | DQ(int8, flattened_scale, block=32) | ❌ Must dequantize | QDQ with int8 or dequantize |
-| `Q6_K` | DQ(int8, flattened_scale, block=32) | ❌ Must dequantize | QDQ with int8 or dequantize |
-| `Q2_K` | DQ(int4, ...) lossy 2→4 promotion | ❌ Must dequantize | Dequantize to fp16 |
-| `Q3_K` | DQ(int4, ...) lossy 3→4 promotion | ❌ Must dequantize | Dequantize to fp16 |
-| `IQ4_NL` | ❌ Non-linear, no QDQ mapping | ❌ Non-linear | **Dequantize only** |
-| `IQ4_XS` | ❌ Non-linear, no QDQ mapping | ❌ Non-linear | **Dequantize only** |
-
-**Key insight**: Q4_0, Q4_1, and Q8_0 are the only GGUF types that map
-cleanly to _both_ representations. These are also the simplest and most
-common non-K-quant types. Q4_K (the most popular K-quant) requires
-lossy super-block flattening regardless of representation.
+The implemented mapping is summarized in
+[Section 3.3.1](#331-quantization-format-mapping). In particular, Q4_1 rounds
+its effective zero-point, Q4_K uses lossy dequantize/requantize, and supported
+IQ/MXFP4 blocks are byte-retained only for text-only
+`BlockQuantizedMatMul` builds. Multimodal builds normalize quantized text
+projections to a common affine `MatMulNBits` target.
 
 ### 8.6 Limitations of Both Representations
 
@@ -877,51 +854,31 @@ Neither QDQ nor MatMulNBits can natively represent:
    promotion to int8 (wasting storage), but there's no native 5-bit or
    6-bit ONNX type. MatMulNBits doesn't support these at all.
 
-### 8.7 Recommendation: Dual-Path Strategy
+### 8.7 Implemented Direct-Import Policy
 
-We recommend **QDQ as the primary representation** with **MatMulNBits
-as an ORT-specific optimization option**:
+Direct GGUF import preserves supported quantization by default, with an
+explicit fully float path:
 
 ```python
-# Default: portable QDQ model (works everywhere)
-pkg = build_from_gguf("model.gguf", keep_quantized=True)
+# Default: preserve supported quantization
+pkg = build_from_gguf("model.gguf")
 
-# ORT-optimized: MatMulNBits model (best ORT performance)
-pkg = build_from_gguf("model.gguf", keep_quantized=True,
-                       quant_format="matmulnbits")
+# Explicitly dequantize all weights
+pkg = build_from_gguf("model.gguf", keep_quantized=False)
 ```
 
-**Rationale**:
+The quantized path is classified per tensor: supported affine blocks are
+repacked for `MatMulNBits`; in text-only builds, supported native IQ/MXFP4
+projection blocks retain their bytes for `BlockQuantizedMatMul`; and multimodal
+or mixed source qtypes may require dequantization/requantization or produce a
+clear unsupported-layout error. F32-, F16-, and BF16-only files use the float
+path automatically because there is no quantization to preserve.
 
-1. **QDQ first** because portability is the primary value proposition
-   of ONNX. If a user converts GGUF → ONNX but can only run on ORT,
-   we've reduced the value of the conversion (they could use llama.cpp
-   directly). QDQ unlocks TensorRT, OpenVINO, QNN — the real
-   differentiator.
+### 8.8 Historical Alternative: QDQLinear (Not Implemented)
 
-2. **MatMulNBits as opt-in** for users who know they're targeting ORT
-   and want guaranteed fused-kernel performance without relying on EP
-   fusion. This is our existing `QuantizedLinear` component — zero new
-   code for the graph construction side.
-
-3. **Rewrite rule** (future): A `QDQ_to_MatMulNBits` rewrite rule could
-   convert QDQ models to MatMulNBits for ORT deployment, decoupling the
-   "how we represent" question from "how we export." This is consistent
-   with our rewrite rule architecture.
-
-**Implementation impact on Path B phasing**:
-
-| Phase | Path B: Keep Quantized |
-|---|---|
-| Phase 2a | QDQ for Q4_0/Q4_1/Q8_0 (clean mapping, portable) |
-| Phase 2b | MatMulNBits alternative via `quant_format=` flag |
-| Phase 2c | QDQ for Q4_K (flattened super-blocks, lossy but usable) |
-| Phase 3 | Q5_K/Q6_K via QDQ int8 promotion (storage-inefficient) |
-
-### 8.8 New Component: QDQLinear
-
-To support the QDQ path, we need a `QDQLinear` component alongside the
-existing `QuantizedLinear` (MatMulNBits):
+The proposal considered a `QDQLinear` component alongside the existing
+`QuantizedLinear` (MatMulNBits), but direct GGUF import does not currently
+implement or expose this path:
 
 ```python
 class QDQLinear(nn.Module):
@@ -1041,15 +998,15 @@ variant.
 
 ### 8.10 Summary Decision Matrix
 
-| Scenario | Recommended Representation |
+| Scenario | Implemented representation |
 |---|---|
-| GGUF Q4_0/Q8_0 → portable ONNX | **QDQ** (DequantizeLinear + MatMul) |
-| GGUF Q4_0/Q8_0 → ORT-only deployment | **MatMulNBits** (maximum perf) |
-| GGUF Q4_K → any runtime | **QDQ** with flattened scales (lossy) |
-| GGUF Q5_*/Q6_K → any runtime | **Dequantize to fp16** (no clean quantized mapping) |
-| GGUF IQ4_* → any runtime | **Dequantize to fp16** (non-linear) |
-| GPTQ/AWQ models (existing) | **MatMulNBits** (status quo, works well) |
-| New quantization methods | **QDQ first**, MatMulNBits rewrite rule |
+| F32/F16/BF16-only GGUF | Float import path |
+| Q4_0/Q8_0 text-only GGUF | Exact affine repack to `MatMulNBits` |
+| Q4_1 text-only GGUF | Lossy affine repack to `MatMulNBits` |
+| Q4_K or mixed affine GGUF | Dequantize/requantize to a supported common target, or reject |
+| Supported IQ/MXFP4 text-only GGUF | Byte-retained `BlockQuantizedMatMul` |
+| Supported IQ/MXFP4 multimodal text backbone | Dequantize/requantize to common `MatMulNBits` target |
+| `keep_quantized=False` / `--dequantize` | Fully float import path |
 
 ## 9. Risk Analysis
 
@@ -1060,7 +1017,7 @@ variant.
 | K-quant repacking precision loss | Medium | Benchmark perplexity: GGUF-direct vs GGUF→ONNX. Accept if <0.5 PPL increase. |
 | `gguf` package API instability | Low | Pin to `>=0.10.0`, use only stable APIs (`GGUFReader`, `dequantize`). |
 | Architecture coverage gaps | Low | Start with Llama (90% of GGUF models). Add others incrementally. |
-| QDQ INT4 EP fusion gaps | Medium | Benchmark QDQ vs MatMulNBits per-EP; provide `quant_format` flag for user choice. |
+| Runtime support for emitted quantized ops | Medium | Downstream runtimes decide support for `MatMulNBits`, `GatherBlockQuantized`, and `BlockQuantizedMatMul`; Mobius does not add a model/runtime gate. |
 | Tensor permutation bugs | Medium | Validate against HF's GGUF loading (they've battle-tested these transforms). |
 
 ### 9.2 Product Risks

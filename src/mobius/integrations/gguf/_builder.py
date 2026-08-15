@@ -4,15 +4,14 @@
 """GGUF → ONNX build pipeline.
 
 Converts ``.gguf`` model files to ONNX using the standard build
-pipeline.  Two modes:
-
-- **Dequantized** (default): All quantized tensors are dequantized to
-  float.  Simple, but loses the compression benefit of quantization.
-- **Quantized** (``keep_quantized=True``): Affine linear-layer weights are
-  repacked into MatMulNBits format and token embeddings into
-  GatherBlockQuantized format. Runtime-supported native IQ/MXFP4 projection
-  blocks are preserved for BlockQuantizedMatMul. Mixed presets such as Q4_K_M are
-  normalized to one affine layout. Other tensors are dequantized.
+pipeline. Quantized preservation is the default: affine linear-layer weights
+are repacked into MatMulNBits format and token embeddings into
+GatherBlockQuantized format. For text-only builds, runtime-supported native
+IQ/MXFP4 projection blocks are preserved for BlockQuantizedMatMul. Multimodal
+text backbones and mixed presets such as Q4_K_M are normalized to one affine
+layout, so not every source tensor is byte-preserved. Other tensors are
+dequantized. Set ``keep_quantized=False`` to dequantize all weights to float
+explicitly.
 """
 
 from __future__ import annotations
@@ -246,7 +245,7 @@ def build_from_gguf(
     *,
     task: str | None = None,
     dtype: str | None = None,
-    keep_quantized: bool = False,
+    keep_quantized: bool = True,
     execution_provider: str = "default",
     mmproj: str | Path | None = None,
     static_cache: bool = False,
@@ -263,9 +262,12 @@ def build_from_gguf(
     7. Run ``preprocess_weights()`` (HF → ONNX name mapping)
     8. Apply weights to the ONNX model
 
-    When *keep_quantized* is ``True``, supported affine tensors are repacked
-    into MatMulNBits format, while runtime-supported native IQ/MXFP4 projection
-    blocks are retained byte-for-byte for BlockQuantizedMatMul.
+    By default, supported affine tensors are repacked into MatMulNBits format.
+    For text-only builds, runtime-supported native IQ/MXFP4 projection blocks
+    are retained byte-for-byte for BlockQuantizedMatMul. Multimodal text
+    backbones normalize quantized projections to a common affine layout. GGUFs
+    containing only F32, F16, or BF16 weights use the float path because there
+    is no quantization to preserve.
 
     Args:
         gguf_path: Path to the ``.gguf`` file, *or* a HuggingFace Hub
@@ -279,9 +281,12 @@ def build_from_gguf(
             model type.
         dtype: Override model dtype (e.g. ``"f16"``). When ``None``,
             defaults to float32.
-        keep_quantized: When ``True``, preserve quantized linear-layer
-            weights in MatMulNBits format. Mixed Q4_K_M source types are
-            normalized to 4-bit, block-32 weights.
+        keep_quantized: Preserve quantization when quantized tensors are
+            present. This is the default. Supported affine blocks are repacked,
+            text-only runtime-supported native IQ/MXFP4 projection blocks
+            retain their bytes, and mixed or multimodal source types can be
+            normalized to a common affine layout. Set to ``False`` to
+            dequantize all weights.
         execution_provider: Target execution provider for EP-aware
             optimisations (e.g. ``"cpu"`` to apply the
             GroupQueryAttention rewrite). Defaults to ``"default"``
@@ -358,6 +363,9 @@ def build_from_gguf(
     _validate_gguf_model(gguf_model, source=str(gguf_path))
     gguf_arch = gguf_model.architecture
     logger.info("Loaded GGUF file: %s (arch=%s)", gguf_path, gguf_arch)
+    preserve_quantization = keep_quantized and _has_quantized_weights(gguf_model, gguf_arch)
+    if keep_quantized and not preserve_quantization:
+        logger.info("GGUF contains no mapped quantized weights; using the float import path")
 
     # 2. Extract config from GGUF metadata
     config = gguf_to_config(gguf_model)
@@ -371,7 +379,7 @@ def build_from_gguf(
             config = dataclasses.replace(config, dtype=resolved)
 
     # 3. Quantized path: detect dominant type and set config
-    if keep_quantized:
+    if preserve_quantization:
         from mobius._configs import QuantizationConfig
         from mobius._flags import flags
         from mobius.integrations.gguf._tencent_q1_0 import is_tencent_q1_0_layout
@@ -428,7 +436,7 @@ def build_from_gguf(
 
     # 5. Build ONNX graph
     module = module_class(config)
-    if keep_quantized:
+    if preserve_quantization:
         _replace_native_block_linears(module, gguf_model, gguf_arch)
     pkg = build_from_module(
         module, config, resolved_task, execution_provider=execution_provider
@@ -440,7 +448,7 @@ def build_from_gguf(
     )
 
     # 6. Load tensors from GGUF → state_dict
-    if keep_quantized:
+    if preserve_quantization:
         state_dict = _load_quantized_state_dict(gguf_model, gguf_arch, module, config)
     else:
         state_dict = _load_dequantized_state_dict(gguf_model, gguf_arch)
@@ -454,7 +462,7 @@ def build_from_gguf(
     # For the quantized path, only float tensors go through
     # process_tensors; quantized Q/K tensors were permuted in
     # _load_quantized_state_dict already.
-    if keep_quantized:
+    if preserve_quantization:
         float_keys = {
             k
             for k in state_dict
@@ -668,6 +676,28 @@ def _normalize_gguf_weights(
         result[key] = value
 
     return result
+
+
+def _has_quantized_weights(gguf_model, gguf_arch: str) -> bool:
+    """Return whether a GGUF has mapped weights with a quantized tensor type."""
+    from gguf import GGMLQuantizationType
+
+    from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
+
+    float_types = {
+        GGMLQuantizationType.F32,
+        GGMLQuantizationType.F16,
+        GGMLQuantizationType.BF16,
+    }
+    f64_type = getattr(GGMLQuantizationType, "F64", None)
+    if f64_type is not None:
+        float_types.add(f64_type)
+
+    for name, _raw, qtype, _shape in gguf_model.tensor_items_raw():
+        hf_name = map_gguf_to_hf_names(name, gguf_arch)
+        if hf_name is not None and hf_name.endswith(".weight") and qtype not in float_types:
+            return True
+    return False
 
 
 def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:

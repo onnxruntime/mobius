@@ -299,6 +299,14 @@ class TestKeepQuantizedMixedPrecision:
     builder uses, without needing a full quantized text GGUF.
     """
 
+    def test_multimodal_builder_preserves_quantization_by_default(self):
+        import inspect
+
+        from mobius.integrations.gguf import build_gemma4_vlm_from_gguf
+
+        parameter = inspect.signature(build_gemma4_vlm_from_gguf).parameters["keep_quantized"]
+        assert parameter.default is True
+
     def test_decoder_and_embedding_quantized_vision_stays_float(self, clip_mmproj_gguf: Path):
         import dataclasses
 

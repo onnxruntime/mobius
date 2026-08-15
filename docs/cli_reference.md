@@ -291,6 +291,9 @@ mobius build --model Qwen/Qwen2.5-0.5B output_dir/ \
 ## `mobius build-gguf`
 
 Build an ONNX model from a GGUF file (e.g. from llama.cpp).
+Supported GGUF quantization is preserved by default. This can involve
+byte-preserving native blocks in text-only builds, affine repacking, or
+dequantize/requantize for multimodal and mixed source qtypes.
 
 > **Note**: Requires the optional `gguf` package: `pip install mobius-onnx[gguf]`
 
@@ -311,7 +314,8 @@ mobius build-gguf GGUF_PATH [options]
 | Option | Description |
 |--------|-------------|
 | `--output DIR`, `-o DIR` | Output directory. Default: `<gguf_stem>_onnx/`. |
-| `--keep-quantized` | Preserve supported affine blocks as `MatMulNBits` and supported native IQ/MXFP4 blocks. Mixed presets may still require requantization. |
+| `--dequantize` | Explicitly dequantize all GGUF weights to float. |
+| `--keep-quantized` | Deprecated compatibility alias for the default quantization-preserving behavior. Cannot be combined with `--dequantize`. |
 | `--dtype DTYPE` | Target dtype for model weights: `f16`, `bf16`, `f32`. |
 | `--external-data FORMAT` | External data format: `onnx` (default) or `safetensors`. |
 | `--ep EP` | Target execution provider for EP-aware optimization. |
@@ -322,15 +326,18 @@ mobius build-gguf GGUF_PATH [options]
 ### Examples
 
 ```bash
-# Basic GGUF conversion
+# Basic GGUF conversion (preserves supported quantization)
 mobius build-gguf model.gguf --output output/
 
-# Preserve quantization
-mobius build-gguf model.gguf --output output/ --keep-quantized
+# Explicitly dequantize all weights
+mobius build-gguf model.gguf --output output-float/ --dequantize
 
 # Convert with specific dtype
 mobius build-gguf model.gguf --output output/ --dtype f16
 ```
+
+F32-, F16-, and BF16-only files build normally as float models because they
+contain no quantization to preserve.
 
 Sharded GGUF inputs are rejected because a single shard has an incomplete
 tensor table. `nemotron_h_moe` is also rejected until its MTP block, Mamba2
