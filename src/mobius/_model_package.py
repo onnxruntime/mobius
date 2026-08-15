@@ -34,6 +34,7 @@ import torch
 import tqdm
 
 from mobius._optimizations import fold_initializers_after_weights
+from mobius.adapters import AdapterArtifact
 from mobius.generation import PolicyComponent
 from mobius.integrations._weight_loading import _assign_weight
 
@@ -53,10 +54,19 @@ class ModelPackage(UserDict[str, ir.Model]):
         models: dict[str, ir.Model] | None = None,
         config: object | None = None,
         policy_components: dict[str, PolicyComponent] | None = None,
+        adapter_artifacts: dict[str, AdapterArtifact] | None = None,
     ) -> None:
         super().__init__(models or {})
         self.config = config
         self.policy_components = dict(policy_components or {})
+        self.adapter_artifacts: dict[str, AdapterArtifact] = {}
+        for name, artifact in (adapter_artifacts or {}).items():
+            if name != artifact.name:
+                raise ValueError(
+                    f"adapter catalog key {name!r} does not match artifact name "
+                    f"{artifact.name!r}"
+                )
+            self.add_adapter_artifact(artifact)
 
     def __repr__(self) -> str:
         names = ", ".join(repr(k) for k in self.data)
@@ -194,6 +204,20 @@ class ModelPackage(UserDict[str, ir.Model]):
         if not name or "/" in name or "\\" in name:
             raise ValueError("Policy component name must be a non-empty path segment")
         self.policy_components[name] = component
+
+    def add_adapter_artifact(
+        self, artifact: AdapterArtifact, *, validate_base: bool = True
+    ) -> None:
+        """Attach a model-agnostic adapter artifact to this package.
+
+        Persistence and ONNX GenAI metadata emission intentionally remain separate
+        until the runtime artifact/schema contract is finalized.
+        """
+        if artifact.name in self.adapter_artifacts:
+            raise ValueError(f"adapter artifact {artifact.name!r} is already attached")
+        if validate_base:
+            artifact.validate_base(self.data)
+        self.adapter_artifacts[artifact.name] = artifact
 
     def save_policy_components(
         self,

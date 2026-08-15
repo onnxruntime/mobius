@@ -5,6 +5,12 @@ from __future__ import annotations
 
 __all__ = [
     "ArchitectureConfig",
+    "AdapterApplication",
+    "AdapterArtifact",
+    "AdapterBatchSelection",
+    "AdapterRowSelection",
+    "AdapterTarget",
+    "AdapterWeights",
     "AudioConfig",
     "BaseModelConfig",
     "CausalLMConfig",
@@ -44,9 +50,11 @@ __all__ = [
     "build_from_gguf",
     "build_from_module",
     "build_from_nemo",
+    "compose_adapter_deltas",
     "components",
     "ep_capabilities",
     "ep_registry",
+    "fingerprint_model_weights",
     "generation",
     "get_build_dtype",
     "get_ep",
@@ -61,6 +69,16 @@ __all__ = [
 __version__ = "0.1.0"
 
 from mobius import components, generation, models, tasks
+from mobius.adapters import (
+    AdapterApplication,
+    AdapterArtifact,
+    AdapterBatchSelection,
+    AdapterRowSelection,
+    AdapterTarget,
+    AdapterWeights,
+    compose_adapter_deltas,
+    fingerprint_model_weights,
+)
 from mobius._build_context import build_context, ep_capabilities, get_build_dtype
 from mobius._builder import build_from_module
 from mobius._configs import (
