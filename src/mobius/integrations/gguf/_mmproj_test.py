@@ -214,7 +214,7 @@ def clip_mmproj_gguf(tmp_path: Path) -> Path:
 
 
 class TestMultimodalPreflightGuards:
-    def test_rejects_unsupported_text_architecture_before_config(
+    def test_validates_text_adapter_before_resolving_mmproj(
         self,
         tmp_path: Path,
     ):
@@ -228,7 +228,7 @@ class TestMultimodalPreflightGuards:
                 "mobius.integrations.gguf._mmproj._resolve_local_path",
                 side_effect=[str(text_path)],
             ) as resolve,
-            pytest.raises(NotImplementedError, match="nemotron_h_moe"),
+            pytest.raises(ValueError, match="missing metadata 'block_count'"),
         ):
             build_gemma4_vlm_from_gguf(text_path, "owner/repo:mmproj.gguf")
 

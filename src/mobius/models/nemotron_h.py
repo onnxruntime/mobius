@@ -43,13 +43,28 @@ from mobius.components import (
     Embedding,
     Linear,
     Mamba2Block,
+    QuantizedEmbedding,
     RMSNorm,
     create_padding_mask,
+    make_quantized_linear_factory,
 )
 
 # ---------------------------------------------------------------------------
 # Decoder layers
 # ---------------------------------------------------------------------------
+
+
+def _quantized_linear_class(config: NemotronHConfig) -> type | None:
+    quantization = config.quantization
+    if quantization is None or quantization.quant_method == "none":
+        return None
+    zero_point_dtype = config.dtype if quantization.float_zero_point else ir.DataType.UINT8
+    return make_quantized_linear_factory(
+        bits=quantization.bits,
+        block_size=quantization.group_size,
+        has_zero_point=not quantization.sym,
+        zero_point_dtype=zero_point_dtype,
+    )
 
 
 class NemotronHMambaLayer(nn.Module):
@@ -61,7 +76,7 @@ class NemotronHMambaLayer(nn.Module):
         config: NemotronH architecture config.
     """
 
-    def __init__(self, config: NemotronHConfig):
+    def __init__(self, config: NemotronHConfig, linear_class: type | None = None):
         super().__init__()
         # d_inner = num_heads * head_dim (not hidden_size * expand)
         d_inner = config.mamba_n_heads * config.mamba_d_head
@@ -81,6 +96,7 @@ class NemotronHMambaLayer(nn.Module):
             # group of heads_per_group * head_dim dimensions.
             norm_group_size=d_inner // config.mamba_n_groups,
             time_step_min=config.mamba_time_step_min,
+            linear_class=linear_class,
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -121,9 +137,9 @@ class NemotronHAttentionLayer(nn.Module):
         config: NemotronH architecture config.
     """
 
-    def __init__(self, config: NemotronHConfig):
+    def __init__(self, config: NemotronHConfig, linear_class: type | None = None):
         super().__init__()
-        self.self_attn = Attention(config)
+        self.self_attn = Attention(config, linear_class=linear_class)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -159,13 +175,14 @@ class NemotronHMLPLayer(nn.Module):
         config: NemotronH architecture config.
     """
 
-    def __init__(self, config: NemotronHConfig):
+    def __init__(self, config: NemotronHConfig, linear_class: type | None = None):
         super().__init__()
         self.mlp = FCMLP(
             config.hidden_size,
             config.intermediate_size,
             activation=config.hidden_act,
             bias=config.mlp_bias,
+            linear_class=linear_class,
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -293,7 +310,7 @@ class NemotronHMoEBlock(nn.Module):
     HuggingFace reference: ``NemotronHMoE``.
     """
 
-    def __init__(self, config: NemotronHConfig):
+    def __init__(self, config: NemotronHConfig, linear_class: type | None = None):
         super().__init__()
         assert config.num_local_experts is not None
         assert config.num_experts_per_tok is not None
@@ -322,6 +339,7 @@ class NemotronHMoEBlock(nn.Module):
                     config.moe_intermediate_size,
                     activation=config.hidden_act,
                     bias=config.mlp_bias,
+                    linear_class=linear_class,
                 )
                 for _ in range(num_experts)
             ]
@@ -336,18 +354,20 @@ class NemotronHMoEBlock(nn.Module):
             shared_intermediate,
             activation=config.hidden_act,
             bias=config.mlp_bias,
+            linear_class=linear_class,
         )
 
         # Optional latent projection (e.g. 120B: 4096 → 1024 → experts
         # → 1024 → 4096)
         self._has_latent = config.moe_latent_size is not None
         if self._has_latent:
-            self.fc1_latent_proj = Linear(
+            latent_linear_class = linear_class or Linear
+            self.fc1_latent_proj = latent_linear_class(
                 config.hidden_size,
                 config.moe_latent_size,
                 bias=config.mlp_bias,
             )
-            self.fc2_latent_proj = Linear(
+            self.fc2_latent_proj = latent_linear_class(
                 config.moe_latent_size,
                 config.hidden_size,
                 bias=config.mlp_bias,
@@ -404,9 +424,9 @@ class NemotronHMoELayer(nn.Module):
         config: NemotronH architecture config.
     """
 
-    def __init__(self, config: NemotronHConfig):
+    def __init__(self, config: NemotronHConfig, linear_class: type | None = None):
         super().__init__()
-        self.moe = NemotronHMoEBlock(config)
+        self.moe = NemotronHMoEBlock(config, linear_class=linear_class)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -450,22 +470,34 @@ class _NemotronHTextModel(nn.Module):
     def __init__(self, config: NemotronHConfig):
         super().__init__()
         self._dtype = config.dtype
-        self.embed_tokens = Embedding(
-            config.vocab_size, config.hidden_size, config.pad_token_id
-        )
+        linear_class = _quantized_linear_class(config)
+        quantization = config.quantization
+        if quantization is not None and quantization.quantize_embeddings:
+            self.embed_tokens = QuantizedEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                bits=quantization.bits,
+                block_size=quantization.group_size,
+                has_zero_point=not quantization.sym,
+                padding_idx=config.pad_token_id,
+            )
+        else:
+            self.embed_tokens = Embedding(
+                config.vocab_size, config.hidden_size, config.pad_token_id
+            )
 
         layer_types = config.layer_types or []
         self.layers = nn.ModuleList([])
         for i in range(config.num_hidden_layers):
             ltype = layer_types[i] if i < len(layer_types) else "full_attention"
             if ltype == "mamba2":
-                self.layers.append(NemotronHMambaLayer(config))
+                self.layers.append(NemotronHMambaLayer(config, linear_class=linear_class))
             elif ltype == "mlp":
-                self.layers.append(NemotronHMLPLayer(config))
+                self.layers.append(NemotronHMLPLayer(config, linear_class=linear_class))
             elif ltype == "moe":
-                self.layers.append(NemotronHMoELayer(config))
+                self.layers.append(NemotronHMoELayer(config, linear_class=linear_class))
             else:
-                self.layers.append(NemotronHAttentionLayer(config))
+                self.layers.append(NemotronHAttentionLayer(config, linear_class=linear_class))
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -530,8 +562,16 @@ class NemotronHCausalLMModel(nn.Module):
             )
         self.config = config
         self.model = _NemotronHTextModel(config)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
-        if config.tie_word_embeddings:
+        quantization = config.quantization
+        if quantization is not None and quantization.quantize_lm_head:
+            linear_class = _quantized_linear_class(config)
+            assert linear_class is not None
+            self.lm_head = linear_class(config.hidden_size, config.vocab_size, bias=False)
+        else:
+            self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings and not (
+            quantization is not None and quantization.quantize_embeddings
+        ):
             self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(

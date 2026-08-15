@@ -21,19 +21,114 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
+
+# Mistral/Pixtral's Unicode-aware split expression.  This is the expression
+# serialized by NVIDIA's Nemotron 3.5 Lightning tokenizer.json.
+_PIXTRAL_GPT2_SPLIT_REGEX = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*"
+    r"|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+
+
+def _is_pixtral_gpt2_profile(metadata: dict[str, Any]) -> bool:
+    """Whether GGUF metadata needs the strict Pixtral/GPT-2 BPE profile."""
+    return (
+        metadata.get("tokenizer.ggml.model"),
+        metadata.get("tokenizer.ggml.pre"),
+    ) == ("gpt2", "pixtral")
+
+
+def _reconstruct_pixtral_gpt2_tokenizer(
+    metadata: dict[str, Any], output_dir: str | Path
+) -> str:
+    """Reconstruct the exact ByteLevel BPE tokenizer used by Nemotron Lightning.
+
+    GGUF token types distinguish control tokens from user-defined tokens.
+    Tokenizers must expose the former as special and the latter as ordinary
+    added tokens; treating both as special changes chat-template tokenization.
+    """
+    from tokenizers import AddedToken, Regex, Tokenizer, decoders, pre_tokenizers, processors
+    from tokenizers.models import BPE
+
+    tokens = metadata.get("tokenizer.ggml.tokens")
+    merges_raw = metadata.get("tokenizer.ggml.merges")
+    token_types = metadata.get("tokenizer.ggml.token_type")
+    if not isinstance(tokens, list) or not tokens:
+        raise ValueError("Pixtral/GPT-2 GGUF tokenizer is missing tokenizer.ggml.tokens.")
+    if not isinstance(merges_raw, list) or not merges_raw:
+        raise ValueError("Pixtral/GPT-2 GGUF tokenizer is missing tokenizer.ggml.merges.")
+    if not isinstance(token_types, list) or len(token_types) != len(tokens):
+        raise ValueError(
+            "Pixtral/GPT-2 GGUF tokenizer requires tokenizer.ggml.token_type for every token."
+        )
+    if not all(
+        isinstance(token_type, int) and token_type in (1, 3, 4) for token_type in token_types
+    ):
+        raise ValueError("Pixtral/GPT-2 GGUF tokenizer contains an unsupported token type.")
+    if not all(isinstance(token, str) for token in tokens):
+        raise ValueError("Pixtral/GPT-2 GGUF tokenizer contains a non-string token.")
+    if len(set(tokens)) != len(tokens):
+        raise ValueError("Pixtral/GPT-2 GGUF tokenizer contains duplicate tokens.")
+
+    merges: list[tuple[str, str]] = []
+    for merge in merges_raw:
+        if not isinstance(merge, str):
+            raise ValueError(  # noqa: TRY004 - malformed GGUF metadata is a value error.
+                "Pixtral/GPT-2 GGUF tokenizer contains a non-string merge."
+            )
+        parts = merge.split(" ")
+        if len(parts) != 2 or not all(parts):
+            raise ValueError(f"Pixtral/GPT-2 GGUF tokenizer has an invalid merge: {merge!r}.")
+        merges.append((parts[0], parts[1]))
+
+    control_tokens = [
+        AddedToken(tokens[index], normalized=False, special=True)
+        for index, token_type in enumerate(token_types)
+        if token_type == 3
+    ]
+    user_defined_tokens = [
+        AddedToken(tokens[index], normalized=False, special=False)
+        for index, token_type in enumerate(token_types)
+        if token_type == 4
+    ]
+
+    tokenizer = Tokenizer(
+        BPE(
+            vocab={token: index for index, token in enumerate(tokens)},
+            merges=merges,
+            ignore_merges=True,
+        )
+    )
+    # Match the Tekken/Pixtral tokenizer: Unicode words are split before byte
+    # encoding, so the BPE vocab's GPT-2 byte symbols are consumed verbatim.
+    tokenizer.pre_tokenizer = pre_tokenizers.Sequence(
+        [
+            pre_tokenizers.Split(Regex(_PIXTRAL_GPT2_SPLIT_REGEX), behavior="isolated"),
+            pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+        ]
+    )
+    tokenizer.decoder = decoders.ByteLevel()
+    tokenizer.post_processor = processors.ByteLevel(trim_offsets=False)
+    tokenizer.add_special_tokens(control_tokens)
+    tokenizer.add_tokens(user_defined_tokens)
+
+    path = os.path.join(str(output_dir), "tokenizer.json")
+    tokenizer.save(path)
+    return path
 
 
 def write_gguf_tokenizer_json(gguf_path: str | Path, output_dir: str | Path) -> str | None:
     """Write ``tokenizer.json`` for a GGUF-built package.
 
     Reconstructs the fast tokenizer from the GGUF ``tokenizer.ggml.*`` metadata
-    and serializes it to ``<output_dir>/tokenizer.json``. This is best-effort:
-    it logs a warning and returns ``None`` (never raising) when ``transformers``
-    is unavailable or the GGUF's tokenizer model cannot be converted, so the
-    build is not blocked — the onnx-genai runners can be given a
-    ``tokenizer.json`` separately.
+    and serializes it to ``<output_dir>/tokenizer.json``. The verified
+    GPT-2/Pixtral profile is strict and raises for malformed metadata. Other
+    profiles retain the historical best-effort behavior and return ``None`` if
+    no supported converter is available.
 
     Args:
         gguf_path: Path to the ``.gguf`` file whose embedded tokenizer to emit.
@@ -44,6 +139,23 @@ def write_gguf_tokenizer_json(gguf_path: str | Path, output_dir: str | Path) -> 
         emitted.
     """
     gguf_path = Path(gguf_path)
+    # Do not let AutoTokenizer select its generic SentencePiece conversion for
+    # this known GPT-2 profile.  Its reconstruction has strict, verified
+    # ByteLevel semantics and must report malformed metadata rather than emit a
+    # tokenizer that looks valid but produces different ids.
+    try:
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        gguf_model = GGUFModel(str(gguf_path))
+    except (ImportError, IndexError, OSError, RuntimeError, TypeError, ValueError):
+        # Preserve the historical best-effort behavior for unreadable or
+        # unsupported GGUF files, including test doubles used by callers.
+        pass
+    else:
+        metadata = gguf_model.metadata
+        if _is_pixtral_gpt2_profile(metadata):
+            return _reconstruct_pixtral_gpt2_tokenizer(metadata, output_dir)
+
     try:
         from transformers import AutoTokenizer
     except ImportError:
@@ -154,7 +266,20 @@ def _reconstruct_tokenizer_from_ggml(gguf_path: Path, output_dir: str | Path) ->
         return None
 
     try:
-        metadata = GGUFModel(str(gguf_path)).metadata
+        gguf_model = GGUFModel(str(gguf_path))
+        metadata = gguf_model.metadata
+    except (IndexError, OSError, RuntimeError, TypeError, ValueError) as error:
+        _LOGGER.warning(
+            "Failed to read tokenizer metadata from GGUF %r: %s; "
+            "skipping tokenizer.json emission.",
+            str(gguf_path),
+            error,
+        )
+        return None
+    if _is_pixtral_gpt2_profile(metadata):
+        return _reconstruct_pixtral_gpt2_tokenizer(metadata, output_dir)
+
+    try:
         tokens = metadata.get("tokenizer.ggml.tokens")
         merges_raw = metadata.get("tokenizer.ggml.merges")
         if not tokens or not merges_raw:

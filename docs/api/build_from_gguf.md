@@ -91,163 +91,137 @@ LLM architectures are supported.
 Sharded GGUF files are rejected. A single shard has only part of the tensor
 table, and treating it as a complete checkpoint would create a corrupt model.
 
-## NVIDIA Nemotron 3.5 Lightning waiver
+## NVIDIA Nemotron 3.5 Lightning Q8_0
 
-Direct conversion of GGUF architecture `nemotron_h_moe` is intentionally
-disabled. The following evidence is pinned:
+Mobius supports the pinned single-file `Q8_0` GGUF production slice:
 
-- GGUF repository:
-  `unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF` at
-  `f2d3fe3694501008786e81e5f20360cbf715496a`.
-- Official BF16 comparison:
-  `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16` at
-  `d468880b6ad3c6e0d21377ce7242adaea4cc884d`.
-- The official backbone has exactly 52 layers: 23 Mamba, 23 MoE, and
-  6 attention layers. GGUF block 52 is a separate combined attention+MoE MTP
-  auxiliary block, so `block_count=53` cannot be aliased to the backbone.
+- Repository: `unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF`
+- Revision: `f2d3fe3694501008786e81e5f20360cbf715496a`
+- File: `NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf`
+- Size: `35,004,643,392` bytes
+- SHA-256: `dc5276dd0619c04e277504d2358a793e31ccbe39e894d767d0d14f2a221e2ca4`
 
-### Quantization findings
+The architecture adapter validates the complete 417-tensor header before graph
+construction. It maps exactly 401 backbone sources, explicitly excludes the
+16 tensors in auxiliary MTP block 52, and produces 6,243 logical decoder
+weights. The backbone schedule must be exactly 23 Mamba + 23 MoE + 6 attention
+layers. Block 52 remains a separate combined attention+MoE MTP block rather
+than becoming a false 53rd decoder layer.
 
-| GGUF file | Relevant tensor inventory | Direct preservation |
-|---|---|---|
-| `...-Q8_0.gguf` | 32.904B parameters in `Q8_0` | Qtype-compatible, but blocked by architecture and semantic validation |
-| `...-MXFP4_MOE.gguf` | 14.687B `MXFP4`, 12.772B `Q5_1`, 5.445B `Q8_0` | No; the 5-bit expert weights require a quantization-changing float round-trip |
-| `...-UD-Q4_K_M.gguf` | 15.326B `Q5_0`, 12.772B `Q5_1`, 4.806B `Q8_0` | No; the preset name does not describe its actual per-tensor types |
-| `BF16/...-0000*-of-00002.gguf` | 329 tensors in shard 1 and 88 in shard 2 | No; Mobius does not assemble GGUF shards |
-
-The GGUF embeds GPT-2/Pixtral BPE metadata with BOS 1 and EOS 11, but declares
-padding ID 999 (`<SPECIAL_999>`). The pinned official tokenizer declares
-`<|im_end|>` (ID 11) as padding. The GGUF also names the BF16 base repository
-without recording its immutable source commit. Both discrepancies must be
-resolved before a self-contained runtime package can be accepted.
-
-The guard also reflects missing semantic evidence: Nemotron-H Mamba2 synthetic
-full-logit parity is not passing, and no real-weight ORT or ORT GenAI generation
-has passed. Graph creation, config emission, or session creation is not a
-substitute for generation.
-
-### Reproduce the guard with a pinned download
-
-The `Q8_0` file is the only practical candidate whose large quantized tensors
-all use a currently repackable type. Download it explicitly so the source does
-not move:
+### Pinned build
 
 ```powershell
 $repo = "unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF"
 $revision = "f2d3fe3694501008786e81e5f20360cbf715496a"
 $file = "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf"
+$official = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
+$officialRevision = "d468880b6ad3c6e0d21377ce7242adaea4cc884d"
 
 python -m pip install `
   --index-url https://packagefeedproxy.microsoft.io/pypi/simple `
   huggingface_hub
 hf download $repo $file --revision $revision --local-dir .\nemotron-gguf
+hf download $official tokenizer.json tokenizer_config.json `
+  special_tokens_map.json chat_template.jinja `
+  --revision $officialRevision --local-dir .\nemotron-tokenizer
 
-# Expected: fail-fast NotImplementedError; no ONNX package is emitted.
 python -m mobius build-gguf ".\nemotron-gguf\$file" `
   --ep cpu `
-  --external-data safetensors --output .\nemotron-gguf-onnx
+  --external-data onnx --output .\nemotron-gguf-onnx
+Copy-Item .\nemotron-tokenizer\tokenizer_config.json .\nemotron-gguf-onnx\
+Copy-Item .\nemotron-tokenizer\special_tokens_map.json .\nemotron-gguf-onnx\
+Copy-Item .\nemotron-tokenizer\chat_template.jinja .\nemotron-gguf-onnx\
 ```
 
-`mobius build-gguf --runtime ort-genai` is rejected separately. The GGUF CLI
-does not emit `genai_config.json` until a selected architecture's cache and
-tokenizer contracts have passed real ORT GenAI generation.
+The Q8 blocks are affine-repacked exactly into
+`MatMulNBits(bits=8, block_size=32)`. Routed expert tensors are expanded along
+their leading expert axis without dequantization. The resulting graph has
+6,005 `MatMulNBits` nodes and one `GatherBlockQuantized` embedding node, with
+no `QuantizeLinear`/`DequantizeLinear` round trip.
 
-To execute the pinned GGUF without changing its quantization, use current
-llama.cpp instead:
+On the 63.3 GiB Windows acceptance host, the pinned build completed in
+227.001 seconds plus 145.792 seconds to save. The package is
+36,920,438,736 bytes and the build process peaked at 54,818,070,528 bytes of
+working set. The weighted graph contains all 18,255 mapped weight
+initializers, including 6,006 Q8 weights.
+
+### Tokenizer and runtime contract
+
+The embedded GPT-2/Pixtral vocabulary and merges are reconstructed as a
+ByteLevel tokenizer. The source metadata's padding ID 999 is rejected because
+it names `<SPECIAL_999>`, not the model's runtime padding convention. The
+package keeps two explicit contracts:
+
+- Pinned tokenizer asset: BOS 1 and `<|im_end|>` as EOS/padding ID 11.
+- Direct-ORT model contract: padding ID 0 and EOS IDs `[2, 11]`.
+
+The reconstructed tokenizer has the exact official vocabulary, pre-tokenizer,
+decoder, post-processor, special-token flags, and encode/decode behavior. The
+GGUF's embedded chat template is not the template at the pinned official
+revision, so it is not silently emitted as authoritative. The recipe copies
+the official `tokenizer_config.json`, `special_tokens_map.json`, and
+`chat_template.jinja` sidecars by immutable revision instead.
+
+The direct-ORT runner uses unpadded prompts. Its validation also compares every
+real-token logit from an unpadded prefill with the same prompt followed by
+right padding and an explicit attention mask. It never continues cached
+generation from recurrent states advanced through padding.
+
+Generic ORT GenAI configuration cannot currently bind arbitrary non-KV
+recurrent cache inputs such as the graph's convolution and SSM states. Use
+direct ONNX Runtime generation rather than treating session creation as
+generation evidence.
+
+### Reproduce semantic acceptance
+
+The validator builds and saves in one process, then loads and generates in a
+fresh process. It records package/operator/initializer counts, mapping
+completeness, runtime versions, timings, and peak working sets:
 
 ```powershell
-.\llama-cli.exe `
-  --model ".\nemotron-gguf\$file" `
-  --temp 0.6 --top-p 0.95 --min-p 0.01
+python examples\olive\nemotron-3_5-lightning-30b\validate_gguf_q8.py `
+  --phase all `
+  --gguf ".\nemotron-gguf\$file" `
+  --official-tokenizer-dir .\nemotron-tokenizer `
+  --output .\nemotron-gguf-onnx `
+  --device cpu
 ```
 
-### Option A: official BF16, then Olive
+The independent greedy reference was produced by llama.cpp commit
+`9d57ce456c94d241dde672b2db9cf18879766568` from prompt
+`The capital of France is`:
 
-Option A is the ONNX route because it preserves authoritative config,
-tokenizer, and weight provenance. It is still a candidate until Nemotron-H
-semantic tests pass, and currently targets direct ONNX Runtime rather than
-ORT GenAI:
-
-```powershell
-$repo = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
-$revision = "d468880b6ad3c6e0d21377ce7242adaea4cc884d"
-
-hf download $repo --revision $revision --local-dir .\nemotron-bf16
-python -m mobius build `
-  --config .\nemotron-bf16 `
-  --dtype bf16 --ep cuda `
-  --external-data safetensors --max-shard-size 5GB `
-  .\nemotron-bf16-onnx
+```text
+llama-server -m NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf \
+  -c 128 -t 12 -tb 12 -b 64 -ub 64 -ngl 0 \
+  --host 127.0.0.1 --port 18081 --no-warmup
+POST /completion
+{"prompt":"The capital of France is","n_predict":8,"temperature":0,
+ "seed":1,"cache_prompt":false,"n_probs":1}
 ```
 
-After the BF16 package passes full-logit and generation parity, quantize its
-decoder with an initialized Olive environment:
+- Prompt IDs: `[1784, 8961, 1307, 5498, 1395]`
+- Generated IDs: `[6993, 1046, 1256, 1010, 1784, 8961, 1307, 10787]`
+- Text: ` Paris.  \nThe capital of Germany`
+- Throughput: 5.58 prompt tok/s and 5.95 generated tok/s
+- Peak working set from a separate CLI run: 16.81 GiB
 
-```json
-{
-  "input_model": {
-    "type": "OnnxModel",
-    "model_path": "nemotron-bf16-onnx/model.onnx"
-  },
-  "passes": {
-    "int4": {
-      "type": "OnnxKQuantQuantization",
-      "bits": 4,
-      "block_size": 32
-    }
-  },
-  "output_dir": "nemotron-int4-onnx"
-}
-```
+The fresh-process ONNX Runtime 1.28.0 CPU run at commit `45de2a8b06`
+loaded the package in 38.329 seconds and completed the five-token prefill in
+99.447 seconds. Its seven cached decode calls ran at 0.01617 steps/s and the
+process peaked at 38,148,943,872 bytes of working set. The right-padded
+explicit-mask check had zero maximum absolute difference across all real-token
+logits, and cached greedy generation matched every llama.cpp token and the
+decoded text above.
 
-```powershell
-python -m pip install `
-  --index-url https://packagefeedproxy.microsoft.io/pypi/simple `
-  olive-ai onnxruntime
-olive run --config .\olive-int4.json
-Copy-Item .\nemotron-bf16\tokenizer* .\nemotron-int4-onnx\
-Copy-Item .\nemotron-bf16\special_tokens_map.json .\nemotron-int4-onnx\
-Copy-Item .\nemotron-bf16\chat_template.jinja .\nemotron-int4-onnx\
-```
+### Explicitly unsupported variants
 
-The candidate can be checked for direct ORT session loading:
+| GGUF file | Relevant tensor inventory | Status |
+|---|---|---|
+| `...-Q8_0.gguf` | 32.904B parameters in `Q8_0` | Supported through exact affine repacking |
+| `...-MXFP4_MOE.gguf` | 14.687B `MXFP4`, 12.772B `Q5_1`, 5.445B `Q8_0` | Rejected; the large `Q5_1` source has no validated preserved runtime mapping |
+| `...-UD-Q4_K_M.gguf` | 15.326B `Q5_0`, 12.772B `Q5_1`, 4.806B `Q8_0` | Rejected; the preset name does not describe its large source qtypes |
+| `BF16/...-0000*-of-00002.gguf` | 329 tensors in shard 1 and 88 tensors in shard 2 | Rejected by the generic shard-assembly guard |
 
-```python
-import onnxruntime as ort
-
-session = ort.InferenceSession(
-    r".\nemotron-int4-onnx\model.onnx",
-    providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-)
-print(session.get_providers())
-print([(value.name, value.shape, value.type) for value in session.get_inputs()])
-```
-
-Session loading is not generation evidence. There is intentionally no ORT
-GenAI generation command for this model at the pinned revisions:
-
-- ORT GenAI 0.15.2 does not register model type `nemotron_h`.
-- The generated generic decoder config does not bind the graph's Mamba
-  `conv_state` and `recurrent_state` cache inputs.
-- The official `generation_config.json` uses EOS IDs `[2, 11]`, while the
-  architecture config alone supplies EOS 2.
-
-Do not publish the package unless BF16 full logits match the pinned reference,
-direct-ORT greedy generation is coherent and deterministic through an
-independently validated hybrid-cache loop, the quantized package remains
-non-degenerate, and ORT GenAI model/cache/token support is implemented before
-claiming ORT GenAI compatibility.
-
-### Prerequisites for revisiting direct GGUF conversion
-
-1. Map the 52-layer schedule exactly and model block 52 as MTP, or explicitly
-   exclude it with generation evidence.
-2. Fix Nemotron-H Mamba2 full-logit parity before testing quantized output.
-3. Preserve every large source qtype. For Q5 variants this requires a validated
-   5-bit runtime kernel and repacker; dequantize/requantize is not direct
-   preservation.
-4. Resolve the GGUF padding-token mismatch and record an immutable upstream
-   BF16 source revision.
-5. Pass real-weight prefill, cached decode, deterministic multi-token
-   generation, ORT load/inference, and ORT GenAI package generation on each
-   claimed EP.
+Dequantizing and requantizing Q5-family tensors would change their
+quantization and is not described as preservation.

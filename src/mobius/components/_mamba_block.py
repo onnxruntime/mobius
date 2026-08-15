@@ -294,8 +294,11 @@ class Mamba2Block(nn.Module):
         eps: float = 1e-5,
         norm_group_size: int | None = None,
         time_step_min: float = 0.0,
+        linear_class: type | None = None,
     ):
         super().__init__()
+        if linear_class is None:
+            linear_class = Linear
         self.d_model = d_model
         self.d_inner = d_inner
         self.num_heads = num_heads
@@ -310,7 +313,7 @@ class Mamba2Block(nn.Module):
         self.conv_dim = d_inner + 2 * n_groups * d_state
 
         proj_size = d_inner + self.conv_dim + num_heads
-        self.in_proj = Linear(d_model, proj_size, bias=proj_bias)
+        self.in_proj = linear_class(d_model, proj_size, bias=proj_bias)
         self.conv1d = _Mamba2DepthwiseConv1d(
             self.conv_dim,
             conv_kernel,
@@ -327,7 +330,7 @@ class Mamba2Block(nn.Module):
             eps=eps,
             group_size=norm_group_size,
         )
-        self.out_proj = Linear(d_inner, d_model, bias=proj_bias)
+        self.out_proj = linear_class(d_inner, d_model, bias=proj_bias)
 
     def forward(
         self,

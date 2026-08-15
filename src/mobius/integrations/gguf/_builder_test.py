@@ -877,126 +877,25 @@ class TestRawTensorIterator:
 class TestGGUFPreflightGuards:
     """Unsupported layouts fail before graph construction or large downloads."""
 
-    def test_nemotron_layout_excludes_combined_mtp_block(self):
-        from mobius.integrations.gguf._builder import (
-            _summarize_nemotron_h_moe_layout,
-        )
-
-        # Pinned NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 schedule:
-        # 52 backbone layers followed by one combined attention+MoE MTP block.
-        backbone_schedule = (
-            "mamba",
-            "moe",
-            "mamba",
-            "moe",
-            "mamba",
-            "attention",
-            "moe",
-            "mamba",
-            "moe",
-            "mamba",
-            "moe",
-            "mamba",
-            "attention",
-            "moe",
-            "mamba",
-            "moe",
-            "mamba",
-            "moe",
-            "mamba",
-            "attention",
-            "moe",
-            "mamba",
-            "moe",
-            "mamba",
-            "moe",
-            "mamba",
-            "attention",
-            "moe",
-            "mamba",
-            "moe",
-            "mamba",
-            "moe",
-            "mamba",
-            "attention",
-            "moe",
-            "mamba",
-            "moe",
-            "mamba",
-            "moe",
-            "mamba",
-            "moe",
-            "mamba",
-            "attention",
-            "moe",
-            "mamba",
-            "moe",
-            "mamba",
-            "moe",
-            "mamba",
-            "moe",
-            "mamba",
-            "moe",
-        )
-        assert len(backbone_schedule) == 52
-
-        representative_tensor = {
-            "mamba": "ssm_in.weight",
-            "moe": "ffn_up_exps.weight",
-            "attention": "attn_q.weight",
-        }
-        tensor_names = [
-            f"blk.{index}.{representative_tensor[layer_type]}"
-            for index, layer_type in enumerate(backbone_schedule)
-        ]
-        tensor_names.extend(
-            [
-                "blk.52.nextn.eh_proj.weight",
-                "blk.52.attn_q.weight",
-                "blk.52.ffn_up_exps.weight",
-            ]
-        )
-
-        counts, mtp_blocks, mtp_kinds = _summarize_nemotron_h_moe_layout(tensor_names)
-
-        assert dict(counts) == {"mamba": 23, "moe": 23, "attention": 6}
-        assert mtp_blocks == (52,)
-        assert mtp_kinds == {52: frozenset({"attention", "moe"})}
-
-    def test_local_nemotron_h_moe_fails_before_graph_build(self, tmp_path: Path):
-        from mobius.integrations.gguf import build_from_gguf
-
-        path = tmp_path / "nemotron-h-moe-q8.gguf"
-        _write_quantized_gguf(path, architecture="nemotron_h_moe")
-
-        with pytest.raises(NotImplementedError) as exc_info:
-            build_from_gguf(path, keep_quantized=True)
-
-        message = str(exc_info.value)
-        assert "intentionally disabled" in message
-        assert "MTP auxiliary block" in message
-        assert "Q5_0/Q5_1" in message
-        assert "llama.cpp/Unsloth" in message
-        assert "Olive" in message
-
-    def test_remote_nemotron_h_moe_fails_before_download(self):
+    def test_remote_supported_adapter_proceeds_to_download(self):
         from mobius.integrations.gguf._builder import _resolve_gguf_path
 
         filename = "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf"
         with (
             mock.patch("mobius.integrations.gguf._builder.HfApi") as api_type,
             mock.patch("mobius.integrations.gguf._builder.hf_hub_download") as download,
-            pytest.raises(NotImplementedError, match="nemotron_h_moe"),
         ):
             api_type.return_value.model_info.return_value = SimpleNamespace(
                 gguf={"architecture": "nemotron_h_moe"}
             )
-            _resolve_gguf_path(f"unsloth/nemotron:{filename}")
+            download.return_value = "cached.gguf"
+            result = _resolve_gguf_path(f"unsloth/nemotron:{filename}")
 
+        assert result == "cached.gguf"
         api_type.return_value.model_info.assert_called_once_with(
             "unsloth/nemotron", expand=["gguf"]
         )
-        download.assert_not_called()
+        download.assert_called_once_with(repo_id="unsloth/nemotron", filename=filename)
 
     @pytest.mark.parametrize(
         "preflight_error",

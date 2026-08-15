@@ -15,6 +15,7 @@ from mobius.integrations.gguf._repacker import (
     preserve_native_blocks,
     repack_dequantized_tensor,
     repack_gguf_tensor,
+    repack_stacked_gguf_tensor,
 )
 
 _Q4_0 = 2
@@ -398,6 +399,105 @@ class TestRepackQ80:
         ort_deq = (elements - 128.0) * s
 
         np.testing.assert_allclose(ort_deq, gguf_deq.ravel(), atol=1e-3)
+
+    def test_stacked_experts_execute_as_individual_matmulnbits(self, tmp_path):
+        import onnx_ir as ir
+        import onnxruntime as ort
+
+        blocks = []
+        source = np.empty((2, 2, 32), dtype=np.float32)
+        for expert in range(2):
+            for row in range(2):
+                values = [((index * (expert + 1) + row * 7) % 31) - 15 for index in range(32)]
+                scale = 0.125 * (expert + row + 1)
+                blocks.append(_make_q8_0_block(scale, values))
+                source[expert, row] = np.asarray(values, dtype=np.float32) * np.float16(scale)
+        repacked = repack_stacked_gguf_tensor(
+            np.concatenate(blocks),
+            _Q8_0,
+            (2, 2, 32),
+        )
+
+        def _value(name: str, array: np.ndarray) -> ir.Value:
+            value = ir.Value(name=name)
+            value.const_value = ir.tensor(array)
+            value.shape = ir.Shape(array.shape)
+            value.dtype = value.const_value.dtype
+            return value
+
+        x = ir.Value(
+            name="x",
+            shape=ir.Shape([1, 32]),
+            type=ir.TensorType(ir.DataType.FLOAT),
+        )
+        nodes = []
+        initializers = []
+        expert_outputs = []
+        for index, tensor in enumerate(repacked):
+            weight = _value(f"expert_{index}.weight", tensor.weight)
+            scales = _value(
+                f"expert_{index}.scales",
+                tensor.scales.astype(np.float32),
+            )
+            zero_points = _value(
+                f"expert_{index}.zero_points",
+                tensor.zero_points,
+            )
+            output = ir.Value(
+                name=f"expert_{index}.output",
+                shape=ir.Shape([1, 2]),
+                type=ir.TensorType(ir.DataType.FLOAT),
+            )
+            nodes.append(
+                ir.Node(
+                    "com.microsoft",
+                    "MatMulNBits",
+                    inputs=[x, weight, scales, zero_points],
+                    outputs=[output],
+                    attributes=ir.convenience.convert_attributes(
+                        {"K": 32, "N": 2, "bits": 8, "block_size": 32}
+                    ),
+                )
+            )
+            initializers.extend([weight, scales, zero_points])
+            expert_outputs.append(output)
+
+        output = ir.Value(
+            name="output",
+            shape=ir.Shape([1, 4]),
+            type=ir.TensorType(ir.DataType.FLOAT),
+        )
+        nodes.append(
+            ir.Node(
+                "",
+                "Concat",
+                inputs=expert_outputs,
+                outputs=[output],
+                attributes=ir.convenience.convert_attributes({"axis": -1}),
+            )
+        )
+        graph = ir.Graph(
+            inputs=[x],
+            outputs=[output],
+            nodes=nodes,
+            initializers=initializers,
+            opset_imports={"": 18, "com.microsoft": 1},
+            name="stacked_experts_q8",
+        )
+        path = tmp_path / "stacked_experts_q8.onnx"
+        ir.save(ir.Model(graph, ir_version=10), path)
+
+        feed = np.linspace(-1.0, 1.0, 32, dtype=np.float32)[None, :]
+        session = ort.InferenceSession(
+            str(path),
+            providers=["CPUExecutionProvider"],
+        )
+        (actual,) = session.run(None, {"x": feed})
+        expected = np.concatenate(
+            [feed @ source[index].T for index in range(2)],
+            axis=-1,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
 
 
 class TestEdgeCases:

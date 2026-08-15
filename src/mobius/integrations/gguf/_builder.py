@@ -21,7 +21,7 @@ __all__ = ["build_from_gguf"]
 import logging
 import re
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -39,6 +39,8 @@ else:
     _HUB_PREFLIGHT_TRANSPORT_ERRORS += (_HttpxTransportError,)
 
 if TYPE_CHECKING:
+    from mobius.integrations.gguf._architecture import GGUFArchitectureAdapter
+    from mobius.integrations.gguf._reader import GGUFModel
     from mobius.tasks import ModelTask
 
 logger = logging.getLogger(__name__)
@@ -47,76 +49,6 @@ _GGUF_SHARD_FILENAME_RE = re.compile(
     r"-(?P<index>\d{5})-of-(?P<count>\d{5})\.gguf$",
     re.IGNORECASE,
 )
-_NEMOTRON_H_MOE_ARCHITECTURE = "nemotron_h_moe"
-
-
-def _summarize_nemotron_h_moe_layout(
-    tensor_names: Iterable[str],
-) -> tuple[Counter[str], tuple[int, ...], dict[int, frozenset[str]]]:
-    """Summarize base-layer and MTP mixer types from Nemotron-H GGUF names."""
-    layer_kinds: dict[int, set[str]] = {}
-    mtp_blocks: set[int] = set()
-    for name in tensor_names:
-        match = re.match(r"^blk\.(\d+)\.(.+)$", name)
-        if match is None:
-            continue
-        block_index = int(match.group(1))
-        suffix = match.group(2)
-        kinds = layer_kinds.setdefault(block_index, set())
-        if suffix.startswith("nextn."):
-            mtp_blocks.add(block_index)
-        elif suffix.startswith("ssm_"):
-            kinds.add("mamba")
-        elif suffix.startswith(("ffn_", "exp_probs_")):
-            kinds.add("moe")
-        elif suffix.startswith(("attn_q.", "attn_k.", "attn_v.", "attn_output.")):
-            kinds.add("attention")
-
-    base_counts: Counter[str] = Counter()
-    for block_index, kinds in layer_kinds.items():
-        if block_index not in mtp_blocks:
-            base_counts.update(kinds)
-    mtp_kinds = {
-        block_index: frozenset(layer_kinds.get(block_index, set()))
-        for block_index in sorted(mtp_blocks)
-    }
-    return base_counts, tuple(sorted(mtp_blocks)), mtp_kinds
-
-
-def _raise_for_unsupported_gguf_architecture(
-    architecture: str,
-    *,
-    source: str,
-    tensor_names: Iterable[str] | None = None,
-) -> None:
-    """Reject GGUF architectures that do not have semantic conversion evidence."""
-    if architecture != _NEMOTRON_H_MOE_ARCHITECTURE:
-        return
-
-    layout = ""
-    if tensor_names is not None:
-        counts, mtp_blocks, mtp_kinds = _summarize_nemotron_h_moe_layout(tensor_names)
-        mtp_kind_names = {index: sorted(kinds) for index, kinds in mtp_kinds.items()}
-        layout = (
-            " Detected base schedule: "
-            f"{counts['mamba']} Mamba + {counts['moe']} MoE + "
-            f"{counts['attention']} attention layers; auxiliary MTP blocks: "
-            f"{list(mtp_blocks)} with mixer types {mtp_kind_names}."
-        )
-
-    raise NotImplementedError(
-        "Direct GGUF conversion for architecture 'nemotron_h_moe' is intentionally "
-        f"disabled for {source!r}.{layout} GGUF block_count includes a combined "
-        "attention+MoE MTP auxiliary block, so aliasing it to the 52-layer "
-        "'nemotron_h' backbone would build the wrong graph. The current Nemotron-H "
-        "Mamba2 path also lacks passing full-logit/generation parity, and common "
-        "GGUF presets contain Q5_0/Q5_1 expert tensors that cannot be preserved by "
-        "MatMulNBits. No ONNX artifacts were emitted. Use llama.cpp/Unsloth to run "
-        "the GGUF without changing its quantization, or start from the official "
-        "pinned BF16 Hugging Face checkpoint and quantize the validated ONNX export "
-        "with Olive only after L4/L5 semantic generation passes. See "
-        "docs/api/build_from_gguf.md for the pinned recipe and waiver."
-    )
 
 
 def _raise_for_sharded_gguf(
@@ -176,21 +108,23 @@ def _preflight_hf_gguf(api: HfApi, repo_id: str, filename: str) -> None:
     else:
         architecture = getattr(gguf_metadata, "architecture", None)
     if isinstance(architecture, str):
-        _raise_for_unsupported_gguf_architecture(
-            architecture,
-            source=source,
-        )
+        logger.debug("Hub GGUF architecture preflight for %s: %s", source, architecture)
 
 
-def _validate_gguf_model(gguf_model, *, source: str) -> None:
+def _validate_gguf_model(
+    gguf_model: GGUFModel,
+    *,
+    source: str,
+) -> GGUFArchitectureAdapter | None:
     """Validate a parsed GGUF before config extraction or graph construction."""
+    from mobius.integrations.gguf._architecture import create_architecture_adapter
+
     split_count = int(gguf_model.get_metadata("split.count", 1))
     _raise_for_sharded_gguf(source=source, split_count=split_count)
-    _raise_for_unsupported_gguf_architecture(
-        gguf_model.architecture,
-        source=source,
-        tensor_names=gguf_model.tensor_names,
-    )
+    adapter = create_architecture_adapter(gguf_model.architecture, gguf_model)
+    if adapter is not None:
+        adapter.validate_model(source=source)
+    return adapter
 
 
 def _looks_like_hf_repo_id(value: str) -> bool:
@@ -363,15 +297,17 @@ def build_from_gguf(
     # 1. Parse GGUF file (auto-download from HF Hub when given "owner/repo[:filename]")
     gguf_path = _resolve_gguf_path(gguf_path)
     gguf_model = GGUFModel(gguf_path)
-    _validate_gguf_model(gguf_model, source=str(gguf_path))
+    adapter = _validate_gguf_model(gguf_model, source=str(gguf_path))
     gguf_arch = gguf_model.architecture
     logger.info("Loaded GGUF file: %s (arch=%s)", gguf_path, gguf_arch)
-    preserve_quantization = keep_quantized and _has_quantized_weights(gguf_model, gguf_arch)
+    preserve_quantization = keep_quantized and _has_quantized_weights(
+        gguf_model, gguf_arch, adapter=adapter
+    )
     if keep_quantized and not preserve_quantization:
         logger.info("GGUF contains no mapped quantized weights; using the float import path")
 
     # 2. Extract config from GGUF metadata
-    config = gguf_to_config(gguf_model)
+    config = gguf_to_config(gguf_model, adapter=adapter)
     model_type = getattr(config, "_gguf_model_type", None)
     if model_type is None:
         model_type = GGUF_ARCH_TO_MODEL_TYPE.get(gguf_arch, gguf_arch)
@@ -383,27 +319,30 @@ def build_from_gguf(
 
     # 3. Quantized path: detect dominant type and set config
     if preserve_quantization:
-        from mobius._configs import QuantizationConfig
-        from mobius._flags import flags
-        from mobius.integrations.gguf._tencent_q1_0 import is_tencent_q1_0_layout
+        if adapter is not None:
+            quantization = adapter.quantization_config()
+        else:
+            from mobius._configs import QuantizationConfig
+            from mobius._flags import flags
+            from mobius.integrations.gguf._tencent_q1_0 import is_tencent_q1_0_layout
 
-        bits, block_size, is_sym = _detect_quant_params(gguf_model, gguf_arch)
-        # Float zero-point only when actually using Tencent's native 2-bit form.
-        float_zp = is_tencent_q1_0_layout(gguf_model) and flags.tencent_q1_0_use_native_2bit
-        quantize_embeddings = _can_quantize_embedding(
-            gguf_model,
-            gguf_arch,
-            bits=bits,
-            block_size=block_size,
-        )
-        quantize_lm_head = (
-            quantize_embeddings
-            if config.tie_word_embeddings
-            else _can_quantize_lm_head(gguf_model, gguf_arch)
-        )
-        config = dataclasses.replace(
-            config,
-            quantization=QuantizationConfig(
+            bits, block_size, is_sym = _detect_quant_params(gguf_model, gguf_arch)
+            # Float zero-point only when actually using Tencent's native 2-bit form.
+            float_zp = (
+                is_tencent_q1_0_layout(gguf_model) and flags.tencent_q1_0_use_native_2bit
+            )
+            quantize_embeddings = _can_quantize_embedding(
+                gguf_model,
+                gguf_arch,
+                bits=bits,
+                block_size=block_size,
+            )
+            quantize_lm_head = (
+                quantize_embeddings
+                if config.tie_word_embeddings
+                else _can_quantize_lm_head(gguf_model, gguf_arch)
+            )
+            quantization = QuantizationConfig(
                 bits=bits,
                 group_size=block_size,
                 quant_method="gguf",
@@ -412,17 +351,20 @@ def build_from_gguf(
                 quantize_embeddings=quantize_embeddings,
                 quantize_lm_head=quantize_lm_head,
                 tie_word_embeddings=quantize_lm_head and config.tie_word_embeddings,
-            ),
+            )
+        config = dataclasses.replace(
+            config,
+            quantization=quantization,
         )
         logger.info(
             "Quantized mode: bits=%d, block_size=%d, symmetric=%s, "
             "float_zp=%s, embedding=%s, lm_head=%s",
-            bits,
-            block_size,
-            is_sym,
-            float_zp,
-            quantize_embeddings,
-            quantize_lm_head,
+            quantization.bits,
+            quantization.group_size,
+            quantization.sym,
+            quantization.float_zero_point,
+            quantization.quantize_embeddings,
+            quantization.quantize_lm_head,
         )
 
     # 4. Look up module class and resolve task
@@ -439,7 +381,7 @@ def build_from_gguf(
 
     # 5. Build ONNX graph
     module = module_class(config)
-    if preserve_quantization:
+    if preserve_quantization and adapter is None:
         _replace_native_block_linears(module, gguf_model, gguf_arch)
     pkg = build_from_module(
         module, config, resolved_task, execution_provider=execution_provider
@@ -452,9 +394,19 @@ def build_from_gguf(
 
     # 6. Load tensors from GGUF → state_dict
     if preserve_quantization:
-        state_dict = _load_quantized_state_dict(gguf_model, gguf_arch, module, config)
+        state_dict = _load_quantized_state_dict(
+            gguf_model,
+            gguf_arch,
+            module,
+            config,
+            adapter=adapter,
+        )
     else:
-        state_dict = _load_dequantized_state_dict(gguf_model, gguf_arch)
+        state_dict = _load_dequantized_state_dict(
+            gguf_model,
+            gguf_arch,
+            adapter=adapter,
+        )
 
     logger.info(
         "Mapped %d state_dict entries from GGUF tensors",
@@ -465,28 +417,29 @@ def build_from_gguf(
     # For the quantized path, only float tensors go through
     # process_tensors; quantized Q/K tensors were permuted in
     # _load_quantized_state_dict already.
-    if preserve_quantization:
-        float_keys = {
-            k
-            for k in state_dict
-            if not (
-                k.endswith((".scales", ".zero_points"))
-                or _is_quantized_weight(k, state_dict)
-                or _is_native_block_weight(k, state_dict)
-            )
-        }
-        float_dict = {k: state_dict[k] for k in float_keys}
-        quant_dict = {k: state_dict[k] for k in state_dict if k not in float_keys}
-        float_dict = process_tensors(float_dict, config)
-        state_dict = {**float_dict, **quant_dict}
-    else:
-        state_dict = process_tensors(state_dict, config)
+    if adapter is None:
+        if preserve_quantization:
+            float_keys = {
+                k
+                for k in state_dict
+                if not (
+                    k.endswith((".scales", ".zero_points"))
+                    or _is_quantized_weight(k, state_dict)
+                    or _is_native_block_weight(k, state_dict)
+                )
+            }
+            float_dict = {k: state_dict[k] for k in float_keys}
+            quant_dict = {k: state_dict[k] for k in state_dict if k not in float_keys}
+            float_dict = process_tensors(float_dict, config)
+            state_dict = {**float_dict, **quant_dict}
+        else:
+            state_dict = process_tensors(state_dict, config)
 
-    # 7b. Normalize GGUF-specific weight shapes to match HF conventions.
-    # This converts GGUF tensor quirks (stacked experts, 1D gates, 2D
-    # conv weights, suffix artifacts) into the shapes that HF models
-    # produce, so preprocess_weights only needs to handle HF→ONNX.
-    state_dict = _normalize_gguf_weights(state_dict)
+        # Normalize GGUF-specific weight shapes to match HF conventions.
+        # This converts GGUF tensor quirks (stacked experts, 1D gates, 2D
+        # conv weights, suffix artifacts) into the shapes that HF models
+        # produce, so preprocess_weights only needs to handle HF→ONNX.
+        state_dict = _normalize_gguf_weights(state_dict)
 
     # 8. Run model-specific preprocess_weights (HF → ONNX names)
     if hasattr(module, "preprocess_weights"):
@@ -494,6 +447,10 @@ def build_from_gguf(
 
     # 9. Apply weights to ONNX model
     prefix_map = getattr(module, "weight_prefix_map", None)
+    if adapter is not None:
+        from mobius.integrations.gguf._architecture import validate_package_state_dict
+
+        validate_package_state_dict(pkg, state_dict)
     pkg.apply_weights(state_dict, prefix_map=prefix_map)
 
     return pkg
@@ -681,7 +638,7 @@ def _normalize_gguf_weights(
     return result
 
 
-def _has_quantized_weights(gguf_model, gguf_arch: str) -> bool:
+def _has_quantized_weights(gguf_model, gguf_arch: str, *, adapter=None) -> bool:
     """Return whether a GGUF has mapped weights with a quantized tensor type."""
     from gguf import GGMLQuantizationType
 
@@ -696,9 +653,16 @@ def _has_quantized_weights(gguf_model, gguf_arch: str) -> bool:
     if f64_type is not None:
         float_types.add(f64_type)
 
-    for name, _raw, qtype, _shape in gguf_model.tensor_items_raw():
-        hf_name = map_gguf_to_hf_names(name, gguf_arch)
-        if hf_name is not None and hf_name.endswith(".weight") and qtype not in float_types:
+    for name, _raw, qtype, shape in gguf_model.tensor_items_raw():
+        if adapter is not None:
+            mapping = adapter.map_tensor(name, shape)
+            mapped_weight = mapping is not None and any(
+                target.initializer_name.endswith(".weight") for target in mapping.targets
+            )
+        else:
+            hf_name = map_gguf_to_hf_names(name, gguf_arch)
+            mapped_weight = hf_name is not None and hf_name.endswith(".weight")
+        if mapped_weight and qtype not in float_types:
             return True
     return False
 
@@ -984,11 +948,200 @@ def repack_gguf_weight_to_target(
     )
 
 
+def _load_adapter_dequantized_state_dict(
+    gguf_model,
+    adapter,
+) -> dict:
+    """Load an adapter-mapped state dict through the float path."""
+    import numpy as np
+    import torch
+
+    from mobius.integrations.gguf._architecture import GGUFMappingAudit
+
+    audit = GGUFMappingAudit()
+    state_dict: dict[str, torch.Tensor] = {}
+    for source_name, raw, qtype, source_shape in tqdm.tqdm(
+        gguf_model.tensor_items_raw(),
+        desc="Dequantizing tensors",
+        total=len(gguf_model._tensor_index),
+    ):
+        mapping = adapter.map_tensor(source_name, source_shape)
+        audit.record(source_name, mapping)
+        if mapping is None or mapping.exclusion is not None:
+            continue
+
+        array = gguf_model.dequantize_raw_tensor(raw, qtype, source_shape)
+        if not array.flags.writeable:
+            array = np.array(array)
+        source_tensor = torch.from_numpy(array)
+        for target in mapping.targets:
+            tensor = (
+                source_tensor
+                if target.source_index is None
+                else source_tensor[target.source_index]
+            )
+            state_dict[target.state_dict_name] = adapter.transform_tensor(
+                source_name,
+                target,
+                tensor,
+            )
+
+    adapter.validate_mapping_audit(audit)
+    return state_dict
+
+
+def _load_adapter_quantized_state_dict(
+    gguf_model,
+    adapter,
+    module,
+    config,
+) -> dict:
+    """Load adapter targets with exact affine-block preservation."""
+    import numpy as np
+    import torch
+
+    from mobius.components import QuantizedEmbedding, QuantizedLinear
+    from mobius.integrations.gguf._architecture import GGUFMappingAudit
+    from mobius.integrations.gguf._repacker import (
+        repack_gguf_tensor,
+        repack_quant_params,
+        repack_stacked_gguf_tensor,
+    )
+
+    quantized_stems = {
+        name
+        for name, child in module.named_modules()
+        if isinstance(child, QuantizedLinear)
+        or getattr(child, "_gguf_quantized_linear", False)
+    }
+    embedding_stems = {
+        name for name, child in module.named_modules() if isinstance(child, QuantizedEmbedding)
+    }
+
+    audit = GGUFMappingAudit()
+    state_dict: dict[str, torch.Tensor] = {}
+    repacked_targets = 0
+    target_params = (config.quantization.bits, config.quantization.group_size)
+
+    for source_name, raw, qtype, source_shape in tqdm.tqdm(
+        gguf_model.tensor_items_raw(),
+        desc="Repacking tensors",
+        total=len(gguf_model._tensor_index),
+    ):
+        mapping = adapter.map_tensor(source_name, source_shape)
+        audit.record(source_name, mapping)
+        if mapping is None or mapping.exclusion is not None:
+            continue
+
+        target_stems = [
+            target.initializer_name.removesuffix(".weight") for target in mapping.targets
+        ]
+        target_is_quantized = [
+            stem in quantized_stems or stem in embedding_stems for stem in target_stems
+        ]
+        if any(target_is_quantized) and not all(target_is_quantized):
+            raise ValueError(f"GGUF source {source_name!r} mixes quantized and float targets")
+
+        if all(target_is_quantized):
+            if not all(
+                target.initializer_name.endswith(".weight") for target in mapping.targets
+            ):
+                raise ValueError(
+                    f"Quantized GGUF source {source_name!r} has a non-weight target"
+                )
+            qtype_value = qtype.value if hasattr(qtype, "value") else qtype
+            if repack_quant_params(qtype_value) != target_params:
+                raise ValueError(
+                    f"GGUF source {source_name!r} has quantization "
+                    f"{getattr(qtype, 'name', qtype)!r}; expected an exact "
+                    f"{target_params[0]}-bit/block-{target_params[1]} repack"
+                )
+
+            packed = raw.ravel().view(np.uint8)
+            if len(source_shape) == 2 and len(mapping.targets) == 1:
+                repacked = (
+                    repack_gguf_tensor(
+                        packed,
+                        qtype_value,
+                        source_shape,
+                    ),
+                )
+            elif len(source_shape) == 3:
+                repacked = repack_stacked_gguf_tensor(
+                    packed,
+                    qtype_value,
+                    source_shape,
+                )
+                source_indices = {target.source_index for target in mapping.targets}
+                if source_indices != set(range(source_shape[0])):
+                    raise ValueError(
+                        f"Stacked GGUF source {source_name!r} does not map every "
+                        "leading-axis slice exactly once"
+                    )
+            else:
+                raise ValueError(
+                    f"Cannot exactly repack GGUF source {source_name!r} with "
+                    f"shape {source_shape} into {len(mapping.targets)} targets"
+                )
+
+            for target in mapping.targets:
+                index = target.source_index or 0
+                target_tensor = adapter.transform_repacked(
+                    source_name,
+                    target,
+                    repacked[index],
+                )
+                state_stem = target.state_dict_name.removesuffix(".weight")
+                initializer_stem = target.initializer_name.removesuffix(".weight")
+                if initializer_stem in embedding_stems:
+                    state_dict[f"{state_stem}.qweight"] = torch.from_numpy(
+                        target_tensor.weight.reshape(target_tensor.weight.shape[0], -1)
+                    )
+                else:
+                    state_dict[target.state_dict_name] = torch.from_numpy(target_tensor.weight)
+                state_dict[f"{state_stem}.scales"] = torch.from_numpy(target_tensor.scales)
+                if target_tensor.zero_points is not None:
+                    state_dict[f"{state_stem}.zero_points"] = torch.from_numpy(
+                        target_tensor.zero_points
+                    )
+                repacked_targets += 1
+            continue
+
+        array = gguf_model.dequantize_raw_tensor(raw, qtype, source_shape)
+        if not array.flags.writeable:
+            array = np.array(array)
+        source_tensor = torch.from_numpy(array)
+        for target in mapping.targets:
+            tensor = (
+                source_tensor
+                if target.source_index is None
+                else source_tensor[target.source_index]
+            )
+            state_dict[target.state_dict_name] = adapter.transform_tensor(
+                source_name,
+                target,
+                tensor,
+            )
+
+    adapter.validate_mapping_audit(audit)
+    logger.info(
+        "Loaded %d adapter state-dict entries with %d exact quantized targets",
+        len(state_dict),
+        repacked_targets,
+    )
+    return state_dict
+
+
 def _load_dequantized_state_dict(
     gguf_model,
     gguf_arch: str,
+    *,
+    adapter=None,
 ) -> dict:
     """Load all tensors dequantized to float (Phase 1 path)."""
+    if adapter is not None:
+        return _load_adapter_dequantized_state_dict(gguf_model, adapter)
+
     import numpy as np
     import torch
 
@@ -1019,6 +1172,8 @@ def _load_quantized_state_dict(
     gguf_arch: str,
     module,
     config,
+    *,
+    adapter=None,
 ) -> dict:
     """Load tensors, preserving native blocks or normalizing to MatMulNBits.
 
@@ -1033,6 +1188,14 @@ def _load_quantized_state_dict(
     row-level reverse-permutation that ``process_tensors`` would
     normally apply.
     """
+    if adapter is not None:
+        return _load_adapter_quantized_state_dict(
+            gguf_model,
+            adapter,
+            module,
+            config,
+        )
+
     import numpy as np
     import torch
     from gguf import GGMLQuantizationType, dequantize

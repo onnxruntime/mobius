@@ -343,10 +343,10 @@ Quantized files containing only qtypes with no supported preservation target
 float. Re-run with `--dequantize` to request explicit float conversion.
 
 Sharded GGUF inputs are rejected because a single shard has an incomplete
-tensor table. `nemotron_h_moe` is also rejected until its MTP block, Mamba2
-parity, mixed expert quantization, tokenizer provenance, and real ORT/ORT GenAI
-generation are validated. See
-[`build_from_gguf()`](api/build_from_gguf.md#nvidia-nemotron-35-lightning-waiver).
+tensor table. The pinned Nemotron 3.5 Lightning single-file Q8_0 artifact is
+supported with exact Q8 repacking; mixed Q5 variants and split BF16 GGUFs
+remain rejected. See
+[`build_from_gguf()`](api/build_from_gguf.md#nvidia-nemotron-35-lightning-q8_0).
 
 ---
 

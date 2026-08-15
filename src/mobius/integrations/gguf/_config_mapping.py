@@ -25,7 +25,7 @@ __all__ = ["gguf_to_config"]
 import contextlib
 import dataclasses
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -36,6 +36,9 @@ from mobius._configs import (
     MuseGlimmerConfig,
     _shallow_fields,
 )
+
+if TYPE_CHECKING:
+    from mobius.integrations.gguf._architecture import GGUFArchitectureAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -266,6 +269,8 @@ def _extract_config_fields(
 
 def gguf_to_config(
     model: Any,  # GGUFModel — typed as Any to avoid circular import
+    *,
+    adapter: GGUFArchitectureAdapter | None = None,
 ) -> ArchitectureConfig:
     """Convert GGUF metadata to an :class:`ArchitectureConfig`.
 
@@ -286,6 +291,26 @@ def gguf_to_config(
     """
     gguf_arch = model.architecture
     metadata = model.metadata
+
+    if adapter is None:
+        from mobius.integrations.gguf._architecture import create_architecture_adapter
+
+        adapter = create_architecture_adapter(gguf_arch, model)
+        if adapter is not None:
+            adapter.validate_model(source=str(getattr(model, "_path", "<GGUF model>")))
+    if adapter is not None:
+        config = adapter.build_config()
+        logger.info(
+            "Extracted config through GGUF architecture adapter: "
+            "arch=%s, model_type=%s, hidden=%d, layers=%d, heads=%d, vocab=%d",
+            gguf_arch,
+            adapter.model_type,
+            config.hidden_size,
+            config.num_hidden_layers,
+            config.num_attention_heads,
+            config.vocab_size,
+        )
+        return config
 
     # Resolve model_type
     model_type = GGUF_ARCH_TO_MODEL_TYPE.get(gguf_arch, gguf_arch)

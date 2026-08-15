@@ -232,6 +232,68 @@ def repack_gguf_tensor(
         return _repack_q8_0(blocks, n_out, n_blocks_per_row)
 
 
+def repack_stacked_gguf_tensor(
+    raw_data: np.ndarray,
+    gguf_type: int,
+    shape: tuple[int, ...],
+) -> tuple[RepackedTensor, ...]:
+    """Repack a leading-axis stack of 2-D weights without dequantizing.
+
+    The source block rows must end at each matrix boundary. This is true for
+    routed-expert tensors whose input dimension is block-aligned and prevents
+    an expert slice from accidentally consuming bytes from the next expert.
+    """
+    if len(shape) != 3:
+        raise ValueError(f"Expected stacked 3D shape (E, N, K), got {shape}")
+    if gguf_type not in _SUPPORTED_TYPES:
+        raise ValueError(
+            f"Unsupported GGUF type {gguf_type}. Supported: {sorted(_SUPPORTED_TYPES)}"
+        )
+
+    num_slices, n_out, k_in = shape
+    block_elements = _GGUF_BLOCK_ELEMENTS[gguf_type]
+    if k_in % block_elements:
+        raise ValueError(
+            f"Stacked tensor input dimension {k_in} is not aligned to the "
+            f"{block_elements}-element GGUF block"
+        )
+
+    expected_bytes = num_slices * n_out * (k_in // block_elements) * _BLOCK_BYTES[gguf_type]
+    packed = raw_data.ravel().view(np.uint8)
+    if packed.size != expected_bytes:
+        raise ValueError(
+            f"Stacked GGUF data size mismatch: got {packed.size} bytes, "
+            f"expected {expected_bytes} for shape {shape}"
+        )
+
+    combined = repack_gguf_tensor(
+        packed,
+        gguf_type,
+        (num_slices * n_out, k_in),
+    )
+    weight = combined.weight.reshape(num_slices, n_out, *combined.weight.shape[1:])
+    scales = combined.scales.reshape(num_slices, n_out, *combined.scales.shape[1:])
+    zero_points = (
+        None
+        if combined.zero_points is None
+        else combined.zero_points.reshape(
+            num_slices,
+            n_out,
+            *combined.zero_points.shape[1:],
+        )
+    )
+    return tuple(
+        RepackedTensor(
+            weight=weight[index],
+            scales=scales[index],
+            zero_points=None if zero_points is None else zero_points[index],
+            block_size=combined.block_size,
+            bits=combined.bits,
+        )
+        for index in range(num_slices)
+    )
+
+
 def _reorder_nibbles_gguf_to_ort(
     gguf_packed: np.ndarray,
 ) -> np.ndarray:
