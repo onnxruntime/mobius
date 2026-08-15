@@ -96,7 +96,8 @@ pkg = build("facebook/wav2vec2-base")
 
 ### Build from a GGUF file
 
-Convert a GGUF model (e.g. from llama.cpp) to ONNX:
+Convert a GGUF model (e.g. from llama.cpp) to ONNX. Supported quantization is
+preserved by default:
 
 ```python
 from mobius import build_from_gguf
@@ -110,6 +111,10 @@ Or via CLI:
 ```bash
 mobius build-gguf path/to/model.gguf --output output/model/
 ```
+
+Pass `--dequantize` on the CLI, or `keep_quantized=False` to
+`build_from_gguf()`, when a fully float ONNX model is required. F32-, F16-, and
+BF16-only GGUFs automatically use the float path.
 
 > **Note**: GGUF support requires the optional `gguf` package:
 > `pip install mobius-onnx[gguf]`

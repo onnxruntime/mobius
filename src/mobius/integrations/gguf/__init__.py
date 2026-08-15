@@ -12,6 +12,8 @@ Usage::
 
     # Text-only model
     pkg = build_from_gguf("path/to/model.gguf")
+    # Supported quantization is preserved by default; pass
+    # keep_quantized=False for a fully float model.
 
     # Multimodal (text + companion mmproj vision/audio encoder)
     pkg = build_from_gguf("path/to/model.gguf", mmproj="path/to/mmproj.gguf")

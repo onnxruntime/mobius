@@ -94,6 +94,7 @@ def _write_quantized_gguf(
     value_projection_quantization: str | None = None,
     output_quantization: str | None = None,
     tie_embeddings: bool = False,
+    float_type: str = "f32",
 ) -> None:
     """Write a GGUF file with quantized projection weights.
 
@@ -118,6 +119,21 @@ def _write_quantized_gguf(
 
     def _add_f32(name: str, shape: tuple[int, ...]) -> None:
         writer.add_tensor(name, np.random.randn(*shape).astype(np.float32))
+
+    def _add_f16(name: str, shape: tuple[int, ...]) -> None:
+        writer.add_tensor(name, np.random.randn(*shape).astype(np.float16))
+
+    def _add_bf16(name: str, shape: tuple[int, ...]) -> None:
+        values = np.random.randn(*shape).astype(np.float32)
+        raw = (values.view(np.uint32) >> 16).astype(np.uint16)
+        writer.add_tensor(
+            name,
+            raw,
+            raw_shape=shape,
+            raw_dtype=GGMLQuantizationType.BF16,
+        )
+
+    add_float = {"f32": _add_f32, "f16": _add_f16, "bf16": _add_bf16}[float_type]
 
     def _add_q4_0(name: str, n_out: int, k_in: int) -> None:
         """Write a Q4_0-quantized weight tensor."""
@@ -204,13 +220,18 @@ def _write_quantized_gguf(
     elif embedding_quantization == "q8_0":
         _add_q8_0("token_embd.weight", vocab_size, hidden_size)
     else:
-        _add_f32("token_embd.weight", (vocab_size, hidden_size))
+        add_float("token_embd.weight", (vocab_size, hidden_size))
 
     if projection_quantization in {"q4_0", "q8_0"}:
         add_projection = {
             "q4_0": _add_q4_0,
             "q8_0": _add_q8_0,
         }[projection_quantization]
+    elif projection_quantization in {"f32", "f16", "bf16"}:
+
+        def add_projection(name: str, n_out: int, k_in: int) -> None:
+            add_float(name, (n_out, k_in))
+
     else:
 
         def add_projection(name: str, n_out: int, k_in: int) -> None:
@@ -245,18 +266,18 @@ def _write_quantized_gguf(
         add_projection(f"blk.{i}.ffn_up.weight", intermediate_size, hidden_size)
         add_projection(f"blk.{i}.ffn_down.weight", hidden_size, intermediate_size)
         # Norms (float32)
-        _add_f32(f"blk.{i}.attn_norm.weight", (hidden_size,))
-        _add_f32(f"blk.{i}.ffn_norm.weight", (hidden_size,))
+        add_float(f"blk.{i}.attn_norm.weight", (hidden_size,))
+        add_float(f"blk.{i}.ffn_norm.weight", (hidden_size,))
 
     # Output norm + optional untied lm_head
-    _add_f32("output_norm.weight", (hidden_size,))
+    add_float("output_norm.weight", (hidden_size,))
     if not tie_embeddings:
         if output_quantization == "q4_0":
             _add_q4_0("output.weight", vocab_size, hidden_size)
         elif output_quantization == "q8_0":
             _add_q8_0("output.weight", vocab_size, hidden_size)
         else:
-            _add_f32("output.weight", (vocab_size, hidden_size))
+            add_float("output.weight", (vocab_size, hidden_size))
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -269,6 +290,19 @@ def q4_0_gguf(tmp_path: Path) -> Path:
     """Create a Q4_0 quantized GGUF test file."""
     path = tmp_path / "test_q4_0.gguf"
     _write_quantized_gguf(path)
+    return path
+
+
+@pytest.fixture(params=["f32", "f16", "bf16"])
+def float_only_gguf(tmp_path: Path, request) -> Path:
+    """Create a GGUF with only unquantized tensor types."""
+    float_type = request.param
+    path = tmp_path / f"test_{float_type}.gguf"
+    _write_quantized_gguf(
+        path,
+        projection_quantization=float_type,
+        float_type=float_type,
+    )
     return path
 
 
@@ -357,27 +391,55 @@ def mixed_native_q5_q8_gguf(tmp_path: Path) -> Path:
 
 
 class TestBuildQuantizedGguf:
-    """Tests for build_from_gguf(keep_quantized=True)."""
+    """Tests for the default quantization-preserving GGUF build."""
 
     def test_produces_model_package(self, q4_0_gguf: Path):
         """Quantized build returns a valid ModelPackage."""
         from mobius.integrations.gguf import build_from_gguf
 
-        pkg = build_from_gguf(q4_0_gguf, keep_quantized=True)
+        pkg = build_from_gguf(q4_0_gguf)
         assert "model" in pkg
         assert pkg["model"].graph is not None
 
     def test_model_has_matmulnbits_ops(self, q4_0_gguf: Path):
-        """Quantized model uses MatMulNBits instead of MatMul."""
+        """The API default uses MatMulNBits instead of float MatMul weights."""
         from mobius.integrations.gguf import build_from_gguf
 
-        pkg = build_from_gguf(q4_0_gguf, keep_quantized=True)
+        pkg = build_from_gguf(q4_0_gguf)
         model = pkg["model"]
 
         op_types = {node.op_type for node in model.graph if node.op_type}
         assert "MatMulNBits" in op_types, (
             f"Expected MatMulNBits in ops, got: {sorted(op_types)}"
         )
+
+    def test_default_quantized_package_save_reload(self, q4_0_gguf: Path, tmp_path: Path):
+        """Default quantized ops and weights survive ModelPackage persistence."""
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.gguf import build_from_gguf
+
+        output_dir = tmp_path / "saved"
+        build_from_gguf(q4_0_gguf).save(str(output_dir), progress_bar=False)
+        reloaded = ModelPackage.load(str(output_dir))
+
+        op_types = {node.op_type for node in reloaded["model"].graph}
+        assert "MatMulNBits" in op_types
+        assert (
+            reloaded["model"]
+            .graph.initializers["model.layers.0.self_attn.q_proj.weight"]
+            .const_value
+            is not None
+        )
+
+    def test_float_only_default_uses_float_path(self, float_only_gguf: Path):
+        """F32/BF16-only GGUFs do not fail when preservation is the default."""
+        from mobius.integrations.gguf import build_from_gguf
+
+        model = build_from_gguf(float_only_gguf)["model"]
+        op_types = {node.op_type for node in model.graph}
+        assert "MatMulNBits" not in op_types
+        assert "GatherBlockQuantized" not in op_types
+        assert "BlockQuantizedMatMul" not in op_types
 
     def test_q4_0_matmulnbits_has_explicit_zero_points(self, q4_0_gguf: Path):
         """GGUF Q4_0 projections explicitly encode zp=8 instead of EP defaults."""
@@ -561,7 +623,7 @@ class TestBuildQuantizedGguf:
                 )
 
     def test_dequantized_path_no_matmulnbits(self, q4_0_gguf: Path):
-        """Without keep_quantized, no MatMulNBits ops."""
+        """Explicit API dequantization emits no quantized projection ops."""
         from mobius.integrations.gguf import build_from_gguf
 
         pkg = build_from_gguf(q4_0_gguf, keep_quantized=False)
@@ -569,6 +631,7 @@ class TestBuildQuantizedGguf:
 
         op_types = {node.op_type for node in model.graph if node.op_type}
         assert "MatMulNBits" not in op_types
+        assert "BlockQuantizedMatMul" not in op_types
 
     def test_detect_quant_params(self, q4_0_gguf: Path):
         """_detect_quant_params finds Q4_0 as dominant type."""
@@ -638,6 +701,31 @@ class TestBuildQuantizedGguf:
 
         bits, block_size, is_sym = _detect_quant_params(_MixedModel(), "llama")
         assert (bits, block_size, is_sym) == (4, 32, False)
+
+    def test_pure_q6_k_requires_explicit_dequantization(self):
+        """Unsupported quantized inputs fail instead of silently becoming float."""
+        from gguf import GGMLQuantizationType
+
+        from mobius.integrations.gguf._builder import _detect_quant_params
+
+        class _UnsupportedModel:
+            def tensor_items_raw(self):
+                yield (
+                    "blk.0.ffn_down.weight",
+                    np.empty(0, dtype=np.uint8),
+                    GGMLQuantizationType.Q6_K,
+                    (64, 128),
+                )
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                r"No supported quantized preservation target for GGUF weight "
+                r"types: Q6_K. Use keep_quantized=False \(API\) or "
+                r"--dequantize \(CLI\) for explicit float import."
+            ),
+        ):
+            _detect_quant_params(_UnsupportedModel(), "llama")
 
     def test_runtime_unsupported_format_does_not_select_native_op(self):
         """A GGUF type outside the runtime contract remains on the fallback."""
@@ -710,6 +798,31 @@ class TestBuildGgufStaticCache:
                 static_cache=True,
                 task="text-generation",
             )
+
+
+class TestMultimodalQuantizationDefault:
+    @pytest.mark.parametrize("keep_quantized", [True, False])
+    def test_build_from_gguf_forwards_quantization_policy_to_mmproj(
+        self, keep_quantized: bool
+    ):
+        from mobius.integrations.gguf import build_from_gguf
+
+        expected = mock.sentinel.package
+        with mock.patch(
+            "mobius.integrations.gguf._mmproj.build_gemma4_vlm_from_gguf",
+            return_value=expected,
+        ) as build_multimodal:
+            kwargs = {} if keep_quantized else {"keep_quantized": False}
+            actual = build_from_gguf("text.gguf", mmproj="mmproj.gguf", **kwargs)
+
+        assert actual is expected
+        build_multimodal.assert_called_once_with(
+            "text.gguf",
+            "mmproj.gguf",
+            dtype=None,
+            execution_provider="default",
+            keep_quantized=keep_quantized,
+        )
 
 
 class TestRawTensorIterator:

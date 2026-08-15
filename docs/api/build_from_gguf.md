@@ -17,7 +17,7 @@ def build_from_gguf(
     *,
     task: str | None = None,
     dtype: str | None = None,
-    keep_quantized: bool = False,
+    keep_quantized: bool = True,
     execution_provider: str = "default",
     mmproj: str | Path | None = None,
     static_cache: bool = False,
@@ -32,7 +32,7 @@ def build_from_gguf(
 | `gguf_path` | `str \| Path` | (required) | Local `.gguf` path or `owner/repo:filename.gguf` Hub reference. |
 | `task` | `str \| None` | `None` | Override the model task (e.g. `"text-generation"`). When `None`, the task is auto-detected from the model type. |
 | `dtype` | `str \| None` | `None` | Override model dtype (e.g. `"f16"`). When `None`, defaults to float32. |
-| `keep_quantized` | `bool` | `False` | Preserve supported affine blocks as `MatMulNBits` and supported IQ/MXFP4 blocks in the onnx-genai native format. A mixed preset may still require dequantization/requantization. |
+| `keep_quantized` | `bool` | `True` | Preserve quantization when present. Supported affine blocks are repacked as `MatMulNBits`; in text-only builds, supported native IQ/MXFP4 projection blocks retain their bytes. Multimodal and mixed presets may require dequantization/requantization. Set to `False` to dequantize all weights. |
 | `execution_provider` | `str` | `"default"` | Target EP for EP-aware graph optimization. |
 | `mmproj` | `str \| Path \| None` | `None` | Optional companion multimodal-projector GGUF. |
 | `static_cache` | `bool` | `False` | Build a fixed-width KV cache when the architecture supports it. |
@@ -47,15 +47,15 @@ def build_from_gguf(
 ```python
 from mobius import build_from_gguf
 
-# Basic conversion (dequantizes to float)
+# Basic conversion preserves supported quantization by default
 pkg = build_from_gguf("llama-3.2-1b-q4_0.gguf")
 pkg.save("output/llama/")
 ```
 
 ```python
-# Preserve quantization (Q4_0/Q4_1/Q8_0 → MatMulNBits)
-pkg = build_from_gguf("llama-3.2-1b-q4_0.gguf", keep_quantized=True)
-pkg.save("output/llama-q4/")
+# Explicitly dequantize every weight to float
+pkg = build_from_gguf("llama-3.2-1b-q4_0.gguf", keep_quantized=False)
+pkg.save("output/llama-float/")
 ```
 
 ```bash
@@ -67,12 +67,20 @@ mobius build-gguf llama-3.2-1b-q4_0.gguf --output output/llama/
 
 1. Reads GGUF metadata to detect architecture and config
 2. Maps GGUF tensor names to HuggingFace weight names
-3. Dequantizes quantized tensors to float (or repacks into MatMulNBits
-   when `keep_quantized=True`)
+3. Preserves supported quantized tensors by default, using repacking,
+   text-only native-block retention, or dequantize/requantize according to the
+   source qtype and build path; `keep_quantized=False` dequantizes every tensor
 4. Applies architecture-specific tensor processors (e.g. Q/K permute)
 5. Builds the ONNX graph using the same pipeline as `build()`
 6. Runs `preprocess_weights()` (HF → ONNX name mapping)
 7. Applies weights to the graph
+
+F32-, F16-, and BF16-only GGUFs use the normal float import path even though
+`keep_quantized=True` is the default: there is no quantization to preserve.
+Quantized GGUFs containing only qtypes with no supported preservation target
+(for example, pure Q6_K or Q5_K weights) fail with an actionable error rather
+than silently becoming float. Pass `keep_quantized=False` to request that float
+conversion explicitly.
 
 ## Supported GGUF Architectures
 
@@ -136,7 +144,7 @@ hf download $repo $file --revision $revision --local-dir .\nemotron-gguf
 
 # Expected: fail-fast NotImplementedError; no ONNX package is emitted.
 python -m mobius build-gguf ".\nemotron-gguf\$file" `
-  --keep-quantized --ep cpu `
+  --ep cpu `
   --external-data safetensors --output .\nemotron-gguf-onnx
 ```
 
