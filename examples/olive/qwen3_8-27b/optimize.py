@@ -23,6 +23,7 @@ _ASSETS = {
     "preprocessor_config.json",
     "processor_config.json",
     "image_processor.json",
+    "processor-waiver.txt",
 }
 
 
@@ -123,19 +124,25 @@ def quantize_package(source_dir: str | Path, output_dir: str | Path) -> Path:
     for name in _ASSETS:
         if (source / name).is_file():
             shutil.copy2(source / name, output / name)
-    manifest = {
-        "model_id": MODEL_ID,
-        "revision": REVISION,
-        "quantization": "Q4_K_M",
-        "quantized_component": "decoder",
-        "olive_provider": "CPUExecutionProvider",
-        "preserved_fp16_recurrent_gate_nodes": len(preserved_fp16_nodes),
-        "components": [
-            "decoder/model.onnx",
-            "embedding/model.onnx",
-            "vision_encoder/model.onnx",
-        ],
-    }
+    source_manifest = source / "source_manifest.json"
+    manifest = (
+        json.loads(source_manifest.read_text(encoding="utf-8"))
+        if source_manifest.is_file()
+        else {"model_id": MODEL_ID, "revision": REVISION}
+    )
+    manifest.update(
+        {
+            "quantization": "Q4_K_M",
+            "quantized_component": "decoder",
+            "olive_provider": "CPUExecutionProvider",
+            "preserved_fp16_recurrent_gate_nodes": len(preserved_fp16_nodes),
+            "components": [
+                "decoder/model.onnx",
+                "embedding/model.onnx",
+                "vision_encoder/model.onnx",
+            ],
+        }
+    )
     (output / "source_manifest.json").write_text(
         json.dumps(manifest, indent=2), encoding="utf-8"
     )

@@ -234,6 +234,10 @@ def test_qwen38_reduced_olive_q4_package(tmp_path):
     ).__name__ == ("Qwen3VLVideoProcessor")
     assert not (result / "tokenizer.json").exists()
     assert not (result / "generation_config.json").exists()
+    manifest = json.loads((result / "source_manifest.json").read_text())
+    assert manifest["text_input_contract"] == "token-ids-only"
+    assert manifest["runtime"] == "onnxruntime-direct"
+    assert manifest["quantization"] == "Q4_K_M"
     for name in ("decoder", "embedding", "vision_encoder"):
         validator._create_session(result / name / "model.onnx", "cuda")
     ids, logits, _ = validator.run_token_ids(
