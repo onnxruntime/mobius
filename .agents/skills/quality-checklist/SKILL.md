@@ -3,10 +3,10 @@ name: quality-checklist
 description: >
   Use this skill when verifying that a new model is truly done and ready to
   merge. Provides a Definition-of-Done checklist covering all five test
-  confidence levels (L1 graph build through L5 Foundry Local smoke-test),
-  ORT GenAI runtime validation, Olive quantization compatibility, multi-dtype
-  (f32/f16/bf16) and multi-EP (CPU/CUDA/DML) correctness, documentation
-  requirements, and code review criteria.
+  confidence levels (L1 graph build through L5 generation), faithful runtime
+  metadata, optional downstream runtime probes, Olive quantization
+  compatibility, multi-dtype (f32/f16/bf16) and multi-EP (CPU/CUDA/DML)
+  correctness, documentation requirements, and code review criteria.
 ---
 
 # Skill: Quality Checklist
@@ -14,8 +14,8 @@ description: >
 ## When to use
 
 Use this checklist before marking a new model addition as **done**.
-Every item must be checked — or explicitly waived with a written reason —
-before the PR is merged.
+Every required item must be checked — or explicitly waived with a written
+reason — before the PR is merged.
 
 ---
 
@@ -162,27 +162,33 @@ python examples/<model>_text_generation.py --compare-hf --dtype bf16
 - [ ] Final fusion claims use loaded weights/constants; no-weight graphs cannot
       prove initializer folding
 
-### 9. ORT GenAI runtime
+### 9. ORT GenAI metadata and downstream runtime
 
-- [ ] Model can be loaded with `ort_genai.Model(output_dir)` without error
-- [ ] Actual generation with required media/features produces coherent output;
-      schema/config emission alone is not runtime support
-- [ ] ORT GenAI test added to `tests/ort_genai_test.py`
-      (or confirmed covered by an existing parametrized test)
-- [ ] Structurally unsupported contracts fail before artifacts are emitted and
-      have a version-specific, evidence-based waiver
+- [ ] Generated metadata faithfully reflects graph filenames, semantic I/O,
+      representable cache templates, and global cache-slot indices
+- [ ] Intrinsic schema/config errors are tested without inferring downstream
+      runtime capability
 
-Run the ORT GenAI integration test:
+Optional downstream evidence:
+
+- [ ] If ORT GenAI load/generation is run, record the exact runtime version and
+      result. Failures document limitations but never gate Mobius export based
+      on the runtime registry, topology support, or cache executor capability.
+- [ ] Add an ORT GenAI integration test when useful, but do not require one for
+      export acceptance.
+
+Optional ORT GenAI integration probe:
 
 ```bash
 python -m pytest tests/ort_genai_test.py -m integration_slow -k "<model>" -sv
 ```
 
-### 10. Foundry Local smoke test
+### 10. Foundry Local package check
 
-- [ ] Model exported package can be loaded and run in Foundry Local
-- [ ] At minimum, verify that the `genai_config.json` and all ONNX files
-      are present and the model responds to a short prompt
+- [ ] `genai_config.json` and all ONNX files are present and internally
+      consistent
+- [ ] If Foundry Local is available, record its version and load/generation
+      result as optional downstream evidence; limitations do not block export
 
 > If Foundry Local is not available in the current environment, document the
 > skip with a `# TODO: verify with Foundry Local` comment in the PR.
@@ -194,8 +200,9 @@ python -m pytest tests/ort_genai_test.py -m integration_slow -k "<model>" -sv
 - [ ] Quantized model produces non-degenerate output (coherent text)
 - [ ] Quantization uses only required execution providers if unrelated provider
       registration fails, and evidence includes size, load, and inference
-- [ ] If quantization changes the graph structure (e.g. MatMulNBits), verify
-      the `genai_config.json` still loads correctly in ORT GenAI
+- [ ] If quantization changes graph names (e.g. `logits_Q4`), regenerate or
+      verify metadata against the final graph; ORT GenAI loading remains an
+      optional downstream probe
 
 Run the quantization integration test suite to confirm existing patterns
 are not broken:
@@ -223,8 +230,8 @@ novel weight layouts (e.g. fused QKV, non-standard expert routing).
       after optimization or rebase changes
 - [ ] Rebase linearly onto `origin/main`; resolve shared registries/helpers
       semantically, run shared-surface tests, and push with `--force-with-lease`
-- [ ] After rebase, rerun config generation and actual runtime load/generation;
-      parity-only tests do not catch changed cache/runtime contracts
+- [ ] After rebase, rerun metadata generation and intrinsic config validation.
+      If downstream runtime evidence is included, rerun that exact probe too.
 - [ ] Confirm the remote PR head SHA, mergeability, replacement lint, and
       architecture checks after the final push
 - [ ] Triage red CI at check/job/test granularity against the exact base SHA;
@@ -236,17 +243,17 @@ novel weight layouts (e.g. fused QKV, non-standard expert routing).
 
 ## Waiver policy
 
-Any item that cannot be completed must be waived explicitly in the PR
+Any required item that cannot be completed must be waived explicitly in the PR
 description:
 
 ```
 **Waivers:**
 - L5 golden: Model is 70B — generating golden data exceeds CI resources.
   skip_reason added to YAML.
-- Foundry Local: Not available in this environment. Tracked in issue #NNN.
 ```
 
-Unchecked items without a waiver are grounds to request changes before merge.
+Unchecked required items without a waiver are grounds to request changes
+before merge. Optional downstream probes need no waiver.
 
 ---
 
