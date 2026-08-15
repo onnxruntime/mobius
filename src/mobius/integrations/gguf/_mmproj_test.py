@@ -120,6 +120,92 @@ def _write_minimal_gguf(
     writer.close()
 
 
+def _write_quantized_gemma4_text_gguf(path: Path) -> None:
+    """Write a tiny Gemma4 text GGUF with Q4 projections and a float embedding."""
+    from gguf import GGMLQuantizationType, GGUFWriter
+
+    hidden_size = 32
+    intermediate_size = 64
+    vocab_size = 64
+    num_layers = 2
+    num_heads = 4
+    num_kv_heads = 1
+    head_dim = hidden_size // num_heads
+
+    writer = GGUFWriter(str(path), "gemma4")
+    writer.add_context_length(128)
+    writer.add_embedding_length(hidden_size)
+    writer.add_feed_forward_length(intermediate_size)
+    writer.add_block_count(num_layers)
+    writer.add_head_count(num_heads)
+    writer.add_head_count_kv(num_kv_heads)
+    writer.add_key_length(head_dim)
+    writer.add_key_length_swa(head_dim)
+    writer.add_rope_dimension_count(head_dim)
+    writer.add_rope_dimension_count_swa(head_dim)
+    writer.add_rope_freq_base(10_000.0)
+    writer.add_rope_freq_base_swa(10_000.0)
+    writer.add_layer_norm_rms_eps(1e-6)
+    writer.add_vocab_size(vocab_size)
+    writer.add_array(
+        "gemma4.attention.sliding_window_pattern",
+        [True] * num_layers,
+    )
+
+    def _f32(name: str, shape: tuple[int, ...]) -> None:
+        writer.add_tensor(name, np.random.randn(*shape).astype(np.float32))
+
+    def _q4_0(name: str, n_out: int, k_in: int) -> None:
+        block_size = 32
+        block_bytes = 18
+        raw = np.zeros((n_out, k_in // block_size * block_bytes), dtype=np.uint8)
+        for row in range(n_out):
+            for block in range(k_in // block_size):
+                offset = block * block_bytes
+                raw[row, offset : offset + 2] = np.array(
+                    [np.random.uniform(0.01, 1.0)],
+                    dtype=np.float16,
+                ).view(np.uint8)
+                raw[row, offset + 2 : offset + block_bytes] = np.random.randint(
+                    0,
+                    256,
+                    size=block_bytes - 2,
+                    dtype=np.uint8,
+                )
+        writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q4_0)
+
+    # The float embedding is deliberately incompatible with the projection
+    # Q4_0 target, so the graph must retain a normal float embedding initializer.
+    _f32("token_embd.weight", (vocab_size, hidden_size))
+    _q4_0("output.weight", vocab_size, hidden_size)
+    _f32("output_norm.weight", (hidden_size,))
+
+    for layer in range(num_layers):
+        prefix = f"blk.{layer}"
+        _q4_0(f"{prefix}.attn_q.weight", num_heads * head_dim, hidden_size)
+        _q4_0(f"{prefix}.attn_k.weight", num_kv_heads * head_dim, hidden_size)
+        _q4_0(f"{prefix}.attn_v.weight", num_kv_heads * head_dim, hidden_size)
+        _q4_0(f"{prefix}.attn_output.weight", hidden_size, num_heads * head_dim)
+        _q4_0(f"{prefix}.ffn_gate.weight", intermediate_size, hidden_size)
+        _q4_0(f"{prefix}.ffn_up.weight", intermediate_size, hidden_size)
+        _q4_0(f"{prefix}.ffn_down.weight", hidden_size, intermediate_size)
+        for norm in (
+            "attn_norm",
+            "post_attention_norm",
+            "ffn_norm",
+            "post_ffw_norm",
+        ):
+            _f32(f"{prefix}.{norm}.weight", (hidden_size,))
+        for norm in ("attn_q_norm", "attn_k_norm"):
+            _f32(f"{prefix}.{norm}.weight", (head_dim,))
+        _f32(f"{prefix}.layer_output_scale.weight", (1,))
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
 @pytest.fixture
 def clip_mmproj_gguf(tmp_path: Path) -> Path:
     path = tmp_path / "mmproj.gguf"
@@ -369,6 +455,44 @@ class TestKeepQuantizedMixedPrecision:
         # The mmproj-sourced vision encoder is float — no quantized ops.
         assert "MatMulNBits" not in vision_ops
         assert "GatherBlockQuantized" not in vision_ops
+
+    def test_incompatible_embedding_stays_float_and_package_round_trips(
+        self,
+        clip_mmproj_gguf: Path,
+        tmp_path: Path,
+    ):
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.gguf import build_gemma4_vlm_from_gguf
+
+        text_gguf = tmp_path / "gemma4-q4-f32-embedding.gguf"
+        _write_quantized_gemma4_text_gguf(text_gguf)
+
+        package = build_gemma4_vlm_from_gguf(text_gguf, clip_mmproj_gguf)
+        assert "MatMulNBits" in _component_op_types(package["decoder"])
+        assert "GatherBlockQuantized" not in _component_op_types(package["embedding"])
+        float_embedding = package["embedding"].graph.initializers[
+            "embedding.embed_tokens.weight"
+        ]
+        assert float_embedding.const_value is not None
+        assert list(float_embedding.shape) == [64, 32]
+
+        missing = [
+            f"{component}:{name}"
+            for component, model in package.items()
+            for name, initializer in model.graph.initializers.items()
+            if initializer.const_value is None
+        ]
+        assert missing == []
+
+        output_dir = tmp_path / "saved"
+        package.save(str(output_dir), progress_bar=False)
+        reloaded = ModelPackage.load(str(output_dir))
+        assert set(reloaded) == {"decoder", "vision_encoder", "embedding"}
+        assert all(
+            initializer.const_value is not None
+            for model in reloaded.values()
+            for initializer in model.graph.initializers.values()
+        )
 
     def test_quantized_decoder_loads_in_onnxruntime(
         self, clip_mmproj_gguf: Path, tmp_path: Path

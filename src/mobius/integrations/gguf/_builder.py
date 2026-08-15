@@ -5,7 +5,7 @@
 
 Converts ``.gguf`` model files to ONNX using the standard build
 pipeline. Quantized preservation is the default: affine linear-layer weights
-are repacked into MatMulNBits format and token embeddings into
+are repacked into MatMulNBits format and compatible token embeddings into
 GatherBlockQuantized format. For text-only builds, runtime-supported native
 IQ/MXFP4 projection blocks are preserved for BlockQuantizedMatMul. Multimodal
 text backbones and mixed presets such as Q4_K_M are normalized to one affine
@@ -1016,10 +1016,11 @@ def _load_quantized_state_dict(
     """Load tensors, preserving native blocks or normalizing to MatMulNBits.
 
     Projection weights (Q/K/V/O, MLP, and a quantized output head) are
-    converted to the graph's common MatMulNBits format, and token embeddings
-    to GatherBlockQuantized format. Mixed or unsupported source types are
-    dequantized and requantized when they do not match that target. Norms
-    and other non-linear tensors remain dequantized.
+    converted to the graph's common MatMulNBits format, and compatible token
+    embeddings to GatherBlockQuantized format. Mixed or unsupported source
+    types are dequantized and requantized when they do not match that target.
+    Incompatible embeddings, norms, and other non-linear tensors remain
+    dequantized.
 
     For llama-family models, quantized Q/K weights receive the
     row-level reverse-permutation that ``process_tensors`` would

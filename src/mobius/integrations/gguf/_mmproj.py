@@ -214,14 +214,15 @@ def _text_gguf_to_hf_multimodal_quantized(
     block_size: int,
     symmetric: bool,
 ) -> dict:
-    """Load text-backbone GGUF tensors, quantizing the decoder + token embeddings.
+    """Load text GGUF tensors, quantizing the decoder and compatible embeddings.
 
     Mirrors :func:`_text_gguf_to_hf_multimodal` but keeps the text decoder
     projections in MatMulNBits form (``.weight`` uint8 + ``.scales`` [+
-    ``.zero_points``]) and the token-embedding tables in GatherBlockQuantized
-    form (``.qweight`` + ``.scales`` [+ ``.zero_points``]).  Norms and the
-    float per-layer projections stay dequantized.  Vision/audio weights are
-    loaded separately and always stay float.
+    ``.zero_points``]) and compatible token-embedding tables in
+    GatherBlockQuantized form (``.qweight`` + ``.scales`` [+
+    ``.zero_points``]). Incompatible token embeddings, norms, and float
+    per-layer projections stay dequantized. Vision/audio weights are loaded
+    separately and always stay float.
 
     Names are the HF multimodal ``language_model.*`` names that
     :meth:`Gemma4Model.preprocess_weights` expects.
@@ -230,6 +231,7 @@ def _text_gguf_to_hf_multimodal_quantized(
 
     from mobius.integrations.gguf._builder import repack_gguf_weight_to_target
 
+    quantize_embeddings = bool(getattr(config.quantization, "quantize_embeddings", False))
     quantize_lm_head = bool(getattr(config.quantization, "quantize_lm_head", False))
     tie_word_embeddings = bool(config.tie_word_embeddings)
 
@@ -255,7 +257,7 @@ def _text_gguf_to_hf_multimodal_quantized(
         is_quant_linear = hf_name.endswith(_QUANTIZED_LINEAR_SUFFIXES) or (
             quantize_lm_head and hf_name == "language_model.lm_head.weight"
         )
-        is_quant_embedding = hf_name in _QUANTIZED_EMBEDDING_NAMES
+        is_quant_embedding = quantize_embeddings and hf_name in _QUANTIZED_EMBEDDING_NAMES
 
         if (is_quant_linear or is_quant_embedding) and len(np_shape) == 2:
             repacked = repack_gguf_weight_to_target(
@@ -342,13 +344,14 @@ def build_gemma4_vlm_from_gguf(
             encoder. Off by default — see the module docstring.
         keep_quantized: Preserve the text backbone's GGUF quantization when
             present. This is the default: decoder projections become
-            MatMulNBits and token-embedding tables become GatherBlockQuantized.
-            Quantized projection source types, including native IQ/MXFP4
-            blocks, are normalized to the common affine layout rather than
-            retained byte-for-byte. Set to ``False`` to dequantize all text
-            weights. The vision (and audio) encoder always stays float because
-            its weights come from the mmproj as F16 — see the "Mixed precision"
-            note below.
+            MatMulNBits and compatible token-embedding tables become
+            GatherBlockQuantized. Incompatible embedding qtypes or shapes stay
+            float. Quantized projection source types, including native
+            IQ/MXFP4 blocks, are normalized to the common affine layout rather
+            than retained byte-for-byte. Set to ``False`` to dequantize all
+            text weights. The vision (and audio) encoder always stays float
+            because its weights come from the mmproj as F16 — see the "Mixed
+            precision" note below.
 
     Returns:
         A :class:`ModelPackage` with ``decoder`` + ``vision_encoder`` +
@@ -417,8 +420,8 @@ def build_gemma4_vlm_from_gguf(
             config = dataclasses.replace(config, dtype=resolved)
 
     # 1b. Quantized mode: set the module-global quantization config from the
-    # text GGUF BEFORE building so the text graph emits MatMulNBits /
-    # GatherBlockQuantized. The vision/audio encoders ignore it and stay float.
+    # text GGUF BEFORE building so the text graph emits MatMulNBits and, when
+    # compatible, GatherBlockQuantized. The vision/audio encoders stay float.
     quant_params: tuple[int, int, bool] | None = None
     if preserve_quantization:
         from mobius._configs import QuantizationConfig
