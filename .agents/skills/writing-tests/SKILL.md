@@ -269,8 +269,8 @@ integration test alongside any new custom function or Scan op.**
 - When the checkpoint is too large, HTTP-range-read safetensors headers and the
   exact tensors for a production-dimension reduced fixture. Cover every layer
   family and cache contract, record the source layer/row derivation, and create
-  L4/L5 goldens from the independently invoked HuggingFace model. This is
-  reduced real-weight evidence, not a claim of full-checkpoint parity.
+  L4/L5 goldens from the independently invoked HuggingFace model. Treat this as
+  reduced real-weight evidence, not as a claim of full-checkpoint parity.
 - Before accepting an architecture xfail, verify config vocabulary, epsilon,
   and layer-kind translation. A stale `mlp`->`moe` mapping can look like an SSM
   numerical failure while loading the wrong weights entirely.

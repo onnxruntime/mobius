@@ -285,7 +285,7 @@ processor doesn't provide. Either:
 ### Config metadata and downstream runtime acceptance
 
 Mobius owns metadata correctness, not ORT GenAI capability decisions. Emit the
-best accurate package from graph metadata: filenames, semantic graph inputs and
+most accurate package from graph metadata: filenames, semantic graph inputs and
 outputs, every cache template the current config schema can represent, and the
 global cache-slot count. Preserve intrinsic schema/config validation, but do
 not gate or reject export based on the current GenAI model registry, runtime

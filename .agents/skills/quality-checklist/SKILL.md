@@ -190,9 +190,6 @@ python -m pytest tests/ort_genai_test.py -m integration_slow -k "<model>" -sv
 - [ ] If Foundry Local is available, record its version and load/generation
       result as optional downstream evidence; limitations do not block export
 
-> If Foundry Local is not available in the current environment, document the
-> skip with a `# TODO: verify with Foundry Local` comment in the PR.
-
 ### 11. Olive quantization compatibility
 
 - [ ] Model can be loaded from the exported ONNX package by Olive

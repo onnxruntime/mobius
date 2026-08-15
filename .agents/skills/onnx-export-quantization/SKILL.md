@@ -151,8 +151,11 @@ Before implementing or claiming a direct conversion:
    pinned upstream tokenizer. A self-contained package is invalid when padding,
    EOS, or BOS semantics disagree.
 7. Require real-weight full-logit parity and deterministic multi-token
-   generation through both ONNX Runtime and the declared GenAI runtime. Graph,
-   config, and session creation are not acceptance evidence.
+   generation directly through ONNX Runtime. Graph, config, and session creation
+   alone are not acceptance evidence.
+8. Optionally run the same generation through the declared GenAI runtime as
+   downstream evidence. Record its version and outcome, but do not gate direct
+   GGUF artifacts on its acceptance.
 
 Use Hub GGUF architecture metadata to fail before downloading multi-gigabyte
 unsupported files, then repeat the guard from the local GGUF header so local
