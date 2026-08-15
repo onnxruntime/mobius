@@ -559,6 +559,22 @@ class TestConfigMapping:
         assert fields["hidden_size"] == 4096
         assert fields["num_hidden_layers"] == 32
 
+    def test_extract_config_fields_preserves_tokenizer_metadata(self):
+        fields = _extract_config_fields(
+            "llama",
+            {
+                "tokenizer.ggml.bos_token_id": 1,
+                "tokenizer.ggml.eos_token_id": 2,
+                "tokenizer.ggml.padding_token_id": 3,
+                "tokenizer.ggml.tokens": ["a", "<image_soft_token>", "b"],
+            },
+        )
+
+        assert fields["bos_token_id"] == 1
+        assert fields["eos_token_id"] == 2
+        assert fields["pad_token_id"] == 3
+        assert fields["image_token_id"] == 1
+
     def test_infer_tie_embeddings_true(self, tied_gguf: Path):
         model = GGUFModel(tied_gguf)
         assert _infer_tie_embeddings(model) is True

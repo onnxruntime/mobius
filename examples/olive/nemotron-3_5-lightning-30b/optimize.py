@@ -69,6 +69,10 @@ def export_checkpoint(output_dir: str | Path, *, ep: str) -> Path:
 
     output = Path(output_dir)
     _require_empty_output(output)
+    # CUDA fused cache kernels diverge during multi-step decode for this hybrid
+    # architecture. Keep a portable graph and let CUDA place supported standard
+    # ops; reduced-real validation enforces <=1e-2 at every cached step.
+    build_ep = "onnx-standard" if ep == "cuda" else ep
     with override_flags(ort_cuda_grouped_rmsnorm_workaround=ep == "cuda"):
         package = build(
             MODEL_ID,
@@ -76,13 +80,20 @@ def export_checkpoint(output_dir: str | Path, *, ep: str) -> Path:
             dtype="f16",
             load_weights=True,
             trust_remote_code=False,
-            execution_provider=ep,
+            execution_provider=build_ep,
         )
     package.save(output, external_data="onnx")
     _save_pinned_metadata(output)
     manifest_path = output / "source_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest.update({"source_dtype": "bf16", "dtype": "f16", "target_ep": ep})
+    manifest.update(
+        {
+            "source_dtype": "bf16",
+            "dtype": "f16",
+            "target_ep": ep,
+            "build_ep": build_ep,
+        }
+    )
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return output
 

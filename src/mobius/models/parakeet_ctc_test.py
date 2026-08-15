@@ -168,11 +168,10 @@ def test_parakeet_synthetic_parity_with_padding():
     np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
-def test_parakeet_rejects_unsupported_ort_genai_export(tmp_path):
+def test_parakeet_emits_ort_genai_metadata(tmp_path):
     _, _, _, package = _build_tiny()
 
-    with pytest.raises(
-        ValueError,
-        match="does not define a feature-input CTC ASR pipeline",
-    ):
-        write_ort_genai_config(package, str(tmp_path))
+    result = write_ort_genai_config(package, str(tmp_path))
+
+    assert "genai_config" in result
+    assert (tmp_path / "genai_config.json").is_file()

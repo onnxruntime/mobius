@@ -301,12 +301,15 @@ def _mobius_package(
     config = NemotronHConfig.from_transformers(_hf_config())
     config.dtype = getattr(ir.DataType, _DTYPES[dtype_name][1])
     module = NemotronHCausalLMModel(config)
+    # Keep CUDA execution portable: fused hybrid cache kernels show
+    # provider-dependent multi-step drift even when prefill matches.
+    build_ep = "onnx-standard" if ep == "cuda" else ep
     with override_flags(ort_cuda_grouped_rmsnorm_workaround=ep == "cuda"):
         package = build_from_module(
             module,
             config,
             task="hybrid-text-generation",
-            execution_provider=ep,
+            execution_provider=build_ep,
             trace_optimization=True,
         )
     package.apply_weights(module.preprocess_weights(dict(state)))

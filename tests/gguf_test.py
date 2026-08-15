@@ -9,6 +9,7 @@ test the full pipeline without network downloads.
 
 from __future__ import annotations
 
+import json
 from unittest import mock
 
 import numpy as np
@@ -52,6 +53,9 @@ def _create_tiny_gguf(
     writer.add_context_length(128)
     writer.add_feed_forward_length(ffn_size)
     writer.add_vocab_size(vocab)
+    writer.add_bos_token_id(1)
+    writer.add_eos_token_id(2)
+    writer.add_pad_token_id(3)
 
     # Tensors — unquantized random weights
     rng = np.random.default_rng(42)
@@ -544,20 +548,25 @@ class TestCLIBuildGGUF:
             )
         assert exc_info.value.code == 2
 
-    def test_ort_genai_runtime_is_rejected_before_artifacts(self, tmp_path):
-        """build-gguf must not silently ignore an ORT GenAI runtime request."""
+    def test_ort_genai_runtime_writes_graph_derived_config(self, tmp_path):
         from mobius.__main__ import main
 
+        path = _create_tiny_gguf(tmp_path / "test.gguf")
         output_dir = tmp_path / "output"
-        with pytest.raises(SystemExit, match="does not yet support --runtime ort-genai"):
-            main(
-                [
-                    "build-gguf",
-                    str(tmp_path / "not-downloaded.gguf"),
-                    "--runtime",
-                    "ort-genai",
-                    "--output",
-                    str(output_dir),
-                ]
-            )
-        assert not output_dir.exists()
+        main(
+            [
+                "build-gguf",
+                path,
+                "--runtime",
+                "ort-genai",
+                "--output",
+                str(output_dir),
+            ]
+        )
+
+        assert (output_dir / "model.onnx").is_file()
+        assert (output_dir / "genai_config.json").is_file()
+        config = json.loads((output_dir / "genai_config.json").read_text(encoding="utf-8"))
+        assert config["model"]["bos_token_id"] == 1
+        assert config["model"]["eos_token_id"] == 2
+        assert config["model"]["pad_token_id"] == 3
