@@ -440,7 +440,7 @@ class AdapterRowSelection:
             raise ValueError("adapter request epoch must be non-negative")
         names = [application.adapter for application in self.adapters]
         if len(names) != len(set(names)):
-            raise ValueError("an adapter may appear at most once in a row composition")
+            raise ValueError("adapter row contains duplicate adapter")
 
 
 @dataclasses.dataclass(frozen=True)

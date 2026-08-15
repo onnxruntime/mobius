@@ -551,6 +551,12 @@ def test_application_scale_matches_runtime_bound() -> None:
         AdapterApplication("style", 16.1)
 
 
+def test_selection_rejects_duplicate_adapter() -> None:
+    application = AdapterApplication("style")
+    with pytest.raises(ValueError, match="contains duplicate adapter"):
+        AdapterRowSelection(100, 0, (application, application))
+
+
 def test_selection_rejects_unknown_adapter_and_invalid_permutation() -> None:
     batch = AdapterBatchSelection(
         (AdapterRowSelection(100, 0, (AdapterApplication("missing"),)),)
