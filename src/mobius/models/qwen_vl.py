@@ -1031,7 +1031,7 @@ class Qwen3VLEmbeddingModel(Qwen25VLEmbeddingModel):
         # feature, regardless of placeholder order or batch row.
         image_mask = op.Equal(input_ids, op.Constant(value_int=self.image_token_id))
         if self.video_token_id is None:
-            video_mask = op.CastLike(False, image_mask)
+            video_mask = op.Not(op.Equal(input_ids, input_ids))
         else:
             video_mask = op.Equal(
                 input_ids,
@@ -1040,7 +1040,8 @@ class Qwen3VLEmbeddingModel(Qwen25VLEmbeddingModel):
         media_mask = op.Or(image_mask, video_mask)
         media_mask_3d = op.Unsqueeze(media_mask, [-1])
 
-        flat_image_mask = op.Cast(op.Reshape(image_mask, [-1]), to=7)
+        flat_image_mask_bool = op.Reshape(image_mask, [-1])
+        flat_image_mask = op.Cast(flat_image_mask_bool, to=7)
         flat_video_mask = op.Cast(op.Reshape(video_mask, [-1]), to=7)
         image_indices = op.Sub(
             op.CumSum(flat_image_mask, op.Constant(value_int=0)),
@@ -1054,7 +1055,7 @@ class Qwen3VLEmbeddingModel(Qwen25VLEmbeddingModel):
             op.ReduceSum(flat_image_mask, keepdims=0),
         )
         flat_indices = op.Where(
-            op.CastLike(flat_image_mask, image_mask),
+            flat_image_mask_bool,
             image_indices,
             video_indices,
         )

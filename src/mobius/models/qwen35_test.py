@@ -249,6 +249,48 @@ class TestQwen38Alias:
         session.close()
         np.testing.assert_array_equal(decode, embedding_weight[decode_ids])
 
+    def test_embedding_scatter_without_video_token_id(self):
+        config = ArchitectureConfig(
+            vocab_size=16,
+            hidden_size=4,
+            pad_token_id=0,
+            image_token_id=10,
+            video_token_id=None,
+            dtype=ir.DataType.FLOAT,
+        )
+        graph = build_embedding_from_features(
+            Qwen3VLEmbeddingModel(config),
+            config,
+            feature_name="image_features",
+            feature_dim=config.hidden_size,
+        )
+        embedding_weight = np.arange(
+            config.vocab_size * config.hidden_size,
+            dtype=np.float32,
+        ).reshape(config.vocab_size, config.hidden_size)
+        for name, initializer in graph.graph.initializers.items():
+            if name.endswith("embed_tokens.weight"):
+                initializer.const_value = ir.tensor(embedding_weight)
+
+        input_ids = np.array(
+            [[config.image_token_id, 1], [2, config.image_token_id]],
+            dtype=np.int64,
+        )
+        image_features = np.arange(100, 108, dtype=np.float32).reshape(2, 4)
+        session = OnnxModelSession(graph)
+        result = session.run(
+            {
+                "input_ids": input_ids,
+                "image_features": image_features,
+            }
+        )["inputs_embeds"]
+        session.close()
+
+        expected = embedding_weight[input_ids].copy()
+        expected[0, 0] = image_features[0]
+        expected[1, 1] = image_features[1]
+        np.testing.assert_array_equal(result, expected)
+
 
 def _moe_config(quantization: QuantizationConfig | None) -> object:
     return make_config(
