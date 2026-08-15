@@ -200,6 +200,11 @@ class AdapterTargetManifest:
                     f"adapter manifest node {descriptor.node_name!r} resolved "
                     f"{len(nodes)} times"
                 )
+            if initializer not in nodes[0].inputs:
+                raise ValueError(
+                    f"adapter manifest node {descriptor.node_name!r} does not consume "
+                    f"parameter {descriptor.target.parameter!r}"
+                )
             if descriptor.output_name not in {
                 output.name for output in nodes[0].outputs if output.name is not None
             }:
