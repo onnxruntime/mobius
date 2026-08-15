@@ -84,6 +84,7 @@ class TestResolveOrtGenaiModelType:
         assert _resolve_ort_genai_model_type("qwen3") == "qwen2"
         assert _resolve_ort_genai_model_type("qwen3_5") == "qwen3_5"
         assert _resolve_ort_genai_model_type("qwen3_5_vl") == "qwen3_5"
+        assert _resolve_ort_genai_model_type("qwen3_5_text") == "qwen3_5"
         assert _resolve_ort_genai_model_type("gemma2") == "gemma"
         assert _resolve_ort_genai_model_type("llama") == "llama"
 
@@ -355,6 +356,38 @@ class TestWriteProcessorConfig:
             "temporal_patch_size": 2,
             "merge_size": 2,
         }
+
+    def test_qwen35_text_subtype_uses_packed_qwen_image_pipeline(self, tmp_path):
+        vision = types.SimpleNamespace(
+            image_size=448,
+            patch_size=16,
+            spatial_merge_size=2,
+            model_type="qwen3_5",
+        )
+        config = types.SimpleNamespace(
+            vision=vision,
+            model_type="qwen3_5_text",
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+        )
+
+        path = _write_vision_processor_config(config, str(tmp_path))
+
+        assert path is not None
+        with open(path, encoding="utf-8") as config_file:
+            processor = json.load(config_file)["processor"]
+        assert processor["name"] == "qwen2_5_image_processor"
+        transforms = processor["transforms"]
+        assert transforms[-1]["operation"] == {
+            "name": "patch_image",
+            "type": "PatchImage",
+            "attrs": {
+                "patch_size": 16,
+                "temporal_patch_size": 2,
+                "merge_size": 2,
+            },
+        }
+        assert transforms[-2]["operation"]["attrs"]["qwen2_5_vl"] == 1
 
     def test_gemma3_vision_config(self, tmp_path):
         """Gemma3 gets a fixed-size resize + Permute3D (not the generic branch).
@@ -1094,7 +1127,7 @@ class TestExportForOrtGenai:
 
         @dataclasses.dataclass
         class FakeConfig:
-            model_type: str = "qwen3_5"
+            model_type: str = "qwen3_5_text"
             vocab_size: int = 256
             hidden_size: int = 64
             num_hidden_layers: int = 4
