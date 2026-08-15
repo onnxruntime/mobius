@@ -32,10 +32,11 @@ pipeline:
           shape:
           - batch
         role:
-          kind: opaque
+          kind: runtime
+          version: '1.0'
+          role: adapter_active
         source:
-          kind: application
-          name: active
+          kind: request
       request.request_epochs:
         contract:
           dtype: int64
@@ -60,6 +61,44 @@ pipeline:
         source:
           kind: application
           name: activations
+      request.adapter_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - 2
+        role:
+          kind: runtime
+          version: '1.0'
+          role: adapter_ids
+        source:
+          kind: request
+      request.adapter_counts:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: runtime
+          version: '1.0'
+          role: adapter_counts
+        source:
+          kind: request
+      request.adapter_scales:
+        contract:
+          dtype: float32
+          rank: 2
+          shape:
+          - batch
+          - 2
+        role:
+          kind: runtime
+          version: '1.0'
+          role: adapter_scales
+        source:
+          kind: request
     outputs:
       result:
         contract:
@@ -119,11 +158,16 @@ pipeline:
       output: result
       mode: replace
     adapters:
-      base_model_fingerprint: sha256:3fd36990826adeab952ece1ca18d2b2c721e47a21a40cd0d32e74c2af46bcd96
-      row_ids: request.row_ids
-      request_epochs: request.request_epochs
-      active: request.active
-      application_capability: onnx-genai.adapters
+      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:3bc8619d443995ec33644536e15ad6e777609c63eb078273e098fb733d2c415f
+      selection:
+        row_ids: request.row_ids
+        request_epochs: request.request_epochs
+        adapter_ids: request.adapter_ids
+        adapter_counts: request.adapter_counts
+        scales: request.adapter_scales
+        active: request.active
+        max_adapters: 2
+      application_capability: onnx-genai.adapters@1
       portable_fallback: true
       cache:
         max_entries: 2
@@ -134,16 +178,36 @@ pipeline:
         invalidate_capture_on_eviction: true
       artifacts:
         blue:
+          index: 0
           identity: blue
           version: '1'
-          base_model_fingerprint: sha256:3fd36990826adeab952ece1ca18d2b2c721e47a21a40cd0d32e74c2af46bcd96
+          base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:3bc8619d443995ec33644536e15ad6e777609c63eb078273e098fb733d2c415f
           rank: 1
           alpha: 1.0
           dtype: float32
           provenance: in_memory
           weights:
-          - location: adapters/blue.json
-            sha256: 66ecbb05ef164997eb5d21cd7ced595ee7457daa67ac6c4b26bdba27d7d238e7
+          - location: adapters/blue/adapter.json
+            sha256: d9e67499ad74d4c2d62c45a79ceeea8dfa94893afde9615ea6030b79d052ddbe
+            format: json
+          targets:
+          - component: decoder
+            parameter: projection
+            weight_key: projection
+            input_features: 2
+            output_features: 2
+        green:
+          index: 1
+          identity: green
+          version: '1'
+          base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:3bc8619d443995ec33644536e15ad6e777609c63eb078273e098fb733d2c415f
+          rank: 1
+          alpha: 1.0
+          dtype: float32
+          provenance: in_memory
+          weights:
+          - location: adapters/green/adapter.json
+            sha256: d49ae9a3336884fa1ed8503caca1380699788add893870a670f6290c473bc935
             format: json
           targets:
           - component: decoder
@@ -152,16 +216,17 @@ pipeline:
             input_features: 2
             output_features: 2
         red:
+          index: 2
           identity: red
           version: '1'
-          base_model_fingerprint: sha256:3fd36990826adeab952ece1ca18d2b2c721e47a21a40cd0d32e74c2af46bcd96
+          base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:3bc8619d443995ec33644536e15ad6e777609c63eb078273e098fb733d2c415f
           rank: 1
           alpha: 1.0
           dtype: float32
           provenance: in_memory
           weights:
-          - location: adapters/red.json
-            sha256: 7de6cf124e348f4e8fce31694559fb73644a463ee6b43931bf66cc617e157783
+          - location: adapters/red/adapter.json
+            sha256: b4bd656305aa2fea1d518df351af5fd3bf99b3d0a6c8bd8501dfc5107ac278a1
             format: json
           targets:
           - component: decoder

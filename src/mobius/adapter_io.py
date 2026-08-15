@@ -138,7 +138,11 @@ def load_peft_adapter(
     )
 
 
-def adapter_source_from_onnx_adapter(path: str | Path) -> AdapterSource:
+def adapter_source_from_onnx_adapter(
+    path: str | Path,
+    *,
+    native_parameters: Mapping[AdapterTarget, tuple[str, str]] | None = None,
+) -> AdapterSource:
     """Declare an ORT FlatBuffers adapter source without making it mandatory."""
     path = Path(path)
     payload = path.read_bytes()
@@ -148,4 +152,11 @@ def adapter_source_from_onnx_adapter(path: str | Path) -> AdapterSource:
         "onnx_adapter",
         path=str(path),
         checksum=f"sha256:{hashlib.sha256(payload).hexdigest()}",
+        native_parameters=tuple(
+            (target, names[0], names[1])
+            for target, names in sorted(
+                (native_parameters or {}).items(),
+                key=lambda item: (item[0].component, item[0].parameter),
+            )
+        ),
     )

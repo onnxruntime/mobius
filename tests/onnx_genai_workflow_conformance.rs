@@ -38,6 +38,27 @@ fn adapter_request(
     selection: AdapterSelection,
 ) -> anyhow::Result<PipelineGenerateRequest> {
     let batch = i64::try_from(row_ids.len())?;
+    let mut adapter_ids = vec![-1i64; row_ids.len() * 2];
+    let mut adapter_counts = vec![0i64; row_ids.len()];
+    let mut adapter_scales = vec![0.0f32; row_ids.len() * 2];
+    for (row, (&row_id, &request_epoch)) in row_ids.iter().zip(request_epochs).enumerate() {
+        let identity = onnx_genai_engine::AdapterRowIdentity {
+            row_id,
+            request_epoch,
+        };
+        if let Some(activations) = selection.rows.get(&identity) {
+            adapter_counts[row] = i64::try_from(activations.len())?;
+            for (slot, activation) in activations.iter().enumerate() {
+                adapter_ids[row * 2 + slot] = match activation.adapter.as_str() {
+                    "blue" => 0,
+                    "green" => 1,
+                    "red" => 2,
+                    other => anyhow::bail!("unknown test adapter {other}"),
+                };
+                adapter_scales[row * 2 + slot] = activation.scale;
+            }
+        }
+    }
     Ok(PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![]),
         options: Default::default(),
@@ -46,6 +67,18 @@ fn adapter_request(
     .with_input(
         "request.request_epochs",
         Value::from_slice_i64(request_epochs, &[batch])?,
+    )
+    .with_input(
+        "request.adapter_ids",
+        Value::from_slice_i64(&adapter_ids, &[batch, 2])?,
+    )
+    .with_input(
+        "request.adapter_counts",
+        Value::from_slice_i64(&adapter_counts, &[batch])?,
+    )
+    .with_input(
+        "request.adapter_scales",
+        Value::from_slice_f32(&adapter_scales, &[batch, 2])?,
     )
     .with_input(
         "request.active",
@@ -58,8 +91,7 @@ fn adapter_request(
     .with_input(
         "activations",
         Value::from_slice_f32(values, &[batch, 2])?,
-    )
-    .with_adapters(selection))
+    ))
 }
 
 #[test]
@@ -67,6 +99,11 @@ fn mobius_parameter_adapters_preserve_order_rows_compaction_and_epochs() -> anyh
     let mut engine = Engine::from_pipeline_dir(&root("adapter")?, EngineConfig::default())?;
     let selection = AdapterSelection::default()
         .with_row(10, 0, [AdapterActivation::new("red", 1.0)])
+        .with_row(
+            20,
+            0,
+            [AdapterActivation::new("blue", 1.0)],
+        )
         .with_row(
             30,
             0,
@@ -99,6 +136,18 @@ fn mobius_parameter_adapters_preserve_order_rows_compaction_and_epochs() -> anyh
     );
     let reused =
         AdapterSelection::default().with_row(10, 1, [AdapterActivation::new("blue", 1.0)]);
+    let stale = engine.run_pipeline(adapter_request(
+        &[10],
+        &[1],
+        &[true],
+        &[1.0, 2.0],
+        AdapterSelection::default().with_row(
+            10,
+            0,
+            [AdapterActivation::new("red", 1.0)],
+        ),
+    )?)?;
+    assert_eq!(stale["result"].to_vec_f32()?, vec![1.0, 2.0]);
     for _ in 0..2 {
         let output = engine.run_pipeline(adapter_request(
             &[10],
@@ -109,9 +158,34 @@ fn mobius_parameter_adapters_preserve_order_rows_compaction_and_epochs() -> anyh
         )?)?;
         assert_eq!(output["result"].to_vec_f32()?, vec![7.0, 10.0]);
     }
+    let green =
+        AdapterSelection::default().with_row(40, 0, [AdapterActivation::new("green", 1.0)]);
+    let output = engine.run_pipeline(adapter_request(
+        &[40],
+        &[0],
+        &[true],
+        &[1.0, 2.0],
+        green,
+    )?)?;
+    assert_eq!(output["result"].to_vec_f32()?, vec![4.0, 5.0]);
+    let red =
+        AdapterSelection::default().with_row(50, 0, [AdapterActivation::new("red", 1.0)]);
+    for _ in 0..2 {
+        let output = engine.run_pipeline(adapter_request(
+            &[50],
+            &[0],
+            &[true],
+            &[1.0, 2.0],
+            red.clone(),
+        )?)?;
+        assert_eq!(output["result"].to_vec_f32()?, vec![2.0, 4.0]);
+    }
     let diagnostic = engine.adapter_lifecycle_diagnostic();
-    assert_eq!(diagnostic.loads, 2);
+    assert_eq!(diagnostic.loads, 4);
     assert!(diagnostic.cache_hits > 0);
+    assert_eq!(diagnostic.evictions, 2);
+    assert_eq!(diagnostic.reloads, 1);
+    assert_eq!(diagnostic.capture_invalidations, 2);
     assert!(diagnostic.replayed_plans > 0);
     Ok(())
 }

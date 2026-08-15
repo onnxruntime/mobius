@@ -22,7 +22,6 @@ __all__ = ["ModelPackage"]
 
 import hashlib
 import inspect
-import json
 import logging
 import os
 import shutil
@@ -32,9 +31,12 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
 
+import numpy as np
 import onnx_ir as ir
+import rfc8785
 import torch
 import tqdm
+from safetensors.numpy import save_file as save_safetensors_file
 
 from mobius._optimizations import fold_initializers_after_weights
 from mobius.adapters import (
@@ -62,18 +64,13 @@ def _adapter_dtype_name(dtype: ir.DataType) -> str:
         ) from error
 
 
-def _adapter_source_file(artifact: AdapterArtifact) -> tuple[str, str]:
+def _adapter_source_file(artifact: AdapterArtifact) -> str:
     if artifact.source.path is None:
         raise ValueError(
             f"adapter {artifact.name!r} cannot preserve an in-memory source format"
         )
     if artifact.source.format == "onnx_adapter":
-        return artifact.source.path, "ort_genai"
-    if artifact.source.format == "peft_safetensors":
-        path = artifact.source.path
-        if os.path.isdir(path):
-            path = os.path.join(path, "adapter_model.safetensors")
-        return path, "safetensors"
+        return artifact.source.path
     raise ValueError(
         f"adapter {artifact.name!r} source format {artifact.source.format!r} "
         "cannot be preserved"
@@ -266,21 +263,26 @@ class ModelPackage(UserDict[str, ir.Model]):
         if artifact.name in self.adapter_artifacts:
             raise ValueError(f"adapter artifact {artifact.name!r} is already attached")
         if validate_base:
-            artifact.validate_base(self.data)
+            artifact.validate_base(
+                self.data,
+                fingerprint_targets=(
+                    tuple(self.adapter_target_manifest.bindings)
+                    if self.adapter_target_manifest is not None
+                    else None
+                ),
+            )
         if self.adapter_target_manifest is not None:
+            if artifact.base_fingerprint != self.adapter_target_manifest.base_fingerprint:
+                raise ValueError(
+                    f"adapter {artifact.name!r} base fingerprint does not match "
+                    "the authoritative target manifest"
+                )
             missing = artifact.target_bindings - self.adapter_target_manifest.bindings
             if missing:
                 raise ValueError(
                     f"adapter artifact {artifact.name!r} contains targets outside "
                     f"the authoritative manifest: {sorted(map(str, missing))}"
                 )
-            if self.adapter_artifacts:
-                expected = next(iter(self.adapter_artifacts.values())).target_bindings
-                if artifact.target_bindings != expected:
-                    raise ValueError(
-                        f"adapter artifact {artifact.name!r} target set does not align "
-                        "with the existing N-adapter catalog"
-                    )
         self.adapter_artifacts[artifact.name] = artifact
 
     def save_adapter_artifacts(self, directory: str) -> dict[str, dict[str, object]]:
@@ -300,7 +302,9 @@ class ModelPackage(UserDict[str, ir.Model]):
         }
         catalog: dict[str, dict[str, object]] = {}
         identities: set[tuple[str, str]] = set()
-        for alias, artifact in sorted(self.adapter_artifacts.items()):
+        for artifact_index, (alias, artifact) in enumerate(
+            sorted(self.adapter_artifacts.items())
+        ):
             identity_version = (artifact.stable_identity, artifact.version)
             if identity_version in identities:
                 raise ValueError(
@@ -330,43 +334,67 @@ class ModelPackage(UserDict[str, ir.Model]):
                 )
             targets: list[dict[str, object]] = []
             portable_targets: dict[str, dict[str, list[float]]] = {}
+            portable_safetensors: dict[str, np.ndarray] = {}
+            native_parameters = {
+                target: {"a": a, "b": b} for target, a, b in artifact.source.native_parameters
+            }
             for weight in sorted(
                 artifact.weights,
                 key=lambda item: (item.target.component, item.target.parameter),
             ):
                 descriptor = descriptors[weight.target]
                 weight_key = descriptor.semantic_name
-                targets.append(
-                    {
-                        "component": weight.target.component,
-                        "parameter": weight.target.parameter,
-                        "weight_key": weight_key,
-                        "input_features": descriptor.input_size,
-                        "output_features": descriptor.output_size,
-                    }
-                )
+                target_entry: dict[str, object] = {
+                    "component": weight.target.component,
+                    "parameter": weight.target.parameter,
+                    "weight_key": weight_key,
+                    "input_features": descriptor.input_size,
+                    "output_features": descriptor.output_size,
+                }
+                if (
+                    self.adapter_service_options.preserve_source_format
+                    and artifact.source.format == "onnx_adapter"
+                ):
+                    try:
+                        target_entry["native_parameters"] = native_parameters[weight.target]
+                    except KeyError as error:
+                        raise ValueError(
+                            f"adapter {alias!r} must declare exact native A/B parameter "
+                            f"names for {weight.target.component}.{weight.target.parameter}"
+                        ) from error
+                targets.append(target_entry)
                 portable_targets[weight_key] = {
                     "a": weight.a.numpy().reshape(-1).astype("float32").tolist(),
                     "b": weight.b.numpy().reshape(-1).astype("float32").tolist(),
                 }
+                portable_safetensors[f"{weight_key}.a"] = weight.a.numpy()
+                portable_safetensors[f"{weight_key}.b"] = weight.b.numpy()
 
+            artifact_dir = os.path.join(directory, "adapters", alias)
+            os.makedirs(artifact_dir, exist_ok=True)
             if self.adapter_service_options.preserve_source_format:
-                source_path, weight_format = _adapter_source_file(artifact)
-                extension = ".onnx_adapter" if weight_format == "ort_genai" else ".safetensors"
-                relative_location = f"adapters/{alias}{extension}"
-                destination = os.path.join(directory, relative_location)
-                shutil.copyfile(source_path, destination)
+                if artifact.source.format == "onnx_adapter":
+                    source_path = _adapter_source_file(artifact)
+                    weight_format = "ort_genai"
+                    relative_location = f"adapters/{alias}/adapter.onnx_adapter"
+                    destination = os.path.join(directory, relative_location)
+                    shutil.copyfile(source_path, destination)
+                elif artifact.source.format == "peft_safetensors":
+                    weight_format = "safetensors"
+                    relative_location = f"adapters/{alias}/adapter.safetensors"
+                    destination = os.path.join(directory, relative_location)
+                    save_safetensors_file(portable_safetensors, destination)
+                else:
+                    raise ValueError(
+                        f"adapter {alias!r} source format {artifact.source.format!r} "
+                        "cannot be preserved"
+                    )
                 with open(destination, "rb") as handle:
                     payload = handle.read()
             else:
-                relative_location = f"adapters/{alias}.json"
+                relative_location = f"adapters/{alias}/adapter.json"
                 destination = os.path.join(directory, relative_location)
-                payload = json.dumps(
-                    {"targets": portable_targets},
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    allow_nan=False,
-                ).encode("utf-8")
+                payload = rfc8785.dumps({"targets": portable_targets})
                 with open(destination, "wb") as handle:
                     handle.write(payload)
                 weight_format = "json"
@@ -378,6 +406,7 @@ class ModelPackage(UserDict[str, ir.Model]):
             if artifact.source.checksum:
                 provenance_parts.append(f"source_{artifact.source.checksum}")
             catalog[alias] = {
+                "index": artifact_index,
                 "identity": artifact.stable_identity,
                 "version": artifact.version,
                 "base_model_fingerprint": artifact.base_fingerprint,

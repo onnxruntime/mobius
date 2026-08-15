@@ -10,6 +10,7 @@ __all__ = [
     "AdapterArtifact",
     "AdapterBatchSelection",
     "AdapterRowSelection",
+    "AdapterSelectionTensors",
     "AdapterServiceOptions",
     "AdapterSource",
     "AdapterTarget",
@@ -26,11 +27,13 @@ import hashlib
 import itertools
 import json
 import math
+import sys
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal
 
 import numpy as np
 import onnx_ir as ir
+import rfc8785
 
 
 def _validate_identifier(value: str, description: str) -> None:
@@ -40,6 +43,10 @@ def _validate_identifier(value: str, description: str) -> None:
 
 def _tensor_bytes(tensor: ir.Tensor) -> bytes:
     array = np.ascontiguousarray(tensor.numpy())
+    if array.dtype.byteorder == ">" or (
+        array.dtype.byteorder == "=" and sys.byteorder == "big"
+    ):
+        array = array.byteswap().view(array.dtype.newbyteorder("<"))
     return array.tobytes(order="C")
 
 
@@ -56,27 +63,108 @@ def _update_tensor_hash(digest: Any, tensor: ir.Tensor) -> None:
     digest.update(_tensor_bytes(tensor))
 
 
-def fingerprint_model_weights(models: Mapping[str, ir.Model]) -> str:
-    """Return a deterministic SHA-256 fingerprint of loaded base-model weights.
+def _canonical_attribute_value(attribute: ir.Attr) -> object:
+    value = attribute.value
+    if attribute.type in {
+        ir.AttributeType.FLOAT,
+        ir.AttributeType.INT,
+        ir.AttributeType.STRING,
+    }:
+        return value
+    if attribute.type in {
+        ir.AttributeType.FLOATS,
+        ir.AttributeType.INTS,
+        ir.AttributeType.STRINGS,
+    }:
+        return list(value)
+    if attribute.type == ir.AttributeType.TENSOR:
+        return {
+            "dtype": int(value.dtype),
+            "shape": [int(dimension) for dimension in value.shape],
+            "sha256": hashlib.sha256(_tensor_bytes(value)).hexdigest(),
+        }
+    if attribute.type == ir.AttributeType.TENSORS:
+        return [
+            {
+                "dtype": int(tensor.dtype),
+                "shape": [int(dimension) for dimension in tensor.shape],
+                "sha256": hashlib.sha256(_tensor_bytes(tensor)).hexdigest(),
+            }
+            for tensor in value
+        ]
+    raise ValueError(
+        f"cannot canonicalize adapter target consumer attribute "
+        f"{attribute.name!r} of type {attribute.type.name}"
+    )
 
-    Component and initializer names are part of the digest, so an adapter cannot
-    silently bind to an equal-shaped parameter in a different model component.
-    """
-    digest = hashlib.sha256()
-    for component_name, model in sorted(models.items()):
-        digest.update(component_name.encode())
-        digest.update(b"\0")
-        for parameter_name, initializer in sorted(model.graph.initializers.items()):
-            if initializer.const_value is None:
-                raise ValueError(
-                    f"cannot fingerprint unloaded initializer "
-                    f"{component_name!r}/{parameter_name!r}"
-                )
-            digest.update(parameter_name.encode())
-            digest.update(b"\0")
-            _update_tensor_hash(digest, initializer.const_value)
-            digest.update(b"\0")
-    return f"sha256:{digest.hexdigest()}"
+
+def _target_fingerprint_record(
+    models: Mapping[str, ir.Model],
+    target: AdapterTarget,
+) -> dict[str, object]:
+    model = models.get(target.component)
+    if model is None:
+        raise ValueError(f"cannot fingerprint unknown component {target.component!r}")
+    initializer = model.graph.initializers.get(target.parameter)
+    if initializer is None:
+        raise ValueError(
+            f"cannot fingerprint unknown parameter {target.component!r}/{target.parameter!r}"
+        )
+    if initializer.const_value is None:
+        raise ValueError(
+            f"cannot fingerprint unloaded initializer "
+            f"{target.component!r}/{target.parameter!r}"
+        )
+    consumers: list[dict[str, object]] = []
+    for node_ordinal, node in enumerate(model.graph):
+        for input_ordinal, node_input in enumerate(node.inputs):
+            if node_input is not initializer:
+                continue
+            consumers.append(
+                {
+                    "attributes": {
+                        name: _canonical_attribute_value(attribute)
+                        for name, attribute in sorted(node.attributes.items())
+                    },
+                    "domain": node.domain or "ai.onnx",
+                    "input_ordinal": input_ordinal,
+                    "node_ordinal": node_ordinal,
+                    "op_type": node.op_type,
+                }
+            )
+    return {
+        "component": target.component,
+        "consumers": consumers,
+        "dtype": int(initializer.dtype),
+        "parameter": target.parameter,
+        "shape": [int(dimension) for dimension in initializer.shape],
+        "tensor_sha256": hashlib.sha256(_tensor_bytes(initializer.const_value)).hexdigest(),
+    }
+
+
+def fingerprint_model_weights(
+    models: Mapping[str, ir.Model],
+    targets: Sequence[AdapterTarget] | None = None,
+) -> str:
+    """Fingerprint the exact immutable base parameters targeted by adapters."""
+    if targets is None:
+        targets = tuple(
+            AdapterTarget(component, parameter)
+            for component, model in sorted(models.items())
+            for parameter in sorted(model.graph.initializers)
+        )
+    unique_targets = sorted(set(targets), key=lambda item: (item.component, item.parameter))
+    if not unique_targets:
+        raise ValueError("adapter base fingerprint requires at least one target")
+    canonical = rfc8785.dumps(
+        {
+            "schema": "onnx-genai-targeted-base-v1",
+            "targets": [
+                _target_fingerprint_record(models, target) for target in unique_targets
+            ],
+        }
+    )
+    return f"onnx-genai-targeted-base-v1:sha256:{hashlib.sha256(canonical).hexdigest()}"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -170,12 +258,6 @@ class AdapterTargetManifest:
             raise ValueError("adapter target manifest contains duplicate semantic names")
 
     def validate(self, models: Mapping[str, ir.Model]) -> None:
-        actual_fingerprint = fingerprint_model_weights(models)
-        if actual_fingerprint != self.base_fingerprint:
-            raise ValueError(
-                "adapter target manifest base fingerprint mismatch: "
-                f"expected {self.base_fingerprint}, got {actual_fingerprint}"
-            )
         for descriptor in self.targets:
             model = models.get(descriptor.target.component)
             if model is None:
@@ -214,6 +296,14 @@ class AdapterTargetManifest:
                     f"adapter manifest node {descriptor.node_name!r} does not produce "
                     f"{descriptor.output_name!r}"
                 )
+        actual_fingerprint = fingerprint_model_weights(
+            models, tuple(descriptor.target for descriptor in self.targets)
+        )
+        if actual_fingerprint != self.base_fingerprint:
+            raise ValueError(
+                "adapter target manifest base fingerprint mismatch: "
+                f"expected {self.base_fingerprint}, got {actual_fingerprint}"
+            )
 
     @property
     def bindings(self) -> frozenset[AdapterTarget]:
@@ -230,12 +320,20 @@ class AdapterSource:
     checksum: str | None = None
     base_model: str | None = None
     revision: str | None = None
+    native_parameters: tuple[tuple[AdapterTarget, str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if self.format != "in_memory" and not self.path:
             raise ValueError(f"{self.format} adapter source requires a path")
         if self.checksum is not None and not self.checksum.startswith("sha256:"):
             raise ValueError("adapter source checksum must use sha256")
+        targets = [target for target, _, _ in self.native_parameters]
+        if len(targets) != len(set(targets)):
+            raise ValueError("adapter source contains duplicate native parameter bindings")
+        if any(not a or not b or a == b for _, a, b in self.native_parameters):
+            raise ValueError(
+                "adapter native parameters must contain distinct non-empty A/B names"
+            )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -331,15 +429,13 @@ class AdapterArtifact:
             weight.a.numpy().nbytes + weight.b.numpy().nbytes for weight in self.weights
         )
 
-    def validate_base(self, models: Mapping[str, ir.Model]) -> None:
+    def validate_base(
+        self,
+        models: Mapping[str, ir.Model],
+        *,
+        fingerprint_targets: Sequence[AdapterTarget] | None = None,
+    ) -> None:
         """Validate fingerprint, target existence, dtype, and matrix dimensions."""
-        actual_fingerprint = fingerprint_model_weights(models)
-        if actual_fingerprint != self.base_fingerprint:
-            raise ValueError(
-                f"adapter {self.name!r} base fingerprint mismatch: "
-                f"expected {self.base_fingerprint}, got {actual_fingerprint}"
-            )
-
         for weight in self.weights:
             model = models.get(weight.target.component)
             if model is None:
@@ -367,6 +463,15 @@ class AdapterArtifact:
                     f"{weight.target.parameter!r} has dtype {initializer.dtype.name}, "
                     f"but adapter factors have dtype {weight.dtype.name}"
                 )
+        actual_fingerprint = fingerprint_model_weights(
+            models,
+            fingerprint_targets or tuple(weight.target for weight in self.weights),
+        )
+        if actual_fingerprint != self.base_fingerprint:
+            raise ValueError(
+                f"adapter {self.name!r} base fingerprint mismatch: "
+                f"expected {self.base_fingerprint}, got {actual_fingerprint}"
+            )
 
     @property
     def target_bindings(self) -> frozenset[AdapterTarget]:
@@ -406,8 +511,12 @@ class AdapterServiceOptions:
 
     row_ids: str | None = None
     request_epochs: str | None = None
+    adapter_ids: str = "request.adapter_ids"
+    adapter_counts: str = "request.adapter_counts"
+    scales: str = "request.adapter_scales"
     active: str | None = None
-    application_capability: str = "onnx-genai.adapters"
+    max_adapters: int = 4
+    application_capability: str = "onnx-genai.adapters@1"
     portable_fallback: bool = True
     cache_max_entries: int = 16
     bucket_by_adapter_set: bool = True
@@ -420,6 +529,8 @@ class AdapterServiceOptions:
             raise ValueError("adapter application capability must be non-empty")
         if self.cache_max_entries <= 0:
             raise ValueError("adapter cache max_entries must be greater than zero")
+        if self.max_adapters <= 0:
+            raise ValueError("adapter max_adapters must be greater than zero")
         if self.portable_fallback and self.preserve_source_format:
             raise ValueError(
                 "portable fallback requires portable JSON artifacts; "
@@ -468,12 +579,69 @@ class AdapterBatchSelection:
             raise ValueError("adapter compaction must be a permutation of all batch rows")
         return AdapterBatchSelection(tuple(self.rows[index] for index in permutation))
 
+    def to_tensors(
+        self,
+        artifacts: Mapping[str, AdapterArtifact],
+        *,
+        max_adapters: int,
+        active: Sequence[bool] | None = None,
+    ) -> AdapterSelectionTensors:
+        """Lower aliases to fixed-shape request tensors without serializing numeric IDs."""
+        if max_adapters <= 0:
+            raise ValueError("adapter max_adapters must be greater than zero")
+        if active is None:
+            active = [True] * len(self.rows)
+        if len(active) != len(self.rows):
+            raise ValueError("adapter active rows must match the selection batch size")
+        self.validate_catalog(artifacts)
+        aliases = tuple(sorted(artifacts))
+        indices = {alias: index for index, alias in enumerate(aliases)}
+        adapter_ids = np.full((len(self.rows), max_adapters), -1, dtype=np.int64)
+        scales = np.zeros((len(self.rows), max_adapters), dtype=np.float32)
+        counts = np.zeros((len(self.rows),), dtype=np.int64)
+        for row_index, (row, is_active) in enumerate(zip(self.rows, active)):
+            if not is_active:
+                continue
+            if len(row.adapters) > max_adapters:
+                raise ValueError(
+                    f"adapter row {row.row_id} selects {len(row.adapters)} adapters, "
+                    f"exceeding max_adapters {max_adapters}"
+                )
+            counts[row_index] = len(row.adapters)
+            for slot, application in enumerate(row.adapters):
+                adapter_ids[row_index, slot] = indices[application.adapter]
+                scales[row_index, slot] = application.scale
+        return AdapterSelectionTensors(
+            row_ids=np.asarray([row.row_id for row in self.rows], dtype=np.int64),
+            request_epochs=np.asarray(
+                [row.request_epoch for row in self.rows], dtype=np.int64
+            ),
+            adapter_ids=adapter_ids,
+            adapter_counts=counts,
+            scales=scales,
+            active=np.asarray(active, dtype=np.bool_),
+            aliases=aliases,
+        )
+
     @property
     def referenced_adapters(self) -> frozenset[str]:
         """Live adapter set that a paged runtime must pin against eviction."""
         return frozenset(
             application.adapter for row in self.rows for application in row.adapters
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class AdapterSelectionTensors:
+    """Fixed-shape SSA request buffers for the ``onnx-genai.adapters@1`` ABI."""
+
+    row_ids: np.ndarray
+    request_epochs: np.ndarray
+    adapter_ids: np.ndarray
+    adapter_counts: np.ndarray
+    scales: np.ndarray
+    active: np.ndarray
+    aliases: tuple[str, ...]
 
 
 def compose_adapter_deltas(

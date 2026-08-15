@@ -1500,56 +1500,94 @@ def add_adapter_service_to_workflow(
     options = pkg.adapter_service_options
     inputs = workflow.get("inputs", {})
 
-    def compatible_input(name: str, *, dtype: str) -> bool:
+    def compatible_input(
+        name: str,
+        *,
+        dtype: str,
+        shape: list[str | int],
+        role: str,
+    ) -> bool:
         declaration = inputs.get(name)
         if not isinstance(declaration, dict):
             return False
         contract = declaration.get("contract", {})
+        semantic_role = declaration.get("role", {})
         return (
             contract.get("dtype") == dtype
-            and contract.get("rank") == 1
-            and contract.get("shape") == ["batch"]
+            and contract.get("rank") == len(shape)
+            and contract.get("shape") == shape
+            and declaration.get("required", True)
+            and declaration.get("source") == {"kind": "request"}
+            and semantic_role == {"kind": "runtime", "version": "1.0", "role": role}
         )
 
-    row_ids = options.row_ids
-    if row_ids is None:
-        row_ids = next(
-            (
-                candidate
-                for candidate in ("package.slot_ids", "request.row_ids")
-                if compatible_input(candidate, dtype="int64")
-            ),
-            None,
-        )
-    if row_ids is None or not compatible_input(row_ids, dtype="int64"):
-        raise ValueError("adapter row_ids must reference an int64[batch] workflow input")
+    def ensure_input(
+        name: str,
+        *,
+        dtype: str,
+        shape: list[str | int],
+        role: str,
+    ) -> None:
+        if name not in inputs:
+            inputs[name] = {
+                "contract": {"dtype": dtype, "rank": len(shape), "shape": shape},
+                "role": {"kind": "runtime", "version": "1.0", "role": role},
+                "source": {"kind": "request"},
+            }
+        if not compatible_input(name, dtype=dtype, shape=shape, role=role):
+            raise ValueError(
+                f"adapter {role} must reference a required request-sourced "
+                f"{dtype}{shape} workflow input"
+            )
+
+    row_ids = options.row_ids or "request.row_ids"
+    ensure_input(row_ids, dtype="int64", shape=["batch"], role="row_ids")
     request_epochs = options.request_epochs or "request.request_epochs"
-    if request_epochs not in inputs:
-        inputs[request_epochs] = {
-            "contract": {"dtype": "int64", "rank": 1, "shape": ["batch"]},
-            "role": {
-                "kind": "runtime",
-                "version": "1.0",
-                "role": "request_epochs",
-            },
-            "source": {"kind": "request"},
-        }
-    if not compatible_input(request_epochs, dtype="int64"):
-        raise ValueError(
-            "adapter request_epochs must reference an int64[batch] workflow input"
-        )
+    ensure_input(
+        request_epochs,
+        dtype="int64",
+        shape=["batch"],
+        role="request_epochs",
+    )
+    ensure_input(
+        options.adapter_ids,
+        dtype="int64",
+        shape=["batch", options.max_adapters],
+        role="adapter_ids",
+    )
+    ensure_input(
+        options.adapter_counts,
+        dtype="int64",
+        shape=["batch"],
+        role="adapter_counts",
+    )
+    ensure_input(
+        options.scales,
+        dtype="float32",
+        shape=["batch", options.max_adapters],
+        role="adapter_scales",
+    )
     active = options.active
-    if active is None and compatible_input("package.active", dtype="bool"):
-        active = "package.active"
-    if active is not None and not compatible_input(active, dtype="bool"):
-        raise ValueError("adapter active must reference a bool[batch] workflow input")
+    if active is not None:
+        ensure_input(
+            active,
+            dtype="bool",
+            shape=["batch"],
+            role="adapter_active",
+        )
 
     catalog = pkg.save_adapter_artifacts(output_dir)
     workflow["adapters"] = {
         "base_model_fingerprint": manifest.base_fingerprint,
-        "row_ids": row_ids,
-        "request_epochs": request_epochs,
-        **({"active": active} if active is not None else {}),
+        "selection": {
+            "row_ids": row_ids,
+            "request_epochs": request_epochs,
+            "adapter_ids": options.adapter_ids,
+            "adapter_counts": options.adapter_counts,
+            "scales": options.scales,
+            **({"active": active} if active is not None else {}),
+            "max_adapters": options.max_adapters,
+        },
         "application_capability": options.application_capability,
         "portable_fallback": options.portable_fallback,
         "cache": {
