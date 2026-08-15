@@ -163,7 +163,7 @@ python examples/<model>_text_generation.py --compare-hf --dtype bf16
 - [ ] Intrinsic schema/config errors are tested without inferring downstream
       runtime capability
 
-Optional downstream evidence:
+Downstream evidence:
 
 - [ ] If ORT GenAI load/generation is run, record the exact runtime version and
       result. Failures document limitations but never gate Mobius export based
@@ -177,7 +177,10 @@ Optional downstream evidence:
 
 Omitting these downstream probes requires no waiver or TODO.
 
-Optional ORT GenAI integration probe:
+
+Waiver needed if any of the steps are not possible.
+
+Run the ORT GenAI integration test:
 
 ```bash
 python -m pytest tests/ort_genai_test.py -m integration_slow -k "<model>" -sv
@@ -197,9 +200,8 @@ python -m pytest tests/ort_genai_test.py -m integration_slow -k "<model>" -sv
 - [ ] Quantized model produces non-degenerate output (coherent text)
 - [ ] Quantization uses only required execution providers if unrelated provider
       registration fails, and evidence includes size, load, and inference
-- [ ] If quantization changes graph names (e.g. `logits_Q4`), regenerate or
-      verify metadata against the final graph; ORT GenAI loading remains an
-      optional downstream probe
+- [ ] If quantization changes the graph structure (e.g. MatMulNBits), verify
+      the `genai_config.json` still loads correctly in ORT GenAI
 
 Run the quantization integration test suite to confirm existing patterns
 are not broken:
@@ -249,8 +251,7 @@ description:
   skip_reason added to YAML.
 ```
 
-Unchecked required items without a waiver are grounds to request changes
-before merge. Optional downstream probes need no waiver.
+Unchecked items without a waiver are grounds to request changes before merge.
 
 ---
 

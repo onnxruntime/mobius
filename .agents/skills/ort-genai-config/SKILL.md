@@ -291,14 +291,6 @@ global cache-slot count. Preserve intrinsic schema/config validation, but do
 not gate or reject export based on the current GenAI model registry, runtime
 version, topology support, or cache executor capability.
 
-Runtime load/generation is an optional downstream probe. Record its exact
-version and outcome, but a downstream limitation never blocks Mobius export or
-requires a model-specific capability guard. For example, NemotronH mixes sparse
-key/value, convolution, and SSM state. Emit key/value and convolution templates
-plus the graph-derived slot count; the current schema has no `ssm_state`
-template, so omit only that unrepresentable field and let ORT GenAI decide
-whether it can execute the package now or in a future release.
-
 ### "input_ids size exceeds max length"
 
 For image prompts, the tokenized input_ids (including image_pad tokens) can
