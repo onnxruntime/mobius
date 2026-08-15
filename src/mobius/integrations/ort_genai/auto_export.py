@@ -94,7 +94,7 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "qwen3_vl_text": "qwen3_vl",
     "qwen3_5": "qwen3_5",
     "qwen3_5_vl": "qwen3_5",
-    "qwen3_5_text": "qwen3_5",
+    "qwen3_5_text": "qwen3_5_text",
     # MiniCPM uses standard 1D decoder position IDs (unlike Qwen-VL MRoPE).
     # The phi3v multimodal runtime provides that contract; callers supply
     # HF-preprocessed packed pixels through Generator.set_inputs().
@@ -186,6 +186,11 @@ def _select_ort_model_type(
     """
     if is_decoder_only and config_model_type in _ORT_GENAI_MODEL_TYPE:
         return _ORT_GENAI_MODEL_TYPE[config_model_type]
+    if not is_decoder_only and config_model_type == "qwen3_5_text":
+        # Qwen3.5/Qwen3.8 multimodal builds unwrap the parent config to its
+        # text subtype, but their vision/embedding package uses the multimodal
+        # ORT pipeline and processor metadata.
+        return "qwen3_5"
     return _resolve_ort_genai_model_type(hf_model_type or "unknown")
 
 
@@ -1379,7 +1384,11 @@ def write_ort_genai_config(
             # does not bind, so borrowing that type would mis-wire the graph.
             ort_model_type = "gemma3n"
         else:
-            ort_model_type = _resolve_ort_genai_model_type(raw_type)
+            ort_model_type = _select_ort_model_type(
+                raw_type,
+                raw_type,
+                is_decoder_only=is_decoder_only,
+            )
         if ort_model_type == "unknown":
             logger.warning(
                 "Could not determine ORT-GenAI model type: pkg.config.model_type "

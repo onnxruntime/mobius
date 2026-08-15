@@ -84,7 +84,7 @@ class TestResolveOrtGenaiModelType:
         assert _resolve_ort_genai_model_type("qwen3") == "qwen2"
         assert _resolve_ort_genai_model_type("qwen3_5") == "qwen3_5"
         assert _resolve_ort_genai_model_type("qwen3_5_vl") == "qwen3_5"
-        assert _resolve_ort_genai_model_type("qwen3_5_text") == "qwen3_5"
+        assert _resolve_ort_genai_model_type("qwen3_5_text") == "qwen3_5_text"
         assert _resolve_ort_genai_model_type("gemma2") == "gemma"
         assert _resolve_ort_genai_model_type("llama") == "llama"
 
@@ -143,6 +143,24 @@ class TestSelectOrtModelType:
 
     def test_decoder_only_falls_back_to_hf_when_config_missing(self):
         assert _select_ort_model_type(None, "qwen3", is_decoder_only=True) == "qwen2"
+
+    def test_qwen35_text_type_depends_on_package_topology(self):
+        assert (
+            _select_ort_model_type(
+                "qwen3_5_text",
+                "qwen3_5",
+                is_decoder_only=True,
+            )
+            == "qwen3_5_text"
+        )
+        assert (
+            _select_ort_model_type(
+                "qwen3_5_text",
+                "qwen3_5_text",
+                is_decoder_only=False,
+            )
+            == "qwen3_5"
+        )
 
     def test_decoder_only_unknown_config_falls_back_to_hf(self):
         # An unrecognised config.model_type (not in _ORT_GENAI_MODEL_TYPE) must
@@ -1175,6 +1193,51 @@ class TestExportForOrtGenai:
         assert decoder["num_hidden_layers"] == 4
         assert decoder["inputs"]["past_key_names"] == "past_key_values.%d.key"
         assert decoder["inputs"]["past_conv_names"] == "past_key_values.%d.conv_state"
+
+    def test_qwen35_text_package_preserves_decoder_only_model_type(self, tmp_path):
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "qwen3_5_text"
+            vocab_size: int = 256
+            hidden_size: int = 64
+            num_hidden_layers: int = 4
+            num_attention_heads: int = 4
+            num_key_value_heads: int = 2
+            head_dim: int = 16
+            max_position_embeddings: int = 128
+            pad_token_id: int = 0
+
+        package = ModelPackage(
+            {
+                "model": _mock_model(
+                    inputs=[
+                        "input_ids",
+                        "attention_mask",
+                        "position_ids",
+                        "past_key_values.0.conv_state",
+                        "past_key_values.3.key",
+                        "past_key_values.3.value",
+                    ],
+                    outputs=[
+                        "logits",
+                        "present.0.conv_state",
+                        "present.3.key",
+                        "present.3.value",
+                    ],
+                )
+            },
+            config=FakeConfig(),
+        )
+
+        result = write_ort_genai_config(package, str(tmp_path))
+
+        with open(result["genai_config"], encoding="utf-8") as config_file:
+            generated = json.load(config_file)
+        assert generated["model"]["type"] == "qwen3_5_text"
 
     def test_olive_renamed_logits_output_is_emitted(self, tmp_path):
         pkg = _make_fake_llm_pkg("qwen2")
