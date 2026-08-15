@@ -20,9 +20,12 @@ from __future__ import annotations
 
 __all__ = ["ModelPackage"]
 
+import hashlib
 import inspect
+import json
 import logging
 import os
+import shutil
 import threading
 from collections import UserDict
 from collections.abc import Callable, Iterator
@@ -34,11 +37,47 @@ import torch
 import tqdm
 
 from mobius._optimizations import fold_initializers_after_weights
-from mobius.adapters import AdapterArtifact, AdapterTargetManifest
+from mobius.adapters import (
+    AdapterArtifact,
+    AdapterServiceOptions,
+    AdapterTargetManifest,
+)
 from mobius.generation import PolicyComponent
 from mobius.integrations._weight_loading import _assign_weight
 
 logger = logging.getLogger(__name__)
+
+
+def _adapter_dtype_name(dtype: ir.DataType) -> str:
+    names = {
+        ir.DataType.FLOAT16: "float16",
+        ir.DataType.FLOAT: "float32",
+        ir.DataType.BFLOAT16: "bfloat16",
+    }
+    try:
+        return names[dtype]
+    except KeyError as error:
+        raise ValueError(
+            f"adapter dtype {dtype.name} must be a floating-point adapter dtype"
+        ) from error
+
+
+def _adapter_source_file(artifact: AdapterArtifact) -> tuple[str, str]:
+    if artifact.source.path is None:
+        raise ValueError(
+            f"adapter {artifact.name!r} cannot preserve an in-memory source format"
+        )
+    if artifact.source.format == "onnx_adapter":
+        return artifact.source.path, "ort_genai"
+    if artifact.source.format == "peft_safetensors":
+        path = artifact.source.path
+        if os.path.isdir(path):
+            path = os.path.join(path, "adapter_model.safetensors")
+        return path, "safetensors"
+    raise ValueError(
+        f"adapter {artifact.name!r} source format {artifact.source.format!r} "
+        "cannot be preserved"
+    )
 
 
 class ModelPackage(UserDict[str, ir.Model]):
@@ -56,11 +95,13 @@ class ModelPackage(UserDict[str, ir.Model]):
         policy_components: dict[str, PolicyComponent] | None = None,
         adapter_artifacts: dict[str, AdapterArtifact] | None = None,
         adapter_target_manifest: AdapterTargetManifest | None = None,
+        adapter_service_options: AdapterServiceOptions | None = None,
     ) -> None:
         super().__init__(models or {})
         self.config = config
         self.policy_components = dict(policy_components or {})
         self.adapter_target_manifest = adapter_target_manifest
+        self.adapter_service_options = adapter_service_options or AdapterServiceOptions()
         if adapter_target_manifest is not None:
             adapter_target_manifest.validate(self.data)
         self.adapter_artifacts: dict[str, AdapterArtifact] = {}
@@ -97,6 +138,7 @@ class ModelPackage(UserDict[str, ir.Model]):
         progress_bar: bool = True,
         check_weights: bool = True,
         include_policy_components: bool = True,
+        include_adapter_artifacts: bool = True,
     ) -> None:
         """Save all component models to a directory.
 
@@ -150,6 +192,8 @@ class ModelPackage(UserDict[str, ir.Model]):
                 Set to ``False`` when saving skeleton models without weights.
             include_policy_components: Save attached generation-policy ONNX
                 components under ``policies/``. Defaults to ``True``.
+            include_adapter_artifacts: Save attached parameter-adapter bundles
+                under ``adapters/``. Defaults to ``True``.
 
         Raises:
             ValueError: If *external_data* is not ``"onnx"`` or
@@ -202,6 +246,8 @@ class ModelPackage(UserDict[str, ir.Model]):
 
         if include_policy_components:
             self.save_policy_components(directory, check_weights=check_weights)
+        if include_adapter_artifacts:
+            self.save_adapter_artifacts(directory)
 
     def add_policy_component(self, name: str, component: PolicyComponent) -> None:
         """Attach a reusable generation-policy graph to this package."""
@@ -236,6 +282,119 @@ class ModelPackage(UserDict[str, ir.Model]):
                         "with the existing N-adapter catalog"
                     )
         self.adapter_artifacts[artifact.name] = artifact
+
+    def save_adapter_artifacts(self, directory: str) -> dict[str, dict[str, object]]:
+        """Save exact adapter bundles and return ONNX GenAI catalog entries."""
+        if not self.adapter_artifacts:
+            return {}
+        if self.adapter_target_manifest is None:
+            raise ValueError(
+                "adapter artifacts require an authoritative adapter target manifest"
+            )
+        self.adapter_target_manifest.validate(self.data)
+        adapter_dir = os.path.join(directory, "adapters")
+        os.makedirs(adapter_dir, exist_ok=True)
+        descriptors = {
+            descriptor.target: descriptor
+            for descriptor in self.adapter_target_manifest.targets
+        }
+        catalog: dict[str, dict[str, object]] = {}
+        identities: set[tuple[str, str]] = set()
+        for alias, artifact in sorted(self.adapter_artifacts.items()):
+            identity_version = (artifact.stable_identity, artifact.version)
+            if identity_version in identities:
+                raise ValueError(
+                    f"adapter identity/version {identity_version[0]}@"
+                    f"{identity_version[1]} must be unique"
+                )
+            identities.add(identity_version)
+            ranks = {weight.rank for weight in artifact.weights}
+            alphas = {weight.alpha for weight in artifact.weights}
+            dtypes = {weight.dtype for weight in artifact.weights}
+            if len(ranks) != 1 or len(alphas) != 1 or len(dtypes) != 1:
+                raise ValueError(
+                    f"adapter {alias!r} has heterogeneous target rank/alpha/dtype, "
+                    "which the ONNX GenAI artifact contract cannot represent"
+                )
+            rank = ranks.pop()
+            alpha = alphas.pop()
+            dtype = _adapter_dtype_name(dtypes.pop())
+            if (
+                self.adapter_service_options.preserve_source_format
+                and artifact.source.format == "onnx_adapter"
+                and alpha != rank
+            ):
+                raise ValueError(
+                    f"adapter {alias!r} imports .onnx_adapter weights with baked scale; "
+                    "alpha must equal rank"
+                )
+            targets: list[dict[str, object]] = []
+            portable_targets: dict[str, dict[str, list[float]]] = {}
+            for weight in sorted(
+                artifact.weights,
+                key=lambda item: (item.target.component, item.target.parameter),
+            ):
+                descriptor = descriptors[weight.target]
+                weight_key = descriptor.semantic_name
+                targets.append(
+                    {
+                        "component": weight.target.component,
+                        "parameter": weight.target.parameter,
+                        "weight_key": weight_key,
+                        "input_features": descriptor.input_size,
+                        "output_features": descriptor.output_size,
+                    }
+                )
+                portable_targets[weight_key] = {
+                    "a": weight.a.numpy().reshape(-1).astype("float32").tolist(),
+                    "b": weight.b.numpy().reshape(-1).astype("float32").tolist(),
+                }
+
+            if self.adapter_service_options.preserve_source_format:
+                source_path, weight_format = _adapter_source_file(artifact)
+                extension = ".onnx_adapter" if weight_format == "ort_genai" else ".safetensors"
+                relative_location = f"adapters/{alias}{extension}"
+                destination = os.path.join(directory, relative_location)
+                shutil.copyfile(source_path, destination)
+                with open(destination, "rb") as handle:
+                    payload = handle.read()
+            else:
+                relative_location = f"adapters/{alias}.json"
+                destination = os.path.join(directory, relative_location)
+                payload = json.dumps(
+                    {"targets": portable_targets},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+                with open(destination, "wb") as handle:
+                    handle.write(payload)
+                weight_format = "json"
+            provenance_parts = [artifact.source.format]
+            if artifact.source.base_model:
+                provenance_parts.append(f"base={artifact.source.base_model}")
+            if artifact.source.revision:
+                provenance_parts.append(f"revision={artifact.source.revision}")
+            if artifact.source.checksum:
+                provenance_parts.append(f"source_{artifact.source.checksum}")
+            catalog[alias] = {
+                "identity": artifact.stable_identity,
+                "version": artifact.version,
+                "base_model_fingerprint": artifact.base_fingerprint,
+                "rank": rank,
+                "alpha": alpha,
+                "dtype": dtype,
+                "provenance": ";".join(provenance_parts),
+                "weights": [
+                    {
+                        "location": relative_location,
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                        "format": weight_format,
+                    }
+                ],
+                "targets": targets,
+            }
+        return catalog
 
     def save_policy_components(
         self,

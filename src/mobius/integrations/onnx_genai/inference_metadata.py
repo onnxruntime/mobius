@@ -1482,6 +1482,94 @@ def add_policy_components_to_workflow(
     return metadata
 
 
+def add_adapter_service_to_workflow(
+    metadata: dict[str, Any],
+    pkg: Any,
+    output_dir: str,
+) -> dict[str, Any]:
+    """Attach the exact generic adapter catalog and saved artifact references."""
+    artifacts = getattr(pkg, "adapter_artifacts", {})
+    if not artifacts:
+        return metadata
+    workflow = metadata.get("pipeline", {}).get("workflow")
+    if not isinstance(workflow, dict):
+        raise ValueError("parameter adapters require pipeline.workflow metadata")
+    manifest = getattr(pkg, "adapter_target_manifest", None)
+    if manifest is None:
+        raise ValueError("parameter adapters require an authoritative adapter target manifest")
+    options = pkg.adapter_service_options
+    inputs = workflow.get("inputs", {})
+
+    def compatible_input(name: str, *, dtype: str) -> bool:
+        declaration = inputs.get(name)
+        if not isinstance(declaration, dict):
+            return False
+        contract = declaration.get("contract", {})
+        return (
+            contract.get("dtype") == dtype
+            and contract.get("rank") == 1
+            and contract.get("shape") == ["batch"]
+        )
+
+    row_ids = options.row_ids
+    if row_ids is None:
+        row_ids = next(
+            (
+                candidate
+                for candidate in ("package.slot_ids", "request.row_ids")
+                if compatible_input(candidate, dtype="int64")
+            ),
+            None,
+        )
+    if row_ids is None or not compatible_input(row_ids, dtype="int64"):
+        raise ValueError("adapter row_ids must reference an int64[batch] workflow input")
+    request_epochs = options.request_epochs or "request.request_epochs"
+    if request_epochs not in inputs:
+        inputs[request_epochs] = {
+            "contract": {"dtype": "int64", "rank": 1, "shape": ["batch"]},
+            "role": {
+                "kind": "runtime",
+                "version": "1.0",
+                "role": "request_epochs",
+            },
+            "source": {"kind": "request"},
+        }
+    if not compatible_input(request_epochs, dtype="int64"):
+        raise ValueError(
+            "adapter request_epochs must reference an int64[batch] workflow input"
+        )
+    active = options.active
+    if active is None and compatible_input("package.active", dtype="bool"):
+        active = "package.active"
+    if active is not None and not compatible_input(active, dtype="bool"):
+        raise ValueError("adapter active must reference a bool[batch] workflow input")
+
+    catalog = pkg.save_adapter_artifacts(output_dir)
+    workflow["adapters"] = {
+        "base_model_fingerprint": manifest.base_fingerprint,
+        "row_ids": row_ids,
+        "request_epochs": request_epochs,
+        **({"active": active} if active is not None else {}),
+        "application_capability": options.application_capability,
+        "portable_fallback": options.portable_fallback,
+        "cache": {
+            "max_entries": options.cache_max_entries,
+            "eviction": "lru",
+        },
+        "planning": {
+            "bucket_by_adapter_set": options.bucket_by_adapter_set,
+            "stable_buffers": options.stable_buffers,
+            "invalidate_capture_on_eviction": (options.invalidate_capture_on_eviction),
+        },
+        "artifacts": catalog,
+    }
+    capabilities = workflow.setdefault("manifest", {}).setdefault("capabilities", [])
+    for capability in ("parameter_adapters", "heterogeneous_adapter_batching"):
+        if capability not in capabilities:
+            capabilities.append(capability)
+    return metadata
+
+
 def _topological_order(
     names: Iterable[str],
     edges: list[dict[str, Any]],

@@ -10,6 +10,7 @@ __all__ = [
     "AdapterArtifact",
     "AdapterBatchSelection",
     "AdapterRowSelection",
+    "AdapterServiceOptions",
     "AdapterSource",
     "AdapterTarget",
     "AdapterTargetDescriptor",
@@ -257,8 +258,8 @@ class AdapterWeights:
             )
         if self.a.dtype != self.b.dtype:
             raise ValueError("adapter A and B factors must have the same dtype")
-        if not math.isfinite(self.alpha):
-            raise ValueError("adapter alpha must be finite")
+        if not math.isfinite(self.alpha) or self.alpha <= 0.0:
+            raise ValueError("adapter alpha must be finite and greater than zero")
 
     @property
     def rank(self) -> int:
@@ -283,11 +284,17 @@ class AdapterArtifact:
     source: AdapterSource = dataclasses.field(
         default_factory=lambda: AdapterSource("in_memory")
     )
+    identity: str | None = None
+    version: str = "1"
 
     def __post_init__(self) -> None:
         _validate_identifier(self.name, "adapter name")
         if not self.base_fingerprint:
             raise ValueError("adapter base fingerprint must be non-empty")
+        if self.identity is not None and not self.identity:
+            raise ValueError("adapter identity must be non-empty")
+        if not self.version:
+            raise ValueError("adapter version must be non-empty")
         if not self.weights:
             raise ValueError("adapter artifact must contain at least one target")
         targets = [weight.target for weight in self.weights]
@@ -365,6 +372,11 @@ class AdapterArtifact:
         """Exact base parameters modified by this artifact."""
         return frozenset(weight.target for weight in self.weights)
 
+    @property
+    def stable_identity(self) -> str:
+        """Stable identity used independently from the package catalog alias."""
+        return self.identity or self.name
+
     def validate_checksum(self, expected: str) -> None:
         """Reject corrupted or substituted adapter tensor data."""
         if self.checksum != expected:
@@ -383,8 +395,35 @@ class AdapterApplication:
 
     def __post_init__(self) -> None:
         _validate_identifier(self.adapter, "adapter application name")
-        if not math.isfinite(self.scale):
-            raise ValueError("adapter application scale must be finite")
+        if not math.isfinite(self.scale) or not -16.0 <= self.scale <= 16.0:
+            raise ValueError("adapter application scale must be finite and within [-16, 16]")
+
+
+@dataclasses.dataclass(frozen=True)
+class AdapterServiceOptions:
+    """Producer-neutral runtime lifecycle, planning, and artifact format options."""
+
+    row_ids: str | None = None
+    request_epochs: str | None = None
+    active: str | None = None
+    application_capability: str = "onnx-genai.adapters"
+    portable_fallback: bool = True
+    cache_max_entries: int = 16
+    bucket_by_adapter_set: bool = True
+    stable_buffers: bool = True
+    invalidate_capture_on_eviction: bool = True
+    preserve_source_format: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.application_capability:
+            raise ValueError("adapter application capability must be non-empty")
+        if self.cache_max_entries <= 0:
+            raise ValueError("adapter cache max_entries must be greater than zero")
+        if self.portable_fallback and self.preserve_source_format:
+            raise ValueError(
+                "portable fallback requires portable JSON artifacts; "
+                "source-format preservation requires a native adapter capability"
+            )
 
 
 @dataclasses.dataclass(frozen=True)

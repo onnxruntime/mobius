@@ -5,8 +5,18 @@ from pathlib import Path
 
 import numpy as np
 import onnx_ir as ir
+import yaml
 from onnxscript import GraphBuilder
 
+from mobius.adapters import (
+    AdapterArtifact,
+    AdapterServiceOptions,
+    AdapterTarget,
+    AdapterTargetDescriptor,
+    AdapterTargetManifest,
+    AdapterWeights,
+    fingerprint_model_weights,
+)
 from mobius._model_package import ModelPackage
 from mobius.integrations.onnx_genai import write_onnx_genai_config
 from mobius.integrations.onnx_genai.auto_export_test import (
@@ -17,6 +27,9 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     write_audio_codec_workflow_metadata,
     write_language_diffusion_workflow_metadata,
     write_speculative_workflow_metadata,
+)
+from mobius.integrations.onnx_genai.inference_metadata import (
+    add_adapter_service_to_workflow,
 )
 from mobius.models.qwen3_tts import Qwen3TTSForConditionalGeneration
 from mobius.models.qwen3_tts_test import _TINY_CONFIG
@@ -461,6 +474,211 @@ def _executable_codec_package() -> ModelPackage:
     )
 
 
+def _adapter_package() -> ModelPackage:
+    graph, builder = _graph("decoder")
+    activations = builder.input("activations", ir.DataType.FLOAT, ["batch", 2])
+    weight = ir.Value(
+        name="projection",
+        const_value=ir.tensor(np.eye(2, dtype=np.float32)),
+        type=ir.TensorType(ir.DataType.FLOAT),
+        shape=ir.Shape([2, 2]),
+    )
+    graph.initializers.add(weight)
+    projection = builder.op.MatMul(activations, weight)
+    projection.producer().name = "projection"
+    projection.name = "projection.output"
+    builder.add_output(
+        _typed(projection, ir.DataType.FLOAT, ["batch", 2]),
+        "projection.output",
+    )
+    model = ir.Model(graph, ir_version=11)
+    fingerprint = fingerprint_model_weights({"decoder": model})
+    target = AdapterTarget("decoder", "projection")
+    manifest = AdapterTargetManifest(
+        fingerprint,
+        (
+            AdapterTargetDescriptor(
+                target,
+                semantic_name="projection",
+                node_name="projection",
+                output_name="projection.output",
+                input_size=2,
+                output_size=2,
+            ),
+        ),
+    )
+    package = ModelPackage(
+        {"decoder": model},
+        adapter_target_manifest=manifest,
+        adapter_service_options=AdapterServiceOptions(
+            row_ids="request.row_ids",
+            request_epochs="request.request_epochs",
+            active="request.active",
+            cache_max_entries=2,
+        ),
+    )
+    for name, a, b in (
+        (
+            "red",
+            np.array([[1.0, 0.0]], dtype=np.float32),
+            np.array([[1.0], [2.0]], dtype=np.float32),
+        ),
+        (
+            "blue",
+            np.array([[0.0, 1.0]], dtype=np.float32),
+            np.array([[3.0], [4.0]], dtype=np.float32),
+        ),
+    ):
+        package.add_adapter_artifact(
+            AdapterArtifact(
+                name,
+                fingerprint,
+                (AdapterWeights(target, ir.tensor(a), ir.tensor(b), 1.0),),
+                identity=name,
+                version="1",
+            )
+        )
+    return package
+
+
+def _write_adapter_metadata(package: ModelPackage, directory: Path) -> None:
+    metadata = {
+        "schema_version": "v1",
+        "pipeline": {
+            "workflow": {
+                "manifest": {
+                    "ir_version": "1.0",
+                    "onnx_opsets": {"ai.onnx": 24},
+                    "adapter_abis": {"onnx-genai.parameter-overlay": "1"},
+                    "capabilities": [
+                        "workflow_ssa",
+                        "typed_emit",
+                        "parameter_adapters",
+                        "heterogeneous_adapter_batching",
+                    ],
+                },
+                "inputs": {
+                    "request.row_ids": {
+                        "contract": {
+                            "dtype": "int64",
+                            "rank": 1,
+                            "shape": ["batch"],
+                        },
+                        "role": {
+                            "kind": "runtime",
+                            "version": "1.0",
+                            "role": "row_ids",
+                        },
+                        "source": {"kind": "request"},
+                    },
+                    "request.active": {
+                        "contract": {
+                            "dtype": "bool",
+                            "rank": 1,
+                            "shape": ["batch"],
+                        },
+                        "role": {"kind": "opaque"},
+                        "source": {"kind": "application", "name": "active"},
+                    },
+                    "request.request_epochs": {
+                        "contract": {
+                            "dtype": "int64",
+                            "rank": 1,
+                            "shape": ["batch"],
+                        },
+                        "role": {
+                            "kind": "runtime",
+                            "version": "1.0",
+                            "role": "request_epochs",
+                        },
+                        "source": {"kind": "request"},
+                    },
+                    "activations": {
+                        "contract": {
+                            "dtype": "float32",
+                            "rank": 2,
+                            "shape": ["batch", 2],
+                        },
+                        "role": {"kind": "opaque"},
+                        "source": {"kind": "application", "name": "activations"},
+                    },
+                },
+                "outputs": {
+                    "result": {
+                        "contract": {
+                            "dtype": "float32",
+                            "rank": 2,
+                            "shape": ["batch", 2],
+                        },
+                        "role": "tensor",
+                        "stage": "pre_adapter",
+                    }
+                },
+                "components": {
+                    "decoder": {
+                        "implementation": {
+                            "kind": "onnx",
+                            "artifact": "model.onnx",
+                        },
+                        "ports": {},
+                    },
+                    "overlay": {
+                        "implementation": {
+                            "kind": "adapter",
+                            "abi": "onnx-genai.parameter-overlay",
+                            "version": "1",
+                        },
+                        "ports": {
+                            "inputs": {
+                                "input": {
+                                    "dtype": "float32",
+                                    "rank": 2,
+                                    "shape": ["batch", 2],
+                                }
+                            },
+                            "outputs": {
+                                "output": {
+                                    "dtype": "float32",
+                                    "rank": 2,
+                                    "shape": ["batch", 2],
+                                }
+                            },
+                        },
+                        "contract": {
+                            "id": "onnx-genai.parameter-overlay",
+                            "version": "1",
+                            "bindings": {"input": "input", "output": "output"},
+                            "parameters": {
+                                "action": "apply",
+                                "component": "decoder",
+                                "parameter": "projection",
+                            },
+                        },
+                    },
+                },
+                "state": {},
+                "steps": [
+                    {
+                        "kind": "invoke",
+                        "component": "overlay",
+                        "inputs": {"input": "activations"},
+                        "outputs": {"output": "adapted"},
+                    },
+                    {
+                        "kind": "emit",
+                        "value": "adapted",
+                        "output": "result",
+                        "mode": "replace",
+                    },
+                ],
+            }
+        },
+    }
+    add_adapter_service_to_workflow(metadata, package, str(directory))
+    with open(directory / "inference_metadata.yaml", "w", encoding="utf-8") as handle:
+        yaml.safe_dump(metadata, handle, sort_keys=False)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("output", type=Path)
@@ -504,16 +722,23 @@ def main() -> None:
     codec.save(str(directory), progress_bar=False, check_weights=False)
     write_audio_codec_workflow_metadata(codec, str(directory))
 
+    adapter = _adapter_package()
+    directory = args.output / "adapter"
+    adapter.save(str(directory), progress_bar=False)
+    _write_adapter_metadata(adapter, directory)
+
     (args.output / "README.md").write_text(
         """# ONNX GenAI workflow conformance fixtures
 
 Generated by `tests/generate_onnx_genai_validation_packages.py` for semantic
-validation and runtime conformance against `justinchuby/onnx-genai@c9bddd6e`.
+validation and runtime conformance against `justinchuby/onnx-genai@8549e425`.
 
 The decoder, VLM, diffusion, masked diffusion, speculative, and codec packages
 contain executable synthetic models. The TTS fixture uses the real tiny
 Qwen3-TTS producer graphs with deterministic synthetic weights. No downloaded
-model weights are included.
+model weights are included. The adapter fixture covers authoritative target
+metadata, portable artifacts, ordered heterogeneous composition, inactive rows,
+compaction, and request-epoch slot reuse.
 """,
         encoding="utf-8",
     )

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import shutil
 import uuid
 from pathlib import Path
@@ -20,6 +21,7 @@ from mobius import (
     AdapterArtifact,
     AdapterBatchSelection,
     AdapterRowSelection,
+    AdapterServiceOptions,
     AdapterSource,
     AdapterTarget,
     AdapterTargetDescriptor,
@@ -31,6 +33,9 @@ from mobius import (
     compose_adapter_deltas,
     fingerprint_model_weights,
     load_peft_adapter,
+)
+from mobius.integrations.onnx_genai.inference_metadata import (
+    add_adapter_service_to_workflow,
 )
 
 
@@ -362,9 +367,188 @@ def test_onnx_adapter_migration_source_is_optional_and_checksummed() -> None:
         shutil.rmtree(directory)
 
 
+def test_onnx_adapter_source_can_be_declared_for_native_capability() -> None:
+    directory = Path("artifacts") / f"adapter-native-test-{uuid.uuid4().hex}"
+    source_directory = directory / "source"
+    output_directory = directory / "package"
+    source_directory.mkdir(parents=True)
+    output_directory.mkdir()
+    try:
+        source_path = source_directory / "style.onnx_adapter"
+        source_path.write_bytes(b"\x00\x00\x00\x00TORTsynthetic")
+        model = _model()
+        package = ModelPackage(
+            {"decoder": model},
+            adapter_target_manifest=_manifest(model),
+            adapter_service_options=AdapterServiceOptions(
+                portable_fallback=False,
+                preserve_source_format=True,
+            ),
+        )
+        package.add_adapter_artifact(
+            AdapterArtifact(
+                "style",
+                fingerprint_model_weights({"decoder": model}),
+                (_weights(alpha=2.0),),
+                source=adapter_source_from_onnx_adapter(source_path),
+            )
+        )
+        catalog = package.save_adapter_artifacts(str(output_directory))
+        declared = catalog["style"]["weights"][0]
+        assert declared["format"] == "ort_genai"
+        assert declared["location"] == "adapters/style.onnx_adapter"
+        copied = output_directory / declared["location"]
+        assert copied.read_bytes() == source_path.read_bytes()
+        assert declared["sha256"] == hashlib.sha256(copied.read_bytes()).hexdigest()
+    finally:
+        shutil.rmtree(directory)
+
+
 def test_adapter_source_rejects_unprovenanced_external_artifact() -> None:
     with pytest.raises(ValueError, match="requires a path"):
         AdapterSource("onnx_adapter")
+
+
+def test_exact_onnx_genai_catalog_and_portable_bundle_serialization() -> None:
+    directory = Path("artifacts") / f"adapter-export-test-{uuid.uuid4().hex}"
+    directory.mkdir(parents=True)
+    try:
+        model = _model()
+        package = ModelPackage(
+            {"decoder": model},
+            adapter_target_manifest=_manifest(model),
+            adapter_service_options=AdapterServiceOptions(
+                row_ids="request.row_ids",
+                active="request.active",
+                cache_max_entries=2,
+            ),
+        )
+        package.add_adapter_artifact(
+            AdapterArtifact(
+                "red",
+                fingerprint_model_weights({"decoder": model}),
+                (_weights(alpha=2.0),),
+                identity="style-red",
+                version="2026.08",
+            )
+        )
+        metadata = {
+            "pipeline": {
+                "workflow": {
+                    "manifest": {"capabilities": []},
+                    "inputs": {
+                        "request.row_ids": {
+                            "contract": {
+                                "dtype": "int64",
+                                "rank": 1,
+                                "shape": ["batch"],
+                            }
+                        },
+                        "request.active": {
+                            "contract": {
+                                "dtype": "bool",
+                                "rank": 1,
+                                "shape": ["batch"],
+                            }
+                        },
+                    },
+                    "components": {"decoder": {"implementation": {"kind": "binding"}}},
+                    "steps": [],
+                }
+            }
+        }
+        add_adapter_service_to_workflow(metadata, package, str(directory))
+        service = metadata["pipeline"]["workflow"]["adapters"]
+        assert service["base_model_fingerprint"].startswith("sha256:")
+        assert service["row_ids"] == "request.row_ids"
+        assert service["request_epochs"] == "request.request_epochs"
+        assert service["active"] == "request.active"
+        assert service["application_capability"] == "onnx-genai.adapters"
+        assert service["cache"] == {"max_entries": 2, "eviction": "lru"}
+        assert service["planning"] == {
+            "bucket_by_adapter_set": True,
+            "stable_buffers": True,
+            "invalidate_capture_on_eviction": True,
+        }
+        assert metadata["pipeline"]["workflow"]["inputs"]["request.request_epochs"] == {
+            "contract": {"dtype": "int64", "rank": 1, "shape": ["batch"]},
+            "role": {
+                "kind": "runtime",
+                "version": "1.0",
+                "role": "request_epochs",
+            },
+            "source": {"kind": "request"},
+        }
+        artifact = service["artifacts"]["red"]
+        assert artifact["identity"] == "style-red"
+        assert artifact["version"] == "2026.08"
+        assert artifact["rank"] == 2
+        assert artifact["alpha"] == 2.0
+        assert artifact["dtype"] == "float32"
+        assert artifact["targets"] == [
+            {
+                "component": "decoder",
+                "parameter": "projection.weight",
+                "weight_key": "layers.0.self_attn.q_proj",
+                "input_features": 4,
+                "output_features": 3,
+            }
+        ]
+        weight = artifact["weights"][0]
+        payload = (directory / weight["location"]).read_bytes()
+        assert weight["format"] == "json"
+        assert len(weight["sha256"]) == 64
+        assert weight["sha256"] == hashlib.sha256(payload).hexdigest()
+        bundle = json.loads(payload)
+        assert set(bundle["targets"]) == {"layers.0.self_attn.q_proj"}
+        assert len(bundle["targets"]["layers.0.self_attn.q_proj"]["a"]) == 8
+        assert len(bundle["targets"]["layers.0.self_attn.q_proj"]["b"]) == 6
+    finally:
+        shutil.rmtree(directory)
+
+
+def test_wire_contract_rejects_heterogeneous_target_rank() -> None:
+    model = _model()
+    other = ir.Value(
+        name="other.weight",
+        const_value=ir.tensor(np.ones((3, 4), dtype=np.float32)),
+        type=ir.TensorType(ir.DataType.FLOAT),
+        shape=ir.Shape([3, 4]),
+    )
+    node = ir.Node("", "MatMul", [model.graph.inputs[0], other], name="other")
+    node.outputs[0].name = "other.output"
+    model.graph.append(node)
+    model.graph.initializers.add(other)
+    package = ModelPackage(
+        {"decoder": model},
+        adapter_target_manifest=_manifest(model, include_second=True),
+    )
+    package.add_adapter_artifact(
+        AdapterArtifact(
+            "mixed-rank",
+            fingerprint_model_weights({"decoder": model}),
+            (
+                _weights(),
+                _weights(
+                    parameter="other.weight",
+                    a=np.ones((1, 4), dtype=np.float32),
+                    b=np.ones((3, 1), dtype=np.float32),
+                ),
+            ),
+        )
+    )
+    directory = Path("artifacts") / f"adapter-rank-test-{uuid.uuid4().hex}"
+    directory.mkdir(parents=True)
+    try:
+        with pytest.raises(ValueError, match="heterogeneous target rank"):
+            package.save_adapter_artifacts(str(directory))
+    finally:
+        shutil.rmtree(directory)
+
+
+def test_application_scale_matches_runtime_bound() -> None:
+    with pytest.raises(ValueError, match=r"within \[-16, 16\]"):
+        AdapterApplication("style", 16.1)
 
 
 def test_selection_rejects_unknown_adapter_and_invalid_permutation() -> None:

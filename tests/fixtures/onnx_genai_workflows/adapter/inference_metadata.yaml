@@ -1,0 +1,171 @@
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      ir_version: '1.0'
+      onnx_opsets:
+        ai.onnx: 24
+      adapter_abis:
+        onnx-genai.parameter-overlay: '1'
+      capabilities:
+      - workflow_ssa
+      - typed_emit
+      - parameter_adapters
+      - heterogeneous_adapter_batching
+    inputs:
+      request.row_ids:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: runtime
+          version: '1.0'
+          role: row_ids
+        source:
+          kind: request
+      request.active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: active
+      request.request_epochs:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: runtime
+          version: '1.0'
+          role: request_epochs
+        source:
+          kind: request
+      activations:
+        contract:
+          dtype: float32
+          rank: 2
+          shape:
+          - batch
+          - 2
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: activations
+    outputs:
+      result:
+        contract:
+          dtype: float32
+          rank: 2
+          shape:
+          - batch
+          - 2
+        role: tensor
+        stage: pre_adapter
+    components:
+      decoder:
+        implementation:
+          kind: onnx
+          artifact: model.onnx
+        ports: {}
+      overlay:
+        implementation:
+          kind: adapter
+          abi: onnx-genai.parameter-overlay
+          version: '1'
+        ports:
+          inputs:
+            input:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - 2
+          outputs:
+            output:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - 2
+        contract:
+          id: onnx-genai.parameter-overlay
+          version: '1'
+          bindings:
+            input: input
+            output: output
+          parameters:
+            action: apply
+            component: decoder
+            parameter: projection
+    state: {}
+    steps:
+    - kind: invoke
+      component: overlay
+      inputs:
+        input: activations
+      outputs:
+        output: adapted
+    - kind: emit
+      value: adapted
+      output: result
+      mode: replace
+    adapters:
+      base_model_fingerprint: sha256:3fd36990826adeab952ece1ca18d2b2c721e47a21a40cd0d32e74c2af46bcd96
+      row_ids: request.row_ids
+      request_epochs: request.request_epochs
+      active: request.active
+      application_capability: onnx-genai.adapters
+      portable_fallback: true
+      cache:
+        max_entries: 2
+        eviction: lru
+      planning:
+        bucket_by_adapter_set: true
+        stable_buffers: true
+        invalidate_capture_on_eviction: true
+      artifacts:
+        blue:
+          identity: blue
+          version: '1'
+          base_model_fingerprint: sha256:3fd36990826adeab952ece1ca18d2b2c721e47a21a40cd0d32e74c2af46bcd96
+          rank: 1
+          alpha: 1.0
+          dtype: float32
+          provenance: in_memory
+          weights:
+          - location: adapters/blue.json
+            sha256: 66ecbb05ef164997eb5d21cd7ced595ee7457daa67ac6c4b26bdba27d7d238e7
+            format: json
+          targets:
+          - component: decoder
+            parameter: projection
+            weight_key: projection
+            input_features: 2
+            output_features: 2
+        red:
+          identity: red
+          version: '1'
+          base_model_fingerprint: sha256:3fd36990826adeab952ece1ca18d2b2c721e47a21a40cd0d32e74c2af46bcd96
+          rank: 1
+          alpha: 1.0
+          dtype: float32
+          provenance: in_memory
+          weights:
+          - location: adapters/red.json
+            sha256: 7de6cf124e348f4e8fce31694559fb73644a463ee6b43931bf66cc617e157783
+            format: json
+          targets:
+          - component: decoder
+            parameter: projection
+            weight_key: projection
+            input_features: 2
+            output_features: 2
