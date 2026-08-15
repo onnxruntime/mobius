@@ -141,7 +141,7 @@ def _target_fingerprint_record(
         "component": target.component,
         "consumers": consumers,
         "dtype": int(initializer.dtype),
-        "parameter": target.parameter,
+        "initializer": target.parameter,
         "shape": [int(dimension) for dimension in initializer.shape],
         "tensor_sha256": hashlib.sha256(_tensor_bytes(initializer.const_value)).hexdigest(),
     }

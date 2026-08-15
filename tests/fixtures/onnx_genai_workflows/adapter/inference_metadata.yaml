@@ -157,17 +157,20 @@ pipeline:
       output: result
       mode: replace
 adapters:
-  base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:e7001822e692c6c2e51b0665bc105db3a4ae9a517d90c116e6f3dca1ee992316
+  base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:702704827be590661fd77676445ddaf1557e4f4d446eaa7bcfb78754466cccdb
   target_manifest:
     targets:
     - id: projection
       component: decoder
-      parameter: projection
+      initializer: projection
       node_name: projection
       output_name: projection.output
       activation_dtype: float32
       input_features: 2
       output_features: 2
+      layer_index: 0
+      rank: 1
+      alpha: 1.0
       graph_inputs:
         a: lora.projection.a
         b: lora.projection.b
@@ -195,7 +198,7 @@ adapters:
       index: 0
       identity: blue
       version: '1'
-      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:e7001822e692c6c2e51b0665bc105db3a4ae9a517d90c116e6f3dca1ee992316
+      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:702704827be590661fd77676445ddaf1557e4f4d446eaa7bcfb78754466cccdb
       rank: 1
       alpha: 1.0
       dtype: float32
@@ -214,7 +217,7 @@ adapters:
       index: 1
       identity: green
       version: '1'
-      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:e7001822e692c6c2e51b0665bc105db3a4ae9a517d90c116e6f3dca1ee992316
+      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:702704827be590661fd77676445ddaf1557e4f4d446eaa7bcfb78754466cccdb
       rank: 1
       alpha: 1.0
       dtype: float32
@@ -233,7 +236,7 @@ adapters:
       index: 2
       identity: peft
       version: '1'
-      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:e7001822e692c6c2e51b0665bc105db3a4ae9a517d90c116e6f3dca1ee992316
+      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:702704827be590661fd77676445ddaf1557e4f4d446eaa7bcfb78754466cccdb
       rank: 1
       alpha: 1.0
       dtype: float32
@@ -261,7 +264,7 @@ adapters:
       index: 3
       identity: red
       version: '1'
-      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:e7001822e692c6c2e51b0665bc105db3a4ae9a517d90c116e6f3dca1ee992316
+      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:702704827be590661fd77676445ddaf1557e4f4d446eaa7bcfb78754466cccdb
       rank: 1
       alpha: 1.0
       dtype: float32

@@ -298,8 +298,9 @@ class ModelPackage(UserDict[str, ir.Model]):
             descriptor.target: descriptor
             for descriptor in self.adapter_target_manifest.targets
         }
-        manifest_target_ids = {
-            target["id"] for target in self.adapter_target_manifest_metadata()["targets"]
+        manifest_targets = {
+            target["id"]: target
+            for target in self.adapter_target_manifest_metadata()["targets"]
         }
         catalog: dict[str, dict[str, object]] = {}
         identities: set[tuple[str, str]] = set()
@@ -335,11 +336,34 @@ class ModelPackage(UserDict[str, ir.Model]):
             for weight in ordered_weights:
                 descriptor = descriptors[weight.target]
                 target_id = weight.target_id or descriptor.semantic_name
-                if target_id not in manifest_target_ids:
+                if target_id not in manifest_targets:
                     raise ValueError(
                         f"adapter {alias!r} references target ID {target_id!r} "
                         "outside the authoritative manifest"
                     )
+                target_policy = manifest_targets[target_id]
+                if target_policy.get("rank", weight.rank) != weight.rank:
+                    raise ValueError(
+                        f"adapter {alias!r} target {target_id!r} rank {weight.rank} "
+                        f"violates manifest policy {target_policy['rank']}"
+                    )
+                if target_policy.get("alpha", weight.alpha) != weight.alpha:
+                    raise ValueError(
+                        f"adapter {alias!r} target {target_id!r} alpha {weight.alpha} "
+                        f"violates manifest policy {target_policy['alpha']}"
+                    )
+                slice_policy = target_policy.get("output_slice")
+                if isinstance(slice_policy, dict):
+                    if slice_policy.get("rank", weight.rank) != weight.rank:
+                        raise ValueError(
+                            f"adapter {alias!r} target {target_id!r} rank {weight.rank} "
+                            f"violates output-slice policy {slice_policy['rank']}"
+                        )
+                    if slice_policy.get("alpha", weight.alpha) != weight.alpha:
+                        raise ValueError(
+                            f"adapter {alias!r} target {target_id!r} alpha {weight.alpha} "
+                            f"violates output-slice policy {slice_policy['alpha']}"
+                        )
                 weight_key = weight.weight_key or descriptor.semantic_name
                 binding: dict[str, object] = {
                     "target": target_id,
@@ -466,13 +490,19 @@ class ModelPackage(UserDict[str, ir.Model]):
             base: dict[str, object] = {
                 "id": descriptor.semantic_name,
                 "component": descriptor.target.component,
-                "parameter": descriptor.target.parameter,
+                "initializer": descriptor.target.parameter,
                 "node_name": descriptor.node_name,
                 "output_name": descriptor.output_name,
                 "activation_dtype": activation_dtype,
                 "input_features": descriptor.input_size,
                 "output_features": descriptor.output_size,
             }
+            if descriptor.layer_index is not None:
+                base["layer_index"] = descriptor.layer_index
+            if descriptor.rank is not None:
+                base["rank"] = descriptor.rank
+            if descriptor.alpha is not None:
+                base["alpha"] = descriptor.alpha
             if descriptor.graph_input_a is not None:
                 graph_inputs = {
                     "a": descriptor.graph_input_a,
@@ -485,11 +515,16 @@ class ModelPackage(UserDict[str, ir.Model]):
             for target_slice in descriptor.slices:
                 sliced = dict(base)
                 sliced["id"] = f"{descriptor.semantic_name}.{target_slice.role}"
-                sliced["output_slice"] = {
+                output_slice: dict[str, object] = {
                     "role": target_slice.role,
                     "offset": target_slice.offset,
                     "width": target_slice.width,
                 }
+                if target_slice.rank is not None:
+                    output_slice["rank"] = target_slice.rank
+                if target_slice.alpha is not None:
+                    output_slice["alpha"] = target_slice.alpha
+                sliced["output_slice"] = output_slice
                 targets.append(sliced)
         return {"targets": targets}
 

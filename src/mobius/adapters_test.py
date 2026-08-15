@@ -609,7 +609,8 @@ def test_exact_onnx_genai_catalog_and_portable_bundle_serialization() -> None:
         assert target == {
             "id": "layers.0.self_attn.q_proj",
             "component": "decoder",
-            "parameter": "projection.weight",
+            "initializer": "projection.weight",
+            "layer_index": 0,
             "node_name": "projection",
             "output_name": "projection.output",
             "activation_dtype": "float32",
@@ -625,6 +626,8 @@ def test_exact_onnx_genai_catalog_and_portable_bundle_serialization() -> None:
             "role": "q",
             "offset": 0,
             "width": 3,
+            "rank": 2,
+            "alpha": 4.0,
         }
         assert service["cache"] == {"max_entries": 2, "eviction": "lru"}
         assert service["planning"] == {
@@ -742,6 +745,35 @@ def test_wire_contract_emits_per_target_rank_override() -> None:
         bindings = {binding["target"]: binding for binding in artifact["bindings"]}
         assert bindings["layers.0.self_attn.q_proj.q"]["rank"] == 2
         assert "rank" not in bindings["layers.0.self_attn.v_proj"]
+    finally:
+        shutil.rmtree(directory)
+
+
+def test_wire_contract_rejects_manifest_rank_policy_violation() -> None:
+    model = _model()
+    descriptor = AdapterTargetDescriptor(
+        AdapterTarget("decoder", "projection.weight"),
+        semantic_name="projection",
+        node_name="projection",
+        output_name="projection.output",
+        input_size=4,
+        output_size=3,
+        rank=1,
+        alpha=4.0,
+    )
+    manifest = AdapterTargetManifest(
+        fingerprint_model_weights({"decoder": model}, (descriptor,)),
+        (descriptor,),
+    )
+    package = ModelPackage({"decoder": model}, adapter_target_manifest=manifest)
+    package.add_adapter_artifact(
+        AdapterArtifact("style", manifest.base_fingerprint, (_weights(),))
+    )
+    directory = Path("artifacts") / f"adapter-policy-test-{uuid.uuid4().hex}"
+    directory.mkdir(parents=True)
+    try:
+        with pytest.raises(ValueError, match="violates manifest policy"):
+            package.save_adapter_artifacts(str(directory))
     finally:
         shutil.rmtree(directory)
 
