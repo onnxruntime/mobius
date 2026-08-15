@@ -20,8 +20,8 @@ The Q4 recipe keeps DeltaNet's narrow `in_proj_a` decay and `in_proj_b`
 time-step gates in FP16. Quantizing those recurrent controls destabilizes
 cached generation; all larger decoder matrices remain eligible for
 `MatMulNBits`. All three Q4 package components are reloaded with CUDA enabled;
-the 20-token semantic run uses CPU because ORT 1.26's CUDA `MatMulNBits`
-execution is itself nondeterministic for this reduced hybrid fixture.
+the 20-token semantic run uses CPU because repeated identical ORT 1.26 CUDA
+`MatMulNBits` runs can diverge and produce non-finite logits for this fixture.
 `optimize.py` derives the recurrent-gate node exclusions from the exported
 decoder, so the validated package must be assembled through that script rather
 than a static Olive JSON recipe.
