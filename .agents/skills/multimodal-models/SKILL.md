@@ -255,10 +255,9 @@ must scale with rows/windows, not total-patches × media-count. Keep dense masks
 only as a portable fallback and assert optimized CUDA/DML graphs lack the
 quadratic construction.
 
-Config generation is not runtime support. Emit graph-derived metadata faithfully
-and, when useful, execute real media through ORT GenAI as a downstream probe.
-If it cannot supply a required encoder input or position-ID rank, record the
-exact runtime/version limitation without blocking Mobius export.
+Config generation is not runtime support. Execute real media through ORT GenAI;
+if it cannot supply a required encoder input or position-ID rank, reject export
+before writing artifacts and use the same evidence for any Foundry waiver.
 
 ## GQA for KV-shared layers (Gemma4)
 

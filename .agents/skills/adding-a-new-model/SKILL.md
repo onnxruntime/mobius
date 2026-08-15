@@ -286,8 +286,7 @@ see the [quality-checklist skill](../quality-checklist/SKILL.md).
 - [ ] Integration test in `tests/integration_test.py` (if small checkpoint available)
 - [ ] L4 golden file generated and committed (`testdata/golden/`)
 - [ ] L5 generation golden file generated and committed
-- [ ] Graph-derived ORT GenAI metadata is tested; downstream load/generation is
-      optional evidence and never an export capability gate
+- [ ] ORT GenAI test added to `tests/ort_genai_test.py` (text-generation and VLM models)
 - [ ] CLI build works (`mobius build --model ...`)
 - [ ] Multi-dtype correctness verified (fp32, fp16, bf16)
 - [ ] Pinned revision reaches every Hub/processor/weight/golden call

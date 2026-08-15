@@ -242,16 +242,6 @@ pip install cupy-cuda12x
 # Olive auto-detects cupy and uses GPU when available
 ```
 
-### Isolate Olive from unrelated provider DLLs
-
-Olive 0.13 may auto-register every provider DLL bundled in an ORT GPU wheel
-even when a weight-only pass explicitly targets CPU. A missing TensorRT DLL can
-then abort K-quant before the pass starts. Keep the accelerator CPU-only and,
-for programmatic workflows, suppress `olive.systems.local` EP-library
-registration around `olive.workflows.run`; restore it immediately afterward.
-This is safe for `OnnxKQuantQuantization`, which does not create an inference
-session. Still load and execute the resulting package with the intended EP.
-
 ### Quantizing multi-model exports
 
 Quantize each sub-model independently. Typically only the decoder is
@@ -435,9 +425,9 @@ compare_golden(
 )
 ```
 
-### Optional ORT GenAI downstream smoke test
+### L5: End-to-end smoke test
 
-When useful, run inference with the quantized model through ORT GenAI:
+Run inference with the quantized model through ORT GenAI:
 
 ```python
 import onnxruntime_genai as og
@@ -451,10 +441,6 @@ params.input_ids = tokenizer.encode("Hello, world!")
 output_ids = model.generate(params)
 print(tokenizer.decode(output_ids[0]))
 ```
-
-ORT GenAI acceptance is not a Mobius export gate. Always validate the final
-quantized ONNX package directly; treat ORT GenAI load/generation as optional
-downstream evidence and record its version/outcome without blocking export.
 
 ### Numerical parity verification
 
