@@ -62,7 +62,7 @@ body:
         - label: QNN
         - label: OpenVINO
         - label: MIGraphX
-        - label: CoreML (macOS)
+        - label: MLX (macOS)
         - label: Other
     validations:
       required: true
