@@ -8,6 +8,7 @@ import onnx_ir as ir
 import yaml
 from onnxscript import GraphBuilder
 
+from mobius._model_package import ModelPackage
 from mobius.adapters import (
     AdapterArtifact,
     AdapterServiceOptions,
@@ -17,19 +18,18 @@ from mobius.adapters import (
     AdapterWeights,
     fingerprint_model_weights,
 )
-from mobius._model_package import ModelPackage
 from mobius.integrations.onnx_genai import write_onnx_genai_config
 from mobius.integrations.onnx_genai.auto_export_test import (
     _Cfg,
     _VlmCfg,
 )
+from mobius.integrations.onnx_genai.inference_metadata import (
+    add_adapter_service_to_workflow,
+)
 from mobius.integrations.onnx_genai.workflow_metadata import (
     write_audio_codec_workflow_metadata,
     write_language_diffusion_workflow_metadata,
     write_speculative_workflow_metadata,
-)
-from mobius.integrations.onnx_genai.inference_metadata import (
-    add_adapter_service_to_workflow,
 )
 from mobius.models.qwen3_tts import Qwen3TTSForConditionalGeneration
 from mobius.models.qwen3_tts_test import _TINY_CONFIG

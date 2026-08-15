@@ -1493,7 +1493,7 @@ def add_adapter_service_to_workflow(
         return metadata
     workflow = metadata.get("pipeline", {}).get("workflow")
     if not isinstance(workflow, dict):
-        raise ValueError("parameter adapters require pipeline.workflow metadata")
+        raise TypeError("parameter adapters require pipeline.workflow metadata")
     manifest = getattr(pkg, "adapter_target_manifest", None)
     if manifest is None:
         raise ValueError("parameter adapters require an authoritative adapter target manifest")
