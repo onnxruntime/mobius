@@ -19,13 +19,13 @@ The checkpoint is a real `nemotron_h` model, not an alias:
   graph does not instantiate MTP, and upstream marks those keys unexpected.
   No base-decoder generation input, cache, logit, or weight depends on them.
 
-ONNX Runtime GenAI 0.15.2 cannot bind this model's mixed cache: Mamba layers
-need `conv_state` plus `ssm_state`, while sparse full-attention layers need
-key/value caches at global layer indices. Mobius rejects this graph contract
-structurally because `genai_config.json` has no `ssm_state` input/output
-template; it does not hard-code a NemotronH or runtime-version check. The guard
-can be removed when config emission represents that state. This validated
-package uses direct ONNX Runtime generation through `inference.py`.
+This model's graph mixes `conv_state` plus `ssm_state` with sparse
+full-attention key/value caches. Mobius emits every field the current
+`genai_config.json` schema can represent (semantic inputs, key/value and
+convolution templates, and global cache-slot count) and leaves runtime
+acceptance to ORT GenAI. The schema currently has no `ssm_state` template. The
+validated recipe uses direct ONNX Runtime generation through `inference.py`;
+downstream load/generation outcomes are informational and do not gate export.
 
 ## Install
 
@@ -56,7 +56,9 @@ The script performs four gated steps:
 1. Downloads the exact 14-shard BF16 checkpoint revision and exports FP16 ONNX.
    BF16 execution is rejected explicitly because corrected reduced-real parity
    reaches `0.8594` max logit error, above the `1e-2` reduced-precision gate.
-2. Applies CUDA GQA/LinearAttention fusion and the grouped-RMSNorm workaround.
+2. Emits standard ONNX cache operations and applies the grouped-RMSNorm CUDA
+   workaround. CUDA still executes supported compute nodes; portable cache
+   operations avoid provider-dependent fused decode drift.
 3. Runs Olive Q4 K-quant with an explicitly CPU-only target. It also suppresses
    Olive 0.13's unrelated GPU-EP DLL auto-registration, so a missing TensorRT
    installation cannot abort CPU weight-only quantization.
@@ -98,9 +100,9 @@ output/
     └── source_manifest.json
 ```
 
-This recipe intentionally omits `genai_config.json`: direct ONNX Runtime is
-the validated runtime, and core Mobius rejects the currently unrepresentable
-SSM cache contract before creating runtime artifacts.
+This recipe intentionally uses direct ONNX Runtime, while
+`mobius build --runtime ort-genai` remains allowed and emits the best current
+schema metadata for downstream testing.
 
 ## Direct generation and profiling
 
@@ -151,13 +153,14 @@ Validated results on ORT 1.28.0 / Olive 0.13.0:
 | Variant | Full-logit max abs | Generated IDs | Placement |
 |---|---:|---|---|
 | FP32 CPU | `9.54e-6` | `12, 13, 12, 12` | CPU |
-| FP16 CUDA | `0.00977` | `12, 13, 12, 12` | 833 CUDA / 14 CPU events |
+| FP16 CUDA | `<= 0.0078125` (prefill + every cached step) | `12, 13, 12, 12` | portable ONNX graph on CUDA |
 | BF16 CUDA | rejected (`0.8594`) | N/A | fails numerical gate |
-| Olive Q4 | quantized | `12, 13, 12, 12` | 833 CUDA / 14 CPU events |
+| Olive Q4 | quantized | `12, 13, 12, 12` | portable ONNX graph on CUDA |
 
-The reduced FP16 package is 247,380,256 bytes; Q4 is 73,190,965 bytes
-(`0.296x`). Its weighted graph contains 15 `com.microsoft::MatMulNBits`
-nodes and reloads successfully for multi-token generation.
+The reduced package's portable weighted graph quantizes 17 matrix
+multiplications to `com.microsoft::MatMulNBits` and reloads successfully for
+multi-token generation. Record size/compression from the produced package;
+it varies with external-data serialization and Olive version.
 
 ## Evidence-based waivers
 
@@ -166,5 +169,5 @@ nodes and reloads successfully for multi-token generation.
 - Full 30B Olive run: the recipe and reduced production-dimension pass are
   validated; completing all 2,944 expert subgraphs requires a large-memory
   host.
-- Foundry Local: not available on this host, and its ORT GenAI-based model
-  contract cannot represent NemotronH hybrid state today.
+- Foundry Local was not available on this host. That downstream validation
+  remains informational and does not block Mobius export.

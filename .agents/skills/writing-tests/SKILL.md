@@ -274,6 +274,11 @@ integration test alongside any new custom function or Scan op.**
 - Before accepting an architecture xfail, verify config vocabulary, epsilon,
   and layer-kind translation. A stale `mlp`→`moe` mapping can look like an SSM
   numerical failure while loading the wrong weights entirely.
+- Compare full prefill and every token-by-token prompt/decode logit on the
+  target EP. Fused cache kernels can match multi-token prefill yet diverge on
+  the first reused state. If full-precision and quantized packages fail at the
+  same cached step, test a standard-ONNX cache graph before blaming the
+  quantizer; prefer the portable graph when it restores the numeric gate.
 
 ### Recurrent state ≠ KV cache
 

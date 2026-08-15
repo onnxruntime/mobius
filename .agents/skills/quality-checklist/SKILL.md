@@ -164,15 +164,20 @@ python examples/<model>_text_generation.py --compare-hf --dtype bf16
 
 ### 9. ORT GenAI runtime
 
-- [ ] Model can be loaded with `ort_genai.Model(output_dir)` without error
-- [ ] Actual generation with required media/features produces coherent output;
-      schema/config emission alone is not runtime support
-- [ ] ORT GenAI test added to `tests/ort_genai_test.py`
-      (or confirmed covered by an existing parametrized test)
-- [ ] Structurally unsupported contracts fail before artifacts are emitted and
-      have a version-specific, evidence-based waiver
+- [ ] Generated metadata faithfully reflects graph filenames, semantic I/O,
+      representable cache templates, and global cache-slot indices
+- [ ] Intrinsic schema/config errors are tested without inferring downstream
+      runtime capability
 
-Run the ORT GenAI integration test:
+Optional downstream evidence:
+
+- [ ] If ORT GenAI load/generation is run, record the exact runtime version and
+      result. Failures document limitations but never gate Mobius export based
+      on the runtime registry, topology support, or cache executor capability.
+- [ ] Add an ORT GenAI integration test when useful, but do not require one for
+      export acceptance.
+
+Optional ORT GenAI integration probe:
 
 ```bash
 python -m pytest tests/ort_genai_test.py -m integration_slow -k "<model>" -sv
@@ -180,9 +185,10 @@ python -m pytest tests/ort_genai_test.py -m integration_slow -k "<model>" -sv
 
 ### 10. Foundry Local smoke test
 
-- [ ] Model exported package can be loaded and run in Foundry Local
-- [ ] At minimum, verify that the `genai_config.json` and all ONNX files
-      are present and the model responds to a short prompt
+- [ ] `genai_config.json` and all ONNX files are present and internally
+      consistent
+- [ ] If Foundry Local is available, record its version and load/generation
+      result as optional downstream evidence; limitations do not block export
 
 > If Foundry Local is not available in the current environment, document the
 > skip with a `# TODO: verify with Foundry Local` comment in the PR.
@@ -194,8 +200,9 @@ python -m pytest tests/ort_genai_test.py -m integration_slow -k "<model>" -sv
 - [ ] Quantized model produces non-degenerate output (coherent text)
 - [ ] Quantization uses only required execution providers if unrelated provider
       registration fails, and evidence includes size, load, and inference
-- [ ] If quantization changes the graph structure (e.g. MatMulNBits), verify
-      the `genai_config.json` still loads correctly in ORT GenAI
+- [ ] If quantization changes graph names (e.g. `logits_Q4`), regenerate or
+      verify metadata against the final graph; ORT GenAI loading remains an
+      optional downstream probe
 
 Run the quantization integration test suite to confirm existing patterns
 are not broken:

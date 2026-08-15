@@ -227,6 +227,71 @@ def _count_cache_layer_slots(model: ir.Model | None) -> int | None:
     return max(layer_indices) + 1 if layer_indices else None
 
 
+_CACHE_INPUT_FIELDS = {
+    (None, "key"): "past_key_names",
+    (None, "value"): "past_value_names",
+    ("self", "key"): "past_key_names",
+    ("self", "value"): "past_value_names",
+    ("cross", "key"): "cross_past_key_names",
+    ("cross", "value"): "cross_past_value_names",
+    (None, "conv_state"): "past_conv_names",
+}
+_CACHE_OUTPUT_FIELDS = {
+    (None, "key"): "present_key_names",
+    (None, "value"): "present_value_names",
+    ("self", "key"): "present_key_names",
+    ("self", "value"): "present_value_names",
+    (None, "conv_state"): "present_conv_names",
+}
+
+
+def _cache_name_parts(name: str, prefix: str) -> tuple[str | None, str, str] | None:
+    """Return ``(scope, suffix, template)`` for indexed cache names."""
+    parts = name.split(".")
+    if len(parts) not in (3, 4) or parts[0] != prefix or not parts[1].isdigit():
+        return None
+    scope = parts[2] if len(parts) == 4 else None
+    suffix = parts[-1]
+    parts[1] = "%d"
+    return scope, suffix, ".".join(parts)
+
+
+def _decoder_cache_templates(model: ir.Model) -> tuple[dict[str, str], dict[str, str]]:
+    """Map graph cache suffixes to every template the current config schema supports."""
+    inputs: dict[str, str] = {}
+    outputs: dict[str, str] = {}
+    for value in model.graph.inputs:
+        if (
+            value.name is None
+            or (parts := _cache_name_parts(value.name, "past_key_values")) is None
+        ):
+            continue
+        scope, suffix, template = parts
+        if (config_name := _CACHE_INPUT_FIELDS.get((scope, suffix))) is not None:
+            inputs[config_name] = template
+    for value in model.graph.outputs:
+        if value.name is None or (parts := _cache_name_parts(value.name, "present")) is None:
+            continue
+        scope, suffix, template = parts
+        if (config_name := _CACHE_OUTPUT_FIELDS.get((scope, suffix))) is not None:
+            outputs[config_name] = template
+    return inputs, outputs
+
+
+def _decoder_output_mapping(model: ir.Model) -> dict[str, str] | None:
+    """Return semantic decoder outputs and graph-derived cache templates."""
+    output_names = [value.name for value in model.graph.outputs if value.name is not None]
+    logits_name = next(
+        (name for name in output_names if name == "logits"),
+        next((name for name in output_names if name.startswith("logits_")), None),
+    )
+    _cache_inputs, cache_outputs = _decoder_cache_templates(model)
+    outputs = dict(cache_outputs)
+    if logits_name is not None:
+        outputs["logits"] = logits_name
+    return outputs or None
+
+
 def _introspect_inputs(pkg: ModelPackage, key: str) -> dict[str, str] | None:
     """Return ``{name: name}`` identity mapping for a sub-model's inputs.
 
@@ -991,45 +1056,23 @@ def _write_genai_config(
     # --- Discover decoder inputs from the ONNX graph ---
     decoder_key = "decoder" if "decoder" in pkg else "model"
     decoder_inputs = _introspect_inputs(pkg, decoder_key)
-    if decoder_inputs is not None:
-        # KV cache entries are template-based, not per-input
-        decoder_inputs["past_key_names"] = "past_key_values.%d.key"
-        decoder_inputs["past_value_names"] = "past_key_values.%d.value"
+    decoder_model = pkg.get(decoder_key)
+    decoder_outputs = None
+    if decoder_model is not None:
+        cache_inputs, _cache_outputs = _decoder_cache_templates(decoder_model)
+        if decoder_inputs is not None:
+            decoder_inputs.update(cache_inputs)
+        decoder_outputs = _decoder_output_mapping(decoder_model)
 
     # Derive decoder filename from the actual package key
     decoder_filename = (
         f"{decoder_key}/model.onnx" if len(pkg) > 1 or decoder_key != "model" else "model.onnx"
     )
 
-    # ORT GenAI's ``past_present_share_buffer`` mode requires the decoder
-    # graph to write the KV cache in place. Only ``com.microsoft.
-    # GroupQueryAttention`` does that; the standard ONNX ``Attention`` op
-    # concatenates ``past_key`` with the new ``K`` and returns a dynamic-
-    # shape ``present_key``, which is incompatible with the pre-allocated
-    # shared buffer. Introspect the graph: if there is at least one GQA
-    # node, the model supports shared-buffer mode; otherwise force it off
-    # regardless of the EP capability flag.
-    #
-    # ``com.microsoft.LinearAttention`` (linear/recurrent-attention layers,
-    # e.g. Qwen3.5's GatedDeltaNet) is a separate, *mandatory* case: its
-    # recurrent state requires ``past_present_share_buffer=True`` regardless
-    # of whether any other layer uses GQA (ORT GenAI raises "RecurrentState
-    # requires past_present_share_buffer=true" otherwise).
-    #
-    # Hybrid models mix LinearAttention layers with full-attention layers,
-    # which may lower to GQA *or* to the standard (non-GQA) ``Attention`` op
-    # depending on EP/dtype (e.g. the CPU EP only lowers to GQA for fp32;
-    # fp16 falls back to standard Attention -- see ``_execution_providers.py``
-    # ``gqa_dtypes``). If a hybrid graph has LinearAttention but its
-    # full-attention layers are still standard (non-GQA) Attention, forcing
-    # ``past_present_share_buffer=True`` produces an unrunnable config: the
-    # recurrent state requires it, but standard Attention's dynamic-shape KV
-    # concat cannot honor a pre-allocated shared buffer, which fails at
-    # generation time with an ``attn_mask``/``total_sequence_length``
-    # mismatch rather than at load time. Rather than silently emit a broken
-    # config, raise a clear error so the caller picks an EP/dtype combination
-    # (e.g. fp32 on CPU) that lowers full attention to GQA.
-    decoder_model = pkg.get(decoder_key)
+    # Derive shared-buffer metadata from the graph. GQA supports in-place KV,
+    # while LinearAttention requires a shared recurrent-state buffer. Mixed
+    # topologies are still emitted faithfully; downstream runtime acceptance
+    # must not become a Mobius export capability gate.
     supports_in_place_kv_cache: bool | None = None
     if decoder_model is not None:
         has_gqa = any(
@@ -1040,26 +1083,6 @@ def _write_genai_config(
             node.op_type == "LinearAttention" and node.domain == "com.microsoft"
             for node in decoder_model.graph
         )
-        has_standard_attention = any(
-            node.op_type == "Attention" and node.domain in ("", "ai.onnx")
-            for node in decoder_model.graph
-        )
-        if has_recurrent_state and has_standard_attention:
-            # A GQA node elsewhere in the graph does NOT make a co-existing
-            # standard Attention node compatible with a shared buffer --
-            # each op instance is independently (in)compatible, so this
-            # must reject on the mere presence of standard Attention, not
-            # only when GQA is completely absent (partial GQA fusion still
-            # leaves the unfused standard Attention layers broken).
-            raise ValueError(
-                "This decoder graph mixes com.microsoft.LinearAttention "
-                "(recurrent state, requires past_present_share_buffer=True) "
-                "with standard (non-GQA) Attention (incompatible with "
-                "past_present_share_buffer=True). This EP/dtype combination "
-                "cannot produce a runnable genai_config -- pick an EP/dtype "
-                "that lowers *all* full-attention layers to "
-                "GroupQueryAttention instead (e.g. fp32 on the CPU EP)."
-            )
         supports_in_place_kv_cache = has_gqa or has_recurrent_state
 
     generator = GenaiConfigGenerator.from_config(
@@ -1071,6 +1094,7 @@ def _write_genai_config(
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
         decoder_inputs=decoder_inputs,
+        decoder_outputs=decoder_outputs,
         decoder_filename=decoder_filename,
         supports_in_place_kv_cache=supports_in_place_kv_cache,
         num_cache_layer_slots=_count_cache_layer_slots(decoder_model),
@@ -1221,48 +1245,6 @@ def _write_genai_config(
     return generator.write(output_dir)
 
 
-def _validate_ort_genai_compatibility(pkg: ModelPackage) -> None:
-    """Reject packages whose required inputs cannot be supplied by ORT GenAI."""
-    config = getattr(pkg, "config", None)
-    decoder_key = "decoder" if "decoder" in pkg else "model"
-    decoder_model = pkg.get(decoder_key)
-    if decoder_model is not None:
-        cache_suffixes = {
-            parts[2]
-            for model_input in decoder_model.graph.inputs
-            if model_input.name is not None
-            and len(parts := model_input.name.split(".")) == 3
-            and parts[0] == "past_key_values"
-            and parts[1].isdigit()
-        }
-        if "ssm_state" in cache_suffixes:
-            raise ValueError(
-                "ORT GenAI config generation cannot represent this decoder's cache "
-                f"inputs {sorted(cache_suffixes)}: no input/output template exists for "
-                "ssm_state. Export without --runtime ort-genai and run the ONNX model "
-                "directly until the config schema and runtime support this graph contract."
-            )
-    if getattr(config, "model_type", None) == "parakeet_ctc":
-        raise ValueError(
-            "ORT GenAI does not define a feature-input CTC ASR pipeline; "
-            "export Parakeet CTC as ONNX and run it directly with ONNX Runtime."
-        )
-    if {"vision_encoder", "decoder"}.issubset(pkg) and "embedding" not in pkg:
-        model_type = getattr(config, "model_type", "unknown")
-        raise NotImplementedError(
-            "onnxruntime-genai does not support generic vision encoder-decoder "
-            f"packages such as {model_type!r}. Run the vision_encoder and decoder "
-            "ONNX sessions directly; emitting genai_config.json would create an "
-            "artifact that the runtime cannot load."
-        )
-    if getattr(config, "model_type", None) == "mage_vl":
-        raise ValueError(
-            "ORT GenAI does not support Mage-VL's required patch_positions vision "
-            "input or its 1D decoder position_ids contract. Export without "
-            "--runtime ort-genai to save the runnable direct three-model ONNX package."
-        )
-
-
 def write_ort_genai_config(
     pkg: ModelPackage,
     directory: str,
@@ -1325,15 +1307,6 @@ def write_ort_genai_config(
             "This is set automatically when building with mobius.build(). "
             "Diffusion models (which have no config) are not supported."
         )
-    _validate_ort_genai_compatibility(pkg)
-
-    if getattr(config, "model_type", None) == "moonshine":
-        raise NotImplementedError(
-            "onnxruntime-genai does not support Moonshine's variable-length raw-waveform "
-            "encoder. Run the exported encoder and cached decoder directly with "
-            "ONNX Runtime."
-        )
-
     os.makedirs(directory, exist_ok=True)
 
     # Normalize EP: 'default' and 'onnx-standard' are portable-ONNX modes
@@ -1393,6 +1366,10 @@ def write_ort_genai_config(
             # Gemma3 multimodal configs are unwrapped to the text sub-config
             # during build, but ORT GenAI needs the multimodal parent type.
             ort_model_type = "gemma3"
+        elif is_vlm and raw_type == "gemma4_text":
+            # GGUF multimodal builds retain the text checkpoint's model type
+            # after attaching the companion vision projector.
+            ort_model_type = "gemma4"
         elif is_vlm and raw_type == "gemma3n_text":
             # Same unwrapping for Gemma3n, whose parent type is "gemma3n".
             # Deliberately *not* aliased to "gemma3": the package threads
@@ -1602,8 +1579,6 @@ def export_package(
             "Diffusion models (which have no config) are not supported — "
             "use ModelPackage.save() directly for those."
         )
-    _validate_ort_genai_compatibility(pkg)
-
     os.makedirs(output_dir, exist_ok=True)
 
     # 1. Save ONNX models + weights

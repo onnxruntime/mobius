@@ -363,8 +363,9 @@ Before advertising runtime support, execute the complete path:
 Verify sample/output ranks, source-vs-target token slicing, CFG semantics, and
 the runtime's actual scheduler identifiers/equations. Reload final metadata and
 verify every file path, port, preprocessing step, loop edge, and postprocess.
-If the runtime cannot express the dataflow, reject it before emitting artifacts;
-keep direct component export separate.
+Emit faithful component graphs and metadata even when the tested downstream
+runtime cannot yet express the complete dataflow. Record that runtime/version
+limitation separately; it must not become a Mobius export capability gate.
 
 Validate required VAE statistics against latent channel count before graph
 construction (`len(mean) == len(std) == z_dim`, positive standard deviations).

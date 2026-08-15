@@ -126,6 +126,14 @@ def _as_numpy(value: Any) -> np.ndarray:
     return value.numpy()
 
 
+def _logits_output_name(output_names: list[str]) -> str:
+    """Resolve the full-precision or Olive-renamed logits output."""
+    for candidate in ("logits", "logits_Q4"):
+        if candidate in output_names:
+            return candidate
+    raise ValueError(f"Model has no logits output; found {output_names}")
+
+
 def _create_session(model_path: Path, device: str, profile: bool):
     if device == "cuda":
         # Importing PyTorch first preloads its matching CUDA/cuDNN DLLs on Windows.
@@ -189,6 +197,7 @@ def run_token_ids(
     session = _create_session(model_path, device, profile)
     states = _initial_states(session)
     output_names = [output.name for output in session.get_outputs()]
+    logits_output_name = _logits_output_name(output_names)
     generated: list[int] = []
     logits_by_step: list[np.ndarray] = []
     past_length = 0
@@ -207,7 +216,9 @@ def run_token_ids(
         past_length += 1
 
     assert outputs is not None
-    logits = _as_numpy(outputs[output_names.index("logits")])[0, -1].astype(np.float32)
+    logits = _as_numpy(outputs[output_names.index(logits_output_name)])[0, -1].astype(
+        np.float32
+    )
     eos_ids = set(eos_token_ids or ())
     for token_index in range(max_new_tokens):
         logits_by_step.append(logits.copy())
@@ -225,7 +236,9 @@ def run_token_ids(
         outputs = _run_session(session, output_names, feeds)
         _update_states(states, output_names, outputs)
         past_length += 1
-        logits = _as_numpy(outputs[output_names.index("logits")])[0, -1].astype(np.float32)
+        logits = _as_numpy(outputs[output_names.index(logits_output_name)])[0, -1].astype(
+            np.float32
+        )
 
     profile_path = session.end_profiling() if profile else None
     return generated, logits_by_step, profile_path

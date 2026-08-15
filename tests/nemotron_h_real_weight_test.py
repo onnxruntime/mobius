@@ -58,13 +58,13 @@ def test_load_eos_token_ids_unions_generation_and_model_config(tmp_path):
     assert validator.load_eos_token_ids(tmp_path) == {2, 11}
 
 
-def test_run_token_ids_stops_on_eos_without_unused_forward(tmp_path, monkeypatch):
+def test_run_token_ids_accepts_olive_logits_and_stops_on_eos(tmp_path, monkeypatch):
     validator = _load_validator()
     inference_globals = validator.run_token_ids.__globals__
     (tmp_path / "model.onnx").touch()
 
     class _Output:
-        name = "logits"
+        name = "logits_Q4"
 
     class _Session:
         @staticmethod
@@ -303,9 +303,20 @@ def test_nemotron_h_3_5_reduced_real_l5(reduced_real_outputs, model_type):
 def test_nemotron_h_3_5_reduced_real_fp16_cuda(reduced_real_fp16_cuda, model_type):
     del model_type
     _validator, _state, package_dir = reduced_real_fp16_cuda
+    import onnx_ir as ir
 
     assert (package_dir / "model.onnx").is_file()
     assert (package_dir / "model.onnx.data").is_file()
+    model = ir.load(package_dir / "model.onnx")
+    op_types = {(node.domain, node.op_type) for node in model.graph.all_nodes()}
+    assert ("", "Attention") in op_types
+    assert ("", "Scan") in op_types
+    assert ("", "Conv") in op_types
+    assert not any(
+        domain == "com.microsoft"
+        and op_type in {"GroupQueryAttention", "LinearAttention", "CausalConvWithState"}
+        for domain, op_type in op_types
+    )
 
 
 @pytest.mark.integration
@@ -355,7 +366,7 @@ def test_nemotron_h_3_5_olive_q4_final_package(
             node.domain == "com.microsoft" and node.op_type == "MatMulNBits"
             for node in quantized_model.graph.all_nodes()
         )
-        == 15
+        == 17
     )
 
     generated, logits, profile_path = validator.run_token_ids(

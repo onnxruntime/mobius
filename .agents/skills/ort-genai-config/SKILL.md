@@ -282,21 +282,22 @@ processor doesn't provide. Either:
 1. Compute them externally and inject via NamedTensors, or
 2. Modify the vision model to compute them from `image_grid_thw` internally
 
-### Config writes successfully but runtime cannot execute
+### Config metadata and downstream runtime acceptance
 
-Config/schema success is not runtime support. Run load plus generation through
-the exported contract. If the runtime cannot route required feature inputs,
-position-ID rank, cache state, scheduler, or multimodal metadata, reject export
-before writing artifacts and report the exact runtime version/limitation.
+Mobius owns metadata correctness, not ORT GenAI capability decisions. Emit the
+best accurate package from graph metadata: filenames, semantic graph inputs and
+outputs, every cache template the current config schema can represent, and the
+global cache-slot count. Preserve intrinsic schema/config validation, but do
+not gate or reject export based on the current GenAI model registry, runtime
+version, topology support, or cache executor capability.
 
-NemotronH is unsupported in ORT GenAI 0.15.2 because sparse global layer
-indices mix attention key/value caches with Mamba `conv_state` and
-`ssm_state`. Do not hard-code a model-type or runtime-version rejection.
-Inspect the actual decoder graph and reject only when it requires cache inputs
-the generated config has no template for (currently `ssm_state`). This keeps
-the guard structural: remove it when config emission can represent that graph
-contract. Record the tested-version waiver and provide a direct ONNX Runtime
-loop for current users.
+Runtime load/generation is an optional downstream probe. Record its exact
+version and outcome, but a downstream limitation never blocks Mobius export or
+requires a model-specific capability guard. For example, NemotronH mixes sparse
+key/value, convolution, and SSM state. Emit key/value and convolution templates
+plus the graph-derived slot count; the current schema has no `ssm_state`
+template, so omit only that unrepresentable field and let ORT GenAI decide
+whether it can execute the package now or in a future release.
 
 ### "input_ids size exceeds max length"
 

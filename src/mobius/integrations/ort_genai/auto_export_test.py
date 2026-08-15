@@ -56,25 +56,6 @@ def _mock_model_with_outputs(names: list[str]) -> ir.Model:
     return _mock_model(outputs=names)
 
 
-def test_moonshine_native_runtime_is_rejected(tmp_path):
-    from mobius._model_package import ModelPackage
-
-    config = mock.MagicMock()
-    config.model_type = "moonshine"
-    package = ModelPackage(
-        {"encoder": _mock_model(), "decoder": _mock_model()},
-        config=config,
-    )
-
-    with pytest.raises(
-        NotImplementedError,
-        match="variable-length raw-waveform encoder",
-    ) as error:
-        write_ort_genai_config(package, str(tmp_path))
-    assert "onnx-genai" not in str(error.value)
-    assert "ONNX Runtime" in str(error.value)
-
-
 def _make_fake_llm_pkg(model_type: str = "qwen2"):
     """Build a minimal LLM-only ModelPackage with a fake config."""
     import dataclasses
@@ -1042,37 +1023,22 @@ class TestExportForOrtGenai:
         assert "model" in data
         assert data["model"]["type"] == "qwen2"
 
-    def test_rejects_generic_vision_encoder_decoder_package(self, tmp_path):
+    def test_nemotron_h_mixed_cache_metadata_is_emitted(self, tmp_path):
         import dataclasses
 
         from mobius._model_package import ModelPackage
 
         @dataclasses.dataclass
         class FakeConfig:
-            model_type: str = "nemotron_parse"
-
-        pkg = ModelPackage(
-            {
-                "vision_encoder": _mock_model(),
-                "decoder": _mock_model(),
-            },
-            config=FakeConfig(),
-        )
-        with pytest.raises(
-            NotImplementedError,
-            match="does not support generic vision encoder-decoder",
-        ):
-            write_ort_genai_config(pkg, str(tmp_path))
-        assert not (tmp_path / "genai_config.json").exists()
-
-    def test_rejects_unrepresentable_mixed_cache_graph_before_writing(self, tmp_path):
-        import dataclasses
-
-        from mobius._model_package import ModelPackage
-
-        @dataclasses.dataclass
-        class FakeConfig:
-            model_type: str = "future_hybrid"
+            model_type: str = "nemotron_h"
+            vocab_size: int = 256
+            hidden_size: int = 64
+            num_hidden_layers: int = 3
+            num_attention_heads: int = 4
+            num_key_value_heads: int = 2
+            head_dim: int = 16
+            max_position_embeddings: int = 128
+            pad_token_id: int = 0
 
         pkg = ModelPackage(
             {
@@ -1084,17 +1050,89 @@ class TestExportForOrtGenai:
                         "past_key_values.0.ssm_state",
                         "past_key_values.2.key",
                         "past_key_values.2.value",
-                    ]
+                    ],
+                    outputs=[
+                        "logits",
+                        "present.0.conv_state",
+                        "present.0.ssm_state",
+                        "present.2.key",
+                        "present.2.value",
+                    ],
                 )
             },
             config=FakeConfig(),
         )
         output_dir = tmp_path / "ort-genai"
 
-        with pytest.raises(ValueError, match=r"no input/output template.*ssm_state"):
-            write_ort_genai_config(pkg, str(output_dir))
+        result = write_ort_genai_config(pkg, str(output_dir))
 
-        assert not output_dir.exists()
+        with open(result["genai_config"], encoding="utf-8") as config_file:
+            generated = json.load(config_file)
+        decoder = generated["model"]["decoder"]
+        assert generated["model"]["type"] == "nemotron_h"
+        assert decoder["num_hidden_layers"] == 3
+        assert decoder["inputs"] == {
+            "input_ids": "input_ids",
+            "attention_mask": "attention_mask",
+            "past_key_names": "past_key_values.%d.key",
+            "past_value_names": "past_key_values.%d.value",
+            "past_conv_names": "past_key_values.%d.conv_state",
+        }
+        assert decoder["outputs"] == {
+            "logits": "logits",
+            "present_key_names": "present.%d.key",
+            "present_value_names": "present.%d.value",
+            "present_conv_names": "present.%d.conv_state",
+        }
+
+    def test_olive_renamed_logits_output_is_emitted(self, tmp_path):
+        pkg = _make_fake_llm_pkg("qwen2")
+        pkg["model"] = _mock_model(
+            inputs=["input_ids", "past_key_values.0.key", "past_key_values.0.value"],
+            outputs=["logits_Q4", "present.0.key", "present.0.value"],
+        )
+
+        result = write_ort_genai_config(pkg, str(tmp_path))
+
+        with open(result["genai_config"], encoding="utf-8") as config_file:
+            generated = json.load(config_file)
+        assert generated["model"]["decoder"]["outputs"]["logits"] == "logits_Q4"
+
+    def test_nested_self_and_cross_cache_templates_are_emitted(self, tmp_path):
+        pkg = _make_fake_llm_pkg("decoder")
+        pkg["model"] = _mock_model(
+            inputs=[
+                "input_ids",
+                "encoder_hidden_states",
+                "past_key_values.0.self.key",
+                "past_key_values.0.self.value",
+                "past_key_values.0.cross.key",
+                "past_key_values.0.cross.value",
+            ],
+            outputs=[
+                "logits",
+                "present.0.self.key",
+                "present.0.self.value",
+            ],
+        )
+
+        result = write_ort_genai_config(pkg, str(tmp_path))
+
+        with open(result["genai_config"], encoding="utf-8") as config_file:
+            decoder = json.load(config_file)["model"]["decoder"]
+        assert decoder["inputs"] == {
+            "input_ids": "input_ids",
+            "encoder_hidden_states": "encoder_hidden_states",
+            "past_key_names": "past_key_values.%d.self.key",
+            "past_value_names": "past_key_values.%d.self.value",
+            "cross_past_key_names": "past_key_values.%d.cross.key",
+            "cross_past_value_names": "past_key_values.%d.cross.value",
+        }
+        assert decoder["outputs"] == {
+            "logits": "logits",
+            "present_key_names": "present.%d.self.key",
+            "present_value_names": "present.%d.self.value",
+        }
 
     def test_processor_config_written_with_vision(self, tmp_path):
         """image_processor.json is written when pkg.config.vision is set."""
@@ -1194,48 +1232,6 @@ class TestExportForOrtGenai:
         assert model["vision"]["tokens_per_second"] == pytest.approx(2.0)
         assert model["vision"]["patch_size"] == 16
         assert model["vision"]["window_size"] == 64
-
-    def test_mage_vl_is_rejected_before_writing_runtime_artifacts(self, tmp_path):
-        import dataclasses
-
-        from mobius._model_package import ModelPackage
-        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
-
-        @dataclasses.dataclass
-        class FakeVision:
-            image_size: int = 448
-            patch_size: int = 16
-            spatial_merge_size: int = 2
-
-        @dataclasses.dataclass
-        class FakeConfig:
-            model_type: str = "mage_vl"
-            vocab_size: int = 151936
-            hidden_size: int = 2560
-            num_hidden_layers: int = 1
-            num_attention_heads: int = 32
-            num_key_value_heads: int = 8
-            head_dim: int = 128
-            image_token_id: int = 151655
-            temporal_patch_size: int = 1
-            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
-
-        pkg = ModelPackage(
-            {
-                "decoder": _mock_model(),
-                "vision_encoder": _mock_model(),
-                "embedding": _mock_model(),
-            },
-            config=FakeConfig(),
-        )
-
-        output_dir = tmp_path / "ort-genai"
-        with pytest.raises(
-            ValueError,
-            match=r"Mage-VL.*patch_positions.*1D decoder position_ids",
-        ):
-            write_ort_genai_config(pkg, str(output_dir))
-        assert not output_dir.exists()
 
     def test_processor_config_not_written_without_vision(self, tmp_path):
         """image_processor.json is NOT written when pkg.config has no vision attr."""
@@ -1586,8 +1582,17 @@ class TestExportForOrtGenai:
         # "gemma2" maps to "gemma" in _ORT_GENAI_MODEL_TYPE
         assert data["model"]["type"] == "gemma"
 
-    def test_config_mode_gemma3_text_vlm_uses_multimodal_model_type(self, tmp_path):
-        """Gemma3 VLM --config exports use ORT's multimodal gemma3 type."""
+    @pytest.mark.parametrize(
+        ("text_model_type", "multimodal_model_type"),
+        [("gemma3_text", "gemma3"), ("gemma4_text", "gemma4")],
+    )
+    def test_config_mode_text_vlm_uses_multimodal_model_type(
+        self,
+        tmp_path,
+        text_model_type,
+        multimodal_model_type,
+    ):
+        """Unwrapped text configs retain their multimodal runtime type."""
         import dataclasses
 
         from mobius._model_package import ModelPackage
@@ -1602,8 +1607,7 @@ class TestExportForOrtGenai:
 
         @dataclasses.dataclass
         class FakeConfig:
-            # build() stores the unwrapped text sub-config type on Gemma3 VLMs.
-            model_type: str = "gemma3_text"
+            model_type: str
             vocab_size: int = 262144
             hidden_size: int = 64
             num_hidden_layers: int = 2
@@ -1620,13 +1624,13 @@ class TestExportForOrtGenai:
                 "vision_encoder": _mock_model_with_inputs(["pixel_values"]),
                 "embedding": _mock_model_with_inputs(["input_ids", "image_features"]),
             },
-            config=FakeConfig(),
+            config=FakeConfig(model_type=text_model_type),
         )
         result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
 
         with open(result["genai_config"]) as f:
             data = json.load(f)
-        assert data["model"]["type"] == "gemma3"
+        assert data["model"]["type"] == multimodal_model_type
 
     def test_config_mode_gemma3n_text_vlm_uses_multimodal_model_type(self, tmp_path):
         """Gemma3n unwraps to "gemma3n_text" too, and must not alias to gemma3.
@@ -1946,8 +1950,6 @@ class TestExportPackage:
 
     def test_writes_both_onnx_and_genai_config(self, tmp_path, monkeypatch):
         """export_package calls pkg.save AND writes genai_config.json."""
-        from mobius.integrations.ort_genai.auto_export import export_package
-
         pkg = self._make_pkg()
         save_calls = []
 
@@ -1967,22 +1969,8 @@ class TestExportPackage:
         # ONNX path is in the manifest (single-component package)
         assert result["model"] == os.path.join(str(tmp_path), "model.onnx")
 
-    def test_mage_vl_is_rejected_before_saving_onnx(self, tmp_path):
-        pkg = self._make_pkg()
-        pkg.config.model_type = "mage_vl"
-
-        with (
-            mock.patch.object(pkg, "save") as save,
-            pytest.raises(ValueError, match=r"Mage-VL.*patch_positions"),
-        ):
-            export_package(pkg, str(tmp_path))
-
-        save.assert_not_called()
-
     def test_propagates_save_kwargs(self, tmp_path, monkeypatch):
         """external_data and progress_bar are forwarded to pkg.save."""
-        from mobius.integrations.ort_genai.auto_export import export_package
-
         pkg = self._make_pkg()
         save_calls = []
 
@@ -2003,8 +1991,6 @@ class TestExportPackage:
 
     def test_propagates_genai_config_kwargs(self, tmp_path, monkeypatch):
         """The ep and context_length kwargs reach the generated genai_config.json."""
-        from mobius.integrations.ort_genai.auto_export import export_package
-
         pkg = self._make_pkg()
         monkeypatch.setattr(pkg.__class__, "save", lambda self, d, **kw: None)
 
@@ -2030,7 +2016,6 @@ class TestExportPackage:
         no genai_config.json.
         """
         from mobius._model_package import ModelPackage
-        from mobius.integrations.ort_genai.auto_export import export_package
 
         pkg = ModelPackage({"model": _mock_model()}, config=None)
         save_called = []
@@ -2048,8 +2033,6 @@ class TestExportPackage:
 
     def test_returns_manifest_with_all_artifacts(self, tmp_path, monkeypatch):
         """Returned manifest contains ONNX paths AND config artifacts."""
-        from mobius.integrations.ort_genai.auto_export import export_package
-
         pkg = self._make_pkg()
         monkeypatch.setattr(pkg.__class__, "save", lambda self, d, **kw: None)
 
@@ -2265,16 +2248,8 @@ class TestPixtralGenaiConfig:
         assert data["model"]["image_token_id"] == 10
 
 
-class TestHybridAttentionShareBufferGuard:
-    """Tests for the LinearAttention/GQA past_present_share_buffer guard.
-
-    See the comment above ``supports_in_place_kv_cache`` in
-    ``_write_genai_config``: recurrent-state layers (LinearAttention)
-    mandate ``past_present_share_buffer=True``, but standard (non-GQA)
-    Attention is incompatible with it. A hybrid graph with both, and no
-    GQA node to lower the standard Attention layers to, must raise a clear
-    build-time error rather than silently emit a broken config.
-    """
+class TestHybridAttentionShareBufferMetadata:
+    """Tests graph-derived shared-buffer metadata without runtime gating."""
 
     @staticmethod
     def _make_pkg(node_op_types: list[tuple[str, str]]):
@@ -2322,13 +2297,14 @@ class TestHybridAttentionShareBufferGuard:
             has_speech=False,
         )
 
-    def test_recurrent_state_with_standard_attention_and_no_gqa_raises(self, tmp_path):
-        """LinearAttention + standard Attention + no GQA is an unrunnable config."""
+    def test_recurrent_state_with_standard_attention_is_emitted(self, tmp_path):
         pkg = self._make_pkg(
             [("LinearAttention", "com.microsoft"), ("Attention", "")],
         )
-        with pytest.raises(ValueError, match="past_present_share_buffer"):
-            self._write(pkg, tmp_path)
+        path = self._write(pkg, tmp_path)
+        with open(path) as f:
+            data = json.load(f)
+        assert data["search"]["past_present_share_buffer"] is True
 
     def test_recurrent_state_with_gqa_does_not_raise(self, tmp_path):
         """LinearAttention + GQA (no standard Attention) is a valid hybrid config."""
@@ -2343,16 +2319,7 @@ class TestHybridAttentionShareBufferGuard:
             data = json.load(f)
         assert data["search"]["past_present_share_buffer"] is True
 
-    def test_recurrent_state_with_standard_attention_and_gqa_raises(self, tmp_path):
-        """Partial GQA fusion still leaves an incompatible standard Attention node.
-
-        Regression test: the guard previously read
-        ``has_recurrent_state and has_standard_attention and not has_gqa``, so
-        a GQA node present *anywhere* in the graph would short-circuit the
-        check even though a separate, unfused standard Attention node
-        coexists. A GQA node on one layer doesn't make a standard Attention
-        node on another layer safe for ``past_present_share_buffer=True``.
-        """
+    def test_recurrent_state_with_standard_attention_and_gqa_is_emitted(self, tmp_path):
         pkg = self._make_pkg(
             [
                 ("LinearAttention", "com.microsoft"),
@@ -2360,8 +2327,10 @@ class TestHybridAttentionShareBufferGuard:
                 ("Attention", ""),
             ],
         )
-        with pytest.raises(ValueError, match="past_present_share_buffer"):
-            self._write(pkg, tmp_path)
+        path = self._write(pkg, tmp_path)
+        with open(path) as f:
+            data = json.load(f)
+        assert data["search"]["past_present_share_buffer"] is True
 
     def test_recurrent_state_only_does_not_raise(self, tmp_path):
         """LinearAttention with no full-attention layers at all is unaffected."""
@@ -2705,18 +2674,6 @@ class TestGemma4RealModel:
         # cpu maps to the portable default build (backward compatible).
         assert captured["execution_provider"] == "default"
         assert captured["text_only"] is False
-
-    def test_auto_export_rejects_mage_vl_before_saving(self, tmp_path):
-        pkg = _make_fake_llm_pkg("mage_vl")
-
-        with (
-            mock.patch("mobius._builder.build", return_value=pkg),
-            mock.patch.object(pkg, "save") as save,
-            pytest.raises(ValueError, match=r"Mage-VL.*patch_positions"),
-        ):
-            auto_export("microsoft/Mage-VL", str(tmp_path))
-
-        save.assert_not_called()
 
     def test_auto_export_produces_genai_config(self, tmp_path):
         """Mock build() to return a tiny package, verify genai_config."""

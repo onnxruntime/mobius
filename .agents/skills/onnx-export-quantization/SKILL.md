@@ -435,9 +435,9 @@ compare_golden(
 )
 ```
 
-### L5: End-to-end smoke test
+### Optional ORT GenAI downstream smoke test
 
-Run inference with the quantized model through ORT GenAI:
+When useful, run inference with the quantized model through ORT GenAI:
 
 ```python
 import onnxruntime_genai as og
@@ -451,6 +451,10 @@ params.input_ids = tokenizer.encode("Hello, world!")
 output_ids = model.generate(params)
 print(tokenizer.decode(output_ids[0]))
 ```
+
+ORT GenAI acceptance is not a Mobius export gate. Always validate the final
+quantized ONNX package directly; treat ORT GenAI load/generation as optional
+downstream evidence and record its version/outcome without blocking export.
 
 ### Numerical parity verification
 
