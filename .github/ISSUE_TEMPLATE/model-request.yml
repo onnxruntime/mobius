@@ -1,0 +1,111 @@
+name: Request a new model
+description: Request support for a Hugging Face model architecture in Mobius.
+title: "[Model Request]: "
+labels:
+  - model-request
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a model. Please provide enough detail for us to evaluate
+        the architecture and prioritize implementation.
+
+  - type: input
+    id: model-name
+    attributes:
+      label: Model name
+      description: What is the model or model family called?
+      placeholder: e.g. Qwen3, Llama 4, or Whisper
+    validations:
+      required: true
+
+  - type: input
+    id: model-link
+    attributes:
+      label: Hugging Face model or repository link
+      description: Link to a specific checkpoint, model card, or source repository.
+      placeholder: https://huggingface.co/<organization>/<model>
+    validations:
+      required: true
+
+  - type: textarea
+    id: architecture
+    attributes:
+      label: Architecture details
+      description: |
+        Include the Hugging Face `model_type`, architecture class, and any relevant
+        details such as MoE, multimodal inputs, or custom code requirements.
+      placeholder: |
+        model_type: ...
+        architectures: ...
+        Additional details: ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: task
+    attributes:
+      label: Primary task
+      description: What do you want to do with this model?
+      options:
+        - Text generation
+        - Text classification or embeddings
+        - Speech recognition or audio
+        - Image or vision
+        - Vision-language or multimodal generation
+        - Diffusion or image generation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case
+      description: Describe what you want to build and why this model is important.
+      placeholder: Tell us about the intended application, users, or deployment scenario.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: execution-providers
+    attributes:
+      label: Execution providers
+      description: Which execution providers do you need?
+      options:
+        - label: CPU
+        - label: CUDA
+        - label: DirectML
+        - label: Other
+    validations:
+      required: true
+
+  - type: input
+    id: hardware
+    attributes:
+      label: Target hardware
+      description: What hardware and memory constraints should be considered?
+      placeholder: e.g. NVIDIA RTX 4090 with 24 GB VRAM, or laptop CPU
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Are there already-supported models that could meet your needs?
+      placeholder: Describe any alternatives and why they are insufficient.
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I can help test this model.
+        - label: I can help implement this model.
+        - label: I have checked that a duplicate request does not already exist.
+          required: true
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add benchmark results, error messages, links, or other relevant information.
