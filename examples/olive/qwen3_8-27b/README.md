@@ -19,10 +19,19 @@ not an ORT GenAI capability-gated test.
 The Q4 recipe keeps DeltaNet's narrow `in_proj_a` decay and `in_proj_b`
 time-step gates in FP16. Quantizing those recurrent controls destabilizes
 cached generation; all larger decoder matrices remain eligible for
-`MatMulNBits`.
+`MatMulNBits`. All three Q4 package components are reloaded with CUDA enabled;
+the 20-token semantic run uses CPU because ORT 1.26's CUDA `MatMulNBits`
+execution is itself nondeterministic for this reduced hybrid fixture.
 
 BF16 export and package reload are valid Mobius outputs. The CUDA-12-compatible
 ORT 1.26 wheel used for this reduced-real run cannot initialize the BF16 hybrid
 graph (`CausalConvWithState`/`Softplus` provider placement), while newer
 ORT-GPU wheels available in the test environment require CUDA 13. This is a
 downstream runtime waiver, not an export or support gate.
+
+The same old ORT wheel is nondeterministic for dynamic Qwen vision batches
+through its `PackedMultiHeadAttention` CUDA kernel. The validator therefore
+uses the portable standard-attention vision graph for stable real CUDA
+image/video/mixed execution while retaining the CUDA-optimized decoder parity
+and provider profile. Mobius still emits both graph variants without deciding
+which downstream runtime version can load them.

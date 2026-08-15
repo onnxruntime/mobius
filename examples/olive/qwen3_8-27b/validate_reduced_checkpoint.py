@@ -463,6 +463,25 @@ def _media_smoke(package_dir: Path, device: str) -> dict[str, tuple[int, ...]]:
     return results
 
 
+def _cuda_standard_vision_smoke(
+    state: dict[str, torch.Tensor],
+    output_root: Path,
+    *,
+    dtype_name: str,
+) -> dict[str, tuple[int, ...]]:
+    """Run media through the standard-attention vision graph on CUDA.
+
+    ORT 1.26's CUDA PackedMultiHeadAttention kernel is nondeterministic for
+    dynamic packed vision batches. The portable graph still places vision
+    compute on CUDA and provides stable image/video/mixed runtime evidence.
+    """
+    package = _mobius_package(state, dtype_name=dtype_name, ep="cpu")
+    package_dir = output_root / f"{dtype_name}-cuda-standard-vision"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    package.save(package_dir, external_data="onnx")
+    return _media_smoke(package_dir, "cuda")
+
+
 def _save_variant(
     state: dict[str, torch.Tensor],
     output_root: Path,
@@ -534,7 +553,15 @@ def _validate_variant(
         print(f"{dtype_name}/{device} provider placement: {placement}")
     print(f"{dtype_name}/{device} generated IDs: {generated}")
     print(f"{dtype_name}/{device} graph audit: {_graph_audit(package)}")
-    print(f"{dtype_name}/{device} media shapes: {_media_smoke(package_dir, device)}")
+    if device == "cuda":
+        media_shapes = _cuda_standard_vision_smoke(
+            state,
+            output_root,
+            dtype_name=dtype_name,
+        )
+        print(f"{dtype_name}/{device} standard-vision media shapes: {media_shapes}")
+    else:
+        print(f"{dtype_name}/{device} media shapes: {_media_smoke(package_dir, device)}")
     return package_dir
 
 
@@ -660,7 +687,7 @@ def main() -> None:
             [1, 42, 17],
             hidden_size=_HIDDEN_SIZE,
             max_new_tokens=_GENERATION_TOKENS,
-            device="cuda",
+            device="cpu",
         )
         if len(ids) != _GENERATION_TOKENS or not all(
             np.isfinite(logit).all() for logit in logits
@@ -670,7 +697,7 @@ def main() -> None:
             "Q4_K_M package audit: "
             f"MatMulNBits={matmul_nbits}, source={source_bytes}, quantized={quantized_bytes}"
         )
-        print(f"Q4_K_M direct-session IDs: {ids}")
+        print(f"Q4_K_M direct CPU-session IDs: {ids}")
 
 
 if __name__ == "__main__":

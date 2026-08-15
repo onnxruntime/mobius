@@ -55,6 +55,10 @@ def olive_config(
         },
         "no_artifacts": True,
         "output_dir": str(output),
+        # A global Olive cache can return a decoder produced with a different
+        # exclusion set. Scope and clean it so recurrent-gate policy is exact.
+        "cache_dir": str(output.parent / ".olive-cache"),
+        "clean_cache": True,
     }
 
 
@@ -109,6 +113,9 @@ def quantize_package(source_dir: str | Path, output_dir: str | Path) -> Path:
     if produced != decoder_dir / "model.onnx":
         produced.replace(decoder_dir / "model.onnx")
     shutil.rmtree(olive_output)
+    olive_cache = output / ".olive-cache"
+    if olive_cache.exists():
+        shutil.rmtree(olive_cache)
     for name in ("embedding", "vision_encoder"):
         shutil.copytree(source / name, output / name)
     for name in _ASSETS:

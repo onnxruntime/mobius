@@ -88,6 +88,8 @@ def test_olive_recipe_is_q4_k_m_cpu_weight_only(tmp_path):
     config = recipe["passes"]["q4_k_m"]
     assert config["type"] == "OnnxKQuantQuantization"
     assert config["bits"] == 4
+    assert recipe["clean_cache"] is True
+    assert Path(recipe["cache_dir"]).name == ".olive-cache"
     assert recipe["engine"]["target"]["accelerators"][0]["execution_providers"] == [
         "CPUExecutionProvider"
     ]
@@ -218,12 +220,35 @@ def test_qwen38_reduced_olive_q4_package(tmp_path):
     assert sum(path.stat().st_size for path in result.rglob("*") if path.is_file()) < sum(
         path.stat().st_size for path in source.rglob("*") if path.is_file()
     )
+    for name in ("decoder", "embedding", "vision_encoder"):
+        validator._create_session(result / name / "model.onnx", "cuda")
     ids, logits, _ = validator.run_token_ids(
         result,
         [1, 42, 17],
         hidden_size=256,
         max_new_tokens=20,
-        device="cuda",
+        device="cpu",
     )
-    assert len(ids) == 20
+    assert ids == [
+        134,
+        244,
+        242,
+        167,
+        81,
+        34,
+        155,
+        251,
+        142,
+        90,
+        224,
+        31,
+        76,
+        250,
+        240,
+        120,
+        134,
+        120,
+        134,
+        120,
+    ]
     assert all(np.isfinite(value).all() for value in logits)
