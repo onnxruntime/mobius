@@ -271,8 +271,9 @@ def _make_progress_callback():
 
     Newer ``onnx_ir`` versions may invoke callbacks concurrently and out of
     index order. Count invocations instead of tracking ``metadata.index`` and
-    serialize all progress-bar mutations. This remains compatible with
-    ``onnx_ir`` 1.0, where callbacks are invoked serially.
+    derive each bar's position from its shard filename so rendering order is
+    deterministic. Serialize all progress-bar mutations. This remains compatible
+    with ``onnx_ir`` 1.0, where callbacks are invoked serially.
     """
     lock = threading.Lock()
     bars: dict[str, tqdm.tqdm] = {}
@@ -288,10 +289,16 @@ def _make_progress_callback():
                     if shard_total is not None
                     else "Saving external data"
                 )
+                position = 0
+                if shard_total is not None:
+                    shard_prefix, separator, _ = metadata.filename.rpartition("-of-")
+                    shard_number = shard_prefix.rpartition("-")[2]
+                    if separator and shard_number.isdigit():
+                        position = int(shard_number) - 1
                 pbar = tqdm.tqdm(
                     total=shard_total if shard_total is not None else metadata.total,
                     desc=description,
-                    position=len(bars),
+                    position=position,
                     leave=True,
                 )
                 bars[key] = pbar

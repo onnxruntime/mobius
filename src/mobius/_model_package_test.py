@@ -146,7 +146,7 @@ class TestProgressCallback:
         def close(self):
             self.closed = True
 
-    def test_creates_one_progress_bar_per_shard(self, monkeypatch):
+    def test_orders_progress_bars_by_shard_number(self, monkeypatch):
         bars = []
 
         def make_bar(**kwargs):
@@ -156,7 +156,10 @@ class TestProgressCallback:
 
         monkeypatch.setattr("mobius._model_package.tqdm.tqdm", make_bar)
         callback = _make_progress_callback()
-        for filename in ("model-00001-of-00002.data", "model-00002-of-00002.data"):
+        for filename in (
+            "model-00002-of-00002.onnx.data",
+            "model-00001-of-00002.onnx.data",
+        ):
             for shard_index in reversed(range(2)):
                 callback(
                     self._Tensor(),
@@ -171,10 +174,10 @@ class TestProgressCallback:
                 )
 
         assert len(bars) == 2
-        assert [bar.position for bar in bars] == [0, 1]
+        assert [bar.position for bar in bars] == [1, 0]
         assert all(bar.total == 2 and bar.n == 2 and bar.closed for bar in bars)
-        assert "model-00001-of-00002.data" in bars[0].desc
-        assert "model-00002-of-00002.data" in bars[1].desc
+        assert "model-00002-of-00002.onnx.data" in bars[0].desc
+        assert "model-00001-of-00002.onnx.data" in bars[1].desc
 
     def test_falls_back_to_one_bar_with_onnx_ir_1_0(self, monkeypatch):
         bars = []
@@ -200,6 +203,7 @@ class TestProgressCallback:
         assert len(bars) == 1
         assert bars[0].total == 4
         assert bars[0].n == 4
+        assert bars[0].position == 0
         assert bars[0].closed
 
     def test_is_thread_safe(self, monkeypatch):
