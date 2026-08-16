@@ -20,7 +20,6 @@ from __future__ import annotations
 
 __all__ = ["ModelPackage"]
 
-import inspect
 import logging
 import os
 import threading
@@ -118,9 +117,9 @@ class ModelPackage(UserDict[str, ir.Model]):
                 tensors.  Weights that need a dtype cast are held as
                 :class:`ir.LazyTensor` and converted at save time, so this
                 overlaps the casting work with disk writes and parallelizes
-                both.  Pass ``None`` or ``1`` to save serially.  Peak memory
-                stays bounded regardless of the worker count.  Only used when
-                *external_data* is ``"onnx"``.
+                both.  Defaults to ``8``.  Pass ``None`` or ``1`` to save
+                serially.  Peak memory stays bounded regardless of the worker
+                count.  Only used when *external_data* is ``"onnx"``.
 
         Raises:
             ValueError: If *external_data* is not ``"onnx"`` or
@@ -159,15 +158,12 @@ class ModelPackage(UserDict[str, ir.Model]):
                     callback=callback,
                 )
             else:
-                save_kwargs = {}
-                if max_workers is not None and _ir_save_supports_max_workers():
-                    save_kwargs["max_workers"] = max_workers
                 ir.save(
                     model,
                     path,
                     external_data="model.onnx.data",
                     callback=callback,
-                    **save_kwargs,
+                    max_workers=max_workers,
                 )
 
     @classmethod
@@ -275,18 +271,6 @@ class ModelPackage(UserDict[str, ir.Model]):
         # be constant-folded once the weight tensors carry their const_value.
         for model in self.data.values():
             fold_initializers_after_weights(model)
-
-
-def _ir_save_supports_max_workers() -> bool:
-    """Whether the installed ``onnx_ir`` can save external data concurrently.
-
-    ``max_workers`` was added to ``ir.save`` after 0.2.x. Detect it so mobius
-    keeps working against older releases instead of raising ``TypeError``.
-    """
-    try:
-        return "max_workers" in inspect.signature(ir.save).parameters
-    except (TypeError, ValueError):
-        return False
 
 
 def _make_progress_callback():

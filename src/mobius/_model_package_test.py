@@ -12,11 +12,7 @@ import torch
 
 from mobius._builder import build_from_module
 from mobius._configs import VisionConfig
-from mobius._model_package import (
-    ModelPackage,
-    _ir_save_supports_max_workers,
-    _make_progress_callback,
-)
+from mobius._model_package import ModelPackage, _make_progress_callback
 from mobius._testing import make_config
 from mobius.models.base import CausalLMModel
 from mobius.models.gemma3 import Gemma3MultiModalModel
@@ -162,12 +158,6 @@ class TestParallelSave:
             thread.join()
         bar = callback.__closure__[1].cell_contents
         assert bar.n == total
-
-    def test_feature_detection_matches_installed_ir(self):
-        import inspect as _inspect
-
-        expected = "max_workers" in _inspect.signature(ir.save).parameters
-        assert _ir_save_supports_max_workers() is expected
 
 
 class TestModelPackageSaveLoad:
