@@ -180,6 +180,9 @@ lintrunner f --all-files
 
 ### Adding a new model
 
+To [request a new model](https://github.com/onnxruntime/mobius/issues/new?template=model-request.yml),
+or ask an AI coding agent to implement a new model, use the resources below:
+
 See the [AI-assisted model support strategy](https://onnxruntime.github.io/mobius/ai-model-support-strategy.html)
 and the developer skills in `.agents/skills/`:
 
