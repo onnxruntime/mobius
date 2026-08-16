@@ -12,11 +12,7 @@ import torch
 
 from mobius._builder import build_from_module
 from mobius._configs import VisionConfig
-from mobius._model_package import (
-    ModelPackage,
-    _default_save_workers,
-    _make_progress_callback,
-)
+from mobius._model_package import ModelPackage
 from mobius._testing import make_config
 from mobius.models.base import CausalLMModel
 from mobius.models.gemma3 import Gemma3MultiModalModel
@@ -79,127 +75,6 @@ class TestModelPackageDict:
         config = make_config()
         pkg = ModelPackage({"m": _make_simple_model()}, config=config)
         assert pkg.config is config
-
-
-class TestParallelSave:
-    """Saving concurrently must match serial output and keep the bar correct."""
-
-    def test_parallel_save_matches_serial(self, tmp_path):
-        serial_dir = tmp_path / "serial"
-        parallel_dir = tmp_path / "parallel"
-        ModelPackage({"m": _make_simple_model("m")}).save(
-            str(serial_dir), max_workers=None, progress_bar=False
-        )
-        ModelPackage({"m": _make_simple_model("m")}).save(
-            str(parallel_dir), max_workers=8, progress_bar=False
-        )
-        serial_data = (serial_dir / "model.onnx.data").read_bytes()
-        parallel_data = (parallel_dir / "model.onnx.data").read_bytes()
-        assert serial_data == parallel_data
-
-    def test_parallel_save_roundtrips(self, tmp_path):
-        pkg = ModelPackage({"m": _make_simple_model("m")})
-        pkg.save(str(tmp_path), max_workers=8, progress_bar=False)
-        # A single-component package is saved flat as ``model.onnx``.
-        loaded = ModelPackage.load(str(tmp_path))
-        assert set(loaded.data) == {"model"}
-
-    def test_onnx_external_data_is_sharded(self, tmp_path):
-        graph = ir.Graph([], [], nodes=[], name="m")
-        for index in range(6):
-            name = f"weight_{index}"
-            graph.register_initializer(
-                ir.Value(
-                    name=name,
-                    const_value=ir.Tensor(
-                        torch.full((1024,), index, dtype=torch.float32),
-                        name=name,
-                        dtype=ir.DataType.FLOAT,
-                    ),
-                )
-            )
-        pkg = ModelPackage({"m": ir.Model(graph, ir_version=10)})
-
-        pkg.save(
-            str(tmp_path),
-            external_data="onnx",
-            max_shard_size_bytes=8192,
-            max_workers=8,
-            progress_bar=False,
-        )
-
-        shards = sorted(tmp_path.glob("model.onnx-*-of-*.data"))
-        assert len(shards) == 3
-        assert all(shard.stat().st_size <= 8192 for shard in shards)
-        loaded = ModelPackage.load(str(tmp_path))
-        assert set(loaded.data) == {"model"}
-
-    def test_progress_bar_counts_every_tensor_out_of_order(self):
-        # ir.save may invoke the callback from worker threads and out of index
-        # order, so the bar must count calls rather than follow ``index``.
-        callback = _make_progress_callback()
-
-        class _Tensor:
-            name = "w"
-            shape = (2, 2)
-
-            class dtype:  # noqa: N801
-                @staticmethod
-                def short_name():
-                    return "f32"
-
-        total = 8
-        for index in reversed(range(total)):
-            callback(
-                _Tensor(),
-                ir.external_data.CallbackInfo(
-                    total=total, index=index, offset=0, filename="model.onnx.data"
-                ),
-            )
-        # Closure state is private to the callback; assert via the bound bar.
-        bar = callback.__closure__[1].cell_contents
-        assert bar.total == total
-        assert bar.n == total
-
-    def test_default_workers_does_not_track_core_count(self, monkeypatch):
-        # These threads block on I/O rather than competing for CPU, and a low
-        # core count needs *more* concurrency to hide a slow serial cast, so
-        # the default must not shrink on small machines.
-        for cores in (2, 8, 128, None):
-            monkeypatch.setattr("mobius._model_package.os.cpu_count", lambda c=cores: c)
-            assert _default_save_workers() == 8
-
-    def test_progress_bar_is_thread_safe(self):
-        import threading
-
-        callback = _make_progress_callback()
-
-        class _Tensor:
-            name = "w"
-            shape = (2, 2)
-
-            class dtype:  # noqa: N801
-                @staticmethod
-                def short_name():
-                    return "f32"
-
-        total = 200
-
-        def worker(index):
-            callback(
-                _Tensor(),
-                ir.external_data.CallbackInfo(
-                    total=total, index=index, offset=0, filename="model.onnx.data"
-                ),
-            )
-
-        threads = [threading.Thread(target=worker, args=(i,)) for i in range(total)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-        bar = callback.__closure__[1].cell_contents
-        assert bar.n == total
 
 
 class TestModelPackageSaveLoad:

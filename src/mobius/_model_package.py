@@ -22,7 +22,6 @@ __all__ = ["ModelPackage"]
 
 import logging
 import os
-import threading
 from collections import UserDict
 from collections.abc import Callable
 
@@ -34,10 +33,6 @@ from mobius._optimizations import fold_initializers_after_weights
 from mobius._weight_loading import _assign_weight
 
 logger = logging.getLogger(__name__)
-
-# Default thread count for writing external data. Intentionally independent of
-# the core count -- see _default_save_workers for the measurements.
-_DEFAULT_SAVE_WORKERS = 8
 
 
 class ModelPackage(UserDict[str, ir.Model]):
@@ -71,7 +66,6 @@ class ModelPackage(UserDict[str, ir.Model]):
         components: Callable[[str], bool] | None = None,
         progress_bar: bool = True,
         check_weights: bool = True,
-        max_workers: int | None = None,
     ) -> None:
         """Save all component models to a directory.
 
@@ -101,10 +95,8 @@ class ModelPackage(UserDict[str, ir.Model]):
                     errors on some CUDA/cuBLAS versions when loading weights
                     via memory-mapped I/O.  Use ``"onnx"`` (the default) for
                     models targeting CUDA execution.
-            max_shard_size_bytes: Maximum external-data shard size in bytes.
-                Used by both ONNX and safetensors external-data formats. A
-                single tensor larger than this value is written in its own
-                oversized shard.
+            max_shard_size_bytes: Maximum shard size in bytes for safetensors
+                format.  Only used when *external_data* is ``"safetensors"``.
             components: Optional predicate ``(name) -> bool`` that selects
                 which components to save.  When ``None`` (default), all
                 components are saved.  Examples::
@@ -119,13 +111,6 @@ class ModelPackage(UserDict[str, ir.Model]):
             check_weights: Whether to verify that all initializers have
                 weight data before saving.  Defaults to ``True``.
                 Set to ``False`` when saving skeleton models without weights.
-            max_workers: Number of threads used to materialize and write
-                tensors.  Weights that need a dtype cast are held as
-                :class:`ir.LazyTensor` and converted at save time, so this
-                overlaps the casting work with disk writes.  ``None`` (the
-                default) picks :func:`_default_save_workers`; pass ``1`` to
-                save serially.  Peak memory stays bounded regardless of the
-                worker count.  Only used when *external_data* is ``"onnx"``.
 
         Raises:
             ValueError: If *external_data* is not ``"onnx"`` or
@@ -164,16 +149,7 @@ class ModelPackage(UserDict[str, ir.Model]):
                     callback=callback,
                 )
             else:
-                ir.save(
-                    model,
-                    path,
-                    external_data="model.onnx.data",
-                    max_shard_size_bytes=max_shard_size_bytes,
-                    callback=callback,
-                    max_workers=(
-                        _default_save_workers() if max_workers is None else max_workers
-                    ),
-                )
+                ir.save(model, path, external_data="model.onnx.data", callback=callback)
 
     @classmethod
     def load(cls, directory: str) -> ModelPackage:
@@ -282,57 +258,20 @@ class ModelPackage(UserDict[str, ir.Model]):
             fold_initializers_after_weights(model)
 
 
-def _default_save_workers() -> int:
-    """Pick a default thread count for writing external data.
-
-    Deliberately a constant rather than a function of ``os.cpu_count()``.
-
-    The bottleneck is the storage device, not the CPU: casting bf16 to f16
-    runs around 12 GB/s while serial writes reach 1.6 GB/s, and a write-only
-    scaling test saturates at 2 threads. Nearly all of the win comes from
-    overlapping the cast with the write, and these threads spend their time
-    blocked in ``tofile`` with the GIL released rather than competing for CPU.
-
-    Sizing the pool by core count gets this backwards. With torch pinned to a
-    single intra-op thread -- i.e. a small machine -- 8 workers is the *fastest*
-    configuration (1.55x) while 2 workers is slower than serial, because more
-    concurrency is needed to hide a slow serial cast. ``cpu_count() // 2`` would
-    give 1 on a 2-core box, disabling the optimization exactly where it helps
-    most. Oversubscription is also not penalized in practice: with full torch
-    threads, everything from 4 to 32 workers lands within noise of each other.
-
-    Weights that live on an accelerator benefit the most. The device-to-host
-    copy happens inside ``tofile`` with the GIL released, so it overlaps with
-    other threads' writes: GPU-resident weights measured 6.3x at 8 workers
-    versus 1.5x for CPU weights, on a machine whose CPUs were largely idle.
-    """
-    return _DEFAULT_SAVE_WORKERS
-
-
 def _make_progress_callback():
-    """Create a tqdm progress-bar callback for ``ir.save``.
-
-    ``ir.save`` invokes the callback from worker threads when ``max_workers``
-    is greater than 1, and does not deliver calls in ``metadata.index`` order.
-    The bar therefore counts invocations rather than tracking indices, and
-    guards its own state with a lock. ``tqdm.update`` is itself thread-safe,
-    but ``total``/``set_description`` are not, and reading ``tensor.shape``
-    concurrently with the write threads must not race the bar's own state.
-    """
+    """Create a tqdm progress-bar callback for ``ir.save``."""
     pbar = tqdm.tqdm()
-    lock = threading.Lock()
     total_set = False
 
     def callback(tensor: ir.TensorProtocol, metadata: ir.external_data.CallbackInfo) -> None:
         nonlocal total_set
-        with lock:
-            if not total_set:
-                pbar.total = metadata.total
-                total_set = True
-            pbar.update()
-            pbar.set_description(
-                f"Saving {tensor.name} ({tensor.dtype.short_name()}, {tensor.shape})"
-            )
+        if not total_set:
+            pbar.total = metadata.total
+            total_set = True
+        pbar.update()
+        pbar.set_description(
+            f"Saving {tensor.name} ({tensor.dtype.short_name()}, {tensor.shape})"
+        )
 
     return callback
 
