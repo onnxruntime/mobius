@@ -93,5 +93,5 @@ pkg.save("output/llama/", external_data="safetensors")
 
 ## Output Layout
 
-- **Single model**: `directory/model.onnx` + `directory/model.onnx.data`
+- **Single model**: `directory/model.onnx` + `directory/model.onnx_data`
 - **Multi model**: `directory/{name}/model.onnx` for each component

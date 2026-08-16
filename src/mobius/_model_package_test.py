@@ -103,7 +103,7 @@ class TestOnnxShardedSave:
             progress_bar=False,
         )
 
-        shards = sorted(tmp_path.glob("model.onnx-*-of-*.data"))
+        shards = sorted(tmp_path.glob("model-*-of-*.onnx_data"))
         assert len(shards) == 3
         assert all(shard.stat().st_size <= 8192 for shard in shards)
         loaded = ModelPackage.load(str(tmp_path))
@@ -214,7 +214,7 @@ class TestProgressCallback:
                     total=total,
                     index=index,
                     offset=0,
-                    filename="model.onnx.data",
+                    filename="model.onnx_data",
                     shard_total=total,
                     shard_index=index,
                 ),
