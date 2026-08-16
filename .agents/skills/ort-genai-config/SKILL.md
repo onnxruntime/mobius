@@ -282,12 +282,14 @@ processor doesn't provide. Either:
 1. Compute them externally and inject via NamedTensors, or
 2. Modify the vision model to compute them from `image_grid_thw` internally
 
-### Config writes successfully but runtime cannot execute
+### Config metadata and downstream runtime acceptance
 
-Config/schema success is not runtime support. Run load plus generation through
-the exported contract. If the runtime cannot route required feature inputs,
-position-ID rank, cache state, scheduler, or multimodal metadata, reject export
-before writing artifacts and report the exact runtime version/limitation.
+Mobius owns metadata correctness, not ORT GenAI capability decisions. Emit the
+most accurate package from graph metadata: filenames, semantic graph inputs and
+outputs, every cache template the current config schema can represent, and the
+global cache-slot count. Preserve intrinsic schema/config validation, but do
+not gate or reject export based on the current GenAI model registry, runtime
+version, topology support, or cache executor capability.
 
 ### "input_ids size exceeds max length"
 
