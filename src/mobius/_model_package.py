@@ -13,7 +13,7 @@ Example::
 
     pkg = build("meta-llama/Llama-3-8B")
     pkg["model"]              # ir.Model
-    pkg.save("/output/llama/")  # saves model.onnx + model.onnx_data
+    pkg.save("/output/llama/")  # saves model.onnx + model.onnx.data
 """
 
 from __future__ import annotations
@@ -86,7 +86,7 @@ class ModelPackage(UserDict[str, ir.Model]):
         Args:
             directory: Path to the output directory (created if needed).
             external_data: External data format. ``"onnx"`` (default) saves
-                weights to ``model.onnx_data``. ``"safetensors"`` saves
+                weights to ``model.onnx.data``. ``"safetensors"`` saves
                 weights in safetensors format.
 
                 .. warning::
@@ -154,7 +154,7 @@ class ModelPackage(UserDict[str, ir.Model]):
                 ir.save(
                     model,
                     path,
-                    external_data="model.onnx_data",
+                    external_data="model.onnx.data",
                     max_shard_size_bytes=max_shard_size_bytes,
                     callback=callback,
                 )

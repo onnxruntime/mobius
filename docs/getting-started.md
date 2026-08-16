@@ -223,7 +223,7 @@ collection of named `ir.Model` objects.
 
 ```python
 pkg.save("output/")
-# Single model: output/model.onnx + output/model.onnx_data
+# Single model: output/model.onnx + output/model.onnx.data
 # Multi model: output/model/model.onnx, output/vision/model.onnx, ...
 ```
 

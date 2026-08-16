@@ -103,7 +103,14 @@ class TestOnnxShardedSave:
             progress_bar=False,
         )
 
-        shards = sorted(tmp_path.glob("model-*-of-*.onnx_data"))
+        shards = sorted(
+            [
+                *tmp_path.glob("model-*-of-*.onnx.data"),
+                # onnx_ir 1.0.0 did not yet recognize .onnx.data as a
+                # compound suffix.
+                *tmp_path.glob("model.onnx-*-of-*.data"),
+            ]
+        )
         assert len(shards) == 3
         assert all(shard.stat().st_size <= 8192 for shard in shards)
         loaded = ModelPackage.load(str(tmp_path))
@@ -214,7 +221,7 @@ class TestProgressCallback:
                     total=total,
                     index=index,
                     offset=0,
-                    filename="model.onnx_data",
+                    filename="model.onnx.data",
                     shard_total=total,
                     shard_index=index,
                 ),
