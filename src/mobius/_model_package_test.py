@@ -12,7 +12,11 @@ import torch
 
 from mobius._builder import build_from_module
 from mobius._configs import VisionConfig
-from mobius._model_package import ModelPackage
+from mobius._model_package import (
+    ModelPackage,
+    _ir_save_supports_max_workers,
+    _make_progress_callback,
+)
 from mobius._testing import make_config
 from mobius.models.base import CausalLMModel
 from mobius.models.gemma3 import Gemma3MultiModalModel
@@ -75,6 +79,95 @@ class TestModelPackageDict:
         config = make_config()
         pkg = ModelPackage({"m": _make_simple_model()}, config=config)
         assert pkg.config is config
+
+
+class TestParallelSave:
+    """Saving concurrently must match serial output and keep the bar correct."""
+
+    def test_parallel_save_matches_serial(self, tmp_path):
+        serial_dir = tmp_path / "serial"
+        parallel_dir = tmp_path / "parallel"
+        ModelPackage({"m": _make_simple_model("m")}).save(
+            str(serial_dir), max_workers=None, progress_bar=False
+        )
+        ModelPackage({"m": _make_simple_model("m")}).save(
+            str(parallel_dir), max_workers=8, progress_bar=False
+        )
+        serial_data = (serial_dir / "model.onnx.data").read_bytes()
+        parallel_data = (parallel_dir / "model.onnx.data").read_bytes()
+        assert serial_data == parallel_data
+
+    def test_parallel_save_roundtrips(self, tmp_path):
+        pkg = ModelPackage({"m": _make_simple_model("m")})
+        pkg.save(str(tmp_path), max_workers=8, progress_bar=False)
+        # A single-component package is saved flat as ``model.onnx``.
+        loaded = ModelPackage.load(str(tmp_path))
+        assert set(loaded.data) == {"model"}
+
+    def test_progress_bar_counts_every_tensor_out_of_order(self):
+        # ir.save may invoke the callback from worker threads and out of index
+        # order, so the bar must count calls rather than follow ``index``.
+        callback = _make_progress_callback()
+
+        class _Tensor:
+            name = "w"
+            shape = (2, 2)
+
+            class dtype:  # noqa: N801
+                @staticmethod
+                def short_name():
+                    return "f32"
+
+        total = 8
+        for index in reversed(range(total)):
+            callback(
+                _Tensor(),
+                ir.external_data.CallbackInfo(
+                    total=total, index=index, offset=0, filename="model.onnx.data"
+                ),
+            )
+        # Closure state is private to the callback; assert via the bound bar.
+        bar = callback.__closure__[1].cell_contents
+        assert bar.total == total
+        assert bar.n == total
+
+    def test_progress_bar_is_thread_safe(self):
+        import threading
+
+        callback = _make_progress_callback()
+
+        class _Tensor:
+            name = "w"
+            shape = (2, 2)
+
+            class dtype:  # noqa: N801
+                @staticmethod
+                def short_name():
+                    return "f32"
+
+        total = 200
+
+        def worker(index):
+            callback(
+                _Tensor(),
+                ir.external_data.CallbackInfo(
+                    total=total, index=index, offset=0, filename="model.onnx.data"
+                ),
+            )
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(total)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        bar = callback.__closure__[1].cell_contents
+        assert bar.n == total
+
+    def test_feature_detection_matches_installed_ir(self):
+        import inspect as _inspect
+
+        expected = "max_workers" in _inspect.signature(ir.save).parameters
+        assert _ir_save_supports_max_workers() is expected
 
 
 class TestModelPackageSaveLoad:

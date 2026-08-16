@@ -20,8 +20,10 @@ from __future__ import annotations
 
 __all__ = ["ModelPackage"]
 
+import inspect
 import logging
 import os
+import threading
 from collections import UserDict
 from collections.abc import Callable
 
@@ -66,6 +68,7 @@ class ModelPackage(UserDict[str, ir.Model]):
         components: Callable[[str], bool] | None = None,
         progress_bar: bool = True,
         check_weights: bool = True,
+        max_workers: int | None = 8,
     ) -> None:
         """Save all component models to a directory.
 
@@ -111,6 +114,13 @@ class ModelPackage(UserDict[str, ir.Model]):
             check_weights: Whether to verify that all initializers have
                 weight data before saving.  Defaults to ``True``.
                 Set to ``False`` when saving skeleton models without weights.
+            max_workers: Number of threads used to materialize and write
+                tensors.  Weights that need a dtype cast are held as
+                :class:`ir.LazyTensor` and converted at save time, so this
+                overlaps the casting work with disk writes and parallelizes
+                both.  Pass ``None`` or ``1`` to save serially.  Peak memory
+                stays bounded regardless of the worker count.  Only used when
+                *external_data* is ``"onnx"``.
 
         Raises:
             ValueError: If *external_data* is not ``"onnx"`` or
@@ -149,7 +159,16 @@ class ModelPackage(UserDict[str, ir.Model]):
                     callback=callback,
                 )
             else:
-                ir.save(model, path, external_data="model.onnx.data", callback=callback)
+                save_kwargs = {}
+                if max_workers is not None and _ir_save_supports_max_workers():
+                    save_kwargs["max_workers"] = max_workers
+                ir.save(
+                    model,
+                    path,
+                    external_data="model.onnx.data",
+                    callback=callback,
+                    **save_kwargs,
+                )
 
     @classmethod
     def load(cls, directory: str) -> ModelPackage:
@@ -258,20 +277,42 @@ class ModelPackage(UserDict[str, ir.Model]):
             fold_initializers_after_weights(model)
 
 
+def _ir_save_supports_max_workers() -> bool:
+    """Whether the installed ``onnx_ir`` can save external data concurrently.
+
+    ``max_workers`` was added to ``ir.save`` after 0.2.x. Detect it so mobius
+    keeps working against older releases instead of raising ``TypeError``.
+    """
+    try:
+        return "max_workers" in inspect.signature(ir.save).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _make_progress_callback():
-    """Create a tqdm progress-bar callback for ``ir.save``."""
+    """Create a tqdm progress-bar callback for ``ir.save``.
+
+    ``ir.save`` invokes the callback from worker threads when ``max_workers``
+    is greater than 1, and does not deliver calls in ``metadata.index`` order.
+    The bar therefore counts invocations rather than tracking indices, and
+    guards its own state with a lock. ``tqdm.update`` is itself thread-safe,
+    but ``total``/``set_description`` are not, and reading ``tensor.shape``
+    concurrently with the write threads must not race the bar's own state.
+    """
     pbar = tqdm.tqdm()
+    lock = threading.Lock()
     total_set = False
 
     def callback(tensor: ir.TensorProtocol, metadata: ir.external_data.CallbackInfo) -> None:
         nonlocal total_set
-        if not total_set:
-            pbar.total = metadata.total
-            total_set = True
-        pbar.update()
-        pbar.set_description(
-            f"Saving {tensor.name} ({tensor.dtype.short_name()}, {tensor.shape})"
-        )
+        with lock:
+            if not total_set:
+                pbar.total = metadata.total
+                total_set = True
+            pbar.update()
+            pbar.set_description(
+                f"Saving {tensor.name} ({tensor.dtype.short_name()}, {tensor.shape})"
+            )
 
     return callback
 
