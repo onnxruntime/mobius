@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import types
 
 import onnx_ir as ir
 import torch
@@ -119,32 +120,103 @@ class TestProgressCallback:
             def short_name():
                 return "f32"
 
-    def test_counts_out_of_order_callbacks(self):
-        callback = _make_progress_callback()
-        total = 8
+    class _Bar:
+        def __init__(self, *, total, desc, position, leave):
+            self.total = total
+            self.desc = desc
+            self.position = position
+            self.leave = leave
+            self.n = 0
+            self.postfix = ""
+            self.closed = False
 
-        for index in reversed(range(total)):
+        def update(self):
+            self.n += 1
+
+        def set_postfix_str(self, value):
+            self.postfix = value
+
+        def close(self):
+            self.closed = True
+
+    def test_creates_one_progress_bar_per_shard(self, monkeypatch):
+        bars = []
+
+        def make_bar(**kwargs):
+            bar = self._Bar(**kwargs)
+            bars.append(bar)
+            return bar
+
+        monkeypatch.setattr("mobius._model_package.tqdm.tqdm", make_bar)
+        callback = _make_progress_callback()
+        for filename in ("model-00001-of-00002.data", "model-00002-of-00002.data"):
+            for shard_index in reversed(range(2)):
+                callback(
+                    self._Tensor(),
+                    types.SimpleNamespace(
+                        total=4,
+                        index=shard_index,
+                        offset=0,
+                        filename=filename,
+                        shard_total=2,
+                        shard_index=shard_index,
+                    ),
+                )
+
+        assert len(bars) == 2
+        assert [bar.position for bar in bars] == [0, 1]
+        assert all(bar.total == 2 and bar.n == 2 and bar.closed for bar in bars)
+        assert "model-00001-of-00002.data" in bars[0].desc
+        assert "model-00002-of-00002.data" in bars[1].desc
+
+    def test_falls_back_to_one_bar_with_onnx_ir_1_0(self, monkeypatch):
+        bars = []
+
+        def make_bar(**kwargs):
+            bar = self._Bar(**kwargs)
+            bars.append(bar)
+            return bar
+
+        monkeypatch.setattr("mobius._model_package.tqdm.tqdm", make_bar)
+        callback = _make_progress_callback()
+        for index in range(4):
             callback(
                 self._Tensor(),
-                ir.external_data.CallbackInfo(
-                    total=total, index=index, offset=0, filename="model.onnx.data"
+                types.SimpleNamespace(
+                    total=4,
+                    index=index,
+                    offset=0,
+                    filename=f"model-{index}.data",
                 ),
             )
 
-        bar = callback.__closure__[1].cell_contents
-        assert bar.total == total
-        assert bar.n == total
-        assert "model.onnx.data" in bar.desc
+        assert len(bars) == 1
+        assert bars[0].total == 4
+        assert bars[0].n == 4
+        assert bars[0].closed
 
-    def test_is_thread_safe(self):
+    def test_is_thread_safe(self, monkeypatch):
+        bars = []
+
+        def make_bar(**kwargs):
+            bar = self._Bar(**kwargs)
+            bars.append(bar)
+            return bar
+
+        monkeypatch.setattr("mobius._model_package.tqdm.tqdm", make_bar)
         callback = _make_progress_callback()
         total = 200
 
         def invoke(index):
             callback(
                 self._Tensor(),
-                ir.external_data.CallbackInfo(
-                    total=total, index=index, offset=0, filename="model.onnx.data"
+                types.SimpleNamespace(
+                    total=total,
+                    index=index,
+                    offset=0,
+                    filename="model.onnx.data",
+                    shard_total=total,
+                    shard_index=index,
                 ),
             )
 
@@ -154,9 +226,10 @@ class TestProgressCallback:
         for thread in threads:
             thread.join()
 
-        bar = callback.__closure__[1].cell_contents
-        assert bar.total == total
-        assert bar.n == total
+        assert len(bars) == 1
+        assert bars[0].total == total
+        assert bars[0].n == total
+        assert bars[0].closed
 
 
 class TestModelPackageSaveLoad:

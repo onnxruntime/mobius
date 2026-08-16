@@ -126,8 +126,6 @@ class ModelPackage(UserDict[str, ir.Model]):
                 "Expected 'onnx' or 'safetensors'."
             )
         os.makedirs(directory, exist_ok=True)
-        callback = _make_progress_callback() if progress_bar else None
-
         selected = {
             name: model
             for name, model in self.data.items()
@@ -136,6 +134,7 @@ class ModelPackage(UserDict[str, ir.Model]):
         use_subfolders = len(selected) > 1
 
         for name, model in selected.items():
+            callback = _make_progress_callback() if progress_bar else None
             if check_weights:
                 _check_weights(name, model)
             if use_subfolders:
@@ -275,21 +274,33 @@ def _make_progress_callback():
     serialize all progress-bar mutations. This remains compatible with
     ``onnx_ir`` 1.0, where callbacks are invoked serially.
     """
-    pbar = tqdm.tqdm()
     lock = threading.Lock()
-    total_set = False
+    bars: dict[str, tqdm.tqdm] = {}
 
     def callback(tensor: ir.TensorProtocol, metadata: ir.external_data.CallbackInfo) -> None:
-        nonlocal total_set
         with lock:
-            if not total_set:
-                pbar.total = metadata.total
-                total_set = True
+            shard_total = getattr(metadata, "shard_total", None)
+            key = metadata.filename if shard_total is not None else "__all__"
+            pbar = bars.get(key)
+            if pbar is None:
+                description = (
+                    f"Saving {metadata.filename}"
+                    if shard_total is not None
+                    else "Saving external data"
+                )
+                pbar = tqdm.tqdm(
+                    total=shard_total if shard_total is not None else metadata.total,
+                    desc=description,
+                    position=len(bars),
+                    leave=True,
+                )
+                bars[key] = pbar
             pbar.update()
-            pbar.set_description(
-                f"Saving {metadata.filename}: "
+            pbar.set_postfix_str(
                 f"{tensor.name} ({tensor.dtype.short_name()}, {tensor.shape})"
             )
+            if pbar.n >= pbar.total:
+                pbar.close()
 
     return callback
 
