@@ -287,7 +287,8 @@ def _make_progress_callback():
                 total_set = True
             pbar.update()
             pbar.set_description(
-                f"Saving {tensor.name} ({tensor.dtype.short_name()}, {tensor.shape})"
+                f"Saving {metadata.filename}: "
+                f"{tensor.name} ({tensor.dtype.short_name()}, {tensor.shape})"
             )
 
     return callback

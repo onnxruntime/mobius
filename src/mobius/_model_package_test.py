@@ -134,6 +134,7 @@ class TestProgressCallback:
         bar = callback.__closure__[1].cell_contents
         assert bar.total == total
         assert bar.n == total
+        assert "model.onnx.data" in bar.desc
 
     def test_is_thread_safe(self):
         callback = _make_progress_callback()
