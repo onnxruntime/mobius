@@ -12,7 +12,11 @@ import torch
 
 from mobius._builder import build_from_module
 from mobius._configs import VisionConfig
-from mobius._model_package import ModelPackage, _make_progress_callback
+from mobius._model_package import (
+    ModelPackage,
+    _default_save_workers,
+    _make_progress_callback,
+)
 from mobius._testing import make_config
 from mobius.models.base import CausalLMModel
 from mobius.models.gemma3 import Gemma3MultiModalModel
@@ -126,6 +130,17 @@ class TestParallelSave:
         bar = callback.__closure__[1].cell_contents
         assert bar.total == total
         assert bar.n == total
+
+    def test_default_workers_is_clamped_by_core_count(self, monkeypatch):
+        # The write bottleneck is the disk, so the default is a small constant
+        # rather than a function of the core count -- but it must never exceed
+        # the cores actually available.
+        monkeypatch.setattr("mobius._model_package.os.cpu_count", lambda: 2)
+        assert _default_save_workers() == 2
+        monkeypatch.setattr("mobius._model_package.os.cpu_count", lambda: 128)
+        assert _default_save_workers() == 8
+        monkeypatch.setattr("mobius._model_package.os.cpu_count", lambda: None)
+        assert _default_save_workers() == 1
 
     def test_progress_bar_is_thread_safe(self):
         import threading

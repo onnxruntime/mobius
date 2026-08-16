@@ -35,6 +35,10 @@ from mobius._weight_loading import _assign_weight
 
 logger = logging.getLogger(__name__)
 
+# Upper bound for the default external-data write thread count. Writes plateau
+# well before this on the machines measured; see _default_save_workers.
+_MAX_DEFAULT_SAVE_WORKERS = 8
+
 
 class ModelPackage(UserDict[str, ir.Model]):
     """A dict-like collection of named ``ir.Model`` objects.
@@ -67,7 +71,7 @@ class ModelPackage(UserDict[str, ir.Model]):
         components: Callable[[str], bool] | None = None,
         progress_bar: bool = True,
         check_weights: bool = True,
-        max_workers: int | None = 8,
+        max_workers: int | None = None,
     ) -> None:
         """Save all component models to a directory.
 
@@ -116,10 +120,10 @@ class ModelPackage(UserDict[str, ir.Model]):
             max_workers: Number of threads used to materialize and write
                 tensors.  Weights that need a dtype cast are held as
                 :class:`ir.LazyTensor` and converted at save time, so this
-                overlaps the casting work with disk writes and parallelizes
-                both.  Defaults to ``8``.  Pass ``None`` or ``1`` to save
-                serially.  Peak memory stays bounded regardless of the worker
-                count.  Only used when *external_data* is ``"onnx"``.
+                overlaps the casting work with disk writes.  ``None`` (the
+                default) picks :func:`_default_save_workers`; pass ``1`` to
+                save serially.  Peak memory stays bounded regardless of the
+                worker count.  Only used when *external_data* is ``"onnx"``.
 
         Raises:
             ValueError: If *external_data* is not ``"onnx"`` or
@@ -163,7 +167,9 @@ class ModelPackage(UserDict[str, ir.Model]):
                     path,
                     external_data="model.onnx.data",
                     callback=callback,
-                    max_workers=max_workers,
+                    max_workers=(
+                        _default_save_workers() if max_workers is None else max_workers
+                    ),
                 )
 
     @classmethod
@@ -271,6 +277,23 @@ class ModelPackage(UserDict[str, ir.Model]):
         # be constant-folded once the weight tensors carry their const_value.
         for model in self.data.values():
             fold_initializers_after_weights(model)
+
+
+def _default_save_workers() -> int:
+    """Pick a default thread count for writing external data.
+
+    The bottleneck is the storage device, not the CPU: casting weights runs
+    around 12 GB/s here while writes saturate near 1.6 GB/s, and a write-only
+    scaling test stops improving past ~2 threads. Most of the win therefore
+    comes from overlapping the cast with the write rather than from write
+    parallelism, so this deliberately does not scale with the core count --
+    that would oversubscribe against torch's own intra-op thread pool without
+    making the disk any faster.
+
+    A small constant, clamped by the core count so tiny containers do not
+    spawn more threads than they can run, is enough to reach the plateau.
+    """
+    return max(1, min(_MAX_DEFAULT_SAVE_WORKERS, os.cpu_count() or 1))
 
 
 def _make_progress_callback():
