@@ -297,6 +297,11 @@ def _default_save_workers() -> int:
     give 1 on a 2-core box, disabling the optimization exactly where it helps
     most. Oversubscription is also not penalized in practice: with full torch
     threads, everything from 4 to 32 workers lands within noise of each other.
+
+    Weights that live on an accelerator benefit the most. The device-to-host
+    copy happens inside ``tofile`` with the GIL released, so it overlaps with
+    other threads' writes: GPU-resident weights measured 6.3x at 8 workers
+    versus 1.5x for CPU weights, on a machine whose CPUs were largely idle.
     """
     return _DEFAULT_SAVE_WORKERS
 
