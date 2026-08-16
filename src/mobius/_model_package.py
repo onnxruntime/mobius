@@ -95,8 +95,10 @@ class ModelPackage(UserDict[str, ir.Model]):
                     errors on some CUDA/cuBLAS versions when loading weights
                     via memory-mapped I/O.  Use ``"onnx"`` (the default) for
                     models targeting CUDA execution.
-            max_shard_size_bytes: Maximum shard size in bytes for safetensors
-                format.  Only used when *external_data* is ``"safetensors"``.
+            max_shard_size_bytes: Maximum external-data shard size in bytes.
+                Used by both ONNX and safetensors external-data formats. A
+                single tensor larger than this value is written in its own
+                oversized shard.
             components: Optional predicate ``(name) -> bool`` that selects
                 which components to save.  When ``None`` (default), all
                 components are saved.  Examples::
@@ -149,7 +151,13 @@ class ModelPackage(UserDict[str, ir.Model]):
                     callback=callback,
                 )
             else:
-                ir.save(model, path, external_data="model.onnx.data", callback=callback)
+                ir.save(
+                    model,
+                    path,
+                    external_data="model.onnx.data",
+                    max_shard_size_bytes=max_shard_size_bytes,
+                    callback=callback,
+                )
 
     @classmethod
     def load(cls, directory: str) -> ModelPackage:

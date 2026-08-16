@@ -77,6 +77,37 @@ class TestModelPackageDict:
         assert pkg.config is config
 
 
+class TestOnnxShardedSave:
+    def test_onnx_external_data_is_sharded(self, tmp_path):
+        graph = ir.Graph([], [], nodes=[], name="m")
+        for index in range(6):
+            name = f"weight_{index}"
+            graph.register_initializer(
+                ir.Value(
+                    name=name,
+                    const_value=ir.Tensor(
+                        torch.full((1024,), index, dtype=torch.float32),
+                        name=name,
+                        dtype=ir.DataType.FLOAT,
+                    ),
+                )
+            )
+        pkg = ModelPackage({"m": ir.Model(graph, ir_version=10)})
+
+        pkg.save(
+            str(tmp_path),
+            external_data="onnx",
+            max_shard_size_bytes=8192,
+            progress_bar=False,
+        )
+
+        shards = sorted(tmp_path.glob("model.onnx-*-of-*.data"))
+        assert len(shards) == 3
+        assert all(shard.stat().st_size <= 8192 for shard in shards)
+        loaded = ModelPackage.load(str(tmp_path))
+        assert set(loaded.data) == {"model"}
+
+
 class TestModelPackageSaveLoad:
     def test_save_creates_files(self, tmp_path):
         pkg = ModelPackage(
