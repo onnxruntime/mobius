@@ -22,6 +22,7 @@ __all__ = ["ModelPackage"]
 
 import logging
 import os
+import threading
 from collections import UserDict
 from collections.abc import Callable
 
@@ -267,19 +268,27 @@ class ModelPackage(UserDict[str, ir.Model]):
 
 
 def _make_progress_callback():
-    """Create a tqdm progress-bar callback for ``ir.save``."""
+    """Create a thread-safe tqdm progress-bar callback for ``ir.save``.
+
+    Newer ``onnx_ir`` versions may invoke callbacks concurrently and out of
+    index order. Count invocations instead of tracking ``metadata.index`` and
+    serialize all progress-bar mutations. This remains compatible with
+    ``onnx_ir`` 1.0, where callbacks are invoked serially.
+    """
     pbar = tqdm.tqdm()
+    lock = threading.Lock()
     total_set = False
 
     def callback(tensor: ir.TensorProtocol, metadata: ir.external_data.CallbackInfo) -> None:
         nonlocal total_set
-        if not total_set:
-            pbar.total = metadata.total
-            total_set = True
-        pbar.update()
-        pbar.set_description(
-            f"Saving {tensor.name} ({tensor.dtype.short_name()}, {tensor.shape})"
-        )
+        with lock:
+            if not total_set:
+                pbar.total = metadata.total
+                total_set = True
+            pbar.update()
+            pbar.set_description(
+                f"Saving {tensor.name} ({tensor.dtype.short_name()}, {tensor.shape})"
+            )
 
     return callback
 

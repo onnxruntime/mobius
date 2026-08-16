@@ -6,13 +6,14 @@
 from __future__ import annotations
 
 import logging
+import threading
 
 import onnx_ir as ir
 import torch
 
 from mobius._builder import build_from_module
 from mobius._configs import VisionConfig
-from mobius._model_package import ModelPackage
+from mobius._model_package import ModelPackage, _make_progress_callback
 from mobius._testing import make_config
 from mobius.models.base import CausalLMModel
 from mobius.models.gemma3 import Gemma3MultiModalModel
@@ -106,6 +107,55 @@ class TestOnnxShardedSave:
         assert all(shard.stat().st_size <= 8192 for shard in shards)
         loaded = ModelPackage.load(str(tmp_path))
         assert set(loaded.data) == {"model"}
+
+
+class TestProgressCallback:
+    class _Tensor:
+        name = "w"
+        shape = (2, 2)
+
+        class dtype:  # noqa: N801
+            @staticmethod
+            def short_name():
+                return "f32"
+
+    def test_counts_out_of_order_callbacks(self):
+        callback = _make_progress_callback()
+        total = 8
+
+        for index in reversed(range(total)):
+            callback(
+                self._Tensor(),
+                ir.external_data.CallbackInfo(
+                    total=total, index=index, offset=0, filename="model.onnx.data"
+                ),
+            )
+
+        bar = callback.__closure__[1].cell_contents
+        assert bar.total == total
+        assert bar.n == total
+
+    def test_is_thread_safe(self):
+        callback = _make_progress_callback()
+        total = 200
+
+        def invoke(index):
+            callback(
+                self._Tensor(),
+                ir.external_data.CallbackInfo(
+                    total=total, index=index, offset=0, filename="model.onnx.data"
+                ),
+            )
+
+        threads = [threading.Thread(target=invoke, args=(index,)) for index in range(total)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        bar = callback.__closure__[1].cell_contents
+        assert bar.total == total
+        assert bar.n == total
 
 
 class TestModelPackageSaveLoad:
