@@ -131,16 +131,13 @@ class TestParallelSave:
         assert bar.total == total
         assert bar.n == total
 
-    def test_default_workers_is_clamped_by_core_count(self, monkeypatch):
-        # The write bottleneck is the disk, so the default is a small constant
-        # rather than a function of the core count -- but it must never exceed
-        # the cores actually available.
-        monkeypatch.setattr("mobius._model_package.os.cpu_count", lambda: 2)
-        assert _default_save_workers() == 2
-        monkeypatch.setattr("mobius._model_package.os.cpu_count", lambda: 128)
-        assert _default_save_workers() == 8
-        monkeypatch.setattr("mobius._model_package.os.cpu_count", lambda: None)
-        assert _default_save_workers() == 1
+    def test_default_workers_does_not_track_core_count(self, monkeypatch):
+        # These threads block on I/O rather than competing for CPU, and a low
+        # core count needs *more* concurrency to hide a slow serial cast, so
+        # the default must not shrink on small machines.
+        for cores in (2, 8, 128, None):
+            monkeypatch.setattr("mobius._model_package.os.cpu_count", lambda c=cores: c)
+            assert _default_save_workers() == 8
 
     def test_progress_bar_is_thread_safe(self):
         import threading

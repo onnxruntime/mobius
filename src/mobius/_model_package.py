@@ -35,9 +35,9 @@ from mobius._weight_loading import _assign_weight
 
 logger = logging.getLogger(__name__)
 
-# Upper bound for the default external-data write thread count. Writes plateau
-# well before this on the machines measured; see _default_save_workers.
-_MAX_DEFAULT_SAVE_WORKERS = 8
+# Default thread count for writing external data. Intentionally independent of
+# the core count -- see _default_save_workers for the measurements.
+_DEFAULT_SAVE_WORKERS = 8
 
 
 class ModelPackage(UserDict[str, ir.Model]):
@@ -282,18 +282,23 @@ class ModelPackage(UserDict[str, ir.Model]):
 def _default_save_workers() -> int:
     """Pick a default thread count for writing external data.
 
-    The bottleneck is the storage device, not the CPU: casting weights runs
-    around 12 GB/s here while writes saturate near 1.6 GB/s, and a write-only
-    scaling test stops improving past ~2 threads. Most of the win therefore
-    comes from overlapping the cast with the write rather than from write
-    parallelism, so this deliberately does not scale with the core count --
-    that would oversubscribe against torch's own intra-op thread pool without
-    making the disk any faster.
+    Deliberately a constant rather than a function of ``os.cpu_count()``.
 
-    A small constant, clamped by the core count so tiny containers do not
-    spawn more threads than they can run, is enough to reach the plateau.
+    The bottleneck is the storage device, not the CPU: casting bf16 to f16
+    runs around 12 GB/s while serial writes reach 1.6 GB/s, and a write-only
+    scaling test saturates at 2 threads. Nearly all of the win comes from
+    overlapping the cast with the write, and these threads spend their time
+    blocked in ``tofile`` with the GIL released rather than competing for CPU.
+
+    Sizing the pool by core count gets this backwards. With torch pinned to a
+    single intra-op thread -- i.e. a small machine -- 8 workers is the *fastest*
+    configuration (1.55x) while 2 workers is slower than serial, because more
+    concurrency is needed to hide a slow serial cast. ``cpu_count() // 2`` would
+    give 1 on a 2-core box, disabling the optimization exactly where it helps
+    most. Oversubscription is also not penalized in practice: with full torch
+    threads, everything from 4 to 32 workers lands within noise of each other.
     """
-    return max(1, min(_MAX_DEFAULT_SAVE_WORKERS, os.cpu_count() or 1))
+    return _DEFAULT_SAVE_WORKERS
 
 
 def _make_progress_callback():
