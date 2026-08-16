@@ -104,6 +104,36 @@ class TestParallelSave:
         loaded = ModelPackage.load(str(tmp_path))
         assert set(loaded.data) == {"model"}
 
+    def test_onnx_external_data_is_sharded(self, tmp_path):
+        graph = ir.Graph([], [], nodes=[], name="m")
+        for index in range(6):
+            name = f"weight_{index}"
+            graph.register_initializer(
+                ir.Value(
+                    name=name,
+                    const_value=ir.Tensor(
+                        torch.full((1024,), index, dtype=torch.float32),
+                        name=name,
+                        dtype=ir.DataType.FLOAT,
+                    ),
+                )
+            )
+        pkg = ModelPackage({"m": ir.Model(graph, ir_version=10)})
+
+        pkg.save(
+            str(tmp_path),
+            external_data="onnx",
+            max_shard_size_bytes=8192,
+            max_workers=8,
+            progress_bar=False,
+        )
+
+        shards = sorted(tmp_path.glob("model.onnx-*-of-*.data"))
+        assert len(shards) == 3
+        assert all(shard.stat().st_size <= 8192 for shard in shards)
+        loaded = ModelPackage.load(str(tmp_path))
+        assert set(loaded.data) == {"model"}
+
     def test_progress_bar_counts_every_tensor_out_of_order(self):
         # ir.save may invoke the callback from worker threads and out of index
         # order, so the bar must count calls rather than follow ``index``.
