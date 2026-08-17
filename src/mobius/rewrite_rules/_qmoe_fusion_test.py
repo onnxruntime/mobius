@@ -145,7 +145,9 @@ def _constant_int(graph_nodes: list[ir.Node], name: str, value: int) -> ir.Value
     return node.outputs[0]
 
 
-def _build_dense_graph() -> tuple[ir.Model, dict[str, _Quant], np.ndarray]:
+def _build_dense_graph(
+    activation_dtype: ir.DataType = ir.DataType.FLOAT16,
+) -> tuple[ir.Model, dict[str, _Quant], np.ndarray]:
     """Build a tiny dense-fallback Qwen35-MoE graph and return it with its weights."""
     rng = _rng()
     quants: dict[str, _Quant] = {}
@@ -154,7 +156,7 @@ def _build_dense_graph() -> tuple[ir.Model, dict[str, _Quant], np.ndarray]:
     hidden = ir.Value(
         name="hidden",
         shape=ir.Shape(["T", H]),
-        type=ir.TensorType(ir.DataType.FLOAT16),
+        type=ir.TensorType(activation_dtype),
     )
     graph = ir.Graph([hidden], [], nodes=[], name="tiny_moe")
 
@@ -287,7 +289,7 @@ def _build_dense_graph() -> tuple[ir.Model, dict[str, _Quant], np.ndarray]:
     )
     final.outputs[0].name = "moe_out"
     final.outputs[0].shape = ir.Shape(["T", H])
-    final.outputs[0].type = ir.TensorType(ir.DataType.FLOAT16)
+    final.outputs[0].type = ir.TensorType(activation_dtype)
     nodes.append(final)
 
     for node in nodes:
@@ -425,13 +427,21 @@ def test_qmoe_weights_are_bit_identical_to_concatenated_experts() -> None:
         np.testing.assert_array_equal(fc2_z[e], quants[f"d{e}"].zero_points)
 
 
-def test_scales_are_lossless_float32_upcast() -> None:
-    model, quants, _ = _build_dense_graph()
+@pytest.mark.parametrize(
+    "activation_dtype",
+    [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16],
+)
+def test_scales_match_activation_dtype(activation_dtype: ir.DataType) -> None:
+    model, quants, _ = _build_dense_graph(activation_dtype)
     fuse_dense_moe_to_qmoe(model)
     qmoe = next(n for n in model.graph if n.op_type == "QMoE")
 
     fc1_s = qmoe.inputs[3].const_value.numpy()
-    assert fc1_s.dtype == np.float32
+    fc2_s = qmoe.inputs[6].const_value.numpy()
+    assert qmoe.inputs[3].dtype == activation_dtype
+    assert qmoe.inputs[6].dtype == activation_dtype
+    assert fc1_s.dtype == activation_dtype.numpy()
+    assert fc2_s.dtype == activation_dtype.numpy()
     for e in range(E):
         expected = np.concatenate(
             [
@@ -439,7 +449,7 @@ def test_scales_are_lossless_float32_upcast() -> None:
                 quants[f"u{e}"].scales.reshape(INTER, -1),
             ],
             axis=0,
-        ).astype(np.float32)
+        ).astype(activation_dtype.numpy())
         np.testing.assert_array_equal(fc1_s[e], expected)
 
 
@@ -451,15 +461,19 @@ def test_rewritten_forward_matches_dense_forward() -> None:
     np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)
 
 
-def test_router_probs_cast_to_float32() -> None:
-    model, _, _ = _build_dense_graph()
+@pytest.mark.parametrize(
+    "activation_dtype",
+    [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16],
+)
+def test_router_probs_cast_to_activation_dtype(activation_dtype: ir.DataType) -> None:
+    model, _, _ = _build_dense_graph(activation_dtype)
     fuse_dense_moe_to_qmoe(model)
     graph = model.graph
     qmoe = next(n for n in graph if n.op_type == "QMoE")
     router_probs = qmoe.inputs[1]
     cast = router_probs.producer()
     assert cast.op_type == "Cast"
-    assert cast.attributes["to"].value == ir.DataType.FLOAT.value
+    assert cast.attributes["to"].value == activation_dtype.value
 
 
 def test_attributes_match_qmoe_abi() -> None:

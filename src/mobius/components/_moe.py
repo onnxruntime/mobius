@@ -371,7 +371,6 @@ class MoELayer(nn.Module):
             dtype=ir.DataType.UINT8,
         )
         self.fc1_scales = nn.Parameter([self.num_experts, fc1_out, hidden_size // block_size])
-        self.fc1_scales._keep_float32 = True
         self.fc2_experts_weights = nn.Parameter(
             [self.num_experts, hidden_size, intermediate_size * bits // 8],
             dtype=ir.DataType.UINT8,
@@ -379,7 +378,6 @@ class MoELayer(nn.Module):
         self.fc2_scales = nn.Parameter(
             [self.num_experts, hidden_size, intermediate_size // block_size]
         )
-        self.fc2_scales._keep_float32 = True
         if quantization.sym:
             self.fc1_experts_zero_points = None
             self.fc2_experts_zero_points = None
