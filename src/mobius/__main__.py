@@ -185,6 +185,8 @@ def _cmd_build(args: argparse.Namespace) -> None:
     # Validate --max-seq-len is positive
     if args.max_seq_len is not None and args.max_seq_len <= 0:
         raise SystemExit("Error: --max-seq-len must be a positive integer.")
+    if args.max_workers <= 0:
+        raise SystemExit("Error: --max-workers must be a positive integer.")
 
     max_length = getattr(args, "max_length", None)
     if max_length is not None and args.runtime != "onnx-genai":
@@ -394,6 +396,7 @@ def _save_package(
         output_dir,
         external_data=args.external_data,
         max_shard_size_bytes=max_shard_size_bytes,
+        max_workers=args.max_workers,
         components=components,
         check_weights=not args.no_weights,
     )
@@ -529,6 +532,8 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         raise SystemExit("Error: --max-seq-len can only be used with --static-cache.")
     if args.max_seq_len is not None and args.max_seq_len <= 0:
         raise SystemExit("Error: --max-seq-len must be a positive integer.")
+    if args.max_workers <= 0:
+        raise SystemExit("Error: --max-workers must be a positive integer.")
     if mmproj_path is not None and args.static_cache:
         raise SystemExit("Error: --static-cache cannot be used with --mmproj.")
 
@@ -545,6 +550,7 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
     pkg.save(
         output_dir,
         external_data=args.external_data,
+        max_workers=args.max_workers,
     )
     for name in pkg:
         use_subfolders = len(pkg) > 1
@@ -708,6 +714,13 @@ def main(argv: list[str] | None = None) -> None:
         help="Maximum external-data shard size (e.g. '5GB'). Used by both ONNX and safetensors.",
     )
     build_parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=8,
+        metavar="N",
+        help="Number of threads used to write ONNX external data (default: 8; use 1 for serial saves).",
+    )
+    build_parser.add_argument(
         "--no-weights",
         action="store_true",
         help="Do not include weights in the output ONNX model.",
@@ -856,6 +869,13 @@ def main(argv: list[str] | None = None) -> None:
         choices=["onnx", "safetensors"],
         default="onnx",
         help="External data format (default: onnx).",
+    )
+    gguf_parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=8,
+        metavar="N",
+        help="Number of threads used to write ONNX external data (default: 8; use 1 for serial saves).",
     )
     gguf_parser.add_argument(
         "--ep",

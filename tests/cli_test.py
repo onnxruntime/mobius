@@ -65,6 +65,56 @@ class TestCLIBuild:
             )
             assert os.path.isfile(os.path.join(tmpdir, "model.onnx"))
 
+    def test_max_workers_defaults_to_eight(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius._diffusers_builder._load_diffusers_pipeline_index",
+                return_value=None,
+            ),
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()),
+            mock.patch("mobius.__main__._save_package") as save_package,
+        ):
+            main(["build", "--model", "Qwen/Qwen2.5-0.5B", tmpdir, "--no-weights"])
+
+        assert save_package.call_args.args[2].max_workers == 8
+
+    def test_max_workers_override_reaches_model_package_save(self):
+        pkg = mock.MagicMock()
+        pkg.items.return_value = []
+        pkg.__iter__.return_value = iter(())
+        args = SimpleNamespace(
+            max_shard_size=None,
+            max_workers=1,
+            external_data="onnx",
+            execution_provider="cpu",
+            no_weights=True,
+            runtime=None,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _save_package(pkg, tmpdir, args, None, None)
+
+        assert pkg.save.call_args.kwargs["max_workers"] == 1
+
+    @pytest.mark.parametrize("max_workers", [0, -1])
+    def test_non_positive_max_workers_errors(self, max_workers):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(SystemExit, match=r"--max-workers must be a positive integer"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "Qwen/Qwen2.5-0.5B",
+                    tmpdir,
+                    "--no-weights",
+                    "--max-workers",
+                    str(max_workers),
+                ]
+            )
+
     def test_build_encoder_decoder_produces_separate_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             main(["build", "--model", "facebook/bart-base", tmpdir, "--no-weights"])
@@ -514,6 +564,7 @@ class TestCLIBuildRuntime:
         pkg.config = object()
         args = SimpleNamespace(
             max_shard_size=None,
+            max_workers=8,
             external_data="onnx",
             execution_provider="cpu",
             no_weights=True,
@@ -553,6 +604,7 @@ class TestCLIBuildRuntime:
         pkg.config = object()
         args = SimpleNamespace(
             max_shard_size=None,
+            max_workers=8,
             external_data="onnx",
             execution_provider="cpu",
             no_weights=True,
