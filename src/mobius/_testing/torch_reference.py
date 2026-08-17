@@ -252,6 +252,7 @@ def load_torch_multimodal_model(
     model_id: str,
     dtype: torch.dtype = torch.float32,
     device: str = "cpu",
+    revision: str | None = None,
 ):
     """Load a HuggingFace multimodal model for reference inference.
 
@@ -261,6 +262,7 @@ def load_torch_multimodal_model(
         model_id: HuggingFace model identifier.
         dtype: Model dtype (default float32 for numerical comparison).
         device: Device to load on.
+        revision: Optional immutable HuggingFace checkpoint revision.
 
     Returns:
         Tuple of (model, tokenizer, image_processor).
@@ -271,12 +273,14 @@ def load_torch_multimodal_model(
         model_id,
         transformers.AutoTokenizer.from_pretrained,
         model_id,
+        revision=revision,
         trust_remote_code=True,
     )
     processor = _load_mage_compatible(
         model_id,
         transformers.AutoProcessor.from_pretrained,
         model_id,
+        revision=revision,
         trust_remote_code=True,
     )
 
@@ -293,6 +297,7 @@ def load_torch_multimodal_model(
         model_id,
         transformers.AutoConfig.from_pretrained,
         model_id,
+        revision=revision,
         trust_remote_code=True,
     )
     config._attn_implementation = "eager"
@@ -304,7 +309,12 @@ def load_torch_multimodal_model(
     # The weight-dtype keyword was renamed from ``torch_dtype`` to ``dtype`` in
     # transformers 5.x; support both so offline golden generation also works on
     # the older transformers (e.g. 4.43) required by 4.x-era remote-code models.
-    base_kwargs = dict(config=config, device_map=device, trust_remote_code=True)
+    base_kwargs = dict(
+        config=config,
+        device_map=device,
+        revision=revision,
+        trust_remote_code=True,
+    )
 
     def _load_from_pretrained(auto_cls):
         try:

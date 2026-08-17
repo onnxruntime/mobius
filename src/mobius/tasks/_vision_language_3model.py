@@ -219,6 +219,47 @@ class QwenVLTask(VisionLanguageTask):
         return _make_model(graph)
 
 
+class GlmOcrVLTask(QwenVLTask):
+    """GLM-OCR packed vision task with a float32 processor boundary."""
+
+    def _build_vision(
+        self,
+        vision: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        total_patches = ir.SymbolicDim("total_patches")
+        num_images = ir.SymbolicDim("num_images")
+        vision_config = config.vision
+        assert vision_config is not None
+        patch_size = vision_config.patch_size or 14
+        pixel_dim = (
+            vision_config.in_channels
+            * vision_config.temporal_patch_size
+            * patch_size
+            * patch_size
+        )
+
+        graph, builder = _make_graph(name="vision_encoder")
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=ir.DataType.FLOAT,
+            shape=[total_patches, pixel_dim],
+        )
+        image_grid_thw = builder.input(
+            "image_grid_thw",
+            dtype=ir.DataType.INT64,
+            shape=[num_images, 3],
+        )
+        model_pixels = builder.op.Cast(pixel_values, to=config.dtype)
+        image_features = vision(
+            builder.op,
+            pixel_values=model_pixels,
+            image_grid_thw=image_grid_thw,
+        )
+        builder.add_output(image_features, "image_features")
+        return _make_model(graph)
+
+
 class MuseGlimmerVLTask(QwenVLTask):
     """Muse Glimmer packed vision pipeline with standard 1D text RoPE."""
 

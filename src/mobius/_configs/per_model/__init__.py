@@ -29,6 +29,7 @@ from mobius._configs.per_model import (  # noqa: F401
     _gemma4_audio,
     _gemma4_unified_audio,
     _gemma4_unified_vision,
+    _glm_ocr_vision,
     _hunyuan_vl_mot_vision,
     _internvl_vision,
     _mage_vl_vision,

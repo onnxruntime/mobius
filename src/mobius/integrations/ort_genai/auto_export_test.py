@@ -1202,6 +1202,139 @@ class TestExportForOrtGenai:
         assert model["vision"]["patch_size"] == 16
         assert model["vision"]["window_size"] == 64
 
+    def test_glm_ocr_writes_qwen_runtime_and_packed_processor_contract(self, tmp_path):
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 336
+            patch_size: int = 14
+            spatial_merge_size: int = 2
+            model_type: str = "glm_ocr_vision"
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "glm_ocr_text"
+            vocab_size: int = 59392
+            hidden_size: int = 1536
+            num_hidden_layers: int = 16
+            num_attention_heads: int = 16
+            num_key_value_heads: int = 8
+            head_dim: int = 128
+            image_token_id: int = 59280
+            vision_start_token_id: int = 59256
+            temporal_patch_size: int = 2
+            spatial_merge_size: int = 2
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+
+        pkg = ModelPackage(
+            {
+                "decoder": _mock_model(
+                    inputs=["inputs_embeds", "attention_mask", "position_ids"],
+                    outputs=["logits"],
+                ),
+                "vision_encoder": _mock_model(
+                    inputs=["pixel_values", "image_grid_thw"],
+                    outputs=["image_features"],
+                ),
+                "embedding": _mock_model(
+                    inputs=["input_ids", "image_features"],
+                    outputs=["inputs_embeds"],
+                ),
+            },
+            config=FakeConfig(),
+        )
+
+        result = write_ort_genai_config(pkg, str(tmp_path), ep="cuda")
+
+        with open(result["genai_config"]) as f:
+            model = json.load(f)["model"]
+        assert model["type"] == "qwen2_5_vl"
+        assert model["image_token_id"] == 59280
+        assert model["vision_start_token_id"] == 59256
+        assert model["vision"]["spatial_merge_size"] == 2
+        assert model["vision"]["config_filename"] == "processor_config.json"
+        assert model["vision"]["inputs"] == {
+            "pixel_values": "pixel_values",
+            "image_grid_thw": "image_grid_thw",
+        }
+
+        with open(result["processor_config"]) as f:
+            processor = json.load(f)["processor"]
+        assert processor["name"] == "qwen2_5_image_processor"
+        patch_image = processor["transforms"][-1]["operation"]
+        assert patch_image == {
+            "name": "patch_image",
+            "type": "PatchImage",
+            "attrs": {
+                "patch_size": 14,
+                "temporal_patch_size": 2,
+                "merge_size": 2,
+            },
+        }
+
+    def test_glm_ocr_pixel_bounds_are_not_used_as_image_dimensions(self, tmp_path):
+        """GLM-OCR's longest_edge is a pixel-count ceiling, not a side length."""
+        import dataclasses
+
+        from mobius.integrations.ort_genai.auto_export import (
+            _write_vision_processor_config,
+        )
+
+        revision = "ca5d8b3e287e52589e37c28385d9655ee4372f9d"
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 336
+            patch_size: int = 14
+            spatial_merge_size: int = 2
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "glm_ocr_text"
+            temporal_patch_size: int = 2
+            spatial_merge_size: int = 2
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+
+        image_processor = mock.MagicMock()
+        image_processor.image_mean = [0.48145466, 0.4578275, 0.40821073]
+        image_processor.image_std = [0.26862954, 0.26130258, 0.27577711]
+        image_processor.rescale_factor = 1.0 / 255.0
+        image_processor.resample = 3
+        image_processor.size = {
+            "shortest_edge": 12544,
+            "longest_edge": 9633792,
+        }
+        hf_processor = mock.MagicMock(image_processor=image_processor)
+
+        with mock.patch(
+            "transformers.AutoProcessor.from_pretrained",
+            return_value=hf_processor,
+        ) as mock_from_pretrained:
+            path = _write_vision_processor_config(
+                FakeConfig(),
+                str(tmp_path),
+                hf_model_id="zai-org/GLM-OCR",
+                revision=revision,
+            )
+
+        mock_from_pretrained.assert_called_once_with(
+            "zai-org/GLM-OCR",
+            revision=revision,
+            trust_remote_code=False,
+        )
+        assert path is not None
+        with open(path) as f:
+            transforms = json.load(f)["processor"]["transforms"]
+        resize = transforms[1]["operation"]["attrs"]
+        assert resize["height"] == 336
+        assert resize["width"] == 336
+        assert resize["min_pixels"] == 12544
+        assert resize["max_pixels"] == 9633792
+
     def test_mage_vl_is_rejected_before_writing_runtime_artifacts(self, tmp_path):
         import dataclasses
 
@@ -1550,6 +1683,39 @@ class TestExportForOrtGenai:
             data = json.load(f)
         assert data["model"]["eos_token_id"] == [248046, 248044]
         assert data["model"]["pad_token_id"] == 248044
+    def test_hf_revision_is_used_for_config_and_tokenizer_assets(self, tmp_path):
+        """A pinned export never mixes config and tokenizer revisions."""
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        pkg = self._make_pkg()
+        revision = "0123456789abcdef"
+        with (
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files",
+                return_value=[],
+            ) as mock_copy,
+            mock.patch("transformers.AutoConfig.from_pretrained") as mock_hf,
+        ):
+            mock_hf.return_value = mock.MagicMock(
+                model_type="qwen2", bos_token_id=1, eos_token_id=2, pad_token_id=0
+            )
+            write_ort_genai_config(
+                pkg,
+                str(tmp_path),
+                hf_model_id="fake/model",
+                revision=revision,
+            )
+
+        mock_hf.assert_called_once_with(
+            "fake/model",
+            revision=revision,
+            trust_remote_code=False,
+        )
+        mock_copy.assert_called_once_with(
+            "fake/model",
+            str(tmp_path),
+            revision=revision,
+        )
 
     def test_ep_default_normalizes_to_cpu(self, tmp_path):
         """ep='default' is normalized to cpu (provider_options=[])."""

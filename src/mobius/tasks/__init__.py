@@ -42,6 +42,7 @@ __all__ = [
     "Gemma4Task",
     "Gemma4UnifiedTask",
     "Gemma4TextCausalLMTask",
+    "GlmOcrVLTask",
     "HybridCausalLMTask",
     "Cosmos3EdgeVLTask",
     "HybridQwenVLTask",
@@ -148,6 +149,7 @@ from mobius.tasks._vision_encoder_decoder import VisionEncoderDecoderTask
 from mobius.tasks._vision_language import Qwen3VLVisionLanguageTask
 from mobius.tasks._vision_language_3model import (
     Cosmos3EdgeVLTask,
+    GlmOcrVLTask,
     HybridQwenVLTask,
     MageVLTask,
     MiniCPMVLTask,
@@ -204,6 +206,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "mage-vl": MageVLTask,
     "muse-glimmer-vl": MuseGlimmerVLTask,
     "qwen-vl": QwenVLTask,
+    "glm-ocr": GlmOcrVLTask,
     "hybrid-qwen-vl": HybridQwenVLTask,
     "minicpm-vl": MiniCPMVLTask,
     "qwen3-vl-vision-language": Qwen3VLVisionLanguageTask,

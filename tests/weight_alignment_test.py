@@ -300,3 +300,31 @@ def test_mage_vl_huggingface_checkpoint_alignment():
     hf_state["model.language_model.embed_tokens.weight"] = torch.ones(1)
     aligned = module.preprocess_weights(hf_state)
     assert set(aligned) == parameter_names
+
+
+def test_glm_ocr_huggingface_checkpoint_alignment():
+    """Every exported GLM-OCR parameter maps to its checkpoint tensor name."""
+    config_overrides = next(overrides for mt, overrides, _ in VL_CONFIGS if mt == "glm_ocr")
+    config = _base_config(**config_overrides)
+    module = registry.get("glm_ocr")(config)
+    pkg = get_task("glm-ocr").build(module, config)
+    parameter_names = _collect_parameter_names(pkg)
+
+    hf_state: dict[str, torch.Tensor] = {}
+    for name in parameter_names:
+        if name == "embedding.embed_tokens.weight":
+            hf_name = "model.language_model.embed_tokens.weight"
+        elif name.startswith("decoder.model."):
+            hf_name = f"model.language_model.{name.removeprefix('decoder.model.')}"
+        elif name == "decoder.lm_head.weight":
+            hf_name = "lm_head.weight"
+        elif name.startswith("vision_encoder.visual."):
+            hf_name = f"model.{name.removeprefix('vision_encoder.')}"
+        else:
+            raise AssertionError(f"Unrecognized GLM-OCR parameter name: {name}")
+        hf_state[hf_name] = torch.ones(1)
+
+    # The real checkpoint has one auxiliary predictor layer after the decoder.
+    hf_state["model.language_model.layers.2.input_layernorm.weight"] = torch.ones(1)
+    aligned = module.preprocess_weights(hf_state)
+    assert set(aligned) == parameter_names

@@ -60,6 +60,7 @@ __all__ = [
     "Glm4CausalLMModel",
     "Glm4MoECausalLMModel",
     "GlmCausalLMModel",
+    "GlmOcrForConditionalGeneration",
     "GraniteCausalLMModel",
     "GraniteMoECausalLMModel",
     "GraniteMoeHybridCausalLMModel",
@@ -220,6 +221,7 @@ from mobius.models.gemma4 import (
 )
 from mobius.models.gemma4_assistant import Gemma4AssistantCausalLMModel
 from mobius.models.glm import Glm4CausalLMModel, GlmCausalLMModel
+from mobius.models.glm_ocr import GlmOcrForConditionalGeneration
 from mobius.models.gpt2 import GPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
 from mobius.models.gptj_codegen import CodeGenCausalLMModel, GPTJCausalLMModel

@@ -63,6 +63,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _revision_kwargs(revision: str | None) -> dict[str, str]:
+    """Return an optional HuggingFace revision keyword without passing ``None``."""
+    return {"revision": revision} if revision is not None else {}
+
+
 # ORT-GenAI model type overrides for model types whose ORT-GenAI name
 # differs from the HuggingFace model_type.
 _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
@@ -96,6 +102,10 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "qwen3_vl_text": "qwen3_vl",
     "qwen3_5": "qwen2_5_vl",
     "qwen3_5_vl": "qwen2_5_vl",
+    # GLM-OCR uses the Qwen2.5-VL three-model runtime contract: packed image
+    # patches, M-RoPE position IDs, an embedding mixer, and a cached decoder.
+    "glm_ocr": "qwen2_5_vl",
+    "glm_ocr_text": "qwen2_5_vl",
     # MiniCPM uses standard 1D decoder position IDs (unlike Qwen-VL MRoPE).
     # The phi3v multimodal runtime provides that contract; callers supply
     # HF-preprocessed packed pixels through Generator.set_inputs().
@@ -135,6 +145,8 @@ _QWEN_VL_MODEL_TYPES = frozenset(
         "qwen2_5_vl",
         "qwen3_vl",
         "mage_vl",
+        "glm_ocr",
+        "glm_ocr_text",
         "qwen3_vl_text",
         "qwen3_5",
         "qwen3_5_vl",
@@ -269,6 +281,8 @@ def _introspect_outputs(pkg: ModelPackage, key: str) -> dict[str, str] | None:
 def _copy_tokenizer_files(
     model_id: str,
     output_dir: str,
+    *,
+    revision: str | None = None,
 ) -> list[str]:
     """Download and copy tokenizer files from HuggingFace Hub.
 
@@ -280,7 +294,7 @@ def _copy_tokenizer_files(
     copied: list[str] = []
     for filename in _TOKENIZER_FILES:
         try:
-            src = hf_hub_download(model_id, filename)
+            src = hf_hub_download(model_id, filename, **_revision_kwargs(revision))
             dst = os.path.join(output_dir, filename)
             shutil.copy2(src, dst)
             copied.append(filename)
@@ -357,7 +371,12 @@ def _fix_tokenizer_config(output_dir: str) -> bool:
     return True
 
 
-def _fix_chat_template(output_dir: str, hf_model_id: str | None) -> bool:
+def _fix_chat_template(
+    output_dir: str,
+    hf_model_id: str | None,
+    *,
+    revision: str | None = None,
+) -> bool:
     """Ensure chat_template is present in tokenizer_config.json.
 
     Some HuggingFace models don't store ``chat_template`` in the
@@ -386,7 +405,10 @@ def _fix_chat_template(output_dir: str, hf_model_id: str | None) -> bool:
     try:
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(hf_model_id)
+        tokenizer = AutoTokenizer.from_pretrained(
+            hf_model_id,
+            **_revision_kwargs(revision),
+        )
         template = getattr(tokenizer, "chat_template", None)
         if template:
             tc["chat_template"] = template
@@ -525,6 +547,7 @@ def _write_vision_processor_config(
     output_dir: str,
     *,
     hf_model_id: str | None = None,
+    revision: str | None = None,
     trust_remote_code: bool = False,
 ) -> str | None:
     """Write the vision processor config file for VLM models.
@@ -660,6 +683,7 @@ def _write_vision_processor_config(
                 hf_proc = AutoProcessor.from_pretrained(
                     hf_model_id,
                     trust_remote_code=trust_remote_code,
+                    **_revision_kwargs(revision),
                 )
                 ip = getattr(hf_proc, "image_processor", None)
                 if ip is not None:
@@ -763,6 +787,7 @@ def _write_vision_processor_config(
                 hf_proc = AutoProcessor.from_pretrained(
                     hf_model_id,
                     trust_remote_code=trust_remote_code,
+                    **_revision_kwargs(revision),
                 )
                 ip = getattr(hf_proc, "image_processor", None)
                 if ip is not None:
@@ -776,8 +801,15 @@ def _write_vision_processor_config(
                             image_size = size
                         else:
                             size = _size_mapping(size)
-                            if size.get("longest_edge") is not None:
-                                image_size = size["longest_edge"]
+                            # Qwen-style processors encode shortest_edge and
+                            # longest_edge as pixel-count bounds, not side lengths.
+                            # Keep the vision config's nominal image size for the
+                            # Resize metadata and preserve those values below as
+                            # smart-resize bounds.
+                            if size.get("height") is not None:
+                                image_size = size["height"]
+                            elif size.get("width") is not None:
+                                image_size = size["width"]
                             min_pixels = size.get("shortest_edge") or min_pixels
                             max_pixels = size.get("longest_edge") or max_pixels
             except Exception:
@@ -1266,6 +1298,7 @@ def write_ort_genai_config(
     directory: str,
     *,
     hf_model_id: str | None = None,
+    revision: str | None = None,
     ep: str = "cpu",
     context_length: int = 4096,
     local_config_dir: str | None = None,
@@ -1291,6 +1324,8 @@ def write_ort_genai_config(
             (``bos_token_id``, ``eos_token_id``, ``pad_token_id``) populated
             by :meth:`~mobius._configs.ArchitectureConfig.from_transformers`,
             and tokenizer files are not copied unless ``local_config_dir`` is set.
+        revision: Immutable HuggingFace revision used for the config, tokenizer,
+            processor, and copied assets.
         ep: Execution provider for ``session_options`` in
             ``genai_config.json`` (e.g. ``"cpu"``, ``"cuda"``, ``"dml"``,
             ``"trt-rtx"``). Defaults to ``"cpu"``.
@@ -1358,7 +1393,9 @@ def write_ort_genai_config(
         import transformers
 
         hf_config = transformers.AutoConfig.from_pretrained(
-            hf_model_id, trust_remote_code=trust_remote_code
+            hf_model_id,
+            trust_remote_code=trust_remote_code,
+            **_revision_kwargs(revision),
         )
         model_type = hf_config.model_type
         cfg_model_type = getattr(config, "model_type", None)
@@ -1491,7 +1528,11 @@ def write_ort_genai_config(
             tokenizer_files = _copy_tokenizer_files_from_local(hf_model_id, directory)
         else:
             logger.info("Copying tokenizer files from %s", hf_model_id)
-            tokenizer_files = _copy_tokenizer_files(hf_model_id, directory)
+            tokenizer_files = _copy_tokenizer_files(
+                hf_model_id,
+                directory,
+                **_revision_kwargs(revision),
+            )
         for tf in tokenizer_files:
             result[tf] = os.path.join(directory, tf)
     elif local_config_dir is not None:
@@ -1512,6 +1553,7 @@ def write_ort_genai_config(
         config,
         directory,
         hf_model_id=hf_model_id,
+        revision=revision,
         trust_remote_code=trust_remote_code,
     )
     if processor_path:
@@ -1526,7 +1568,7 @@ def write_ort_genai_config(
     _fix_tokenizer_config(directory)
 
     # Ensure chat_template is in tokenizer_config.json
-    _fix_chat_template(directory, hf_model_id)
+    _fix_chat_template(directory, hf_model_id, revision=revision)
 
     # Correct assets that ship broken from upstream
     apply_asset_patches(directory)
@@ -1540,6 +1582,7 @@ def export_package(
     output_dir: str,
     *,
     hf_model_id: str | None = None,
+    revision: str | None = None,
     ep: str = "cpu",
     context_length: int = 4096,
     local_config_dir: str | None = None,
@@ -1573,6 +1616,8 @@ def export_package(
             resolution.  When ``None``, token IDs are read from ``pkg.config``
             and tokenizer files are not copied (unless ``local_config_dir``
             is provided).
+        revision: Immutable HuggingFace revision used for all downloaded
+            configuration, tokenizer, processor, and asset files.
         ep: Execution provider written to ``session_options`` in
             ``genai_config.json`` (e.g. ``"cpu"``, ``"cuda"``, ``"dml"``,
             ``"webgpu"``, ``"trt-rtx"``).
@@ -1636,6 +1681,7 @@ def export_package(
         pkg,
         output_dir,
         hf_model_id=hf_model_id,
+        revision=revision,
         ep=ep,
         context_length=context_length,
         local_config_dir=local_config_dir,
@@ -1657,6 +1703,7 @@ def auto_export(
     model_id: str,
     output_dir: str,
     *,
+    revision: str | None = None,
     dtype: str | None = None,
     task: str | None = None,
     external_data: str = "onnx",
@@ -1680,6 +1727,7 @@ def auto_export(
     Args:
         model_id: HuggingFace model repository ID.
         output_dir: Directory to write all output files.
+        revision: Immutable HuggingFace revision used for all downloads.
         dtype: Override model dtype (``"f32"``, ``"f16"``, ``"bf16"``).
         task: Override model task (auto-detected if ``None``).
         external_data: External data format (``"onnx"`` or
@@ -1725,6 +1773,7 @@ def auto_export(
     pkg = build(
         model_id,
         task=task,
+        revision=revision,
         dtype=dtype,
         load_weights=True,
         trust_remote_code=trust_remote_code,
@@ -1745,6 +1794,7 @@ def auto_export(
         pkg,
         output_dir,
         hf_model_id=model_id,
+        revision=revision,
         ep=ep,
         context_length=context_length,
         trust_remote_code=trust_remote_code,

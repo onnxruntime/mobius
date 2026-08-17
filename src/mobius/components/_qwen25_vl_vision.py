@@ -123,6 +123,9 @@ class Qwen25VLVisionRotaryEmbedding(nn.Module):
         # Concat h and w frequencies, then duplicate for cos/sin
         freqs = op.Concat(h_freqs, w_freqs, axis=-1)  # (N, dim)
         emb = op.Concat(freqs, freqs, axis=-1)  # (N, 2*dim)
+        # HuggingFace evaluates rotary trigonometry in float32. Keeping Cos/Sin
+        # out of bf16 also avoids unsupported CUDA/CPU fallback kernels.
+        emb = op.Cast(emb, to=1)
         cos = op.Cos(emb)
         sin = op.Sin(emb)
         return cos, sin

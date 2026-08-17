@@ -471,7 +471,10 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
     }
     torch_dtype = dtype_map.get(case.dtype, torch.float32)
     model, _tokenizer, processor = load_torch_multimodal_model(
-        case.model_id, dtype=torch_dtype, device=device
+        case.model_id,
+        dtype=torch_dtype,
+        device=device,
+        revision=case.revision,
     )
 
     # Load real image/video media from testdata/.

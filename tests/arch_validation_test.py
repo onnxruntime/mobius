@@ -94,7 +94,7 @@ _PARSE_PARAMS = _build_arch_params({})
 _GRAPH_PARAMS = _build_arch_params(_GRAPH_ONLY_XFAILS)
 
 
-def _load_hf_config(model_id: str):
+def _load_hf_config(model_id: str, revision: str | None = None):
     """Load HF config using AutoConfig first, fallback to raw config.json.
 
     AutoConfig handles model-specific field mappings (e.g. GPT-2's
@@ -104,9 +104,13 @@ def _load_hf_config(model_id: str):
     import transformers
 
     try:
-        return transformers.AutoConfig.from_pretrained(model_id, trust_remote_code=False)
+        return transformers.AutoConfig.from_pretrained(
+            model_id,
+            revision=revision,
+            trust_remote_code=False,
+        )
     except (ValueError, OSError):
-        return _try_load_config_json(model_id)
+        return _try_load_config_json(model_id, revision=revision)
 
 
 def _resolve_hf_config(hf_config):
@@ -147,14 +151,14 @@ def _build_graph(model_type: str, model_id: str):
     to bypass ArchitectureConfig.validate() which rejects non-LM configs
     (e.g. vision models with vocab_size=0).
     """
-    hf_config = _load_hf_config(model_id)
+    registration = registry.get_registration(model_type)
+    hf_config = _load_hf_config(model_id, revision=registration.test_revision)
     if hf_config is None:
         pytest.skip(
             f"Cannot download config for {model_id} (gated/private model or network error)"
         )
 
     hf_config, parent_config = _resolve_hf_config(hf_config)
-    registration = registry.get_registration(model_type)
     config = _config_from_hf(
         hf_config,
         parent_config=parent_config,
@@ -179,7 +183,8 @@ class TestArchValidation:
     @pytest.mark.parametrize("model_type,model_id", _PARSE_PARAMS)
     def test_config_downloads_and_parses(self, model_type: str, model_id: str):
         """Verify config.json can be downloaded and parsed."""
-        hf_config = _load_hf_config(model_id)
+        revision = registry.get_registration(model_type).test_revision
+        hf_config = _load_hf_config(model_id, revision=revision)
         if hf_config is None:
             pytest.skip(
                 f"Cannot download config for {model_id} (gated/private model or network error)"

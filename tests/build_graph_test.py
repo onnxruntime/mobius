@@ -1121,6 +1121,52 @@ class TestBuildGraphVisionLanguage:
         assert "input_ids" in {i.name for i in embed.graph.inputs}
         assert "inputs_embeds" in {o.name for o in embed.graph.outputs}
 
+    def test_glm_ocr_graph(self):
+        """Build GLM-OCR's dedicated vision tower and GLM text decoder."""
+        config = _base_config(
+            hidden_size=64,
+            intermediate_size=192,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            num_hidden_layers=2,
+            attn_qkv_bias=False,
+            mrope_section=[2, 3, 3],
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                patch_size=14,
+                in_channels=3,
+                out_hidden_size=64,
+                norm_eps=1e-5,
+            ),
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+            image_token_id=59280,
+            vision_start_token_id=59256,
+            vision_end_token_id=59257,
+        )
+        module = registry.get("glm_ocr")(config)
+        task = get_task(_default_task_for_model("glm_ocr"))
+        pkg = task.build(module, config)
+
+        assert set(pkg) == {"decoder", "vision_encoder", "embedding"}
+        assert {value.name for value in pkg["vision_encoder"].graph.inputs} == {
+            "pixel_values",
+            "image_grid_thw",
+        }
+        assert {value.name for value in pkg["vision_encoder"].graph.outputs} == {
+            "image_features"
+        }
+        assert "inputs_embeds" in {value.name for value in pkg["decoder"].graph.inputs}
+        assert "logits" in {value.name for value in pkg["decoder"].graph.outputs}
+        assert {value.name for value in pkg["embedding"].graph.inputs} == {
+            "input_ids",
+            "image_features",
+        }
+
     def test_qwen2_5_vl_text_graph(self):
         """Build Qwen2.5-VL text-only model."""
         config = _base_config(attn_qkv_bias=True, mrope_section=[8, 12, 12])

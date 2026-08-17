@@ -208,6 +208,11 @@ def _cmd_build(args: argparse.Namespace) -> None:
             "Error: --features text-only is not supported with --config (local "
             "directory). Use --model <hf-id> --features text-only instead."
         )
+    if args.revision is not None and args.config:
+        raise SystemExit(
+            "Error: --revision is only supported with --model. "
+            "Local --config directories are already immutable inputs."
+        )
 
     # --component selects one component of a diffusers pipeline; text-only
     # produces a single decoder-only model. Combining them would silently
@@ -342,13 +347,16 @@ def _cmd_build(args: argparse.Namespace) -> None:
             import transformers
 
             hf_config = transformers.AutoConfig.from_pretrained(
-                model_id_or_path, trust_remote_code=trust_remote_code
+                model_id_or_path,
+                revision=args.revision,
+                trust_remote_code=trust_remote_code,
             )
             task = _resolve_static_cache_task(getattr(hf_config, "model_type", ""))
 
         pkg = build(
             model_id_or_path,
             task=task,
+            revision=args.revision,
             dtype=dtype_override,
             load_weights=load_weights,
             trust_remote_code=trust_remote_code,
@@ -421,6 +429,7 @@ def _save_package(
             pkg,
             output_dir,
             hf_model_id=hf_model_id,
+            revision=getattr(args, "revision", None),
             ep=ep,
             local_config_dir=local_config_dir,
             trust_remote_code=getattr(args, "trust_remote_code", False),
@@ -691,6 +700,12 @@ def main(argv: list[str] | None = None) -> None:
         "--config",
         metavar="CONFIG_PATH",
         help="Path to a local model directory containing config.json (and optionally safetensors weights).",
+    )
+    build_parser.add_argument(
+        "--revision",
+        default=None,
+        metavar="REVISION",
+        help="Immutable HuggingFace revision used for config, weights, tokenizer, and assets.",
     )
     build_parser.add_argument(
         "output_dir",
