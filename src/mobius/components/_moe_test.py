@@ -244,8 +244,8 @@ class TestMoELayer:
 
         _cast_module_dtype(layer, ir.DataType.FLOAT16)
         assert layer.gate.weight.dtype == ir.DataType.FLOAT16
-        assert layer.fc1_scales.dtype == ir.DataType.FLOAT
-        assert layer.fc2_scales.dtype == ir.DataType.FLOAT
+        assert layer.fc1_scales.dtype == ir.DataType.FLOAT16
+        assert layer.fc2_scales.dtype == ir.DataType.FLOAT16
 
     def test_expert_major_packing_matches_static_64_expert_top6_reference(self):
         """Packed QMoE math matches the existing loop-over-experts semantics."""
