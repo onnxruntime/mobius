@@ -8,7 +8,7 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import pack_qmoe_expert_weights
+from mobius._weight_utils import pack_qmoe_expert_weights, preprocess_olive_weights
 from mobius.components._attention import Qwen35Attention
 from mobius.components._common import (
     Embedding,
@@ -724,8 +724,58 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
         ``lm_head.*`` (final projection — tied or untied to embeddings).
         Mirrors :meth:`Qwen35VL3ModelCausalLMModel.preprocess_weights` but
         the decoder uses the MoE-flavoured text model and HF stores experts
-        as fused tensors that must be unpacked.
+        as fused tensors. For the portable dense fallback these tensors are
+        unpacked into per-expert weights. When Olive quantization matches the
+        native QMoE ABI, they instead remain expert-major, are renamed from
+        Olive's suffix convention, and are packed into QMoE parameters.
         """
+        quantization = self.config.quantization
+        use_qmoe = _supported_qmoe_quantization(quantization) is not None
+        if use_qmoe and quantization.quant_method != "olive":
+            raise NotImplementedError(
+                "Qwen35MoEVL3ModelCausalLMModel currently only supports QMoE "
+                "export for Olive-quantized checkpoints "
+                f"(quant_method='olive'); got quant_method={quantization.quant_method!r}. "
+                "GPTQ/AWQ VL-MoE export is not yet implemented."
+            )
+        if quantization is not None and (
+            quantization.quantize_embeddings or quantization.quantize_lm_head
+        ):
+            raise NotImplementedError(
+                "Quantized embeddings and LM heads are not yet supported by "
+                "Qwen35MoEVL3ModelCausalLMModel: decoder.model.embed_tokens, "
+                "embedding.embed_tokens, and decoder.lm_head currently require "
+                "float weights."
+            )
+
+        tie = self.config.tie_word_embeddings or (
+            quantization is not None and quantization.tie_word_embeddings
+        )
+        if not use_qmoe:
+            packed_expert_keys = []
+            for key in state_dict:
+                stripped = key[len("model.") :] if key.startswith("model.") else key
+                if (
+                    stripped.startswith("language_model.")
+                    and ".mlp.experts." in stripped
+                    and any(
+                        stripped.endswith(suffix)
+                        for suffix in ("_qweight", "_scales", "_qzeros")
+                    )
+                ):
+                    packed_expert_keys.append(key)
+            if packed_expert_keys:
+                raise ValueError(
+                    "Quantized decoder MoE expert weights were found "
+                    f"(e.g. {packed_expert_keys[0]!r}) but this quantization "
+                    "config doesn't match the native QMoE ABI "
+                    "(_supported_qmoe_quantization returned None). The dense "
+                    "loop-over-experts fallback only supports unquantized "
+                    "fused expert tensors, not packed quantized ones. Use a "
+                    "QMoE-ABI-compatible quantization config (see "
+                    "_supported_qmoe_quantization) for MoE models instead."
+                )
+
         renamed: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             if key.startswith(("mtp_", "mtp.")):
@@ -742,10 +792,7 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
                 suffix = stripped[len("language_model.") :]
                 renamed[f"decoder.model.{suffix}"] = value
                 renamed[f"embedding.{suffix}"] = value
-                if (
-                    self.config.tie_word_embeddings
-                    and stripped == "language_model.embed_tokens.weight"
-                ):
+                if tie and stripped == "language_model.embed_tokens.weight":
                     renamed["decoder.lm_head.weight"] = value
             elif stripped.startswith("language_model.lm_head."):
                 renamed[f"decoder.{stripped[len('language_model.') :]}"] = value
@@ -759,16 +806,31 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
                 # ``[num_experts, 2*inter, hidden]`` (gate + up concatenated
                 # along dim 1) and ``experts.down_proj`` as
                 # ``[num_experts, hidden, inter]``.
-                if suffix.endswith(".mlp.experts.gate_up_proj"):
+                if not use_qmoe and suffix.endswith(".mlp.experts.gate_up_proj"):
                     prefix = target[: -len("experts.gate_up_proj")]
                     half = value.shape[1] // 2
                     for i in range(value.shape[0]):
                         renamed[f"{prefix}experts.{i}.gate_proj.weight"] = value[i, :half]
                         renamed[f"{prefix}experts.{i}.up_proj.weight"] = value[i, half:]
-                elif suffix.endswith(".mlp.experts.down_proj"):
+                elif not use_qmoe and suffix.endswith(".mlp.experts.down_proj"):
                     prefix = target[: -len("experts.down_proj")]
                     for i in range(value.shape[0]):
                         renamed[f"{prefix}experts.{i}.down_proj.weight"] = value[i]
                 else:
                     renamed[target] = value
+
+        if quantization is not None and quantization.quant_method == "olive":
+            renamed = preprocess_olive_weights(
+                renamed,
+                bits=quantization.bits,
+                group_size=quantization.group_size,
+                quantize_embeddings=quantization.quantize_embeddings,
+                quantize_lm_head=quantization.quantize_lm_head,
+                tie_word_embeddings=tie,
+            )
+        if use_qmoe:
+            # ``pack_qmoe_expert_weights`` replaces only the matched
+            # ``.mlp.experts.*`` substring, preserving the routed
+            # ``decoder.model.layers.N`` prefix.
+            renamed = pack_qmoe_expert_weights(renamed, target_moe_path=".mlp")
         return renamed
