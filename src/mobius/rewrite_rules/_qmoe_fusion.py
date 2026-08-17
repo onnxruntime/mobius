@@ -498,6 +498,13 @@ def fuse_dense_moe_to_qmoe(model: ir.Model) -> int:
             )
             continue
         activation_dtype = layer.hidden.dtype
+        if activation_dtype is None:
+            # `layer.hidden` is often a graph-internal, not-yet-type-inferred
+            # value in real models. Fall back to the dtype of an existing
+            # expert's MatMulNBits scales, which already matches the
+            # pre-fusion activation dtype (scales share QMoE's/MatMulNBits's
+            # "T" type constraint with the activation).
+            activation_dtype = down.inputs[2].dtype
         if activation_dtype not in {
             ir.DataType.FLOAT,
             ir.DataType.FLOAT16,

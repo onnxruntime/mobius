@@ -92,15 +92,24 @@ def _dequant(
 class _Quant:
     """A randomly-generated int4 ``MatMulNBits`` weight triple."""
 
-    def __init__(self, rng: np.random.Generator, n: int, kdim: int) -> None:
+    def __init__(
+        self,
+        rng: np.random.Generator,
+        n: int,
+        kdim: int,
+        scale_dtype: ir.DataType = ir.DataType.FLOAT16,
+    ) -> None:
         n_blocks = kdim // BLOCK
         codes = rng.integers(0, 16, size=(n, kdim), dtype=np.int32)
         zp_codes = rng.integers(0, 16, size=(n, n_blocks), dtype=np.int32)
         self.weight = _pack_weight(codes, BLOCK)
-        self.scales = rng.random((n, n_blocks), dtype=np.float32).astype(np.float16) * 0.1
+        self.scales = (rng.random((n, n_blocks), dtype=np.float32) * 0.1).astype(
+            scale_dtype.numpy()
+        )
         self.zero_points = _pack_zero_points(zp_codes)
         self.n = n
         self.kdim = kdim
+        self.scale_dtype = scale_dtype
 
     @property
     def dense(self) -> np.ndarray:
@@ -118,7 +127,7 @@ def _init(graph: ir.Graph, name: str, arr: np.ndarray, dtype: ir.DataType) -> ir
 
 def _matmulnbits(name: str, x: ir.Value, q: _Quant, graph: ir.Graph) -> ir.Value:
     w = _init(graph, f"{name}.weight", q.weight, ir.DataType.UINT8)
-    s = _init(graph, f"{name}.scales", q.scales, ir.DataType.FLOAT16)
+    s = _init(graph, f"{name}.scales", q.scales, q.scale_dtype)
     z = _init(graph, f"{name}.zero_points", q.zero_points, ir.DataType.UINT8)
     node = ir.node(
         "MatMulNBits",
@@ -147,21 +156,31 @@ def _constant_int(graph_nodes: list[ir.Node], name: str, value: int) -> ir.Value
 
 def _build_dense_graph(
     activation_dtype: ir.DataType = ir.DataType.FLOAT16,
+    *,
+    hidden_dtype: ir.DataType | None = None,
 ) -> tuple[ir.Model, dict[str, _Quant], np.ndarray]:
-    """Build a tiny dense-fallback Qwen35-MoE graph and return it with its weights."""
+    """Build a tiny dense-fallback Qwen35-MoE graph and return it with its weights.
+
+    ``activation_dtype`` controls the dtype of MatMulNBits scales/router casts.
+    ``hidden_dtype`` (defaults to ``activation_dtype``) controls the declared
+    type of the ``hidden`` graph input; pass ``ir.DataType.UNDEFINED`` to
+    simulate a not-yet-type-inferred graph-internal value.
+    """
     rng = _rng()
     quants: dict[str, _Quant] = {}
     nodes: list[ir.Node] = []
+    if hidden_dtype is None:
+        hidden_dtype = activation_dtype
 
     hidden = ir.Value(
         name="hidden",
         shape=ir.Shape(["T", H]),
-        type=ir.TensorType(activation_dtype),
+        type=ir.TensorType(hidden_dtype) if hidden_dtype != ir.DataType.UNDEFINED else None,
     )
     graph = ir.Graph([hidden], [], nodes=[], name="tiny_moe")
 
     def q(key: str, n: int, kdim: int) -> _Quant:
-        quants[key] = _Quant(rng, n, kdim)
+        quants[key] = _Quant(rng, n, kdim, scale_dtype=activation_dtype)
         return quants[key]
 
     # Router: quantized gate MatMulNBits -> TopK -> Softmax.
@@ -451,6 +470,26 @@ def test_scales_match_activation_dtype(activation_dtype: ir.DataType) -> None:
             axis=0,
         ).astype(activation_dtype.numpy())
         np.testing.assert_array_equal(fc1_s[e], expected)
+        expected_fc2 = quants[f"d{e}"].scales.reshape(H, -1).astype(activation_dtype.numpy())
+        np.testing.assert_array_equal(fc2_s[e], expected_fc2)
+
+
+def test_fuses_when_hidden_dtype_is_untyped() -> None:
+    """Graph-internal `hidden` values are commonly untyped before shape inference.
+
+    The fusion must still succeed by falling back to the dtype of an existing
+    expert's MatMulNBits scales, rather than silently skipping the layer.
+    """
+    model, _, _ = _build_dense_graph(ir.DataType.FLOAT16, hidden_dtype=ir.DataType.UNDEFINED)
+    graph = model.graph
+    assert graph.inputs[0].dtype is None
+
+    fused = fuse_dense_moe_to_qmoe(model)
+
+    assert fused == 1
+    qmoe = next(n for n in graph if n.op_type == "QMoE")
+    assert qmoe.inputs[3].dtype == ir.DataType.FLOAT16
+    assert qmoe.inputs[6].dtype == ir.DataType.FLOAT16
 
 
 def test_rewritten_forward_matches_dense_forward() -> None:
