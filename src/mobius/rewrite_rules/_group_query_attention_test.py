@@ -327,12 +327,14 @@ class TestGroupQueryAttentionRules:
             # computed in FLOAT32 for routing-score numerical stability.
             assert node.inputs[1] is not None
             assert node.inputs[1].dtype == ir.DataType.FLOAT16
-            # fc1_scales/fc2_scales (indices 3, 6) are quantization scale
-            # tensors, independent of the hidden_states/router dtype.
+            # fc1_scales/fc2_scales (indices 3, 6) must match the
+            # hidden_states/activation dtype (FLOAT16 here): QMoE's kernel
+            # registration requires T2 (scales) to exactly equal T
+            # (activation), so scales are no longer pinned to FLOAT32.
             assert node.inputs[3] is not None
-            assert node.inputs[3].dtype == ir.DataType.FLOAT
+            assert node.inputs[3].dtype == ir.DataType.FLOAT16
             assert node.inputs[6] is not None
-            assert node.inputs[6].dtype == ir.DataType.FLOAT
+            assert node.inputs[6].dtype == ir.DataType.FLOAT16
             assert node.inputs[14] is not None
             assert node.inputs[14].dtype == ir.DataType.FLOAT16
 

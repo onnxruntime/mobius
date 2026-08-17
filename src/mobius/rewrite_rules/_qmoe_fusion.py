@@ -21,14 +21,15 @@ a requantization:
   (the packed ``uint8`` bytes are copied unchanged; ``swiglu_fusion=2`` tells the
   kernel the gate half precedes the up half).
 * ``fc2_experts_weights`` = per-expert ``flatten(down_w)`` (bytes unchanged).
-* scales are upcast ``float16 -> float32`` (value-exact, lossless) because the
-  QMoE kernel requires ``float32`` scales and ``router_probs``.
+* scales are cast to the activation dtype because QMoE's ``T2`` kernel type
+  constraint requires integer-quantization scales to match ``input``.
 * zero-points are copied unchanged (same low-nibble-first packing as
   ``MatMulNBits``).
 
-The router logits (a quantized ``MatMulNBits`` gate) are ``Cast`` to ``float32``
-and passed as ``router_probs`` with ``normalize_routing_weights=1`` -- matching
-:class:`mobius.components._moe.TopKGate` (``Softmax(TopK(logits))``).
+The router logits (a quantized ``MatMulNBits`` gate) are cast to the activation
+dtype and passed as ``router_probs`` with ``normalize_routing_weights=1`` --
+matching :class:`mobius.components._moe.TopKGate`
+(``Softmax(TopK(logits))``).
 
 Any surrounding **shared expert** (Qwen2-MoE style ``shared_expert`` +
 ``shared_expert_gate``) is left untouched: only the routed per-expert storm and
@@ -319,12 +320,14 @@ def _pack_projection(nodes: list[ir.Node], slot: int) -> np.ndarray:
     return np.stack(stacked, axis=0)
 
 
-def _pack_scales(nodes: list[ir.Node], slot: int, out_features: int) -> np.ndarray:
+def _pack_scales(
+    nodes: list[ir.Node], slot: int, out_features: int, dtype: ir.DataType
+) -> np.ndarray:
     stacked = []
     for node in nodes:
         arr = _array(node.inputs[slot]).reshape(out_features, -1)
-        stacked.append(arr.astype(np.float32))
-    return np.stack(stacked, axis=0)
+        stacked.append(arr)
+    return np.stack(stacked, axis=0).astype(dtype.numpy())
 
 
 def _pack_zero_points(nodes: list[ir.Node], slot: int, out_features: int) -> np.ndarray:
@@ -334,7 +337,9 @@ def _pack_zero_points(nodes: list[ir.Node], slot: int, out_features: int) -> np.
     return np.stack(stacked, axis=0)
 
 
-def _fuse_layer(graph: ir.Graph, layer: _DenseMoELayer, index: int) -> None:
+def _fuse_layer(
+    graph: ir.Graph, layer: _DenseMoELayer, index: int, activation_dtype: ir.DataType
+) -> None:
     ids = sorted(layer.experts)
     gate_nodes = [layer.experts[i].gate for i in ids]
     up_nodes = [layer.experts[i].up for i in ids]
@@ -350,10 +355,10 @@ def _fuse_layer(graph: ir.Graph, layer: _DenseMoELayer, index: int) -> None:
     fc1_w = np.concatenate([gate_w, up_w], axis=1)
     fc2_w = _pack_projection(down_nodes, 1)
 
-    gate_s = _pack_scales(gate_nodes, 2, inter)
-    up_s = _pack_scales(up_nodes, 2, inter)
+    gate_s = _pack_scales(gate_nodes, 2, inter, activation_dtype)
+    up_s = _pack_scales(up_nodes, 2, inter, activation_dtype)
     fc1_s = np.concatenate([gate_s, up_s], axis=1)
-    fc2_s = _pack_scales(down_nodes, 2, hidden_dim)
+    fc2_s = _pack_scales(down_nodes, 2, hidden_dim, activation_dtype)
 
     fc1_zp = fc2_zp = None
     if has_zp:
@@ -366,11 +371,11 @@ def _fuse_layer(graph: ir.Graph, layer: _DenseMoELayer, index: int) -> None:
     fc1_w_v = _make_initializer(
         graph, f"{prefix}.fc1_experts_weights", fc1_w, ir.DataType.UINT8
     )
-    fc1_s_v = _make_initializer(graph, f"{prefix}.fc1_scales", fc1_s, ir.DataType.FLOAT)
+    fc1_s_v = _make_initializer(graph, f"{prefix}.fc1_scales", fc1_s, activation_dtype)
     fc2_w_v = _make_initializer(
         graph, f"{prefix}.fc2_experts_weights", fc2_w, ir.DataType.UINT8
     )
-    fc2_s_v = _make_initializer(graph, f"{prefix}.fc2_scales", fc2_s, ir.DataType.FLOAT)
+    fc2_s_v = _make_initializer(graph, f"{prefix}.fc2_scales", fc2_s, activation_dtype)
     fc1_zp_v = (
         _make_initializer(graph, f"{prefix}.fc1_zero_points", fc1_zp, ir.DataType.UINT8)
         if fc1_zp is not None
@@ -385,7 +390,7 @@ def _fuse_layer(graph: ir.Graph, layer: _DenseMoELayer, index: int) -> None:
     cast = ir.node(
         "Cast",
         inputs=[layer.logits],
-        attributes={"to": ir.DataType.FLOAT.value},
+        attributes={"to": activation_dtype.value},
         num_outputs=1,
         name=f"{prefix}.router_probs_cast",
     )
@@ -460,9 +465,9 @@ def fuse_dense_moe_to_qmoe(model: ir.Model) -> int:
     """Fuse every dense-fallback MoE subgraph in ``model`` into ``QMoE`` nodes.
 
     Reuses the existing int4 ``MatMulNBits`` expert weights byte-for-byte (pure
-    expert-major concat/layout transform, no requantization). ``float16`` scales
-    are upcast to the ``float32`` the QMoE kernel requires (lossless). Any shared
-    expert is preserved.
+    expert-major concat/layout transform, no requantization). Scales and router
+    probabilities are cast to the activation dtype required by QMoE's kernel
+    type constraints. Any shared expert is preserved.
 
     Args:
         model: The IR model to rewrite in place.
@@ -492,7 +497,26 @@ def fuse_dense_moe_to_qmoe(model: ir.Model) -> int:
                 block_size,
             )
             continue
-        _fuse_layer(graph, layer, index)
+        activation_dtype = layer.hidden.dtype
+        if activation_dtype is None:
+            # `layer.hidden` is often a graph-internal, not-yet-type-inferred
+            # value in real models. Fall back to the dtype of an existing
+            # expert's MatMulNBits scales, which already matches the
+            # pre-fusion activation dtype (scales share QMoE's/MatMulNBits's
+            # "T" type constraint with the activation).
+            activation_dtype = down.inputs[2].dtype
+        if activation_dtype not in {
+            ir.DataType.FLOAT,
+            ir.DataType.FLOAT16,
+            ir.DataType.BFLOAT16,
+        }:
+            logger.warning(
+                "skipping MoE layer at %s: QMoE activation dtype is missing or unsupported (%s)",
+                layer.topk.name,
+                activation_dtype,
+            )
+            continue
+        _fuse_layer(graph, layer, index, activation_dtype)
         fused += 1
     if fused:
         _remove_dead_nodes(graph)

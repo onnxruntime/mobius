@@ -20,10 +20,13 @@ from __future__ import annotations
 
 __all__ = ["ModelPackage"]
 
+import inspect
 import logging
 import os
+import threading
 from collections import UserDict
 from collections.abc import Callable
+from typing import Any
 
 import onnx_ir as ir
 import torch
@@ -71,6 +74,7 @@ class ModelPackage(UserDict[str, ir.Model]):
         *,
         external_data: str = "onnx",
         max_shard_size_bytes: int | None = None,
+        max_workers: int = 8,
         components: Callable[[str], bool] | None = None,
         progress_bar: bool = True,
         check_weights: bool = True,
@@ -103,8 +107,14 @@ class ModelPackage(UserDict[str, ir.Model]):
                     errors on some CUDA/cuBLAS versions when loading weights
                     via memory-mapped I/O.  Use ``"onnx"`` (the default) for
                     models targeting CUDA execution.
-            max_shard_size_bytes: Maximum shard size in bytes for safetensors
-                format.  Only used when *external_data* is ``"safetensors"``.
+            max_shard_size_bytes: Maximum external-data shard size in bytes.
+                Used by both ONNX and safetensors external-data formats. A
+                single tensor larger than this value is written in its own
+                oversized shard.
+            max_workers: Number of threads used to write ONNX external data.
+                Defaults to 8. Set to 1 to save serially. Older ``onnx_ir``
+                versions that do not support concurrent saves fall back to
+                serial behavior.
             components: Optional predicate ``(name) -> bool`` that selects
                 which components to save.  When ``None`` (default), all
                 components are saved.  Examples::
@@ -122,17 +132,18 @@ class ModelPackage(UserDict[str, ir.Model]):
 
         Raises:
             ValueError: If *external_data* is not ``"onnx"`` or
-                ``"safetensors"``, or if *check_weights* is ``True`` and
-                any initializer is missing its ``const_value``.
+                ``"safetensors"``, if *max_workers* is not positive, or if
+                *check_weights* is ``True`` and any initializer is missing its
+                ``const_value``.
         """
         if external_data not in {"onnx", "safetensors"}:
             raise ValueError(
                 f"Unknown external_data format {external_data!r}. "
                 "Expected 'onnx' or 'safetensors'."
             )
+        if max_workers <= 0:
+            raise ValueError(f"max_workers must be positive, got {max_workers}.")
         os.makedirs(directory, exist_ok=True)
-        callback = _make_progress_callback() if progress_bar else None
-
         selected = {
             name: model
             for name, model in self.data.items()
@@ -141,6 +152,7 @@ class ModelPackage(UserDict[str, ir.Model]):
         use_subfolders = len(selected) > 1
 
         for name, model in selected.items():
+            callback = _make_progress_callback() if progress_bar else None
             if check_weights:
                 _check_weights(name, model)
             if use_subfolders:
@@ -157,7 +169,14 @@ class ModelPackage(UserDict[str, ir.Model]):
                     callback=callback,
                 )
             else:
-                ir.save(model, path, external_data="model.onnx.data", callback=callback)
+                save_kwargs: dict[str, Any] = {
+                    "external_data": "model.onnx.data",
+                    "max_shard_size_bytes": max_shard_size_bytes,
+                    "callback": callback,
+                }
+                if "max_workers" in inspect.signature(ir.save).parameters:
+                    save_kwargs["max_workers"] = max_workers
+                ir.save(model, path, **save_kwargs)
 
     def validate_weights(self) -> None:
         """Raise if any component initializer has no assigned tensor data."""
@@ -294,19 +313,47 @@ class ModelPackage(UserDict[str, ir.Model]):
 
 
 def _make_progress_callback():
-    """Create a tqdm progress-bar callback for ``ir.save``."""
-    pbar = tqdm.tqdm()
-    total_set = False
+    """Create a thread-safe tqdm progress-bar callback for ``ir.save``.
+
+    Newer ``onnx_ir`` versions may invoke callbacks concurrently and out of
+    index order. Count invocations instead of tracking ``metadata.index`` and
+    derive each bar's position from its shard filename so rendering order is
+    deterministic. Serialize all progress-bar mutations. This remains compatible
+    with ``onnx_ir`` 1.0, where callbacks are invoked serially.
+    """
+    lock = threading.Lock()
+    bars: dict[str, tqdm.tqdm] = {}
 
     def callback(tensor: ir.TensorProtocol, metadata: ir.external_data.CallbackInfo) -> None:
-        nonlocal total_set
-        if not total_set:
-            pbar.total = metadata.total
-            total_set = True
-        pbar.update()
-        pbar.set_description(
-            f"Saving {tensor.name} ({tensor.dtype.short_name()}, {tensor.shape})"
-        )
+        with lock:
+            shard_total = getattr(metadata, "shard_total", None)
+            key = metadata.filename if shard_total is not None else "__all__"
+            pbar = bars.get(key)
+            if pbar is None:
+                description = (
+                    f"Saving {metadata.filename}"
+                    if shard_total is not None
+                    else "Saving external data"
+                )
+                position = 0
+                if shard_total is not None:
+                    shard_prefix, separator, _ = metadata.filename.rpartition("-of-")
+                    shard_number = shard_prefix.rpartition("-")[2]
+                    if separator and shard_number.isdigit():
+                        position = int(shard_number) - 1
+                pbar = tqdm.tqdm(
+                    total=shard_total if shard_total is not None else metadata.total,
+                    desc=description,
+                    position=position,
+                    leave=True,
+                )
+                bars[key] = pbar
+            pbar.update()
+            pbar.set_postfix_str(
+                f"{tensor.name} ({tensor.dtype.short_name()}, {tensor.shape})"
+            )
+            if pbar.n >= pbar.total:
+                pbar.close()
 
     return callback
 
