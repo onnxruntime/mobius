@@ -23,7 +23,6 @@ from onnxscript import OpBuilder, nn
 
 from mobius.components._common import Linear
 from mobius.components._rms_norm import RMSNorm
-from mobius.components._vision import VisionLayerNorm
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -116,90 +115,6 @@ class MLPMultiModalProjector(nn.Module):
         hidden = op.Gelu(hidden)
         hidden = self.linear_2(op, hidden)
         return hidden
-
-
-class Cosmos3EdgeMultiModalProjector(nn.Module):
-    """Cosmos3-Edge pixel-shuffle merger projector.
-
-    ``LayerNorm → spatial 2x2 pixel-shuffle → Linear(fc1) → GELU → Linear(fc2)``
-
-    The SigLIP vision encoder emits a fixed ``grid x grid`` patch grid
-    (``num_patches`` patches, e.g. 16x16 = 256). ``use_postshuffle_norm=false``
-    means the ``LayerNorm`` is applied on the raw ``vision_hidden_size`` (1152)
-    features **before** the spatial merge. The merge concatenates each
-    ``spatial_merge_size x spatial_merge_size`` block of adjacent patches into a
-    single ``spatial_merge_size**2 * vision_hidden_size`` (4608) vector, which
-    ``linear_fc1`` maps to ``intermediate_size`` (11520) and ``linear_fc2`` maps
-    to ``text_hidden_size`` (2048).
-
-    HF weights (``model.projector.*``):
-    - ``norm.{weight,bias}`` (pre-shuffle LayerNorm)
-    - ``linear_fc1.{weight,bias}``
-    - ``linear_fc2.{weight,bias}``
-    """
-
-    def __init__(
-        self,
-        vision_hidden_size: int,
-        text_hidden_size: int,
-        intermediate_size: int,
-        grid_size: int,
-        spatial_merge_size: int = 2,
-        norm_eps: float = 1e-6,
-    ):
-        super().__init__()
-        if grid_size <= 0:
-            raise ValueError(f"grid_size must be positive, got {grid_size}")
-        if spatial_merge_size <= 0:
-            raise ValueError(f"spatial_merge_size must be positive, got {spatial_merge_size}")
-        if grid_size % spatial_merge_size != 0:
-            raise ValueError(
-                f"grid_size ({grid_size}) must be divisible by "
-                f"spatial_merge_size ({spatial_merge_size})"
-            )
-        self._grid = grid_size
-        self._ms = spatial_merge_size
-        self._vision_hidden = vision_hidden_size
-        merged_dim = vision_hidden_size * spatial_merge_size * spatial_merge_size
-        # Pre-shuffle LayerNorm over the raw vision hidden size.
-        self.norm = VisionLayerNorm(vision_hidden_size, eps=norm_eps)
-        self.linear_fc1 = Linear(merged_dim, intermediate_size, bias=True)
-        self.linear_fc2 = Linear(intermediate_size, text_hidden_size, bias=True)
-
-    def forward(self, op: OpBuilder, vision_features: ir.Value):
-        # vision_features: [batch, grid*grid, vision_hidden]
-        ms = self._ms
-        g = self._grid
-        gm = g // ms
-        d = self._vision_hidden
-
-        # Pre-shuffle LayerNorm (use_postshuffle_norm=false).
-        x = self.norm(op, vision_features)
-
-        batch = op.Shape(vision_features, start=0, end=1)  # dynamic [1]
-
-        # [B, g*g, D] -> [B, g/ms, ms, g/ms, ms, D]
-        shape_6d = op.Concat(
-            batch,
-            op.Constant(value_ints=[gm, ms, gm, ms, d]),
-            axis=0,
-        )
-        x = op.Reshape(x, shape_6d)
-        # Group hidden dim outermost per merged block (HF F.unfold ordering):
-        # [B, g/ms, ms, g/ms, ms, D] -> [B, g/ms, g/ms, D, ms, ms]
-        x = op.Transpose(x, perm=[0, 1, 3, 5, 2, 4])
-        # Flatten to [B, (g/ms)^2, D*ms*ms]
-        shape_3d = op.Concat(
-            batch,
-            op.Constant(value_ints=[gm * gm, d * ms * ms]),
-            axis=0,
-        )
-        x = op.Reshape(x, shape_3d)
-
-        x = self.linear_fc1(op, x)
-        x = op.Gelu(x)
-        x = self.linear_fc2(op, x)
-        return x
 
 
 class LinearMultiModalProjector(nn.Module):

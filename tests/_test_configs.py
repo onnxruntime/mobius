@@ -2183,12 +2183,20 @@ _TINY_COSMOS3_EDGE_VISION = VisionConfig(
     intermediate_size=64,
     num_hidden_layers=1,
     num_attention_heads=2,
-    image_size=28,
-    patch_size=14,
+    image_size=64,
+    patch_size=16,
+    # Learned position-embedding reference grid (4x4), resampled per image.
+    num_patches=16,
     norm_eps=1e-6,
     spatial_merge_size=2,
+    temporal_patch_size=1,
     out_hidden_size=64,
     projector_intermediate_size=64,
+    use_postshuffle_norm=False,
+    image_token_id=19,
+    video_token_id=18,
+    vision_start_token_id=20,
+    vision_end_token_id=21,
 )
 
 _TINY_MUSE_GLIMMER_VISION = VisionConfig(
@@ -2286,6 +2294,7 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
             "hidden_act": "relu2",
             "mlp_bias": False,
             "mrope_section": [24, 20, 20],
+            "mrope_interleaved": True,
         },
         True,
     ),

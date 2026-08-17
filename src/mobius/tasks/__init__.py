@@ -29,6 +29,9 @@ __all__ = [
     "CodecTask",
     "ComponentSpec",
     "ControlNetTask",
+    "Cosmos3AVAEAudioDecoderTask",
+    "Cosmos3AVAEAudioTokenizerTask",
+    "Cosmos3OmniGeneratorTask",
     "DeepSeekV4Task",
     "DFlashDraftTask",
     "Eagle3DraftTask",
@@ -46,6 +49,7 @@ __all__ = [
     "Cosmos3EdgeVLTask",
     "HybridQwenVLTask",
     "ImageClassificationTask",
+    "LatentDynamicsTask",
     "ModelTask",
     "MllamaVisionLanguageTask",
     "MageVLTask",
@@ -77,6 +81,7 @@ __all__ = [
     "VisionLanguageTask",
     "VisionEncoderDecoderTask",
     "WorldModelTask",
+    "WanVAETask",
     "build_decoder_from_embeds",
     "build_embedding_from_features",
     "get_task",
@@ -98,6 +103,11 @@ from mobius.tasks._causal_lm import (
 )
 from mobius.tasks._codec import CodecTask
 from mobius.tasks._controlnet import ControlNetTask
+from mobius.tasks._cosmos3_audio import (
+    Cosmos3AVAEAudioDecoderTask,
+    Cosmos3AVAEAudioTokenizerTask,
+)
+from mobius.tasks._cosmos3_omni_generator import Cosmos3OmniGeneratorTask
 from mobius.tasks._ctc_asr import CTCAsrTask, FeatureCTCAsrTask
 from mobius.tasks._deepseek_v4 import DeepSeekV4Task
 from mobius.tasks._denoising import DenoisingTask
@@ -145,7 +155,8 @@ from mobius.tasks._vision_language_3model import (
     QwenVLTask,
     VisionLanguageTask,
 )
-from mobius.tasks._world_model import WorldModelTask
+from mobius.tasks._wan_vae import WanVAETask
+from mobius.tasks._world_model import LatentDynamicsTask, WorldModelTask
 
 # ---------------------------------------------------------------------------
 # Task registry
@@ -159,6 +170,9 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "feature-ctc-asr": FeatureCTCAsrTask,
     "codec": CodecTask,
     "controlnet": ControlNetTask,
+    "cosmos3-audio-decoder": Cosmos3AVAEAudioDecoderTask,
+    "cosmos3-audio-tokenizer": Cosmos3AVAEAudioTokenizerTask,
+    "cosmos3-omni-generator": Cosmos3OmniGeneratorTask,
     "denoising": DenoisingTask,
     "diarization": DiarizationTask,
     "feature-extraction": FeatureExtractionTask,
@@ -175,6 +189,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "eagle3-draft": Eagle3DraftTask,
     "qwen35-mtp": Qwen35MtpTask,
     "vae": VAETask,
+    "wan-vae": WanVAETask,
     "qwen-image-vae": QwenImageVAETask,
     "qwen-image-denoising": QwenImageDenoisingTask,
     "qwen-image-edit-vae": QwenImageEditVAETask,
@@ -206,6 +221,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "ssm2-text-generation": SSM2CausalLMTask,
     "tts": TTSTask,
     "video-denoising": VideoDenoisingTask,
+    "latent-dynamics": LatentDynamicsTask,
     "world-model": WorldModelTask,
 }
 

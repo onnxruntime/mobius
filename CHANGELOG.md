@@ -7,35 +7,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Compositional world-model pipelines
+
+#### Added
+
+- A runtime-agnostic `PipelineBuilder` / `PipelineManifest` /
+  `PipelinePackage` framework for heterogeneous world models. It validates
+  typed graph ports, input-source closure, dataflow, recurrent state,
+  registered roles/strategies/transforms, runtime capabilities, safe assets,
+  and atomic `pipeline.json` persistence.
+- Executable pipeline schema 1.1: versioned model profiles, input semantics,
+  registered generated-input programs, explicit state lifecycle,
+  scheduler/sampling/stopping controls, transform parameters, and per-component
+  dtype/EP hints.
+- `build_world_model()` and `--features world-model`, with a complete
+  `cosmos3_omni` implementation: Qwen3-VL Reasoner, unified MoT diffusion
+  Generator, Wan video VAE, optional full/decoder-only Cosmos3 AVAE, Sound
+  projection, and domain-aware Action projection.
+- Complete `cosmos3_edge` world-model composition for
+  `nvidia/Cosmos3-Edge` and `Cosmos3-Edge-Policy-DROID`: Edge
+  Nemotron/SigLIP Reasoner, shared MoT Generator, Wan VAE, and Action head.
+- Exact Mobius implementations for `Cosmos3OmniTransformer`,
+  `AutoencoderKLWan`, and `Cosmos3AVAEAudioTokenizer`.
+- Single-frame (image) mode for the Wan video VAE: the exported encoder accepts
+  `frames = 1` and the decoder accepts `latent_frames = 1`, matching upstream
+  diffusers' chunk-0 behaviour, which enables native Cosmos3 text-to-image.
+
+#### Changed
+
+- The original fixed four-output world-model API is now accurately named
+  `LatentDynamicsTask` / `LatentDynamicsConfig` /
+  `MLPLatentDynamicsModel`. The original `WorldModel*` names remain aliases.
+
 ### NVIDIA Cosmos 3 Edge vision-language model (`cosmos3_edge`)
 
 #### Added
 
 - Support for the **full `cosmos3_edge` vision-language model**
   (`nvidia/Cosmos3-Edge`, `Cosmos3EdgeForConditionalGeneration`) as a 3-model
-  onnxruntime-genai split (`decoder` + `vision_encoder` + `embedding`):
+  split (`decoder` + `vision_encoder` + `embedding`):
   - **decoder**: grouped-query-attention text reasoner with a **non-gated
     squared-ReLU FFN** (`hidden_act="relu2"`, `up_proj → relu2 → down_proj`)
-    and 3D multimodal RoPE (`mrope_section=[24, 20, 20]`); takes
-    `inputs_embeds`.
-  - **vision_encoder**: SigLIP vision tower + a new
-    `Cosmos3EdgeMultiModalProjector` (pre-shuffle `LayerNorm` → 2×2
-    pixel-shuffle → `linear_fc1` → GELU → `linear_fc2`).
-  - **embedding**: token embedding + image-feature fusion at
-    `image_token_id=19`.
+    and **interleaved** 3D multimodal RoPE (`mrope_section=[24, 20, 20]`,
+    axis per frequency channel `i % 3`); takes `inputs_embeds` and
+    `position_ids [3, batch, seq]`.
+  - **vision_encoder**: **variable-resolution** SigLIP2 tower
+    (`Cosmos3EdgeVisionTower`) + `Cosmos3EdgePatchMerger` (pre-shuffle
+    `LayerNorm` → 2×2 pixel-shuffle → `linear_fc1` → GELU → `linear_fc2`).
+    Consumes the processor's packed, block-major, channel-last patches
+    (`pixel_values [total_patches, patch*patch*3]`) plus `grid_thw [3]`, and
+    resamples the learned 16×16 position grid to the image's own patch grid
+    with an exact antialiased-bilinear filter. **The same graph serves images
+    (`grid_t = 1`) and videos (`grid_t = num_frames`)**, matching
+    `Cosmos3EdgeModel.get_video_features`, which delegates to
+    `get_image_features`.
+  - **embedding**: token embedding + **two** feature streams —
+    `image_features` scattered at `image_token_id=19` and `video_features` at
+    `video_token_id=18` — mirroring the reference's two `masked_scatter`
+    calls. Either stream may be empty.
   `preprocess_weights` routes the single HF checkpoint to the three
-  sub-models: `model.visual.*` / `model.projector.*` → vision (with SigLIP
-  `mlp.fc1/fc2` → `up_proj/down_proj`), `embed_tokens` → embedding, the
-  top-level text tower (`layers.*` / `norm` / `lm_head`) → decoder (renaming
+  sub-models: `model.visual.*` / `model.projector.*` → vision (only the
+  `model.` prefix and the SigLIP `mlp.fc1/fc2` → `up_proj/down_proj` naming
+  differ), `embed_tokens` → embedding, the top-level text tower
+  (`layers.*` / `norm` / `lm_head`) → decoder (renaming
   `self_attn.to_{q,k,v,out}` → `{q,k,v,o}_proj`), and drops the
   generator-tower `k_norm_und_for_gen` key-norm. Built via a new
   `Cosmos3EdgeVLTask` (`cosmos3-edge-vl`). The decoder-only text reasoner
   remains available as `cosmos3_edge_text`.
-- **L1 graph-build tested only.** NVIDIA does not publish modeling code for
-  `cosmos3_edge` (not in `transformers`, no remote-code module), so the exact
-  pixel-shuffle ordering and numerical parity are unverifiable; L4/L5 parity
-  is deferred. The `cosmos3_omni` variants (`Cosmos3-Nano`/`-Super`) are
-  two-tower diffusion world models tracked separately.
+- Video understanding for `cosmos3_edge`: per-frame vision spans with
+  timestamps, the `video_token_id=18` placeholder stream, and a
+  `vision_understanding` world-model manifest block describing the token ids,
+  per-frame token expansion, feature routing, the full packed-patch
+  preprocessing contract (bicubic `smart_resize` to a multiple of 32 inside the
+  processor's pixel-area bounds, `1/255` rescale, RGB conversion, mean/std
+  `0.5` — the first three are processor class defaults absent from the shipped
+  `preprocessor_config.json`), and the interleaved M-RoPE axis assignment
+  including the per-frame `grid_t = 1` video index rule.
+- **Numerically verified against the published reference.** The Reasoner
+  (vision tower, merger projector, image/video token fusion and decoder
+  logits) is compared against `tests/_cosmos3_edge_reference.py`, a PyTorch
+  transcription of `transformers`' `modular_cosmos3_edge.py`
+  (`models/cosmos3_edge`, commit `e8ea728`; cross-checked with vLLM's
+  `cosmos3_edge.py`), at tiny scale
+  (`tests/cosmos3_edge_vision_test.py`) and with the real checkpoint
+  (`tests/cosmos3_edge_integration_test.py`). The Cosmos3-Edge
+  Generator/Action/Sound towers that share the same checkpoint remain
+  proprietary rectified-flow components with no published reference, so their
+  numerics stay unverifiable.
+- The complete Cosmos3-Edge world-model pipeline is also available through
+  `build_world_model()` / `--features world-model`.
+
+#### Fixed
+
+- `cosmos3_edge` image understanding produced uncorrelated vision features
+  (Pearson r ≈ 0.001 against the reference on a 256×256 image). Three
+  independent root causes:
+  - the patch embedding was reshaped into a `Conv2d` `[out, C, kH, kW]`
+    kernel, but the checkpoint ships an `nn.Linear` over **channel-last**
+    `(patch_h, patch_w, channel)` values;
+  - the vision graph assumed a fixed 256×256 square input in raster patch
+    order instead of the processor's variable-resolution, **block-major**
+    packed patches with resampled position embeddings;
+  - the merger projector concatenated the merged block as
+    `(hidden, merge, merge)` instead of `(merge_h, merge_w, hidden)`.
+- `cosmos3_edge` used Qwen-style **chunked** M-RoPE rather than Cosmos'
+  **interleaved** M-RoPE. The two agree exactly on text tokens (`|Δcos| = 0`)
+  but differ by up to 1.95 on visual tokens, which is why text-only output was
+  correct while image understanding was not.
 
 ### Cargo-style `--features` build option
 
@@ -45,8 +123,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   single Rust/cargo-style option. Accepts a comma-separated list and may be
   repeated (`--features fp8-kv-cache,static-cache` or `--features fp8-kv-cache
   --features static-cache`). Available features: `static-cache`, `fp8-kv-cache`,
-  `prune-prefill-prefix`, `text-only`. Unknown feature names are rejected with an error
-  listing the valid set.
+  `prune-prefill-prefix`, `text-only`, `world-model`. Unknown feature names are
+  rejected with an error listing the valid set.
 
 #### Changed
 

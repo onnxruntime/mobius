@@ -7,6 +7,7 @@ Public API documentation for `mobius`.
 - [`build()`](build.md) — Build from a HuggingFace model ID
 - [`build_from_module()`](build_from_module.md) — Build from a module instance
 - [`build_from_gguf()`](build_from_gguf.md) — Build from a GGUF file
+- [`build_world_model()`](build_world_model.md) — Build a complete compositional world model
 - [`apply_weights()`](apply_weights.md) — Apply weights to a built model
 
 ## Core Classes
@@ -22,6 +23,7 @@ Public API documentation for `mobius`.
 build
 build_from_module
 build_from_gguf
+build_world_model
 apply_weights
 model_package
 base_model_config

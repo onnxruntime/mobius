@@ -86,6 +86,17 @@ class VisionConfig:
     # (HF: projector_config.merger_intermediate_size). ``None`` means the model
     # does not use a Cosmos-style merger projector.
     projector_intermediate_size: int | None = None
+    # Cosmos3-Edge: apply the merger LayerNorm *after* the spatial shuffle
+    # (HF: projector_config.use_postshuffle_norm).
+    use_postshuffle_norm: bool = False
+    # SigLIP2-style learned position-embedding reference grid size, in patches
+    # (HF: vision_config.num_patches, e.g. 256 -> 16x16). Variable-resolution
+    # towers resample this grid per image instead of using a fixed image_size.
+    num_patches: int | None = None
+    # ``True`` when the text decoder's 3D M-RoPE assigns axes to *interleaved*
+    # frequency channels (T, H, W, T, H, W, ...) rather than contiguous
+    # ``mrope_section`` chunks. ``None`` leaves the decoder default alone.
+    mrope_interleaved: bool | None = None
     # CLIP-style feature extraction: which ``hidden_states`` index to output
     # (HuggingFace convention, e.g. -2 for Phi-3.5-Vision). ``None`` means use
     # the final hidden state (all layers + post_layernorm).

@@ -17,12 +17,14 @@ from __future__ import annotations
 
 __all__ = [
     "apply_weights",
+    "iter_weight_shards",
 ]
 
 import concurrent.futures
 import json
 import logging
 import pathlib
+from collections.abc import Iterator
 
 import onnx_ir as ir
 import safetensors.torch
@@ -311,6 +313,28 @@ def _download_weights(model_id: str, revision: str | None = None) -> dict[str, t
     downloads from HuggingFace Hub. Uses parallel downloads when multiple
     safetensors shards exist.
     """
+    state_dict: dict[str, torch.Tensor] = {}
+    for shard in iter_weight_shards(model_id, revision=revision):
+        state_dict.update(shard)
+    return _dequantize_fp8_weights(state_dict)
+
+
+def iter_weight_shards(
+    model_id: str, revision: str | None = None
+) -> Iterator[dict[str, torch.Tensor]]:
+    """Yield raw checkpoint state dictionaries one safetensors shard at a time.
+
+    Index entries may reference safe relative subpaths, as used by unified
+    checkpoints whose transformer and vision weights share a top-level index.
+    *revision* pins the Hugging Face revision used for every downloaded file.
+    Keeping shard boundaries lets composite exporters route a tensor to
+    multiple component graphs before advancing to the next file.
+
+    FP8 dequantization is intentionally not performed here: a weight and its
+    ``weight_scale_inv`` may live in different shards. Callers that need
+    dequantized weights must merge the shards first, as :func:`_download_weights`
+    does, or implement an index-aware cross-shard scale resolver.
+    """
     paths = _local_weight_paths(pathlib.Path(model_id))
     if paths is None:
         try:
@@ -329,9 +353,5 @@ def _download_weights(model_id: str, revision: str | None = None) -> dict[str, t
             desc="safetensors",
         )
 
-    state_dict: dict[str, torch.Tensor] = {}
     for path in tqdm.tqdm(paths, desc="Loading weights"):
-        state_dict.update(safetensors.torch.load_file(path))
-
-    state_dict = _dequantize_fp8_weights(state_dict)
-    return state_dict
+        yield safetensors.torch.load_file(path)

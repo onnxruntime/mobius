@@ -117,12 +117,19 @@ mobius build --model openai/whisper-tiny output_dir/
 ```
 
 Build-mode toggles use the cargo-style `--features` option. Available features
-are `static-cache`, `fp8-kv-cache`, `prune-prefill-prefix`, and `text-only`. Pass them
-as a comma-separated list or repeat the option:
+are `static-cache`, `fp8-kv-cache`, `prune-prefill-prefix`, `text-only`, and
+`world-model`. Pass them as a comma-separated list or repeat the option:
 
 ```sh
 mobius build --model meta-llama/Llama-3.2-1B output_dir/ \
-      --features static-cache,prune-prefill-prefix --max-seq-len 2048
+    --features static-cache,prune-prefill-prefix --max-seq-len 2048
+
+# Export a complete heterogeneous world-model pipeline
+mobius build --model nvidia/Cosmos3-Nano cosmos3_onnx/ \
+    --features world-model
+
+mobius build --model nvidia/Cosmos3-Edge cosmos3_edge_onnx/ \
+    --features world-model
 ```
 
 See the [CLI Reference](https://onnxruntime.github.io/mobius/cli_reference.html) for all subcommands and flags.
