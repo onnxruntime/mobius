@@ -705,7 +705,7 @@ def main(argv: list[str] | None = None) -> None:
         "--max-shard-size",
         metavar="SIZE",
         default=None,
-        help="Max shard size for safetensors (e.g. '5GB'). Only used with --external-data safetensors.",
+        help="Maximum external-data shard size (e.g. '5GB'). Used by both ONNX and safetensors.",
     )
     build_parser.add_argument(
         "--no-weights",
