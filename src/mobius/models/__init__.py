@@ -90,6 +90,11 @@ __all__ = [
     "MimiModel",
     "MoshiDepformerModel",
     "MoshiTemporalModel",
+    "MiniMaxMusic3ConditionEncoder",
+    "MiniMaxMusic3LanguageModel",
+    "MiniMaxMusic3RVQDepthDecoder",
+    "MiniMaxMusic3Transformer1DModel",
+    "MiniMaxMusic3Vocoder",
     "MoECausalLMModel",
     "NanoChatCausalLMModel",
     "NemotronCausalLMModel",
@@ -238,6 +243,13 @@ from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
 from mobius.models.mimi import MimiModel, mimi_default_config
 from mobius.models.minicpmv4_6 import MiniCPMV46ForConditionalGeneration
 from mobius.models.minimax import MiniMaxCausalLMModel
+from mobius.models.minimax_music3 import (
+    MiniMaxMusic3ConditionEncoder,
+    MiniMaxMusic3LanguageModel,
+    MiniMaxMusic3RVQDepthDecoder,
+    MiniMaxMusic3Transformer1DModel,
+    MiniMaxMusic3Vocoder,
+)
 from mobius.models.moe import (
     Ernie45MoECausalLMModel,
     Glm4MoECausalLMModel,

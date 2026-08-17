@@ -46,6 +46,7 @@ _PIPELINE_COMPONENT_TASK_OVERRIDES: dict[str, dict[str, str]] = {
 }
 
 _PIPELINE_MODEL_TYPES: dict[str, str] = {
+    "MiniMaxMusic3ModularPipeline": "minimax_music3",
     "QwenImageEditPlusPipeline": "qwen_image_edit",
 }
 
@@ -58,6 +59,11 @@ def _init_diffusers_class_map() -> None:
     from mobius._diffusers_configs import (
         CLIPTextConfig,
         CogVideoXConfig,
+        MiniMaxMusic3ConditionConfig,
+        MiniMaxMusic3LanguageConfig,
+        MiniMaxMusic3RVQConfig,
+        MiniMaxMusic3TransformerConfig,
+        MiniMaxMusic3VocoderConfig,
         QwenImageConfig,
         QwenImageTextEncoderConfig,
         QwenImageVAEConfig,
@@ -76,6 +82,13 @@ def _init_diffusers_class_map() -> None:
         SD3Transformer2DModel,
     )
     from mobius.models.hunyuan_dit import HunyuanDiT2DModel, HunyuanDiTConfig
+    from mobius.models.minimax_music3 import (
+        MiniMaxMusic3ConditionEncoder,
+        MiniMaxMusic3LanguageModel,
+        MiniMaxMusic3RVQDepthDecoder,
+        MiniMaxMusic3Transformer1DModel,
+        MiniMaxMusic3Vocoder,
+    )
     from mobius.models.qwen_image import QwenImageTransformer2DModel
     from mobius.models.qwen_image_vae import AutoencoderKLQwenImageModel
     from mobius.models.qwen_vl import Qwen25VLCausalLMModel
@@ -124,6 +137,31 @@ def _init_diffusers_class_map() -> None:
                 CogVideoXConfig,
                 "video-denoising",
             ),
+            "Qwen3ForCausalLM": (
+                MiniMaxMusic3LanguageModel,
+                MiniMaxMusic3LanguageConfig,
+                "minimax-music3-language",
+            ),
+            "MiniMaxMusic3RVQDepthDecoder": (
+                MiniMaxMusic3RVQDepthDecoder,
+                MiniMaxMusic3RVQConfig,
+                "minimax-music3-rvq",
+            ),
+            "MiniMaxMusic3ConditionEncoder": (
+                MiniMaxMusic3ConditionEncoder,
+                MiniMaxMusic3ConditionConfig,
+                "minimax-music3-condition",
+            ),
+            "MiniMaxMusic3Transformer1DModel": (
+                MiniMaxMusic3Transformer1DModel,
+                MiniMaxMusic3TransformerConfig,
+                "minimax-music3-denoising",
+            ),
+            "MiniMaxMusic3Vocoder": (
+                MiniMaxMusic3Vocoder,
+                MiniMaxMusic3VocoderConfig,
+                "minimax-music3-vocoder",
+            ),
         }
     )
 
@@ -136,15 +174,20 @@ def _load_diffusers_pipeline_index(
     Returns the parsed JSON dict, or ``None`` if not found.
     """
     from huggingface_hub import hf_hub_download
+    from huggingface_hub.utils import EntryNotFoundError
 
-    try:
-        path = hf_hub_download(
-            repo_id=model_id,
-            filename="model_index.json",
-            revision=revision,
-        )
-    except (OSError, ValueError) as e:
-        logger.debug("Failed to download model_index.json for %s: %s", model_id, e)
+    path = None
+    for filename in ("model_index.json", "modular_model_index.json"):
+        try:
+            path = hf_hub_download(
+                repo_id=model_id,
+                filename=filename,
+                revision=revision,
+            )
+            break
+        except (EntryNotFoundError, OSError, ValueError) as e:
+            logger.debug("Failed to download %s for %s: %s", filename, model_id, e)
+    if path is None:
         return None
 
     with open(path) as f:
@@ -156,6 +199,7 @@ def _download_diffusers_component_weights(
     component_name: str,
     *,
     revision: str | None = None,
+    subfolder: str | None = None,
 ) -> dict[str, torch.Tensor]:
     """Download weights for a specific component of a diffusers pipeline.
 
@@ -168,7 +212,8 @@ def _download_diffusers_component_weights(
     from huggingface_hub import hf_hub_download
     from huggingface_hub.utils import EntryNotFoundError
 
-    prefix = f"{component_name}/"
+    resolved_subfolder = component_name if subfolder is None else subfolder
+    prefix = f"{resolved_subfolder}/" if resolved_subfolder else ""
     # Diffusers uses two naming conventions for the weight basename, and either
     # safetensors (preferred) or PyTorch .bin serialization. Some real repos
     # (e.g. OFA-Sys/small-stable-diffusion-v0) ship only .bin.
@@ -234,26 +279,61 @@ def _load_diffusers_component_config(
     component_name: str,
     *,
     revision: str | None = None,
+    subfolder: str | None = None,
 ) -> dict:
     """Load the config.json for a specific diffusers pipeline component."""
     from huggingface_hub import hf_hub_download
 
+    resolved_subfolder = component_name if subfolder is None else subfolder
+    filename = f"{resolved_subfolder}/config.json" if resolved_subfolder else "config.json"
     path = hf_hub_download(
         repo_id=model_id,
-        filename=f"{component_name}/config.json",
+        filename=filename,
         revision=revision,
     )
     with open(path) as f:
         return json.load(f)
 
 
-def _load_optional_diffusers_json(model_id: str, filename: str) -> dict:
+def _resolve_diffusers_component_source(
+    root_model_id: str,
+    root_revision: str | None,
+    component_name: str,
+    component_info: list,
+) -> tuple[str, str | None, str | None]:
+    """Resolve a modular component's repository, revision, and subfolder.
+
+    Legacy two-item entries always use ``root_model_id/component_name`` at the
+    caller's revision. For modular three-item entries, an external repository
+    uses its metadata revision independently of the root pin. A component that
+    still references the root repository uses the explicit caller revision when
+    supplied, otherwise its metadata revision.
+    """
+    if len(component_info) == 2 or not isinstance(component_info[2], dict):
+        return root_model_id, root_revision, component_name
+
+    metadata = component_info[2]
+    component_model_id = metadata.get("pretrained_model_name_or_path") or root_model_id
+    metadata_revision = metadata.get("revision")
+    if component_model_id == root_model_id:
+        component_revision = root_revision if root_revision is not None else metadata_revision
+    else:
+        component_revision = metadata_revision
+    subfolder = metadata.get("subfolder") if "subfolder" in metadata else component_name
+    if subfolder is None:
+        subfolder = ""
+    return component_model_id, component_revision, subfolder
+
+
+def _load_optional_diffusers_json(
+    model_id: str, filename: str, *, revision: str | None = None
+) -> dict:
     """Load optional non-neural pipeline metadata without failing the build."""
     from huggingface_hub import hf_hub_download
     from huggingface_hub.utils import EntryNotFoundError
 
     try:
-        path = hf_hub_download(repo_id=model_id, filename=filename)
+        path = hf_hub_download(repo_id=model_id, filename=filename, revision=revision)
     except EntryNotFoundError:
         return {}
     with open(path) as f:
@@ -347,10 +427,18 @@ def build_diffusers_pipeline(
             continue
         if components is not None and component_name not in components:
             continue
-        if not isinstance(component_info, list) or len(component_info) != 2:
+        if not isinstance(component_info, list) or len(component_info) not in (2, 3):
             continue
 
-        library, class_name = component_info
+        library, class_name = component_info[:2]
+        component_model_id, component_revision, component_subfolder = (
+            _resolve_diffusers_component_source(
+                model_id,
+                revision,
+                component_name,
+                component_info,
+            )
+        )
         if class_name not in _DIFFUSERS_CLASS_MAP:
             logger.info(
                 "Skipping diffusers component '%s' (class '%s' from '%s' is not registered).",
@@ -367,10 +455,13 @@ def build_diffusers_pipeline(
             class_name,
         )
 
+        component_source_kwargs = {"revision": component_revision}
+        if len(component_info) == 3 and isinstance(component_info[2], dict):
+            component_source_kwargs["subfolder"] = component_subfolder
         component_config_dict = _load_diffusers_component_config(
-            model_id,
+            component_model_id,
             component_name,
-            revision=revision,
+            **component_source_kwargs,
         )
         component_configs[component_name] = component_config_dict
         config = config_class.from_diffusers(component_config_dict)
@@ -415,9 +506,9 @@ def build_diffusers_pipeline(
 
         if load_weights:
             state_dict = _download_diffusers_component_weights(
-                model_id,
+                component_model_id,
                 component_name,
-                revision=revision,
+                **component_source_kwargs,
             )
             if hasattr(model_module, "preprocess_weights"):
                 state_dict = model_module.preprocess_weights(state_dict)
@@ -435,17 +526,36 @@ def build_diffusers_pipeline(
 
     from mobius._diffusers_configs import DiffusersPipelineConfig
 
+    def load_optional_component_json(component_name: str, filename: str) -> dict:
+        component_info = pipeline_index.get(component_name)
+        if not isinstance(component_info, list) or len(component_info) not in (2, 3):
+            return {}
+        source_model_id, source_revision, source_subfolder = (
+            _resolve_diffusers_component_source(
+                model_id,
+                revision,
+                component_name,
+                component_info,
+            )
+        )
+        component_filename = f"{source_subfolder}/{filename}" if source_subfolder else filename
+        return _load_optional_diffusers_json(
+            source_model_id,
+            component_filename,
+            revision=source_revision,
+        )
+
     package.config = DiffusersPipelineConfig(
         source_model_id=model_id,
         pipeline_class=pipeline_class,
         component_configs=component_configs,
         scheduler_config=(
-            _load_optional_diffusers_json(model_id, "scheduler/scheduler_config.json")
+            load_optional_component_json("scheduler", "scheduler_config.json")
             if "scheduler" in pipeline_index
             else {}
         ),
         processor_config=(
-            _load_optional_diffusers_json(model_id, "processor/preprocessor_config.json")
+            load_optional_component_json("processor", "preprocessor_config.json")
             if "processor" in pipeline_index
             else {}
         ),

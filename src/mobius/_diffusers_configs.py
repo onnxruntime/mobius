@@ -13,6 +13,12 @@ import onnx_ir as ir
 if TYPE_CHECKING:
     from mobius._configs import ArchitectureConfig
 
+MINIMAX_MUSIC3_AUDIO_END_TOKEN_ID = 151670
+MINIMAX_MUSIC3_AUDIO_CODE_OFFSET = 151675
+MINIMAX_MUSIC3_SEMANTIC_VOCAB_SIZE = 16384
+MINIMAX_MUSIC3_NUM_CODEBOOKS = 8
+MINIMAX_MUSIC3_FEEDBACK_SCALE = MINIMAX_MUSIC3_NUM_CODEBOOKS**-0.5
+
 
 class CLIPTextConfig:
     """Adapter that builds an :class:`ArchitectureConfig` for a CLIP text encoder.
@@ -76,6 +82,24 @@ class QwenImageTextEncoderConfig:
         return ArchitectureConfig.from_transformers(text_config, parent_config=hf_config)
 
 
+class MiniMaxMusic3LanguageConfig:
+    """Adapter for the Qwen3 global language model bundled with Music 3."""
+
+    @classmethod
+    def from_diffusers(cls, config: dict) -> ArchitectureConfig:
+        import transformers
+
+        from mobius._configs import ArchitectureConfig
+
+        fields = dict(config)
+        fields.pop("architectures", None)
+        fields.pop("transformers_version", None)
+        fields.pop("dtype", None)
+        model_type = fields.pop("model_type", "qwen3")
+        hf_config = transformers.AutoConfig.for_model(model_type, **fields)
+        return ArchitectureConfig.from_transformers(hf_config)
+
+
 @dataclasses.dataclass
 class DiffusersPipelineConfig:
     """Non-neural diffusers pipeline metadata retained on a ModelPackage."""
@@ -86,6 +110,102 @@ class DiffusersPipelineConfig:
     scheduler_config: dict
     processor_config: dict
     model_type: str = "diffusers"
+
+
+@dataclasses.dataclass
+class MiniMaxMusic3RVQConfig:
+    """Configuration for the MiniMax Music 3 residual-codebook depth decoder."""
+
+    hidden_size: int = 4096
+    num_layers: int = 4
+    num_attention_heads: int = 16
+    intermediate_size: int = 6144
+    audio_vocab_size: int = 1024
+    num_codebooks: int = 8
+    max_position_embeddings: int = 16
+    dtype: ir.DataType = ir.DataType.FLOAT
+
+    @classmethod
+    def from_diffusers(cls, config: dict) -> MiniMaxMusic3RVQConfig:
+        return cls(
+            **{
+                field.name: config[field.name]
+                for field in dataclasses.fields(cls)
+                if field.name in config
+            }
+        )
+
+
+@dataclasses.dataclass
+class MiniMaxMusic3ConditionConfig:
+    """Configuration for the MiniMax Music 3 frame-condition encoder."""
+
+    condition_hidden_dim: int = 4096
+    num_condition_layers: int = 8
+    out_dim: int = 2048
+    input_sampling_rate: int = 24000
+    input_hop_length: int = 960
+    output_sampling_rate: int = 44100
+    output_hop_length: int = 512
+    dtype: ir.DataType = ir.DataType.FLOAT
+
+    @classmethod
+    def from_diffusers(cls, config: dict) -> MiniMaxMusic3ConditionConfig:
+        return cls(
+            **{
+                field.name: config[field.name]
+                for field in dataclasses.fields(cls)
+                if field.name in config
+            }
+        )
+
+
+@dataclasses.dataclass
+class MiniMaxMusic3TransformerConfig:
+    """Configuration for the MiniMax Music 3 1D flow-matching transformer."""
+
+    in_channels: int = 128
+    condition_dim: int = 2048
+    num_layers: int = 36
+    num_attention_heads: int = 32
+    attention_head_dim: int = 64
+    ff_inner_dim: int = 8192
+    rotary_dim: int = 32
+    fourier_embedding_dim: int = 256
+    dtype: ir.DataType = ir.DataType.FLOAT
+
+    @classmethod
+    def from_diffusers(cls, config: dict) -> MiniMaxMusic3TransformerConfig:
+        return cls(
+            **{
+                field.name: config[field.name]
+                for field in dataclasses.fields(cls)
+                if field.name in config
+            }
+        )
+
+
+@dataclasses.dataclass
+class MiniMaxMusic3VocoderConfig:
+    """Configuration for the MiniMax Music 3 stereo DAC-style vocoder."""
+
+    latent_channels: int = 128
+    decoder_input_dim: int = 1024
+    decoder_hidden_dim: int = 1536
+    upsampling_ratios: tuple[int, ...] = (8, 8, 4, 2)
+    sampling_rate: int = 44100
+    dtype: ir.DataType = ir.DataType.FLOAT
+
+    @classmethod
+    def from_diffusers(cls, config: dict) -> MiniMaxMusic3VocoderConfig:
+        values = {
+            field.name: config[field.name]
+            for field in dataclasses.fields(cls)
+            if field.name in config
+        }
+        if "upsampling_ratios" in values:
+            values["upsampling_ratios"] = tuple(values["upsampling_ratios"])
+        return cls(**values)
 
 
 @dataclasses.dataclass
