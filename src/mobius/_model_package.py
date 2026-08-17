@@ -20,11 +20,13 @@ from __future__ import annotations
 
 __all__ = ["ModelPackage"]
 
+import inspect
 import logging
 import os
 import threading
 from collections import UserDict
 from collections.abc import Callable
+from typing import Any
 
 import onnx_ir as ir
 import torch
@@ -72,6 +74,7 @@ class ModelPackage(UserDict[str, ir.Model]):
         *,
         external_data: str = "onnx",
         max_shard_size_bytes: int | None = None,
+        max_workers: int = 8,
         components: Callable[[str], bool] | None = None,
         progress_bar: bool = True,
         check_weights: bool = True,
@@ -108,6 +111,10 @@ class ModelPackage(UserDict[str, ir.Model]):
                 Used by both ONNX and safetensors external-data formats. A
                 single tensor larger than this value is written in its own
                 oversized shard.
+            max_workers: Number of threads used to write ONNX external data.
+                Defaults to 8. Set to 1 to save serially. Older ``onnx_ir``
+                versions that do not support concurrent saves fall back to
+                serial behavior.
             components: Optional predicate ``(name) -> bool`` that selects
                 which components to save.  When ``None`` (default), all
                 components are saved.  Examples::
@@ -125,14 +132,17 @@ class ModelPackage(UserDict[str, ir.Model]):
 
         Raises:
             ValueError: If *external_data* is not ``"onnx"`` or
-                ``"safetensors"``, or if *check_weights* is ``True`` and
-                any initializer is missing its ``const_value``.
+                ``"safetensors"``, if *max_workers* is not positive, or if
+                *check_weights* is ``True`` and any initializer is missing its
+                ``const_value``.
         """
         if external_data not in {"onnx", "safetensors"}:
             raise ValueError(
                 f"Unknown external_data format {external_data!r}. "
                 "Expected 'onnx' or 'safetensors'."
             )
+        if max_workers <= 0:
+            raise ValueError(f"max_workers must be positive, got {max_workers}.")
         os.makedirs(directory, exist_ok=True)
         selected = {
             name: model
@@ -159,13 +169,14 @@ class ModelPackage(UserDict[str, ir.Model]):
                     callback=callback,
                 )
             else:
-                ir.save(
-                    model,
-                    path,
-                    external_data="model.onnx.data",
-                    max_shard_size_bytes=max_shard_size_bytes,
-                    callback=callback,
-                )
+                save_kwargs: dict[str, Any] = {
+                    "external_data": "model.onnx.data",
+                    "max_shard_size_bytes": max_shard_size_bytes,
+                    "callback": callback,
+                }
+                if "max_workers" in inspect.signature(ir.save).parameters:
+                    save_kwargs["max_workers"] = max_workers
+                ir.save(model, path, **save_kwargs)
 
     @classmethod
     def load(cls, directory: str) -> ModelPackage:

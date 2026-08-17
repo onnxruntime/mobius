@@ -125,6 +125,77 @@ class TestOnnxShardedSave:
         loaded = ModelPackage.load(str(tmp_path))
         assert set(loaded.data) == {"model"}
 
+    def test_defaults_to_eight_workers_when_supported(self, tmp_path, monkeypatch):
+        calls = []
+
+        def save(
+            model,
+            path,
+            *,
+            external_data,
+            max_shard_size_bytes,
+            callback,
+            max_workers,
+        ):
+            calls.append(max_workers)
+
+        monkeypatch.setattr(ir, "save", save)
+
+        ModelPackage({"m": _make_simple_model()}).save(
+            str(tmp_path), progress_bar=False, check_weights=False
+        )
+
+        assert calls == [8]
+
+    def test_forwards_serial_worker_override(self, tmp_path, monkeypatch):
+        calls = []
+
+        def save(
+            model,
+            path,
+            *,
+            external_data,
+            max_shard_size_bytes,
+            callback,
+            max_workers,
+        ):
+            calls.append(max_workers)
+
+        monkeypatch.setattr(ir, "save", save)
+
+        ModelPackage({"m": _make_simple_model()}).save(
+            str(tmp_path),
+            max_workers=1,
+            progress_bar=False,
+            check_weights=False,
+        )
+
+        assert calls == [1]
+
+    def test_omits_max_workers_for_onnx_ir_1_0(self, tmp_path, monkeypatch):
+        calls = []
+
+        def save(model, path, *, external_data, max_shard_size_bytes, callback):
+            calls.append((model, path))
+
+        monkeypatch.setattr(ir, "save", save)
+
+        ModelPackage({"m": _make_simple_model()}).save(
+            str(tmp_path), progress_bar=False, check_weights=False
+        )
+
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize("max_workers", [0, -1])
+    def test_rejects_non_positive_max_workers(self, tmp_path, max_workers):
+        with pytest.raises(ValueError, match="max_workers must be positive"):
+            ModelPackage({"m": _make_simple_model()}).save(
+                str(tmp_path),
+                max_workers=max_workers,
+                progress_bar=False,
+                check_weights=False,
+            )
+
 
 class TestProgressCallback:
     class _Tensor:
