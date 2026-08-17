@@ -34,6 +34,13 @@ class TestConv1d:
         params = list(conv.parameters())
         assert len(params) == 2  # weight + bias
 
+    def test_positional_bias_and_grouped_weight_shape(self):
+        biasless = Conv1d(4, 4, 3, 1, 1, False)
+        grouped = Conv1d(4, 4, 3, groups=4)
+
+        assert biasless.bias is None
+        assert list(grouped.weight.shape) == [4, 1, 3]
+
     def test_forward_builds_graph(self):
         conv = Conv1d(80, 512, kernel_size=3, padding=1)
         builder, op, graph = create_test_builder()

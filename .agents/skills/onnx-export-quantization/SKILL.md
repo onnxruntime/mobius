@@ -96,6 +96,71 @@ output/
 └── genai_config.json
 ```
 
+### Direct GGUF import
+
+Direct GGUF conversion preserves supported quantization by default because the
+usual intent is a quantized ONNX model:
+
+```bash
+mobius build-gguf model.gguf --output output/
+```
+
+The equivalent API call is:
+
+```python
+from mobius import build_from_gguf
+
+package = build_from_gguf("model.gguf")
+```
+
+Use `mobius build-gguf model.gguf --dequantize` or
+`build_from_gguf("model.gguf", keep_quantized=False)` to request a fully float
+model. The older `--keep-quantized` CLI flag remains a compatibility alias for
+the default and must not be combined with `--dequantize`. F32-, F16-, and
+BF16-only GGUFs build through the float path because they have no quantized
+tensors to preserve.
+
+Preservation does not mean every source tensor remains byte-identical. In
+text-only builds, runtime-native IQ/MXFP4 projection blocks can retain their
+bytes. Supported affine blocks are repacked, but the conversion can be lossy
+for source types such as Q4_1 and Q4_K. Multimodal, mixed, or unsupported source
+qtypes may be dequantized and requantized or rejected. Apply the classification
+and acceptance checks below before making preservation claims.
+
+### Direct GGUF import acceptance
+
+Do not infer a GGUF's quantization from its filename. Presets such as
+`Q4_K_M`, `MXFP4_MOE`, and Unsloth Dynamic variants can contain large tensors
+in different per-tensor formats (for example Q5_0, Q5_1, Q8_0, and MXFP4).
+Before implementing or claiming a direct conversion:
+
+1. Pin the GGUF repository revision, filename, file size, and LFS SHA-256.
+2. Inspect the GGUF metadata and complete tensor table (names, logical shapes,
+   and quantization types) without downloading tensor payloads when range
+   requests are available.
+3. Compare the layer schedule and tensor shapes with a separately pinned
+   official config and safetensors headers. `block_count` may include auxiliary
+   MTP/draft blocks rather than decoder backbone layers.
+4. Classify every large tensor as byte-preserved native blocks, affine
+   repacking (lossless or lossy, with numerical validation), or
+   dequantize/requantize. If any large tensor takes the third path, the
+   conversion does **not** preserve the source quantization.
+5. Reject split GGUF shards unless the importer explicitly assembles every
+   shard. Reading one shard can build a plausible but incomplete model.
+6. Compare embedded tokenizer special-token IDs and chat template with the
+   pinned upstream tokenizer. A self-contained package is invalid when padding,
+   EOS, or BOS semantics disagree.
+7. Require real-weight full-logit parity and deterministic multi-token
+   generation directly through ONNX Runtime. Graph, config, and session creation
+   alone are not acceptance evidence.
+8. Optionally run the same generation through the declared GenAI runtime as
+   downstream evidence. Record its version and outcome, but do not gate direct
+   GGUF artifacts on its acceptance.
+
+Use Hub GGUF architecture metadata to fail before downloading multi-gigabyte
+unsupported files, then repeat the guard from the local GGUF header so local
+paths receive the same actionable error.
+
 ## Quantization with Olive
 
 ### Installation
@@ -179,6 +244,16 @@ pip install cupy-cuda12x
 
 # Olive auto-detects cupy and uses GPU when available
 ```
+
+### Isolate Olive from unrelated provider DLLs
+
+Olive 0.13 may auto-register every provider DLL bundled in an ORT GPU wheel
+even when a weight-only pass explicitly targets CPU. A missing TensorRT DLL can
+then abort K-quant before the pass starts. Keep the accelerator CPU-only and,
+for programmatic workflows, suppress `olive.systems.local` EP-library
+registration around `olive.workflows.run`; restore it immediately afterward.
+This is safe for `OnnxKQuantQuantization`, which does not create an inference
+session. Still load and execute the resulting package with the intended EP.
 
 ### Quantizing multi-model exports
 
@@ -322,6 +397,13 @@ FP32 when the model is BF16. Add `op.CastLike(result, input)` to
 ensure dtype consistency. See the `reusable-components` skill's
 section on precision behaviour.
 
+### 6. Attention rewrite schema mismatch
+
+Quantizers may rewrite Attention to a contrib op with fewer outputs or a
+different cache contract. Restrict the quantized op set when schemas do not
+match, then load and execute the result; successful conversion alone is not
+evidence. Document the narrowed recipe and unsupported rewrite explicitly.
+
 ## Testing quantized models
 
 ### L4: Golden data generation
@@ -356,9 +438,9 @@ compare_golden(
 )
 ```
 
-### L5: End-to-end smoke test
+### Optional ORT GenAI downstream smoke test
 
-Run inference with the quantized model through ORT GenAI:
+When useful, run inference with the quantized model through ORT GenAI:
 
 ```python
 import onnxruntime_genai as og
@@ -372,6 +454,10 @@ params.input_ids = tokenizer.encode("Hello, world!")
 output_ids = model.generate(params)
 print(tokenizer.decode(output_ids[0]))
 ```
+
+ORT GenAI acceptance is not a Mobius export gate. Always validate the final
+quantized ONNX package directly; treat ORT GenAI load/generation as optional
+downstream evidence and record its version/outcome without blocking export.
 
 ### Numerical parity verification
 

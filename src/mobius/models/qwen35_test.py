@@ -41,21 +41,28 @@ def _moe_config(quantization: QuantizationConfig | None) -> object:
 
 
 def _olive_expert_state_dict() -> dict[str, torch.Tensor]:
-    """Synthetic HF-style fused Olive-quantized MoE expert tensors."""
+    """Synthetic HF-style fused Olive-quantized MoE expert tensors.
+
+    Olive's on-disk suffix convention is an *underscore* suffix directly on
+    the parameter name (``<pname>_qweight``/``_scales``/``_qzeros``), not a
+    dotted one -- see ``olive/common/quant/state_dict.py``. For a fused MoE
+    parameter like ``gate_up_proj`` (no nested ``nn.Linear``), this means
+    ``experts.gate_up_proj_qweight``, not ``experts.gate_up_proj.qweight``.
+    """
     p = "model.language_model.layers.0.mlp."
     return {
-        p + "experts.gate_up_proj.qweight": torch.randint(
+        p + "experts.gate_up_proj_qweight": torch.randint(
             0, 256, (_E, _FC1_OUT, _H * _BITS // 8), dtype=torch.uint8
         ),
-        p + "experts.gate_up_proj.scales": torch.rand(_E, _FC1_OUT, _H // _BLK),
-        p + "experts.gate_up_proj.qzeros": torch.randint(
+        p + "experts.gate_up_proj_scales": torch.rand(_E, _FC1_OUT, _H // _BLK),
+        p + "experts.gate_up_proj_qzeros": torch.randint(
             0, 256, (_E, _FC1_OUT, 1), dtype=torch.uint8
         ),
-        p + "experts.down_proj.qweight": torch.randint(
+        p + "experts.down_proj_qweight": torch.randint(
             0, 256, (_E, _H, _INT * _BITS // 8), dtype=torch.uint8
         ),
-        p + "experts.down_proj.scales": torch.rand(_E, _H, _INT // _BLK),
-        p + "experts.down_proj.qzeros": torch.randint(0, 256, (_E, _H, 1), dtype=torch.uint8),
+        p + "experts.down_proj_scales": torch.rand(_E, _H, _INT // _BLK),
+        p + "experts.down_proj_qzeros": torch.randint(0, 256, (_E, _H, 1), dtype=torch.uint8),
         p + "gate.weight": torch.rand(_E, _H),
     }
 
@@ -119,3 +126,28 @@ class TestQwen35MoEQMoEExport:
             _INT,
         )
         assert not any("fc1_experts_weights" in k for k in out)
+
+    def test_unsupported_qmoe_quantization_with_packed_experts_raises(self):
+        """Packed quantized expert weights + an unsupported QMoE ABI must raise.
+
+        Regression test: ``group_size=24`` (not a power of two) makes
+        ``_supported_qmoe_quantization`` reject the config, so
+        ``preprocess_weights`` takes the dense-fallback branch. But that
+        branch's fused-tensor unfuser only knows how to split *unquantized*
+        float ``experts.gate_up_proj``/``experts.down_proj`` tensors -- there
+        is no code path that splits packed ``_qweight``/``_scales``/
+        ``_qzeros`` fused-expert tensors into per-expert quantized Linear
+        initializers. Previously this silently fell through to
+        ``cleaned[key] = value`` and produced a graph whose per-expert
+        Linear modules expect keys that were never generated.
+        """
+        config = _moe_config(
+            QuantizationConfig(bits=8, group_size=_BLK, quant_method="olive", sym=False)
+        )
+        model = Qwen35MoECausalLMModel(config)
+        try:
+            model.preprocess_weights(_olive_expert_state_dict())
+        except ValueError as e:
+            assert "QMoE ABI" in str(e)
+        else:
+            raise AssertionError("expected ValueError for unsupported QMoE + packed experts")

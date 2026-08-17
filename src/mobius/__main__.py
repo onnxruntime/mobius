@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 _BUILD_FEATURES: dict[str, str] = {
     "static-cache": "static_cache",
     "fp8-kv-cache": "fp8_kv_cache",
-    "prune-lm-head": "prune_lm_head",
+    "prune-prefill-prefix": "prune_prefill_prefix",
     "text-only": "text_only",
     "world-model": "world_model",
 }
@@ -224,7 +224,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             for feature, enabled in (
                 ("static-cache", args.static_cache),
                 ("fp8-kv-cache", args.fp8_kv_cache),
-                ("prune-lm-head", args.prune_lm_head),
+                ("prune-prefill-prefix", args.prune_prefill_prefix),
                 ("text-only", args.text_only),
             )
             if enabled
@@ -257,7 +257,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
     # FP8 KV cache: resolve the optional per-layer scale file up front so both
     # the --config and --model build paths can pass the same scales.
     fp8_kv_cache = getattr(args, "fp8_kv_cache", False)
-    prune_lm_head = getattr(args, "prune_lm_head", False)
+    prune_prefill_prefix = getattr(args, "prune_prefill_prefix", False)
     kv_cache_scales: dict[int, tuple[float, float]] | None = None
     scale_file = getattr(args, "kv_cache_scale_file", None)
     if scale_file is not None and not fp8_kv_cache:
@@ -309,10 +309,20 @@ def _cmd_build(args: argparse.Namespace) -> None:
             print(
                 f"Detected diffusers pipeline: {pipeline_index.get('_class_name', 'Unknown')}"
             )
+            pipeline_components = None
+            if component_filter:
+                roots = [
+                    name
+                    for name in pipeline_index
+                    if not name.startswith("_")
+                    and (component_filter == name or component_filter.startswith(f"{name}_"))
+                ]
+                pipeline_components = {max(roots, key=len)} if roots else {component_filter}
             pkg = build_diffusers_pipeline(
                 args.model,
                 dtype=dtype_override,
                 load_weights=load_weights,
+                components=pipeline_components,
                 execution_provider=execution_provider,
             )
             _save_package(pkg, output_dir, args, optimize, component_filter)
@@ -361,7 +371,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             execution_provider=execution_provider,
             fp8_kv_cache=fp8_kv_cache,
             kv_cache_scales=kv_cache_scales,
-            prune_lm_head=prune_lm_head,
+            prune_prefill_prefix=prune_prefill_prefix,
         )
         for name, model in pkg.items():
             model.graph.name = f"{config_path}/{name}"
@@ -391,7 +401,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             text_only=args.text_only,
             fp8_kv_cache=fp8_kv_cache,
             kv_cache_scales=kv_cache_scales,
-            prune_lm_head=prune_lm_head,
+            prune_prefill_prefix=prune_prefill_prefix,
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)
@@ -401,6 +411,17 @@ def _save_package(
     pkg, output_dir: str, args, optimize: str | None, component_filter: str | None
 ) -> None:
     """Save a ModelPackage to disk, applying optimizations and runtime configs."""
+    runtime = getattr(args, "runtime", None)
+    if runtime == "ort-genai":
+        from mobius.integrations.ort_genai.auto_export import (
+            _validate_ort_genai_compatibility,
+        )
+
+        try:
+            _validate_ort_genai_compatibility(pkg)
+        except ValueError as error:
+            raise SystemExit(f"Error: {error}") from error
+
     components = (lambda name: name == component_filter) if component_filter else None
     for name, model in pkg.items():
         if components is not None and not components(name):
@@ -432,7 +453,6 @@ def _save_package(
             path = os.path.join(output_dir, "model.onnx")
         print(f"Saved {name} to {path}")
 
-    runtime = getattr(args, "runtime", None)
     if runtime == "ort-genai":
         from mobius.integrations.ort_genai import write_ort_genai_config
 
@@ -447,6 +467,7 @@ def _save_package(
             hf_model_id=hf_model_id,
             ep=ep,
             local_config_dir=local_config_dir,
+            trust_remote_code=getattr(args, "trust_remote_code", False),
         )
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
@@ -530,13 +551,22 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         )
         raise SystemExit(1)
 
-    mmproj_path = getattr(args, "mmproj", None)
-
-    if args.keep_quantized:
-        print(
-            "Quantized mode: preserving GGUF quantization as "
-            "MatMulNBits/GatherBlockQuantized..."
+    if getattr(args, "runtime", None) == "ort-genai":
+        raise SystemExit(
+            "Error: mobius build-gguf does not yet support --runtime ort-genai. "
+            "The command cannot emit a valid genai_config.json until the selected "
+            "GGUF architecture's cache and tokenizer contracts have passed real "
+            "ORT GenAI generation. Use --runtime onnx-genai where supported, or "
+            "omit --runtime and run the ONNX model directly."
         )
+
+    mmproj_path = getattr(args, "mmproj", None)
+    keep_quantized = not args.dequantize
+
+    if keep_quantized:
+        print("Preserving supported GGUF quantization (float-only inputs stay float)...")
+    else:
+        print("Dequantized mode: converting GGUF weights to float...")
 
     gguf_path = args.gguf_path
     output_dir = args.output or os.path.splitext(gguf_path)[0] + "_onnx"
@@ -553,7 +583,7 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         gguf_path,
         mmproj=mmproj_path,
         dtype=args.dtype,
-        keep_quantized=args.keep_quantized,
+        keep_quantized=keep_quantized,
         execution_provider=args.execution_provider,
         static_cache=args.static_cache,
         max_seq_len=args.max_seq_len,
@@ -848,12 +878,18 @@ def main(argv: list[str] | None = None) -> None:
             "Currently supports Gemma4 vision; audio is experimental."
         ),
     )
-    gguf_parser.add_argument(
+    quantization_group = gguf_parser.add_mutually_exclusive_group()
+    quantization_group.add_argument(
+        "--dequantize",
+        action="store_true",
+        help="Dequantize all GGUF weights to float instead of preserving quantization.",
+    )
+    quantization_group.add_argument(
         "--keep-quantized",
         action="store_true",
         help=(
-            "Preserve supported projection, output-head, and embedding "
-            "quantization via MatMulNBits/GatherBlockQuantized."
+            "Deprecated compatibility alias; supported GGUF quantization is "
+            "preserved by default."
         ),
     )
     gguf_parser.add_argument(
@@ -888,8 +924,8 @@ def main(argv: list[str] | None = None) -> None:
             "Generate runtime-specific config files after building. "
             "'onnx-genai' writes inference_metadata.yaml plus a tokenizer.json "
             "reconstructed from the GGUF's embedded tokenizer metadata; "
-            "'ort-genai' writes genai_config.json + copies tokenizer files. "
-            "Either way the quantized model runs directly in the target runtime."
+            "'ort-genai' is currently rejected until GGUF cache/tokenizer "
+            "contracts have runtime generation coverage."
         ),
     )
     gguf_parser.add_argument(

@@ -29,14 +29,18 @@ multi-component export for pipelines.
 |---|---|
 | **Text Generation** | Llama 2/3/4, Mistral, Qwen 2/2.5/3/3.5/3.6, Phi-3/3.5, Gemma 1/2/3/4, Granite, GPT-2, OPT, OLMo, SmolLM3, and many more |
 | **Mixture of Experts** | PhiMoE, GPTOSS, Mixtral, OLMoE, DeepSeek-V2/V3, Qwen2-MoE, Qwen3-MoE, Qwen3-Next, GLM-4-MoE, Arctic, DBRX, Jamba |
-| **Multimodal** | Gemma 3/4, Phi-4MM (vision + audio + LoRA), LLaVA, InternVL2, Qwen2.5-VL, Qwen3-VL, Qwen3.5/3.6-VL, Pixtral |
+| **Multimodal** | Gemma 3/4, Phi-4MM (vision + audio + LoRA), Nemotron Parse, LLaVA, InternVL2, Mage-VL (image + streaming video), MiniCPM-V 4.6, Qwen2.5-VL, Qwen3-VL, Qwen3.5/3.6-VL, Pixtral |
 | **Encoder-only** | BERT, RoBERTa, ALBERT, DeBERTa, DistilBERT, ELECTRA, XLNet |
 | **Encoder-Decoder** | BART, T5/mT5, Marian, M2M-100, Pegasus, BigBird-Pegasus |
-| **Speech-to-Text** | Whisper, FastConformer-RNNT, FunASR, Qwen3-ASR, SenseVoice |
+| **Speech-to-Text** | Whisper, Moonshine, FastConformer-RNNT, FunASR, Qwen3-ASR, SenseVoice |
 | **Audio** | Wav2Vec2, HuBERT, WavLM, SpeechT5 |
 | **Vision** | ViT, BEiT, DeiT, DINOv2, Swin, CLIP, SigLIP |
-| **Diffusion** | Stable Diffusion (UNet + VAE + ControlNet), Flux, SD3, DiT, QwenImage, HunyuanDiT, CogVideoX |
+| **Diffusion** | Stable Diffusion (UNet + VAE + ControlNet), Flux, SD3, DiT, QwenImage / Qwen-Image-Edit-2509, HunyuanDiT, CogVideoX |
 | **Adapters** | T2I-Adapter, IP-Adapter |
+
+Mage-VL supports direct three-model ONNX export. ORT GenAI export is currently
+rejected because the runtime cannot supply its required `patch_positions` input
+or Mage-VL's 1D decoder positions.
 
 Supports **290+ Transformers model types** and **10 Diffusers component types**
 across **40+ task types** and **100+ reusable components**.
@@ -113,12 +117,12 @@ mobius build --model openai/whisper-tiny output_dir/
 ```
 
 Build-mode toggles use the cargo-style `--features` option. Available features
-are `static-cache`, `fp8-kv-cache`, `prune-lm-head`, `text-only`, and
+are `static-cache`, `fp8-kv-cache`, `prune-prefill-prefix`, `text-only`, and
 `world-model`. Pass them as a comma-separated list or repeat the option:
 
 ```sh
 mobius build --model meta-llama/Llama-3.2-1B output_dir/ \
-    --features static-cache,prune-lm-head --max-seq-len 2048
+    --features static-cache,prune-prefill-prefix --max-seq-len 2048
 
 # Export a complete heterogeneous world-model pipeline
 mobius build --model nvidia/Cosmos3-Nano cosmos3_onnx/ \
@@ -182,6 +186,9 @@ lintrunner f --all-files
 ```
 
 ### Adding a new model
+
+To [request a new model](https://github.com/onnxruntime/mobius/issues/new?template=model-request.yml),
+or ask an AI coding agent to implement a new model, use the resources below:
 
 See the [AI-assisted model support strategy](https://onnxruntime.github.io/mobius/ai-model-support-strategy.html)
 and the developer skills in `.agents/skills/`:

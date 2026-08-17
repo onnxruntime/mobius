@@ -32,7 +32,9 @@ from _test_configs import (
     DETECTION_CONFIGS,
     ENCODER_CONFIGS,
     SEQ2SEQ_CONFIGS,
+    SPEECH_CONFIGS,
     VISION_CONFIGS,
+    VL_CONFIGS,
     _base_config,
 )
 
@@ -204,6 +206,20 @@ class TestSeq2SeqWeightAlignment:
 
 
 # ---------------------------------------------------------------------------
+# Speech encoder-decoder weight alignment
+# ---------------------------------------------------------------------------
+_SPEECH_PARAMS = _mark_xfail_if_filtering(SPEECH_CONFIGS)
+
+
+@pytest.mark.parametrize("model_type,config_overrides", _SPEECH_PARAMS)
+class TestSpeechWeightAlignment:
+    """Verify speech encoder-decoder preprocessors preserve aligned parameters."""
+
+    def test_identity_state_dict_roundtrip(self, model_type: str, config_overrides: dict):
+        _assert_identity_roundtrip(model_type, config_overrides)
+
+
+# ---------------------------------------------------------------------------
 # Vision model weight alignment
 # ---------------------------------------------------------------------------
 # Vision models: preprocess_weights() renames from HF encoder.layers.*
@@ -218,6 +234,23 @@ class TestVisionWeightAlignment:
     """Verify preprocess_weights() preserves all parameter names for vision models."""
 
     def test_identity_state_dict_roundtrip(self, model_type: str, config_overrides: dict):
+        _assert_identity_roundtrip(model_type, config_overrides)
+
+
+@pytest.mark.parametrize(
+    "model_type,config_overrides",
+    [
+        pytest.param(model_type, overrides, id=model_type)
+        for model_type, overrides, _ in VL_CONFIGS
+        if model_type == "nemotron_parse"
+    ],
+)
+class TestNemotronParseWeightAlignment:
+    """Verify the two-model package preserves every aligned parameter."""
+
+    def test_identity_state_dict_roundtrip(
+        self, model_type: str, config_overrides: dict
+    ) -> None:
         _assert_identity_roundtrip(model_type, config_overrides)
 
 
@@ -239,3 +272,31 @@ class TestDetectionWeightAlignment:
 
     def test_identity_state_dict_roundtrip(self, model_type: str, config_overrides: dict):
         _assert_identity_roundtrip(model_type, config_overrides)
+
+
+def test_mage_vl_huggingface_checkpoint_alignment():
+    """Every Mage-VL package parameter is populated from its exact HF key."""
+    config_overrides = next(overrides for mt, overrides, _ in VL_CONFIGS if mt == "mage_vl")
+    config = _base_config(**config_overrides)
+    module = registry.get("mage_vl")(config)
+    pkg = get_task("mage-vl").build(module, config)
+    parameter_names = _collect_parameter_names(pkg)
+
+    hf_state: dict[str, torch.Tensor] = {}
+    for name in parameter_names:
+        if name == "embedding.embed_tokens.weight":
+            continue
+        if name.startswith("decoder.model.language_model."):
+            hf_name = name[len("decoder.") :]
+        elif name.startswith("decoder.lm_head."):
+            hf_name = name[len("decoder.") :]
+        elif name.startswith("vision_encoder.visual."):
+            hf_name = f"model.{name[len('vision_encoder.') :]}"
+        else:
+            raise AssertionError(f"Unrecognized Mage-VL parameter name: {name}")
+        hf_state[hf_name] = torch.ones(1)
+
+    # The shared source embedding must populate both decoder and embedding models.
+    hf_state["model.language_model.embed_tokens.weight"] = torch.ones(1)
+    aligned = module.preprocess_weights(hf_state)
+    assert set(aligned) == parameter_names

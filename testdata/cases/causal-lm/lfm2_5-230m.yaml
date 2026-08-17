@@ -1,0 +1,17 @@
+model_id: "LiquidAI/LFM2.5-230M"
+model_type: "lfm2"
+revision: "13a53837c4906b4f7405932532ba85d182bb013b"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Here is my poem:"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+notes: "LFM2.5 230M. Hybrid double-gated short-convolution and QK-norm GQA architecture."

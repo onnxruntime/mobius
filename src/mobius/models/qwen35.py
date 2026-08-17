@@ -3,8 +3,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
+import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
@@ -19,6 +18,7 @@ from mobius.components._common import (
 from mobius.components._gated_deltanet import GatedDeltaNet
 from mobius.components._mlp import MLP
 from mobius.components._moe import _supported_qmoe_quantization
+from mobius.components._quantized_linear import make_quantized_linear_factory
 from mobius.components._rms_norm import OffsetRMSNorm
 from mobius.components._rotary_embedding import initialize_rope
 from mobius.models.base import CausalLMModel
@@ -30,12 +30,29 @@ from mobius.models.qwen_vl import (
     split_deepstack_embeds,
 )
 
-if TYPE_CHECKING:
-    import onnx_ir as ir
-
 # ---------------------------------------------------------------------------
 # Qwen3.5 — hybrid linear/full attention
 # ---------------------------------------------------------------------------
+
+
+def _linear_factory(config: ArchitectureConfig) -> type | None:
+    """Build a quantized-linear factory from ``config.quantization``, or None.
+
+    Returns ``None`` (meaning "use plain ``Linear``") when the model is
+    unquantized. Shared by the dense (:class:`Qwen35DecoderLayer`) and MoE
+    (:class:`Qwen35MoEDecoderLayer`) variants so ``self_attn``/``linear_attn``/
+    ``mlp``/``shared_expert`` are all quantized consistently.
+    """
+    quantization = config.quantization
+    if quantization is None or quantization.quant_method == "none":
+        return None
+    zero_point_dtype = config.dtype if quantization.float_zero_point else ir.DataType.UINT8
+    return make_quantized_linear_factory(
+        bits=quantization.bits,
+        block_size=quantization.group_size,
+        has_zero_point=not quantization.sym,
+        zero_point_dtype=zero_point_dtype,
+    )
 
 
 class Qwen35DecoderLayer(nn.Module):
@@ -47,6 +64,12 @@ class Qwen35DecoderLayer(nn.Module):
 
     Both variants use :class:`OffsetRMSNorm` (the *1 + weight* variant)
     for pre-attention and post-attention normalization.
+
+    When ``config.quantization`` is set, ``self_attn``/``linear_attn``/``mlp``
+    projections are built with a quantized-linear factory (see
+    :func:`_linear_factory`) so quantized checkpoints (e.g. Olive
+    RTN/GPTQ) load correctly instead of hitting a dense-vs-packed shape
+    mismatch.
     """
 
     def __init__(self, config: ArchitectureConfig, layer_idx: int):
@@ -55,13 +78,14 @@ class Qwen35DecoderLayer(nn.Module):
         self.layer_type: str = (
             layer_types[layer_idx] if layer_idx < len(layer_types) else "full_attention"
         )
+        linear_class = _linear_factory(config)
 
         if self.layer_type == "linear_attention":
-            self.linear_attn = GatedDeltaNet(config)
+            self.linear_attn = GatedDeltaNet(config, linear_class=linear_class)
         else:
-            self.self_attn = Qwen35Attention(config)
+            self.self_attn = Qwen35Attention(config, linear_class=linear_class)
 
-        self.mlp = MLP(config)
+        self.mlp = MLP(config, linear_class=linear_class)
         self.input_layernorm = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = OffsetRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -247,11 +271,18 @@ class Qwen35MoEDecoderLayer(Qwen35DecoderLayer):
     Same hybrid DeltaNet/full-attention architecture as
     :class:`Qwen35DecoderLayer`, but replaces the dense MLP with a
     :class:`Qwen35MoEBlock`.
+
+    The routed experts are quantized via the fused ``com.microsoft::QMoE``
+    path (see :class:`~mobius.components._moe.MoELayer`), driven directly
+    by ``config.quantization``. The always-active ``shared_expert``/
+    ``shared_expert_gate`` are not part of that fused op, so they are
+    quantized separately via the same ``linear_class`` factory used for
+    ``self_attn``/``linear_attn``/dense ``mlp`` (see :func:`_linear_factory`).
     """
 
     def __init__(self, config: ArchitectureConfig, layer_idx: int):
         super().__init__(config, layer_idx)
-        self.mlp = Qwen35MoEBlock(config)
+        self.mlp = Qwen35MoEBlock(config, linear_class=_linear_factory(config))
 
 
 class Qwen35MoETextModel(nn.Module):
@@ -364,6 +395,40 @@ class Qwen35MoECausalLMModel(CausalLMModel):
         # instead of un-fusing into per-expert MLPs. Uses the same predicate
         # as MoELayer so the weights and the emitted graph never disagree.
         use_qmoe = _supported_qmoe_quantization(self.config.quantization) is not None
+        if not use_qmoe:
+            # The dense per-expert fallback (MoELayer.experts) only knows how
+            # to consume *unquantized* fused expert tensors -- the split
+            # below un-fuses a bare float [num_experts, ...] tensor into
+            # per-expert nn.Linear-shaped weights. If quantization produced
+            # packed Olive tensors here (suffixed "_qweight"/"_scales"/
+            # "_qzeros", see preprocess_olive_weights) but the quantization
+            # config doesn't match the native QMoE ABI, there is no code path
+            # that splits a *packed* fused expert tensor into per-expert
+            # quantized Linear initializers -- silently falling through would
+            # emit a graph whose per-expert Linear modules request
+            # "experts.N.{gate,up}_proj.weight_qweight" keys that were never
+            # produced, since the packed tensor stays fused under
+            # "experts.gate_up_proj_qweight" instead. Reject explicitly
+            # rather than emit an unloadable graph.
+            packed_expert_keys = [
+                key
+                for key in state_dict
+                if ".mlp.experts." in key
+                and any(key.endswith(suffix) for suffix in ("_qweight", "_scales", "_qzeros"))
+            ]
+            if packed_expert_keys:
+                raise ValueError(
+                    "Quantized MoE expert weights were found "
+                    f"(e.g. {packed_expert_keys[0]!r}) but this quantization "
+                    "config doesn't match the native QMoE ABI "
+                    "(_supported_qmoe_quantization returned None). The dense "
+                    "loop-over-experts fallback only supports unquantized "
+                    "fused expert tensors, not packed quantized ones -- "
+                    "there is no path to un-fuse a packed expert tensor into "
+                    "per-expert quantized Linear initializers. Use a "
+                    "QMoE-ABI-compatible quantization config (see "
+                    "_supported_qmoe_quantization) for MoE models instead."
+                )
         cleaned: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             if key.startswith(("mtp_", "mtp.")):
@@ -388,7 +453,7 @@ class Qwen35MoECausalLMModel(CausalLMModel):
 
             # Unpack fused float expert weights into per-expert tensors for the
             # dense fallback. When ``use_qmoe`` is set the fused quantized
-            # tensors arrive as ``.qweight``/``.scales``/``.qzeros`` (which do
+            # tensors arrive as ``_qweight``/``_scales``/``_qzeros`` (which do
             # not match these suffixes) and are kept expert-major for
             # ``pack_qmoe_expert_weights`` below.
             # HF format: [num_experts, fused_dim, hidden] with gate+up fused

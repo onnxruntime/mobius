@@ -1,0 +1,13 @@
+model_id: "Qwen/Qwen-Image-Edit-2509"
+model_type: "qwen_image_edit"
+revision: "d3968ef930e841f4c73640fb8afa3b306a78167e"
+task_type: "image-to-image"
+dtype: "bfloat16"
+level: "L4+L5"
+inputs:
+  prompts:
+    - "Make the cat wear a bright red scarf while preserving its pose."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+skip_reason: "The official 20.4B pipeline requires over 57 GB of weights; genuine reduced-config diffusion L4/L5 goldens are covered by src/mobius/models/qwen_image_test.py and are explicitly not official-weight outputs."
+notes: "QwenImageEditPlusPipeline. The reduced golden encodes pipeline-cat-chonk.jpeg through a seeded diffusers Qwen Image VAE, packs the normalized posterior mode as source conditioning, runs the diffusers transformer and three FlowMatch Euler steps, and decodes the final edit latent. Mobius independently replays the same VAE-to-denoiser-to-decoder chain."

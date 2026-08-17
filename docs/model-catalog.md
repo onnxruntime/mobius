@@ -243,8 +243,12 @@ Supported component classes include:
 - `ControlNetModel` — ControlNet conditioning
 - `CogVideoXTransformer3DModel` — CogVideoX
 - `VideoAutoencoderModel` — Video VAE
-- `QwenImageTransformer2DModel` — Qwen image generation
-- `AutoencoderKLQwenImageModel` — Qwen image VAE
+- `QwenImageTransformer2DModel` — Qwen image generation and packed-token
+  Qwen-Image-Edit-2509 denoising with source-image conditioning, masks, and 3D RoPE
+- `AutoencoderKLQwenImageModel` — Qwen image VAE, including edit-pipeline latent
+  normalization
+- `Qwen2_5_VLForConditionalGeneration` — image-aware prompt encoder used by
+  Qwen-Image-Edit-2509
 
 ```python
 from mobius import build
@@ -263,9 +267,11 @@ All decoder-only LLMs and MoE models support quantized weight loading:
 | **AWQ** | HuggingFace (e.g. `-AWQ` suffix models) | `build("TheBloke/Llama-2-7B-AWQ")` |
 | **GGUF** | Local `.gguf` files | `build_from_gguf("model.gguf")` |
 
-GGUF support (Phase 1) dequantizes weights to float before building the
-ONNX graph. Phase 2 (`--keep-quantized`) preserves quantization using
-MatMulNBits ops.
+GGUF import preserves supported quantization by default using affine repacking
+or, for supported text-only inputs, native quantized ops. Multimodal and mixed
+source qtypes can require dequantization/requantization, so this does not imply
+byte preservation for every tensor. Use `--dequantize` for an explicitly float
+model.
 
 ## Summary
 

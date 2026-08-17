@@ -716,19 +716,29 @@ def preprocess_olive_weights(
 ) -> dict[str, torch.Tensor]:
     """Rename and reshape Olive-packed quantized weights.
 
-    Olive stores quantized weights with uint8 packing:
-      - ``*.qweight``: [N, packed_K] uint8
-      - ``*.scales``: [N, n_blocks]
-      - ``*.qzeros``: [N, ceil(n_blocks * bits / 8)] uint8, asymmetric only
+    Olive stores the quantized state of a parameter named ``<pname>`` (e.g.
+    ``"weight"`` for ``nn.Linear``/``nn.Embedding``, or ``"gate_up_proj"`` for
+    a fused-3D MoE expert parameter) as sibling buffers on the owning module,
+    using an *underscore* suffix convention (see Olive's
+    ``olive/common/quant/state_dict.py``) — **not** a dotted one:
+      - ``<pname>_qweight``: [N, packed_K] uint8 (always present)
+      - ``<pname>_scales``: [N, n_blocks] (always present)
+      - ``<pname>_qzeros``: [N, ceil(n_blocks * bits / 8)] uint8 (asymmetric only)
+
+    e.g. ``model.layers.0.mlp.gate_proj.weight_qweight`` (regular ``nn.Linear``)
+    or ``model.layers.0.mlp.experts.gate_up_proj_qweight`` (fused MoE param,
+    no ``.weight`` component since the parameter itself has no nested Linear).
 
     Linear projections target ``MatMulNBits``, which expects ``weight`` as
     [N, n_blocks, blob_size]; scales and zero-points already match the
     expected orientation, so they are renamed but not transposed.
 
-    The input embedding table (``*.embed_tokens.qweight``) instead targets
-    ``GatherBlockQuantized``, which consumes the **2-D** uint8 ``qweight``
-    directly — so it is kept as-is (only ``qzeros`` is renamed to
-    ``zero_points``).
+    The input embedding table (``*.embed_tokens.weight_qweight``) instead
+    targets ``GatherBlockQuantized``, which consumes the **2-D** uint8
+    ``qweight`` directly — so it is renamed to ``*.embed_tokens.qweight``
+    (dropping only the redundant ``weight`` component, not the ``qweight``
+    name itself); ``qzeros``/``scales`` are renamed the same way as the
+    general case below.
 
     Tied LM head: Olive RTN drops ``lm_head.*`` when the head is tied. When the
     head is **quantized**, no ``lm_head`` weights are produced here — the model
@@ -751,9 +761,45 @@ def preprocess_olive_weights(
     blob_size = group_size * bits // 8
     result: dict[str, torch.Tensor] = {}
 
+    def _rename(key: str, raw_suffix: str, dotted_name: str) -> str:
+        """Convert an Olive ``<owner>[.weight]{raw_suffix}`` key to ``<owner>.<dotted_name>``.
+
+        Olive's ``pname`` is either the bare ``"weight"`` parameter of an
+        ``nn.Linear``/``nn.Embedding`` (so the raw key carries a redundant
+        ``.weight`` component before the suffix, e.g. ``...gate_proj.weight_qweight``)
+        or a fused MoE parameter with no nested Linear (e.g.
+        ``...experts.gate_up_proj_qweight``). Strip the suffix, drop a
+        trailing ``.weight`` if present, then append ``.<dotted_name>`` so
+        both shapes land on a single canonical ``<owner>.<dotted_name>`` key.
+        """
+        stem = key[: -len(raw_suffix)]
+        if stem.endswith(".weight"):
+            stem = stem[: -len(".weight")]
+        return f"{stem}.{dotted_name}"
+
     for key, value in state_dict.items():
-        if key.endswith("embed_tokens.qweight"):
-            # GatherBlockQuantized consumes the 2-D uint8 table directly.
+        is_embed_qweight = key.endswith("embed_tokens.weight_qweight")
+        is_embed_qzeros = key.endswith("embed_tokens.weight_qzeros")
+        is_embed_scales = key.endswith("embed_tokens.weight_scales")
+        if (
+            is_embed_qweight or is_embed_qzeros or is_embed_scales
+        ) and not quantize_embeddings:
+            # These Olive keys only exist when the embedding table itself was
+            # quantized; ``quantize_embeddings=False`` means the caller
+            # expects a float embedding, so a packed embedding key showing up
+            # anyway indicates a caller/config mismatch rather than a case to
+            # silently reroute through the generic Linear renaming below
+            # (which would wrongly 3-D reshape ``qweight`` and break
+            # ``GatherBlockQuantized``'s 2-D contract).
+            raise ValueError(
+                f"Found packed embedding quantization key {key!r} but "
+                "quantize_embeddings=False; the caller's quantize_embeddings "
+                "flag doesn't match the state dict."
+            )
+        if is_embed_qweight and quantize_embeddings:
+            # GatherBlockQuantized consumes the 2-D uint8 table directly, so
+            # this keeps the ``qweight`` name (unlike MatMulNBits linears,
+            # which rename to ``weight`` below).
             if value.dtype != torch.uint8:
                 raise ValueError(
                     f"Olive embedding qweight must be uint8 for {key}, got {value.dtype}"
@@ -763,16 +809,16 @@ def preprocess_olive_weights(
                     f"Olive embedding qweight packed dimension for {key} "
                     f"({value.shape[-1]}) must be divisible by blob_size ({blob_size})"
                 )
-            result[key] = value.contiguous()
-        elif key.endswith("embed_tokens.qzeros"):
+            result[key[: -len("weight_qweight")] + "qweight"] = value.contiguous()
+        elif is_embed_qzeros and quantize_embeddings:
             if value.dtype != torch.uint8:
                 raise ValueError(
                     f"Olive embedding qzeros must be uint8 for {key}, got {value.dtype}"
                 )
-            result[key.replace(".qzeros", ".zero_points")] = value.contiguous()
-        elif key.endswith("embed_tokens.scales"):
-            result[key] = value
-        elif key.endswith(".qweight"):
+            result[key[: -len("weight_qzeros")] + "zero_points"] = value.contiguous()
+        elif is_embed_scales and quantize_embeddings:
+            result[key[: -len("weight_scales")] + "scales"] = value
+        elif key.endswith("_qweight"):
             if value.dtype != torch.uint8:
                 raise ValueError(f"Olive qweight must be uint8 for {key}, got {value.dtype}")
             if value.shape[-1] % blob_size != 0:
@@ -780,17 +826,20 @@ def preprocess_olive_weights(
                     f"Olive qweight packed dimension for {key} ({value.shape[-1]}) "
                     f"must be divisible by blob_size ({blob_size})"
                 )
-            new_key = key.replace(".qweight", ".weight")
+            new_key = _rename(key, "_qweight", "weight")
             # Preserve all leading dims so fused expert-major tensors
             # ``[E, N, packed_K]`` reshape to ``[E, N, n_blocks, blob_size]``
             # for the QMoE repacker; 2-D linears ``[N, packed_K]`` are
             # unchanged (``[N, n_blocks, blob_size]``).
             result[new_key] = value.reshape(*value.shape[:-1], -1, blob_size).contiguous()
-        elif key.endswith(".qzeros"):
+        elif key.endswith("_qzeros"):
             if value.dtype != torch.uint8:
                 raise ValueError(f"Olive qzeros must be uint8 for {key}, got {value.dtype}")
-            new_key = key.replace(".qzeros", ".zero_points")
+            new_key = _rename(key, "_qzeros", "zero_points")
             result[new_key] = value.contiguous()
+        elif key.endswith("_scales"):
+            new_key = _rename(key, "_scales", "scales")
+            result[new_key] = value
         else:
             result[key] = value
 

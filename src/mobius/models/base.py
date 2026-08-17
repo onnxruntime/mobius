@@ -22,7 +22,7 @@ from onnxscript import OpBuilder, nn
 from mobius._build_context import (
     ep_capabilities,
     get_build_dtype,
-    is_lm_head_pruning_enabled,
+    is_prefill_prefix_pruning_enabled,
 )
 from mobius._configs import ArchitectureConfig, CausalLMConfig
 from mobius._flags import flags
@@ -448,11 +448,11 @@ class CausalLMModel(nn.Module):
         )
         if len(result) == 3:
             hidden_states, present_key_values, intermediate_hidden_states = result
-            hidden_states = _prune_lm_head_hidden_states(op, hidden_states)
+            hidden_states = _retain_last_sequence_token(op, hidden_states)
             logits = self.lm_head(op, hidden_states)
             return logits, present_key_values, intermediate_hidden_states
         hidden_states, present_key_values = result
-        hidden_states = _prune_lm_head_hidden_states(op, hidden_states)
+        hidden_states = _retain_last_sequence_token(op, hidden_states)
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
 
@@ -499,9 +499,9 @@ class CausalLMModel(nn.Module):
         return state_dict
 
 
-def _prune_lm_head_hidden_states(op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
-    """Select the final sequence position before the LM-head projection."""
-    if not is_lm_head_pruning_enabled():
+def _retain_last_sequence_token(op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
+    """Retain only the final sequence position when prefill-prefix pruning is active."""
+    if not is_prefill_prefix_pruning_enabled():
         return hidden_states
     last_hidden = op.Gather(hidden_states, op.Constant(value_int=-1), axis=1)
     return op.Unsqueeze(last_hidden, op.Constant(value_ints=[1]))

@@ -214,14 +214,15 @@ def _text_gguf_to_hf_multimodal_quantized(
     block_size: int,
     symmetric: bool,
 ) -> dict:
-    """Load text-backbone GGUF tensors, quantizing the decoder + token embeddings.
+    """Load text GGUF tensors, quantizing the decoder and compatible embeddings.
 
     Mirrors :func:`_text_gguf_to_hf_multimodal` but keeps the text decoder
     projections in MatMulNBits form (``.weight`` uint8 + ``.scales`` [+
-    ``.zero_points``]) and the token-embedding tables in GatherBlockQuantized
-    form (``.qweight`` + ``.scales`` [+ ``.zero_points``]).  Norms and the
-    float per-layer projections stay dequantized.  Vision/audio weights are
-    loaded separately and always stay float.
+    ``.zero_points``]) and compatible token-embedding tables in
+    GatherBlockQuantized form (``.qweight`` + ``.scales`` [+
+    ``.zero_points``]). Incompatible token embeddings, norms, and float
+    per-layer projections stay dequantized. Vision/audio weights are loaded
+    separately and always stay float.
 
     Names are the HF multimodal ``language_model.*`` names that
     :meth:`Gemma4Model.preprocess_weights` expects.
@@ -230,6 +231,7 @@ def _text_gguf_to_hf_multimodal_quantized(
 
     from mobius.integrations.gguf._builder import repack_gguf_weight_to_target
 
+    quantize_embeddings = bool(getattr(config.quantization, "quantize_embeddings", False))
     quantize_lm_head = bool(getattr(config.quantization, "quantize_lm_head", False))
     tie_word_embeddings = bool(config.tie_word_embeddings)
 
@@ -255,7 +257,7 @@ def _text_gguf_to_hf_multimodal_quantized(
         is_quant_linear = hf_name.endswith(_QUANTIZED_LINEAR_SUFFIXES) or (
             quantize_lm_head and hf_name == "language_model.lm_head.weight"
         )
-        is_quant_embedding = hf_name in _QUANTIZED_EMBEDDING_NAMES
+        is_quant_embedding = quantize_embeddings and hf_name in _QUANTIZED_EMBEDDING_NAMES
 
         if (is_quant_linear or is_quant_embedding) and len(np_shape) == 2:
             repacked = repack_gguf_weight_to_target(
@@ -326,7 +328,7 @@ def build_gemma4_vlm_from_gguf(
     execution_provider: str = "default",
     image_token_id: int | None = None,
     include_audio: bool = False,
-    keep_quantized: bool = False,
+    keep_quantized: bool = True,
 ) -> ModelPackage:
     """Build a full Gemma4 multimodal ONNX package from text + mmproj GGUFs.
 
@@ -340,20 +342,24 @@ def build_gemma4_vlm_from_gguf(
             value carried by the text config is used (if any).
         include_audio: When ``True``, also build the (experimental) audio
             encoder. Off by default — see the module docstring.
-        keep_quantized: When ``True``, preserve the text backbone's GGUF
-            quantization: the decoder projections become MatMulNBits and the
-            token-embedding tables become GatherBlockQuantized (int4), roughly
-            an 8x size reduction over the dequantized package. The
-            vision (and audio) encoder always stay float because their weights
-            come from the mmproj as F16 — see the "Mixed precision" note below.
+        keep_quantized: Preserve the text backbone's GGUF quantization when
+            present. This is the default: decoder projections become
+            MatMulNBits and compatible token-embedding tables become
+            GatherBlockQuantized. Incompatible embedding qtypes or shapes stay
+            float. Quantized projection source types, including native
+            IQ/MXFP4 blocks, are normalized to the common affine layout rather
+            than retained byte-for-byte. Set to ``False`` to dequantize all
+            text weights. The vision (and audio) encoder always stays float
+            because its weights come from the mmproj as F16 — see the "Mixed
+            precision" note below.
 
     Returns:
         A :class:`ModelPackage` with ``decoder`` + ``vision_encoder`` +
         ``embedding`` components (plus ``audio_encoder`` if ``include_audio``).
 
     Mixed precision:
-        ``keep_quantized`` yields a mixed-precision package. Only the Gemma4
-        *text* components read ``config.quantization`` (see
+        Quantized text weights yield a mixed-precision package. Only the
+        Gemma4 *text* components read ``config.quantization`` (see
         :func:`mobius.models.gemma4._text_linear_class`); the vision/audio
         encoder modules always build float ``Linear`` layers, so a single
         module-global :class:`QuantizationConfig` quantizes the decoder +
@@ -363,13 +369,26 @@ def build_gemma4_vlm_from_gguf(
     import dataclasses
 
     from mobius._builder import resolve_dtype
+    from mobius.integrations.gguf._builder import (
+        _has_quantized_weights,
+        _validate_gguf_model,
+    )
     from mobius.integrations.gguf._config_mapping import gguf_to_config
     from mobius.integrations.gguf._reader import GGUFModel
     from mobius.models.gemma4 import Gemma4Model
     from mobius.tasks._gemma4 import Gemma4Task
 
     text_gguf = GGUFModel(_resolve_local_path(text_gguf_path))
+    _validate_gguf_model(text_gguf, source=str(text_gguf_path))
+
+    preserve_quantization = keep_quantized and _has_quantized_weights(text_gguf, "gemma4")
+    if keep_quantized and not preserve_quantization:
+        logger.info(
+            "Text GGUF contains no mapped quantized weights; using the float import path"
+        )
+
     mmproj_gguf = GGUFModel(_resolve_local_path(mmproj_gguf_path))
+    _validate_gguf_model(mmproj_gguf, source=str(mmproj_gguf_path))
     if mmproj_gguf.architecture != "clip":
         raise ValueError(
             f"Expected a 'clip' mmproj GGUF, got architecture "
@@ -401,10 +420,10 @@ def build_gemma4_vlm_from_gguf(
             config = dataclasses.replace(config, dtype=resolved)
 
     # 1b. Quantized mode: set the module-global quantization config from the
-    # text GGUF BEFORE building so the text graph emits MatMulNBits /
-    # GatherBlockQuantized. The vision/audio encoders ignore it and stay float.
+    # text GGUF BEFORE building so the text graph emits MatMulNBits and, when
+    # compatible, GatherBlockQuantized. The vision/audio encoders stay float.
     quant_params: tuple[int, int, bool] | None = None
-    if keep_quantized:
+    if preserve_quantization:
         from mobius._configs import QuantizationConfig
         from mobius.integrations.gguf._builder import (
             _can_quantize_embedding,
@@ -459,7 +478,7 @@ def build_gemma4_vlm_from_gguf(
 
     # 3. Assemble the combined HF-multimodal state dict from both GGUFs. The
     #    text backbone is quantized when requested; vision/audio always float.
-    if keep_quantized:
+    if preserve_quantization:
         bits, block_size, is_symmetric = quant_params
         state_dict = _text_gguf_to_hf_multimodal_quantized(
             text_gguf,

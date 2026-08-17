@@ -106,25 +106,46 @@ def _cast_module_dtype(module: nn.Module, dtype: ir.DataType) -> None:
             param.const_value = tensor_adapters.TorchTensor(cast_tensor)
 
 
-def _enable_pruned_lm_head_task(task: str | ModelTask) -> str | ModelTask:
-    """Return a task equivalent to *task* with LM-head pruning enabled."""
-    from mobius.tasks import CausalLMTask, HybridCausalLMTask
+def _enable_prefill_prefix_pruning_task(task: str | ModelTask) -> str | ModelTask:
+    """Return a task equivalent to *task* with prefill-prefix pruning enabled."""
+    from mobius.tasks import (
+        CausalLMTask,
+        Gemma4Task,
+        Gemma4TextCausalLMTask,
+        HybridCausalLMTask,
+    )
 
     if task == "text-generation":
-        return CausalLMTask(prune_lm_head=True)
+        return CausalLMTask(prune_prefill_prefix=True)
     if task == "hybrid-text-generation":
-        return HybridCausalLMTask(prune_lm_head=True)
+        return HybridCausalLMTask(prune_prefill_prefix=True)
+    if task == "gemma4-text-generation":
+        return Gemma4TextCausalLMTask(prune_prefill_prefix=True)
+    if task == "gemma4":
+        return Gemma4Task(prune_prefill_prefix=True)
     if isinstance(task, CausalLMTask):
         return CausalLMTask(
             static_cache=getattr(task, "_static_cache", False),
             max_seq_len=getattr(task, "_max_seq_len", None),
-            prune_lm_head=True,
+            prune_prefill_prefix=True,
         )
     if isinstance(task, HybridCausalLMTask):
-        return HybridCausalLMTask(prune_lm_head=True)
+        return HybridCausalLMTask(prune_prefill_prefix=True)
+    if isinstance(task, Gemma4TextCausalLMTask):
+        return Gemma4TextCausalLMTask(
+            static_cache=getattr(task, "_static_cache", False),
+            max_seq_len=getattr(task, "_max_seq_len", None),
+            prune_prefill_prefix=True,
+        )
+    if isinstance(task, Gemma4Task):
+        return Gemma4Task(
+            static_cache=getattr(task, "_static_cache", False),
+            max_seq_len=getattr(task, "_max_seq_len", None),
+            prune_prefill_prefix=True,
+        )
     raise ValueError(
-        "prune_lm_head=True is only supported for text-generation and "
-        "hybrid-text-generation tasks."
+        "prune_prefill_prefix=True is only supported for text-generation, "
+        "hybrid-text-generation, gemma4-text-generation, and gemma4 tasks."
     )
 
 
@@ -159,7 +180,7 @@ def build_from_module(
     trace_optimization: bool = False,
     fp8_kv_cache: bool = False,
     kv_cache_scales: dict[int, tuple[float, float]] | None = None,
-    prune_lm_head: bool = False,
+    prune_prefill_prefix: bool = False,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a module instance and config.
 
@@ -200,10 +221,10 @@ def build_from_module(
             per-tensor FP8 scales (from offline calibration), used only when
             ``fp8_kv_cache`` is ``True``. Layers absent from the map use a unit
             scale of ``1.0``.
-        prune_lm_head: When ``True``, reduce decoder logits to the final token
-            via the causal-LM task so runtimes can avoid full prefill LM-head
-            projection. Only supported by ``text-generation`` and
-            ``hybrid-text-generation`` tasks.
+        prune_prefill_prefix: When ``True``, retain only the final sequence position
+            before the LM head so ``logits`` is shaped ``[B, 1, vocab]``. Some
+            models (e.g. Gemma 4) additionally prune decoder suffix computation
+            during prefill. Only supported by causal generation tasks.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -237,8 +258,8 @@ def build_from_module(
     # are included — their graph inputs are kept at f32 (matching GenAI's
     # image processor output) with a Cast at the graph entry.
     _cast_module_dtype(module, dtype)
-    if prune_lm_head:
-        task = _enable_pruned_lm_head_task(task)
+    if prune_prefill_prefix:
+        task = _enable_prefill_prefix_pruning_task(task)
     resolved_task = get_task(task)
     capabilities = ep_registry.require(execution_provider)
     with build_context(capabilities, dtype):
@@ -390,6 +411,7 @@ def build(
     model_id: str,
     task: str | ModelTask | None = None,
     *,
+    revision: str | None = None,
     module_class: type[nn.Module] | None = None,
     dtype: str | ir.DataType | None = None,
     output_layer_indices: list[int] | None = None,
@@ -400,7 +422,7 @@ def build(
     text_only: bool = False,
     fp8_kv_cache: bool = False,
     kv_cache_scales: dict[int, tuple[float, float]] | None = None,
-    prune_lm_head: bool = False,
+    prune_prefill_prefix: bool = False,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a HuggingFace model ID.
 
@@ -422,6 +444,8 @@ def build(
         task: The model task. Either a task name string
             (e.g. ``"text-generation"``) or a :class:`ModelTask` instance.
             When ``None``, the task is auto-detected from the model type.
+        revision: Optional Hugging Face revision used consistently for the
+            configuration and every weight shard.
         module_class: Custom module class to use instead of the auto-detected
             one. The class must accept an :class:`ArchitectureConfig` as its
             constructor argument and have a ``forward()`` method compatible
@@ -476,7 +500,7 @@ def build(
             per-tensor FP8 scales (from offline calibration), used only when
             ``fp8_kv_cache`` is ``True``. Layers absent from the map use a unit
             scale of ``1.0``.
-        prune_lm_head: When ``True``, build supported causal-LM tasks so the
+        prune_prefill_prefix: When ``True``, build supported causal-LM tasks so the
             exported ``logits`` output contains only the final token
             (``[B, 1, vocab]``). This is intended for single-token
             autoregressive generation and is incompatible with workflows that
@@ -516,14 +540,15 @@ def build(
     from mobius._diffusers_builder import build_diffusers_pipeline
 
     try:
-        hf_config = transformers.AutoConfig.from_pretrained(
-            model_id, trust_remote_code=trust_remote_code
-        )
+        config_kwargs = {"trust_remote_code": trust_remote_code}
+        if revision is not None:
+            config_kwargs["revision"] = revision
+        hf_config = transformers.AutoConfig.from_pretrained(model_id, **config_kwargs)
     except (ValueError, KeyError, OSError):
         # AutoConfig failed — the model_type may not be in transformers,
         # or the HF config class has a bug (e.g. NemotronH with '-' pattern).
         # Try loading config.json directly if the model is in our registry.
-        hf_config = _try_load_config_json(model_id)
+        hf_config = _try_load_config_json(model_id, revision=revision)
         if hf_config is None or hf_config.model_type not in registry:
             if text_only:
                 raise ValueError(
@@ -534,8 +559,10 @@ def build(
             # Not a model we support — try diffusers pipeline
             return build_diffusers_pipeline(
                 model_id,
+                revision=revision,
                 dtype=dtype,
                 load_weights=load_weights,
+                execution_provider=execution_provider,
             )
 
     model_type = hf_config.model_type
@@ -659,14 +686,14 @@ def build(
         trace_optimization=trace_optimization,
         fp8_kv_cache=fp8_kv_cache,
         kv_cache_scales=kv_cache_scales,
-        prune_lm_head=prune_lm_head,
+        prune_prefill_prefix=prune_prefill_prefix,
     )
 
     for name, model in pkg.items():
         model.graph.name = f"{model_id}/{name}"
 
     if load_weights:
-        state_dict = _download_weights(model_id)
+        state_dict = _download_weights(model_id, revision=revision)
         if hasattr(model_module, "preprocess_weights"):
             state_dict = model_module.preprocess_weights(state_dict)
         prefix_map = getattr(model_module, "weight_prefix_map", None)

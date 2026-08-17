@@ -133,13 +133,14 @@ class _ExpertProjections:
 def _trace_expert(down: ir.Node) -> _ExpertProjections | None:
     """Walk back from a ``down_proj`` ``MatMulNBits`` to its gate/up projections.
 
-    Expert MLP shape (SwiGLU): ``down(  (gate*sigmoid(gate)) * up  )``.
+    Expert MLP shape (SwiGLU): ``down(Swish(gate) * up)``. The legacy
+    ``gate * Sigmoid(gate)`` decomposition remains accepted for imported graphs.
     """
     act_mul = _require_producer(down.inputs[0], "Mul")
     if act_mul is None:
         return None
     a, b = act_mul.inputs[0], act_mul.inputs[1]
-    # one operand is the up projection (MatMulNBits), the other the SiLU Mul.
+    # One operand is the up projection (MatMulNBits), the other the SiLU activation.
     if a.producer() and a.producer().op_type == "MatMulNBits":
         up_out, silu_out = a, b
     elif b.producer() and b.producer().op_type == "MatMulNBits":
@@ -148,17 +149,30 @@ def _trace_expert(down: ir.Node) -> _ExpertProjections | None:
         return None
     up = up_out.producer()
     silu = silu_out.producer()
-    if silu is None or silu.op_type != "Mul":
+    if silu is None:
         return None
+    if silu.op_type == "Swish":
+        gate = silu.inputs[0].producer()
+        if gate is None or gate.op_type != "MatMulNBits":
+            return None
+        return _ExpertProjections(gate, up, down)
+    if silu.op_type != "Mul":
+        return None
+
+    # Accept the legacy gate * Sigmoid(gate) decomposition.
     x, y = silu.inputs[0], silu.inputs[1]
-    # gate_out feeds both the SiLU Mul directly and a Sigmoid.
-    if x.producer() and x.producer().op_type == "MatMulNBits":
-        gate = x.producer()
-    elif y.producer() and y.producer().op_type == "MatMulNBits":
-        gate = y.producer()
-    else:
-        return None
-    return _ExpertProjections(gate, up, down)
+    for gate_out, sigmoid_out in ((x, y), (y, x)):
+        gate = gate_out.producer()
+        sigmoid = sigmoid_out.producer()
+        if (
+            gate is not None
+            and gate.op_type == "MatMulNBits"
+            and sigmoid is not None
+            and sigmoid.op_type == "Sigmoid"
+            and sigmoid.inputs[0] is gate_out
+        ):
+            return _ExpertProjections(gate, up, down)
+    return None
 
 
 def _router_gate(logits: ir.Value) -> ir.Node | None:

@@ -5,14 +5,17 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import mock_open, patch
 
 import onnx_ir as ir
 import pytest
 
 from mobius._diffusers_builder import (
     _DIFFUSERS_CLASS_MAP,
+    _download_diffusers_component_weights,
     _init_diffusers_class_map,
+    _load_diffusers_component_config,
+    _load_diffusers_pipeline_index,
     build_diffusers_pipeline,
 )
 from mobius._model_package import ModelPackage
@@ -53,6 +56,7 @@ class TestInitDiffusersClassMap:
             "FluxTransformer2DModel",
             "SD3Transformer2DModel",
             "QwenImageTransformer2DModel",
+            "Qwen2_5_VLForConditionalGeneration",
             "UNet2DConditionModel",
             "CLIPTextModel",
             "AutoencoderKL",
@@ -83,6 +87,8 @@ class TestInitDiffusersClassMap:
             "denoising",
             "vae",
             "qwen-image-vae",
+            "qwen-image-denoising",
+            "qwen-image-text-encoding",
             "video-denoising",
             "feature-extraction",
             "cosmos3-omni-generator",
@@ -135,6 +141,70 @@ class TestBuildDiffusersPipelineErrors:
         """ValueError when pipeline only has non-NN components (scheduler, tokenizer)."""
         with pytest.raises(ValueError, match="No supported neural network components"):
             build_diffusers_pipeline("fake/scheduler-only", load_weights=False)
+
+
+# ── Hub revision propagation ─────────────────────────────────────────────
+
+
+class TestDiffusersHubRevision:
+    @patch("huggingface_hub.hf_hub_download", return_value="model_index.json")
+    def test_pipeline_index_download_uses_revision(self, mock_download):
+        with patch("builtins.open", mock_open(read_data='{"_class_name": "FakePipeline"}')):
+            result = _load_diffusers_pipeline_index(
+                "fake/model",
+                revision="pinned-revision",
+            )
+
+        assert result == {"_class_name": "FakePipeline"}
+        mock_download.assert_called_once_with(
+            repo_id="fake/model",
+            filename="model_index.json",
+            revision="pinned-revision",
+        )
+
+    @patch("huggingface_hub.hf_hub_download", return_value="config.json")
+    def test_component_config_download_uses_revision(self, mock_download):
+        with patch("builtins.open", mock_open(read_data='{"in_channels": 3}')):
+            result = _load_diffusers_component_config(
+                "fake/model",
+                "vae",
+                revision="pinned-revision",
+            )
+
+        assert result == {"in_channels": 3}
+        mock_download.assert_called_once_with(
+            repo_id="fake/model",
+            filename="vae/config.json",
+            revision="pinned-revision",
+        )
+
+    @patch("mobius._diffusers_builder._parallel_download", return_value=[])
+    @patch("huggingface_hub.hf_hub_download", return_value="weights.index.json")
+    def test_component_weight_downloads_use_revision(
+        self,
+        mock_download,
+        mock_parallel_download,
+    ):
+        index = '{"weight_map": {"weight": "model-00001-of-00001.safetensors"}}'
+        with patch("builtins.open", mock_open(read_data=index)):
+            result = _download_diffusers_component_weights(
+                "fake/model",
+                "vae",
+                revision="pinned-revision",
+            )
+
+        assert result == {}
+        mock_download.assert_called_once_with(
+            repo_id="fake/model",
+            filename="vae/diffusion_pytorch_model.safetensors.index.json",
+            revision="pinned-revision",
+        )
+        mock_parallel_download.assert_called_once_with(
+            "fake/model",
+            ["vae/model-00001-of-00001.safetensors"],
+            revision="pinned-revision",
+            desc="vae weights",
+        )
 
 
 # ── build_diffusers_pipeline component filtering ─────────────────────────
@@ -431,6 +501,102 @@ class TestBuildDiffusersPipelineSuccess:
             "trace_optimization": True,
         }
 
+    @patch("mobius._diffusers_builder._download_diffusers_component_weights")
+    @patch("mobius._diffusers_builder.apply_weights")
+    @patch("mobius._diffusers_builder.build_from_module")
+    @patch("mobius._diffusers_builder._load_diffusers_component_config")
+    @patch("mobius._diffusers_builder._load_diffusers_pipeline_index")
+    def test_revision_propagates_to_all_pipeline_artifacts(
+        self,
+        mock_load_index,
+        mock_load_config,
+        mock_build_from_module,
+        mock_apply_weights,
+        mock_download_weights,
+    ):
+        mock_load_index.return_value = _fake_pipeline_index(
+            {"vae": ["diffusers", "AutoencoderKL"]}
+        )
+        mock_load_config.return_value = {}
+        graph = ir.Graph([], [], nodes=[], name="vae")
+        model = ir.Model(graph, ir_version=10)
+        mock_build_from_module.return_value = ModelPackage({"model": model})
+        mock_download_weights.return_value = {}
+
+        build_diffusers_pipeline("fake/model", revision="pinned-revision")
+
+        mock_load_index.assert_called_once_with("fake/model", revision="pinned-revision")
+        mock_load_config.assert_called_once_with(
+            "fake/model", "vae", revision="pinned-revision"
+        )
+        mock_download_weights.assert_called_once_with(
+            "fake/model", "vae", revision="pinned-revision"
+        )
+        mock_apply_weights.assert_called_once()
+
+    @patch("mobius._diffusers_builder.build_from_module")
+    @patch("mobius._diffusers_builder._load_diffusers_component_config")
+    @patch("mobius._diffusers_builder._load_diffusers_pipeline_index")
+    def test_qwen_edit_uses_normalized_vae_task(
+        self,
+        mock_load_index,
+        mock_load_config,
+        mock_build_from_module,
+    ):
+        mock_load_index.return_value = {
+            "_class_name": "QwenImageEditPlusPipeline",
+            "vae": ["diffusers", "AutoencoderKLQwenImage"],
+        }
+        mock_load_config.return_value = {
+            "base_dim": 8,
+            "z_dim": 4,
+            "dim_mult": [1, 2],
+            "num_res_blocks": 1,
+            "temperal_downsample": [False],
+            "latents_mean": [0.0] * 4,
+            "latents_std": [1.0] * 4,
+        }
+        graph = ir.Graph([], [], nodes=[], name="vae")
+        mock_build_from_module.return_value = ModelPackage(
+            {"model": ir.Model(graph, ir_version=10)}
+        )
+
+        result = build_diffusers_pipeline("fake/qwen-edit", load_weights=False)
+
+        assert "vae" in result
+        assert mock_build_from_module.call_args.args[2] == "qwen-image-edit-vae"
+        assert result.config.model_type == "qwen_image_edit"
+
+    @patch("mobius._diffusers_builder.build_from_module")
+    @patch("mobius._diffusers_builder._load_diffusers_component_config")
+    @patch("mobius._diffusers_builder._load_diffusers_pipeline_index")
+    def test_component_allowlist_avoids_building_other_components(
+        self,
+        mock_load_index,
+        mock_load_config,
+        mock_build_from_module,
+    ):
+        mock_load_index.return_value = _fake_pipeline_index(
+            {
+                "transformer": ["diffusers", "FluxTransformer2DModel"],
+                "vae": ["diffusers", "AutoencoderKL"],
+            }
+        )
+        mock_load_config.return_value = {}
+        graph = ir.Graph([], [], nodes=[], name="transformer")
+        mock_build_from_module.return_value = ModelPackage(
+            {"model": ir.Model(graph, ir_version=10)}
+        )
+
+        result = build_diffusers_pipeline(
+            "fake/filtered",
+            load_weights=False,
+            components={"transformer"},
+        )
+
+        assert set(result) == {"transformer"}
+        mock_load_config.assert_called_once_with("fake/filtered", "transformer", revision=None)
+
 
 # ── build_diffusers_pipeline weight loading ──────────────────────────────
 
@@ -438,6 +604,7 @@ class TestBuildDiffusersPipelineSuccess:
 class TestBuildDiffusersPipelineWeights:
     """Tests for weight loading paths in build_diffusers_pipeline."""
 
+    @patch("mobius._diffusers_builder.fold_initializers_after_weights")
     @patch("mobius._diffusers_builder.apply_weights")
     @patch(
         "mobius._diffusers_builder._download_diffusers_component_weights",
@@ -456,6 +623,7 @@ class TestBuildDiffusersPipelineWeights:
         mock_build_from_module,
         mock_download_weights,
         mock_apply_weights,
+        mock_fold_initializers,
     ):
         """When load_weights=True, weights are downloaded and applied."""
         mock_load_index.return_value = _fake_pipeline_index(
@@ -469,8 +637,9 @@ class TestBuildDiffusersPipelineWeights:
 
         build_diffusers_pipeline("fake/model", load_weights=True)
 
-        mock_download_weights.assert_called_once_with("fake/model", "vae")
+        mock_download_weights.assert_called_once_with("fake/model", "vae", revision=None)
         mock_apply_weights.assert_called_once()
+        mock_fold_initializers.assert_called_once_with(model)
 
     @patch(
         "mobius._diffusers_builder._download_diffusers_component_weights",

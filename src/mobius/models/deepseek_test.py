@@ -10,7 +10,7 @@ import pytest
 from onnxscript import GraphBuilder
 
 from mobius._constants import OPSET_VERSION
-from mobius._testing import make_config
+from mobius._testing import create_test_builder, create_test_input, make_config
 from mobius.models.deepseek import DeepSeekMoEGate, _DeepSeekMoEFFN
 
 
@@ -127,6 +127,38 @@ def test_noaux_tc_supports_single_expert_groups():
 
     assert output is not None
     assert any(node.op_type == "TopK" for node in graph)
+
+
+def test_qmoe_routing_casts_scores_back_to_hidden_states_dtype():
+    """qmoe_routing()'s router_probs/router_weights must match hidden_states' dtype.
+
+    QMoE's contrib-op schema binds router_probs/router_weights to the same
+    type constraint ("T") as hidden_states. _routing_scores() computes in
+    FLOAT32 for numerical stability (matching HF's fp32 routing), so
+    qmoe_routing() must cast the result back to hidden_states' dtype --
+    otherwise a fp16/bf16 model export would hit a QMoE type-mismatch error.
+    """
+    config = make_config(
+        hidden_size=4,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        n_group=1,
+        topk_group=1,
+        scoring_func="softmax",
+        topk_method="greedy",
+        norm_topk_prob=True,
+        routed_scaling_factor=1.0,
+    )
+    gate = DeepSeekMoEGate(config)
+    builder, op, _graph = create_test_builder()
+    hidden = create_test_input(
+        builder, "hidden", [1, 2, config.hidden_size], ir.DataType.FLOAT16
+    )
+
+    router_probs, router_weights, _normalize, _scale = gate.qmoe_routing(op, hidden)
+
+    assert router_probs.dtype == ir.DataType.FLOAT16
+    assert router_weights.dtype == ir.DataType.FLOAT16
 
 
 def test_grouped_routing_rejects_non_divisible_expert_count():

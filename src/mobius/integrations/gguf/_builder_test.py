@@ -6,11 +6,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
+import httpx
 import numpy as np
 import onnx_ir as ir
 import onnxruntime as ort
 import pytest
+from huggingface_hub.utils import OfflineModeIsEnabled
 
 
 def _run_gather_block_quantized(
@@ -77,6 +81,7 @@ def _run_gather_block_quantized(
 def _write_quantized_gguf(
     path: Path,
     *,
+    architecture: str = "llama",
     hidden_size: int = 64,
     num_layers: int = 1,
     num_heads: int = 4,
@@ -89,6 +94,7 @@ def _write_quantized_gguf(
     value_projection_quantization: str | None = None,
     output_quantization: str | None = None,
     tie_embeddings: bool = False,
+    float_type: str = "f32",
 ) -> None:
     """Write a GGUF file with quantized projection weights.
 
@@ -98,7 +104,7 @@ def _write_quantized_gguf(
     """
     from gguf import GGMLQuantizationType, GGUFWriter
 
-    writer = GGUFWriter(str(path), "llama")
+    writer = GGUFWriter(str(path), architecture)
     writer.add_context_length(512)
     writer.add_embedding_length(hidden_size)
     writer.add_feed_forward_length(intermediate_size)
@@ -113,6 +119,21 @@ def _write_quantized_gguf(
 
     def _add_f32(name: str, shape: tuple[int, ...]) -> None:
         writer.add_tensor(name, np.random.randn(*shape).astype(np.float32))
+
+    def _add_f16(name: str, shape: tuple[int, ...]) -> None:
+        writer.add_tensor(name, np.random.randn(*shape).astype(np.float16))
+
+    def _add_bf16(name: str, shape: tuple[int, ...]) -> None:
+        values = np.random.randn(*shape).astype(np.float32)
+        raw = (values.view(np.uint32) >> 16).astype(np.uint16)
+        writer.add_tensor(
+            name,
+            raw,
+            raw_shape=shape,
+            raw_dtype=GGMLQuantizationType.BF16,
+        )
+
+    add_float = {"f32": _add_f32, "f16": _add_f16, "bf16": _add_bf16}[float_type]
 
     def _add_q4_0(name: str, n_out: int, k_in: int) -> None:
         """Write a Q4_0-quantized weight tensor."""
@@ -199,13 +220,18 @@ def _write_quantized_gguf(
     elif embedding_quantization == "q8_0":
         _add_q8_0("token_embd.weight", vocab_size, hidden_size)
     else:
-        _add_f32("token_embd.weight", (vocab_size, hidden_size))
+        add_float("token_embd.weight", (vocab_size, hidden_size))
 
     if projection_quantization in {"q4_0", "q8_0"}:
         add_projection = {
             "q4_0": _add_q4_0,
             "q8_0": _add_q8_0,
         }[projection_quantization]
+    elif projection_quantization in {"f32", "f16", "bf16"}:
+
+        def add_projection(name: str, n_out: int, k_in: int) -> None:
+            add_float(name, (n_out, k_in))
+
     else:
 
         def add_projection(name: str, n_out: int, k_in: int) -> None:
@@ -240,18 +266,18 @@ def _write_quantized_gguf(
         add_projection(f"blk.{i}.ffn_up.weight", intermediate_size, hidden_size)
         add_projection(f"blk.{i}.ffn_down.weight", hidden_size, intermediate_size)
         # Norms (float32)
-        _add_f32(f"blk.{i}.attn_norm.weight", (hidden_size,))
-        _add_f32(f"blk.{i}.ffn_norm.weight", (hidden_size,))
+        add_float(f"blk.{i}.attn_norm.weight", (hidden_size,))
+        add_float(f"blk.{i}.ffn_norm.weight", (hidden_size,))
 
     # Output norm + optional untied lm_head
-    _add_f32("output_norm.weight", (hidden_size,))
+    add_float("output_norm.weight", (hidden_size,))
     if not tie_embeddings:
         if output_quantization == "q4_0":
             _add_q4_0("output.weight", vocab_size, hidden_size)
         elif output_quantization == "q8_0":
             _add_q8_0("output.weight", vocab_size, hidden_size)
         else:
-            _add_f32("output.weight", (vocab_size, hidden_size))
+            add_float("output.weight", (vocab_size, hidden_size))
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -264,6 +290,19 @@ def q4_0_gguf(tmp_path: Path) -> Path:
     """Create a Q4_0 quantized GGUF test file."""
     path = tmp_path / "test_q4_0.gguf"
     _write_quantized_gguf(path)
+    return path
+
+
+@pytest.fixture(params=["f32", "f16", "bf16"])
+def float_only_gguf(tmp_path: Path, request) -> Path:
+    """Create a GGUF with only unquantized tensor types."""
+    float_type = request.param
+    path = tmp_path / f"test_{float_type}.gguf"
+    _write_quantized_gguf(
+        path,
+        projection_quantization=float_type,
+        float_type=float_type,
+    )
     return path
 
 
@@ -352,27 +391,55 @@ def mixed_native_q5_q8_gguf(tmp_path: Path) -> Path:
 
 
 class TestBuildQuantizedGguf:
-    """Tests for build_from_gguf(keep_quantized=True)."""
+    """Tests for the default quantization-preserving GGUF build."""
 
     def test_produces_model_package(self, q4_0_gguf: Path):
         """Quantized build returns a valid ModelPackage."""
         from mobius.integrations.gguf import build_from_gguf
 
-        pkg = build_from_gguf(q4_0_gguf, keep_quantized=True)
+        pkg = build_from_gguf(q4_0_gguf)
         assert "model" in pkg
         assert pkg["model"].graph is not None
 
     def test_model_has_matmulnbits_ops(self, q4_0_gguf: Path):
-        """Quantized model uses MatMulNBits instead of MatMul."""
+        """The API default uses MatMulNBits instead of float MatMul weights."""
         from mobius.integrations.gguf import build_from_gguf
 
-        pkg = build_from_gguf(q4_0_gguf, keep_quantized=True)
+        pkg = build_from_gguf(q4_0_gguf)
         model = pkg["model"]
 
         op_types = {node.op_type for node in model.graph if node.op_type}
         assert "MatMulNBits" in op_types, (
             f"Expected MatMulNBits in ops, got: {sorted(op_types)}"
         )
+
+    def test_default_quantized_package_save_reload(self, q4_0_gguf: Path, tmp_path: Path):
+        """Default quantized ops and weights survive ModelPackage persistence."""
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.gguf import build_from_gguf
+
+        output_dir = tmp_path / "saved"
+        build_from_gguf(q4_0_gguf).save(str(output_dir), progress_bar=False)
+        reloaded = ModelPackage.load(str(output_dir))
+
+        op_types = {node.op_type for node in reloaded["model"].graph}
+        assert "MatMulNBits" in op_types
+        assert (
+            reloaded["model"]
+            .graph.initializers["model.layers.0.self_attn.q_proj.weight"]
+            .const_value
+            is not None
+        )
+
+    def test_float_only_default_uses_float_path(self, float_only_gguf: Path):
+        """F32/BF16-only GGUFs do not fail when preservation is the default."""
+        from mobius.integrations.gguf import build_from_gguf
+
+        model = build_from_gguf(float_only_gguf)["model"]
+        op_types = {node.op_type for node in model.graph}
+        assert "MatMulNBits" not in op_types
+        assert "GatherBlockQuantized" not in op_types
+        assert "BlockQuantizedMatMul" not in op_types
 
     def test_q4_0_matmulnbits_has_explicit_zero_points(self, q4_0_gguf: Path):
         """GGUF Q4_0 projections explicitly encode zp=8 instead of EP defaults."""
@@ -556,7 +623,7 @@ class TestBuildQuantizedGguf:
                 )
 
     def test_dequantized_path_no_matmulnbits(self, q4_0_gguf: Path):
-        """Without keep_quantized, no MatMulNBits ops."""
+        """Explicit API dequantization emits no quantized projection ops."""
         from mobius.integrations.gguf import build_from_gguf
 
         pkg = build_from_gguf(q4_0_gguf, keep_quantized=False)
@@ -564,6 +631,7 @@ class TestBuildQuantizedGguf:
 
         op_types = {node.op_type for node in model.graph if node.op_type}
         assert "MatMulNBits" not in op_types
+        assert "BlockQuantizedMatMul" not in op_types
 
     def test_detect_quant_params(self, q4_0_gguf: Path):
         """_detect_quant_params finds Q4_0 as dominant type."""
@@ -633,6 +701,31 @@ class TestBuildQuantizedGguf:
 
         bits, block_size, is_sym = _detect_quant_params(_MixedModel(), "llama")
         assert (bits, block_size, is_sym) == (4, 32, False)
+
+    def test_pure_q6_k_requires_explicit_dequantization(self):
+        """Unsupported quantized inputs fail instead of silently becoming float."""
+        from gguf import GGMLQuantizationType
+
+        from mobius.integrations.gguf._builder import _detect_quant_params
+
+        class _UnsupportedModel:
+            def tensor_items_raw(self):
+                yield (
+                    "blk.0.ffn_down.weight",
+                    np.empty(0, dtype=np.uint8),
+                    GGMLQuantizationType.Q6_K,
+                    (64, 128),
+                )
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                r"No supported quantized preservation target for GGUF weight "
+                r"types: Q6_K. Use keep_quantized=False \(API\) or "
+                r"--dequantize \(CLI\) for explicit float import."
+            ),
+        ):
+            _detect_quant_params(_UnsupportedModel(), "llama")
 
     def test_runtime_unsupported_format_does_not_select_native_op(self):
         """A GGUF type outside the runtime contract remains on the fallback."""
@@ -707,6 +800,31 @@ class TestBuildGgufStaticCache:
             )
 
 
+class TestMultimodalQuantizationDefault:
+    @pytest.mark.parametrize("keep_quantized", [True, False])
+    def test_build_from_gguf_forwards_quantization_policy_to_mmproj(
+        self, keep_quantized: bool
+    ):
+        from mobius.integrations.gguf import build_from_gguf
+
+        expected = mock.sentinel.package
+        with mock.patch(
+            "mobius.integrations.gguf._mmproj.build_gemma4_vlm_from_gguf",
+            return_value=expected,
+        ) as build_multimodal:
+            kwargs = {} if keep_quantized else {"keep_quantized": False}
+            actual = build_from_gguf("text.gguf", mmproj="mmproj.gguf", **kwargs)
+
+        assert actual is expected
+        build_multimodal.assert_called_once_with(
+            "text.gguf",
+            "mmproj.gguf",
+            dtype=None,
+            execution_provider="default",
+            keep_quantized=keep_quantized,
+        )
+
+
 class TestRawTensorIterator:
     """Tests for GGUFModel.tensor_items_raw()."""
 
@@ -754,3 +872,181 @@ class TestRawTensorIterator:
         expected = model.get_tensor(name)
         actual = model.dequantize_raw_tensor(raw, qtype, shape)
         np.testing.assert_array_equal(actual, expected)
+
+
+class TestGGUFPreflightGuards:
+    """Unsupported layouts fail before graph construction or large downloads."""
+
+    def test_nemotron_layout_excludes_combined_mtp_block(self):
+        from mobius.integrations.gguf._builder import (
+            _summarize_nemotron_h_moe_layout,
+        )
+
+        # Pinned NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 schedule:
+        # 52 backbone layers followed by one combined attention+MoE MTP block.
+        backbone_schedule = (
+            "mamba",
+            "moe",
+            "mamba",
+            "moe",
+            "mamba",
+            "attention",
+            "moe",
+            "mamba",
+            "moe",
+            "mamba",
+            "moe",
+            "mamba",
+            "attention",
+            "moe",
+            "mamba",
+            "moe",
+            "mamba",
+            "moe",
+            "mamba",
+            "attention",
+            "moe",
+            "mamba",
+            "moe",
+            "mamba",
+            "moe",
+            "mamba",
+            "attention",
+            "moe",
+            "mamba",
+            "moe",
+            "mamba",
+            "moe",
+            "mamba",
+            "attention",
+            "moe",
+            "mamba",
+            "moe",
+            "mamba",
+            "moe",
+            "mamba",
+            "moe",
+            "mamba",
+            "attention",
+            "moe",
+            "mamba",
+            "moe",
+            "mamba",
+            "moe",
+            "mamba",
+            "moe",
+            "mamba",
+            "moe",
+        )
+        assert len(backbone_schedule) == 52
+
+        representative_tensor = {
+            "mamba": "ssm_in.weight",
+            "moe": "ffn_up_exps.weight",
+            "attention": "attn_q.weight",
+        }
+        tensor_names = [
+            f"blk.{index}.{representative_tensor[layer_type]}"
+            for index, layer_type in enumerate(backbone_schedule)
+        ]
+        tensor_names.extend(
+            [
+                "blk.52.nextn.eh_proj.weight",
+                "blk.52.attn_q.weight",
+                "blk.52.ffn_up_exps.weight",
+            ]
+        )
+
+        counts, mtp_blocks, mtp_kinds = _summarize_nemotron_h_moe_layout(tensor_names)
+
+        assert dict(counts) == {"mamba": 23, "moe": 23, "attention": 6}
+        assert mtp_blocks == (52,)
+        assert mtp_kinds == {52: frozenset({"attention", "moe"})}
+
+    def test_local_nemotron_h_moe_fails_before_graph_build(self, tmp_path: Path):
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "nemotron-h-moe-q8.gguf"
+        _write_quantized_gguf(path, architecture="nemotron_h_moe")
+
+        with pytest.raises(NotImplementedError) as exc_info:
+            build_from_gguf(path, keep_quantized=True)
+
+        message = str(exc_info.value)
+        assert "intentionally disabled" in message
+        assert "MTP auxiliary block" in message
+        assert "Q5_0/Q5_1" in message
+        assert "llama.cpp/Unsloth" in message
+        assert "Olive" in message
+
+    def test_remote_nemotron_h_moe_fails_before_download(self):
+        from mobius.integrations.gguf._builder import _resolve_gguf_path
+
+        filename = "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf"
+        with (
+            mock.patch("mobius.integrations.gguf._builder.HfApi") as api_type,
+            mock.patch("mobius.integrations.gguf._builder.hf_hub_download") as download,
+            pytest.raises(NotImplementedError, match="nemotron_h_moe"),
+        ):
+            api_type.return_value.model_info.return_value = SimpleNamespace(
+                gguf={"architecture": "nemotron_h_moe"}
+            )
+            _resolve_gguf_path(f"unsloth/nemotron:{filename}")
+
+        api_type.return_value.model_info.assert_called_once_with(
+            "unsloth/nemotron", expand=["gguf"]
+        )
+        download.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "preflight_error",
+        [
+            pytest.param(
+                OfflineModeIsEnabled("offline"),
+                id="offline-cache",
+            ),
+            pytest.param(
+                TypeError("model_info() got an unexpected keyword argument 'expand'"),
+                id="older-huggingface-hub",
+            ),
+            pytest.param(
+                httpx.ConnectError("disconnected"),
+                id="transport-error",
+            ),
+        ],
+    )
+    def test_unavailable_hub_preflight_falls_back_to_download(self, preflight_error):
+        from mobius.integrations.gguf._builder import _resolve_gguf_path
+
+        with (
+            mock.patch("mobius.integrations.gguf._builder.HfApi") as api_type,
+            mock.patch(
+                "mobius.integrations.gguf._builder.hf_hub_download",
+                return_value="cached-model.gguf",
+            ) as download,
+        ):
+            api_type.return_value.model_info.side_effect = preflight_error
+            result = _resolve_gguf_path("owner/repo:model.gguf")
+
+        assert result == "cached-model.gguf"
+        download.assert_called_once_with(repo_id="owner/repo", filename="model.gguf")
+
+    def test_remote_shard_fails_before_hub_calls(self):
+        from mobius.integrations.gguf._builder import _resolve_gguf_path
+
+        filename = "BF16/model-00001-of-00002.gguf"
+        with (
+            mock.patch("mobius.integrations.gguf._builder.HfApi") as api_type,
+            mock.patch("mobius.integrations.gguf._builder.hf_hub_download") as download,
+            pytest.raises(NotImplementedError, match="shard 1 of 2"),
+        ):
+            _resolve_gguf_path(f"owner/repo:{filename}")
+
+        api_type.return_value.model_info.assert_not_called()
+        download.assert_not_called()
+
+    def test_local_split_metadata_is_rejected(self):
+        from mobius.integrations.gguf._builder import _raise_for_sharded_gguf
+
+        with pytest.raises(NotImplementedError, match="cannot assemble split tensor tables"):
+            _raise_for_sharded_gguf(source="model-00001-of-00002.gguf", split_count=2)

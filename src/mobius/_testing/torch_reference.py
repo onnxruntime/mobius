@@ -5,12 +5,50 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
+from pathlib import Path
 
 import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _mage_vl_optional_streammind_import(model_id: str):
+    """Treat StreamMind's mamba-ssm dependency as optional for base Mage-VL.
+
+    The remote ``modeling_mage_vl.py`` imports ``streammind_gate`` only inside
+    StreamMind-specific methods, but Transformers recursively validates that
+    sibling module and otherwise requires mamba-ssm even for ordinary
+    image/video generation. mamba-ssm has no Windows wheel and is not used by
+    the base checkpoint path exercised here.
+    """
+    if model_id.lower() != "microsoft/mage-vl":
+        yield
+        return
+
+    import transformers.dynamic_module_utils as dynamic_module_utils
+
+    original_get_imports = dynamic_module_utils.get_imports
+
+    def _get_imports(filename):
+        imports = original_get_imports(filename)
+        if Path(filename).name == "streammind_gate.py":
+            return [name for name in imports if name != "mamba_ssm"]
+        return imports
+
+    dynamic_module_utils.get_imports = _get_imports
+    try:
+        yield
+    finally:
+        dynamic_module_utils.get_imports = original_get_imports
+
+
+def _load_mage_compatible(model_id: str, loader, *args, **kwargs):
+    with _mage_vl_optional_streammind_import(model_id):
+        return loader(*args, **kwargs)
 
 
 def _install_dynamic_cache_legacy_shims() -> None:
@@ -229,8 +267,18 @@ def load_torch_multimodal_model(
     """
     import transformers
 
-    tokenizer = transformers.AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    processor = transformers.AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+    tokenizer = _load_mage_compatible(
+        model_id,
+        transformers.AutoTokenizer.from_pretrained,
+        model_id,
+        trust_remote_code=True,
+    )
+    processor = _load_mage_compatible(
+        model_id,
+        transformers.AutoProcessor.from_pretrained,
+        model_id,
+        trust_remote_code=True,
+    )
 
     # Shim: transformers 5.x removed DynamicCache.from_legacy_cache and
     # DynamicCache.get_usable_length, but some trust_remote_code models
@@ -241,7 +289,12 @@ def load_torch_multimodal_model(
     # Some models (e.g. Phi-3.5-vision-instruct) hardcode flash_attention_2
     # in their config.json, which causes an ImportError when flash_attn is
     # not installed.
-    config = transformers.AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    config = _load_mage_compatible(
+        model_id,
+        transformers.AutoConfig.from_pretrained,
+        model_id,
+        trust_remote_code=True,
+    )
     config._attn_implementation = "eager"
 
     # Some trust_remote_code VLMs (e.g. Phi-3-Vision) are registered as
@@ -255,9 +308,21 @@ def load_torch_multimodal_model(
 
     def _load_from_pretrained(auto_cls):
         try:
-            return auto_cls.from_pretrained(model_id, dtype=dtype, **base_kwargs)
+            return _load_mage_compatible(
+                model_id,
+                auto_cls.from_pretrained,
+                model_id,
+                dtype=dtype,
+                **base_kwargs,
+            )
         except TypeError:
-            return auto_cls.from_pretrained(model_id, torch_dtype=dtype, **base_kwargs)
+            return _load_mage_compatible(
+                model_id,
+                auto_cls.from_pretrained,
+                model_id,
+                torch_dtype=dtype,
+                **base_kwargs,
+            )
 
     try:
         image_text_to_text_cls = transformers.AutoModelForImageTextToText
@@ -288,8 +353,8 @@ def torch_forward(
     input_ids: np.ndarray,
     attention_mask: np.ndarray,
     position_ids: np.ndarray,
-    past_key_values: list[tuple[np.ndarray, np.ndarray]] | None = None,
-) -> tuple[np.ndarray, list[tuple[np.ndarray, np.ndarray]]]:
+    past_key_values: object | None = None,
+) -> tuple[np.ndarray, object]:
     """Run a single forward pass on a HuggingFace causal LM model.
 
     Args:
@@ -297,10 +362,12 @@ def torch_forward(
         input_ids: [batch, seq_len] int64 numpy array.
         attention_mask: [batch, total_seq_len] int64 numpy array.
         position_ids: [batch, seq_len] int64 numpy array.
-        past_key_values: Optional list of (key, value) numpy array tuples.
+        past_key_values: Optional list of (key, value) numpy array tuples, or
+            an opaque HuggingFace Cache for hybrid recurrent models.
 
     Returns:
-        Tuple of (logits as numpy, list of (key, value) numpy tuples).
+        Tuple of logits and either a list of KV numpy tuples or an opaque
+        HuggingFace Cache when model-specific recurrent state must be retained.
     """
     import inspect
 
@@ -323,16 +390,21 @@ def torch_forward(
         kwargs["position_ids"] = pos_t
 
     if past_key_values is not None:
-        from transformers.cache_utils import DynamicCache
+        from transformers.cache_utils import Cache, DynamicCache
 
-        cache = DynamicCache()
-        for layer_idx, (k, v) in enumerate(past_key_values):
-            cache.update(
-                torch.from_numpy(k).to(device=device, dtype=dtype),
-                torch.from_numpy(v).to(device=device, dtype=dtype),
-                layer_idx,
-            )
-        kwargs["past_key_values"] = cache
+        if isinstance(past_key_values, Cache):
+            # Hybrid caches carry model-specific recurrent state (for example
+            # LFM2 conv windows) that cannot be reconstructed from KV pairs.
+            kwargs["past_key_values"] = past_key_values
+        else:
+            cache = DynamicCache()
+            for layer_idx, (k, v) in enumerate(past_key_values):
+                cache.update(
+                    torch.from_numpy(k).to(device=device, dtype=dtype),
+                    torch.from_numpy(v).to(device=device, dtype=dtype),
+                    layer_idx,
+                )
+            kwargs["past_key_values"] = cache
 
     try:
         outputs = model(**kwargs)
@@ -351,6 +423,10 @@ def torch_forward(
     # Extract KV cache if available (Mamba models don't have it)
     present_kv: list[tuple[np.ndarray, np.ndarray]] = []
     cache = getattr(outputs, "past_key_values", None)
+    layer_types = getattr(model.config, "layer_types", None) or []
+    if "conv" in layer_types:
+        return logits, cache
+
     if cache is not None and hasattr(cache, "layers"):
         for layer_idx in range(len(cache.layers)):
             layer_cache = cache.layers[layer_idx]

@@ -42,6 +42,7 @@ from _test_configs import (
     VISION_CONFIGS,
     VL_CONFIGS,
     _base_config,
+    vl_overrides,
 )
 
 # --- ONNX Checker infrastructure (merged from onnx_checker_test.py) --------
@@ -257,8 +258,12 @@ class TestBuildGraph:
         output_names = {out.name for out in model.graph.outputs}
         assert "logits" in output_names
 
-        # Check KV cache / hybrid cache outputs
-        num_layers = config.num_hidden_layers
+        # Check KV cache / hybrid cache outputs.  Models whose trailing layers
+        # borrow K,V from an earlier layer (Gemma 3n's num_kv_shared_layers)
+        # expose fewer cache entries than they have layers; the non-shared
+        # layers are the leading ones, so truncating the range is enough.
+        count_fn = getattr(module, "kv_cache_layer_count", None)
+        num_layers = count_fn() if callable(count_fn) else config.num_hidden_layers
         layer_types = config.layer_types or []
         for i in range(num_layers):
             ltype = layer_types[i] if i < len(layer_types) else "full_attention"
@@ -282,6 +287,10 @@ class TestBuildGraph:
                 )
                 assert f"present.{i}.ssm_state" in output_names, (
                     f"Missing present.{i}.ssm_state"
+                )
+            elif ltype == "conv":
+                assert f"present.{i}.conv_state" in output_names, (
+                    f"Missing present.{i}.conv_state"
                 )
             else:
                 assert f"present.{i}.key" in output_names, f"Missing present.{i}.key"
@@ -1053,6 +1062,36 @@ class TestBuildGraphVisionLanguage:
         model = pkg["model"]
         assert model.graph is not None
         assert "logits" in {out.name for out in model.graph.outputs}
+
+    def test_qwen_image_edit_text_encoder_graphs(self):
+        """Build the Qwen2.5-VL hidden-state encoder split used by image edit."""
+        from mobius.tasks import QwenImageTextEncoderTask
+
+        config = _base_config(
+            attn_qkv_bias=True,
+            mrope_section=[8, 12, 12],
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                patch_size=14,
+                in_channels=3,
+                out_hidden_size=64,
+            ),
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+            fullatt_block_indexes=[1],
+            image_token_id=151655,
+        )
+        module = registry.get("qwen2_5_vl")(config)
+        package = QwenImageTextEncoderTask().build(module, config)
+
+        assert set(package) == {"model", "vision_encoder", "embedding"}
+        assert {output.name for output in package["model"].graph.outputs} == {
+            "prompt_embeds",
+            "prompt_embeds_mask",
+        }
 
     def test_qwen3_vl_graph(self):
         """Build Qwen3-VL with its auto-detected 3-model task."""
@@ -1989,6 +2028,122 @@ class TestBuildGraphVisionLanguage:
             f"(num_global_key_value_heads), got {layer1_key_shape[1]}"
         )
 
+    def test_gemma3n_multimodal_graph(self):
+        """Build Gemma 3n via the registry (4-model split, audio configured).
+
+        The tiny config is taken from ``VL_CONFIGS`` so this test and the
+        parametrized suite can never drift apart.
+        """
+        config = _base_config(**vl_overrides("gemma3n"))
+        module = registry.get("gemma3n")(config)
+        task_name = _default_task_for_model("gemma3n")
+        assert task_name == "gemma3n"
+        pkg = get_task(task_name).build(module, config)
+
+        assert set(pkg.keys()) == {
+            "decoder",
+            "vision_encoder",
+            "audio_encoder",
+            "embedding",
+        }, f"Gemma3n with audio should produce 4 models, got: {set(pkg.keys())}"
+
+        # --- decoder: inputs_embeds + per_layer_inputs -> logits + KV cache.
+        # The per-layer embedding tables live in the embedding sub-model, so
+        # the decoder takes their combined output as a graph input and never
+        # sees input_ids.
+        decoder = pkg["decoder"]
+        decoder_inputs = {i.name: i for i in decoder.graph.inputs}
+        assert "input_ids" not in decoder_inputs
+        assert "inputs_embeds" in decoder_inputs
+        assert "per_layer_inputs" in decoder_inputs
+        assert list(decoder_inputs["per_layer_inputs"].shape)[-1] == (
+            config.num_hidden_layers * config.hidden_size_per_layer_input
+        )
+        decoder_outputs = {o.name for o in decoder.graph.outputs}
+        assert "logits" in decoder_outputs
+        # num_kv_shared_layers=0 here, so every layer owns a cache entry.
+        assert module.decoder.kv_cache_layer_count() == config.num_hidden_layers
+        for i in range(config.num_hidden_layers):
+            assert f"past_key_values.{i}.key" in decoder_inputs
+            assert f"present.{i}.key" in decoder_outputs
+
+        # --- vision: fixed-size pixels -> [B*256, hidden], no mask.
+        vision = pkg["vision_encoder"]
+        vision_inputs = {i.name: i for i in vision.graph.inputs}
+        assert set(vision_inputs) == {"pixel_values"}
+        image_size = config.vision.image_size
+        assert list(vision_inputs["pixel_values"].shape)[1:] == [3, image_size, image_size]
+        image_features = next(o for o in vision.graph.outputs if o.name == "image_features")
+        assert len(image_features.shape) == 2
+        assert image_features.shape[-1] == config.hidden_size
+        assert component_presence(vision.graph) == "image"
+
+        # --- audio: mel frames + bool mask -> fixed-count [B*188, hidden].
+        # Unlike Gemma 4, padded rows are not stripped, so there is no
+        # companion audio_features_mask output.
+        audio = pkg["audio_encoder"]
+        audio_inputs = {i.name: i for i in audio.graph.inputs}
+        assert set(audio_inputs) == {"input_features", "input_features_mask"}
+        assert list(audio_inputs["input_features"].shape)[-1] == (config.audio.input_feat_size)
+        assert audio_inputs["input_features_mask"].dtype == ir.DataType.BOOL
+        assert {o.name for o in audio.graph.outputs} == {"audio_features"}
+        audio_features = next(o for o in audio.graph.outputs if o.name == "audio_features")
+        assert len(audio_features.shape) == 2
+        assert audio_features.shape[-1] == config.hidden_size
+        assert component_presence(audio.graph) == "audio"
+
+        # --- embedding: ids + both feature sets -> inputs_embeds + per_layer.
+        embedding = pkg["embedding"]
+        emb_inputs = {i.name: i for i in embedding.graph.inputs}
+        assert set(emb_inputs) == {"input_ids", "image_features", "audio_features"}
+        for name, presence in (("image_features", "image"), ("audio_features", "audio")):
+            assert optional_input_contract(emb_inputs[name]) == {
+                "presence": presence,
+                "absent": {"kind": "zeros", "shape": [0, config.hidden_size]},
+            }, name
+        assert {o.name for o in embedding.graph.outputs} == {
+            "inputs_embeds",
+            "per_layer_inputs",
+        }
+        # The embedding's per_layer_inputs must match what the decoder expects.
+        emb_per_layer = next(
+            o for o in embedding.graph.outputs if o.name == "per_layer_inputs"
+        )
+        assert (
+            list(emb_per_layer.shape)[-1]
+            == (list(decoder_inputs["per_layer_inputs"].shape)[-1])
+        )
+        # The 4.7 GB per-layer table belongs to the embedding model only.
+        assert "embedding.embed_tokens_per_layer.weight" in embedding.graph.initializers
+        assert not any("embed_tokens_per_layer" in n for n in decoder.graph.initializers)
+        # Only the *hard* embedder path is built here, so the soft-path norm
+        # (which the towers own) must not add a dangling initializer.
+        assert "embedding.embed_vision.hard_embedding_norm.weight" in (
+            embedding.graph.initializers
+        )
+        assert not any("soft_embedding_norm" in n for n in embedding.graph.initializers)
+
+    def test_gemma3n_multimodal_graph_without_audio(self):
+        """With ``config.audio=None`` the package drops the audio encoder.
+
+        The embedding model must then also drop its ``audio_features`` input,
+        or the runtime would be asked for a tensor no component produces.
+        """
+        overrides = vl_overrides("gemma3n")
+        overrides["audio"] = None
+        overrides["audio_token_id"] = None
+        config = _base_config(**overrides)
+        module = registry.get("gemma3n")(config)
+        pkg = get_task("gemma3n").build(module, config)
+
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
+        assert module.audio_encoder is None
+        emb_input_names = {i.name for i in pkg["embedding"].graph.inputs}
+        assert "image_features" in emb_input_names
+        assert "audio_features" not in emb_input_names
+        # No audio embedder weights should be built either.
+        assert not any("embed_audio" in n for n in pkg["embedding"].graph.initializers)
+
     def test_blip2_vision_language_graph(self):
         """Build BLIP-2 with ViT + Q-Former + LLM 3-model split."""
         config = _base_config(
@@ -2648,7 +2803,7 @@ class TestBuildGraphMultiModal:
 class TestBuildGraphWhisper:
     """Verify Whisper encoder-decoder builds with SpeechToTextTask."""
 
-    def _whisper_config(self):
+    def _whisper_config(self, *, num_mel_bins=16):
         from mobius._configs import WhisperConfig
 
         return WhisperConfig(
@@ -2667,7 +2822,7 @@ class TestBuildGraphWhisper:
             encoder_layers=TINY_LAYERS,
             encoder_attention_heads=TINY_HEADS,
             encoder_ffn_dim=TINY_INTERMEDIATE,
-            num_mel_bins=16,
+            num_mel_bins=num_mel_bins,
             max_source_positions=100,
             max_target_positions=50,
             scale_embedding=True,
@@ -2702,6 +2857,22 @@ class TestBuildGraphWhisper:
         output_names = {out.name for out in encoder.graph.outputs}
         assert "input_features" in input_names
         assert "encoder_hidden_states" in output_names
+
+    def test_whisper_128_mel_encoder_input_shape(self):
+        """Whisper large-v3/turbo graphs use their configured 128 mel channels."""
+        from mobius._builder import build_from_module
+        from mobius.models.whisper import WhisperForConditionalGeneration
+        from mobius.tasks import SpeechToTextTask
+
+        config = self._whisper_config(num_mel_bins=128)
+        module = WhisperForConditionalGeneration(config)
+        encoder = build_from_module(module, config, task=SpeechToTextTask())["encoder"]
+        input_features = next(
+            value for value in encoder.graph.inputs if value.name == "input_features"
+        )
+
+        assert config.encoder_input_channels == 128
+        assert input_features.shape[1] == 128
 
     def test_whisper_decoder_io(self):
         """Verify decoder inputs/outputs including KV cache."""
@@ -2772,6 +2943,93 @@ class TestBuildGraphWhisper:
         from mobius.models.whisper import WhisperForConditionalGeneration
 
         assert model_cls is WhisperForConditionalGeneration
+
+
+class TestBuildGraphMoonshine:
+    """Verify Moonshine raw-audio encoder and cached decoder graphs."""
+
+    def _moonshine_config(self):
+        from mobius._configs import MoonshineConfig
+
+        return MoonshineConfig(
+            vocab_size=512,
+            hidden_size=TINY_HIDDEN,
+            intermediate_size=TINY_INTERMEDIATE,
+            num_hidden_layers=TINY_LAYERS,
+            num_attention_heads=TINY_HEADS,
+            num_key_value_heads=TINY_HEADS,
+            head_dim=TINY_HIDDEN // TINY_HEADS,
+            hidden_act="silu",
+            pad_token_id=2,
+            tie_word_embeddings=True,
+            max_position_embeddings=194,
+            rope_type="default",
+            rope_theta=10_000.0,
+            partial_rotary_factor=0.75,
+            rope_interleave=True,
+            encoder_num_hidden_layers=TINY_LAYERS,
+            encoder_num_attention_heads=TINY_HEADS,
+            encoder_num_key_value_heads=TINY_HEADS,
+        )
+
+    def test_moonshine_package_and_io(self):
+        from mobius._builder import build_from_module
+        from mobius.models import MoonshineForConditionalGeneration
+        from mobius.tasks import SpeechToTextTask
+
+        config = self._moonshine_config()
+        package = build_from_module(
+            MoonshineForConditionalGeneration(config),
+            config,
+            task=SpeechToTextTask(),
+        )
+
+        assert set(package) == {"encoder", "decoder"}
+        encoder_inputs = {value.name for value in package["encoder"].graph.inputs}
+        encoder_outputs = {value.name for value in package["encoder"].graph.outputs}
+        decoder_inputs = {value.name for value in package["decoder"].graph.inputs}
+        assert encoder_inputs == {"input_values", "attention_mask"}
+        assert encoder_outputs == {
+            "encoder_hidden_states",
+            "encoder_attention_mask",
+        }
+        assert "encoder_attention_mask" in decoder_inputs
+        assert "position_ids" in decoder_inputs
+        for layer_idx in range(TINY_LAYERS):
+            assert f"past_key_values.{layer_idx}.key" in decoder_inputs
+
+    def test_moonshine_architecture_initializers(self):
+        from mobius._builder import build_from_module
+        from mobius.models import MoonshineForConditionalGeneration
+        from mobius.tasks import SpeechToTextTask
+
+        config = self._moonshine_config()
+        package = build_from_module(
+            MoonshineForConditionalGeneration(config),
+            config,
+            task=SpeechToTextTask(),
+        )
+        encoder_initializers = set(package["encoder"].graph.initializers)
+        decoder_initializers = set(package["decoder"].graph.initializers)
+
+        assert "encoder.conv1.weight" in encoder_initializers
+        assert "encoder.conv1.bias" not in encoder_initializers
+        assert "encoder.groupnorm.weight" in encoder_initializers
+        assert "encoder.layers.0.input_layernorm.weight" in encoder_initializers
+        assert "encoder.layers.0.input_layernorm.bias" not in encoder_initializers
+        assert "encoder.layers.0.self_attn.q_proj.weight" in encoder_initializers
+        assert "encoder.layers.0.self_attn.q_proj.bias" not in encoder_initializers
+        assert "encoder.layers.0.mlp.fc1.bias" in encoder_initializers
+        assert "encoder.layers.0.encoder_attn.q_proj.weight" not in encoder_initializers
+
+        assert "decoder.embed_tokens.weight" in decoder_initializers
+        assert "decoder.layers.0.encoder_attn.q_proj.weight" in decoder_initializers
+        assert "decoder.layers.0.mlp.fc1.weight" in decoder_initializers
+        assert "decoder.proj_out.weight" in decoder_initializers
+        assert "GroupNormalization" in {node.op_type for node in package["encoder"].graph}
+        decoder_ops = [node.op_type for node in package["decoder"].graph]
+        assert decoder_ops.count("Swish") == TINY_LAYERS
+        assert "Sigmoid" not in decoder_ops
 
 
 class TestBuildGraphQwen3ASR:
@@ -3979,7 +4237,7 @@ class TestBuildQwenImageGraph:
     def test_qwen_image_transformer_graph_builds(self):
         from mobius._diffusers_configs import QwenImageConfig
         from mobius.models.qwen_image import QwenImageTransformer2DModel
-        from mobius.tasks import DenoisingTask
+        from mobius.tasks import QwenImageDenoisingTask
 
         config = QwenImageConfig(
             in_channels=4,
@@ -3992,7 +4250,7 @@ class TestBuildQwenImageGraph:
             cross_attention_dim=64,
         )
         module = QwenImageTransformer2DModel(config)
-        task = DenoisingTask()
+        task = QwenImageDenoisingTask()
         pkg = task.build(module, config)
         model = pkg["model"]
 
@@ -4001,6 +4259,9 @@ class TestBuildQwenImageGraph:
         assert "sample" in input_names
         assert "timestep" in input_names
         assert "encoder_hidden_states" in input_names
+        assert "encoder_hidden_states_mask" in input_names
+        assert "image_rotary_cos" in input_names
+        assert "target_sequence_length" in input_names
         assert "noise_pred" in {out.name for out in model.graph.outputs}
 
     def test_qwen_image_vae_encoder_decoder_graphs_build(self):
@@ -5473,6 +5734,133 @@ class TestBuildStaticCacheGraph:
         assert "Expand" in op_types  # Tile (GQA repeat) replacement
 
 
+class TestBuildGemma3nKvSharing:
+    """Gemma 3n's trailing layers borrow K,V instead of projecting their own.
+
+    Layers at or after ``num_hidden_layers - num_kv_shared_layers`` reuse the
+    K,V of the last preceding layer of the *same* attention type, so they own
+    no KV cache entry and carry no ``k_proj``/``v_proj``/``k_norm`` weights.
+    """
+
+    @staticmethod
+    def _build(num_kv_shared_layers, layer_types):
+        from mobius._configs import Gemma3nConfig
+
+        config = Gemma3nConfig(
+            num_hidden_layers=len(layer_types),
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            vocab_size=256,
+            max_position_embeddings=128,
+            rms_norm_eps=1e-6,
+            hidden_act="gelu_pytorch_tanh",
+            rope_type="default",
+            rope_theta=10_000.0,
+            rope_local_base_freq=10_000.0,
+            attn_qk_norm=True,
+            layer_types=layer_types,
+            sliding_window=8,
+            altup_num_inputs=2,
+            altup_active_idx=0,
+            altup_correct_scale=True,
+            laurel_rank=16,
+            hidden_size_per_layer_input=32,
+            vocab_size_per_layer_input=256,
+            num_kv_shared_layers=num_kv_shared_layers,
+            pad_token_id=0,
+        )
+        module = registry.get("gemma3n_text")(config)
+        pkg = get_task(_default_task_for_model("gemma3n_text")).build(module, config)
+        return module, pkg["model"], config
+
+    def test_cache_io_excludes_shared_layers(self):
+        """Only non-shared layers get past/present KV entries."""
+        module, model, _config = self._build(2, ["full_attention"] * 4)
+
+        assert module.kv_cache_layer_count() == 2
+        input_names = {i.name for i in model.graph.inputs}
+        output_names = {o.name for o in model.graph.outputs}
+        for i in range(2):
+            assert f"past_key_values.{i}.key" in input_names
+            assert f"past_key_values.{i}.value" in input_names
+            assert f"present.{i}.key" in output_names
+            assert f"present.{i}.value" in output_names
+        for i in (2, 3):
+            assert f"past_key_values.{i}.key" not in input_names
+            assert f"present.{i}.key" not in output_names
+
+    def test_shared_layers_have_no_kv_weights(self):
+        """KV-shared layers must not request k_proj/v_proj/k_norm initializers.
+
+        The checkpoint ships these tensors for every layer, but HF only builds
+        them for the non-shared layers — emitting them here would create
+        initializers with no consumer.
+        """
+        _module, model, _config = self._build(2, ["full_attention"] * 4)
+
+        names = set(model.graph.initializers)
+        for i in (0, 1):
+            assert f"model.layers.{i}.self_attn.k_proj.weight" in names
+            assert f"model.layers.{i}.self_attn.v_proj.weight" in names
+        for i in (2, 3):
+            assert f"model.layers.{i}.self_attn.k_proj.weight" not in names
+            assert f"model.layers.{i}.self_attn.v_proj.weight" not in names
+            assert f"model.layers.{i}.self_attn.k_norm.weight" not in names
+
+    def test_source_layer_matches_attention_type(self):
+        """Sliding and full layers borrow from different source layers.
+
+        HF indexes the *pre-cutoff* slice of ``layer_types`` for the matching
+        type, so a shared sliding layer never borrows a full layer's K,V.
+        """
+        layer_types = [
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+        ]
+        module, _model, _config = self._build(2, layer_types)
+
+        attns = [layer.self_attn for layer in module.model.layers]
+        assert [a.is_kv_shared_layer for a in attns] == [False, False, False, True, True]
+        # Last non-shared layer of each type publishes its K,V for reuse.
+        assert [a.provides_shared_kv for a in attns] == [False, True, True, False, False]
+        # Shared sliding layer 3 -> layer 1; shared full layer 4 -> layer 2.
+        assert attns[3].kv_shared_layer_index == 1
+        assert attns[4].kv_shared_layer_index == 2
+
+    def test_drops_shared_layer_weights_from_state_dict(self):
+        """preprocess_weights discards the K/V tensors HF never constructs."""
+        import torch
+
+        module, _model, config = self._build(2, ["full_attention"] * 4)
+        state_dict = {
+            f"model.layers.{i}.self_attn.{name}.weight": torch.zeros(1)
+            for i in range(config.num_hidden_layers)
+            for name in ("q_proj", "k_proj", "v_proj", "k_norm")
+        }
+
+        result = module.preprocess_weights(state_dict)
+
+        for i in range(config.num_hidden_layers):
+            assert f"model.layers.{i}.self_attn.q_proj.weight" in result
+        for i in (0, 1):
+            assert f"model.layers.{i}.self_attn.k_proj.weight" in result
+        for i in (2, 3):
+            assert f"model.layers.{i}.self_attn.k_proj.weight" not in result
+            assert f"model.layers.{i}.self_attn.v_proj.weight" not in result
+            assert f"model.layers.{i}.self_attn.k_norm.weight" not in result
+
+    def test_rejects_sharing_every_layer(self):
+        """A layer cannot borrow K,V when no earlier layer computes any."""
+        with pytest.raises(ValueError, match="num_kv_shared_layers"):
+            self._build(4, ["full_attention"] * 4)
+
+
 class TestBuildGemma4StaticCacheGraph:
     """Verify Gemma4TextCausalLMTask(static_cache=True) builds a valid graph."""
 
@@ -5621,6 +6009,7 @@ _VL_MODEL_PARAMS = _make_params(VL_CONFIGS)
 
 # VL models that produce a single "model" key instead of 3-model split
 _VL_SINGLE_MODEL_TASKS = {"qwen3-vl-vision-language"}
+_VL_TWO_MODEL_TASKS = {"vision-encoder-decoder"}
 
 
 @pytest.mark.parametrize("model_type,config_overrides", _VL_MODEL_PARAMS)
@@ -5642,6 +6031,14 @@ class TestBuildVLGraph:
             assert model.graph is not None
             output_names = {o.name for o in model.graph.outputs}
             assert "logits" in output_names
+        elif task_name in _VL_TWO_MODEL_TASKS:
+            assert set(pkg) == {"decoder", "vision_encoder"}
+            decoder = pkg["decoder"]
+            assert "encoder_hidden_states" in {i.name for i in decoder.graph.inputs}
+            assert "logits" in {o.name for o in decoder.graph.outputs}
+            vision = pkg["vision_encoder"]
+            pixel_values = next(i for i in vision.graph.inputs if i.name == "pixel_values")
+            assert pixel_values.dtype == ir.DataType.FLOAT
         else:
             assert "decoder" in pkg, f"{model_type} should produce 'decoder'"
             assert "vision_encoder" in pkg, f"{model_type} should produce 'vision_encoder'"
@@ -5652,7 +6049,8 @@ class TestBuildVLGraph:
             assert "logits" in {o.name for o in decoder.graph.outputs}
 
             vision = pkg["vision_encoder"]
-            assert "pixel_values" in {i.name for i in vision.graph.inputs}
+            pixel_values = next(i for i in vision.graph.inputs if i.name == "pixel_values")
+            assert pixel_values.dtype == ir.DataType.FLOAT
 
     def test_has_initializers(self, model_type: str, config_overrides: dict):
         """Verify all sub-models have non-empty initializers."""
@@ -5695,6 +6093,7 @@ _SPEECH_TASK_KEYS: dict[str, set[str]] = {
     "speech-language": {"audio_encoder", "embedding", "decoder"},
     "codec": {"decoder", "encoder"},
     "audio-feature-extraction": {"model"},
+    "feature-ctc-asr": {"model"},
 }
 
 

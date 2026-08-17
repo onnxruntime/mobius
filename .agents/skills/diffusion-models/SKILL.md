@@ -353,6 +353,27 @@ Compare `named_parameters()` output with HF weight names. Use the
 techniques from the **weight-name-alignment** skill to minimize
 `preprocess_weights`.
 
+### 7. Prove pipeline executability
+
+A component graph or metadata file is not a runnable diffusion pipeline.
+Before advertising runtime support, execute the complete path:
+
+`image encoder/VAE -> latent packing -> denoiser loop + scheduler -> target token unpacking -> VAE decoder`
+
+Verify sample/output ranks, source-vs-target token slicing, CFG semantics, and
+the runtime's actual scheduler identifiers/equations. Reload final metadata and
+verify every file path, port, preprocessing step, loop edge, and postprocess.
+Emit faithful component graphs and metadata even when the tested downstream
+runtime cannot yet express the complete dataflow. Record that runtime/version
+limitation separately; it must not become a Mobius export capability gate.
+
+Validate required VAE statistics against latent channel count before graph
+construction (`len(mean) == len(std) == z_dim`, positive standard deviations).
+Keep model-specific component/task overrides data-driven rather than adding
+pipeline-name conditionals. Fold initializers after weight loading and mark
+denoiser/VAE roles by semantics, not names. Tests must use `os.path.join`/`Path`
+for temporary ONNX and profiling paths so cleanup works on POSIX and Windows.
+
 ## Naming conventions for diffusers models
 
 Diffusers uses different conventions than transformers:

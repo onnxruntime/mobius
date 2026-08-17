@@ -76,7 +76,7 @@ def _default_task_for_model(model_type: str) -> str:
     return getattr(cls, "default_task", "text-generation")
 
 
-def _try_load_config_json(model_id: str):
+def _try_load_config_json(model_id: str, revision: str | None = None):
     """Try to load config.json directly for models not in transformers.
 
     Returns a ``PretrainedConfig``-like object with attribute access,
@@ -87,7 +87,10 @@ def _try_load_config_json(model_id: str):
     from huggingface_hub import hf_hub_download
 
     try:
-        path = hf_hub_download(repo_id=model_id, filename="config.json")
+        kwargs = {"repo_id": model_id, "filename": "config.json"}
+        if revision is not None:
+            kwargs["revision"] = revision
+        path = hf_hub_download(**kwargs)
     except (OSError, ValueError) as e:
         logger.debug("Failed to download config.json for %s: %s", model_id, e)
         return None
@@ -114,6 +117,15 @@ def _dict_to_pretrained_config(d: dict):
     works correctly.
     """
     import transformers
+    from huggingface_hub import errors as hub_errors
+
+    # Introduced in newer huggingface_hub releases. Older supported versions
+    # can still construct these configs and should not fail on the import.
+    strict_validation_error = getattr(
+        hub_errors,
+        "StrictDataclassClassValidationError",
+        TypeError,
+    )
 
     # Composite configs (e.g. configs with text_config/thinker_config) may
     # duplicate rope_scaling at the top level.  PretrainedConfig's rope
@@ -143,21 +155,30 @@ def _dict_to_pretrained_config(d: dict):
 
     try:
         config = transformers.PretrainedConfig(**d)
-    except (AttributeError, KeyError, TypeError) as e:
+    except (
+        AttributeError,
+        KeyError,
+        TypeError,
+        strict_validation_error,
+    ) as e:
         # Newer transformers may crash during rope standardization
         # (e.g. Phi4-MM longrope format where PretrainedConfig doesn't
-        # set max_position_embeddings before accessing it).  Strip rope
-        # fields, construct the config, then restore them as attributes
-        # so _extract_rope_config can still read them.
+        # set max_position_embeddings before accessing it), or reject a
+        # model-specific layer type that is newer than the installed
+        # transformers (e.g. Muse Glimmer's ``window_attention``). Strip
+        # only the fields validated by PretrainedConfig, construct the
+        # attribute container, then restore their authoritative raw values.
         logger.warning(
-            "Retrying %s config without rope fields after PretrainedConfig init failure: %s",
+            "Retrying %s config without validated model-specific fields after "
+            "PretrainedConfig init failure: %s",
             d.get("model_type", "unknown"),
             e,
         )
-        saved_rope = {k: d[k] for k in rope_keys if k in d}
-        d_clean = {k: v for k, v in d.items() if k not in rope_keys}
+        retry_keys = (*rope_keys, "layer_types")
+        saved_fields = {k: d[k] for k in retry_keys if k in d}
+        d_clean = {k: v for k, v in d.items() if k not in retry_keys}
         config = transformers.PretrainedConfig(**d_clean)
-        for k, v in saved_rope.items():
+        for k, v in saved_fields.items():
             setattr(config, k, v)
 
     # Recursively convert known nested config keys

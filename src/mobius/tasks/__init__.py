@@ -24,6 +24,7 @@ __all__ = [
     "AudioFeatureExtractionTask",
     "CausalLMTask",
     "CTCAsrTask",
+    "FeatureCTCAsrTask",
     "RNNTTask",
     "CodecTask",
     "ComponentSpec",
@@ -39,6 +40,7 @@ __all__ = [
     "DiarizationTask",
     "FeatureExtractionTask",
     "FunASRSpeechLanguageTask",
+    "Gemma3nTask",
     "Gemma4AssistantTask",
     "Gemma4Task",
     "Gemma4UnifiedTask",
@@ -50,6 +52,9 @@ __all__ = [
     "LatentDynamicsTask",
     "ModelTask",
     "MllamaVisionLanguageTask",
+    "MageVLTask",
+    "MiniCPMVLTask",
+    "MuseGlimmerVLTask",
     "MaskedDiffusionTask",
     "MoshiDepformerTask",
     "MoshiTemporalTask",
@@ -60,6 +65,9 @@ __all__ = [
     "PixtralVLTask",
     "Qwen3VLVisionLanguageTask",
     "QwenImageVAETask",
+    "QwenImageDenoisingTask",
+    "QwenImageEditVAETask",
+    "QwenImageTextEncoderTask",
     "QwenVLTask",
     "SSM2CausalLMTask",
     "SSMCausalLMTask",
@@ -71,6 +79,7 @@ __all__ = [
     "VAETask",
     "VideoDenoisingTask",
     "VisionLanguageTask",
+    "VisionEncoderDecoderTask",
     "WorldModelTask",
     "WanVAETask",
     "build_decoder_from_embeds",
@@ -99,7 +108,7 @@ from mobius.tasks._cosmos3_audio import (
     Cosmos3AVAEAudioTokenizerTask,
 )
 from mobius.tasks._cosmos3_omni_generator import Cosmos3OmniGeneratorTask
-from mobius.tasks._ctc_asr import CTCAsrTask
+from mobius.tasks._ctc_asr import CTCAsrTask, FeatureCTCAsrTask
 from mobius.tasks._deepseek_v4 import DeepSeekV4Task
 from mobius.tasks._denoising import DenoisingTask
 from mobius.tasks._dflash import DFlashDraftTask
@@ -107,6 +116,7 @@ from mobius.tasks._diarization import DiarizationTask
 from mobius.tasks._eagle3 import Eagle3DraftTask
 from mobius.tasks._feature_extraction import FeatureExtractionTask
 from mobius.tasks._fun_asr_speech_language import FunASRSpeechLanguageTask
+from mobius.tasks._gemma3n import Gemma3nTask
 from mobius.tasks._gemma4 import (
     Gemma4Task,
     Gemma4TextCausalLMTask,
@@ -121,7 +131,9 @@ from mobius.tasks._multimodal import MultiModalTask
 from mobius.tasks._object_detection import ObjectDetectionTask
 from mobius.tasks._phi4mm_multimodal import Phi4MMMultiModalTask
 from mobius.tasks._qwen35_mtp import Qwen35MtpTask
-from mobius.tasks._qwen_image_vae import QwenImageVAETask
+from mobius.tasks._qwen_image import QwenImageDenoisingTask
+from mobius.tasks._qwen_image_text_encoder import QwenImageTextEncoderTask
+from mobius.tasks._qwen_image_vae import QwenImageEditVAETask, QwenImageVAETask
 from mobius.tasks._rnnt import RNNTTask
 from mobius.tasks._seq2seq import Seq2SeqTask
 from mobius.tasks._speech_language import SpeechLanguageTask
@@ -130,11 +142,15 @@ from mobius.tasks._ssm_causal_lm import SSM2CausalLMTask, SSMCausalLMTask
 from mobius.tasks._tts import TTSTask
 from mobius.tasks._vae import VAETask
 from mobius.tasks._video_denoising import VideoDenoisingTask
+from mobius.tasks._vision_encoder_decoder import VisionEncoderDecoderTask
 from mobius.tasks._vision_language import Qwen3VLVisionLanguageTask
 from mobius.tasks._vision_language_3model import (
     Cosmos3EdgeVLTask,
     HybridQwenVLTask,
+    MageVLTask,
+    MiniCPMVLTask,
     MllamaVisionLanguageTask,
+    MuseGlimmerVLTask,
     PixtralVLTask,
     QwenVLTask,
     VisionLanguageTask,
@@ -151,6 +167,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "audio-ctc": AudioCTCTask,
     "audio-feature-extraction": AudioFeatureExtractionTask,
     "ctc-asr": CTCAsrTask,
+    "feature-ctc-asr": FeatureCTCAsrTask,
     "codec": CodecTask,
     "controlnet": ControlNetTask,
     "cosmos3-audio-decoder": Cosmos3AVAEAudioDecoderTask,
@@ -174,13 +191,21 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "vae": VAETask,
     "wan-vae": WanVAETask,
     "qwen-image-vae": QwenImageVAETask,
+    "qwen-image-denoising": QwenImageDenoisingTask,
+    "qwen-image-edit-vae": QwenImageEditVAETask,
+    "qwen-image-text-encoding": QwenImageTextEncoderTask,
     "vision-language": VisionLanguageTask,
+    "vision-encoder-decoder": VisionEncoderDecoderTask,
     "cosmos3-edge-vl": Cosmos3EdgeVLTask,
     "pixtral-vl": PixtralVLTask,
     "mllama-vision-language": MllamaVisionLanguageTask,
+    "mage-vl": MageVLTask,
+    "muse-glimmer-vl": MuseGlimmerVLTask,
     "qwen-vl": QwenVLTask,
     "hybrid-qwen-vl": HybridQwenVLTask,
+    "minicpm-vl": MiniCPMVLTask,
     "qwen3-vl-vision-language": Qwen3VLVisionLanguageTask,
+    "gemma3n": Gemma3nTask,
     "gemma4": Gemma4Task,
     "gemma4-text-generation": Gemma4TextCausalLMTask,
     "gemma4-unified": Gemma4UnifiedTask,

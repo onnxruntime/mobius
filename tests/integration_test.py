@@ -21,6 +21,7 @@ Run only prefill tests::
 
 from __future__ import annotations
 
+import gc
 import os
 
 import numpy as np
@@ -46,6 +47,112 @@ from mobius._testing.torch_reference import (
 )
 
 
+@pytest.mark.integration
+@pytest.mark.integration_slow
+def test_nemotron_parse_real_weight_cuda_parity():
+    """Compare real BF16 C-RADIO features and decoder logits on a document image."""
+    if _get_test_device() != "cuda" or not torch.cuda.is_available():
+        pytest.skip("Nemotron Parse real-weight parity requires CUDA")
+
+    import ml_dtypes
+    from transformers import AutoModel, AutoProcessor
+
+    model_id = "nvidia/NVIDIA-Nemotron-Parse-2.0"
+    revision = "635b84d9b09bb9526b9a684d0b2c953d3cc3df05"
+    prompt = "</s><s><predict_bbox><predict_classes><output_markdown><predict_no_text_in_pic>"
+    image_path = os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "testdata",
+        "nemotron-parse-document.png",
+    )
+    processor = AutoProcessor.from_pretrained(
+        model_id,
+        revision=revision,
+        trust_remote_code=True,
+    )
+    processed = processor(
+        images=[Image.open(image_path).convert("RGB")],
+        text=prompt,
+        return_tensors="pt",
+        add_special_tokens=False,
+    )
+    hf_model = AutoModel.from_pretrained(
+        model_id,
+        revision=revision,
+        dtype=torch.bfloat16,
+        trust_remote_code=True,
+    ).to("cuda")
+    hf_model.eval()
+    pixel_values = processed["pixel_values"].to("cuda")
+    decoder_input_ids = processed["input_ids"].to("cuda")
+    with torch.no_grad():
+        encoder_outputs = hf_model.encoder(pixel_values=pixel_values)
+        hf_encoder = encoder_outputs[0].float().cpu().numpy()
+        hf_logits = (
+            hf_model(
+                encoder_outputs=encoder_outputs,
+                decoder_input_ids=decoder_input_ids,
+            )
+            .logits[:, -1]
+            .float()
+            .cpu()
+            .numpy()
+        )
+    del hf_model, encoder_outputs
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    pkg = build(
+        model_id,
+        dtype="bf16",
+        load_weights=True,
+        trust_remote_code=True,
+        execution_provider="cuda",
+    )
+    vision_session = _make_session(pkg["vision_encoder"])
+    decoder_session = _make_session(pkg["decoder"])
+    try:
+        onnx_pixel_values = processed["pixel_values"].float().cpu().numpy()
+        onnx_encoder = vision_session.run({"pixel_values": onnx_pixel_values})[
+            "last_hidden_state"
+        ]
+        empty_cache = {
+            name: np.zeros(
+                (1, pkg.config.num_key_value_heads, 0, pkg.config.head_dim),
+                dtype=ml_dtypes.bfloat16,
+            )
+            for name in decoder_session.input_names
+            if name.startswith("past_key_values.")
+        }
+        onnx_logits = decoder_session.run(
+            {
+                "input_ids": processed["input_ids"].numpy().astype(np.int64),
+                "attention_mask": np.ones_like(processed["input_ids"].numpy(), dtype=np.int64),
+                "encoder_hidden_states": onnx_encoder,
+                **empty_cache,
+            }
+        )["logits"][:, -1]
+    finally:
+        vision_session.close()
+        decoder_session.close()
+
+    onnx_encoder_f32 = onnx_encoder.astype(np.float32)
+    encoder_cosine = np.dot(onnx_encoder_f32.ravel(), hf_encoder.ravel()) / (
+        np.linalg.norm(onnx_encoder_f32) * np.linalg.norm(hf_encoder)
+    )
+    onnx_logits_f32 = onnx_logits.astype(np.float32)
+    logits_cosine = np.dot(onnx_logits_f32.ravel(), hf_logits.ravel()) / (
+        np.linalg.norm(onnx_logits_f32) * np.linalg.norm(hf_logits)
+    )
+    assert encoder_cosine > 0.99
+    assert logits_cosine > 0.995
+    np.testing.assert_array_equal(
+        np.argmax(onnx_logits_f32, axis=-1),
+        np.argmax(hf_logits, axis=-1),
+    )
+
+
 def _get_test_device() -> str:
     """Return 'cuda' if MOBIUS_TEST_DEVICE=cuda, else 'cpu'."""
     return os.environ.get("MOBIUS_TEST_DEVICE", "cpu").strip().lower()
@@ -68,6 +175,75 @@ def _model_accessible(model_id: str) -> bool:
         return True
 
 
+@pytest.mark.integration
+def test_minicpmv4_6_real_weight_vision_parity():
+    """Real nonzero pixels match through SigLIP2 and both visual mergers."""
+    import gc
+
+    from transformers import AutoModelForImageTextToText, AutoProcessor
+
+    model_id = "openbmb/MiniCPM-V-4.6"
+    processor = AutoProcessor.from_pretrained(model_id)
+    image = Image.open("testdata/pipeline-cat-chonk.jpeg").convert("RGB")
+    # A square source triggers the default overview + slice path with
+    # non-uniform patch grids (e.g. 32x32 overview and 40x24 slices).
+    image = image.resize((1024, 1024))
+    prompt = processor.apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": "testdata/pipeline-cat-chonk.jpeg"},
+                    {"type": "text", "text": "Describe this image in detail."},
+                ],
+            }
+        ],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    inputs = processor(
+        text=prompt,
+        images=[image],
+        return_tensors="pt",
+    )
+
+    hf_model = AutoModelForImageTextToText.from_pretrained(
+        model_id,
+        dtype=torch.float32,
+    ).eval()
+    expected_parts = []
+    start = 0
+    with torch.no_grad():
+        for size in inputs["target_sizes"]:
+            num_patches = int(size.prod())
+            end = start + num_patches * 14
+            unit_pixels = inputs["pixel_values"][:, :, :, start:end]
+            expected_parts.extend(
+                hf_model.get_image_features(
+                    unit_pixels,
+                    size.unsqueeze(0),
+                ).pooler_output
+            )
+            start = end
+    expected = torch.cat(expected_parts, dim=0).numpy()
+    del hf_model
+    gc.collect()
+
+    package = build(model_id, dtype="float32", load_weights=True)
+    session = _make_session(package["vision_encoder"])
+    actual = session.run(
+        {
+            "pixel_values": inputs["pixel_values"].numpy(),
+            "target_sizes": inputs["target_sizes"].numpy(),
+        }
+    )["image_features"]
+    session.close()
+
+    assert float(np.linalg.norm(inputs["pixel_values"].numpy())) > 0.0
+    assert np.unique(inputs["target_sizes"].numpy(), axis=0).shape[0] > 1
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-3)
+
+
 # ---------------------------------------------------------------------------
 # Model catalogue: small models for each supported architecture
 #
@@ -85,6 +261,7 @@ def _model_accessible(model_id: str) -> bool:
 _TEXT_MODELS = [
     # CausalLMModel (base: llama/mistral/qwen2 architecture)
     pytest.param("Qwen/Qwen2.5-0.5B", False, id="qwen2.5-0.5b"),
+    pytest.param("LiquidAI/LFM2.5-230M", False, id="lfm2.5-230m"),
     pytest.param("HuggingFaceTB/SmolLM-135M", False, id="smollm-135m"),
     # SmolLM3 (per-layer RoPE gating via no_rope_layers)
     pytest.param("HuggingFaceTB/SmolLM3-3B", False, id="smollm3-3b"),
@@ -194,6 +371,14 @@ def _make_prefill_feeds(config, input_ids, attention_mask, position_ids):
         "position_ids": position_ids,
     }
     for i in range(config.num_hidden_layers):
+        layer_types = config.layer_types or []
+        layer_type = layer_types[i] if i < len(layer_types) else "full_attention"
+        if layer_type == "conv":
+            feeds[f"past_key_values.{i}.conv_state"] = np.zeros(
+                (1, config.hidden_size, config.short_conv_kernel - 1),
+                dtype=np.float32,
+            )
+            continue
         feeds[f"past_key_values.{i}.key"] = np.zeros(
             (1, config.num_key_value_heads, 0, config.head_dim),
             dtype=np.float32,
@@ -215,6 +400,13 @@ def _make_decode_feeds(
         "position_ids": decode_position_ids,
     }
     for i in range(config.num_hidden_layers):
+        layer_types = config.layer_types or []
+        layer_type = layer_types[i] if i < len(layer_types) else "full_attention"
+        if layer_type == "conv":
+            feeds[f"past_key_values.{i}.conv_state"] = onnx_prefill_out[
+                f"present.{i}.conv_state"
+            ]
+            continue
         feeds[f"past_key_values.{i}.key"] = onnx_prefill_out[f"present.{i}.key"]
         feeds[f"past_key_values.{i}.value"] = onnx_prefill_out[f"present.{i}.value"]
     return feeds
@@ -1770,9 +1962,10 @@ class TestQwenImageVAEDecoder:
         # ONNX decode
         import tempfile
 
-        with tempfile.NamedTemporaryFile(suffix=".onnx") as f:
-            onnx_ir.save(dec_model, f.name)
-            sess = ort.InferenceSession(f.name)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "decoder.onnx")
+            onnx_ir.save(dec_model, path)
+            sess = ort.InferenceSession(path)
             onnx_out = sess.run(None, {"latent_sample": z.numpy()})[0]
 
         np.testing.assert_allclose(onnx_out, hf_out, atol=1e-4, rtol=1e-4)
@@ -1822,9 +2015,10 @@ class TestQwenImageVAEDecoder:
 
         import tempfile
 
-        with tempfile.NamedTemporaryFile(suffix=".onnx") as f:
-            onnx_ir.save(enc_model, f.name)
-            sess = ort.InferenceSession(f.name)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "encoder.onnx")
+            onnx_ir.save(enc_model, path)
+            sess = ort.InferenceSession(path)
             onnx_out = sess.run(None, {"sample": x.numpy()})[0]
 
         np.testing.assert_allclose(onnx_out, hf_out, atol=1e-4, rtol=1e-4)

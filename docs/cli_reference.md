@@ -175,7 +175,7 @@ option. Pass a comma-separated list (and/or repeat the flag):
 
 ```
 --features fp8-kv-cache,static-cache
---features prune-lm-head
+--features prune-prefill-prefix
 --features text-only
 --features world-model
 ```
@@ -186,7 +186,7 @@ Available features:
 |---------|--------|
 | `static-cache` | Pre-allocate fixed-size KV cache buffers using `TensorScatter` (pair with `--max-seq-len N`). Requires `DecoderLayer` / `MoEDecoderLayer` models. Cannot combine with `--task`. |
 | `fp8-kv-cache` | Store the `GroupQueryAttention` KV cache as `FLOAT8E4M3FN` (per-tensor E4M3), halving KV-cache memory. Requires a GQA build (e.g. `--ep cuda --dtype f16`) and an ORT runtime with the FP8 KV-cache kernel (SM89+). Pair with `--kv-cache-scale-file` for calibrated scales. |
-| `prune-lm-head` | Select the final hidden-state position before the LM-head projection and emit logits shaped `[B, 1, vocab]`. Supported by models using the base `CausalLMModel.forward()` path; unsupported custom forwards fail explicitly. Use only when the downstream workflow does not need per-token logits. |
+| `prune-prefill-prefix` | Emit logits shaped `[B, 1, vocab]` by selecting the final token before the LM head. Gemma 4 also prunes its KV-sharing layer suffix and per-layer inputs to reduce prefill compute. |
 | `text-only` | Export the text backbone of a multimodal checkpoint as a standalone decoder-only LLM (see below). |
 | `world-model` | Export a supported world-model package containing ONNX components and `pipeline.json`. |
 
@@ -201,7 +201,7 @@ mobius build --model Qwen/Qwen2.5-0.5B output/ \
     --ep cuda --dtype f16 --features fp8-kv-cache
 
 mobius build --model meta-llama/Llama-3.2-1B output/ \
-    --features prune-lm-head
+    --features prune-prefill-prefix
 
 mobius build --model nvidia/Cosmos3-Nano output/cosmos3/ \
     --features world-model
@@ -299,6 +299,9 @@ mobius build --model Qwen/Qwen2.5-0.5B output_dir/ \
 ## `mobius build-gguf`
 
 Build an ONNX model from a GGUF file (e.g. from llama.cpp).
+Supported GGUF quantization is preserved by default. This can involve
+byte-preserving native blocks in text-only builds, affine repacking, or
+dequantize/requantize for multimodal and mixed source qtypes.
 
 > **Note**: Requires the optional `gguf` package: `pip install mobius-onnx[gguf]`
 
@@ -319,22 +322,39 @@ mobius build-gguf GGUF_PATH [options]
 | Option | Description |
 |--------|-------------|
 | `--output DIR`, `-o DIR` | Output directory. Default: `<gguf_stem>_onnx/`. |
-| `--keep-quantized` | Preserve GGUF quantization as `MatMulNBits` (Q4_0/Q4_1/Q8_0). |
+| `--dequantize` | Explicitly dequantize all GGUF weights to float. |
+| `--keep-quantized` | Deprecated compatibility alias for the default quantization-preserving behavior. Cannot be combined with `--dequantize`. |
 | `--dtype DTYPE` | Target dtype for model weights: `f16`, `bf16`, `f32`. |
 | `--external-data FORMAT` | External data format: `onnx` (default) or `safetensors`. |
+| `--ep EP` | Target execution provider for EP-aware optimization. |
+| `--runtime RUNTIME` | `onnx-genai` emits supported runtime metadata. `ort-genai` is rejected until GGUF cache/tokenizer generation coverage exists. |
+| `--static-cache` | Build a fixed-width cache where supported. |
+| `--max-seq-len N` | Set the fixed cache length; requires `--static-cache`. |
 
 ### Examples
 
 ```bash
-# Basic GGUF conversion
+# Basic GGUF conversion (preserves supported quantization)
 mobius build-gguf model.gguf --output output/
 
-# Preserve quantization
-mobius build-gguf model.gguf --output output/ --keep-quantized
+# Explicitly dequantize all weights
+mobius build-gguf model.gguf --output output-float/ --dequantize
 
 # Convert with specific dtype
 mobius build-gguf model.gguf --output output/ --dtype f16
 ```
+
+F32-, F16-, and BF16-only files build normally as float models because they
+contain no quantization to preserve.
+Quantized files containing only qtypes with no supported preservation target
+(for example, pure Q6_K or Q5_K weights) fail instead of silently becoming
+float. Re-run with `--dequantize` to request explicit float conversion.
+
+Sharded GGUF inputs are rejected because a single shard has an incomplete
+tensor table. `nemotron_h_moe` is also rejected until its MTP block, Mamba2
+parity, mixed expert quantization, tokenizer provenance, and real ORT/ORT GenAI
+generation are validated. See
+[`build_from_gguf()`](api/build_from_gguf.md#nvidia-nemotron-35-lightning-waiver).
 
 ---
 

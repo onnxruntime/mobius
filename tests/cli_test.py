@@ -306,8 +306,8 @@ class TestCLIBuild:
             )
         assert mock_build.call_args.kwargs.get("fp8_kv_cache") is True
 
-    def test_features_prune_lm_head_passed_through(self):
-        """--features prune-lm-head sets prune_lm_head on the build() call."""
+    def test_features_prune_prefill_prefix_passed_through(self):
+        """--features prune-prefill-prefix sets the build option."""
         with (
             tempfile.TemporaryDirectory() as tmpdir,
             mock.patch(
@@ -325,10 +325,10 @@ class TestCLIBuild:
                     tmpdir,
                     "--no-weights",
                     "--features",
-                    "prune-lm-head",
+                    "prune-prefill-prefix",
                 ]
             )
-        assert mock_build.call_args.kwargs.get("prune_lm_head") is True
+        assert mock_build.call_args.kwargs.get("prune_prefill_prefix") is True
 
     def test_features_comma_separated_multiple(self):
         """A single --features accepts a comma-separated list."""
@@ -349,13 +349,13 @@ class TestCLIBuild:
                     tmpdir,
                     "--no-weights",
                     "--features",
-                    "text-only,fp8-kv-cache,prune-lm-head",
+                    "text-only,fp8-kv-cache,prune-prefill-prefix",
                 ]
             )
         kwargs = mock_build.call_args.kwargs
         assert kwargs.get("text_only") is True
         assert kwargs.get("fp8_kv_cache") is True
-        assert kwargs.get("prune_lm_head") is True
+        assert kwargs.get("prune_prefill_prefix") is True
 
     def test_features_unknown_errors(self):
         """An unrecognised feature name is rejected with a clear error."""
@@ -515,6 +515,59 @@ class TestCLIBuildRuntime:
         mock_export.assert_called_once()
         call_kwargs = mock_export.call_args
         assert call_kwargs.kwargs.get("hf_model_id") == "Qwen/Qwen2.5-0.5B"
+        assert call_kwargs.kwargs.get("trust_remote_code") is False
+
+    def test_runtime_ort_genai_propagates_trust_remote_code(self):
+        """--trust-remote-code also applies to runtime config generation."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.ort_genai.write_ort_genai_config",
+                return_value={},
+            ) as mock_export,
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "Qwen/Qwen2.5-0.5B",
+                    tmpdir,
+                    "--no-weights",
+                    "--trust-remote-code",
+                    "--runtime",
+                    "ort-genai",
+                ]
+            )
+
+        assert mock_export.call_args.kwargs["trust_remote_code"] is True
+
+    def test_runtime_ort_genai_rejects_mage_vl_before_saving(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch("mobius._model_package.ModelPackage.save") as save,
+            mock.patch(
+                "mobius.integrations.ort_genai.write_ort_genai_config"
+            ) as config_writer,
+            pytest.raises(
+                SystemExit,
+                match=r"Mage-VL.*patch_positions.*1D decoder position_ids",
+            ),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "microsoft/Mage-VL",
+                    tmpdir,
+                    "--no-weights",
+                    "--trust-remote-code",
+                    "--runtime",
+                    "ort-genai",
+                ]
+            )
+
+        save.assert_not_called()
+        config_writer.assert_not_called()
 
     def test_runtime_onnx_genai_uses_native_vlm_emitter(self):
         pkg = mock.MagicMock()

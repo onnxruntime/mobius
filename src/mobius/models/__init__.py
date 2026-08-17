@@ -54,6 +54,7 @@ __all__ = [
     "Gemma3CausalLMModel",
     "Gemma3MultiModalModel",
     "Gemma3nCausalLMModel",
+    "Gemma3nMultiModalModel",
     "Gemma4AssistantCausalLMModel",
     "Gemma4CausalLMModel",
     "Gemma4Model",
@@ -72,18 +73,24 @@ __all__ = [
     "IPAdapterModel",
     "InternLM2CausalLMModel",
     "InternVL2Model",
+    "MageVLForConditionalGeneration",
     "JambaCausalLMModel",
     "JetMoeCausalLMModel",
     "Llama4CausalLMModel",
     "LLaDAModel",
     "LLaVAModel",
     "LayerNormCausalLMModel",
+    "Lfm2CausalLMModel",
     "LongcatFlashCausalLMModel",
     "MPTCausalLMModel",
     "MLPLatentDynamicsModel",
     "Mamba2CausalLMModel",
     "MambaCausalLMModel",
     "MiniMaxCausalLMModel",
+    "MiniCPMV46ForConditionalGeneration",
+    "MoonshineForConditionalGeneration",
+    "MuseGlimmerForConditionalGeneration",
+    "MuseGlimmerTextCausalLMModel",
     "MimiModel",
     "MoshiDepformerModel",
     "MoshiTemporalModel",
@@ -91,9 +98,11 @@ __all__ = [
     "NanoChatCausalLMModel",
     "NemotronCausalLMModel",
     "NemotronHCausalLMModel",
+    "NemotronParseForConditionalGeneration",
     "OLMo2CausalLMModel",
     "OLMoCausalLMModel",
     "OPTCausalLMModel",
+    "ParakeetForCTCModel",
     "PersimmonCausalLMModel",
     "Phi3CausalLMModel",
     "Phi3MoECausalLMModel",
@@ -167,7 +176,11 @@ from mobius.models.apertus import ApertusCausalLMModel
 from mobius.models.arcee import ArceeCausalLMModel
 from mobius.models.bamba import BambaCausalLMModel
 from mobius.models.bart import BartForConditionalGeneration
-from mobius.models.base import CausalLMModel, FusedGateUpCausalLMModel, LayerNormCausalLMModel
+from mobius.models.base import (
+    CausalLMModel,
+    FusedGateUpCausalLMModel,
+    LayerNormCausalLMModel,
+)
 from mobius.models.bert import BertModel
 from mobius.models.blip2 import Blip2Model
 from mobius.models.chatglm import ChatGLMCausalLMModel
@@ -194,13 +207,17 @@ from mobius.models.doge import DogeCausalLMModel
 from mobius.models.eagle3 import Eagle3DraftModel
 from mobius.models.ernie import ErnieCausalLMModel
 from mobius.models.exaone4 import ExaOne4CausalLMModel
-from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel, MPTCausalLMModel
+from mobius.models.falcon import (
+    BloomCausalLMModel,
+    FalconCausalLMModel,
+    MPTCausalLMModel,
+)
 from mobius.models.flux_sd3 import FluxTransformer2DModel, SD3Transformer2DModel
 from mobius.models.fun_asr import FunASRForConditionalGeneration
 from mobius.models.gemma import Gemma2CausalLMModel, GemmaCausalLMModel
 from mobius.models.gemma3 import Gemma3MultiModalModel
 from mobius.models.gemma3_text import Gemma3CausalLMModel
-from mobius.models.gemma3n import Gemma3nCausalLMModel
+from mobius.models.gemma3n import Gemma3nCausalLMModel, Gemma3nMultiModalModel
 from mobius.models.gemma4 import (
     Gemma4CausalLMModel,
     Gemma4Model,
@@ -221,12 +238,15 @@ from mobius.models.internlm import InternLM2CausalLMModel
 from mobius.models.internvl import InternVL2Model
 from mobius.models.jamba import JambaCausalLMModel
 from mobius.models.jetmoe import JetMoeCausalLMModel
+from mobius.models.lfm2 import Lfm2CausalLMModel
 from mobius.models.llada import LLaDAModel
 from mobius.models.llama4 import Llama4CausalLMModel
 from mobius.models.llava import LLaVAModel
 from mobius.models.longcat_flash import LongcatFlashCausalLMModel
+from mobius.models.mage_vl import MageVLForConditionalGeneration
 from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
 from mobius.models.mimi import MimiModel, mimi_default_config
+from mobius.models.minicpmv4_6 import MiniCPMV46ForConditionalGeneration
 from mobius.models.minimax import MiniMaxCausalLMModel
 from mobius.models.moe import (
     Ernie45MoECausalLMModel,
@@ -236,18 +256,25 @@ from mobius.models.moe import (
     Phi3MoECausalLMModel,
     Qwen2MoECausalLMModel,
 )
+from mobius.models.moonshine import MoonshineForConditionalGeneration
 from mobius.models.moshi import (
     MoshiDepformerModel,
     MoshiTemporalModel,
     moshi_depformer_config,
     moshi_temporal_config,
 )
+from mobius.models.muse_glimmer import (
+    MuseGlimmerForConditionalGeneration,
+    MuseGlimmerTextCausalLMModel,
+)
 from mobius.models.nanochat import NanoChatCausalLMModel
 from mobius.models.nemo_rnnt import EncDecRNNTModel
 from mobius.models.nemotron import NemotronCausalLMModel
 from mobius.models.nemotron_h import NemotronHCausalLMModel
+from mobius.models.nemotron_parse import NemotronParseForConditionalGeneration
 from mobius.models.olmo import OLMo2CausalLMModel, OLMoCausalLMModel
 from mobius.models.opt import OPTCausalLMModel
+from mobius.models.parakeet_ctc import ParakeetForCTCModel
 from mobius.models.persimmon import PersimmonCausalLMModel
 from mobius.models.phi import (
     Phi3SmallCausalLMModel,

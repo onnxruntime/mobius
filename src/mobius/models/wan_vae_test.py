@@ -456,10 +456,10 @@ class TestGraphConstruction:
 
         # Causal 3D convolution (Pad + Conv), spatial downsample (ZeroPad2d),
         # AvgDown3D shortcut (Pad/Reshape/Transpose/ReduceMean), RMS norm
-        # (ReduceL2/Max/Div), SiLU (Sigmoid/Mul), single-head attention, and the
+        # (ReduceL2/Max/Div), SiLU (fused Swish), single-head attention, and the
         # posterior split with the logvar clamp.
         assert {"Conv", "Pad", "Reshape", "Transpose", "Concat"} <= ops
-        assert {"ReduceL2", "Max", "Div", "Sigmoid", "Mul", "Add"} <= ops
+        assert {"ReduceL2", "Max", "Div", "Swish", "Mul", "Add"} <= ops
         assert "ReduceMean" in ops  # AvgDown3D grouped mean
         assert "Attention" in ops  # mid-block single-head attention
         assert {"Split", "Clip"} <= ops  # mean/logvar split + logvar clamp

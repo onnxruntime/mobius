@@ -65,7 +65,7 @@ def _resolve_hidden_act(config, model_type: str) -> str | None:
         or getattr(config, "afn", None)
         # LLaDA/OLMo expose the activation as ``activation_type`` (e.g. "silu").
         or getattr(config, "activation_type", None)
-        or ("silu" if model_type in ("qwen", "chatglm") else None)
+        or ("silu" if model_type in ("qwen", "chatglm", "lfm2") else None)
         # gelu_activation is a boolean (XLM) — must be after all string
         # attrs so it cannot override an explicit hidden_act.
         or ("gelu" if getattr(config, "gelu_activation", False) else None)
@@ -411,6 +411,10 @@ class ArchitectureConfig(BaseModelConfig):
     linear_num_key_heads: int | None = None
     linear_num_value_heads: int | None = None
 
+    # Double-gated short-convolution config (LFM2-style hybrid layers).
+    short_conv_kernel: int = 3
+    short_conv_bias: bool = False
+
     rms_norm_eps: float = 1e-6
 
     # Rotary embedding config.
@@ -494,8 +498,14 @@ class ArchitectureConfig(BaseModelConfig):
     # Vision shared fields (accessed as top-level config.X by tasks)
     mm_tokens_per_image: int | None = None
     image_token_id: int | None = None
+    video_token_id: int | None = None
+    vision_start_token_id: int | None = None
+    vision_end_token_id: int | None = None
+    downsample_mode: str = "16x"
     spatial_merge_size: int = 2
     temporal_patch_size: int = 2
+    frame_windows_size: int = 4
+    tokens_per_second: float = 1.0
     deepstack_visual_indexes: list[int] | None = None
     fullatt_block_indexes: list[int] | None = None
     window_size: int = 112
@@ -681,7 +691,7 @@ class ArchitectureConfig(BaseModelConfig):
                 or 0
             ),
             hidden_size=_as_int(hidden_size),
-            intermediate_size=(
+            intermediate_size=_as_int(
                 getattr(config, "intermediate_size", None)
                 or getattr(config, "mlp_hidden_size", None)
                 or getattr(config, "n_inner", None)
@@ -706,10 +716,17 @@ class ArchitectureConfig(BaseModelConfig):
             linear_value_head_dim=(getattr(config, "linear_value_head_dim", None)),
             linear_num_key_heads=(getattr(config, "linear_num_key_heads", None)),
             linear_num_value_heads=(getattr(config, "linear_num_value_heads", None)),
+            short_conv_kernel=getattr(config, "conv_L_cache", 3),
+            short_conv_bias=getattr(config, "conv_bias", False),
             pad_token_id=(getattr(config, "pad_token_id", 0)),
             model_type=model_type,
             bos_token_id=getattr(config, "bos_token_id", None),
             eos_token_id=getattr(config, "eos_token_id", None),
+            video_token_id=getattr(
+                parent_config or config,
+                "video_token_id",
+                getattr(config, "video_token_id", None),
+            ),
             rms_norm_eps=(
                 getattr(config, "rms_norm_eps", None)
                 or getattr(config, "layer_norm_eps", None)
@@ -786,6 +803,9 @@ class ArchitectureConfig(BaseModelConfig):
                 model_type
                 in (
                     "gemma3_text",
+                    "gemma3n",
+                    "gemma3n_text",
+                    "lfm2",
                     "flex_olmo",
                     "olmoe",
                     "olmo2",
@@ -982,6 +1002,8 @@ class ArchitectureConfig(BaseModelConfig):
 
         # Vision config (from multimodal models)
         options.update(_extract_vision_config(config, parent_config, model_type))
+        if getattr(parent_config, "model_type", None) == "mage_vl":
+            options["model_type"] = "mage_vl"
 
         # Audio config
         options.update(_extract_audio_config(config, parent_config, model_type))
@@ -1267,9 +1289,169 @@ class VisionLanguageConfig(CausalLMConfig):
     """
 
 
+@dataclasses.dataclass
+class NemotronParseConfig(ArchitectureConfig):
+    """Configuration for NVIDIA Nemotron Parse image-to-text models."""
+
+    image_height: int = 2048
+    image_width: int = 1664
+    vision_max_grid_size: int = 128
+    num_summary_tokens: int = 3
+    decoder_start_token_id: int = 2
+    scale_embedding: bool = True
+    add_final_layer_norm: bool = True
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> NemotronParseConfig:
+        del parent_config
+        import types
+
+        def _namespace(value):
+            if isinstance(value, dict):
+                return types.SimpleNamespace(
+                    **{key: _namespace(item) for key, item in value.items()}
+                )
+            if isinstance(value, list):
+                return [_namespace(item) for item in value]
+            return value
+
+        decoder = _namespace(getattr(config, "decoder", None))
+        if decoder is None:
+            raise ValueError("Nemotron Parse config is missing its decoder sub-config")
+        base = ArchitectureConfig.from_transformers(decoder, parent_config=config)
+        fields = _shallow_fields(base)
+        num_attention_heads = int(
+            getattr(decoder, "decoder_attention_heads", None)
+            or getattr(decoder, "num_attention_heads", fields["num_attention_heads"])
+        )
+        hidden_size = int(fields["hidden_size"])
+        if hidden_size % num_attention_heads:
+            raise ValueError(
+                "Nemotron Parse decoder hidden size must be divisible by its attention heads"
+            )
+        fields.update(
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_attention_heads,
+            head_dim=hidden_size // num_attention_heads,
+        )
+
+        raw_image_size = getattr(config, "image_size", (2048, 1664))
+        if isinstance(raw_image_size, int):
+            image_height = image_width = raw_image_size
+        else:
+            image_height, image_width = (int(raw_image_size[0]), int(raw_image_size[1]))
+
+        encoder = _namespace(getattr(config, "encoder", None))
+        patch_size = int(getattr(encoder, "patch_size", 16))
+        max_resolution = int(
+            getattr(encoder, "max_resolution", max(image_height, image_width))
+        )
+        fields.update(
+            model_type="nemotron_parse",
+            bos_token_id=getattr(config, "bos_token_id", fields.get("bos_token_id")),
+            eos_token_id=getattr(config, "eos_token_id", fields.get("eos_token_id")),
+            pad_token_id=getattr(config, "pad_token_id", fields["pad_token_id"]),
+            tie_word_embeddings=getattr(config, "tie_word_embeddings", True),
+            max_position_embeddings=(
+                getattr(config, "max_sequence_length", None)
+                or fields["max_position_embeddings"]
+            ),
+            vision=VisionConfig(
+                hidden_size=1280,
+                intermediate_size=5120,
+                num_hidden_layers=32,
+                num_attention_heads=16,
+                image_size=max_resolution,
+                patch_size=patch_size,
+                norm_eps=1e-6,
+                model_type="radio_v2.5-h",
+                in_channels=3,
+            ),
+        )
+        resolved_dtype = _resolve_dtype(config)
+        if resolved_dtype is not None:
+            fields["dtype"] = resolved_dtype
+
+        return cls(
+            **fields,
+            image_height=image_height,
+            image_width=image_width,
+            vision_max_grid_size=max_resolution // patch_size,
+            num_summary_tokens=3,
+            decoder_start_token_id=int(getattr(config, "decoder_start_token_id", 2)),
+            scale_embedding=bool(getattr(decoder, "scale_embedding", True)),
+            add_final_layer_norm=bool(getattr(decoder, "add_final_layer_norm", True)),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Model-family subclasses — add model-specific fields
 # ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class MuseGlimmerConfig(ArchitectureConfig):
+    """Configuration for Muse Glimmer text and vision-language models."""
+
+    qk_scale_factor: float = 3.87
+    output_multiplier: float = 0.19611613513818404
+    final_logit_softcapping: float = 20.0
+    post_norm_eps: float = 1e-8
+    layer_rope_theta: list[float | int] | None = None
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> MuseGlimmerConfig:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        layer_rope_theta = getattr(config, "layer_rope_theta", None)
+        if layer_rope_theta is not None:
+            layer_rope_theta = list(layer_rope_theta)
+            no_rope_layers = [
+                layer_idx
+                for layer_idx, rope_theta in enumerate(layer_rope_theta)
+                if rope_theta == 0
+            ]
+            base = dataclasses.replace(base, no_rope_layers=no_rope_layers)
+        base = dataclasses.replace(base, attn_qk_norm=True)
+        return cls(
+            **_shallow_fields(base),
+            qk_scale_factor=getattr(config, "qk_scale_factor", 3.87),
+            output_multiplier=getattr(config, "output_multiplier", 0.19611613513818404),
+            final_logit_softcapping=(getattr(config, "final_logit_softcapping", 20.0) or 0.0),
+            post_norm_eps=getattr(config, "post_norm_eps", 1e-8),
+            layer_rope_theta=layer_rope_theta,
+        )
+
+
+@dataclasses.dataclass
+class Lfm2Config(CausalLMConfig):
+    """Configuration for LFM2's automatically adjusted feed-forward width."""
+
+    block_multiple_of: int = 256
+    block_ffn_dim_multiplier: float | int | None = 1.0
+    block_auto_adjust_ff_dim: bool = True
+
+    @property
+    def effective_intermediate_size(self) -> int:
+        """The MLP width constructed by HuggingFace's ``Lfm2MLP``."""
+        intermediate_size = self.intermediate_size
+        if self.block_auto_adjust_ff_dim:
+            intermediate_size = int(2 * intermediate_size / 3)
+            if self.block_ffn_dim_multiplier is not None:
+                intermediate_size = int(self.block_ffn_dim_multiplier * intermediate_size)
+                intermediate_size = self.block_multiple_of * (
+                    (intermediate_size + self.block_multiple_of - 1) // self.block_multiple_of
+                )
+        return intermediate_size
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Lfm2Config:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        return cls(
+            **_shallow_fields(base),
+            block_multiple_of=getattr(config, "block_multiple_of", 256),
+            block_ffn_dim_multiplier=getattr(config, "block_ffn_dim_multiplier", 1.0),
+            block_auto_adjust_ff_dim=getattr(config, "block_auto_adjust_ff_dim", True),
+        )
 
 
 @dataclasses.dataclass
@@ -1503,6 +1685,21 @@ class Gemma3nConfig(CausalLMConfig):
 
     Adds AltUp prediction/correction parameters and per-layer input
     dimension fields used exclusively by :mod:`models.gemma3n`.
+
+    ``num_kv_shared_layers`` mirrors the Gemma4 field of the same name: the
+    last N decoder layers borrow K,V from the last non-shared layer of the
+    same attention type instead of projecting their own, so they own no KV
+    cache entry.  E4B ships 15 (of 35 layers), i.e. layers 20..34 are shared.
+
+    ``activation_sparsity_pattern`` holds a per-layer target sparsity for the
+    MLP gate branch.  Where it is non-zero the gate activations below a
+    Gaussian quantile cutoff are zeroed (see
+    :class:`~mobius.models.gemma3n.Gemma3nMLP`).  E4B ships 0.95 for layers
+    0..9 and 0.0 for the rest; ``None`` disables sparsity everywhere.
+
+    ``final_logit_softcapping`` tanh-caps the LM head output as in Gemma2
+    (``cap * tanh(logits / cap)``).  Every published Gemma 3n config ships
+    30.0; ``0.0`` disables it.
     """
 
     altup_num_inputs: int = 4
@@ -1511,10 +1708,14 @@ class Gemma3nConfig(CausalLMConfig):
     laurel_rank: int = 64
     hidden_size_per_layer_input: int = 256
     vocab_size_per_layer_input: int = 262_144
+    num_kv_shared_layers: int = 0
+    activation_sparsity_pattern: list[float] | None = None
+    final_logit_softcapping: float = 0.0
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Gemma3nConfig:
         base = ArchitectureConfig.from_transformers(config, parent_config)
+        sparsity = getattr(config, "activation_sparsity_pattern", None)
         return cls(
             **_shallow_fields(base),
             altup_num_inputs=getattr(config, "altup_num_inputs", 4),
@@ -1523,6 +1724,66 @@ class Gemma3nConfig(CausalLMConfig):
             laurel_rank=getattr(config, "laurel_rank", 64),
             hidden_size_per_layer_input=getattr(config, "hidden_size_per_layer_input", 256),
             vocab_size_per_layer_input=getattr(config, "vocab_size_per_layer_input", 262_144),
+            num_kv_shared_layers=getattr(config, "num_kv_shared_layers", 0) or 0,
+            activation_sparsity_pattern=(
+                [float(s) for s in sparsity] if sparsity is not None else None
+            ),
+            final_logit_softcapping=(getattr(config, "final_logit_softcapping", 0.0) or 0.0),
+        )
+
+
+@dataclasses.dataclass
+class Gemma3nMultiModalConfig(Gemma3nConfig):
+    """Configuration for the full Gemma 3n image + audio + text model.
+
+    Carries the same text-decoder fields as :class:`Gemma3nConfig` (from which
+    it inherits, since the decoder is unchanged) plus the multimodal wiring.
+    The towers live in the inherited ``vision`` (:class:`VisionConfig`, a
+    MobileNet-V5 encoder rather than SigLIP) and ``audio``
+    (:class:`Gemma3nAudioConfig`, a USM Conformer) sub-configs, populated by
+    the ``gemma3n`` extractor hooks.
+
+    Both modalities are projected into the decoder's embedding space and
+    spliced in at their placeholder token positions, so each needs its token
+    id and its fixed soft-token count.  The token ids come from the inherited
+    ``image_token_id`` / ``audio_token_id`` (262145 and 262273 for E4B, also
+    mirrored on the sub-configs per the Gemma4 convention); the per-image
+    counts are fixed because both towers emit a fixed-size feature map:
+
+    - ``vision_soft_tokens_per_image``: 256 — a 768x768 image becomes a 16x16
+      grid.
+    - ``audio_soft_tokens_per_image``: 188.
+
+    Audio is optional: checkpoints without an ``audio_config`` leave ``audio``
+    as ``None`` and the exported package omits the audio encoder.
+    """
+
+    vision_soft_tokens_per_image: int = 256
+    audio_soft_tokens_per_image: int = 188
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Gemma3nMultiModalConfig:
+        # The HF Gemma3nConfig wraps a text_config while the multimodal token
+        # ids and soft-token counts live on the outer config.  build() may hand
+        # us either one, so resolve in both directions.
+        text_config = getattr(config, "text_config", None) or config
+        composite = parent_config if parent_config is not None else config
+        base = Gemma3nConfig.from_transformers(text_config, composite)
+        # audio_token_id is an ArchitectureConfig field that no generic
+        # extractor populates for gemma3n (the audio hook puts it on the
+        # sub-config); lift it so tasks can read it at the top level.
+        if base.audio_token_id is None:
+            base = dataclasses.replace(
+                base, audio_token_id=getattr(composite, "audio_token_id", None)
+            )
+        return cls(
+            **_shallow_fields(base),
+            vision_soft_tokens_per_image=int(
+                getattr(composite, "vision_soft_tokens_per_image", 256) or 256
+            ),
+            audio_soft_tokens_per_image=int(
+                getattr(composite, "audio_soft_tokens_per_image", 188) or 188
+            ),
         )
 
 
@@ -2489,7 +2750,19 @@ class JetMoeConfig(CausalLMConfig):
 
 
 @dataclasses.dataclass
-class WhisperConfig(BaseModelConfig):
+class SpeechToTextConfig(ArchitectureConfig):
+    """Shared configuration contract for encoder-decoder speech models."""
+
+    encoder_input_name: str = "input_features"
+    encoder_input_channels: int | None = None
+    encoder_uses_attention_mask: bool = False
+    decoder_uses_encoder_attention_mask: bool = False
+    decoder_start_token_id: int | None = None
+    layer_norm_eps: float = 1e-5
+
+
+@dataclasses.dataclass
+class WhisperConfig(SpeechToTextConfig):
     """Configuration for Whisper encoder-decoder models."""
 
     encoder_layers: int = DEFAULT_INT
@@ -2499,11 +2772,19 @@ class WhisperConfig(BaseModelConfig):
     max_source_positions: int = 1500
     max_target_positions: int = 448
     scale_embedding: bool = False
-    decoder_start_token_id: int | None = None
-    layer_norm_eps: float = 1e-5
+
+    def __post_init__(self):
+        if self.encoder_input_channels is None:
+            self.encoder_input_channels = self.num_mel_bins
+        elif self.encoder_input_channels != self.num_mel_bins:
+            raise ValueError(
+                "WhisperConfig: encoder_input_channels "
+                f"({self.encoder_input_channels}) must equal num_mel_bins "
+                f"({self.num_mel_bins})."
+            )
 
     @classmethod
-    def from_transformers(cls, config) -> WhisperConfig:
+    def from_transformers(cls, config, parent_config=None) -> WhisperConfig:
         if config.model_type != "whisper":
             raise ValueError(
                 f"WhisperConfig expects model_type='whisper', got '{config.model_type}'"
@@ -2544,6 +2825,81 @@ class WhisperConfig(BaseModelConfig):
 
 
 @dataclasses.dataclass
+class MoonshineConfig(SpeechToTextConfig):
+    """Configuration for Moonshine raw-waveform encoder-decoder ASR models."""
+
+    encoder_input_name: str = "input_values"
+    encoder_input_channels: int | None = None
+    encoder_uses_attention_mask: bool = True
+    decoder_uses_encoder_attention_mask: bool = True
+    encoder_num_hidden_layers: int = DEFAULT_INT
+    encoder_num_attention_heads: int = DEFAULT_INT
+    encoder_num_key_value_heads: int = DEFAULT_INT
+    encoder_hidden_act: str = "gelu"
+    decoder_hidden_act: str = "silu"
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> MoonshineConfig:
+        if config.model_type != "moonshine":
+            raise ValueError(
+                f"MoonshineConfig expects model_type='moonshine', got '{config.model_type}'"
+            )
+
+        hidden_size = config.hidden_size
+        decoder_heads = config.decoder_num_attention_heads
+        encoder_heads = config.encoder_num_attention_heads
+        rope_parameters = getattr(config, "rope_parameters", None) or getattr(
+            config, "rope_scaling", None
+        )
+        rope_type = (rope_parameters or {}).get("rope_type", "default")
+        options = dict(
+            vocab_size=config.vocab_size,
+            hidden_size=hidden_size,
+            intermediate_size=config.intermediate_size,
+            num_hidden_layers=config.decoder_num_hidden_layers,
+            num_attention_heads=decoder_heads,
+            num_key_value_heads=getattr(config, "decoder_num_key_value_heads", decoder_heads),
+            head_dim=hidden_size // decoder_heads,
+            hidden_act=getattr(config, "decoder_hidden_act", "silu"),
+            pad_token_id=getattr(config, "pad_token_id", 2),
+            tie_word_embeddings=getattr(config, "tie_word_embeddings", True),
+            attn_qkv_bias=getattr(config, "attention_bias", False),
+            attn_o_bias=getattr(config, "attention_bias", False),
+            max_position_embeddings=getattr(config, "max_position_embeddings", 194),
+            rope_type=rope_type,
+            rope_theta=getattr(
+                config,
+                "rope_theta",
+                (rope_parameters or {}).get("rope_theta", 10_000.0),
+            ),
+            rope_scaling=rope_parameters,
+            partial_rotary_factor=getattr(
+                config,
+                "partial_rotary_factor",
+                (rope_parameters or {}).get("partial_rotary_factor", 0.9),
+            ),
+            rope_interleave=True,
+            mlp_bias=True,
+            encoder_num_hidden_layers=config.encoder_num_hidden_layers,
+            encoder_num_attention_heads=encoder_heads,
+            encoder_num_key_value_heads=getattr(
+                config, "encoder_num_key_value_heads", encoder_heads
+            ),
+            encoder_hidden_act=getattr(config, "encoder_hidden_act", "gelu"),
+            decoder_hidden_act=getattr(config, "decoder_hidden_act", "silu"),
+            decoder_start_token_id=getattr(config, "decoder_start_token_id", 1),
+            layer_norm_eps=getattr(config, "layer_norm_eps", 1e-5),
+            model_type="moonshine",
+            bos_token_id=getattr(config, "bos_token_id", 1),
+            eos_token_id=getattr(config, "eos_token_id", 2),
+        )
+        resolved = _resolve_dtype(config)
+        if resolved is not None:
+            options["dtype"] = resolved
+        return cls(**options)
+
+
+@dataclasses.dataclass
 class MMSConfig(ArchitectureConfig):
     """Configuration for MMS (Massively Multilingual Speech) CTC models.
 
@@ -2580,4 +2936,52 @@ class MMSConfig(ArchitectureConfig):
             adapter_kernel_size=getattr(config, "adapter_kernel_size", 3),
             adapter_stride=getattr(config, "adapter_stride", 2),
             num_adapter_layers=getattr(config, "num_adapter_layers", 3),
+        )
+
+
+@dataclasses.dataclass
+class ParakeetCTCConfig(ArchitectureConfig):
+    """Configuration for Hugging Face Parakeet FastConformer CTC models."""
+
+    num_mel_bins: int = 80
+    subsampling_factor: int = 8
+    subsampling_conv_channels: int = 256
+    subsampling_conv_kernel_size: int = 3
+    subsampling_conv_stride: int = 2
+    conv_kernel_size: int = 9
+    attention_bias: bool = True
+    convolution_bias: bool = True
+    scale_input: bool = True
+    layer_norm_eps: float = 1e-5
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> ParakeetCTCConfig:
+        """Extract the nested Parakeet encoder and parent CTC vocabulary fields."""
+        encoder = getattr(config, "encoder_config", config)
+        parent = config if encoder is not config else parent_config
+        base = ArchitectureConfig.from_transformers(encoder, parent_config=parent)
+        fields = _shallow_fields(base)
+        fields.update(
+            vocab_size=getattr(parent, "vocab_size", fields["vocab_size"]),
+            pad_token_id=getattr(parent, "pad_token_id", fields["pad_token_id"]),
+            model_type=getattr(parent, "model_type", fields["model_type"]),
+        )
+        resolved_dtype = _resolve_dtype(parent)
+        # ORT CUDA executes this architecture in bf16 but diverges enough to
+        # collapse real CTC output to blanks. The checkpoint weights are fp32,
+        # so keep the safe fp32 default; callers may explicitly select fp16.
+        if resolved_dtype is not None and resolved_dtype != ir.DataType.BFLOAT16:
+            fields["dtype"] = resolved_dtype
+        return cls(
+            **fields,
+            num_mel_bins=getattr(encoder, "num_mel_bins", 80),
+            subsampling_factor=getattr(encoder, "subsampling_factor", 8),
+            subsampling_conv_channels=getattr(encoder, "subsampling_conv_channels", 256),
+            subsampling_conv_kernel_size=getattr(encoder, "subsampling_conv_kernel_size", 3),
+            subsampling_conv_stride=getattr(encoder, "subsampling_conv_stride", 2),
+            conv_kernel_size=getattr(encoder, "conv_kernel_size", 9),
+            attention_bias=getattr(encoder, "attention_bias", True),
+            convolution_bias=getattr(encoder, "convolution_bias", True),
+            scale_input=getattr(encoder, "scale_input", True),
+            layer_norm_eps=getattr(encoder, "layer_norm_eps", 1e-5),
         )

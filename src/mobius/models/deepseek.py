@@ -110,9 +110,14 @@ class DeepSeekMoEGate(nn.Module):
     def qmoe_routing(self, op: OpBuilder, hidden_states: ir.Value):
         """Return distinct expert-selection and aggregation scores for QMoE."""
         scores, scores_for_choice = self._routing_scores(op, hidden_states)
+        # QMoE's router_probs/router_weights inputs share type constraint "T"
+        # with hidden_states (see contrib_defs.cc). _routing_scores computes
+        # in float32 for numerical stability (matching HF's fp32 routing), so
+        # cast back to hidden_states' dtype before returning -- otherwise
+        # QMoE rejects a fp16/bf16 model with a mismatched-T type error.
         return (
-            scores_for_choice,
-            scores,
+            op.CastLike(scores_for_choice, hidden_states),
+            op.CastLike(scores, hidden_states),
             self.norm_topk_prob,
             float(self.routed_scaling_factor),
         )
@@ -328,8 +333,7 @@ class _SharedExpertMLP(nn.Module):
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
         gate_out = self.gate_proj(op, hidden_states)
-        # SiLU = x * sigmoid(x)
-        gate = op.Mul(gate_out, op.Sigmoid(gate_out))
+        gate = op.Swish(gate_out)
         up = self.up_proj(op, hidden_states)
         return self.down_proj(op, op.Mul(gate, up))
 

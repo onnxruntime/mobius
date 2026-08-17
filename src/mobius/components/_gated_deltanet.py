@@ -102,10 +102,23 @@ class GatedDeltaNet(nn.Module):
     The forward pass is a clean sequence of op calls.
 
     The recurrent state replaces the KV cache for these layers.
+
+    Args:
+        config: Architecture configuration.
+        linear_class: Factory callable ``(in_features, out_features, bias=...)``
+            for creating the ``in_proj_qkv``/``in_proj_z``/``in_proj_b``/
+            ``in_proj_a``/``out_proj`` projections. Defaults to ``Linear``.
+            Pass a quantized-linear factory (see
+            ``make_quantized_linear_factory``) to emit ``MatMulNBits`` for
+            these projections instead. ``dt_bias``, ``A_log``, and
+            ``conv1d.weight`` are small recurrent-state parameters and are
+            never quantized regardless of this argument.
     """
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(self, config: ArchitectureConfig, linear_class: type | None = None):
         super().__init__()
+        if linear_class is None:
+            linear_class = Linear
         self.hidden_size = config.hidden_size
         self._dtype = config.dtype
         self.num_v_heads = config.linear_num_value_heads
@@ -118,17 +131,17 @@ class GatedDeltaNet(nn.Module):
         self.conv_dim = self.key_dim * 2 + self.value_dim
 
         # QKV projection (fused: Q, K, V in one linear)
-        self.in_proj_qkv = Linear(
+        self.in_proj_qkv = linear_class(
             self.hidden_size,
             self.key_dim * 2 + self.value_dim,
             bias=False,
         )
         # Gating projection (z for silu gating in output norm)
-        self.in_proj_z = Linear(self.hidden_size, self.value_dim, bias=False)
+        self.in_proj_z = linear_class(self.hidden_size, self.value_dim, bias=False)
         # Beta projection (forget gate)
-        self.in_proj_b = Linear(self.hidden_size, self.num_v_heads, bias=False)
+        self.in_proj_b = linear_class(self.hidden_size, self.num_v_heads, bias=False)
         # Alpha projection (decay control)
-        self.in_proj_a = Linear(self.hidden_size, self.num_v_heads, bias=False)
+        self.in_proj_a = linear_class(self.hidden_size, self.num_v_heads, bias=False)
 
         # Causal depthwise Conv1D
         self.conv1d = _DepthwiseConv1d(self.conv_dim, self.conv_kernel_size)
@@ -141,7 +154,7 @@ class GatedDeltaNet(nn.Module):
         self.norm = PostGatedRMSNorm(self.head_v_dim, eps=config.rms_norm_eps)
 
         # Output projection
-        self.out_proj = Linear(self.value_dim, self.hidden_size, bias=False)
+        self.out_proj = linear_class(self.value_dim, self.hidden_size, bias=False)
 
     def forward(
         self,
