@@ -237,7 +237,7 @@ def test_dispatch_vision_multimodal_pipeline(tmp_path):
     assert pipeline["strategy"]["kind"] == "composite"
 
 
-def test_dispatch_audio_only_multimodal_pipeline(tmp_path):
+def test_dispatch_audio_only_multimodal_pipeline(tmp_path, monkeypatch):
     # The audio-only fusion shape used by speech-language ASR models such as
     # qwen3_asr and fun_asr: audio_encoder -> embedding fusion -> AR decoder.
     pkg = _MultimodalPkg(
@@ -247,7 +247,26 @@ def test_dispatch_audio_only_multimodal_pipeline(tmp_path):
             "embedding": object(),
         }
     )
-    artifacts = write_onnx_genai_config(pkg, str(tmp_path))
+    audio_processor = tmp_path / "audio_processor.json"
+    audio_processor.write_text("{}")
+    calls: list[tuple[str | None, str | None]] = []
+
+    def fake_audio_processor(output_dir, source, *, revision=None):
+        calls.append((source, revision))
+        return str(audio_processor)
+
+    monkeypatch.setattr(
+        "mobius.integrations.onnx_genai.auto_export._write_hf_audio_processor",
+        fake_audio_processor,
+    )
+    artifacts = write_onnx_genai_config(
+        pkg,
+        str(tmp_path),
+        source="zai-org/GLM-ASR-Nano-2512",
+        revision="pinned-revision",
+    )
+    assert artifacts["audio_processor"] == str(audio_processor)
+    assert calls == [("zai-org/GLM-ASR-Nano-2512", "pinned-revision")]
 
     with open(artifacts["inference_metadata"]) as handle:
         metadata = yaml.safe_load(handle)

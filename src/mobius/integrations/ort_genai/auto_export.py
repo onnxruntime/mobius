@@ -112,6 +112,7 @@ _GEMMA4_MODEL_TYPES = frozenset(
 # must preprocess with the HuggingFace processor and feed tensors via
 # ``Generator.set_inputs`` (see examples/gemma4_unified_ort_genai.py).
 _GEMMA4_UNIFIED_MODEL_TYPES = frozenset({"gemma4_unified", "gemma4_unified_text"})
+_GLMASR_MODEL_TYPES = frozenset({"glmasr"})
 _MINICPM_MODEL_TYPES = frozenset({"minicpmv4_6"})
 # gemma-3 multimodal. build() unwraps the composite HF config to its text
 # sub-config, so at export time ``config.model_type`` is "gemma3_text" (not
@@ -254,6 +255,8 @@ def _introspect_outputs(pkg: ModelPackage, key: str) -> dict[str, str] | None:
 def _copy_tokenizer_files(
     model_id: str,
     output_dir: str,
+    *,
+    revision: str | None = None,
 ) -> list[str]:
     """Download and copy tokenizer files from HuggingFace Hub.
 
@@ -265,7 +268,8 @@ def _copy_tokenizer_files(
     copied: list[str] = []
     for filename in _TOKENIZER_FILES:
         try:
-            src = hf_hub_download(model_id, filename)
+            revision_kwargs = {"revision": revision} if revision is not None else {}
+            src = hf_hub_download(model_id, filename, **revision_kwargs)
             dst = os.path.join(output_dir, filename)
             shutil.copy2(src, dst)
             copied.append(filename)
@@ -342,7 +346,12 @@ def _fix_tokenizer_config(output_dir: str) -> bool:
     return True
 
 
-def _fix_chat_template(output_dir: str, hf_model_id: str | None) -> bool:
+def _fix_chat_template(
+    output_dir: str,
+    hf_model_id: str | None,
+    *,
+    revision: str | None = None,
+) -> bool:
     """Ensure chat_template is present in tokenizer_config.json.
 
     Some HuggingFace models don't store ``chat_template`` in the
@@ -371,7 +380,8 @@ def _fix_chat_template(output_dir: str, hf_model_id: str | None) -> bool:
     try:
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(hf_model_id)
+        revision_kwargs = {"revision": revision} if revision is not None else {}
+        tokenizer = AutoTokenizer.from_pretrained(hf_model_id, **revision_kwargs)
         template = getattr(tokenizer, "chat_template", None)
         if template:
             tc["chat_template"] = template
@@ -511,6 +521,7 @@ def _write_vision_processor_config(
     *,
     hf_model_id: str | None = None,
     trust_remote_code: bool = False,
+    revision: str | None = None,
 ) -> str | None:
     """Write the vision processor config file for VLM models.
 
@@ -642,9 +653,11 @@ def _write_vision_processor_config(
             try:
                 from transformers import AutoProcessor
 
+                revision_kwargs = {"revision": revision} if revision is not None else {}
                 hf_proc = AutoProcessor.from_pretrained(
                     hf_model_id,
                     trust_remote_code=trust_remote_code,
+                    **revision_kwargs,
                 )
                 ip = getattr(hf_proc, "image_processor", None)
                 if ip is not None:
@@ -745,9 +758,11 @@ def _write_vision_processor_config(
             try:
                 from transformers import AutoProcessor
 
+                revision_kwargs = {"revision": revision} if revision is not None else {}
                 hf_proc = AutoProcessor.from_pretrained(
                     hf_model_id,
                     trust_remote_code=trust_remote_code,
+                    **revision_kwargs,
                 )
                 ip = getattr(hf_proc, "image_processor", None)
                 if ip is not None:
@@ -955,6 +970,46 @@ def _write_audio_processor_config(
             }
         }
         proc_filename = "audio_feature_extraction.json"
+    elif model_type in _GLMASR_MODEL_TYPES:
+        # GLM-ASR uses the standard Whisper log-mel contract with 128 mel
+        # bins and a fixed 30-second window. These operation names and attrs
+        # are consumed by OrtxCreateSpeechFeatureExtractor.
+        processor = {
+            "feature_extraction": {
+                "sequence": [
+                    {
+                        "operation": {
+                            "name": "audio_decoder",
+                            "type": "AudioDecoder",
+                        }
+                    },
+                    {
+                        "operation": {
+                            "name": "stft",
+                            "type": "STFTNorm",
+                            "attrs": {
+                                "n_fft": 400,
+                                "frame_length": 400,
+                                "hop_length": 160,
+                            },
+                        }
+                    },
+                    {
+                        "operation": {
+                            "name": "log_mel",
+                            "type": "LogMelSpectrum",
+                            "attrs": {
+                                "chunk_size": 30,
+                                "hop_length": 160,
+                                "n_fft": 400,
+                                "n_mel": 128,
+                            },
+                        }
+                    },
+                ]
+            }
+        }
+        proc_filename = "audio_processor.json"
     else:
         # Generic audio processor — add model-specific branches as needed.
         return None
@@ -1210,6 +1265,12 @@ def _write_genai_config(
                 "audio_embeds": "input_features",
                 "attention_mask": "input_features_mask",
             }
+        elif model_type in _GLMASR_MODEL_TYPES:
+            audio_kwargs["config_filename"] = "audio_processor.json"
+            audio_kwargs["input_names"] = {
+                "audio_embeds": "input_features",
+                "attention_mask": "input_features_mask",
+            }
         else:
             if audio_input_mapping is not None:
                 audio_kwargs["input_names"] = audio_input_mapping
@@ -1218,6 +1279,13 @@ def _write_genai_config(
             boa_token_id=boa_token_id,
             **audio_kwargs,
         )
+        embedding_inputs = _introspect_inputs(pkg, "embedding")
+        embedding_outputs = _introspect_outputs(pkg, "embedding")
+        if embedding_inputs is not None:
+            generator.with_embedding(
+                input_names=embedding_inputs,
+                output_names=embedding_outputs,
+            )
 
     return generator.write(output_dir)
 
@@ -1255,6 +1323,7 @@ def write_ort_genai_config(
     context_length: int = 4096,
     local_config_dir: str | None = None,
     trust_remote_code: bool = False,
+    revision: str | None = None,
 ) -> dict[str, str]:
     """Generate ORT-GenAI config artifacts for an already-built ModelPackage.
 
@@ -1340,8 +1409,11 @@ def write_ort_genai_config(
     if hf_model_id is not None:
         import transformers
 
+        revision_kwargs = {"revision": revision} if revision is not None else {}
         hf_config = transformers.AutoConfig.from_pretrained(
-            hf_model_id, trust_remote_code=trust_remote_code
+            hf_model_id,
+            trust_remote_code=trust_remote_code,
+            **revision_kwargs,
         )
         model_type = hf_config.model_type
         cfg_model_type = getattr(config, "model_type", None)
@@ -1460,7 +1532,14 @@ def write_ort_genai_config(
             tokenizer_files = _copy_tokenizer_files_from_local(hf_model_id, directory)
         else:
             logger.info("Copying tokenizer files from %s", hf_model_id)
-            tokenizer_files = _copy_tokenizer_files(hf_model_id, directory)
+            if revision is None:
+                tokenizer_files = _copy_tokenizer_files(hf_model_id, directory)
+            else:
+                tokenizer_files = _copy_tokenizer_files(
+                    hf_model_id,
+                    directory,
+                    revision=revision,
+                )
         for tf in tokenizer_files:
             result[tf] = os.path.join(directory, tf)
     elif local_config_dir is not None:
@@ -1482,6 +1561,7 @@ def write_ort_genai_config(
         directory,
         hf_model_id=hf_model_id,
         trust_remote_code=trust_remote_code,
+        revision=revision,
     )
     if processor_path:
         result["processor_config"] = processor_path
@@ -1495,7 +1575,7 @@ def write_ort_genai_config(
     _fix_tokenizer_config(directory)
 
     # Ensure chat_template is in tokenizer_config.json
-    _fix_chat_template(directory, hf_model_id)
+    _fix_chat_template(directory, hf_model_id, revision=revision)
 
     logger.info("ORT-GenAI artifacts written: %d files", len(result))
     return result

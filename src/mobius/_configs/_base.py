@@ -2750,6 +2750,34 @@ class JetMoeConfig(CausalLMConfig):
 
 
 @dataclasses.dataclass
+class GlmAsrConfig(CausalLMConfig):
+    """Configuration for GLM-ASR audio-language models."""
+
+    projector_hidden_act: str = "gelu"
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> GlmAsrConfig:
+        composite = parent_config or config
+        text_config = getattr(composite, "text_config", None) or config
+        base = ArchitectureConfig.from_transformers(text_config, parent_config=composite)
+        fields = _shallow_fields(base)
+        fields.update(
+            model_type=getattr(composite, "model_type", "glmasr"),
+            audio_token_id=getattr(composite, "audio_token_id", base.audio_token_id),
+            tie_word_embeddings=getattr(
+                composite, "tie_word_embeddings", base.tie_word_embeddings
+            ),
+        )
+        resolved_dtype = _resolve_dtype(composite)
+        if resolved_dtype is not None:
+            fields["dtype"] = resolved_dtype
+        return cls(
+            **fields,
+            projector_hidden_act=getattr(composite, "projector_hidden_act", "gelu"),
+        )
+
+
+@dataclasses.dataclass
 class SpeechToTextConfig(ArchitectureConfig):
     """Shared configuration contract for encoder-decoder speech models."""
 

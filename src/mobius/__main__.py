@@ -247,6 +247,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
     else:
         static_cache_params = None
     trust_remote_code = args.trust_remote_code
+    revision = args.revision
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
     dtype_override = resolve_dtype(args.dtype)
@@ -259,7 +260,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
     # central build() validation reject a diffusers/unsupported repo rather
     # than silently exporting a diffusion pipeline and ignoring the flag.
     if args.model and not args.config and not args.text_only:
-        pipeline_index = _load_diffusers_pipeline_index(args.model)
+        pipeline_index = _load_diffusers_pipeline_index(args.model, revision=revision)
         if pipeline_index is not None:
             print(
                 f"Detected diffusers pipeline: {pipeline_index.get('_class_name', 'Unknown')}"
@@ -275,6 +276,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 pipeline_components = {max(roots, key=len)} if roots else {component_filter}
             pkg = build_diffusers_pipeline(
                 args.model,
+                revision=revision,
                 dtype=dtype_override,
                 load_weights=load_weights,
                 components=pipeline_components,
@@ -342,13 +344,16 @@ def _cmd_build(args: argparse.Namespace) -> None:
             import transformers
 
             hf_config = transformers.AutoConfig.from_pretrained(
-                model_id_or_path, trust_remote_code=trust_remote_code
+                model_id_or_path,
+                revision=revision,
+                trust_remote_code=trust_remote_code,
             )
             task = _resolve_static_cache_task(getattr(hf_config, "model_type", ""))
 
         pkg = build(
             model_id_or_path,
             task=task,
+            revision=revision,
             dtype=dtype_override,
             load_weights=load_weights,
             trust_remote_code=trust_remote_code,
@@ -424,6 +429,7 @@ def _save_package(
             ep=ep,
             local_config_dir=local_config_dir,
             trust_remote_code=getattr(args, "trust_remote_code", False),
+            revision=getattr(args, "revision", None),
         )
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
@@ -436,6 +442,9 @@ def _save_package(
 
         config = getattr(pkg, "config", None)
         source = getattr(args, "config", None) or getattr(args, "model", None)
+        revision_kwargs = (
+            {"revision": args.revision} if getattr(args, "revision", None) is not None else {}
+        )
         if is_native_vlm_package(pkg):
             try:
                 artifacts = write_native_vlm_package_metadata(
@@ -443,11 +452,18 @@ def _save_package(
                     output_dir,
                     config=config,
                     source=source,
+                    **revision_kwargs,
                 )
             except ValueError as error:
                 raise SystemExit(f"Error: {error}") from error
         else:
-            artifacts = write_onnx_genai_config(pkg, output_dir, config=config, source=source)
+            artifacts = write_onnx_genai_config(
+                pkg,
+                output_dir,
+                config=config,
+                source=source,
+                **revision_kwargs,
+            )
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
 
@@ -700,6 +716,14 @@ def main(argv: list[str] | None = None) -> None:
         "--task",
         default=None,
         help="Model task (auto-detected if not specified). Use 'mobius list tasks' to see available tasks.",
+    )
+    build_parser.add_argument(
+        "--revision",
+        default=None,
+        help=(
+            "Immutable HuggingFace revision used for config, weights, tokenizer, "
+            "processor, and runtime metadata artifacts."
+        ),
     )
     build_parser.add_argument(
         "--external-data",

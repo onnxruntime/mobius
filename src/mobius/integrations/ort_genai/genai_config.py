@@ -389,6 +389,32 @@ class GenaiConfigGenerator:
             self._vlm_token_ids["video_token_id"] = video_token_id
         return self
 
+    def with_embedding(
+        self,
+        *,
+        filename: str = "embedding/model.onnx",
+        input_names: dict[str, str] | None = None,
+        output_names: dict[str, str] | None = None,
+    ) -> GenaiConfigGenerator:
+        """Add a standalone multimodal embedding stage."""
+        self._embedding = {
+            "filename": filename,
+            "inputs": input_names
+            if input_names is not None
+            else {
+                "input_ids": "input_ids",
+                "audio_features": "audio_features",
+            },
+            "outputs": output_names
+            if output_names is not None
+            else {"inputs_embeds": "inputs_embeds"},
+            "session_options": _make_session_options(
+                self.ep,
+                enable_graph_capture=False,
+            ),
+        }
+        return self
+
     def with_audio(
         self,
         *,

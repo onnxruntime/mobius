@@ -17,6 +17,7 @@ from mobius.integrations.diffusers._builder import (
     _init_diffusers_class_map,
     _load_diffusers_component_config,
     _load_diffusers_pipeline_index,
+    _load_optional_diffusers_json,
     _resolve_diffusers_component_source,
     build_diffusers_pipeline,
 )
@@ -198,6 +199,22 @@ class TestDiffusersHubRevision:
             repo_id="external/component-repo",
             filename="nested/transformer/config.json",
             revision="component-revision",
+        )
+
+    @patch("huggingface_hub.hf_hub_download", return_value="scheduler_config.json")
+    def test_optional_metadata_download_uses_revision(self, mock_download):
+        with patch("builtins.open", mock_open(read_data='{"beta_start": 0.001}')):
+            result = _load_optional_diffusers_json(
+                "fake/model",
+                "scheduler/scheduler_config.json",
+                revision="pinned-revision",
+            )
+
+        assert result == {"beta_start": 0.001}
+        mock_download.assert_called_once_with(
+            repo_id="fake/model",
+            filename="scheduler/scheduler_config.json",
+            revision="pinned-revision",
         )
 
     @patch("mobius.integrations.diffusers._builder._parallel_download", return_value=[])

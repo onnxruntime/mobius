@@ -3042,6 +3042,171 @@ class TestBuildGraphMoonshine:
         assert "Sigmoid" not in decoder_ops
 
 
+class TestBuildGraphGlmAsr:
+    """Verify GLM-ASR's audio encoder, projector, embedding, and decoder split."""
+
+    def _config(self):
+        from mobius._configs import GlmAsrConfig
+
+        return _base_config(
+            _config_cls=GlmAsrConfig,
+            audio_token_id=100,
+            audio=AudioConfig(
+                d_model=64,
+                encoder_layers=2,
+                encoder_attention_heads=4,
+                encoder_ffn_dim=256,
+                encoder_head_dim=16,
+                encoder_num_key_value_heads=4,
+                encoder_partial_rotary_factor=0.5,
+                encoder_rope_theta=10_000.0,
+                encoder_layer_norm_eps=1e-5,
+                num_mel_bins=128,
+                max_source_positions=256,
+                output_dim=64,
+                activation_function="gelu",
+                audio_token_id=100,
+            ),
+        )
+
+    def _build(self):
+        from mobius.models.glm_asr import GlmAsrForConditionalGeneration
+        from mobius.tasks import GlmAsrSpeechLanguageTask
+
+        config = self._config()
+        module = GlmAsrForConditionalGeneration(config)
+        return (
+            config,
+            module,
+            build_from_module(module, config, task=GlmAsrSpeechLanguageTask()),
+        )
+
+    def test_package_contract_and_attention(self):
+        config, _, pkg = self._build()
+
+        assert set(pkg) == {"audio_encoder", "embedding", "decoder"}
+        audio = pkg["audio_encoder"]
+        assert {value.name for value in audio.graph.inputs} == {
+            "input_features",
+            "input_features_mask",
+        }
+        assert {value.name for value in audio.graph.outputs} == {
+            "audio_features",
+            "audio_feature_lengths",
+        }
+        attention_nodes = [node for node in audio.graph if node.op_type == "Attention"]
+        assert len(attention_nodes) == config.audio.encoder_layers
+        assert all(node.attributes["is_causal"].value == 0 for node in attention_nodes)
+        assert all(len(node.inputs) == 3 or node.inputs[3] is None for node in attention_nodes)
+
+        decoder_inputs = {value.name for value in pkg["decoder"].graph.inputs}
+        assert {"inputs_embeds", "attention_mask", "position_ids"} <= decoder_inputs
+        assert "past_key_values.0.key" in decoder_inputs
+        assert "past_key_values.0.value" in decoder_inputs
+
+    def test_checkpoint_weight_routing(self):
+        import torch
+
+        _, module, _ = self._build()
+        tensor = torch.ones(1)
+        routed = module.preprocess_weights(
+            {
+                "audio_tower.conv1.weight": tensor,
+                "multi_modal_projector.linear_1.weight": tensor,
+                "language_model.model.embed_tokens.weight": tensor,
+                "language_model.model.layers.0.self_attn.q_proj.weight": tensor,
+                "language_model.model.norm.weight": tensor,
+                "language_model.lm_head.weight": tensor,
+            }
+        )
+
+        assert set(routed) == {
+            "audio_encoder.audio_tower.conv1.weight",
+            "audio_encoder.multi_modal_projector.linear_1.weight",
+            "embedding.embed_tokens.weight",
+            "decoder.layers.0.self_attn.q_proj.weight",
+            "decoder.norm.weight",
+            "decoder.lm_head.weight",
+        }
+
+    def test_cuda_build_preserves_standard_decoder_attention(self):
+        from mobius.models.glm_asr import GlmAsrForConditionalGeneration
+        from mobius.tasks import GlmAsrSpeechLanguageTask
+
+        config = self._config()
+        config.dtype = ir.DataType.FLOAT16
+        package = build_from_module(
+            GlmAsrForConditionalGeneration(config),
+            config,
+            task=GlmAsrSpeechLanguageTask(),
+            execution_provider="cuda",
+        )
+        decoder_ops = [node.op_type for node in package["decoder"].graph]
+        assert decoder_ops.count("Attention") == config.num_hidden_layers
+        assert "GroupQueryAttention" not in decoder_ops
+
+    def test_three_stage_pipeline_runs_with_ort(self):
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.rewrite_rules._testing_utils import fill_random_weights
+
+        config, _, pkg = self._build()
+        for model in pkg.values():
+            fill_random_weights(model)
+
+        mel_sequence = 32
+        audio_session = OnnxModelSession(pkg["audio_encoder"])
+        audio_outputs = audio_session.run(
+            {
+                "input_features": np.random.default_rng(0)
+                .standard_normal((1, 128, mel_sequence))
+                .astype(np.float32),
+                "input_features_mask": np.ones((1, mel_sequence), dtype=np.int64),
+            }
+        )
+        audio_session.close()
+        assert audio_outputs["audio_feature_lengths"].tolist() == [4]
+        audio_features = audio_outputs["audio_features"].reshape(-1, config.hidden_size)
+
+        input_ids = np.array(
+            [[1, 2, *([config.audio_token_id] * audio_features.shape[0]), 3]],
+            dtype=np.int64,
+        )
+        embedding_session = OnnxModelSession(pkg["embedding"])
+        inputs_embeds = embedding_session.run(
+            {"input_ids": input_ids, "audio_features": audio_features}
+        )["inputs_embeds"]
+        embedding_session.close()
+
+        sequence_length = input_ids.shape[1]
+        decoder_inputs = {
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": np.ones_like(input_ids),
+            "position_ids": np.arange(sequence_length, dtype=np.int64)[None, :],
+        }
+        for layer in range(config.num_hidden_layers):
+            for cache_kind in ("key", "value"):
+                decoder_inputs[f"past_key_values.{layer}.{cache_kind}"] = np.zeros(
+                    (1, config.num_key_value_heads, 0, config.head_dim),
+                    dtype=np.float32,
+                )
+        decoder_session = OnnxModelSession(pkg["decoder"])
+        decoder_outputs = decoder_session.run(decoder_inputs)
+        decoder_session.close()
+
+        assert decoder_outputs["logits"].shape == (
+            1,
+            sequence_length,
+            config.vocab_size,
+        )
+        assert decoder_outputs["present.0.key"].shape[2] == sequence_length
+
+    def test_registry_lookup(self):
+        from mobius.models.glm_asr import GlmAsrForConditionalGeneration
+
+        assert registry.get("glmasr") is GlmAsrForConditionalGeneration
+        assert _default_task_for_model("glmasr") == "glmasr-speech-language"
+
+
 class TestBuildGraphQwen3ASR:
     """Verify Qwen3-ASR 3-model split with SpeechLanguageTask."""
 
