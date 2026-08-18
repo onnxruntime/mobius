@@ -11,7 +11,8 @@ import math
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
-from mobius._configs import ArchitectureConfig, QuantizationConfig
+from mobius._configs import ArchitectureConfig
+from mobius._weight_utils import supported_qmoe_quantization as _supported_qmoe_quantization
 from mobius.components._mlp import MLP
 
 
@@ -495,28 +496,3 @@ class MoELayer(nn.Module):
                 result = op.Add(result, contribution)
 
         return result
-
-
-def _supported_qmoe_quantization(
-    quantization: QuantizationConfig | None,
-) -> QuantizationConfig | None:
-    """Return quantization settings when they match the native QMoE ABI.
-
-    Accepts the integer-affine int4 block schemes whose ``(q - zero_point) *
-    scale`` dequantization is byte-identical to ``MatMulNBits`` and to the
-    ``com.microsoft::QMoE`` kernel: GPTQ, AWQ, and Olive RTN
-    (``quant_method="olive"``, blk32 int4). The CUDA QMoE kernel requires a
-    power-of-two ``block_size >= 16``, so configs outside that range fall back
-    to the portable dense representation instead of emitting an unrunnable node.
-    """
-    if (
-        quantization is None
-        or quantization.bits != 4
-        or quantization.float_zero_point
-        or quantization.quant_method not in {"gptq", "awq", "olive"}
-    ):
-        return None
-    block_size = quantization.group_size
-    if block_size < 16 or (block_size & (block_size - 1)) != 0:
-        return None
-    return quantization
