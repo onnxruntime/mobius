@@ -262,3 +262,71 @@ def test_muse_glimmer_tiny_multimodal_prefill_matches_hf():
         "model.embed_tokens.weight": embed_weight,
         "lm_head.weight": lm_head_weight,
     }
+
+
+def test_muse_glimmer_text_quantization_emits_quantized_ops():
+    from mobius._configs import QuantizationConfig
+
+    config = MuseGlimmerConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        num_hidden_layers=2,
+        vocab_size=256,
+        max_position_embeddings=128,
+        hidden_act="silu",
+        layer_types=["sliding_attention", "full_attention"],
+        layer_rope_theta=[500_000.0, 0],
+        sliding_window=8,
+        pad_token_id=0,
+        rope_type="default",
+        rope_theta=500_000.0,
+        rms_norm_eps=1e-5,
+        dtype=ir.DataType.BFLOAT16,
+        quantization=QuantizationConfig(
+            bits=4,
+            group_size=32,
+            quant_method="gguf",
+            sym=False,
+            quantize_embeddings=True,
+            quantize_lm_head=True,
+        ),
+    )
+    module = MuseGlimmerTextCausalLMModel(config)
+    model = build_from_module(module, config)["model"]
+    counts = Counter(node.op_type for node in model.graph)
+
+    # 5 attention projections + 3 MLP projections per layer, plus the LM head.
+    assert counts["MatMulNBits"] == 2 * 8 + 1
+    assert counts["GatherBlockQuantized"] == 1
+    assert counts["MatMul"] == 0
+
+
+def test_muse_glimmer_without_quantization_stays_float():
+    config = MuseGlimmerConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        num_hidden_layers=2,
+        vocab_size=256,
+        max_position_embeddings=128,
+        hidden_act="silu",
+        layer_types=["sliding_attention", "full_attention"],
+        layer_rope_theta=[500_000.0, 0],
+        sliding_window=8,
+        pad_token_id=0,
+        rope_type="default",
+        rope_theta=500_000.0,
+        rms_norm_eps=1e-5,
+        dtype=ir.DataType.BFLOAT16,
+    )
+    module = MuseGlimmerTextCausalLMModel(config)
+    model = build_from_module(module, config)["model"]
+    counts = Counter(node.op_type for node in model.graph)
+
+    assert counts["MatMulNBits"] == 0
+    assert counts["GatherBlockQuantized"] == 0
