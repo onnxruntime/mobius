@@ -18,17 +18,17 @@ if TYPE_CHECKING:
     import onnx_ir as ir
     import torch
 
-from mobius._builder import (
+from mobius._registry import registry
+from mobius.integrations._builder import (
     DTYPE_MAP,
-    build,
     build_from_module,
     resolve_dtype,
 )
-from mobius._config_resolver import (
+from mobius.integrations.transformers import (
     _config_from_hf,
     _default_task_for_model,
+    build,
 )
-from mobius._registry import registry
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +150,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
     """Execute the 'build' subcommand."""
     import dataclasses
 
-    from mobius._diffusers_builder import (
+    from mobius.integrations.diffusers._builder import (
         _load_diffusers_pipeline_index,
         build_diffusers_pipeline,
     )
@@ -605,7 +605,7 @@ def _cmd_convert_comfyui(args: argparse.Namespace) -> None:
 
 def _cmd_info(args: argparse.Namespace) -> None:
     """Execute the 'info' subcommand."""
-    from mobius._diffusers_builder import (
+    from mobius.integrations.diffusers._builder import (
         _DIFFUSERS_CLASS_MAP,
         _init_diffusers_class_map,
         _load_diffusers_pipeline_index,

@@ -1675,6 +1675,8 @@ def auto_export(
                 "tokenizer.json": "/output/tokenizer.json",
             }
     """
+    # Import through the compatibility alias so downstream integrations that
+    # patch ``mobius._builder.build`` continue to intercept auto-export.
     from mobius._builder import build
 
     os.makedirs(output_dir, exist_ok=True)

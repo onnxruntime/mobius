@@ -18,9 +18,9 @@ import onnx_ir as ir
 import onnxruntime as ort
 import onnxruntime_easy as ort_easy
 
-from mobius._builder import _graph_requires_opset24
 from mobius._flags import flags
 from mobius._model_package import ModelPackage
+from mobius.integrations._builder import _graph_requires_opset24
 
 logger = logging.getLogger(__name__)
 

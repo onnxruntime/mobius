@@ -97,7 +97,7 @@ def build_mimi(
     """
     from safetensors.torch import load_file
 
-    from mobius._builder import build_from_module, resolve_dtype
+    from mobius.integrations._builder import build_from_module, resolve_dtype
     from mobius.models.mimi import MimiModel, mimi_default_config
     from mobius.tasks import CodecTask
 
@@ -183,7 +183,7 @@ def build_moshi_lm(
     """
     from safetensors.torch import load_file
 
-    from mobius._builder import build_from_module, resolve_dtype
+    from mobius.integrations._builder import build_from_module, resolve_dtype
     from mobius.models.moshi import (
         MoshiDepformerModel,
         MoshiTemporalModel,

@@ -11,13 +11,13 @@ import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
-from mobius._diffusers_configs import (
+from mobius.components import Embedding, LayerNorm, Linear, RMSNorm, TimestepEmbedding
+from mobius.integrations.diffusers._configs import (
     MiniMaxMusic3ConditionConfig,
     MiniMaxMusic3RVQConfig,
     MiniMaxMusic3TransformerConfig,
     MiniMaxMusic3VocoderConfig,
 )
-from mobius.components import Embedding, LayerNorm, Linear, RMSNorm, TimestepEmbedding
 from mobius.models.qwen import Qwen3CausalLMModel
 
 

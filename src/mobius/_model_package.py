@@ -33,7 +33,7 @@ import torch
 import tqdm
 
 from mobius._optimizations import fold_initializers_after_weights
-from mobius._weight_loading import _assign_weight
+from mobius.integrations._weight_loading import _assign_weight
 
 logger = logging.getLogger(__name__)
 

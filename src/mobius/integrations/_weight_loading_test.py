@@ -12,7 +12,7 @@ loading code. They verify:
 5. Corrupted / truncated weight files are handled gracefully.
 6. The ``build_from_module`` public contract is preserved.
 
-Targets the current code in both ``_weight_loading.py`` and ``_exporter.py``.
+Targets the integration weight loader and exporter.
 Uses MockWeightProvider pattern for test isolation — no network calls needed.
 """
 
@@ -32,7 +32,7 @@ import torch
 from mobius._builder import build_from_module
 from mobius._model_package import ModelPackage
 from mobius._testing import make_config
-from mobius._weight_loading import _download_weights, apply_weights
+from mobius.integrations._weight_loading import _download_weights, apply_weights
 from mobius.models.base import CausalLMModel
 from mobius.tasks import CausalLMTask, ModelTask
 
@@ -40,14 +40,14 @@ from mobius.tasks import CausalLMTask, ModelTask
 # Helpers
 # ---------------------------------------------------------------------------
 
-_SRC_ROOT = pathlib.Path(__file__).resolve().parent
+_SRC_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 # Paths to scan for security regressions (non-test source files)
 _SOURCE_FILES = [p for p in _SRC_ROOT.rglob("*.py") if not p.name.endswith("_test.py")]
 
 # Key weight-loading files to scan (both current and refactored paths)
 _WEIGHT_FILES = [
-    _SRC_ROOT / "_weight_loading.py",
+    _SRC_ROOT / "integrations" / "_weight_loading.py",
 ]
 
 

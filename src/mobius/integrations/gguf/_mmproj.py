@@ -368,7 +368,7 @@ def build_gemma4_vlm_from_gguf(
     """
     import dataclasses
 
-    from mobius._builder import resolve_dtype
+    from mobius.integrations._builder import resolve_dtype
     from mobius.integrations.gguf._builder import (
         _has_quantized_weights,
         _validate_gguf_model,
@@ -468,7 +468,7 @@ def build_gemma4_vlm_from_gguf(
     #    optimize_model passes (GQA fusion, etc.) — the same pipeline the
     #    text-only build_from_gguf path uses; calling Gemma4Task().build()
     #    directly would skip those optimizations.
-    from mobius._builder import build_from_module
+    from mobius.integrations._builder import build_from_module
 
     module = Gemma4Model(config)
     pkg = build_from_module(

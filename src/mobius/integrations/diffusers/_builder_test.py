@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Tests for _diffusers_builder.py — diffusers pipeline building."""
+"""Tests for the Diffusers integration builder."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from unittest.mock import mock_open, patch
 import onnx_ir as ir
 import pytest
 
-from mobius._diffusers_builder import (
+from mobius.integrations.diffusers._builder import (
     _DIFFUSERS_CLASS_MAP,
     _download_diffusers_component_weights,
     _init_diffusers_class_map,

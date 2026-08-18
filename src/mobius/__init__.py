@@ -59,10 +59,6 @@ __version__ = "0.1.0"
 
 from mobius import components, models, tasks
 from mobius._build_context import build_context, ep_capabilities, get_build_dtype
-from mobius._builder import (
-    build,
-    build_from_module,
-)
 from mobius._configs import (
     ArchitectureConfig,
     AudioConfig,
@@ -89,7 +85,6 @@ from mobius._configs import (
     YolosConfig,
 )
 from mobius._constants import OPSET_VERSION
-from mobius._diffusers_builder import build_diffusers_pipeline
 from mobius._execution_providers import EpCapabilities, ep_registry, get_ep, register_ep
 from mobius._model_package import ModelPackage
 from mobius._optimizations import optimize_model
@@ -98,8 +93,13 @@ from mobius._registry import (
     ModelRegistry,
     registry,
 )
-from mobius._weight_loading import apply_weights
+from mobius.integrations._builder import (
+    build_from_module,
+)
+from mobius.integrations._weight_loading import apply_weights
+from mobius.integrations.diffusers import build_diffusers_pipeline
 from mobius.integrations.gguf import build_from_gguf
 from mobius.integrations.nemo import build_from_nemo
+from mobius.integrations.transformers import build
 from mobius.models import MLPWorldModel
 from mobius.tasks import CausalLMTask, ModelTask, WorldModelTask

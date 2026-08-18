@@ -13,8 +13,8 @@ from typing import ClassVar
 
 import onnx_ir as ir
 
-from mobius._diffusers_configs import UNet2DConfig
 from mobius._model_package import ModelPackage
+from mobius.integrations.diffusers._configs import UNet2DConfig
 from mobius.tasks._base import ModelTask, _make_graph, _make_model
 
 
