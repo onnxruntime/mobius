@@ -262,3 +262,31 @@ class TestMuseGlimmerPostprocess:
                 self._metadata(),
                 self._FakeModel([3.87] * 127 + [1.0]),
             )
+
+    def test_underscore_spelled_architecture_is_read_the_same_way(self) -> None:
+        """Both ``muse-glimmer`` and ``muse_glimmer`` name the same architecture.
+
+        The metadata prefix follows whatever the file calls itself, so the
+        postprocessor has to take the prefix from the model rather than assume
+        the hyphenated spelling.
+        """
+        from mobius.integrations.gguf._config_mapping import (
+            _ARCH_KEY_MAPS,
+            _muse_glimmer_postprocess,
+        )
+
+        model = self._FakeModel([3.87] * 128)
+        model.architecture = "muse_glimmer"
+        metadata = {
+            key.replace("muse-glimmer.", "muse_glimmer."): value
+            for key, value in self._metadata().items()
+        }
+
+        result = _muse_glimmer_postprocess(self._base_config(), metadata, model)
+
+        assert result.sliding_window == 2048
+        assert result.no_rope_layers == [3, 7]
+        assert result.output_multiplier == pytest.approx(0.19611613513818404)
+        # The key map is what turns attention.key_length into head_dim, so it
+        # has to answer to both spellings too.
+        assert _ARCH_KEY_MAPS["muse_glimmer"] == _ARCH_KEY_MAPS["muse-glimmer"]

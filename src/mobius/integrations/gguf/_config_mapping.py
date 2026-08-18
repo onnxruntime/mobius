@@ -98,12 +98,16 @@ _DEFAULT_KEY_MAP: dict[str, str] = {
     "ssm.conv_kernel": "linear_conv_kernel_dim",
 }
 
+# Muse Glimmer has no rope.dimension_count; head_dim comes from key_length.
+_MUSE_GLIMMER_KEY_MAP = {
+    "attention.key_length": "head_dim",
+    "attention.sliding_window": "sliding_window",
+}
+
 _ARCH_KEY_MAPS: dict[str, dict[str, str]] = {
-    # Muse Glimmer has no rope.dimension_count; head_dim comes from key_length.
-    "muse-glimmer": {
-        "attention.key_length": "head_dim",
-        "attention.sliding_window": "sliding_window",
-    },
+    # Both spellings are accepted wherever muse-glimmer is recognized.
+    "muse-glimmer": _MUSE_GLIMMER_KEY_MAP,
+    "muse_glimmer": _MUSE_GLIMMER_KEY_MAP,
     "deepseek4": {
         "attention.key_length": "head_dim",
         "rope.dimension_count": "qk_rope_head_dim",
@@ -764,7 +768,7 @@ def _muse_glimmer_postprocess(
         Not represented in GGUF; the dataclass default (1e-8, matching the
         published checkpoints) is kept.
     """
-    arch = "muse-glimmer"
+    arch = getattr(model, "architecture", None) or "muse-glimmer"
 
     # --- Layer types and NoPE layers from the sliding-window pattern ---
     # Unlike Gemma 4, which stores a per-layer bool array, Muse Glimmer stores a
