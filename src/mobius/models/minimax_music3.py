@@ -105,7 +105,8 @@ class _DepthAttention(nn.Module):
             op.MatMul(query, op.Transpose(key, perm=[0, 1, 3, 2])),
             self._head_dim**-0.5,
         )
-        scores = op.Where(causal_mask, scores, float("-inf"))
+        neg_inf = op.CastLike(float("-inf"), scores)
+        scores = op.Where(causal_mask, scores, neg_inf)
         attended = op.MatMul(op.Softmax(scores, axis=-1), value)
         attended = op.Transpose(attended, perm=[0, 2, 1, 3])
         attended = op.Reshape(
