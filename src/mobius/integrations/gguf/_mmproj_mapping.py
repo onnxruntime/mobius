@@ -35,6 +35,7 @@ from __future__ import annotations
 __all__ = [
     "is_mmproj_stat_tensor",
     "map_mmproj_audio_to_hf",
+    "map_mmproj_muse_glimmer_vision_to_hf",
     "map_mmproj_vision_to_hf",
 ]
 
@@ -145,6 +146,83 @@ def map_mmproj_vision_to_hf(name: str) -> str | None:
     if name == "mm.input_projection.weight":
         return "embed_vision.embedding_projection.weight"
     return None
+
+
+# ---------------------------------------------------------------------------
+# Muse Glimmer vision tower (v.* / mm.N)
+# ---------------------------------------------------------------------------
+# Muse Glimmer's tower is a dynamic-resolution ViT with a plain pre-norm block
+# (LayerNorm + biased Q/K/V/out + GELU MLP), so unlike Gemma4 there are no
+# post-norms, no SwiGLU gate and no QK norms. The projector is three separate
+# `mm.N` matrices rather than a single input projection: two adapter layers on
+# the pixel-shuffled features and one projection into the text hidden size.
+_MUSE_GLIMMER_VISION_BLOCK_STEMS: dict[str, str] = {
+    "ln1.weight": "norm1.weight",
+    "ln1.bias": "norm1.bias",
+    "ln2.weight": "norm2.weight",
+    "ln2.bias": "norm2.bias",
+    "attn_q.weight": "attn.q_proj.weight",
+    "attn_q.bias": "attn.q_proj.bias",
+    "attn_k.weight": "attn.k_proj.weight",
+    "attn_k.bias": "attn.k_proj.bias",
+    "attn_v.weight": "attn.v_proj.weight",
+    "attn_v.bias": "attn.v_proj.bias",
+    "attn_out.weight": "attn.proj.weight",
+    "attn_out.bias": "attn.proj.bias",
+    "ffn_up.weight": "mlp.fc1.weight",
+    "ffn_up.bias": "mlp.fc1.bias",
+    "ffn_down.weight": "mlp.fc2.weight",
+    "ffn_down.bias": "mlp.fc2.bias",
+}
+
+# The three projector matrices, in file order. mm.0/mm.1 are the adapter that
+# runs on merge_size**2-shuffled patches; mm.2 projects into the text model.
+_MUSE_GLIMMER_PROJECTOR: dict[str, str] = {
+    "mm.0.weight": "model.vision_adapter.fc1.weight",
+    "mm.1.weight": "model.vision_adapter.fc2.weight",
+    "mm.2.weight": "model.vision_projection.weight",
+}
+
+
+def map_mmproj_muse_glimmer_vision_to_hf(name: str) -> str | None:
+    """Map a Muse Glimmer ``clip`` mmproj tensor name to its HF name.
+
+    Returns the name consumed by
+    :meth:`mobius.models.muse_glimmer.MuseGlimmerForConditionalGeneration.preprocess_weights`
+    (``model.vision_tower.*``, ``model.vision_adapter.*``,
+    ``model.vision_projection.*``), or ``None`` for tensors that are skipped.
+
+    The projector matrices are named positionally in the GGUF (``mm.0`` …
+    ``mm.2``); their roles are fixed by the published ``clip.projector_type =
+    muse-glimmer`` layout and confirmed by their shapes — ``mm.0`` consumes
+    ``hidden_size * merge_size**2``, ``mm.2`` produces the text hidden size.
+    """
+    if is_mmproj_stat_tensor(name):
+        return None
+
+    blk = _VISION_BLK.match(name)
+    if blk is not None:
+        idx, stem = blk.group(1), blk.group(2)
+        hf_stem = _MUSE_GLIMMER_VISION_BLOCK_STEMS.get(stem)
+        if hf_stem is None:
+            return None
+        return f"model.vision_tower.layers.{idx}.{hf_stem}"
+
+    top: dict[str, str] = {
+        # Conv patch embedding [out, in_ch, kh, kw]; flattened to the Linear
+        # the encoder uses by the builder.
+        "v.patch_embd.weight": ("model.vision_tower.patch_embedder.patch_embedding.weight"),
+        # [pos_grid**2, hidden] learned table, interpolated per resolution.
+        "v.position_embd.weight": (
+            "model.vision_tower.patch_embedder.position_embedding_table.weight"
+        ),
+        "v.pre_ln.weight": "model.vision_tower.ln_pre.weight",
+        "v.pre_ln.bias": "model.vision_tower.ln_pre.bias",
+        "v.post_ln.weight": "model.vision_tower.ln_post.weight",
+        "v.post_ln.bias": "model.vision_tower.ln_post.bias",
+        **_MUSE_GLIMMER_PROJECTOR,
+    }
+    return top.get(name)
 
 
 def map_mmproj_audio_to_hf(name: str) -> str | None:
