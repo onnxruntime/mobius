@@ -42,8 +42,11 @@ def _linear_factory(config: ArchitectureConfig) -> type | None:
 
     Returns ``None`` (meaning "use plain ``Linear``") when the model is
     unquantized. Shared by the dense (:class:`Qwen35DecoderLayer`) and MoE
-    (:class:`Qwen35MoEDecoderLayer`) variants so ``self_attn``/``linear_attn``/
-    ``mlp``/``shared_expert`` are all quantized consistently.
+    (:class:`Qwen35MoEDecoderLayer`) variants so ``self_attn``/``mlp``/
+    ``shared_expert`` are all quantized consistently.
+
+    A few modules opt out of this factory for specific quantizers — see
+    :data:`_FLOAT_MODULE_QUANT_METHODS`.
     """
     quantization = config.quantization
     if quantization is None or quantization.quant_method == "none":
@@ -54,6 +57,32 @@ def _linear_factory(config: ArchitectureConfig) -> type | None:
         block_size=quantization.group_size,
         has_zero_point=not quantization.sym,
         zero_point_dtype=zero_point_dtype,
+    )
+
+
+#: Quantizers that produce Qwen3.5/3.6-**MoE** checkpoints in which the
+#: GatedDeltaNet (``linear_attn``) projections and the ``shared_expert_gate``
+#: are left in floating point while the rest of the decoder is quantized.
+#:
+#: Olive's PyTorch-side quantization walk skips both module groups for the
+#: MoE model types: ``ModelWrapper.MAMBA`` maps ``qwen3_5_moe`` and
+#: ``qwen3_5_moe_text`` to ``linear_attn``, and ``SHARED_EXPERT_GATE``
+#: excludes ``shared_expert_gate`` for every model type
+#: (microsoft/Olive#2630). The **dense** Qwen3.5 model types are *not* in
+#: Olive's ``MAMBA`` table, so dense Olive checkpoints still carry a
+#: quantized ``linear_attn`` — the exclusion below is deliberately scoped to
+#: the MoE stack (:class:`Qwen35MoEDecoderLayer` / :class:`Qwen35MoEBlock`).
+#:
+#: Other checkpoint formats retain the graph construction used before this
+#: Olive-specific compatibility fix.
+_FLOAT_MODULE_QUANT_METHODS = frozenset({"olive"})
+
+
+def _keeps_modules_float(config: ArchitectureConfig) -> bool:
+    """True when the checkpoint's quantizer leaves the opt-out modules float."""
+    quantization = config.quantization
+    return (
+        quantization is not None and quantization.quant_method in _FLOAT_MODULE_QUANT_METHODS
     )
 
 
@@ -69,10 +98,19 @@ class Qwen35DecoderLayer(nn.Module):
 
     When ``config.quantization`` is set, ``self_attn``/``linear_attn``/``mlp``
     projections are built with a quantized-linear factory (see
-    :func:`_linear_factory`) so quantized checkpoints (e.g. Olive
-    RTN/GPTQ) load correctly instead of hitting a dense-vs-packed shape
-    mismatch.
+    :func:`_linear_factory`) so quantized checkpoints (e.g. Olive RTN/GPTQ)
+    load correctly instead of hitting a dense-vs-packed shape mismatch.
+
+    ``linear_attn`` (GatedDeltaNet) stays quantized here: Olive's ``MAMBA``
+    exclusion table only covers the MoE model types, so dense Qwen3.5
+    checkpoints do carry packed linear-attention projections. The MoE stack
+    overrides this via :attr:`float_linear_attn_quant_methods` (see
+    :class:`Qwen35MoEDecoderLayer`).
     """
+
+    #: Quantization methods whose checkpoints leave ``linear_attn`` float.
+    #: Empty for the dense stack; see :data:`_FLOAT_MODULE_QUANT_METHODS`.
+    float_linear_attn_quant_methods: frozenset[str] = frozenset()
 
     def __init__(self, config: ArchitectureConfig, layer_idx: int):
         super().__init__()
@@ -83,7 +121,9 @@ class Qwen35DecoderLayer(nn.Module):
         linear_class = _linear_factory(config)
 
         if self.layer_type == "linear_attention":
-            self.linear_attn = GatedDeltaNet(config, linear_class=linear_class)
+            self.linear_attn = GatedDeltaNet(
+                config, linear_class=self._linear_attn_class(config, linear_class)
+            )
         else:
             self.self_attn = Qwen35Attention(config, linear_class=linear_class)
 
@@ -92,6 +132,23 @@ class Qwen35DecoderLayer(nn.Module):
         self.post_attention_layernorm = OffsetRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+
+    @classmethod
+    def _linear_attn_class(
+        cls, config: ArchitectureConfig, linear_class: type | None
+    ) -> type | None:
+        """Linear factory for ``linear_attn`` — ``None`` means plain float.
+
+        Returns ``None`` when the checkpoint's quantizer left GatedDeltaNet in
+        floating point (a quantized graph would then expect packed
+        ``MatMulNBits`` initializers the checkpoint never contains); otherwise
+        the same factory used for the rest of the layer.
+        """
+        quantization = config.quantization
+        method = quantization.quant_method if quantization is not None else None
+        if method in cls.float_linear_attn_quant_methods:
+            return None
+        return linear_class
 
     def forward(
         self,
@@ -263,8 +320,30 @@ class Qwen35MoEBlock(Qwen2MoELayer):
         shared_expert.{gate,up,down}_proj.weight
         shared_expert_gate.weight    → sigmoid gate for shared expert
 
-    Retained as a named subclass for readability within the Qwen3.5 hybrid stack.
+    Retained as a named subclass for readability within the Qwen3.5 hybrid stack,
+    and to keep ``shared_expert_gate`` in plain floating :class:`Linear` for the
+    quantizers listed in :data:`_FLOAT_MODULE_QUANT_METHODS`: Olive excludes
+    this ``[1, hidden]`` gate from its quantization walk (microsoft/Olive#2630),
+    so a quantized gate module would expect packed ``MatMulNBits`` initializers
+    that such a checkpoint never contains. Other checkpoint formats retain
+    the previous graph construction. The router ``gate`` (top-k logits) is
+    unaffected — it is created by
+    :class:`~mobius.components._moe.MoELayer` and was never quantized.
     """
+
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        gate: nn.Module | None = None,
+        linear_class: type | None = None,
+    ):
+        super().__init__(
+            config,
+            gate=gate,
+            linear_class=linear_class,
+            # ``None`` falls back to ``linear_class`` (quantized gate).
+            shared_expert_gate_class=Linear if _keeps_modules_float(config) else None,
+        )
 
 
 class Qwen35MoEDecoderLayer(Qwen35DecoderLayer):
@@ -276,11 +355,25 @@ class Qwen35MoEDecoderLayer(Qwen35DecoderLayer):
 
     The routed experts are quantized via the fused ``com.microsoft::QMoE``
     path (see :class:`~mobius.components._moe.MoELayer`), driven directly
-    by ``config.quantization``. The always-active ``shared_expert``/
-    ``shared_expert_gate`` are not part of that fused op, so they are
-    quantized separately via the same ``linear_class`` factory used for
-    ``self_attn``/``linear_attn``/dense ``mlp`` (see :func:`_linear_factory`).
+    by ``config.quantization``. The always-active ``shared_expert`` is not
+    part of that fused op, so it is quantized separately via the same
+    ``linear_class`` factory used for ``self_attn``/dense ``mlp`` (see
+    :func:`_linear_factory`).
+
+    For Olive-quantized MoE checkpoints only, ``linear_attn`` (via
+    :attr:`float_linear_attn_quant_methods`) and ``shared_expert_gate`` (see
+    :class:`Qwen35MoEBlock`) stay in floating point, matching the modules
+    Olive excludes from its quantization walk for ``qwen3_5_moe`` /
+    ``qwen3_5_moe_text``. Other checkpoint formats retain the previous graph
+    construction.
+
+    Note: ``super().__init__`` builds a dense :class:`MLP` that is immediately
+    replaced by the MoE block here, so the dense module never reaches the
+    exported graph.
     """
+
+    #: Olive leaves the MoE stack's GatedDeltaNet projections float.
+    float_linear_attn_quant_methods: frozenset[str] = _FLOAT_MODULE_QUANT_METHODS
 
     def __init__(self, config: ArchitectureConfig, layer_idx: int):
         super().__init__(config, layer_idx)

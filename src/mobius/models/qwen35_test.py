@@ -13,11 +13,16 @@ random configs -- no checkpoint download.
 
 from __future__ import annotations
 
+import dataclasses
+
+import onnx_ir as ir
+import pytest
 import torch
 
 from mobius._configs import QuantizationConfig, VisionConfig
 from mobius._testing import make_config
 from mobius.models.qwen35 import (
+    Qwen35CausalLMModel,
     Qwen35MoECausalLMModel,
     Qwen35MoEVL3ModelCausalLMModel,
     Qwen35VL3ModelCausalLMModel,
@@ -464,3 +469,224 @@ class TestQwen35VL3ModelQuantization:
         assert result["vision_encoder.visual.blocks.0.mlp.up_proj.weight"] is vision_weight
         assert result["decoder.model.embed_tokens.weight"] is embedding
         assert result["embedding.embed_tokens.weight"] is embedding
+
+
+# ---------------------------------------------------------------------------
+# Mixed float/quantized decoder: Olive-quantized Qwen3.5/3.6-MoE keeps the
+# GatedDeltaNet projections and shared_expert_gate in floating point. Dense
+# Qwen3.5 and GPTQ/AWQ MoE checkpoints stay fully quantized.
+# ---------------------------------------------------------------------------
+
+# GatedDeltaNet dims chosen so in_proj_qkv is [key_dim * 2 + value_dim, _H]
+# = [8 * 2 + 32, 32] = [48, 32] -- the exact shape from the Olive repro.
+_LINEAR_ATTN_DIMS = dict(
+    linear_num_value_heads=2,
+    linear_num_key_heads=1,
+    linear_key_head_dim=8,
+    linear_value_head_dim=16,
+    linear_conv_kernel_dim=4,
+)
+_QKV_OUT = 48
+# Qwen3.5 full attention fuses the output gate into q_proj: 2 * heads * head_dim.
+_Q_OUT = 2 * 4 * 8
+
+
+def _hybrid_moe_config(
+    quantization: QuantizationConfig | None, *, vision: bool = False
+) -> object:
+    """Two-layer Qwen3.5-MoE config: layer 0 linear attention, layer 1 full."""
+    factory = _moe_vl_config if vision else _moe_config
+    config = factory(quantization)
+    config = dataclasses.replace(
+        config,
+        num_hidden_layers=2,
+        layer_types=["linear_attention", "full_attention"],
+        **_LINEAR_ATTN_DIMS,
+    )
+    return config
+
+
+def _hybrid_dense_config(quantization: QuantizationConfig | None) -> object:
+    """Two-layer dense Qwen3.5 config: layer 0 linear attention, layer 1 full."""
+    return make_config(
+        num_hidden_layers=2,
+        hidden_size=_H,
+        intermediate_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        layer_types=["linear_attention", "full_attention"],
+        quantization=quantization,
+        **_LINEAR_ATTN_DIMS,
+    )
+
+
+def _quant(method: str) -> QuantizationConfig:
+    return QuantizationConfig(bits=4, group_size=_BLK, quant_method=method, sym=False)
+
+
+def _olive_quant() -> QuantizationConfig:
+    return _quant("olive")
+
+
+def _packed_shape(out_features: int, in_features: int) -> tuple[int, int, int]:
+    """MatMulNBits initializer shape for an int4 blk-``_BLK`` linear."""
+    return (out_features, in_features // _BLK, _BLK * _BITS // 8)
+
+
+class TestQwen35MixedPrecisionDecoder:
+    """Olive-quantized Qwen3.5/3.6-**MoE** leaves some decoder modules float.
+
+    Olive's quantization walk excludes GatedDeltaNet (``linear_attn``, mapped
+    for ``qwen3_5_moe``/``qwen3_5_moe_text`` only) and ``shared_expert_gate``,
+    while ordinary attention, the shared expert MLP and the routed experts
+    stay quantized. The exported MoE graph must match that mixed layout, and
+    only for Olive: dense Qwen3.5 and GPTQ/AWQ MoE checkpoints keep a fully
+    quantized ``linear_attn``/gate.
+    """
+
+    def test_linear_attention_projections_are_float(self):
+        model = Qwen35MoECausalLMModel(_hybrid_moe_config(_olive_quant()))
+        linear_attn = model.model.layers[0].linear_attn
+
+        assert tuple(linear_attn.in_proj_qkv.weight.shape) == (_QKV_OUT, _H)
+        assert linear_attn.in_proj_qkv.weight.dtype != ir.DataType.UINT8
+        # Float Linear has no packed sidecar parameters.
+        assert not hasattr(linear_attn.in_proj_qkv, "scales")
+        for name in ("in_proj_z", "in_proj_b", "in_proj_a", "out_proj"):
+            projection = getattr(linear_attn, name)
+            assert len(projection.weight.shape) == 2, name
+            assert projection.weight.dtype != ir.DataType.UINT8, name
+            assert not hasattr(projection, "scales"), name
+
+    def test_dense_olive_linear_attention_stays_quantized(self):
+        """Dense Qwen3.5 is absent from Olive's MAMBA table -> still packed."""
+        model = Qwen35CausalLMModel(_hybrid_dense_config(_olive_quant()))
+        linear_attn = model.model.layers[0].linear_attn
+
+        assert tuple(linear_attn.in_proj_qkv.weight.shape) == _packed_shape(_QKV_OUT, _H)
+        assert linear_attn.in_proj_qkv.weight.dtype == ir.DataType.UINT8
+        assert linear_attn.in_proj_qkv.scales is not None
+        for name in ("in_proj_z", "in_proj_b", "in_proj_a", "out_proj"):
+            projection = getattr(linear_attn, name)
+            assert projection.weight.dtype == ir.DataType.UINT8, name
+        # Ordinary attention in the dense stack is quantized as before.
+        assert model.model.layers[1].self_attn.q_proj.weight.dtype == ir.DataType.UINT8
+
+    @pytest.mark.parametrize("method", ["gptq", "awq"])
+    def test_non_olive_quantization_preserves_existing_graph(self, method: str):
+        """The Olive-specific fix does not change other graph formats."""
+        model = Qwen35MoECausalLMModel(_hybrid_moe_config(_quant(method)))
+
+        linear_attn = model.model.layers[0].linear_attn
+        assert tuple(linear_attn.in_proj_qkv.weight.shape) == _packed_shape(_QKV_OUT, _H)
+        assert linear_attn.in_proj_qkv.weight.dtype == ir.DataType.UINT8
+
+        block = model.model.layers[1].mlp
+        assert tuple(block.shared_expert_gate.weight.shape) == _packed_shape(1, _H)
+        assert block.shared_expert_gate.weight.dtype == ir.DataType.UINT8
+        # Routed experts still take the fused QMoE path.
+        assert block.experts is None
+        assert tuple(block.fc1_experts_weights.shape) == (_E, _FC1_OUT, _H * _BITS // 8)
+
+    def test_full_attention_and_shared_expert_stay_quantized(self):
+        model = Qwen35MoECausalLMModel(_hybrid_moe_config(_olive_quant()))
+        layer = model.model.layers[1]
+
+        q_proj = layer.self_attn.q_proj
+        assert tuple(q_proj.weight.shape) == _packed_shape(_Q_OUT, _H)
+        assert q_proj.weight.dtype == ir.DataType.UINT8
+        assert q_proj.scales is not None
+
+        gate_proj = layer.mlp.shared_expert.gate_proj
+        assert tuple(gate_proj.weight.shape) == _packed_shape(_INT, _H)
+        assert gate_proj.weight.dtype == ir.DataType.UINT8
+        assert gate_proj.scales is not None
+
+    def test_shared_expert_gate_is_float_and_router_gate_unchanged(self):
+        model = Qwen35MoECausalLMModel(_hybrid_moe_config(_olive_quant()))
+        block = model.model.layers[1].mlp
+
+        assert tuple(block.shared_expert_gate.weight.shape) == (1, _H)
+        assert block.shared_expert_gate.weight.dtype != ir.DataType.UINT8
+        assert not hasattr(block.shared_expert_gate, "scales")
+
+        # Router gate behavior is untouched: still a plain float [E, H] linear.
+        assert tuple(block.gate.weight.shape) == (_E, _H)
+        assert block.gate.weight.dtype != ir.DataType.UINT8
+
+    def test_routed_experts_remain_fused_qmoe(self):
+        model = Qwen35MoECausalLMModel(_hybrid_moe_config(_olive_quant()))
+        block = model.model.layers[1].mlp
+
+        assert block.experts is None
+        assert tuple(block.fc1_experts_weights.shape) == (_E, _FC1_OUT, _H * _BITS // 8)
+        assert tuple(block.fc2_experts_weights.shape) == (_E, _H, _INT * _BITS // 8)
+
+    def test_unquantized_hybrid_layer_is_unaffected(self):
+        model = Qwen35MoECausalLMModel(_hybrid_moe_config(None))
+        assert tuple(model.model.layers[0].linear_attn.in_proj_qkv.weight.shape) == (
+            _QKV_OUT,
+            _H,
+        )
+        assert tuple(model.model.layers[1].mlp.shared_expert_gate.weight.shape) == (1, _H)
+        assert tuple(model.model.layers[1].self_attn.q_proj.weight.shape) == (_Q_OUT, _H)
+
+    def test_vl_decoder_shares_the_mixed_layout(self):
+        model = Qwen35MoEVL3ModelCausalLMModel(_hybrid_moe_config(_olive_quant(), vision=True))
+        layers = model.decoder.model.layers
+
+        assert tuple(layers[0].linear_attn.in_proj_qkv.weight.shape) == (_QKV_OUT, _H)
+        assert layers[0].linear_attn.in_proj_qkv.weight.dtype != ir.DataType.UINT8
+        assert tuple(layers[1].mlp.shared_expert_gate.weight.shape) == (1, _H)
+        assert layers[1].mlp.shared_expert_gate.weight.dtype != ir.DataType.UINT8
+        assert layers[1].self_attn.q_proj.weight.dtype == ir.DataType.UINT8
+
+    def test_mixed_olive_state_dict_preprocesses_and_binds(self):
+        """Post-#2630 Olive checkpoint (float deltanet + gate) binds cleanly."""
+        config = _hybrid_moe_config(_olive_quant())
+        model = Qwen35MoECausalLMModel(config)
+
+        linear_attn = "model.language_model.layers.0.linear_attn."
+        moe = "model.language_model.layers.1.mlp."
+        attn = "model.language_model.layers.1.self_attn."
+        state_dict: dict[str, torch.Tensor] = {
+            # Float (unquantized by Olive) GatedDeltaNet projections.
+            linear_attn + "in_proj_qkv.weight": torch.rand(_QKV_OUT, _H),
+            linear_attn + "in_proj_z.weight": torch.rand(32, _H),
+            linear_attn + "in_proj_b.weight": torch.rand(2, _H),
+            linear_attn + "in_proj_a.weight": torch.rand(2, _H),
+            linear_attn + "out_proj.weight": torch.rand(_H, 32),
+            # Float shared-expert gate.
+            moe + "shared_expert_gate.weight": torch.rand(1, _H),
+            # Quantized ordinary attention + shared expert.
+            attn + "q_proj.weight_qweight": torch.randint(
+                0, 256, (_Q_OUT, _H * _BITS // 8), dtype=torch.uint8
+            ),
+            attn + "q_proj.weight_scales": torch.rand(_Q_OUT, _H // _BLK),
+            moe + "shared_expert.gate_proj.weight_qweight": torch.randint(
+                0, 256, (_INT, _H * _BITS // 8), dtype=torch.uint8
+            ),
+            moe + "shared_expert.gate_proj.weight_scales": torch.rand(_INT, _H // _BLK),
+        }
+        # Fused QMoE experts for layer 1.
+        for key, value in _olive_expert_state_dict().items():
+            state_dict[key.replace("layers.0.", "layers.1.")] = value
+
+        out = model.preprocess_weights(state_dict)
+        params = dict(model.named_parameters())
+
+        # Every produced initializer binds to a parameter of matching shape.
+        for key, value in out.items():
+            assert key in params, key
+            assert tuple(params[key].shape) == tuple(value.shape), key
+
+        assert tuple(out["model.layers.0.linear_attn.in_proj_qkv.weight"].shape) == (
+            _QKV_OUT,
+            _H,
+        )
+        assert tuple(out["model.layers.1.mlp.shared_expert_gate.weight"].shape) == (1, _H)
+        assert tuple(out["model.layers.1.self_attn.q_proj.weight"].shape) == _packed_shape(
+            _Q_OUT, _H
+        )
+        assert "model.layers.1.mlp.fc1_experts_weights" in out

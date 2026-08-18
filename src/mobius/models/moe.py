@@ -276,11 +276,18 @@ class Qwen2MoELayer(MoELayer):
     Forward: ``routing_output + sigmoid(shared_gate(h)) * shared_expert(h)``
 
     ``linear_class``, when provided, is used for the shared expert's MLP and
-    gate, and is threaded through to :class:`MoELayer` so it also drives the
-    dense loop-over-experts fallback (used when the config doesn't match the
-    native QMoE ABI). It has no effect on the fused QMoE path, whose
-    quantized parameters are constructed directly by
-    :meth:`MoELayer._init_qmoe_parameters`.
+    -- by default only -- for ``shared_expert_gate``, and is threaded through
+    to :class:`MoELayer` so it also drives the dense loop-over-experts
+    fallback (used when the config doesn't match the native QMoE ABI). It has
+    no effect on the fused QMoE path, whose quantized parameters are
+    constructed directly by :meth:`MoELayer._init_qmoe_parameters`.
+
+    ``shared_expert_gate_class`` overrides the factory used for the
+    ``shared_expert_gate`` projection only; when it is ``None`` the gate falls
+    back to ``linear_class`` (backward compatible). Callers pass an explicit
+    factory when their checkpoint's quantizer leaves this tiny ``[1, hidden]``
+    gate in floating point — see
+    :class:`~mobius.models.qwen35.Qwen35MoEBlock`.
 
     Replicates HuggingFace ``Qwen2MoeSparseMoeBlock``.
     """
@@ -290,6 +297,7 @@ class Qwen2MoELayer(MoELayer):
         config: ArchitectureConfig,
         gate: nn.Module | None = None,
         linear_class: type | None = None,
+        shared_expert_gate_class: type | None = None,
     ):
         super().__init__(config, gate=gate, linear_class=linear_class)
         assert config.shared_expert_intermediate_size is not None, (
@@ -297,11 +305,13 @@ class Qwen2MoELayer(MoELayer):
         )
         if linear_class is None:
             linear_class = Linear
+        if shared_expert_gate_class is None:
+            shared_expert_gate_class = linear_class
         shared_config = dataclasses.replace(
             config, intermediate_size=config.shared_expert_intermediate_size
         )
         self.shared_expert = MLP(shared_config, linear_class=linear_class)
-        self.shared_expert_gate = linear_class(config.hidden_size, 1, bias=False)
+        self.shared_expert_gate = shared_expert_gate_class(config.hidden_size, 1, bias=False)
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # Routing expert output: top-k weighted sum  [B, S, H]
