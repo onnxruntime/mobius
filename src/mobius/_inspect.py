@@ -61,8 +61,11 @@ def _resolve_task_model_type_and_config(
     """
     import transformers
 
-    from mobius._config_resolver import _default_task_for_model, _try_load_config_json
     from mobius._registry import _detect_fallback_registration, registry
+    from mobius.integrations.transformers._config_resolver import (
+        _default_task_for_model,
+        _try_load_config_json,
+    )
 
     try:
         hf_config = transformers.AutoConfig.from_pretrained(
