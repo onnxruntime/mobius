@@ -841,7 +841,8 @@ def main(argv: list[str] | None = None) -> None:
             "Path to a companion 'clip' mmproj GGUF (vision/audio encoder). "
             "When set, builds a full multimodal package (decoder + "
             "vision_encoder + embedding) instead of a text-only model. "
-            "Currently supports Gemma4 vision; audio is experimental."
+            "Currently supports Gemma4 and Muse Glimmer vision; audio is "
+            "experimental."
         ),
     )
     quantization_group = gguf_parser.add_mutually_exclusive_group()
