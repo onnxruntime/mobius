@@ -17,7 +17,6 @@ from mobius._builder import (
     _enable_prefill_prefix_pruning_task,
     _graph_requires_opset24,
     _maybe_apply_opset_lowering,
-    build,
     flags,
 )
 from mobius._model_package import ModelPackage
@@ -184,48 +183,3 @@ def test_maybe_apply_opset_lowering_skipped_when_flag_disabled(
     _maybe_apply_opset_lowering(pkg, execution_provider="cuda")
 
     assert pkg["embedding"].graph.opset_imports[""] == 24
-
-
-def test_build_threads_revision_to_diffusers_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    import transformers
-
-    import mobius._config_resolver as config_resolver
-    import mobius._diffusers_builder as diffusers_builder
-
-    monkeypatch.setattr(
-        transformers.AutoConfig,
-        "from_pretrained",
-        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("not transformers")),
-    )
-    monkeypatch.setattr(config_resolver, "_try_load_config_json", lambda *args, **kwargs: None)
-    expected = ModelPackage({})
-    calls: list[tuple[tuple, dict]] = []
-
-    def fake_build_diffusers(*args, **kwargs):
-        calls.append((args, kwargs))
-        return expected
-
-    monkeypatch.setattr(
-        diffusers_builder,
-        "build_diffusers_pipeline",
-        fake_build_diffusers,
-    )
-
-    result = build(
-        "fake/diffusers",
-        revision="pinned-revision",
-        load_weights=False,
-    )
-
-    assert result is expected
-    assert calls == [
-        (
-            ("fake/diffusers",),
-            {
-                "revision": "pinned-revision",
-                "dtype": None,
-                "load_weights": False,
-                "execution_provider": "default",
-            },
-        )
-    ]

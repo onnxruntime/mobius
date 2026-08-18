@@ -423,7 +423,7 @@ def tie_word_embeddings(
     to **the same Python tensor object** as the existing key.
 
     This identity relationship is what enables true ONNX weight sharing
-    downstream: :func:`~mobius._weight_loading.apply_weights` detects
+    downstream: :func:`~mobius.integrations._weight_loading.apply_weights` detects
     that two state-dict entries share the same underlying storage (via
     ``data_ptr()``), creates a **single** ONNX initializer for the first
     occurrence, and redirects all graph uses of the second initializer to

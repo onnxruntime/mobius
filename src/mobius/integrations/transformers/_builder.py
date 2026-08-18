@@ -7,15 +7,41 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from typing import Any
 
 import onnx_ir as ir
 from onnxscript import nn
 
+from mobius._builder import build_from_module, resolve_dtype
 from mobius._model_package import ModelPackage
 from mobius._registry import registry
+from mobius.integrations._weight_loading import _download_weights
 from mobius.tasks import ModelTask
 
 logger = logging.getLogger(__name__)
+
+
+def _strip_to_text_only(config: Any, model_type: str) -> Any:
+    """Return a copy of *config* reduced to a pure text-only decoder."""
+    if not dataclasses.is_dataclass(config):
+        raise TypeError(
+            f"_strip_to_text_only expects a dataclass config instance, got {type(config)!r}"
+        )
+    field_names = {field.name for field in dataclasses.fields(config)}
+    overrides: dict[str, Any] = {"model_type": model_type}
+    for name in (
+        "image_token_id",
+        "use_bidirectional_attention",
+        "audio_token_id",
+        "boa_token_id",
+        "vision",
+        "audio",
+    ):
+        if name in field_names:
+            overrides[name] = None
+    return dataclasses.replace(
+        config, **{key: value for key, value in overrides.items() if key in field_names}
+    )
 
 
 def _load_transformers_config(
@@ -138,8 +164,6 @@ def build_transformers_model(
     If the repository is not a supported Transformers checkpoint, dispatch to
     the Diffusers integration so :func:`mobius.build` remains ecosystem-agnostic.
     """
-    from mobius.integrations import _builder as integration_builder
-    from mobius.integrations._builder import build_from_module, resolve_dtype
     from mobius.integrations.diffusers import build_diffusers_pipeline
     from mobius.integrations.transformers._config_resolver import (
         _config_from_hf,
@@ -170,7 +194,6 @@ def build_transformers_model(
 
     if text_only:
         from mobius._registry import _TEXT_ONLY_MODEL_TYPE
-        from mobius.integrations._builder import _strip_to_text_only
 
         text_type = _TEXT_ONLY_MODEL_TYPE.get(model_type)
         if text_type is None:
@@ -220,7 +243,7 @@ def build_transformers_model(
         model.graph.name = f"{model_id}/{name}"
 
     if load_weights:
-        state_dict = integration_builder._download_weights(model_id, revision=revision)
+        state_dict = _download_weights(model_id, revision=revision)
         if hasattr(model_module, "preprocess_weights"):
             state_dict = model_module.preprocess_weights(state_dict)
         package.apply_weights(

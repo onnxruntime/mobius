@@ -22,7 +22,7 @@ from transformers import (
 from mobius import build_from_module
 from mobius._configs import ParakeetCTCConfig
 from mobius._testing.ort_inference import OnnxModelSession
-from mobius._weight_loading import apply_weights
+from mobius.integrations._weight_loading import apply_weights
 from mobius.integrations.ort_genai import write_ort_genai_config
 from mobius.models import ParakeetForCTCModel
 from mobius.tasks import FeatureCTCAsrTask

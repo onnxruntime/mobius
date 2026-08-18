@@ -337,11 +337,11 @@ def build_from_gguf(
             keep_quantized=keep_quantized,
         )
 
-    from mobius._registry import registry
-    from mobius.integrations._builder import (
+    from mobius._builder import (
         build_from_module,
         resolve_dtype,
     )
+    from mobius._registry import registry
     from mobius.integrations.gguf._config_mapping import (
         GGUF_ARCH_TO_MODEL_TYPE,
         gguf_to_config,

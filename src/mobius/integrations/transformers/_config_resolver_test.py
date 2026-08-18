@@ -7,15 +7,15 @@ from __future__ import annotations
 
 import pytest
 
-from mobius.integrations.transformers._config_resolver import (
-    _config_from_hf,
-    _default_task_for_model,
-    _dict_to_pretrained_config,
-)
 from mobius._configs import (
     ArchitectureConfig,
     MoonshineConfig,
     WhisperConfig,
+)
+from mobius.integrations.transformers._config_resolver import (
+    _config_from_hf,
+    _default_task_for_model,
+    _dict_to_pretrained_config,
 )
 
 

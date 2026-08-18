@@ -156,7 +156,9 @@ class TestLocalSafetensorsLoading:
         def _unexpected_hub_call(*_args, **_kwargs):
             raise AssertionError("local checkpoint should not call hf_hub_download")
 
-        monkeypatch.setattr("mobius._weight_loading.hf_hub_download", _unexpected_hub_call)
+        monkeypatch.setattr(
+            "mobius.integrations._weight_loading.hf_hub_download", _unexpected_hub_call
+        )
 
         state_dict = _download_weights(str(tmp_path))
 
@@ -182,7 +184,9 @@ class TestLocalSafetensorsLoading:
         def _unexpected_hub_call(*_args, **_kwargs):
             raise AssertionError("local checkpoint should not call hf_hub_download")
 
-        monkeypatch.setattr("mobius._weight_loading.hf_hub_download", _unexpected_hub_call)
+        monkeypatch.setattr(
+            "mobius.integrations._weight_loading.hf_hub_download", _unexpected_hub_call
+        )
 
         state_dict = _download_weights(str(tmp_path))
 
@@ -195,7 +199,9 @@ class TestLocalSafetensorsLoading:
         def _unexpected_hub_call(*_args, **_kwargs):
             raise AssertionError("local checkpoint should not call hf_hub_download")
 
-        monkeypatch.setattr("mobius._weight_loading.hf_hub_download", _unexpected_hub_call)
+        monkeypatch.setattr(
+            "mobius.integrations._weight_loading.hf_hub_download", _unexpected_hub_call
+        )
 
         with pytest.raises(FileNotFoundError, match="Local checkpoint directory has no"):
             _download_weights(str(tmp_path))
@@ -379,7 +385,7 @@ class TestPathTraversalPrevention:
     )
     def test_build_with_malicious_model_id_raises(self, malicious_model_id):
         """build() with a path-traversal model_id should raise, not silently proceed."""
-        from mobius._builder import build
+        from mobius.integrations.transformers import build
 
         with pytest.raises((ValueError, OSError, Exception)):
             build(malicious_model_id, load_weights=False)
@@ -788,7 +794,7 @@ class TestDequantizeFP8Weights:
 
     def test_no_fp8_returns_unchanged(self):
         """Non-FP8 state dicts pass through unchanged."""
-        from mobius._weight_loading import _dequantize_fp8_weights
+        from mobius.integrations._weight_loading import _dequantize_fp8_weights
 
         state_dict = {
             "layer.weight": torch.randn(4, 4),
@@ -800,7 +806,7 @@ class TestDequantizeFP8Weights:
 
     def test_fp8_e4m3fn_dequantized(self):
         """FP8 weights are multiplied by weight_scale_inv."""
-        from mobius._weight_loading import _dequantize_fp8_weights
+        from mobius.integrations._weight_loading import _dequantize_fp8_weights
 
         fp8_weight = torch.tensor([1.0, 2.0, -1.0, 0.5], dtype=torch.float32).to(
             torch.float8_e4m3fn
@@ -820,7 +826,7 @@ class TestDequantizeFP8Weights:
 
     def test_activation_scale_removed(self):
         """Auxiliary activation_scale tensors are removed."""
-        from mobius._weight_loading import _dequantize_fp8_weights
+        from mobius.integrations._weight_loading import _dequantize_fp8_weights
 
         state_dict = {
             "proj.weight": torch.tensor([1.0], dtype=torch.float32).to(torch.float8_e4m3fn),
@@ -836,7 +842,7 @@ class TestDequantizeFP8Weights:
         For a key like 'model.weight_proj.weight', the scale key should be
         'model.weight_proj.weight_scale_inv' (not 'model.weight_scale_inv_proj.weight_scale_inv').
         """
-        from mobius._weight_loading import _dequantize_fp8_weights
+        from mobius.integrations._weight_loading import _dequantize_fp8_weights
 
         fp8_weight = torch.tensor([1.0], dtype=torch.float32).to(torch.float8_e4m3fn)
         scale = torch.tensor(2.0, dtype=torch.bfloat16)
@@ -850,7 +856,7 @@ class TestDequantizeFP8Weights:
 
     def test_missing_scale_casts_without_scaling(self):
         """FP8 weight without scale_inv is cast to bfloat16 without scaling."""
-        from mobius._weight_loading import _dequantize_fp8_weights
+        from mobius.integrations._weight_loading import _dequantize_fp8_weights
 
         fp8_weight = torch.tensor([1.0, 2.0], dtype=torch.float32).to(torch.float8_e4m3fn)
         state_dict = {"orphan.weight": fp8_weight}
@@ -859,7 +865,7 @@ class TestDequantizeFP8Weights:
 
     def test_fp32_scale_produces_bf16_output(self):
         """FP32 weight_scale_inv should still produce bfloat16 output."""
-        from mobius._weight_loading import _dequantize_fp8_weights
+        from mobius.integrations._weight_loading import _dequantize_fp8_weights
 
         fp8_weight = torch.tensor([1.0, 2.0], dtype=torch.float32).to(torch.float8_e4m3fn)
         # Scale stored as FP32 (common for scalar scales in real checkpoints)
@@ -875,7 +881,7 @@ class TestDequantizeFP8Weights:
 
     def test_does_not_mutate_input(self):
         """_dequantize_fp8_weights should not mutate the input dict."""
-        from mobius._weight_loading import _dequantize_fp8_weights
+        from mobius.integrations._weight_loading import _dequantize_fp8_weights
 
         fp8_weight = torch.tensor([1.0], dtype=torch.float32).to(torch.float8_e4m3fn)
         scale = torch.tensor(1.0, dtype=torch.bfloat16)

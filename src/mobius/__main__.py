@@ -18,12 +18,12 @@ if TYPE_CHECKING:
     import onnx_ir as ir
     import torch
 
-from mobius._registry import registry
-from mobius.integrations._builder import (
+from mobius._builder import (
     DTYPE_MAP,
     build_from_module,
     resolve_dtype,
 )
+from mobius._registry import registry
 from mobius.integrations.transformers import (
     _config_from_hf,
     _default_task_for_model,

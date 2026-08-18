@@ -1924,8 +1924,8 @@ class TestQwenImageVAEDecoder:
             AutoencoderKLQwenImage,
         )
 
-        from mobius._diffusers_configs import QwenImageVAEConfig
-        from mobius._weight_loading import apply_weights
+        from mobius.integrations._weight_loading import apply_weights
+        from mobius.integrations.diffusers._configs import QwenImageVAEConfig
         from mobius.models.qwen_image_vae import AutoencoderKLQwenImageModel
         from mobius.tasks._qwen_image_vae import QwenImageVAETask
 
@@ -1981,8 +1981,8 @@ class TestQwenImageVAEDecoder:
             AutoencoderKLQwenImage,
         )
 
-        from mobius._diffusers_configs import QwenImageVAEConfig
-        from mobius._weight_loading import apply_weights
+        from mobius.integrations._weight_loading import apply_weights
+        from mobius.integrations.diffusers._configs import QwenImageVAEConfig
         from mobius.models.qwen_image_vae import AutoencoderKLQwenImageModel
         from mobius.tasks._qwen_image_vae import QwenImageVAETask
 
@@ -2034,7 +2034,7 @@ def _build_and_compare_qwen35(hf_model, text_config, onnx_module_cls):
     import onnx_ir as ir
 
     from mobius import build_from_module
-    from mobius._weight_loading import apply_weights
+    from mobius.integrations._weight_loading import apply_weights
 
     arch_config = ArchitectureConfig.from_transformers(text_config)
     # Force float32 for numerical comparison (HF config may default to bf16)
@@ -2161,7 +2161,7 @@ def _build_and_compare_qwen3_next(hf_model, config, onnx_module_cls):
     import onnx_ir as ir
 
     from mobius import build_from_module
-    from mobius._weight_loading import apply_weights
+    from mobius.integrations._weight_loading import apply_weights
 
     arch_config = ArchitectureConfig.from_transformers(config)
     arch_config.dtype = ir.DataType.FLOAT
@@ -2266,7 +2266,7 @@ def _build_and_compare_deepseek(hf_model, config, onnx_module_cls):
     import onnx_ir as ir
 
     from mobius import build_from_module
-    from mobius._weight_loading import apply_weights
+    from mobius.integrations._weight_loading import apply_weights
 
     arch_config = ArchitectureConfig.from_transformers(config)
     arch_config.dtype = ir.DataType.FLOAT
@@ -2495,7 +2495,7 @@ def test_sam_vit_encoder_features_match():
     from transformers import SamConfig
     from transformers.models.sam.modeling_sam import SamVisionEncoder
 
-    from mobius._weight_loading import apply_weights
+    from mobius.integrations._weight_loading import apply_weights
 
     img_size = 128
     embed_dim = 64
@@ -3591,7 +3591,7 @@ def test_qwen35_vl_3model_text_only_parity():
     )
 
     from mobius import build_from_module
-    from mobius._weight_loading import apply_weights
+    from mobius.integrations._weight_loading import apply_weights
 
     hf_config = _make_tiny_qwen35_vl_config()
     tc = hf_config.text_config
@@ -3710,7 +3710,7 @@ def test_qwen35_vl_vision_features_match():
     )
 
     from mobius import build_from_module
-    from mobius._weight_loading import apply_weights
+    from mobius.integrations._weight_loading import apply_weights
 
     hf_config = _make_tiny_qwen35_vl_config()
 
@@ -3835,10 +3835,10 @@ def test_qwen35_deltanet_single_layer_parity():
     except ImportError:
         pytest.skip("Qwen3_5GatedDeltaNet not available in this transformers version")
 
-    from mobius._weight_loading import apply_weights
     from mobius.components._gated_deltanet import (
         GatedDeltaNet,
     )
+    from mobius.integrations._weight_loading import apply_weights
 
     # Tiny config for isolated DeltaNet test
     hf_config = _make_tiny_qwen35_vl_config()
@@ -4587,7 +4587,7 @@ def test_internvl2_3model_parity():
     from transformers import Qwen2Config, Qwen2ForCausalLM
 
     from mobius import build_from_module
-    from mobius._weight_loading import apply_weights
+    from mobius.integrations._weight_loading import apply_weights
 
     config = _make_tiny_internvl2_config()
     config.dtype = ir.DataType.FLOAT
@@ -4797,7 +4797,7 @@ def test_bamba_prefill_logits_match():
     from mobius import build_from_module
     from mobius._configs import BambaConfig
     from mobius._testing.comparison import assert_logits_close
-    from mobius._weight_loading import apply_weights
+    from mobius.integrations._weight_loading import apply_weights
     from mobius.models.bamba import BambaCausalLMModel
 
     hf_config = HFBambaConfig(
@@ -4914,7 +4914,7 @@ def test_bert_hidden_states_parity():
 
     from mobius import build_from_module, models
     from mobius._configs import ArchitectureConfig
-    from mobius._weight_loading import apply_weights
+    from mobius.integrations._weight_loading import apply_weights
 
     # Tiny BERT config
     hf_cfg = BertConfig(
@@ -4990,7 +4990,7 @@ def test_distilbert_hidden_states_parity():
 
     from mobius import build_from_module, models
     from mobius._configs import ArchitectureConfig
-    from mobius._weight_loading import apply_weights
+    from mobius.integrations._weight_loading import apply_weights
 
     # Tiny DistilBERT config
     hf_cfg = DistilBertConfig(
@@ -5062,7 +5062,7 @@ def test_roberta_hidden_states_parity():
 
     from mobius import build_from_module, models
     from mobius._configs import ArchitectureConfig
-    from mobius._weight_loading import apply_weights
+    from mobius.integrations._weight_loading import apply_weights
 
     # Tiny RoBERTa config: type_vocab_size=1, pad_token_id=1
     hf_cfg = RobertaConfig(
@@ -5195,7 +5195,7 @@ def test_gemma4_e2b_text_prefill():
 
     from mobius import build_from_module
     from mobius._configs import Gemma4Config
-    from mobius._weight_loading import apply_weights
+    from mobius.integrations._weight_loading import apply_weights
     from mobius.models.gemma4 import Gemma4CausalLMModel
 
     model_id = "google/gemma-4-E2B-it"
@@ -5292,7 +5292,7 @@ def test_gemma4_e2b_text_prefill_bf16():
 
     from mobius import build_from_module
     from mobius._configs import Gemma4Config
-    from mobius._weight_loading import apply_weights
+    from mobius.integrations._weight_loading import apply_weights
     from mobius.models.gemma4 import Gemma4CausalLMModel
 
     model_id = "google/gemma-4-E2B-it"
@@ -5428,7 +5428,7 @@ def test_gemma4_unified_12b_text_prefill():
 
     from mobius import build_from_module
     from mobius._configs import Gemma4Config
-    from mobius._weight_loading import apply_weights
+    from mobius.integrations._weight_loading import apply_weights
     from mobius.models.gemma4 import Gemma4CausalLMModel
 
     model_id = "google/gemma-4-12B"
@@ -5532,7 +5532,7 @@ def test_gemma4_unified_12b_multimodal_prefill():
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
     from mobius._configs import Gemma4Config
-    from mobius._weight_loading import _download_weights, apply_weights
+    from mobius.integrations._weight_loading import _download_weights, apply_weights
     from mobius.models.gemma4 import Gemma4UnifiedModel
     from mobius.tasks import TASK_REGISTRY
 

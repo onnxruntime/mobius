@@ -245,7 +245,7 @@ Diffusers models have a different structure than Transformers:
 
 #### B.1. Adding a new diffusers component
 
-1. **Create a config dataclass** in `_diffusers_configs.py`:
+1. **Create a config dataclass** in `integrations/diffusers/_configs.py`:
 
 ```python
 @dataclasses.dataclass
@@ -260,7 +260,8 @@ class MyDiffuserConfig:
 
 2. **Create the model module** in `models/my_diffuser.py`
 
-3. **Register in `_DIFFUSERS_CLASS_MAP`** (in `_diffusers_builder.py`):
+3. **Register in `_DIFFUSERS_CLASS_MAP`** (in
+   `integrations/diffusers/_builder.py`):
 
 ```python
 _DIFFUSERS_CLASS_MAP["MyDiffuserClass"] = (MyDiffuserModel, MyDiffuserConfig, "denoising")

@@ -20,7 +20,7 @@ import onnx_ir as ir
 import torch
 import tqdm
 
-from mobius.integrations._builder import build_from_module, resolve_dtype
+from mobius._builder import build_from_module, resolve_dtype
 from mobius._model_package import ModelPackage
 from mobius._optimizations import fold_initializers_after_weights
 from mobius.integrations._weight_loading import _parallel_download, apply_weights

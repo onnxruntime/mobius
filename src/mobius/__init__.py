@@ -59,6 +59,7 @@ __version__ = "0.1.0"
 
 from mobius import components, models, tasks
 from mobius._build_context import build_context, ep_capabilities, get_build_dtype
+from mobius._builder import build_from_module
 from mobius._configs import (
     ArchitectureConfig,
     AudioConfig,
@@ -92,9 +93,6 @@ from mobius._registry import (
     ModelRegistration,
     ModelRegistry,
     registry,
-)
-from mobius.integrations._builder import (
-    build_from_module,
 )
 from mobius.integrations._weight_loading import apply_weights
 from mobius.integrations.diffusers import build_diffusers_pipeline

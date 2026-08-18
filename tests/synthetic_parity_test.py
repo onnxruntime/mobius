@@ -36,11 +36,11 @@ from _test_configs import (
     _base_config,
 )
 
-from mobius._config_resolver import _default_task_for_model
 from mobius._configs import ArchitectureConfig
 from mobius._registry import registry
 from mobius._testing.parity import ParityResult, compare_synthetic
-from mobius._weight_loading import apply_weights
+from mobius.integrations._weight_loading import apply_weights
+from mobius.integrations.transformers._config_resolver import _default_task_for_model
 from mobius.tasks import get_task
 
 logger = logging.getLogger(__name__)

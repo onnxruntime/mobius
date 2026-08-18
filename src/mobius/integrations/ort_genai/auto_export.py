@@ -1636,7 +1636,7 @@ def auto_export(
     This is the end-to-end convenience function for producing ORT-GenAI-ready
     model directories. It:
 
-    1. Builds the ONNX graph(s) via :func:`~mobius._builder.build`
+    1. Builds the ONNX graph(s) via :func:`mobius.integrations.transformers.build`
     2. Downloads and applies HuggingFace weights
     3. Saves ONNX model(s) with external data
     4. Calls :func:`write_ort_genai_config` to write ``genai_config.json``,
@@ -1661,7 +1661,8 @@ def auto_export(
         progress_bar: Show progress bar during save.
         text_only: When ``True``, export the text backbone of a multimodal
             checkpoint as a standalone decoder-only LLM (see
-            :func:`~mobius._builder.build`). Produces a single ``model.onnx``
+            :func:`mobius.integrations.transformers.build`). Produces a single
+            ``model.onnx``
             with a decoder-only ``genai_config.json`` (no vision/audio
             sections). Currently supported for ``gemma4_unified``
             (``google/gemma-4-12B``).
@@ -1675,9 +1676,7 @@ def auto_export(
                 "tokenizer.json": "/output/tokenizer.json",
             }
     """
-    # Import through the compatibility alias so downstream integrations that
-    # patch ``mobius._builder.build`` continue to intercept auto-export.
-    from mobius._builder import build
+    from mobius.integrations.transformers import build
 
     os.makedirs(output_dir, exist_ok=True)
 

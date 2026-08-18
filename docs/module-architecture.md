@@ -1,32 +1,33 @@
 # Module Architecture Guide
 
 This guide documents the internal module structure of `mobius`,
-covering model registration, decoder layer extension, weight loading security,
-and backward compatibility.
+covering model registration, decoder layer extension, and weight loading security.
 
 ## Module Overview
 
-The original `_exporter.py` monolith (1,188 lines) has been split into five
-focused modules:
+The original `_exporter.py` monolith (1,188 lines) has been split into focused
+modules:
 
 | Module | Responsibility |
 |---|---|
 | `_registry.py` | Model registration — maps HuggingFace `model_type` strings to `nn.Module` subclasses |
-| `_config_resolver.py` | Resolves HuggingFace `PretrainedConfig` objects to internal `BaseModelConfig` subclasses |
-| `_weight_loading.py` | Downloads and applies safetensors weights to ONNX IR models |
-| `_builder.py` | Core build API — `build()` and `build_from_module()` |
-| `_diffusers_builder.py` | Builds ONNX models from diffusers pipelines (Flux, SD3, VAEs) |
+| `integrations/transformers/_config_resolver.py` | Resolves HuggingFace `PretrainedConfig` objects to internal `BaseModelConfig` subclasses |
+| `integrations/_weight_loading.py` | Downloads and applies safetensors weights to ONNX IR models |
+| `_builder.py` | Ecosystem-agnostic graph construction via `build_from_module()` |
+| `integrations/transformers/_builder.py` | Transformers checkpoint orchestration |
+| `integrations/diffusers/_builder.py` | Diffusers pipeline orchestration |
 
 ### Dependency graph
 
 ```
-_builder.py          ← build(), build_from_module()
+integrations/transformers/_builder.py  ← build_transformers_model()
   ├── _registry.py
-  ├── _config_resolver.py
-  └── _weight_loading.py
-_diffusers_builder.py
+  ├── integrations/transformers/_config_resolver.py
+  ├── integrations/_weight_loading.py
+  └── _builder.py    (build_from_module, resolve_dtype)
+integrations/diffusers/_builder.py
   ├── _builder.py    (build_from_module, resolve_dtype)
-  └── _weight_loading.py
+  └── integrations/_weight_loading.py
 ```
 
 ---
@@ -290,7 +291,8 @@ apply_weights(model, state_dict)
 
 ### For diffusers components
 
-`_diffusers_builder.py` uses `_download_diffusers_component_weights()` which
+`integrations/diffusers/_builder.py` uses
+`_download_diffusers_component_weights()` which
 follows the same safetensors-only pattern. It looks for:
 - `{component}/diffusion_pytorch_model.safetensors(.index.json)`
 - `{component}/model.safetensors(.index.json)`
@@ -312,21 +314,23 @@ follows the same safetensors-only pattern. It looks for:
 All code imports directly from the specific module that owns the symbol:
 
 ```python
-from mobius._builder import build, build_from_module
+from mobius._builder import build_from_module
 from mobius._registry import registry
-from mobius._weight_loading import apply_weights
-from mobius._diffusers_builder import build_diffusers_pipeline
+from mobius.integrations._weight_loading import apply_weights
+from mobius.integrations.diffusers._builder import build_diffusers_pipeline
+from mobius.integrations.transformers._builder import build_transformers_model
 ```
 
 ### Module → symbols reference
 
 | Source module | Symbols |
 |---|---|
-| `_builder` | `DTYPE_MAP`, `build`, `build_from_module`, `resolve_dtype`, `_cast_module_dtype`, `_DEFAULT_PASSES`, `_optimize` |
-| `_config_resolver` | `_config_from_hf`, `_default_task_for_model`, `_dict_to_pretrained_config`, `_try_load_config_json` |
-| `_diffusers_builder` | `build_diffusers_pipeline`, `_DIFFUSERS_CLASS_MAP`, `_download_diffusers_component_weights`, `_init_diffusers_class_map`, `_load_diffusers_component_config`, `_load_diffusers_pipeline_index` |
+| `_builder` | `DTYPE_MAP`, `build_from_module`, `resolve_dtype`, `_cast_module_dtype` |
+| `integrations.transformers._builder` | `build_transformers_model` |
+| `integrations.transformers._config_resolver` | `_config_from_hf`, `_default_task_for_model`, `_dict_to_pretrained_config`, `_try_load_config_json` |
+| `integrations.diffusers._builder` | `build_diffusers_pipeline`, `_DIFFUSERS_CLASS_MAP`, `_download_diffusers_component_weights`, `_init_diffusers_class_map`, `_load_diffusers_component_config`, `_load_diffusers_pipeline_index` |
 | `_registry` | `MODEL_MAP`, `ModelRegistration`, `ModelRegistry`, `registry` |
-| `_weight_loading` | `apply_weights`, `_download_weights`, `_parallel_download` |
+| `integrations._weight_loading` | `apply_weights`, `_download_weights`, `_parallel_download` |
 
 ---
 
@@ -335,7 +339,7 @@ from mobius._diffusers_builder import build_diffusers_pipeline
 ### Build a model from HuggingFace
 
 ```python
-from mobius._builder import build
+from mobius import build
 
 pkg = build("meta-llama/Llama-3-8B")
 pkg.save("/output/llama/")
@@ -344,7 +348,7 @@ pkg.save("/output/llama/")
 ### Build from a custom module
 
 ```python
-from mobius._builder import build_from_module
+from mobius import build_from_module
 
 module = MyCausalLMModel(config)
 pkg = build_from_module(module, config, task="text-generation")
@@ -353,8 +357,8 @@ pkg = build_from_module(module, config, task="text-generation")
 ### Register and build a custom architecture
 
 ```python
+from mobius import build
 from mobius._registry import registry
-from mobius._builder import build
 
 registry.register("my_arch", MyCausalLMModel)
 pkg = build("my-org/my-model")  # auto-detects "my_arch" from config.json
@@ -363,8 +367,8 @@ pkg = build("my-org/my-model")  # auto-detects "my_arch" from config.json
 ### Apply weights separately
 
 ```python
-from mobius._builder import build
-from mobius._weight_loading import apply_weights, _download_weights
+from mobius import build
+from mobius.integrations._weight_loading import apply_weights, _download_weights
 
 pkg = build("meta-llama/Llama-3-8B", load_weights=False)
 state_dict = _download_weights("meta-llama/Llama-3-8B")

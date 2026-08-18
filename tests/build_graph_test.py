@@ -52,7 +52,6 @@ from mobius._builder import (
     DTYPE_MAP,
     build_from_module,
 )
-from mobius._config_resolver import _default_task_for_model
 from mobius._configs import (
     ArchitectureConfig,
     AudioConfig,
@@ -65,6 +64,7 @@ from mobius._configs import (
 from mobius._optimizations import SymbolicShapeInferencePass
 from mobius._pipeline_contract import component_presence, optional_input_contract
 from mobius._registry import registry
+from mobius.integrations.transformers._config_resolver import _default_task_for_model
 from mobius.tasks import (
     CausalLMTask,
     Phi4MMMultiModalTask,
@@ -1474,8 +1474,8 @@ class TestBuildGraphVisionLanguage:
         """
         from collections import Counter
 
-        from mobius._builder import _strip_to_text_only
         from mobius._configs import Gemma4Config
+        from mobius.integrations.transformers._builder import _strip_to_text_only
         from mobius.tasks import get_task
 
         config = Gemma4Config(
@@ -1519,8 +1519,8 @@ class TestBuildGraphVisionLanguage:
 
     def test_strip_to_text_only(self):
         """``_strip_to_text_only`` nulls multimodal fields and sets model_type."""
-        from mobius._builder import _strip_to_text_only
         from mobius._configs import Gemma4AudioConfig, Gemma4Config
+        from mobius.integrations.transformers._builder import _strip_to_text_only
 
         config = Gemma4Config(
             model_type="gemma4_unified",
@@ -1556,7 +1556,7 @@ class TestBuildGraphVisionLanguage:
         """``build(text_only=True)`` rejects model types with no text sibling."""
         from unittest import mock
 
-        from mobius._builder import build
+        from mobius.integrations.transformers import build
 
         fake_hf = type("HF", (), {"model_type": "llama"})()
         with (
@@ -1573,7 +1573,7 @@ class TestBuildGraphVisionLanguage:
         """
         from unittest import mock
 
-        from mobius import _builder
+        from mobius.integrations.transformers import _builder as transformers_builder
 
         fake_hf = type("HF", (), {"model_type": "gemma4_unified"})()
         raw_config = mock.MagicMock(name="raw_config")
@@ -1585,21 +1585,28 @@ class TestBuildGraphVisionLanguage:
         with (
             mock.patch("transformers.AutoConfig.from_pretrained", return_value=fake_hf),
             mock.patch.object(
-                _builder.registry, "get", return_value=fake_module_cls
+                transformers_builder.registry, "get", return_value=fake_module_cls
             ) as mock_get,
-            mock.patch("mobius._config_resolver._config_from_hf", return_value=raw_config),
             mock.patch(
-                "mobius._builder._strip_to_text_only", return_value=stripped_config
+                "mobius.integrations.transformers._config_resolver._config_from_hf",
+                return_value=raw_config,
+            ),
+            mock.patch(
+                "mobius.integrations.transformers._builder._strip_to_text_only",
+                return_value=stripped_config,
             ) as mock_strip,
             mock.patch(
-                "mobius._config_resolver._default_task_for_model",
+                "mobius.integrations.transformers._config_resolver._default_task_for_model",
                 return_value="text-generation",
             ),
             mock.patch(
-                "mobius._builder.build_from_module", return_value=fake_pkg
+                "mobius.integrations.transformers._builder.build_from_module",
+                return_value=fake_pkg,
             ) as mock_build_mod,
         ):
-            pkg = _builder.build("google/gemma-4-12B", load_weights=False, text_only=True)
+            pkg = transformers_builder.build_transformers_model(
+                "google/gemma-4-12B", load_weights=False, text_only=True
+            )
 
         # model_type was remapped to the text sibling before module lookup
         mock_get.assert_called_once_with("gemma4_unified_text")
@@ -1618,14 +1625,17 @@ class TestBuildGraphVisionLanguage:
         """
         from unittest import mock
 
-        from mobius._builder import build
+        from mobius.integrations.transformers import build
 
         with (
             mock.patch(
                 "transformers.AutoConfig.from_pretrained",
                 side_effect=ValueError("no such model_type"),
             ),
-            mock.patch("mobius._config_resolver._try_load_config_json", return_value=None),
+            mock.patch(
+                "mobius.integrations.transformers._config_resolver._try_load_config_json",
+                return_value=None,
+            ),
             pytest.raises(ValueError, match="does not resolve to a registered"),
         ):
             build("some/diffusion-pipeline", load_weights=False, text_only=True)
@@ -3628,7 +3638,7 @@ class TestBuildVAEGraph:
     """Verify VAE (AutoencoderKL) graph construction."""
 
     def _vae_config(self):
-        from mobius._diffusers_configs import VAEConfig
+        from mobius.integrations.diffusers._configs import VAEConfig
 
         return VAEConfig(
             in_channels=3,
@@ -3900,7 +3910,7 @@ class TestBuildMMSGraph:
     """Verify UNet2DConditionModel graph construction."""
 
     def _unet_config(self):
-        from mobius._diffusers_configs import UNet2DConfig
+        from mobius.integrations.diffusers._configs import UNet2DConfig
 
         return UNet2DConfig(
             in_channels=4,
@@ -4155,7 +4165,7 @@ class TestBuildCogVideoXGraph:
     """Verify CogVideoX 3D video transformer graph construction."""
 
     def test_cogvideox_graph_builds(self):
-        from mobius._diffusers_configs import CogVideoXConfig
+        from mobius.integrations.diffusers._configs import CogVideoXConfig
         from mobius.models.cogvideox import CogVideoXTransformer3DModel
         from mobius.tasks import VideoDenoisingTask
 
@@ -4235,7 +4245,7 @@ class TestBuildQwenImageGraph:
     """Verify QwenImage transformer denoiser graph construction."""
 
     def test_qwen_image_transformer_graph_builds(self):
-        from mobius._diffusers_configs import QwenImageConfig
+        from mobius.integrations.diffusers._configs import QwenImageConfig
         from mobius.models.qwen_image import QwenImageTransformer2DModel
         from mobius.tasks import QwenImageDenoisingTask
 
@@ -4265,7 +4275,7 @@ class TestBuildQwenImageGraph:
         assert "noise_pred" in {out.name for out in model.graph.outputs}
 
     def test_qwen_image_vae_encoder_decoder_graphs_build(self):
-        from mobius._diffusers_configs import QwenImageVAEConfig
+        from mobius.integrations.diffusers._configs import QwenImageVAEConfig
         from mobius.models.qwen_image_vae import AutoencoderKLQwenImageModel
         from mobius.tasks import QwenImageVAETask
 
