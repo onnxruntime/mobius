@@ -16,11 +16,38 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 
 import torch
 
+from mobius._configs import QuantizationConfig
+
 logger = logging.getLogger(__name__)
+
+
+def supported_qmoe_quantization(
+    quantization: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    """Return quantization settings when they match the native QMoE ABI.
+
+    Accepts the integer-affine int4 block schemes whose ``(q - zero_point) *
+    scale`` dequantization is byte-identical to ``MatMulNBits`` and to the
+    ``com.microsoft::QMoE`` kernel: GPTQ, AWQ, and Olive RTN. The CUDA QMoE
+    kernel requires a power-of-two ``block_size >= 16``; unsupported configs
+    fall back to the portable dense representation instead of emitting an
+    unrunnable node.
+    """
+    if (
+        quantization is None
+        or quantization.bits != 4
+        or quantization.float_zero_point
+        or quantization.quant_method not in {"gptq", "awq", "olive"}
+    ):
+        return None
+    block_size = quantization.group_size
+    if block_size < 16 or (block_size & (block_size - 1)) != 0:
+        return None
+    return quantization
 
 
 def merge_lora_weights(
@@ -431,6 +458,11 @@ def tie_word_embeddings(
     table in the ONNX file, used by both the Gather (embedding lookup)
     and MatMul (LM head projection) nodes.
 
+    This also supports subclasses that replace ``self.model`` after
+    :class:`CausalLMModel` construction (for example, Cohere and GPT-2-family
+    models). Their embedding and head Parameters may initially be distinct,
+    but the shared tensor storage lets weight loading unify them.
+
     Mutates *state_dict* in place.
 
     Args:
@@ -713,6 +745,8 @@ def preprocess_olive_weights(
     quantize_embeddings: bool = False,
     quantize_lm_head: bool = False,
     tie_word_embeddings: bool = False,
+    embed_key: str = "model.embed_tokens.weight",
+    head_key: str = "lm_head.weight",
 ) -> dict[str, torch.Tensor]:
     """Rename and reshape Olive-packed quantized weights.
 
@@ -753,6 +787,8 @@ def preprocess_olive_weights(
         quantize_embeddings: Whether the embedding table is quantized.
         quantize_lm_head: Whether the LM head is quantized.
         tie_word_embeddings: Whether embedding and LM head share weights.
+        embed_key: Float embedding key used for the tied-head fallback.
+        head_key: Float LM-head key used for the tied-head fallback.
 
     Returns:
         State dict with renamed and reshaped weights (and, for a float tied
@@ -849,10 +885,10 @@ def preprocess_olive_weights(
     if (
         tie_word_embeddings
         and not quantize_lm_head
-        and "lm_head.weight" not in result
-        and "model.embed_tokens.weight" in result
+        and head_key not in result
+        and embed_key in result
     ):
-        result["lm_head.weight"] = result["model.embed_tokens.weight"]
+        result[head_key] = result[embed_key]
 
     return result
 
@@ -917,3 +953,163 @@ def preprocess_awq_weights(
             result[key] = value
 
     return result
+
+
+def preprocess_quantized_weights(
+    state_dict: dict[str, torch.Tensor],
+    quantization: QuantizationConfig | None,
+    *,
+    tie_embeddings: bool = False,
+    embed_key: str = "model.embed_tokens.weight",
+    head_key: str = "lm_head.weight",
+    qmoe_target_path: str | None = None,
+    qmoe_quant_methods: Collection[str] = ("gptq", "awq", "olive"),
+    reject_quantized_embeddings_lm_head: bool = False,
+    model_name: str = "model",
+) -> dict[str, torch.Tensor]:
+    """Apply shared quantization conversion, tying, and QMoE packing.
+
+    Args:
+        state_dict: Weight dictionary to preprocess.
+        quantization: Quantization format and packing settings, or ``None`` for
+            float weights.
+        tie_embeddings: Whether to alias missing float embedding/head weights.
+        embed_key: Canonical float embedding-table key.
+        head_key: Canonical float LM-head key.
+        qmoe_target_path: MoE path replaced by packed QMoE parameter names.
+            ``None`` means this model does not support or require QMoE handling.
+        qmoe_quant_methods: Quantization methods supported by this caller when
+            the config matches the native QMoE ABI.
+        reject_quantized_embeddings_lm_head: Reject packed embedding/head
+            weights because the caller's graph requires float parameters.
+        model_name: Model name included in actionable error messages.
+
+    Returns:
+        The preprocessed weight dictionary.
+
+    GPTQ and AWQ conversion falls through to the shared float-tying and QMoE
+    packing tail. Olive returns from its own branch because
+    :func:`preprocess_olive_weights` must handle quantized embedding/head tying
+    internally before optional QMoE packing.
+    """
+    use_qmoe = (
+        supported_qmoe_quantization(quantization) is not None
+        if qmoe_target_path is not None
+        else False
+    )
+    packed_suffixes = (
+        "_qweight",
+        "_scales",
+        "_qzeros",
+        ".qweight",
+        ".scales",
+        ".qzeros",
+    )
+    if (
+        use_qmoe
+        and quantization is not None
+        and quantization.quant_method not in qmoe_quant_methods
+    ):
+        methods = tuple(qmoe_quant_methods)
+        if methods == ("olive",):
+            raise NotImplementedError(
+                f"{model_name} currently only supports QMoE export for "
+                "Olive-quantized checkpoints (quant_method='olive'); got "
+                f"quant_method={quantization.quant_method!r}. GPTQ/AWQ VL-MoE "
+                "export is not yet implemented."
+            )
+        raise NotImplementedError(
+            f"{model_name} supports QMoE export for quant_method values "
+            f"{methods!r}; got quant_method={quantization.quant_method!r}."
+        )
+
+    if qmoe_target_path is not None and not use_qmoe:
+        packed_expert_keys = [
+            key
+            for key in state_dict
+            if qmoe_target_path in key and ".experts." in key and key.endswith(packed_suffixes)
+        ]
+        if packed_expert_keys:
+            raise ValueError(
+                f"Quantized MoE expert weights were found for {model_name} "
+                f"(e.g. {packed_expert_keys[0]!r}) but this quantization "
+                "config doesn't match the native QMoE ABI "
+                "(supported_qmoe_quantization returned None). The dense "
+                "loop-over-experts fallback only supports unquantized fused "
+                "expert tensors, not packed quantized ones. Use a "
+                "QMoE-ABI-compatible quantization config (see "
+                "supported_qmoe_quantization) for MoE models instead."
+            )
+
+    def _is_packed_key(key: str, float_key: str) -> bool:
+        owner = float_key.removesuffix(".weight")
+        return any(key == float_key + suffix for suffix in packed_suffixes[:3]) or any(
+            key == owner + suffix for suffix in packed_suffixes[3:]
+        )
+
+    packed_embedding_or_head = (
+        next(
+            (
+                key
+                for key in state_dict
+                if _is_packed_key(key, embed_key) or _is_packed_key(key, head_key)
+            ),
+            None,
+        )
+        if reject_quantized_embeddings_lm_head
+        else None
+    )
+    configured_quantized_table = quantization is not None and (
+        quantization.quantize_embeddings or quantization.quantize_lm_head
+    )
+    if reject_quantized_embeddings_lm_head and (
+        configured_quantized_table or packed_embedding_or_head is not None
+    ):
+        packed_key_detail = (
+            f" Packed checkpoint key {packed_embedding_or_head!r} was found."
+            if packed_embedding_or_head is not None
+            else ""
+        )
+        raise NotImplementedError(
+            "Quantized embeddings and LM heads are not yet supported by "
+            f"{model_name}: {embed_key.removesuffix('.weight')}, "
+            f"{head_key.removesuffix('.weight')}, and related embedding "
+            f"initializers currently require float weights.{packed_key_detail}"
+        )
+
+    if quantization is not None and quantization.quant_method == "gptq":
+        state_dict = preprocess_gptq_weights(
+            state_dict, bits=quantization.bits, group_size=quantization.group_size
+        )
+    elif quantization is not None and quantization.quant_method == "awq":
+        state_dict = preprocess_awq_weights(
+            state_dict, bits=quantization.bits, group_size=quantization.group_size
+        )
+    elif quantization is not None and quantization.quant_method == "olive":
+        olive_tie = tie_embeddings or quantization.tie_word_embeddings
+        return_state_dict = preprocess_olive_weights(
+            state_dict,
+            bits=quantization.bits,
+            group_size=quantization.group_size,
+            quantize_embeddings=quantization.quantize_embeddings,
+            quantize_lm_head=quantization.quantize_lm_head,
+            tie_word_embeddings=olive_tie,
+            embed_key=embed_key,
+            head_key=head_key,
+        )
+        if use_qmoe and qmoe_target_path is not None:
+            return_state_dict = pack_qmoe_expert_weights(
+                return_state_dict, target_moe_path=qmoe_target_path
+            )
+        return return_state_dict
+
+    tied_quantized_table = (
+        quantization is not None
+        and quantization.quantize_embeddings
+        and quantization.quantize_lm_head
+    )
+    if tie_embeddings and not tied_quantized_table:
+        tie_word_embeddings(state_dict, embed_key=embed_key, head_key=head_key)
+    if use_qmoe and qmoe_target_path is not None:
+        state_dict = pack_qmoe_expert_weights(state_dict, target_moe_path=qmoe_target_path)
+    return state_dict

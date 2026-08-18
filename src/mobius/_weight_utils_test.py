@@ -8,11 +8,13 @@ from __future__ import annotations
 import pytest
 import torch
 
+from mobius._configs import QuantizationConfig
 from mobius._weight_utils import (
     merge_lora_weights,
     preprocess_awq_weights,
     preprocess_gptq_weights,
     preprocess_olive_weights,
+    preprocess_quantized_weights,
     rename_weight_keys,
     split_codegen_qkv,
     split_fused_qkv,
@@ -760,6 +762,19 @@ class TestPreprocessOliveWeights:
         )
         assert result["lm_head.weight"] is embed
 
+    def test_float_tie_fallback_uses_custom_keys(self):
+        embed = torch.randn(self.V, self.K)
+        result = preprocess_olive_weights(
+            {"decoder.model.embed_tokens.weight": embed},
+            bits=self.BITS,
+            group_size=self.GROUP_SIZE,
+            tie_word_embeddings=True,
+            embed_key="decoder.model.embed_tokens.weight",
+            head_key="decoder.lm_head.weight",
+        )
+        assert result["decoder.lm_head.weight"] is embed
+        assert "lm_head.weight" not in result
+
     def test_untied_quantized_lm_head_not_overwritten(self):
         """A present lm_head.weight_qweight must not be replaced by embed synthesis."""
         lm_head = torch.randint(0, 255, (self.V, self.PACKED_K), dtype=torch.uint8)
@@ -922,6 +937,114 @@ class TestPreprocessAwqWeights:
         sd = {"q_proj.qzeros": torch.zeros(1, self.N, dtype=torch.int32)}
         with pytest.raises(ValueError, match=r"Missing q_proj\.qweight"):
             preprocess_awq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+
+
+class TestPreprocessQuantizedWeights:
+    @pytest.mark.parametrize("quant_method", ["gptq", "awq", "olive"])
+    def test_dispatches_quantization_method(self, quant_method):
+        quantization = QuantizationConfig(bits=4, group_size=16, quant_method=quant_method)
+        if quant_method == "olive":
+            state_dict = {"layer.weight_qweight": torch.zeros(8, 16, dtype=torch.uint8)}
+        else:
+            state_dict = {"layer.qweight": torch.zeros(4, 8, dtype=torch.int32)}
+
+        result = preprocess_quantized_weights(state_dict, quantization)
+
+        assert result["layer.weight"].shape == (8, 2, 8)
+
+    @pytest.mark.parametrize(
+        "suffix",
+        ["_qweight", "_scales", "_qzeros", ".qweight", ".scales", ".qzeros"],
+    )
+    def test_rejects_packed_experts_for_unsupported_qmoe_abi(self, suffix):
+        quantization = QuantizationConfig(bits=8, group_size=16, quant_method="olive")
+        state_dict = {
+            f"decoder.model.layers.0.mlp.experts.gate_up_proj{suffix}": torch.zeros(1)
+        }
+
+        with pytest.raises(ValueError, match="QMoE ABI"):
+            preprocess_quantized_weights(
+                state_dict,
+                quantization,
+                qmoe_target_path=".mlp",
+                model_name="TestModel",
+            )
+
+    def test_rejects_unsupported_qmoe_quantization_method(self):
+        quantization = QuantizationConfig(bits=4, group_size=16, quant_method="gptq")
+        with pytest.raises(NotImplementedError, match="only supports QMoE export"):
+            preprocess_quantized_weights(
+                {},
+                quantization,
+                qmoe_target_path=".mlp",
+                qmoe_quant_methods=("olive",),
+                model_name="TestModel",
+            )
+
+    @pytest.mark.parametrize("flag", ["quantize_embeddings", "quantize_lm_head"])
+    def test_rejects_quantized_embedding_or_lm_head(self, flag):
+        quantization = QuantizationConfig(
+            bits=4,
+            group_size=16,
+            quant_method="olive",
+            **{flag: True},
+        )
+        with pytest.raises(NotImplementedError, match="TestModel"):
+            preprocess_quantized_weights(
+                {},
+                quantization,
+                reject_quantized_embeddings_lm_head=True,
+                model_name="TestModel",
+            )
+
+    @pytest.mark.parametrize(
+        ("float_key", "suffix"),
+        [
+            (float_key, suffix)
+            for float_key in (
+                "decoder.model.embed_tokens.weight",
+                "decoder.lm_head.weight",
+            )
+            for suffix in (
+                "_qweight",
+                "_scales",
+                "_qzeros",
+                ".qweight",
+                ".scales",
+                ".qzeros",
+            )
+        ],
+    )
+    def test_rejects_packed_embedding_or_head_key_without_config_flags(
+        self, float_key, suffix
+    ):
+        owner = float_key.removesuffix(".weight")
+        packed_key = float_key + suffix if suffix.startswith("_") else owner + suffix
+        quantization = QuantizationConfig(bits=4, group_size=16, quant_method="gptq")
+
+        with pytest.raises(NotImplementedError, match="Packed checkpoint key") as error:
+            preprocess_quantized_weights(
+                {packed_key: torch.zeros(1)},
+                quantization,
+                reject_quantized_embeddings_lm_head=True,
+                embed_key="decoder.model.embed_tokens.weight",
+                head_key="decoder.lm_head.weight",
+                model_name="TestModel",
+            )
+
+        assert packed_key in str(error.value)
+
+    def test_ties_custom_float_keys(self):
+        embedding = torch.randn(8, 16)
+        result = preprocess_quantized_weights(
+            {"decoder.model.embed_tokens.weight": embedding},
+            None,
+            tie_embeddings=True,
+            embed_key="decoder.model.embed_tokens.weight",
+            head_key="decoder.lm_head.weight",
+        )
+
+        assert result["decoder.lm_head.weight"] is embedding
 
 
 class TestMergeLoraWeights:

@@ -20,6 +20,7 @@ from mobius._testing import make_config
 from mobius.models.qwen35 import (
     Qwen35MoECausalLMModel,
     Qwen35MoEVL3ModelCausalLMModel,
+    Qwen35VL3ModelCausalLMModel,
 )
 
 _E, _H, _INT, _BLK, _BITS = 8, 32, 16, 16, 4
@@ -328,3 +329,138 @@ class TestQwen35MoEVL3ModelQMoEExport:
         assert out["embedding.embed_tokens.weight"] is embedding
         assert out["decoder.lm_head.weight"] is embedding
         assert "mtp_head.weight" not in out
+
+
+class TestQwen35VL3ModelQuantization:
+    def test_olive_quantization_renames_and_binds(self):
+        config = _moe_vl_config(
+            QuantizationConfig(bits=4, group_size=_BLK, quant_method="olive", sym=False)
+        )
+        model = Qwen35VL3ModelCausalLMModel(config)
+        target = "decoder.model.layers.0.self_attn.q_proj.weight"
+        expected_shape = tuple(dict(model.named_parameters())[target].shape)
+        key = "model.language_model.layers.0.self_attn.q_proj.weight_qweight"
+        result = model.preprocess_weights(
+            {
+                key: torch.zeros(
+                    expected_shape[0],
+                    expected_shape[1] * expected_shape[2],
+                    dtype=torch.uint8,
+                )
+            }
+        )
+
+        assert tuple(result[target].shape) == expected_shape
+
+    def test_quantized_embeddings_or_lm_head_raise(self):
+        for flag in ("quantize_embeddings", "quantize_lm_head"):
+            config = _moe_vl_config(
+                QuantizationConfig(
+                    bits=4,
+                    group_size=_BLK,
+                    quant_method="olive",
+                    sym=False,
+                    **{flag: True},
+                )
+            )
+            model = Qwen35VL3ModelCausalLMModel(config)
+
+            try:
+                model.preprocess_weights({})
+            except NotImplementedError as error:
+                assert "Qwen35VL3ModelCausalLMModel" in str(error)
+            else:
+                raise AssertionError(
+                    f"expected NotImplementedError when {flag}=True for dense VL export"
+                )
+
+    def test_gptq_and_awq_quantization(self):
+        for quant_method in ("gptq", "awq"):
+            config = _moe_vl_config(
+                QuantizationConfig(
+                    bits=4,
+                    group_size=_BLK,
+                    quant_method=quant_method,
+                    sym=False,
+                )
+            )
+            model = Qwen35VL3ModelCausalLMModel(config)
+            target = "decoder.model.layers.0.self_attn.q_proj.weight"
+            expected_shape = tuple(dict(model.named_parameters())[target].shape)
+            k_packed = expected_shape[1] * _BLK * _BITS // 32
+            key = "model.language_model.layers.0.self_attn.q_proj.qweight"
+            result = model.preprocess_weights(
+                {
+                    key: torch.zeros(
+                        k_packed,
+                        expected_shape[0],
+                        dtype=torch.int32,
+                    )
+                }
+            )
+
+            assert tuple(result[target].shape) == expected_shape
+
+    def test_packed_embedding_or_lm_head_key_raises_without_config_flag(self):
+        for quant_method, key in (
+            ("olive", "model.language_model.embed_tokens.weight_qweight"),
+            ("gptq", "model.language_model.embed_tokens.qweight"),
+            ("awq", "lm_head.qweight"),
+        ):
+            config = _moe_vl_config(
+                QuantizationConfig(
+                    bits=4,
+                    group_size=_BLK,
+                    quant_method=quant_method,
+                    sym=False,
+                )
+            )
+            model = Qwen35VL3ModelCausalLMModel(config)
+
+            try:
+                model.preprocess_weights({key: torch.zeros(1)})
+            except NotImplementedError as error:
+                assert "Packed checkpoint key" in str(error)
+            else:
+                raise AssertionError(
+                    f"expected packed {quant_method} embedding/head rejection"
+                )
+
+    def test_tied_lm_head_backfills_all_embedding_initializers(self):
+        head = torch.randn(128, _H)
+        for model_class in (
+            Qwen35VL3ModelCausalLMModel,
+            Qwen35MoEVL3ModelCausalLMModel,
+        ):
+            model = model_class(_moe_vl_config(None, tie_word_embeddings=True))
+            result = model.preprocess_weights({"lm_head.weight": head})
+
+            assert result["decoder.lm_head.weight"] is head
+            assert result["decoder.model.embed_tokens.weight"] is head
+            assert result["embedding.embed_tokens.weight"] is head
+
+    def test_tying_partial_state_dict_without_tables_is_a_noop(self):
+        for model_class in (
+            Qwen35VL3ModelCausalLMModel,
+            Qwen35MoEVL3ModelCausalLMModel,
+        ):
+            model = model_class(_moe_vl_config(None, tie_word_embeddings=True))
+            assert model.preprocess_weights({}) == {}
+
+    def test_unquantized_float_routing_is_unchanged(self):
+        model = Qwen35VL3ModelCausalLMModel(_moe_vl_config(None))
+        decoder_weight = torch.randn(_H, _H)
+        vision_weight = torch.randn(32, 16)
+        embedding = torch.randn(128, _H)
+        result = model.preprocess_weights(
+            {
+                "model.language_model.layers.0.self_attn.q_proj.weight": decoder_weight,
+                "model.visual.blocks.0.mlp.linear_fc1.weight": vision_weight,
+                "model.language_model.embed_tokens.weight": embedding,
+            }
+        )
+
+        assert result["decoder.model.layers.0.self_attn.q_proj.weight"] is decoder_weight
+        assert result["vision_encoder.visual.blocks.0.mlp.up_proj.weight"] is vision_weight
+        assert result["decoder.model.embed_tokens.weight"] is embedding
+        assert result["embedding.embed_tokens.weight"] is embedding
