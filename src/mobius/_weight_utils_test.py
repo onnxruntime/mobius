@@ -987,9 +987,7 @@ class TestPreprocessQuantizedWeights:
             quant_method="olive",
             **{flag: True},
         )
-        with pytest.raises(
-            NotImplementedError, match="Quantized embeddings and LM heads"
-        ):
+        with pytest.raises(NotImplementedError, match="Quantized embeddings and LM heads"):
             preprocess_quantized_weights(
                 {},
                 quantization,
