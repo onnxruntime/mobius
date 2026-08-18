@@ -16,6 +16,7 @@ from mobius._diffusers_builder import (
     _init_diffusers_class_map,
     _load_diffusers_component_config,
     _load_diffusers_pipeline_index,
+    _resolve_diffusers_component_source,
     build_diffusers_pipeline,
 )
 from mobius._model_package import ModelPackage
@@ -63,6 +64,11 @@ class TestInitDiffusersClassMap:
             "AutoencoderKLQwenImage",
             "AutoencoderKLCogVideoX",
             "CogVideoXTransformer3DModel",
+            "MiniMaxMusic3ConditionEncoder",
+            "MiniMaxMusic3RVQDepthDecoder",
+            "MiniMaxMusic3Transformer1DModel",
+            "MiniMaxMusic3Vocoder",
+            "Qwen3ForCausalLM",
         }
         assert expected_keys == set(_DIFFUSERS_CLASS_MAP.keys())
 
@@ -89,6 +95,11 @@ class TestInitDiffusersClassMap:
             "qwen-image-text-encoding",
             "video-denoising",
             "feature-extraction",
+            "minimax-music3-condition",
+            "minimax-music3-denoising",
+            "minimax-music3-language",
+            "minimax-music3-rvq",
+            "minimax-music3-vocoder",
         }
         for class_name, (_, _, task_name) in _DIFFUSERS_CLASS_MAP.items():
             assert task_name in valid_tasks, f"Unknown task '{task_name}' for {class_name}"
@@ -174,6 +185,21 @@ class TestDiffusersHubRevision:
             revision="pinned-revision",
         )
 
+    @patch("huggingface_hub.hf_hub_download", return_value="config.json")
+    def test_component_config_uses_resolved_external_subfolder(self, mock_download):
+        with patch("builtins.open", mock_open(read_data='{"in_channels": 3}')):
+            _load_diffusers_component_config(
+                "external/component-repo",
+                "transformer",
+                revision="component-revision",
+                subfolder="nested/transformer",
+            )
+        mock_download.assert_called_once_with(
+            repo_id="external/component-repo",
+            filename="nested/transformer/config.json",
+            revision="component-revision",
+        )
+
     @patch("mobius._diffusers_builder._parallel_download", return_value=[])
     @patch("huggingface_hub.hf_hub_download", return_value="weights.index.json")
     def test_component_weight_downloads_use_revision(
@@ -202,6 +228,95 @@ class TestDiffusersHubRevision:
             desc="vae weights",
         )
 
+    @patch("mobius._diffusers_builder._parallel_download", return_value=[])
+    @patch("huggingface_hub.hf_hub_download", return_value="weights.index.json")
+    def test_component_weights_use_resolved_external_subfolder(
+        self,
+        mock_download,
+        mock_parallel_download,
+    ):
+        index = '{"weight_map": {"weight": "model-00001-of-00001.safetensors"}}'
+        with patch("builtins.open", mock_open(read_data=index)):
+            _download_diffusers_component_weights(
+                "external/component-repo",
+                "transformer",
+                revision="component-revision",
+                subfolder="nested/transformer",
+            )
+        mock_download.assert_called_once_with(
+            repo_id="external/component-repo",
+            filename=("nested/transformer/diffusion_pytorch_model.safetensors.index.json"),
+            revision="component-revision",
+        )
+        mock_parallel_download.assert_called_once_with(
+            "external/component-repo",
+            ["nested/transformer/model-00001-of-00001.safetensors"],
+            revision="component-revision",
+            desc="transformer weights",
+        )
+
+    def test_component_source_revision_precedence(self):
+        root_entry = [
+            "diffusers",
+            "MiniMaxMusic3ConditionEncoder",
+            {
+                "pretrained_model_name_or_path": "root/music",
+                "revision": "metadata-revision",
+                "subfolder": "condition_encoder",
+            },
+        ]
+        assert _resolve_diffusers_component_source(
+            "root/music", "caller-revision", "condition_encoder", root_entry
+        ) == ("root/music", "caller-revision", "condition_encoder")
+        assert _resolve_diffusers_component_source(
+            "root/music", None, "condition_encoder", root_entry
+        ) == ("root/music", "metadata-revision", "condition_encoder")
+
+        external_entry = [
+            "diffusers",
+            "MiniMaxMusic3ConditionEncoder",
+            {
+                "pretrained_model_name_or_path": "external/components",
+                "revision": "external-revision",
+                "subfolder": None,
+            },
+        ]
+        assert _resolve_diffusers_component_source(
+            "root/music", "caller-revision", "condition_encoder", external_entry
+        ) == ("external/components", "external-revision", "")
+
+    @patch("huggingface_hub.hf_hub_download", return_value="scheduler.json")
+    def test_optional_metadata_download_uses_revision(self, mock_download):
+        from mobius._diffusers_builder import _load_optional_diffusers_json
+
+        with patch("builtins.open", mock_open(read_data='{"shift": 3.0}')):
+            result = _load_optional_diffusers_json(
+                "fake/model",
+                "scheduler/scheduler_config.json",
+                revision="pinned-revision",
+            )
+        assert result == {"shift": 3.0}
+        mock_download.assert_called_once_with(
+            repo_id="fake/model",
+            filename="scheduler/scheduler_config.json",
+            revision="pinned-revision",
+        )
+
+    @patch("huggingface_hub.hf_hub_download")
+    def test_falls_back_to_modular_model_index(self, mock_download):
+        from huggingface_hub.utils import EntryNotFoundError
+
+        mock_download.side_effect = [
+            EntryNotFoundError("missing"),
+            "modular_model_index.json",
+        ]
+        with patch(
+            "builtins.open",
+            mock_open(read_data='{"_class_name": "MiniMaxMusic3ModularPipeline"}'),
+        ):
+            result = _load_diffusers_pipeline_index("fake/model", revision="pinned-revision")
+        assert result["_class_name"] == "MiniMaxMusic3ModularPipeline"
+
 
 # ── build_diffusers_pipeline component filtering ─────────────────────────
 
@@ -226,6 +341,64 @@ class TestBuildDiffusersPipelineFiltering:
             build_diffusers_pipeline("fake/model", load_weights=False)
         # _load_diffusers_component_config should never be called
         mock_load_config.assert_not_called()
+
+    @patch("mobius._diffusers_builder._load_optional_diffusers_json", return_value={})
+    @patch(
+        "mobius._diffusers_builder._load_diffusers_component_config",
+        return_value={
+            "condition_hidden_dim": 16,
+            "num_condition_layers": 2,
+            "out_dim": 8,
+            "input_sampling_rate": 24000,
+            "input_hop_length": 960,
+            "output_sampling_rate": 44100,
+            "output_hop_length": 512,
+        },
+    )
+    @patch(
+        "mobius._diffusers_builder._load_diffusers_pipeline_index",
+        return_value={
+            "_class_name": "MiniMaxMusic3ModularPipeline",
+            "condition_encoder": [
+                "diffusers",
+                "MiniMaxMusic3ConditionEncoder",
+                {
+                    "pretrained_model_name_or_path": "fake/music3",
+                    "revision": None,
+                    "subfolder": "condition_encoder",
+                },
+            ],
+            "scheduler": [
+                "diffusers",
+                "FlowMatchEulerDiscreteScheduler",
+                {
+                    "pretrained_model_name_or_path": "external/scheduler",
+                    "revision": "scheduler-revision",
+                    "subfolder": "flow",
+                },
+            ],
+        },
+    )
+    def test_builds_modular_index_entry_with_metadata(
+        self, _mock_index, _mock_config, _mock_optional
+    ):
+        package = build_diffusers_pipeline(
+            "fake/music3", revision="root-revision", load_weights=False
+        )
+        assert set(package) == {"condition_encoder"}
+        assert package.config.model_type == "minimax_music3"
+        assert package.config.pipeline_class == "MiniMaxMusic3ModularPipeline"
+        _mock_config.assert_called_once_with(
+            "fake/music3",
+            "condition_encoder",
+            revision="root-revision",
+            subfolder="condition_encoder",
+        )
+        _mock_optional.assert_called_once_with(
+            "external/scheduler",
+            "flow/scheduler_config.json",
+            revision="scheduler-revision",
+        )
 
     @patch(
         "mobius._diffusers_builder._load_diffusers_component_config",
@@ -252,11 +425,11 @@ class TestBuildDiffusersPipelineFiltering:
         "mobius._diffusers_builder._load_diffusers_pipeline_index",
     )
     def test_skips_lists_with_wrong_length(self, mock_load_index, mock_load_config):
-        """Lists that don't have exactly 2 elements are skipped."""
+        """Lists that don't have two elements or two plus metadata are skipped."""
         mock_load_index.return_value = {
             "_class_name": "FluxPipeline",
             "single": ["only_one"],
-            "triple": ["a", "b", "c"],
+            "quadruple": ["a", "b", {}, "extra"],
             "empty": [],
         }
         with pytest.raises(ValueError, match="No supported neural network"):

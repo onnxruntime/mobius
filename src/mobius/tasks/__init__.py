@@ -54,6 +54,11 @@ __all__ = [
     "MaskedDiffusionTask",
     "MoshiDepformerTask",
     "MoshiTemporalTask",
+    "MiniMaxMusic3ConditionTask",
+    "MiniMaxMusic3DenoisingTask",
+    "MiniMaxMusic3LanguageTask",
+    "MiniMaxMusic3RVQTask",
+    "MiniMaxMusic3VocoderTask",
     "MultiModalTask",
     "OPSET_VERSION",
     "ObjectDetectionTask",
@@ -116,6 +121,13 @@ from mobius.tasks._gemma4_assistant import Gemma4AssistantTask
 from mobius.tasks._hunyuan_vl_mot import HunYuanVLMoTTask
 from mobius.tasks._image_classification import ImageClassificationTask
 from mobius.tasks._masked_diffusion import MaskedDiffusionTask
+from mobius.tasks._minimax_music3 import (
+    MiniMaxMusic3ConditionTask,
+    MiniMaxMusic3DenoisingTask,
+    MiniMaxMusic3LanguageTask,
+    MiniMaxMusic3RVQTask,
+    MiniMaxMusic3VocoderTask,
+)
 from mobius.tasks._moshi import MoshiDepformerTask, MoshiTemporalTask
 from mobius.tasks._multimodal import MultiModalTask
 from mobius.tasks._object_detection import ObjectDetectionTask
@@ -163,6 +175,11 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "diarization": DiarizationTask,
     "feature-extraction": FeatureExtractionTask,
     "masked-diffusion": MaskedDiffusionTask,
+    "minimax-music3-condition": MiniMaxMusic3ConditionTask,
+    "minimax-music3-denoising": MiniMaxMusic3DenoisingTask,
+    "minimax-music3-language": MiniMaxMusic3LanguageTask,
+    "minimax-music3-rvq": MiniMaxMusic3RVQTask,
+    "minimax-music3-vocoder": MiniMaxMusic3VocoderTask,
     "image-classification": ImageClassificationTask,
     "object-detection": ObjectDetectionTask,
     "seq2seq": Seq2SeqTask,
