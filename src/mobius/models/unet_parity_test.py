@@ -50,7 +50,7 @@ def test_cross_attention_block_matches_diffusers():
     import torch
     from diffusers.models.transformers.transformer_2d import Transformer2DModel
 
-    from mobius._weight_loading import apply_weights
+    from mobius.integrations._weight_loading import apply_weights
     from mobius.models.unet import _CrossAttentionBlock
     from mobius.tasks._base import _make_graph, _make_model
 
@@ -87,8 +87,8 @@ def test_unet_matches_diffusers():
     import torch
     from diffusers import UNet2DConditionModel as HFUNet
 
-    from mobius._diffusers_configs import UNet2DConfig
-    from mobius._weight_loading import apply_weights
+    from mobius.integrations._weight_loading import apply_weights
+    from mobius.integrations.diffusers._configs import UNet2DConfig
     from mobius.models.unet import UNet2DConditionModel
     from mobius.tasks._denoising import DenoisingTask
 
@@ -148,8 +148,8 @@ def test_unet_sd1x_mixed_block_types_matches_diffusers():
     import torch
     from diffusers import UNet2DConditionModel as HFUNet
 
-    from mobius._diffusers_configs import UNet2DConfig
-    from mobius._weight_loading import apply_weights
+    from mobius.integrations._weight_loading import apply_weights
+    from mobius.integrations.diffusers._configs import UNet2DConfig
     from mobius.models.unet import UNet2DConditionModel
     from mobius.tasks._denoising import DenoisingTask
 
@@ -211,8 +211,8 @@ def test_unet_lora_gate_parity():
     from peft import LoraConfig
     from peft.utils import get_peft_model_state_dict
 
-    from mobius._diffusers_configs import UNet2DConfig
-    from mobius._weight_loading import apply_weights
+    from mobius.integrations._weight_loading import apply_weights
+    from mobius.integrations.diffusers._configs import UNet2DConfig
     from mobius.models.unet import (
         UNet2DConditionModel,
         remap_diffusers_unet_lora,

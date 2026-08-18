@@ -17,9 +17,9 @@ from typing import TYPE_CHECKING
 
 from onnxscript import OpBuilder, nn
 
-from mobius._diffusers_configs import QwenImageVAEConfig
 from mobius.components import Conv2d as _Conv2d
 from mobius.components import SiLU as _SiLU
+from mobius.integrations.diffusers._configs import QwenImageVAEConfig
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -102,10 +102,10 @@ class _RMSNorm3d(nn.Module):
     Shape: (B, C, T, H, W) — normalize over C for each spatial position.
     """
 
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, *, images: bool = False):
         super().__init__()
-        # gamma shape: (C, 1, 1, 1) for broadcasting over T, H, W
-        self.gamma = nn.Parameter((dim, 1, 1, 1))
+        # Residual paths are 5D (C,T,H,W); attention flattens time and is 4D.
+        self.gamma = nn.Parameter((dim, 1, 1) if images else (dim, 1, 1, 1))
         self._scale = dim**0.5
 
     def forward(self, op: OpBuilder, x: ir.Value):
@@ -154,7 +154,7 @@ class _AttentionBlock(nn.Module):
 
     def __init__(self, dim: int):
         super().__init__()
-        self.norm = _RMSNorm3d(dim)
+        self.norm = _RMSNorm3d(dim, images=True)
         # 1x1 conv projections (operates on (B*T, C, H, W))
         self.to_qkv = _Conv2d(dim, dim * 3, kernel_size=1)
         self.proj = _Conv2d(dim, dim, kernel_size=1)
@@ -506,3 +506,7 @@ class AutoencoderKLQwenImageModel(nn.Module):
         self.decoder = _Decoder3d(config)
         self.quant_conv = _CausalConv3d(config.z_dim * 2, config.z_dim * 2, 1)
         self.post_quant_conv = _CausalConv3d(config.z_dim, config.z_dim, 1)
+
+    def preprocess_weights(self, state_dict):
+        """Return diffusers weights unchanged; the module hierarchy is aligned."""
+        return state_dict

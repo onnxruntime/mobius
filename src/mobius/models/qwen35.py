@@ -5,11 +5,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, ClassVar
 
+import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import pack_qmoe_expert_weights
+from mobius._weight_utils import (
+    preprocess_quantized_weights,
+    supported_qmoe_quantization,
+)
 from mobius.components._attention import Qwen35Attention
 from mobius.components._common import (
     Embedding,
@@ -18,7 +22,7 @@ from mobius.components._common import (
 )
 from mobius.components._gated_deltanet import GatedDeltaNet
 from mobius.components._mlp import MLP
-from mobius.components._moe import _supported_qmoe_quantization
+from mobius.components._quantized_linear import make_quantized_linear_factory
 from mobius.components._rms_norm import OffsetRMSNorm
 from mobius.components._rotary_embedding import initialize_rope
 from mobius.models.base import CausalLMModel
@@ -30,12 +34,29 @@ from mobius.models.qwen_vl import (
     split_deepstack_embeds,
 )
 
-if TYPE_CHECKING:
-    import onnx_ir as ir
-
 # ---------------------------------------------------------------------------
 # Qwen3.5 — hybrid linear/full attention
 # ---------------------------------------------------------------------------
+
+
+def _linear_factory(config: ArchitectureConfig) -> type | None:
+    """Build a quantized-linear factory from ``config.quantization``, or None.
+
+    Returns ``None`` (meaning "use plain ``Linear``") when the model is
+    unquantized. Shared by the dense (:class:`Qwen35DecoderLayer`) and MoE
+    (:class:`Qwen35MoEDecoderLayer`) variants so ``self_attn``/``linear_attn``/
+    ``mlp``/``shared_expert`` are all quantized consistently.
+    """
+    quantization = config.quantization
+    if quantization is None or quantization.quant_method == "none":
+        return None
+    zero_point_dtype = config.dtype if quantization.float_zero_point else ir.DataType.UINT8
+    return make_quantized_linear_factory(
+        bits=quantization.bits,
+        block_size=quantization.group_size,
+        has_zero_point=not quantization.sym,
+        zero_point_dtype=zero_point_dtype,
+    )
 
 
 class Qwen35DecoderLayer(nn.Module):
@@ -47,6 +68,12 @@ class Qwen35DecoderLayer(nn.Module):
 
     Both variants use :class:`OffsetRMSNorm` (the *1 + weight* variant)
     for pre-attention and post-attention normalization.
+
+    When ``config.quantization`` is set, ``self_attn``/``linear_attn``/``mlp``
+    projections are built with a quantized-linear factory (see
+    :func:`_linear_factory`) so quantized checkpoints (e.g. Olive
+    RTN/GPTQ) load correctly instead of hitting a dense-vs-packed shape
+    mismatch.
     """
 
     def __init__(self, config: ArchitectureConfig, layer_idx: int):
@@ -55,13 +82,14 @@ class Qwen35DecoderLayer(nn.Module):
         self.layer_type: str = (
             layer_types[layer_idx] if layer_idx < len(layer_types) else "full_attention"
         )
+        linear_class = _linear_factory(config)
 
         if self.layer_type == "linear_attention":
-            self.linear_attn = GatedDeltaNet(config)
+            self.linear_attn = GatedDeltaNet(config, linear_class=linear_class)
         else:
-            self.self_attn = Qwen35Attention(config)
+            self.self_attn = Qwen35Attention(config, linear_class=linear_class)
 
-        self.mlp = MLP(config)
+        self.mlp = MLP(config, linear_class=linear_class)
         self.input_layernorm = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = OffsetRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -247,11 +275,18 @@ class Qwen35MoEDecoderLayer(Qwen35DecoderLayer):
     Same hybrid DeltaNet/full-attention architecture as
     :class:`Qwen35DecoderLayer`, but replaces the dense MLP with a
     :class:`Qwen35MoEBlock`.
+
+    The routed experts are quantized via the fused ``com.microsoft::QMoE``
+    path (see :class:`~mobius.components._moe.MoELayer`), driven directly
+    by ``config.quantization``. The always-active ``shared_expert``/
+    ``shared_expert_gate`` are not part of that fused op, so they are
+    quantized separately via the same ``linear_class`` factory used for
+    ``self_attn``/``linear_attn``/dense ``mlp`` (see :func:`_linear_factory`).
     """
 
     def __init__(self, config: ArchitectureConfig, layer_idx: int):
         super().__init__(config, layer_idx)
-        self.mlp = Qwen35MoEBlock(config)
+        self.mlp = Qwen35MoEBlock(config, linear_class=_linear_factory(config))
 
 
 class Qwen35MoETextModel(nn.Module):
@@ -363,7 +398,7 @@ class Qwen35MoECausalLMModel(CausalLMModel):
         # fused expert-major tensors and route them through the QMoE repacker
         # instead of un-fusing into per-expert MLPs. Uses the same predicate
         # as MoELayer so the weights and the emitted graph never disagree.
-        use_qmoe = _supported_qmoe_quantization(self.config.quantization) is not None
+        use_qmoe = supported_qmoe_quantization(self.config.quantization) is not None
         cleaned: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             if key.startswith(("mtp_", "mtp.")):
@@ -388,9 +423,9 @@ class Qwen35MoECausalLMModel(CausalLMModel):
 
             # Unpack fused float expert weights into per-expert tensors for the
             # dense fallback. When ``use_qmoe`` is set the fused quantized
-            # tensors arrive as ``.qweight``/``.scales``/``.qzeros`` (which do
+            # tensors arrive as ``_qweight``/``_scales``/``_qzeros`` (which do
             # not match these suffixes) and are kept expert-major for
-            # ``pack_qmoe_expert_weights`` below.
+            # the shared quantization preprocessor.
             # HF format: [num_experts, fused_dim, hidden] with gate+up fused
             if not use_qmoe and key.endswith(".mlp.experts.gate_up_proj"):
                 prefix = key[: -len("experts.gate_up_proj")]
@@ -411,12 +446,13 @@ class Qwen35MoECausalLMModel(CausalLMModel):
 
             cleaned[key] = value
 
-        processed = super().preprocess_weights(cleaned)
-        if use_qmoe:
-            # Qwen3.5-MoE's MoELayer lives directly at ``.mlp`` (Qwen35MoEBlock
-            # is the MoELayer), unlike DeepSeek's nested ``.mlp.moe``.
-            processed = pack_qmoe_expert_weights(processed, target_moe_path=".mlp")
-        return processed
+        return preprocess_quantized_weights(
+            cleaned,
+            self.config.quantization,
+            tie_embeddings=self.config.tie_word_embeddings,
+            qmoe_target_path=".mlp",
+            qmoe_quant_methods=("gptq", "awq", "olive"),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -503,11 +539,6 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
                 suffix = stripped[len("language_model.") :]
                 renamed[f"decoder.model.{suffix}"] = value
                 renamed[f"embedding.{suffix}"] = value
-                if (
-                    self.config.tie_word_embeddings
-                    and stripped == "language_model.embed_tokens.weight"
-                ):
-                    renamed["decoder.lm_head.weight"] = value
             elif stripped.startswith("language_model.lm_head."):
                 renamed[f"decoder.{stripped[len('language_model.') :]}"] = value
             elif stripped.startswith("lm_head."):
@@ -515,7 +546,38 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
             elif stripped.startswith("language_model."):
                 suffix = stripped[len("language_model.") :]
                 renamed[f"decoder.model.{suffix}"] = value
-        return renamed
+        quantization = self.config.quantization
+        tie = self.config.tie_word_embeddings or (
+            quantization is not None and getattr(quantization, "tie_word_embeddings", False)
+        )
+        # Preserve the old VL partial-state-dict behavior: tying is a no-op
+        # when neither decoder table is present. Production builds pass the
+        # full checkpoint, while focused callers may pass architecture slices.
+        apply_tie = tie and any(
+            key in renamed
+            for key in ("decoder.model.embed_tokens.weight", "decoder.lm_head.weight")
+        )
+        result = preprocess_quantized_weights(
+            renamed,
+            quantization,
+            tie_embeddings=apply_tie,
+            embed_key="decoder.model.embed_tokens.weight",
+            head_key="decoder.lm_head.weight",
+            qmoe_target_path=None,
+            reject_quantized_embeddings_lm_head=True,
+        )
+        if tie:
+            if (
+                "decoder.model.embed_tokens.weight" not in result
+                and "decoder.lm_head.weight" in result
+            ):
+                result["decoder.model.embed_tokens.weight"] = result["decoder.lm_head.weight"]
+            if "decoder.model.embed_tokens.weight" in result:
+                result.setdefault(
+                    "embedding.embed_tokens.weight",
+                    result["decoder.model.embed_tokens.weight"],
+                )
+        return result
 
 
 class Qwen35VLDecoderModel(nn.Module):
@@ -683,8 +745,17 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
         ``lm_head.*`` (final projection — tied or untied to embeddings).
         Mirrors :meth:`Qwen35VL3ModelCausalLMModel.preprocess_weights` but
         the decoder uses the MoE-flavoured text model and HF stores experts
-        as fused tensors that must be unpacked.
+        as fused tensors. For the portable dense fallback these tensors are
+        unpacked into per-expert weights. When Olive quantization matches the
+        native QMoE ABI, they instead remain expert-major, are renamed from
+        Olive's suffix convention, and are packed into QMoE parameters.
         """
+        quantization = self.config.quantization
+        use_qmoe = supported_qmoe_quantization(quantization) is not None
+
+        tie = self.config.tie_word_embeddings or (
+            quantization is not None and quantization.tie_word_embeddings
+        )
         renamed: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             if key.startswith(("mtp_", "mtp.")):
@@ -701,11 +772,6 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
                 suffix = stripped[len("language_model.") :]
                 renamed[f"decoder.model.{suffix}"] = value
                 renamed[f"embedding.{suffix}"] = value
-                if (
-                    self.config.tie_word_embeddings
-                    and stripped == "language_model.embed_tokens.weight"
-                ):
-                    renamed["decoder.lm_head.weight"] = value
             elif stripped.startswith("language_model.lm_head."):
                 renamed[f"decoder.{stripped[len('language_model.') :]}"] = value
             elif stripped.startswith("lm_head."):
@@ -718,16 +784,45 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
                 # ``[num_experts, 2*inter, hidden]`` (gate + up concatenated
                 # along dim 1) and ``experts.down_proj`` as
                 # ``[num_experts, hidden, inter]``.
-                if suffix.endswith(".mlp.experts.gate_up_proj"):
+                if not use_qmoe and suffix.endswith(".mlp.experts.gate_up_proj"):
                     prefix = target[: -len("experts.gate_up_proj")]
                     half = value.shape[1] // 2
                     for i in range(value.shape[0]):
                         renamed[f"{prefix}experts.{i}.gate_proj.weight"] = value[i, :half]
                         renamed[f"{prefix}experts.{i}.up_proj.weight"] = value[i, half:]
-                elif suffix.endswith(".mlp.experts.down_proj"):
+                elif not use_qmoe and suffix.endswith(".mlp.experts.down_proj"):
                     prefix = target[: -len("experts.down_proj")]
                     for i in range(value.shape[0]):
                         renamed[f"{prefix}experts.{i}.down_proj.weight"] = value[i]
                 else:
                     renamed[target] = value
-        return renamed
+
+        # Preserve the old VL partial-state-dict behavior: tying is a no-op
+        # when neither decoder table is present. Production builds pass the
+        # full checkpoint, while focused callers may pass architecture slices.
+        apply_tie = tie and any(
+            key in renamed
+            for key in ("decoder.model.embed_tokens.weight", "decoder.lm_head.weight")
+        )
+        result = preprocess_quantized_weights(
+            renamed,
+            quantization,
+            tie_embeddings=apply_tie,
+            embed_key="decoder.model.embed_tokens.weight",
+            head_key="decoder.lm_head.weight",
+            qmoe_target_path=".mlp",
+            qmoe_quant_methods=("olive",),
+            reject_quantized_embeddings_lm_head=True,
+        )
+        if tie:
+            if (
+                "decoder.model.embed_tokens.weight" not in result
+                and "decoder.lm_head.weight" in result
+            ):
+                result["decoder.model.embed_tokens.weight"] = result["decoder.lm_head.weight"]
+            if "decoder.model.embed_tokens.weight" in result:
+                result.setdefault(
+                    "embedding.embed_tokens.weight",
+                    result["decoder.model.embed_tokens.weight"],
+                )
+        return result

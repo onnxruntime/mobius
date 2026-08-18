@@ -1,20 +1,21 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Tests for _config_resolver.py — pure function input/output tests."""
+"""Tests for the Transformers config resolver."""
 
 from __future__ import annotations
 
 import pytest
 
-from mobius._config_resolver import (
+from mobius._configs import (
+    ArchitectureConfig,
+    MoonshineConfig,
+    WhisperConfig,
+)
+from mobius.integrations.transformers._config_resolver import (
     _config_from_hf,
     _default_task_for_model,
     _dict_to_pretrained_config,
-)
-from mobius._configs import (
-    ArchitectureConfig,
-    WhisperConfig,
 )
 
 
@@ -408,9 +409,15 @@ class TestWhisperEncoderDecoder:
         hf = self._whisper_hf_config()
         result = _config_from_hf(hf)
         assert result.num_mel_bins == 80
+        assert result.encoder_input_channels == 80
         assert result.max_source_positions == 1500
         assert result.max_target_positions == 448
         assert result.decoder_start_token_id == 50258
+
+    def test_whisper_128_mel_channels_are_synchronized(self):
+        result = _config_from_hf(self._whisper_hf_config(num_mel_bins=128))
+        assert result.num_mel_bins == 128
+        assert result.encoder_input_channels == 128
 
     def test_whisper_default_task(self):
         assert _default_task_for_model("whisper") == "speech-to-text"
@@ -428,11 +435,84 @@ class TestWhisperEncoderDecoder:
         assert result.tie_word_embeddings is True
 
 
+class TestMoonshineEncoderDecoder:
+    """Moonshine config extraction preserves its distinct ASR architecture."""
+
+    def _moonshine_hf_config(self):
+        return type(
+            "FakeMoonshineConfig",
+            (),
+            {
+                "model_type": "moonshine",
+                "vocab_size": 32768,
+                "hidden_size": 288,
+                "intermediate_size": 1152,
+                "decoder_num_hidden_layers": 6,
+                "decoder_num_attention_heads": 8,
+                "decoder_num_key_value_heads": 8,
+                "encoder_num_hidden_layers": 6,
+                "encoder_num_attention_heads": 8,
+                "encoder_num_key_value_heads": 8,
+                "decoder_hidden_act": "silu",
+                "encoder_hidden_act": "gelu",
+                "max_position_embeddings": 194,
+                "partial_rotary_factor": 0.9,
+                "rope_scaling": {
+                    "rope_type": "default",
+                    "rope_theta": 10_000.0,
+                    "partial_rotary_factor": 0.9,
+                },
+                "attention_bias": False,
+                "pad_token_id": 2,
+                "bos_token_id": 1,
+                "eos_token_id": 2,
+                "decoder_start_token_id": 1,
+                "tie_word_embeddings": True,
+            },
+        )()
+
+    def test_moonshine_routes_to_moonshine_config(self):
+        result = _config_from_hf(self._moonshine_hf_config())
+        assert isinstance(result, MoonshineConfig)
+        assert result.encoder_input_name == "input_values"
+        assert result.encoder_input_channels is None
+        assert result.encoder_uses_attention_mask is True
+        assert result.decoder_uses_encoder_attention_mask is True
+
+    def test_moonshine_attention_and_rope_fields(self):
+        result = _config_from_hf(self._moonshine_hf_config())
+        assert result.head_dim == 36
+        assert result.encoder_num_hidden_layers == 6
+        assert result.encoder_num_attention_heads == 8
+        assert result.partial_rotary_factor == pytest.approx(0.9)
+        assert result.rope_interleave is True
+        assert result.attn_qkv_bias is False
+        assert result.attn_o_bias is False
+
+    def test_moonshine_default_task(self):
+        assert _default_task_for_model("moonshine") == "speech-to-text"
+
+
 # ── _dict_to_pretrained_config ──────────────────────────────────────────
 
 
 class TestDictToPretrainedConfig:
     """Tests for dict → PretrainedConfig conversion with nested configs."""
+
+    def test_older_hub_without_strict_validation_error(self, monkeypatch):
+        import transformers
+        from huggingface_hub import errors as hub_errors
+
+        # Resolve the lazy Transformers import before simulating an older,
+        # mutually compatible huggingface_hub release.
+        assert transformers.PretrainedConfig is not None
+        monkeypatch.delattr(
+            hub_errors,
+            "StrictDataclassClassValidationError",
+            raising=False,
+        )
+        config = _dict_to_pretrained_config({"model_type": "llama", "hidden_size": 64})
+        assert config.hidden_size == 64
 
     def test_flat_dict(self):
         d = {"model_type": "llama", "hidden_size": 4096, "vocab_size": 32000}

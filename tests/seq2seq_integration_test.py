@@ -25,7 +25,7 @@ from mobius._testing.torch_reference import (
     torch_seq2seq_decoder_forward,
     torch_seq2seq_encoder_forward,
 )
-from mobius._weight_loading import _download_weights
+from mobius.integrations._weight_loading import _download_weights
 from mobius.models.bart import BartForConditionalGeneration
 from mobius.tasks import Seq2SeqTask
 

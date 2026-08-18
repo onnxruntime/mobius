@@ -351,7 +351,7 @@ class Qwen3TTSEmbeddingModel(nn.Module):
         # Text: embed → project (fc1 → SiLU → fc2)
         text_embeds = self.text_embedding(op, text_ids)
         text_embeds = self.text_projection_fc1(op, text_embeds)
-        text_embeds = op.Mul(text_embeds, op.Sigmoid(text_embeds))  # SiLU
+        text_embeds = op.Swish(text_embeds)
         text_embeds = self.text_projection_fc2(op, text_embeds)
 
         # Codec: simple embedding lookup
@@ -556,7 +556,7 @@ class Qwen3TTSTalkerPrefillEmbedder(nn.Module):
         """Embed *ids* through the text embedding + projection (fc1 → SiLU → fc2)."""
         embeds = self.text_embedding(op, ids)
         embeds = self.text_projection_fc1(op, embeds)
-        embeds = op.Mul(embeds, op.Sigmoid(embeds))  # SiLU
+        embeds = op.Swish(embeds)
         return self.text_projection_fc2(op, embeds)
 
     def forward(self, op: OpBuilder, text_ids: ir.Value):

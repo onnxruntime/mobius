@@ -23,12 +23,12 @@ import numpy as np
 import torch
 from onnxscript import OpBuilder, nn
 
-from mobius._diffusers_configs import UNet2DConfig
 from mobius.components import Conv2d as _Conv2d
 from mobius.components import GroupNorm as _GroupNorm
 from mobius.components import Linear as _Linear
 from mobius.components import LoRALinear as _LoRALinear
 from mobius.components import SiLU as _SiLU
+from mobius.integrations.diffusers._configs import UNet2DConfig
 
 if TYPE_CHECKING:
     import onnx_ir as ir

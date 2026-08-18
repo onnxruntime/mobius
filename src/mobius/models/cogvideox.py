@@ -27,7 +27,6 @@ import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
-from mobius._diffusers_configs import CogVideoXConfig
 from mobius._weight_utils import rename_weight_keys
 from mobius.components import LayerNorm as _LayerNorm
 from mobius.components import Linear as _Linear
@@ -35,6 +34,7 @@ from mobius.components._activations import SiLU as _SiLU
 from mobius.components._diffusion import (
     TimestepEmbedding as _TimestepEmbedding,
 )
+from mobius.integrations.diffusers._configs import CogVideoXConfig
 
 # ---------------------------------------------------------------------------
 # 3D sincos positional embedding helpers

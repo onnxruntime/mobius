@@ -40,7 +40,8 @@ git fetch origin && git checkout <branch> && git pull
 
 ## 2. Commit Coordination Protocol
 
-Multiple agents committing to the same branch requires discipline to avoid divergence.
+Choose the branch strategy in §9 first. When multiple agents contribute to one
+branch, use this protocol to avoid divergence.
 
 **Rules**:
 1. **Pull before commit**: Always `git pull origin <branch> --rebase` immediately before committing.
@@ -67,11 +68,14 @@ Checks at each stage prevent problems from compounding across agents.
 - Verify the branch exists and is up to date.
 - Run the relevant tests to establish a baseline — know what was already failing before you touched anything.
 - Check for uncommitted changes left by previous agents in your worktree.
+- Verify `inspect.getfile(mobius)` points into the agent's worktree; editable
+  installs from another worktree invalidate all test evidence.
 
 ### After each commit
 - Run the affected tests immediately (don't batch; catch regressions early).
 - Verify the commit landed on the correct branch (`git log --oneline -3`).
 - Confirm the push succeeded.
+- Confirm the remote ref/PR head SHA, not just local `HEAD`.
 
 ### Before final review (lead audit)
 - Check ALL worktrees for unpushed commits or uncommitted changes.
@@ -84,6 +88,15 @@ Checks at each stage prevent problems from compounding across agents.
 - All review findings addressed.
 - Final test run passes.
 - PR description updated with an accurate scorecard of what changed.
+
+### CI failures and main refreshes
+- Compare the exact failing test on the exact base SHA; a red overall workflow
+  does not prove the same job failed on base.
+- Keep feature scope: document unrelated baseline names/metrics instead of
+  changing their code or tolerances.
+- Rebase independent PRs linearly onto `origin/main`. Resolve shared registries,
+  exports, helpers, and guards semantically by retaining both sides; then run
+  shared-surface tests, lint, and review before `push --force-with-lease`.
 
 ---
 
@@ -171,18 +184,14 @@ Match the agent role to the task type. Mismatched roles waste agent capacity.
 
 ---
 
-## 9. Single-Branch Strategy
+## 9. Branch Strategy
 
-For large multi-agent efforts, use **one shared feature branch** rather than one branch per agent.
-
-**Why**: Avoids complex multi-branch merge scenarios at the end. All agents commit to the same branch via their isolated worktrees.
-
-**Trade-offs**:
-- More `pull --rebase` cycles per agent.
-- Occasional push conflicts (recoverable with rebase).
-- BUT: much simpler final state, single PR, linear history.
-
-**Alternative**: Separate branches per agent merged via separate PRs — only viable when features are truly independent and don't share files.
+- Use one branch only when agents contribute to one atomic PR; serialize edits
+  to shared files and require pull/rebase before every push.
+- Use separate branches/PRs for independent deliverables (for example, separate
+  model architectures). This isolates CI, review, rollback, and publication.
+- Never merge main into a linear-history feature branch. Rebase, resolve shared
+  surfaces semantically, and force-push only with `--force-with-lease`.
 
 ---
 

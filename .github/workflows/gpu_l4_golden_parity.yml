@@ -5,6 +5,13 @@ on:
     # Run nightly at 4am UTC (after golden regen on Sunday)
     - cron: '0 4 * * *'
   workflow_dispatch:
+    inputs:
+      affected_models:
+        description: >-
+          JSON array of model names. Empty string or empty array runs all models.
+        required: false
+        type: string
+        default: ""
   workflow_call:
     inputs:
       affected_models:
@@ -48,8 +55,6 @@ jobs:
         with:
           path: ~/.cache/huggingface
           key: hf-gpu-${{ hashFiles('testdata/cases/**/*.yaml') }}
-          restore-keys: |
-            hf-gpu-
 
       - name: Install PyTorch (CUDA)
         run: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128

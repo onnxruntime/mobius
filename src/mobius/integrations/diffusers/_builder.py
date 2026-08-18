@@ -22,7 +22,8 @@ import tqdm
 
 from mobius._builder import build_from_module, resolve_dtype
 from mobius._model_package import ModelPackage
-from mobius._weight_loading import _parallel_download, apply_weights
+from mobius._optimizations import fold_initializers_after_weights
+from mobius.integrations._weight_loading import _parallel_download, apply_weights
 
 logger = logging.getLogger(__name__)
 
@@ -36,16 +37,35 @@ logger = logging.getLogger(__name__)
 #: module class, config parser, and task used to build the ONNX graph.
 _DIFFUSERS_CLASS_MAP: dict[str, tuple[type, type, str]] = {}
 
+# A component class can require a different graph contract in a specific
+# pipeline while retaining the same neural-network implementation.
+_PIPELINE_COMPONENT_TASK_OVERRIDES: dict[str, dict[str, str]] = {
+    "QwenImageEditPlusPipeline": {
+        "AutoencoderKLQwenImage": "qwen-image-edit-vae",
+    },
+}
+
+_PIPELINE_MODEL_TYPES: dict[str, str] = {
+    "MiniMaxMusic3ModularPipeline": "minimax_music3",
+    "QwenImageEditPlusPipeline": "qwen_image_edit",
+}
+
 
 def _init_diffusers_class_map() -> None:
     """Lazily populate the diffusers class map on first use."""
     if _DIFFUSERS_CLASS_MAP:
         return
 
-    from mobius._diffusers_configs import (
+    from mobius.integrations.diffusers._configs import (
         CLIPTextConfig,
         CogVideoXConfig,
+        MiniMaxMusic3ConditionConfig,
+        MiniMaxMusic3LanguageConfig,
+        MiniMaxMusic3RVQConfig,
+        MiniMaxMusic3TransformerConfig,
+        MiniMaxMusic3VocoderConfig,
         QwenImageConfig,
+        QwenImageTextEncoderConfig,
         QwenImageVAEConfig,
         UNet2DConfig,
         VAEConfig,
@@ -62,8 +82,16 @@ def _init_diffusers_class_map() -> None:
         SD3Transformer2DModel,
     )
     from mobius.models.hunyuan_dit import HunyuanDiT2DModel, HunyuanDiTConfig
+    from mobius.models.minimax_music3 import (
+        MiniMaxMusic3ConditionEncoder,
+        MiniMaxMusic3LanguageModel,
+        MiniMaxMusic3RVQDepthDecoder,
+        MiniMaxMusic3Transformer1DModel,
+        MiniMaxMusic3Vocoder,
+    )
     from mobius.models.qwen_image import QwenImageTransformer2DModel
     from mobius.models.qwen_image_vae import AutoencoderKLQwenImageModel
+    from mobius.models.qwen_vl import Qwen25VLCausalLMModel
     from mobius.models.unet import UNet2DConditionModel
     from mobius.models.vae import AutoencoderKLModel
     from mobius.models.video_vae import VideoAutoencoderModel, VideoVAEConfig
@@ -86,7 +114,12 @@ def _init_diffusers_class_map() -> None:
             "QwenImageTransformer2DModel": (
                 QwenImageTransformer2DModel,
                 QwenImageConfig,
-                "denoising",
+                "qwen-image-denoising",
+            ),
+            "Qwen2_5_VLForConditionalGeneration": (
+                Qwen25VLCausalLMModel,
+                QwenImageTextEncoderConfig,
+                "qwen-image-text-encoding",
             ),
             "AutoencoderKL": (AutoencoderKLModel, VAEConfig, "vae"),
             "AutoencoderKLQwenImage": (
@@ -104,21 +137,57 @@ def _init_diffusers_class_map() -> None:
                 CogVideoXConfig,
                 "video-denoising",
             ),
+            "Qwen3ForCausalLM": (
+                MiniMaxMusic3LanguageModel,
+                MiniMaxMusic3LanguageConfig,
+                "minimax-music3-language",
+            ),
+            "MiniMaxMusic3RVQDepthDecoder": (
+                MiniMaxMusic3RVQDepthDecoder,
+                MiniMaxMusic3RVQConfig,
+                "minimax-music3-rvq",
+            ),
+            "MiniMaxMusic3ConditionEncoder": (
+                MiniMaxMusic3ConditionEncoder,
+                MiniMaxMusic3ConditionConfig,
+                "minimax-music3-condition",
+            ),
+            "MiniMaxMusic3Transformer1DModel": (
+                MiniMaxMusic3Transformer1DModel,
+                MiniMaxMusic3TransformerConfig,
+                "minimax-music3-denoising",
+            ),
+            "MiniMaxMusic3Vocoder": (
+                MiniMaxMusic3Vocoder,
+                MiniMaxMusic3VocoderConfig,
+                "minimax-music3-vocoder",
+            ),
         }
     )
 
 
-def _load_diffusers_pipeline_index(model_id: str) -> dict | None:
+def _load_diffusers_pipeline_index(
+    model_id: str, *, revision: str | None = None
+) -> dict | None:
     """Try to load a diffusers ``model_index.json`` from HuggingFace.
 
     Returns the parsed JSON dict, or ``None`` if not found.
     """
     from huggingface_hub import hf_hub_download
+    from huggingface_hub.utils import EntryNotFoundError
 
-    try:
-        path = hf_hub_download(repo_id=model_id, filename="model_index.json")
-    except (OSError, ValueError) as e:
-        logger.debug("Failed to download model_index.json for %s: %s", model_id, e)
+    path = None
+    for filename in ("model_index.json", "modular_model_index.json"):
+        try:
+            path = hf_hub_download(
+                repo_id=model_id,
+                filename=filename,
+                revision=revision,
+            )
+            break
+        except (EntryNotFoundError, OSError, ValueError) as e:
+            logger.debug("Failed to download %s for %s: %s", filename, model_id, e)
+    if path is None:
         return None
 
     with open(path) as f:
@@ -126,7 +195,11 @@ def _load_diffusers_pipeline_index(model_id: str) -> dict | None:
 
 
 def _download_diffusers_component_weights(
-    model_id: str, component_name: str
+    model_id: str,
+    component_name: str,
+    *,
+    revision: str | None = None,
+    subfolder: str | None = None,
 ) -> dict[str, torch.Tensor]:
     """Download weights for a specific component of a diffusers pipeline.
 
@@ -139,7 +212,8 @@ def _download_diffusers_component_weights(
     from huggingface_hub import hf_hub_download
     from huggingface_hub.utils import EntryNotFoundError
 
-    prefix = f"{component_name}/"
+    resolved_subfolder = component_name if subfolder is None else subfolder
+    prefix = f"{resolved_subfolder}/" if resolved_subfolder else ""
     # Diffusers uses two naming conventions for the weight basename, and either
     # safetensors (preferred) or PyTorch .bin serialization. Some real repos
     # (e.g. OFA-Sys/small-stable-diffusion-v0) ship only .bin.
@@ -153,6 +227,7 @@ def _download_diffusers_component_weights(
                 index_path = hf_hub_download(
                     repo_id=model_id,
                     filename=f"{prefix}{basename}.{ext}.index.json",
+                    revision=revision,
                 )
                 with open(index_path) as f:
                     index = json.load(f)
@@ -165,7 +240,11 @@ def _download_diffusers_component_weights(
         # Single-file weights.
         for basename in weight_basenames:
             try:
-                hf_hub_download(repo_id=model_id, filename=f"{prefix}{basename}.{ext}")
+                hf_hub_download(
+                    repo_id=model_id,
+                    filename=f"{prefix}{basename}.{ext}",
+                    revision=revision,
+                )
                 all_files = [f"{basename}.{ext}"]
                 break
             except EntryNotFoundError:
@@ -182,6 +261,7 @@ def _download_diffusers_component_weights(
     paths = _parallel_download(
         model_id,
         [f"{prefix}{f}" for f in all_files],
+        revision=revision,
         desc=f"{component_name} weights",
     )
 
@@ -194,11 +274,68 @@ def _download_diffusers_component_weights(
     return state_dict
 
 
-def _load_diffusers_component_config(model_id: str, component_name: str) -> dict:
+def _load_diffusers_component_config(
+    model_id: str,
+    component_name: str,
+    *,
+    revision: str | None = None,
+    subfolder: str | None = None,
+) -> dict:
     """Load the config.json for a specific diffusers pipeline component."""
     from huggingface_hub import hf_hub_download
 
-    path = hf_hub_download(repo_id=model_id, filename=f"{component_name}/config.json")
+    resolved_subfolder = component_name if subfolder is None else subfolder
+    filename = f"{resolved_subfolder}/config.json" if resolved_subfolder else "config.json"
+    path = hf_hub_download(
+        repo_id=model_id,
+        filename=filename,
+        revision=revision,
+    )
+    with open(path) as f:
+        return json.load(f)
+
+
+def _resolve_diffusers_component_source(
+    root_model_id: str,
+    root_revision: str | None,
+    component_name: str,
+    component_info: list,
+) -> tuple[str, str | None, str | None]:
+    """Resolve a modular component's repository, revision, and subfolder.
+
+    Legacy two-item entries always use ``root_model_id/component_name`` at the
+    caller's revision. For modular three-item entries, an external repository
+    uses its metadata revision independently of the root pin. A component that
+    still references the root repository uses the explicit caller revision when
+    supplied, otherwise its metadata revision.
+    """
+    if len(component_info) == 2 or not isinstance(component_info[2], dict):
+        return root_model_id, root_revision, component_name
+
+    metadata = component_info[2]
+    component_model_id = metadata.get("pretrained_model_name_or_path") or root_model_id
+    metadata_revision = metadata.get("revision")
+    if component_model_id == root_model_id:
+        component_revision = root_revision if root_revision is not None else metadata_revision
+    else:
+        component_revision = metadata_revision
+    subfolder = metadata.get("subfolder") if "subfolder" in metadata else component_name
+    if subfolder is None:
+        subfolder = ""
+    return component_model_id, component_revision, subfolder
+
+
+def _load_optional_diffusers_json(
+    model_id: str, filename: str, *, revision: str | None = None
+) -> dict:
+    """Load optional non-neural pipeline metadata without failing the build."""
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.utils import EntryNotFoundError
+
+    try:
+        path = hf_hub_download(repo_id=model_id, filename=filename, revision=revision)
+    except EntryNotFoundError:
+        return {}
     with open(path) as f:
         return json.load(f)
 
@@ -233,9 +370,12 @@ def _prepare_unet_loras(unet_loras: dict) -> tuple[tuple, dict]:
 def build_diffusers_pipeline(
     model_id: str,
     *,
+    revision: str | None = None,
     dtype: str | ir.DataType | None = None,
     load_weights: bool = True,
     unet_loras: dict | None = None,
+    components: set[str] | None = None,
+    execution_provider: str = "default",
 ) -> ModelPackage:
     """Build ONNX models for all supported components in a diffusers pipeline.
 
@@ -248,6 +388,7 @@ def build_diffusers_pipeline(
 
     Args:
         model_id: HuggingFace model repository ID for a diffusers pipeline.
+        revision: Optional Hugging Face revision used for all pipeline artifacts.
         dtype: Override the model dtype.
         load_weights: Whether to download and apply weights.
         unet_loras: Optional ``{adapter_name: lora.safetensors}`` map. Each LoRA
@@ -255,6 +396,9 @@ def build_diffusers_pipeline(
             inferred from the file); at inference a ``lora_gate.{name}`` scalar
             input switches/blends it. Requires ``load_weights=True`` to apply the
             adapter weights.
+        components: Optional component-name allowlist. Non-neural pipeline metadata
+            is still retained so a single-component export preserves its contract.
+        execution_provider: Target execution provider for EP-aware graph optimization.
 
     Returns:
         A :class:`ModelPackage` containing the built component model(s).
@@ -264,7 +408,7 @@ def build_diffusers_pipeline(
     """
     _init_diffusers_class_map()
 
-    pipeline_index = _load_diffusers_pipeline_index(model_id)
+    pipeline_index = _load_diffusers_pipeline_index(model_id, revision=revision)
     if pipeline_index is None:
         raise ValueError(
             f"'{model_id}' does not appear to be a diffusers pipeline "
@@ -275,14 +419,26 @@ def build_diffusers_pipeline(
         dtype = resolve_dtype(dtype)
 
     package = ModelPackage({})
+    component_configs: dict[str, dict] = {}
+    pipeline_class = str(pipeline_index.get("_class_name", "DiffusionPipeline"))
 
     for component_name, component_info in pipeline_index.items():
         if component_name.startswith("_"):
             continue
-        if not isinstance(component_info, list) or len(component_info) != 2:
+        if components is not None and component_name not in components:
+            continue
+        if not isinstance(component_info, list) or len(component_info) not in (2, 3):
             continue
 
-        library, class_name = component_info
+        library, class_name = component_info[:2]
+        component_model_id, component_revision, component_subfolder = (
+            _resolve_diffusers_component_source(
+                model_id,
+                revision,
+                component_name,
+                component_info,
+            )
+        )
         if class_name not in _DIFFUSERS_CLASS_MAP:
             logger.info(
                 "Skipping diffusers component '%s' (class '%s' from '%s' is not registered).",
@@ -299,7 +455,15 @@ def build_diffusers_pipeline(
             class_name,
         )
 
-        component_config_dict = _load_diffusers_component_config(model_id, component_name)
+        component_source_kwargs = {"revision": component_revision}
+        if len(component_info) == 3 and isinstance(component_info[2], dict):
+            component_source_kwargs["subfolder"] = component_subfolder
+        component_config_dict = _load_diffusers_component_config(
+            component_model_id,
+            component_name,
+            **component_source_kwargs,
+        )
+        component_configs[component_name] = component_config_dict
         config = config_class.from_diffusers(component_config_dict)
 
         if dtype is not None and hasattr(config, "dtype"):
@@ -318,7 +482,15 @@ def build_diffusers_pipeline(
 
         model_module = module_class(config)
 
-        sub_pkg = build_from_module(model_module, config, task_name)
+        task_name = _PIPELINE_COMPONENT_TASK_OVERRIDES.get(pipeline_class, {}).get(
+            class_name, task_name
+        )
+        sub_pkg = build_from_module(
+            model_module,
+            config,
+            task_name,
+            execution_provider=execution_provider,
+        )
 
         # Flatten sub-package into the top-level package
         if len(sub_pkg) == 1 and "model" in sub_pkg:
@@ -326,17 +498,25 @@ def build_diffusers_pipeline(
             package[component_name] = sub_pkg["model"]
         else:
             for sub_name, sub_model in sub_pkg.items():
-                sub_model.graph.name = f"{model_id}/{component_name}_{sub_name}"
-                package[f"{component_name}_{sub_name}"] = sub_model
+                package_name = (
+                    component_name if sub_name == "model" else f"{component_name}_{sub_name}"
+                )
+                sub_model.graph.name = f"{model_id}/{package_name}"
+                package[package_name] = sub_model
 
         if load_weights:
-            state_dict = _download_diffusers_component_weights(model_id, component_name)
+            state_dict = _download_diffusers_component_weights(
+                component_model_id,
+                component_name,
+                **component_source_kwargs,
+            )
             if hasattr(model_module, "preprocess_weights"):
                 state_dict = model_module.preprocess_weights(state_dict)
             if lora_weights:
                 state_dict = {**state_dict, **lora_weights}
             for model in sub_pkg.values():
                 apply_weights(model, state_dict)
+                fold_initializers_after_weights(model)
 
     if not package:
         raise ValueError(
@@ -344,4 +524,41 @@ def build_diffusers_pipeline(
             f"Supported diffusers classes: {sorted(_DIFFUSERS_CLASS_MAP)}."
         )
 
+    from mobius.integrations.diffusers._configs import DiffusersPipelineConfig
+
+    def load_optional_component_json(component_name: str, filename: str) -> dict:
+        component_info = pipeline_index.get(component_name)
+        if not isinstance(component_info, list) or len(component_info) not in (2, 3):
+            return {}
+        source_model_id, source_revision, source_subfolder = (
+            _resolve_diffusers_component_source(
+                model_id,
+                revision,
+                component_name,
+                component_info,
+            )
+        )
+        component_filename = f"{source_subfolder}/{filename}" if source_subfolder else filename
+        return _load_optional_diffusers_json(
+            source_model_id,
+            component_filename,
+            revision=source_revision,
+        )
+
+    package.config = DiffusersPipelineConfig(
+        source_model_id=model_id,
+        pipeline_class=pipeline_class,
+        component_configs=component_configs,
+        scheduler_config=(
+            load_optional_component_json("scheduler", "scheduler_config.json")
+            if "scheduler" in pipeline_index
+            else {}
+        ),
+        processor_config=(
+            load_optional_component_json("processor", "preprocessor_config.json")
+            if "processor" in pipeline_index
+            else {}
+        ),
+        model_type=_PIPELINE_MODEL_TYPES.get(pipeline_class, "diffusers"),
+    )
     return package

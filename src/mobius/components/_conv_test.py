@@ -14,11 +14,48 @@ from mobius._testing import (
 )
 from mobius.components._codec_conv import CausalConvNd
 from mobius.components._conv import (
+    BatchNorm1d,
     BatchNorm2d,
     Conv2d,
     Conv2dNoBias,
     ConvTranspose2d,
+    _resolve_pads,
 )
+
+
+class TestResolvePads:
+    """Tests for the ``padding`` argument shared by the Conv2d classes."""
+
+    def test_int_pads_all_four_edges(self):
+        assert _resolve_pads(2) == [2, 2, 2, 2]
+
+    def test_four_tuple_is_taken_verbatim(self):
+        # ONNX order: [top, left, bottom, right].  SAME padding with an odd
+        # total puts the extra pixel on the end edges.
+        assert _resolve_pads((0, 0, 1, 1)) == [0, 0, 1, 1]
+
+    def test_pytorch_style_two_tuple_is_rejected(self):
+        # A (h, w) pair would be padded out to the wrong edges, which only
+        # shows up much later as a numerical mismatch.  Fail at construction.
+        with pytest.raises(ValueError, match="exactly 4 elements"):
+            _resolve_pads((1, 1))
+
+    @pytest.mark.parametrize("bad", [(), (1,), (1, 2, 3), (1, 2, 3, 4, 5)])
+    def test_other_lengths_are_rejected(self, bad):
+        with pytest.raises(ValueError, match="exactly 4 elements"):
+            _resolve_pads(bad)
+
+    def test_non_int_elements_are_rejected(self):
+        with pytest.raises(TypeError):
+            _resolve_pads((None, 0, 0, 0))
+
+    def test_conv2d_rejects_bad_padding_at_construction(self):
+        with pytest.raises(ValueError, match="exactly 4 elements"):
+            Conv2d(3, 16, kernel_size=3, padding=(1, 1))
+
+    def test_conv2d_no_bias_rejects_bad_padding_at_construction(self):
+        with pytest.raises(ValueError, match="exactly 4 elements"):
+            Conv2dNoBias(3, 16, kernel_size=3, padding=(1, 1))
 
 
 class TestConv2d:
@@ -64,6 +101,18 @@ class TestConv2d:
         conv(op, x)
         assert count_op_type(graph, "Conv") >= 1
 
+    def test_asymmetric_kernel_stride_and_padding(self):
+        conv = Conv2d(
+            3,
+            16,
+            kernel_size=(1, 4),
+            stride=(1, 4),
+            padding=(0, 2, 0, 2),
+        )
+        assert list(conv.weight.shape) == [16, 3, 1, 4]
+        assert conv._strides == (1, 4)
+        assert conv._pads == [0, 2, 0, 2]
+
 
 class TestConv2dNoBias:
     """Tests for 2D convolution without bias."""
@@ -85,6 +134,11 @@ class TestConv2dNoBias:
         result = conv(op, x)
         builder._adapt_outputs([result], "")
         assert count_op_type(graph, "Conv") >= 1
+
+    def test_asymmetric_kernel_and_stride(self):
+        conv = Conv2dNoBias(3, 16, kernel_size=(1, 4), stride=(1, 4))
+        assert list(conv.weight.shape) == [16, 3, 1, 4]
+        assert conv._strides == (1, 4)
 
 
 class TestBatchNorm2d:
@@ -111,6 +165,21 @@ class TestBatchNorm2d:
         result = bn(op, x)
         builder._adapt_outputs([result], "")
         assert count_op_type(graph, "BatchNormalization") >= 1
+
+
+class TestBatchNorm1d:
+    """Tests for 1D batch normalization."""
+
+    def test_forward_uses_fused_op(self):
+        bn = BatchNorm1d(16)
+        builder, op, graph = create_test_builder()
+        x = create_test_input(builder, "x", [1, 16, 32])
+
+        result = bn(op, x)
+        builder._adapt_outputs([result], "")
+
+        assert count_op_type(graph, "BatchNormalization") == 1
+        assert count_op_type(graph, "Sqrt") == 0
 
 
 class TestConvTranspose2d:

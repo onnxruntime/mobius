@@ -88,6 +88,15 @@ class GoldenTestCase:
     images: list[str]
     """Image paths relative to ``testdata/`` (VL tasks)."""
 
+    videos: list[str]
+    """Video paths relative to ``testdata/`` (video-language tasks)."""
+
+    video_num_frames: int | None
+    """Optional deterministic number of frames sampled from each video."""
+
+    media_max_pixels: int | None
+    """Optional deterministic pixel budget applied to each image/video frame."""
+
     audio: list[str]
     """Audio paths relative to ``testdata/`` (speech tasks)."""
 
@@ -99,6 +108,9 @@ class GoldenTestCase:
 
     trust_remote_code: bool
     """Whether the HF model requires ``trust_remote_code``."""
+
+    reference_loader: str
+    """HF reference loader kind: ``causal-lm`` or ``multimodal``."""
 
     skip_reason: str | None
     """If set, the test runner should skip with this message."""
@@ -235,10 +247,14 @@ def load_test_case(yaml_path: Path) -> GoldenTestCase:
         level=data["level"],
         prompts=inputs.get("prompts", []) or [],
         images=inputs.get("images", []) or [],
+        videos=inputs.get("videos", []) or [],
+        video_num_frames=inputs.get("video_num_frames"),
+        media_max_pixels=inputs.get("media_max_pixels"),
         audio=inputs.get("audio", []) or [],
         decoder_prompt=inputs.get("decoder_prompt", "") or "",
         generation_params=generation,
         trust_remote_code=data.get("trust_remote_code", False),
+        reference_loader=data.get("reference_loader", "causal-lm"),
         skip_reason=data.get("skip_reason"),
         ci_skip_reason=data.get("ci_skip_reason"),
         min_token_match_ratio=data.get("min_token_match_ratio"),

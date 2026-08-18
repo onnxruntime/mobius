@@ -9,6 +9,7 @@ import numpy as np
 import onnx_ir as ir
 import pytest
 
+from mobius._constants import OPSET_VERSION
 from mobius.rewrite_rules import fuse_dense_moe_to_qmoe
 from mobius.rewrite_rules._qmoe_fusion import _qmoe_abi_supported
 
@@ -91,15 +92,24 @@ def _dequant(
 class _Quant:
     """A randomly-generated int4 ``MatMulNBits`` weight triple."""
 
-    def __init__(self, rng: np.random.Generator, n: int, kdim: int) -> None:
+    def __init__(
+        self,
+        rng: np.random.Generator,
+        n: int,
+        kdim: int,
+        scale_dtype: ir.DataType = ir.DataType.FLOAT16,
+    ) -> None:
         n_blocks = kdim // BLOCK
         codes = rng.integers(0, 16, size=(n, kdim), dtype=np.int32)
         zp_codes = rng.integers(0, 16, size=(n, n_blocks), dtype=np.int32)
         self.weight = _pack_weight(codes, BLOCK)
-        self.scales = rng.random((n, n_blocks), dtype=np.float32).astype(np.float16) * 0.1
+        self.scales = (rng.random((n, n_blocks), dtype=np.float32) * 0.1).astype(
+            scale_dtype.numpy()
+        )
         self.zero_points = _pack_zero_points(zp_codes)
         self.n = n
         self.kdim = kdim
+        self.scale_dtype = scale_dtype
 
     @property
     def dense(self) -> np.ndarray:
@@ -117,7 +127,7 @@ def _init(graph: ir.Graph, name: str, arr: np.ndarray, dtype: ir.DataType) -> ir
 
 def _matmulnbits(name: str, x: ir.Value, q: _Quant, graph: ir.Graph) -> ir.Value:
     w = _init(graph, f"{name}.weight", q.weight, ir.DataType.UINT8)
-    s = _init(graph, f"{name}.scales", q.scales, ir.DataType.FLOAT16)
+    s = _init(graph, f"{name}.scales", q.scales, q.scale_dtype)
     z = _init(graph, f"{name}.zero_points", q.zero_points, ir.DataType.UINT8)
     node = ir.node(
         "MatMulNBits",
@@ -144,21 +154,33 @@ def _constant_int(graph_nodes: list[ir.Node], name: str, value: int) -> ir.Value
     return node.outputs[0]
 
 
-def _build_dense_graph() -> tuple[ir.Model, dict[str, _Quant], np.ndarray]:
-    """Build a tiny dense-fallback Qwen35-MoE graph and return it with its weights."""
+def _build_dense_graph(
+    activation_dtype: ir.DataType = ir.DataType.FLOAT16,
+    *,
+    hidden_dtype: ir.DataType | None = None,
+) -> tuple[ir.Model, dict[str, _Quant], np.ndarray]:
+    """Build a tiny dense-fallback Qwen35-MoE graph and return it with its weights.
+
+    ``activation_dtype`` controls the dtype of MatMulNBits scales/router casts.
+    ``hidden_dtype`` (defaults to ``activation_dtype``) controls the declared
+    type of the ``hidden`` graph input; pass ``ir.DataType.UNDEFINED`` to
+    simulate a not-yet-type-inferred graph-internal value.
+    """
     rng = _rng()
     quants: dict[str, _Quant] = {}
     nodes: list[ir.Node] = []
+    if hidden_dtype is None:
+        hidden_dtype = activation_dtype
 
     hidden = ir.Value(
         name="hidden",
         shape=ir.Shape(["T", H]),
-        type=ir.TensorType(ir.DataType.FLOAT16),
+        type=ir.TensorType(hidden_dtype) if hidden_dtype != ir.DataType.UNDEFINED else None,
     )
     graph = ir.Graph([hidden], [], nodes=[], name="tiny_moe")
 
     def q(key: str, n: int, kdim: int) -> _Quant:
-        quants[key] = _Quant(rng, n, kdim)
+        quants[key] = _Quant(rng, n, kdim, scale_dtype=activation_dtype)
         return quants[key]
 
     # Router: quantized gate MatMulNBits -> TopK -> Softmax.
@@ -223,12 +245,7 @@ def _build_dense_graph() -> tuple[ir.Model, dict[str, _Quant], np.ndarray]:
 
         gate = _matmulnbits(f"expert{e}.gate_proj", hidden, q(f"g{e}", INTER, H), graph)
         nodes.append(gate.producer())
-        sig = ir.node("Sigmoid", inputs=[gate], num_outputs=1, name=f"expert{e}.sigmoid")
-        sig.outputs[0].name = f"expert{e}.sigmoid.out"
-        nodes.append(sig)
-        silu = ir.node(
-            "Mul", inputs=[gate, sig.outputs[0]], num_outputs=1, name=f"expert{e}.silu"
-        )
+        silu = ir.node("Swish", inputs=[gate], num_outputs=1, name=f"expert{e}.silu")
         silu.outputs[0].name = f"expert{e}.silu.out"
         nodes.append(silu)
         up = _matmulnbits(f"expert{e}.up_proj", hidden, q(f"u{e}", INTER, H), graph)
@@ -291,7 +308,7 @@ def _build_dense_graph() -> tuple[ir.Model, dict[str, _Quant], np.ndarray]:
     )
     final.outputs[0].name = "moe_out"
     final.outputs[0].shape = ir.Shape(["T", H])
-    final.outputs[0].type = ir.TensorType(ir.DataType.FLOAT16)
+    final.outputs[0].type = ir.TensorType(activation_dtype)
     nodes.append(final)
 
     for node in nodes:
@@ -299,7 +316,7 @@ def _build_dense_graph() -> tuple[ir.Model, dict[str, _Quant], np.ndarray]:
     graph.outputs.append(final.outputs[0])
 
     model = ir.Model(graph, ir_version=10, producer_name="test")
-    model.opset_imports[""] = 21
+    model.opset_imports[""] = OPSET_VERSION
     model.opset_imports["com.microsoft"] = 1
     return model, quants, rng.standard_normal((5, H)).astype(np.float32)
 
@@ -429,13 +446,21 @@ def test_qmoe_weights_are_bit_identical_to_concatenated_experts() -> None:
         np.testing.assert_array_equal(fc2_z[e], quants[f"d{e}"].zero_points)
 
 
-def test_scales_are_lossless_float32_upcast() -> None:
-    model, quants, _ = _build_dense_graph()
+@pytest.mark.parametrize(
+    "activation_dtype",
+    [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16],
+)
+def test_scales_match_activation_dtype(activation_dtype: ir.DataType) -> None:
+    model, quants, _ = _build_dense_graph(activation_dtype)
     fuse_dense_moe_to_qmoe(model)
     qmoe = next(n for n in model.graph if n.op_type == "QMoE")
 
     fc1_s = qmoe.inputs[3].const_value.numpy()
-    assert fc1_s.dtype == np.float32
+    fc2_s = qmoe.inputs[6].const_value.numpy()
+    assert qmoe.inputs[3].dtype == activation_dtype
+    assert qmoe.inputs[6].dtype == activation_dtype
+    assert fc1_s.dtype == activation_dtype.numpy()
+    assert fc2_s.dtype == activation_dtype.numpy()
     for e in range(E):
         expected = np.concatenate(
             [
@@ -443,8 +468,28 @@ def test_scales_are_lossless_float32_upcast() -> None:
                 quants[f"u{e}"].scales.reshape(INTER, -1),
             ],
             axis=0,
-        ).astype(np.float32)
+        ).astype(activation_dtype.numpy())
         np.testing.assert_array_equal(fc1_s[e], expected)
+        expected_fc2 = quants[f"d{e}"].scales.reshape(H, -1).astype(activation_dtype.numpy())
+        np.testing.assert_array_equal(fc2_s[e], expected_fc2)
+
+
+def test_fuses_when_hidden_dtype_is_untyped() -> None:
+    """Graph-internal `hidden` values are commonly untyped before shape inference.
+
+    The fusion must still succeed by falling back to the dtype of an existing
+    expert's MatMulNBits scales, rather than silently skipping the layer.
+    """
+    model, _, _ = _build_dense_graph(ir.DataType.FLOAT16, hidden_dtype=ir.DataType.UNDEFINED)
+    graph = model.graph
+    assert graph.inputs[0].dtype is None
+
+    fused = fuse_dense_moe_to_qmoe(model)
+
+    assert fused == 1
+    qmoe = next(n for n in graph if n.op_type == "QMoE")
+    assert qmoe.inputs[3].dtype == ir.DataType.FLOAT16
+    assert qmoe.inputs[6].dtype == ir.DataType.FLOAT16
 
 
 def test_rewritten_forward_matches_dense_forward() -> None:
@@ -455,15 +500,19 @@ def test_rewritten_forward_matches_dense_forward() -> None:
     np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)
 
 
-def test_router_probs_cast_to_float32() -> None:
-    model, _, _ = _build_dense_graph()
+@pytest.mark.parametrize(
+    "activation_dtype",
+    [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16],
+)
+def test_router_probs_cast_to_activation_dtype(activation_dtype: ir.DataType) -> None:
+    model, _, _ = _build_dense_graph(activation_dtype)
     fuse_dense_moe_to_qmoe(model)
     graph = model.graph
     qmoe = next(n for n in graph if n.op_type == "QMoE")
     router_probs = qmoe.inputs[1]
     cast = router_probs.producer()
     assert cast.op_type == "Cast"
-    assert cast.attributes["to"].value == ir.DataType.FLOAT.value
+    assert cast.attributes["to"].value == activation_dtype.value
 
 
 def test_attributes_match_qmoe_abi() -> None:
@@ -478,6 +527,8 @@ def test_attributes_match_qmoe_abi() -> None:
     assert attrs["swiglu_fusion"].value == 2
     assert attrs["normalize_routing_weights"].value == 1
     assert attrs["activation_type"].value == "swiglu"
+    assert attrs["quant_type"].value == "int"
+    assert attrs["weights_prepacked"].value == 0
 
 
 @pytest.mark.parametrize(

@@ -79,6 +79,41 @@ class TestGenaiConfigGeneratorLLM:
         assert outputs["present_key_names"] == "present.%d.key"
         assert outputs["present_value_names"] == "present.%d.value"
 
+    def test_lfm2_decoder_declares_hybrid_cache(self):
+        gen = GenaiConfigGenerator(
+            "lfm2",
+            vocab_size=65536,
+            hidden_size=1024,
+            num_hidden_layers=4,
+            num_attention_heads=16,
+            num_key_value_heads=8,
+            head_dim=64,
+            layer_types=["conv", "conv", "full_attention", "conv"],
+            conv_cache_size=2,
+        )
+
+        decoder = gen.generate()["model"]["decoder"]
+
+        assert decoder["layer_types"] == ["conv", "conv", "full_attention", "conv"]
+        assert decoder["conv_cache_size"] == 2
+        assert decoder["inputs"]["past_conv_names"] == "past_key_values.%d.conv_state"
+        assert decoder["outputs"]["present_conv_names"] == "present.%d.conv_state"
+        assert gen.generate()["search"]["past_present_share_buffer"] is False
+
+    def test_lfm2_kernel_one_preserves_zero_width_cache(self):
+        gen = GenaiConfigGenerator(
+            "lfm2",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            layer_types=["conv"],
+            conv_cache_size=0,
+        )
+        assert gen.generate()["model"]["decoder"]["conv_cache_size"] == 0
+
     def test_token_ids_included_when_set(self):
         """Token IDs are included in the model section."""
         gen = GenaiConfigGenerator(
@@ -231,6 +266,27 @@ class TestGenaiConfigGeneratorLLM:
         webgpu = next(opts["webgpu"] for opts in provider_options if "webgpu" in opts)
         assert webgpu["enableGraphCapture"] == "1"
         assert webgpu["validationMode"] == "disabled"
+
+    def test_webgpu_graph_capture_is_decoder_only_for_multimodal(self):
+        gen = GenaiConfigGenerator(
+            "gemma4",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+            ep="webgpu",
+        )
+        config = gen.with_vision(image_token_id=255999).with_audio().generate()
+
+        model = config["model"]
+        decoder_webgpu = model["decoder"]["session_options"]["provider_options"][0]["webgpu"]
+        assert decoder_webgpu["enableGraphCapture"] == "1"
+        for component in ("vision", "embedding", "speech"):
+            webgpu = model[component]["session_options"]["provider_options"][0]["webgpu"]
+            assert webgpu["enableGraphCapture"] == "0"
+            assert webgpu["validationMode"] == "basic"
 
     def test_search_params_custom_ep_with_share_buffer(self):
         """A custom EP registered with supports_past_present_share_buffer=True gets the flag set.
@@ -500,6 +556,96 @@ class TestGenaiConfigFromConfig:
         gen = GenaiConfigGenerator.from_config(cfg, "llama")
         config = gen.generate()
         assert config["model"]["context_length"] == 4096
+
+    def test_num_cache_layer_slots_overrides_num_hidden_layers(self):
+        """KV-sharing models report the graph's cache count, not the layer count.
+
+        Gemma 3n / Gemma 4 trailing layers borrow K,V from an earlier layer and
+        own no cache entry, so ORT-GenAI must bind fewer
+        ``past_key_values.%d.*`` pairs than the architecture has layers.
+        """
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            vocab_size: int = 32000
+            hidden_size: int = 4096
+            num_hidden_layers: int = 35
+            num_attention_heads: int = 32
+            num_key_value_heads: int = 8
+            head_dim: int = 128
+
+        cfg = FakeConfig()
+        gen = GenaiConfigGenerator.from_config(cfg, "gemma3n", num_cache_layer_slots=20)
+        assert gen.generate()["model"]["decoder"]["num_hidden_layers"] == 20
+
+        # None falls back to the config value.
+        gen = GenaiConfigGenerator.from_config(cfg, "gemma3n")
+        assert gen.generate()["model"]["decoder"]["num_hidden_layers"] == 35
+
+    def test_hybrid_cache_slots_keep_global_layer_count(self):
+        """Hybrid cache slots retain global layer indices without model checks."""
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            vocab_size: int = 65536
+            hidden_size: int = 1024
+            num_hidden_layers: int = 14
+            num_attention_heads: int = 16
+            num_key_value_heads: int = 8
+            head_dim: int = 64
+            layer_types: list[str] = dataclasses.field(
+                default_factory=lambda: ["conv"] * 8 + ["full_attention"] * 6
+            )
+            short_conv_kernel: int = 3
+
+        gen = GenaiConfigGenerator.from_config(
+            FakeConfig(),
+            "custom_hybrid",
+            num_cache_layer_slots=14,
+        )
+        decoder = gen.generate()["model"]["decoder"]
+        assert decoder["num_hidden_layers"] == 14
+
+
+def test_cuda_enables_decoder_graph_capture_only():
+    gen = GenaiConfigGenerator(
+        "qwen2_5_vl",
+        vocab_size=202048,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+    ).with_vision(image_token_id=200092)
+
+    config = gen.generate()
+
+    decoder_options = config["model"]["decoder"]["session_options"]["provider_options"]
+    vision_options = config["model"]["vision"]["session_options"]["provider_options"]
+    embedding_options = config["model"]["embedding"]["session_options"]["provider_options"]
+    assert decoder_options[0]["cuda"]["enable_cuda_graph"] == "1"
+    assert vision_options[0]["cuda"]["enable_cuda_graph"] == "0"
+    assert embedding_options[0]["cuda"]["enable_cuda_graph"] == "0"
+
+
+def test_cuda_decoder_graph_capture_can_be_disabled():
+    gen = GenaiConfigGenerator(
+        "test_model",
+        vocab_size=1000,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+        decoder_graph_capture=False,
+    )
+
+    config = gen.generate()
+    decoder_options = config["model"]["decoder"]["session_options"]["provider_options"]
+
+    assert decoder_options[0]["cuda"]["enable_cuda_graph"] == "0"
 
 
 class TestGenaiConfigWrite:

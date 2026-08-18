@@ -11,11 +11,13 @@ import types
 from unittest import mock
 
 import numpy as np
+import onnx_ir as ir
 import pytest
 
 from mobius.integrations.ort_genai.auto_export import (
     _copy_tokenizer_files,
     _copy_tokenizer_files_from_local,
+    _count_cache_layer_slots,
     _fix_chat_template,
     _fix_tokenizer_config,
     _graph_input_names,
@@ -26,32 +28,51 @@ from mobius.integrations.ort_genai.auto_export import (
     _write_genai_config,
     _write_vision_processor_config,
     auto_export,
+    export_package,
     write_ort_genai_config,
 )
 
 
-def _mock_model_with_inputs(names):
-    """Create a mock ir.Model whose graph.inputs have the given names."""
-    inputs = []
-    for n in names:
-        inp = mock.MagicMock()
-        inp.name = n
-        inputs.append(inp)
-    m = mock.MagicMock()
-    m.graph.inputs = inputs
-    return m
+def _mock_model(
+    *, inputs: list[str] | None = None, outputs: list[str] | None = None
+) -> ir.Model:
+    """Create a minimal ir.Model for package and graph-introspection tests."""
+    graph = ir.Graph(
+        inputs=[ir.Value(name=name) for name in inputs or []],
+        outputs=[ir.Value(name=name) for name in outputs or []],
+        nodes=[],
+        name="mock_model",
+    )
+    return ir.Model(graph, ir_version=10)
 
 
-def _mock_model_with_outputs(names):
-    """Create a mock ir.Model whose graph.outputs have the given names."""
-    outputs = []
-    for n in names:
-        out = mock.MagicMock()
-        out.name = n
-        outputs.append(out)
-    m = mock.MagicMock()
-    m.graph.outputs = outputs
-    return m
+def _mock_model_with_inputs(names: list[str]) -> ir.Model:
+    """Create a minimal ir.Model whose graph inputs have the given names."""
+    return _mock_model(inputs=names)
+
+
+def _mock_model_with_outputs(names: list[str]) -> ir.Model:
+    """Create a minimal ir.Model whose graph outputs have the given names."""
+    return _mock_model(outputs=names)
+
+
+def test_moonshine_native_runtime_is_rejected(tmp_path):
+    from mobius._model_package import ModelPackage
+
+    config = mock.MagicMock()
+    config.model_type = "moonshine"
+    package = ModelPackage(
+        {"encoder": _mock_model(), "decoder": _mock_model()},
+        config=config,
+    )
+
+    with pytest.raises(
+        NotImplementedError,
+        match="variable-length raw-waveform encoder",
+    ) as error:
+        write_ort_genai_config(package, str(tmp_path))
+    assert "onnx-genai" not in str(error.value)
+    assert "ONNX Runtime" in str(error.value)
 
 
 def _make_fake_llm_pkg(model_type: str = "qwen2"):
@@ -72,7 +93,7 @@ def _make_fake_llm_pkg(model_type: str = "qwen2"):
         max_position_embeddings: int = 128
 
     return ModelPackage(
-        {"model": mock.MagicMock()},
+        {"model": _mock_model()},
         config=FakeConfig(model_type=model_type),
     )
 
@@ -173,22 +194,92 @@ class TestWriteProcessorConfig:
         proc = data["processor"]
         assert proc["name"] == "image_processor"
         transforms = proc["transforms"]
-        assert len(transforms) == 5
+        assert len(transforms) == 4
         assert transforms[0]["operation"]["type"] == "DecodeImage"
-        assert transforms[1]["operation"]["type"] == "ConvertRGB"
-        assert transforms[2]["operation"]["type"] == "Resize"
-        assert transforms[3]["operation"]["type"] == "Rescale"
-        assert transforms[4]["operation"]["type"] == "Normalize"
+        assert transforms[1]["operation"]["type"] == "Resize"
+        assert transforms[2]["operation"]["type"] == "Rescale"
+        assert transforms[3]["operation"]["type"] == "Normalize"
 
         # Check resize attrs
-        resize_attrs = transforms[2]["operation"]["attrs"]
+        resize_attrs = transforms[1]["operation"]["attrs"]
         assert resize_attrs["patch_size"] == 14
         assert resize_attrs["merge_size"] == 2
 
         # Check normalization defaults (CLIP-standard)
-        norm_attrs = transforms[4]["operation"]["attrs"]
+        norm_attrs = transforms[3]["operation"]["attrs"]
         assert len(norm_attrs["mean"]) == 3
         assert len(norm_attrs["std"]) == 3
+
+    def test_mage_vl_writes_packed_patch_processor(self, tmp_path):
+        vision = types.SimpleNamespace(
+            image_size=448,
+            patch_size=16,
+            spatial_merge_size=2,
+            temporal_patch_size=1,
+            model_type="mage_vl_vision",
+        )
+        config = types.SimpleNamespace(
+            vision=vision,
+            model_type="mage_vl",
+            spatial_merge_size=2,
+            temporal_patch_size=1,
+        )
+
+        path = _write_vision_processor_config(config, str(tmp_path))
+        assert path is not None
+        assert path.endswith("image_processor.json")
+        with open(path) as f:
+            data = json.load(f)
+
+        assert data["processor"]["name"] == "qwen2_5_image_processor"
+        transforms = data["processor"]["transforms"]
+        assert transforms[-1]["operation"] == {
+            "name": "patch_image",
+            "type": "PatchImage",
+            "attrs": {
+                "patch_size": 16,
+                "temporal_patch_size": 1,
+                "merge_size": 2,
+            },
+        }
+        normalize = next(
+            transform["operation"]
+            for transform in transforms
+            if transform["operation"]["type"] == "Normalize"
+        )
+        assert normalize["attrs"]["qwen2_5_vl"] == 1
+
+    def test_mage_vl_processor_propagates_trust_remote_code(self, tmp_path):
+        vision = types.SimpleNamespace(
+            image_size=448,
+            patch_size=16,
+            spatial_merge_size=2,
+            temporal_patch_size=1,
+            model_type="mage_vl_vision",
+        )
+        config = types.SimpleNamespace(
+            vision=vision,
+            model_type="mage_vl",
+            spatial_merge_size=2,
+            temporal_patch_size=1,
+        )
+        hf_processor = mock.MagicMock()
+        hf_processor.image_processor = None
+        with mock.patch(
+            "transformers.AutoProcessor.from_pretrained",
+            return_value=hf_processor,
+        ) as from_pretrained:
+            _write_vision_processor_config(
+                config,
+                str(tmp_path),
+                hf_model_id="microsoft/Mage-VL",
+                trust_remote_code=True,
+            )
+
+        from_pretrained.assert_called_once_with(
+            "microsoft/Mage-VL",
+            trust_remote_code=True,
+        )
 
     def test_gemma4_unified_skips_image_processor(self, tmp_path):
         """Encoder-free gemma4_unified has no native transform: no image_processor.json."""
@@ -220,13 +311,12 @@ class TestWriteProcessorConfig:
         proc = data["processor"]
         assert proc["name"] == "pixtral_image_processor"
         transforms = proc["transforms"]
-        assert len(transforms) == 7
+        assert len(transforms) == 6
 
-        # Verify all 7 transform types in order
+        # Verify all 6 transform types in order
         types = [t["operation"]["type"] for t in transforms]
         assert types == [
             "DecodeImage",
-            "ConvertRGB",
             "Resize",
             "Rescale",
             "Normalize",
@@ -234,13 +324,54 @@ class TestWriteProcessorConfig:
             "PixtralImageSizes",
         ]
 
-        resize = transforms[2]["operation"]["attrs"]
+        resize = transforms[1]["operation"]["attrs"]
         assert resize["height"] == 1540
         assert resize["width"] == 1540
 
         # Permute3D has correct dims
-        permute = transforms[5]["operation"]["attrs"]
+        permute = transforms[4]["operation"]["attrs"]
         assert permute["dims"] == [2, 0, 1]
+
+    def test_muse_glimmer_uses_packed_qwen_image_pipeline(self, tmp_path):
+        """Muse vision consumes flattened patches and image grid dimensions.
+
+        No ``ConvertRGB``: it unconditionally swaps R and B, so pairing it with
+        ``DecodeImage(color_space="RGB")`` would hand the encoder BGR. The
+        ``qwen2_5_vl`` flag therefore lands on ``Normalize`` at index 3.
+        """
+        vision = mock.MagicMock()
+        vision.image_size = 448
+        vision.patch_size = 14
+        vision.spatial_merge_size = 2
+        vision.model_type = "muse_glimmer_vision"
+        config = mock.MagicMock()
+        config.vision = vision
+        # Composite builds unwrap to the text config before processor export.
+        config.model_type = "muse_glimmer_text"
+        config.spatial_merge_size = 2
+        config.temporal_patch_size = 2
+
+        path = _write_vision_processor_config(config, str(tmp_path))
+        assert path is not None
+        with open(path) as f:
+            data = json.load(f)
+
+        proc = data["processor"]
+        assert proc["name"] == "qwen2_5_image_processor"
+        transforms = proc["transforms"]
+        assert [t["operation"]["type"] for t in transforms] == [
+            "DecodeImage",
+            "Resize",
+            "Rescale",
+            "Normalize",
+            "PatchImage",
+        ]
+        assert transforms[3]["operation"]["attrs"]["qwen2_5_vl"] == 1
+        assert transforms[4]["operation"]["attrs"] == {
+            "patch_size": 14,
+            "temporal_patch_size": 2,
+            "merge_size": 2,
+        }
 
     def test_gemma3_vision_config(self, tmp_path):
         """Gemma3 gets a fixed-size resize + Permute3D (not the generic branch).
@@ -269,11 +400,10 @@ class TestWriteProcessorConfig:
         proc = data["processor"]
         transforms = proc["transforms"]
 
-        # 6-step pipeline ending in Permute3D (HWC→CHW).
+        # 5-step pipeline ending in Permute3D (HWC→CHW).
         types = [t["operation"]["type"] for t in transforms]
         assert types == [
             "DecodeImage",
-            "ConvertRGB",
             "Resize",
             "Rescale",
             "Normalize",
@@ -281,15 +411,262 @@ class TestWriteProcessorConfig:
         ]
 
         # Fixed-size resize: smart_resize disabled, no variable-pixel bounds.
-        resize = transforms[2]["operation"]["attrs"]
+        resize = transforms[1]["operation"]["attrs"]
         assert resize["smart_resize"] == 0
         assert resize["height"] == 896
         assert resize["width"] == 896
         assert "min_pixels" not in resize
         assert "max_pixels" not in resize
+        # SigLIP resamples bilinear; ort-extensions would default to CUBIC.
+        assert resize["interpolation"] == "LINEAR"
 
         # Trailing Permute3D matches the encoder's channels-first contract.
-        assert transforms[5]["operation"]["attrs"]["dims"] == [2, 0, 1]
+        assert transforms[4]["operation"]["attrs"]["dims"] == [2, 0, 1]
+
+    def test_gemma3n_vision_config_omits_normalize(self, tmp_path):
+        """Gemma3n shares gemma3's fixed resize but skips Normalize.
+
+        Its ``SiglipImageProcessorFast`` sets ``do_normalize=False``, so the
+        MobileNet-V5 tower is trained on [0, 1] pixels.  Emitting a mean/std-0.5
+        Normalize would map them to [-1, 1] and silently degrade every caption.
+        """
+        vision = mock.MagicMock()
+        vision.image_size = 768
+        vision.model_type = "gemma3n_vision"
+        config = mock.MagicMock()
+        config.vision = vision
+        # Unwrapped text-config model_type — NOT "gemma3n".
+        config.model_type = "gemma3n_text"
+
+        path = _write_vision_processor_config(config, str(tmp_path))
+        assert path is not None
+        assert path.endswith("processor_config.json")
+        with open(path) as f:
+            data = json.load(f)
+
+        transforms = data["processor"]["transforms"]
+        types = [t["operation"]["type"] for t in transforms]
+        assert types == [
+            "DecodeImage",
+            "Resize",
+            "Rescale",
+            "Permute3D",
+        ]
+
+        # Fixed 768x768 resize (MobileNet-V5 has no dynamic-resolution path).
+        resize = transforms[1]["operation"]["attrs"]
+        assert resize["smart_resize"] == 0
+        assert resize["height"] == 768
+        assert resize["width"] == 768
+        assert transforms[2]["operation"]["attrs"]["rescale_factor"] == pytest.approx(
+            1.0 / 255.0
+        )
+        assert transforms[-1]["operation"]["attrs"]["dims"] == [2, 0, 1]
+
+    def test_gemma3n_vision_config_honours_hf_do_normalize(self, tmp_path):
+        """A checkpoint that *does* normalize gets the Normalize step back."""
+        vision = mock.MagicMock()
+        vision.image_size = 768
+        config = mock.MagicMock()
+        config.vision = vision
+        config.model_type = "gemma3n_text"
+
+        image_processor = mock.MagicMock()
+        image_processor.image_mean = [0.5, 0.5, 0.5]
+        image_processor.image_std = [0.5, 0.5, 0.5]
+        image_processor.rescale_factor = 1.0 / 255.0
+        image_processor.do_normalize = True
+        image_processor.resample = 2
+        image_processor.size = {"height": 768, "width": 768}
+        hf_proc = mock.MagicMock()
+        hf_proc.image_processor = image_processor
+
+        with mock.patch("transformers.AutoProcessor.from_pretrained", return_value=hf_proc):
+            path = _write_vision_processor_config(
+                config, str(tmp_path), hf_model_id="google/gemma-3n-E4B-it"
+            )
+
+        with open(path) as f:
+            transforms = json.load(f)["processor"]["transforms"]
+        types = [t["operation"]["type"] for t in transforms]
+        assert types == [
+            "DecodeImage",
+            "Resize",
+            "Rescale",
+            "Normalize",
+            "Permute3D",
+        ]
+
+    @pytest.mark.parametrize(
+        "model_type,vision_model_type",
+        [
+            ("gemma3n_text", "gemma3n_vision"),
+            ("gemma3_text", "siglip_vision_model"),
+            ("mistral3", "pixtral"),
+            ("paligemma", "siglip_vision_model"),
+        ],
+    )
+    def test_no_pipeline_emits_convert_rgb(self, tmp_path, model_type, vision_model_type):
+        """ConvertRGB after DecodeImage(RGB) hands the encoder BGR.
+
+        ort-extensions' ``convert_to_rgb`` swaps R and B *unconditionally* — it
+        is the fix-up for a BGR decode, not a no-op assertion of RGB-ness.
+        Chaining it onto ``DecodeImage(color_space="RGB")`` therefore inverted
+        the red and blue channels of every image fed to every exported VLM.
+        Measured against HF's own processor on a 1920x1242 JPEG, that put the
+        pixel tensor 22% (relative L2) away from the reference; dropping the
+        step brings it to 0.01%.
+        """
+        vision = mock.MagicMock()
+        vision.image_size = 768
+        vision.patch_size = 14
+        vision.spatial_merge_size = 2
+        vision.model_type = vision_model_type
+        config = mock.MagicMock()
+        config.vision = vision
+        config.model_type = model_type
+        config.spatial_merge_size = 2
+
+        path = _write_vision_processor_config(config, str(tmp_path))
+        with open(path) as f:
+            transforms = json.load(f)["processor"]["transforms"]
+
+        types = [t["operation"]["type"] for t in transforms]
+        assert "ConvertRGB" not in types
+        assert types[0] == "DecodeImage"
+        assert transforms[0]["operation"]["attrs"]["color_space"] == "RGB"
+
+    @pytest.mark.parametrize(
+        "resample,expected",
+        [(0, "NEAREST"), (1, "LANCZOS"), (2, "LINEAR"), (3, "CUBIC")],
+    )
+    def test_resize_interpolation_follows_hf_resample(self, tmp_path, resample, expected):
+        """The HF processor's PIL ``resample`` must reach the Resize step.
+
+        ort-extensions defaults to CUBIC while HF image processors
+        overwhelmingly use PIL BILINEAR (``resample=2``), so leaving the
+        attribute off silently resamples with the wrong kernel.
+        """
+        vision = mock.MagicMock()
+        vision.image_size = 768
+        vision.model_type = "gemma3n_vision"
+        config = mock.MagicMock()
+        config.vision = vision
+        config.model_type = "gemma3n_text"
+
+        image_processor = mock.MagicMock()
+        image_processor.image_mean = [0.5, 0.5, 0.5]
+        image_processor.image_std = [0.5, 0.5, 0.5]
+        image_processor.rescale_factor = 1.0 / 255.0
+        image_processor.do_normalize = False
+        image_processor.resample = resample
+        image_processor.size = {"height": 768, "width": 768}
+        hf_proc = mock.MagicMock()
+        hf_proc.image_processor = image_processor
+
+        with mock.patch("transformers.AutoProcessor.from_pretrained", return_value=hf_proc):
+            path = _write_vision_processor_config(
+                config, str(tmp_path), hf_model_id="google/gemma-3n-E4B-it"
+            )
+
+        with open(path) as f:
+            transforms = json.load(f)["processor"]["transforms"]
+        resize = next(t["operation"] for t in transforms if t["operation"]["type"] == "Resize")
+        assert resize["attrs"]["interpolation"] == expected
+
+    def test_unsupported_resample_omits_interpolation(self, tmp_path):
+        """PIL BOX/HAMMING have no ort-extensions filter: fall back, don't crash."""
+        vision = mock.MagicMock()
+        vision.image_size = 768
+        vision.model_type = "gemma3n_vision"
+        config = mock.MagicMock()
+        config.vision = vision
+        config.model_type = "gemma3n_text"
+
+        image_processor = mock.MagicMock()
+        image_processor.image_mean = [0.5, 0.5, 0.5]
+        image_processor.image_std = [0.5, 0.5, 0.5]
+        image_processor.rescale_factor = 1.0 / 255.0
+        image_processor.do_normalize = False
+        image_processor.resample = 4  # PIL BOX
+        image_processor.size = {"height": 768, "width": 768}
+        hf_proc = mock.MagicMock()
+        hf_proc.image_processor = image_processor
+
+        with mock.patch("transformers.AutoProcessor.from_pretrained", return_value=hf_proc):
+            path = _write_vision_processor_config(
+                config, str(tmp_path), hf_model_id="google/gemma-3n-E4B-it"
+            )
+
+        with open(path) as f:
+            transforms = json.load(f)["processor"]["transforms"]
+        resize = next(t["operation"] for t in transforms if t["operation"]["type"] == "Resize")
+        assert "interpolation" not in resize["attrs"]
+
+    def test_size_mapping_reads_transformers_v5_size_dict(self, tmp_path):
+        """``image_processor.size`` is a SizeDict, not a dict, in transformers >= 5.
+
+        An ``isinstance(size, dict)`` guard silently discards it and falls back
+        to the hardcoded per-family default, so a checkpoint at any other
+        resolution would export a processor config that disagrees with the
+        encoder's own input shape.
+        """
+
+        class SizeDict:  # mirrors transformers.image_utils.SizeDict: not a dict
+            height = 512
+            width = 512
+            longest_edge = None
+            shortest_edge = None
+
+            def get(self, key, default=None):
+                return getattr(self, key, default)
+
+        vision = mock.MagicMock()
+        vision.image_size = 768
+        vision.model_type = "gemma3n_vision"
+        config = mock.MagicMock()
+        config.vision = vision
+        config.model_type = "gemma3n_text"
+
+        image_processor = mock.MagicMock()
+        image_processor.image_mean = [0.5, 0.5, 0.5]
+        image_processor.image_std = [0.5, 0.5, 0.5]
+        image_processor.rescale_factor = 1.0 / 255.0
+        image_processor.do_normalize = False
+        image_processor.resample = 2
+        image_processor.size = SizeDict()
+        hf_proc = mock.MagicMock()
+        hf_proc.image_processor = image_processor
+
+        with mock.patch("transformers.AutoProcessor.from_pretrained", return_value=hf_proc):
+            path = _write_vision_processor_config(
+                config, str(tmp_path), hf_model_id="google/gemma-3n-E4B-it"
+            )
+
+        with open(path) as f:
+            transforms = json.load(f)["processor"]["transforms"]
+        resize = next(t["operation"] for t in transforms if t["operation"]["type"] == "Resize")
+        assert resize["attrs"]["height"] == 512
+        assert resize["attrs"]["width"] == 512
+
+    def test_gemma3_vision_config_keeps_normalize(self, tmp_path):
+        """Sharing the branch with gemma3n must not drop gemma3's Normalize."""
+        vision = mock.MagicMock()
+        vision.image_size = 896
+        vision.model_type = "siglip_vision_model"
+        config = mock.MagicMock()
+        config.vision = vision
+        config.model_type = "gemma3_text"
+
+        path = _write_vision_processor_config(config, str(tmp_path))
+
+        with open(path) as f:
+            transforms = json.load(f)["processor"]["transforms"]
+        normalize = next(
+            t["operation"] for t in transforms if t["operation"]["type"] == "Normalize"
+        )
+        assert normalize["attrs"]["mean"] == [0.5, 0.5, 0.5]
+        assert normalize["attrs"]["std"] == [0.5, 0.5, 0.5]
 
     def test_siglip_vision_config_non_gemma3_uses_generic_branch(self, tmp_path):
         """A SigLIP vision tower alone is not enough to select Gemma3 preprocessing."""
@@ -310,8 +687,8 @@ class TestWriteProcessorConfig:
 
         transforms = data["processor"]["transforms"]
         types = [t["operation"]["type"] for t in transforms]
-        assert types == ["DecodeImage", "ConvertRGB", "Resize", "Rescale", "Normalize"]
-        resize = transforms[2]["operation"]["attrs"]
+        assert types == ["DecodeImage", "Resize", "Rescale", "Normalize"]
+        resize = transforms[1]["operation"]["attrs"]
         assert resize["smart_resize"] == 1
         assert "min_pixels" in resize
         assert "max_pixels" in resize
@@ -342,7 +719,7 @@ class TestWriteProcessorConfig:
 
         proc = data["processor"]
         # Should use CLIP-standard normalization defaults
-        normalize = proc["transforms"][4]["operation"]["attrs"]
+        normalize = proc["transforms"][3]["operation"]["attrs"]
         assert normalize["mean"] == pytest.approx([0.48145466, 0.4578275, 0.40821073])
         assert normalize["std"] == pytest.approx([0.26862954, 0.26130258, 0.27577711])
 
@@ -665,6 +1042,29 @@ class TestExportForOrtGenai:
         assert "model" in data
         assert data["model"]["type"] == "qwen2"
 
+    def test_rejects_generic_vision_encoder_decoder_package(self, tmp_path):
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "nemotron_parse"
+
+        pkg = ModelPackage(
+            {
+                "vision_encoder": _mock_model(),
+                "decoder": _mock_model(),
+            },
+            config=FakeConfig(),
+        )
+        with pytest.raises(
+            NotImplementedError,
+            match="does not support generic vision encoder-decoder",
+        ):
+            write_ort_genai_config(pkg, str(tmp_path))
+        assert not (tmp_path / "genai_config.json").exists()
+
     def test_processor_config_written_with_vision(self, tmp_path):
         """image_processor.json is written when pkg.config.vision is set."""
         import dataclasses
@@ -693,9 +1093,9 @@ class TestExportForOrtGenai:
 
         pkg = ModelPackage(
             {
-                "model": mock.MagicMock(),
-                "vision_encoder": mock.MagicMock(),
-                "embedding": mock.MagicMock(),
+                "model": _mock_model(),
+                "vision_encoder": _mock_model(),
+                "embedding": _mock_model(),
             },
             config=FakeConfig(),
         )
@@ -710,7 +1110,7 @@ class TestExportForOrtGenai:
         transforms = data["processor"]["transforms"]
         assert len(transforms) >= 4
         # Verify resize uses config values
-        resize = transforms[2]["operation"]["attrs"]
+        resize = transforms[1]["operation"]["attrs"]
         assert resize["patch_size"] == 14
 
     def test_qwen3_vl_writes_qwen3_vl_model_type_and_vision_fields(self, tmp_path):
@@ -745,9 +1145,9 @@ class TestExportForOrtGenai:
 
         pkg = ModelPackage(
             {
-                "decoder": mock.MagicMock(),
-                "vision_encoder": mock.MagicMock(),
-                "embedding": mock.MagicMock(),
+                "decoder": _mock_model(),
+                "vision_encoder": _mock_model(),
+                "embedding": _mock_model(),
             },
             config=FakeConfig(),
         )
@@ -763,6 +1163,48 @@ class TestExportForOrtGenai:
         assert model["vision"]["tokens_per_second"] == pytest.approx(2.0)
         assert model["vision"]["patch_size"] == 16
         assert model["vision"]["window_size"] == 64
+
+    def test_mage_vl_is_rejected_before_writing_runtime_artifacts(self, tmp_path):
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 448
+            patch_size: int = 16
+            spatial_merge_size: int = 2
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "mage_vl"
+            vocab_size: int = 151936
+            hidden_size: int = 2560
+            num_hidden_layers: int = 1
+            num_attention_heads: int = 32
+            num_key_value_heads: int = 8
+            head_dim: int = 128
+            image_token_id: int = 151655
+            temporal_patch_size: int = 1
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+
+        pkg = ModelPackage(
+            {
+                "decoder": _mock_model(),
+                "vision_encoder": _mock_model(),
+                "embedding": _mock_model(),
+            },
+            config=FakeConfig(),
+        )
+
+        output_dir = tmp_path / "ort-genai"
+        with pytest.raises(
+            ValueError,
+            match=r"Mage-VL.*patch_positions.*1D decoder position_ids",
+        ):
+            write_ort_genai_config(pkg, str(output_dir))
+        assert not output_dir.exists()
 
     def test_processor_config_not_written_without_vision(self, tmp_path):
         """image_processor.json is NOT written when pkg.config has no vision attr."""
@@ -801,9 +1243,9 @@ class TestExportForOrtGenai:
 
         pkg = ModelPackage(
             {
-                "model": mock.MagicMock(),
-                "vision": mock.MagicMock(),
-                "embedding": mock.MagicMock(),
+                "model": _mock_model(),
+                "vision": _mock_model(),
+                "embedding": _mock_model(),
             },
             config=FakeConfig(),
         )
@@ -861,9 +1303,9 @@ class TestExportForOrtGenai:
 
         pkg = ModelPackage(
             {
-                "model": mock.MagicMock(),
-                "audio_encoder": mock.MagicMock(),
-                "embedding": mock.MagicMock(),
+                "model": _mock_model(),
+                "audio_encoder": _mock_model(),
+                "embedding": _mock_model(),
             },
             config=FakeConfig(),
         )
@@ -911,7 +1353,7 @@ class TestExportForOrtGenai:
             num_key_value_heads: int = 1
             head_dim: int = 256
 
-        pkg = ModelPackage({"model": mock.MagicMock()}, config=FakeConfig())
+        pkg = ModelPackage({"model": _mock_model()}, config=FakeConfig())
         result = write_ort_genai_config(pkg, str(tmp_path))
 
         assert "audio_processor" not in result
@@ -943,9 +1385,9 @@ class TestExportForOrtGenai:
 
         pkg = ModelPackage(
             {
-                "model": mock.MagicMock(),
-                "audio_encoder": mock.MagicMock(),
-                "embedding": mock.MagicMock(),
+                "model": _mock_model(),
+                "audio_encoder": _mock_model(),
+                "embedding": _mock_model(),
             },
             config=FakeConfig(),
         )
@@ -1001,6 +1443,30 @@ class TestExportForOrtGenai:
         mock_copy.assert_called_once_with("fake/model", str(tmp_path))
         assert "tokenizer.json" in result
 
+    def test_hf_config_propagates_trust_remote_code(self, tmp_path):
+        """Remote-code models can resolve their HuggingFace configuration."""
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        pkg = self._make_pkg()
+        with (
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files",
+                return_value=[],
+            ),
+            mock.patch("transformers.AutoConfig.from_pretrained") as mock_hf,
+        ):
+            mock_hf.return_value = mock.MagicMock(
+                model_type="mage_vl", bos_token_id=1, eos_token_id=2, pad_token_id=0
+            )
+            write_ort_genai_config(
+                pkg,
+                str(tmp_path),
+                hf_model_id="microsoft/Mage-VL",
+                trust_remote_code=True,
+            )
+
+        mock_hf.assert_called_once_with("microsoft/Mage-VL", trust_remote_code=True)
+
     def test_ep_default_normalizes_to_cpu(self, tmp_path):
         """ep='default' is normalized to cpu (provider_options=[])."""
         from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
@@ -1041,7 +1507,7 @@ class TestExportForOrtGenai:
         from mobius._model_package import ModelPackage
         from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
 
-        pkg = ModelPackage({"model": mock.MagicMock()}, config=None)
+        pkg = ModelPackage({"model": _mock_model()}, config=None)
         with pytest.raises(ValueError, match="config"):
             write_ort_genai_config(pkg, str(tmp_path))
 
@@ -1081,7 +1547,7 @@ class TestExportForOrtGenai:
             head_dim: int = 16
             max_position_embeddings: int = 128
 
-        pkg = ModelPackage({"model": mock.MagicMock()}, config=FakeConfig())
+        pkg = ModelPackage({"model": _mock_model()}, config=FakeConfig())
         result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
 
         with open(result["genai_config"]) as f:
@@ -1131,6 +1597,256 @@ class TestExportForOrtGenai:
             data = json.load(f)
         assert data["model"]["type"] == "gemma3"
 
+    def test_config_mode_gemma3n_text_vlm_uses_multimodal_model_type(self, tmp_path):
+        """Gemma3n unwraps to "gemma3n_text" too, and must not alias to gemma3.
+
+        Its package threads ``per_layer_inputs`` (and optional audio) that
+        gemma3's ORT pipeline does not bind, so borrowing that type would
+        mis-wire the graph.
+        """
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 768
+            model_type: str = "gemma3n_vision"
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            # build() stores the unwrapped text sub-config type on Gemma3n VLMs.
+            model_type: str = "gemma3n_text"
+            vocab_size: int = 262400
+            hidden_size: int = 64
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 4
+            num_key_value_heads: int = 2
+            head_dim: int = 16
+            max_position_embeddings: int = 128
+            image_token_id: int = 262145
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+
+        pkg = ModelPackage(
+            {
+                "decoder": _mock_model_with_inputs(
+                    ["inputs_embeds", "attention_mask", "per_layer_inputs"]
+                ),
+                "vision_encoder": _mock_model_with_inputs(["pixel_values"]),
+                "embedding": _mock_model_with_inputs(["input_ids", "image_features"]),
+            },
+            config=FakeConfig(),
+        )
+        result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+        assert data["model"]["type"] == "gemma3n"
+
+    def test_gemma3n_references_only_processor_files_that_exist(self, tmp_path):
+        """Every processor file genai_config.json names must be on disk.
+
+        Gemma3n is the first model to reach the ``elif has_speech`` vision
+        branch, which sets no ``config_filename``; it used to inherit
+        ``with_vision``'s "image_processor.json" default (written only for
+        gemma4) while ``_write_vision_processor_config`` wrote
+        processor_config.json. The audio side had no writer at all, so
+        ``with_audio``'s "audio_processor.json" default dangled too. Both
+        references pointed at files that were never created.
+
+        Vision and audio are deliberately two different files: ORT-GenAI loads
+        them via ``OrtxCreateProcessor`` and
+        ``OrtxCreateSpeechFeatureExtractor`` respectively, which parse
+        different schemas. Dropping either reference is not an option — the
+        runtime throws when ``speech.filename`` is set without
+        ``speech.config_filename``.
+        """
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 768
+            model_type: str = "gemma3n_vision"
+
+        @dataclasses.dataclass
+        class FakeAudio:
+            model_type: str = "gemma3n_audio"
+            input_feat_size: int = 128
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "gemma3n_text"
+            vocab_size: int = 262400
+            hidden_size: int = 64
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 4
+            num_key_value_heads: int = 2
+            head_dim: int = 16
+            max_position_embeddings: int = 128
+            image_token_id: int = 262145
+            audio_token_id: int = 262273
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+            audio: FakeAudio = dataclasses.field(default_factory=FakeAudio)
+
+        pkg = ModelPackage(
+            {
+                "decoder": _mock_model_with_inputs(
+                    ["inputs_embeds", "attention_mask", "per_layer_inputs"]
+                ),
+                "vision_encoder": _mock_model_with_inputs(["pixel_values"]),
+                "audio_encoder": _mock_model_with_inputs(
+                    ["input_features", "input_features_mask"]
+                ),
+                "embedding": _mock_model_with_inputs(
+                    ["input_ids", "image_features", "audio_features"]
+                ),
+            },
+            config=FakeConfig(),
+        )
+        result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
+
+        with open(result["genai_config"]) as f:
+            model = json.load(f)["model"]
+
+        # Each modality must name the file its own writer actually produced.
+        assert model["vision"]["config_filename"] == "processor_config.json"
+        assert model["speech"]["config_filename"] == "audio_feature_extraction.json"
+
+        # Both must be on disk. Every processor reference is checked, so a new
+        # section that names a file nothing writes fails here too.
+        for section in ("vision", "speech"):
+            named = model[section]["config_filename"]
+            assert os.path.exists(os.path.join(str(tmp_path), named)), (
+                f"genai_config.json model.{section} references {named!r}, "
+                "which was never written"
+            )
+
+    def test_gemma3n_speech_inputs_use_runtime_schema_keys(self, tmp_path):
+        """``model.speech.inputs`` keys are a closed set, not graph names.
+
+        Unlike the decoder and vision sections — where the keys happen to equal
+        the graph input names, so an introspected identity map works — ORT-GenAI
+        defines exactly four accepted keys for the speech section
+        (``audio_embeds``, ``attention_mask``, ``audio_sizes``,
+        ``audio_projection_mode``) and maps each to a graph name. Passing
+        ``_introspect_inputs``' identity map made the config unparseable:
+        ``model:speech:inputs: Unknown value "input_features"``.
+        """
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 768
+            model_type: str = "gemma3n_vision"
+
+        @dataclasses.dataclass
+        class FakeAudio:
+            model_type: str = "gemma3n_audio"
+            input_feat_size: int = 128
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "gemma3n_text"
+            vocab_size: int = 262400
+            hidden_size: int = 64
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 4
+            num_key_value_heads: int = 2
+            head_dim: int = 16
+            max_position_embeddings: int = 128
+            image_token_id: int = 262145
+            audio_token_id: int = 262273
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+            audio: FakeAudio = dataclasses.field(default_factory=FakeAudio)
+
+        pkg = ModelPackage(
+            {
+                "decoder": _mock_model_with_inputs(
+                    ["inputs_embeds", "attention_mask", "per_layer_inputs"]
+                ),
+                "vision_encoder": _mock_model_with_inputs(["pixel_values"]),
+                "audio_encoder": _mock_model_with_inputs(
+                    ["input_features", "input_features_mask"]
+                ),
+                "embedding": _mock_model_with_inputs(
+                    ["input_ids", "image_features", "audio_features"]
+                ),
+            },
+            config=FakeConfig(),
+        )
+        result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
+
+        with open(result["genai_config"]) as f:
+            speech = json.load(f)["model"]["speech"]
+
+        # Schema key -> graph name, same as the gemma4 branch above.
+        assert speech["inputs"] == {
+            "audio_embeds": "input_features",
+            "attention_mask": "input_features_mask",
+        }
+
+        # No key may be a graph name the runtime doesn't recognise. This is the
+        # assertion that fails if someone reintroduces the identity map.
+        assert set(speech["inputs"]) <= {
+            "audio_embeds",
+            "attention_mask",
+            "audio_sizes",
+            "audio_projection_mode",
+        }
+
+    def test_gemma3n_audio_processor_uses_gemma3n_mel_params(self, tmp_path):
+        """Gemma3n reuses gemma4's op but not its filterbank values.
+
+        Gemma3nAudioFeatureExtractor is a different mel filterbank from
+        gemma4's; copying gemma4's attrs would silently degrade transcription
+        rather than fail. Values are from the E4B preprocessor_config.json.
+        """
+        import dataclasses
+
+        @dataclasses.dataclass
+        class FakeAudio:
+            model_type: str = "gemma3n_audio"
+            input_feat_size: int = 128
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "gemma3n_text"
+            audio: FakeAudio = dataclasses.field(default_factory=FakeAudio)
+
+        path = _write_audio_processor_config(FakeConfig(), str(tmp_path))
+        assert path is not None
+        assert path.endswith("audio_feature_extraction.json")
+
+        with open(path) as f:
+            sequence = json.load(f)["feature_extraction"]["sequence"]
+
+        # OrtxCreateSpeechFeatureExtractor requires the feature_extraction
+        # .sequence schema, decoder first.
+        assert sequence[0]["operation"]["type"] == "AudioDecoder"
+        op = sequence[1]["operation"]
+        assert op["type"] == "Gemma4LogMel"
+
+        # frame_length 512 / hop_length 160 samples @ 16 kHz, in milliseconds.
+        assert op["attrs"] == {
+            "feature_size": 128,
+            "sampling_rate": 16000,
+            "frame_length_ms": 32.0,
+            "hop_length_ms": 10.0,
+            "min_frequency": 125.0,
+            "max_frequency": 7600.0,
+            "preemphasis": 0.97,
+            "preemphasis_htk_flavor": 1,
+            "fft_overdrive": 1,
+            "mel_floor": 1e-05,
+        }
+
     def test_config_mode_token_ids_propagated(self, tmp_path):
         """bos/eos token IDs in genai_config.json come from config fields in --config mode."""
         import dataclasses
@@ -1152,7 +1868,7 @@ class TestExportForOrtGenai:
             eos_token_id: int = 2
             pad_token_id: int = 0
 
-        pkg = ModelPackage({"model": mock.MagicMock()}, config=FakeConfig())
+        pkg = ModelPackage({"model": _mock_model()}, config=FakeConfig())
         result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
 
         with open(result["genai_config"]) as f:
@@ -1182,7 +1898,7 @@ class TestExportForOrtGenai:
             eos_token_id: list = dataclasses.field(default_factory=lambda: [1, 106])
             pad_token_id: int = 0
 
-        pkg = ModelPackage({"model": mock.MagicMock()}, config=FakeConfig())
+        pkg = ModelPackage({"model": _mock_model()}, config=FakeConfig())
         result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
 
         with open(result["genai_config"]) as f:
@@ -1219,6 +1935,18 @@ class TestExportPackage:
         assert os.path.isfile(result["genai_config"])
         # ONNX path is in the manifest (single-component package)
         assert result["model"] == os.path.join(str(tmp_path), "model.onnx")
+
+    def test_mage_vl_is_rejected_before_saving_onnx(self, tmp_path):
+        pkg = self._make_pkg()
+        pkg.config.model_type = "mage_vl"
+
+        with (
+            mock.patch.object(pkg, "save") as save,
+            pytest.raises(ValueError, match=r"Mage-VL.*patch_positions"),
+        ):
+            export_package(pkg, str(tmp_path))
+
+        save.assert_not_called()
 
     def test_propagates_save_kwargs(self, tmp_path, monkeypatch):
         """external_data and progress_bar are forwarded to pkg.save."""
@@ -1273,7 +2001,7 @@ class TestExportPackage:
         from mobius._model_package import ModelPackage
         from mobius.integrations.ort_genai.auto_export import export_package
 
-        pkg = ModelPackage({"model": mock.MagicMock()}, config=None)
+        pkg = ModelPackage({"model": _mock_model()}, config=None)
         save_called = []
 
         def fake_save(self, *a, **kw):
@@ -1506,6 +2234,113 @@ class TestPixtralGenaiConfig:
         assert data["model"]["image_token_id"] == 10
 
 
+class TestHybridAttentionShareBufferGuard:
+    """Tests for the LinearAttention/GQA past_present_share_buffer guard.
+
+    See the comment above ``supports_in_place_kv_cache`` in
+    ``_write_genai_config``: recurrent-state layers (LinearAttention)
+    mandate ``past_present_share_buffer=True``, but standard (non-GQA)
+    Attention is incompatible with it. A hybrid graph with both, and no
+    GQA node to lower the standard Attention layers to, must raise a clear
+    build-time error rather than silently emit a broken config.
+    """
+
+    @staticmethod
+    def _make_pkg(node_op_types: list[tuple[str, str]]):
+        """Build a fake decoder pkg whose graph has the given (op_type, domain) nodes."""
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "qwen35_moe"
+            vocab_size: int = 256
+            hidden_size: int = 64
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 4
+            num_key_value_heads: int = 2
+            head_dim: int = 16
+            max_position_embeddings: int = 128
+
+        nodes = [
+            ir.Node(op_type=op_type, domain=domain, inputs=[], num_outputs=1)
+            for op_type, domain in node_op_types
+        ]
+        graph = ir.Graph(
+            inputs=[ir.Value(name="input_ids")],
+            outputs=[ir.Value(name="logits")],
+            nodes=nodes,
+            name="decoder",
+        )
+        decoder = ir.Model(graph, ir_version=10)
+        return ModelPackage({"model": decoder}, config=FakeConfig())
+
+    def _write(self, pkg, tmp_path):
+        return _write_genai_config(
+            pkg.config,
+            str(tmp_path),
+            pkg=pkg,
+            ort_model_type="qwen35_moe",
+            ep="cpu",
+            context_length=4096,
+            bos_token_id=1,
+            eos_token_id=2,
+            pad_token_id=0,
+            is_vlm=False,
+            has_speech=False,
+        )
+
+    def test_recurrent_state_with_standard_attention_and_no_gqa_raises(self, tmp_path):
+        """LinearAttention + standard Attention + no GQA is an unrunnable config."""
+        pkg = self._make_pkg(
+            [("LinearAttention", "com.microsoft"), ("Attention", "")],
+        )
+        with pytest.raises(ValueError, match="past_present_share_buffer"):
+            self._write(pkg, tmp_path)
+
+    def test_recurrent_state_with_gqa_does_not_raise(self, tmp_path):
+        """LinearAttention + GQA (no standard Attention) is a valid hybrid config."""
+        pkg = self._make_pkg(
+            [
+                ("LinearAttention", "com.microsoft"),
+                ("GroupQueryAttention", "com.microsoft"),
+            ],
+        )
+        path = self._write(pkg, tmp_path)
+        with open(path) as f:
+            data = json.load(f)
+        assert data["search"]["past_present_share_buffer"] is True
+
+    def test_recurrent_state_with_standard_attention_and_gqa_raises(self, tmp_path):
+        """Partial GQA fusion still leaves an incompatible standard Attention node.
+
+        Regression test: the guard previously read
+        ``has_recurrent_state and has_standard_attention and not has_gqa``, so
+        a GQA node present *anywhere* in the graph would short-circuit the
+        check even though a separate, unfused standard Attention node
+        coexists. A GQA node on one layer doesn't make a standard Attention
+        node on another layer safe for ``past_present_share_buffer=True``.
+        """
+        pkg = self._make_pkg(
+            [
+                ("LinearAttention", "com.microsoft"),
+                ("GroupQueryAttention", "com.microsoft"),
+                ("Attention", ""),
+            ],
+        )
+        with pytest.raises(ValueError, match="past_present_share_buffer"):
+            self._write(pkg, tmp_path)
+
+    def test_recurrent_state_only_does_not_raise(self, tmp_path):
+        """LinearAttention with no full-attention layers at all is unaffected."""
+        pkg = self._make_pkg([("LinearAttention", "com.microsoft")])
+        path = self._write(pkg, tmp_path)
+        with open(path) as f:
+            data = json.load(f)
+        assert data["search"]["past_present_share_buffer"] is True
+
+
 class TestGraphInputNames:
     """Tests for _graph_input_names() helper."""
 
@@ -1593,15 +2428,54 @@ class TestIntrospectVisionOutputs:
         assert _introspect_outputs(pkg, "vision_encoder") is None
 
 
+class TestCountCacheLayerSlots:
+    """Tests for _count_cache_layer_slots() helper."""
+
+    def test_counts_key_inputs(self):
+        """Counts past_key_values.{i}.key inputs, not the value pairs."""
+        model = _mock_model_with_inputs(
+            [
+                "input_ids",
+                "attention_mask",
+                "past_key_values.0.key",
+                "past_key_values.0.value",
+                "past_key_values.1.key",
+                "past_key_values.1.value",
+            ]
+        )
+        assert _count_cache_layer_slots(model) == 2
+
+    def test_uses_global_indices_across_hybrid_cache_types(self):
+        model = _mock_model_with_inputs(
+            [
+                "past_key_values.0.conv_state",
+                "past_key_values.1.key",
+                "past_key_values.1.value",
+                "past_key_values.3.recurrent_state",
+            ]
+        )
+        assert _count_cache_layer_slots(model) == 4
+
+    def test_returns_none_without_kv_cache(self):
+        """A static-cache export (key_cache.{i}) falls back to the config."""
+        model = _mock_model_with_inputs(["input_ids", "key_cache.0", "value_cache.0"])
+        assert _count_cache_layer_slots(model) is None
+
+    def test_returns_none_for_missing_model(self):
+        assert _count_cache_layer_slots(None) is None
+
+
 class TestGemma4RealModel:
     """Build a real tiny Gemma4 model and verify genai config inputs."""
 
     def test_gemma4_genai_config_from_real_model(self, tmp_path):
         """Build tiny Gemma4 VLM, generate genai config, verify inputs."""
         from mobius._builder import build_from_module
-        from mobius._config_resolver import _default_task_for_model
         from mobius._configs import Gemma4Config, VisionConfig
         from mobius._registry import registry
+        from mobius.integrations.transformers._config_resolver import (
+            _default_task_for_model,
+        )
         from mobius.tasks import get_task
 
         config = Gemma4Config(
@@ -1682,10 +2556,13 @@ class TestGemma4RealModel:
         (``gemma4_text``), NOT the multimodal HF config (``gemma4_unified``),
         and that no vision/audio sections or processor files are written.
         """
-        from mobius._builder import _strip_to_text_only, build_from_module
-        from mobius._config_resolver import _default_task_for_model
+        from mobius._builder import build_from_module
         from mobius._configs import Gemma4Config
         from mobius._registry import registry
+        from mobius.integrations.transformers._builder import _strip_to_text_only
+        from mobius.integrations.transformers._config_resolver import (
+            _default_task_for_model,
+        )
         from mobius.tasks import get_task
 
         # Start from a multimodal-flavoured config and strip to text-only, the
@@ -1780,7 +2657,7 @@ class TestGemma4RealModel:
             return {"genai_config": os.path.join(output_dir, "genai_config.json")}
 
         with (
-            mock.patch("mobius._builder.build", side_effect=fake_build),
+            mock.patch("mobius.integrations.transformers.build", side_effect=fake_build),
             mock.patch(
                 "mobius.integrations.ort_genai.auto_export.export_package",
                 side_effect=fake_export_package,
@@ -1792,7 +2669,7 @@ class TestGemma4RealModel:
 
         captured.clear()
         with (
-            mock.patch("mobius._builder.build", side_effect=fake_build),
+            mock.patch("mobius.integrations.transformers.build", side_effect=fake_build),
             mock.patch(
                 "mobius.integrations.ort_genai.auto_export.export_package",
                 side_effect=fake_export_package,
@@ -1802,6 +2679,18 @@ class TestGemma4RealModel:
         # cpu maps to the portable default build (backward compatible).
         assert captured["execution_provider"] == "default"
         assert captured["text_only"] is False
+
+    def test_auto_export_rejects_mage_vl_before_saving(self, tmp_path):
+        pkg = _make_fake_llm_pkg("mage_vl")
+
+        with (
+            mock.patch("mobius.integrations.transformers.build", return_value=pkg),
+            mock.patch.object(pkg, "save") as save,
+            pytest.raises(ValueError, match=r"Mage-VL.*patch_positions"),
+        ):
+            auto_export("microsoft/Mage-VL", str(tmp_path))
+
+        save.assert_not_called()
 
     def test_auto_export_produces_genai_config(self, tmp_path):
         """Mock build() to return a tiny package, verify genai_config."""

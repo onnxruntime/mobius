@@ -6,13 +6,16 @@
 from __future__ import annotations
 
 import logging
+import threading
+import types
 
 import onnx_ir as ir
+import pytest
 import torch
 
 from mobius._builder import build_from_module
 from mobius._configs import VisionConfig
-from mobius._model_package import ModelPackage
+from mobius._model_package import ModelPackage, _make_progress_callback
 from mobius._testing import make_config
 from mobius.models.base import CausalLMModel
 from mobius.models.gemma3 import Gemma3MultiModalModel
@@ -36,6 +39,14 @@ class TestModelPackageDict:
         m = _make_simple_model()
         pkg["new"] = m
         assert pkg["new"] is m
+
+    def test_rejects_component_without_graph(self):
+        with pytest.raises(TypeError, match=r"must be an ir\.Model with a graph"):
+            ModelPackage({"invalid": object()})  # type: ignore[arg-type]
+
+        pkg = ModelPackage()
+        with pytest.raises(TypeError, match=r"must be an ir\.Model with a graph"):
+            pkg["invalid"] = object()  # type: ignore[assignment]
 
     def test_delitem(self):
         pkg = ModelPackage({"a": _make_simple_model()})
@@ -77,6 +88,241 @@ class TestModelPackageDict:
         assert pkg.config is config
 
 
+class TestOnnxShardedSave:
+    def test_onnx_external_data_is_sharded(self, tmp_path):
+        graph = ir.Graph([], [], nodes=[], name="m")
+        for index in range(6):
+            name = f"weight_{index}"
+            graph.register_initializer(
+                ir.Value(
+                    name=name,
+                    const_value=ir.Tensor(
+                        torch.full((1024,), index, dtype=torch.float32),
+                        name=name,
+                        dtype=ir.DataType.FLOAT,
+                    ),
+                )
+            )
+        pkg = ModelPackage({"m": ir.Model(graph, ir_version=10)})
+
+        pkg.save(
+            str(tmp_path),
+            external_data="onnx",
+            max_shard_size_bytes=8192,
+            progress_bar=False,
+        )
+
+        shards = sorted(
+            [
+                *tmp_path.glob("model-*-of-*.onnx.data"),
+                # onnx_ir 1.0.0 did not yet recognize .onnx.data as a
+                # compound suffix.
+                *tmp_path.glob("model.onnx-*-of-*.data"),
+            ]
+        )
+        assert len(shards) == 3
+        assert all(shard.stat().st_size <= 8192 for shard in shards)
+        loaded = ModelPackage.load(str(tmp_path))
+        assert set(loaded.data) == {"model"}
+
+    def test_defaults_to_eight_workers_when_supported(self, tmp_path, monkeypatch):
+        calls = []
+
+        def save(
+            model,
+            path,
+            *,
+            external_data,
+            max_shard_size_bytes,
+            callback,
+            max_workers,
+        ):
+            calls.append(max_workers)
+
+        monkeypatch.setattr(ir, "save", save)
+
+        ModelPackage({"m": _make_simple_model()}).save(
+            str(tmp_path), progress_bar=False, check_weights=False
+        )
+
+        assert calls == [8]
+
+    def test_forwards_serial_worker_override(self, tmp_path, monkeypatch):
+        calls = []
+
+        def save(
+            model,
+            path,
+            *,
+            external_data,
+            max_shard_size_bytes,
+            callback,
+            max_workers,
+        ):
+            calls.append(max_workers)
+
+        monkeypatch.setattr(ir, "save", save)
+
+        ModelPackage({"m": _make_simple_model()}).save(
+            str(tmp_path),
+            max_workers=1,
+            progress_bar=False,
+            check_weights=False,
+        )
+
+        assert calls == [1]
+
+    def test_omits_max_workers_for_onnx_ir_1_0(self, tmp_path, monkeypatch):
+        calls = []
+
+        def save(model, path, *, external_data, max_shard_size_bytes, callback):
+            calls.append((model, path))
+
+        monkeypatch.setattr(ir, "save", save)
+
+        ModelPackage({"m": _make_simple_model()}).save(
+            str(tmp_path), progress_bar=False, check_weights=False
+        )
+
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize("max_workers", [0, -1])
+    def test_rejects_non_positive_max_workers(self, tmp_path, max_workers):
+        with pytest.raises(ValueError, match="max_workers must be positive"):
+            ModelPackage({"m": _make_simple_model()}).save(
+                str(tmp_path),
+                max_workers=max_workers,
+                progress_bar=False,
+                check_weights=False,
+            )
+
+
+class TestProgressCallback:
+    class _Tensor:
+        name = "w"
+        shape = (2, 2)
+
+        class dtype:  # noqa: N801
+            @staticmethod
+            def short_name():
+                return "f32"
+
+    class _Bar:
+        def __init__(self, *, total, desc, position, leave):
+            self.total = total
+            self.desc = desc
+            self.position = position
+            self.leave = leave
+            self.n = 0
+            self.postfix = ""
+            self.closed = False
+
+        def update(self):
+            self.n += 1
+
+        def set_postfix_str(self, value):
+            self.postfix = value
+
+        def close(self):
+            self.closed = True
+
+    def test_orders_progress_bars_by_shard_number(self, monkeypatch):
+        bars = []
+
+        def make_bar(**kwargs):
+            bar = self._Bar(**kwargs)
+            bars.append(bar)
+            return bar
+
+        monkeypatch.setattr("mobius._model_package.tqdm.tqdm", make_bar)
+        callback = _make_progress_callback()
+        for filename in (
+            "model-00002-of-00002.onnx.data",
+            "model-00001-of-00002.onnx.data",
+        ):
+            for shard_index in reversed(range(2)):
+                callback(
+                    self._Tensor(),
+                    types.SimpleNamespace(
+                        total=4,
+                        index=shard_index,
+                        offset=0,
+                        filename=filename,
+                        shard_total=2,
+                        shard_index=shard_index,
+                    ),
+                )
+
+        assert len(bars) == 2
+        assert [bar.position for bar in bars] == [1, 0]
+        assert all(bar.total == 2 and bar.n == 2 and bar.closed for bar in bars)
+        assert "model-00002-of-00002.onnx.data" in bars[0].desc
+        assert "model-00001-of-00002.onnx.data" in bars[1].desc
+
+    def test_falls_back_to_one_bar_with_onnx_ir_1_0(self, monkeypatch):
+        bars = []
+
+        def make_bar(**kwargs):
+            bar = self._Bar(**kwargs)
+            bars.append(bar)
+            return bar
+
+        monkeypatch.setattr("mobius._model_package.tqdm.tqdm", make_bar)
+        callback = _make_progress_callback()
+        for index in range(4):
+            callback(
+                self._Tensor(),
+                types.SimpleNamespace(
+                    total=4,
+                    index=index,
+                    offset=0,
+                    filename=f"model-{index}.data",
+                ),
+            )
+
+        assert len(bars) == 1
+        assert bars[0].total == 4
+        assert bars[0].n == 4
+        assert bars[0].position == 0
+        assert bars[0].closed
+
+    def test_is_thread_safe(self, monkeypatch):
+        bars = []
+
+        def make_bar(**kwargs):
+            bar = self._Bar(**kwargs)
+            bars.append(bar)
+            return bar
+
+        monkeypatch.setattr("mobius._model_package.tqdm.tqdm", make_bar)
+        callback = _make_progress_callback()
+        total = 200
+
+        def invoke(index):
+            callback(
+                self._Tensor(),
+                types.SimpleNamespace(
+                    total=total,
+                    index=index,
+                    offset=0,
+                    filename="model.onnx.data",
+                    shard_total=total,
+                    shard_index=index,
+                ),
+            )
+
+        threads = [threading.Thread(target=invoke, args=(index,)) for index in range(total)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert len(bars) == 1
+        assert bars[0].total == total
+        assert bars[0].n == total
+        assert bars[0].closed
+
+
 class TestModelPackageSaveLoad:
     def test_save_creates_files(self, tmp_path):
         pkg = ModelPackage(
@@ -99,6 +345,7 @@ class TestModelPackageSaveLoad:
 
         assert len(loaded) == 1
         assert "model" in loaded
+        assert pkg["model"].graph is not None
         assert loaded["model"].graph.num_nodes() == pkg["model"].graph.num_nodes()
 
     def test_load_multiple(self, tmp_path):

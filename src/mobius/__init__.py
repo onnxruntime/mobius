@@ -15,21 +15,27 @@ __all__ = [
     "EpCapabilities",
     "Gemma2Config",
     "Gemma3nConfig",
+    "Gemma3nMultiModalConfig",
     "Gemma4AudioConfig",
     "Gemma4Config",
     "MambaConfig",
     "MllamaConfig",
+    "MoonshineConfig",
     "ModelPackage",
     "ModelRegistration",
     "ModelRegistry",
     "ModelTask",
+    "MLPWorldModel",
     "MMSConfig",
     "OPSET_VERSION",
     "Sam2Config",
     "SegformerConfig",
+    "SpeechToTextConfig",
     "VisionConfig",
     "VisionLanguageConfig",
     "WhisperConfig",
+    "WorldModelConfig",
+    "WorldModelTask",
     "YolosConfig",
     "apply_weights",
     "build",
@@ -55,10 +61,7 @@ __version__ = "0.1.0"
 
 from mobius import components, models, tasks
 from mobius._build_context import build_context, ep_capabilities, get_build_dtype
-from mobius._builder import (
-    build,
-    build_from_module,
-)
+from mobius._builder import build_from_module
 from mobius._configs import (
     ArchitectureConfig,
     AudioConfig,
@@ -68,20 +71,23 @@ from mobius._configs import (
     EncoderConfig,
     Gemma2Config,
     Gemma3nConfig,
+    Gemma3nMultiModalConfig,
     Gemma4AudioConfig,
     Gemma4Config,
     MambaConfig,
     MllamaConfig,
     MMSConfig,
+    MoonshineConfig,
     Sam2Config,
     SegformerConfig,
+    SpeechToTextConfig,
     VisionConfig,
     VisionLanguageConfig,
     WhisperConfig,
+    WorldModelConfig,
     YolosConfig,
 )
 from mobius._constants import OPSET_VERSION
-from mobius._diffusers_builder import build_diffusers_pipeline
 from mobius._execution_providers import EpCapabilities, ep_registry, get_ep, register_ep
 from mobius._inspect import ComponentInfo, inspect_components
 from mobius._model_package import ModelPackage
@@ -91,7 +97,10 @@ from mobius._registry import (
     ModelRegistry,
     registry,
 )
-from mobius._weight_loading import apply_weights
+from mobius.integrations._weight_loading import apply_weights
+from mobius.integrations.diffusers import build_diffusers_pipeline
 from mobius.integrations.gguf import build_from_gguf
 from mobius.integrations.nemo import build_from_nemo
-from mobius.tasks import CausalLMTask, ModelTask
+from mobius.integrations.transformers import build
+from mobius.models import MLPWorldModel
+from mobius.tasks import CausalLMTask, ModelTask, WorldModelTask

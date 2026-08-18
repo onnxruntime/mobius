@@ -26,7 +26,7 @@ from typing import ClassVar
 import onnx_ir as ir
 from onnxscript import GraphBuilder, nn
 
-from mobius._build_context import ep_capabilities
+from mobius._build_context import ep_capabilities, prefill_prefix_pruning
 from mobius._configs import Gemma4Config
 from mobius._model_package import ModelPackage
 from mobius._pipeline_contract import (
@@ -278,9 +278,11 @@ class Gemma4TextCausalLMTask(ModelTask):
         *,
         static_cache: bool = False,
         max_seq_len: int | None = None,
+        prune_prefill_prefix: bool = False,
     ):
         self._static_cache = static_cache
         self._max_seq_len = max_seq_len
+        self._prune_prefill_prefix = prune_prefill_prefix
 
     def build(
         self,
@@ -353,13 +355,14 @@ class Gemma4TextCausalLMTask(ModelTask):
                 past_seq_len,
             )
 
-        logits, present_key_values = module(
-            op,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-        )
+        with prefill_prefix_pruning(self._prune_prefill_prefix):
+            logits, present_key_values = module(
+                op,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+            )
         builder.add_output(logits, "logits")
 
         if static:
@@ -427,9 +430,11 @@ class Gemma4Task(ModelTask):
         *,
         static_cache: bool = False,
         max_seq_len: int | None = None,
+        prune_prefill_prefix: bool = False,
     ):
         self._static_cache = static_cache
         self._max_seq_len = max_seq_len
+        self._prune_prefill_prefix = prune_prefill_prefix
 
     def build(
         self,
@@ -562,15 +567,16 @@ class Gemma4Task(ModelTask):
                 past_seq_len,
             )
 
-        logits, present_key_values = decoder(
-            op,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            per_layer_inputs=per_layer_inputs_val,
-            past_key_values=past_key_values,
-            input_ids=input_ids_val,
-        )
+        with prefill_prefix_pruning(self._prune_prefill_prefix):
+            logits, present_key_values = decoder(
+                op,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                per_layer_inputs=per_layer_inputs_val,
+                past_key_values=past_key_values,
+                input_ids=input_ids_val,
+            )
 
         builder.add_output(logits, "logits")
         if static:

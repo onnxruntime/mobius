@@ -146,10 +146,10 @@ class TestScaleFreeRMSNormOverflow:
         import numpy as np
 
         from mobius._testing.ort_inference import OnnxModelSession
-        from mobius.models.gemma4 import _Gemma4ScaleFreeRMSNorm
+        from mobius.components import ScaleFreeRMSNorm
 
         dim = 64
-        norm = _Gemma4ScaleFreeRMSNorm(dim, eps=1e-6)
+        norm = ScaleFreeRMSNorm(dim, eps=1e-6)
 
         # Build a minimal ONNX graph for the norm
         from mobius.tasks._base import _make_graph, _make_model

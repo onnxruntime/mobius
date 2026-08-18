@@ -239,6 +239,47 @@ integration test alongside any new custom function or Scan op.**
 - **Vision with real pixel values** — zeros don't exercise the encoder
 - **All dtypes** (f32, f16, bf16) — each can expose different bugs
 - **GPU when available** — different kernels on CUDA
+- **Actual package wiring** — feed each ONNX stage from the preceding ONNX
+  stage, not an HF intermediate that bypasses the integration under test
+- **Defaults and masks** — assert constructor/config defaults in emitted ONNX
+  attributes and test padding invariance across prefill plus cached decode
+- **Real processor contract** — record input names, shapes, dtypes, media-row
+  ordering, and sampled frame positions from nonzero image/video/audio data
+- **Batch and decode edges** — use two rows with distinguishable media
+  features, mixed modality order, and a decode step with zero new media
+
+### Golden tests must be reproducible and exact
+
+- Pin one revision through config, processor, weight shards, reference
+  generation, and ONNX build; test that plumbing forwards it.
+- Assert sequence lengths before exact token/frame comparison. For CTC, compare
+  the full argmax frame sequence and collapsed transcript.
+- Test image-only, video-only, and mixed media; pass processor kwargs only for
+  media that are present.
+- On hosted runners, isolate and eagerly delete each test's Hub, assets, and
+  Xet caches. Patching `HF_HOME` after `huggingface_hub` import is insufficient;
+  patch its imported cache constants too.
+- Run the exact L2 discovery path: YAML schema, `test_model_id`, revision, and
+  trust flags can be missed by model-local tests.
+- Run affected-model detection on the full diff before GPU CI. A new model
+  should select its targeted L4/L5 cases; distinguish all-model timeout or
+  runner termination from a model assertion failure.
+- Reference goldens must come from an independently invoked upstream pipeline,
+  never from the implementation under test or ad-hoc intermediate features.
+- When the checkpoint is too large, HTTP-range-read safetensors headers and the
+  exact tensors for a production-dimension reduced fixture. Cover every layer
+  family and cache contract, record the source layer/row derivation, and create
+  L4/L5 goldens from the independently invoked HuggingFace model. Treat this as
+  reduced real-weight evidence, not as a claim of full-checkpoint parity.
+- Before accepting an architecture xfail, verify config vocabulary, epsilon,
+  and layer-kind translation. A stale `mlp`->`moe` mapping can look like an SSM
+  numerical failure while loading the wrong weights entirely.
+- Compare full prefill and every token-by-token prompt/decode logit on the
+  target EP. Fused cache kernels can match multi-token prefill yet diverge on
+  the first reused-state step. If full-precision and quantized packages fail at
+  the same reused-state step, suspect source cache semantics rather than Olive.
+  Test the equivalent standard-ONNX cache graph before assigning blame; prefer
+  the portable graph when it restores the numeric gate.
 
 ### Recurrent state ≠ KV cache
 

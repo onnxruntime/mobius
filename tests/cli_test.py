@@ -65,6 +65,56 @@ class TestCLIBuild:
             )
             assert os.path.isfile(os.path.join(tmpdir, "model.onnx"))
 
+    def test_max_workers_defaults_to_eight(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
+                return_value=None,
+            ),
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()),
+            mock.patch("mobius.__main__._save_package") as save_package,
+        ):
+            main(["build", "--model", "Qwen/Qwen2.5-0.5B", tmpdir, "--no-weights"])
+
+        assert save_package.call_args.args[2].max_workers == 8
+
+    def test_max_workers_override_reaches_model_package_save(self):
+        pkg = mock.MagicMock()
+        pkg.items.return_value = []
+        pkg.__iter__.return_value = iter(())
+        args = SimpleNamespace(
+            max_shard_size=None,
+            max_workers=1,
+            external_data="onnx",
+            execution_provider="cpu",
+            no_weights=True,
+            runtime=None,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _save_package(pkg, tmpdir, args, None, None)
+
+        assert pkg.save.call_args.kwargs["max_workers"] == 1
+
+    @pytest.mark.parametrize("max_workers", [0, -1])
+    def test_non_positive_max_workers_errors(self, max_workers):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(SystemExit, match=r"--max-workers must be a positive integer"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "Qwen/Qwen2.5-0.5B",
+                    tmpdir,
+                    "--no-weights",
+                    "--max-workers",
+                    str(max_workers),
+                ]
+            )
+
     def test_build_encoder_decoder_produces_separate_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             main(["build", "--model", "facebook/bart-base", tmpdir, "--no-weights"])
@@ -122,7 +172,7 @@ class TestCLIBuild:
         with (
             tempfile.TemporaryDirectory() as tmpdir,
             mock.patch(
-                "mobius._diffusers_builder._load_diffusers_pipeline_index"
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index"
             ) as mock_diffusers,
             mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
             mock.patch("mobius.__main__._save_package"),
@@ -201,7 +251,7 @@ class TestCLIBuild:
         with (
             tempfile.TemporaryDirectory() as tmpdir,
             mock.patch(
-                "mobius._diffusers_builder._load_diffusers_pipeline_index",
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
                 return_value=None,
             ),
             mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
@@ -225,7 +275,7 @@ class TestCLIBuild:
         with (
             tempfile.TemporaryDirectory() as tmpdir,
             mock.patch(
-                "mobius._diffusers_builder._load_diffusers_pipeline_index",
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
                 return_value=None,
             ),
             mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
@@ -244,12 +294,12 @@ class TestCLIBuild:
             )
         assert mock_build.call_args.kwargs.get("fp8_kv_cache") is True
 
-    def test_features_prune_lm_head_passed_through(self):
-        """--features prune-lm-head sets prune_lm_head on the build() call."""
+    def test_features_prune_prefill_prefix_passed_through(self):
+        """--features prune-prefill-prefix sets the build option."""
         with (
             tempfile.TemporaryDirectory() as tmpdir,
             mock.patch(
-                "mobius._diffusers_builder._load_diffusers_pipeline_index",
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
                 return_value=None,
             ),
             mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
@@ -263,17 +313,17 @@ class TestCLIBuild:
                     tmpdir,
                     "--no-weights",
                     "--features",
-                    "prune-lm-head",
+                    "prune-prefill-prefix",
                 ]
             )
-        assert mock_build.call_args.kwargs.get("prune_lm_head") is True
+        assert mock_build.call_args.kwargs.get("prune_prefill_prefix") is True
 
     def test_features_comma_separated_multiple(self):
         """A single --features accepts a comma-separated list."""
         with (
             tempfile.TemporaryDirectory() as tmpdir,
             mock.patch(
-                "mobius._diffusers_builder._load_diffusers_pipeline_index",
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
                 return_value=None,
             ),
             mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
@@ -287,13 +337,13 @@ class TestCLIBuild:
                     tmpdir,
                     "--no-weights",
                     "--features",
-                    "text-only,fp8-kv-cache,prune-lm-head",
+                    "text-only,fp8-kv-cache,prune-prefill-prefix",
                 ]
             )
         kwargs = mock_build.call_args.kwargs
         assert kwargs.get("text_only") is True
         assert kwargs.get("fp8_kv_cache") is True
-        assert kwargs.get("prune_lm_head") is True
+        assert kwargs.get("prune_prefill_prefix") is True
 
     def test_features_unknown_errors(self):
         """An unrecognised feature name is rejected with a clear error."""
@@ -453,6 +503,59 @@ class TestCLIBuildRuntime:
         mock_export.assert_called_once()
         call_kwargs = mock_export.call_args
         assert call_kwargs.kwargs.get("hf_model_id") == "Qwen/Qwen2.5-0.5B"
+        assert call_kwargs.kwargs.get("trust_remote_code") is False
+
+    def test_runtime_ort_genai_propagates_trust_remote_code(self):
+        """--trust-remote-code also applies to runtime config generation."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.ort_genai.write_ort_genai_config",
+                return_value={},
+            ) as mock_export,
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "Qwen/Qwen2.5-0.5B",
+                    tmpdir,
+                    "--no-weights",
+                    "--trust-remote-code",
+                    "--runtime",
+                    "ort-genai",
+                ]
+            )
+
+        assert mock_export.call_args.kwargs["trust_remote_code"] is True
+
+    def test_runtime_ort_genai_rejects_mage_vl_before_saving(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch("mobius._model_package.ModelPackage.save") as save,
+            mock.patch(
+                "mobius.integrations.ort_genai.write_ort_genai_config"
+            ) as config_writer,
+            pytest.raises(
+                SystemExit,
+                match=r"Mage-VL.*patch_positions.*1D decoder position_ids",
+            ),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "microsoft/Mage-VL",
+                    tmpdir,
+                    "--no-weights",
+                    "--trust-remote-code",
+                    "--runtime",
+                    "ort-genai",
+                ]
+            )
+
+        save.assert_not_called()
+        config_writer.assert_not_called()
 
     def test_runtime_onnx_genai_uses_native_vlm_emitter(self):
         pkg = mock.MagicMock()
@@ -461,6 +564,7 @@ class TestCLIBuildRuntime:
         pkg.config = object()
         args = SimpleNamespace(
             max_shard_size=None,
+            max_workers=8,
             external_data="onnx",
             execution_provider="cpu",
             no_weights=True,
@@ -500,6 +604,7 @@ class TestCLIBuildRuntime:
         pkg.config = object()
         args = SimpleNamespace(
             max_shard_size=None,
+            max_workers=8,
             external_data="onnx",
             execution_provider="cpu",
             no_weights=True,

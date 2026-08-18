@@ -22,16 +22,11 @@ from onnxscript import OpBuilder, nn
 from mobius._build_context import (
     ep_capabilities,
     get_build_dtype,
-    is_lm_head_pruning_enabled,
+    is_prefill_prefix_pruning_enabled,
 )
 from mobius._configs import ArchitectureConfig, CausalLMConfig
 from mobius._flags import flags
-from mobius._weight_utils import (
-    preprocess_awq_weights,
-    preprocess_gptq_weights,
-    preprocess_olive_weights,
-    tie_word_embeddings,
-)
+from mobius._weight_utils import preprocess_quantized_weights
 from mobius.components import (
     DecoderLayer,
     Embedding,
@@ -448,11 +443,11 @@ class CausalLMModel(nn.Module):
         )
         if len(result) == 3:
             hidden_states, present_key_values, intermediate_hidden_states = result
-            hidden_states = _prune_lm_head_hidden_states(op, hidden_states)
+            hidden_states = _retain_last_sequence_token(op, hidden_states)
             logits = self.lm_head(op, hidden_states)
             return logits, present_key_values, intermediate_hidden_states
         hidden_states, present_key_values = result
-        hidden_states = _prune_lm_head_hidden_states(op, hidden_states)
+        hidden_states = _retain_last_sequence_token(op, hidden_states)
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
 
@@ -461,47 +456,17 @@ class CausalLMModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Preprocess the state_dict to match the model's expected keys."""
         qc = getattr(self.config, "quantization", None)
-        if qc is not None and qc.quant_method == "gptq":
-            state_dict = preprocess_gptq_weights(
-                state_dict, bits=qc.bits, group_size=qc.group_size
-            )
-        elif qc is not None and qc.quant_method == "awq":
-            state_dict = preprocess_awq_weights(
-                state_dict, bits=qc.bits, group_size=qc.group_size
-            )
-        elif qc is not None and qc.quant_method == "olive":
-            # Olive-packed weights: also handles quantized embed/lm_head and
-            # the float tied-head fallback, so return directly.
-            tie = self.config.tie_word_embeddings or getattr(qc, "tie_word_embeddings", False)
-            return preprocess_olive_weights(
-                state_dict,
-                bits=qc.bits,
-                group_size=qc.group_size,
-                quantize_embeddings=getattr(qc, "quantize_embeddings", False),
-                quantize_lm_head=getattr(qc, "quantize_lm_head", False),
-                tie_word_embeddings=tie,
-            )
-        tied_quantized_table = (
-            qc is not None
-            and getattr(qc, "quantize_embeddings", False)
-            and getattr(qc, "quantize_lm_head", False)
+        return preprocess_quantized_weights(
+            state_dict,
+            qc,
+            tie_embeddings=self.config.tie_word_embeddings,
+            qmoe_target_path=None,
         )
-        if self.config.tie_word_embeddings and not tied_quantized_table:
-            # Ensure both embed_tokens.weight and lm_head.weight are present so
-            # apply_weights can assign each to its initializer.  For graph-level
-            # tied models (standard CausalLMModel) both ir.Values are the same
-            # object, so apply_weights' id()-dedup redirects lm_head uses to the
-            # embed_tokens canonical and drops the duplicate initializer.  For
-            # subclasses that override self.model after super().__init__ (e.g.
-            # Cohere, GPT-2 family), the ir.Values differ but the dedup still
-            # unifies them at load time via replace_all_uses_with.
-            tie_word_embeddings(state_dict)
-        return state_dict
 
 
-def _prune_lm_head_hidden_states(op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
-    """Select the final sequence position before the LM-head projection."""
-    if not is_lm_head_pruning_enabled():
+def _retain_last_sequence_token(op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
+    """Retain only the final sequence position when prefill-prefix pruning is active."""
+    if not is_prefill_prefix_pruning_enabled():
         return hidden_states
     last_hidden = op.Gather(hidden_states, op.Constant(value_int=-1), axis=1)
     return op.Unsqueeze(last_hidden, op.Constant(value_ints=[1]))

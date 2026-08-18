@@ -338,8 +338,10 @@ the default test run.  They download real model weights and run inference.
 src/mobius/
 ├── __init__.py              # Public API
 ├── _configs.py              # ArchitectureConfig (128 supported architectures)
-├── _diffusers_configs.py    # VAEConfig, UNet2DConfig, DiTConfig, etc.
 ├── _registry.py             # model type → module class mapping
+├── integrations/
+│   └── diffusers/
+│       └── _configs.py      # VAEConfig, UNet2DConfig, etc.
 ├── components/
 │   ├── __init__.py          # Component exports
 │   ├── _activations.py      # get_activation() → SiLU, GELU, etc.

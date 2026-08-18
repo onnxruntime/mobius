@@ -9,6 +9,8 @@ test the full pipeline without network downloads.
 
 from __future__ import annotations
 
+from unittest import mock
+
 import numpy as np
 import pytest
 import torch
@@ -31,6 +33,7 @@ def _create_tiny_gguf(
     heads: int = 2,
     vocab: int = 256,
     ffn_size: int | None = None,
+    float_type: str = "f32",
 ) -> str:
     """Create a minimal GGUF file with fp32 weights for testing.
 
@@ -48,61 +51,41 @@ def _create_tiny_gguf(
     writer.add_head_count_kv(heads)
     writer.add_context_length(128)
     writer.add_feed_forward_length(ffn_size)
+    writer.add_vocab_size(vocab)
 
-    # Tensors — fp32 random weights
+    # Tensors — unquantized random weights
     rng = np.random.default_rng(42)
 
-    writer.add_tensor(
-        "token_embd.weight",
-        rng.standard_normal((vocab, hidden), dtype=np.float32),
-    )
-    writer.add_tensor(
-        "output_norm.weight",
-        rng.standard_normal((hidden,), dtype=np.float32),
-    )
-    writer.add_tensor(
-        "output.weight",
-        rng.standard_normal((vocab, hidden), dtype=np.float32),
-    )
+    def add_float(name, shape):
+        values = rng.standard_normal(shape, dtype=np.float32)
+        if float_type == "bf16":
+            raw = (values.view(np.uint32) >> 16).astype(np.uint16)
+            writer.add_tensor(
+                name,
+                raw,
+                raw_shape=shape,
+                raw_dtype=gguf_lib.GGMLQuantizationType.BF16,
+            )
+        elif float_type == "f16":
+            writer.add_tensor(name, values.astype(np.float16))
+        else:
+            writer.add_tensor(name, values)
+
+    add_float("token_embd.weight", (vocab, hidden))
+    add_float("output_norm.weight", (hidden,))
+    add_float("output.weight", (vocab, hidden))
 
     for i in range(layers):
         prefix = f"blk.{i}"
-        writer.add_tensor(
-            f"{prefix}.attn_q.weight",
-            rng.standard_normal((hidden, hidden), dtype=np.float32),
-        )
-        writer.add_tensor(
-            f"{prefix}.attn_k.weight",
-            rng.standard_normal((hidden, hidden), dtype=np.float32),
-        )
-        writer.add_tensor(
-            f"{prefix}.attn_v.weight",
-            rng.standard_normal((hidden, hidden), dtype=np.float32),
-        )
-        writer.add_tensor(
-            f"{prefix}.attn_output.weight",
-            rng.standard_normal((hidden, hidden), dtype=np.float32),
-        )
-        writer.add_tensor(
-            f"{prefix}.ffn_gate.weight",
-            rng.standard_normal((ffn_size, hidden), dtype=np.float32),
-        )
-        writer.add_tensor(
-            f"{prefix}.ffn_up.weight",
-            rng.standard_normal((ffn_size, hidden), dtype=np.float32),
-        )
-        writer.add_tensor(
-            f"{prefix}.ffn_down.weight",
-            rng.standard_normal((hidden, ffn_size), dtype=np.float32),
-        )
-        writer.add_tensor(
-            f"{prefix}.attn_norm.weight",
-            rng.standard_normal((hidden,), dtype=np.float32),
-        )
-        writer.add_tensor(
-            f"{prefix}.ffn_norm.weight",
-            rng.standard_normal((hidden,), dtype=np.float32),
-        )
+        add_float(f"{prefix}.attn_q.weight", (hidden, hidden))
+        add_float(f"{prefix}.attn_k.weight", (hidden, hidden))
+        add_float(f"{prefix}.attn_v.weight", (hidden, hidden))
+        add_float(f"{prefix}.attn_output.weight", (hidden, hidden))
+        add_float(f"{prefix}.ffn_gate.weight", (ffn_size, hidden))
+        add_float(f"{prefix}.ffn_up.weight", (ffn_size, hidden))
+        add_float(f"{prefix}.ffn_down.weight", (hidden, ffn_size))
+        add_float(f"{prefix}.attn_norm.weight", (hidden,))
+        add_float(f"{prefix}.ffn_norm.weight", (hidden,))
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -492,7 +475,8 @@ class TestCLIBuildGGUF:
         with pytest.raises(SystemExit):
             main(["build-gguf", "--help"])
         out = capsys.readouterr().out
-        assert "GGUF" in out or "gguf" in out
+        assert "--dequantize" in out
+        assert "preserved by default" in out
 
     def test_missing_gguf_path_errors(self):
         """build-gguf requires a gguf_path argument."""
@@ -501,10 +485,79 @@ class TestCLIBuildGGUF:
         with pytest.raises(SystemExit):
             main(["build-gguf"])
 
-    def test_keep_quantized_no_quantized_tensors(self, tmp_path):
-        """--keep-quantized on F32 GGUF raises ValueError."""
+    @pytest.mark.parametrize("float_type", ["f32", "f16", "bf16"])
+    def test_default_float_only_input_builds_and_reloads(self, tmp_path, float_type):
+        """The quantized-by-default CLI accepts F32/F16/BF16-only GGUFs."""
+        from mobius.__main__ import main
+        from mobius._model_package import ModelPackage
+
+        path = _create_tiny_gguf(tmp_path / f"test-{float_type}.gguf", float_type=float_type)
+        output_dir = tmp_path / f"output-{float_type}"
+        main(["build-gguf", path, "--output", str(output_dir)])
+
+        package = ModelPackage.load(str(output_dir))
+        op_types = {node.op_type for node in package["model"].graph}
+        assert "MatMulNBits" not in op_types
+        assert "BlockQuantizedMatMul" not in op_types
+
+    @pytest.mark.parametrize(
+        ("extra_args", "expected"),
+        [
+            ([], True),
+            (["--keep-quantized"], True),
+            (["--dequantize"], False),
+        ],
+    )
+    def test_quantization_flag_parsing(self, tmp_path, extra_args, expected):
+        """Default, compatibility alias, and explicit opt-out map to the API."""
         from mobius.__main__ import main
 
-        path = _create_tiny_gguf(tmp_path / "test.gguf")
-        with pytest.raises((SystemExit, ValueError)):
-            main(["build-gguf", path, "--keep-quantized"])
+        package = mock.MagicMock()
+        package.__iter__.return_value = iter(())
+        with mock.patch(
+            "mobius.integrations.gguf.build_from_gguf",
+            return_value=package,
+        ) as build:
+            main(
+                [
+                    "build-gguf",
+                    str(tmp_path / "model.gguf"),
+                    "--output",
+                    str(tmp_path / "output"),
+                    *extra_args,
+                ]
+            )
+
+        assert build.call_args.kwargs["keep_quantized"] is expected
+
+    def test_contradictory_quantization_flags_error(self, tmp_path):
+        from mobius.__main__ import main
+
+        with pytest.raises(SystemExit) as exc_info:
+            main(
+                [
+                    "build-gguf",
+                    str(tmp_path / "model.gguf"),
+                    "--keep-quantized",
+                    "--dequantize",
+                ]
+            )
+        assert exc_info.value.code == 2
+
+    def test_ort_genai_runtime_is_rejected_before_artifacts(self, tmp_path):
+        """build-gguf must not silently ignore an ORT GenAI runtime request."""
+        from mobius.__main__ import main
+
+        output_dir = tmp_path / "output"
+        with pytest.raises(SystemExit, match="does not yet support --runtime ort-genai"):
+            main(
+                [
+                    "build-gguf",
+                    str(tmp_path / "not-downloaded.gguf"),
+                    "--runtime",
+                    "ort-genai",
+                    "--output",
+                    str(output_dir),
+                ]
+            )
+        assert not output_dir.exists()

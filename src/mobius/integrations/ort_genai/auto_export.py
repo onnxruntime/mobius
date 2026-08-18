@@ -83,6 +83,7 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "gemma4_unified_text": "gemma4_text",
     "mistral": "mistral",
     "mistral3": "mistral3",
+    "lfm2": "lfm2",
     # HunYuan-V1 dense / Hy-MT1.5 — generic decoder LLM type accepted by
     # ORT GenAI (see onnxruntime-genai/src/models/model_type.h LLM list).
     "hunyuan_v1_dense": "decoder",
@@ -93,6 +94,10 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "qwen3_vl_text": "qwen3_vl",
     "qwen3_5": "qwen2_5_vl",
     "qwen3_5_vl": "qwen2_5_vl",
+    # MiniCPM uses standard 1D decoder position IDs (unlike Qwen-VL MRoPE).
+    # The phi3v multimodal runtime provides that contract; callers supply
+    # HF-preprocessed packed pixels through Generator.set_inputs().
+    "minicpmv4_6": "phi3v",
 }
 
 _GEMMA4_MODEL_TYPES = frozenset(
@@ -107,16 +112,27 @@ _GEMMA4_MODEL_TYPES = frozenset(
 # must preprocess with the HuggingFace processor and feed tensors via
 # ``Generator.set_inputs`` (see examples/gemma4_unified_ort_genai.py).
 _GEMMA4_UNIFIED_MODEL_TYPES = frozenset({"gemma4_unified", "gemma4_unified_text"})
+_MINICPM_MODEL_TYPES = frozenset({"minicpmv4_6"})
 # gemma-3 multimodal. build() unwraps the composite HF config to its text
 # sub-config, so at export time ``config.model_type`` is "gemma3_text" (not
 # "gemma3").
 _GEMMA3_MODEL_TYPES = frozenset({"gemma3", "gemma3_text"})
+# gemma-3n multimodal. Like gemma-3, build() unwraps the composite config, so
+# ``config.model_type`` is "gemma3n_text" at export time. Its MobileNet-V5
+# tower takes the same fixed NCHW ``pixel_values`` as gemma-3's SigLIP (at
+# 768x768), so it shares that fixed-resize branch — but the checkpoint's
+# ``SiglipImageProcessorFast`` sets ``do_normalize=False``, i.e. pixels stay in
+# [0, 1] rather than being mapped to [-1, 1].
+_GEMMA3N_MODEL_TYPES = frozenset({"gemma3n", "gemma3n_text"})
 _PIXTRAL_MODEL_TYPES = frozenset({"mistral3"})
 _QWEN_VL_MODEL_TYPES = frozenset(
     {
+        "muse_glimmer",
+        "muse_glimmer_text",
         "qwen2_vl",
         "qwen2_5_vl",
         "qwen3_vl",
+        "mage_vl",
         "qwen3_vl_text",
         "qwen3_5",
         "qwen3_5_vl",
@@ -134,6 +150,9 @@ _TOKENIZER_FILES = [
     "merges.txt",  # BPE
     "vocab.json",  # BPE
     "chat_template.jinja",  # Chat template for ORT GenAI
+    # Preserve HuggingFace processor metadata for VLMs whose preprocessing
+    # cannot be represented by an ort-extensions image_processor.json.
+    "preprocessor_config.json",
 ]
 
 
@@ -182,6 +201,30 @@ def _graph_input_names(model: ir.Model) -> list[str]:
         and not inp.name.startswith("past_key_values.")
         and not inp.name.startswith("past_")
     ]
+
+
+def _count_cache_layer_slots(model: ir.Model | None) -> int | None:
+    """Return the number of globally indexed cache slots required by *model*.
+
+    ORT-GenAI binds cache inputs by ``past_key_values.{i}.*`` names, so
+    ``num_hidden_layers`` must cover the highest global layer index in the
+    graph. Counting only ``.key`` inputs undercounts hybrid models whose other
+    layers carry convolution or recurrent state; counting all inputs overcounts
+    key/value pairs. The required slot count is therefore ``max(i) + 1``.
+
+    This also preserves the smaller graph-derived count for KV-sharing models
+    whose cache-owning layer indices form a shorter contiguous prefix. Returns
+    ``None`` when *model* is absent or has no dynamic-cache inputs (e.g. a
+    static-cache export using ``key_cache.{i}``).
+    """
+    if model is None:
+        return None
+    layer_indices: set[int] = set()
+    for inp in model.graph.inputs:
+        parts = inp.name.split(".") if inp.name is not None else []
+        if len(parts) >= 3 and parts[0] == "past_key_values" and parts[1].isdigit():
+            layer_indices.add(int(parts[1]))
+    return max(layer_indices) + 1 if layer_indices else None
 
 
 def _introspect_inputs(pkg: ModelPackage, key: str) -> dict[str, str] | None:
@@ -347,6 +390,47 @@ def _fix_chat_template(output_dir: str, hf_model_id: str | None) -> bool:
     return False
 
 
+# PIL resample constant -> ort-extensions Resize "interpolation" name.  HF image
+# processors store ``resample`` as the PIL integer; ort-extensions names the same
+# filters differently and defaults to CUBIC, so an unmapped value silently
+# resamples with the wrong kernel.  PIL BOX/HAMMING (4/5) have no counterpart.
+_PIL_RESAMPLE_TO_INTERPOLATION = {0: "NEAREST", 1: "LANCZOS", 2: "LINEAR", 3: "CUBIC"}
+
+
+def _size_mapping(size: Any) -> dict[str, Any]:
+    """Normalise an HF ``image_processor.size`` to a plain dict.
+
+    transformers >= 5 hands back a ``SizeDict``, which is *not* a ``dict``
+    subclass, so an ``isinstance(size, dict)`` guard silently discards it and
+    falls through to whatever default the caller hardcoded.
+    """
+    if isinstance(size, dict):
+        return size
+    if hasattr(size, "get"):  # SizeDict and friends
+        return {
+            k: getattr(size, k, None)
+            for k in ("height", "width", "longest_edge", "shortest_edge")
+        }
+    return {}
+
+
+def _resize_interpolation(resample: Any) -> str | None:
+    """Map an HF ``image_processor.resample`` to an ort-extensions filter name."""
+    if resample is None:
+        return None
+    try:
+        name = _PIL_RESAMPLE_TO_INTERPOLATION.get(int(resample))
+    except (TypeError, ValueError):
+        return None
+    if name is None:
+        logger.warning(
+            "Unsupported image resample %s; ort-extensions has no matching "
+            "filter and will fall back to its CUBIC default",
+            resample,
+        )
+    return name
+
+
 def _build_vision_transform_pipeline(
     *,
     image_size: int,
@@ -357,13 +441,32 @@ def _build_vision_transform_pipeline(
     image_std: list[float],
     min_pixels: int = 784,
     max_pixels: int = 2371600,
+    resample: Any = None,
 ) -> list[dict[str, Any]]:
-    """Build the common 5-step vision transform pipeline.
+    """Build the common 4-step vision transform pipeline.
 
-    Returns the base transforms: DecodeImage → ConvertRGB → Resize →
-    Rescale → Normalize.  Callers may append model-specific steps
-    (e.g. Permute3D, PixtralImageSizes) after this.
+    Returns the base transforms: DecodeImage → Resize → Rescale → Normalize.
+    Callers may append model-specific steps (e.g. Permute3D, PixtralImageSizes)
+    after this.
+
+    No ``ConvertRGB``: ort-extensions' ``convert_to_rgb`` *unconditionally*
+    swaps R and B (it exists to fix up a BGR decode), while ``DecodeImage`` with
+    ``color_space="RGB"`` already emits RGB.  Chaining the two hands the encoder
+    BGR — see :func:`_write_vision_processor_config`.
     """
+    resize_attrs: dict[str, Any] = {
+        "height": image_size,
+        "width": image_size,
+        "smart_resize": 1,
+        "min_pixels": min_pixels,
+        "max_pixels": max_pixels,
+        "patch_size": patch_size,
+        "merge_size": merge_size,
+    }
+    interpolation = _resize_interpolation(resample)
+    if interpolation is not None:
+        resize_attrs["interpolation"] = interpolation
+
     return [
         {
             "operation": {
@@ -374,23 +477,9 @@ def _build_vision_transform_pipeline(
         },
         {
             "operation": {
-                "name": "convert_to_rgb",
-                "type": "ConvertRGB",
-            }
-        },
-        {
-            "operation": {
                 "name": "resize",
                 "type": "Resize",
-                "attrs": {
-                    "height": image_size,
-                    "width": image_size,
-                    "smart_resize": 1,
-                    "min_pixels": min_pixels,
-                    "max_pixels": max_pixels,
-                    "patch_size": patch_size,
-                    "merge_size": merge_size,
-                },
+                "attrs": resize_attrs,
             }
         },
         {
@@ -420,6 +509,7 @@ def _write_vision_processor_config(
     output_dir: str,
     *,
     hf_model_id: str | None = None,
+    trust_remote_code: bool = False,
 ) -> str | None:
     """Write the vision processor config file for VLM models.
 
@@ -436,15 +526,28 @@ def _write_vision_processor_config(
       encoder-free model has no matching ort-extensions transform; callers feed
       HF-preprocessed pixel_values via ``Generator.set_inputs``.
     - **Gemma3** (``gemma3`` or ``gemma3_text``): Writes
-      ``processor_config.json`` with a 6-step pipeline (DecodeImage →
-      ConvertRGB → Resize[fixed] → Rescale → Normalize → Permute3D). Uses a
+      ``processor_config.json`` with a 5-step pipeline (DecodeImage →
+      Resize[fixed] → Rescale → Normalize → Permute3D). Uses a
       fixed-size resize (no ``smart_resize``) so the SigLIP encoder's fixed
       NCHW ``pixel_values`` input contract is met.
-    - **Pixtral / Mistral3**: Writes ``processor_config.json`` with a 7-step
-      pipeline (DecodeImage → ConvertRGB → Resize → Rescale → Normalize →
+    - **Gemma3n** (``gemma3n`` or ``gemma3n_text``): Same fixed-resize pipeline
+      at 768x768 for the MobileNet-V5 tower, but with the ``Normalize`` step
+      *omitted* — the checkpoint's processor sets ``do_normalize=False``, so
+      pixels stay in [0, 1] (4 steps).
+    - **Pixtral / Mistral3**: Writes ``processor_config.json`` with a 6-step
+      pipeline (DecodeImage → Resize → Rescale → Normalize →
       Permute3D → PixtralImageSizes).
-    - **Other VLMs**: Writes ``processor_config.json`` with a 5-step pipeline
-      (DecodeImage → ConvertRGB → Resize → Rescale → Normalize).
+    - **Mage-VL**: Writes ``image_processor.json`` with Qwen-style smart resize,
+      CLIP normalization, and packed patch extraction.
+    - **Other VLMs**: Writes ``processor_config.json`` with a 4-step pipeline
+      (DecodeImage → Resize → Rescale → Normalize).
+
+    No pipeline emits ``ConvertRGB``.  ort-extensions' ``convert_to_rgb``
+    unconditionally swaps R and B — it is the fix-up for a BGR decode — so
+    pairing it with ``DecodeImage(color_space="RGB")`` fed every VLM BGR
+    pixels.  The ``Resize`` step carries an explicit ``interpolation`` derived
+    from the HF processor's ``resample``, since ort-extensions otherwise
+    defaults to CUBIC where HF models overwhelmingly use BILINEAR.
 
     Returns the written file path, or None if the config has no vision section.
     """
@@ -460,6 +563,17 @@ def _write_vision_processor_config(
         logger.info(
             "Skipping image_processor.json for encoder-free %s "
             "(no native ort-extensions transform; use HF processor + set_inputs)",
+            model_type,
+        )
+        return None
+    if model_type in _MINICPM_MODEL_TYPES:
+        # MiniCPM needs adaptive slicing and NaViT horizontal patch packing.
+        # ort-extensions has no equivalent transform, so preserving the HF
+        # processor output and injecting it through set_inputs is the only
+        # numerically faithful runtime path.
+        logger.info(
+            "Skipping image_processor.json for %s "
+            "(use MiniCPMV4_6Processor + Generator.set_inputs)",
             model_type,
         )
         return None
@@ -503,39 +617,66 @@ def _write_vision_processor_config(
             }
         }
         path = os.path.join(output_dir, "image_processor.json")
-    elif model_type in _GEMMA3_MODEL_TYPES:
-        # Gemma3's SigLIP vision encoder takes a plain NCHW image tensor
-        # ([batch, 3, image_size, image_size]). The generic-VLM branch below
-        # emits smart_resize (variable HxW) and no Permute3D, leaving a
-        # variable-size HWC tensor that fails the encoder's fixed input.
-        # Emit a fixed-size resize (no smart_resize) + trailing Permute3D.
-        image_size = getattr(vision, "image_size", None) or 896
+    elif model_type in _GEMMA3_MODEL_TYPES or model_type in _GEMMA3N_MODEL_TYPES:
+        # Gemma3's SigLIP encoder and Gemma3n's MobileNet-V5 tower both take a
+        # plain NCHW image tensor ([batch, 3, image_size, image_size]). The
+        # generic-VLM branch below emits smart_resize (variable HxW) and no
+        # Permute3D, leaving a variable-size HWC tensor that fails either
+        # encoder's fixed input. Emit a fixed-size resize (no smart_resize) +
+        # trailing Permute3D.
+        is_gemma3n = model_type in _GEMMA3N_MODEL_TYPES
+        family = "gemma3n" if is_gemma3n else "gemma3"
+        image_size = getattr(vision, "image_size", None) or (768 if is_gemma3n else 896)
         image_mean = [0.5, 0.5, 0.5]
         image_std = [0.5, 0.5, 0.5]
         rescale_factor = 1.0 / 255.0
+        # Gemma3n's SiglipImageProcessorFast sets do_normalize=False: the tower
+        # is trained on [0, 1] pixels, so a mean/std-0.5 Normalize would shift
+        # them to [-1, 1] and silently degrade every caption.
+        do_normalize = not is_gemma3n
+        # Both families' processors resample with PIL BILINEAR; ort-extensions
+        # would otherwise apply its CUBIC default.
+        resample: Any = 2
         if hf_model_id is not None:
             try:
                 from transformers import AutoProcessor
 
-                hf_proc = AutoProcessor.from_pretrained(hf_model_id)
+                hf_proc = AutoProcessor.from_pretrained(
+                    hf_model_id,
+                    trust_remote_code=trust_remote_code,
+                )
                 ip = getattr(hf_proc, "image_processor", None)
                 if ip is not None:
                     image_mean = list(getattr(ip, "image_mean", image_mean))
                     image_std = list(getattr(ip, "image_std", image_std))
                     rescale_factor = getattr(ip, "rescale_factor", rescale_factor)
-                    size = getattr(ip, "size", None)
-                    if isinstance(size, dict):
+                    hf_do_normalize = getattr(ip, "do_normalize", None)
+                    if hf_do_normalize is not None:
+                        do_normalize = bool(hf_do_normalize)
+                    resample = getattr(ip, "resample", resample)
+                    size = _size_mapping(getattr(ip, "size", None))
+                    if size:
                         image_size = (
                             size.get("height") or size.get("longest_edge") or image_size
                         )
             except Exception:
                 logger.warning(
-                    "Could not load HF processor for %s; using gemma3 defaults "
-                    "(image_size=%s, mean/std=0.5)",
+                    "Could not load HF processor for %s; using %s defaults "
+                    "(image_size=%s, mean/std=0.5, do_normalize=%s)",
                     hf_model_id,
+                    family,
                     image_size,
+                    do_normalize,
                     exc_info=True,
                 )
+        resize_attrs: dict[str, Any] = {
+            "height": image_size,
+            "width": image_size,
+            "smart_resize": 0,
+        }
+        interpolation = _resize_interpolation(resample)
+        if interpolation is not None:
+            resize_attrs["interpolation"] = interpolation
         transforms = [
             {
                 "operation": {
@@ -546,19 +687,9 @@ def _write_vision_processor_config(
             },
             {
                 "operation": {
-                    "name": "convert_to_rgb",
-                    "type": "ConvertRGB",
-                }
-            },
-            {
-                "operation": {
                     "name": "resize",
                     "type": "Resize",
-                    "attrs": {
-                        "height": image_size,
-                        "width": image_size,
-                        "smart_resize": 0,
-                    },
+                    "attrs": resize_attrs,
                 }
             },
             {
@@ -568,21 +699,26 @@ def _write_vision_processor_config(
                     "attrs": {"rescale_factor": rescale_factor},
                 }
             },
-            {
-                "operation": {
-                    "name": "normalize",
-                    "type": "Normalize",
-                    "attrs": {"mean": image_mean, "std": image_std},
+        ]
+        if do_normalize:
+            transforms.append(
+                {
+                    "operation": {
+                        "name": "normalize",
+                        "type": "Normalize",
+                        "attrs": {"mean": image_mean, "std": image_std},
+                    }
                 }
-            },
+            )
+        transforms.append(
             {
                 "operation": {
                     "name": "permute",
                     "type": "Permute3D",
                     "attrs": {"dims": [2, 0, 1]},
                 }
-            },
-        ]
+            }
+        )
         processor_config = {"processor": {"name": "image_processor", "transforms": transforms}}
         path = os.path.join(output_dir, "processor_config.json")
     else:
@@ -602,26 +738,32 @@ def _write_vision_processor_config(
         min_pixels = 784
         max_pixels = 2371600
         image_size = getattr(vision, "image_size", None)
+        resample = None
 
         if hf_model_id is not None:
             try:
                 from transformers import AutoProcessor
 
-                hf_proc = AutoProcessor.from_pretrained(hf_model_id)
+                hf_proc = AutoProcessor.from_pretrained(
+                    hf_model_id,
+                    trust_remote_code=trust_remote_code,
+                )
                 ip = getattr(hf_proc, "image_processor", None)
                 if ip is not None:
                     image_mean = list(getattr(ip, "image_mean", image_mean))
                     image_std = list(getattr(ip, "image_std", image_std))
                     rescale_factor = getattr(ip, "rescale_factor", rescale_factor)
+                    resample = getattr(ip, "resample", resample)
                     if hasattr(ip, "size"):
                         size = ip.size
-                        if isinstance(size, dict):
-                            if "longest_edge" in size:
-                                image_size = size["longest_edge"]
-                            min_pixels = size.get("shortest_edge", min_pixels)
-                            max_pixels = size.get("longest_edge", max_pixels)
-                        elif isinstance(size, int):
+                        if isinstance(size, int):
                             image_size = size
+                        else:
+                            size = _size_mapping(size)
+                            if size.get("longest_edge") is not None:
+                                image_size = size["longest_edge"]
+                            min_pixels = size.get("shortest_edge") or min_pixels
+                            max_pixels = size.get("longest_edge") or max_pixels
             except Exception:
                 logger.warning(
                     "Could not load HF processor for %s; "
@@ -642,6 +784,7 @@ def _write_vision_processor_config(
             image_std=image_std,
             min_pixels=min_pixels,
             max_pixels=max_pixels,
+            resample=resample,
         )
 
         if is_pixtral:
@@ -701,7 +844,10 @@ def _write_vision_processor_config(
                 "transforms": transforms,
             }
         }
-        path = os.path.join(output_dir, "processor_config.json")
+        path = os.path.join(
+            output_dir,
+            "image_processor.json" if model_type == "mage_vl" else "processor_config.json",
+        )
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(processor_config, f, indent=4)
@@ -767,6 +913,47 @@ def _write_audio_processor_config(
             }
         }
         proc_filename = "audio_feature_extraction.json"
+    elif model_type in _GEMMA3N_MODEL_TYPES:
+        # Gemma3n reuses gemma4's Gemma4LogMel op, but NOT its attribute values:
+        # Gemma3nAudioFeatureExtractor is a different filterbank. Values below are
+        # from the E4B preprocessor_config.json; the ones that differ from the
+        # gemma4 branch above are marked.
+        #
+        # frame_length/hop_length are given in samples upstream (512/160 @ 16 kHz)
+        # and converted to the milliseconds this op takes: 512/16000 = 32 ms,
+        # 160/16000 = 10 ms. fft_length 1024 is implied by fft_overdrive (the next
+        # power of two above frame_length, doubled) and has no separate attribute.
+        processor = {
+            "feature_extraction": {
+                "sequence": [
+                    {
+                        "operation": {
+                            "name": "audio_decoder",
+                            "type": "AudioDecoder",
+                        }
+                    },
+                    {
+                        "operation": {
+                            "name": "gemma3n_log_mel",
+                            "type": "Gemma4LogMel",
+                            "attrs": {
+                                "feature_size": 128,
+                                "sampling_rate": 16000,
+                                "frame_length_ms": 32.0,  # differs (gemma4: 20.0)
+                                "hop_length_ms": 10.0,
+                                "min_frequency": 125.0,  # differs (gemma4: 0.0)
+                                "max_frequency": 7600.0,  # differs (gemma4: 8000.0)
+                                "preemphasis": 0.97,  # differs (gemma4: 0.0)
+                                "preemphasis_htk_flavor": 1,
+                                "fft_overdrive": 1,  # differs (gemma4: 0)
+                                "mel_floor": 1e-05,  # differs (gemma4: 0.001)
+                            },
+                        }
+                    },
+                ]
+            }
+        }
+        proc_filename = "audio_feature_extraction.json"
     else:
         # Generic audio processor — add model-specific branches as needed.
         return None
@@ -822,13 +1009,58 @@ def _write_genai_config(
     # shared buffer. Introspect the graph: if there is at least one GQA
     # node, the model supports shared-buffer mode; otherwise force it off
     # regardless of the EP capability flag.
+    #
+    # ``com.microsoft.LinearAttention`` (linear/recurrent-attention layers,
+    # e.g. Qwen3.5's GatedDeltaNet) is a separate, *mandatory* case: its
+    # recurrent state requires ``past_present_share_buffer=True`` regardless
+    # of whether any other layer uses GQA (ORT GenAI raises "RecurrentState
+    # requires past_present_share_buffer=true" otherwise).
+    #
+    # Hybrid models mix LinearAttention layers with full-attention layers,
+    # which may lower to GQA *or* to the standard (non-GQA) ``Attention`` op
+    # depending on EP/dtype (e.g. the CPU EP only lowers to GQA for fp32;
+    # fp16 falls back to standard Attention -- see ``_execution_providers.py``
+    # ``gqa_dtypes``). If a hybrid graph has LinearAttention but its
+    # full-attention layers are still standard (non-GQA) Attention, forcing
+    # ``past_present_share_buffer=True`` produces an unrunnable config: the
+    # recurrent state requires it, but standard Attention's dynamic-shape KV
+    # concat cannot honor a pre-allocated shared buffer, which fails at
+    # generation time with an ``attn_mask``/``total_sequence_length``
+    # mismatch rather than at load time. Rather than silently emit a broken
+    # config, raise a clear error so the caller picks an EP/dtype combination
+    # (e.g. fp32 on CPU) that lowers full attention to GQA.
     decoder_model = pkg.get(decoder_key)
     supports_in_place_kv_cache: bool | None = None
     if decoder_model is not None:
-        supports_in_place_kv_cache = any(
+        has_gqa = any(
             node.op_type == "GroupQueryAttention" and node.domain == "com.microsoft"
             for node in decoder_model.graph
         )
+        has_recurrent_state = any(
+            node.op_type == "LinearAttention" and node.domain == "com.microsoft"
+            for node in decoder_model.graph
+        )
+        has_standard_attention = any(
+            node.op_type == "Attention" and node.domain in ("", "ai.onnx")
+            for node in decoder_model.graph
+        )
+        if has_recurrent_state and has_standard_attention:
+            # A GQA node elsewhere in the graph does NOT make a co-existing
+            # standard Attention node compatible with a shared buffer --
+            # each op instance is independently (in)compatible, so this
+            # must reject on the mere presence of standard Attention, not
+            # only when GQA is completely absent (partial GQA fusion still
+            # leaves the unfused standard Attention layers broken).
+            raise ValueError(
+                "This decoder graph mixes com.microsoft.LinearAttention "
+                "(recurrent state, requires past_present_share_buffer=True) "
+                "with standard (non-GQA) Attention (incompatible with "
+                "past_present_share_buffer=True). This EP/dtype combination "
+                "cannot produce a runnable genai_config -- pick an EP/dtype "
+                "that lowers *all* full-attention layers to "
+                "GroupQueryAttention instead (e.g. fp32 on the CPU EP)."
+            )
+        supports_in_place_kv_cache = has_gqa or has_recurrent_state
 
     generator = GenaiConfigGenerator.from_config(
         config,
@@ -841,25 +1073,42 @@ def _write_genai_config(
         decoder_inputs=decoder_inputs,
         decoder_filename=decoder_filename,
         supports_in_place_kv_cache=supports_in_place_kv_cache,
+        num_cache_layer_slots=_count_cache_layer_slots(decoder_model),
     )
 
     if is_vlm:
         image_token_id = getattr(config, "image_token_id", None)
         if image_token_id is not None:
+            model_type = getattr(config, "model_type", "")
             vision_input_mapping = _introspect_inputs(pkg, "vision_encoder")
             embedding_input_mapping = _introspect_inputs(pkg, "embedding")
+            if model_type in _MINICPM_MODEL_TYPES and vision_input_mapping is not None:
+                # ORT GenAI's VisionInputs schema only accepts its predefined
+                # semantic keys. ``target_sizes`` remains an ONNX graph input
+                # and is supplied as a named tensor through set_inputs().
+                vision_input_mapping.pop("target_sizes", None)
 
             # spatial_merge_size and config_filename are config-level
             # properties that cannot be inferred from the graph.
             vision_kwargs: dict[str, Any] = {}
-            model_type = getattr(config, "model_type", "")
             if model_type in _GEMMA4_MODEL_TYPES:
                 vision_cfg = getattr(config, "vision", None)
                 vision_kwargs["spatial_merge_size"] = getattr(
                     vision_cfg, "spatial_merge_size", 2
                 )
+            elif model_type in _MINICPM_MODEL_TYPES:
+                # MiniCPM performs both 2x2 merges inside the ONNX vision
+                # graph and consumes HF-prepacked pixels, not Qwen grid_thw.
+                vision_kwargs["spatial_merge_size"] = None
             elif has_speech:
                 vision_kwargs["spatial_merge_size"] = None
+                # Gemma3n shares gemma3's fixed-resize branch in
+                # _write_vision_processor_config, which writes
+                # processor_config.json. Without this, with_vision's
+                # "image_processor.json" default would be referenced instead —
+                # a filename only the gemma4 branch above ever writes.
+                if model_type in _GEMMA3N_MODEL_TYPES:
+                    vision_kwargs["config_filename"] = "processor_config.json"
             elif (
                 model_type in _PIXTRAL_MODEL_TYPES
                 or getattr(getattr(config, "vision", None), "model_type", None) == "pixtral"
@@ -879,8 +1128,12 @@ def _write_genai_config(
                 )
                 if sms is not None:
                     vision_kwargs["spatial_merge_size"] = sms
-                vision_kwargs["config_filename"] = "processor_config.json"
-                if model_type in {"qwen3_vl", "qwen3_vl_text"}:
+                vision_kwargs["config_filename"] = (
+                    "image_processor.json"
+                    if model_type == "mage_vl"
+                    else "processor_config.json"
+                )
+                if model_type in {"mage_vl", "qwen3_vl", "qwen3_vl_text"}:
                     patch_size = getattr(vision_cfg, "patch_size", None)
                     window_size = getattr(vision_cfg, "window_size", None)
                     if patch_size is not None:
@@ -937,8 +1190,28 @@ def _write_genai_config(
                 "audio_embeds": "input_features",
                 "attention_mask": "input_features_mask",
             }
-        elif audio_input_mapping is not None:
-            audio_kwargs["input_names"] = audio_input_mapping
+        elif model_type in _GEMMA3N_MODEL_TYPES:
+            # Same USM log-mel contract as gemma4 (and the same writer), so it
+            # names the same file. The reference must be present: ORT-GenAI
+            # rejects a speech section that sets ``filename`` without
+            # ``config_filename`` ("Both are required for audio support"),
+            # so omitting it would turn a missing-file error into a
+            # load-time throw.
+            audio_kwargs["config_filename"] = "audio_feature_extraction.json"
+            # Same two graph inputs as gemma4, so the same schema mapping. This
+            # must not come from _introspect_inputs: unlike the decoder and
+            # vision sections, ``model.speech.inputs`` keys are a *closed set*
+            # the runtime defines (audio_embeds / attention_mask / audio_sizes /
+            # audio_projection_mode), not graph input names. An identity map is
+            # rejected outright with 'model:speech:inputs: Unknown value
+            # "input_features"'.
+            audio_kwargs["input_names"] = {
+                "audio_embeds": "input_features",
+                "attention_mask": "input_features_mask",
+            }
+        else:
+            if audio_input_mapping is not None:
+                audio_kwargs["input_names"] = audio_input_mapping
         generator.with_audio(
             audio_token_id=audio_token_id,
             boa_token_id=boa_token_id,
@@ -946,6 +1219,30 @@ def _write_genai_config(
         )
 
     return generator.write(output_dir)
+
+
+def _validate_ort_genai_compatibility(pkg: ModelPackage) -> None:
+    """Reject packages whose required inputs cannot be supplied by ORT GenAI."""
+    config = getattr(pkg, "config", None)
+    if getattr(config, "model_type", None) == "parakeet_ctc":
+        raise ValueError(
+            "ORT GenAI does not define a feature-input CTC ASR pipeline; "
+            "export Parakeet CTC as ONNX and run it directly with ONNX Runtime."
+        )
+    if {"vision_encoder", "decoder"}.issubset(pkg) and "embedding" not in pkg:
+        model_type = getattr(config, "model_type", "unknown")
+        raise NotImplementedError(
+            "onnxruntime-genai does not support generic vision encoder-decoder "
+            f"packages such as {model_type!r}. Run the vision_encoder and decoder "
+            "ONNX sessions directly; emitting genai_config.json would create an "
+            "artifact that the runtime cannot load."
+        )
+    if getattr(config, "model_type", None) == "mage_vl":
+        raise ValueError(
+            "ORT GenAI does not support Mage-VL's required patch_positions vision "
+            "input or its 1D decoder position_ids contract. Export without "
+            "--runtime ort-genai to save the runnable direct three-model ONNX package."
+        )
 
 
 def write_ort_genai_config(
@@ -956,6 +1253,7 @@ def write_ort_genai_config(
     ep: str = "cpu",
     context_length: int = 4096,
     local_config_dir: str | None = None,
+    trust_remote_code: bool = False,
 ) -> dict[str, str]:
     """Generate ORT-GenAI config artifacts for an already-built ModelPackage.
 
@@ -986,6 +1284,8 @@ def write_ort_genai_config(
             this directory instead of downloaded from HuggingFace Hub.
             Typically set when the CLI ``--config`` flag points to a local
             directory rather than a HuggingFace model ID.
+        trust_remote_code: Allow custom HuggingFace configuration code when
+            resolving token IDs and model type.
 
     Returns:
         Dict mapping artifact name to file path, e.g.::
@@ -1006,6 +1306,14 @@ def write_ort_genai_config(
             "write_ort_genai_config requires ModelPackage.config to be set. "
             "This is set automatically when building with mobius.build(). "
             "Diffusion models (which have no config) are not supported."
+        )
+    _validate_ort_genai_compatibility(pkg)
+
+    if getattr(config, "model_type", None) == "moonshine":
+        raise NotImplementedError(
+            "onnxruntime-genai does not support Moonshine's variable-length raw-waveform "
+            "encoder. Run the exported encoder and cached decoder directly with "
+            "ONNX Runtime."
         )
 
     os.makedirs(directory, exist_ok=True)
@@ -1031,7 +1339,9 @@ def write_ort_genai_config(
     if hf_model_id is not None:
         import transformers
 
-        hf_config = transformers.AutoConfig.from_pretrained(hf_model_id)
+        hf_config = transformers.AutoConfig.from_pretrained(
+            hf_model_id, trust_remote_code=trust_remote_code
+        )
         model_type = hf_config.model_type
         cfg_model_type = getattr(config, "model_type", None)
         # See _select_ort_model_type: decoder-only packages prefer the package's
@@ -1065,6 +1375,12 @@ def write_ort_genai_config(
             # Gemma3 multimodal configs are unwrapped to the text sub-config
             # during build, but ORT GenAI needs the multimodal parent type.
             ort_model_type = "gemma3"
+        elif is_vlm and raw_type == "gemma3n_text":
+            # Same unwrapping for Gemma3n, whose parent type is "gemma3n".
+            # Deliberately *not* aliased to "gemma3": the package threads
+            # per_layer_inputs (and optional audio) that gemma3's ORT pipeline
+            # does not bind, so borrowing that type would mis-wire the graph.
+            ort_model_type = "gemma3n"
         else:
             ort_model_type = _resolve_ort_genai_model_type(raw_type)
         if ort_model_type == "unknown":
@@ -1160,7 +1476,12 @@ def write_ort_genai_config(
             result[tf] = os.path.join(directory, tf)
 
     # Write processor config for VLMs
-    processor_path = _write_vision_processor_config(config, directory, hf_model_id=hf_model_id)
+    processor_path = _write_vision_processor_config(
+        config,
+        directory,
+        hf_model_id=hf_model_id,
+        trust_remote_code=trust_remote_code,
+    )
     if processor_path:
         result["processor_config"] = processor_path
 
@@ -1187,6 +1508,7 @@ def export_package(
     ep: str = "cpu",
     context_length: int = 4096,
     local_config_dir: str | None = None,
+    trust_remote_code: bool = False,
     external_data: str = "onnx",
     progress_bar: bool = True,
 ) -> dict[str, str]:
@@ -1224,6 +1546,8 @@ def export_package(
             larger.
         local_config_dir: Local model directory to copy tokenizer files from
             when ``hf_model_id`` is ``None``.
+        trust_remote_code: Allow custom HuggingFace configuration code when
+            resolving token IDs and model type.
         external_data: External-data format passed to :meth:`ModelPackage.save`
             (``"onnx"`` or ``"safetensors"``).
         progress_bar: Whether to show the save progress bar.
@@ -1260,6 +1584,7 @@ def export_package(
             "Diffusion models (which have no config) are not supported — "
             "use ModelPackage.save() directly for those."
         )
+    _validate_ort_genai_compatibility(pkg)
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -1279,6 +1604,7 @@ def export_package(
         ep=ep,
         context_length=context_length,
         local_config_dir=local_config_dir,
+        trust_remote_code=trust_remote_code,
     )
 
     # 3. Add ONNX paths to the manifest
@@ -1310,7 +1636,7 @@ def auto_export(
     This is the end-to-end convenience function for producing ORT-GenAI-ready
     model directories. It:
 
-    1. Builds the ONNX graph(s) via :func:`~mobius._builder.build`
+    1. Builds the ONNX graph(s) via :func:`mobius.integrations.transformers.build`
     2. Downloads and applies HuggingFace weights
     3. Saves ONNX model(s) with external data
     4. Calls :func:`write_ort_genai_config` to write ``genai_config.json``,
@@ -1335,7 +1661,8 @@ def auto_export(
         progress_bar: Show progress bar during save.
         text_only: When ``True``, export the text backbone of a multimodal
             checkpoint as a standalone decoder-only LLM (see
-            :func:`~mobius._builder.build`). Produces a single ``model.onnx``
+            :func:`mobius.integrations.transformers.build`). Produces a single
+            ``model.onnx``
             with a decoder-only ``genai_config.json`` (no vision/audio
             sections). Currently supported for ``gemma4_unified``
             (``google/gemma-4-12B``).
@@ -1349,7 +1676,7 @@ def auto_export(
                 "tokenizer.json": "/output/tokenizer.json",
             }
     """
-    from mobius._builder import build
+    from mobius.integrations.transformers import build
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -1385,6 +1712,7 @@ def auto_export(
         hf_model_id=model_id,
         ep=ep,
         context_length=context_length,
+        trust_remote_code=trust_remote_code,
         external_data=external_data,
         progress_bar=progress_bar,
     )

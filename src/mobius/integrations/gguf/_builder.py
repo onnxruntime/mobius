@@ -4,15 +4,14 @@
 """GGUF → ONNX build pipeline.
 
 Converts ``.gguf`` model files to ONNX using the standard build
-pipeline.  Two modes:
-
-- **Dequantized** (default): All quantized tensors are dequantized to
-  float.  Simple, but loses the compression benefit of quantization.
-- **Quantized** (``keep_quantized=True``): Affine linear-layer weights are
-  repacked into MatMulNBits format and token embeddings into
-  GatherBlockQuantized format. Runtime-supported native IQ/MXFP4 projection
-  blocks are preserved for BlockQuantizedMatMul. Mixed presets such as Q4_K_M are
-  normalized to one affine layout. Other tensors are dequantized.
+pipeline. Quantized preservation is the default: affine linear-layer weights
+are repacked into MatMulNBits format and compatible token embeddings into
+GatherBlockQuantized format. For text-only builds, runtime-supported native
+IQ/MXFP4 projection blocks are preserved for BlockQuantizedMatMul. Multimodal
+text backbones and mixed presets such as Q4_K_M are normalized to one affine
+layout, so not every source tensor is byte-preserved. Other tensors are
+dequantized. Set ``keep_quantized=False`` to dequantize all weights to float
+explicitly.
 """
 
 from __future__ import annotations
@@ -20,7 +19,9 @@ from __future__ import annotations
 __all__ = ["build_from_gguf"]
 
 import logging
+import re
 from collections import Counter
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -29,10 +30,167 @@ from huggingface_hub import HfApi, hf_hub_download
 
 from mobius._model_package import ModelPackage
 
+_HUB_PREFLIGHT_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (OSError,)
+try:
+    from httpx import TransportError as _HttpxTransportError
+except ImportError:
+    pass
+else:
+    _HUB_PREFLIGHT_TRANSPORT_ERRORS += (_HttpxTransportError,)
+
 if TYPE_CHECKING:
     from mobius.tasks import ModelTask
 
 logger = logging.getLogger(__name__)
+
+_GGUF_SHARD_FILENAME_RE = re.compile(
+    r"-(?P<index>\d{5})-of-(?P<count>\d{5})\.gguf$",
+    re.IGNORECASE,
+)
+_NEMOTRON_H_MOE_ARCHITECTURE = "nemotron_h_moe"
+
+
+def _summarize_nemotron_h_moe_layout(
+    tensor_names: Iterable[str],
+) -> tuple[Counter[str], tuple[int, ...], dict[int, frozenset[str]]]:
+    """Summarize base-layer and MTP mixer types from Nemotron-H GGUF names."""
+    layer_kinds: dict[int, set[str]] = {}
+    mtp_blocks: set[int] = set()
+    for name in tensor_names:
+        match = re.match(r"^blk\.(\d+)\.(.+)$", name)
+        if match is None:
+            continue
+        block_index = int(match.group(1))
+        suffix = match.group(2)
+        kinds = layer_kinds.setdefault(block_index, set())
+        if suffix.startswith("nextn."):
+            mtp_blocks.add(block_index)
+        elif suffix.startswith("ssm_"):
+            kinds.add("mamba")
+        elif suffix.startswith(("ffn_", "exp_probs_")):
+            kinds.add("moe")
+        elif suffix.startswith(("attn_q.", "attn_k.", "attn_v.", "attn_output.")):
+            kinds.add("attention")
+
+    base_counts: Counter[str] = Counter()
+    for block_index, kinds in layer_kinds.items():
+        if block_index not in mtp_blocks:
+            base_counts.update(kinds)
+    mtp_kinds = {
+        block_index: frozenset(layer_kinds.get(block_index, set()))
+        for block_index in sorted(mtp_blocks)
+    }
+    return base_counts, tuple(sorted(mtp_blocks)), mtp_kinds
+
+
+def _raise_for_unsupported_gguf_architecture(
+    architecture: str,
+    *,
+    source: str,
+    tensor_names: Iterable[str] | None = None,
+) -> None:
+    """Reject GGUF architectures that do not have semantic conversion evidence."""
+    if architecture != _NEMOTRON_H_MOE_ARCHITECTURE:
+        return
+
+    layout = ""
+    if tensor_names is not None:
+        counts, mtp_blocks, mtp_kinds = _summarize_nemotron_h_moe_layout(tensor_names)
+        mtp_kind_names = {index: sorted(kinds) for index, kinds in mtp_kinds.items()}
+        layout = (
+            " Detected base schedule: "
+            f"{counts['mamba']} Mamba + {counts['moe']} MoE + "
+            f"{counts['attention']} attention layers; auxiliary MTP blocks: "
+            f"{list(mtp_blocks)} with mixer types {mtp_kind_names}."
+        )
+
+    raise NotImplementedError(
+        "Direct GGUF conversion for architecture 'nemotron_h_moe' is intentionally "
+        f"disabled for {source!r}.{layout} GGUF block_count includes a combined "
+        "attention+MoE MTP auxiliary block, so aliasing it to the 52-layer "
+        "'nemotron_h' backbone would build the wrong graph. The current Nemotron-H "
+        "Mamba2 path also lacks passing full-logit/generation parity, and common "
+        "GGUF presets contain Q5_0/Q5_1 expert tensors that cannot be preserved by "
+        "MatMulNBits. No ONNX artifacts were emitted. Use llama.cpp/Unsloth to run "
+        "the GGUF without changing its quantization, or start from the official "
+        "pinned BF16 Hugging Face checkpoint and quantize the validated ONNX export "
+        "with Olive only after L4/L5 semantic generation passes. See "
+        "docs/api/build_from_gguf.md for the pinned recipe and waiver."
+    )
+
+
+def _raise_for_sharded_gguf(
+    *,
+    source: str,
+    filename: str | None = None,
+    split_count: int | None = None,
+) -> None:
+    """Reject one-shard inputs before they can produce an incomplete model."""
+    shard_index: int | None = None
+    if filename is not None:
+        match = _GGUF_SHARD_FILENAME_RE.search(filename)
+        if match is not None:
+            shard_index = int(match.group("index"))
+            split_count = int(match.group("count"))
+    if split_count is None or split_count <= 1:
+        return
+
+    shard_detail = f" shard {shard_index} of {split_count}" if shard_index else ""
+    raise NotImplementedError(
+        f"Sharded GGUF input is not supported: {source!r} is{shard_detail}. "
+        "The GGUF builder reads one file and cannot assemble split tensor tables; "
+        "continuing would emit an incomplete ONNX model. Select a single-file GGUF "
+        "variant, join the shards with a GGUF-aware tool, or build from the original "
+        "Hugging Face checkpoint."
+    )
+
+
+def _preflight_hf_gguf(api: HfApi, repo_id: str, filename: str) -> None:
+    """Use Hub metadata to reject known-bad inputs before a multi-GB download."""
+    source = f"{repo_id}:{filename}"
+    _raise_for_sharded_gguf(source=source, filename=filename)
+    try:
+        info = api.model_info(repo_id, expand=["gguf"])
+    except TypeError as error:
+        if "expand" not in str(error):
+            raise
+        logger.info(
+            "Skipping Hub GGUF architecture preflight for %s because this "
+            "huggingface_hub version has no model_info(expand=...) support; "
+            "the downloaded or cached local header will still be validated.",
+            source,
+        )
+        return
+    except _HUB_PREFLIGHT_TRANSPORT_ERRORS as error:
+        logger.warning(
+            "Hub GGUF architecture preflight failed for %s (%s); continuing to "
+            "hf_hub_download so an authenticated or cached file can still be used. "
+            "The local header will be validated before graph construction.",
+            source,
+            error,
+        )
+        return
+    gguf_metadata = getattr(info, "gguf", None)
+    if isinstance(gguf_metadata, Mapping):
+        architecture = gguf_metadata.get("architecture")
+    else:
+        architecture = getattr(gguf_metadata, "architecture", None)
+    if isinstance(architecture, str):
+        _raise_for_unsupported_gguf_architecture(
+            architecture,
+            source=source,
+        )
+
+
+def _validate_gguf_model(gguf_model, *, source: str) -> None:
+    """Validate a parsed GGUF before config extraction or graph construction."""
+    split_count = int(gguf_model.get_metadata("split.count", 1))
+    _raise_for_sharded_gguf(source=source, split_count=split_count)
+    _raise_for_unsupported_gguf_architecture(
+        gguf_model.architecture,
+        source=source,
+        tensor_names=gguf_model.tensor_names,
+    )
 
 
 def _looks_like_hf_repo_id(value: str) -> bool:
@@ -65,8 +223,9 @@ def _resolve_gguf_path(gguf_path: str | Path) -> str:
         # FileNotFoundError with the original path.
         return raw
 
+    api = HfApi()
     if not filename:
-        files = [f for f in HfApi().list_repo_files(repo_id) if f.endswith(".gguf")]
+        files = [f for f in api.list_repo_files(repo_id) if f.endswith(".gguf")]
         if not files:
             raise FileNotFoundError(f"No *.gguf files found in HF repo {repo_id!r}")
         if len(files) > 1:
@@ -76,6 +235,7 @@ def _resolve_gguf_path(gguf_path: str | Path) -> str:
             )
         filename = files[0]
 
+    _preflight_hf_gguf(api, repo_id, filename)
     logger.info("Downloading %s from %s", filename, repo_id)
     return hf_hub_download(repo_id=repo_id, filename=filename)
 
@@ -85,7 +245,7 @@ def build_from_gguf(
     *,
     task: str | None = None,
     dtype: str | None = None,
-    keep_quantized: bool = False,
+    keep_quantized: bool = True,
     execution_provider: str = "default",
     mmproj: str | Path | None = None,
     static_cache: bool = False,
@@ -102,9 +262,14 @@ def build_from_gguf(
     7. Run ``preprocess_weights()`` (HF → ONNX name mapping)
     8. Apply weights to the ONNX model
 
-    When *keep_quantized* is ``True``, supported affine tensors are repacked
-    into MatMulNBits format, while runtime-supported native IQ/MXFP4 projection
-    blocks are retained byte-for-byte for BlockQuantizedMatMul.
+    By default, supported affine tensors are repacked into MatMulNBits format.
+    For text-only builds, runtime-supported native IQ/MXFP4 projection blocks
+    are retained byte-for-byte for BlockQuantizedMatMul. Multimodal text
+    backbones normalize quantized projections to a common affine layout. GGUFs
+    containing only F32, F16, or BF16 weights use the float path because there
+    is no quantization to preserve.
+    Quantized files with no supported preservation target raise an actionable
+    error instead of silently falling back to a float model.
 
     Args:
         gguf_path: Path to the ``.gguf`` file, *or* a HuggingFace Hub
@@ -118,9 +283,12 @@ def build_from_gguf(
             model type.
         dtype: Override model dtype (e.g. ``"f16"``). When ``None``,
             defaults to float32.
-        keep_quantized: When ``True``, preserve quantized linear-layer
-            weights in MatMulNBits format. Mixed Q4_K_M source types are
-            normalized to 4-bit, block-32 weights.
+        keep_quantized: Preserve quantization when quantized tensors are
+            present. This is the default. Supported affine blocks are repacked,
+            text-only runtime-supported native IQ/MXFP4 projection blocks
+            retain their bytes, and mixed or multimodal source types can be
+            normalized to a common affine layout. Set to ``False`` to
+            dequantize all weights.
         execution_provider: Target execution provider for EP-aware
             optimisations (e.g. ``"cpu"`` to apply the
             GroupQueryAttention rewrite). Defaults to ``"default"``
@@ -148,7 +316,8 @@ def build_from_gguf(
         ImportError: If the ``gguf`` package is not installed.
         FileNotFoundError: If the GGUF file does not exist.
         KeyError: If the GGUF architecture is not in the registry.
-        ValueError: If *static_cache* is combined with an explicit *task*.
+        ValueError: If *static_cache* is combined with an explicit *task*, or
+            if a quantized input has no supported preservation target.
     """
     import dataclasses
 
@@ -172,9 +341,6 @@ def build_from_gguf(
         build_from_module,
         resolve_dtype,
     )
-    from mobius._config_resolver import (
-        _default_task_for_model,
-    )
     from mobius._registry import registry
     from mobius.integrations.gguf._config_mapping import (
         GGUF_ARCH_TO_MODEL_TYPE,
@@ -183,6 +349,9 @@ def build_from_gguf(
     from mobius.integrations.gguf._reader import GGUFModel
     from mobius.integrations.gguf._tensor_processors import (
         process_tensors,
+    )
+    from mobius.integrations.transformers import (
+        _default_task_for_model,
     )
 
     if static_cache and task is not None:
@@ -194,8 +363,12 @@ def build_from_gguf(
     # 1. Parse GGUF file (auto-download from HF Hub when given "owner/repo[:filename]")
     gguf_path = _resolve_gguf_path(gguf_path)
     gguf_model = GGUFModel(gguf_path)
+    _validate_gguf_model(gguf_model, source=str(gguf_path))
     gguf_arch = gguf_model.architecture
     logger.info("Loaded GGUF file: %s (arch=%s)", gguf_path, gguf_arch)
+    preserve_quantization = keep_quantized and _has_quantized_weights(gguf_model, gguf_arch)
+    if keep_quantized and not preserve_quantization:
+        logger.info("GGUF contains no mapped quantized weights; using the float import path")
 
     # 2. Extract config from GGUF metadata
     config = gguf_to_config(gguf_model)
@@ -209,7 +382,7 @@ def build_from_gguf(
             config = dataclasses.replace(config, dtype=resolved)
 
     # 3. Quantized path: detect dominant type and set config
-    if keep_quantized:
+    if preserve_quantization:
         from mobius._configs import QuantizationConfig
         from mobius._flags import flags
         from mobius.integrations.gguf._tencent_q1_0 import is_tencent_q1_0_layout
@@ -266,7 +439,7 @@ def build_from_gguf(
 
     # 5. Build ONNX graph
     module = module_class(config)
-    if keep_quantized:
+    if preserve_quantization:
         _replace_native_block_linears(module, gguf_model, gguf_arch)
     pkg = build_from_module(
         module, config, resolved_task, execution_provider=execution_provider
@@ -278,7 +451,7 @@ def build_from_gguf(
     )
 
     # 6. Load tensors from GGUF → state_dict
-    if keep_quantized:
+    if preserve_quantization:
         state_dict = _load_quantized_state_dict(gguf_model, gguf_arch, module, config)
     else:
         state_dict = _load_dequantized_state_dict(gguf_model, gguf_arch)
@@ -292,7 +465,7 @@ def build_from_gguf(
     # For the quantized path, only float tensors go through
     # process_tensors; quantized Q/K tensors were permuted in
     # _load_quantized_state_dict already.
-    if keep_quantized:
+    if preserve_quantization:
         float_keys = {
             k
             for k in state_dict
@@ -508,6 +681,28 @@ def _normalize_gguf_weights(
     return result
 
 
+def _has_quantized_weights(gguf_model, gguf_arch: str) -> bool:
+    """Return whether a GGUF has mapped weights with a quantized tensor type."""
+    from gguf import GGMLQuantizationType
+
+    from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
+
+    float_types = {
+        GGMLQuantizationType.F32,
+        GGMLQuantizationType.F16,
+        GGMLQuantizationType.BF16,
+    }
+    f64_type = getattr(GGMLQuantizationType, "F64", None)
+    if f64_type is not None:
+        float_types.add(f64_type)
+
+    for name, _raw, qtype, _shape in gguf_model.tensor_items_raw():
+        hf_name = map_gguf_to_hf_names(name, gguf_arch)
+        if hf_name is not None and hf_name.endswith(".weight") and qtype not in float_types:
+            return True
+    return False
+
+
 def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
     """Detect the common MatMulNBits target for GGUF projection weights.
 
@@ -528,7 +723,7 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
         map_gguf_to_hf_names,
     )
 
-    # Symmetry of each supported GGUF quantization type.
+    # Whether the graph can omit zero_points for each supported GGUF type.
     #
     # Mainline Q1_0 (1-bit binary) is repacked into 2-bit MatMulNBits
     # with zp=1 — see _repack_q1_0. Tencent's custom Q1_0 (2-bit SEQ,
@@ -536,11 +731,17 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
     # parse_tencent_q1_0_tensor — because the ORT CPU unpacked-float-zp
     # path is currently only implemented for bits=4, and the half-integer
     # SEQ offset 1.5 cannot be expressed with integer zp at bits=2.
-    type_symmetry: dict = {
-        GGMLQuantizationType.Q4_0: True,
+    #
+    # Q4_0 and Q8_0 are symmetric formats, but their GGUF dequantization
+    # formulas are still ``(q - 8) * scale`` and ``(q - 128) * scale``.
+    # Emit those zero_points explicitly: GatherBlockQuantized has diverging
+    # CPU/CUDA defaults when the input is omitted, which corrupts embeddings
+    # on CUDA before the first decoder layer runs.
+    type_can_omit_zero_points: dict = {
+        GGMLQuantizationType.Q4_0: False,
         GGMLQuantizationType.Q4_1: False,
         GGMLQuantizationType.Q4_K: False,
-        GGMLQuantizationType.Q8_0: True,
+        GGMLQuantizationType.Q8_0: False,
         GGMLQuantizationType.Q1_0: False,
     }
 
@@ -561,9 +762,18 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
         {qtype: count for qtype, count in counts.items() if _native_block_format(qtype)}
     )
     if native_counts:
-        asymmetric_types = {"Q2_K", "Q4_1", "Q4_K", "Q5_1", "Q5_K"}
-        is_sym = not any(
-            getattr(qtype, "name", None) in asymmetric_types
+        explicit_zero_point_types = {
+            "Q1_0",
+            "Q2_K",
+            "Q4_0",
+            "Q4_1",
+            "Q4_K",
+            "Q5_1",
+            "Q5_K",
+            "Q8_0",
+        }
+        can_omit_zero_points = not any(
+            getattr(qtype, "name", None) in explicit_zero_point_types
             for qtype in counts
             if qtype not in native_counts
         )
@@ -571,7 +781,7 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
             "Native GGUF quant types present; using 4-bit/block-32 module "
             "scaffolding for non-native quantized tensors",
         )
-        return 4, 32, is_sym
+        return 4, 32, can_omit_zero_points
 
     # Q4_K_M is deliberately a mixed preset. Depending on tensor dimensions
     # and importance it may contain mostly Q5_0 plus Q4_K, Q6_K, and Q8_0.
@@ -589,16 +799,20 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
             }
         )
         if not repackable_counts:
+            source_types = ", ".join(
+                sorted({getattr(qtype, "name", str(qtype)) for qtype in counts})
+            )
             raise ValueError(
-                "No repackable quantized tensors found in GGUF file. "
-                "Use keep_quantized=False for dequantized import."
+                "No supported quantized preservation target for GGUF weight "
+                f"types: {source_types}. Use keep_quantized=False (API) or "
+                "--dequantize (CLI) for explicit float import."
             )
         dominant = repackable_counts.most_common(1)[0][0]
     dominant_value = dominant.value if hasattr(dominant, "value") else dominant
     params = repack_quant_params(dominant_value)
     assert params is not None
     bits, block_size = params
-    is_sym = type_symmetry[dominant]
+    is_sym = type_can_omit_zero_points[dominant]
 
     # Tencent Q1_0 files reuse the Q1_0 type id but ship a different
     # on-disk layout (2-bit SEQ, 512-element blocks, fp16 scale per block).
@@ -809,10 +1023,11 @@ def _load_quantized_state_dict(
     """Load tensors, preserving native blocks or normalizing to MatMulNBits.
 
     Projection weights (Q/K/V/O, MLP, and a quantized output head) are
-    converted to the graph's common MatMulNBits format, and token embeddings
-    to GatherBlockQuantized format. Mixed or unsupported source types are
-    dequantized and requantized when they do not match that target. Norms
-    and other non-linear tensors remain dequantized.
+    converted to the graph's common MatMulNBits format, and compatible token
+    embeddings to GatherBlockQuantized format. Mixed or unsupported source
+    types are dequantized and requantized when they do not match that target.
+    Incompatible embeddings, norms, and other non-linear tensors remain
+    dequantized.
 
     For llama-family models, quantized Q/K weights receive the
     row-level reverse-permutation that ``process_tensors`` would

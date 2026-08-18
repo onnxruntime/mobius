@@ -39,7 +39,7 @@ When the CLI or `build()` encounters a model that isn't a transformers model,
 it checks for `model_index.json` (the diffusers pipeline descriptor):
 
 ```python
-# In _diffusers_builder.py
+# In integrations/diffusers/_builder.py
 # 1. Try transformers AutoConfig → if fails:
 # 2. Try loading model_index.json → if found:
 # 3. Parse components and build each via _DIFFUSERS_CLASS_MAP
@@ -47,7 +47,8 @@ it checks for `model_index.json` (the diffusers pipeline descriptor):
 
 ### Registering a new diffusers model
 
-Add an entry to `_init_diffusers_class_map()` in `_diffusers_builder.py`:
+Add an entry to `_init_diffusers_class_map()` in
+`integrations/diffusers/_builder.py`:
 
 ```python
 def _init_diffusers_class_map():
@@ -118,7 +119,7 @@ Existing config classes:
 - `QwenImageVAEConfig` — QwenImage 3D causal VAE
 - `VideoVAEConfig` — 3D video VAE
 
-All defined in `src/mobius/_diffusers_configs.py`.
+All defined in `src/mobius/integrations/diffusers/_configs.py`.
 
 ## Task classes
 
@@ -284,7 +285,7 @@ x = op.Add(x, op.Mul(attn_out, gate_msa))
 
 ### 1. Create config class
 
-In `_diffusers_configs.py`:
+In `integrations/diffusers/_configs.py`:
 
 ```python
 @dataclasses.dataclass
@@ -324,7 +325,7 @@ class MyDenoiser2DModel(nn.Module):
 
 ### 3. Register in _DIFFUSERS_CLASS_MAP
 
-In `_diffusers_builder.py`, add to `_init_diffusers_class_map()`:
+In `integrations/diffusers/_builder.py`, add to `_init_diffusers_class_map()`:
 
 ```python
 _DIFFUSERS_CLASS_MAP["MyDenoiser2DModel"] = (
@@ -353,6 +354,27 @@ Compare `named_parameters()` output with HF weight names. Use the
 techniques from the **weight-name-alignment** skill to minimize
 `preprocess_weights`.
 
+### 7. Prove pipeline executability
+
+A component graph or metadata file is not a runnable diffusion pipeline.
+Before advertising runtime support, execute the complete path:
+
+`image encoder/VAE -> latent packing -> denoiser loop + scheduler -> target token unpacking -> VAE decoder`
+
+Verify sample/output ranks, source-vs-target token slicing, CFG semantics, and
+the runtime's actual scheduler identifiers/equations. Reload final metadata and
+verify every file path, port, preprocessing step, loop edge, and postprocess.
+Emit faithful component graphs and metadata even when the tested downstream
+runtime cannot yet express the complete dataflow. Record that runtime/version
+limitation separately; it must not become a Mobius export capability gate.
+
+Validate required VAE statistics against latent channel count before graph
+construction (`len(mean) == len(std) == z_dim`, positive standard deviations).
+Keep model-specific component/task overrides data-driven rather than adding
+pipeline-name conditionals. Fold initializers after weight loading and mark
+denoiser/VAE roles by semantics, not names. Tests must use `os.path.join`/`Path`
+for temporary ONNX and profiling paths so cleanup works on POSIX and Windows.
+
 ## Naming conventions for diffusers models
 
 Diffusers uses different conventions than transformers:
@@ -372,8 +394,8 @@ Diffusers uses different conventions than transformers:
 
 | File | Contains |
 |------|----------|
-| `_diffusers_configs.py` | All diffusers config dataclasses |
-| `_diffusers_builder.py` | Pipeline detection, `_DIFFUSERS_CLASS_MAP`, build functions |
+| `integrations/diffusers/_configs.py` | All diffusers config dataclasses |
+| `integrations/diffusers/_builder.py` | Pipeline detection, `_DIFFUSERS_CLASS_MAP`, build functions |
 | `models/unet.py` | UNet2DConditionModel + all UNet blocks |
 | `models/vae.py` | AutoencoderKLModel + encoder/decoder blocks |
 | `models/dit.py` | DiTTransformer2DModel + AdaLN blocks |

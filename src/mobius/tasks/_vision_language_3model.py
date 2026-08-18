@@ -219,6 +219,67 @@ class QwenVLTask(VisionLanguageTask):
         return _make_model(graph)
 
 
+class MuseGlimmerVLTask(QwenVLTask):
+    """Muse Glimmer packed vision pipeline with standard 1D text RoPE."""
+
+    def build(
+        self,
+        module: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ModelPackage:
+        self._validate_components(module)
+        models: dict[str, ir.Model] = {}
+        models["decoder"] = build_decoder_from_embeds(module.decoder, config)
+        models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
+        models["embedding"] = build_embedding_from_features(
+            module.embedding,
+            config,
+            feature_name="image_features",
+            feature_dim=config.hidden_size,
+        )
+        return ModelPackage(models, config=config)
+
+
+class MageVLTask(VisionLanguageTask):
+    """Mage-VL split with packed patches and explicit sampled-frame positions."""
+
+    def _build_vision(
+        self,
+        vision: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        total_patches = ir.SymbolicDim("total_patches")
+        num_visuals = ir.SymbolicDim("num_visuals")
+        patch_size = (config.vision.patch_size if config.vision else None) or 16
+        in_channels = config.vision.in_channels if config.vision else 3
+        pixel_dim = in_channels * patch_size * patch_size
+
+        graph, builder = _make_graph(name="vision_encoder")
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=ir.DataType.FLOAT,
+            shape=[total_patches, pixel_dim],
+        )
+        image_grid_thw = builder.input(
+            "image_grid_thw",
+            dtype=ir.DataType.INT64,
+            shape=[num_visuals, 3],
+        )
+        patch_positions = builder.input(
+            "patch_positions",
+            dtype=ir.DataType.INT64,
+            shape=[total_patches, 3],
+        )
+        image_features = vision(
+            builder.op,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            patch_positions=patch_positions,
+        )
+        builder.add_output(image_features, "image_features")
+        return _make_model(graph)
+
+
 class HybridQwenVLTask(QwenVLTask):
     """Qwen VL 3-model split with hybrid KV + DeltaNet cache.
 
@@ -248,6 +309,68 @@ class HybridQwenVLTask(QwenVLTask):
             deepstack=deepstack,
         )
         return ModelPackage(models, config=config)
+
+
+class MiniCPMVLTask(VisionLanguageTask):
+    """MiniCPM-V packed-NaViT vision with a Qwen3.5 hybrid decoder."""
+
+    def build(
+        self,
+        module: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ModelPackage:
+        self._validate_components(module)
+        models: dict[str, ir.Model] = {}
+        models["decoder"] = build_decoder_from_embeds(
+            module.decoder,
+            config,
+            hybrid=True,
+        )
+        models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
+        models["embedding"] = build_embedding_from_features(
+            module.embedding,
+            config,
+            feature_name="image_features",
+            feature_dim=config.hidden_size,
+        )
+        return ModelPackage(models, config=config)
+
+    def _build_vision(
+        self,
+        vision: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build packed pixels + patch-grid sizes -> compressed visual tokens."""
+        packed_batch = ir.SymbolicDim("packed_batch")
+        packed_width = ir.SymbolicDim("packed_width")
+        num_visual_units = ir.SymbolicDim("num_visual_units")
+        vision_config = config.vision
+        assert vision_config is not None
+        patch_size = vision_config.patch_size or 14
+
+        graph, builder = _make_graph(name="vision_encoder")
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=config.dtype,
+            shape=[
+                packed_batch,
+                vision_config.in_channels,
+                patch_size,
+                packed_width,
+            ],
+        )
+        target_sizes = builder.input(
+            "target_sizes",
+            dtype=ir.DataType.INT32,
+            shape=[num_visual_units, 2],
+        )
+        image_features = vision(
+            builder.op,
+            pixel_values=pixel_values,
+            target_sizes=target_sizes,
+        )
+        builder.add_output(image_features, "image_features")
+        return _make_model(graph)
 
 
 class PixtralVLTask(VisionLanguageTask):

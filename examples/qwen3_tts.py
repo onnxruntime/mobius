@@ -79,7 +79,10 @@ def build_or_load(
         # TTS models have nested talker_config; codec models don't.
         # Config reconstruction is best-effort — not all model types
         # support it (e.g. codec tokenizers use a custom config).
-        from mobius._config_resolver import _config_from_hf, _try_load_config_json
+        from mobius.integrations.transformers._config_resolver import (
+            _config_from_hf,
+            _try_load_config_json,
+        )
 
         parent_config = _try_load_config_json(model_id)
         if parent_config is not None:

@@ -35,6 +35,8 @@ Read these when you need deeper detail on a specific topic:
 - Find a small checkpoint on HuggingFace Hub for testing
 - Have the HuggingFace `transformers` source available to reference the
   PyTorch implementation
+- Pin the checkpoint revision before collecting configs, weights, processors,
+  parity data, or goldens
 
 ## Step-by-step
 
@@ -219,6 +221,12 @@ Then add the new module to `src/mobius/_configs/per_model/__init__.py` so its
 side-effect registration runs at import time. The dispatcher filters hooks by
 the declared model_type strings, so unrelated models never see your hook.
 
+Match upstream config semantics, not just field names: preserve transformation
+order (rounding/scaling), explicit `None`, alias precedence, zero-as-disabled
+sentinels, and wrapped/unwrapped composite configs. Add focused tests for each
+nontrivial transform. Test both trusted/custom config classes and raw pinned
+JSON, especially nested decoder fields such as head/layer counts.
+
 ### 7. Write tests
 
 See the **writing-tests** skill for full details.  At minimum:
@@ -278,9 +286,11 @@ see the [quality-checklist skill](../quality-checklist/SKILL.md).
 - [ ] Integration test in `tests/integration_test.py` (if small checkpoint available)
 - [ ] L4 golden file generated and committed (`testdata/golden/`)
 - [ ] L5 generation golden file generated and committed
-- [ ] ORT GenAI test added to `tests/ort_genai_test.py` (text-generation and VLM models)
+- [ ] Graph-derived ORT GenAI metadata is tested; downstream load/generation is
+      optional evidence and never an export capability gate
 - [ ] CLI build works (`mobius build --model ...`)
 - [ ] Multi-dtype correctness verified (fp32, fp16, bf16)
+- [ ] Pinned revision reaches every Hub/processor/weight/golden call
 
 **Note:** Default optimizer passes (CSE, deduplicate initializers, identity
 elimination, remove unused nodes/opsets) are applied automatically.
@@ -425,6 +435,18 @@ config-driven features for the offending subclass.
 > scaling, identity node folding, fp32 upcast patterns, multi-token prefill,
 > embedding table off-by-one), read
 > [`references/weight-preprocessing.md`](references/weight-preprocessing.md).
+
+### 8. Compatibility and optional dependency traps
+
+- Guard imports of symbols from unpinned dependencies when older supported
+  versions may not define them.
+- If remote code imports an optional package, first prove the selected model
+  path needs it. Scope any test-only shim to that unused import; do not add a
+  production fallback or require an irrelevant package.
+- When extending a public component, append optional parameters after existing
+  positional parameters and add a positional-call compatibility test.
+- Helpers with rank/shape contracts must receive a value of that rank; do not
+  rely on incidental compatibility from a higher-rank tensor.
 
 ## Reference examples
 

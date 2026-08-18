@@ -61,3 +61,46 @@ class CTCAsrTask(ModelTask):
         builder.add_output(logits, "logits")
 
         return ModelPackage({"model": _make_model(graph)}, config=config)
+
+
+class FeatureCTCAsrTask(ModelTask):
+    """Build feature-input CTC ASR (log-mel features → frame logits).
+
+    Inputs:
+        ``input_features`` — (batch, frames, mel_bins) normalized log-mel values
+        ``attention_mask`` — (batch, frames) BOOL valid-frame mask
+
+    Output:
+        ``logits`` — (batch, subsampled_frames, vocab_size) CTC scores
+    """
+
+    name = "feature-ctc-asr"
+    model_roles: ClassVar[dict[str, str]] = {"model": "encoder"}
+
+    def build(
+        self,
+        module,
+        config: ArchitectureConfig,
+    ) -> ModelPackage:
+        batch = ir.SymbolicDim("batch")
+        frames = ir.SymbolicDim("frames")
+
+        graph, builder = _make_graph(name="feature_ctc_asr")
+        input_features = builder.input(
+            "input_features",
+            dtype=config.dtype,
+            shape=[batch, frames, config.num_mel_bins],
+        )
+        attention_mask = builder.input(
+            "attention_mask",
+            dtype=ir.DataType.BOOL,
+            shape=[batch, frames],
+        )
+
+        logits = module(
+            builder.op,
+            input_features=input_features,
+            attention_mask=attention_mask,
+        )
+        builder.add_output(logits, "logits")
+        return ModelPackage({"model": _make_model(graph)}, config=config)

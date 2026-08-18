@@ -244,6 +244,15 @@ decoder_inputs = {name: name for name in decoder_input_names}
 This means the genai config automatically adapts when `RemoveDeadGraphInputsPass`
 removes unused inputs (e.g. `position_ids` absorbed by GQA fusion).
 
+Hybrid cache metadata must preserve global layer indices across KV, convolution,
+and recurrent states. Derive slot count from the maximum
+`past_key_values.<index>.*` input index plus one; counting only `.key` inputs
+silently drops non-KV or sparsely indexed layers.
+
+CUDA Graph capture belongs on stable-shape autoregressive decoder sessions,
+not one-shot variable-shape vision/embedding stages. Keep an explicit decoder
+opt-out and validate capture together with shared KV buffers on the real model.
+
 > For the full generation flow, input routing, QwenImageProcessor output
 > tensors, and the multimodal processor factory, see
 > [`references/multimodal-pipeline.md`](references/multimodal-pipeline.md).
@@ -272,6 +281,15 @@ The vision ONNX model expects packed-attention inputs that the ORT GenAI
 processor doesn't provide. Either:
 1. Compute them externally and inject via NamedTensors, or
 2. Modify the vision model to compute them from `image_grid_thw` internally
+
+### Config metadata and downstream runtime acceptance
+
+Mobius owns metadata correctness, not ORT GenAI capability decisions. Emit the
+most accurate package from graph metadata: filenames, semantic graph inputs and
+outputs, every cache template the current config schema can represent, and the
+global cache-slot count. Preserve intrinsic schema/config validation, but do
+not gate or reject export based on the current GenAI model registry, runtime
+version, topology support, or cache executor capability.
 
 ### "input_ids size exceeds max length"
 

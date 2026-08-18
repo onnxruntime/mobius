@@ -434,7 +434,7 @@ class TestDenoisingTask:
 
 class TestVAETask:
     def _make_vae(self):
-        from mobius._diffusers_configs import VAEConfig
+        from mobius.integrations.diffusers._configs import VAEConfig
         from mobius.models.vae import AutoencoderKLModel
 
         config = VAEConfig(

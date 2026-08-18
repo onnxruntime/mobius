@@ -1,4 +1,4 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Integration modules for external runtimes."""
+"""Integrations with external model ecosystems and runtimes."""

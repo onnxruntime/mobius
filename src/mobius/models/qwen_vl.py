@@ -202,6 +202,7 @@ class Qwen25VLDecoderModel(nn.Module):
         attention_mask: ir.Value,
         position_ids: ir.Value,
         past_key_values: list | None = None,
+        return_hidden_states: bool = False,
     ):
         hidden_states, present_key_values = self.model(
             op,
@@ -211,6 +212,8 @@ class Qwen25VLDecoderModel(nn.Module):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
         )
+        if return_hidden_states:
+            return hidden_states, present_key_values
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
 

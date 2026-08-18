@@ -138,9 +138,11 @@ class TestMatMulNBitsEpGating:
         from collections import Counter
 
         from mobius._builder import build_from_module
-        from mobius._config_resolver import _default_task_for_model
         from mobius._configs import CausalLMConfig, QuantizationConfig
         from mobius._registry import registry
+        from mobius.integrations.transformers._config_resolver import (
+            _default_task_for_model,
+        )
 
         cfg = CausalLMConfig(
             num_hidden_layers=2,

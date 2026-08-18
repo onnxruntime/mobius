@@ -151,7 +151,7 @@ class MambaBlock(nn.Module):
         conv_out = self.conv1d(op, conv_input)
 
         # --- Step 3: SiLU activation ---
-        conv_out = op.Mul(conv_out, op.Sigmoid(conv_out))
+        conv_out = op.Swish(conv_out)
 
         # Transpose back: (batch, 1, d_inner)
         x_ssm = op.Transpose(conv_out, perm=[0, 2, 1])
@@ -161,7 +161,7 @@ class MambaBlock(nn.Module):
         # y: (batch, 1, d_inner)
 
         # --- Step 5: Output gating: y * SiLU(z) ---
-        z_activated = op.Mul(z_gate, op.Sigmoid(z_gate))
+        z_activated = op.Swish(z_gate)
         gated = op.Mul(y, z_activated)
 
         # --- Step 6: Output projection ---
