@@ -11,10 +11,10 @@ import onnx_ir as ir
 import torch
 
 from mobius._builder import build_from_module
-from mobius._config_resolver import _default_task_for_model
 from mobius._configs import ArchitectureConfig, QuantizationConfig
 from mobius._testing import count_op_type, make_config
 from mobius.integrations.ort_genai import export_package
+from mobius.integrations.transformers._config_resolver import _default_task_for_model
 from mobius.models.deepseek_v4 import DeepSeekV4CausalLMModel
 
 

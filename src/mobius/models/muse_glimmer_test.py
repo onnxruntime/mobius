@@ -14,7 +14,7 @@ from mobius import build_from_module
 from mobius._configs import MuseGlimmerConfig
 from mobius._testing import create_test_builder, create_test_input
 from mobius._testing.ort_inference import OnnxModelSession
-from mobius._weight_loading import apply_weights
+from mobius.integrations._weight_loading import apply_weights
 from mobius.models.muse_glimmer import (
     MuseGlimmerForConditionalGeneration,
     MuseGlimmerScaleFreeRMSNorm,

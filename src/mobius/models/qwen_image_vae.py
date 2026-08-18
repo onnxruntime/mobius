@@ -17,9 +17,9 @@ from typing import TYPE_CHECKING
 
 from onnxscript import OpBuilder, nn
 
-from mobius._diffusers_configs import QwenImageVAEConfig
 from mobius.components import Conv2d as _Conv2d
 from mobius.components import SiLU as _SiLU
+from mobius.integrations.diffusers._configs import QwenImageVAEConfig
 
 if TYPE_CHECKING:
     import onnx_ir as ir

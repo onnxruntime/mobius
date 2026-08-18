@@ -13,13 +13,8 @@ import torch
 
 from mobius._builder import (
     _cast_module_dtype,
-    build,
     build_from_module,
     resolve_dtype,
-)
-from mobius._config_resolver import (
-    _config_from_hf,
-    _default_task_for_model,
 )
 from mobius._model_package import ModelPackage
 from mobius._registry import (
@@ -28,7 +23,12 @@ from mobius._registry import (
     registry,
 )
 from mobius._testing import make_config
-from mobius._weight_loading import apply_weights
+from mobius.integrations._weight_loading import apply_weights
+from mobius.integrations.transformers import build
+from mobius.integrations.transformers._config_resolver import (
+    _config_from_hf,
+    _default_task_for_model,
+)
 from mobius.models.base import CausalLMModel
 from mobius.tasks import CausalLMTask, ModelTask
 

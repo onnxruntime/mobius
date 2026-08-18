@@ -30,12 +30,12 @@ import logging
 
 import pytest
 
-from mobius._config_resolver import (
+from mobius._registry import registry
+from mobius.integrations.transformers._config_resolver import (
     _config_from_hf,
     _default_task_for_model,
     _try_load_config_json,
 )
-from mobius._registry import registry
 from mobius.tasks import get_task
 
 logger = logging.getLogger(__name__)

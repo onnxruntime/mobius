@@ -10,12 +10,12 @@ from typing import ClassVar
 import onnx_ir as ir
 from onnxscript import nn
 
-from mobius._diffusers_configs import (
+from mobius._model_package import ModelPackage
+from mobius.components import Embedding
+from mobius.integrations.diffusers._configs import (
     MINIMAX_MUSIC3_AUDIO_CODE_OFFSET,
     MINIMAX_MUSIC3_FEEDBACK_SCALE,
 )
-from mobius._model_package import ModelPackage
-from mobius.components import Embedding
 from mobius.tasks._base import ModelTask, _make_graph, _make_model
 from mobius.tasks._cache_utils import (
     _make_kv_cache_inputs,

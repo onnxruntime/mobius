@@ -1,21 +1,21 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Tests for _config_resolver.py — pure function input/output tests."""
+"""Tests for the Transformers config resolver."""
 
 from __future__ import annotations
 
 import pytest
 
-from mobius._config_resolver import (
-    _config_from_hf,
-    _default_task_for_model,
-    _dict_to_pretrained_config,
-)
 from mobius._configs import (
     ArchitectureConfig,
     MoonshineConfig,
     WhisperConfig,
+)
+from mobius.integrations.transformers._config_resolver import (
+    _config_from_hf,
+    _default_task_for_model,
+    _dict_to_pretrained_config,
 )
 
 

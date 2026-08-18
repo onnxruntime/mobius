@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Tests for _diffusers_builder.py — diffusers pipeline building."""
+"""Tests for the Diffusers integration builder."""
 
 from __future__ import annotations
 
@@ -10,7 +10,8 @@ from unittest.mock import mock_open, patch
 import onnx_ir as ir
 import pytest
 
-from mobius._diffusers_builder import (
+from mobius._model_package import ModelPackage
+from mobius.integrations.diffusers._builder import (
     _DIFFUSERS_CLASS_MAP,
     _download_diffusers_component_weights,
     _init_diffusers_class_map,
@@ -19,7 +20,6 @@ from mobius._diffusers_builder import (
     _resolve_diffusers_component_source,
     build_diffusers_pipeline,
 )
-from mobius._model_package import ModelPackage
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -119,7 +119,7 @@ class TestBuildDiffusersPipelineErrors:
     """Tests for error paths in build_diffusers_pipeline."""
 
     @patch(
-        "mobius._diffusers_builder._load_diffusers_pipeline_index",
+        "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
         return_value=None,
     )
     def test_raises_when_no_model_index(self, _mock_load):
@@ -128,7 +128,7 @@ class TestBuildDiffusersPipelineErrors:
             build_diffusers_pipeline("fake/no-index-model", load_weights=False)
 
     @patch(
-        "mobius._diffusers_builder._load_diffusers_pipeline_index",
+        "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
         return_value={"_class_name": "SomePipeline"},
     )
     def test_raises_when_no_supported_components(self, _mock_load):
@@ -137,7 +137,7 @@ class TestBuildDiffusersPipelineErrors:
             build_diffusers_pipeline("fake/empty-pipeline", load_weights=False)
 
     @patch(
-        "mobius._diffusers_builder._load_diffusers_pipeline_index",
+        "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
         return_value={
             "_class_name": "SomePipeline",
             "scheduler": ["diffusers", "EulerDiscreteScheduler"],
@@ -200,7 +200,7 @@ class TestDiffusersHubRevision:
             revision="component-revision",
         )
 
-    @patch("mobius._diffusers_builder._parallel_download", return_value=[])
+    @patch("mobius.integrations.diffusers._builder._parallel_download", return_value=[])
     @patch("huggingface_hub.hf_hub_download", return_value="weights.index.json")
     def test_component_weight_downloads_use_revision(
         self,
@@ -228,7 +228,7 @@ class TestDiffusersHubRevision:
             desc="vae weights",
         )
 
-    @patch("mobius._diffusers_builder._parallel_download", return_value=[])
+    @patch("mobius.integrations.diffusers._builder._parallel_download", return_value=[])
     @patch("huggingface_hub.hf_hub_download", return_value="weights.index.json")
     def test_component_weights_use_resolved_external_subfolder(
         self,
@@ -287,7 +287,7 @@ class TestDiffusersHubRevision:
 
     @patch("huggingface_hub.hf_hub_download", return_value="scheduler.json")
     def test_optional_metadata_download_uses_revision(self, mock_download):
-        from mobius._diffusers_builder import _load_optional_diffusers_json
+        from mobius.integrations.diffusers._builder import _load_optional_diffusers_json
 
         with patch("builtins.open", mock_open(read_data='{"shift": 3.0}')):
             result = _load_optional_diffusers_json(
@@ -325,10 +325,10 @@ class TestBuildDiffusersPipelineFiltering:
     """Tests for how build_diffusers_pipeline filters pipeline components."""
 
     @patch(
-        "mobius._diffusers_builder._load_diffusers_component_config",
+        "mobius.integrations.diffusers._builder._load_diffusers_component_config",
     )
     @patch(
-        "mobius._diffusers_builder._load_diffusers_pipeline_index",
+        "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
     )
     def test_skips_underscore_prefixed_keys(self, mock_load_index, mock_load_config):
         """Keys starting with '_' (like _class_name) are skipped."""
@@ -342,9 +342,12 @@ class TestBuildDiffusersPipelineFiltering:
         # _load_diffusers_component_config should never be called
         mock_load_config.assert_not_called()
 
-    @patch("mobius._diffusers_builder._load_optional_diffusers_json", return_value={})
     @patch(
-        "mobius._diffusers_builder._load_diffusers_component_config",
+        "mobius.integrations.diffusers._builder._load_optional_diffusers_json",
+        return_value={},
+    )
+    @patch(
+        "mobius.integrations.diffusers._builder._load_diffusers_component_config",
         return_value={
             "condition_hidden_dim": 16,
             "num_condition_layers": 2,
@@ -356,7 +359,7 @@ class TestBuildDiffusersPipelineFiltering:
         },
     )
     @patch(
-        "mobius._diffusers_builder._load_diffusers_pipeline_index",
+        "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
         return_value={
             "_class_name": "MiniMaxMusic3ModularPipeline",
             "condition_encoder": [
@@ -401,10 +404,10 @@ class TestBuildDiffusersPipelineFiltering:
         )
 
     @patch(
-        "mobius._diffusers_builder._load_diffusers_component_config",
+        "mobius.integrations.diffusers._builder._load_diffusers_component_config",
     )
     @patch(
-        "mobius._diffusers_builder._load_diffusers_pipeline_index",
+        "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
     )
     def test_skips_non_list_entries(self, mock_load_index, mock_load_config):
         """Non-list entries (e.g. strings, dicts) are skipped."""
@@ -419,10 +422,10 @@ class TestBuildDiffusersPipelineFiltering:
         mock_load_config.assert_not_called()
 
     @patch(
-        "mobius._diffusers_builder._load_diffusers_component_config",
+        "mobius.integrations.diffusers._builder._load_diffusers_component_config",
     )
     @patch(
-        "mobius._diffusers_builder._load_diffusers_pipeline_index",
+        "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
     )
     def test_skips_lists_with_wrong_length(self, mock_load_index, mock_load_config):
         """Lists that don't have two elements or two plus metadata are skipped."""
@@ -437,10 +440,10 @@ class TestBuildDiffusersPipelineFiltering:
         mock_load_config.assert_not_called()
 
     @patch(
-        "mobius._diffusers_builder._load_diffusers_component_config",
+        "mobius.integrations.diffusers._builder._load_diffusers_component_config",
     )
     @patch(
-        "mobius._diffusers_builder._load_diffusers_pipeline_index",
+        "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
     )
     def test_skips_unregistered_class_names(self, mock_load_index, mock_load_config):
         """Components with unregistered class names are skipped with a log message."""
@@ -476,12 +479,12 @@ class TestBuildDiffusersPipelineSuccess:
         model = ir.Model(graph, ir_version=10)
         mock_build_from_module.return_value = ModelPackage({"model": model})
 
-    @patch("mobius._diffusers_builder.build_from_module")
+    @patch("mobius.integrations.diffusers._builder.build_from_module")
     @patch(
-        "mobius._diffusers_builder._load_diffusers_component_config",
+        "mobius.integrations.diffusers._builder._load_diffusers_component_config",
     )
     @patch(
-        "mobius._diffusers_builder._load_diffusers_pipeline_index",
+        "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
     )
     def test_returns_model_package(
         self,
@@ -494,12 +497,12 @@ class TestBuildDiffusersPipelineSuccess:
         result = build_diffusers_pipeline("fake/vae-model", load_weights=False)
         assert isinstance(result, ModelPackage)
 
-    @patch("mobius._diffusers_builder.build_from_module")
+    @patch("mobius.integrations.diffusers._builder.build_from_module")
     @patch(
-        "mobius._diffusers_builder._load_diffusers_component_config",
+        "mobius.integrations.diffusers._builder._load_diffusers_component_config",
     )
     @patch(
-        "mobius._diffusers_builder._load_diffusers_pipeline_index",
+        "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
     )
     def test_single_model_subpackage_flattened(
         self,
@@ -514,12 +517,12 @@ class TestBuildDiffusersPipelineSuccess:
         assert "vae" in result
         assert "model" not in result
 
-    @patch("mobius._diffusers_builder.build_from_module")
+    @patch("mobius.integrations.diffusers._builder.build_from_module")
     @patch(
-        "mobius._diffusers_builder._load_diffusers_component_config",
+        "mobius.integrations.diffusers._builder._load_diffusers_component_config",
     )
     @patch(
-        "mobius._diffusers_builder._load_diffusers_pipeline_index",
+        "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
     )
     def test_graph_name_set_to_model_id_component(
         self,
@@ -532,12 +535,12 @@ class TestBuildDiffusersPipelineSuccess:
         result = build_diffusers_pipeline("fake/vae-model", load_weights=False)
         assert result["vae"].graph.name == "fake/vae-model/vae"
 
-    @patch("mobius._diffusers_builder.build_from_module")
+    @patch("mobius.integrations.diffusers._builder.build_from_module")
     @patch(
-        "mobius._diffusers_builder._load_diffusers_component_config",
+        "mobius.integrations.diffusers._builder._load_diffusers_component_config",
     )
     @patch(
-        "mobius._diffusers_builder._load_diffusers_pipeline_index",
+        "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
     )
     def test_multi_model_subpackage_prefixed(
         self,
@@ -565,12 +568,12 @@ class TestBuildDiffusersPipelineSuccess:
         assert result["vae_encoder"].graph.name == "fake/multi/vae_encoder"
         assert result["vae_decoder"].graph.name == "fake/multi/vae_decoder"
 
-    @patch("mobius._diffusers_builder.build_from_module")
+    @patch("mobius.integrations.diffusers._builder.build_from_module")
     @patch(
-        "mobius._diffusers_builder._load_diffusers_component_config",
+        "mobius.integrations.diffusers._builder._load_diffusers_component_config",
     )
     @patch(
-        "mobius._diffusers_builder._load_diffusers_pipeline_index",
+        "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
     )
     def test_multiple_components_built(
         self,
@@ -600,12 +603,12 @@ class TestBuildDiffusersPipelineSuccess:
         assert "vae" in result
         assert "text_encoder" in result
 
-    @patch("mobius._diffusers_builder.build_from_module")
+    @patch("mobius.integrations.diffusers._builder.build_from_module")
     @patch(
-        "mobius._diffusers_builder._load_diffusers_component_config",
+        "mobius.integrations.diffusers._builder._load_diffusers_component_config",
     )
     @patch(
-        "mobius._diffusers_builder._load_diffusers_pipeline_index",
+        "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
     )
     def test_dtype_string_resolved(
         self,
@@ -620,12 +623,12 @@ class TestBuildDiffusersPipelineSuccess:
         # Verify build_from_module was called (string dtype resolved without error)
         mock_build_from_module.assert_called_once()
 
-    @patch("mobius._diffusers_builder.build_from_module")
+    @patch("mobius.integrations.diffusers._builder.build_from_module")
     @patch(
-        "mobius._diffusers_builder._load_diffusers_component_config",
+        "mobius.integrations.diffusers._builder._load_diffusers_component_config",
     )
     @patch(
-        "mobius._diffusers_builder._load_diffusers_pipeline_index",
+        "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
     )
     def test_dtype_ir_datatype_passthrough(
         self,
@@ -643,11 +646,11 @@ class TestBuildDiffusersPipelineSuccess:
         # Verify build_from_module was called (ir.DataType accepted without error)
         mock_build_from_module.assert_called_once()
 
-    @patch("mobius._diffusers_builder._download_diffusers_component_weights")
-    @patch("mobius._diffusers_builder.apply_weights")
-    @patch("mobius._diffusers_builder.build_from_module")
-    @patch("mobius._diffusers_builder._load_diffusers_component_config")
-    @patch("mobius._diffusers_builder._load_diffusers_pipeline_index")
+    @patch("mobius.integrations.diffusers._builder._download_diffusers_component_weights")
+    @patch("mobius.integrations.diffusers._builder.apply_weights")
+    @patch("mobius.integrations.diffusers._builder.build_from_module")
+    @patch("mobius.integrations.diffusers._builder._load_diffusers_component_config")
+    @patch("mobius.integrations.diffusers._builder._load_diffusers_pipeline_index")
     def test_revision_propagates_to_all_pipeline_artifacts(
         self,
         mock_load_index,
@@ -676,9 +679,9 @@ class TestBuildDiffusersPipelineSuccess:
         )
         mock_apply_weights.assert_called_once()
 
-    @patch("mobius._diffusers_builder.build_from_module")
-    @patch("mobius._diffusers_builder._load_diffusers_component_config")
-    @patch("mobius._diffusers_builder._load_diffusers_pipeline_index")
+    @patch("mobius.integrations.diffusers._builder.build_from_module")
+    @patch("mobius.integrations.diffusers._builder._load_diffusers_component_config")
+    @patch("mobius.integrations.diffusers._builder._load_diffusers_pipeline_index")
     def test_qwen_edit_uses_normalized_vae_task(
         self,
         mock_load_index,
@@ -709,9 +712,9 @@ class TestBuildDiffusersPipelineSuccess:
         assert mock_build_from_module.call_args.args[2] == "qwen-image-edit-vae"
         assert result.config.model_type == "qwen_image_edit"
 
-    @patch("mobius._diffusers_builder.build_from_module")
-    @patch("mobius._diffusers_builder._load_diffusers_component_config")
-    @patch("mobius._diffusers_builder._load_diffusers_pipeline_index")
+    @patch("mobius.integrations.diffusers._builder.build_from_module")
+    @patch("mobius.integrations.diffusers._builder._load_diffusers_component_config")
+    @patch("mobius.integrations.diffusers._builder._load_diffusers_pipeline_index")
     def test_component_allowlist_avoids_building_other_components(
         self,
         mock_load_index,
@@ -746,17 +749,17 @@ class TestBuildDiffusersPipelineSuccess:
 class TestBuildDiffusersPipelineWeights:
     """Tests for weight loading paths in build_diffusers_pipeline."""
 
-    @patch("mobius._diffusers_builder.fold_initializers_after_weights")
-    @patch("mobius._diffusers_builder.apply_weights")
+    @patch("mobius.integrations.diffusers._builder.fold_initializers_after_weights")
+    @patch("mobius.integrations.diffusers._builder.apply_weights")
     @patch(
-        "mobius._diffusers_builder._download_diffusers_component_weights",
+        "mobius.integrations.diffusers._builder._download_diffusers_component_weights",
     )
-    @patch("mobius._diffusers_builder.build_from_module")
+    @patch("mobius.integrations.diffusers._builder.build_from_module")
     @patch(
-        "mobius._diffusers_builder._load_diffusers_component_config",
+        "mobius.integrations.diffusers._builder._load_diffusers_component_config",
     )
     @patch(
-        "mobius._diffusers_builder._load_diffusers_pipeline_index",
+        "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
     )
     def test_load_weights_true_downloads_and_applies(
         self,
@@ -784,14 +787,14 @@ class TestBuildDiffusersPipelineWeights:
         mock_fold_initializers.assert_called_once_with(model)
 
     @patch(
-        "mobius._diffusers_builder._download_diffusers_component_weights",
+        "mobius.integrations.diffusers._builder._download_diffusers_component_weights",
     )
-    @patch("mobius._diffusers_builder.build_from_module")
+    @patch("mobius.integrations.diffusers._builder.build_from_module")
     @patch(
-        "mobius._diffusers_builder._load_diffusers_component_config",
+        "mobius.integrations.diffusers._builder._load_diffusers_component_config",
     )
     @patch(
-        "mobius._diffusers_builder._load_diffusers_pipeline_index",
+        "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
     )
     def test_load_weights_false_skips_download(
         self,
@@ -813,16 +816,16 @@ class TestBuildDiffusersPipelineWeights:
         build_diffusers_pipeline("fake/model", load_weights=False)
         mock_download_weights.assert_not_called()
 
-    @patch("mobius._diffusers_builder.apply_weights")
+    @patch("mobius.integrations.diffusers._builder.apply_weights")
     @patch(
-        "mobius._diffusers_builder._download_diffusers_component_weights",
+        "mobius.integrations.diffusers._builder._download_diffusers_component_weights",
     )
-    @patch("mobius._diffusers_builder.build_from_module")
+    @patch("mobius.integrations.diffusers._builder.build_from_module")
     @patch(
-        "mobius._diffusers_builder._load_diffusers_component_config",
+        "mobius.integrations.diffusers._builder._load_diffusers_component_config",
     )
     @patch(
-        "mobius._diffusers_builder._load_diffusers_pipeline_index",
+        "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
     )
     def test_preprocess_weights_called_when_available(
         self,
@@ -862,7 +865,7 @@ def test_prepare_unet_loras_infers_rank_and_merges(tmp_path):
     import torch
     from safetensors.torch import save_file
 
-    from mobius._diffusers_builder import _prepare_unet_loras
+    from mobius.integrations.diffusers._builder import _prepare_unet_loras
 
     path = tmp_path / "style.safetensors"
     save_file(

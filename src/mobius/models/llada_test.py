@@ -27,7 +27,7 @@ import pytest
 import torch
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_loading import apply_weights
+from mobius.integrations._weight_loading import apply_weights
 from mobius.models.llada import LLaDAModel
 from mobius.tasks._masked_diffusion import MaskedDiffusionTask
 

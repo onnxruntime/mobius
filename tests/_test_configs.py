@@ -2912,8 +2912,10 @@ def _auto_generated_configs() -> list[tuple[str, dict, bool]]:
     that cannot be guessed.
     """
     try:
-        from mobius._config_resolver import _default_task_for_model
         from mobius._registry import registry
+        from mobius.integrations.transformers._config_resolver import (
+            _default_task_for_model,
+        )
     except Exception:
         return []
 

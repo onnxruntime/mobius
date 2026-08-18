@@ -2471,9 +2471,11 @@ class TestGemma4RealModel:
     def test_gemma4_genai_config_from_real_model(self, tmp_path):
         """Build tiny Gemma4 VLM, generate genai config, verify inputs."""
         from mobius._builder import build_from_module
-        from mobius._config_resolver import _default_task_for_model
         from mobius._configs import Gemma4Config, VisionConfig
         from mobius._registry import registry
+        from mobius.integrations.transformers._config_resolver import (
+            _default_task_for_model,
+        )
         from mobius.tasks import get_task
 
         config = Gemma4Config(
@@ -2554,10 +2556,13 @@ class TestGemma4RealModel:
         (``gemma4_text``), NOT the multimodal HF config (``gemma4_unified``),
         and that no vision/audio sections or processor files are written.
         """
-        from mobius._builder import _strip_to_text_only, build_from_module
-        from mobius._config_resolver import _default_task_for_model
+        from mobius._builder import build_from_module
         from mobius._configs import Gemma4Config
         from mobius._registry import registry
+        from mobius.integrations.transformers._builder import _strip_to_text_only
+        from mobius.integrations.transformers._config_resolver import (
+            _default_task_for_model,
+        )
         from mobius.tasks import get_task
 
         # Start from a multimodal-flavoured config and strip to text-only, the
@@ -2652,7 +2657,7 @@ class TestGemma4RealModel:
             return {"genai_config": os.path.join(output_dir, "genai_config.json")}
 
         with (
-            mock.patch("mobius._builder.build", side_effect=fake_build),
+            mock.patch("mobius.integrations.transformers.build", side_effect=fake_build),
             mock.patch(
                 "mobius.integrations.ort_genai.auto_export.export_package",
                 side_effect=fake_export_package,
@@ -2664,7 +2669,7 @@ class TestGemma4RealModel:
 
         captured.clear()
         with (
-            mock.patch("mobius._builder.build", side_effect=fake_build),
+            mock.patch("mobius.integrations.transformers.build", side_effect=fake_build),
             mock.patch(
                 "mobius.integrations.ort_genai.auto_export.export_package",
                 side_effect=fake_export_package,
@@ -2679,7 +2684,7 @@ class TestGemma4RealModel:
         pkg = _make_fake_llm_pkg("mage_vl")
 
         with (
-            mock.patch("mobius._builder.build", return_value=pkg),
+            mock.patch("mobius.integrations.transformers.build", return_value=pkg),
             mock.patch.object(pkg, "save") as save,
             pytest.raises(ValueError, match=r"Mage-VL.*patch_positions"),
         ):

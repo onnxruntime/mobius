@@ -19,7 +19,6 @@ import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
-from mobius._diffusers_configs import QwenImageConfig
 from mobius.components import (
     INT64_MAX,
 )
@@ -32,6 +31,7 @@ from mobius.components import (
 from mobius.components import (
     SiLU as _SiLU,
 )
+from mobius.integrations.diffusers._configs import QwenImageConfig
 
 _QWEN_TIMESTEP_EMBEDDING_SIZE = 256
 

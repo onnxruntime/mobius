@@ -19,7 +19,7 @@ import transformers
 from mobius import build, build_from_module
 from mobius._configs import ParakeetCTCConfig
 from mobius._testing.ort_inference import OnnxModelSession
-from mobius._weight_loading import apply_weights
+from mobius.integrations._weight_loading import apply_weights
 from mobius.models import ParakeetForCTCModel
 from mobius.tasks import FeatureCTCAsrTask
 
