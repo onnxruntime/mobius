@@ -12,10 +12,8 @@ import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import supported_qmoe_quantization
+from mobius._weight_utils import supported_qmoe_quantization as _supported_qmoe_quantization
 from mobius.components._mlp import MLP
-
-_supported_qmoe_quantization = supported_qmoe_quantization
 
 
 def _interleave_gate_up_rows(

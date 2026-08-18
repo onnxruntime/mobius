@@ -368,7 +368,7 @@ class TestQwen35VL3ModelQuantization:
             try:
                 model.preprocess_weights({})
             except NotImplementedError as error:
-                assert "Qwen35VL3ModelCausalLMModel" in str(error)
+                assert "Quantized embeddings and LM heads" in str(error)
             else:
                 raise AssertionError(
                     f"expected NotImplementedError when {flag}=True for dense VL export"

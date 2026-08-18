@@ -965,7 +965,6 @@ def preprocess_quantized_weights(
     qmoe_target_path: str | None = None,
     qmoe_quant_methods: Collection[str] = ("gptq", "awq", "olive"),
     reject_quantized_embeddings_lm_head: bool = False,
-    model_name: str = "model",
 ) -> dict[str, torch.Tensor]:
     """Apply shared quantization conversion, tying, and QMoE packing.
 
@@ -982,7 +981,6 @@ def preprocess_quantized_weights(
             the config matches the native QMoE ABI.
         reject_quantized_embeddings_lm_head: Reject packed embedding/head
             weights because the caller's graph requires float parameters.
-        model_name: Model name included in actionable error messages.
 
     Returns:
         The preprocessed weight dictionary.
@@ -1013,13 +1011,13 @@ def preprocess_quantized_weights(
         methods = tuple(qmoe_quant_methods)
         if methods == ("olive",):
             raise NotImplementedError(
-                f"{model_name} currently only supports QMoE export for "
+                "This model currently only supports QMoE export for "
                 "Olive-quantized checkpoints (quant_method='olive'); got "
                 f"quant_method={quantization.quant_method!r}. GPTQ/AWQ VL-MoE "
                 "export is not yet implemented."
             )
         raise NotImplementedError(
-            f"{model_name} supports QMoE export for quant_method values "
+            "This model supports QMoE export for quant_method values "
             f"{methods!r}; got quant_method={quantization.quant_method!r}."
         )
 
@@ -1031,7 +1029,7 @@ def preprocess_quantized_weights(
         ]
         if packed_expert_keys:
             raise ValueError(
-                f"Quantized MoE expert weights were found for {model_name} "
+                "Quantized MoE expert weights were found for this model "
                 f"(e.g. {packed_expert_keys[0]!r}) but this quantization "
                 "config doesn't match the native QMoE ABI "
                 "(supported_qmoe_quantization returned None). The dense "
@@ -1072,7 +1070,7 @@ def preprocess_quantized_weights(
         )
         raise NotImplementedError(
             "Quantized embeddings and LM heads are not yet supported by "
-            f"{model_name}: {embed_key.removesuffix('.weight')}, "
+            f"this model: {embed_key.removesuffix('.weight')}, "
             f"{head_key.removesuffix('.weight')}, and related embedding "
             f"initializers currently require float weights.{packed_key_detail}"
         )

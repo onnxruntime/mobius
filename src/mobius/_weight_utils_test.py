@@ -967,7 +967,6 @@ class TestPreprocessQuantizedWeights:
                 state_dict,
                 quantization,
                 qmoe_target_path=".mlp",
-                model_name="TestModel",
             )
 
     def test_rejects_unsupported_qmoe_quantization_method(self):
@@ -978,7 +977,6 @@ class TestPreprocessQuantizedWeights:
                 quantization,
                 qmoe_target_path=".mlp",
                 qmoe_quant_methods=("olive",),
-                model_name="TestModel",
             )
 
     @pytest.mark.parametrize("flag", ["quantize_embeddings", "quantize_lm_head"])
@@ -989,12 +987,13 @@ class TestPreprocessQuantizedWeights:
             quant_method="olive",
             **{flag: True},
         )
-        with pytest.raises(NotImplementedError, match="TestModel"):
+        with pytest.raises(
+            NotImplementedError, match="Quantized embeddings and LM heads"
+        ):
             preprocess_quantized_weights(
                 {},
                 quantization,
                 reject_quantized_embeddings_lm_head=True,
-                model_name="TestModel",
             )
 
     @pytest.mark.parametrize(
@@ -1029,7 +1028,6 @@ class TestPreprocessQuantizedWeights:
                 reject_quantized_embeddings_lm_head=True,
                 embed_key="decoder.model.embed_tokens.weight",
                 head_key="decoder.lm_head.weight",
-                model_name="TestModel",
             )
 
         assert packed_key in str(error.value)

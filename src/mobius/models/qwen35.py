@@ -450,7 +450,6 @@ class Qwen35MoECausalLMModel(CausalLMModel):
             tie_embeddings=self.config.tie_word_embeddings,
             qmoe_target_path=".mlp",
             qmoe_quant_methods=("gptq", "awq", "olive"),
-            model_name="Qwen35MoECausalLMModel",
         )
 
 
@@ -552,7 +551,6 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
             head_key="decoder.lm_head.weight",
             qmoe_target_path=None,
             reject_quantized_embeddings_lm_head=True,
-            model_name="Qwen35VL3ModelCausalLMModel",
         )
         if tie:
             if (
@@ -789,7 +787,6 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
             qmoe_target_path=".mlp",
             qmoe_quant_methods=("olive",),
             reject_quantized_embeddings_lm_head=True,
-            model_name="Qwen35MoEVL3ModelCausalLMModel",
         )
         if tie:
             if (
