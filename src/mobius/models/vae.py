@@ -13,11 +13,11 @@ from typing import TYPE_CHECKING
 import torch
 from onnxscript import OpBuilder, nn
 
-from mobius._diffusers_configs import VAEConfig
 from mobius.components import Conv2d as _Conv2d
 from mobius.components import GroupNorm as _GroupNorm
 from mobius.components import Linear as _Linear
 from mobius.components import SiLU as _SiLU
+from mobius.integrations.diffusers._configs import VAEConfig
 
 if TYPE_CHECKING:
     import onnx_ir as ir

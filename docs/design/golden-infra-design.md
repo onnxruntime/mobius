@@ -946,7 +946,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from mobius._builder import build, build_from_module
+from mobius import build, build_from_module
 from mobius._registry import registry
 from mobius._testing.golden import (
     TestCase,

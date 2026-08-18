@@ -14,8 +14,8 @@ import numpy as np
 import onnx_ir as ir
 import pytest
 
-from mobius._diffusers_configs import QwenImageConfig
-from mobius._weight_loading import apply_weights
+from mobius.integrations._weight_loading import apply_weights
+from mobius.integrations.diffusers._configs import QwenImageConfig
 from mobius.models.qwen_image import (
     QwenImageTransformer2DModel,
     prepare_qwen_image_rotary_embeddings,
@@ -130,7 +130,7 @@ def test_transformer_weight_names_match_diffusers():
 def test_vae_weight_names_match_diffusers():
     diffusers = pytest.importorskip("diffusers")
 
-    from mobius._diffusers_configs import QwenImageVAEConfig
+    from mobius.integrations.diffusers._configs import QwenImageVAEConfig
     from mobius.models.qwen_image_vae import AutoencoderKLQwenImageModel
 
     hf_vae = diffusers.AutoencoderKLQwenImage(
@@ -153,7 +153,7 @@ def test_vae_weight_names_match_diffusers():
 
 
 def test_edit_vae_rejects_wrong_latent_statistics_length():
-    from mobius._diffusers_configs import QwenImageVAEConfig
+    from mobius.integrations.diffusers._configs import QwenImageVAEConfig
     from mobius.models.qwen_image_vae import AutoencoderKLQwenImageModel
     from mobius.tasks import QwenImageEditVAETask
 
@@ -302,7 +302,7 @@ def test_edit_vae_matches_diffusers_on_real_source_image():
     diffusers = pytest.importorskip("diffusers")
     image_module = pytest.importorskip("PIL.Image")
 
-    from mobius._diffusers_configs import QwenImageVAEConfig
+    from mobius.integrations.diffusers._configs import QwenImageVAEConfig
     from mobius.models.qwen_image_vae import AutoencoderKLQwenImageModel
     from mobius.tasks import QwenImageEditVAETask
 
@@ -374,7 +374,7 @@ def test_deterministic_l4_l5_image_edit_golden():
     diffusers = pytest.importorskip("diffusers")
     image_module = pytest.importorskip("PIL.Image")
 
-    from mobius._diffusers_configs import QwenImageVAEConfig
+    from mobius.integrations.diffusers._configs import QwenImageVAEConfig
     from mobius.models.qwen_image_vae import AutoencoderKLQwenImageModel
     from mobius.tasks import QwenImageEditVAETask
 

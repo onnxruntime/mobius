@@ -38,8 +38,8 @@ from _test_configs import (
     _base_config,
 )
 
-from mobius._config_resolver import _default_task_for_model
 from mobius._registry import registry
+from mobius.integrations.transformers._config_resolver import _default_task_for_model
 from mobius.tasks import get_task
 
 # ---------------------------------------------------------------------------

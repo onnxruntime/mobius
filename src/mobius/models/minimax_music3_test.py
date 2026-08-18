@@ -8,7 +8,9 @@ import onnx_ir as ir
 import torch
 
 from mobius import build_from_module
-from mobius._diffusers_configs import (
+from mobius._testing.ort_inference import OnnxModelSession
+from mobius.integrations._weight_loading import apply_weights
+from mobius.integrations.diffusers._configs import (
     MINIMAX_MUSIC3_AUDIO_CODE_OFFSET,
     MINIMAX_MUSIC3_AUDIO_END_TOKEN_ID,
     MINIMAX_MUSIC3_FEEDBACK_SCALE,
@@ -19,8 +21,6 @@ from mobius._diffusers_configs import (
     MiniMaxMusic3TransformerConfig,
     MiniMaxMusic3VocoderConfig,
 )
-from mobius._testing.ort_inference import OnnxModelSession
-from mobius._weight_loading import apply_weights
 from mobius.models.minimax_music3 import (
     MiniMaxMusic3ConditionEncoder,
     MiniMaxMusic3LanguageModel,

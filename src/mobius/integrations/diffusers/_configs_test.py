@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Tests for the diffusers-config adapters (``mobius._diffusers_configs``).
+"""Tests for the Diffusers configuration adapters.
 
 Focuses on the classic Stable Diffusion adapters added for the from-scratch SD
 build: the CLIP text-encoder adapter (transformers field names -> generic
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from mobius._diffusers_configs import (
+from mobius.integrations.diffusers._configs import (
     CLIPTextConfig,
     QwenImageConfig,
     QwenImageVAEConfig,

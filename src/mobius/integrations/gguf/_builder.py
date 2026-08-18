@@ -341,9 +341,6 @@ def build_from_gguf(
         build_from_module,
         resolve_dtype,
     )
-    from mobius._config_resolver import (
-        _default_task_for_model,
-    )
     from mobius._registry import registry
     from mobius.integrations.gguf._config_mapping import (
         GGUF_ARCH_TO_MODEL_TYPE,
@@ -352,6 +349,9 @@ def build_from_gguf(
     from mobius.integrations.gguf._reader import GGUFModel
     from mobius.integrations.gguf._tensor_processors import (
         process_tensors,
+    )
+    from mobius.integrations.transformers import (
+        _default_task_for_model,
     )
 
     if static_cache and task is not None:
