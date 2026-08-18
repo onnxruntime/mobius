@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 # rope and store Q/K in plain HF row order — applying the permute to them
 # scrambles the attention heads and produces garbage output. They must
 # NOT be reverse-permuted.
-LLAMA_QK_PERMUTE_MODEL_TYPES = frozenset({"llama", "mistral"})
+LLAMA_QK_PERMUTE_MODEL_TYPES = frozenset({"llama", "mistral", "muse_glimmer_text"})
 
 
 def needs_llama_qk_permute(model_type: str | None) -> bool:
@@ -205,7 +205,12 @@ def _process_muse_glimmer(
     stored uncentered, so it must be left alone -- verified against the
     published checkpoint, where ``model.norm.weight`` is centered on 0 while the
     per-block norms are centered on 1.
+
+    Muse Glimmer's llama.cpp converter also stores Q/K with the interleaved-rope
+    permutation, on every layer including the NoPE (full-attention) ones, so the
+    llama reverse-permute has to run as well.
     """
+    state_dict = _process_llama(state_dict, config)
     for name in list(state_dict):
         if not name.endswith(".weight"):
             continue

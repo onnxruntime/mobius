@@ -302,7 +302,11 @@ class TestProcessMuseGlimmer:
     """Muse Glimmer stores centered block norms as ``w_hf + 1``."""
 
     def test_block_norms_lose_the_offset(self) -> None:
-        config = SimpleNamespace(model_type="muse_glimmer_text")
+        config = SimpleNamespace(
+            model_type="muse_glimmer_text",
+            num_attention_heads=1,
+            num_key_value_heads=1,
+        )
         state_dict = {
             "model.layers.0.input_layernorm.weight": torch.tensor([1.25, 0.0]),
             "model.layers.0.post_attention_layernorm.weight": (torch.tensor([2.0, 1.0])),
@@ -327,17 +331,39 @@ class TestProcessMuseGlimmer:
             torch.tensor([-0.5]),
         )
 
-    def test_final_norm_and_projections_are_untouched(self) -> None:
-        # model.norm is a plain RMSNorm in this architecture, and projections
-        # obviously carry no offset.
-        config = SimpleNamespace(model_type="muse_glimmer_text")
-        state_dict = {
-            "model.norm.weight": torch.tensor([0.25, -3.0]),
-            "model.layers.0.self_attn.q_proj.weight": (torch.tensor([[1.0, 2.0]])),
-        }
+    def test_final_norm_is_untouched(self) -> None:
+        # model.norm is a plain RMSNorm in this architecture.
+        config = SimpleNamespace(
+            model_type="muse_glimmer_text",
+            num_attention_heads=1,
+            num_key_value_heads=1,
+        )
+        state_dict = {"model.norm.weight": torch.tensor([0.25, -3.0])}
         result = process_tensors(state_dict, config)
         torch.testing.assert_close(result["model.norm.weight"], torch.tensor([0.25, -3.0]))
-        torch.testing.assert_close(
-            result["model.layers.0.self_attn.q_proj.weight"],
-            torch.tensor([[1.0, 2.0]]),
+
+    def test_qk_weights_are_reverse_permuted(self) -> None:
+        # llama.cpp's muse-glimmer converter permutes attn_q/attn_k for
+        # interleaved rope, on every layer including the NoPE ones.
+        config = SimpleNamespace(
+            model_type="muse_glimmer_text",
+            num_attention_heads=1,
+            num_key_value_heads=1,
         )
+        original = torch.arange(8.0).reshape(4, 2)
+        state_dict = {
+            "model.layers.0.self_attn.q_proj.weight": original.clone(),
+            "model.layers.3.self_attn.k_proj.weight": original.clone(),
+            "model.layers.0.self_attn.v_proj.weight": original.clone(),
+        }
+        result = process_tensors(state_dict, config)
+        expected = torch.tensor([[0.0, 1.0], [4.0, 5.0], [2.0, 3.0], [6.0, 7.0]])
+        torch.testing.assert_close(result["model.layers.0.self_attn.q_proj.weight"], expected)
+        torch.testing.assert_close(result["model.layers.3.self_attn.k_proj.weight"], expected)
+        torch.testing.assert_close(result["model.layers.0.self_attn.v_proj.weight"], original)
+
+    def test_quantized_path_permutes_qk(self) -> None:
+        from mobius.integrations.gguf._builder import _needs_qk_permute
+
+        name = "model.layers.0.self_attn.q_proj.weight"
+        assert _needs_qk_permute(name, 32, 2, "muse_glimmer_text") is True
