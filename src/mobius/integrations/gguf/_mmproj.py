@@ -41,6 +41,7 @@ __all__ = [
 ]
 
 import logging
+import math
 from pathlib import Path
 from typing import Any
 
@@ -60,11 +61,35 @@ _DEFAULT_POOLING_KERNEL_SIZE = 4
 # Muse Glimmer's vision tower uses ordinary 2D RoPE. The mmproj stores no
 # rope.freq_base, so use the published vision config value.
 _MUSE_GLIMMER_VISION_ROPE_THETA = 10_000.0
-# Temporal patch depth (video frames folded into one patch). Not represented in
-# the clip metadata; the published checkpoints use 2.
-_MUSE_GLIMMER_TEMPORAL_PATCH_SIZE = 2
 # Full-attention stride: every 4th block is global, and so is the last block.
 _MUSE_GLIMMER_VISION_FULL_ATTENTION_STRIDE = 4
+
+
+def _muse_glimmer_temporal_patch_size(patch_embd: Any, *, patch_size: int) -> int:
+    """Recover the temporal patch depth from the patch-embedding weight.
+
+    ``clip.vision.*`` metadata carries no temporal depth. HF checkpoints fold
+    ``temporal_patch_size`` frames into a single Conv3d kernel, but a converter
+    is free to collapse that axis (llama.cpp emits a plain Conv2d kernel of
+    ``[out, in_channels, patch, patch]``, which is exactly the image-only case
+    with both frames summed). Trusting a hard-coded 2 therefore builds a tower
+    whose patch embedding is twice as wide as the weight it is about to load,
+    so derive the depth from the weight itself.
+    """
+    shape = tuple(int(dim) for dim in patch_embd.shape)
+    if len(shape) < 2:
+        raise ValueError(
+            f"Muse Glimmer patch embedding must be at least 2D, got shape {shape}."
+        )
+    in_channels = shape[1]
+    per_frame = in_channels * patch_size * patch_size
+    elements = math.prod(shape[1:])
+    if per_frame == 0 or elements % per_frame != 0:
+        raise ValueError(
+            f"Muse Glimmer patch embedding of shape {shape} is not divisible into "
+            f"{in_channels}x{patch_size}x{patch_size} frames."
+        )
+    return elements // per_frame
 
 
 def read_mmproj_muse_glimmer_vision_config(gguf_model: Any):
@@ -127,7 +152,9 @@ def read_mmproj_muse_glimmer_vision_config(gguf_model: Any):
         norm_eps=float(md.get("clip.vision.attention.layer_norm_epsilon", 1e-5)),
         in_channels=int(patch_embd.shape[1]),
         spatial_merge_size=merge_size,
-        temporal_patch_size=_MUSE_GLIMMER_TEMPORAL_PATCH_SIZE,
+        temporal_patch_size=_muse_glimmer_temporal_patch_size(
+            patch_embd, patch_size=int(md["clip.vision.patch_size"])
+        ),
         position_embedding_size=position_rows,
         position_embedding_height=grid,
         position_embedding_width=grid,

@@ -689,8 +689,9 @@ class TestReadMuseGlimmerVisionConfig:
         assert config.out_hidden_size == _MG_HIDDEN * _MG_MERGE * _MG_MERGE
         # Every 4th block is global attention, and so is the last one.
         assert config.fullatt_block_indexes == [3, 5]
-        # Not in GGUF at all; published architectural constants.
-        assert config.temporal_patch_size == 2
+        # Derived from the patch-embedding weight: llama.cpp stores a plain
+        # Conv2d kernel, i.e. a single temporal frame.
+        assert config.temporal_patch_size == 1
         assert config.rope_theta == pytest.approx(10_000.0)
 
     def test_returns_none_without_vision_encoder(self, mmproj: Path):
@@ -771,3 +772,26 @@ class TestVlmRouting:
             execution_provider="default",
             keep_quantized=False,
         )
+
+
+class TestMuseGlimmerTemporalPatchSize:
+    """The temporal depth is read off the weight, not assumed."""
+
+    def test_conv2d_kernel_means_a_single_frame(self) -> None:
+        from mobius.integrations.gguf._mmproj import _muse_glimmer_temporal_patch_size
+
+        weight = np.zeros((1536, 3, 14, 14), dtype=np.float32)
+        assert _muse_glimmer_temporal_patch_size(weight, patch_size=14) == 1
+
+    def test_conv3d_kernel_keeps_its_temporal_depth(self) -> None:
+        from mobius.integrations.gguf._mmproj import _muse_glimmer_temporal_patch_size
+
+        weight = np.zeros((1536, 3, 2, 14, 14), dtype=np.float32)
+        assert _muse_glimmer_temporal_patch_size(weight, patch_size=14) == 2
+
+    def test_indivisible_kernel_is_rejected(self) -> None:
+        from mobius.integrations.gguf._mmproj import _muse_glimmer_temporal_patch_size
+
+        weight = np.zeros((1536, 3, 13, 14), dtype=np.float32)
+        with pytest.raises(ValueError, match="not divisible"):
+            _muse_glimmer_temporal_patch_size(weight, patch_size=14)
