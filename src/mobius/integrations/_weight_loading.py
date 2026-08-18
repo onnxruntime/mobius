@@ -175,7 +175,7 @@ def _parallel_download(
             kwargs["revision"] = revision
         return [hf_hub_download(filename=f, **kwargs) for f in filenames]
 
-    print(f"Downloading {len(filenames)} {desc} files (parallel)...")
+    logger.info("Downloading %d %s files in parallel", len(filenames), desc)
     path_map: dict[str, str] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         kwargs = {"repo_id": model_id}
