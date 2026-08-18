@@ -545,7 +545,7 @@ class MiniMaxMusic3LanguageModel(Qwen3CausalLMModel):
         position_ids: ir.Value,
         past_key_values: list | None = None,
     ):
-        hidden_states, present_key_values = self.model(
+        result = self.model(
             op,
             input_ids=inputs_embeds,
             inputs_embeds=inputs_embeds,
@@ -553,4 +553,8 @@ class MiniMaxMusic3LanguageModel(Qwen3CausalLMModel):
             position_ids=position_ids,
             past_key_values=past_key_values,
         )
+        if len(result) == 3:
+            hidden_states, present_key_values, _ = result
+        else:
+            hidden_states, present_key_values = result
         return self.lm_head(op, hidden_states), hidden_states, present_key_values
