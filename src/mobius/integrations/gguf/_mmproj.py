@@ -40,6 +40,7 @@ __all__ = [
     "read_mmproj_vision_config",
 ]
 
+import dataclasses
 import logging
 import math
 from pathlib import Path
@@ -63,6 +64,25 @@ _DEFAULT_POOLING_KERNEL_SIZE = 4
 _MUSE_GLIMMER_VISION_ROPE_THETA = 10_000.0
 # Full-attention stride: every 4th block is global, and so is the last block.
 _MUSE_GLIMMER_VISION_FULL_ATTENTION_STRIDE = 4
+
+
+def _with_muse_glimmer_media_token_ids(config: Any) -> Any:
+    """Fill in the media placeholder ids a GGUF cannot carry.
+
+    They belong to the tokenizer, not to the model metadata, so a converted
+    config arrives with both unset. Leaving them that way is not cosmetic: the
+    embedding graph compares ``input_ids`` against them, and the ort-genai
+    exporter omits the field from ``genai_config`` entirely when it is ``None``,
+    producing a package that cannot address video at all.
+    """
+    from mobius.models.muse_glimmer import IMAGE_TOKEN_ID, VIDEO_TOKEN_ID
+
+    updates = {}
+    if config.image_token_id is None:
+        updates["image_token_id"] = IMAGE_TOKEN_ID
+    if config.video_token_id is None:
+        updates["video_token_id"] = VIDEO_TOKEN_ID
+    return dataclasses.replace(config, **updates) if updates else config
 
 
 def _muse_glimmer_temporal_patch_size(patch_embd: Any, *, patch_size: int) -> int:
@@ -714,6 +734,7 @@ def build_muse_glimmer_vlm_from_gguf(
     config = dataclasses.replace(config, vision=vision_config, audio=None)
     if image_token_id is not None:
         config = dataclasses.replace(config, image_token_id=image_token_id)
+    config = _with_muse_glimmer_media_token_ids(config)
     if dtype is not None:
         resolved = resolve_dtype(dtype)
         if resolved is not None:

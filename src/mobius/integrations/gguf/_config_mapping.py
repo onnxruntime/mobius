@@ -775,31 +775,34 @@ def _muse_glimmer_postprocess(
     # single stride: every `pattern`-th layer is a full-attention layer and the
     # rest are sliding. Full-attention layers are also the NoPE layers -- the HF
     # checkpoint expresses this as layer_rope_theta[i] == 0.
-    pattern = metadata.get(f"{arch}.attention.sliding_window_pattern")
-    if pattern is not None:
-        pattern = int(pattern)
-        if pattern <= 0:
-            raise ValueError(
-                f"GGUF metadata {arch}.attention.sliding_window_pattern must be "
-                f"positive, got {pattern}."
-            )
-        layer_types = [
-            "full_attention" if (index + 1) % pattern == 0 else "sliding_attention"
-            for index in range(config.num_hidden_layers)
-        ]
-        layer_rope_theta: list[float | int] = [
-            0 if layer_type == "full_attention" else config.rope_theta
-            for layer_type in layer_types
-        ]
-        config = dataclasses.replace(
-            config,
-            layer_types=layer_types,
-            no_rope_layers=[
-                index for index, theta in enumerate(layer_rope_theta) if theta == 0
-            ],
+    #
+    # There is no defensible fallback if the stride is missing. Guessing leaves
+    # every layer sliding and rotated, which is a different architecture that
+    # happens to load, so refuse the conversion instead of emitting one.
+    key = f"{arch}.attention.sliding_window_pattern"
+    pattern = metadata.get(key)
+    if pattern is None:
+        raise ValueError(
+            f"GGUF metadata is missing {key}. Muse Glimmer needs it to place "
+            f"the full-attention and NoPE layers; without it the converted "
+            f"model would silently be a different architecture."
         )
-    else:
-        layer_rope_theta = None
+    pattern = int(pattern)
+    if pattern <= 0:
+        raise ValueError(f"GGUF metadata {key} must be positive, got {pattern}.")
+    layer_types = [
+        "full_attention" if (index + 1) % pattern == 0 else "sliding_attention"
+        for index in range(config.num_hidden_layers)
+    ]
+    layer_rope_theta: list[float | int] = [
+        0 if layer_type == "full_attention" else config.rope_theta
+        for layer_type in layer_types
+    ]
+    config = dataclasses.replace(
+        config,
+        layer_types=layer_types,
+        no_rope_layers=[index for index, theta in enumerate(layer_rope_theta) if theta == 0],
+    )
 
     sliding_window = metadata.get(f"{arch}.attention.sliding_window")
     if sliding_window is not None:

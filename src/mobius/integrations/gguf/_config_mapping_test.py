@@ -290,3 +290,19 @@ class TestMuseGlimmerPostprocess:
         # The key map is what turns attention.key_length into head_dim, so it
         # has to answer to both spellings too.
         assert _ARCH_KEY_MAPS["muse_glimmer"] == _ARCH_KEY_MAPS["muse-glimmer"]
+
+    def test_a_missing_sliding_window_pattern_is_rejected(self) -> None:
+        """Guessing the stride would yield a different architecture.
+
+        Without it every layer is left sliding and rotated, which loads and
+        runs and is not Muse Glimmer. Refusing is the only honest answer.
+        """
+        from mobius.integrations.gguf._config_mapping import _muse_glimmer_postprocess
+
+        metadata = self._metadata()
+        del metadata["muse-glimmer.attention.sliding_window_pattern"]
+
+        with pytest.raises(ValueError, match="sliding_window_pattern"):
+            _muse_glimmer_postprocess(
+                self._base_config(), metadata, self._FakeModel([3.87] * 128)
+            )

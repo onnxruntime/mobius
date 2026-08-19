@@ -29,6 +29,13 @@ from mobius.components import (
 from mobius.components._attention import StaticCacheState
 from mobius.components._rotary_embedding import apply_rotary_pos_emb
 
+# The media placeholder ids belong to the tokenizer, so a config assembled from
+# anything but a full HF checkpoint -- a GGUF import, say -- arrives with them
+# unset. The published Muse Glimmer values stand in, because the embedding
+# graph has to compare ``input_ids`` against a number.
+IMAGE_TOKEN_ID = 200092
+VIDEO_TOKEN_ID = 200091
+
 # ---------------------------------------------------------------------------
 # Weight-quantization helpers
 #
@@ -314,6 +321,25 @@ class MuseGlimmerTextDecoderLayer(nn.Module):
         return op.Add(residual, hidden_states), present_key_value
 
 
+def _resolve_layer_rope_theta(config: ArchitectureConfig) -> list[float | int]:
+    """Return the per-layer RoPE base, with 0 marking a NoPE layer.
+
+    ``layer_rope_theta`` is an optional field, so it is present and ``None``
+    whenever a source config did not carry it -- a shape that ``getattr`` with
+    a default cannot see. ``no_rope_layers`` names the same set of layers, so
+    prefer it before falling back to rotating every layer.
+    """
+    layer_rope_theta = getattr(config, "layer_rope_theta", None)
+    if layer_rope_theta:
+        return list(layer_rope_theta)
+
+    no_rope_layers = set(config.no_rope_layers or ())
+    return [
+        0 if index in no_rope_layers else config.rope_theta
+        for index in range(config.num_hidden_layers)
+    ]
+
+
 class MuseGlimmerTextModel(nn.Module):
     """Muse language backbone with mixed sliding/full attention and NoPE layers."""
 
@@ -323,11 +349,7 @@ class MuseGlimmerTextModel(nn.Module):
         self._layer_types = (
             config.layer_types or ["sliding_attention"] * config.num_hidden_layers
         )
-        self._layer_rope_theta = getattr(
-            config,
-            "layer_rope_theta",
-            [config.rope_theta] * config.num_hidden_layers,
-        )
+        self._layer_rope_theta = _resolve_layer_rope_theta(config)
         self._sliding_window = config.sliding_window
         self.embed_tokens = _make_text_embedding(config)
         self.embed_norm = MuseGlimmerScaleFreeRMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -559,8 +581,8 @@ class MuseGlimmerEmbeddingModel(nn.Module):
         self.embed_tokens = _make_text_embedding(config)
         self.embed_norm = MuseGlimmerScaleFreeRMSNorm(config.hidden_size, config.rms_norm_eps)
         self._hidden_size = config.hidden_size
-        self._image_token_id = config.image_token_id or 200092
-        self._video_token_id = getattr(config, "video_token_id", 200091)
+        self._image_token_id = config.image_token_id or IMAGE_TOKEN_ID
+        self._video_token_id = config.video_token_id or VIDEO_TOKEN_ID
 
     def forward(
         self,

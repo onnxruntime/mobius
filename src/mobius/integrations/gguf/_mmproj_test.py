@@ -795,3 +795,61 @@ class TestMuseGlimmerTemporalPatchSize:
         weight = np.zeros((1536, 3, 13, 14), dtype=np.float32)
         with pytest.raises(ValueError, match="not divisible"):
             _muse_glimmer_temporal_patch_size(weight, patch_size=14)
+
+
+class TestMuseGlimmerMediaTokenIds:
+    """A GGUF carries no tokenizer, so the media placeholder ids arrive unset.
+
+    Leaving them unset is not cosmetic. The embedding graph compares
+    ``input_ids`` against them, and the ort-genai exporter drops the field from
+    ``genai_config`` when it is ``None``, so the exported package loses the
+    ability to address video entirely.
+    """
+
+    @staticmethod
+    def _config(**overrides):
+        from mobius._configs import MuseGlimmerConfig
+
+        values = dict(
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_hidden_layers=2,
+            vocab_size=256,
+        )
+        values.update(overrides)
+        return MuseGlimmerConfig(**values)
+
+    def test_fills_in_the_published_ids(self) -> None:
+        from mobius.integrations.gguf._mmproj import _with_muse_glimmer_media_token_ids
+        from mobius.models.muse_glimmer import IMAGE_TOKEN_ID, VIDEO_TOKEN_ID
+
+        config = self._config()
+        assert config.image_token_id is None
+        assert config.video_token_id is None
+
+        result = _with_muse_glimmer_media_token_ids(config)
+
+        assert result.image_token_id == IMAGE_TOKEN_ID
+        assert result.video_token_id == VIDEO_TOKEN_ID
+
+    def test_does_not_override_ids_the_caller_supplied(self) -> None:
+        from mobius.integrations.gguf._mmproj import _with_muse_glimmer_media_token_ids
+
+        result = _with_muse_glimmer_media_token_ids(
+            self._config(image_token_id=7, video_token_id=9)
+        )
+
+        assert result.image_token_id == 7
+        assert result.video_token_id == 9
+
+    def test_the_embedding_graph_never_compares_against_none(self) -> None:
+        from mobius.models.muse_glimmer import (
+            VIDEO_TOKEN_ID,
+            MuseGlimmerEmbeddingModel,
+        )
+
+        module = MuseGlimmerEmbeddingModel(self._config())
+
+        assert module._video_token_id == VIDEO_TOKEN_ID
