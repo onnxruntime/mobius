@@ -341,7 +341,7 @@ class Qwen35MoEBlock(Qwen2MoELayer):
             config,
             gate=gate,
             linear_class=linear_class,
-            # ``None`` falls back to ``linear_class`` (quantized gate).
+            # ``None`` falls back to ``linear_class``.
             shared_expert_gate_class=Linear if _keeps_modules_float(config) else None,
         )
 

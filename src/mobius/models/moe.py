@@ -276,11 +276,12 @@ class Qwen2MoELayer(MoELayer):
     Forward: ``routing_output + sigmoid(shared_gate(h)) * shared_expert(h)``
 
     ``linear_class``, when provided, is used for the shared expert's MLP and
-    -- by default only -- for ``shared_expert_gate``, and is threaded through
-    to :class:`MoELayer` so it also drives the dense loop-over-experts
-    fallback (used when the config doesn't match the native QMoE ABI). It has
-    no effect on the fused QMoE path, whose quantized parameters are
-    constructed directly by :meth:`MoELayer._init_qmoe_parameters`.
+    for ``shared_expert_gate`` unless ``shared_expert_gate_class`` overrides
+    the gate factory. It is also threaded through to :class:`MoELayer` so it
+    drives the dense loop-over-experts fallback (used when the config doesn't
+    match the native QMoE ABI). It has no effect on the fused QMoE path, whose
+    quantized parameters are constructed directly by
+    :meth:`MoELayer._init_qmoe_parameters`.
 
     ``shared_expert_gate_class`` overrides the factory used for the
     ``shared_expert_gate`` projection only; when it is ``None`` the gate falls
