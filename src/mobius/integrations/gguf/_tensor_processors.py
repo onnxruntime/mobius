@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 # rope and store Q/K in plain HF row order — applying the permute to them
 # scrambles the attention heads and produces garbage output. They must
 # NOT be reverse-permuted.
-LLAMA_QK_PERMUTE_MODEL_TYPES = frozenset({"llama", "mistral"})
+LLAMA_QK_PERMUTE_MODEL_TYPES = frozenset({"llama", "mistral", "muse_glimmer_text"})
 
 
 def needs_llama_qk_permute(model_type: str | None) -> bool:
@@ -192,6 +192,40 @@ def _process_nemotron(
     return state_dict
 
 
+def _process_muse_glimmer(
+    state_dict: dict[str, torch.Tensor],
+    config: Any,
+) -> dict[str, torch.Tensor]:
+    """Restore Muse Glimmer's centered per-block norm weights.
+
+    Muse Glimmer's four per-block norms are *centered*: the HF checkpoint stores
+    ``w`` and the model multiplies by ``w + 1``. llama.cpp folds the ``+ 1`` in
+    at conversion time so its generic RMSNorm can use the tensor directly, so a
+    GGUF file holds ``w_gguf = w_hf + 1`` and importing it needs the offset
+    removed. This is the opposite direction from Gemma/Nemotron, which store
+    ``w_hf - 1``.
+
+    The final ``model.norm`` is a plain RMSNorm in this architecture and is
+    stored uncentered, so it must be left alone -- verified against the
+    published checkpoint, where ``model.norm.weight`` is centered on 0 while the
+    per-block norms are centered on 1.
+
+    Muse Glimmer's llama.cpp converter also stores Q/K with the interleaved-rope
+    permutation, on every layer including the NoPE (full-attention) ones, so the
+    llama reverse-permute has to run as well.
+    """
+    state_dict = _process_llama(state_dict, config)
+    for name in list(state_dict):
+        if not name.endswith(".weight"):
+            continue
+        if ".layers." not in name:
+            continue
+        if "layernorm" not in name:
+            continue
+        state_dict[name] = state_dict[name] - 1
+    return state_dict
+
+
 def _process_gpt2(
     state_dict: dict[str, torch.Tensor],
     config: Any,
@@ -246,6 +280,7 @@ _PROCESSORS: dict[str, Any] = {
     "gemma2": _process_gemma,
     "gemma3": _process_gemma,
     "nemotron": _process_nemotron,
+    "muse_glimmer_text": _process_muse_glimmer,
     "gpt2": _process_gpt2,
     "mamba": _process_mamba,
 }

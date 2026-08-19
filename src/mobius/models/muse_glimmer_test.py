@@ -19,6 +19,7 @@ from mobius.models.muse_glimmer import (
     MuseGlimmerForConditionalGeneration,
     MuseGlimmerScaleFreeRMSNorm,
     MuseGlimmerTextCausalLMModel,
+    _resolve_layer_rope_theta,
 )
 from mobius.tasks import MuseGlimmerVLTask
 
@@ -68,6 +69,75 @@ def test_muse_glimmer_uses_fused_rms_normalization():
     assert counts["SkipSimplifiedLayerNormalization"] == 1
     assert counts["ReduceMean"] == 0
     assert counts["Pow"] == 0
+
+
+def _text_config(**overrides):
+    """A small text config; ``layer_rope_theta`` is deliberately left unset."""
+    values = dict(
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        num_hidden_layers=4,
+        vocab_size=256,
+        max_position_embeddings=128,
+        hidden_act="silu",
+        sliding_window=8,
+        pad_token_id=0,
+        rope_type="default",
+        rope_theta=500_000.0,
+        rms_norm_eps=1e-5,
+        dtype=ir.DataType.FLOAT,
+    )
+    values.update(overrides)
+    return MuseGlimmerConfig(**values)
+
+
+def test_nope_layers_survive_a_config_without_layer_rope_theta():
+    """``layer_rope_theta`` is optional and defaults to ``None``.
+
+    ``getattr(config, name, default)`` cannot see that -- the attribute exists,
+    so the default never applies and the model indexes ``None``. Any config
+    that names its NoPE layers has to keep placing them correctly.
+    """
+    config = _text_config(
+        layer_types=[
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
+        ],
+        no_rope_layers=[3],
+    )
+    assert config.layer_rope_theta is None
+
+    resolved = _resolve_layer_rope_theta(config)
+
+    assert resolved == [500_000.0, 500_000.0, 500_000.0, 0]
+
+
+def test_every_layer_rotates_when_a_config_names_no_nope_layers():
+    config = _text_config()
+
+    assert _resolve_layer_rope_theta(config) == [500_000.0] * 4
+
+
+def test_an_explicit_layer_rope_theta_wins():
+    config = _text_config(layer_rope_theta=[0, 1.0, 2.0, 3.0])
+
+    assert _resolve_layer_rope_theta(config) == [0, 1.0, 2.0, 3.0]
+
+
+def test_the_text_model_builds_without_layer_rope_theta():
+    config = _text_config(
+        layer_types=["sliding_attention"] * 3 + ["full_attention"],
+        no_rope_layers=[3],
+    )
+
+    module = MuseGlimmerTextCausalLMModel(config)
+
+    assert module.model._layer_rope_theta == [500_000.0, 500_000.0, 500_000.0, 0]
 
 
 def _hf_tiny_muse_glimmer():
@@ -262,3 +332,71 @@ def test_muse_glimmer_tiny_multimodal_prefill_matches_hf():
         "model.embed_tokens.weight": embed_weight,
         "lm_head.weight": lm_head_weight,
     }
+
+
+def test_muse_glimmer_text_quantization_emits_quantized_ops():
+    from mobius._configs import QuantizationConfig
+
+    config = MuseGlimmerConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        num_hidden_layers=2,
+        vocab_size=256,
+        max_position_embeddings=128,
+        hidden_act="silu",
+        layer_types=["sliding_attention", "full_attention"],
+        layer_rope_theta=[500_000.0, 0],
+        sliding_window=8,
+        pad_token_id=0,
+        rope_type="default",
+        rope_theta=500_000.0,
+        rms_norm_eps=1e-5,
+        dtype=ir.DataType.BFLOAT16,
+        quantization=QuantizationConfig(
+            bits=4,
+            group_size=32,
+            quant_method="gguf",
+            sym=False,
+            quantize_embeddings=True,
+            quantize_lm_head=True,
+        ),
+    )
+    module = MuseGlimmerTextCausalLMModel(config)
+    model = build_from_module(module, config)["model"]
+    counts = Counter(node.op_type for node in model.graph)
+
+    # 5 attention projections + 3 MLP projections per layer, plus the LM head.
+    assert counts["MatMulNBits"] == 2 * 8 + 1
+    assert counts["GatherBlockQuantized"] == 1
+    assert counts["MatMul"] == 0
+
+
+def test_muse_glimmer_without_quantization_stays_float():
+    config = MuseGlimmerConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        num_hidden_layers=2,
+        vocab_size=256,
+        max_position_embeddings=128,
+        hidden_act="silu",
+        layer_types=["sliding_attention", "full_attention"],
+        layer_rope_theta=[500_000.0, 0],
+        sliding_window=8,
+        pad_token_id=0,
+        rope_type="default",
+        rope_theta=500_000.0,
+        rms_norm_eps=1e-5,
+        dtype=ir.DataType.BFLOAT16,
+    )
+    module = MuseGlimmerTextCausalLMModel(config)
+    model = build_from_module(module, config)["model"]
+    counts = Counter(node.op_type for node in model.graph)
+
+    assert counts["MatMulNBits"] == 0
+    assert counts["GatherBlockQuantized"] == 0

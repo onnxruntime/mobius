@@ -71,6 +71,126 @@ def _propagate_dtype(source: ir.Value, *targets: ir.Value) -> None:
         target.dtype = dtype
 
 
+def _skip_view_ops(value: ir.Value | None) -> ir.Value | None:
+    """Walk back through shape-only ops that do not change a mask's meaning."""
+    while value is not None:
+        producer = value.producer()
+        if producer is None or producer.op_type not in ("Cast", "Unsqueeze", "Identity"):
+            return value
+        value = producer.inputs[0]
+    return value
+
+
+def _constant_int(value: ir.Value | None) -> int | None:
+    """Return ``value`` as a Python int when it is a graph constant."""
+    if value is None:
+        return None
+    tensor = value.const_value
+    if tensor is None:
+        producer = value.producer()
+        if producer is None or producer.op_type != "Constant":
+            return None
+        attr = producer.attributes.get("value", None)
+        tensor = getattr(attr, "value", None)
+    if tensor is None:
+        return None
+    try:
+        array = tensor.numpy()
+    except Exception:  # pragma: no cover - defensive: exotic tensor backings
+        return None
+    if array.size != 1:
+        return None
+    return int(array.reshape(-1)[0])
+
+
+class _MaskShape:
+    """Outcome of inspecting the mask subgraph behind an attention bias.
+
+    ``recognized`` is False when the mask does something
+    ``GroupQueryAttention`` cannot express, so the ``Attention`` node must be
+    left alone rather than fused.
+    """
+
+    __slots__ = ("recognized", "window")
+
+    def __init__(self, recognized: bool, window: int | None = None) -> None:
+        self.recognized = recognized
+        self.window = window
+
+
+# Cap on how much of the bias subgraph is walked. Mask construction is a few
+# dozen shape/compare ops; anything larger is not a mask we can vouch for.
+_MASK_WALK_LIMIT = 512
+
+
+def _sliding_window_from_less(node: ir.Node) -> int | None:
+    """Return the window of a ``Less(query_index - key_index, window)`` term.
+
+    That comparison is how a sliding window is written into an attention bias:
+    a key is visible while its distance to the query is below ``window``, i.e.
+    ``window`` keys are visible including the query's own position. ORT's
+    ``local_window_size`` is defined the same way ("mask out tokens prior to
+    total_sequence_length - local_window_size"), so the value transfers as is.
+
+    Other ``Less`` comparisons in a mask (a padding test against a dynamic
+    length, say) have no constant bound and return ``None``.
+    """
+    if len(node.inputs) < 2:
+        return None
+    distance = _skip_view_ops(node.inputs[0])
+    distance_producer = distance.producer() if distance is not None else None
+    if distance_producer is None or distance_producer.op_type != "Sub":
+        return None
+    window = _constant_int(node.inputs[1])
+    if window is None or window <= 0:
+        return None
+    return window
+
+
+def local_window_from_attention_bias(attention_bias: ir.Value | None) -> _MaskShape:
+    """Recover the local-attention window baked into an attention bias.
+
+    ``GroupQueryAttention`` takes no attention bias: it rebuilds the mask from
+    ``seqlens_k``/``total_seq_len``. Fusing an ``Attention`` whose bias encodes
+    a sliding window therefore *deletes* that window unless it is re-expressed
+    as the ``local_window_size`` attribute -- and a decoder that silently widens
+    2048-token local attention to global attention produces fluent nonsense once
+    a prompt outgrows the window, with no error raised anywhere.
+
+    Padding and causal terms need no translation (GQA derives both), so the walk
+    only looks for two things: the sliding-window comparison, and any ``Or``,
+    which is how a bidirectional block overlay unmasks positions the plain
+    causal mask forbids. GQA cannot express that, so such a bias is reported as
+    unrecognized and the caller must leave the node unfused.
+    """
+    window: int | None = None
+    seen: set[int] = set()
+    stack = [attention_bias]
+    visited = 0
+    while stack:
+        value = stack.pop()
+        if value is None or id(value) in seen:
+            continue
+        seen.add(id(value))
+        producer = value.producer()
+        if producer is None:
+            continue
+        visited += 1
+        if visited > _MASK_WALK_LIMIT:
+            return _MaskShape(False)
+        if producer.op_type == "Or":
+            return _MaskShape(False)
+        if producer.op_type == "Less":
+            found = _sliding_window_from_less(producer)
+            if found is not None:
+                if window is not None and window != found:
+                    return _MaskShape(False)
+                window = found
+                continue
+        stack.extend(producer.inputs)
+    return _MaskShape(True, window)
+
+
 def _has_unequal_kv_head_dimensions(k, v, past_key, past_value) -> bool:
     """Return whether static K/V shapes prove incompatible GQA head dimensions."""
 
@@ -157,8 +277,16 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
 
     # ------------------------------------------------------------------ check
 
-    def check(self, context, attn_out, k_pre, v, cos, sin, past_key, past_value, **_):
+    def check(
+        self, context, attn_out, k_pre, v, attention_bias, cos, sin, past_key, past_value, **_
+    ):
         result = MatchResult()
+
+        if not local_window_from_attention_bias(attention_bias).recognized:
+            return result.fail(
+                "Attention bias is not a plain causal/sliding mask; GroupQueryAttention "
+                "would drop it"
+            )
 
         attn = attn_out.producer()
         if attn.attributes.get_float("scale", None) is None:
@@ -261,6 +389,9 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
         }
         if softcap:
             gqa_attrs["softcap"] = softcap
+        window = local_window_from_attention_bias(attention_bias).window
+        if window is not None:
+            gqa_attrs["local_window_size"] = window
         outputs = op.GroupQueryAttention(
             q_pre,
             k_pre,
@@ -595,8 +726,15 @@ class AttentionToGQA(RewriteRuleClassBase):
 
     # ------------------------------------------------------------------ check
 
-    def check(self, context, attn_out, k, v, past_key, past_value, **_):
+    def check(self, context, attn_out, k, v, attention_bias, past_key, past_value, **_):
         result = MatchResult()
+
+        if not local_window_from_attention_bias(attention_bias).recognized:
+            return result.fail(
+                "Attention bias is not a plain causal/sliding mask; GroupQueryAttention "
+                "would drop it"
+            )
+
         attn = attn_out.producer()
 
         if attn.attributes.get_float("scale", None) is None:
@@ -667,6 +805,9 @@ class AttentionToGQA(RewriteRuleClassBase):
         }
         if softcap:
             gqa_attrs["softcap"] = softcap
+        window = local_window_from_attention_bias(attention_bias).window
+        if window is not None:
+            gqa_attrs["local_window_size"] = window
 
         outputs = op.GroupQueryAttention(
             q,
