@@ -102,9 +102,11 @@ def _ensure_bos_post_processor(backend, gguf_path: Path) -> None:
             return
         bos_id = metadata.get("tokenizer.ggml.bos_token_id")
         tokens = metadata.get("tokenizer.ggml.tokens")
-        if bos_id is None or not tokens or int(bos_id) >= len(tokens):
+        if bos_id is None or not tokens:
             return
         bos_id = int(bos_id)
+        if bos_id < 0 or bos_id >= len(tokens):
+            return
         bos_token = tokens[bos_id]
         # Probe: only attach BOS if the current pipeline does not already emit
         # it (avoids a doubled ``<bos>`` when transformers did wire it up).
@@ -120,8 +122,7 @@ def _ensure_bos_post_processor(backend, gguf_path: Path) -> None:
             special_tokens=[(bos_token, bos_id)],
         )
         _LOGGER.info(
-            "Restored BOS post-processor (%r, id=%d) on GGUF-reconstructed "
-            "tokenizer.",
+            "Restored BOS post-processor (%r, id=%d) on GGUF-reconstructed tokenizer.",
             bos_token,
             bos_id,
         )
@@ -210,12 +211,16 @@ def _reconstruct_tokenizer_from_ggml(gguf_path: Path, output_dir: str | Path) ->
         if special_tokens:
             tokenizer.add_special_tokens(special_tokens)
 
-        if add_bos and bos_id is not None and int(bos_id) < len(tokens):
-            bos_token = tokens[int(bos_id)]
+        if add_bos and bos_id is not None:
+            bos_id = int(bos_id)
+            if bos_id < 0 or bos_id >= len(tokens):
+                bos_id = None
+        if add_bos and bos_id is not None:
+            bos_token = tokens[bos_id]
             tokenizer.post_processor = processors.TemplateProcessing(
                 single=f"{bos_token} $A",
                 pair=f"{bos_token} $A {bos_token} $B",
-                special_tokens=[(bos_token, int(bos_id))],
+                special_tokens=[(bos_token, bos_id)],
             )
 
         # Sanity check: encode→decode round-trip. This is a soft signal (a small
