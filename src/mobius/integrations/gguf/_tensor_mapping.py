@@ -65,17 +65,21 @@ _LLAMA_MAPPING: dict[str, str] = {
     "blk.{bid}.ffn_norm": ("model.layers.{bid}.post_attention_layernorm"),
 }
 
-# Gemma2/3 adds pre/post feedforward layernorms.
+# Gemma2 uses the llama.cpp Gemma tensor names (the same norm subset as
+# Gemma3/4, minus the per-head Q/K norms): ``ffn_norm`` is the pre-feedforward
+# norm (overriding the Llama post-attention mapping), ``post_attention_norm`` is
+# the post-attention sandwich norm, and ``post_ffw_norm`` is the post-feedforward
+# norm. The older ``pre_ffn_norm``/``post_ffn_norm`` names never appear in real
+# llama.cpp Gemma2 GGUFs, so mapping them left the sandwich norms unloaded.
 _GEMMA2_EXTRAS: dict[str, str] = {
-    "blk.{bid}.pre_ffn_norm": ("model.layers.{bid}.pre_feedforward_layernorm"),
-    "blk.{bid}.post_ffn_norm": ("model.layers.{bid}.post_feedforward_layernorm"),
+    "blk.{bid}.ffn_norm": ("model.layers.{bid}.pre_feedforward_layernorm"),
+    "blk.{bid}.post_attention_norm": ("model.layers.{bid}.post_attention_layernorm"),
+    "blk.{bid}.post_ffw_norm": ("model.layers.{bid}.post_feedforward_layernorm"),
 }
 
-# Gemma3 uses the llama.cpp Gemma tensor names (same as Gemma4's norm subset),
-# NOT the ``pre_ffn_norm``/``post_ffn_norm`` names in _GEMMA2_EXTRAS: ``ffn_norm``
-# is the pre-feedforward norm (overriding the Llama post-attention mapping),
-# ``post_ffw_norm`` is the post-feedforward norm, ``post_attention_norm`` is the
-# post-attention norm, and each attention block carries per-head Q/K norms.
+# Gemma3 uses the llama.cpp Gemma tensor names (ffn_norm as the pre-feedforward
+# norm, plus post_attention/post_ffw norms) and additionally carries per-head
+# Q/K norms that Gemma2 lacks.
 _GEMMA3_EXTRAS: dict[str, str] = {
     "blk.{bid}.ffn_norm": ("model.layers.{bid}.pre_feedforward_layernorm"),
     "blk.{bid}.post_attention_norm": ("model.layers.{bid}.post_attention_layernorm"),
@@ -338,9 +342,17 @@ def _build_mapping(
         # the shared _GEMMA_FAMILY path.
         result = dict(_LLAMA_MAPPING)
         result.update(_GEMMA3_EXTRAS)
-    elif arch in _GEMMA_FAMILY:
+    elif arch == "gemma2":
+        # Gemma2 uses the llama.cpp Gemma tensor names (ffn_norm as the
+        # pre-feedforward norm, plus post_attention/post_ffw sandwich norms),
+        # distinct from the plain-Llama norm layout of Gemma v1. It has no
+        # per-head Q/K norms (those are Gemma3+).
         result = dict(_LLAMA_MAPPING)
         result.update(_GEMMA2_EXTRAS)
+    elif arch in _GEMMA_FAMILY:
+        # Gemma v1: standard two-norm (input + post-attention) Llama layout with
+        # no sandwich feedforward norms, so the plain Llama base is correct.
+        result = dict(_LLAMA_MAPPING)
     elif arch == "gemma4":
         # Gemma 4 starts from the Llama base but needs several overrides and
         # many new tensor types for Q/K norms, per-layer scalars, MoE norms,

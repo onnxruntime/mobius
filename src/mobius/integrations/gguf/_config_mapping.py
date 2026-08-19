@@ -28,7 +28,7 @@ from typing import Any
 
 import numpy as np
 
-from mobius._configs import ArchitectureConfig, Gemma4Config
+from mobius._configs import ArchitectureConfig, Gemma2Config, Gemma4Config
 
 logger = logging.getLogger(__name__)
 
@@ -463,6 +463,60 @@ def gguf_to_config(
     return config
 
 
+def _gemma2_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+) -> Gemma2Config:
+    """Convert a base config to Gemma2Config with architecture-specific fields.
+
+    Gemma2 applies tanh soft-capping to both the attention logits and the final
+    logits, and uses ``query_pre_attn_scalar`` for the attention scale. These
+    fields live on :class:`Gemma2Config`; without this postprocessor the GGUF
+    path hands the Gemma2 module a plain :class:`ArchitectureConfig` and crashes
+    in ``Gemma2Attention.__init__`` on ``config.query_pre_attn_scalar`` /
+    ``config.attn_logit_softcapping``.
+
+    GGUF key mapping (``gemma2.`` prefix omitted for readability):
+
+    =================================== ======================================
+    GGUF key                            Gemma2Config field
+    =================================== ======================================
+    attn_logit_softcapping              attn_logit_softcapping
+    final_logit_softcapping             final_logit_softcapping
+    attention.key_length                head_dim (already on the base config)
+    =================================== ======================================
+
+    GGUF does not carry ``query_pre_attn_scalar``. For every released Gemma2
+    checkpoint except 27B it equals ``head_dim``, so the default
+    ``1/sqrt(head_dim)`` scale is numerically exact; we therefore leave it
+    ``None`` (which selects that default) unless a checkpoint provides the key.
+    """
+    arch = "gemma2"
+    attn_logit_softcapping = metadata.get(f"{arch}.attn_logit_softcapping")
+    final_logit_softcapping = metadata.get(f"{arch}.final_logit_softcapping")
+    query_pre_attn_scalar = metadata.get(f"{arch}.attention.query_pre_attn_scalar")
+
+    # Gemma2 always uses standard (default) RoPE, but its GGUF omits every
+    # ``rope.*`` key (llama.cpp hardcodes theta=10000). The base extractor only
+    # promotes ``rope_type`` to ``"default"`` when ``rope.freq_base`` is present,
+    # so it is left as ``None`` here — which would disable RoPE and make
+    # ``initialize_rope`` return ``None``. Force the default variant; the base
+    # ``rope_theta`` default (10000.0) already matches the architecture.
+    if config.rope_type is None:
+        config = dataclasses.replace(config, rope_type="default")
+
+    return Gemma2Config(
+        # Inherit all base ArchitectureConfig fields
+        **{f.name: getattr(config, f.name) for f in dataclasses.fields(ArchitectureConfig)},
+        # Gemma2-specific fields
+        attn_logit_softcapping=float(attn_logit_softcapping or 0.0),
+        final_logit_softcapping=float(final_logit_softcapping or 0.0),
+        query_pre_attn_scalar=float(query_pre_attn_scalar)
+        if query_pre_attn_scalar is not None
+        else None,
+    )
+
+
 def _gemma4_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -723,6 +777,7 @@ def _gemma3_postprocess(
 # Each takes a base ArchitectureConfig + raw metadata and returns
 # an architecture-specific config subclass.
 _CONFIG_POSTPROCESSORS: dict[str, Any] = {
+    "gemma2": _gemma2_postprocess,
     "gemma3_text": _gemma3_postprocess,
     "gemma4_text": _gemma4_postprocess,
 }

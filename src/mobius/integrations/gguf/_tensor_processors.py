@@ -161,15 +161,19 @@ def _process_gemma(
     state_dict: dict[str, torch.Tensor],
     config: Any,
 ) -> dict[str, torch.Tensor]:
-    """Restore Gemma2/3 norm weights.
+    """Restore Gemma norm weights to the HF convention.
 
-    GGUF stores ``w_gguf = w_hf - 1`` for all norm weights.
-    Reference: ``Gemma2TensorProcessor`` in HF's
-    ``modeling_gguf_pytorch_utils.py``.
+    llama.cpp bakes the Gemma ``(1 + w)`` RMSNorm offset into the stored
+    weights: ``w_gguf = w_hf + 1``. The mobius Gemma graph normalizes with
+    :class:`OffsetRMSNorm`, which re-applies ``(1 + weight)`` at runtime, so the
+    initializer it consumes must be the raw ``w_hf``. Subtract 1 to undo the
+    llama.cpp offset (matching HF's ``Gemma2TensorProcessor`` in
+    ``modeling_gguf_pytorch_utils.py``); otherwise the offset is applied twice
+    and every norm — hence the whole model — is corrupted.
     """
     for name in list(state_dict):
         if "norm" in name and name.endswith(".weight"):
-            state_dict[name] = state_dict[name] + 1
+            state_dict[name] = state_dict[name] - 1
     return state_dict
 
 

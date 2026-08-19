@@ -74,9 +74,63 @@ def write_gguf_tokenizer_json(gguf_path: str | Path, output_dir: str | Path) -> 
             str(gguf_path),
         )
         return None
+    _ensure_bos_post_processor(backend, gguf_path)
     path = os.path.join(str(output_dir), "tokenizer.json")
     backend.save(path)
     return path
+
+
+def _ensure_bos_post_processor(backend, gguf_path: Path) -> None:
+    """Attach a BOS-prepending post-processor if the GGUF asks for one.
+
+    ``transformers`` (5.x) can reconstruct a fast tokenizer from a GGUF's
+    ``tokenizer.ggml.*`` metadata, but for some architectures (e.g. Gemma,
+    whose GGUF tokenizer is loaded as a ``Unigram`` model) the resulting fast
+    backend does **not** carry the ``add_bos_token`` post-processor. Models
+    like Gemma require the ``<bos>`` prefix — without it, greedy decode
+    degenerates into single-token repetition. This restores that post-processor
+    from the GGUF metadata when the reconstructed tokenizer would otherwise omit
+    it. Best-effort: never raises (a tokenizer without BOS still saves).
+    """
+    try:
+        from tokenizers import processors
+
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        metadata = GGUFModel(str(gguf_path)).metadata
+        if not bool(metadata.get("tokenizer.ggml.add_bos_token", False)):
+            return
+        bos_id = metadata.get("tokenizer.ggml.bos_token_id")
+        tokens = metadata.get("tokenizer.ggml.tokens")
+        if bos_id is None or not tokens or int(bos_id) >= len(tokens):
+            return
+        bos_id = int(bos_id)
+        bos_token = tokens[bos_id]
+        # Probe: only attach BOS if the current pipeline does not already emit
+        # it (avoids a doubled ``<bos>`` when transformers did wire it up).
+        try:
+            probe = backend.encode("probe").ids
+            if probe and probe[0] == bos_id:
+                return
+        except Exception:  # pragma: no cover - probing is best-effort
+            pass
+        backend.post_processor = processors.TemplateProcessing(
+            single=f"{bos_token} $A",
+            pair=f"{bos_token} $A {bos_token} $B",
+            special_tokens=[(bos_token, bos_id)],
+        )
+        _LOGGER.info(
+            "Restored BOS post-processor (%r, id=%d) on GGUF-reconstructed "
+            "tokenizer.",
+            bos_token,
+            bos_id,
+        )
+    except Exception as error:  # pragma: no cover - best-effort
+        _LOGGER.warning(
+            "Could not verify/restore BOS post-processor for %r: %s.",
+            str(gguf_path),
+            error,
+        )
 
 
 def _reconstruct_tokenizer_from_ggml(gguf_path: Path, output_dir: str | Path) -> str | None:
