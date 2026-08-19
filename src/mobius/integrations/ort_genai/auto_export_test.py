@@ -2728,7 +2728,7 @@ class TestGemma4RealModel:
             return {"genai_config": os.path.join(output_dir, "genai_config.json")}
 
         with (
-            mock.patch("mobius._builder.build", side_effect=fake_build),
+            mock.patch("mobius.integrations.transformers.build", side_effect=fake_build),
             mock.patch(
                 "mobius.integrations.ort_genai.auto_export.export_package",
                 side_effect=fake_export_package,

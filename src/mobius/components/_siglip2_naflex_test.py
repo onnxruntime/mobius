@@ -10,8 +10,8 @@ import torch
 
 from mobius._configs import VisionConfig
 from mobius._testing.ort_inference import OnnxModelSession
-from mobius._weight_loading import apply_weights
 from mobius.components import Siglip2NaFlexVisionModel
+from mobius.integrations._weight_loading import apply_weights
 from mobius.tasks._base import _make_graph, _make_model
 
 _HIDDEN_SIZE = 32

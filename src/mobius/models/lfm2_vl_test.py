@@ -10,9 +10,10 @@ import onnx_ir as ir
 import pytest
 import torch
 
+from mobius import build_from_module
 from mobius._configs import Lfm2VlConfig
 from mobius._testing.ort_inference import OnnxModelSession
-from mobius._weight_loading import apply_weights
+from mobius.integrations._weight_loading import apply_weights
 from mobius.models.lfm2_vl import Lfm2VlForConditionalGeneration
 from mobius.tasks import Lfm2VlTask
 
@@ -341,14 +342,20 @@ def _empty_decoder_cache(config: Lfm2VlConfig, batch: int) -> dict[str, np.ndarr
     return feeds
 
 
-def test_decoder_matches_transformers_on_prefill_and_cached_decode():
+@pytest.mark.parametrize("execution_provider", ["default", "cuda"])
+def test_decoder_matches_transformers_on_prefill_and_cached_decode(execution_provider: str):
     """L3: the inputs_embeds decoder and hybrid cache match HF step for step."""
     torch.manual_seed(11)
     hf_model = _hf_causal_lm()
 
     config = _tiny_config()
     module = Lfm2VlForConditionalGeneration(config)
-    package = Lfm2VlTask().build(module, config)
+    package = build_from_module(
+        module,
+        config,
+        task="lfm2-vl",
+        execution_provider=execution_provider,
+    )
 
     state_dict = {
         f"model.language_model.{name[len('model.') :]}": value
