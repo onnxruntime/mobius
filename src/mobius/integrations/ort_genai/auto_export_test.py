@@ -373,6 +373,40 @@ class TestWriteProcessorConfig:
             "merge_size": 2,
         }
 
+    def test_qwen35_moe_text_uses_packed_qwen_image_pipeline(self, tmp_path):
+        """Qwen3.6 VL builds unwrap to the MoE text config before processor export."""
+        vision = mock.MagicMock()
+        vision.image_size = 16_777_216
+        vision.patch_size = 16
+        vision.spatial_merge_size = 2
+        config = mock.MagicMock()
+        config.vision = vision
+        config.model_type = "qwen3_5_moe_text"
+        config.spatial_merge_size = 2
+        config.temporal_patch_size = 2
+
+        path = _write_vision_processor_config(config, str(tmp_path))
+        assert path is not None
+        with open(path) as f:
+            data = json.load(f)
+
+        proc = data["processor"]
+        assert proc["name"] == "qwen2_5_image_processor"
+        transforms = proc["transforms"]
+        assert [t["operation"]["type"] for t in transforms] == [
+            "DecodeImage",
+            "Resize",
+            "Rescale",
+            "Normalize",
+            "PatchImage",
+        ]
+        assert transforms[3]["operation"]["attrs"]["qwen2_5_vl"] == 1
+        assert transforms[4]["operation"]["attrs"] == {
+            "patch_size": 16,
+            "temporal_patch_size": 2,
+            "merge_size": 2,
+        }
+
     def test_gemma3_vision_config(self, tmp_path):
         """Gemma3 gets a fixed-size resize + Permute3D (not the generic branch).
 
