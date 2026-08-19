@@ -837,8 +837,55 @@ class TestBuildGraphQuantized:
         expected = 1 * self.NUM_PROJECTIONS_PER_LAYER
         assert len(matmulnbits) == expected
 
+    def _granitemoe_config(self, quantization=None):
+        overrides = dict(
+            num_hidden_layers=2,
+            num_local_experts=8,
+            num_experts_per_tok=2,
+            moe_intermediate_size=32,
+            intermediate_size=32,
+        )
+        if quantization is not None:
+            overrides["quantization"] = quantization
+        return _base_config(**overrides)
 
-class TestBuildGraphVisionLanguage:
+    def test_granitemoe_int4_fuses_to_qmoe(self):
+        """int4 GraniteMoE fuses each MoE layer into one com.microsoft::QMoE node.
+
+        Instead of the dense loop-over-experts (per-expert MatMul + Equal)
+        representation. The CUDA EP executes only the quantized fused MoE ops
+        (QMoE / BlockQuantizedMoE); there is no float MoE kernel, so int4 is the
+        path that yields a fused, runnable graph.
+        """
+        from mobius._configs import QuantizationConfig
+
+        qc = QuantizationConfig(bits=4, group_size=32, quant_method="olive", sym=False)
+        config = self._granitemoe_config(quantization=qc)
+        module = registry.get("granitemoe")(config)
+        pkg = CausalLMTask().build(module, config)
+        model = pkg["model"]
+
+        qmoe = [n for n in model.graph if n.op_type == "QMoE"]
+        equal = [n for n in model.graph if n.op_type == "Equal"]
+        assert len(qmoe) == 2, f"expected one QMoE per MoE layer, got {len(qmoe)}"
+        assert len(equal) == 0, "fused QMoE must not emit per-expert Equal masks"
+
+    def test_granitemoe_dense_has_no_qmoe(self):
+        """Without quantization, GraniteMoE stays on the dense loop path.
+
+        No fused QMoE; per-expert Equal masks present.
+        """
+        config = self._granitemoe_config()
+        module = registry.get("granitemoe")(config)
+        pkg = CausalLMTask().build(module, config)
+        model = pkg["model"]
+
+        qmoe = [n for n in model.graph if n.op_type == "QMoE"]
+        equal = [n for n in model.graph if n.op_type == "Equal"]
+        assert len(qmoe) == 0, "unquantized MoE must not fuse to QMoE"
+        assert len(equal) > 0, "dense fallback selects experts with Equal masks"
+
+
     """Verify multimodal models build correctly."""
 
     def test_phi4mm_multimodal_graph(self):

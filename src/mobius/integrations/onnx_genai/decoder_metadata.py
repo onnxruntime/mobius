@@ -154,17 +154,55 @@ def build_decoder_metadata(
     return metadata
 
 
+def _moe_representation_from_config(config: Any) -> str:
+    """Return the MoE graph representation implied by *config*'s quantization.
+
+    ``MoELayer`` emits a fused ``com.microsoft::QMoE`` node (one per MoE layer)
+    exactly when :func:`mobius.components._moe._supported_qmoe_quantization`
+    accepts the model's quantization settings (int4, power-of-two
+    ``block_size >= 16``, GPTQ/AWQ/Olive-RTN); otherwise it falls back to the
+    portable loop-over-experts dense representation. The onnx-genai runtime
+    schema (``mixture_of_experts.representation``) distinguishes these as
+    ``qmoe`` vs ``dense_fallback``, and the weight-offload / expert-paging path
+    keys off that distinction -- a fused graph exposes per-expert structure the
+    dense loop hides. Reporting ``dense_fallback`` for a graph that actually
+    fused would make the runtime treat resident experts as an opaque bank.
+
+    This mirrors ``MoELayer``'s construction-time decision from *config* alone.
+    Gates without a ``qmoe_routing`` hook (only ``SparseMixerGate`` today) stay
+    dense even when quantized; those are not reachable through the standard
+    onnx-genai int4 MoE export, so a config-level derivation is faithful for
+    every fused path this emitter produces.
+    """
+    from mobius.components._moe import _supported_qmoe_quantization
+
+    quantization = getattr(config, "quantization", None)
+    if _supported_qmoe_quantization(quantization) is not None:
+        return "qmoe"
+    return "dense_fallback"
+
+
 def moe_metadata_from_config(
-    config: Any, *, representation: str = "dense_fallback"
+    config: Any, *, representation: str | None = None
 ) -> dict[str, Any] | None:
     """Build generic MoE metadata from explicit architecture configuration.
 
     Returns ``None`` for dense models. The emitted contract describes graph
     structure and router semantics only; it never dispatches on a model name.
+
+    When *representation* is ``None`` (the default) it is derived from the
+    config's quantization via :func:`_moe_representation_from_config` so the
+    emitted ``representation`` reflects whether ``MoELayer`` actually fused the
+    experts into ``com.microsoft::QMoE`` (``qmoe``) or emitted the dense
+    loop-over-experts fallback (``dense_fallback``). Callers may pass an
+    explicit value to override the derivation.
     """
     routed_experts = _clean_int(getattr(config, "num_local_experts", None))
     if routed_experts is None or routed_experts <= 1:
         return None
+
+    if representation is None:
+        representation = _moe_representation_from_config(config)
 
     experts_per_token = _clean_int(getattr(config, "num_experts_per_tok", None))
     expert_intermediate_size = _clean_int(

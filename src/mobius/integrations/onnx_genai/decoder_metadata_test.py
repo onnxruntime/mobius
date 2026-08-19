@@ -196,6 +196,44 @@ class TestDecoderMetadata:
         assert meta["model"]["mixture_of_experts"]["routed_expert_count"] == 4
         assert meta["model"]["mixture_of_experts"]["representation"] == "dense_fallback"
 
+    def test_moe_representation_is_qmoe_for_fused_int4_quantization(self):
+        """An int4 blk32 config fuses to QMoE, so metadata must say qmoe.
+
+        The onnx-genai runtime's expert-paging path keys off
+        ``representation``, so a fused graph must not advertise the dense
+        fallback.
+        """
+        cfg = _FakeConfig()
+        cfg.num_local_experts = 8
+        cfg.num_experts_per_tok = 2
+        cfg.moe_intermediate_size = 256
+        cfg.quantization = QuantizationConfig(
+            bits=4, group_size=32, quant_method="olive", sym=False
+        )
+
+        moe = moe_metadata_from_config(cfg)
+
+        assert moe is not None
+        assert moe["representation"] == "qmoe"
+
+    def test_moe_representation_stays_dense_for_unfusable_quantization(self):
+        """A non-power-of-two block size stays dense (unrunnable by CUDA QMoE).
+
+        ``MoELayer`` keeps the dense loop; the metadata must match.
+        """
+        cfg = _FakeConfig()
+        cfg.num_local_experts = 8
+        cfg.num_experts_per_tok = 2
+        cfg.moe_intermediate_size = 256
+        cfg.quantization = QuantizationConfig(
+            bits=4, group_size=48, quant_method="olive", sym=False
+        )
+
+        moe = moe_metadata_from_config(cfg)
+
+        assert moe is not None
+        assert moe["representation"] == "dense_fallback"
+
     def test_moe_metadata_rejects_incomplete_contract(self):
         cfg = _FakeConfig()
         cfg.num_local_experts = 4
