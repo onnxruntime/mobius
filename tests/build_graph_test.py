@@ -846,6 +846,76 @@ class TestBuildGraphQuantized:
         expected = 1 * self.NUM_PROJECTIONS_PER_LAYER
         assert len(matmulnbits) == expected
 
+    def _shared_moe_config(self, model_type, quantization=None):
+        overrides = dict(
+            num_hidden_layers=1,
+            num_local_experts=8,
+            num_experts_per_tok=2,
+            moe_intermediate_size=32,
+            intermediate_size=32,
+            shared_expert_intermediate_size=32,
+            hidden_size=64,
+        )
+        if quantization is not None:
+            overrides["quantization"] = quantization
+        return _base_config(**overrides)
+
+    def test_qwen2_moe_int4_quantizes_shared_expert(self):
+        """int4 Qwen2-MoE builds shared-expert projections as MatMulNBits (mobius#513).
+
+        The GPTQ Qwen1.5-MoE-A2.7B-Int4 checkpoint quantizes
+        ``mlp.shared_expert.{gate,up,down}_proj`` (they appear in
+        ``modules_in_block_to_quantize``). Before the fix ``Qwen2MoEDecoderLayer``
+        built ``Qwen2MoELayer`` without a ``linear_class``, so the shared expert was
+        a dense ``MLP`` whose ``Linear`` layers expected an unpacked ``[hidden,inter]``
+        weight and failed to load the packed GPTQ tensor. The shared-expert MLP must
+        use the quantization-aware factory (three MatMulNBits: gate/up/down), while
+        the tiny ``shared_expert_gate`` (hidden -> 1) stays dense.
+        """
+        from mobius._configs import QuantizationConfig
+
+        qc = QuantizationConfig(bits=4, group_size=32, quant_method="gptq", sym=False)
+        module = registry.get("qwen2_moe")(self._shared_moe_config("qwen2_moe", qc))
+        layer = module.model.layers[0]
+        # Attention projections must also use the quantized factory: the MoE
+        # decoder path previously built dense Attention, so a GPTQ checkpoint's
+        # packed self_attn weights could not load (mobius#513).
+        assert type(layer.self_attn.q_proj).__name__ == "QuantizedLinear"
+        assert type(layer.mlp.shared_expert.gate_proj).__name__ == "QuantizedLinear"
+        assert type(layer.mlp.shared_expert.up_proj).__name__ == "QuantizedLinear"
+        assert type(layer.mlp.shared_expert.down_proj).__name__ == "QuantizedLinear"
+        # Routing projection stays dense (excluded from quantization in the source).
+        assert type(layer.mlp.shared_expert_gate).__name__ == "Linear"
+
+        pkg = CausalLMTask().build(module, module.config)
+        model = pkg["model"]
+        qmoe = [n for n in model.graph if n.op_type == "QMoE"]
+        nbits = [n for n in model.graph if n.op_type == "MatMulNBits"]
+        assert len(qmoe) == 1, f"routed experts must fuse to one QMoE, got {len(qmoe)}"
+        assert len(nbits) >= 3, (
+            f"shared expert must emit >=3 MatMulNBits (gate/up/down), got {len(nbits)}"
+        )
+
+    def test_qwen2_moe_dense_shared_expert_stays_linear(self):
+        """Without quantization the Qwen2-MoE shared expert stays a dense MLP."""
+        module = registry.get("qwen2_moe")(self._shared_moe_config("qwen2_moe"))
+        layer = module.model.layers[0]
+        assert type(layer.mlp.shared_expert.down_proj).__name__ == "Linear"
+        assert type(layer.mlp.shared_expert_gate).__name__ == "Linear"
+
+    def test_glm4_moe_int4_quantizes_shared_expert(self):
+        """int4 GLM4-MoE (ungated shared expert) quantizes its shared expert too.
+
+        Same mobius#513 class of bug in ``UngatedSharedMoELayer`` (Ernie4.5 / GLM4),
+        which built the shared expert with a dense ``MLP`` regardless of quantization.
+        """
+        from mobius._configs import QuantizationConfig
+
+        qc = QuantizationConfig(bits=4, group_size=32, quant_method="gptq", sym=False)
+        module = registry.get("glm4_moe")(self._shared_moe_config("glm4_moe", qc))
+        layer = module.model.layers[0]
+        assert type(layer.mlp.shared_expert.down_proj).__name__ == "QuantizedLinear"
+
 
 class TestBuildGraphVisionLanguage:
     """Verify multimodal models build correctly."""

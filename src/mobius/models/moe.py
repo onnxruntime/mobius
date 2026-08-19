@@ -6,12 +6,13 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
-from typing import TYPE_CHECKING
 
+import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
+from mobius._weight_utils import preprocess_quantized_weights
 from mobius.components import (
     Attention,
     Embedding,
@@ -25,10 +26,53 @@ from mobius.components import (
 )
 from mobius.components._attention import StaticCacheState
 from mobius.components._moe import MLP, SigmoidTopKGate, SoftmaxTopKGate
+from mobius.components._quantized_linear import make_quantized_linear_factory
 from mobius.models.base import CausalLMModel
 
-if TYPE_CHECKING:
-    import onnx_ir as ir
+
+def _quantized_linear_class(config: ArchitectureConfig) -> type | None:
+    """Return a QuantizedLinear factory when the checkpoint is quantized.
+
+    MoE decoder-layer projections (attention Q/K/V/O and the shared-expert MLP
+    ``gate_proj``/``up_proj``/``down_proj``) are quantized in GPTQ/AWQ MoE
+    checkpoints (e.g. Qwen1.5-MoE-A2.7B-GPTQ-Int4 lists ``self_attn.*`` and
+    ``mlp.shared_expert.*`` in ``modules_in_block_to_quantize``), so they must be
+    built through the same quantization-aware factory as the routed experts;
+    otherwise the packed weights fail to load into dense ``Linear`` layers.
+    Returns ``None`` for unquantized configs so callers fall back to dense Linear.
+    """
+    qc = getattr(config, "quantization", None)
+    if qc is None or qc.quant_method == "none":
+        return None
+    zp_dtype = config.dtype if getattr(qc, "float_zero_point", False) else ir.DataType.UINT8
+    return make_quantized_linear_factory(
+        bits=qc.bits,
+        block_size=qc.group_size,
+        has_zero_point=not qc.sym,
+        zero_point_dtype=zp_dtype,
+    )
+
+
+def _preprocess_moe_weights(model: nn.Module, state_dict) -> dict:
+    """Shared MoE weight preprocessing that routes routed experts through QMoE.
+
+    Applies the standard quantization conversion (GPTQ/AWQ/Olive) and, when the
+    checkpoint's quantization matches the native QMoE ABI, stacks per-expert
+    projections into the fused expert-major tensors and packs them into
+    ``com.microsoft::QMoE`` parameters (``qmoe_target_path=".mlp"`` — the routed
+    ``self.mlp`` block). Float and non-QMoE checkpoints fall through to the dense
+    loop-over-experts representation unchanged.
+
+    Callers pass a state dict whose HF expert layout has already been
+    normalised (see :func:`_rename_moe_expert_weights`).
+    """
+    return preprocess_quantized_weights(
+        state_dict,
+        getattr(model.config, "quantization", None),
+        tie_embeddings=model.config.tie_word_embeddings,
+        qmoe_target_path=".mlp",
+        qmoe_quant_methods=("gptq", "awq", "olive"),
+    )
 
 
 class MoEDecoderLayer(nn.Module):
@@ -56,8 +100,12 @@ class MoEDecoderLayer(nn.Module):
         super().__init__()
         self._post_feedforward_norm = config.post_feedforward_norm
         attention_scale = getattr(config, "attention_multiplier", None)
-        self.self_attn = Attention(config, scale=attention_scale)
-        self.mlp = MoELayer(config, gate=gate)
+        # Quantize attention Q/K/V/O when the checkpoint does (GPTQ/AWQ MoE lists
+        # ``self_attn.*`` in ``modules_in_block_to_quantize``); the MoE decoder path
+        # otherwise builds dense projections that cannot load packed weights.
+        linear_class = _quantized_linear_class(config)
+        self.self_attn = Attention(config, scale=attention_scale, linear_class=linear_class)
+        self.mlp = MoELayer(config, gate=gate, linear_class=linear_class)
         residual_multiplier = getattr(config, "residual_multiplier", None)
         self._residual_multiplier = 1.0 if residual_multiplier is None else residual_multiplier
         if not self._post_feedforward_norm:
@@ -262,7 +310,7 @@ class MoECausalLMModel(CausalLMModel):
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         state_dict = _rename_moe_expert_weights(state_dict)
-        return super().preprocess_weights(state_dict)
+        return _preprocess_moe_weights(self, state_dict)
 
 
 class Qwen2MoELayer(MoELayer):
@@ -336,7 +384,15 @@ class Qwen2MoEDecoderLayer(MoEDecoderLayer):
         super().__init__(config, gate=gate, norm_class=norm_class)
         # Replace the standard MoELayer with the Qwen2 variant (shared expert).
         # Re-use the gate already created by MoEDecoderLayer.__init__.
-        self.mlp = Qwen2MoELayer(config, gate=self.mlp.gate)
+        # Thread the quantization-aware factory so a GPTQ/AWQ checkpoint's packed
+        # shared-expert weights load (mobius#513). The tiny shared_expert_gate
+        # (hidden -> 1) is left dense: it is excluded from quantization in source.
+        self.mlp = Qwen2MoELayer(
+            config,
+            gate=self.mlp.gate,
+            linear_class=_quantized_linear_class(config),
+            shared_expert_gate_class=Linear,
+        )
 
 
 class Qwen2MoECausalLMModel(CausalLMModel):
@@ -359,7 +415,7 @@ class Qwen2MoECausalLMModel(CausalLMModel):
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         state_dict = _rename_moe_expert_weights(state_dict)
-        return super().preprocess_weights(state_dict)
+        return _preprocess_moe_weights(self, state_dict)
 
 
 class UngatedSharedMoELayer(MoELayer):
@@ -382,7 +438,9 @@ class UngatedSharedMoELayer(MoELayer):
         shared_config = dataclasses.replace(
             config, intermediate_size=config.shared_expert_intermediate_size
         )
-        self.shared_expert = MLP(shared_config)
+        # Quantize the shared expert when the checkpoint does (mobius#513);
+        # GPTQ/AWQ Ernie4.5-MoE / GLM4-MoE pack ``mlp.shared_expert.*``.
+        self.shared_expert = MLP(shared_config, linear_class=_quantized_linear_class(config))
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # Routed expert output: top-k weighted sum  [B, S, H]
@@ -450,7 +508,7 @@ class Ernie45MoECausalLMModel(CausalLMModel):
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         state_dict = _preprocess_shared_moe_weights(state_dict)
-        return super().preprocess_weights(state_dict)
+        return _preprocess_moe_weights(self, state_dict)
 
 
 class Glm4MoECausalLMModel(CausalLMModel):
@@ -485,7 +543,7 @@ class Glm4MoECausalLMModel(CausalLMModel):
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         state_dict = _preprocess_shared_moe_weights(state_dict)
-        return super().preprocess_weights(state_dict)
+        return _preprocess_moe_weights(self, state_dict)
 
 
 class HunYuanMoEV1CausalLMModel(CausalLMModel):

@@ -20,6 +20,7 @@ from mobius._weight_utils import (
     split_fused_qkv,
     split_gate_up_proj,
     split_interleaved_qkv,
+    stack_per_expert_moe_weights,
     strip_prefix,
     tie_word_embeddings,
     vlm_decoder_weights,
@@ -979,6 +980,48 @@ class TestPreprocessQuantizedWeights:
                 qmoe_quant_methods=("olive",),
             )
 
+    def test_per_expert_gptq_moe_produces_populated_fused_qmoe(self):
+        """Per-expert GPTQ experts stack+pack into non-empty fused QMoE params.
+
+        This is the end-to-end guard for the per-expert -> fused-QMoE path:
+        a symmetric GPTQ MoE checkpoint whose routed experts are stored as
+        separate modules must yield populated ``fc1/fc2_experts_weights`` with a
+        leading expert axis, and leave no per-expert expert tensors behind.
+        """
+        quantization = QuantizationConfig(bits=4, group_size=32, quant_method="gptq", sym=True)
+        num_experts = 3
+        hidden, inter = 256, 128
+        prefix = "model.layers.0.mlp.experts"
+        state_dict: dict[str, torch.Tensor] = {}
+        for e in range(num_experts):
+            # gate/up: in=hidden(256), out=inter(128); down: in=inter(128), out=hidden(256)
+            for proj, k, n in (
+                ("gate_proj", hidden, inter),
+                ("up_proj", hidden, inter),
+                ("down_proj", inter, hidden),
+            ):
+                k_packed = k * 4 // 32
+                n_groups = k // 32
+                state_dict[f"{prefix}.{e}.{proj}.qweight"] = torch.randint(
+                    0, 255, (k_packed, n), dtype=torch.int32
+                )
+                state_dict[f"{prefix}.{e}.{proj}.scales"] = torch.randn(n_groups, n)
+
+        result = preprocess_quantized_weights(
+            state_dict, quantization, qmoe_target_path=".mlp"
+        )
+
+        fc1 = result["model.layers.0.mlp.fc1_experts_weights"]
+        fc2 = result["model.layers.0.mlp.fc2_experts_weights"]
+        assert fc1.shape[0] == num_experts
+        assert fc2.shape[0] == num_experts
+        assert fc1.shape[1] == 2 * inter  # gate rows then up rows
+        assert fc2.shape[1] == hidden
+        assert fc1.numel() > 0 and fc2.numel() > 0
+        # No per-expert expert tensors survive the fusion.
+        assert not any(".experts." in k and ".gate_proj" in k for k in result)
+        assert not any(".experts." in k and ".down_proj" in k for k in result)
+
     @pytest.mark.parametrize("flag", ["quantize_embeddings", "quantize_lm_head"])
     def test_rejects_quantized_embedding_or_lm_head(self, flag):
         quantization = QuantizationConfig(
@@ -1251,3 +1294,102 @@ class TestSplitCodegenQKV:
         """mp_num that doesn't divide hidden raises ValueError."""
         with pytest.raises(ValueError, match="divisible"):
             split_codegen_qkv(torch.zeros(96, 32), num_heads=4, head_dim=8, mp_num=3)
+
+
+class TestStackPerExpertMoEWeights:
+    """Per-expert GPTQ/AWQ MoE tensors -> fused expert-major QMoE layout.
+
+    Runs on the MatMulNBits-reshaped layout produced by preprocess_gptq_weights:
+    ``.weight`` [N, n_blocks, blob], ``.scales`` [N, n_blocks].
+    """
+
+    NUM_EXPERTS = 4
+    HIDDEN = 8
+    INTER = 6
+    N_BLOCKS = 2
+    BLOB = 2  # bits=4 -> block_size/2
+
+    def _per_expert_state_dict(self):
+        prefix = "model.layers.0.mlp.experts"
+        sd = {}
+        # Deterministic distinct values so a permutation/gate-up swap is visible.
+        for e in range(self.NUM_EXPERTS):
+            for proj, out in (
+                ("gate_proj", self.INTER),
+                ("up_proj", self.INTER),
+                ("down_proj", self.HIDDEN),
+            ):
+                base = (e + 1) * 1000 + {"gate_proj": 0, "up_proj": 100, "down_proj": 200}[
+                    proj
+                ]
+                w = (
+                    (base + torch.arange(out * self.N_BLOCKS * self.BLOB))
+                    .reshape(out, self.N_BLOCKS, self.BLOB)
+                    .to(torch.uint8)
+                )
+                s = (
+                    (base + torch.arange(out * self.N_BLOCKS))
+                    .reshape(out, self.N_BLOCKS)
+                    .float()
+                )
+                sd[f"{prefix}.{e}.{proj}.weight"] = w
+                sd[f"{prefix}.{e}.{proj}.scales"] = s
+                sd[f"{prefix}.{e}.{proj}.bias"] = torch.zeros(out)
+        return sd, prefix
+
+    def test_stacks_into_fused_expert_major(self):
+        sd, prefix = self._per_expert_state_dict()
+        result = stack_per_expert_moe_weights(sd, qmoe_target_path=".mlp")
+
+        gu_w = result[f"{prefix}.gate_up_proj.weight"]
+        gu_s = result[f"{prefix}.gate_up_proj.scales"]
+        dn_w = result[f"{prefix}.down_proj.weight"]
+
+        assert gu_w.shape == (self.NUM_EXPERTS, 2 * self.INTER, self.N_BLOCKS, self.BLOB)
+        assert gu_s.shape == (self.NUM_EXPERTS, 2 * self.INTER, self.N_BLOCKS)
+        assert dn_w.shape == (self.NUM_EXPERTS, self.HIDDEN, self.N_BLOCKS, self.BLOB)
+
+        # Per-expert biases/g_idx are dropped; no per-expert keys survive.
+        assert not any(".experts.0." in k for k in result)
+
+    def test_gate_first_then_up_ordering(self):
+        """fc1 rows must be [gate(0:inter); up(inter:2*inter)] per expert."""
+        sd, prefix = self._per_expert_state_dict()
+        result = stack_per_expert_moe_weights(sd, qmoe_target_path=".mlp")
+        gu_w = result[f"{prefix}.gate_up_proj.weight"]
+        for e in range(self.NUM_EXPERTS):
+            torch.testing.assert_close(
+                gu_w[e, : self.INTER], sd[f"{prefix}.{e}.gate_proj.weight"]
+            )
+            torch.testing.assert_close(
+                gu_w[e, self.INTER :], sd[f"{prefix}.{e}.up_proj.weight"]
+            )
+
+    def test_expert_axis_order_preserved(self):
+        """Stacking must preserve expert index order (catches permutation)."""
+        sd, prefix = self._per_expert_state_dict()
+        result = stack_per_expert_moe_weights(sd, qmoe_target_path=".mlp")
+        dn_w = result[f"{prefix}.down_proj.weight"]
+        for e in range(self.NUM_EXPERTS):
+            torch.testing.assert_close(dn_w[e], sd[f"{prefix}.{e}.down_proj.weight"])
+
+    def test_already_fused_is_noop(self):
+        """Olive-style fused expert-major tensors pass through unchanged."""
+        sd = {
+            "model.layers.0.mlp.experts.gate_up_proj.weight": torch.zeros(
+                self.NUM_EXPERTS, 2 * self.INTER, self.N_BLOCKS, self.BLOB
+            ),
+            "model.layers.0.mlp.experts.down_proj.weight": torch.zeros(
+                self.NUM_EXPERTS, self.HIDDEN, self.N_BLOCKS, self.BLOB
+            ),
+        }
+        result = stack_per_expert_moe_weights(sd, qmoe_target_path=".mlp")
+        assert result is sd
+
+    def test_non_expert_keys_pass_through(self):
+        sd, _prefix = self._per_expert_state_dict()
+        sd["model.embed_tokens.weight"] = torch.randn(4, 8)
+        result = stack_per_expert_moe_weights(sd, qmoe_target_path=".mlp")
+        assert torch.equal(
+            result["model.embed_tokens.weight"], sd["model.embed_tokens.weight"]
+        )
