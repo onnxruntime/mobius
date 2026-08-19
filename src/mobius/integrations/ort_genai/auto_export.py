@@ -54,6 +54,8 @@ import os
 import shutil
 from typing import TYPE_CHECKING, Any
 
+from mobius.upstream_patches import apply_asset_patches
+
 if TYPE_CHECKING:
     import onnx_ir as ir
 
@@ -1496,6 +1498,9 @@ def write_ort_genai_config(
 
     # Ensure chat_template is in tokenizer_config.json
     _fix_chat_template(directory, hf_model_id)
+
+    # Correct assets that ship broken from upstream
+    apply_asset_patches(directory)
 
     logger.info("ORT-GenAI artifacts written: %d files", len(result))
     return result
