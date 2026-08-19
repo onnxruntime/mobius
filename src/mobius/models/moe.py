@@ -12,6 +12,7 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
+from mobius._weight_utils import preprocess_quantized_weights
 from mobius.components import (
     Attention,
     Embedding,
@@ -49,6 +50,28 @@ def _quantized_linear_class(config: ArchitectureConfig) -> type | None:
         block_size=qc.group_size,
         has_zero_point=not qc.sym,
         zero_point_dtype=zp_dtype,
+    )
+
+
+def _preprocess_moe_weights(model: nn.Module, state_dict) -> dict:
+    """Shared MoE weight preprocessing that routes routed experts through QMoE.
+
+    Applies the standard quantization conversion (GPTQ/AWQ/Olive) and, when the
+    checkpoint's quantization matches the native QMoE ABI, stacks per-expert
+    projections into the fused expert-major tensors and packs them into
+    ``com.microsoft::QMoE`` parameters (``qmoe_target_path=".mlp"`` — the routed
+    ``self.mlp`` block). Float and non-QMoE checkpoints fall through to the dense
+    loop-over-experts representation unchanged.
+
+    Callers pass a state dict whose HF expert layout has already been
+    normalised (see :func:`_rename_moe_expert_weights`).
+    """
+    return preprocess_quantized_weights(
+        state_dict,
+        getattr(model.config, "quantization", None),
+        tie_embeddings=model.config.tie_word_embeddings,
+        qmoe_target_path=".mlp",
+        qmoe_quant_methods=("gptq", "awq", "olive"),
     )
 
 
@@ -287,7 +310,7 @@ class MoECausalLMModel(CausalLMModel):
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         state_dict = _rename_moe_expert_weights(state_dict)
-        return super().preprocess_weights(state_dict)
+        return _preprocess_moe_weights(self, state_dict)
 
 
 class Qwen2MoELayer(MoELayer):
@@ -392,7 +415,7 @@ class Qwen2MoECausalLMModel(CausalLMModel):
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         state_dict = _rename_moe_expert_weights(state_dict)
-        return super().preprocess_weights(state_dict)
+        return _preprocess_moe_weights(self, state_dict)
 
 
 class UngatedSharedMoELayer(MoELayer):
@@ -417,9 +440,7 @@ class UngatedSharedMoELayer(MoELayer):
         )
         # Quantize the shared expert when the checkpoint does (mobius#513);
         # GPTQ/AWQ Ernie4.5-MoE / GLM4-MoE pack ``mlp.shared_expert.*``.
-        self.shared_expert = MLP(
-            shared_config, linear_class=_quantized_linear_class(config)
-        )
+        self.shared_expert = MLP(shared_config, linear_class=_quantized_linear_class(config))
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # Routed expert output: top-k weighted sum  [B, S, H]
@@ -487,7 +508,7 @@ class Ernie45MoECausalLMModel(CausalLMModel):
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         state_dict = _preprocess_shared_moe_weights(state_dict)
-        return super().preprocess_weights(state_dict)
+        return _preprocess_moe_weights(self, state_dict)
 
 
 class Glm4MoECausalLMModel(CausalLMModel):
@@ -522,7 +543,7 @@ class Glm4MoECausalLMModel(CausalLMModel):
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         state_dict = _preprocess_shared_moe_weights(state_dict)
-        return super().preprocess_weights(state_dict)
+        return _preprocess_moe_weights(self, state_dict)
 
 
 class HunYuanMoEV1CausalLMModel(CausalLMModel):
