@@ -104,7 +104,7 @@ class TestQwen38Alias:
         assert _QWEN38_REVISION == "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
         assert registry.get("qwen3_5") is Qwen35VL3ModelCausalLMModel
         assert registry.get("qwen3_5_vl") is Qwen35VL3ModelCausalLMModel
-        assert registry.get_registration("qwen3_5").test_model_id == "Qwen/Qwen3.8-27B"
+        assert registry.get_registration("qwen3_5").test_model_id == "Qwen/Qwen3.5-2B"
         assert registry.get_registration("qwen3_5_vl").test_model_id == "Qwen/Qwen3.5-2B"
         assert config.hidden_size == 5120
         assert config.intermediate_size == 17408
