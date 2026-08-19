@@ -137,6 +137,7 @@ _QWEN_VL_MODEL_TYPES = frozenset(
         "qwen3_5",
         "qwen3_5_vl",
         "qwen3_5_moe",
+        "qwen3_5_moe_text",
         "videochat_flash_qwen",
     }
 )
