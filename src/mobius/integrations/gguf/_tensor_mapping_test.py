@@ -102,13 +102,20 @@ class TestMapGGUFToHFNames:
     # ---- Gemma family ----
 
     def test_gemma2_extras(self) -> None:
+        # Gemma2 GGUF uses the llama.cpp Gemma tensor names (like Gemma3/4):
+        # ffn_norm is the pre-feedforward norm, post_ffw_norm the post-
+        # feedforward norm, post_attention_norm the post-attention sandwich norm.
         assert (
-            map_gguf_to_hf_names("blk.0.pre_ffn_norm.weight", "gemma2")
+            map_gguf_to_hf_names("blk.0.ffn_norm.weight", "gemma2")
             == "model.layers.0.pre_feedforward_layernorm.weight"
         )
         assert (
-            map_gguf_to_hf_names("blk.0.post_ffn_norm.weight", "gemma2")
+            map_gguf_to_hf_names("blk.0.post_ffw_norm.weight", "gemma2")
             == "model.layers.0.post_feedforward_layernorm.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("blk.0.post_attention_norm.weight", "gemma2")
+            == "model.layers.0.post_attention_layernorm.weight"
         )
 
     def test_gemma2_inherits_llama_base(self) -> None:

@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Qwen3.5/3.6-MoE mixed float/quantized decoder (Olive checkpoints)
+
+#### Fixed
+
+- **Olive-quantized** Qwen3.5/3.6-**MoE** exports (text and VL) no longer
+  quantize the modules that Olive's quantization walk skips:
+  - `linear_attn` (GatedDeltaNet) projections now use plain `Linear`.
+  - `shared_expert_gate` (the `[1, hidden]` sigmoid gate of `Qwen35MoEBlock`)
+    now uses plain `Linear`.
+
+  Olive's `ModelWrapper` excludes `linear_attn` for the `qwen3_5_moe` /
+  `qwen3_5_moe_text` model types (`MAMBA` table) and every
+  `shared_expert_gate` (`SHARED_EXPERT_GATE` table) from quantization since
+  microsoft/Olive#2630, so those checkpoints never contain the packed
+  `MatMulNBits` initializers the previous graph expected (e.g.
+  `linear_attn.in_proj_qkv.weight` as `[48, 2, 8]` uint8 + scales). Ordinary
+  self-attention, the shared-expert MLP, the dense MLP and the fused
+  `com.microsoft::QMoE` experts remain quantized; router `gate` behavior is
+  unchanged.
+
+  Scope is deliberately narrow:
+  - **Dense** Qwen3.5/3.6 (`Qwen35CausalLMModel` and its VL split) is *not* in
+    Olive's `MAMBA` table, so its `linear_attn` stays quantized.
+  - Other checkpoint formats retain their previous graph construction; this
+    change only aligns Mobius with Olive's module selection.
+
+- Qwen3.6 VL exports now emit the packed Qwen image-processing pipeline when
+  the composite build exposes its unwrapped `qwen3_5_moe_text` config. This
+  adds the required `PatchImage` transform so `pixel_values` matches the
+  vision encoder's rank-2 packed-patch input.
+
+#### Added
+
+- `Qwen2MoELayer(..., shared_expert_gate_class=...)` to override the linear
+  factory for `shared_expert_gate` only (`None` falls back to `linear_class`,
+  so existing callers are unaffected).
+
+---
+
 ### NVIDIA Cosmos 3 Edge vision-language model (`cosmos3_edge`)
 
 #### Added
