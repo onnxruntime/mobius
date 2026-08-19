@@ -213,15 +213,13 @@ def _reconstruct_tokenizer_from_ggml(gguf_path: Path, output_dir: str | Path) ->
 
         if add_bos and bos_id is not None:
             bos_id = int(bos_id)
-            if bos_id < 0 or bos_id >= len(tokens):
-                bos_id = None
-        if add_bos and bos_id is not None:
-            bos_token = tokens[bos_id]
-            tokenizer.post_processor = processors.TemplateProcessing(
-                single=f"{bos_token} $A",
-                pair=f"{bos_token} $A {bos_token} $B",
-                special_tokens=[(bos_token, bos_id)],
-            )
+            if 0 <= bos_id < len(tokens):
+                bos_token = tokens[bos_id]
+                tokenizer.post_processor = processors.TemplateProcessing(
+                    single=f"{bos_token} $A",
+                    pair=f"{bos_token} $A {bos_token} $B",
+                    special_tokens=[(bos_token, bos_id)],
+                )
 
         # Sanity check: encode→decode round-trip. This is a soft signal (a small
         # or byte-incomplete vocab may not represent arbitrary text); the token
