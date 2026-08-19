@@ -16,7 +16,9 @@ generation:
   max_new_tokens: 30
   do_sample: false
 
-ci_skip_reason: "Official checkpoint is 55.6 GB; reduced-real CUDA and Olive evidence is run manually."
+ci_skip_reason: >-
+  The pinned official checkpoint is 55.6 GB and exceeds hosted CI storage and
+  GPU memory; no reduced or quantized private fixture is committed.
 notes: >-
   Qwen3.8-27B native image/video model. Dense Qwen3.5 alias with 64 hybrid
   layers (48 Gated DeltaNet + 16 gated GQA), a 27-block vision encoder, and an
