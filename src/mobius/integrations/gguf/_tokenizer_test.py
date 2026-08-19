@@ -83,6 +83,40 @@ class TestWriteGgufTokenizerJson:
         _, kwargs = fake_transformers.AutoTokenizer.from_pretrained.call_args
         assert kwargs["gguf_file"] == "model.gguf"
 
+    def test_restores_bos_post_processor_when_primary_path_omits_it(self, tmp_path):
+        """A reconstructed backend lacking BOS gets the GGUF's BOS post-processor.
+
+        Regression: transformers' GGUF loader (e.g. for Gemma) can return a fast
+        tokenizer whose post-processor does NOT prepend ``<bos>``. Gemma requires
+        it — without BOS, greedy decode degenerates into token repetition. The
+        emitter must restore the BOS post-processor from the GGUF metadata.
+        """
+        from tokenizers import Tokenizer
+        from tokenizers.models import BPE
+
+        from mobius.integrations.gguf import _tokenizer
+
+        gguf_path = tmp_path / "model.gguf"
+        _write_gguf_with_bpe_tokenizer(gguf_path)  # add_bos_token=True, bos_id=2
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+
+        # A backend with a valid vocab but NO BOS post-processor.
+        vocab = {"<pad>": 0, "<eos>": 1, "<bos>": 2, "<unk>": 3, "h": 4, "i": 5}
+        backend = Tokenizer(BPE(vocab=vocab, merges=[], unk_token="<unk>"))
+        assert backend.encode("hi").ids[0] != 2  # no BOS before the fix
+
+        fake_tokenizer = mock.Mock()
+        fake_tokenizer.backend_tokenizer = backend
+        fake_transformers = mock.Mock()
+        fake_transformers.AutoTokenizer.from_pretrained.return_value = fake_tokenizer
+
+        with mock.patch.dict("sys.modules", {"transformers": fake_transformers}):
+            result = _tokenizer.write_gguf_tokenizer_json(gguf_path, out_dir)
+
+        saved = Tokenizer.from_file(result)
+        assert saved.encode("hi").ids[0] == 2  # BOS now prepended
+
 
 class TestGgufOnnxGenaiEmission:
     """The onnx-genai metadata is emitted for a GGUF-built decoder package."""

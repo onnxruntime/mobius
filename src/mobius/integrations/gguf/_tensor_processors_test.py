@@ -221,14 +221,14 @@ class TestProcessTensorsGemma:
         }
         result = process_tensors(state_dict, config)
 
-        # Norm weights: +1
+        # Norm weights: undo llama.cpp's baked (w_hf + 1) offset → subtract 1.
         torch.testing.assert_close(
             result["model.layers.0.input_layernorm.weight"],
-            torch.tensor([1.0, 2.0, 0.0]),
+            torch.tensor([-1.0, 0.0, -2.0]),
         )
         torch.testing.assert_close(
             result["model.norm.weight"],
-            torch.tensor([1.5]),
+            torch.tensor([-0.5]),
         )
         # Non-norm weights: unchanged
         torch.testing.assert_close(
