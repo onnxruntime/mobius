@@ -15,6 +15,9 @@ model families Mobius builds:
   composite encoder/fusion/autoregressive-decoder pipeline.
 * **Speech-to-text (ASR)** — :func:`write_speech_to_text_pipeline_metadata` emits
   a Whisper-style cross-attention encode→decode pipeline.
+* **Full-duplex speech-to-speech** — :func:`write_full_duplex_workflow_metadata`
+  emits one-event-per-invocation SSA with session-scoped conversational state
+  (Moshi / PersonaPlex).
 * **Audio codec / multi-decoder TTS** —
   :func:`write_audio_codec_workflow_metadata` emits typed codec SSA, while
   :func:`write_tts_workflow_metadata` reports the current nested-loop induction
@@ -64,6 +67,7 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     build_audio_codec_workflow_metadata,
     build_decoder_workflow_metadata,
     build_diffusion_workflow_metadata,
+    build_full_duplex_workflow_metadata,
     build_image_edit_workflow_metadata,
     build_language_diffusion_pipeline_metadata,
     build_speculative_workflow_metadata,
@@ -73,6 +77,7 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     write_audio_codec_workflow_metadata,
     write_decoder_workflow_metadata,
     write_diffusion_workflow_metadata,
+    write_full_duplex_workflow_metadata,
     write_image_edit_workflow_metadata,
     write_language_diffusion_workflow_metadata,
     write_speculative_workflow_metadata,
@@ -87,6 +92,7 @@ __all__ = [
     "SchedulerConfig",
     "add_policy_components_to_workflow",
     "build_audio_codec_workflow_metadata",
+    "build_full_duplex_workflow_metadata",
     "build_decoder_metadata",
     "build_decoder_workflow_metadata",
     "build_diffusion_pipeline_metadata",
@@ -109,6 +115,7 @@ __all__ = [
     "translate_comfyui_workflow",
     "translate_comfyui_workflow_file",
     "write_audio_codec_workflow_metadata",
+    "write_full_duplex_workflow_metadata",
     "write_decoder_metadata",
     "write_decoder_workflow_metadata",
     "write_diffusion_pipeline_metadata",

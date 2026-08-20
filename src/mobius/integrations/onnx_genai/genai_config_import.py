@@ -132,14 +132,10 @@ def unbound_decoder_ports(package: ModelPackage) -> dict[str, list[str]]:
     decoder = package["decoder"]
     return {
         "inputs": sorted(
-            value.name
-            for value in decoder.graph.inputs
-            if value.name not in declared_inputs
+            value.name for value in decoder.graph.inputs if value.name not in declared_inputs
         ),
         "outputs": sorted(
-            value.name
-            for value in decoder.graph.outputs
-            if value.name not in declared_outputs
+            value.name for value in decoder.graph.outputs if value.name not in declared_outputs
         ),
     }
 

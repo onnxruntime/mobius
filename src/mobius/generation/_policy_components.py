@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 import onnx_ir as ir
 from onnxscript import GraphBuilder
@@ -2665,4 +2665,339 @@ def build_video_latent_unscale(scaling_factor: float) -> PolicyComponent:
     unscaled = op.Div(latent, op.CastLike(op.Constant(value_float=scaling_factor), latent))
     _set_public_shape(unscaled, ["batch", "channels", "frames", "height", "width"])
     builder.add_output(unscaled, "unscaled")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+_INT64_MAX = 2**63 - 1
+
+
+def build_scalar_integer_add() -> PolicyComponent:
+    """Add two rank-0 integer control values.
+
+    Loop induction values and substep indices are scalars, not per-row state, so
+    they need a rank-0 adder rather than the ``[batch]`` :func:`build_integer_add`.
+    """
+    graph, builder = _make_graph("scalar_integer_add")
+    left = builder.input("left", ir.DataType.INT64, [])
+    right = builder.input("right", ir.DataType.INT64, [])
+    total = builder.op.Add(left, right)
+    total.shape = ir.Shape([])
+    builder.add_output(total, "total")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def _duplex_positions(
+    op: Any,
+    offset: Any,
+    delays: Any,
+    cache_length: int,
+    channels: int,
+    batch_shape: Any,
+) -> Any:
+    """Build ``[batch, channels, 1]`` ring indices for ``(offset + delays) % CT``."""
+    positions = op.Mod(op.Add(delays, offset), op.Constant(value_int=cache_length))
+    positions = op.Reshape(positions, op.Constant(value_ints=[1, channels, 1]))
+    target_shape = op.Concat(batch_shape, op.Constant(value_ints=[channels, 1]), axis=0)
+    return op.Expand(positions, target_shape)
+
+
+def build_duplex_frame_assemble(
+    *, channels: int = 17, cache_length: int = 4
+) -> PolicyComponent:
+    """Write per-stream tokens into the delay ring cache and read one model frame.
+
+    Full-duplex codec language models interleave several token streams (one text
+    stream plus interleaved agent and user acoustic streams) that are each shifted
+    by a small per-stream delay. The delay compensation is a ring buffer of
+    ``cache_length`` frames indexed by ``(offset + delay) % cache_length``.
+
+    ``stream_tokens`` carries every externally supplied token for this step; a
+    negative entry means "this stream has nothing to contribute, the model must
+    predict it". ``initial_tokens`` primes streams whose delay has not elapsed.
+    """
+    graph, builder = _make_graph("duplex_frame_assemble")
+    op = builder.op
+    cache = builder.input("token_cache", ir.DataType.INT64, ["batch", channels, cache_length])
+    provided = builder.input(
+        "token_provided", ir.DataType.BOOL, ["batch", channels, cache_length]
+    )
+    offset = builder.input("offset", ir.DataType.INT64, [])
+    stream_tokens = builder.input("stream_tokens", ir.DataType.INT64, ["batch", channels])
+    delays = builder.input("delays", ir.DataType.INT64, [channels])
+    initial_tokens = builder.input("initial_tokens", ir.DataType.INT64, [channels])
+
+    batch_shape = op.Shape(cache, start=0, end=1)
+
+    # 1. scatter externally supplied tokens at their delayed ring slot.
+    write_index = _duplex_positions(op, offset, delays, cache_length, channels, batch_shape)
+    token_update = op.Unsqueeze(stream_tokens, [-1])
+    has_token = op.GreaterOrEqual(token_update, op.Constant(value_int=0))
+    cache = op.ScatterElements(
+        cache,
+        write_index,
+        op.Where(has_token, token_update, op.GatherElements(cache, write_index, axis=2)),
+        axis=2,
+    )
+    # ORT has no bool Where kernel; setting a flag is a saturating Or.
+    provided = op.ScatterElements(
+        provided,
+        write_index,
+        op.Or(op.GatherElements(provided, write_index, axis=2), has_token),
+        axis=2,
+    )
+
+    # 2. prime streams whose delay has not yet elapsed (offset <= delay).
+    ring = op.Mod(offset, op.Constant(value_int=cache_length))
+    target_index = op.Expand(
+        op.Reshape(ring, op.Constant(value_ints=[1, 1, 1])),
+        op.Concat(batch_shape, op.Constant(value_ints=[channels, 1]), axis=0),
+    )
+    primed = op.Reshape(
+        op.LessOrEqual(op.Expand(offset, op.Constant(value_ints=[channels])), delays),
+        op.Constant(value_ints=[1, channels, 1]),
+    )
+    primed = op.Expand(primed, op.Shape(target_index))
+    initial_update = op.Expand(
+        op.Reshape(initial_tokens, op.Constant(value_ints=[1, channels, 1])),
+        op.Shape(target_index),
+    )
+    cache = op.ScatterElements(
+        cache,
+        target_index,
+        op.Where(primed, initial_update, op.GatherElements(cache, target_index, axis=2)),
+        axis=2,
+    )
+    provided = op.ScatterElements(
+        provided,
+        target_index,
+        op.Or(op.GatherElements(provided, target_index, axis=2), primed),
+        axis=2,
+    )
+
+    # 3. read the model input frame (offset - 1) and the teacher-forcing target.
+    input_index = op.Expand(
+        op.Reshape(
+            op.Mod(
+                op.Add(
+                    op.Sub(offset, op.Constant(value_int=1)),
+                    op.Constant(value_int=cache_length),
+                ),
+                op.Constant(value_int=cache_length),
+            ),
+            op.Constant(value_ints=[1, 1, 1]),
+        ),
+        op.Shape(target_index),
+    )
+    input_frame = op.GatherElements(cache, input_index, axis=2)
+    target = op.GatherElements(cache, target_index, axis=2)
+    target_provided = op.GatherElements(provided, target_index, axis=2)
+
+    cache.shape = ir.Shape(["batch", channels, cache_length])
+    provided.shape = ir.Shape(["batch", channels, cache_length])
+    for value in (input_frame, target, target_provided):
+        value.shape = ir.Shape(["batch", channels, 1])
+    builder.add_output(cache, "next_token_cache")
+    builder.add_output(provided, "next_token_provided")
+    builder.add_output(input_frame, "input_frame")
+    builder.add_output(target, "target")
+    builder.add_output(target_provided, "target_provided")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_duplex_frame_commit(
+    *, channels: int = 17, cache_length: int = 4, max_delay: int = 1
+) -> PolicyComponent:
+    """Commit predicted tokens and read the delay-compensated output frame.
+
+    Predictions only fill ring slots that were not externally supplied, so a
+    teacher-forced stream keeps its supplied value. The emitted frame undoes the
+    per-stream delay by reading each stream at ``offset - max_delay + delay``,
+    which is only well defined once ``offset`` has passed ``max_delay``.
+    """
+    graph, builder = _make_graph("duplex_frame_commit")
+    op = builder.op
+    cache = builder.input("token_cache", ir.DataType.INT64, ["batch", channels, cache_length])
+    provided = builder.input(
+        "token_provided", ir.DataType.BOOL, ["batch", channels, cache_length]
+    )
+    offset = builder.input("offset", ir.DataType.INT64, [])
+    frame = builder.input("frame", ir.DataType.INT64, ["batch", channels])
+    delays = builder.input("delays", ir.DataType.INT64, [channels])
+
+    batch_shape = op.Shape(cache, start=0, end=1)
+    cell_shape = op.Concat(batch_shape, op.Constant(value_ints=[channels, 1]), axis=0)
+    false_like = op.ConstantOfShape(cell_shape, value=ir.tensor([False]))
+
+    def ring_index(value: Any) -> Any:
+        return op.Expand(
+            op.Reshape(
+                op.Mod(
+                    op.Add(value, op.Constant(value_int=cache_length)),
+                    op.Constant(value_int=cache_length),
+                ),
+                op.Constant(value_ints=[1, 1, 1]),
+            ),
+            cell_shape,
+        )
+
+    # 1. retire the slot that was just consumed as model input.
+    input_index = ring_index(op.Sub(offset, op.Constant(value_int=1)))
+    provided = op.ScatterElements(provided, input_index, false_like, axis=2)
+
+    # 2. fill only the slots the caller did not supply.
+    target_index = ring_index(offset)
+    target_provided = op.GatherElements(provided, target_index, axis=2)
+    existing = op.GatherElements(cache, target_index, axis=2)
+    cache = op.ScatterElements(
+        cache,
+        target_index,
+        op.Where(target_provided, existing, op.Unsqueeze(frame, [-1])),
+        axis=2,
+    )
+
+    # 3. undo the per-stream delay: stream k is read at offset - max_delay + delay[k].
+    read_index = _duplex_positions(
+        op,
+        op.Sub(offset, op.Constant(value_int=max_delay)),
+        delays,
+        cache_length,
+        channels,
+        batch_shape,
+    )
+    out_frame = op.Squeeze(op.GatherElements(cache, read_index, axis=2), [-1])
+    next_offset = op.Add(offset, op.Constant(value_int=1))
+    emit = op.Greater(offset, op.Constant(value_int=max_delay))
+
+    cache.shape = ir.Shape(["batch", channels, cache_length])
+    provided.shape = ir.Shape(["batch", channels, cache_length])
+    out_frame.shape = ir.Shape(["batch", channels])
+    next_offset.shape = ir.Shape([])
+    emit.shape = ir.Shape([])
+    builder.add_output(cache, "next_token_cache")
+    builder.add_output(provided, "next_token_provided")
+    builder.add_output(out_frame, "out_frame")
+    builder.add_output(next_offset, "next_offset")
+    builder.add_output(emit, "emit")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_duplex_teacher_select(*, channels: int = 17) -> PolicyComponent:
+    """Choose the supplied token over the sampled token for one stream index."""
+    graph, builder = _make_graph("duplex_teacher_select")
+    op = builder.op
+    target = builder.input("target", ir.DataType.INT64, ["batch", channels, 1])
+    target_provided = builder.input(
+        "target_provided", ir.DataType.BOOL, ["batch", channels, 1]
+    )
+    sampled = builder.input("sampled", ir.DataType.INT64, ["batch"])
+    index = builder.input("index", ir.DataType.INT64, [])
+    stream = op.Reshape(index, op.Constant(value_ints=[1]))
+    picked = op.Squeeze(op.Gather(target, stream, axis=1), [1, 2])
+    flag = op.Squeeze(op.Gather(target_provided, stream, axis=1), [1, 2])
+    token = op.Where(flag, picked, sampled)
+    token.shape = ir.Shape(["batch"])
+    builder.add_output(token, "token")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_duplex_stream_append(
+    *, streams: int = 8, dtype: ir.DataType = ir.DataType.INT64
+) -> PolicyComponent:
+    """Append one frame to a growing ``[batch, streams, length]`` prefix."""
+    graph, builder = _make_graph("duplex_stream_append")
+    op = builder.op
+    prefix = builder.input("prefix", dtype, ["batch", streams, "length"])
+    frame = builder.input("frame", dtype, ["batch", streams])
+    appended = op.Concat(prefix, op.Unsqueeze(frame, [-1]), axis=2)
+    appended.shape = ir.Shape(["batch", streams, "length + 1"])
+    builder.add_output(appended, "next_prefix")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_duplex_waveform_append(*, dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponent:
+    """Append a packed audio chunk to a growing ``[batch, 1, samples]`` prefix."""
+    graph, builder = _make_graph("duplex_waveform_append")
+    op = builder.op
+    prefix = builder.input("prefix", dtype, ["batch", 1, "samples"])
+    chunk = builder.input("chunk", dtype, ["batch", 1, "chunk"])
+    appended = op.Concat(prefix, chunk, axis=2)
+    appended.shape = ir.Shape(["batch", 1, "samples + chunk"])
+    builder.add_output(appended, "next_prefix")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_duplex_stream_tail(
+    *, streams: int = 8, dtype: ir.DataType = ir.DataType.INT64, rank: int = 3
+) -> PolicyComponent:
+    """Read the trailing ``count`` positions of a growing prefix.
+
+    Stateless codec graphs are replayed over an accumulated prefix, so only the
+    newest ``count`` positions belong to the current event.
+    """
+    graph, builder = _make_graph("duplex_stream_tail")
+    op = builder.op
+    shape = ["batch", streams, "length"] if rank == 3 else ["batch", "length"]
+    prefix = builder.input("prefix", dtype, shape)
+    count = builder.input("count", ir.DataType.INT64, [])
+    axis = rank - 1
+    length = op.Squeeze(op.Shape(prefix, start=axis, end=axis + 1), [0])
+    start = op.Reshape(op.Sub(length, count), op.Constant(value_ints=[1]))
+    tail = op.Slice(
+        prefix,
+        start,
+        op.Constant(value_ints=[_INT64_MAX]),
+        op.Constant(value_ints=[axis]),
+    )
+    tail.shape = ir.Shape([*shape[:-1], "count"])
+    builder.add_output(tail, "tail")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_duplex_user_stream_merge(*, channels: int = 17, streams: int = 8) -> PolicyComponent:
+    """Overlay freshly encoded user codes onto the supplied stream-token frame.
+
+    The trailing ``streams`` channels of a full-duplex frame carry the incoming
+    user audio, so the codec output always wins over the request-supplied frame.
+    """
+    graph, builder = _make_graph("duplex_user_stream_merge")
+    op = builder.op
+    frame = builder.input("frame_codes", ir.DataType.INT64, ["batch", channels])
+    codes = builder.input("codes", ir.DataType.INT64, ["batch", streams, 1])
+    head = op.Slice(
+        frame,
+        op.Constant(value_ints=[0]),
+        op.Constant(value_ints=[channels - streams]),
+        op.Constant(value_ints=[1]),
+    )
+    merged = op.Concat(head, op.Squeeze(codes, [-1]), axis=1)
+    merged.shape = ir.Shape(["batch", channels])
+    builder.add_output(merged, "stream_tokens")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_duplex_cell_to_frame(*, channels: int = 17) -> PolicyComponent:
+    """Drop the single-position axis of one ring-buffer cell."""
+    graph, builder = _make_graph("duplex_cell_to_frame")
+    target = builder.input("target", ir.DataType.INT64, ["batch", channels, 1])
+    frame = builder.op.Squeeze(target, [-1])
+    frame.shape = ir.Shape(["batch", channels])
+    builder.add_output(frame, "frame")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_duplex_agent_frame_select(
+    *, channels: int = 17, streams: int = 8
+) -> PolicyComponent:
+    """Read the agent acoustic streams out of a delay-compensated frame."""
+    graph, builder = _make_graph("duplex_agent_frame_select")
+    op = builder.op
+    frame = builder.input("frame", ir.DataType.INT64, ["batch", channels])
+    codes = op.Slice(
+        frame,
+        op.Constant(value_ints=[1]),
+        op.Constant(value_ints=[1 + streams]),
+        op.Constant(value_ints=[1]),
+    )
+    codes.shape = ir.Shape(["batch", streams])
+    builder.add_output(codes, "codes")
     return _component("mobius.policy.auxiliary@1", graph, {})

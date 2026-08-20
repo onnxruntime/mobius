@@ -28,6 +28,15 @@ from mobius.generation import (
     build_ddim_solver_step,
     build_decoder_state_initializer,
     build_decoder_step_update,
+    build_duplex_agent_frame_select,
+    build_duplex_cell_to_frame,
+    build_duplex_frame_assemble,
+    build_duplex_frame_commit,
+    build_duplex_stream_append,
+    build_duplex_stream_tail,
+    build_duplex_teacher_select,
+    build_duplex_user_stream_merge,
+    build_duplex_waveform_append,
     build_empty_features,
     build_eos_termination,
     build_euler_model_input,
@@ -42,6 +51,7 @@ from mobius.generation import (
     build_pack_latents_2x2,
     build_proposal_metrics,
     build_scalar_constant,
+    build_scalar_integer_add,
     build_schedule_constant,
     build_schedule_history_append,
     build_schedule_lookup,
@@ -7685,6 +7695,929 @@ def write_ctc_asr_workflow_metadata(
     """Write one-file CTC ASR metadata into *output_dir*."""
     os.makedirs(output_dir, exist_ok=True)
     metadata = build_ctc_asr_workflow_metadata(pkg, config, source=source)
+    path = os.path.join(output_dir, "inference_metadata.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        _dump_yaml(metadata, handle)
+    return path
+
+
+def _ir_dtype(value: ir.Value) -> ir.DataType:
+    """Return the exact ONNX element type of a graph port."""
+    dtype = value.dtype
+    if dtype is None:
+        raise ValueError(f"port {value.name!r} has no element type")
+    return dtype
+
+
+def _duplex_delays(config: Any) -> list[int]:
+    """Read the per-stream delay pattern of a Moshi-family full-duplex LM."""
+    delays = getattr(config, "delays", None)
+    if delays is None:
+        raise ValueError("full-duplex workflow requires a delay pattern on the config")
+    return [int(value) for value in delays]
+
+
+def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
+    """Build typed SSA metadata for one event of a full-duplex speech workflow.
+
+    Full-duplex speech-to-speech models (Moshi, PersonaPlex) consume and produce
+    audio simultaneously at a fixed frame rate. One invocation of this workflow is
+    exactly one frame: it accepts one packed audio chunk plus a session ID, and it
+    emits at most one packed audio chunk. Everything that must survive between
+    frames -- the temporal transformer KV cache, the delay ring buffer, the frame
+    offset, and the codec prefixes -- is declared as ``session``-scoped state with
+    a ``session`` release boundary and an exclusive session lease, so a runtime can
+    resume the conversation on the next invocation without replaying history.
+
+    The acoustic (depformer) loop is the only loop in the graph. Its KV cache is
+    ``invocation``-scoped because the upstream model resets it on every frame.
+
+    Components:
+
+    * ``encoder`` / ``decoder`` -- the Mimi-style neural audio codec.
+    * ``temporal`` -- the frame-rate transformer over the interleaved token frame.
+    * ``depformer`` -- the per-frame acoustic transformer over ``num_streams`` substeps.
+    * ``frame_assemble`` / ``frame_commit`` -- the delay ring-buffer bookkeeping.
+    * ``teacher_select`` -- prefers an externally supplied token over a sampled one.
+    * ``token_sampler`` -- greedy sampling shared by the text and acoustic heads.
+    """
+    required = {"encoder", "decoder", "temporal", "depformer"}
+    missing = required - set(pkg.keys())
+    if missing:
+        raise ValueError(
+            f"full-duplex workflow requires components {sorted(required)}; "
+            f"missing {sorted(missing)}"
+        )
+    encoder = pkg["encoder"]
+    decoder = pkg["decoder"]
+    temporal = pkg["temporal"]
+    depformer = pkg["depformer"]
+
+    delays = _duplex_delays(config)
+    channels = len(delays)
+    max_delay = max(delays)
+    cache_length = max_delay + 3
+    num_streams = int(getattr(config, "dep_q", channels // 2))
+    audio_streams = int(getattr(config, "n_q", num_streams))
+    frame_size = int(getattr(config, "frame_size", 1920))
+    initial_tokens = [int(getattr(config, "text_initial_token_id", 32000))] + [
+        int(getattr(config, "initial_token_id", 2048))
+    ] * (channels - 1)
+
+    waveform_input = _find_port(encoder.graph.inputs, "waveform")
+    codes_output = _find_port(encoder.graph.outputs, "codes")
+    codes_input = _find_port(decoder.graph.inputs, "codes")
+    waveform_output = _find_port(decoder.graph.outputs, "waveform")
+    input_frame = _find_port(temporal.graph.inputs, "input_frame")
+    temporal_mask = _find_port(temporal.graph.inputs, "attention_mask")
+    temporal_position = _find_port(temporal.graph.inputs, "position_ids")
+    hidden = _find_port(temporal.graph.outputs, "hidden")
+    text_logits = _find_port(temporal.graph.outputs, "text_logits")
+    dep_hidden = _find_port(depformer.graph.inputs, "hidden")
+    dep_prev = _find_port(depformer.graph.inputs, "prev_token")
+    dep_index = _find_port(depformer.graph.inputs, "substep_index")
+    dep_logits = _find_port(depformer.graph.outputs, "logits")
+    ports = (
+        waveform_input,
+        codes_output,
+        codes_input,
+        waveform_output,
+        input_frame,
+        temporal_mask,
+        temporal_position,
+        hidden,
+        text_logits,
+        dep_hidden,
+        dep_prev,
+        dep_index,
+        dep_logits,
+    )
+    if any(port is None for port in ports):
+        raise ValueError("full-duplex workflow is missing a required component port")
+    temporal_caches = _model_cache_pairs(temporal)
+    depformer_caches = _model_cache_pairs(depformer)
+    if not temporal_caches:
+        raise ValueError("full-duplex workflow requires a temporal KV cache")
+    if not depformer_caches:
+        raise ValueError("full-duplex workflow requires a depformer KV cache")
+
+    attach_policy_components(pkg, PolicyCapabilities(sampler="greedy"))
+    pkg.add_policy_component(
+        "frame_assemble",
+        build_duplex_frame_assemble(channels=channels, cache_length=cache_length),
+    )
+    pkg.add_policy_component(
+        "frame_commit",
+        build_duplex_frame_commit(
+            channels=channels, cache_length=cache_length, max_delay=max_delay
+        ),
+    )
+    pkg.add_policy_component("teacher_select", build_duplex_teacher_select(channels=channels))
+    pkg.add_policy_component(
+        "frame_update", build_code_frame_update(channels, scalar_index=True)
+    )
+    pkg.add_policy_component(
+        "waveform_append", build_duplex_waveform_append(dtype=_ir_dtype(waveform_input))
+    )
+    pkg.add_policy_component("codes_append", build_duplex_stream_append(streams=audio_streams))
+    pkg.add_policy_component("codes_tail", build_duplex_stream_tail(streams=audio_streams))
+    pkg.add_policy_component(
+        "chunk_tail",
+        build_duplex_stream_tail(streams=1, dtype=_ir_dtype(waveform_output)),
+    )
+
+    batch = _contract(input_frame)["shape"][0]
+    request_aligned = {"kind": "request_aligned", "axis": 0}
+    control_int = {"dtype": "int64", "rank": 0, "shape": []}
+    scalar_bool = {"dtype": "bool", "rank": 0, "shape": []}
+    batch_bool = {
+        "dtype": "bool",
+        "rank": 1,
+        "shape": [batch],
+        "batch_layout": request_aligned,
+    }
+    batch_int = {
+        "dtype": "int64",
+        "rank": 1,
+        "shape": [batch],
+        "batch_layout": request_aligned,
+    }
+    loop_flag = {"dtype": "bool", "rank": 1, "shape": [1]}
+    frame_contract = {"dtype": "int64", "rank": 2, "shape": [batch, channels]}
+    ring_contract = {"dtype": "int64", "rank": 3, "shape": [batch, channels, cache_length]}
+    ring_flags = {"dtype": "bool", "rank": 3, "shape": [batch, channels, cache_length]}
+
+    inputs: dict[str, Any] = {
+        "request.audio_chunk": {
+            "contract": _contract(waveform_input),
+            "role": {"kind": "runtime", "version": "1.0", "role": "media"},
+            "source": {"kind": "request", "field": "media"},
+            "required": True,
+        },
+        "request.session_id": {
+            "contract": {"dtype": "int64", "rank": 1, "shape": [batch]},
+            "role": {"kind": "runtime", "version": "1.0", "role": "session_id"},
+            "source": {"kind": "request", "field": "session_id"},
+            "required": True,
+        },
+        "package.stream_tokens": {
+            "contract": frame_contract,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            # -1 marks "this stream has nothing to contribute this frame", so the
+            # broadcast default is a frame in which the model predicts everything.
+            "default": -1,
+        },
+        "package.frames_per_invocation": {
+            "contract": control_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            # One event per invocation by default; a runtime that batches several
+            # codec frames into a single call raises this without changing the graph.
+            "default": 1,
+        },
+        "package.true_batch": {
+            "contract": batch_bool,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": True,
+        },
+        "package.false_batch": {
+            "contract": batch_bool,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": False,
+        },
+        "package.zero_batch": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 0,
+        },
+        "package.one_batch": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 1,
+        },
+        "package.delays": {
+            "contract": {"dtype": "int64", "rank": 1, "shape": [channels]},
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": delays,
+        },
+        "package.initial_tokens": {
+            "contract": {"dtype": "int64", "rank": 1, "shape": [channels]},
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": initial_tokens,
+        },
+        "package.num_streams": {
+            "contract": control_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": num_streams,
+        },
+        "package.one_frame": {
+            "contract": control_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 1,
+        },
+        "package.frame_size": {
+            "contract": control_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": frame_size,
+        },
+        "package.false": {
+            "contract": scalar_bool,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": False,
+        },
+    }
+
+    session_lease = {"policy": "exclusive", "optimistic_metadata_version": False}
+
+    def session_cell(
+        contract: dict[str, Any],
+        initializer: str,
+        recurrence: dict[str, Any],
+        *,
+        release: str = "session",
+    ) -> dict[str, Any]:
+        return {
+            "contract": contract,
+            "scope": "session",
+            "initializer": initializer,
+            "recurrence": recurrence,
+            "management": "runtime",
+            "release_boundary": release,
+            "session": session_lease,
+        }
+
+    invariant = {"kind": "invariant"}
+    state: dict[str, Any] = {
+        "token_cache": session_cell(ring_contract, "package.token_cache_init", invariant),
+        "token_provided": session_cell(ring_flags, "package.token_provided_init", invariant),
+        "offset": session_cell(control_int, "package.offset_init", invariant),
+        "attention_mask": session_cell(
+            {
+                "dtype": _contract(temporal_mask)["dtype"],
+                "rank": 2,
+                "shape": [batch, "context"],
+            },
+            "package.attention_mask_init",
+            {
+                "kind": "growing",
+                "axis": 1,
+                "increment": "package.one_frame",
+                "max": "package.context_limit",
+            },
+        ),
+        "position_ids": session_cell(
+            _contract(temporal_position), "package.position_ids_init", invariant
+        ),
+        "user_waveform": session_cell(
+            {
+                "dtype": _contract(waveform_input)["dtype"],
+                "rank": 3,
+                "shape": [batch, 1, "user_samples"],
+            },
+            "package.user_waveform_init",
+            {
+                "kind": "growing",
+                "axis": 2,
+                "increment": "package.frame_size",
+                "max": "package.codec_prefix_limit",
+            },
+            release="invocation",
+        ),
+        "agent_codes": session_cell(
+            {
+                "dtype": _contract(codes_input)["dtype"],
+                "rank": 3,
+                "shape": [batch, audio_streams, "agent_frames"],
+            },
+            "package.agent_codes_init",
+            {
+                "kind": "growing",
+                "axis": 2,
+                "increment": "package.one_frame",
+                "max": "package.codec_frame_limit",
+            },
+            release="invocation",
+        ),
+    }
+    inputs["package.context_limit"] = {
+        "contract": control_int,
+        "role": {"kind": "opaque"},
+        "source": {"kind": "literal"},
+        "required": False,
+        "default": int(getattr(config, "context", 3000)),
+    }
+    inputs["package.codec_prefix_limit"] = {
+        "contract": control_int,
+        "role": {"kind": "opaque"},
+        "source": {"kind": "literal"},
+        "required": False,
+        "default": int(getattr(config, "context", 3000)) * frame_size,
+    }
+    inputs["package.codec_frame_limit"] = {
+        "contract": control_int,
+        "role": {"kind": "opaque"},
+        "source": {"kind": "literal"},
+        "required": False,
+        "default": int(getattr(config, "context", 3000)),
+    }
+    zero_default = {"int64": 0, "int32": 0, "bool": False}
+    for name, initial in (
+        ("package.token_cache_init", ring_contract),
+        ("package.token_provided_init", ring_flags),
+        ("package.attention_mask_init", state["attention_mask"]["contract"]),
+        ("package.position_ids_init", _contract(temporal_position)),
+        ("package.user_waveform_init", state["user_waveform"]["contract"]),
+        ("package.agent_codes_init", state["agent_codes"]["contract"]),
+    ):
+        inputs[name] = {
+            "contract": initial,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            # A scalar default broadcasts across the whole contract, so an empty
+            # session starts from an all-zero (or all-false) tensor.
+            "default": zero_default.get(initial["dtype"], 0.0),
+        }
+    inputs["package.offset_init"] = {
+        "contract": control_int,
+        "role": {"kind": "opaque"},
+        "source": {"kind": "literal"},
+        "required": False,
+        "default": 1,
+    }
+
+    for index, (past, present) in enumerate(temporal_caches):
+        # A runtime that owns the cache must be able to permute and compact rows,
+        # so a service-bound cell has to declare its request axis explicitly.
+        cache_contract = {**_contract(past), "batch_layout": request_aligned}
+        state[f"temporal_cache_{index}"] = session_cell(
+            cache_contract,
+            f"package.temporal_cache_{index}_init",
+            {
+                # The temporal cache is a sliding context window: it grows one
+                # frame per invocation but never past ``context``, so it is
+                # bounded rather than unboundedly growing.
+                "kind": "bounded",
+                "axis": 2,
+                "max": "package.context_limit",
+            },
+        )
+        state[f"temporal_cache_{index}"]["service_group"] = "temporal_cache"
+        state[f"temporal_cache_{index}"]["class"] = "semantic"
+        inputs[f"package.temporal_cache_{index}_init"] = {
+            "contract": cache_contract,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 0.0,
+        }
+        del present
+    state["temporal_cache_lengths"] = {
+        "contract": batch_int,
+        "class": "semantic",
+        "scope": "session",
+        "initializer": "package.zero_batch",
+        "recurrence": invariant,
+        "session": session_lease,
+    }
+    state["active"] = {
+        "contract": batch_bool,
+        "class": "semantic",
+        "scope": "invocation",
+        "initializer": "package.true_batch",
+        "recurrence": invariant,
+    }
+    state["done"] = {
+        "contract": batch_bool,
+        "class": "semantic",
+        "scope": "invocation",
+        "initializer": "package.false_batch",
+        "recurrence": invariant,
+    }
+    state["accepted_len"] = {
+        "contract": batch_int,
+        "class": "semantic",
+        "scope": "invocation",
+        "initializer": "package.zero_batch",
+        "recurrence": invariant,
+    }
+    for index, (past, _) in enumerate(depformer_caches):
+        state[f"depformer_cache_{index}"] = {
+            "contract": _contract(past),
+            "scope": "invocation",
+            "initializer": f"package.depformer_cache_{index}_init",
+            "recurrence": {
+                "kind": "growing",
+                "axis": 2,
+                "increment": "package.one_frame",
+                "max": "package.num_streams",
+            },
+        }
+        inputs[f"package.depformer_cache_{index}_init"] = {
+            "contract": _contract(past),
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 0.0,
+        }
+    state["acoustic_frame"] = {
+        "contract": frame_contract,
+        "scope": "invocation",
+        "initializer": "duplex.target_frame",
+        "recurrence": invariant,
+    }
+    state["prev_token"] = {
+        "contract": {"dtype": "int64", "rank": 1, "shape": [batch]},
+        "scope": "invocation",
+        "initializer": "duplex.text_token",
+        "recurrence": invariant,
+    }
+
+    depformer_inputs = {
+        dep_hidden.name: "duplex.hidden",
+        dep_prev.name: "duplex.prev_token_slot",
+        dep_index.name: "duplex.substep",
+        **{
+            past.name: f"state.depformer_cache_{index}.body"
+            for index, (past, _) in enumerate(depformer_caches)
+        },
+    }
+    depformer_outputs = {
+        dep_logits.name: "duplex.acoustic_logits",
+        **{
+            present.name: f"duplex.depformer_cache_{index}"
+            for index, (_, present) in enumerate(depformer_caches)
+        },
+    }
+
+    acoustic_loop = {
+        "kind": "loop",
+        "setup": {"kind": "sequence", "nodes": []},
+        "body": {
+            "kind": "sequence",
+            "nodes": [
+                _invoke(
+                    "token_to_slot",
+                    {"token": "state.prev_token.body"},
+                    {"slot": "duplex.prev_token_slot"},
+                ),
+                _invoke("depformer", depformer_inputs, depformer_outputs),
+                _invoke(
+                    "last_acoustic_logits",
+                    {"logits": "duplex.acoustic_logits"},
+                    {"last_logits": "duplex.acoustic_last"},
+                ),
+                _invoke(
+                    "token_sampler",
+                    {"logits": "duplex.acoustic_last"},
+                    {"token": "duplex.acoustic_sampled"},
+                ),
+                _invoke(
+                    "frame_update",
+                    {
+                        "frame_codes": "state.acoustic_frame.body",
+                        "token": "duplex.acoustic_sampled",
+                        "index": "duplex.acoustic_stream",
+                    },
+                    {"next_frame": "duplex.acoustic_frame_next"},
+                ),
+                _invoke(
+                    "teacher_select",
+                    {
+                        "target": "duplex.target",
+                        "target_provided": "duplex.target_provided",
+                        "sampled": "duplex.acoustic_sampled",
+                        "index": "duplex.acoustic_stream",
+                    },
+                    {"token": "duplex.acoustic_prev_next"},
+                ),
+            ],
+        },
+        "condition": "package.loop_active",
+        "max_iterations": "package.num_streams",
+        "iteration": {"value": "duplex.substep", "contract": control_int},
+        "carried": [
+            {
+                "cell": "acoustic_frame",
+                "current": "duplex.target_frame",
+                "body_input": "state.acoustic_frame.body",
+                "body_output": "duplex.acoustic_frame_next",
+                "next": "duplex.acoustic_frame_final",
+            },
+            {
+                "cell": "prev_token",
+                "current": "duplex.text_token",
+                "body_input": "state.prev_token.body",
+                "body_output": "duplex.acoustic_prev_next",
+                "next": "duplex.prev_token_final",
+            },
+            *[
+                {
+                    "cell": f"depformer_cache_{index}",
+                    "current": f"package.depformer_cache_{index}_init",
+                    "body_input": f"state.depformer_cache_{index}.body",
+                    "body_output": f"duplex.depformer_cache_{index}",
+                    "next": f"duplex.depformer_cache_{index}_final",
+                }
+                for index in range(len(depformer_caches))
+            ],
+        ],
+    }
+    inputs["package.loop_active"] = {
+        "contract": loop_flag,
+        "role": {"kind": "opaque"},
+        "source": {"kind": "literal"},
+        "required": False,
+        "default": True,
+    }
+    inputs["package.acoustic_stream_offset"] = {
+        "contract": control_int,
+        "role": {"kind": "opaque"},
+        "source": {"kind": "literal"},
+        "required": False,
+        "default": 1,
+    }
+    acoustic_loop["body"]["nodes"].insert(
+        0,
+        _invoke(
+            "stream_index",
+            {"left": "duplex.substep", "right": "package.acoustic_stream_offset"},
+            {"total": "duplex.acoustic_stream"},
+        ),
+    )
+    pkg.add_policy_component("stream_index", build_scalar_integer_add())
+    pkg.add_policy_component("last_text_logits", build_last_token_logits())
+    pkg.add_policy_component("last_acoustic_logits", build_last_token_logits())
+    pkg.add_policy_component("token_to_slot", build_token_to_slot())
+
+    temporal_inputs = {
+        input_frame.name: "duplex.input_frame",
+        temporal_mask.name: "state.attention_mask.body",
+        temporal_position.name: "state.position_ids.body",
+        **{
+            past.name: f"state.temporal_cache_{index}.body"
+            for index, (past, _) in enumerate(temporal_caches)
+        },
+    }
+    temporal_outputs = {
+        hidden.name: "duplex.hidden",
+        text_logits.name: "duplex.text_logits",
+        **{
+            present.name: f"duplex.temporal_cache_{index}"
+            for index, (_, present) in enumerate(temporal_caches)
+        },
+    }
+
+    graph = {
+        "kind": "sequence",
+        "nodes": [],
+    }
+    frame_body = graph["nodes"]
+    frame_body.extend(
+        [
+            # 1. packed audio in: grow the codec prefix and encode the newest frame.
+            _invoke(
+                "waveform_append",
+                {"prefix": "state.user_waveform.body", "chunk": "request.audio_chunk"},
+                {"next_prefix": "duplex.user_waveform_next"},
+            ),
+            _invoke(
+                "encoder",
+                {waveform_input.name: "duplex.user_waveform_next"},
+                {codes_output.name: "duplex.user_codes"},
+            ),
+            _invoke(
+                "codes_tail",
+                {"prefix": "duplex.user_codes", "count": "package.one_frame"},
+                {"tail": "duplex.user_frame_codes"},
+            ),
+            # 2. delay ring buffer: write every supplied stream, read one frame.
+            _invoke(
+                "user_stream_merge",
+                {
+                    "frame_codes": "package.stream_tokens",
+                    "codes": "duplex.user_frame_codes",
+                },
+                {"stream_tokens": "duplex.stream_tokens"},
+            ),
+            _invoke(
+                "frame_assemble",
+                {
+                    "token_cache": "state.token_cache.body",
+                    "token_provided": "state.token_provided.body",
+                    "offset": "state.offset.body",
+                    "stream_tokens": "duplex.stream_tokens",
+                    "delays": "package.delays",
+                    "initial_tokens": "package.initial_tokens",
+                },
+                {
+                    "next_token_cache": "duplex.cache_assembled",
+                    "next_token_provided": "duplex.provided_assembled",
+                    "input_frame": "duplex.input_frame",
+                    "target": "duplex.target",
+                    "target_provided": "duplex.target_provided",
+                },
+            ),
+            # 3. frame-rate temporal transformer over the interleaved frame.
+            _invoke("temporal", temporal_inputs, temporal_outputs),
+            _invoke(
+                "last_text_logits",
+                {"logits": "duplex.text_logits"},
+                {"last_logits": "duplex.text_last"},
+            ),
+            _invoke(
+                "token_sampler",
+                {"logits": "duplex.text_last"},
+                {"token": "duplex.text_sampled"},
+            ),
+            _invoke(
+                "teacher_select",
+                {
+                    "target": "duplex.target",
+                    "target_provided": "duplex.target_provided",
+                    "sampled": "duplex.text_sampled",
+                    "index": "package.text_stream",
+                },
+                {"token": "duplex.text_token"},
+            ),
+            _invoke(
+                "target_frame",
+                {"target": "duplex.target"},
+                {"frame": "duplex.target_frame"},
+            ),
+            # 4. acoustic loop: one substep per acoustic stream, KV reset per frame.
+            acoustic_loop,
+            _invoke(
+                "text_frame_update",
+                {
+                    "frame_codes": "duplex.acoustic_frame_final",
+                    "token": "duplex.text_token",
+                    "index": "package.text_stream",
+                },
+                {"next_frame": "duplex.completed_frame"},
+            ),
+            # 5. commit the frame and undo the per-stream delays.
+            _invoke(
+                "frame_commit",
+                {
+                    "token_cache": "duplex.cache_assembled",
+                    "token_provided": "duplex.provided_assembled",
+                    "offset": "state.offset.body",
+                    "frame": "duplex.completed_frame",
+                    "delays": "package.delays",
+                },
+                {
+                    "next_token_cache": "duplex.cache_committed",
+                    "next_token_provided": "duplex.provided_committed",
+                    "out_frame": "duplex.out_frame",
+                    "next_offset": "duplex.next_offset",
+                    "emit": "duplex.emit",
+                },
+            ),
+            # 6. packed audio out: grow the agent code prefix and decode it.
+            _invoke(
+                "agent_frame_select",
+                {"frame": "duplex.out_frame"},
+                {"codes": "duplex.agent_frame"},
+            ),
+            _invoke(
+                "codes_append",
+                {"prefix": "state.agent_codes.body", "frame": "duplex.agent_frame"},
+                {"next_prefix": "duplex.agent_codes_next"},
+            ),
+            _invoke(
+                "decoder",
+                {codes_input.name: "duplex.agent_codes_next"},
+                {waveform_output.name: "duplex.agent_waveform"},
+            ),
+            _invoke(
+                "chunk_tail",
+                {"prefix": "duplex.agent_waveform", "count": "package.frame_size"},
+                {"tail": "duplex.agent_chunk"},
+            ),
+            _invoke(
+                "step_update",
+                {
+                    "attention_mask": "state.attention_mask.body",
+                    "position_ids": "state.position_ids.body",
+                },
+                {
+                    "next_attention_mask": "duplex.attention_mask_next",
+                    "next_position_ids": "duplex.position_ids_next",
+                },
+            ),
+            {
+                "kind": "emit",
+                "value": "duplex.agent_chunk",
+                "output": "audio_chunk",
+                "mode": "event",
+                "when": "duplex.emit",
+            },
+        ]
+    )
+    # Session-resident cells are only readable inside a loop carry, so the whole
+    # frame body is a loop. ``package.frames_per_invocation`` defaults to 1, which
+    # makes one invocation exactly one duplex event; a runtime that hands several
+    # codec frames to a single call raises it without changing the graph.
+    session_carries = [
+        # A duplex conversation has no generation-side termination predicate: it
+        # runs until the session lease is released, so liveness is invariant.
+        # These are carried first because the temporal cache recurrence quotes
+        # ``accepted_len`` as its per-row growth increment.
+        ("active", "package.true_batch", "package.true_batch"),
+        ("done", "package.false_batch", "package.false_batch"),
+        ("accepted_len", "package.zero_batch", "package.one_batch"),
+        ("token_cache", "package.token_cache_init", "duplex.cache_committed"),
+        ("token_provided", "package.token_provided_init", "duplex.provided_committed"),
+        ("offset", "package.offset_init", "duplex.next_offset"),
+        ("attention_mask", "package.attention_mask_init", "duplex.attention_mask_next"),
+        ("position_ids", "package.position_ids_init", "duplex.position_ids_next"),
+        ("user_waveform", "package.user_waveform_init", "duplex.user_waveform_next"),
+        ("agent_codes", "package.agent_codes_init", "duplex.agent_codes_next"),
+        *[
+            (
+                f"temporal_cache_{index}",
+                f"package.temporal_cache_{index}_init",
+                f"duplex.temporal_cache_{index}",
+            )
+            for index in range(len(temporal_caches))
+        ],
+        ("temporal_cache_lengths", "package.zero_batch", "duplex.temporal_cache_lengths"),
+    ]
+    frame_body.append(
+        _invoke(
+            "cache_length_update",
+            {
+                "left": "state.temporal_cache_lengths.body",
+                "right": "package.one_batch",
+            },
+            {"total": "duplex.temporal_cache_lengths"},
+        )
+    )
+    pkg.add_policy_component("cache_length_update", build_integer_add())
+    frame_loop = {
+        "kind": "loop",
+        "setup": {"kind": "sequence", "nodes": []},
+        "body": {"kind": "sequence", "nodes": frame_body},
+        "condition": "package.loop_active",
+        "max_iterations": "package.frames_per_invocation",
+        "iteration": {"value": "duplex.frame_index", "contract": batch_int},
+        "carried": [
+            {
+                "cell": cell,
+                "current": current,
+                "body_input": f"state.{cell}.body",
+                "body_output": produced,
+                "next": f"duplex.{cell}_final",
+            }
+            for cell, current, produced in session_carries
+        ],
+    }
+    graph = {"kind": "sequence", "nodes": [frame_loop]}
+
+    pkg.add_policy_component(
+        "user_stream_merge",
+        build_duplex_user_stream_merge(channels=channels, streams=audio_streams),
+    )
+    pkg.add_policy_component("target_frame", build_duplex_cell_to_frame(channels=channels))
+    pkg.add_policy_component(
+        "agent_frame_select",
+        build_duplex_agent_frame_select(channels=channels, streams=audio_streams),
+    )
+    pkg.add_policy_component(
+        "text_frame_update", build_code_frame_update(channels, scalar_index=True)
+    )
+    pkg.add_policy_component(
+        "step_update",
+        build_decoder_step_update(
+            attention_dtype=_ir_dtype(temporal_mask),
+            position_dtype=_ir_dtype(temporal_position),
+        ),
+    )
+    inputs["package.text_stream"] = {
+        "contract": control_int,
+        "role": {"kind": "opaque"},
+        "source": {"kind": "literal"},
+        "required": False,
+        "default": 0,
+    }
+
+    workflow = {
+        "manifest": {
+            "ir_version": "1.0",
+            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
+            "capabilities": [
+                "workflow_ssa",
+                "linear_effects",
+                "typed_emit",
+                "streaming_emit",
+                "nested_control_flow",
+                "loop_induction_values",
+                "bounded_state_recurrence",
+                "serving_service_contract",
+                "session_state_lease",
+            ],
+        },
+        "inputs": inputs,
+        "outputs": {
+            "audio_chunk": {
+                "contract": {
+                    **_contract(waveform_output),
+                    "batch_layout": request_aligned,
+                },
+                "role": "audio",
+                "stage": "post_adapter",
+            }
+        },
+        "components": {
+            "encoder": _component(encoder, "encoder/model.onnx"),
+            "decoder": _component(decoder, "decoder/model.onnx"),
+            "temporal": _component(temporal, "temporal/model.onnx"),
+            "depformer": _component(depformer, "depformer/model.onnx"),
+        },
+        "state": state,
+        "graph": graph,
+    }
+    metadata = {
+        "schema_version": "v1",
+        "pipeline": {"workflow": _publish_workflow_v1(workflow)},
+    }
+    add_policy_components_to_workflow(metadata, pkg)
+    _annotate_duplex_state_service(metadata, config, temporal_caches)
+    return metadata
+
+
+def _annotate_duplex_state_service(
+    metadata: dict[str, Any],
+    config: Any,
+    temporal_caches: list[tuple[ir.Value, ir.Value]],
+) -> None:
+    """Publish the semantic contract of the session-resident temporal KV group.
+
+    A full-duplex conversation has no termination predicate: it runs until the
+    session is released. The serving contract therefore points ``active``/``done``
+    at the session-scoped liveness cells rather than at a generation-loop flag.
+    """
+    workflow = metadata["pipeline"]["workflow"]
+    context = int(getattr(config, "context", 0))
+    workflow["serving"] = {
+        "active": "active",
+        "done": "done",
+        "accepted_len": "accepted_len",
+        "state_service": {
+            "groups": {
+                "temporal_cache": {
+                    "kind": "sliding_attention" if context else "full_attention",
+                    "sequence_axis": 2,
+                    "layout": "bnsh",
+                    "logical_lengths": "temporal_cache_lengths",
+                    "aliasing": "permitted",
+                    "reuse": {"prefix_reusable": True, "evictable_prefix": False},
+                    "capabilities": {"snapshot": True, "fork": False},
+                    "ports": {
+                        "temporal": {
+                            f"temporal_cache_{index}": {
+                                "input": past.name,
+                                "output": present.name,
+                            }
+                            for index, (past, present) in enumerate(temporal_caches)
+                        }
+                    },
+                }
+            }
+        },
+    }
+
+
+def write_full_duplex_workflow_metadata(pkg: Any, config: Any, output_dir: str) -> str:
+    """Write full-duplex workflow metadata and its policy artifacts."""
+    os.makedirs(output_dir, exist_ok=True)
+    metadata = build_full_duplex_workflow_metadata(pkg, config)
+    pkg.save_policy_components(output_dir)
+    add_adapter_service_to_metadata(metadata, pkg, output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
         _dump_yaml(metadata, handle)
