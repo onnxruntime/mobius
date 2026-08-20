@@ -129,7 +129,7 @@ def test_unet_matches_diffusers():
         model,
         {
             "sample": sample.numpy(),
-            "timestep": timestep.numpy().astype(np.int64),
+            "timestep": timestep.numpy().astype(np.float32),
             "encoder_hidden_states": encoder_hidden_states.numpy(),
         },
     )
@@ -194,7 +194,7 @@ def test_unet_sd1x_mixed_block_types_matches_diffusers():
         model,
         {
             "sample": sample.numpy(),
-            "timestep": timestep.numpy().astype(np.int64),
+            "timestep": timestep.numpy().astype(np.float32),
             "encoder_hidden_states": encoder_hidden_states.numpy(),
         },
     )
@@ -273,7 +273,7 @@ def test_unet_lora_gate_parity():
 
     feed = {
         "sample": sample.numpy(),
-        "timestep": timestep.numpy().astype(np.int64),
+        "timestep": timestep.numpy().astype(np.float32),
         "encoder_hidden_states": encoder_hidden_states.numpy(),
     }
     off, on = _run_onnx(
