@@ -1091,6 +1091,18 @@ def _write_genai_config(
         supports_in_place_kv_cache=supports_in_place_kv_cache,
         num_cache_layer_slots=_count_cache_layer_slots(decoder_model),
     )
+    source_model_type = getattr(config, "model_type", "") or ""
+    if source_model_type.startswith("qwen2"):
+        generator.with_special_tokens(bot_token_id=151657, eot_token_id=151658)
+    elif source_model_type.startswith("qwen3"):
+        generator.with_special_tokens(
+            bot_token_id=151657,
+            eot_token_id=151658,
+            bor_token_id=151667,
+            eor_token_id=151668,
+        )
+    elif source_model_type.startswith("phi3"):
+        generator.with_special_tokens(bot_token_id=200025, eot_token_id=200026)
 
     if is_vlm:
         image_token_id = getattr(config, "image_token_id", None)

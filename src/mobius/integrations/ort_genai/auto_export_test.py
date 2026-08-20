@@ -1961,6 +1961,32 @@ class TestExportForOrtGenai:
         assert data["model"]["eos_token_id"] == 2
         assert data["model"]["pad_token_id"] == 0
 
+    @pytest.mark.parametrize(
+        ("model_type", "special_token_ids"),
+        [
+            ("qwen2", {"bot_token_id": 151657, "eot_token_id": 151658}),
+            (
+                "qwen3",
+                {
+                    "bot_token_id": 151657,
+                    "eot_token_id": 151658,
+                    "bor_token_id": 151667,
+                    "eor_token_id": 151668,
+                },
+            ),
+            ("phi3", {"bot_token_id": 200025, "eot_token_id": 200026}),
+        ],
+    )
+    def test_tool_call_special_tokens_emitted(self, tmp_path, model_type, special_token_ids):
+        """Tool-call delimiters are included for model families that define them."""
+        result = write_ort_genai_config(_make_fake_llm_pkg(model_type), str(tmp_path))
+
+        with open(result["genai_config"]) as f:
+            model = json.load(f)["model"]
+
+        for name, token_id in special_token_ids.items():
+            assert model[name] == token_id
+
     def test_config_mode_eos_token_id_as_list(self, tmp_path):
         """eos_token_id can be a list[int] (e.g. Gemma multi-stop tokens)."""
         import dataclasses
