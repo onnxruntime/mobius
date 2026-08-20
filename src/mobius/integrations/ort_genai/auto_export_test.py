@@ -1962,11 +1962,12 @@ class TestExportForOrtGenai:
         assert data["model"]["pad_token_id"] == 0
 
     @pytest.mark.parametrize(
-        ("model_type", "special_token_ids"),
+        ("model_type", "vocab_size", "special_token_ids"),
         [
-            ("qwen2", {"bot_token_id": 151657, "eot_token_id": 151658}),
+            ("qwen2", 256, {"bot_token_id": 151657, "eot_token_id": 151658}),
             (
                 "qwen3",
+                256,
                 {
                     "bot_token_id": 151657,
                     "eot_token_id": 151658,
@@ -1974,18 +1975,27 @@ class TestExportForOrtGenai:
                     "eor_token_id": 151668,
                 },
             ),
-            ("phi3", {"bot_token_id": 200025, "eot_token_id": 200026}),
+            ("phi3", 200064, {"bot_token_id": 200025, "eot_token_id": 200026}),
+            ("phi3small", 100352, {}),
         ],
     )
-    def test_tool_call_special_tokens_emitted(self, tmp_path, model_type, special_token_ids):
+    def test_tool_call_special_tokens_emitted(
+        self, tmp_path, model_type, vocab_size, special_token_ids
+    ):
         """Tool-call delimiters are included for model families that define them."""
-        result = write_ort_genai_config(_make_fake_llm_pkg(model_type), str(tmp_path))
+        pkg = _make_fake_llm_pkg(model_type)
+        pkg.config.vocab_size = vocab_size
+        result = write_ort_genai_config(pkg, str(tmp_path))
 
         with open(result["genai_config"]) as f:
             model = json.load(f)["model"]
 
         for name, token_id in special_token_ids.items():
             assert model[name] == token_id
+        for name in {"bot_token_id", "eot_token_id", "bor_token_id", "eor_token_id"} - set(
+            special_token_ids
+        ):
+            assert name not in model
 
     def test_config_mode_eos_token_id_as_list(self, tmp_path):
         """eos_token_id can be a list[int] (e.g. Gemma multi-stop tokens)."""

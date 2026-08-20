@@ -452,6 +452,9 @@ class GenaiConfigGenerator:
 
     def with_special_tokens(self, **token_ids: int) -> GenaiConfigGenerator:
         """Add model-specific special token IDs."""
+        reserved_token_ids = {"bos_token_id", "eos_token_id", "pad_token_id"}
+        if reserved := reserved_token_ids & token_ids.keys():
+            raise ValueError(f"Special tokens cannot override {', '.join(sorted(reserved))}")
         self._special_token_ids.update(token_ids)
         return self
 

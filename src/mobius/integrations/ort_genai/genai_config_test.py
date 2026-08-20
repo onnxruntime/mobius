@@ -149,6 +149,20 @@ class TestGenaiConfigGeneratorLLM:
         assert "eos_token_id" not in config["model"]
         assert "pad_token_id" not in config["model"]
 
+    def test_special_tokens_cannot_override_standard_token_ids(self):
+        gen = GenaiConfigGenerator(
+            "llama",
+            vocab_size=32000,
+            hidden_size=4096,
+            num_hidden_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            head_dim=128,
+        )
+
+        with pytest.raises(ValueError, match="bos_token_id"):
+            gen.with_special_tokens(bos_token_id=1)
+
     def test_search_params_defaults(self):
         """Search section has sensible defaults for CPU EP."""
         gen = GenaiConfigGenerator(
