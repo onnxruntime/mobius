@@ -115,9 +115,7 @@ def _nearest_indices(op: OpBuilder, out_len: ir.Value, in_len: ir.Value) -> ir.V
     """
     zero = op.Constant(value_ints=[0])
     one = op.Constant(value_ints=[1])
-    positions = op.Range(
-        op.Squeeze(zero, [0]), op.Squeeze(out_len, [0]), op.Squeeze(one, [0])
-    )
+    positions = op.Range(op.Squeeze(zero, [0]), op.Squeeze(out_len, [0]), op.Squeeze(one, [0]))
     ratio = op.Div(op.Cast(in_len, to=1), op.Cast(out_len, to=1))
     source = op.Floor(op.Mul(op.Cast(positions, to=1), ratio))
     return op.Cast(source, to=7)
@@ -140,9 +138,7 @@ def _causal_nearest_indices(op: OpBuilder, out_len: ir.Value, in_len: ir.Value) 
     zero = op.Constant(value_ints=[0])
     one = op.Constant(value_ints=[1])
     two = op.Constant(value_ints=[2])
-    positions = op.Range(
-        op.Squeeze(zero, [0]), op.Squeeze(out_len, [0]), op.Squeeze(one, [0])
-    )
+    positions = op.Range(op.Squeeze(zero, [0]), op.Squeeze(out_len, [0]), op.Squeeze(one, [0]))
     uniform = _nearest_indices(op, out_len, in_len)
 
     # Split-first-frame program. ``max(out_len - 1, 1)`` keeps the divisor
@@ -593,7 +589,6 @@ class AutoencoderKLCogVideoXModel(nn.Module):
         """
         config = self.config
         reversed_channels = list(reversed(config.block_out_channels))
-        temporal_levels = int(math.log2(config.temporal_compression_ratio))
         frames = 2  # kernel_t - 1 for every cached convolution
         entries = [ConvCacheEntry("conv_in", config.latent_channels, frames, 1)]
 

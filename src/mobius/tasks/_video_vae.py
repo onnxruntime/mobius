@@ -71,14 +71,12 @@ class VideoVAETask(ModelTask):
                 shape=["batch", entry.channels, "cache_frames", height, width],
             )
 
-        sample, updated_cache = module(
-            op, latent_sample=latent_sample, conv_cache=conv_cache
-        )
+        sample, updated_cache = module(op, latent_sample=latent_sample, conv_cache=conv_cache)
         # The temporal and spatial extents are recovered from Shape ops inside
         # the decoder, which mints anonymous symbolic dimensions. Name them so
         # the published contract states the compression ratios instead of
         # leaking solver-internal dimension identities.
-        spatial = 2**(len(config.block_out_channels) - 1)
+        spatial = 2 ** (len(config.block_out_channels) - 1)
         sample.shape = ir.Shape(
             [
                 "batch",

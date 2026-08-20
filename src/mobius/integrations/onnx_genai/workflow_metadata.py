@@ -40,6 +40,7 @@ from mobius.generation import (
     build_empty_features,
     build_eos_termination,
     build_euler_model_input,
+    build_euler_solver_step,
     build_flow_match_solver_step,
     build_greedy_sampler,
     build_guidance_combine,

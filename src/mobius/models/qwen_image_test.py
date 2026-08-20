@@ -372,7 +372,7 @@ def _temporal_vae(dtype: ir.DataType = ir.DataType.FLOAT):
     uses, and it is the only configuration that instantiates ``time_conv`` in the
     down/upsample blocks -- the code path the image (single frame) case must skip.
     """
-    from mobius._diffusers_configs import QwenImageVAEConfig
+    from mobius.integrations.diffusers._configs import QwenImageVAEConfig
     from mobius.models.qwen_image_vae import AutoencoderKLQwenImageModel
     from mobius.tasks import QwenImageEditVAETask
 
