@@ -792,18 +792,6 @@ def _write_adapter_metadata(package: ModelPackage, directory: Path) -> None:
                     ],
                 },
                 "inputs": {
-                    "request.slot_ids": {
-                        "contract": {
-                            "dtype": "int64",
-                            "rank": 1,
-                            "shape": ["batch"],
-                        },
-                        "role": {"kind": "opaque"},
-                        "source": {
-                            "kind": "application",
-                            "name": "serving.slot_ids",
-                        },
-                    },
                     "request.active": {
                         "contract": {
                             "dtype": "bool",
@@ -814,19 +802,6 @@ def _write_adapter_metadata(package: ModelPackage, directory: Path) -> None:
                             "kind": "runtime",
                             "version": "1.0",
                             "role": "adapter_active",
-                        },
-                        "source": {"kind": "request"},
-                    },
-                    "request.request_epochs": {
-                        "contract": {
-                            "dtype": "int64",
-                            "rank": 1,
-                            "shape": ["batch"],
-                        },
-                        "role": {
-                            "kind": "runtime",
-                            "version": "1.0",
-                            "role": "request_epochs",
                         },
                         "source": {"kind": "request"},
                     },

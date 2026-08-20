@@ -384,6 +384,9 @@ pipeline:
             action: clone
         effects:
         - grammar
+        row_scope:
+          axis: 0
+          stateful: true
       grammar_lookahead:
         implementation:
           kind: adapter
@@ -482,6 +485,9 @@ pipeline:
             action: lookahead
         effects:
         - grammar
+        row_scope:
+          axis: 0
+          stateful: true
       grammar_commit:
         implementation:
           kind: adapter
@@ -580,6 +586,9 @@ pipeline:
             action: commit
         effects:
         - grammar
+        row_scope:
+          axis: 0
+          stateful: true
       speculative_acceptance:
         implementation:
           kind: onnx
@@ -1140,6 +1149,11 @@ pipeline:
                   input: past_key_values.0.key
                   output: present.0.key
             logical_lengths: cache_lengths
+    effects:
+      grammar:
+        retry: transactional
+        speculation_safety:
+          kind: clonable
     steps:
     - kind: loop
       setup: []

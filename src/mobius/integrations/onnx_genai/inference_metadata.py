@@ -1740,6 +1740,11 @@ def add_adapter_service_to_metadata(
         for capability in ("parameter_adapters", "heterogeneous_adapter_batching"):
             if capability not in capabilities:
                 capabilities.append(capability)
+        # Selection inputs carry exactly one entry per in-flight request, so
+        # they are request-aligned by construction. Stamping here rather than
+        # inside `ensure_input` also covers the declarations a producer wrote
+        # by hand before attaching the adapter service.
+        declare_request_alignment(workflow)
     return metadata
 
 

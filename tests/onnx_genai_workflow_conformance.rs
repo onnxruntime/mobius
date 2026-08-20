@@ -31,43 +31,30 @@ fn options(max_new_tokens: usize) -> GenerateOptions {
 }
 
 fn adapter_request(
-    slot_ids: &[i64],
-    request_epochs: &[i64],
     active: &[bool],
     values: &[f32],
-    selection: AdapterSelection,
+    selection: &AdapterSelection,
 ) -> anyhow::Result<PipelineGenerateRequest> {
-    let batch = i64::try_from(slot_ids.len())?;
-    let mut segments = vec![-1i64; slot_ids.len() * 2];
-    let mut adapter_counts = vec![0i64; slot_ids.len()];
-    let mut adapter_scales = vec![0.0f32; slot_ids.len() * 2];
-    for (row, (&slot_id, &request_epoch)) in slot_ids.iter().zip(request_epochs).enumerate() {
-        let identity = onnx_genai_engine::AdapterSlotIdentity {
-            slot_id,
-            request_epoch,
-        };
-        if let Some(activations) = selection.rows.get(&identity) {
-            adapter_counts[row] = i64::try_from(activations.len())?;
-            for (slot, activation) in activations.iter().enumerate() {
-                segments[row * 2 + slot] = match activation.adapter.as_str() {
-                    "blue" => 0,
-                    "green" => 1,
-                    "red" => 3,
-                    other => anyhow::bail!("unknown test adapter {other}"),
-                };
-                adapter_scales[row * 2 + slot] = activation.scale;
-            }
+    let batch = i64::try_from(selection.rows.len())?;
+    let mut segments = vec![-1i64; selection.rows.len() * 2];
+    let mut adapter_counts = vec![0i64; selection.rows.len()];
+    let mut adapter_scales = vec![0.0f32; selection.rows.len() * 2];
+    for (row, activations) in selection.rows.iter().enumerate() {
+        adapter_counts[row] = i64::try_from(activations.len())?;
+        for (slot, activation) in activations.iter().enumerate() {
+            segments[row * 2 + slot] = match activation.adapter.as_str() {
+                "blue" => 0,
+                "green" => 1,
+                "red" => 3,
+                other => anyhow::bail!("unknown test adapter {other}"),
+            };
+            adapter_scales[row * 2 + slot] = activation.scale;
         }
     }
     Ok(PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![]),
         options: Default::default(),
     })
-    .with_input("request.slot_ids", Value::from_slice_i64(slot_ids, &[batch])?)
-    .with_input(
-        "request.request_epochs",
-        Value::from_slice_i64(request_epochs, &[batch])?,
-    )
     .with_input(
         "request.adapter_segments",
         Value::from_slice_i64(&segments, &[batch, 2])?,
@@ -94,90 +81,62 @@ fn adapter_request(
     ))
 }
 
+/// Adapter composition is positional: the runtime keys its cache by the
+/// adapter set a batch row asks for, not by any serialized slot identity. The
+/// rows below therefore describe order, per-row composition, and compaction,
+/// while the request table that maps a row back to a caller stays private to
+/// the runtime.
 #[test]
-fn mobius_parameter_adapters_preserve_order_rows_compaction_and_epochs() -> anyhow::Result<()> {
+fn mobius_parameter_adapters_preserve_order_rows_and_compaction() -> anyhow::Result<()> {
     let mut engine = Engine::from_pipeline_dir(&root("adapter")?, EngineConfig::default())?;
     let selection = AdapterSelection::default()
-        .with_slot(10, 0, [AdapterActivation::new("red", 1.0)])
-        .with_slot(
-            20,
-            0,
-            [AdapterActivation::new("blue", 1.0)],
-        )
-        .with_slot(
-            30,
-            0,
-            [
-                AdapterActivation::new("red", 0.5),
-                AdapterActivation::new("blue", 1.0),
-            ],
-        );
+        .with_row([AdapterActivation::new("red", 1.0)])
+        .with_row([AdapterActivation::new("blue", 1.0)])
+        .with_row([
+            AdapterActivation::new("red", 0.5),
+            AdapterActivation::new("blue", 1.0),
+        ]);
     let output = engine.run_pipeline(adapter_request(
-        &[10, 20, 30],
-        &[0, 0, 0],
         &[true, false, true],
         &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-        selection.clone(),
+        &selection,
     )?)?;
     assert_eq!(
         output["result"].to_vec_f32()?,
         vec![2.0, 4.0, 3.0, 4.0, 25.5, 35.0]
     );
+    // Compaction reorders the batch: the surviving rows keep their composition
+    // while moving to new positions.
+    let compacted_selection = AdapterSelection::default()
+        .with_row([
+            AdapterActivation::new("red", 0.5),
+            AdapterActivation::new("blue", 1.0),
+        ])
+        .with_row([AdapterActivation::new("red", 1.0)]);
     let compacted = engine.run_pipeline(adapter_request(
-        &[30, 10],
-        &[0, 0],
         &[true, true],
         &[5.0, 6.0, 1.0, 2.0],
-        selection,
+        &compacted_selection,
     )?)?;
     assert_eq!(
         compacted["result"].to_vec_f32()?,
         vec![25.5, 35.0, 2.0, 4.0]
     );
-    let reused =
-        AdapterSelection::default().with_slot(10, 1, [AdapterActivation::new("blue", 1.0)]);
-    let stale = engine.run_pipeline(adapter_request(
-        &[10],
-        &[1],
-        &[true],
-        &[1.0, 2.0],
-        AdapterSelection::default().with_slot(
-            10,
-            0,
-            [AdapterActivation::new("red", 1.0)],
-        ),
-    )?)?;
-    assert_eq!(stale["result"].to_vec_f32()?, vec![1.0, 2.0]);
+    // A row that asks for no adapter is passed through unmodified.
+    let unadapted = AdapterSelection::default().with_row([]);
+    let bare = engine.run_pipeline(adapter_request(&[true], &[1.0, 2.0], &unadapted)?)?;
+    assert_eq!(bare["result"].to_vec_f32()?, vec![1.0, 2.0]);
+    let reused = AdapterSelection::default().with_row([AdapterActivation::new("blue", 1.0)]);
     for _ in 0..2 {
-        let output = engine.run_pipeline(adapter_request(
-            &[10],
-            &[1],
-            &[true],
-            &[1.0, 2.0],
-            reused.clone(),
-        )?)?;
+        let output = engine.run_pipeline(adapter_request(&[true], &[1.0, 2.0], &reused)?)?;
         assert_eq!(output["result"].to_vec_f32()?, vec![7.0, 10.0]);
     }
-    let green =
-        AdapterSelection::default().with_slot(40, 0, [AdapterActivation::new("green", 1.0)]);
-    let output = engine.run_pipeline(adapter_request(
-        &[40],
-        &[0],
-        &[true],
-        &[1.0, 2.0],
-        green,
-    )?)?;
+    let green = AdapterSelection::default().with_row([AdapterActivation::new("green", 1.0)]);
+    let output = engine.run_pipeline(adapter_request(&[true], &[1.0, 2.0], &green)?)?;
     assert_eq!(output["result"].to_vec_f32()?, vec![4.0, 5.0]);
-    let red =
-        AdapterSelection::default().with_slot(50, 0, [AdapterActivation::new("red", 1.0)]);
+    let red = AdapterSelection::default().with_row([AdapterActivation::new("red", 1.0)]);
     for _ in 0..2 {
-        let output = engine.run_pipeline(adapter_request(
-            &[50],
-            &[0],
-            &[true],
-            &[1.0, 2.0],
-            red.clone(),
-        )?)?;
+        let output = engine.run_pipeline(adapter_request(&[true], &[1.0, 2.0], &red)?)?;
         assert_eq!(output["result"].to_vec_f32()?, vec![2.0, 4.0]);
     }
     let diagnostic = engine.adapter_lifecycle_diagnostic();
@@ -229,25 +188,25 @@ fn decoder_batch_request(
     active: &[bool],
     max_new_tokens: usize,
 ) -> anyhow::Result<PipelineGenerateRequest> {
-    let slot_ids = (0..batch).collect::<Vec<_>>();
-    decoder_batch_request_with_slots(
+    let seeds = (0..batch).collect::<Vec<_>>();
+    decoder_batch_request_with_seeds(
         input_ids,
         batch,
         sequence,
         prompt_lengths,
         active,
-        &slot_ids,
+        &seeds,
         max_new_tokens,
     )
 }
 
-fn decoder_batch_request_with_slots(
+fn decoder_batch_request_with_seeds(
     input_ids: &[i64],
     batch: i64,
     sequence: i64,
     prompt_lengths: &[i64],
     active: &[bool],
-    slot_ids: &[i64],
+    seeds: &[i64],
     max_new_tokens: usize,
 ) -> anyhow::Result<PipelineGenerateRequest> {
     let bool_bytes = active.iter().map(|value| u8::from(*value)).collect();
@@ -256,7 +215,7 @@ fn decoder_batch_request_with_slots(
     let negative_ones = vec![-1_i64; usize::try_from(batch)?];
     let floats_zero = vec![0.0_f32; usize::try_from(batch)?];
     let floats_one = vec![1.0_f32; usize::try_from(batch)?];
-    assert_eq!(slot_ids.len(), usize::try_from(batch)?);
+    assert_eq!(seeds.len(), usize::try_from(batch)?);
     Ok(PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![0]),
         options: options(max_new_tokens),
@@ -278,10 +237,6 @@ fn decoder_batch_request_with_slots(
         Value::from_raw_bytes(vec![0; usize::try_from(batch)?], &[batch], DataType::Bool)?,
     )
     .with_input("package.one_token", Value::from_slice_i64(&ones, &[batch])?)
-    .with_input(
-        "package.slot_ids",
-        Value::from_slice_i64(slot_ids, &[batch])?,
-    )
     .with_input(
         "request.eos_ids",
         Value::from_slice_i64(&vec![2_i64; usize::try_from(batch)?], &[batch, 1])?,
@@ -307,7 +262,7 @@ fn decoder_batch_request_with_slots(
         "request.min_p",
         Value::from_slice_f32(&floats_zero, &[batch])?,
     )
-    .with_input("request.seed", Value::from_slice_i64(slot_ids, &[batch])?)
+    .with_input("request.seed", Value::from_slice_i64(seeds, &[batch])?)
     .with_input(
         "request.rng_counter",
         Value::from_slice_i64(&zeros, &[batch])?,
@@ -329,8 +284,7 @@ fn mobius_decoder_workflow_executes() -> anyhow::Result<()> {
         PipelineGenerateRequest::new(GenerateRequest {
             prompt: GeneratePrompt::TokenIds(vec![4, 5]),
             options: options(3),
-        })
-        .with_input("package.slot_ids", Value::from_slice_i64(&[0], &[1])?),
+        }),
     )?;
     assert_eq!(
         engine
@@ -403,7 +357,7 @@ fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyh
         .iter()
         .map(|island| island.stable_binding_runs)
         .sum::<u64>();
-    let compacted = decoder_batch_request_with_slots(
+    let compacted = decoder_batch_request_with_seeds(
         &[6, 0, 4, 5],
         2,
         2,
@@ -423,8 +377,11 @@ fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyh
             .1
             .to_vec_i64()
     };
-    assert_eq!(compacted_row(0)?, first_tokens);
-    assert_eq!(compacted_row(1)?, second_tokens);
+    // Semantic row ids are positional: the runtime maps a batch row back to a
+    // caller through its own private request table, so the reordered batch
+    // reports the sequence it actually placed in each row.
+    assert_eq!(compacted_row(0)?, second_tokens);
+    assert_eq!(compacted_row(1)?, first_tokens);
     let stable_after = engine
         .execution_island_diagnostics()
         .iter()
@@ -435,27 +392,23 @@ fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyh
         "same-shape row compaction must reuse stable island bindings"
     );
 
-    let inactive = decoder_batch_request(&[4, 5, 6, 0], 2, 2, &[2, 1], &[true, false], 3)?;
-    let inactive_output = engine.run_pipeline_outputs(inactive)?;
-    let inactive_rows = engine.output_rows_for_role(&inactive_output, WorkflowOutputRole::Tokens);
-    assert_eq!(inactive_rows.len(), 1);
-    assert_eq!(inactive_rows[0].0, 0);
-    assert_eq!(inactive_rows[0].1.to_vec_i64()?, first_tokens);
-
-    let first_inactive = decoder_batch_request(&[4, 5, 6, 0], 2, 2, &[2, 1], &[false, true], 3)?;
-    let first_inactive_output = engine.run_pipeline_outputs(first_inactive)?;
-    let first_inactive_rows =
-        engine.output_rows_for_role(&first_inactive_output, WorkflowOutputRole::Tokens);
-    assert_eq!(first_inactive_rows.len(), 1);
-    assert_eq!(first_inactive_rows[0].0, 1);
-    assert_eq!(first_inactive_rows[0].1.to_vec_i64()?, second_tokens);
-    assert_eq!(
-        engine
-            .structured_output_for_role(&first_inactive_output, WorkflowOutputRole::Tokens)
-            .expect("semantic lookup must return the first emitted row")
-            .to_vec_i64()?,
-        second_tokens
-    );
+    // This decoder concatenates `present` onto `past`, so its cache is dynamic
+    // and its attention mask is a dense carry that grows one column per step
+    // for every row at once. A partially active batch is therefore not
+    // expressible: preserving an inactive row would require its mask to keep
+    // the narrower width the rest of the batch has already outgrown. The
+    // runtime says so instead of silently corrupting the held row, and this
+    // asserts that contract rather than leaving it to chance.
+    for active in [[true, false], [false, true]] {
+        let mixed = decoder_batch_request(&[4, 5, 6, 0], 2, 2, &[2, 1], &active, 3)?;
+        let Err(error) = engine.run_pipeline_outputs(mixed) else {
+            panic!("a growing dense carry cannot hold an inactive row");
+        };
+        assert!(
+            format!("{error:#}").contains("cannot preserve inactive rows"),
+            "{error:#}"
+        );
+    }
 
     let replay = decoder_batch_request(&[6, 0], 1, 2, &[1], &[true], 3)?;
     let replay_output = engine.run_pipeline_outputs(replay)?;
@@ -485,8 +438,7 @@ fn mobius_vlm_workflow_executes_complete_image_path() -> anyhow::Result<()> {
     .with_input(
         "request.image",
         Value::from_raw_bytes(png, &[png_len], DataType::Uint8)?,
-    )
-    .with_input("package.slot_ids", Value::from_slice_i64(&[0], &[1])?);
+    );
     let output = engine.run_pipeline_outputs(request)?;
     assert_eq!(
         engine
@@ -506,7 +458,10 @@ fn mobius_euler_diffusion_workflow_executes_complete_path() -> anyhow::Result<()
         prompt: GeneratePrompt::TokenIds(vec![1, 2]),
         options: options(2),
     })
-    .with_input("latent", Value::from_slice_f32(&[1.0; 64], &[1, 4, 4, 4])?);
+    .with_input(
+        "request.noise",
+        Value::from_slice_f32(&[1.0; 64], &[1, 4, 4, 4])?,
+    );
     let output = engine.run_pipeline_outputs(request)?;
     assert_eq!(output["image"].shape(), [1, 3, 4, 4]);
     assert!(
@@ -549,14 +504,9 @@ fn mobius_codec_workflow_executes() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn tts_request(
-    prompt_tokens: &[i64],
-    batch: i64,
-    slot_ids: &[i64],
-) -> anyhow::Result<PipelineGenerateRequest> {
+fn tts_request(prompt_tokens: &[i64], batch: i64) -> anyhow::Result<PipelineGenerateRequest> {
     let rows = usize::try_from(batch)?;
     assert_eq!(prompt_tokens.len(), rows * 2);
-    assert_eq!(slot_ids.len(), rows);
     Ok(
         PipelineGenerateRequest::new(GenerateRequest {
             prompt: GeneratePrompt::TokenIds(vec![0]),
@@ -581,10 +531,6 @@ fn tts_request(
         .with_input(
             "package.true",
             Value::from_raw_bytes(vec![1; rows], &[batch], DataType::Bool)?,
-        )
-        .with_input(
-            "package.slot_ids",
-            Value::from_slice_i64(slot_ids, &[batch])?,
         ),
     )
 }
@@ -592,16 +538,16 @@ fn tts_request(
 #[test]
 fn mobius_tts_workflow_executes_real_producer_graphs() -> anyhow::Result<()> {
     let mut engine = Engine::from_pipeline_dir(&root("tts")?, EngineConfig::default())?;
-    let output = engine.run_pipeline_outputs(tts_request(&[1, 2], 1, &[0])?)?;
+    let output = engine.run_pipeline_outputs(tts_request(&[1, 2], 1)?)?;
     assert_eq!(output["waveform"].shape()[..2], [1, 1]);
     let first = output["waveform"].to_vec_f32()?;
     assert!(!first.is_empty());
 
     let mut independent = Engine::from_pipeline_dir(&root("tts")?, EngineConfig::default())?;
-    let second_output = independent.run_pipeline_outputs(tts_request(&[3, 4], 1, &[1])?)?;
+    let second_output = independent.run_pipeline_outputs(tts_request(&[3, 4], 1)?)?;
     let second = second_output["waveform"].to_vec_f32()?;
 
-    let batched = engine.run_pipeline_outputs(tts_request(&[1, 2, 3, 4], 2, &[0, 1])?)?;
+    let batched = engine.run_pipeline_outputs(tts_request(&[1, 2, 3, 4], 2)?)?;
     let frames = first.len();
     assert_eq!(batched["waveform"].shape(), [2, 1, i64::try_from(frames)?]);
     let batched_waveform = batched["waveform"].to_vec_f32()?;
@@ -613,7 +559,7 @@ fn mobius_tts_workflow_executes_real_producer_graphs() -> anyhow::Result<()> {
         .iter()
         .map(|island| island.stable_binding_runs)
         .sum::<u64>();
-    let compacted = engine.run_pipeline_outputs(tts_request(&[3, 4, 1, 2], 2, &[1, 0])?)?;
+    let compacted = engine.run_pipeline_outputs(tts_request(&[3, 4, 1, 2], 2)?)?;
     let compacted_waveform = compacted["waveform"].to_vec_f32()?;
     assert_eq!(&compacted_waveform[..frames], second);
     assert_eq!(&compacted_waveform[frames..], first);
@@ -627,7 +573,7 @@ fn mobius_tts_workflow_executes_real_producer_graphs() -> anyhow::Result<()> {
         "same-shape nested TTS compaction must preserve stable bindings"
     );
 
-    let reused = engine.run_pipeline_outputs(tts_request(&[3, 4], 1, &[0])?)?;
+    let reused = engine.run_pipeline_outputs(tts_request(&[3, 4], 1)?)?;
     assert_eq!(reused["waveform"].to_vec_f32()?, second);
     Ok(())
 }
@@ -639,7 +585,6 @@ fn mobius_speculative_workflow_executes_rejection_and_correction() -> anyhow::Re
         prompt: GeneratePrompt::TokenIds(vec![1, 2, 3, 4]),
         options: options(1),
     })
-    .with_input("serving.slot_ids", Value::from_slice_i64(&[0], &[1])?)
     .with_input(
         "verifier.past_key_values.0.key",
         Value::from_slice_f32(&[], &[1, 2, 0, 8])?,

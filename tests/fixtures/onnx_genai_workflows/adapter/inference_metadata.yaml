@@ -13,39 +13,19 @@ pipeline:
       - parameter_adapters
       - heterogeneous_adapter_batching
     inputs:
-      request.slot_ids:
-        contract:
-          dtype: int64
-          rank: 1
-          shape:
-          - batch
-        role:
-          kind: opaque
-        source:
-          kind: application
-          name: serving.slot_ids
       request.active:
         contract:
           dtype: bool
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: runtime
           version: '1.0'
           role: adapter_active
-        source:
-          kind: request
-      request.request_epochs:
-        contract:
-          dtype: int64
-          rank: 1
-          shape:
-          - batch
-        role:
-          kind: runtime
-          version: '1.0'
-          role: request_epochs
         source:
           kind: request
       activations:
@@ -55,6 +35,9 @@ pipeline:
           shape:
           - batch
           - 2
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: opaque
         source:
@@ -67,6 +50,9 @@ pipeline:
           shape:
           - batch
           - 2
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: runtime
           version: '1.0'
@@ -79,6 +65,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: runtime
           version: '1.0'
@@ -92,6 +81,9 @@ pipeline:
           shape:
           - batch
           - 2
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: runtime
           version: '1.0'
@@ -106,6 +98,9 @@ pipeline:
           shape:
           - batch
           - 2
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role: tensor
         stage: pre_adapter
     components:
@@ -127,6 +122,9 @@ pipeline:
               shape:
               - batch
               - 2
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             output:
               dtype: float32
@@ -134,6 +132,9 @@ pipeline:
               shape:
               - batch
               - 2
+              batch_layout:
+                kind: request_aligned
+                axis: 0
         contract:
           id: onnx-genai.parameter-overlay
           version: '1'

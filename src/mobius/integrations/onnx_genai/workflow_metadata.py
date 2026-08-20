@@ -214,6 +214,12 @@ def _grammar_adapter_component(action: str) -> dict[str, Any]:
             "parameters": {"action": action},
         },
         "effects": ["grammar"],
+        # The adapter keeps one grammar FSM per in-flight request, and every
+        # port is request-aligned on axis 0. Declaring the row scope is what
+        # lets the runtime drive the mandatory compact(selection)/release(row)
+        # ABI when the batch changes; without it the FSM rows would drift out
+        # of correspondence with the sequences they guide.
+        "row_scope": {"axis": 0, "stateful": True},
     }
 
 
@@ -5699,6 +5705,18 @@ def build_speculative_workflow_metadata(
                 "grammar_commit": _grammar_adapter_component("commit"),
             }
         )
+        # The grammar adapter's three actions are a speculation protocol:
+        # `clone` snapshots the FSM before a proposal, `lookahead` advances the
+        # snapshot, and `commit` applies only the accepted prefix. Abandoning a
+        # rejected proposal is therefore a transaction abort rather than an
+        # unrecoverable side effect, and the explicit `clone` action is exactly
+        # what makes the domain safe to enter speculatively.
+        workflow["effects"] = {
+            "grammar": {
+                "retry": "transactional",
+                "speculation_safety": {"kind": "clonable"},
+            }
+        }
     if adaptive_k_max is not None:
         workflow["manifest"]["capabilities"].extend(
             ["adaptive_proposal_budget", "advisory_state"]
