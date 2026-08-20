@@ -1094,9 +1094,9 @@ def _write_genai_config(
     source_model_type = getattr(config, "model_type", "") or ""
     # These IDs are the fixed Qwen and Phi-4 Mini tokenizer tool delimiters
     # recognized by ONNX Runtime GenAI.
-    if source_model_type.startswith("qwen2"):
+    if source_model_type.startswith("qwen2") and config.vocab_size > 151658:
         generator.with_special_tokens(bot_token_id=151657, eot_token_id=151658)
-    elif source_model_type.startswith("qwen3"):
+    elif source_model_type.startswith("qwen3") and config.vocab_size > 151668:
         generator.with_special_tokens(
             bot_token_id=151657,
             eot_token_id=151658,

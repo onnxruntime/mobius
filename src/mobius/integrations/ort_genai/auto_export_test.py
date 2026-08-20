@@ -1964,10 +1964,10 @@ class TestExportForOrtGenai:
     @pytest.mark.parametrize(
         ("model_type", "vocab_size", "special_token_ids"),
         [
-            ("qwen2", 256, {"bot_token_id": 151657, "eot_token_id": 151658}),
+            ("qwen2", 151936, {"bot_token_id": 151657, "eot_token_id": 151658}),
             (
                 "qwen3",
-                256,
+                151936,
                 {
                     "bot_token_id": 151657,
                     "eot_token_id": 151658,
@@ -1977,6 +1977,8 @@ class TestExportForOrtGenai:
             ),
             ("phi3", 200064, {"bot_token_id": 200025, "eot_token_id": 200026}),
             ("phi3small", 100352, {}),
+            ("qwen2", 151658, {}),
+            ("qwen3", 151668, {}),
         ],
     )
     def test_tool_call_special_tokens_emitted(
