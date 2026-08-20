@@ -113,6 +113,22 @@ class ApplyAssetPatchesTest(unittest.TestCase):
     def test_tolerates_a_package_missing_the_target(self):
         self.assertEqual(self._apply(), [])
 
+    def test_tolerates_an_unreadable_tokenizer_config(self):
+        self._write_package()
+        (self.package / "tokenizer_config.json").write_text("{not json", encoding="utf-8")
+        with self.assertLogs("mobius.upstream_patches._patches", level="ERROR"):
+            applied = self._apply()
+        self.assertEqual(
+            applied,
+            ["chat_template.jinja"],
+            "the template is still corrected when its duplicate cannot be read",
+        )
+        self.assertEqual(
+            (self.package / "tokenizer_config.json").read_text(encoding="utf-8"),
+            "{not json",
+            "an unreadable config is left exactly as found, not truncated",
+        )
+
     def test_tolerates_a_missing_package_directory(self):
         self.assertEqual(apply_asset_patches(self.package / "absent", root=self.patches), [])
 

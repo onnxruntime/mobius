@@ -103,8 +103,15 @@ def _sync_chat_template(package: pathlib.Path, operation: dict) -> str | None:
         return None
 
     template = source.read_text(encoding="utf-8")
-    with target.open(encoding="utf-8") as handle:
-        config = json.load(handle)
+    try:
+        with target.open(encoding="utf-8") as handle:
+            config = json.load(handle)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        # Correcting assets is opportunistic: a config we cannot read is a
+        # problem for whoever wrote it, not a reason to fail an export that
+        # would otherwise succeed with the stale embedded copy.
+        _LOGGER.exception("Cannot read %s to sync %s into it", target, source.name)
+        return None
     if config.get("chat_template") == template:
         return None
 
