@@ -357,6 +357,47 @@ def _fix_tokenizer_config(output_dir: str) -> bool:
     return True
 
 
+_SPECIAL_TOKEN_FIELDS = {
+    "<tool_call>": "bot_token_id",
+    "</tool_call>": "eot_token_id",
+    "<|tool_call|>": "bot_token_id",
+    "<|/tool_call|>": "eot_token_id",
+    "<think>": "bor_token_id",
+    "</think>": "eor_token_id",
+}
+
+
+def _special_token_ids_from_tokenizer_config(
+    output_dir: str, vocab_size: int
+) -> dict[str, int]:
+    """Read ORT GenAI tool and reasoning delimiter IDs from tokenizer_config.json."""
+    tc_path = os.path.join(output_dir, "tokenizer_config.json")
+    if not os.path.isfile(tc_path):
+        return {}
+
+    try:
+        with open(tc_path, encoding="utf-8") as f:
+            added_tokens = json.load(f).get("added_tokens_decoder", {})
+    except (OSError, json.JSONDecodeError):
+        logger.warning("Could not read special tokens from %s", tc_path, exc_info=True)
+        return {}
+    if not isinstance(added_tokens, dict):
+        return {}
+
+    special_token_ids: dict[str, int] = {}
+    for token_id, token in added_tokens.items():
+        if not isinstance(token, dict):
+            continue
+        field = _SPECIAL_TOKEN_FIELDS.get(token.get("content"))
+        try:
+            token_id = int(token_id)
+        except (TypeError, ValueError):
+            continue
+        if field is not None and 0 <= token_id < vocab_size:
+            special_token_ids[field] = token_id
+    return special_token_ids
+
+
 def _fix_chat_template(output_dir: str, hf_model_id: str | None) -> bool:
     """Ensure chat_template is present in tokenizer_config.json.
 
@@ -1091,20 +1132,9 @@ def _write_genai_config(
         supports_in_place_kv_cache=supports_in_place_kv_cache,
         num_cache_layer_slots=_count_cache_layer_slots(decoder_model),
     )
-    source_model_type = getattr(config, "model_type", "") or ""
-    # These IDs are the fixed Qwen and Phi-4 Mini tokenizer tool delimiters
-    # recognized by ONNX Runtime GenAI.
-    if source_model_type.startswith("qwen2") and config.vocab_size > 151658:
-        generator.with_special_tokens(bot_token_id=151657, eot_token_id=151658)
-    elif source_model_type.startswith("qwen3") and config.vocab_size > 151668:
-        generator.with_special_tokens(
-            bot_token_id=151657,
-            eot_token_id=151658,
-            bor_token_id=151667,
-            eor_token_id=151668,
-        )
-    elif source_model_type == "phi3" and config.vocab_size > 200026:
-        generator.with_special_tokens(bot_token_id=200025, eot_token_id=200026)
+    generator.with_special_tokens(
+        **_special_token_ids_from_tokenizer_config(output_dir, config.vocab_size)
+    )
 
     if is_vlm:
         image_token_id = getattr(config, "image_token_id", None)
@@ -1452,22 +1482,7 @@ def write_ort_genai_config(
     if ort_model_type == "phi" and has_speech:
         ort_model_type = "phi4mm"
 
-    logger.info("Generating genai_config.json for %s (ep=%s)", ort_model_type, ep)
-    genai_path = _write_genai_config(
-        config,
-        directory,
-        pkg=pkg,
-        ort_model_type=ort_model_type,
-        ep=ep,
-        context_length=context_length,
-        bos_token_id=bos_token_id,
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        is_vlm=is_vlm,
-        has_speech=has_speech,
-    )
-
-    result: dict[str, str] = {"genai_config": genai_path}
+    result: dict[str, str] = {}
 
     if "mtp" in pkg:
         mtp_model = pkg["mtp"]
@@ -1520,6 +1535,22 @@ def write_ort_genai_config(
 
         for tf in tokenizer_files:
             result[tf] = os.path.join(directory, tf)
+
+    logger.info("Generating genai_config.json for %s (ep=%s)", ort_model_type, ep)
+    genai_path = _write_genai_config(
+        config,
+        directory,
+        pkg=pkg,
+        ort_model_type=ort_model_type,
+        ep=ep,
+        context_length=context_length,
+        bos_token_id=bos_token_id,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        is_vlm=is_vlm,
+        has_speech=has_speech,
+    )
+    result["genai_config"] = genai_path
 
     # Write processor config for VLMs
     processor_path = _write_vision_processor_config(

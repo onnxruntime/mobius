@@ -1962,11 +1962,20 @@ class TestExportForOrtGenai:
         assert data["model"]["pad_token_id"] == 0
 
     @pytest.mark.parametrize(
-        ("model_type", "vocab_size", "special_token_ids"),
+        ("tokens", "vocab_size", "expected"),
         [
-            ("qwen2", 151936, {"bot_token_id": 151657, "eot_token_id": 151658}),
             (
-                "qwen3",
+                {"<tool_call>": 151657, "</tool_call>": 151658},
+                151936,
+                {"bot_token_id": 151657, "eot_token_id": 151658},
+            ),
+            (
+                {
+                    "<tool_call>": 151657,
+                    "</tool_call>": 151658,
+                    "<think>": 151667,
+                    "</think>": 151668,
+                },
                 151936,
                 {
                     "bot_token_id": 151657,
@@ -1976,39 +1985,58 @@ class TestExportForOrtGenai:
                 },
             ),
             (
-                "qwen3_5_moe",
-                151936,
-                {
-                    "bot_token_id": 151657,
-                    "eot_token_id": 151658,
-                    "bor_token_id": 151667,
-                    "eor_token_id": 151668,
-                },
+                {"<|tool_call|>": 200025, "<|/tool_call|>": 200026},
+                200064,
+                {"bot_token_id": 200025, "eot_token_id": 200026},
             ),
-            ("phi3", 200064, {"bot_token_id": 200025, "eot_token_id": 200026}),
-            ("phi3small", 100352, {}),
-            ("qwen2", 151658, {}),
-            ("qwen3", 151668, {}),
-            ("qwen3_5_moe", 151668, {}),
+            ({}, 256, {}),
+            ({"<tool_call>": 151657, "</tool_call>": 151658}, 151658, {"bot_token_id": 151657}),
         ],
     )
-    def test_tool_call_special_tokens_emitted(
-        self, tmp_path, model_type, vocab_size, special_token_ids
+    def test_tool_call_special_tokens_read_from_tokenizer_config(
+        self, tmp_path, tokens, vocab_size, expected
     ):
-        """Tool-call delimiters are included for model families that define them."""
-        pkg = _make_fake_llm_pkg(model_type)
-        pkg.config.vocab_size = vocab_size
-        result = write_ort_genai_config(pkg, str(tmp_path))
+        """Tool and reasoning delimiters come from tokenizer_config.json."""
+        tokenizer_dir = tmp_path / "tokenizer"
+        tokenizer_dir.mkdir()
+        tokenizer_config = {
+            "added_tokens_decoder": {
+                str(token_id): {"content": token} for token, token_id in tokens.items()
+            }
+        }
+        (tokenizer_dir / "tokenizer_config.json").write_text(json.dumps(tokenizer_config))
 
+        pkg = _make_fake_llm_pkg("llama")
+        pkg.config.vocab_size = vocab_size
+        result = write_ort_genai_config(
+            pkg, str(tmp_path / "output"), local_config_dir=str(tokenizer_dir)
+        )
         with open(result["genai_config"]) as f:
             model = json.load(f)["model"]
 
-        for name, token_id in special_token_ids.items():
-            assert model[name] == token_id
+        assert {name: model[name] for name in expected} == expected
         for name in {"bot_token_id", "eot_token_id", "bor_token_id", "eor_token_id"} - set(
-            special_token_ids
+            expected
         ):
             assert name not in model
+
+    def test_invalid_tokenizer_added_tokens_are_ignored(self, tmp_path):
+        """A malformed added_tokens_decoder does not prevent exporting."""
+        tokenizer_dir = tmp_path / "tokenizer"
+        tokenizer_dir.mkdir()
+        (tokenizer_dir / "tokenizer_config.json").write_text(
+            json.dumps({"added_tokens_decoder": None})
+        )
+
+        result = write_ort_genai_config(
+            _make_fake_llm_pkg("llama"),
+            str(tmp_path / "output"),
+            local_config_dir=str(tokenizer_dir),
+        )
+        with open(result["genai_config"]) as f:
+            model = json.load(f)["model"]
+
+        assert not {"bot_token_id", "eot_token_id", "bor_token_id", "eor_token_id"} & model.keys()
 
     def test_config_mode_eos_token_id_as_list(self, tmp_path):
         """eos_token_id can be a list[int] (e.g. Gemma multi-stop tokens)."""
