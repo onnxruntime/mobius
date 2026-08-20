@@ -660,3 +660,70 @@ fn mobius_speculative_workflow_executes_rejection_and_correction() -> anyhow::Re
     assert_eq!(output["tokens.row.0"].to_vec_i64()?, [1, 31]);
     Ok(())
 }
+
+fn video_request(latent_frames: i64, batch: i64) -> anyhow::Result<PipelineGenerateRequest> {
+    let rows = usize::try_from(batch)?;
+    // [batch, latent_frames, channels, height, width]. Generating from the flat
+    // index keeps row 0 and the leading frames identical across shapes, so the
+    // comparisons below isolate the runtime's handling of the temporal axis.
+    let elements = batch * latent_frames * 4 * 2 * 2;
+    let noise: Vec<f32> = (0..elements)
+        .map(|index| (index % 11) as f32 / 11.0 - 0.5)
+        .collect();
+    Ok(PipelineGenerateRequest::new(GenerateRequest {
+        prompt: GeneratePrompt::TokenIds(vec![]),
+        options: options(3),
+    })
+    .with_input(
+        "request.noise",
+        Value::from_slice_f32(&noise, &[batch, latent_frames, 4, 2, 2])?,
+    )
+    .with_input(
+        "request.encoder_hidden_states",
+        Value::from_slice_f32(&vec![0.25; rows * 2 * 32], &[batch, 2, 32])?,
+    )
+    .with_input(
+        "package.false",
+        Value::from_raw_bytes(vec![0; rows], &[batch], DataType::Bool)?,
+    ))
+}
+
+#[test]
+fn mobius_video_diffusion_workflow_publishes_causal_temporal_chunks() -> anyhow::Result<()> {
+    let mut engine = Engine::from_pipeline_dir(&root("video")?, EngineConfig::default())?;
+
+    // Three latent frames decode as a single chunk and expand 2x in time.
+    let short = engine.run_pipeline_outputs(video_request(3, 1)?)?;
+    assert_eq!(short["video"].shape(), [1, 3, 6, 4, 4]);
+    let short_frames = short["video"].to_vec_f32()?;
+    assert!(short_frames.iter().all(|value| value.is_finite()));
+    let frame = |frames: &[f32], total: usize, channel: usize, time: usize| {
+        let start = (channel * total + time) * 16;
+        frames[start..start + 16].to_vec()
+    };
+
+    // Five latent frames decode as two causal chunks (three frames, then two).
+    // The clip is the concatenation along time, and what the first chunk already
+    // published must not change once the second one runs: that is what the
+    // decoder's carried convolution caches are for.
+    let long = engine.run_pipeline_outputs(video_request(5, 1)?)?;
+    assert_eq!(long["video"].shape(), [1, 3, 10, 4, 4]);
+    let long_frames = long["video"].to_vec_f32()?;
+    for channel in 0..3 {
+        for time in 0..6 {
+            assert_eq!(
+                frame(&short_frames, 6, channel, time),
+                frame(&long_frames, 10, channel, time),
+                "chunk boundary changed already-published frame {time}"
+            );
+        }
+    }
+
+    // A batched request decodes independent clips, and the caches from the
+    // previous invocations are gone: row 0 reproduces the single-row clip.
+    let batched = engine.run_pipeline_outputs(video_request(3, 2)?)?;
+    assert_eq!(batched["video"].shape(), [2, 3, 6, 4, 4]);
+    let batched_frames = batched["video"].to_vec_f32()?;
+    assert_eq!(&batched_frames[..short_frames.len()], &short_frames[..]);
+    Ok(())
+}

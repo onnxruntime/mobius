@@ -20,6 +20,7 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     _kv_storage_contract,
     build_language_diffusion_pipeline_metadata,
     build_speculative_workflow_metadata,
+    build_video_diffusion_workflow_metadata,
     build_vlm_workflow_metadata,
     write_speculative_workflow_metadata,
     write_vlm_workflow_metadata,
@@ -461,6 +462,125 @@ def test_language_diffusion_uses_exclusive_ssa_workflow():
     assert graph["iteration"]["value"] == "loop.iteration"
     assert graph["steps"][0]["inputs"]["total_steps"] == "package.num_steps"
     assert graph["steps"][1]["mode"] == "replace"
+
+
+def _video_package(*, cache_ports: bool = True, latent_rank: int = 5) -> ModelPackage:
+    latent_shape: list[int | str] = ["batch", "num_frames", 4, "height", "width"]
+    if latent_rank == 4:
+        latent_shape = ["batch", 4, "height", "width"]
+    sample = _value("sample", ir.DataType.FLOAT, latent_shape)
+    timestep = _value("timestep", ir.DataType.INT64, ["batch"])
+    conditioning = _value(
+        "encoder_hidden_states", ir.DataType.FLOAT, ["batch", "prompt_sequence", 32]
+    )
+    noise_pred = _value("noise_pred", ir.DataType.FLOAT, latent_shape)
+    denoiser = ir.Graph(
+        inputs=[sample, timestep, conditioning],
+        outputs=[noise_pred],
+        nodes=[],
+        name="transformer",
+        opset_imports={"": 24},
+    )
+
+    latent_sample = _value(
+        "latent_sample",
+        ir.DataType.FLOAT,
+        ["batch", 4, "latent_frames", "latent_height", "latent_width"],
+    )
+    frames = _value(
+        "sample",
+        ir.DataType.FLOAT,
+        ["batch", 3, "frames", "2*latent_height", "2*latent_width"],
+    )
+    vae_inputs = [latent_sample]
+    vae_outputs = [frames]
+    if cache_ports:
+        vae_inputs.append(
+            _value(
+                "conv_cache.conv_in",
+                ir.DataType.FLOAT,
+                ["batch", 4, "cache_frames", "latent_height", "latent_width"],
+            )
+        )
+        vae_outputs.append(
+            _value(
+                "conv_cache_out.conv_in",
+                ir.DataType.FLOAT,
+                ["batch", 4, "cache_frames", "latent_height", "latent_width"],
+            )
+        )
+    vae = ir.Graph(
+        inputs=vae_inputs,
+        outputs=vae_outputs,
+        nodes=[],
+        name="vae_decoder",
+        opset_imports={"": 24},
+    )
+    vae_model = ir.Model(vae, ir_version=11)
+    vae_model.metadata_props["mobius.conv_cache.spatial_scale.conv_cache.conv_in"] = "1"
+    return ModelPackage(
+        {
+            "transformer": ir.Model(denoiser, ir_version=11),
+            "vae_decoder": vae_model,
+        }
+    )
+
+
+def test_video_diffusion_keeps_the_temporal_axis_through_every_stage():
+    metadata = build_video_diffusion_workflow_metadata(
+        _video_package(), num_inference_steps=2, solver="ddim"
+    )
+    workflow = metadata["pipeline"]["workflow"]
+
+    published = workflow["outputs"]["video"]
+    assert published["role"] == "video"
+    assert published["contract"]["rank"] == 5
+
+    latent = workflow["state"]["latent"]
+    assert latent["contract"]["rank"] == 5
+    assert latent["contract"]["shape"][1] == "num_frames"
+
+    # The scheduler trajectory is state, not telemetry: a multistep video solver
+    # reads it back.
+    history = workflow["state"]["scheduler_history"]
+    assert history["recurrence"]["kind"] == "growing"
+    assert history["recurrence"]["axis"] == 1
+
+    cache = workflow["state"]["conv_cache_conv_in"]
+    assert cache["management"] == "runtime"
+    assert cache["release_boundary"] == "invocation"
+    assert cache["recurrence"] == {
+        "kind": "bounded",
+        "axis": 2,
+        "max": "package.cache_frames",
+    }
+
+    denoise, decode = (step for step in workflow["steps"] if step["kind"] == "loop")
+    assert denoise["max_iterations"] == "request.max_iterations"
+    # The decoder runs once per causal chunk, and the chunk count is computed at
+    # run time from the latent rather than fixed by the package.
+    assert decode["max_iterations"] == "decode.chunks"
+    emit = next(node for node in decode["steps"] if node["kind"] == "emit")
+    # Frames append along time. Appending on the last axis -- the token-sequence
+    # default -- would concatenate image columns instead.
+    assert emit["mode"] == "append"
+    assert emit["axis"] == 2
+
+    assert "bounded_state_recurrence" in workflow["manifest"]["capabilities"]
+
+
+def test_video_diffusion_rejects_an_image_latent():
+    with pytest.raises(ValueError, match="rank-5"):
+        build_video_diffusion_workflow_metadata(
+            _video_package(latent_rank=4), num_inference_steps=2
+        )
+
+
+def test_video_diffusion_requires_paired_conv_caches():
+    with pytest.raises(ValueError, match="conv_cache"):
+        build_video_diffusion_workflow_metadata(
+            _video_package(cache_ports=False), num_inference_steps=2
+        )
 
 
 def test_language_diffusion_rejects_zero_steps():

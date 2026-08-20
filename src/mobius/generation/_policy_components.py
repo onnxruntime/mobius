@@ -11,6 +11,7 @@ workflow IR just like neural ONNX components.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -1687,17 +1688,28 @@ def build_counter_rng_normal(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyCo
     )
 
 
-def build_euler_model_input(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponent:
-    """Scale a latent for the Euler denoiser input at the current sigma."""
+_IMAGE_LATENT_DIMS: tuple[str, ...] = ("batch", "channels", "height", "width")
+
+
+def build_euler_model_input(
+    dtype: ir.DataType = ir.DataType.FLOAT,
+    latent_dims: Sequence[str] = _IMAGE_LATENT_DIMS,
+) -> PolicyComponent:
+    """Scale a latent for the Euler denoiser input at the current sigma.
+
+    ``latent_dims`` names the latent axes. The per-row sigma is broadcast over
+    every axis after the batch, so a video latent that carries a temporal axis
+    works without a separate component.
+    """
     graph, builder = _make_graph("euler_model_input")
     op = builder.op
-    sample = builder.input("sample", dtype, ["batch", "channels", "height", "width"])
+    sample = builder.input("sample", dtype, list(latent_dims))
     step = builder.input("step", ir.DataType.INT64, ["batch"])
     schedule = builder.input("schedule", ir.DataType.FLOAT, ["schedule_length"])
     sigma = op.Gather(schedule, step, axis=0)
     scale = op.Sqrt(op.Add(op.Mul(sigma, sigma), op.Constant(value_float=1.0)))
     scale = op.Cast(scale, to=dtype)
-    scale = op.Unsqueeze(scale, op.Constant(value_ints=[1, 2, 3]))
+    scale = op.Unsqueeze(scale, op.Constant(value_ints=list(range(1, len(latent_dims)))))
     model_input = op.Div(sample, scale)
     model_input.shape = sample.shape
     builder.add_output(model_input, "model_input")
@@ -1706,20 +1718,17 @@ def build_euler_model_input(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyCom
 
 def build_euler_solver_step(
     dtype: ir.DataType = ir.DataType.FLOAT,
+    latent_dims: Sequence[str] = _IMAGE_LATENT_DIMS,
 ) -> PolicyComponent:
-    """Build the generic Euler update ``x_next = x + dx * (sigma_next-sigma)``."""
+    """Build the generic Euler update ``x_next = x + dx * (sigma_next-sigma)``.
+
+    ``latent_dims`` names the latent axes so the same update serves image and
+    video latents; the sigma delta broadcasts over every axis after the batch.
+    """
     graph, builder = _make_graph("euler_solver_step")
     op = builder.op
-    sample = builder.input(
-        "sample",
-        dtype,
-        ["batch", "channels", "height", "width"],
-    )
-    derivative = builder.input(
-        "derivative",
-        dtype,
-        ["batch", "channels", "height", "width"],
-    )
+    sample = builder.input("sample", dtype, list(latent_dims))
+    derivative = builder.input("derivative", dtype, list(latent_dims))
     step = builder.input("step", ir.DataType.INT64, ["batch"])
     schedule = builder.input("schedule", ir.DataType.FLOAT, ["schedule_length"])
     final_index = op.Sub(op.Shape(schedule, start=0, end=1), op.Constant(value_ints=[1]))
@@ -1728,7 +1737,7 @@ def build_euler_solver_step(
     sigma_next = op.Gather(schedule, next_step, axis=0)
     delta = op.Sub(sigma_next, sigma)
     delta = op.Cast(delta, to=dtype)
-    delta = op.Unsqueeze(delta, op.Constant(value_ints=[1, 2, 3]))
+    delta = op.Unsqueeze(delta, op.Constant(value_ints=list(range(1, len(latent_dims)))))
     next_sample = op.Add(sample, op.Mul(derivative, delta))
     builder.add_output(next_sample, "next_state")
     return _component(
@@ -1889,6 +1898,69 @@ def build_flow_match_solver_step(
     )
 
 
+def build_ddim_solver_step(
+    dtype: ir.DataType = ir.DataType.FLOAT,
+    latent_dims: Sequence[str] = _IMAGE_LATENT_DIMS,
+    *,
+    clip_sample_range: float | None = None,
+) -> PolicyComponent:
+    """Build the deterministic DDIM update (``eta = 0``, epsilon prediction).
+
+    ``schedule`` holds the cumulative alpha of every denoising step followed by
+    the alpha of the final step's predecessor, so entry ``i + 1`` is the
+    ``alpha_prev`` of step ``i``::
+
+        pred_x0 = (x - sqrt(1 - a_t) * eps) / sqrt(a_t)
+        x_prev  = sqrt(a_prev) * pred_x0 + sqrt(1 - a_prev) * eps
+
+    ``clip_sample_range`` reproduces schedulers configured with
+    ``clip_sample=True``, which clamp the predicted clean sample before the
+    reverse step. ``latent_dims`` names the latent axes, so the same update
+    serves image and video latents.
+    """
+    graph, builder = _make_graph("ddim_solver_step")
+    op = builder.op
+    sample = builder.input("sample", dtype, list(latent_dims))
+    derivative = builder.input("derivative", dtype, list(latent_dims))
+    step = builder.input("step", ir.DataType.INT64, ["batch"])
+    schedule = builder.input("schedule", ir.DataType.FLOAT, ["schedule_length"])
+    final_index = op.Sub(op.Shape(schedule, start=0, end=1), op.Constant(value_ints=[1]))
+    next_step = op.Min(op.Add(step, op.Constant(value_int=1)), final_index)
+    broadcast_axes = op.Constant(value_ints=list(range(1, len(latent_dims))))
+    alpha = op.Unsqueeze(op.Cast(op.Gather(schedule, step, axis=0), to=dtype), broadcast_axes)
+    alpha_prev = op.Unsqueeze(
+        op.Cast(op.Gather(schedule, next_step, axis=0), to=dtype), broadcast_axes
+    )
+    one = op.CastLike(op.Constant(value_float=1.0), sample)
+    # Recover the predicted clean latent, then re-noise it to alpha_prev.
+    pred_original = op.Div(
+        op.Sub(sample, op.Mul(op.Sqrt(op.Sub(one, alpha)), derivative)), op.Sqrt(alpha)
+    )
+    if clip_sample_range is not None:
+        limit = op.CastLike(op.Constant(value_float=float(clip_sample_range)), sample)
+        pred_original = op.Clip(pred_original, op.Neg(limit), limit)
+    next_sample = op.Add(
+        op.Mul(op.Sqrt(alpha_prev), pred_original),
+        op.Mul(op.Sqrt(op.Sub(one, alpha_prev)), derivative),
+    )
+    _set_public_shape(next_sample, list(latent_dims))
+    builder.add_output(next_sample, "next_state")
+    return _component(
+        "onnx-genai.solver-step@1",
+        graph,
+        {
+            "role": "solver_step",
+            "state": "sample",
+            "estimate": "derivative",
+            "step": "step",
+            "schedule": "schedule",
+            "next_state": "next_state",
+            "effect": "solver",
+        },
+        "solver",
+    )
+
+
 def build_pack_latents_2x2(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponent:
     """Patchify a 3D VAE latent into the transformer's packed token layout.
 
@@ -2015,6 +2087,30 @@ SOLVER_BUILDERS = {
     "euler": build_euler_solver_step,
     "multistep": build_multistep_solver_step,
 }
+
+
+def build_identity_model_input(
+    dtype: ir.DataType = ir.DataType.FLOAT,
+    latent_dims: Sequence[str] = _IMAGE_LATENT_DIMS,
+) -> PolicyComponent:
+    """Pass the latent to the denoiser unchanged.
+
+    DDIM-style schedulers define ``scale_model_input`` as the identity. Keeping
+    the node explicit means the workflow reads the same way for every solver
+    and the input scaling stays a declared, swappable policy.
+    """
+    graph, builder = _make_graph("identity_model_input")
+    op = builder.op
+    sample = builder.input("sample", dtype, list(latent_dims))
+    step = builder.input("step", ir.DataType.INT64, ["batch"])
+    schedule = builder.input("schedule", ir.DataType.FLOAT, ["schedule_length"])
+    model_input = op.Identity(sample)
+    # The step and schedule are unused by this policy but stay on the signature
+    # so a package can swap solvers without rewiring the workflow.
+    _ = op.Gather(schedule, step, axis=0)
+    _set_public_shape(model_input, list(latent_dims))
+    builder.add_output(model_input, "model_input")
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 def build_masked_token_update() -> PolicyComponent:
@@ -2335,4 +2431,182 @@ def build_token_to_slot() -> PolicyComponent:
     slot = builder.op.Unsqueeze(token, [-1])
     slot.shape = ir.Shape(["batch", 1])
     builder.add_output(slot, "slot")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_video_latent_initializer(
+    dtype: ir.DataType,
+    init_noise_sigma: float,
+    history_dtype: ir.DataType = ir.DataType.INT64,
+) -> PolicyComponent:
+    """Scale request noise into the scheduler's starting video latent.
+
+    The noise carries the temporal axis, so nothing here collapses a clip to a
+    single frame: the component is rank-agnostic and only applies the
+    scheduler's ``init_noise_sigma``.
+    """
+    graph, builder = _make_graph("video_latent_initializer")
+    op = builder.op
+    noise = builder.input("noise", dtype, ["batch", "frames", "channels", "height", "width"])
+    latent = op.Mul(noise, op.CastLike(op.Constant(value_float=init_noise_sigma), noise))
+    _set_public_shape(latent, ["batch", "frames", "channels", "height", "width"])
+    builder.add_output(latent, "latent")
+    # An empty scheduler history: the denoise loop appends one timestep per step.
+    history = op.ConstantOfShape(
+        op.Concat(op.Shape(noise, start=0, end=1), op.Constant(value_ints=[0]), axis=0),
+        value=ir.tensor([0], dtype=history_dtype),
+    )
+    _set_public_shape(history, ["batch", 0])
+    builder.add_output(history, "history")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_schedule_history_append(dtype: ir.DataType) -> PolicyComponent:
+    """Append the current timestep to the scheduler's history.
+
+    Multistep video schedulers consume the trajectory of previous timesteps, so
+    the history is real state rather than telemetry.
+    """
+    graph, builder = _make_graph("schedule_history_append")
+    op = builder.op
+    history = builder.input("history", dtype, ["batch", "history"])
+    timestep = builder.input("timestep", dtype, ["batch"])
+    updated = op.Concat(history, op.Unsqueeze(timestep, op.Constant(value_ints=[1])), axis=1)
+    _set_public_shape(updated, ["batch", "history"])
+    builder.add_output(updated, "next")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_video_decode_chunk_count(latent_frame_axis: int = 2) -> PolicyComponent:
+    """Number of causal decode chunks a latent clip is split into.
+
+    Mirrors ``AutoencoderKLCogVideoX._decode``: ``max(latent_frames // 2, 1)``.
+    """
+    graph, builder = _make_graph("video_decode_chunk_count")
+    op = builder.op
+    latent = builder.input(
+        "latent",
+        ir.DataType.FLOAT,
+        ["batch", "channels", "latent_frames", "height", "width"],
+    )
+    frames = op.Shape(latent, start=latent_frame_axis, end=latent_frame_axis + 1)
+    count = op.Max(
+        op.Div(frames, op.Constant(value_ints=[2])),
+        op.Constant(value_ints=[1]),
+    )
+    _set_public_shape(count, [1])
+    builder.add_output(count, "count")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_video_decode_chunk(latent_frame_axis: int = 2) -> PolicyComponent:
+    """Slice the latent frames belonging to one causal decode chunk.
+
+    Reproduces the reference chunk walk, where the odd frame left over by the
+    two-frame stride is folded into the first chunk::
+
+        remaining = latent_frames % 2
+        start = 2 * step + (0 if step == 0 else remaining)
+        end   = 2 * (step + 1) + remaining
+    """
+    graph, builder = _make_graph("video_decode_chunk")
+    op = builder.op
+    latent = builder.input(
+        "latent",
+        ir.DataType.FLOAT,
+        ["batch", "channels", "latent_frames", "height", "width"],
+    )
+    step = builder.input("step", ir.DataType.INT64, ["batch"])
+
+    two = op.Constant(value_ints=[2])
+    zero = op.Constant(value_ints=[0])
+    frames = op.Shape(latent, start=latent_frame_axis, end=latent_frame_axis + 1)
+    remaining = op.Mod(frames, two)
+    # The loop induction value is batch-broadcast; every row walks the same clip.
+    index = op.Slice(step, zero, op.Constant(value_ints=[1]), zero)
+    offset = op.Where(op.Equal(index, zero), zero, remaining)
+    start = op.Add(op.Mul(index, two), offset)
+    end = op.Add(op.Mul(op.Add(index, op.Constant(value_ints=[1])), two), remaining)
+    chunk = op.Slice(latent, start, end, op.Constant(value_ints=[latent_frame_axis]))
+    _set_public_shape(chunk, ["batch", "channels", "chunk_frames", "height", "width"])
+    builder.add_output(chunk, "chunk")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_video_conv_cache_initializer(
+    entries: list[tuple[str, int, int]],
+    dtype: ir.DataType = ir.DataType.FLOAT,
+) -> PolicyComponent:
+    """Zero-length causal convolution caches sized from the latent grid.
+
+    ``entries`` are ``(port, channels, spatial_scale)``. A zero-length temporal
+    axis is the encoding of "no previous chunk", which makes the first decode
+    chunk replicate its own first frame exactly as the reference does.
+    """
+    graph, builder = _make_graph("video_conv_cache_initializer")
+    op = builder.op
+    latent = builder.input(
+        "latent",
+        dtype,
+        ["batch", "channels", "latent_frames", "height", "width"],
+    )
+    batch = op.Shape(latent, start=0, end=1)
+    height = op.Shape(latent, start=3, end=4)
+    width = op.Shape(latent, start=4, end=5)
+    zero = ir.tensor([0.0], dtype=dtype)
+    for port, channels, scale in entries:
+        scaled_height = (
+            height if scale == 1 else op.Mul(height, op.Constant(value_ints=[scale]))
+        )
+        scaled_width = width if scale == 1 else op.Mul(width, op.Constant(value_ints=[scale]))
+        shape = op.Concat(
+            batch,
+            op.Constant(value_ints=[channels, 0]),
+            scaled_height,
+            scaled_width,
+            axis=0,
+        )
+        cache = op.ConstantOfShape(shape, value=zero)
+        _set_public_shape(
+            cache,
+            [
+                "batch",
+                channels,
+                0,
+                "height" if scale == 1 else f"{scale}*height",
+                "width" if scale == 1 else f"{scale}*width",
+            ],
+        )
+        builder.add_output(cache, port)
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_video_latent_permute(perm: list[int]) -> PolicyComponent:
+    """Reorder a video latent between the denoiser and VAE layouts.
+
+    CogVideoX denoises ``[batch, frames, channels, height, width]`` but decodes
+    ``[batch, channels, frames, height, width]``; the transposition is part of
+    the pipeline contract, not an implementation detail of either model.
+    """
+    graph, builder = _make_graph("video_latent_permute")
+    op = builder.op
+    source = builder.input(
+        "latent", ir.DataType.FLOAT, ["batch", "frames", "channels", "height", "width"]
+    )
+    permuted = op.Transpose(source, perm=perm)
+    _set_public_shape(permuted, ["batch", "channels", "frames", "height", "width"])
+    builder.add_output(permuted, "permuted")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_video_latent_unscale(scaling_factor: float) -> PolicyComponent:
+    """Undo the autoencoder's latent scaling before decoding."""
+    graph, builder = _make_graph("video_latent_unscale")
+    op = builder.op
+    latent = builder.input(
+        "latent", ir.DataType.FLOAT, ["batch", "channels", "frames", "height", "width"]
+    )
+    unscaled = op.Div(latent, op.CastLike(op.Constant(value_float=scaling_factor), latent))
+    _set_public_shape(unscaled, ["batch", "channels", "frames", "height", "width"])
+    builder.add_output(unscaled, "unscaled")
     return _component("mobius.policy.auxiliary@1", graph, {})

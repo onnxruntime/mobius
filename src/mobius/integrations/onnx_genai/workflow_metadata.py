@@ -25,6 +25,7 @@ from mobius.generation import (
     build_code_history_append,
     build_codec_layout_transpose,
     build_counter_rng_normal,
+    build_ddim_solver_step,
     build_decoder_state_initializer,
     build_decoder_step_update,
     build_empty_features,
@@ -33,6 +34,7 @@ from mobius.generation import (
     build_flow_match_solver_step,
     build_greedy_sampler,
     build_guidance_combine,
+    build_identity_model_input,
     build_integer_add,
     build_integer_minimum,
     build_last_token_logits,
@@ -41,6 +43,7 @@ from mobius.generation import (
     build_proposal_metrics,
     build_scalar_constant,
     build_schedule_constant,
+    build_schedule_history_append,
     build_schedule_lookup,
     build_seeded_categorical_sampler,
     build_selective_integer_add,
@@ -56,6 +59,12 @@ from mobius.generation import (
     build_tts_decoder_step_update,
     build_tts_state_initializer,
     build_unpack_latents_2x2,
+    build_video_conv_cache_initializer,
+    build_video_decode_chunk,
+    build_video_decode_chunk_count,
+    build_video_latent_initializer,
+    build_video_latent_permute,
+    build_video_latent_unscale,
     build_zeros_like,
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
@@ -289,6 +298,8 @@ def _publish_workflow_v1(workflow: dict[str, Any]) -> dict[str, Any]:
                 "output": node["output"],
                 "mode": node["mode"],
             }
+            if "axis" in node:
+                result["axis"] = node["axis"]
             if "valid_length" in node:
                 result["valid_length"] = rewrite(node["valid_length"])
             if "when" in node:
@@ -2396,6 +2407,29 @@ def _accumulated_contract(contract: dict[str, Any], symbol: str) -> dict[str, An
     shape = list(contract["shape"])
     shape[-1] = symbol
     return {**contract, "shape": shape}
+def _cache_cell(port: str) -> str:
+    """State-cell name for a ``conv_cache.<path>`` decoder port."""
+    return "conv_cache_" + port[len("conv_cache.") :].replace(".", "_")
+
+
+CONV_CACHE_SCALE_METADATA = "mobius.conv_cache.spatial_scale."
+
+
+def _cache_spatial_scale(model: Any, value: ir.Value) -> int:
+    """Spatial upsampling a conv-cache port has undergone relative to the latent.
+
+    A causal video decoder caches activations at several resolutions, and the
+    workflow has to allocate the empty first-chunk caches at exactly those
+    resolutions or the decoder's concatenation fails. The producing task records
+    the ratio on the model, because symbolic dimension names are not a reliable
+    channel: shape inference is free to replace a declared ``8*latent_height``
+    with an anonymous symbol when it unifies the port with an internal value.
+    """
+    recorded = model.metadata_props.get(f"{CONV_CACHE_SCALE_METADATA}{value.name}")
+    if recorded is not None:
+        return int(recorded)
+    dimension = str(list(value.shape)[3])
+    return int(dimension.split("*")[0]) if "*" in dimension else 1
 
 
 def build_diffusion_workflow_metadata(
@@ -3315,6 +3349,549 @@ def write_image_edit_workflow_metadata(
         timesteps=timesteps,
         guidance_scale=guidance_scale,
     )
+    pkg.save_policy_components(output_dir)
+    add_adapter_service_to_metadata(metadata, pkg, output_dir)
+    path = os.path.join(output_dir, "inference_metadata.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        _dump_yaml(metadata, handle)
+    return path
+
+
+def build_video_diffusion_workflow_metadata(
+    pkg: Any,
+    *,
+    num_inference_steps: int,
+    schedule: list[float] | None = None,
+    timesteps: list[float] | None = None,
+    init_noise_sigma: float = 1.0,
+    scaling_factor: float = 1.0,
+    latent_permutation: list[int] | None = None,
+    solver: str = "euler",
+    clip_sample_range: float | None = None,
+) -> dict[str, Any]:
+    """Build a text-to-video diffusion workflow over rank-5 temporal latents.
+
+    The shape of the workflow differs from the image path in ways that are
+    intrinsic to video rather than cosmetic:
+
+    - the latent and the published frames carry a temporal axis, so every
+      contract is rank 5 and no stage may assume a single frame;
+    - the scheduler's timestep history is carried state, not telemetry;
+    - the decoder is causal and is invoked once per latent-frame chunk, with the
+      convolution caches as runtime-owned state released at the end of the
+      invocation;
+    - frames are published incrementally, appending on the temporal axis as each
+      chunk is decoded, so a consumer sees frames before the clip is finished.
+    """
+    if num_inference_steps < 1:
+        raise ValueError("num_inference_steps must be >= 1")
+    names = set(pkg.keys())
+    denoiser_name = next(
+        (name for name in ("denoiser", "transformer", "unet") if name in names), None
+    )
+    vae_name = next(
+        (name for name in ("vae_decoder", "decoder", "vae") if name in names), None
+    )
+    if denoiser_name is None or vae_name is None or denoiser_name == vae_name:
+        raise ValueError("video workflow requires distinct denoiser and VAE decoder")
+    denoiser = pkg[denoiser_name]
+    vae = pkg[vae_name]
+    sample_input = _find_port(denoiser.graph.inputs, "sample", "latent", "hidden_states")
+    timestep_input = _find_port(denoiser.graph.inputs, "timestep", "time")
+    estimate_output = next(iter(denoiser.graph.outputs), None)
+    vae_input = _find_port(vae.graph.inputs, "latent_sample", "latent", "sample")
+    vae_output = next(
+        (value for value in vae.graph.outputs if not value.name.startswith("conv_cache")),
+        None,
+    )
+    if None in (sample_input, timestep_input, estimate_output, vae_input, vae_output):
+        raise ValueError("video components do not expose sample/timestep/estimate/VAE ports")
+    assert sample_input is not None
+    assert timestep_input is not None
+    assert estimate_output is not None
+    assert vae_input is not None
+    assert vae_output is not None
+    if len(sample_input.shape or []) != 5:
+        raise ValueError(
+            "video diffusion workflow requires a rank-5 [batch, frames, channels, "
+            "height, width] latent; use build_diffusion_workflow_metadata for images"
+        )
+    if _contract(sample_input) != _contract(estimate_output):
+        raise ValueError("video workflow requires matching latent/estimate contracts")
+    if len(vae_input.shape or []) != 5 or len(vae_output.shape or []) != 5:
+        raise ValueError("video VAE decode must be rank 5 on both the latent and the frames")
+
+    cache_ports = [
+        value.name for value in vae.graph.inputs if value.name.startswith("conv_cache.")
+    ]
+    cache_outputs = {
+        value.name[len("conv_cache_out.") :]: value.name
+        for value in vae.graph.outputs
+        if value.name.startswith("conv_cache_out.")
+    }
+    if not cache_ports or set(cache_ports) != {f"conv_cache.{name}" for name in cache_outputs}:
+        raise ValueError("causal video decode requires paired conv_cache/conv_cache_out ports")
+    cache_entries = [
+        (
+            port,
+            int(list(next(v for v in vae.graph.inputs if v.name == port).shape)[1]),
+            _cache_spatial_scale(vae, next(v for v in vae.graph.inputs if v.name == port)),
+        )
+        for port in cache_ports
+    ]
+
+    text_name = next(
+        (name for name in ("text_encoder", "text_encoder_2") if name in names), None
+    )
+    text_encoder = pkg[text_name] if text_name is not None else None
+    conditioning_input = next(
+        (
+            value
+            for value in denoiser.graph.inputs
+            if value is not sample_input
+            and value is not timestep_input
+            and ("encoder" in value.name or "context" in value.name)
+        ),
+        None,
+    )
+    conditioning_output = None
+    if text_encoder is not None and conditioning_input is not None:
+        conditioning_output = next(
+            (
+                value
+                for value in text_encoder.graph.outputs
+                if _contract(value) == _contract(conditioning_input)
+            ),
+            next(iter(text_encoder.graph.outputs), None),
+        )
+
+    if solver not in ("euler", "ddim"):
+        raise ValueError("video solver must be 'euler' or 'ddim'")
+    latent_dims = ["batch", "frames", "channels", "height", "width"]
+    attach_policy_components(pkg, PolicyCapabilities())
+    if solver == "ddim":
+        # DDIM defines scale_model_input as the identity and consumes cumulative
+        # alphas rather than sigmas.
+        pkg.add_policy_component(
+            "model_input", build_identity_model_input(sample_input.dtype, latent_dims)
+        )
+        pkg.add_policy_component(
+            "solver_step",
+            build_ddim_solver_step(
+                sample_input.dtype, latent_dims, clip_sample_range=clip_sample_range
+            ),
+        )
+    else:
+        pkg.add_policy_component(
+            "model_input", build_euler_model_input(sample_input.dtype, latent_dims)
+        )
+        pkg.add_policy_component(
+            "solver_step", build_euler_solver_step(sample_input.dtype, latent_dims)
+        )
+    pkg.add_policy_component("continue_predicate", build_boolean_not())
+    pkg.add_policy_component(
+        "video_latent_init",
+        build_video_latent_initializer(sample_input.dtype, init_noise_sigma),
+    )
+    pkg.add_policy_component(
+        "schedule_history_append", build_schedule_history_append(timestep_input.dtype)
+    )
+    pkg.add_policy_component(
+        "video_latent_permute",
+        build_video_latent_permute(latent_permutation or [0, 2, 1, 3, 4]),
+    )
+    pkg.add_policy_component(
+        "video_latent_unscale", build_video_latent_unscale(scaling_factor)
+    )
+    pkg.add_policy_component("video_decode_chunks", build_video_decode_chunk_count())
+    pkg.add_policy_component("video_decode_chunk", build_video_decode_chunk())
+    pkg.add_policy_component(
+        "video_conv_cache_init", build_video_conv_cache_initializer(cache_entries)
+    )
+
+    schedule_values = schedule or [
+        1.0 - index / num_inference_steps for index in range(num_inference_steps + 1)
+    ]
+    timestep_values = timesteps or schedule_values[:-1]
+    if len(schedule_values) != num_inference_steps + 1:
+        raise ValueError("video solver schedule must contain num_inference_steps + 1 values")
+    if len(timestep_values) != num_inference_steps:
+        raise ValueError("video timesteps must contain num_inference_steps values")
+    pkg.add_policy_component("diffusion_schedule", build_schedule_constant(schedule_values))
+    pkg.add_policy_component("diffusion_timesteps", build_schedule_constant(timestep_values))
+    pkg.add_policy_component("schedule_lookup", build_schedule_lookup(timestep_input.dtype))
+
+    latent_contract = _request_aligned(_contract(sample_input))
+    batch = latent_contract["shape"][0]
+    batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
+    batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch]}
+    control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
+    history_contract = _request_aligned(
+        {
+            "dtype": _contract(timestep_input)["dtype"],
+            "rank": 2,
+            "shape": [batch, "scheduler_history"],
+        }
+    )
+
+    inputs: dict[str, Any] = {
+        "request.noise": {
+            "contract": latent_contract,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "application", "name": "noise"},
+            "required": True,
+        },
+        "request.max_iterations": {
+            "contract": control_int,
+            "role": {"kind": "runtime", "version": "1.0", "role": "max_iterations"},
+            "source": {"kind": "request", "field": "max_iterations"},
+            "required": False,
+            "default": num_inference_steps,
+        },
+        "package.false": {
+            "contract": batch_bool,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": False,
+        },
+        "package.one_control": {
+            "contract": control_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 1,
+        },
+        "package.history_limit": {
+            "contract": control_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": num_inference_steps,
+        },
+        "package.cache_frames": {
+            "contract": control_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 2,
+        },
+    }
+
+    setup_nodes: list[dict[str, Any]] = [
+        _invoke("diffusion_schedule", {}, {"schedule": "diffusion.schedule"}),
+        _invoke("diffusion_timesteps", {}, {"schedule": "diffusion.timesteps"}),
+    ]
+    conditioning_value = None
+    if text_encoder is not None and conditioning_output is not None:
+        text_inputs = {}
+        for index, value in enumerate(text_encoder.graph.inputs):
+            name = f"request.{value.name}"
+            inputs[name] = {
+                "contract": _request_aligned(_contract(value)),
+                "role": (
+                    {"kind": "runtime", "version": "1.0", "role": "prompt_tokens"}
+                    if index == 0
+                    else {"kind": "opaque"}
+                ),
+                "source": (
+                    {"kind": "request", "field": "prompt_tokens"}
+                    if index == 0
+                    else {"kind": "application", "name": value.name}
+                ),
+                "required": True,
+            }
+            text_inputs[value.name] = name
+        conditioning_value = "conditioning.hidden_states"
+        setup_nodes.append(
+            _invoke(text_name, text_inputs, {conditioning_output.name: conditioning_value})
+        )
+    if conditioning_input is not None and conditioning_value is None:
+        # No text encoder ships with the package, so the prompt embedding is
+        # supplied by the application. Conditioning stays a declared input
+        # rather than an implicit constant: an unconditioned video model would
+        # simply have no such port on its denoiser.
+        conditioning_value = f"request.{conditioning_input.name}"
+        inputs[conditioning_value] = {
+            "contract": _request_aligned(_contract(conditioning_input)),
+            "role": {"kind": "opaque"},
+            "source": {"kind": "application", "name": conditioning_input.name},
+            "required": True,
+        }
+    setup_nodes.append(
+        _invoke(
+            "continue_predicate",
+            {"done": "package.false"},
+            {"continue": "setup.continue"},
+        )
+    )
+
+    denoiser_inputs = {
+        sample_input.name: "diffusion.model_input",
+        timestep_input.name: "diffusion.timestep",
+    }
+    if conditioning_input is not None and conditioning_value is not None:
+        denoiser_inputs[conditioning_input.name] = conditioning_value
+
+    body_nodes: list[dict[str, Any]] = [
+        _invoke(
+            "schedule_lookup",
+            {"schedule": "diffusion.timesteps", "step": "loop.iteration"},
+            {"timestep": "diffusion.timestep"},
+        ),
+        _invoke(
+            "model_input",
+            {
+                "sample": "state.latent.body",
+                "step": "loop.iteration",
+                "schedule": "diffusion.schedule",
+            },
+            {"model_input": "diffusion.model_input"},
+        ),
+        _invoke(denoiser_name, denoiser_inputs, {estimate_output.name: "denoiser.estimate"}),
+        _invoke(
+            "solver_step",
+            {
+                "sample": "state.latent.body",
+                "derivative": "denoiser.estimate",
+                "step": "loop.iteration",
+                "schedule": "diffusion.schedule",
+            },
+            {"next_state": "latent.body"},
+            {"solver": _effect("solver.0", "solver.1")},
+        ),
+        _invoke(
+            "schedule_history_append",
+            {"history": "state.scheduler_history.body", "timestep": "diffusion.timestep"},
+            {"next": "scheduler_history.body"},
+        ),
+        _invoke(
+            "continue_predicate",
+            {"done": "package.false"},
+            {"continue": "loop.continue"},
+        ),
+    ]
+
+    decode_body: list[dict[str, Any]] = [
+        _invoke(
+            "video_decode_chunk",
+            {"latent": "decode.latent", "step": "decode.iteration"},
+            {"chunk": "decode.chunk"},
+        ),
+        _invoke(
+            vae_name,
+            {
+                vae_input.name: "decode.chunk",
+                **{port: f"state.{_cache_cell(port)}.body" for port in cache_ports},
+            },
+            {
+                vae_output.name: "decode.frames",
+                **{
+                    cache_outputs[name]: f"{_cache_cell(f'conv_cache.{name}')}.body"
+                    for name in cache_outputs
+                },
+            },
+        ),
+        {
+            "kind": "emit",
+            "value": "decode.frames",
+            "output": "video",
+            "mode": "append",
+            "axis": 2,
+            "effect_name": "emit",
+            "effect": _effect("emit.0", "emit.1"),
+        },
+        _invoke(
+            "continue_predicate",
+            {"done": "package.false"},
+            {"continue": "decode.loop.continue"},
+        ),
+    ]
+
+    frames_contract = _request_aligned(_contract(vae_output))
+    workflow = {
+        "manifest": {
+            "ir_version": "1.0",
+            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
+            "capabilities": [
+                "workflow_ssa",
+                "linear_effects",
+                "nested_control_flow",
+                "loop_induction_values",
+                "typed_emit",
+                "bounded_state_recurrence",
+            ],
+        },
+        "inputs": inputs,
+        "outputs": {
+            "video": {
+                "contract": frames_contract,
+                "role": "video",
+                "stage": "pre_adapter",
+            }
+        },
+        "components": {
+            name: _component(model, _artifact(name, len(pkg))) for name, model in pkg.items()
+        },
+        "state": {
+            "latent": {
+                "contract": latent_contract,
+                "scope": "invocation",
+                "initializer": "latent.initial",
+                "recurrence": {"kind": "invariant"},
+            },
+            "scheduler_history": {
+                "contract": history_contract,
+                "scope": "invocation",
+                "initializer": "scheduler.history.initial",
+                "recurrence": {
+                    "kind": "growing",
+                    "axis": 1,
+                    "increment": "package.one_control",
+                    "max": "package.history_limit",
+                },
+            },
+            **{
+                _cache_cell(port): {
+                    "contract": _request_aligned(
+                        _contract(next(v for v in vae.graph.inputs if v.name == port))
+                    ),
+                    "scope": "invocation",
+                    "initializer": f"{_cache_cell(port)}.initial",
+                    "recurrence": {
+                        "kind": "bounded",
+                        "axis": 2,
+                        "max": "package.cache_frames",
+                    },
+                    "management": "runtime",
+                    "release_boundary": "invocation",
+                }
+                for port in cache_ports
+            },
+        },
+        "initial_effects": {
+            "solver": "solver.0",
+            "state:latent": "state:latent.0",
+            "state:scheduler_history": "state:scheduler_history.0",
+            **{
+                f"state:{_cache_cell(port)}": f"state:{_cache_cell(port)}.0"
+                for port in cache_ports
+            },
+            "emit": "emit.0",
+        },
+        "graph": {
+            "kind": "sequence",
+            "nodes": [
+                _invoke(
+                    "video_latent_init",
+                    {"noise": "request.noise"},
+                    {"latent": "latent.initial", "history": "scheduler.history.initial"},
+                ),
+                {
+                    "kind": "loop",
+                    "setup": {"kind": "sequence", "nodes": setup_nodes},
+                    "body": {"kind": "sequence", "nodes": body_nodes},
+                    "condition": "loop.continue",
+                    "max_iterations": "request.max_iterations",
+                    "iteration": {"value": "loop.iteration", "contract": batch_int},
+                    "carried": [
+                        {
+                            "cell": "latent",
+                            "current": "latent.initial",
+                            "body_input": "state.latent.body",
+                            "body_output": "latent.body",
+                            "next": "latent.final",
+                            "read_effect": _effect("state:latent.0", "state:latent.read"),
+                            "write_effect": _effect("state:latent.read", "state:latent.1"),
+                        },
+                        {
+                            "cell": "scheduler_history",
+                            "current": "scheduler.history.initial",
+                            "body_input": "state.scheduler_history.body",
+                            "body_output": "scheduler_history.body",
+                            "next": "scheduler_history.final",
+                            "read_effect": _effect(
+                                "state:scheduler_history.0", "state:scheduler_history.read"
+                            ),
+                            "write_effect": _effect(
+                                "state:scheduler_history.read", "state:scheduler_history.1"
+                            ),
+                        },
+                    ],
+                },
+                _invoke(
+                    "video_latent_permute",
+                    {"latent": "latent.final"},
+                    {"permuted": "decode.latent_permuted"},
+                ),
+                _invoke(
+                    "video_latent_unscale",
+                    {"latent": "decode.latent_permuted"},
+                    {"unscaled": "decode.latent"},
+                ),
+                _invoke(
+                    "video_decode_chunks",
+                    {"latent": "decode.latent"},
+                    {"count": "decode.chunks"},
+                ),
+                _invoke(
+                    "video_conv_cache_init",
+                    {"latent": "decode.latent"},
+                    {port: f"{_cache_cell(port)}.initial" for port in cache_ports},
+                ),
+                {
+                    "kind": "loop",
+                    "setup": {
+                        "kind": "sequence",
+                        "nodes": [
+                            _invoke(
+                                "continue_predicate",
+                                {"done": "package.false"},
+                                {"continue": "decode.setup.continue"},
+                            )
+                        ],
+                    },
+                    "body": {"kind": "sequence", "nodes": decode_body},
+                    "condition": "decode.loop.continue",
+                    "max_iterations": "decode.chunks",
+                    "iteration": {"value": "decode.iteration", "contract": batch_int},
+                    "carried": [
+                        {
+                            "cell": _cache_cell(port),
+                            "current": f"{_cache_cell(port)}.initial",
+                            "body_input": f"state.{_cache_cell(port)}.body",
+                            "body_output": f"{_cache_cell(port)}.body",
+                            "next": f"{_cache_cell(port)}.final",
+                            "read_effect": _effect(
+                                f"state:{_cache_cell(port)}.0",
+                                f"state:{_cache_cell(port)}.read",
+                            ),
+                            "write_effect": _effect(
+                                f"state:{_cache_cell(port)}.read",
+                                f"state:{_cache_cell(port)}.1",
+                            ),
+                        }
+                        for port in cache_ports
+                    ],
+                },
+            ],
+        },
+    }
+    metadata = {
+        "schema_version": "v1",
+        "pipeline": {"workflow": _publish_workflow_v1(workflow)},
+    }
+    add_policy_components_to_workflow(metadata, pkg)
+    return metadata
+
+
+def write_video_diffusion_workflow_metadata(
+    pkg: Any,
+    output_dir: str,
+    **kwargs: Any,
+) -> str:
+    os.makedirs(output_dir, exist_ok=True)
+    metadata = build_video_diffusion_workflow_metadata(pkg, **kwargs)
     pkg.save_policy_components(output_dir)
     add_adapter_service_to_metadata(metadata, pkg, output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")

@@ -35,6 +35,7 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     write_diffusion_workflow_metadata,
     write_language_diffusion_workflow_metadata,
     write_speculative_workflow_metadata,
+    write_video_diffusion_workflow_metadata,
 )
 from mobius.models.qwen3_tts import Qwen3TTSForConditionalGeneration
 from mobius.models.qwen3_tts_test import _TINY_CONFIG
@@ -323,6 +324,196 @@ def _executable_diffusion_package() -> ModelPackage:
             "text_encoder": ir.Model(text_graph, ir_version=11),
             "denoiser": ir.Model(denoiser_graph, ir_version=11),
             "vae_decoder": ir.Model(vae_graph, ir_version=11),
+        }
+    )
+
+
+def _causal_temporal_step(
+    builder,
+    value: ir.Value,
+    cache: ir.Value,
+    taps: int,
+) -> tuple[ir.Value, ir.Value]:
+    """One causal temporal convolution over frames, threaded through a cache.
+
+    Reproduces the structure a real causal video decoder relies on: the frames
+    that precede the current chunk come from the cache, the first chunk of a
+    clip replicates its own first frame instead, and the tail of the padded
+    input becomes the next chunk's cache. Returns the filtered frames and the
+    cache to carry.
+    """
+    op = builder.op
+    padded = op.Concat(cache, value, axis=2)
+    # A zero-length cache means this is the clip's first chunk, so the missing
+    # history is the first frame repeated -- the same branch-free trick the real
+    # decoder uses to avoid a first-chunk special case.
+    have = op.Min(
+        op.Shape(cache, start=2, end=3),
+        op.Constant(value_ints=[taps]),
+    )
+    front = op.Sub(op.Constant(value_ints=[taps]), have)
+    padded = op.Pad(
+        padded,
+        op.Concat(front, op.Constant(value_ints=[0]), axis=0),
+        None,
+        op.Constant(value_ints=[2]),
+        mode="edge",
+    )
+    length = op.Shape(padded, start=2, end=3)
+    current = op.Slice(
+        padded,
+        op.Constant(value_ints=[taps]),
+        length,
+        op.Constant(value_ints=[2]),
+    )
+    history = op.Slice(
+        padded,
+        op.Constant(value_ints=[0]),
+        op.Sub(length, op.Constant(value_ints=[taps])),
+        op.Constant(value_ints=[2]),
+    )
+    filtered = op.Mul(
+        op.Add(current, history),
+        op.CastLike(op.Constant(value_float=0.5), current),
+    )
+    next_cache = op.Slice(
+        padded,
+        op.Sub(length, op.Constant(value_ints=[taps])),
+        length,
+        op.Constant(value_ints=[2]),
+    )
+    return filtered, next_cache
+
+
+def _executable_video_package() -> ModelPackage:
+    """A rank-5 video denoiser plus a causal, chunked video decoder.
+
+    Small enough to run anywhere, but structurally a video pipeline: the latent
+    carries a temporal axis through the denoise loop, and the decoder expands
+    frames, works at two spatial resolutions, and keeps per-resolution
+    convolution caches so a clip can be decoded a chunk at a time.
+    """
+    denoiser_graph, denoiser_builder = _graph("transformer")
+    op = denoiser_builder.op
+    sample = denoiser_builder.input(
+        "sample", ir.DataType.FLOAT, ["batch", "num_frames", 4, "height", "width"]
+    )
+    timestep = denoiser_builder.input("timestep", ir.DataType.INT64, ["batch"])
+    conditioning = denoiser_builder.input(
+        "encoder_hidden_states", ir.DataType.FLOAT, ["batch", "prompt_sequence", 32]
+    )
+    scalar_shape = op.Concat(
+        op.Shape(sample, start=0, end=1),
+        op.Constant(value_ints=[1, 1, 1, 1]),
+        axis=0,
+    )
+    timestep_bias = op.Reshape(
+        op.Div(op.Cast(timestep, to=ir.DataType.FLOAT), op.Constant(value_float=1000.0)),
+        scalar_shape,
+    )
+    conditioning_bias = op.Reshape(op.ReduceMean(conditioning, axes=[1, 2]), scalar_shape)
+    # A frame-dependent term, so a stage that collapsed or reordered the temporal
+    # axis would change the result rather than silently pass.
+    frame_index = op.Cast(
+        op.Range(
+            op.Squeeze(op.Constant(value_ints=[0])),
+            op.Squeeze(op.Shape(sample, start=1, end=2)),
+            op.Squeeze(op.Constant(value_ints=[1])),
+        ),
+        to=ir.DataType.FLOAT,
+    )
+    frame_bias = op.Div(
+        op.Reshape(frame_index, op.Constant(value_ints=[1, -1, 1, 1, 1])),
+        op.Constant(value_float=100.0),
+    )
+    estimate = op.Add(
+        op.Mul(sample, op.Constant(value_float=0.5)),
+        op.Add(op.Add(timestep_bias, conditioning_bias), frame_bias),
+    )
+    denoiser_builder.add_output(
+        _typed(estimate, ir.DataType.FLOAT, ["batch", "num_frames", 4, "height", "width"]),
+        "noise_pred",
+    )
+
+    vae_graph, vae_builder = _graph("vae_decoder")
+    op = vae_builder.op
+    latent = vae_builder.input(
+        "latent_sample",
+        ir.DataType.FLOAT,
+        ["batch", 4, "latent_frames", "latent_height", "latent_width"],
+    )
+    cache_in = vae_builder.input(
+        "conv_cache.conv_in",
+        ir.DataType.FLOAT,
+        ["batch", 4, "cache_frames", "latent_height", "latent_width"],
+    )
+    cache_out_port = vae_builder.input(
+        "conv_cache.conv_out",
+        ir.DataType.FLOAT,
+        ["batch", 3, "cache_frames", "2*latent_height", "2*latent_width"],
+    )
+    filtered, next_cache_in = _causal_temporal_step(vae_builder, latent, cache_in, 1)
+    # Nearest-neighbour expansion in time and space: [B,C,T,H,W] -> [B,C,2T,2H,2W].
+    shape = op.Shape(filtered)
+    batch = op.Slice(shape, [0], [1], [0])
+    channels = op.Slice(shape, [1], [2], [0])
+    frames = op.Slice(shape, [2], [3], [0])
+    height = op.Slice(shape, [3], [4], [0])
+    width = op.Slice(shape, [4], [5], [0])
+    one = op.Constant(value_ints=[1])
+    two = op.Constant(value_ints=[2])
+    expanded = op.Reshape(
+        filtered,
+        op.Concat(batch, channels, frames, one, height, one, width, one, axis=0),
+    )
+    expanded = op.Expand(
+        expanded,
+        op.Concat(batch, channels, frames, two, height, two, width, two, axis=0),
+    )
+    expanded = op.Reshape(
+        expanded,
+        op.Concat(
+            batch,
+            channels,
+            op.Mul(frames, two),
+            op.Mul(height, two),
+            op.Mul(width, two),
+            axis=0,
+        ),
+    )
+    rgb = op.Slice(expanded, [0], [3], [1])
+    decoded, next_cache_out = _causal_temporal_step(vae_builder, rgb, cache_out_port, 1)
+    vae_builder.add_output(
+        _typed(
+            decoded,
+            ir.DataType.FLOAT,
+            ["batch", 3, "frames", "2*latent_height", "2*latent_width"],
+        ),
+        "sample",
+    )
+    vae_builder.add_output(
+        _typed(
+            next_cache_in,
+            ir.DataType.FLOAT,
+            ["batch", 4, "cache_frames", "latent_height", "latent_width"],
+        ),
+        "conv_cache_out.conv_in",
+    )
+    vae_builder.add_output(
+        _typed(
+            next_cache_out,
+            ir.DataType.FLOAT,
+            ["batch", 3, "cache_frames", "2*latent_height", "2*latent_width"],
+        ),
+        "conv_cache_out.conv_out",
+    )
+    vae_model = ir.Model(vae_graph, ir_version=11)
+    vae_model.metadata_props["mobius.conv_cache.spatial_scale.conv_cache.conv_in"] = "1"
+    vae_model.metadata_props["mobius.conv_cache.spatial_scale.conv_cache.conv_out"] = "2"
+    return ModelPackage(
+        {
+            "transformer": ir.Model(denoiser_graph, ir_version=11),
+            "vae_decoder": vae_model,
         }
     )
 
@@ -784,6 +975,20 @@ def main() -> None:
         masked,
         str(directory),
         num_inference_steps=8,
+    )
+
+    video = _executable_video_package()
+    directory = args.output / "video"
+    video.save(str(directory), progress_bar=False, check_weights=False)
+    write_video_diffusion_workflow_metadata(
+        video,
+        str(directory),
+        num_inference_steps=3,
+        schedule=[0.9, 0.6, 0.3, 1.0],
+        timesteps=[600.0, 300.0, 0.0],
+        solver="ddim",
+        clip_sample_range=1.0,
+        scaling_factor=1.15258426,
     )
 
     codec = _executable_codec_package()

@@ -16,6 +16,7 @@ from mobius.generation import (
     build_boolean_not,
     build_code_frame_update,
     build_counter_rng_normal,
+    build_ddim_solver_step,
     build_decoder_state_initializer,
     build_decoder_step_update,
     build_empty_features,
@@ -35,6 +36,7 @@ from mobius.generation import (
     build_pack_latents_2x2,
     build_proposal_metrics,
     build_scalar_constant,
+    build_schedule_history_append,
     build_seeded_categorical_sampler,
     build_sequence_concat,
     build_shape_constant,
@@ -45,6 +47,10 @@ from mobius.generation import (
     build_token_state_update,
     build_true_cfg,
     build_unpack_latents_2x2,
+    build_video_conv_cache_initializer,
+    build_video_decode_chunk,
+    build_video_decode_chunk_count,
+    build_video_latent_initializer,
     build_zeros_like,
 )
 from mobius.generation._policy_components import _make_graph
@@ -755,6 +761,104 @@ def test_euler_solver_runtime_parity(tmp_path):
         },
     )
     np.testing.assert_allclose(actual, sample - derivative)
+
+
+def test_ddim_solver_runtime_parity_on_a_video_latent(tmp_path):
+    # [batch, frames, channels, height, width]: the update has to broadcast the
+    # per-row alphas over a temporal axis, not just over an image.
+    dims = ["batch", "frames", "channels", "height", "width"]
+    sample = np.linspace(-2.0, 2.0, 24, dtype=np.float32).reshape(1, 3, 2, 2, 2)
+    estimate = np.full_like(sample, 0.25)
+    schedule = np.array([0.4, 0.9, 1.0], np.float32)
+    (actual,) = _run(
+        build_ddim_solver_step(latent_dims=dims),
+        tmp_path,
+        {
+            "sample": sample,
+            "derivative": estimate,
+            "step": np.array([0], np.int64),
+            "schedule": schedule,
+        },
+    )
+    alpha, alpha_prev = schedule[0], schedule[1]
+    expected = (
+        np.sqrt(alpha_prev) * ((sample - np.sqrt(1 - alpha) * estimate) / np.sqrt(alpha))
+        + np.sqrt(1 - alpha_prev) * estimate
+    )
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_ddim_solver_clips_the_predicted_clean_latent(tmp_path):
+    dims = ["batch", "frames", "channels", "height", "width"]
+    sample = np.full((1, 1, 1, 1, 1), 8.0, np.float32)
+    estimate = np.zeros_like(sample)
+    (actual,) = _run(
+        build_ddim_solver_step(latent_dims=dims, clip_sample_range=1.0),
+        tmp_path,
+        {
+            "sample": sample,
+            "derivative": estimate,
+            "step": np.array([0], np.int64),
+            "schedule": np.array([0.25, 0.81], np.float32),
+        },
+    )
+    # pred_x0 = 8 / sqrt(0.25) = 16, clipped to 1, then renoised to alpha_prev.
+    np.testing.assert_allclose(actual, np.sqrt(0.81), rtol=1e-6)
+
+
+def test_video_decode_chunk_walk_matches_the_reference(tmp_path):
+    latent = np.arange(5 * 2, dtype=np.float32).reshape(1, 1, 5, 1, 2)
+    (count,) = _run(build_video_decode_chunk_count(), tmp_path, {"latent": latent})
+    np.testing.assert_array_equal(count, [2])
+    chunks = [
+        _run(
+            build_video_decode_chunk(),
+            tmp_path,
+            {"latent": latent, "step": np.array([step], np.int64)},
+        )[0]
+        for step in range(int(count[0]))
+    ]
+    # Five latent frames split as three then two: the odd frame is folded into
+    # the first chunk, and the chunks tile the clip without gaps or overlap.
+    assert [chunk.shape[2] for chunk in chunks] == [3, 2]
+    np.testing.assert_array_equal(np.concatenate(chunks, axis=2), latent)
+
+    single = np.arange(3 * 2, dtype=np.float32).reshape(1, 1, 3, 1, 2)
+    (single_count,) = _run(build_video_decode_chunk_count(), tmp_path, {"latent": single})
+    np.testing.assert_array_equal(single_count, [1])
+
+
+def test_video_conv_cache_initializer_sizes_each_resolution(tmp_path):
+    latent = np.zeros((2, 4, 3, 5, 6), np.float32)
+    caches = _run(
+        build_video_conv_cache_initializer(
+            [("conv_cache.conv_in", 4, 1), ("conv_cache.conv_out", 8, 4)]
+        ),
+        tmp_path,
+        {"latent": latent},
+    )
+    # Zero frames is how "no previous chunk" is expressed; the spatial extents
+    # still have to match the resolution each cached convolution runs at.
+    assert caches[0].shape == (2, 4, 0, 5, 6)
+    assert caches[1].shape == (2, 8, 0, 20, 24)
+
+
+def test_scheduler_history_starts_empty_and_grows_per_step(tmp_path):
+    noise = np.zeros((2, 3, 4, 2, 2), np.float32)
+    latent, history = _run(
+        build_video_latent_initializer(ir.DataType.FLOAT, 2.0), tmp_path, {"noise": noise}
+    )
+    assert latent.shape == noise.shape
+    assert history.shape == (2, 0)
+    assert history.dtype == np.int64
+    for step, timestep in enumerate([600, 300, 0]):
+        (history,) = _run(
+            build_schedule_history_append(ir.DataType.INT64),
+            tmp_path,
+            {"history": history, "timestep": np.array([timestep, timestep], np.int64)},
+        )
+        assert history.shape == (2, step + 1)
+    np.testing.assert_array_equal(history, [[600, 300, 0], [600, 300, 0]])
 
 
 def test_masked_update_runtime_parity(tmp_path):
