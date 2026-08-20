@@ -57,6 +57,10 @@ class TTSTask(ModelTask):
     Each sub-module is wired into its own ONNX graph.
     """
 
+    # Every key the package produces must appear here: ``model_roles`` is what
+    # ``inspect_components`` reports and what ``build_from_module`` uses to pick
+    # optimization passes. An undeclared component silently falls back to the
+    # ``"decoder"`` role and would be handed GQA / QKV-packing fusion.
     model_roles: ClassVar[dict[str, str]] = {
         "talker": "decoder",
         "code_predictor": "decoder",
@@ -64,6 +68,13 @@ class TTSTask(ModelTask):
         "talker_step_embedder": "embedding",
         "talker_prefill_embedder": "embedding",
         "speaker_encoder": "encoder",
+        # Parameter-free graphs that wire the generation loop. They read every
+        # tensor they use from their own graph inputs, so they carry no weights
+        # and no fusion pass applies to them.
+        "code_predictor_prefill": "glue",
+        "code_predictor_step_embedder": "glue",
+        "code_predictor_indices": "glue",
+        "talker_text_step": "glue",
     }
     components: ClassVar[ComponentSpec] = ComponentSpec(
         talker="talker",

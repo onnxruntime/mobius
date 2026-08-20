@@ -169,6 +169,30 @@ def test_talker_text_step_clamps_to_last_trailing_embedding():
     np.testing.assert_array_equal(got, trailing[:, 2:3])
 
 
+def test_every_built_component_declares_a_role():
+    """model_roles must cover every key the task puts in the package.
+
+    ``build_from_module`` looks each component up in ``model_roles`` and falls
+    back to ``"decoder"`` when it is absent, which would hand the parameter-free
+    loop-wiring graphs the GQA / QKV-packing passes meant for attention stacks.
+    ``inspect_components`` reports exactly ``model_roles``, so an undeclared
+    component would also be invisible to callers planning per-component work.
+    """
+    module = Qwen3TTSForConditionalGeneration(_TINY_CONFIG)
+    package = TTSTask().build(module, _TINY_CONFIG)
+
+    # speaker_encoder is optional, so the package is a subset of the declared
+    # roles; nothing may be built that is not declared.
+    assert set(package) <= set(TTSTask.model_roles)
+    assert set(TTSTask.model_roles) - set(package) == {"speaker_encoder"}
+
+    # Glue components are pure wiring: every tensor they read is a graph input,
+    # so preprocess_weights never routes a parameter to one.
+    glue = {name for name, role in TTSTask.model_roles.items() if role == "glue"}
+    weights = module.preprocess_weights({})
+    assert not [name for name in weights if name.split(".")[0] in glue]
+
+
 def test_step_embedder_weights_shared_with_existing_tables():
     """preprocess_weights routes the same codec tables to the step embedder."""
     model = Qwen3TTSForConditionalGeneration(_TINY_CONFIG)

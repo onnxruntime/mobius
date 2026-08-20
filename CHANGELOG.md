@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Every component a task builds now declares an optimization role. Qwen3-TTS's
+  four loop-wiring graphs (`code_predictor_prefill`,
+  `code_predictor_step_embedder`, `code_predictor_indices`, `talker_text_step`)
+  were absent from `TTSTask.model_roles`, so `build_from_module` fell back to
+  the `"decoder"` role and offered them the GQA / QKV-packing passes meant for
+  attention stacks, and `inspect_components` under-reported the package by four
+  components. They now declare a `"glue"` role: a parameter-free graph that
+  reads every tensor it uses from a graph input. `arch_validation_test` fails
+  any task that builds a component it does not declare, and a network-free unit
+  test pins the same invariant for Qwen3-TTS.
+
 ### One canonical serialized representation
 
 #### Changed
