@@ -1683,6 +1683,7 @@ class TestExportForOrtGenai:
             data = json.load(f)
         assert data["model"]["eos_token_id"] == [248046, 248044]
         assert data["model"]["pad_token_id"] == 248044
+
     def test_hf_revision_is_used_for_config_and_tokenizer_assets(self, tmp_path):
         """A pinned export never mixes config and tokenizer revisions."""
         from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
