@@ -284,6 +284,9 @@ def test_seeded_decoder_sampler_uses_request_controls_and_direct_kv_carry():
     ]
     assert workflow["state"]["rng_counter"]["class"] == "semantic"
     assert workflow["state"]["rng_counter"]["initializer"] == "request.rng_counter"
+    emit = next(node for node in workflow["steps"][0]["steps"] if node["kind"] == "emit")
+    assert "row_ids" not in emit
+    assert "emit_row_identity" not in workflow["manifest"]["capabilities"]
     assert set(
         workflow["serving"]["state_service"]["groups"]["decoder_cache"]["ports"]["model"]
     ) == {"cache_0", "cache_1"}
@@ -623,12 +626,13 @@ def test_dispatch_speech_to_text_pipeline(tmp_path):
             "decoder": _FakeModel(["decoder_input_ids", "encoder_hidden_states"], ["logits"]),
         }
     )
-    artifacts = write_onnx_genai_config(pkg, str(tmp_path), kv_native_dtype="bf16")
+    artifacts = write_onnx_genai_config(pkg, str(tmp_path))
 
     with open(artifacts["inference_metadata"]) as handle:
         metadata = yaml.safe_load(handle)
 
-    assert metadata["kv_cache"] == {"native_dtype": "bfloat16"}
+    # Cache storage representation is derived from the graph, never declared.
+    assert "kv_cache" not in metadata
     pipeline = metadata["pipeline"]
     assert pipeline["models"]["encoder"]["filename"] == "encoder/model.onnx"
     assert pipeline["models"]["encoder"]["type"] == "encoder"

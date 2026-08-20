@@ -113,6 +113,10 @@ def _port(value: Any) -> _Port:
     )
 
 
+_BATCH_DIMENSION = "batch"
+"""Symbolic leading dimension mobius uses for per-request batching."""
+
+
 def _shape_metadata(port: _Port) -> list[int | str | None]:
     """Return a YAML-safe graph shape without losing symbolic dimensions."""
     shape: list[int | str | None] = []
@@ -123,6 +127,62 @@ def _shape_metadata(port: _Port) -> list[int | str | None]:
         value = getattr(dim, "value", None)
         shape.append(str(value) if value is not None else None)
     return shape
+
+
+def _name_image_preprocessing_program(image: dict[str, Any]) -> None:
+    """Convert structural preprocessing transforms into explicit typed SSA values."""
+    transforms = image["transforms"]
+    if all("source" in output for output in image["outputs"]) and all(
+        "outputs" in transform for transform in transforms
+    ):
+        # Already named: re-running would append duplicate derived transforms.
+        return
+    current: str | None = None
+    decoded: str | None = None
+    for index, transform in enumerate(transforms):
+        name = f"image.transform_{index}"
+        if transform["op"] in {"decode", "decode_rgb"}:
+            transform.pop("inputs", None)
+            decoded = name
+        else:
+            if current is None:
+                raise ValueError("image preprocessing must decode before transforming")
+            transform["inputs"] = [current]
+        transform["outputs"] = [name]
+        current = name
+    if current is None:
+        raise ValueError("image preprocessing must declare at least one transform")
+
+    derived_ops = {
+        "original_size": ("emit_original_size", decoded),
+        "transformed_size": ("emit_transformed_size", current),
+        "validity_mask": ("emit_validity_mask", current),
+        "patch_coordinates": ("emit_patch_coordinates", current),
+        "grid_dimensions": ("emit_grid_coordinates", current),
+    }
+    for output in image["outputs"]:
+        content = output["content"]
+        if content == "pixels":
+            output["source"] = current
+            continue
+        if content not in derived_ops:
+            raise ValueError(
+                f"image preprocessing output content {content!r} has no typed SSA producer"
+            )
+        operation, source = derived_ops[content]
+        if source is None:
+            raise ValueError(
+                f"image preprocessing output content {content!r} requires a decoded image"
+            )
+        name = f"image.output_{content}"
+        transforms.append(
+            {
+                "op": operation,
+                "inputs": [source],
+                "outputs": [name],
+            }
+        )
+        output["source"] = name
 
 
 def _port_metadata(port: _Port) -> dict[str, Any]:
@@ -1451,11 +1511,19 @@ def add_policy_components_to_workflow(
             "fp16": "float16",
             "bf16": "bfloat16",
         }.get(port.dtype, port.dtype)
-        return {
+        shape = _shape_metadata(port)
+        contract: dict[str, Any] = {
             "dtype": dtype,
             "rank": port.rank,
-            "shape": _shape_metadata(port),
+            "shape": shape,
         }
+        # Policy components are per-row operators: when the graph's leading
+        # dimension is the batch symbol, axis 0 carries exactly one entry per
+        # in-flight request. Declaring it lets the runtime permute/compact the
+        # batch without the producer serializing any row identity.
+        if shape and shape[0] == _BATCH_DIMENSION:
+            contract["batch_layout"] = {"kind": "request_aligned", "axis": 0}
+        return contract
 
     for name, component in policy_components.items():
         declaration = {
@@ -1932,6 +2000,9 @@ def build_native_vlm_package_metadata(
             "outputs": preprocessing_outputs,
         }
     }
+    # Bind every declared output to the processor-local value that produces it,
+    # so the runtime never has to guess which transform an output came from.
+    _name_image_preprocessing_program(metadata["preprocessing"]["image"])
     metadata["pipeline"] = {
         "models": models,
         "dataflow": dataflow,
@@ -2005,8 +2076,6 @@ def write_native_vlm_package_metadata(
     *,
     config: Any,
     source: str | None = None,
-    revision: str | None = None,
-    kv_native_dtype: str | None = None,
     filename: str = "inference_metadata.yaml",
 ) -> dict[str, str]:
     """Write native VLM metadata and the runtime's tokenizer/processor assets."""
@@ -2018,8 +2087,7 @@ def write_native_vlm_package_metadata(
         pkg,
         config=config,
         source=source,
-        revision=revision,
-        decoder_metadata=decoder_metadata_from_config(config, kv_native_dtype=kv_native_dtype),
+        decoder_metadata=decoder_metadata_from_config(config),
     )
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, filename)

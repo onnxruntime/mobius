@@ -48,7 +48,10 @@ def test_speculative_emit_uses_accepted_prefix_length():
     ]
     emit = next(node for node in workflow["steps"][0]["steps"] if node["kind"] == "emit")
     assert emit["valid_length"] == "acceptance.length"
+    # Row identity is runtime-private: the published emit step must not name it.
+    assert "row_ids" not in emit
     assert "emit_valid_length" in workflow["manifest"]["capabilities"]
+    assert "emit_row_identity" not in workflow["manifest"]["capabilities"]
     assert workflow["inputs"]["request.slot_ids"]["source"]["name"] == "serving.slot_ids"
     assert workflow["outputs"]["tokens"]["contract"]["shape"][-1] == "accepted_sequence"
     assert workflow["state"]["cache_0"]["recurrence"] == {
@@ -292,6 +295,8 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     )
     assert emit["when"] == "active"
     assert emit["valid_length"] == "token.emitted_length"
+    assert "row_ids" not in emit
+    assert "emit_row_identity" not in workflow["manifest"]["capabilities"]
     assert policy_invokes["decoder_step_update"]["inputs"]["logical_length"] == "cache_lengths"
     assert workflow["state"]["attention_mask"]["initializer"] == ("initializer.attention_mask")
     assert any(
@@ -309,6 +314,17 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     assert set(media_branch["cases"]) == {"true", "false"}
     assert media_branch["cases"]["false"]["component"] == "empty_image_features"
     state_service = workflow["serving"]["state_service"]
+    # Storage class, allocator, and compaction algorithm are the runtime's to
+    # choose; the package only declares semantics.
+    assert set(state_service) == {"groups"}
+    decoder_group = state_service["groups"]["decoder_cache"]
+    assert decoder_group["kind"] == "full_attention"
+    assert decoder_group["aliasing"] == "permitted"
+    assert decoder_group["reuse"] == {
+        "prefix_reusable": True,
+        "evictable_prefix": False,
+    }
+    assert "storage" not in decoder_group
     carried = {item["cell"] for item in workflow["steps"][0]["carried"]}
     assert {
         "slot_ids",
@@ -327,8 +343,6 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     # Shared buffering is expressed by the admitted cache ports and runtime I/O
     # binding, even when the graph has no node-level share-buffer attribute.
     assert all("past_present_share_buffer" not in node.attributes for node in decoder.graph)
-    assert decoder_cache["aliasing"] == "permitted"
-    assert decoder_cache["kind"] == "full_attention"
     kv_ports = decoder_cache["ports"]["decoder"]
     assert len(kv_ports) == 104
     assert kv_ports["cache_103"] == {
@@ -530,12 +544,17 @@ def test_speculative_workflow_uses_per_row_ragged_state_and_rng():
     assert acceptance["outputs"]["accepted_len"] == "acceptance.length"
     emit = next(node for node in body if node["kind"] == "emit")
     assert emit["valid_length"] == "acceptance.length"
+    assert "row_ids" not in emit
     assert not any(node["kind"] == "branch" for node in body)
     assert workflow["serving"]["active"] == "active"
     assert workflow["serving"]["done"] == "done"
-    assert workflow["serving"]["state_service"]["groups"]["verifier_cache"]["ports"]["verifier"][
-        "cache_0"
-    ] == {
+    assert workflow["serving"]["state_service"]["groups"]["verifier_cache"]["kind"] == (
+        "full_attention"
+    )
+    assert "slot_ids" not in workflow["serving"]
+    assert workflow["serving"]["state_service"]["groups"]["verifier_cache"]["ports"][
+        "verifier"
+    ]["cache_0"] == {
         "input": "past_key_values.0.key",
         "output": "present.0.key",
     }

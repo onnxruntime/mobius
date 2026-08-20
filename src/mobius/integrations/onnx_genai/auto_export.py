@@ -25,6 +25,7 @@ from mobius.integrations.onnx_genai.decoder_metadata import (
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
+    _copy_runtime_assets,
     add_adapter_service_to_metadata,
     add_explicit_package_io,
     add_policy_components_to_workflow,
@@ -591,17 +592,14 @@ def write_onnx_genai_config(
             source=source,
         )
         artifacts = {"inference_metadata": path}
-        tokenizer_path = _write_hf_tokenizer(output_dir, source, revision=revision)
-        if tokenizer_path is not None:
-            artifacts["tokenizer"] = tokenizer_path
-        if "audio_encoder" in pkg:
-            audio_processor_path = _write_hf_audio_processor(
-                output_dir,
-                source,
-                revision=revision,
-            )
-            if audio_processor_path is not None:
-                artifacts["audio_processor"] = audio_processor_path
+        # A multimodal package needs the processor assets as well as the
+        # tokenizer, because the runtime resolves image/audio preprocessing
+        # parameters from them.
+        artifacts.update(_copy_runtime_assets(output_dir, source))
+        if "tokenizer" not in artifacts:
+            tokenizer_path = _write_hf_tokenizer(output_dir, source)
+            if tokenizer_path is not None:
+                artifacts["tokenizer"] = tokenizer_path
         return artifacts
 
     if _looks_like_speech_to_text(pkg):
@@ -612,9 +610,12 @@ def write_onnx_genai_config(
             "encoder_attention_mask" in encoder_outputs
             and "encoder_attention_mask" in decoder_inputs,
         )
-        decoder_metadata = decoder_metadata_from_config(
-            resolved_config, kv_native_dtype=kv_native_dtype
-        )
+        if kv_native_dtype is not None:
+            raise ValueError(
+                "speech-to-text export derives KV state dtype from ONNX ports; "
+                "kv_native_dtype overrides are unsupported"
+            )
+        decoder_metadata = decoder_metadata_from_config(resolved_config)
         path = write_speech_to_text_pipeline_metadata(
             output_dir,
             decoder_metadata=decoder_metadata,

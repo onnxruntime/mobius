@@ -285,3 +285,107 @@ def test_pruned_prefill_matches_unpruned_final_row(
     # Double head size survives pruning: global layers stay twice as wide.
     assert base_out["present.0.key"].shape[-1] == config.head_dim
     assert base_out["present.1.key"].shape[-1] == config.global_head_dim
+
+
+def _dual_head_dim_config() -> Gemma4Config:
+    """A Gemma 4 text config whose global layers use a wider head than sliding ones."""
+    config = _make_config()
+    config.global_head_dim = 32
+    return config
+
+
+def test_metadata_splits_cache_groups_by_attention_kind() -> None:
+    """Gemma 4's two cache geometries must surface as two declared state groups.
+
+    Local/sliding layers store ``head_dim``-wide entries and are prefix-evictable;
+    global/full-attention layers store ``global_head_dim``-wide entries and keep
+    the entire history. A single undifferentiated group would let a runtime apply
+    sliding-window eviction to the global layers and corrupt them.
+    """
+    from mobius.integrations.onnx_genai.workflow_metadata import (
+        build_decoder_workflow_metadata,
+    )
+
+    config = _dual_head_dim_config()
+    module = registry.get("gemma4_text")(config)
+    pkg = build_from_module(module, config, task="gemma4-text-generation")
+
+    metadata = build_decoder_workflow_metadata(pkg, config)
+    workflow = metadata["pipeline"]["workflow"]
+    groups = workflow["serving"]["state_service"]["groups"]
+
+    assert set(groups) == {
+        "decoder_cache_sliding_attention",
+        "decoder_cache_full_attention",
+    }
+    assert groups["decoder_cache_sliding_attention"]["kind"] == "sliding_attention"
+    assert groups["decoder_cache_full_attention"]["kind"] == "full_attention"
+    # Only the sliding layers may drop their prefix.
+    assert groups["decoder_cache_sliding_attention"]["reuse"]["evictable_prefix"] is True
+    assert groups["decoder_cache_full_attention"]["reuse"]["evictable_prefix"] is False
+
+    head_dims: dict[str, set[int]] = {}
+    for name, group in groups.items():
+        cells = {cell for ports in group["ports"].values() for cell in ports}
+        head_dims[name] = {workflow["state"][cell]["contract"]["shape"][-1] for cell in cells}
+    assert head_dims["decoder_cache_sliding_attention"] == {config.head_dim}
+    assert head_dims["decoder_cache_full_attention"] == {config.global_head_dim}
+
+
+def test_metadata_declares_no_cache_for_kv_shared_layers() -> None:
+    """KV-shared layers borrow K/V and must not own phantom cache slots."""
+    from mobius.integrations.onnx_genai.workflow_metadata import (
+        build_decoder_workflow_metadata,
+    )
+
+    config = _dual_head_dim_config()
+    module = registry.get("gemma4_text")(config)
+    pkg = build_from_module(module, config, task="gemma4-text-generation")
+
+    metadata = build_decoder_workflow_metadata(pkg, config)
+    workflow = metadata["pipeline"]["workflow"]
+    groups = workflow["serving"]["state_service"]["groups"]
+    cells = {
+        cell
+        for group in groups.values()
+        for ports in group["ports"].values()
+        for cell in ports
+    }
+
+    cache_owning_layers = config.num_hidden_layers - config.num_kv_shared_layers
+    assert len(cells) == 2 * cache_owning_layers
+
+    present_outputs = [
+        value.name for value in pkg["model"].graph.outputs if value.name.startswith("present.")
+    ]
+    assert len(present_outputs) == 2 * cache_owning_layers
+    assert max(int(name.split(".")[1]) for name in present_outputs) == cache_owning_layers - 1
+
+
+def test_metadata_cache_cells_are_runtime_managed_and_request_aligned() -> None:
+    """Cache cells the runtime allocates must declare ownership and a row axis."""
+    from mobius.integrations.onnx_genai.workflow_metadata import (
+        build_decoder_workflow_metadata,
+    )
+
+    config = _dual_head_dim_config()
+    module = registry.get("gemma4_text")(config)
+    pkg = build_from_module(module, config, task="gemma4-text-generation")
+
+    workflow = build_decoder_workflow_metadata(pkg, config)["pipeline"]["workflow"]
+    groups = workflow["serving"]["state_service"]["groups"]
+    for group in groups.values():
+        # Runtime-private storage: no allocator/paging/slot policy is serialized.
+        assert "storage" not in group
+        assert "paging" not in group
+        assert group["aliasing"] == "permitted"
+        for ports in group["ports"].values():
+            for cell in ports:
+                state = workflow["state"][cell]
+                assert state["management"] == "runtime"
+                assert state["release_boundary"] == "invocation"
+                assert state["contract"]["batch_layout"] == {
+                    "kind": "request_aligned",
+                    "axis": 0,
+                }
+    assert "slot_ids" not in workflow["serving"]

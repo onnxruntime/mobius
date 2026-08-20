@@ -906,6 +906,8 @@ class TestNativeVlmPackageMetadata:
             "max_patches": 2520,
             "pooling_kernel_size": 3,
             "interpolation": "bicubic",
+            "inputs": ["image.transform_0"],
+            "outputs": ["image.transform_1"],
         }
         assert (
             next(transform for transform in transforms if transform["op"] == "pad")[
@@ -932,17 +934,21 @@ class TestNativeVlmPackageMetadata:
         }
         assert kv_inputs["past_key_values.1.key"]["shape"][-1] == 16
         image_outputs = metadata["preprocessing"]["image"]["outputs"]
+        # Every output binds the processor-local value that produces it, so the
+        # runtime never has to guess which transform an output came from.
         assert image_outputs == [
             {
                 "name": "vision_encoder.pixel_values",
                 "content": "pixels",
                 "dtype": "fp32",
+                "source": "image.transform_4",
             },
             {
                 "name": "vision_encoder.pixel_position_ids",
                 "content": "patch_coordinates",
                 "dtype": "int64",
                 "pad_value": -1,
+                "source": "image.output_patch_coordinates",
             },
         ]
         broken = copy.deepcopy(metadata)
@@ -1478,6 +1484,8 @@ class TestNativeVlmPackageMetadata:
             "max_patches": 2520,
             "pooling_kernel_size": 3,
             "interpolation": "bicubic",
+            "inputs": ["image.transform_0"],
+            "outputs": ["image.transform_1"],
         }
         assert pad["target_length"] == reference["pixel_values"].shape[1] == 2520
         assert patchify["channel_order"] == "channels_last"

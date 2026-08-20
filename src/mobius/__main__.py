@@ -435,35 +435,13 @@ def _save_package(
             print(f"  {name}: {path}")
     elif runtime == "onnx-genai":
         from mobius.integrations.onnx_genai import write_onnx_genai_config
-        from mobius.integrations.onnx_genai.inference_metadata import (
-            is_native_vlm_package,
-            write_native_vlm_package_metadata,
-        )
 
         config = getattr(pkg, "config", None)
         source = getattr(args, "config", None) or getattr(args, "model", None)
-        revision_kwargs = (
-            {"revision": args.revision} if getattr(args, "revision", None) is not None else {}
-        )
-        if is_native_vlm_package(pkg):
-            try:
-                artifacts = write_native_vlm_package_metadata(
-                    pkg,
-                    output_dir,
-                    config=config,
-                    source=source,
-                    **revision_kwargs,
-                )
-            except ValueError as error:
-                raise SystemExit(f"Error: {error}") from error
-        else:
-            artifacts = write_onnx_genai_config(
-                pkg,
-                output_dir,
-                config=config,
-                source=source,
-                **revision_kwargs,
-            )
+        try:
+            artifacts = write_onnx_genai_config(pkg, output_dir, config=config, source=source)
+        except ValueError as error:
+            raise SystemExit(f"Error: {error}") from error
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
 

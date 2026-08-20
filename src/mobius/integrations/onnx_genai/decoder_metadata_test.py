@@ -55,7 +55,6 @@ class TestDecoderMetadata:
             num_kv_heads=8,
             head_dim=128,
             max_sequence_length=131072,
-            kv_native_dtype="bf16",
         )
         assert meta["required_capabilities"] == ["kv_cache", "grouped_query_attention"]
         att = meta["model"]["attention"]
@@ -64,7 +63,8 @@ class TestDecoderMetadata:
         assert att["num_kv_heads"] == 8
         assert att["head_dim"] == 128
         assert meta["model"]["max_sequence_length"] == 131072
-        assert meta["kv_cache"]["native_dtype"] == "bfloat16"
+        # The cache's storage representation is graph-derived, never declared.
+        assert "kv_cache" not in meta
 
     def test_multi_head_when_kv_equals_heads(self):
         meta = build_decoder_metadata(num_attention_heads=16, num_kv_heads=16, head_dim=64)
@@ -94,7 +94,7 @@ class TestDecoderMetadata:
             build_decoder_metadata(num_attention_heads=12, num_kv_heads=5, head_dim=64)
 
     def test_from_config_reads_mobius_fields(self):
-        meta = decoder_metadata_from_config(_FakeConfig(), kv_native_dtype="fp16")
+        meta = decoder_metadata_from_config(_FakeConfig())
         att = meta["model"]["attention"]
         assert att["type"] == "grouped_query_attention"
         assert att["num_attention_heads"] == 32
@@ -102,16 +102,17 @@ class TestDecoderMetadata:
         assert att["head_dim"] == 128
         assert meta["model"]["max_sequence_length"] == 131072
         assert meta["model"]["architecture"] == "llama"
-        assert meta["kv_cache"]["native_dtype"] == "float16"
+        assert "kv_cache" not in meta
 
-    def test_from_config_infers_fp16_kv_dtype_for_int4_weights(self):
+    def test_from_config_never_declares_package_level_kv_dtype(self):
+        """Cache storage is a runtime choice derived from the exported graph."""
         cfg = _FakeConfig()
         cfg.dtype = ir.DataType.FLOAT16
         cfg.quantization = QuantizationConfig(bits=4, quant_method="rtn")
 
         meta = decoder_metadata_from_config(cfg)
 
-        assert meta["kv_cache"]["native_dtype"] == "float16"
+        assert "kv_cache" not in meta
 
     def test_from_config_derives_head_dim_and_drops_unset(self):
         cfg = _FakeConfig(head_dim=-42, sliding_window=-42)  # DEFAULT_INT sentinel
@@ -137,7 +138,7 @@ class TestDecoderMetadata:
         cfg.topk_method = "noaux_tc"
         cfg.n_group = 4
         cfg.topk_group = 2
-        meta = decoder_metadata_from_config(cfg, kv_native_dtype="bf16")
+        meta = decoder_metadata_from_config(cfg)
 
         schema_path = _schema_path()
         if schema_path is None:

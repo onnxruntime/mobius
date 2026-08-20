@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 
 import onnx_ir as ir
@@ -44,6 +45,7 @@ from mobius.generation import (
     build_tts_state_initializer,
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
+    _name_image_preprocessing_program,
     _port,
     _shape_metadata,
     add_adapter_service_to_metadata,
@@ -103,6 +105,16 @@ def _contract(value: ir.Value) -> dict[str, Any]:
         "rank": port.rank,
         "shape": _shape_metadata(port),
     }
+
+
+def _request_aligned(contract: dict[str, Any], axis: int = 0) -> dict[str, Any]:
+    """Mark a contract as carrying exactly one entry per in-flight request.
+
+    This is a structural batching fact, not a row identity: it tells the runtime
+    which axis to permute when it compacts the batch, while scheduler slots and
+    sequence handles stay runtime-private.
+    """
+    return {**contract, "batch_layout": {"kind": "request_aligned", "axis": axis}}
 
 
 def _component(
@@ -319,59 +331,6 @@ def _publish_workflow_v1(workflow: dict[str, Any]) -> dict[str, Any]:
     return workflow
 
 
-
-
-def _name_image_preprocessing_program(image: dict[str, Any]) -> None:
-    """Convert structural preprocessing transforms into explicit typed SSA values."""
-    transforms = image["transforms"]
-    current: str | None = None
-    decoded: str | None = None
-    for index, transform in enumerate(transforms):
-        name = f"image.transform_{index}"
-        if transform["op"] in {"decode", "decode_rgb"}:
-            transform.pop("inputs", None)
-            decoded = name
-        else:
-            if current is None:
-                raise ValueError("image preprocessing must decode before transforming")
-            transform["inputs"] = [current]
-        transform["outputs"] = [name]
-        current = name
-    if current is None:
-        raise ValueError("image preprocessing must declare at least one transform")
-
-    derived_ops = {
-        "original_size": ("emit_original_size", decoded),
-        "transformed_size": ("emit_transformed_size", current),
-        "validity_mask": ("emit_validity_mask", current),
-        "patch_coordinates": ("emit_patch_coordinates", current),
-        "grid_dimensions": ("emit_grid_coordinates", current),
-    }
-    for output in image["outputs"]:
-        content = output["content"]
-        if content == "pixels":
-            output["source"] = current
-            continue
-        if content not in derived_ops:
-            raise ValueError(
-                f"image preprocessing output content {content!r} has no typed SSA producer"
-            )
-        operation, source = derived_ops[content]
-        if source is None:
-            raise ValueError(
-                f"image preprocessing output content {content!r} requires a decoded image"
-            )
-        name = f"image.output_{content}"
-        transforms.append(
-            {
-                "op": operation,
-                "inputs": [source],
-                "outputs": [name],
-            }
-        )
-        output["source"] = name
-
-
 def _invoke(
     component: str,
     inputs: dict[str, str],
@@ -537,6 +496,17 @@ def _kv_storage_contract(model: ir.Model) -> dict[str, Any]:
     }
 
 
+def _aliasing_for_storage(storage: str) -> str:
+    """Translate a physical storage class into the semantic aliasing contract.
+
+    Shared-buffer and paged layouts let the runtime bind ``present`` onto the
+    same allocation as ``past``; the metadata only declares that doing so is
+    *legal*, never that the runtime must.  A growable cache returns a fresh,
+    longer tensor each step and must never be aliased onto its own input.
+    """
+    return "permitted" if storage in {"shared_buffer", "paged"} else "forbidden"
+
+
 def _state_group(
     *,
     ports: dict[str, Any],
@@ -558,11 +528,7 @@ def _state_group(
         "kind": kind,
         "sequence_axis": sequence_axis,
         "layout": layout,
-        "aliasing": (
-            aliasing
-            if aliasing is not None
-            else ("permitted" if storage in ("shared_buffer", "paged") else "forbidden")
-        ),
+        "aliasing": (aliasing if aliasing is not None else _aliasing_for_storage(storage)),
         "reuse": {"prefix_reusable": True, "evictable_prefix": False},
         "capabilities": {"snapshot": True, "fork": True},
         "ports": ports,
@@ -570,6 +536,102 @@ def _state_group(
     if logical_lengths is not None:
         group["logical_lengths"] = logical_lengths
     return group
+
+
+_LAYER_STATE_KINDS = {
+    "sliding_attention": "sliding_attention",
+    "full_attention": "full_attention",
+    "chunked_attention": "sliding_attention",
+}
+
+
+def _state_aliasing(kv_contract: dict[str, Any]) -> str:
+    """Translate a physical KV storage contract into the aliasing contract."""
+    return _aliasing_for_storage(str(kv_contract["storage"]))
+
+
+def _cache_layer_index(port_name: str, fallback: int) -> int:
+    """Recover the decoder layer index from a ``past_key_values.N.key`` port name."""
+    match = re.search(r"\.(\d+)\.(?:key|value)$", port_name)
+    return int(match.group(1)) if match else fallback
+
+
+def _state_group_kinds(config: Any, cache_pairs: list[tuple[ir.Value, ir.Value]]) -> list[str]:
+    """Return the semantic ``StateKind`` of every KV cache cell.
+
+    Hybrid models interleave sliding-window and full-attention layers, and the
+    two are not interchangeable: only a sliding layer's oldest positions may be
+    evicted.  Cache-owning layers form a contiguous prefix of the decoder (a
+    KV-sharing suffix owns no cache at all), so the port's own layer index —
+    not its position in the port list — selects the layer type.
+    """
+    layer_types = list(getattr(config, "layer_types", None) or [])
+    default_kind = (
+        "sliding_attention"
+        if not layer_types and getattr(config, "sliding_window", None)
+        else "full_attention"
+    )
+    kinds = []
+    for index, (past, _) in enumerate(cache_pairs):
+        layer = _cache_layer_index(past.name or "", index // 2)
+        layer_type = layer_types[layer] if layer < len(layer_types) else None
+        kinds.append(_LAYER_STATE_KINDS.get(str(layer_type), default_kind))
+    return kinds
+
+
+def _state_service_groups(
+    *,
+    config: Any,
+    cache_pairs: list[tuple[ir.Value, ir.Value]],
+    ports: dict[str, dict[str, dict[str, str]]],
+    sequence_axis: int,
+    logical_lengths: str | None,
+    aliasing: str,
+    base_name: str,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Build ``serving.state_service.groups`` plus each cell's owning group.
+
+    One group per semantic kind: a hybrid decoder therefore publishes distinct
+    ``sliding_attention`` and ``full_attention`` groups whose per-cell contracts
+    carry their own geometry (Gemma 4's global layers are double-wide).  The
+    group declares *semantics* only — eviction legality, aliasing legality,
+    layout — never a storage class, allocator, or compaction algorithm, which
+    are the runtime's to choose.
+    """
+    kinds = _state_group_kinds(config, cache_pairs)
+    distinct = sorted(set(kinds))
+    names = {
+        kind: (base_name if len(distinct) == 1 else f"{base_name}_{kind}") for kind in distinct
+    }
+    cell_group = {}
+    grouped_ports: dict[str, dict[str, dict[str, dict[str, str]]]] = {
+        name: {} for name in names.values()
+    }
+    for index, kind in enumerate(kinds):
+        cell = f"cache_{index}"
+        cell_group[cell] = names[kind]
+    for component, aliases in ports.items():
+        for cell, alias in aliases.items():
+            grouped_ports[cell_group[cell]].setdefault(component, {})[cell] = alias
+    groups = {
+        names[kind]: {
+            "kind": kind,
+            "sequence_axis": sequence_axis,
+            "layout": "bnsh",
+            **({"logical_lengths": logical_lengths} if logical_lengths else {}),
+            "aliasing": aliasing,
+            "reuse": {
+                "prefix_reusable": True,
+                # Dropping the oldest positions is only semantics-preserving
+                # for a windowed layer; a full-attention layer that loses its
+                # prefix silently answers a different question.
+                "evictable_prefix": kind == "sliding_attention",
+            },
+            "ports": grouped_ports[names[kind]],
+        }
+        for kind in distinct
+    }
+    return groups, cell_group
 
 
 def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
@@ -712,8 +774,8 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
         pkg.add_policy_component("codec_layout", build_codec_layout_transpose(num_groups))
 
     batch = _contract(prompt)["shape"][0]
-    batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
-    batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch]}
+    batch_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": [batch]})
+    batch_bool = _request_aligned({"dtype": "bool", "rank": 1, "shape": [batch]})
     control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
     inputs = {
         "request.prompt_tokens": {
@@ -1473,7 +1535,7 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
     }
     for index, (past, present) in enumerate(talker_caches):
         state[f"talker_cache_{index}"] = {
-            "contract": _contract(past),
+            "contract": _request_aligned(_contract(past)),
             "class": "semantic",
             "scope": "invocation",
             "initializer": f"talker.setup.{present.name}",
@@ -1483,10 +1545,12 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
                 "max": "package.talker_context_limit",
             },
             "service_group": "talker_cache",
+            "management": "runtime",
+            "release_boundary": "invocation",
         }
     for index, (past, present) in enumerate(predictor_caches):
         state[f"predictor_cache_{index}"] = {
-            "contract": _contract(past),
+            "contract": _request_aligned(_contract(past)),
             "class": "semantic",
             "scope": "invocation",
             "initializer": f"frame.predictor.{present.name}",
@@ -1496,6 +1560,8 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
                 "max": "package.predictor_context_limit",
             },
             "service_group": "predictor_cache",
+            "management": "runtime",
+            "release_boundary": "invocation",
         }
 
     outer_carried = [
@@ -1843,8 +1909,8 @@ def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
         pkg.add_policy_component("codec_layout", build_codec_layout_transpose(num_groups))
 
     batch = _contract(prompt_input)["shape"][0]
-    batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
-    batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch]}
+    batch_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": [batch]})
+    batch_bool = _request_aligned({"dtype": "bool", "rank": 1, "shape": [batch]})
     control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
     inputs: dict[str, Any] = {
         "request.prompt_tokens": {
@@ -2333,8 +2399,8 @@ def build_diffusion_workflow_metadata(
     pkg.add_policy_component("schedule_lookup", build_schedule_lookup(timestep_input.dtype))
 
     batch = _contract(sample_input)["shape"][0]
-    batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
-    batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch]}
+    batch_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": [batch]})
+    batch_bool = _request_aligned({"dtype": "bool", "rank": 1, "shape": [batch]})
     control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
     inputs: dict[str, Any] = {
         "request.latent": {
@@ -2740,8 +2806,8 @@ def build_vlm_workflow_metadata(
         pkg.add_policy_component("cache_length_update", build_selective_integer_add())
 
     batch = _contract(token_input)["shape"][0]
-    batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
-    batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch]}
+    batch_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": [batch]})
+    batch_bool = _request_aligned({"dtype": "bool", "rank": 1, "shape": [batch]})
     control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
     eos = _source_token_id(source, "eos_token_id", getattr(config, "eos_token_id", 0))
     inputs: dict[str, Any] = {
@@ -3166,7 +3232,7 @@ def build_vlm_workflow_metadata(
     for index, (past, present) in enumerate(cache_pairs):
         cell = f"cache_{index}"
         state[cell] = {
-            "contract": _contract(past),
+            "contract": _request_aligned(_contract(past)),
             "scope": "invocation",
             "initializer": f"decoder.setup.{present.name}",
             "recurrence": {
@@ -3181,7 +3247,8 @@ def build_vlm_workflow_metadata(
                 ),
                 "max": "package.max_context",
             },
-            "service_group": "decoder_cache",
+            "management": "runtime",
+            "release_boundary": "invocation",
         }
         setup_decoder_outputs[present.name] = f"decoder.setup.{present.name}"
         body_decoder_outputs[present.name] = f"decoder.body.{present.name}"
@@ -3194,6 +3261,33 @@ def build_vlm_workflow_metadata(
                 f"state.{past.name}.final",
             )
         )
+    # Hybrid VL decoders (Gemma 3/4) publish one group per attention kind so a
+    # global layer's prefix is never evicted with the sliding layers'.
+    vlm_state_groups, vlm_cell_groups = _state_service_groups(
+        config=getattr(config, "text", config),
+        cache_pairs=cache_pairs,
+        ports={
+            "decoder": {
+                f"cache_{index}": {"input": past.name, "output": present.name}
+                for index, (past, present) in enumerate(cache_pairs)
+            }
+        },
+        sequence_axis=next(
+            (
+                axis
+                for axis, dimension in enumerate(_contract(cache_pairs[0][0])["shape"])
+                if "sequence" in str(dimension)
+            ),
+            2,
+        )
+        if cache_pairs
+        else 2,
+        logical_lengths="cache_lengths",
+        aliasing=_state_aliasing(decoder_kv),
+        base_name="decoder_cache",
+    )
+    for cell, group_name in vlm_cell_groups.items():
+        state[cell]["service_group"] = group_name
     carried = []
     initial_effects = {
         "sample": "sample.0",
@@ -3510,11 +3604,13 @@ def build_vlm_workflow_metadata(
         "inputs": inputs,
         "outputs": {
             "tokens": {
-                "contract": {
-                    "dtype": "int64",
-                    "rank": 2,
-                    "shape": [batch, "generated_sequence"],
-                },
+                "contract": _request_aligned(
+                    {
+                        "dtype": "int64",
+                        "rank": 2,
+                        "shape": [batch, "generated_sequence"],
+                    }
+                ),
                 "role": "tokens",
                 "stage": "pre_adapter",
             }
@@ -3527,33 +3623,7 @@ def build_vlm_workflow_metadata(
                     "active": "active",
                     "done": "done",
                     "accepted_len": "accepted_len",
-                    "state_service": {
-                        "groups": {
-                            "decoder_cache": _state_group(
-                                sequence_axis=next(
-                                    (
-                                        axis
-                                        for axis, dimension in enumerate(
-                                            _contract(cache_pairs[0][0])["shape"]
-                                        )
-                                        if "sequence" in str(dimension)
-                                    ),
-                                    2,
-                                ),
-                                logical_lengths="cache_lengths",
-                                storage=decoder_kv["storage"],
-                                ports={
-                                    "decoder": {
-                                        f"cache_{index}": {
-                                            "input": past.name,
-                                            "output": present.name,
-                                        }
-                                        for index, (past, present) in enumerate(cache_pairs)
-                                    }
-                                },
-                            )
-                        },
-                    },
+                    "state_service": {"groups": vlm_state_groups},
                 }
             }
             if cache_pairs
@@ -3679,8 +3749,8 @@ def build_speculative_workflow_metadata(
         pkg.add_policy_component("proposal_metrics", build_proposal_metrics())
     pkg.add_policy_component("cache_length_update", build_integer_add())
     batch = _contract(proposer_input)["shape"][0]
-    batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
-    batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch]}
+    batch_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": [batch]})
+    batch_bool = _request_aligned({"dtype": "bool", "rank": 1, "shape": [batch]})
     control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
     inputs: dict[str, Any] = {
         "request.tokens": {
@@ -4250,7 +4320,7 @@ def build_speculative_workflow_metadata(
             2,
         )
         state[cell] = {
-            "contract": _contract(past),
+            "contract": _request_aligned(_contract(past)),
             "class": "semantic",
             "scope": "invocation",
             "initializer": initializer,
@@ -4260,6 +4330,8 @@ def build_speculative_workflow_metadata(
                 "max": "package.max_context",
             },
             "service_group": "verifier_cache",
+            "management": "runtime",
+            "release_boundary": "invocation",
         }
         kv_ports[cell] = {"input": past.name, "output": present.name}
         state_specs.append(
@@ -4316,13 +4388,15 @@ def build_speculative_workflow_metadata(
         "inputs": inputs,
         "outputs": {
             "tokens": {
-                "contract": {
-                    **_contract(proposed_tokens),
-                    "shape": [
-                        *_contract(proposed_tokens)["shape"][:-1],
-                        "accepted_sequence",
-                    ],
-                },
+                "contract": _request_aligned(
+                    {
+                        **_contract(proposed_tokens),
+                        "shape": [
+                            *_contract(proposed_tokens)["shape"][:-1],
+                            "accepted_sequence",
+                        ],
+                    }
+                ),
                 "role": "tokens",
                 "stage": "pre_adapter",
             },
@@ -4723,8 +4797,8 @@ def _build_autoregressive_workflow_metadata(
         for decoder_input, (encoder_output, _) in sorted(cross_bindings.items()):
             encoder_invoke_outputs[encoder_output] = f"encoder.{encoder_output}"
     batch_dimension = _shape_metadata(_port(token_input))[0]
-    batch_int = {"dtype": "int64", "rank": 1, "shape": [batch_dimension]}
-    batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch_dimension]}
+    batch_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": [batch_dimension]})
+    batch_bool = _request_aligned({"dtype": "bool", "rank": 1, "shape": [batch_dimension]})
     control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
     eos_token_id = getattr(config, "eos_token_id", 0)
     if isinstance(eos_token_id, list):
@@ -5211,6 +5285,7 @@ def _build_autoregressive_workflow_metadata(
             }
         )
     decoder_kv_ports: dict[str, Any] = {}
+    decoder_cache_cells: list[str] = []
     decoder_kv_axis = 2
     for cache_index, (past, present) in enumerate(cache_pairs):
         # Generated-length state is orthogonal to the admitted cache ABI and
@@ -5229,7 +5304,7 @@ def _build_autoregressive_workflow_metadata(
             2,
         )
         state[cell] = {
-            "contract": _contract(past),
+            "contract": _request_aligned(_contract(past)),
             "scope": "invocation",
             "initializer": setup_value,
             "recurrence": {
@@ -5237,9 +5312,13 @@ def _build_autoregressive_workflow_metadata(
                 "axis": decoder_kv_axis,
                 "max": "package.max_context",
             },
-            "service_group": "decoder_cache",
+            # Binding a cell to a state service group hands its storage to the
+            # runtime, which then owns allocation, compaction, and release.
+            "management": "runtime",
+            "release_boundary": "invocation",
         }
         decoder_kv_ports[cell] = {"input": past.name, "output": present.name}
+        decoder_cache_cells.append(cell)
         effect_name = f"state:{cell}"
         initial_effects[effect_name] = f"{effect_name}.0"
         carried.append(
@@ -5284,6 +5363,26 @@ def _build_autoregressive_workflow_metadata(
                 "write_effect": _effect(f"{effect_name}.read", f"{effect_name}.1"),
             }
         )
+    # One semantic state group per attention kind. A hybrid decoder (Gemma 3/4,
+    # Gemma 3n, ...) publishes distinct sliding and full-attention groups so the
+    # runtime never evicts a global layer's prefix, and so each group's cells
+    # carry their own geometry (Gemma 4's global layers are double-wide).
+    decoder_state_groups, decoder_cell_groups = _state_service_groups(
+        config=config,
+        cache_pairs=cache_pairs,
+        ports={decoder_name: decoder_kv_ports},
+        sequence_axis=decoder_kv_axis,
+        # A mask-free decoder grows its cache instead of writing into a shared
+        # full-capacity buffer: it publishes no logical lengths and its present
+        # ports must never be aliased onto the past bindings.
+        logical_lengths="cache_lengths" if fixed_capacity else None,
+        aliasing=_aliasing_for_storage(
+            decoder_kv_contract["storage"] if fixed_capacity else "growable"
+        ),
+        base_name="decoder_cache",
+    )
+    for cell in decoder_cache_cells:
+        state[cell]["service_group"] = decoder_cell_groups[cell]
 
     setup = {
         "kind": "sequence",
@@ -5579,11 +5678,13 @@ def _build_autoregressive_workflow_metadata(
         "inputs": workflow_inputs,
         "outputs": {
             "tokens": {
-                "contract": {
-                    "dtype": "int64",
-                    "rank": 2,
-                    "shape": [batch_dimension, "generated_sequence"],
-                },
+                "contract": _request_aligned(
+                    {
+                        "dtype": "int64",
+                        "rank": 2,
+                        "shape": [batch_dimension, "generated_sequence"],
+                    }
+                ),
                 "role": "tokens",
                 "stage": "pre_adapter",
             }
@@ -5608,20 +5709,7 @@ def _build_autoregressive_workflow_metadata(
                     "active": "active",
                     "done": "done",
                     "accepted_len": "accepted_len",
-                    "state_service": {
-                        "groups": {
-                            "decoder_cache": _state_group(
-                                sequence_axis=decoder_kv_axis,
-                                logical_lengths="cache_lengths" if fixed_capacity else None,
-                                storage=(
-                                    decoder_kv_contract["storage"]
-                                    if fixed_capacity
-                                    else "growable"
-                                ),
-                                ports={decoder_name: decoder_kv_ports},
-                            )
-                        },
-                    },
+                    "state_service": {"groups": decoder_state_groups},
                 }
             }
             if cache_pairs
@@ -5699,7 +5787,7 @@ def build_language_diffusion_pipeline_metadata(
         "shape": token_contract["shape"],
     }
     batch_dimension = token_contract["shape"][0]
-    batch_int = {"dtype": "int64", "rank": 1, "shape": [batch_dimension]}
+    batch_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": [batch_dimension]})
     control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
     inputs = {
         "request.input_ids": {

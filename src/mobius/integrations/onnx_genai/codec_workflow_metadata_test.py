@@ -178,6 +178,9 @@ def test_real_qwen3_tts_workflow_carries_trained_transitions_and_kv_state():
     assert workflow["state"]["talker_cache_0"]["recurrence"]["kind"] == "bounded"
     assert workflow["state"]["talker_cache_0"]["service_group"] == "talker_cache"
     assert workflow["state"]["predictor_cache_0"]["service_group"] == "predictor_cache"
+    assert workflow["serving"]["state_service"]["groups"]["talker_cache"]["kind"] == (
+        "full_attention"
+    )
     assert workflow["inputs"]["package.slot_ids"] == {
         "contract": {
             "dtype": "int64",
