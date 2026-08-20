@@ -112,6 +112,73 @@ This preserves fixed `[B,V]` shapes. The generated component is marked
 replace it with another implementation of the same versioned port ABI for fundamentally
 custom sampling.
 
+## Fixed-capacity (static) KV cache
+
+A static-cache export does not grow its KV tensors. Each layer owns a
+preallocated `[batch, capacity, kv_hidden]` buffer, and every step writes into
+it at a per-row cursor with `TensorScatter` on axis 1. Two integer control
+ports drive that write:
+
+| port | shape | meaning |
+| --- | --- | --- |
+| `write_indices` | `[batch]` int64 | first slot this step writes, per row |
+| `nonpad_kv_seqlen` | `[batch]` int64 | number of valid slots **after** the write |
+
+The buffers themselves are `key_cache.{layer}` / `value_cache.{layer}` in and
+`updated_key_cache.{layer}` / `updated_value_cache.{layer}` out. All of this is
+published twice, for two different kinds of consumer:
+
+* `model.io.static_cache` names the ports directly, for a consumer that binds
+  the graph without interpreting a workflow.
+* the workflow declares the same thing operationally — the buffers are loop
+  cells with `recurrence: {kind: invariant}` (they do not grow), the capacity is
+  a `package.cache_capacity` literal workflow input, and the state service
+  publishes an `indexed_scatter` update discipline naming the write cursor, the
+  capacity, and the per-component port that carries it.
+
+Because the write cursor and the logical length are the same quantity, both name
+the single carried `cache_lengths` cell rather than introducing a second
+never-consumed carry. A finished row's length stops advancing, so the slot it
+last wrote falls outside its valid prefix and is reclaimed by its next write.
+That is deliberate: it is what makes a fixed-capacity buffer safe to keep
+serving a batch in which rows finish at different times.
+
+**Not claimed:** ragged prefill. ONNX leaves the region between
+`nonpad_kv_seqlen` and the query length undefined, and the workflow scatters one
+same-length chunk per row, so a prefill in which rows have different prompt
+lengths is outside the contract. Per-row cursor divergence during *decode* is
+fully supported.
+
+### Heterogeneous caches
+
+A model may mix disciplines. Gemma 4 keeps its sliding-window layers on a
+growing rank-4 BNSH cache while its full-attention layers use a fixed-capacity
+rank-3 buffer, and its KV-shared suffix owns no buffer at all. These surface as
+separate state-service groups with their own sequence axis, layout, aliasing
+rule and update discipline, and `model.io.static_cache` lists only the layers
+that actually own a buffer. Collapsing them into one group would invite a
+runtime to apply sliding-window eviction to the global layers, or to allocate
+caches for layers that borrow one.
+
+## FP8 KV cache
+
+FP8 KV storage is a property of the *attention operator*, not of the cache
+tensor alone: the scales that dequantize the cache on read are node inputs
+(`k_scale`/`v_scale` at `GroupQueryAttention` slots 12 and 13). The published
+contracts therefore repeat whatever dtype the graph declares — `float8_e4m3fn`
+— because a runtime sizes the buffers from them, and reporting the model's
+compute dtype instead would allocate twice the bytes the model reads.
+
+Two consequences:
+
+* `--features static-cache,fp8-kv-cache` is refused at build time. A
+  static-cache graph scatters into buffers read by `ai.onnx` `Attention`, which
+  has no scale inputs, so there is no operator that could dequantize an FP8
+  buffer. Emitting one anyway would declare FP8 over bytes read as float16.
+* A package whose cache is FP8 is valid even where no local kernel can execute
+  it. The dtype describes the exported graph; kernel availability is a property
+  of the runtime that happens to be installed.
+
 ## Compact examples
 
 ### Decoder

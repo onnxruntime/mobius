@@ -127,6 +127,54 @@ def _executable_decoder_package() -> ModelPackage:
     return ModelPackage({"model": ir.Model(graph, ir_version=11)}, config=config)
 
 
+def _executable_static_cache_package() -> ModelPackage:
+    """A runnable decoder that scatters into fixed-capacity KV buffers.
+
+    The appending decoder fixture grows its cache with ``Concat``; this one
+    keeps a preallocated ``[batch, capacity, kv_hidden]`` buffer and writes each
+    step at a per-row cursor with ``TensorScatter``. That is the shape the
+    workflow's ``indexed_scatter`` state discipline describes, so the engine
+    conformance run exercises the write cursor and the fixed-capacity carry
+    rather than only the growing-tensor path.
+    """
+    capacity = 16
+    graph, builder = _graph("decoder")
+    input_ids = builder.input("input_ids", ir.DataType.INT64, ["batch", "sequence"])
+    builder.input("position_ids", ir.DataType.INT64, ["batch", "sequence"])
+    key_cache = builder.input("key_cache.0", ir.DataType.FLOAT, ["batch", capacity, 8])
+    value_cache = builder.input("value_cache.0", ir.DataType.FLOAT, ["batch", capacity, 8])
+    write_indices = builder.input("write_indices", ir.DataType.INT64, ["batch"])
+    builder.input("nonpad_kv_seqlen", ir.DataType.INT64, ["batch"])
+
+    shape = builder.op.Shape(input_ids)
+    logits = builder.op.ConstantOfShape(
+        builder.op.Concat(shape, builder.op.Constant(value_ints=[128]), axis=0),
+        value=ir.tensor([0.0]),
+    )
+    # This step's keys/values: (batch, sequence, 8), scattered into the buffer
+    # at row `write_indices[b]` along the capacity axis.
+    update_shape = builder.op.Concat(shape, builder.op.Constant(value_ints=[8]), axis=0)
+    update = builder.op.ConstantOfShape(update_shape, value=ir.tensor([0.0]))
+    updated_key = builder.op.TensorScatter(key_cache, update, write_indices, axis=1)
+    updated_value = builder.op.TensorScatter(value_cache, update, write_indices, axis=1)
+
+    builder.add_output(
+        _typed(logits, ir.DataType.FLOAT, ["batch", "sequence", 128]),
+        "logits",
+    )
+    builder.add_output(
+        _typed(updated_key, ir.DataType.FLOAT, ["batch", capacity, 8]),
+        "updated_key_cache.0",
+    )
+    builder.add_output(
+        _typed(updated_value, ir.DataType.FLOAT, ["batch", capacity, 8]),
+        "updated_value_cache.0",
+    )
+    config = _Cfg()
+    config.eos_token_id = 127
+    return ModelPackage({"model": ir.Model(graph, ir_version=11)}, config=config)
+
+
 def _executable_vlm_package() -> ModelPackage:
     vision_graph, vision_builder = _graph("vision_encoder")
     pixel_values = vision_builder.input("pixel_values", ir.DataType.FLOAT, [4, 1176])
@@ -896,8 +944,10 @@ def main() -> None:
     parser.add_argument("output", type=Path)
     args = parser.parse_args()
     decoder = _executable_decoder_package()
+    static_cache = _executable_static_cache_package()
     packages = {
         "decoder": (decoder, {"config": decoder.config}),
+        "static_cache": (static_cache, {"config": static_cache.config}),
         "vlm": (_executable_vlm_package(), {}),
         "diffusion": (
             _executable_diffusion_package(),

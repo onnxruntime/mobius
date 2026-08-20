@@ -298,6 +298,31 @@ fn mobius_decoder_workflow_executes() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The fixed-capacity decoder must execute the same way the appending one does.
+///
+/// Its cache never grows: every step scatters into a preallocated buffer at a
+/// per-row cursor. That exercises the `indexed_scatter` state discipline, the
+/// invariant loop cells and the `package.cache_capacity` input, none of which
+/// the appending `decoder` fixture reaches.
+#[test]
+fn mobius_static_cache_workflow_executes() -> anyhow::Result<()> {
+    let mut engine =
+        Engine::from_pipeline_dir(&root("static_cache")?, EngineConfig::default())?;
+    let output = engine.run_pipeline_outputs(PipelineGenerateRequest::new(GenerateRequest {
+        prompt: GeneratePrompt::TokenIds(vec![4, 5]),
+        options: options(3),
+    }))?;
+    assert_eq!(
+        engine
+            .structured_output_for_role(&output, WorkflowOutputRole::Tokens)
+            .expect("static-cache decoder must emit tokens")
+            .to_vec_i64()?
+            .len(),
+        3
+    );
+    Ok(())
+}
+
 #[test]
 fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyhow::Result<()> {
     let mut engine = Engine::from_pipeline_dir(&root("decoder")?, EngineConfig::default())?;

@@ -15,7 +15,13 @@ from typing import Any
 import onnx_ir as ir
 import yaml
 
-from mobius._constants import OPSET_VERSION
+from mobius._constants import (
+    OPSET_VERSION,
+    STATIC_CACHE_KV_SEQUENCE_LENGTH,
+    STATIC_CACHE_LAYOUT,
+    STATIC_CACHE_SEQUENCE_AXIS,
+    STATIC_CACHE_WRITE_INDICES,
+)
 from mobius.generation import (
     SOLVER_BUILDERS,
     PolicyCapabilities,
@@ -84,6 +90,7 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     _port,
     _shape_metadata,
     _source_asset_path,
+    _static_cache_io,
     add_adapter_service_to_metadata,
     add_policy_components_to_workflow,
     build_native_vlm_package_metadata,
@@ -533,11 +540,7 @@ def _model_cache_pairs(model: ir.Model) -> list[tuple[ir.Value, ir.Value]]:
         present = next(
             (
                 outputs.get(name)
-                for name in (
-                    past.name.replace("past_key_values", "present"),
-                    past.name.replace("past.", "present."),
-                    past.name.replace("past_", "present_"),
-                )
+                for name in _cache_output_candidates(past.name or "")
                 if name in outputs
             ),
             None,
@@ -545,6 +548,109 @@ def _model_cache_pairs(model: ir.Model) -> list[tuple[ir.Value, ir.Value]]:
         if present is not None:
             pairs.append((past, present))
     return pairs
+
+
+def _cache_output_candidates(past_name: str) -> tuple[str, ...]:
+    """Names an exporter may give the output that continues a cache input.
+
+    An appending cache renames ``past`` to ``present``; a static, indexed cache
+    keeps the buffer's name and prefixes the written result instead, because the
+    output is the same buffer rather than a longer one.
+    """
+    return (
+        past_name.replace("past_key_values", "present"),
+        past_name.replace("past.", "present."),
+        past_name.replace("past_", "present_"),
+        f"updated_{past_name}",
+    )
+
+
+def _constant_extent(dimension: Any) -> int | None:
+    """Return *dimension* as an ``int``, or ``None`` when it is symbolic.
+
+    An :class:`ir.Shape` entry is a plain ``int`` exactly when the extent is
+    known; otherwise it is a ``SymbolicDim`` whose value is its name.
+    """
+    return dimension if isinstance(dimension, int) else None
+
+
+def _static_cache_ports(model: ir.Model) -> dict[str, Any] | None:
+    """Return the declared static-cache ABI of *model*, or ``None``.
+
+    The two control ports are per-row integer vectors and so are shape-indistin-
+    guishable from each other; they are matched against the ABI mobius mints in
+    :mod:`mobius._constants`, never guessed from the graph. The buffer ports are
+    then whichever cache inputs the scatter addresses.
+    """
+    inputs = {value.name: value for value in model.graph.inputs}
+    write_indices = inputs.get(STATIC_CACHE_WRITE_INDICES)
+    kv_lengths = inputs.get(STATIC_CACHE_KV_SEQUENCE_LENGTH)
+    if write_indices is None or kv_lengths is None:
+        return None
+    buffers = {
+        past.name: past
+        for past, present in _model_cache_pairs(model)
+        if present.name == f"updated_{past.name}"
+    }
+    if not buffers:
+        raise ValueError(
+            "decoder declares the static-cache control ports "
+            f"{STATIC_CACHE_WRITE_INDICES!r}/{STATIC_CACHE_KV_SEQUENCE_LENGTH!r} but exposes "
+            "no paired cache buffer to scatter into; regenerate the package with "
+            "updated_<buffer> outputs for every static cache input"
+        )
+    axes = {
+        node.attributes.get_int("axis", 0)
+        for node in ir.traversal.RecursiveGraphIterator(model.graph)
+        if node.op_type == "TensorScatter"
+    }
+    if axes - {STATIC_CACHE_SEQUENCE_AXIS}:
+        raise ValueError(
+            f"static cache buffers are addressed on axes {sorted(axes)}, but the mobius "
+            f"static-cache ABI scatters along axis {STATIC_CACHE_SEQUENCE_AXIS}; the "
+            "declared capacity axis and the graph disagree"
+        )
+    capacities = set()
+    for buffer in buffers.values():
+        shape = list(buffer.shape or [])
+        if len(shape) <= STATIC_CACHE_SEQUENCE_AXIS:
+            raise ValueError(
+                f"static cache buffer {buffer.name!r} has rank {len(shape)}, which cannot "
+                f"carry a capacity on axis {STATIC_CACHE_SEQUENCE_AXIS}"
+            )
+        capacity = _constant_extent(shape[STATIC_CACHE_SEQUENCE_AXIS])
+        if capacity is None:
+            raise ValueError(
+                f"static cache buffer {buffer.name!r} declares a symbolic extent "
+                f"{shape[STATIC_CACHE_SEQUENCE_AXIS]!r} on its capacity axis; an "
+                "indexed scatter is only meaningful against one constant capacity"
+            )
+        capacities.add(capacity)
+    if len(capacities) != 1:
+        raise ValueError(
+            f"static cache buffers declare conflicting capacities {sorted(capacities)}; "
+            "one write cursor cannot address buffers of different lengths"
+        )
+    return {
+        "write_indices": STATIC_CACHE_WRITE_INDICES,
+        "kv_sequence_length": STATIC_CACHE_KV_SEQUENCE_LENGTH,
+        "buffers": buffers,
+        "capacity": capacities.pop(),
+    }
+
+
+def _static_cache_model_io(model: ir.Model) -> dict[str, Any]:
+    """Return ``model.io`` declaring the static-cache port ABI of *model*."""
+    static_cache = _static_cache_io(
+        [_port(value) for value in model.graph.inputs],
+        [_port(value) for value in model.graph.outputs],
+    )
+    if static_cache is None:
+        raise ValueError(
+            "decoder was classified as a static-cache graph but exposes no "
+            "updated_<role>_cache.<layer> ports to declare"
+        )
+    return {"kv_ownership": "owned", "static_cache": static_cache}
 
 
 def _kv_storage_contract(model: ir.Model) -> dict[str, Any]:
@@ -608,6 +714,12 @@ def _consumes_explicit_cache_length(model: ir.Model) -> bool:
     cache_values = {
         past.name for past, _ in _model_cache_pairs(model) if past.name is not None
     }
+    # A static buffer's capacity safety comes from its declared write cursor and
+    # logical lengths, not from the attention operator's signature, so its
+    # scatter consumer must not veto the appending caches' storage class.
+    static = _static_cache_ports(model)
+    if static is not None:
+        cache_values -= set(static["buffers"])
     if not cache_values:
         return False
     consumers = {
@@ -674,9 +786,17 @@ def _state_aliasing(kv_contract: dict[str, Any]) -> str:
 
 
 def _cache_layer_index(port_name: str, fallback: int) -> int:
-    """Recover the decoder layer index from a ``past_key_values.N.key`` port name."""
-    match = re.search(r"\.(\d+)\.(?:key|value)$", port_name)
-    return int(match.group(1)) if match else fallback
+    """Recover the decoder layer index from a cache port name.
+
+    Both cache ABIs encode the layer in the port name — ``past_key_values.N.key``
+    for an appending cache, ``key_cache.N`` for a static one — because a hybrid
+    decoder's cache-owning layers are a subset of its layers, so a port's
+    position in the port list is not its layer.
+    """
+    match = re.search(r"\.(\d+)\.(?:key|value)$|(?:key|value)_cache\.(\d+)$", port_name)
+    if match is None:
+        return fallback
+    return int(match.group(1) or match.group(2))
 
 
 def _state_group_kinds(config: Any, cache_pairs: list[tuple[ir.Value, ir.Value]]) -> list[str]:
@@ -711,49 +831,86 @@ def _state_service_groups(
     logical_lengths: str | None,
     aliasing: str,
     base_name: str,
+    indexed_scatter: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, str]]:
     """Build ``serving.state_service.groups`` plus each cell's owning group.
 
-    One group per semantic kind: a hybrid decoder therefore publishes distinct
-    ``sliding_attention`` and ``full_attention`` groups whose per-cell contracts
-    carry their own geometry (Gemma 4's global layers are double-wide).  The
-    group declares *semantics* only — eviction legality, aliasing legality,
-    layout — never a storage class, allocator, or compaction algorithm, which
-    are the runtime's to choose.
+    One group per semantic kind *and update discipline*: a hybrid decoder
+    therefore publishes distinct ``sliding_attention`` and ``full_attention``
+    groups whose per-cell contracts carry their own geometry (Gemma 4's global
+    layers are double-wide), and a decoder that appends some caches while
+    scattering others into fixed buffers keeps those apart too, because the
+    valid region of an appended buffer is its shape while the valid region of a
+    scattered one is a declared prefix.  The group declares *semantics* only —
+    eviction legality, aliasing legality, layout — never a storage class,
+    allocator, or compaction algorithm, which are the runtime's to choose.
+
+    ``indexed_scatter`` describes the static, fixed-capacity buffers: which
+    cache inputs they are, the constant capacity they were built against, the
+    cell carrying each row's write cursor, and the port that receives it.
     """
+    indexed_scatter = indexed_scatter or {}
+    indexed_inputs = set(indexed_scatter.get("buffers", ()))
     kinds = _state_group_kinds(config, cache_pairs)
-    distinct = sorted(set(kinds))
+    scattered = [(past.name or "") in indexed_inputs for past, _ in cache_pairs]
+    # Group identity is (semantic kind, update discipline); the suffix only
+    # appears when more than one identity is present, so a homogeneous decoder
+    # keeps publishing exactly one group under its base name.
+    identities = [
+        (kind, "indexed_scatter" if is_scattered else "append")
+        for kind, is_scattered in zip(kinds, scattered)
+    ]
+    distinct = sorted(set(identities))
     names = {
-        kind: (base_name if len(distinct) == 1 else f"{base_name}_{kind}") for kind in distinct
+        identity: (base_name if len(distinct) == 1 else f"{base_name}_{identity[0]}")
+        for identity in distinct
     }
+    if len({*names.values()}) != len(distinct):
+        names = {identity: f"{base_name}_{identity[0]}_{identity[1]}" for identity in distinct}
     cell_group = {}
     grouped_ports: dict[str, dict[str, dict[str, dict[str, str]]]] = {
         name: {} for name in names.values()
     }
-    for index, kind in enumerate(kinds):
+    for index, identity in enumerate(identities):
         cell = f"cache_{index}"
-        cell_group[cell] = names[kind]
+        cell_group[cell] = names[identity]
     for component, aliases in ports.items():
         for cell, alias in aliases.items():
             grouped_ports[cell_group[cell]].setdefault(component, {})[cell] = alias
-    groups = {
-        names[kind]: {
+    groups = {}
+    for kind, update in distinct:
+        is_scattered = update == "indexed_scatter"
+        name = names[(kind, update)]
+        group: dict[str, Any] = {
             "kind": kind,
-            "sequence_axis": sequence_axis,
-            "layout": "bnsh",
-            **({"logical_lengths": logical_lengths} if logical_lengths else {}),
-            "aliasing": aliasing,
-            "reuse": {
-                "prefix_reusable": True,
-                # Dropping the oldest positions is only semantics-preserving
-                # for a windowed layer; a full-attention layer that loses its
-                # prefix silently answers a different question.
-                "evictable_prefix": kind == "sliding_attention",
-            },
-            "ports": grouped_ports[names[kind]],
+            "sequence_axis": (STATIC_CACHE_SEQUENCE_AXIS if is_scattered else sequence_axis),
+            "layout": STATIC_CACHE_LAYOUT if is_scattered else "bnsh",
         }
-        for kind in distinct
-    }
+        group_lengths = indexed_scatter["logical_lengths"] if is_scattered else logical_lengths
+        if group_lengths:
+            group["logical_lengths"] = group_lengths
+        if is_scattered:
+            group["update"] = {
+                "kind": "indexed_scatter",
+                "write_indices": indexed_scatter["write_indices"],
+                "capacity": indexed_scatter["capacity"],
+                "write_indices_ports": dict.fromkeys(
+                    grouped_ports[name], indexed_scatter["port"]
+                ),
+            }
+        # A scatter writes through its buffer by construction: the written result
+        # *is* the input allocation, so aliasing is legal for every static group
+        # regardless of what the appending caches in the same graph can do.
+        group["aliasing"] = "permitted" if is_scattered else aliasing
+        group["reuse"] = {
+            "prefix_reusable": True,
+            # Dropping the oldest positions is only semantics-preserving
+            # for a windowed layer; a full-attention layer that loses its
+            # prefix silently answers a different question.
+            "evictable_prefix": kind == "sliding_attention",
+        }
+        group["ports"] = grouped_ports[name]
+        groups[name] = group
     return groups, cell_group
 
 
@@ -3985,10 +4142,7 @@ def build_vlm_workflow_metadata(
         present = next(
             (
                 decoder_outputs.get(name)
-                for name in (
-                    value.name.replace("past_key_values", "present"),
-                    value.name.replace("past.", "present."),
-                )
+                for name in _cache_output_candidates(value.name or "")
                 if name in decoder_outputs
             ),
             None,
@@ -3998,6 +4152,10 @@ def build_vlm_workflow_metadata(
                 present.shape = value.shape
             cache_pairs.append((value, present))
     cache_names = {value.name for value, _ in cache_pairs}
+    # A multimodal decoder can be hybrid: sliding layers keep a growing cache
+    # while full-attention layers scatter into fixed buffers. Both disciplines
+    # are described side by side rather than one being folded into the other.
+    static_cache = _static_cache_ports(decoder)
     decoder_kv = _kv_storage_contract(decoder)
     rank2_integer = [
         value
@@ -4012,6 +4170,10 @@ def build_vlm_workflow_metadata(
     if attention_input is None:
         raise ValueError("VLM decoder requires an attention-mask input")
     fixed_capacity = bool(cache_pairs) and decoder_kv["storage"] == "shared_buffer"
+    # A static cache carries its own per-row length on a graph port, so the
+    # prompt length must be materialized for it whether or not the shared-buffer
+    # attention-mask discipline also applies.
+    tracks_cache_lengths = fixed_capacity or static_cache is not None
 
     legacy = build_native_vlm_package_metadata(pkg, config=config, source=source)
     preprocessing = legacy.get("preprocessing")
@@ -4070,6 +4232,9 @@ def build_vlm_workflow_metadata(
             cache_inputs=sorted(cache_names),
             fixed_capacity=fixed_capacity,
             ragged=True,
+            write_indices_output=(
+                static_cache["write_indices"] if static_cache is not None else None
+            ),
         ),
     )
     pkg.add_policy_component(
@@ -4177,6 +4342,21 @@ def build_vlm_workflow_metadata(
                 )
             ),
         },
+        **(
+            {
+                # The capacity a static graph was built against is a graph fact,
+                # not a deployment budget: it bounds legal write destinations.
+                "package.cache_capacity": {
+                    "contract": control_int,
+                    "role": {"kind": "opaque"},
+                    "source": {"kind": "literal"},
+                    "required": False,
+                    "default": int(static_cache["capacity"]),
+                }
+            }
+            if static_cache is not None
+            else {}
+        ),
         "package.one": {
             "contract": batch_int,
             "role": {"kind": "opaque"},
@@ -4336,6 +4516,15 @@ def build_vlm_workflow_metadata(
     if position_input is not None:
         setup_decoder_inputs[position_input.name] = f"initializer.{position_input.name}"
         body_decoder_inputs[position_input.name] = "state.position_ids.body"
+    if static_cache is not None:
+        # Prefill scatters from slot zero; each decode step writes at the row's
+        # current logical length, which is the same cursor the group declares.
+        setup_decoder_inputs[static_cache["write_indices"]] = (
+            f"initializer.{static_cache['write_indices']}"
+        )
+        setup_decoder_inputs[static_cache["kv_sequence_length"]] = "initializer.cache_lengths"
+        body_decoder_inputs[static_cache["write_indices"]] = "state.cache_lengths.body"
+        body_decoder_inputs[static_cache["kv_sequence_length"]] = "cache_lengths.next"
     for past, _ in cache_pairs:
         setup_decoder_inputs[past.name] = f"initializer.{past.name}"
         body_decoder_inputs[past.name] = f"state.{past.name}.body"
@@ -4417,7 +4606,7 @@ def build_vlm_workflow_metadata(
             "class": "semantic",
             "scope": "invocation",
             "initializer": (
-                "initializer.cache_lengths" if fixed_capacity else "package.zero_batch"
+                "initializer.cache_lengths" if tracks_cache_lengths else "package.zero_batch"
             ),
             "recurrence": {"kind": "invariant"},
         },
@@ -4486,7 +4675,7 @@ def build_vlm_workflow_metadata(
         ),
         (
             "cache_lengths",
-            "initializer.cache_lengths" if fixed_capacity else "package.zero_batch",
+            "initializer.cache_lengths" if tracks_cache_lengths else "package.zero_batch",
             "state.cache_lengths.body",
             "cache_lengths.next",
             "state.cache_lengths.final",
@@ -4514,22 +4703,29 @@ def build_vlm_workflow_metadata(
         )
     for index, (past, present) in enumerate(cache_pairs):
         cell = f"cache_{index}"
+        # A scattered buffer overwrites cells inside a capacity fixed at export,
+        # so its extent never changes; only an appending cache grows.
+        scattered = static_cache is not None and past.name in static_cache["buffers"]
         state[cell] = {
             "contract": _request_aligned(_contract(past)),
             "scope": "invocation",
             "initializer": f"decoder.setup.{present.name}",
-            "recurrence": {
-                "kind": "bounded",
-                "axis": next(
-                    (
-                        axis
-                        for axis, dimension in enumerate(_contract(past)["shape"])
-                        if "sequence" in str(dimension)
+            "recurrence": (
+                {"kind": "invariant"}
+                if scattered
+                else {
+                    "kind": "bounded",
+                    "axis": next(
+                        (
+                            axis
+                            for axis, dimension in enumerate(_contract(past)["shape"])
+                            if "sequence" in str(dimension)
+                        ),
+                        2,
                     ),
-                    2,
-                ),
-                "max": "package.max_context",
-            },
+                    "max": "package.max_context",
+                }
+            ),
             "management": "runtime",
             "release_boundary": "invocation",
         }
@@ -4568,6 +4764,19 @@ def build_vlm_workflow_metadata(
         logical_lengths="cache_lengths",
         aliasing=_state_aliasing(decoder_kv),
         base_name="decoder_cache",
+        indexed_scatter=(
+            {
+                "buffers": static_cache["buffers"],
+                "capacity": "package.cache_capacity",
+                # The write cursor and the logical length are one quantity: a
+                # row's next write lands exactly where its valid prefix ends.
+                "write_indices": "cache_lengths",
+                "logical_lengths": "cache_lengths",
+                "port": static_cache["write_indices"],
+            }
+            if static_cache is not None
+            else None
+        ),
     )
     for cell, group_name in vlm_cell_groups.items():
         state[cell]["service_group"] = group_name
@@ -4663,7 +4872,16 @@ def build_vlm_workflow_metadata(
                     "generated_lengths": "initializer.generated_lengths",
                     **(
                         {"cache_lengths": "initializer.cache_lengths"}
-                        if fixed_capacity
+                        if tracks_cache_lengths
+                        else {}
+                    ),
+                    **(
+                        {
+                            static_cache["write_indices"]: (
+                                f"initializer.{static_cache['write_indices']}"
+                            )
+                        }
+                        if static_cache is not None
                         else {}
                     ),
                     **(
@@ -4930,6 +5148,14 @@ def build_vlm_workflow_metadata(
     metadata = {
         "schema_version": "v1",
         "preprocessing": preprocessing,
+        # The scatter ABI's control ports are rank-1 integer vectors and are
+        # indistinguishable by shape, so which is the write cursor and which is
+        # the non-pad length is declared, never inferred.
+        **(
+            {"model": {"io": _static_cache_model_io(decoder)}}
+            if static_cache is not None
+            else {}
+        ),
         "pipeline": {"workflow": _publish_workflow_v1(workflow)},
     }
     add_policy_components_to_workflow(metadata, pkg)
@@ -5909,18 +6135,27 @@ def _build_autoregressive_workflow_metadata(
     for value in inputs:
         if value.name in cross_bindings:
             continue
-        candidates = [
-            value.name.replace("past_key_values", "present"),
-            value.name.replace("past.", "present."),
-            value.name.replace("past_", "present_"),
-        ]
         present = next(
-            (output_by_suffix.get(name) for name in candidates if name in output_by_suffix),
+            (
+                output_by_suffix.get(name)
+                for name in _cache_output_candidates(value.name or "")
+                if name in output_by_suffix
+            ),
             None,
         )
         if present is not None:
             cache_pairs.append((value, present))
     cache_names = {past.name for past, _ in cache_pairs}
+    # A static cache is a fixed-capacity buffer the graph scatters into at
+    # declared destinations, so it needs a write cursor and a per-row valid
+    # length that no shape can carry. Its two control ports are integer vectors
+    # and shape-indistinguishable, hence read from the exporter's declared ABI.
+    static_cache = _static_cache_ports(decoder)
+    static_control_names = (
+        {static_cache["write_indices"], static_cache["kv_sequence_length"]}
+        if static_cache is not None
+        else set()
+    )
     integer_rank2 = [
         value
         for value in inputs
@@ -5959,7 +6194,7 @@ def _build_autoregressive_workflow_metadata(
             None,
         ),
     )
-    derived_names = cache_names | set(cross_bindings)
+    derived_names = cache_names | set(cross_bindings) | static_control_names
     if attention_input is not None:
         derived_names.add(attention_input.name)
     if position_input is not None:
@@ -5978,6 +6213,10 @@ def _build_autoregressive_workflow_metadata(
         and decoder_kv_contract["storage"] == "shared_buffer"
         and attention_input is not None
     )
+    # A static cache carries its own per-row length on a graph port, so the
+    # prompt length has to be materialized for it whether or not an attention
+    # mask is also present.
+    tracks_cache_lengths = fixed_capacity or static_cache is not None
     pkg.add_policy_component(
         "decoder_state_initializer",
         build_decoder_state_initializer(
@@ -5988,6 +6227,9 @@ def _build_autoregressive_workflow_metadata(
             cache_inputs=sorted(cache_names),
             fixed_capacity=fixed_capacity,
             ragged=bool(cache_pairs),
+            write_indices_output=(
+                static_cache["write_indices"] if static_cache is not None else None
+            ),
         ),
     )
     if attention_input is not None:
@@ -6147,6 +6389,16 @@ def _build_autoregressive_workflow_metadata(
             },
         }
     )
+    if static_cache is not None:
+        # The capacity a static graph was built against is a graph fact, not a
+        # deployment budget: it bounds legal write destinations and nothing else.
+        workflow_inputs["package.cache_capacity"] = {
+            "contract": control_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": int(static_cache["capacity"]),
+        }
     if cache_pairs:
         workflow_inputs.update(
             {
@@ -6340,6 +6592,18 @@ def _build_autoregressive_workflow_metadata(
     if position_input is not None:
         setup_decoder_inputs[position_input.name] = f"initializer.{position_input.name}"
         body_decoder_inputs[position_input.name] = "state.position_ids.body"
+    if static_cache is not None:
+        # Prefill scatters the whole prompt from slot zero and ends with
+        # ``prompt_length`` valid entries. Each decode step then writes at the
+        # row's current logical length and ends one entry longer — except for a
+        # finished row, whose length does not advance, so the slot it just wrote
+        # stays outside its valid prefix and is reclaimed by its next write.
+        setup_decoder_inputs[static_cache["write_indices"]] = (
+            f"initializer.{static_cache['write_indices']}"
+        )
+        setup_decoder_inputs[static_cache["kv_sequence_length"]] = "initializer.cache_lengths"
+        body_decoder_inputs[static_cache["write_indices"]] = "state.cache_lengths.body"
+        body_decoder_inputs[static_cache["kv_sequence_length"]] = "cache_lengths.next"
     # Cross state is produced once by the encoder and read unchanged by every
     # decode step, so setup binds the encoder result and the body binds the
     # invariant carried cell that holds it.
@@ -6413,7 +6677,7 @@ def _build_autoregressive_workflow_metadata(
                     "scope": "invocation",
                     "initializer": (
                         "initializer.cache_lengths"
-                        if fixed_capacity
+                        if tracks_cache_lengths
                         else "package.cache_lengths"
                     ),
                     "recurrence": {"kind": "invariant"},
@@ -6480,7 +6744,7 @@ def _build_autoregressive_workflow_metadata(
                     "cell": "cache_lengths",
                     "current": (
                         "initializer.cache_lengths"
-                        if fixed_capacity
+                        if tracks_cache_lengths
                         else "package.cache_lengths"
                     ),
                     "body_input": "state.cache_lengths.body",
@@ -6591,15 +6855,23 @@ def _build_autoregressive_workflow_metadata(
             ),
             2,
         )
+        # A scattered buffer never changes shape: every step overwrites cells
+        # inside a capacity fixed at export, so its extent is invariant and the
+        # logical prefix is carried separately by ``cache_lengths``.
+        scattered = static_cache is not None and past.name in static_cache["buffers"]
         state[cell] = {
             "contract": _request_aligned(_contract(past)),
             "scope": "invocation",
             "initializer": setup_value,
-            "recurrence": {
-                "kind": "bounded",
-                "axis": decoder_kv_axis,
-                "max": "package.max_context",
-            },
+            "recurrence": (
+                {"kind": "invariant"}
+                if scattered
+                else {
+                    "kind": "bounded",
+                    "axis": decoder_kv_axis,
+                    "max": "package.max_context",
+                }
+            ),
             # Binding a cell to a state service group hands its storage to the
             # runtime, which then owns allocation, compaction, and release.
             "management": "runtime",
@@ -6668,6 +6940,19 @@ def _build_autoregressive_workflow_metadata(
             decoder_kv_contract["storage"] if fixed_capacity else "growable"
         ),
         base_name="decoder_cache",
+        indexed_scatter=(
+            {
+                "buffers": static_cache["buffers"],
+                "capacity": "package.cache_capacity",
+                # The write cursor and the logical length are the same quantity:
+                # a row's next write lands exactly where its valid prefix ends.
+                "write_indices": "cache_lengths",
+                "logical_lengths": "cache_lengths",
+                "port": static_cache["write_indices"],
+            }
+            if static_cache is not None
+            else None
+        ),
     )
     for cell in decoder_cache_cells:
         state[cell]["service_group"] = decoder_cell_groups[cell]
@@ -6715,7 +7000,16 @@ def _build_autoregressive_workflow_metadata(
                     ),
                     **(
                         {"cache_lengths": "initializer.cache_lengths"}
-                        if fixed_capacity
+                        if tracks_cache_lengths
+                        else {}
+                    ),
+                    **(
+                        {
+                            static_cache["write_indices"]: (
+                                f"initializer.{static_cache['write_indices']}"
+                            )
+                        }
+                        if static_cache is not None
                         else {}
                     ),
                     **(
@@ -7062,6 +7356,16 @@ def _build_autoregressive_workflow_metadata(
     metadata = {
         "schema_version": "1.0",
         **({"preprocessing": {"audio": audio_program}} if audio_program is not None else {}),
+        # The scatter ABI's two control ports are integer vectors and so are
+        # indistinguishable by shape. ``model.io.static_cache`` is the
+        # authoritative declaration of which port is which, and a runtime that
+        # drives the graph directly rather than through the workflow reads it
+        # from here; it is deliberately redundant with the workflow bindings.
+        **(
+            {"model": {"io": _static_cache_model_io(decoder)}}
+            if static_cache is not None
+            else {}
+        ),
         "pipeline": {"workflow": _publish_workflow_v1(workflow)},
     }
     add_policy_components_to_workflow(metadata, pkg)

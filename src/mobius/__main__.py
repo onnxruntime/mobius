@@ -213,23 +213,6 @@ def _cmd_build(args: argparse.Namespace) -> None:
             "Remove --task to use --features static-cache."
         )
 
-    # Validate static-cache + onnx-genai compatibility.
-    #
-    # A static-cache decoder exposes in-place ring buffers (``key_cache.N`` /
-    # ``updated_key_cache.N``) plus ``write_indices`` and ``nonpad_kv_seqlen``,
-    # and drops the rank-2 attention mask. The onnx-genai workflow decoder
-    # contract is built on ``past_key_values.N`` -> ``present.N`` pairs and that
-    # mask, so the metadata emitter cannot describe a static-cache graph.
-    # Reject the combination up front rather than after exporting the weights.
-    if args.static_cache and args.runtime == "onnx-genai":
-        raise SystemExit(
-            "Error: --features static-cache cannot be combined with "
-            "--runtime onnx-genai. The onnx-genai workflow decoder contract "
-            "requires dynamic past/present KV ports and a rank-2 attention "
-            "mask, which a static-cache graph does not expose. Build without "
-            "--features static-cache, or omit --runtime onnx-genai."
-        )
-
     # text-only resolution lives in build() (model_type remap + config
     # stripping), which is only reached on the HuggingFace model-ID path.
     if args.text_only and args.config:

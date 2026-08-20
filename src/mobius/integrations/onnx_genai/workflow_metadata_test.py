@@ -18,6 +18,7 @@ from mobius.integrations.onnx_genai.inference_metadata_test import (
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
     _kv_storage_contract,
+    _static_cache_ports,
     build_language_diffusion_pipeline_metadata,
     build_speculative_workflow_metadata,
     build_video_diffusion_workflow_metadata,
@@ -787,3 +788,83 @@ def test_paged_cache_inputs_take_precedence_over_operator_derivation():
     contract = _kv_storage_contract(model)
     assert contract["paging"] == "paged"
     assert contract["storage"] == "paged"
+
+
+def _static_cache_model(
+    *,
+    capacities: list[int] | None = None,
+    scatter_axis: int | None = None,
+    paired: bool = True,
+    control_ports: bool = True,
+) -> ir.Model:
+    """A minimal graph shaped like a mobius static-cache decoder export."""
+    capacities = capacities or [32, 32]
+    inputs = [_value("input_ids", ir.DataType.INT64, ["batch", "sequence"])]
+    for layer, capacity in enumerate(capacities):
+        inputs.append(_value(f"key_cache.{layer}", ir.DataType.FLOAT, ["batch", capacity, 16]))
+    if control_ports:
+        inputs.append(_value("write_indices", ir.DataType.INT64, ["batch"]))
+        inputs.append(_value("nonpad_kv_seqlen", ir.DataType.INT64, ["batch"]))
+    outputs: list[tuple[str, ir.DataType, list[int | str]]] = [
+        ("logits", ir.DataType.FLOAT, ["batch", "sequence", 128])
+    ]
+    if paired:
+        for layer, capacity in enumerate(capacities):
+            outputs.append(
+                (f"updated_key_cache.{layer}", ir.DataType.FLOAT, ["batch", capacity, 16])
+            )
+    model = _model("decoder", inputs, outputs)
+    if scatter_axis is not None:
+        cache = model.graph.inputs[1]
+        scattered = _value("scattered", ir.DataType.FLOAT, ["batch", capacities[0], 16])
+        model.graph.append(
+            ir.Node(
+                "",
+                "TensorScatter",
+                [cache, cache, model.graph.inputs[-2]],
+                outputs=[scattered],
+                attributes=[ir.AttrInt64("axis", scatter_axis)],
+                name="scatter",
+            )
+        )
+    return model
+
+
+class TestStaticCachePortDiscovery:
+    """``_static_cache_ports`` reads the ABI from the graph or refuses to guess."""
+
+    def test_returns_none_without_the_control_ports(self):
+        # A dynamic decoder must not be mistaken for a fixed-capacity one.
+        assert _static_cache_ports(_static_cache_model(control_ports=False)) is None
+
+    def test_discovers_buffers_control_ports_and_capacity(self):
+        ports = _static_cache_ports(_static_cache_model())
+        assert ports["write_indices"] == "write_indices"
+        assert ports["kv_sequence_length"] == "nonpad_kv_seqlen"
+        assert ports["capacity"] == 32
+        assert sorted(ports["buffers"]) == ["key_cache.0", "key_cache.1"]
+
+    def test_rejects_control_ports_without_paired_buffers(self):
+        # Nothing to scatter into: the runtime would have no output to carry.
+        with pytest.raises(ValueError, match="no paired cache buffer"):
+            _static_cache_ports(_static_cache_model(paired=False))
+
+    def test_rejects_conflicting_capacities(self):
+        # One write cursor cannot address buffers of different lengths.
+        with pytest.raises(ValueError, match="conflicting capacities"):
+            _static_cache_ports(_static_cache_model(capacities=[32, 64]))
+
+    def test_rejects_a_symbolic_capacity(self):
+        model = _static_cache_model()
+        model.graph.inputs[1].shape = ir.Shape(["batch", "capacity", 16])
+        with pytest.raises(ValueError, match="symbolic extent"):
+            _static_cache_ports(model)
+
+    def test_rejects_a_scatter_that_disagrees_with_the_declared_axis(self):
+        # The capacity axis published in the metadata has to be the axis the
+        # graph actually writes on, or a runtime sizes the wrong dimension.
+        with pytest.raises(ValueError, match="declared capacity axis"):
+            _static_cache_ports(_static_cache_model(scatter_axis=2))
+
+    def test_accepts_a_scatter_on_the_declared_axis(self):
+        assert _static_cache_ports(_static_cache_model(scatter_axis=1))["capacity"] == 32

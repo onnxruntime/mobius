@@ -193,18 +193,18 @@ class TestCLIBuild:
         mock_build.assert_called_once()
         assert mock_build.call_args.kwargs.get("text_only") is True
 
-    def test_static_cache_with_onnx_genai_runtime_errors(self):
-        """static-cache graphs cannot be described by the onnx-genai contract.
+    def test_static_cache_with_onnx_genai_runtime_emits_scatter_abi(self):
+        """A static-cache export is describable, so the CLI must describe it.
 
-        A static-cache decoder exposes in-place ring buffers plus write indices
-        instead of past/present KV pairs and a rank-2 attention mask, so the
-        workflow metadata emitter cannot describe it. The CLI must say so
-        before exporting the weights, not after.
+        The two control ports are rank-1 integer vectors and are therefore
+        shape-indistinguishable from one another, which is exactly why the ABI
+        is *declared* rather than inferred: ``model.io.static_cache`` names
+        which port is the write cursor and which is the non-pad length, and the
+        workflow binds those same names.
         """
-        with (
-            tempfile.TemporaryDirectory() as tmpdir,
-            pytest.raises(SystemExit, match=r"static-cache.*--runtime onnx-genai"),
-        ):
+        import yaml
+
+        with tempfile.TemporaryDirectory() as tmpdir:
             main(
                 [
                     "build",
@@ -214,10 +214,37 @@ class TestCLIBuild:
                     "--no-weights",
                     "--features",
                     "static-cache",
+                    "--max-seq-len",
+                    "128",
                     "--runtime",
                     "onnx-genai",
                 ]
             )
+            with open(
+                os.path.join(tmpdir, "inference_metadata.yaml"), encoding="utf-8"
+            ) as handle:
+                metadata = yaml.safe_load(handle)
+
+        static_cache = metadata["model"]["io"]["static_cache"]
+        assert static_cache["write_indices_input"] == "write_indices"
+        assert static_cache["kv_sequence_length_input"] == "nonpad_kv_seqlen"
+        assert static_cache["key_cache_inputs"][0] == "key_cache.0"
+        assert static_cache["key_cache_outputs"][0] == "updated_key_cache.0"
+        assert (
+            len(static_cache["key_cache_inputs"])
+            == len(static_cache["value_cache_inputs"])
+            == len(static_cache["key_cache_outputs"])
+            == len(static_cache["value_cache_outputs"])
+        )
+
+        workflow = metadata["pipeline"]["workflow"]
+        assert workflow["inputs"]["package.cache_capacity"]["default"] == 128
+        groups = workflow["serving"]["state_service"]["groups"]
+        update = next(group["update"] for group in groups.values() if "update" in group)
+        assert update["kind"] == "indexed_scatter"
+        assert update["capacity"] == "package.cache_capacity"
+        # The write cursor and the logical length are the same quantity.
+        assert update["write_indices"] == "cache_lengths"
 
     def test_static_cache_task_follows_text_only_substitution(self):
         """``text-only`` + ``static-cache`` must resolve the *text* task.

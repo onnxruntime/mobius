@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed-capacity (static) KV cache and FP8 KV cache metadata
+
+#### Added
+
+- `--features static-cache` now produces onnx-genai metadata instead of being
+  refused. The producer publishes the write cursor (`write_indices`), the valid
+  length (`nonpad_kv_seqlen`), the fixed-capacity buffer contracts, the
+  per-layer input/output pairs, and an `indexed_scatter` state-service update
+  discipline naming the cursor, the capacity and the per-component port that
+  carries it. The buffers are declared as `recurrence: {kind: invariant}` loop
+  cells and the capacity as a `package.cache_capacity` literal workflow input.
+  The same ABI is also published authoritatively as `model.io.static_cache`.
+  Nothing dispatches on model name; the ports are read from the graph.
+- Heterogeneous caches keep their own disciplines. Gemma 4's sliding layers stay
+  on a growing rank-4 BNSH cache while its full-attention layers use rank-3
+  fixed-capacity buffers, and `model.io.static_cache` lists only the layers that
+  own a buffer — its KV-shared suffix owns none.
+- A `static_cache` package joined the checked-in onnx-genai conformance
+  fixtures, so the engine exercises the fixed-capacity carry and the write
+  cursor rather than only the growing-tensor path.
+
+#### Fixed
+
+- Gemma 4's shared-KV fallback pinned a 4-D BNSH shape onto *any* borrowed KV
+  tensor whose rank was not 4. A static-cache source hands over a fully known
+  rank-3 `[batch, capacity, kv_hidden]` buffer, so this overwrote a correct
+  shape with a wrong one — corrupting the declared shape of
+  `updated_key_cache.N` and defeating the rank-3 static-source test further
+  down, which would then have transposed a rank-3 tensor as BNSH. The fallback
+  now only supplies a shape when there is none.
+- Gemma 4's vision-language decoder dropped `attention_mask` whenever the export
+  was static, but a Gemma 4 decoder is only *partly* static: its sliding layers
+  keep a dynamic cache and build their bias from that mask. The hybrid decoder
+  therefore lost all padding information. Both builders now apply one rule — a
+  mask exists exactly when some layer still has a dynamic cache — so a fully
+  static decoder carries no unused port and a hybrid one keeps its mask.
+- `--features fp8-kv-cache` no longer silently produces a float16 cache. The
+  gate only tested whether GQA fusion was *expected*; the pass now reports how
+  many caches it converted and the build fails when the answer is zero, naming
+  the reason: FP8 KV storage needs an attention operator with `k_scale`/
+  `v_scale` inputs, which a `TensorScatter` + `ai.onnx` `Attention` static-cache
+  graph does not have.
+
+
 ### Qwen3.5/3.6-MoE mixed float/quantized decoder (Olive checkpoints)
 
 #### Fixed

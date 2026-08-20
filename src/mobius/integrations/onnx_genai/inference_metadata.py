@@ -42,6 +42,10 @@ from typing import Any
 
 import yaml
 
+from mobius._constants import (
+    STATIC_CACHE_KV_SEQUENCE_LENGTH,
+    STATIC_CACHE_WRITE_INDICES,
+)
 from mobius._pipeline_contract import component_presence, optional_input_contract
 from mobius.upstream_patches import apply_asset_patches
 
@@ -867,7 +871,7 @@ def _static_cache_io(
         if (layer, role) not in ports
     ]
     input_names = {port.name for port in decoder_inputs}
-    for control in ("write_indices", "nonpad_kv_seqlen"):
+    for control in (STATIC_CACHE_WRITE_INDICES, STATIC_CACHE_KV_SEQUENCE_LENGTH):
         if control not in input_names:
             missing.append(f"input.{control}")
     if missing:
@@ -876,8 +880,8 @@ def _static_cache_io(
             f"ABI is incomplete: {missing}"
         )
     return {
-        "write_indices_input": "write_indices",
-        "kv_sequence_length_input": "nonpad_kv_seqlen",
+        "write_indices_input": STATIC_CACHE_WRITE_INDICES,
+        "kv_sequence_length_input": STATIC_CACHE_KV_SEQUENCE_LENGTH,
         "key_cache_inputs": [inputs[(layer, "key")] for layer in layers],
         "value_cache_inputs": [inputs[(layer, "value")] for layer in layers],
         "key_cache_outputs": [outputs[(layer, "key")] for layer in layers],

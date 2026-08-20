@@ -79,6 +79,48 @@ demonstration even when the selected implementation is pure same-device ONNX. Pe
 acceptance remains blocked until override selection precedes island partitioning and the resolved
 implementation is evaluated for purity and placement.
 
+## Fixed-capacity cache and FP8 runtime evidence
+
+Measured on an NVIDIA H200 with `onnxruntime-gpu==1.29.0`, CUDA execution
+provider, against a real `--features static-cache` Qwen2 export.
+
+### Static cache — executes as specified
+
+| Check | Result |
+| --- | --- |
+| B=2 prefill vs per-row B=1 | max abs delta 0.0 |
+| Scatter confined to `[0, nonpad_kv_seqlen)` | all rows; zero energy outside |
+| Decode, divergent per-row cursors (row 0 advancing, row 1 finished), 3 steps | max abs delta 3.1e-6 |
+| Compaction: the finished row reclaims its own last slot each step | verified, no writes past the reclaimed slot |
+
+Per-row cursor divergence during decode therefore works. Ragged *prefill* is
+not claimed and was not measured: ONNX leaves the region between
+`nonpad_kv_seqlen` and the query length undefined.
+
+### FP8 KV cache — not executable with the shipped kernel, and not an IMA
+
+Session creation fails during graph partitioning; no kernel is ever launched,
+so this is not an illegal memory access:
+
+```
+transformer_memcpy.cc:253 IsNodeCompatibleWithProvider —
+Provider type for GroupQueryAttention node 'node_GroupQueryAttention_9' is not set
+```
+
+ORT reports an unassigned node as an initialization exception rather than a type
+error, so the cause was isolated by a three-way comparison of the same graph:
+
+| Variant | Result |
+| --- | --- |
+| No FP8 pass | loads and runs on CUDA EP |
+| 14-input GQA with `k_scale`/`v_scale`, quantization attributes, **FLOAT** KV | loads and runs on CUDA EP |
+| Same node with **FLOAT8E4M3FN** KV | node unassigned, session init fails |
+
+The rejection is the KV *type constraint* — `tensor(float8e4m3fn)` is not in the
+CUDA `GroupQueryAttention` past/present type list in 1.29.0 — not the scale
+input arity and not the attributes. The exported graph and its metadata are
+well-formed and validate; only the local kernel is missing.
+
 ## Current measured baseline
 
 ONNX GenAI `8bacf8c` reports paired five-sample synthetic native/composite measurements over

@@ -673,8 +673,15 @@ def build_decoder_state_initializer(
     cache_inputs: list[str],
     fixed_capacity: bool = False,
     ragged: bool = False,
+    write_indices_output: str | None = None,
 ) -> PolicyComponent:
-    """Build prompt-derived decoder state, optionally with capture-stable storage."""
+    """Build prompt-derived decoder state, optionally with capture-stable storage.
+
+    ``write_indices_output`` names the graph port of a static (indexed-scatter)
+    KV cache. Prefill writes the whole prompt chunk starting at slot zero, so the
+    initial destinations are zeros and the resulting logical length is the prompt
+    length; both are emitted here so no consumer has to infer them.
+    """
     if fixed_capacity and attention_mask_input is None:
         raise ValueError(
             "fixed-capacity decoder state requires an attention-mask input to carry "
@@ -846,10 +853,19 @@ def build_decoder_state_initializer(
         )
         generated_lengths.shape = ir.Shape(["batch"])
         builder.add_output(generated_lengths, "generated_lengths")
-    if fixed_capacity:
+    if fixed_capacity or write_indices_output is not None:
         cache_lengths = op.Identity(prompt_lengths)
         cache_lengths.shape = ir.Shape(["batch"])
         builder.add_output(cache_lengths, "cache_lengths")
+    if write_indices_output is not None:
+        # Prefill scatters the whole prompt chunk from slot zero for every row;
+        # the per-row cursor only diverges once decode advances rows separately.
+        write_indices = op.ConstantOfShape(
+            batch_shape,
+            value=ir.tensor([0], dtype=ir.DataType.INT64),
+        )
+        write_indices.shape = ir.Shape(["batch"])
+        builder.add_output(write_indices, write_indices_output)
 
     for name in cache_inputs:
         value = decoder_inputs[name]

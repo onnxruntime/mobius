@@ -28,6 +28,10 @@ from onnxscript import GraphBuilder, nn
 
 from mobius._build_context import ep_capabilities, prefill_prefix_pruning
 from mobius._configs import Gemma4Config
+from mobius._constants import (
+    STATIC_CACHE_KV_SEQUENCE_LENGTH,
+    STATIC_CACHE_WRITE_INDICES,
+)
 from mobius._model_package import ModelPackage
 from mobius._pipeline_contract import (
     declare_component_presence,
@@ -41,6 +45,21 @@ from mobius.tasks._base import (
 from mobius.tasks._cache_utils import (
     _register_kv_cache_outputs,
 )
+
+
+def _has_dynamic_cache_layer(config: Gemma4Config) -> bool:
+    """Whether the static-cache layout still leaves a layer on a dynamic cache.
+
+    Only full-attention layers are addressable by a fixed-capacity scatter; a
+    sliding layer keeps a growing ``past_key_values.N.*`` pair, and the last
+    ``num_kv_shared_layers`` layers borrow KV and own no cache at all.
+    """
+    layer_types = config.layer_types or (["sliding_attention"] * config.num_hidden_layers)
+    num_kv_layers = config.num_hidden_layers - (config.num_kv_shared_layers or 0)
+    return any(
+        (layer_types[i] if i < len(layer_types) else "sliding_attention") != "full_attention"
+        for i in range(num_kv_layers)
+    )
 
 
 def _register_hybrid_cache_outputs(
@@ -146,12 +165,12 @@ def _make_gemma4_static_cache_inputs(
     write_indices = nonpad_kv_seqlen = None
     if has_static:
         write_indices = builder.input(
-            "write_indices",
+            STATIC_CACHE_WRITE_INDICES,
             dtype=ir.DataType.INT64,
             shape=[batch],
         )
         nonpad_kv_seqlen = builder.input(
-            "nonpad_kv_seqlen",
+            STATIC_CACHE_KV_SEQUENCE_LENGTH,
             dtype=ir.DataType.INT64,
             shape=[batch],
         )
@@ -504,17 +523,21 @@ class Gemma4Task(ModelTask):
             shape=[batch, seq_len, config.hidden_size],
         )
 
-        if not static:
-            past_seq_len = ir.SymbolicDim("past_sequence_len")
-            attention_mask = builder.input(
+        past_seq_len = ir.SymbolicDim("past_sequence_len")
+        # A static-cache layer masks itself from ``write_indices`` and
+        # ``nonpad_kv_seqlen`` and takes no bias, but a sliding layer keeps a
+        # dynamic cache even in static mode and still needs the mask to know
+        # where each row's real tokens are. Mint the mask exactly when such a
+        # layer survives, so a fully static decoder does not carry a port
+        # nothing reads and a hybrid one does not lose its padding information.
+        if not static or _has_dynamic_cache_layer(config):
+            attention_mask: ir.Value | None = builder.input(
                 "attention_mask",
                 dtype=ir.DataType.INT64,
                 shape=[batch, "past_seq_len + seq_len"],
             )
         else:
-            # Static cache still needs past_seq_len for sliding-window layers
-            # that use dynamic cache within the hybrid static/dynamic scheme.
-            past_seq_len = ir.SymbolicDim("past_sequence_len")
+            attention_mask = None
 
         position_ids = builder.input(
             "position_ids",
@@ -558,7 +581,6 @@ class Gemma4Task(ModelTask):
                 max_seq_len,
                 past_seq_len,
             )
-            attention_mask = None  # Static cache uses position-based attention
         else:
             past_key_values = _make_gemma4_kv_cache_inputs(
                 builder,

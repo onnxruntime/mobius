@@ -986,8 +986,15 @@ class Gemma4TextAttention(nn.Module):
             # ``o_proj``'s MatMul fail shape inference at model-load time. The
             # source shares the same KV-head/head-dim configuration as this
             # layer, so pin the known 4D BNSH shape to restore inference.
+            #
+            # Only an UNKNOWN shape may be pinned. A static-cache source hands
+            # over its rank-3 ``[batch, capacity, kv_heads * head_dim]`` scatter
+            # buffer, which is fully known; overwriting that with a 4D BNSH
+            # guess both mislabels the graph's declared cache output and defeats
+            # the rank-3 test below, which would then transpose a rank-3 tensor
+            # as if it were BNSH.
             for _kv in (src_key, src_value):
-                if _kv.shape is None or len(_kv.shape) != 4:
+                if _kv.shape is None:
                     _kv.shape = ir.Shape(
                         [
                             "batch",
