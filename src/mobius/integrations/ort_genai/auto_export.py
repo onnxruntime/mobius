@@ -385,6 +385,7 @@ def _special_token_ids_from_tokenizer_config(
         return {}
 
     special_token_ids: dict[str, int] = {}
+    ambiguous_fields: set[str] = set()
     for token_id, token in added_tokens.items():
         if not isinstance(token, dict):
             continue
@@ -394,7 +395,13 @@ def _special_token_ids_from_tokenizer_config(
         except (TypeError, ValueError):
             continue
         if field is not None and 0 <= token_id < vocab_size:
-            special_token_ids[field] = token_id
+            if field in ambiguous_fields:
+                continue
+            if field in special_token_ids and special_token_ids[field] != token_id:
+                special_token_ids.pop(field)
+                ambiguous_fields.add(field)
+            else:
+                special_token_ids[field] = token_id
     return special_token_ids
 
 

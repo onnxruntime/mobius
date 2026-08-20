@@ -2038,6 +2038,31 @@ class TestExportForOrtGenai:
 
         assert not {"bot_token_id", "eot_token_id", "bor_token_id", "eor_token_id"} & model.keys()
 
+    def test_ambiguous_tool_tokens_are_ignored(self, tmp_path):
+        """Conflicting tool delimiter spellings do not choose an arbitrary ID."""
+        tokenizer_dir = tmp_path / "tokenizer"
+        tokenizer_dir.mkdir()
+        (tokenizer_dir / "tokenizer_config.json").write_text(
+            json.dumps(
+                {
+                    "added_tokens_decoder": {
+                        "10": {"content": "<tool_call>"},
+                        "11": {"content": "<|tool_call|>"},
+                    }
+                }
+            )
+        )
+
+        result = write_ort_genai_config(
+            _make_fake_llm_pkg("llama"),
+            str(tmp_path / "output"),
+            local_config_dir=str(tokenizer_dir),
+        )
+        with open(result["genai_config"]) as f:
+            model = json.load(f)["model"]
+
+        assert "bot_token_id" not in model
+
     def test_config_mode_eos_token_id_as_list(self, tmp_path):
         """eos_token_id can be a list[int] (e.g. Gemma multi-stop tokens)."""
         import dataclasses
