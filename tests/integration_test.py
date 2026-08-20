@@ -3841,7 +3841,7 @@ def test_qwen38_vl_image_video_mixed_pipeline_matches_huggingface():
     )
 
     from mobius import build_from_module
-    from mobius._weight_loading import apply_weights
+    from mobius.integrations._weight_loading import apply_weights
 
     hf_config = _make_tiny_qwen35_vl_config(keep_production_vocab=True)
     arch_config = ArchitectureConfig.from_transformers(
