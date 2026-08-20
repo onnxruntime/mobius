@@ -121,6 +121,21 @@ CUDA `GroupQueryAttention` past/present type list in 1.29.0 — not the scale
 input arity and not the attributes. The exported graph and its metadata are
 well-formed and validate; only the local kernel is missing.
 
+### Canonical representation — lowering verified
+
+Against ONNX GenAI `02e22dd6`, with no `model.io` in any package:
+
+| Check | Result |
+| --- | --- |
+| `validate_metadata` over the checked-in fixtures | 11/11 valid |
+| `mobius_workflow_conformance` (engine executes each package) | 11/11 passed |
+| `mobius_static_cache_workflow_executes` specifically | passed |
+
+The last row is the one that matters. The fixed-capacity decode path needs the
+write cursor, the valid length and the per-layer buffer pairs; it resolved all
+of them by lowering the workflow, which is what makes removing the second copy
+safe rather than merely tidy.
+
 ## Current measured baseline
 
 ONNX GenAI `8bacf8c` reports paired five-sample synthetic native/composite measurements over

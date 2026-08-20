@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### One canonical serialized representation
+
+#### Changed
+
+- **`pipeline.workflow` is now the only place a package describes its graph
+  ABI.** No export emits `model.io`, including a bare single-file decoder: that
+  case is a one-component workflow, not a different kind of document. `model`
+  keeps package-wide geometry and capabilities and nothing else. Two writable
+  statements of one fact are a defect whatever they contain — nothing forces
+  them to agree, and a reader of either never learns the other exists — so a
+  runtime that wants an optimized single-graph path derives it by lowering the
+  workflow instead. Verified end to end: the ONNX GenAI runtime executes the
+  fixed-capacity decode path from the workflow alone, with no `model.io` in the
+  package.
+
+#### Added
+
+- Every ONNX component declares `ports.inputs` / `ports.outputs` — a contract
+  (dtype, rank, shape, batch layout) for exactly the graph's inputs and outputs.
+  A subset would let a consumer fall back to opening the artifact; a superset
+  would be a promise the graph does not keep.
+- Every ONNX component declares `ports.roles`: what it *does* with a value bound
+  to a port. An invocation records which SSA value reaches a port, not whether
+  that port is tokens, a mask or logits. Mobius mints these port names in its own
+  task builders, so it states the mapping (`input_ids`→`token_ids`,
+  `inputs_embeds`, `attention_mask`, `position_ids`, `logits`,
+  `last_hidden_state`→`hidden_states`, `encoder_hidden_states`,
+  `audio_features`) rather than inferring it. A port outside that vocabulary
+  carries no role.
+- State port aliases declare `role` (`key`/`value`) and `layer`. A layer's key
+  and value buffers are the same dtype and shape, and a cell's label sorts
+  lexicographically so `cache_10` precedes `cache_2` — pairing per-layer buffers
+  positionally would silently transpose two layers' caches. Both fields are
+  emitted together or not at all, so a recurrent or convolution cache is never
+  given a fabricated index.
+- `IndexedScatter.kv_length_ports` names the port carrying the graph-visible
+  valid length, beside the existing `write_indices_ports`. The two control
+  vectors are both rank-1 integers and are therefore indistinguishable by shape;
+  with both named, the whole fixed-capacity ABI is recoverable from the workflow.
+- `tests/canonical_workflow_contract_test.py` pins the invariant. It asks one
+  set of shape-agnostic questions of dynamic, static-cache, FP8, heterogeneous
+  and composite packages — and of all 11 checked-in fixtures — so a future
+  feature cannot grow its own top-level block while every feature-specific test
+  keeps passing.
+
 ### Fixed-capacity (static) KV cache and FP8 KV cache metadata
 
 #### Added
@@ -18,12 +63,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   discipline naming the cursor, the capacity and the per-component port that
   carries it. The buffers are declared as `recurrence: {kind: invariant}` loop
   cells and the capacity as a `package.cache_capacity` literal workflow input.
-  The same ABI is also published authoritatively as `model.io.static_cache`.
   Nothing dispatches on model name; the ports are read from the graph.
 - Heterogeneous caches keep their own disciplines. Gemma 4's sliding layers stay
   on a growing rank-4 BNSH cache while its full-attention layers use rank-3
-  fixed-capacity buffers, and `model.io.static_cache` lists only the layers that
-  own a buffer — its KV-shared suffix owns none.
+  fixed-capacity buffers, and only the layers that own a buffer bind ports in a
+  state group — its KV-shared suffix owns none.
 - A `static_cache` package joined the checked-in onnx-genai conformance
   fixtures, so the engine exercises the fixed-capacity carry and the write
   cursor rather than only the growing-tensor path.

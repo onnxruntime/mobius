@@ -880,7 +880,28 @@ def _write_adapter_metadata(package: ModelPackage, directory: Path) -> None:
                             "kind": "onnx",
                             "artifact": "model.onnx",
                         },
-                        "ports": {},
+                        # Every ONNX component declares its ports, including the
+                        # ones a hand-written fixture builds: the workflow is the
+                        # only description a package has of itself, and a
+                        # component that declares nothing describes nothing.
+                        "ports": {
+                            "inputs": {
+                                "activations": {
+                                    "dtype": "float32",
+                                    "rank": 2,
+                                    "shape": ["batch", 2],
+                                    "batch_layout": {"kind": "request_aligned", "axis": 0},
+                                }
+                            },
+                            "outputs": {
+                                "projection.output": {
+                                    "dtype": "float32",
+                                    "rank": 2,
+                                    "shape": ["batch", 2],
+                                    "batch_layout": {"kind": "request_aligned", "axis": 0},
+                                }
+                            },
+                        },
                     },
                     "overlay": {
                         "implementation": {

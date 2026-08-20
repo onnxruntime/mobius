@@ -18,15 +18,11 @@ from typing import Any
 
 import numpy as np
 import onnx_ir as ir
-import yaml
 
 from mobius.integrations.onnx_genai.inference_metadata import (
     _TEXT_RUNTIME_ASSET_NAMES,
     SchedulerConfig,
     _copy_runtime_assets,
-    add_adapter_service_to_metadata,
-    add_explicit_package_io,
-    add_policy_components_to_workflow,
     load_diffusers_scheduler_config,
     load_diffusers_vae_scaling_factor,
 )
@@ -199,29 +195,7 @@ def _looks_like_image_edit(pkg: Any) -> bool:
     )
 
 
-def _add_explicit_io_to_file(path: str, pkg: Any, config: Any) -> None:
-    """Augment an emitted sidecar with roles derived from the actual ONNX ports."""
-    try:
-        models = list(pkg.values())
-    except AttributeError:
-        return
-    if not models or any(not hasattr(model, "graph") for model in models):
-        return
-    with open(path, encoding="utf-8") as handle:
-        metadata = yaml.safe_load(handle)
-    add_explicit_package_io(metadata, pkg, config)
-    add_policy_components_to_workflow(metadata, pkg)
-    add_adapter_service_to_metadata(metadata, pkg, os.path.dirname(path))
-    with open(path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(metadata, handle, sort_keys=False)
-
-
-def _write_clip_tokenizer(
-    output_dir: str,
-    source: str | None,
-    *,
-    revision: str | None = None,
-) -> str | None:
+def _write_clip_tokenizer(output_dir: str, source: str | None) -> str | None:
     """Emit ``tokenizer.json`` for a text-conditioned diffusion package.
 
     Classic Stable Diffusion conditions on a CLIP text encoder, and the

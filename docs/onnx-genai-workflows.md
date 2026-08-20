@@ -3,6 +3,55 @@
 Mobius emits the concise public workflow source form. The only control primitives are
 `sequence`/`steps`, `invoke`, `loop`, `branch`, and `emit`.
 
+## One representation
+
+`pipeline.workflow` is where a package describes itself, and it is the only
+place. That is true of a three-graph vision-language package, and it is equally
+true of a bare single-file decoder — the single-file case is a one-component
+workflow, not a different kind of document with its own top-level keys. `model`
+carries package-wide geometry and capabilities; it never carries a port ABI.
+
+The reason is not tidiness. Two writable statements of the same fact are a
+defect whatever they contain, because nothing forces them to agree and a reader
+of one never learns that the other said something else. A runtime that wants an
+optimized single-graph path gets it by *lowering* the one-component workflow,
+which is a derivation and cannot disagree with its source.
+
+For that to work the workflow has to carry everything such a lowering needs, so
+every ONNX component declares:
+
+* `ports.inputs` / `ports.outputs` — a contract (dtype, rank, shape, batch
+  layout) for every graph input and output, no more and no fewer.
+* `ports.roles` — what the component *does* with a value bound to a port. An
+  invocation records which SSA value reaches a port, not whether that port is
+  tokens, a mask or logits, and recovering the difference from spelling is the
+  name-guessing this format refuses everywhere else. Mobius mints these port
+  names in its own task builders, so it states the mapping rather than infers
+  it: `input_ids`→`token_ids`, `inputs_embeds`→`inputs_embeds`,
+  `attention_mask`→`attention_mask`, `position_ids`→`position_ids`,
+  `logits`→`logits`, `last_hidden_state`→`hidden_states`,
+  `encoder_hidden_states`→`encoder_hidden_states`,
+  `audio_features`→`audio_features`. A port outside that vocabulary carries no
+  role, because a workflow that guesses is worse than one that stays silent.
+
+State ports need no role entry — the group that carries them already names each
+`(input, output)` pair — but they do carry two facts nothing else can recover:
+
+* `role` (`key` / `value` / `combined`) — a layer's key buffer and its value
+  buffer are the same dtype and the same shape.
+* `layer` — a cell's label is producer-chosen and sorts lexicographically, so
+  `cache_10` precedes `cache_2`; pairing per-layer buffers positionally would
+  silently transpose two layers' caches.
+
+Both are emitted together or not at all. A recurrent or convolution cache has no
+halves and no layer index to state, and inventing one would corrupt the very
+ordering the index exists to fix.
+
+`tests/canonical_workflow_contract_test.py` holds this invariant: it asks the
+same shape-agnostic questions of dynamic, static-cache, FP8, heterogeneous and
+composite packages, and of every checked-in fixture, so a new feature cannot
+grow a private top-level block unnoticed.
+
 ## Structural execution frequency
 
 - Root `steps` run once per invocation.
@@ -125,16 +174,16 @@ ports drive that write:
 | `nonpad_kv_seqlen` | `[batch]` int64 | number of valid slots **after** the write |
 
 The buffers themselves are `key_cache.{layer}` / `value_cache.{layer}` in and
-`updated_key_cache.{layer}` / `updated_value_cache.{layer}` out. All of this is
-published twice, for two different kinds of consumer:
-
-* `model.io.static_cache` names the ports directly, for a consumer that binds
-  the graph without interpreting a workflow.
-* the workflow declares the same thing operationally — the buffers are loop
-  cells with `recurrence: {kind: invariant}` (they do not grow), the capacity is
-  a `package.cache_capacity` literal workflow input, and the state service
-  publishes an `indexed_scatter` update discipline naming the write cursor, the
-  capacity, and the per-component port that carries it.
+`updated_key_cache.{layer}` / `updated_value_cache.{layer}` out. None of this is
+published in a second place: the workflow declares it operationally and that is
+the only declaration. The buffers are loop cells with
+`recurrence: {kind: invariant}` (they do not grow), the capacity is a
+`package.cache_capacity` literal workflow input, and the state service publishes
+an `indexed_scatter` update discipline naming the write cursor, the capacity,
+the per-component port that carries the cursor (`write_indices_ports`) and the
+per-component port that carries the valid length (`kv_length_ports`). The
+component those ports belong to declares both, so a consumer resolves the whole
+scatter ABI without opening the artifact.
 
 Because the write cursor and the logical length are the same quantity, both name
 the single carried `cache_lengths` cell rather than introducing a second
@@ -155,10 +204,10 @@ A model may mix disciplines. Gemma 4 keeps its sliding-window layers on a
 growing rank-4 BNSH cache while its full-attention layers use a fixed-capacity
 rank-3 buffer, and its KV-shared suffix owns no buffer at all. These surface as
 separate state-service groups with their own sequence axis, layout, aliasing
-rule and update discipline, and `model.io.static_cache` lists only the layers
-that actually own a buffer. Collapsing them into one group would invite a
-runtime to apply sliding-window eviction to the global layers, or to allocate
-caches for layers that borrow one.
+rule and update discipline, and only the layers that actually own a buffer bind
+ports in a group. Collapsing them into one group would invite a runtime to apply
+sliding-window eviction to the global layers, or to allocate caches for layers
+that borrow one.
 
 ## FP8 KV cache
 

@@ -944,6 +944,8 @@ def test_dispatch_speech_to_text_workflow(tmp_path):
     assert groups["decoder_cache"]["ports"]["decoder"]["cache_0"] == {
         "input": "past_key_values.0.key",
         "output": "present.0.key",
+        "role": "key",
+        "layer": 0,
     }
 
 

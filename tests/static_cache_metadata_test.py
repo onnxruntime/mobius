@@ -70,6 +70,46 @@ def _model_invoke(steps) -> dict[str, str]:
     return next(step for step in steps if step.get("component") == "model")["inputs"]
 
 
+def _scatter_group(metadata) -> tuple[str, dict]:
+    """The state-service group whose buffers are written by an indexed scatter."""
+    groups = metadata["pipeline"]["workflow"]["serving"]["state_service"]["groups"]
+    return next(
+        (name, group)
+        for name, group in groups.items()
+        if group.get("update", {}).get("kind") == "indexed_scatter"
+    )
+
+
+def _static_cache_abi(metadata) -> dict:
+    """Recover the whole scatter ABI from the workflow and nothing else.
+
+    This is deliberately written the way a runtime lowers a one-component
+    workflow onto a direct decode path. If it can reconstruct every port a
+    driver needs, then the workflow is a complete description and republishing
+    the same facts under a second top-level key would only create two truths
+    that can disagree.
+    """
+    workflow = metadata["pipeline"]["workflow"]
+    _, group = _scatter_group(metadata)
+    update = group["update"]
+    component = next(iter(update["write_indices_ports"]))
+    declared = workflow["components"][component]["ports"]
+    aliases = group["ports"][component]
+    buffers = [
+        aliases[cell] for cell in sorted(aliases, key=lambda cell: int(cell.rsplit("_")[-1]))
+    ]
+    return {
+        "component": component,
+        "write_indices_input": update["write_indices_ports"][component],
+        "kv_sequence_length_input": update["kv_length_ports"][component],
+        "capacity": workflow["inputs"][update["capacity"]]["default"],
+        "cache_inputs": [alias["input"] for alias in buffers],
+        "cache_outputs": [alias["output"] for alias in buffers],
+        "declared_inputs": declared["inputs"],
+        "declared_outputs": declared["outputs"],
+    }
+
+
 @pytest.fixture(scope="module")
 def static_workflow():
     pkg, config = _static_package()
@@ -91,46 +131,46 @@ def mixed():
     return build_decoder_workflow_metadata(pkg, config)
 
 
-class TestStaticCacheModelIo:
-    """``model.io.static_cache`` is the authoritative port ABI."""
+class TestStaticCacheAbiLivesOnlyInTheWorkflow:
+    """The workflow is the package's single description of its scatter ABI."""
 
-    def test_declares_control_and_buffer_ports(self, static_workflow):
-        static_cache = static_workflow["model"]["io"]["static_cache"]
-        assert static_cache["write_indices_input"] == STATIC_CACHE_WRITE_INDICES
-        assert static_cache["kv_sequence_length_input"] == STATIC_CACHE_KV_SEQUENCE_LENGTH
-        assert static_cache["key_cache_inputs"] == ["key_cache.0", "key_cache.1"]
-        assert static_cache["value_cache_inputs"] == ["value_cache.0", "value_cache.1"]
-        assert static_cache["key_cache_outputs"] == [
-            "updated_key_cache.0",
-            "updated_key_cache.1",
+    def test_no_second_top_level_port_declaration(self, static_workflow):
+        # `model` carries package-wide geometry and capabilities, never a copy
+        # of the port ABI: two declarations of one fact can drift apart, and
+        # nothing in the format says which one wins.
+        assert "io" not in static_workflow.get("model", {})
+
+    def test_control_ports_are_declared_by_the_scatter_discipline(self, static_workflow):
+        abi = _static_cache_abi(static_workflow)
+        assert abi["write_indices_input"] == STATIC_CACHE_WRITE_INDICES
+        assert abi["kv_sequence_length_input"] == STATIC_CACHE_KV_SEQUENCE_LENGTH
+
+    def test_control_ports_are_real_ports_of_the_component(self, static_workflow):
+        # Naming a port the component does not expose would bind nothing.
+        abi = _static_cache_abi(static_workflow)
+        for role in ("write_indices_input", "kv_sequence_length_input"):
+            contract = abi["declared_inputs"][abi[role]]
+            # Both are per-row integer vectors, which is exactly why they are
+            # declared rather than recognized by shape.
+            assert contract["dtype"] == "int64"
+            assert contract["rank"] == 1
+
+    def test_every_buffer_pair_is_declared(self, static_workflow):
+        abi = _static_cache_abi(static_workflow)
+        assert abi["cache_inputs"] == [
+            "key_cache.0",
+            "value_cache.0",
+            "key_cache.1",
+            "value_cache.1",
         ]
-        assert static_cache["value_cache_outputs"] == [
-            "updated_value_cache.0",
-            "updated_value_cache.1",
-        ]
+        assert abi["cache_outputs"] == [f"updated_{name}" for name in abi["cache_inputs"]]
+        for name in (*abi["cache_inputs"], *abi["cache_outputs"]):
+            declared = abi["declared_inputs"] if name in abi["cache_inputs"] else None
+            declared = declared or abi["declared_outputs"]
+            assert declared[name]["shape"][STATIC_CACHE_SEQUENCE_AXIS] == CAPACITY
 
-    def test_per_layer_lists_are_paired(self, static_workflow):
-        # A runtime binds these four lists positionally; unequal lengths would
-        # silently pair layer i's key buffer with layer j's output.
-        static_cache = static_workflow["model"]["io"]["static_cache"]
-        lengths = {
-            len(static_cache[key])
-            for key in (
-                "key_cache_inputs",
-                "value_cache_inputs",
-                "key_cache_outputs",
-                "value_cache_outputs",
-            )
-        }
-        assert lengths == {2}
-
-    def test_owns_its_cache_and_declares_no_appending_ports(self, static_workflow):
-        io = static_workflow["model"]["io"]
-        assert io["kv_ownership"] == "owned"
-        # A static cache has no past/present pair to advertise; declaring one
-        # would invite a runtime to concatenate into a fixed buffer.
-        assert "kv_inputs" not in io
-        assert "kv_outputs" not in io
+    def test_capacity_is_recoverable(self, static_workflow):
+        assert _static_cache_abi(static_workflow)["capacity"] == CAPACITY
 
 
 class TestStaticCacheWorkflow:
@@ -182,6 +222,7 @@ class TestStaticCacheWorkflow:
             "write_indices": "cache_lengths",
             "capacity": "package.cache_capacity",
             "write_indices_ports": {"model": STATIC_CACHE_WRITE_INDICES},
+            "kv_length_ports": {"model": STATIC_CACHE_KV_SEQUENCE_LENGTH},
         }
         assert group["logical_lengths"] == "cache_lengths"
         assert group["sequence_axis"] == STATIC_CACHE_SEQUENCE_AXIS
@@ -194,6 +235,8 @@ class TestStaticCacheWorkflow:
         assert ports["cache_0"] == {
             "input": "key_cache.0",
             "output": "updated_key_cache.0",
+            "role": "key",
+            "layer": 0,
         }
 
     def test_control_ports_are_not_advertised_as_request_inputs(self, static_workflow):
@@ -227,8 +270,15 @@ class TestStaticCachePortDerivation:
 
     def test_layer_count_follows_the_config(self):
         pkg, config = _static_package(num_hidden_layers=3)
-        io = build_decoder_workflow_metadata(pkg, config)["model"]["io"]["static_cache"]
-        assert io["key_cache_inputs"] == ["key_cache.0", "key_cache.1", "key_cache.2"]
+        abi = _static_cache_abi(build_decoder_workflow_metadata(pkg, config))
+        assert abi["cache_inputs"] == [
+            "key_cache.0",
+            "value_cache.0",
+            "key_cache.1",
+            "value_cache.1",
+            "key_cache.2",
+            "value_cache.2",
+        ]
 
 
 class TestHeterogeneousStaticCache:
@@ -244,11 +294,9 @@ class TestHeterogeneousStaticCache:
     def test_only_cache_owning_layers_are_declared(self, mixed):
         # layer_types = [sliding, full, sliding, full] with the last two layers
         # sharing KV: exactly one layer owns a static buffer.
-        static_cache = mixed["model"]["io"]["static_cache"]
-        assert static_cache["key_cache_inputs"] == ["key_cache.1"]
-        assert static_cache["value_cache_inputs"] == ["value_cache.1"]
-        assert static_cache["key_cache_outputs"] == ["updated_key_cache.1"]
-        assert static_cache["value_cache_outputs"] == ["updated_value_cache.1"]
+        abi = _static_cache_abi(mixed)
+        assert abi["cache_inputs"] == ["key_cache.1", "value_cache.1"]
+        assert abi["cache_outputs"] == ["updated_key_cache.1", "updated_value_cache.1"]
 
     def test_each_geometry_gets_its_own_update_discipline(self, mixed):
         groups = mixed["pipeline"]["workflow"]["serving"]["state_service"]["groups"]
@@ -393,13 +441,11 @@ class TestFeatureCombinations:
             pkg["model"], ep="cuda", dtype=ir.DataType.FLOAT16, model_role="decoder"
         )
         metadata = build_decoder_workflow_metadata(pkg, config)
-        group = next(
-            iter(
-                metadata["pipeline"]["workflow"]["serving"]["state_service"]["groups"].values()
-            )
-        )
+        _, group = _scatter_group(metadata)
         assert group["update"]["kind"] == "indexed_scatter"
-        assert metadata["model"]["io"]["static_cache"]["key_cache_inputs"] == [
+        assert _static_cache_abi(metadata)["cache_inputs"] == [
             "key_cache.0",
+            "value_cache.0",
             "key_cache.1",
+            "value_cache.1",
         ]

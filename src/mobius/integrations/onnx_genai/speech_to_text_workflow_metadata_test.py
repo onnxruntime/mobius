@@ -142,6 +142,8 @@ def test_self_attention_cache_is_the_only_served_group():
     assert ports["cache_0"] == {
         "input": "past_key_values.0.key",
         "output": "present.0.key",
+        "role": "key",
+        "layer": 0,
     }
     assert len(ports) == 4
 

@@ -1,18 +1,4 @@
 schema_version: '1.0'
-model:
-  io:
-    kv_ownership: owned
-    static_cache:
-      write_indices_input: write_indices
-      kv_sequence_length_input: nonpad_kv_seqlen
-      key_cache_inputs:
-      - key_cache.0
-      value_cache_inputs:
-      - value_cache.0
-      key_cache_outputs:
-      - updated_key_cache.0
-      value_cache_outputs:
-      - updated_value_cache.0
 pipeline:
   workflow:
     manifest:
@@ -366,6 +352,97 @@ pipeline:
         implementation:
           kind: onnx
           artifact: model.onnx
+        ports:
+          inputs:
+            input_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            position_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            key_cache.0:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - 16
+              - 8
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            value_cache.0:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - 16
+              - 8
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            write_indices:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            nonpad_kv_seqlen:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            logits:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - sequence
+              - 128
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            updated_key_cache.0:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - 16
+              - 8
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            updated_value_cache.0:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - 16
+              - 8
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          roles:
+            input_ids: token_ids
+            position_ids: position_ids
+            logits: logits
       token_sampler:
         implementation:
           kind: onnx
@@ -1148,6 +1225,8 @@ pipeline:
               capacity: package.cache_capacity
               write_indices_ports:
                 model: write_indices
+              kv_length_ports:
+                model: nonpad_kv_seqlen
             aliasing: permitted
             reuse:
               prefix_reusable: true
@@ -1157,9 +1236,13 @@ pipeline:
                 cache_0:
                   input: key_cache.0
                   output: updated_key_cache.0
+                  role: key
+                  layer: 0
                 cache_1:
                   input: value_cache.0
                   output: updated_value_cache.0
+                  role: value
+                  layer: 0
     steps:
     - kind: loop
       setup:

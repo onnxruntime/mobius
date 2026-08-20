@@ -399,6 +399,8 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     assert kv_ports["cache_103"] == {
         "input": "past_key_values.51.value",
         "output": "present.51.value",
+        "role": "value",
+        "layer": 51,
     }
     assert (tmp_path / "package" / "policies" / "last_token_logits.onnx").is_file()
     assert (tmp_path / "package" / "policies" / "empty_image_features.onnx").is_file()
@@ -727,6 +729,8 @@ def test_speculative_workflow_uses_per_row_ragged_state_and_rng():
     ]["cache_0"] == {
         "input": "past_key_values.0.key",
         "output": "present.0.key",
+        "role": "key",
+        "layer": 0,
     }
     assert any(item["cell"].startswith("cache_") for item in workflow["steps"][0]["carried"])
 

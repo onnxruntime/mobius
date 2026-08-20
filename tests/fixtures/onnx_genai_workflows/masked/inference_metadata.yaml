@@ -138,6 +138,40 @@ pipeline:
         implementation:
           kind: onnx
           artifact: model.onnx
+        ports:
+          inputs:
+            input_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            logits:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - sequence
+              - 128
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            proposed_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          roles:
+            input_ids: token_ids
+            logits: logits
       masked_update:
         implementation:
           kind: onnx

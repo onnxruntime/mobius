@@ -198,9 +198,10 @@ class TestCLIBuild:
 
         The two control ports are rank-1 integer vectors and are therefore
         shape-indistinguishable from one another, which is exactly why the ABI
-        is *declared* rather than inferred: ``model.io.static_cache`` names
-        which port is the write cursor and which is the non-pad length, and the
-        workflow binds those same names.
+        is *declared* rather than inferred. It is declared once, in the
+        workflow: the state group that scatters into the buffers names the port
+        carrying the write cursor and the port carrying the non-pad length, and
+        the component those ports belong to declares both.
         """
         import yaml
 
@@ -225,17 +226,8 @@ class TestCLIBuild:
             ) as handle:
                 metadata = yaml.safe_load(handle)
 
-        static_cache = metadata["model"]["io"]["static_cache"]
-        assert static_cache["write_indices_input"] == "write_indices"
-        assert static_cache["kv_sequence_length_input"] == "nonpad_kv_seqlen"
-        assert static_cache["key_cache_inputs"][0] == "key_cache.0"
-        assert static_cache["key_cache_outputs"][0] == "updated_key_cache.0"
-        assert (
-            len(static_cache["key_cache_inputs"])
-            == len(static_cache["value_cache_inputs"])
-            == len(static_cache["key_cache_outputs"])
-            == len(static_cache["value_cache_outputs"])
-        )
+        # One canonical description: no second copy of the port ABI outside it.
+        assert "io" not in metadata.get("model", {})
 
         workflow = metadata["pipeline"]["workflow"]
         assert workflow["inputs"]["package.cache_capacity"]["default"] == 128
@@ -245,6 +237,24 @@ class TestCLIBuild:
         assert update["capacity"] == "package.cache_capacity"
         # The write cursor and the logical length are the same quantity.
         assert update["write_indices"] == "cache_lengths"
+        assert update["write_indices_ports"] == {"model": "write_indices"}
+        assert update["kv_length_ports"] == {"model": "nonpad_kv_seqlen"}
+
+        declared = workflow["components"]["model"]["ports"]["inputs"]
+        assert declared["write_indices"]["rank"] == 1
+        assert declared["nonpad_kv_seqlen"]["rank"] == 1
+
+        group = next(group for group in groups.values() if "update" in group)
+        pairs = group["ports"]["model"]
+        assert {alias["output"] for alias in pairs.values()} == {
+            f"updated_{alias['input']}" for alias in pairs.values()
+        }
+        assert pairs["cache_0"] == {
+            "input": "key_cache.0",
+            "output": "updated_key_cache.0",
+            "role": "key",
+            "layer": 0,
+        }
 
     def test_static_cache_task_follows_text_only_substitution(self):
         """``text-only`` + ``static-cache`` must resolve the *text* task.

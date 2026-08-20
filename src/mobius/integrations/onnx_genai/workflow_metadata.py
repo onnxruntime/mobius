@@ -90,7 +90,6 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     _port,
     _shape_metadata,
     _source_asset_path,
-    _static_cache_io,
     add_adapter_service_to_metadata,
     add_policy_components_to_workflow,
     build_native_vlm_package_metadata,
@@ -167,14 +166,56 @@ def _request_aligned(contract: dict[str, Any], axis: int = 0) -> dict[str, Any]:
     return {**contract, "batch_layout": {"kind": "request_aligned", "axis": axis}}
 
 
+# Translation between the port vocabulary this producer *mints* when it builds
+# a graph and the runtime's architecture-neutral role vocabulary. Both sides are
+# fixed vocabularies and Mobius owns one of them: the task builders in
+# ``mobius.tasks`` choose these exact names, so reading them back here is a
+# lookup, not an inference about a graph of unknown provenance. A port outside
+# this vocabulary carries no role, because a workflow that guesses is worse than
+# one that stays silent.
+_PORT_ROLES: dict[str, str] = {
+    "input_ids": "token_ids",
+    "inputs_embeds": "inputs_embeds",
+    "attention_mask": "attention_mask",
+    "position_ids": "position_ids",
+    "logits": "logits",
+    "last_hidden_state": "hidden_states",
+    "encoder_hidden_states": "encoder_hidden_states",
+    "audio_features": "audio_features",
+}
+
+
 def _component(
     model: ir.Model,
     artifact: str,
     *,
     effects: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    del model, effects
-    return {"implementation": {"kind": "onnx", "artifact": artifact}}
+    """Declare one ONNX-backed workflow component: ports, contracts and roles.
+
+    The workflow is the package's only description of itself, so a component
+    states the contract of every port it exposes rather than leaving a consumer
+    to open the artifact and infer one. That is what lets the scatter ABI, the
+    token and logits roles, and the per-layer cache pairs all be resolved from
+    the workflow alone: an integer control vector is indistinguishable from its
+    neighbours by shape, so the binding that names it has to sit next to a
+    declared port for the name to mean anything.
+
+    A contract says what a value *is*; ``roles`` says what the component *does*
+    with it. An invocation binds an SSA value to a port, which records which
+    value arrives but not whether it is tokens, a mask or logits — and that
+    second fact is what a runtime needs before it can specialize a decode step.
+    Only ports in this producer's own vocabulary get a role; state ports never
+    need one, because the group that carries them already names its pairs.
+    """
+    del effects
+    inputs = {str(value.name): _contract(value) for value in model.graph.inputs}
+    outputs = {str(value.name): _contract(value) for value in model.graph.outputs}
+    roles = {name: _PORT_ROLES[name] for name in (*inputs, *outputs) if name in _PORT_ROLES}
+    ports: dict[str, Any] = {"inputs": inputs, "outputs": outputs}
+    if roles:
+        ports["roles"] = roles
+    return {"implementation": {"kind": "onnx", "artifact": artifact}, "ports": ports}
 
 
 def _grammar_adapter_component(action: str) -> dict[str, Any]:
@@ -639,20 +680,6 @@ def _static_cache_ports(model: ir.Model) -> dict[str, Any] | None:
     }
 
 
-def _static_cache_model_io(model: ir.Model) -> dict[str, Any]:
-    """Return ``model.io`` declaring the static-cache port ABI of *model*."""
-    static_cache = _static_cache_io(
-        [_port(value) for value in model.graph.inputs],
-        [_port(value) for value in model.graph.outputs],
-    )
-    if static_cache is None:
-        raise ValueError(
-            "decoder was classified as a static-cache graph but exposes no "
-            "updated_<role>_cache.<layer> ports to declare"
-        )
-    return {"kv_ownership": "owned", "static_cache": static_cache}
-
-
 def _kv_storage_contract(model: ir.Model) -> dict[str, Any]:
     """Derive physical KV storage from the admitted model interface.
 
@@ -742,6 +769,28 @@ def _aliasing_for_storage(storage: str) -> str:
     return "permitted" if storage in {"shared_buffer", "paged"} else "forbidden"
 
 
+def _annotated_alias(alias: dict[str, Any]) -> dict[str, Any]:
+    """Add the half and layer a state port pair carries, when the name states them.
+
+    A layer's key buffer and its value buffer are the same shape and the same
+    dtype, and a cell's label is producer-chosen so its lexicographic order is
+    not the layer order (``cache_10`` sorts before ``cache_2``). A consumer that
+    paired these positionally would silently transpose two layers' caches. Both
+    facts are recoverable only here, from the port names this producer minted,
+    so both are declared on the alias.
+
+    They are declared together or not at all: a port outside the two attention
+    cache ABIs — recurrent state, a convolution cache — has no half and no layer
+    to state, and inventing an index for it would corrupt the very ordering the
+    index exists to fix.
+    """
+    name = str(alias.get("input", ""))
+    half = _cache_half(name)
+    if half is None:
+        return alias
+    return {**alias, "role": half, "layer": _cache_layer_index(name, 0)}
+
+
 def _state_group(
     *,
     ports: dict[str, Any],
@@ -766,7 +815,10 @@ def _state_group(
         "aliasing": (aliasing if aliasing is not None else _aliasing_for_storage(storage)),
         "reuse": {"prefix_reusable": True, "evictable_prefix": False},
         "capabilities": {"snapshot": True, "fork": True},
-        "ports": ports,
+        "ports": {
+            component: {cell: _annotated_alias(alias) for cell, alias in aliases.items()}
+            for component, aliases in ports.items()
+        },
     }
     if logical_lengths is not None:
         group["logical_lengths"] = logical_lengths
@@ -797,6 +849,22 @@ def _cache_layer_index(port_name: str, fallback: int) -> int:
     if match is None:
         return fallback
     return int(match.group(1) or match.group(2))
+
+
+def _cache_half(port_name: str) -> str | None:
+    """Recover which half of a split attention cache a port carries.
+
+    A layer's key buffer and its value buffer are the same shape and the same
+    dtype, so nothing downstream can tell them apart once they are in a list.
+    This producer minted both names, in the same two ABIs ``_cache_layer_index``
+    reads, so it can say which is which; a port outside those two spellings gets
+    no half, which is the right answer for recurrent and latent state that has
+    no halves to distinguish.
+    """
+    match = re.search(r"\.\d+\.(key|value)$|(key|value)_cache\.\d+$", port_name)
+    if match is None:
+        return None
+    return match.group(1) or match.group(2)
 
 
 def _state_group_kinds(config: Any, cache_pairs: list[tuple[ir.Value, ir.Value]]) -> list[str]:
@@ -868,15 +936,20 @@ def _state_service_groups(
     if len({*names.values()}) != len(distinct):
         names = {identity: f"{base_name}_{identity[0]}_{identity[1]}" for identity in distinct}
     cell_group = {}
-    grouped_ports: dict[str, dict[str, dict[str, dict[str, str]]]] = {
+    grouped_ports: dict[str, dict[str, dict[str, dict[str, Any]]]] = {
         name: {} for name in names.values()
     }
     for index, identity in enumerate(identities):
         cell = f"cache_{index}"
         cell_group[cell] = names[identity]
+    # A cell's label is producer-chosen and its lexicographic order is not the
+    # layer order, and a layer's key and value buffers are shape-identical, so
+    # each alias carries the half and layer its port name states.
     for component, aliases in ports.items():
         for cell, alias in aliases.items():
-            grouped_ports[cell_group[cell]].setdefault(component, {})[cell] = alias
+            grouped_ports[cell_group[cell]].setdefault(component, {})[cell] = _annotated_alias(
+                alias
+            )
     groups = {}
     for kind, update in distinct:
         is_scattered = update == "indexed_scatter"
@@ -896,6 +969,15 @@ def _state_service_groups(
                 "capacity": indexed_scatter["capacity"],
                 "write_indices_ports": dict.fromkeys(
                     grouped_ports[name], indexed_scatter["port"]
+                ),
+                # The graph-visible valid length is a second rank-1 integer
+                # vector sitting beside the destinations, so it is equally
+                # shape-indistinguishable and equally must be named rather than
+                # inferred. Together these two entries and ``ports`` below are
+                # the whole scatter ABI, which is why the package needs no
+                # second copy of it outside the workflow.
+                "kv_length_ports": dict.fromkeys(
+                    grouped_ports[name], indexed_scatter["kv_length_port"]
                 ),
             }
         # A scatter writes through its buffer by construction: the written result
@@ -4773,6 +4855,7 @@ def build_vlm_workflow_metadata(
                 "write_indices": "cache_lengths",
                 "logical_lengths": "cache_lengths",
                 "port": static_cache["write_indices"],
+                "kv_length_port": static_cache["kv_sequence_length"],
             }
             if static_cache is not None
             else None
@@ -5148,14 +5231,6 @@ def build_vlm_workflow_metadata(
     metadata = {
         "schema_version": "v1",
         "preprocessing": preprocessing,
-        # The scatter ABI's control ports are rank-1 integer vectors and are
-        # indistinguishable by shape, so which is the write cursor and which is
-        # the non-pad length is declared, never inferred.
-        **(
-            {"model": {"io": _static_cache_model_io(decoder)}}
-            if static_cache is not None
-            else {}
-        ),
         "pipeline": {"workflow": _publish_workflow_v1(workflow)},
     }
     add_policy_components_to_workflow(metadata, pkg)
@@ -6949,6 +7024,7 @@ def _build_autoregressive_workflow_metadata(
                 "write_indices": "cache_lengths",
                 "logical_lengths": "cache_lengths",
                 "port": static_cache["write_indices"],
+                "kv_length_port": static_cache["kv_sequence_length"],
             }
             if static_cache is not None
             else None
@@ -7356,16 +7432,6 @@ def _build_autoregressive_workflow_metadata(
     metadata = {
         "schema_version": "1.0",
         **({"preprocessing": {"audio": audio_program}} if audio_program is not None else {}),
-        # The scatter ABI's two control ports are integer vectors and so are
-        # indistinguishable by shape. ``model.io.static_cache`` is the
-        # authoritative declaration of which port is which, and a runtime that
-        # drives the graph directly rather than through the workflow reads it
-        # from here; it is deliberately redundant with the workflow bindings.
-        **(
-            {"model": {"io": _static_cache_model_io(decoder)}}
-            if static_cache is not None
-            else {}
-        ),
         "pipeline": {"workflow": _publish_workflow_v1(workflow)},
     }
     add_policy_components_to_workflow(metadata, pkg)
@@ -8922,10 +8988,9 @@ def _annotate_duplex_state_service(
                     "capabilities": {"snapshot": True, "fork": False},
                     "ports": {
                         "temporal": {
-                            f"temporal_cache_{index}": {
-                                "input": past.name,
-                                "output": present.name,
-                            }
+                            f"temporal_cache_{index}": _annotated_alias(
+                                {"input": past.name, "output": present.name}
+                            )
                             for index, (past, present) in enumerate(temporal_caches)
                         }
                     },
