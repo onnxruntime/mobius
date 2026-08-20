@@ -1962,12 +1962,14 @@ class TestExportForOrtGenai:
         assert data["model"]["pad_token_id"] == 0
 
     @pytest.mark.parametrize(
-        ("tokens", "vocab_size", "expected"),
+        ("tokens", "vocab_size", "expected", "filename", "key"),
         [
             (
                 {"<tool_call>": 151657, "</tool_call>": 151658},
                 151936,
                 {"bot_token_id": 151657, "eot_token_id": 151658},
+                "tokenizer_config.json",
+                "added_tokens_decoder",
             ),
             (
                 {
@@ -1983,28 +1985,38 @@ class TestExportForOrtGenai:
                     "bor_token_id": 151667,
                     "eor_token_id": 151668,
                 },
+                "tokenizer.json",
+                "added_tokens",
             ),
             (
                 {"<|tool_call|>": 200025, "<|/tool_call|>": 200026},
                 200064,
                 {"bot_token_id": 200025, "eot_token_id": 200026},
+                "tokenizer.json",
+                "added_tokens",
             ),
-            ({}, 256, {}),
-            ({"<tool_call>": 151657, "</tool_call>": 151658}, 151658, {"bot_token_id": 151657}),
+            ({}, 256, {}, "tokenizer_config.json", "added_tokens_decoder"),
+            (
+                {"<tool_call>": 151657, "</tool_call>": 151658},
+                151658,
+                {"bot_token_id": 151657},
+                "tokenizer.json",
+                "added_tokens",
+            ),
         ],
     )
     def test_tool_call_special_tokens_read_from_tokenizer_config(
-        self, tmp_path, tokens, vocab_size, expected
+        self, tmp_path, tokens, vocab_size, expected, filename, key
     ):
-        """Tool and reasoning delimiters come from tokenizer_config.json."""
+        """Tool and reasoning delimiters are read from both tokenizer metadata formats."""
         tokenizer_dir = tmp_path / "tokenizer"
         tokenizer_dir.mkdir()
-        tokenizer_config = {
-            "added_tokens_decoder": {
-                str(token_id): {"content": token} for token, token_id in tokens.items()
-            }
-        }
-        (tokenizer_dir / "tokenizer_config.json").write_text(json.dumps(tokenizer_config))
+        tokenizer_config = (
+            {str(token_id): {"content": token} for token, token_id in tokens.items()}
+            if key == "added_tokens_decoder"
+            else [{"id": token_id, "content": token} for token, token_id in tokens.items()]
+        )
+        (tokenizer_dir / filename).write_text(json.dumps({key: tokenizer_config}))
 
         pkg = _make_fake_llm_pkg("llama")
         pkg.config.vocab_size = vocab_size
@@ -2036,7 +2048,9 @@ class TestExportForOrtGenai:
         with open(result["genai_config"]) as f:
             model = json.load(f)["model"]
 
-        assert not {"bot_token_id", "eot_token_id", "bor_token_id", "eor_token_id"} & model.keys()
+        assert (
+            not {"bot_token_id", "eot_token_id", "bor_token_id", "eor_token_id"} & model.keys()
+        )
 
     def test_ambiguous_tool_tokens_are_ignored(self, tmp_path):
         """Conflicting tool delimiter spellings do not choose an arbitrary ID."""
@@ -2051,6 +2065,27 @@ class TestExportForOrtGenai:
                     }
                 }
             )
+        )
+
+        result = write_ort_genai_config(
+            _make_fake_llm_pkg("llama"),
+            str(tmp_path / "output"),
+            local_config_dir=str(tokenizer_dir),
+        )
+        with open(result["genai_config"]) as f:
+            model = json.load(f)["model"]
+
+        assert "bot_token_id" not in model
+
+    def test_conflicting_tokenizer_metadata_is_ignored(self, tmp_path):
+        """Conflicting IDs across tokenizer metadata files do not choose an arbitrary ID."""
+        tokenizer_dir = tmp_path / "tokenizer"
+        tokenizer_dir.mkdir()
+        (tokenizer_dir / "tokenizer_config.json").write_text(
+            json.dumps({"added_tokens_decoder": {"10": {"content": "<tool_call>"}}})
+        )
+        (tokenizer_dir / "tokenizer.json").write_text(
+            json.dumps({"added_tokens": [{"id": 11, "content": "<tool_call>"}]})
         )
 
         result = write_ort_genai_config(

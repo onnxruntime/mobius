@@ -370,32 +370,40 @@ _SPECIAL_TOKEN_FIELDS = {
 def _special_token_ids_from_tokenizer_config(
     output_dir: str, vocab_size: int
 ) -> dict[str, int]:
-    """Read delimiters from tokenizer_config.json already copied to *output_dir*."""
-    tc_path = os.path.join(output_dir, "tokenizer_config.json")
-    if not os.path.isfile(tc_path):
-        return {}
-
-    try:
-        with open(tc_path, encoding="utf-8") as f:
-            added_tokens = json.load(f).get("added_tokens_decoder", {})
-    except (OSError, json.JSONDecodeError):
-        logger.warning("Could not read special tokens from %s", tc_path, exc_info=True)
-        return {}
-    if not isinstance(added_tokens, dict):
-        return {}
-
+    """Read delimiter IDs from copied tokenizer_config.json or tokenizer.json."""
     special_token_ids: dict[str, int] = {}
     ambiguous_fields: set[str] = set()
-    for raw_token_id, token in added_tokens.items():
-        if not isinstance(token, dict):
+    token_sources = (
+        ("tokenizer_config.json", "added_tokens_decoder"),
+        ("tokenizer.json", "added_tokens"),
+    )
+    for filename, added_tokens_key in token_sources:
+        path = os.path.join(output_dir, filename)
+        if not os.path.isfile(path):
             continue
-        field = _SPECIAL_TOKEN_FIELDS.get(token.get("content"))
         try:
-            token_id = int(raw_token_id)
-        except (TypeError, ValueError):
+            with open(path, encoding="utf-8") as f:
+                added_tokens = json.load(f).get(added_tokens_key, {})
+        except (OSError, json.JSONDecodeError, AttributeError):
+            logger.warning("Could not read special tokens from %s", path, exc_info=True)
             continue
-        if field is not None and 0 <= token_id < vocab_size:
-            if field in ambiguous_fields:
+        if isinstance(added_tokens, dict):
+            entries = added_tokens.items()
+        elif isinstance(added_tokens, list):
+            entries = (
+                (token.get("id"), token) for token in added_tokens if isinstance(token, dict)
+            )
+        else:
+            continue
+        for raw_token_id, token in entries:
+            if not isinstance(token, dict):
+                continue
+            field = _SPECIAL_TOKEN_FIELDS.get(token.get("content"))
+            try:
+                token_id = int(raw_token_id)
+            except (TypeError, ValueError):
+                continue
+            if field is None or not 0 <= token_id < vocab_size or field in ambiguous_fields:
                 continue
             if field in special_token_ids and special_token_ids[field] != token_id:
                 special_token_ids.pop(field)
