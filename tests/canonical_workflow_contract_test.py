@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 from typing import Any
 
 import onnx_ir as ir
@@ -42,6 +43,11 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
 from mobius.tasks import CausalLMTask
 
 CAPACITY = 64
+
+# Enough layers that a cell label's lexicographic order stops agreeing with its
+# numeric one: with ten or more cells, ``cache_10`` sorts between ``cache_1``
+# and ``cache_2``. Below that threshold every ordering rule looks correct.
+DEEP_LAYERS = 12
 
 FIXTURE_ROOT = os.path.join(os.path.dirname(__file__), "fixtures", "onnx_genai_workflows")
 
@@ -331,6 +337,144 @@ class TestOneSerializedContract:
             assert all(
                 alias["input"] in inputs and alias["output"] in outputs for alias in pairs
             )
+
+
+def _deep_dynamic() -> dict[str, Any]:
+    """An appending cache with enough layers that labels sort out of order."""
+    config = _text_config(num_hidden_layers=DEEP_LAYERS)
+    pkg = CausalLMTask().build(registry.get("qwen2")(config), config)
+    return build_decoder_workflow_metadata(pkg, config)
+
+
+def _deep_static_cache() -> dict[str, Any]:
+    """The same depth, scattered into fixed-capacity buffers."""
+    config = _text_config(num_hidden_layers=DEEP_LAYERS)
+    task = CausalLMTask(static_cache=True, max_seq_len=CAPACITY)
+    pkg = task.build(registry.get("qwen2")(config), config)
+    return build_decoder_workflow_metadata(pkg, config)
+
+
+def _deep_heterogeneous() -> dict[str, Any]:
+    """A deep hybrid whose cache-owning layers are a non-contiguous subset.
+
+    Alternating the layer types makes the full-attention group own layers
+    1, 3, 5, ... only, so a cell's position in its group is never its layer.
+    """
+    config = _text_config(
+        num_hidden_layers=DEEP_LAYERS,
+        sliding_window=8,
+        layer_types=["sliding_attention", "full_attention"] * (DEEP_LAYERS // 2),
+    )
+    pkg = CausalLMTask().build(registry.get("qwen2")(config), config)
+    return build_decoder_workflow_metadata(pkg, config)
+
+
+_DEEP_PACKAGES = {
+    "dynamic": _deep_dynamic,
+    "static_cache": _deep_static_cache,
+    "heterogeneous": _deep_heterogeneous,
+}
+
+
+@pytest.fixture(scope="module")
+def deep_built() -> dict[str, dict[str, Any]]:
+    return {name: build() for name, build in _DEEP_PACKAGES.items()}
+
+
+@pytest.fixture(params=sorted(_DEEP_PACKAGES), scope="module")
+def deep_package(request, deep_built):
+    return deep_built[request.param]
+
+
+def _roled_aliases(metadata: dict[str, Any]) -> list[dict[str, dict[str, Any]]]:
+    """Every per-component alias map that carries key/value halves."""
+    maps = []
+    for group in _groups(metadata["pipeline"]["workflow"]).values():
+        for aliases in (group.get("ports") or {}).values():
+            if any(alias.get("role") for alias in aliases.values()):
+                maps.append(aliases)
+    return maps
+
+
+class TestDeepDecodersDeclareLayersRatherThanPositions:
+    """The layer annotation only earns its place above nine layers.
+
+    Every other package in this file has two layers, and with two layers a
+    cell's label sorts the same way whichever rule is used: lexicographic,
+    numeric, or insertion order all agree. So do the alternatives a producer
+    could accidentally implement — ``layer`` taken from the enumeration index
+    rather than parsed from the port name is indistinguishable from the
+    correct value until some layer's cells outnumber a single digit.
+
+    Real decoders have twenty to eighty layers, so that region is the normal
+    case in production and the unreachable case in this suite. These tests put
+    a package there. They are written to fail loudly if the annotation ever
+    degrades into a restatement of position, because the failure it prevents
+    is silent: two transposed caches have identical shapes and identical
+    dtypes, and the only symptom is that generated text is subtly wrong.
+    """
+
+    def test_labels_really_do_sort_out_of_order_at_this_depth(self, deep_package):
+        # Guards the premise of every other test in this class: if the labels
+        # happened to sort numerically, the rest would prove nothing.
+        for aliases in _roled_aliases(deep_package):
+            by_label = [aliases[cell]["layer"] for cell in sorted(aliases)]
+            assert by_label != sorted(by_label), (
+                "labels sort into layer order, so this package cannot "
+                "distinguish a declared layer from a positional one"
+            )
+
+    def test_the_declared_layer_is_the_one_the_port_name_states(self, deep_package):
+        """The annotation restates the exporter's own port name, not an index."""
+        for aliases in _roled_aliases(deep_package):
+            for alias in aliases.values():
+                stated = re.search(
+                    r"\.(\d+)\.(?:key|value)$|(?:key|value)_cache\.(\d+)$", alias["input"]
+                )
+                assert stated is not None, alias["input"]
+                assert alias["layer"] == int(stated.group(1) or stated.group(2))
+
+    def test_ordering_by_the_declared_layer_recovers_the_buffer_lists(self, deep_package):
+        """Sorting by (layer, half) is what a consumer does; it must be numeric.
+
+        This mirrors how the runtime collects a group's ports, so the assertion
+        fails here rather than as transposed caches at inference time.
+        """
+        for aliases in _roled_aliases(deep_package):
+            ordered = sorted(
+                aliases.values(), key=lambda alias: (alias["layer"], alias["role"])
+            )
+            layers = [alias["layer"] for alias in ordered]
+            assert layers == sorted(layers)
+            keys = [alias["input"] for alias in ordered if alias["role"] == "key"]
+            values = [alias["input"] for alias in ordered if alias["role"] == "value"]
+            assert len(keys) == len(values)
+            # Each layer contributes exactly one key and one value, in step.
+            assert [alias["layer"] for alias in ordered if alias["role"] == "key"] == [
+                alias["layer"] for alias in ordered if alias["role"] == "value"
+            ]
+
+    def test_a_cells_position_in_its_group_is_not_its_layer(self, deep_built):
+        """Each group of a hybrid owns an alternating half of the layers.
+
+        This is the case that separates a declared layer from a positional one
+        even for a producer that sorts numerically: the sliding group owns
+        layers 0, 2, 4, ... and the full-attention group owns 1, 3, 5, ..., so
+        a cell's position within its own group is never its layer.
+        """
+        aliases_by_group = _roled_aliases(deep_built["heterogeneous"])
+        assert len(aliases_by_group) == 2, "expected one group per attention type"
+        owned = [
+            frozenset(alias["layer"] for alias in aliases.values() if alias["role"] == "key")
+            for aliases in aliases_by_group
+        ]
+        evens = frozenset(index for index in range(DEEP_LAYERS) if index % 2 == 0)
+        odds = frozenset(index for index in range(DEEP_LAYERS) if index % 2 == 1)
+        assert set(owned) == {evens, odds}
+        # Neither group's layers are its own positions, which is the property a
+        # positional annotation would have satisfied by construction.
+        for layers in owned:
+            assert layers != frozenset(range(len(layers)))
 
 
 def _fixture_packages() -> list[str]:

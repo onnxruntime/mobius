@@ -123,7 +123,7 @@ well-formed and validate; only the local kernel is missing.
 
 ### Canonical representation — lowering verified
 
-Against ONNX GenAI `c344c2c7`, with no `model.io` in any package:
+Against ONNX GenAI `0d4738e7`, with no `model.io` in any package:
 
 | Check | Result |
 | --- | --- |

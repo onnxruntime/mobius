@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Deep decoders are now covered where the cache layer annotation actually
+  matters. Every metadata package built in the test suite had two layers, and
+  below ten a cell label sorts identically whether ordered lexicographically,
+  numerically or by insertion — so a `layer` derived from a cell's position
+  rather than parsed from its port name would have passed every assertion while
+  transposing caches on any real model. `canonical_workflow_contract_test` now
+  builds twelve-layer dynamic, static-cache and hybrid decoders and pins that
+  the declared layer restates the port name, that ordering by it recovers the
+  buffer lists, and that a hybrid's alternating groups own layers their cells'
+  positions never equal. A producer that dropped the parse leaves the 101
+  pre-existing assertions green and fails seven of these.
+
 - Every component a task builds now declares an optimization role. Qwen3-TTS's
   four loop-wiring graphs (`code_predictor_prefill`,
   `code_predictor_step_embedder`, `code_predictor_indices`, `talker_text_step`)
