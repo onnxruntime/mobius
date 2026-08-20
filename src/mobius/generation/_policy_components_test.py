@@ -22,6 +22,7 @@ from mobius.generation import (
     build_eos_termination,
     build_euler_model_input,
     build_euler_solver_step,
+    build_flow_match_solver_step,
     build_grammar_logits_processor,
     build_greedy_sampler,
     build_guidance_combine,
@@ -31,15 +32,19 @@ from mobius.generation import (
     build_masked_token_update,
     build_model_token_cast,
     build_multistep_solver_step,
+    build_pack_latents_2x2,
     build_proposal_metrics,
     build_scalar_constant,
     build_seeded_categorical_sampler,
+    build_sequence_concat,
     build_shape_constant,
     build_speculative_acceptance,
     build_speculative_state_rollback,
     build_tensor_scale,
     build_termination_batch_initializer,
     build_token_state_update,
+    build_true_cfg,
+    build_unpack_latents_2x2,
     build_zeros_like,
 )
 from mobius.generation._policy_components import _make_graph
@@ -1170,3 +1175,98 @@ def test_state_initializer_allocates_fp8_cache_through_a_cast(tmp_path):
         {"prompt_tokens": np.array([[3, 4, 5]], np.int64)},
     )
     assert outputs[-1].shape == (1, 2, 0, 4)
+
+
+def _reference_pack(latent: np.ndarray) -> np.ndarray:
+    """``QwenImagePipeline._pack_latents`` in numpy: (B,C,T,H,W) -> (B,T*H/2*W/2,C*4)."""
+    batch, channels, frames, height, width = latent.shape
+    packed = latent.reshape(batch, channels, frames, height // 2, 2, width // 2, 2)
+    packed = packed.transpose(0, 2, 3, 5, 1, 4, 6)
+    return packed.reshape(batch, frames * (height // 2) * (width // 2), channels * 4)
+
+
+def test_flow_match_solver_step_runtime_parity(tmp_path):
+    """Flow matching integrates ``x + (sigma_next - sigma) * v`` on rank-3 tokens."""
+    sample = np.arange(12, dtype=np.float32).reshape(1, 3, 4)
+    derivative = np.full_like(sample, 0.5)
+    (actual,) = _run(
+        build_flow_match_solver_step(),
+        tmp_path,
+        {
+            "sample": sample,
+            "derivative": derivative,
+            "step": np.array([1], np.int64),
+            "schedule": np.array([1.0, 0.6, 0.2], np.float32),
+        },
+    )
+    # step 1 moves sigma 0.6 -> 0.2, so the update is -0.4 * derivative.
+    np.testing.assert_allclose(actual, sample - 0.4 * derivative, rtol=1e-6, atol=1e-6)
+
+
+def test_pack_latents_matches_diffusers_patchify(tmp_path):
+    latent = np.arange(2 * 4 * 1 * 4 * 6, dtype=np.float32).reshape(2, 4, 1, 4, 6)
+    (packed,) = _run(build_pack_latents_2x2(), tmp_path, {"latent_sample": latent})
+    assert packed.shape == (2, 6, 16)
+    np.testing.assert_array_equal(packed, _reference_pack(latent))
+
+
+def test_unpack_latents_inverts_pack(tmp_path):
+    """Round-tripping must be exact: the loop packs once and unpacks once.
+
+    ``height``/``width`` are the *packed* token grid, i.e. half the latent
+    spatial extent, because each token folds a 2x2 patch into its channels.
+    """
+    latent = np.arange(1 * 4 * 1 * 6 * 4, dtype=np.float32).reshape(1, 4, 1, 6, 4)
+    (packed,) = _run(build_pack_latents_2x2(), tmp_path, {"latent_sample": latent})
+    (restored,) = _run(
+        build_unpack_latents_2x2(),
+        tmp_path,
+        {
+            "packed_latent": packed,
+            "height": np.array([3], np.int64),
+            "width": np.array([2], np.int64),
+        },
+    )
+    np.testing.assert_array_equal(restored, latent)
+
+
+def test_sequence_concat_joins_target_then_source(tmp_path):
+    """Order matters: the denoiser slices its estimate back off the front."""
+    target = np.ones((1, 2, 3), np.float32)
+    source = np.full((1, 4, 3), 2.0, np.float32)
+    (joined,) = _run(build_sequence_concat(), tmp_path, {"target": target, "source": source})
+    assert joined.shape == (1, 6, 3)
+    np.testing.assert_array_equal(joined, np.concatenate([target, source], axis=1))
+
+
+def test_true_cfg_matches_diffusers_norm_rescale(tmp_path):
+    """True CFG rescales the guided estimate back to the conditional norm.
+
+    ``QwenImageEditPlusPipeline`` computes ``comb = neg + s * (cond - neg)`` and
+    then multiplies by ``||cond||/||comb||`` over the channel axis, so guidance
+    changes direction without inflating magnitude.
+    """
+    rng = np.random.default_rng(3)
+    cond = rng.standard_normal((2, 3, 4)).astype(np.float32)
+    uncond = rng.standard_normal((2, 3, 4)).astype(np.float32)
+    (actual,) = _run(
+        build_true_cfg(guidance_scale=4.0),
+        tmp_path,
+        {"conditional": cond, "unconditional": uncond},
+    )
+    comb = uncond + 4.0 * (cond - uncond)
+    cond_norm = np.linalg.norm(cond, axis=-1, keepdims=True)
+    comb_norm = np.linalg.norm(comb, axis=-1, keepdims=True)
+    np.testing.assert_allclose(actual, comb * (cond_norm / comb_norm), rtol=1e-5, atol=1e-5)
+
+
+def test_true_cfg_is_identity_at_unit_guidance(tmp_path):
+    rng = np.random.default_rng(5)
+    cond = rng.standard_normal((1, 2, 4)).astype(np.float32)
+    uncond = rng.standard_normal((1, 2, 4)).astype(np.float32)
+    (actual,) = _run(
+        build_true_cfg(guidance_scale=1.0),
+        tmp_path,
+        {"conditional": cond, "unconditional": uncond},
+    )
+    np.testing.assert_allclose(actual, cond, rtol=1e-5, atol=1e-5)

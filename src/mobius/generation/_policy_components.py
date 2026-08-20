@@ -895,9 +895,7 @@ def build_decoder_step_update(
         else:
             batch_shape = op.Shape(attention, start=0, end=1)
             one_shape = op.Concat(batch_shape, op.Constant(value_ints=[1]), axis=0)
-            one = op.CastLike(
-                op.ConstantOfShape(one_shape, value=ir.tensor([1])), attention
-            )
+            one = op.CastLike(op.ConstantOfShape(one_shape, value=ir.tensor([1])), attention)
             next_attention = op.Concat(attention, one, axis=1)
             next_attention.shape = ir.Shape(["batch", "context + 1"])
         builder.add_output(next_attention, "next_attention_mask")
@@ -1848,6 +1846,169 @@ def build_multistep_solver_step(
             "next_history": "next_history",
         },
     )
+
+
+def build_flow_match_solver_step(
+    dtype: ir.DataType = ir.DataType.FLOAT,
+) -> PolicyComponent:
+    """Build the Euler update for rank-3 (packed/patchified) latents.
+
+    Identical arithmetic to :func:`build_euler_solver_step` — ``x_next = x + dx *
+    (sigma_next - sigma)`` — but broadcasts the per-batch step size over a
+    ``(batch, sequence, channels)`` latent instead of a rank-4 image latent.
+    Flow-matching transformers (Qwen Image, Flux, SD3) carry latents in this
+    packed layout.
+    """
+    graph, builder = _make_graph("flow_match_solver_step")
+    op = builder.op
+    sample = builder.input("sample", dtype, ["batch", "sequence", "channels"])
+    derivative = builder.input("derivative", dtype, ["batch", "sequence", "channels"])
+    step = builder.input("step", ir.DataType.INT64, ["batch"])
+    schedule = builder.input("schedule", ir.DataType.FLOAT, ["schedule_length"])
+    final_index = op.Sub(op.Shape(schedule, start=0, end=1), op.Constant(value_ints=[1]))
+    next_step = op.Min(op.Add(step, op.Constant(value_int=1)), final_index)
+    sigma = op.Gather(schedule, step, axis=0)
+    sigma_next = op.Gather(schedule, next_step, axis=0)
+    delta = op.Cast(op.Sub(sigma_next, sigma), to=dtype)
+    delta = op.Unsqueeze(delta, op.Constant(value_ints=[1, 2]))
+    next_sample = op.Add(sample, op.Mul(derivative, delta))
+    builder.add_output(next_sample, "next_state")
+    return _component(
+        "onnx-genai.solver-step@1",
+        graph,
+        {
+            "role": "solver_step",
+            "state": "sample",
+            "estimate": "derivative",
+            "step": "step",
+            "schedule": "schedule",
+            "next_state": "next_state",
+            "effect": "solver",
+        },
+        "solver",
+    )
+
+
+def build_pack_latents_2x2(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponent:
+    """Patchify a 3D VAE latent into the transformer's packed token layout.
+
+    ``(B, C, T, H, W) -> (B, T*(H/2)*(W/2), C*4)`` by folding each 2x2 spatial
+    patch into the channel axis, matching ``QwenImagePipeline._pack_latents``.
+    Shapes are derived from the input at runtime so the component stays valid
+    for any resolution.
+    """
+    graph, builder = _make_graph("pack_latents")
+    op = builder.op
+    latent = builder.input(
+        "latent_sample", dtype, ["batch", "channels", "frames", "height", "width"]
+    )
+    two = op.Constant(value_ints=[2])
+    batch = op.Shape(latent, start=0, end=1)
+    channels = op.Shape(latent, start=1, end=2)
+    frames = op.Shape(latent, start=2, end=3)
+    height = op.Shape(latent, start=3, end=4)
+    width = op.Shape(latent, start=4, end=5)
+    half_h = op.Div(height, two)
+    half_w = op.Div(width, two)
+    # (B, C, T, H, W) -> (B, C, T, H/2, 2, W/2, 2)
+    patched = op.Reshape(
+        latent,
+        op.Concat(batch, channels, frames, half_h, two, half_w, two, axis=0),
+    )
+    # -> (B, T, H/2, W/2, C, 2, 2) so each 2x2 patch is contiguous per channel
+    patched = op.Transpose(patched, perm=[0, 2, 3, 5, 1, 4, 6])
+    tokens = op.Mul(op.Mul(frames, half_h), half_w)
+    packed = op.Reshape(
+        patched,
+        op.Concat(batch, tokens, op.Mul(channels, op.Constant(value_ints=[4])), axis=0),
+    )
+    _set_public_shape(packed, ["batch", "sequence", "packed_channels"])
+    builder.add_output(packed, "packed_latent")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_unpack_latents_2x2(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponent:
+    """Invert :func:`build_pack_latents_2x2` back to a 3D VAE latent.
+
+    ``(B, S, C*4) -> (B, C, 1, H*2, W*2)`` given the packed latent grid
+    ``height``/``width`` (in packed tokens). The single frame matches the image
+    pipelines, whose VAE always encodes one temporal chunk.
+    """
+    graph, builder = _make_graph("unpack_latents")
+    op = builder.op
+    packed = builder.input("packed_latent", dtype, ["batch", "sequence", "packed_channels"])
+    height = builder.input("height", ir.DataType.INT64, [1])
+    width = builder.input("width", ir.DataType.INT64, [1])
+    two = op.Constant(value_ints=[2])
+    batch = op.Shape(packed, start=0, end=1)
+    channels = op.Div(op.Shape(packed, start=2, end=3), op.Constant(value_ints=[4]))
+    # (B, S, C*4) -> (B, H, W, C, 2, 2)
+    grid = op.Reshape(packed, op.Concat(batch, height, width, channels, two, two, axis=0))
+    # -> (B, C, H, 2, W, 2) -> (B, C, 1, H*2, W*2)
+    grid = op.Transpose(grid, perm=[0, 3, 1, 4, 2, 5])
+    latent = op.Reshape(
+        grid,
+        op.Concat(
+            batch,
+            channels,
+            op.Constant(value_ints=[1]),
+            op.Mul(height, two),
+            op.Mul(width, two),
+            axis=0,
+        ),
+    )
+    _set_public_shape(latent, ["batch", "channels", "frames", "height", "width"])
+    builder.add_output(latent, "latent_sample")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_sequence_concat(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponent:
+    """Concatenate two token sequences along the sequence axis.
+
+    Image-editing denoisers attend jointly over the generated tokens and the
+    source-image tokens, so the model input is ``concat([target, source], 1)``
+    and the estimate is sliced back to the target length inside the denoiser.
+    """
+    graph, builder = _make_graph("sequence_concat")
+    op = builder.op
+    target = builder.input("target", dtype, ["batch", "target_sequence", "channels"])
+    source = builder.input("source", dtype, ["batch", "source_sequence", "channels"])
+    joined = op.Concat(target, source, axis=1)
+    _set_public_shape(joined, ["batch", "sequence", "channels"])
+    builder.add_output(joined, "sequence")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_true_cfg(
+    dtype: ir.DataType = ir.DataType.FLOAT,
+    *,
+    guidance_scale: float = 4.0,
+) -> PolicyComponent:
+    """Combine conditional/unconditional estimates with Qwen's true CFG.
+
+    ``combined = uncond + scale * (cond - uncond)``, then rescaled to preserve
+    the conditional estimate's per-token norm::
+
+        noise_pred = combined * (||cond||_2 / ||combined||_2)
+
+    The reduction runs in float32: squared activations overflow float16, and
+    onnxruntime ships no bfloat16 ``ReduceL2`` kernel at all (a bfloat16 graph
+    containing one cannot be assigned to any provider and fails to load).
+    """
+    graph, builder = _make_graph("true_cfg")
+    op = builder.op
+    cond = builder.input("conditional", dtype, ["batch", "sequence", "channels"])
+    uncond = builder.input("unconditional", dtype, ["batch", "sequence", "channels"])
+    cond_f32 = op.Cast(cond, to=ir.DataType.FLOAT)
+    uncond_f32 = op.Cast(uncond, to=ir.DataType.FLOAT)
+    scale = op.Constant(value_float=float(guidance_scale))
+    combined = op.Add(uncond_f32, op.Mul(op.Sub(cond_f32, uncond_f32), scale))
+    cond_norm = op.ReduceL2(cond_f32, [-1], keepdims=True)
+    combined_norm = op.Max(op.ReduceL2(combined, [-1], keepdims=True), 1e-12)
+    guided = op.Cast(op.Mul(combined, op.Div(cond_norm, combined_norm)), to=dtype)
+    _set_public_shape(guided, ["batch", "sequence", "channels"])
+    builder.add_output(guided, "estimate")
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 SOLVER_BUILDERS = {
