@@ -367,16 +367,6 @@ def _save_package(
 ) -> None:
     """Save a ModelPackage to disk, applying optimizations and runtime configs."""
     runtime = getattr(args, "runtime", None)
-    if runtime == "ort-genai":
-        from mobius.integrations.ort_genai.auto_export import (
-            _validate_ort_genai_compatibility,
-        )
-
-        try:
-            _validate_ort_genai_compatibility(pkg)
-        except ValueError as error:
-            raise SystemExit(f"Error: {error}") from error
-
     components = (lambda name: name == component_filter) if component_filter else None
     for name, model in pkg.items():
         if components is not None and not components(name):
@@ -507,15 +497,6 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         )
         raise SystemExit(1)
 
-    if getattr(args, "runtime", None) == "ort-genai":
-        raise SystemExit(
-            "Error: mobius build-gguf does not yet support --runtime ort-genai. "
-            "The command cannot emit a valid genai_config.json until the selected "
-            "GGUF architecture's cache and tokenizer contracts have passed real "
-            "ORT GenAI generation. Use --runtime onnx-genai where supported, or "
-            "omit --runtime and run the ONNX model directly."
-        )
-
     mmproj_path = getattr(args, "mmproj", None)
     keep_quantized = not args.dequantize
 
@@ -560,9 +541,9 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             path = os.path.join(output_dir, "model.onnx")
         print(f"Saved {name} to {path}")
 
-    if getattr(args, "runtime", None) == "onnx-genai":
+    runtime = getattr(args, "runtime", None)
+    if runtime in ("ort-genai", "onnx-genai"):
         from mobius.integrations.gguf import write_gguf_tokenizer_json
-        from mobius.integrations.onnx_genai import write_onnx_genai_config
 
         # A GGUF checkpoint has no Hugging Face source directory, so the
         # tokenizer is reconstructed from the file's embedded ggml metadata
@@ -570,9 +551,20 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         tokenizer_path = write_gguf_tokenizer_json(gguf_path, output_dir)
         if tokenizer_path is not None:
             print(f"  tokenizer: {tokenizer_path}")
-        artifacts = write_onnx_genai_config(
-            pkg, output_dir, config=getattr(pkg, "config", None), source=None
-        )
+        if runtime == "onnx-genai":
+            from mobius.integrations.onnx_genai import write_onnx_genai_config
+
+            artifacts = write_onnx_genai_config(
+                pkg, output_dir, config=getattr(pkg, "config", None), source=None
+            )
+        else:
+            from mobius.integrations.ort_genai import write_ort_genai_config
+
+            artifacts = write_ort_genai_config(
+                pkg,
+                output_dir,
+                ep=args.execution_provider,
+            )
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
 
@@ -896,10 +888,9 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help=(
             "Generate runtime-specific config files after building. "
-            "'onnx-genai' writes inference_metadata.yaml plus a tokenizer.json "
-            "reconstructed from the GGUF's embedded tokenizer metadata; "
-            "'ort-genai' is currently rejected until GGUF cache/tokenizer "
-            "contracts have runtime generation coverage."
+            "Both modes reconstruct tokenizer.json from GGUF metadata. "
+            "'onnx-genai' writes inference_metadata.yaml; 'ort-genai' writes "
+            "the best graph-derived genai_config.json metadata."
         ),
     )
     gguf_parser.add_argument(

@@ -195,7 +195,7 @@ class QwenVLTask(VisionLanguageTask):
         op = builder.op
         pixel_values = builder.input(
             "pixel_values",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[total_patches, pixel_dim],
         )
         image_grid_thw = builder.input(
@@ -203,10 +203,11 @@ class QwenVLTask(VisionLanguageTask):
             dtype=ir.DataType.INT64,
             shape=[num_images, 3],
         )
+        model_pixel_values = op.Cast(pixel_values, to=config.dtype)
 
         outputs = vision(
             op,
-            pixel_values=pixel_values,
+            pixel_values=model_pixel_values,
             image_grid_thw=image_grid_thw,
         )
 

@@ -1,0 +1,26 @@
+model_id: "Qwen/Qwen3.8-27B"
+model_type: "qwen3_5"
+revision: "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+task_type: "image-text-to-text"
+dtype: "bfloat16"
+
+inputs:
+  prompts:
+    - "Describe this image in detail."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 30
+  do_sample: false
+
+ci_skip_reason: >-
+  The pinned official checkpoint is 55.6 GB and exceeds hosted CI storage and
+  GPU memory; no reduced or quantized private fixture is committed.
+notes: >-
+  Qwen3.8-27B native image/video model. Dense Qwen3.5 alias with 64 hybrid
+  layers (48 Gated DeltaNet + 16 gated GQA), a 27-block vision encoder, and an
+  optional one-layer self-speculative MTP drafter. The standard target package
+  omits that drafter; Mobius exposes it through the separate qwen35-mtp task.

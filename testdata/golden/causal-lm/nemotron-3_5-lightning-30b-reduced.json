@@ -1,0 +1,43 @@
+{
+  "model_id": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+  "revision": "d468880b6ad3c6e0d21377ce7242adaea4cc884d",
+  "fixture": "Production dimensions; complete checkpoint layers 0 (Mamba2), 1 (MoE with experts 0-3), and 5 (attention); embedding/lm_head rows 0-255.",
+  "input_ids": [
+    1,
+    42,
+    17
+  ],
+  "top1_id": 12,
+  "top2_id": 13,
+  "top10_ids": [
+    12,
+    13,
+    14,
+    1,
+    11,
+    17,
+    16,
+    10,
+    170,
+    201
+  ],
+  "top10_logits": [
+    "0x1.503e9a0000000p+1",
+    "0x1.1e09ce0000000p+1",
+    "0x1.0927420000000p+1",
+    "0x1.a5d06c0000000p-1",
+    "0x1.5fe3a60000000p-1",
+    "0x1.46611e0000000p-1",
+    "0x1.4523960000000p-1",
+    "0x1.3cc3800000000p-1",
+    "0x1.3bab820000000p-1",
+    "0x1.3b882c0000000p-1"
+  ],
+  "logits_summary": [
+    "0x1.503e9a0000000p+1",
+    "-0x1.b120180000000p+0",
+    "0x1.3e00480000000p-1",
+    "0x1.e850aa0000000p-3"
+  ],
+  "full_logits_sha256": "7500c2ed86137e20dddf43a85b016746b8b38c4a932277c29d2efa926cc4a23d"
+}

@@ -156,6 +156,8 @@ class GenaiConfigGenerator:
             :func:`_default_decoder_inputs`. Must already include KV
             cache template entries (``past_key_names``,
             ``past_value_names``).
+        decoder_outputs: Explicit decoder output name mapping. When
+            provided, used instead of :func:`_default_decoder_outputs`.
     """
 
     def __init__(
@@ -174,6 +176,7 @@ class GenaiConfigGenerator:
         eos_token_id: int | list[int] | None = None,
         pad_token_id: int | None = None,
         decoder_inputs: dict[str, str] | None = None,
+        decoder_outputs: dict[str, str] | None = None,
         decoder_filename: str | None = None,
         supports_in_place_kv_cache: bool | None = None,
         decoder_graph_capture: bool | None = None,
@@ -195,6 +198,8 @@ class GenaiConfigGenerator:
 
         # Explicit decoder inputs (from graph introspection); None -> use defaults
         self._decoder_inputs = decoder_inputs
+        # Explicit decoder outputs (from graph introspection); None -> use defaults
+        self._decoder_outputs = decoder_outputs
         # Explicit decoder filename; None -> use "model.onnx"
         self._decoder_filename = decoder_filename
         # Whether the exported decoder ONNX graph supports in-place KV-cache
@@ -230,6 +235,7 @@ class GenaiConfigGenerator:
         eos_token_id: int | list[int] | None = None,
         pad_token_id: int | None = None,
         decoder_inputs: dict[str, str] | None = None,
+        decoder_outputs: dict[str, str] | None = None,
         decoder_filename: str | None = None,
         supports_in_place_kv_cache: bool | None = None,
         num_cache_layer_slots: int | None = None,
@@ -278,6 +284,7 @@ class GenaiConfigGenerator:
             eos_token_id=eos_token_id,
             pad_token_id=pad,
             decoder_inputs=decoder_inputs,
+            decoder_outputs=decoder_outputs,
             decoder_filename=decoder_filename,
             supports_in_place_kv_cache=supports_in_place_kv_cache,
             layer_types=getattr(config, "layer_types", None),
@@ -459,6 +466,10 @@ class GenaiConfigGenerator:
             decoder_inputs = dict(self._decoder_inputs)
         else:
             decoder_inputs = _default_decoder_inputs(is_vlm=is_multimodal)
+        if self._decoder_outputs is not None:
+            decoder_outputs = dict(self._decoder_outputs)
+        else:
+            decoder_outputs = _default_decoder_outputs()
         decoder_filename = "decoder/model.onnx" if is_multimodal else "model.onnx"
         decoder: dict[str, Any] = {
             "session_options": _make_session_options(
@@ -469,7 +480,7 @@ class GenaiConfigGenerator:
             "head_size": self.head_dim,
             "hidden_size": self.hidden_size,
             "inputs": decoder_inputs,
-            "outputs": _default_decoder_outputs(),
+            "outputs": decoder_outputs,
             "num_attention_heads": self.num_attention_heads,
             "num_hidden_layers": self.num_hidden_layers,
             "num_key_value_heads": self.num_key_value_heads,

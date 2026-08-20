@@ -1,0 +1,3 @@
+olive-ai>=0.13.0
+requests>=2.25
+safetensors>=0.4

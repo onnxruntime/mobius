@@ -1,0 +1,20 @@
+model_id: "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
+model_type: "nemotron_h"
+revision: "d468880b6ad3c6e0d21377ce7242adaea4cc884d"
+task_type: "text-generation"
+dtype: "float16"
+trust_remote_code: false
+
+inputs:
+  prompts:
+    - "Here is my poem:"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+skip_reason: "The pinned checkpoint is 65.8 GB with 30B total parameters; L4/L5 reference generation and weighted ONNX export exceed the storage and accelerator memory available to standard CI."
+ci_skip_reason: "30B MoE checkpoint requires a large-memory CUDA host and about 66 GB of checkpoint storage."
+notes: "NVIDIA Nemotron 3.5 Lightning 30B-A3B. Hybrid Mamba2 + sigmoid-routed MoE + full attention; 128 routed experts, top-6. The 270 auxiliary mtp.* checkpoint tensors are intentionally ignored by the trusted NemotronHForCausalLM inference model."

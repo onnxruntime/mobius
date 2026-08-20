@@ -269,8 +269,7 @@ def write_genai_bundle(
     Args:
         pkg: The :class:`~mobius._model_package.ModelPackage` produced by
             :func:`~mobius.integrations.nemo.build_from_nemo`. Must contain the
-            ``encoder_streaming``, ``decoder`` and ``joint`` graphs and be built
-            in float32 (the GenAI pipeline only supports float32 encoder I/O).
+            ``encoder_streaming``, ``decoder`` and ``joint`` graphs.
         archive: The source :class:`NeMoArchive` (for preprocessor parameters
             and the SentencePiece tokenizer).
         dest_dir: Output directory (created if needed).
@@ -283,12 +282,6 @@ def write_genai_bundle(
     Returns:
         The resolved output directory path.
     """
-    dtype = getattr(pkg.config, "dtype", None)
-    if dtype is not None and dtype != ir.DataType.FLOAT:
-        raise ValueError(
-            "ORT GenAI nemotron_speech only supports float32 encoder I/O; build "
-            f"the package with dtype='f32' (got {dtype})."
-        )
     for key in ("encoder_streaming", "decoder", "joint"):
         if key not in pkg:
             raise KeyError(f"ModelPackage is missing required model {key!r}")

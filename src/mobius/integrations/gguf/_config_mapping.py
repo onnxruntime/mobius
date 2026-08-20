@@ -22,6 +22,7 @@ from __future__ import annotations
 
 __all__ = ["gguf_to_config"]
 
+import contextlib
 import dataclasses
 import logging
 from typing import Any
@@ -104,6 +105,18 @@ _MUSE_GLIMMER_KEY_MAP = {
     "attention.key_length": "head_dim",
     "attention.sliding_window": "sliding_window",
 }
+
+_TOKENIZER_KEY_MAP: dict[str, str] = {
+    "tokenizer.ggml.bos_token_id": "bos_token_id",
+    "tokenizer.ggml.padding_token_id": "pad_token_id",
+    # Non-standard but emitted by some multimodal converters.
+    "tokenizer.ggml.image_token_id": "image_token_id",
+}
+_STOP_TOKEN_KEYS = (
+    "tokenizer.ggml.eos_token_id",
+    "tokenizer.ggml.eot_token_id",
+    "tokenizer.ggml.eom_token_id",
+)
 
 _ARCH_KEY_MAPS: dict[str, dict[str, str]] = {
     # Both spellings are accepted wherever muse-glimmer is recognized.
@@ -211,6 +224,42 @@ def _extract_config_fields(
         tokens = metadata.get("tokenizer.ggml.tokens")
         if isinstance(tokens, list):
             hf_fields["vocab_size"] = len(tokens)
+
+    vocab_size = hf_fields.get("vocab_size")
+
+    def _valid_token_id(value: Any) -> int | None:
+        token_id = int(value)
+        if token_id < 0 or token_id == 0xFFFFFFFF:
+            return None
+        if vocab_size is not None and token_id >= int(vocab_size):
+            return None
+        return token_id
+
+    for gguf_key, config_key in _TOKENIZER_KEY_MAP.items():
+        if (
+            gguf_key in metadata
+            and (token_id := _valid_token_id(metadata[gguf_key])) is not None
+        ):
+            hf_fields[config_key] = token_id
+
+    stop_token_ids: list[int] = []
+    for gguf_key in _STOP_TOKEN_KEYS:
+        if gguf_key not in metadata:
+            continue
+        token_id = _valid_token_id(metadata[gguf_key])
+        if token_id is not None and token_id not in stop_token_ids:
+            stop_token_ids.append(token_id)
+    if stop_token_ids:
+        hf_fields["eos_token_id"] = (
+            stop_token_ids[0] if len(stop_token_ids) == 1 else stop_token_ids
+        )
+
+    # Standard GGUF has no dedicated image-token key. Preserve the canonical
+    # HuggingFace placeholder when it is embedded in the tokenizer vocabulary.
+    tokens = metadata.get("tokenizer.ggml.tokens")
+    if "image_token_id" not in hf_fields and isinstance(tokens, list):
+        with contextlib.suppress(ValueError):
+            hf_fields["image_token_id"] = tokens.index("<image_soft_token>")
 
     return hf_fields
 
@@ -387,6 +436,13 @@ def gguf_to_config(
     if isinstance(swiglu_limit, (list, np.ndarray)):
         swiglu_limit = swiglu_limit[0] if len(swiglu_limit) else 0.0
 
+    special_token_fields: dict[str, Any] = {
+        name: int(hf_fields[name])
+        for name in ("bos_token_id", "pad_token_id", "image_token_id")
+        if hf_fields.get(name) is not None
+    }
+    if (eos_token_id := hf_fields.get("eos_token_id")) is not None:
+        special_token_fields["eos_token_id"] = eos_token_id
     config = ArchitectureConfig(
         hidden_size=hidden_size,
         intermediate_size=hf_fields.get("intermediate_size", 4 * hidden_size),
@@ -452,6 +508,7 @@ def gguf_to_config(
         linear_key_head_dim=linear_key_head_dim,
         linear_value_head_dim=linear_value_head_dim,
         linear_conv_kernel_dim=(hf_fields.get("linear_conv_kernel_dim") or 4),
+        **special_token_fields,
     )
 
     # Store model_type for registry lookup and tensor processor dispatch.

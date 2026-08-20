@@ -241,7 +241,6 @@ _COVERAGE_SKIP: dict[str, str] = {
     "mctct": "Audio model — no test_model_id yet",
     "megatron-bert": "Encoder — no test_model_id yet",
     "modernbert-decoder": "Decoder variant — no test_model_id yet",
-    "nemotron_h": "No test_model_id — no suitable public checkpoint",
     "nllb-moe": "Seq2seq MoE — no test_model_id yet",
     "nllb_moe": "Seq2seq MoE — no test_model_id yet",
     "ovis2": "VL model — no test_model_id yet",

@@ -559,6 +559,46 @@ class TestConfigMapping:
         assert fields["hidden_size"] == 4096
         assert fields["num_hidden_layers"] == 32
 
+    def test_extract_config_fields_preserves_tokenizer_metadata(self):
+        fields = _extract_config_fields(
+            "llama",
+            {
+                "tokenizer.ggml.bos_token_id": 1,
+                "tokenizer.ggml.eos_token_id": 2,
+                "tokenizer.ggml.padding_token_id": 3,
+                "tokenizer.ggml.eot_token_id": 4,
+                "tokenizer.ggml.eom_token_id": 2,
+                "tokenizer.ggml.tokens": [
+                    "a",
+                    "<image_soft_token>",
+                    "b",
+                    "c",
+                    "d",
+                ],
+            },
+        )
+
+        assert fields["bos_token_id"] == 1
+        assert fields["eos_token_id"] == [2, 4]
+        assert fields["pad_token_id"] == 3
+        assert fields["image_token_id"] == 1
+
+    def test_extract_config_fields_omits_invalid_token_sentinels(self):
+        fields = _extract_config_fields(
+            "llama",
+            {
+                "tokenizer.ggml.tokens": ["a"],
+                "tokenizer.ggml.bos_token_id": 0xFFFFFFFF,
+                "tokenizer.ggml.eos_token_id": 0xFFFFFFFF,
+                "tokenizer.ggml.eot_token_id": -1,
+                "tokenizer.ggml.padding_token_id": 999,
+            },
+        )
+
+        assert "bos_token_id" not in fields
+        assert "eos_token_id" not in fields
+        assert "pad_token_id" not in fields
+
     def test_infer_tie_embeddings_true(self, tied_gguf: Path):
         model = GGUFModel(tied_gguf)
         assert _infer_tie_embeddings(model) is True

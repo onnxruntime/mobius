@@ -40,6 +40,16 @@ def _resolve_dtype(config) -> ir.DataType | None:
     return None
 
 
+def _resolve_explicit_dtype(value, *, field_name: str) -> ir.DataType:
+    """Normalize a required dtype string/torch/IR value."""
+    if isinstance(value, ir.DataType):
+        return value
+    torch_dtype = getattr(torch, value, None) if isinstance(value, str) else value
+    if isinstance(torch_dtype, torch.dtype):
+        return tensor_adapters.from_torch_dtype(torch_dtype)
+    raise ValueError(f"Unsupported {field_name}: {value!r}")
+
+
 def _resolve_hidden_act(config, model_type: str) -> str | None:
     """Resolve the hidden activation function from HF config patterns.
 
@@ -2643,6 +2653,7 @@ class NemotronHConfig(ArchitectureConfig):
     mamba_conv_bias: bool = True
     mamba_proj_bias: bool = False
     mamba_time_step_min: float = 0.001
+    mamba_ssm_cache_dtype: ir.DataType = ir.DataType.FLOAT
     moe_latent_size: int | None = None
 
     @classmethod
@@ -2660,15 +2671,29 @@ class NemotronHConfig(ArchitectureConfig):
                 "-": "mlp",
                 "E": "moe",
             }
-            layers_block_type = [char_map.get(c, "mamba2") for c in pattern]
+            invalid_chars = sorted(set(pattern) - set(char_map))
+            if invalid_chars:
+                raise ValueError(
+                    "Unsupported NemotronH hybrid_override_pattern character(s): "
+                    f"{invalid_chars}"
+                )
+            layers_block_type = [char_map[c] for c in pattern]
         else:
-            # Convert HF names to mobius names
+            # Transformers 5.x uses ``linear_attention``/``full_attention``;
+            # older configs use ``mamba``/``attention``. Normalize both
+            # vocabularies to Mobius cache-layer names.
             type_map = {
                 "mamba": "mamba2",
+                "linear_attention": "mamba2",
                 "attention": "full_attention",
+                "full_attention": "full_attention",
                 "moe": "moe",
+                "mlp": "mlp",
             }
-            layers_block_type = [type_map.get(t, t) for t in layers_block_type]
+            invalid_types = sorted(set(layers_block_type) - set(type_map))
+            if invalid_types:
+                raise ValueError(f"Unsupported NemotronH layer type(s): {invalid_types}")
+            layers_block_type = [type_map[t] for t in layers_block_type]
 
         # Override num_hidden_layers based on actual pattern length
         n = len(layers_block_type) if layers_block_type else base.num_hidden_layers
@@ -2717,6 +2742,10 @@ class NemotronHConfig(ArchitectureConfig):
             mamba_conv_bias=getattr(config, "use_conv_bias", True),
             mamba_proj_bias=getattr(config, "mamba_proj_bias", False),
             mamba_time_step_min=getattr(config, "time_step_min", 0.001),
+            mamba_ssm_cache_dtype=_resolve_explicit_dtype(
+                getattr(config, "mamba_ssm_cache_dtype", "float32"),
+                field_name="mamba_ssm_cache_dtype",
+            ),
             moe_latent_size=getattr(config, "moe_latent_size", None),
             shared_expert_intermediate_size=shared_expert_intermediate_size,
         )

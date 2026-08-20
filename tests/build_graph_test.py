@@ -5240,6 +5240,61 @@ class TestBuildNemotronHGraph:
         for key in result:
             assert not key.startswith("backbone."), f"Unrenamed key: {key}"
 
+    def test_reduced_precision_keeps_router_bias_and_ssm_cache_float32(self):
+        import onnx_ir as ir
+
+        from mobius import build_from_module
+        from mobius._configs import NemotronHConfig
+        from mobius.models.nemotron_h import NemotronHCausalLMModel
+
+        config = NemotronHConfig(
+            vocab_size=TINY_VOCAB,
+            hidden_size=TINY_HIDDEN,
+            intermediate_size=TINY_INTERMEDIATE,
+            num_hidden_layers=2,
+            num_attention_heads=TINY_HEADS,
+            num_key_value_heads=TINY_KV_HEADS,
+            rms_norm_eps=1e-5,
+            layer_types=["mamba2", "moe"],
+            mamba_n_heads=TINY_KV_HEADS,
+            mamba_d_head=TINY_HEAD_DIM,
+            mamba_d_state=16,
+            mamba_n_groups=1,
+            mamba_d_conv=4,
+            hidden_act="relu2",
+            head_dim=TINY_HEAD_DIM,
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=TINY_INTERMEDIATE,
+            dtype=ir.DataType.FLOAT16,
+        )
+        package = build_from_module(
+            NemotronHCausalLMModel(config),
+            config,
+            task="hybrid-text-generation",
+            execution_provider="cuda",
+        )
+        model = package["model"]
+
+        assert (
+            model.graph.initializers["model.layers.1.moe.gate.e_score_correction_bias"].dtype
+            == ir.DataType.FLOAT
+        )
+        inputs = {value.name: value for value in model.graph.inputs}
+        assert inputs["past_key_values.0.conv_state"].dtype == ir.DataType.FLOAT16
+        assert inputs["past_key_values.0.ssm_state"].dtype == ir.DataType.FLOAT
+
+    def test_bfloat16_is_rejected_with_actionable_error(self):
+        import onnx_ir as ir
+
+        config = self._nemotron_h_config()
+        config.dtype = ir.DataType.BFLOAT16
+
+        with pytest.raises(ValueError, match=r"BF16.*dtype='f16'"):
+            from mobius.models.nemotron_h import NemotronHCausalLMModel
+
+            NemotronHCausalLMModel(config)
+
 
 # ===========================================================================
 # Hybrid SSM+Attention (Jamba) model tests
