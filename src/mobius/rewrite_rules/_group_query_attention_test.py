@@ -850,3 +850,53 @@ class TestGroupQueryAttentionRules:
         for node in gqa_nodes:
             sc = node.attributes.get("softcap")
             assert sc is None, f"Unexpected softcap attribute on GQA node for Llama: {sc}"
+
+    def test_partial_rotary_embedding_dim_propagated(self):
+        """Partial-RoPE models must forward rotary_embedding_dim to the GQA.
+
+        Qwen3.5/3.8 rotate only the first ``head_dim * partial_rotary_factor``
+        head elements (e.g. 64 of 256). If the fusion drops the dimension the
+        fused GQA defaults to the full head_dim and reads past the partial
+        cos/sin cache, corrupting every full-attention layer's output.
+        """
+        cfg = dataclasses.replace(_QWEN3_CONFIG, partial_rotary_factor=0.5)
+        model = registry.get("qwen3")(cfg)
+        pkg = build_from_module(model, cfg)
+        m = pkg["model"]
+
+        rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
+
+        gqa_nodes = [n for n in m.graph if n.op_type == "GroupQueryAttention"]
+        assert len(gqa_nodes) > 0, "Expected GQA nodes after fusion"
+
+        expected = int(cfg.head_dim * 0.5)
+        for node in gqa_nodes:
+            val = node.attributes.get("rotary_embedding_dim")
+            assert val is not None, (
+                "rotary_embedding_dim missing on GQA node — partial RoPE would "
+                "silently rotate the full head_dim and corrupt attention"
+            )
+            assert val.value == expected, (
+                f"Expected rotary_embedding_dim={expected}, got {val.value}"
+            )
+
+    def test_full_rotary_omits_rotary_embedding_dim(self):
+        """Full-RoPE models (Qwen3 default) must not carry rotary_embedding_dim.
+
+        Omitting it lets the GQA kernel default to the full head_dim, which is
+        correct; a spurious attribute could mislead consumers.
+        """
+        model = registry.get("qwen3")(_QWEN3_CONFIG)
+        pkg = build_from_module(model, _QWEN3_CONFIG)
+        m = pkg["model"]
+
+        rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
+
+        gqa_nodes = [n for n in m.graph if n.op_type == "GroupQueryAttention"]
+        assert len(gqa_nodes) > 0
+
+        for node in gqa_nodes:
+            val = node.attributes.get("rotary_embedding_dim")
+            assert val is None, (
+                f"Unexpected rotary_embedding_dim on full-RoPE GQA node: {val}"
+            )
