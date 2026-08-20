@@ -13,6 +13,8 @@ with custom weight renaming for TrOCR-specific names.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import torch
 
 from mobius.models.bart import BartForConditionalGeneration, _rename_bart_weight
@@ -24,6 +26,13 @@ class TrOCRForConditionalGeneration(BartForConditionalGeneration):
     Architecturally identical to BART; only weight renaming differs.
     The vision encoder is a separate model (e.g. ViT, DeiT, BEiT).
     """
+
+    # A standalone HF TrOCRForCausalLM has no encoder. Its decoder is nested
+    # under ``model.decoder`` and its output head is top-level.
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "encoder": (),
+        "decoder": ("model.decoder", "output_projection"),
+    }
 
     # TODO(feature): Add a VisionEncoderDecoderTask that pairs this decoder
     # with a vision encoder (ViT/DeiT/BEiT) for full TrOCR inference.

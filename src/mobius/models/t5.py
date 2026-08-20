@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from onnxscript import OpBuilder, nn
@@ -440,6 +440,12 @@ class T5ForConditionalGeneration(nn.Module):
 
     default_task = "seq2seq"
     category = "encoder-decoder"
+
+    # Runtime HF ``named_modules()`` sub-trees per ONNX component.
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "encoder": ("encoder",),
+        "decoder": ("decoder", "lm_head"),
+    }
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()

@@ -12,7 +12,7 @@ Splits the Gemma3 architecture into three ONNX models:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from onnxscript import OpBuilder, nn
@@ -170,6 +170,18 @@ class Gemma3MultiModalModel(nn.Module):
 
     default_task: str = "vision-language"
     category: str = "Multimodal"
+
+    # Runtime HF ``named_modules()`` sub-trees per ONNX component.
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": (
+            "model.language_model.layers",
+            "model.language_model.norm",
+            "model.language_model.rotary_emb",
+            "lm_head",
+        ),
+        "vision_encoder": ("model.vision_tower", "model.multi_modal_projector"),
+        "embedding": ("model.language_model.embed_tokens",),
+    }
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
