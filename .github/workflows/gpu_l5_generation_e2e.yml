@@ -64,7 +64,9 @@ jobs:
           pip install -r requirements/ci/requirements.txt
           pip install soundfile librosa ml_dtypes flatbuffers numpy packaging protobuf sympy coloredlogs
           pip install -e '.[testing,transformers]'
-          pip install --pre --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-12-nightly/pypi/simple/ onnxruntime-gpu onnxruntime-genai-cuda
+          # PyPI's ORT 1.27+ wheel requires CUDA 13, while these runners use CUDA 12.
+          pip install --pre --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ onnxruntime-gpu
+          pip install --no-deps onnxruntime-genai-cuda
 
       - name: Run L5 generation E2E tests
         env:
