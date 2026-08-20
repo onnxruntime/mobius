@@ -872,6 +872,12 @@ _TEXT_ONLY_MODEL_TYPE: dict[str, str] = {
     "muse_glimmer_text": "muse_glimmer_text",
     "gemma3n": "gemma3n_text",
     "gemma3n_text": "gemma3n_text",
+    # Shipped Gemma 4 multimodal checkpoints (e.g. ``google/gemma-4-E2B-it``)
+    # declare ``model_type="gemma4"`` with a nested ``text_config`` whose own
+    # ``model_type`` is ``gemma4_text``. Both resolve to the same
+    # ``Gemma4CausalLMModel`` backbone, so ``text_only=True`` is supported.
+    "gemma4": "gemma4_text",
+    "gemma4_text": "gemma4_text",
     "gemma4_unified": "gemma4_unified_text",
     "gemma4_unified_text": "gemma4_unified_text",
     # Qwen3.5-MoE-VL (Qwen3.6-35B-A3B): export just the hybrid MoE text
