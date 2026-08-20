@@ -210,6 +210,55 @@
       "type": "string",
       "description": "Human-readable description of the test case. Not parsed by the test runner."
     },
+    "real_weight_validation": {
+      "type": "object",
+      "description": "Record of an out-of-band validation run against the official checkpoint, for cases whose checked-in golden is a reduced-config reference and whose real weights are too large for CI. Not parsed by the test runner; it documents evidence a reviewer would otherwise have to take on trust.",
+      "required": [
+        "status",
+        "checkpoint"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "passed",
+            "failed",
+            "partial"
+          ],
+          "description": "Outcome of the official-weight run."
+        },
+        "checkpoint": {
+          "type": "string",
+          "description": "Checkpoint and revision the run used, including its size."
+        },
+        "hardware": {
+          "type": "string",
+          "description": "Accelerator, driver, and peak memory the run needed."
+        },
+        "upstream": {
+          "type": "string",
+          "description": "Reference implementation and the exact generation settings it ran with."
+        },
+        "export": {
+          "type": "string",
+          "description": "Mobius export configuration under test (dtype, execution provider, sub-models)."
+        },
+        "component_parity": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Per-component agreement with the reference, keyed by sub-model name."
+        },
+        "end_to_end": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Whole-pipeline agreement with the reference, keyed by the execution path measured."
+        }
+      },
+      "additionalProperties": false
+    },
     "architecture": {
       "type": "string",
       "description": "Optional registry architecture key (e.g. Qwen35MtpModel) forcing a specific module class + task at build time. Needed for auxiliary heads (DFlash, MTP) that share a base checkpoint whose architectures field would otherwise auto-route to the base model."

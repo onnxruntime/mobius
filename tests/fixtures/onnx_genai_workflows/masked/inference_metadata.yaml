@@ -20,6 +20,9 @@ pipeline:
           shape:
           - batch
           - sequence
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: runtime
           version: '1.0'
@@ -34,6 +37,9 @@ pipeline:
           shape:
           - batch
           - sequence
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: opaque
         source:
@@ -46,6 +52,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: runtime
           version: '1.0'
@@ -60,6 +69,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: opaque
         source:
@@ -87,6 +99,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: opaque
         source:
@@ -113,6 +128,9 @@ pipeline:
           shape:
           - batch
           - sequence
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role: tokens
         stage: pre_adapter
     components:
@@ -132,12 +150,18 @@ pipeline:
               shape:
               - batch
               - sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             proposed_tokens:
               dtype: int64
               rank: 2
               shape:
               - batch
               - sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             logits:
               dtype: float32
               rank: 3
@@ -145,32 +169,50 @@ pipeline:
               - batch
               - sequence
               - vocabulary
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             masked:
               dtype: bool
               rank: 2
               shape:
               - batch
               - sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             step:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             total_steps:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             seed:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             offset:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             next_state:
               dtype: int64
@@ -178,22 +220,34 @@ pipeline:
               shape:
               - batch
               - sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             next_mask:
               dtype: bool
               rank: 2
               shape:
               - batch
               - sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             next_offset:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             done:
               dtype: bool
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             continue:
               dtype: bool
               rank: 1
@@ -221,6 +275,9 @@ pipeline:
           shape:
           - batch
           - sequence
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         scope: invocation
         initializer: request.input_ids
         recurrence:
@@ -232,6 +289,9 @@ pipeline:
           shape:
           - batch
           - sequence
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         scope: invocation
         initializer: request.mask
         recurrence:
@@ -242,6 +302,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         scope: invocation
         initializer: request.rng_offset
         recurrence:
@@ -254,6 +317,9 @@ pipeline:
           - batch
           - sequence
           - 128
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         scope: invocation
         initializer: denoiser.setup.logits
         recurrence:
@@ -265,6 +331,9 @@ pipeline:
           shape:
           - batch
           - sequence
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         scope: invocation
         initializer: denoiser.setup.proposal
         recurrence:

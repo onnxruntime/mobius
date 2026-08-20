@@ -710,8 +710,6 @@ def _adapter_package(source_root: Path) -> ModelPackage:
         {"decoder": model},
         adapter_target_manifest=manifest,
         adapter_service_options=AdapterServiceOptions(
-            slot_ids="request.slot_ids",
-            request_epochs="request.request_epochs",
             active="request.active",
             max_adapters=2,
             cache_max_entries=2,

@@ -2972,6 +2972,30 @@ class MoonshineConfig(SpeechToTextConfig):
         return cls(**options)
 
 
+def _conv_widths(config, defaults, hidden_size: int) -> tuple[int, ...]:
+    """Per-layer channel widths of a wav2vec2-family convolutional feature encoder.
+
+    ``conv_dim``, ``conv_kernel`` and ``conv_stride`` describe one conv stack, so
+    the depth they imply has to agree. M-CTC-T states its single subsampling
+    convolution through ``conv_kernel``/``conv_stride`` alone and never publishes
+    ``conv_dim``; inheriting wav2vec2's seven-layer default there would describe a
+    stack the checkpoint does not have. Size the widths to the declared depth
+    instead, preferring the checkpoint's own ``conv_channels`` when present.
+    """
+    declared = getattr(config, "conv_dim", None)
+    if declared:
+        return tuple(declared)
+    depth = len(tuple(getattr(config, "conv_kernel", None) or defaults.conv_kernel))
+    if depth == len(defaults.conv_dim):
+        return defaults.conv_dim
+    channels = getattr(config, "conv_channels", None)
+    if channels is None:
+        return (hidden_size,) * depth
+    if isinstance(channels, (list, tuple)):
+        return tuple(channels)
+    return (int(channels),) * depth
+
+
 @dataclasses.dataclass
 class MMSConfig(ArchitectureConfig):
     """Configuration for MMS (Massively Multilingual Speech) CTC models.
@@ -3059,7 +3083,7 @@ class MMSConfig(ArchitectureConfig):
             adapter_kernel_size=getattr(config, "adapter_kernel_size", 3),
             adapter_stride=getattr(config, "adapter_stride", 2),
             num_adapter_layers=getattr(config, "num_adapter_layers", 3),
-            conv_dim=tuple(getattr(config, "conv_dim", None) or defaults.conv_dim),
+            conv_dim=_conv_widths(config, defaults, base_fields["hidden_size"]),
             conv_kernel=tuple(getattr(config, "conv_kernel", None) or defaults.conv_kernel),
             conv_stride=tuple(getattr(config, "conv_stride", None) or defaults.conv_stride),
             conv_bias=bool(getattr(config, "conv_bias", False)),

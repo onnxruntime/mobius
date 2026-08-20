@@ -21,6 +21,9 @@ pipeline:
           shape:
           - batch
           - text_sequence_len
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: runtime
           version: '1.0'
@@ -47,6 +50,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: opaque
         source:
@@ -141,6 +147,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: opaque
         source:
@@ -153,6 +162,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: opaque
         source:
@@ -165,24 +177,15 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: opaque
         source:
           kind: literal
         required: false
         default: true
-      package.slot_ids:
-        contract:
-          dtype: int64
-          rank: 1
-          shape:
-          - batch
-        role:
-          kind: opaque
-        source:
-          kind: application
-          name: serving.slot_ids
-        required: true
       package.setup_predictor_iteration_0:
         contract:
           dtype: int64
@@ -238,6 +241,9 @@ pipeline:
           - batch
           - 1
           - frames
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role: audio
         stage: post_adapter
     components:
@@ -294,6 +300,9 @@ pipeline:
               - batch
               - sequence
               - vocabulary
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             last_logits:
               dtype: float32
@@ -301,6 +310,9 @@ pipeline:
               shape:
               - batch
               - vocabulary
+              batch_layout:
+                kind: request_aligned
+                axis: 0
       setup_talker_sampler:
         implementation:
           kind: onnx
@@ -313,12 +325,18 @@ pipeline:
               shape:
               - batch
               - vocabulary
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             token:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
         contract:
           id: onnx-genai.token-sampler
           version: '1'
@@ -340,12 +358,18 @@ pipeline:
               shape:
               - batch
               - vocabulary
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             token:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
         contract:
           id: onnx-genai.token-sampler
           version: '1'
@@ -367,12 +391,18 @@ pipeline:
               shape:
               - batch
               - vocabulary
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             token:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
         contract:
           id: onnx-genai.token-sampler
           version: '1'
@@ -394,12 +424,18 @@ pipeline:
               shape:
               - batch
               - vocabulary
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             token:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
         contract:
           id: onnx-genai.token-sampler
           version: '1'
@@ -421,12 +457,18 @@ pipeline:
               shape:
               - batch
               - vocabulary
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             token:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
         contract:
           id: onnx-genai.token-sampler
           version: '1'
@@ -447,6 +489,9 @@ pipeline:
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             continue:
               dtype: bool
@@ -465,6 +510,9 @@ pipeline:
               shape:
               - batch
               - sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             frame_codes:
               dtype: int64
@@ -472,12 +520,18 @@ pipeline:
               shape:
               - batch
               - 4
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             token_slot:
               dtype: int64
               rank: 2
               shape:
               - batch
               - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             code_history:
               dtype: int64
               rank: 3
@@ -485,6 +539,9 @@ pipeline:
               - batch
               - 0
               - 4
+              batch_layout:
+                kind: request_aligned
+                axis: 0
       token_to_slot:
         implementation:
           kind: onnx
@@ -496,6 +553,9 @@ pipeline:
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             slot:
               dtype: int64
@@ -503,6 +563,9 @@ pipeline:
               shape:
               - batch
               - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
       code_frame_update:
         implementation:
           kind: onnx
@@ -515,11 +578,17 @@ pipeline:
               shape:
               - batch
               - 4
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             token:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             index:
               dtype: int64
               rank: 0
@@ -531,6 +600,9 @@ pipeline:
               shape:
               - batch
               - 4
+              batch_layout:
+                kind: request_aligned
+                axis: 0
       code_history_append:
         implementation:
           kind: onnx
@@ -544,12 +616,18 @@ pipeline:
               - batch
               - frames
               - 4
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             frame:
               dtype: int64
               rank: 2
               shape:
               - batch
               - 4
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             next_history:
               dtype: int64
@@ -558,6 +636,9 @@ pipeline:
               - batch
               - frames + 1
               - 4
+              batch_layout:
+                kind: request_aligned
+                axis: 0
       cache_length_update:
         implementation:
           kind: onnx
@@ -569,17 +650,26 @@ pipeline:
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             right:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             total:
               dtype: int64
               rank: 1
               shape:
               - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
       talker_state_initializer:
         implementation:
           kind: onnx
@@ -593,6 +683,9 @@ pipeline:
               - batch
               - prefill_sequence
               - 8
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             attention_mask:
               dtype: int64
@@ -600,6 +693,9 @@ pipeline:
               shape:
               - batch
               - past_seq_len + seq_len
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             position_ids:
               dtype: int64
               rank: 3
@@ -613,6 +709,9 @@ pipeline:
               shape:
               - batch
               - prefill_sequence + 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             body_position_ids:
               dtype: int64
               rank: 3
@@ -628,6 +727,9 @@ pipeline:
               - 1
               - past_sequence_len
               - 4
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             past_key_values.0.value:
               dtype: float32
               rank: 4
@@ -636,6 +738,9 @@ pipeline:
               - 1
               - past_sequence_len
               - 4
+              batch_layout:
+                kind: request_aligned
+                axis: 0
       predictor_state_initializer:
         implementation:
           kind: onnx
@@ -649,6 +754,9 @@ pipeline:
               - batch
               - prefill_sequence
               - 8
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             attention_mask:
               dtype: int64
@@ -656,24 +764,36 @@ pipeline:
               shape:
               - batch
               - past_seq_len + seq_len
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             position_ids:
               dtype: int64
               rank: 2
               shape:
               - batch
               - sequence_len
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             body_attention_mask:
               dtype: int64
               rank: 2
               shape:
               - batch
               - prefill_sequence + 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             body_position_ids:
               dtype: int64
               rank: 2
               shape:
               - batch
               - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             past_key_values.0.key:
               dtype: float32
               rank: 4
@@ -682,6 +802,9 @@ pipeline:
               - 8
               - past_sequence_len
               - 128
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             past_key_values.0.value:
               dtype: float32
               rank: 4
@@ -690,6 +813,9 @@ pipeline:
               - 8
               - past_sequence_len
               - 128
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             past_key_values.1.key:
               dtype: float32
               rank: 4
@@ -698,6 +824,9 @@ pipeline:
               - 8
               - past_sequence_len
               - 128
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             past_key_values.1.value:
               dtype: float32
               rank: 4
@@ -706,6 +835,9 @@ pipeline:
               - 8
               - past_sequence_len
               - 128
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             past_key_values.2.key:
               dtype: float32
               rank: 4
@@ -714,6 +846,9 @@ pipeline:
               - 8
               - past_sequence_len
               - 128
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             past_key_values.2.value:
               dtype: float32
               rank: 4
@@ -722,6 +857,9 @@ pipeline:
               - 8
               - past_sequence_len
               - 128
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             past_key_values.3.key:
               dtype: float32
               rank: 4
@@ -730,6 +868,9 @@ pipeline:
               - 8
               - past_sequence_len
               - 128
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             past_key_values.3.value:
               dtype: float32
               rank: 4
@@ -738,6 +879,9 @@ pipeline:
               - 8
               - past_sequence_len
               - 128
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             past_key_values.4.key:
               dtype: float32
               rank: 4
@@ -746,6 +890,9 @@ pipeline:
               - 8
               - past_sequence_len
               - 128
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             past_key_values.4.value:
               dtype: float32
               rank: 4
@@ -754,6 +901,9 @@ pipeline:
               - 8
               - past_sequence_len
               - 128
+              batch_layout:
+                kind: request_aligned
+                axis: 0
       talker_step_update:
         implementation:
           kind: onnx
@@ -766,6 +916,9 @@ pipeline:
               shape:
               - batch
               - context
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             position_ids:
               dtype: int64
               rank: 3
@@ -780,6 +933,9 @@ pipeline:
               shape:
               - batch
               - context + 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             next_position_ids:
               dtype: int64
               rank: 3
@@ -799,12 +955,18 @@ pipeline:
               shape:
               - batch
               - context
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             position_ids:
               dtype: int64
               rank: 2
               shape:
               - batch
               - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             next_attention_mask:
               dtype: int64
@@ -812,12 +974,18 @@ pipeline:
               shape:
               - batch
               - context + 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
             next_position_ids:
               dtype: int64
               rank: 2
               shape:
               - batch
               - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
       codec_layout:
         implementation:
           kind: onnx
@@ -831,6 +999,9 @@ pipeline:
               - batch
               - frames
               - 4
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             codes:
               dtype: int64
@@ -839,6 +1010,9 @@ pipeline:
               - batch
               - 4
               - frames
+              batch_layout:
+                kind: request_aligned
+                axis: 0
     state:
       last_frame:
         contract:
@@ -847,6 +1021,9 @@ pipeline:
           shape:
           - batch
           - 4
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         scope: invocation
         initializer: setup.predictor.remaining_1.frame
         recurrence:
@@ -859,6 +1036,9 @@ pipeline:
           - batch
           - frames
           - 4
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         scope: invocation
         initializer: history.setup
         recurrence:
@@ -873,6 +1053,9 @@ pipeline:
           shape:
           - batch
           - talker_context
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         scope: invocation
         initializer: talker.initializer.body_attention_mask
         recurrence:
@@ -899,6 +1082,9 @@ pipeline:
           shape:
           - batch
           - 4
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         scope: invocation
         initializer: frame.frame_prefill
         recurrence:
@@ -909,6 +1095,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         scope: invocation
         initializer: frame.group1
         recurrence:
@@ -920,6 +1109,9 @@ pipeline:
           shape:
           - batch
           - predictor_context
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         scope: invocation
         initializer: frame.predictor.initializer.body_attention_mask
         recurrence:
@@ -934,6 +1126,9 @@ pipeline:
           shape:
           - batch
           - 1
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         scope: invocation
         initializer: frame.predictor.initializer.body_position_ids
         recurrence:
@@ -944,6 +1139,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         class: semantic
         scope: invocation
         initializer: package.true
@@ -955,6 +1153,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         class: semantic
         scope: invocation
         initializer: package.false
@@ -966,20 +1167,12 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         class: semantic
         scope: invocation
         initializer: package.zero_batch
-        recurrence:
-          kind: invariant
-      slot_ids:
-        contract:
-          dtype: int64
-          rank: 1
-          shape:
-          - batch
-        class: semantic
-        scope: invocation
-        initializer: package.slot_ids
         recurrence:
           kind: invariant
       talker_cache_lengths:
@@ -988,6 +1181,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         class: semantic
         scope: invocation
         initializer: package.zero_batch
@@ -999,6 +1195,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         class: semantic
         scope: invocation
         initializer: package.zero_batch
@@ -1013,6 +1212,9 @@ pipeline:
           - 1
           - past_sequence_len
           - 4
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         class: semantic
         scope: invocation
         initializer: talker.setup.present.0.key
@@ -1021,6 +1223,8 @@ pipeline:
           axis: 2
           max: package.talker_context_limit
         service_group: talker_cache
+        management: runtime
+        release_boundary: invocation
       talker_cache_1:
         contract:
           dtype: float32
@@ -1030,6 +1234,9 @@ pipeline:
           - 1
           - past_sequence_len
           - 4
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         class: semantic
         scope: invocation
         initializer: talker.setup.present.0.value
@@ -1038,6 +1245,8 @@ pipeline:
           axis: 2
           max: package.talker_context_limit
         service_group: talker_cache
+        management: runtime
+        release_boundary: invocation
       predictor_cache_0:
         contract:
           dtype: float32
@@ -1047,6 +1256,9 @@ pipeline:
           - 8
           - past_sequence_len
           - 128
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         class: semantic
         scope: invocation
         initializer: frame.predictor.present.0.key
@@ -1055,6 +1267,8 @@ pipeline:
           axis: 2
           max: package.predictor_context_limit
         service_group: predictor_cache
+        management: runtime
+        release_boundary: invocation
       predictor_cache_1:
         contract:
           dtype: float32
@@ -1064,6 +1278,9 @@ pipeline:
           - 8
           - past_sequence_len
           - 128
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         class: semantic
         scope: invocation
         initializer: frame.predictor.present.0.value
@@ -1072,6 +1289,8 @@ pipeline:
           axis: 2
           max: package.predictor_context_limit
         service_group: predictor_cache
+        management: runtime
+        release_boundary: invocation
       predictor_cache_2:
         contract:
           dtype: float32
@@ -1081,6 +1300,9 @@ pipeline:
           - 8
           - past_sequence_len
           - 128
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         class: semantic
         scope: invocation
         initializer: frame.predictor.present.1.key
@@ -1089,6 +1311,8 @@ pipeline:
           axis: 2
           max: package.predictor_context_limit
         service_group: predictor_cache
+        management: runtime
+        release_boundary: invocation
       predictor_cache_3:
         contract:
           dtype: float32
@@ -1098,6 +1322,9 @@ pipeline:
           - 8
           - past_sequence_len
           - 128
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         class: semantic
         scope: invocation
         initializer: frame.predictor.present.1.value
@@ -1106,6 +1333,8 @@ pipeline:
           axis: 2
           max: package.predictor_context_limit
         service_group: predictor_cache
+        management: runtime
+        release_boundary: invocation
       predictor_cache_4:
         contract:
           dtype: float32
@@ -1115,6 +1344,9 @@ pipeline:
           - 8
           - past_sequence_len
           - 128
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         class: semantic
         scope: invocation
         initializer: frame.predictor.present.2.key
@@ -1123,6 +1355,8 @@ pipeline:
           axis: 2
           max: package.predictor_context_limit
         service_group: predictor_cache
+        management: runtime
+        release_boundary: invocation
       predictor_cache_5:
         contract:
           dtype: float32
@@ -1132,6 +1366,9 @@ pipeline:
           - 8
           - past_sequence_len
           - 128
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         class: semantic
         scope: invocation
         initializer: frame.predictor.present.2.value
@@ -1140,6 +1377,8 @@ pipeline:
           axis: 2
           max: package.predictor_context_limit
         service_group: predictor_cache
+        management: runtime
+        release_boundary: invocation
       predictor_cache_6:
         contract:
           dtype: float32
@@ -1149,6 +1388,9 @@ pipeline:
           - 8
           - past_sequence_len
           - 128
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         class: semantic
         scope: invocation
         initializer: frame.predictor.present.3.key
@@ -1157,6 +1399,8 @@ pipeline:
           axis: 2
           max: package.predictor_context_limit
         service_group: predictor_cache
+        management: runtime
+        release_boundary: invocation
       predictor_cache_7:
         contract:
           dtype: float32
@@ -1166,6 +1410,9 @@ pipeline:
           - 8
           - past_sequence_len
           - 128
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         class: semantic
         scope: invocation
         initializer: frame.predictor.present.3.value
@@ -1174,6 +1421,8 @@ pipeline:
           axis: 2
           max: package.predictor_context_limit
         service_group: predictor_cache
+        management: runtime
+        release_boundary: invocation
       predictor_cache_8:
         contract:
           dtype: float32
@@ -1183,6 +1432,9 @@ pipeline:
           - 8
           - past_sequence_len
           - 128
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         class: semantic
         scope: invocation
         initializer: frame.predictor.present.4.key
@@ -1191,6 +1443,8 @@ pipeline:
           axis: 2
           max: package.predictor_context_limit
         service_group: predictor_cache
+        management: runtime
+        release_boundary: invocation
       predictor_cache_9:
         contract:
           dtype: float32
@@ -1200,6 +1454,9 @@ pipeline:
           - 8
           - past_sequence_len
           - 128
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         class: semantic
         scope: invocation
         initializer: frame.predictor.present.4.value
@@ -1208,6 +1465,8 @@ pipeline:
           axis: 2
           max: package.predictor_context_limit
         service_group: predictor_cache
+        management: runtime
+        release_boundary: invocation
       loop_1_active:
         contract:
           dtype: bool
@@ -1232,17 +1491,19 @@ pipeline:
       active: active
       done: done
       accepted_len: accepted_len
-      slot_ids: slot_ids
-      kv_service:
-        paging: none
-        allocation: runtime
-        compaction: true
+      state_service:
         groups:
           talker_cache:
+            kind: full_attention
             sequence_axis: 2
             layout: bnsh
-            logical_lengths: talker_cache_lengths
-            storage: shared_buffer
+            aliasing: forbidden
+            reuse:
+              prefix_reusable: true
+              evictable_prefix: false
+            capabilities:
+              snapshot: true
+              fork: true
             ports:
               talker:
                 talker_cache_0:
@@ -1251,11 +1512,18 @@ pipeline:
                 talker_cache_1:
                   input: past_key_values.0.value
                   output: present.0.value
+            logical_lengths: talker_cache_lengths
           predictor_cache:
+            kind: full_attention
             sequence_axis: 2
             layout: bnsh
-            logical_lengths: predictor_cache_lengths
-            storage: shared_buffer
+            aliasing: forbidden
+            reuse:
+              prefix_reusable: true
+              evictable_prefix: false
+            capabilities:
+              snapshot: true
+              fork: true
             ports:
               code_predictor:
                 predictor_cache_0:
@@ -1288,6 +1556,7 @@ pipeline:
                 predictor_cache_9:
                   input: past_key_values.4.value
                   output: present.4.value
+            logical_lengths: predictor_cache_lengths
     steps:
     - kind: loop
       setup:
@@ -1920,8 +2189,6 @@ pipeline:
         next: done
       - cell: accepted_len
         next: accepted_len.next
-      - cell: slot_ids
-        next: slot_ids
       - cell: talker_cache_lengths
         next: talker_cache_lengths.next
       - cell: last_frame
@@ -1946,6 +2213,9 @@ pipeline:
           rank: 1
           shape:
           - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
     - kind: invoke
       component: codec_layout
       inputs:

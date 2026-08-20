@@ -177,8 +177,6 @@ adapters:
         scale: lora.projection.scale
   discovery_fallback: disabled
   selection:
-    slot_ids: request.slot_ids
-    request_epochs: request.request_epochs
     segments: request.adapter_segments
     adapter_counts: request.adapter_counts
     scales: request.adapter_scales

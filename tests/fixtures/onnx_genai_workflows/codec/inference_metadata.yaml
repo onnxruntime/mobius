@@ -18,6 +18,9 @@ pipeline:
           - batch
           - 1
           - audio_samples
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role:
           kind: runtime
           version: '1.0'
@@ -34,6 +37,9 @@ pipeline:
           - batch
           - 1
           - audio_samples
+          batch_layout:
+            kind: request_aligned
+            axis: 0
         role: audio
         stage: post_adapter
     components:

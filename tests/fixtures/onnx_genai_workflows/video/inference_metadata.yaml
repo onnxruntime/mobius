@@ -1,0 +1,850 @@
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      ir_version: '1.0'
+      onnx_opsets:
+        ai.onnx: 24
+      capabilities:
+      - workflow_ssa
+      - linear_effects
+      - nested_control_flow
+      - loop_induction_values
+      - typed_emit
+      - bounded_state_recurrence
+    inputs:
+      request.noise:
+        contract:
+          dtype: float32
+          rank: 5
+          shape:
+          - batch
+          - num_frames
+          - 4
+          - height
+          - width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: noise
+        required: true
+      request.max_iterations:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: runtime
+          version: '1.0'
+          role: max_iterations
+        source:
+          kind: request
+        required: false
+        default: 3
+      package.false:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: false
+      package.one_control:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 1
+      package.history_limit:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 3
+      package.cache_frames:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 2
+      request.encoder_hidden_states:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - batch
+          - prompt_sequence
+          - 32
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: encoder_hidden_states
+        required: true
+      package.loop_0_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+      package.loop_1_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+    outputs:
+      video:
+        contract:
+          dtype: float32
+          rank: 5
+          shape:
+          - batch
+          - 3
+          - frames
+          - 2*latent_height
+          - 2*latent_width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: video
+        stage: pre_adapter
+    components:
+      transformer:
+        implementation:
+          kind: onnx
+          artifact: transformer/model.onnx
+      vae_decoder:
+        implementation:
+          kind: onnx
+          artifact: vae_decoder/model.onnx
+      model_input:
+        implementation:
+          kind: onnx
+          artifact: policies/model_input.onnx
+        ports:
+          inputs:
+            sample:
+              dtype: float32
+              rank: 5
+              shape:
+              - batch
+              - frames
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            step:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            schedule:
+              dtype: float32
+              rank: 1
+              shape:
+              - schedule_length
+          outputs:
+            model_input:
+              dtype: float32
+              rank: 5
+              shape:
+              - batch
+              - frames
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      solver_step:
+        implementation:
+          kind: onnx
+          artifact: policies/solver_step.onnx
+        ports:
+          inputs:
+            sample:
+              dtype: float32
+              rank: 5
+              shape:
+              - batch
+              - frames
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            derivative:
+              dtype: float32
+              rank: 5
+              shape:
+              - batch
+              - frames
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            step:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            schedule:
+              dtype: float32
+              rank: 1
+              shape:
+              - schedule_length
+          outputs:
+            next_state:
+              dtype: float32
+              rank: 5
+              shape:
+              - batch
+              - frames
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+        contract:
+          id: onnx-genai.solver-step
+          version: '1'
+          bindings:
+            state: sample
+            estimate: derivative
+            step: step
+            schedule: schedule
+            next_state: next_state
+      continue_predicate:
+        implementation:
+          kind: onnx
+          artifact: policies/continue_predicate.onnx
+        ports:
+          inputs:
+            done:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            continue:
+              dtype: bool
+              rank: 1
+              shape:
+              - 1
+      video_latent_init:
+        implementation:
+          kind: onnx
+          artifact: policies/video_latent_init.onnx
+        ports:
+          inputs:
+            noise:
+              dtype: float32
+              rank: 5
+              shape:
+              - batch
+              - frames
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            latent:
+              dtype: float32
+              rank: 5
+              shape:
+              - batch
+              - frames
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            history:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 0
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      schedule_history_append:
+        implementation:
+          kind: onnx
+          artifact: policies/schedule_history_append.onnx
+        ports:
+          inputs:
+            history:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - history
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            timestep:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            next:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - history
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      video_latent_permute:
+        implementation:
+          kind: onnx
+          artifact: policies/video_latent_permute.onnx
+        ports:
+          inputs:
+            latent:
+              dtype: float32
+              rank: 5
+              shape:
+              - batch
+              - frames
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            permuted:
+              dtype: float32
+              rank: 5
+              shape:
+              - batch
+              - channels
+              - frames
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      video_latent_unscale:
+        implementation:
+          kind: onnx
+          artifact: policies/video_latent_unscale.onnx
+        ports:
+          inputs:
+            latent:
+              dtype: float32
+              rank: 5
+              shape:
+              - batch
+              - channels
+              - frames
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            unscaled:
+              dtype: float32
+              rank: 5
+              shape:
+              - batch
+              - channels
+              - frames
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      video_decode_chunks:
+        implementation:
+          kind: onnx
+          artifact: policies/video_decode_chunks.onnx
+        ports:
+          inputs:
+            latent:
+              dtype: float32
+              rank: 5
+              shape:
+              - batch
+              - channels
+              - latent_frames
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            count:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
+      video_decode_chunk:
+        implementation:
+          kind: onnx
+          artifact: policies/video_decode_chunk.onnx
+        ports:
+          inputs:
+            latent:
+              dtype: float32
+              rank: 5
+              shape:
+              - batch
+              - channels
+              - latent_frames
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            step:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            chunk:
+              dtype: float32
+              rank: 5
+              shape:
+              - batch
+              - channels
+              - chunk_frames
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      video_conv_cache_init:
+        implementation:
+          kind: onnx
+          artifact: policies/video_conv_cache_init.onnx
+        ports:
+          inputs:
+            latent:
+              dtype: float32
+              rank: 5
+              shape:
+              - batch
+              - channels
+              - latent_frames
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            conv_cache.conv_in:
+              dtype: float32
+              rank: 5
+              shape:
+              - batch
+              - 4
+              - 0
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            conv_cache.conv_out:
+              dtype: float32
+              rank: 5
+              shape:
+              - batch
+              - 3
+              - 0
+              - 2*height
+              - 2*width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      diffusion_schedule:
+        implementation:
+          kind: onnx
+          artifact: policies/diffusion_schedule.onnx
+        ports:
+          inputs: {}
+          outputs:
+            schedule:
+              dtype: float32
+              rank: 1
+              shape:
+              - 4
+      diffusion_timesteps:
+        implementation:
+          kind: onnx
+          artifact: policies/diffusion_timesteps.onnx
+        ports:
+          inputs: {}
+          outputs:
+            schedule:
+              dtype: float32
+              rank: 1
+              shape:
+              - 3
+      schedule_lookup:
+        implementation:
+          kind: onnx
+          artifact: policies/schedule_lookup.onnx
+        ports:
+          inputs:
+            schedule:
+              dtype: float32
+              rank: 1
+              shape:
+              - schedule_length
+            step:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            timestep:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+    state:
+      latent:
+        contract:
+          dtype: float32
+          rank: 5
+          shape:
+          - batch
+          - num_frames
+          - 4
+          - height
+          - width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: latent.initial
+        recurrence:
+          kind: invariant
+      scheduler_history:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - scheduler_history
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: scheduler.history.initial
+        recurrence:
+          kind: growing
+          axis: 1
+          increment: package.one_control
+          max: package.history_limit
+      conv_cache_conv_in:
+        contract:
+          dtype: float32
+          rank: 5
+          shape:
+          - batch
+          - 4
+          - cache_frames
+          - latent_height
+          - latent_width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: conv_cache_conv_in.initial
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.cache_frames
+        management: runtime
+        release_boundary: invocation
+      conv_cache_conv_out:
+        contract:
+          dtype: float32
+          rank: 5
+          shape:
+          - batch
+          - 3
+          - cache_frames
+          - 2*latent_height
+          - 2*latent_width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: conv_cache_conv_out.initial
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.cache_frames
+        management: runtime
+        release_boundary: invocation
+      loop_0_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        scope: invocation
+        initializer: package.loop_0_active
+        recurrence:
+          kind: invariant
+      loop_1_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        scope: invocation
+        initializer: package.loop_1_active
+        recurrence:
+          kind: invariant
+    steps:
+    - kind: invoke
+      component: video_latent_init
+      inputs:
+        noise: request.noise
+      outputs:
+        latent: latent.initial
+        history: scheduler.history.initial
+    - kind: loop
+      setup:
+      - kind: invoke
+        component: diffusion_schedule
+        inputs: {}
+        outputs:
+          schedule: diffusion.schedule
+      - kind: invoke
+        component: diffusion_timesteps
+        inputs: {}
+        outputs:
+          schedule: diffusion.timesteps
+      - kind: invoke
+        component: continue_predicate
+        inputs:
+          done: package.false
+        outputs:
+          continue: setup.continue
+      steps:
+      - kind: invoke
+        component: schedule_lookup
+        inputs:
+          schedule: diffusion.timesteps
+          step: loop.iteration
+        outputs:
+          timestep: diffusion.timestep
+      - kind: invoke
+        component: model_input
+        inputs:
+          sample: latent
+          step: loop.iteration
+          schedule: diffusion.schedule
+        outputs:
+          model_input: diffusion.model_input
+      - kind: invoke
+        component: transformer
+        inputs:
+          sample: diffusion.model_input
+          timestep: diffusion.timestep
+          encoder_hidden_states: request.encoder_hidden_states
+        outputs:
+          noise_pred: denoiser.estimate
+      - kind: invoke
+        component: solver_step
+        inputs:
+          sample: latent
+          derivative: denoiser.estimate
+          step: loop.iteration
+          schedule: diffusion.schedule
+        outputs:
+          next_state: latent.body
+      - kind: invoke
+        component: schedule_history_append
+        inputs:
+          history: scheduler_history
+          timestep: diffusion.timestep
+        outputs:
+          next: scheduler_history.body
+      - kind: invoke
+        component: continue_predicate
+        inputs:
+          done: package.false
+        outputs:
+          continue: loop.continue
+      continue_when: loop_0_active
+      max_iterations: request.max_iterations
+      carried:
+      - cell: latent
+        next: latent.body
+      - cell: scheduler_history
+        next: scheduler_history.body
+      - cell: loop_0_active
+        next: loop.continue
+      iteration:
+        value: loop.iteration
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+    - kind: invoke
+      component: video_latent_permute
+      inputs:
+        latent: latent
+      outputs:
+        permuted: decode.latent_permuted
+    - kind: invoke
+      component: video_latent_unscale
+      inputs:
+        latent: decode.latent_permuted
+      outputs:
+        unscaled: decode.latent
+    - kind: invoke
+      component: video_decode_chunks
+      inputs:
+        latent: decode.latent
+      outputs:
+        count: decode.chunks
+    - kind: invoke
+      component: video_conv_cache_init
+      inputs:
+        latent: decode.latent
+      outputs:
+        conv_cache.conv_in: conv_cache_conv_in.initial
+        conv_cache.conv_out: conv_cache_conv_out.initial
+    - kind: loop
+      setup:
+      - kind: invoke
+        component: continue_predicate
+        inputs:
+          done: package.false
+        outputs:
+          continue: decode.setup.continue
+      steps:
+      - kind: invoke
+        component: video_decode_chunk
+        inputs:
+          latent: decode.latent
+          step: decode.iteration
+        outputs:
+          chunk: decode.chunk
+      - kind: invoke
+        component: vae_decoder
+        inputs:
+          latent_sample: decode.chunk
+          conv_cache.conv_in: conv_cache_conv_in
+          conv_cache.conv_out: conv_cache_conv_out
+        outputs:
+          sample: decode.frames
+          conv_cache_out.conv_in: conv_cache_conv_in.body
+          conv_cache_out.conv_out: conv_cache_conv_out.body
+      - kind: emit
+        value: decode.frames
+        output: video
+        mode: append
+        axis: 2
+      - kind: invoke
+        component: continue_predicate
+        inputs:
+          done: package.false
+        outputs:
+          continue: decode.loop.continue
+      continue_when: loop_1_active
+      max_iterations: decode.chunks
+      carried:
+      - cell: conv_cache_conv_in
+        next: conv_cache_conv_in.body
+      - cell: conv_cache_conv_out
+        next: conv_cache_conv_out.body
+      - cell: loop_1_active
+        next: decode.loop.continue
+      iteration:
+        value: decode.iteration
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
