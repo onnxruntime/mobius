@@ -2005,7 +2005,7 @@ class TestExportForOrtGenai:
             ),
         ],
     )
-    def test_tool_call_special_tokens_read_from_tokenizer_config(
+    def test_tool_call_special_tokens_read_from_tokenizer_metadata(
         self, tmp_path, tokens, vocab_size, expected, filename, key
     ):
         """Tool and reasoning delimiters are read from both tokenizer metadata formats."""
