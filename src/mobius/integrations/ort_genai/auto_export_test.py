@@ -1975,10 +1975,21 @@ class TestExportForOrtGenai:
                     "eor_token_id": 151668,
                 },
             ),
+            (
+                "qwen3_5_moe",
+                151936,
+                {
+                    "bot_token_id": 151657,
+                    "eot_token_id": 151658,
+                    "bor_token_id": 151667,
+                    "eor_token_id": 151668,
+                },
+            ),
             ("phi3", 200064, {"bot_token_id": 200025, "eot_token_id": 200026}),
             ("phi3small", 100352, {}),
             ("qwen2", 151658, {}),
             ("qwen3", 151668, {}),
+            ("qwen3_5_moe", 151668, {}),
         ],
     )
     def test_tool_call_special_tokens_emitted(
