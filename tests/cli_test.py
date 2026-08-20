@@ -193,14 +193,48 @@ class TestCLIBuild:
         mock_build.assert_called_once()
         assert mock_build.call_args.kwargs.get("text_only") is True
 
-    def test_revision_is_forwarded_to_detection_and_build(self):
-        revision = "61ba4e0b3309b6656edea3e93e419f7bd5c61957"
+    def test_static_cache_with_onnx_genai_runtime_errors(self):
+        """static-cache graphs cannot be described by the onnx-genai contract.
+
+        A static-cache decoder exposes in-place ring buffers plus write indices
+        instead of past/present KV pairs and a rank-2 attention mask, so the
+        workflow metadata emitter cannot describe it. The CLI must say so
+        before exporting the weights, not after.
+        """
         with (
             tempfile.TemporaryDirectory() as tmpdir,
-            mock.patch(
-                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
-                return_value=None,
-            ) as mock_diffusers,
+            pytest.raises(SystemExit, match=r"static-cache.*--runtime onnx-genai"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "Qwen/Qwen2.5-0.5B",
+                    tmpdir,
+                    "--no-weights",
+                    "--features",
+                    "static-cache",
+                    "--runtime",
+                    "onnx-genai",
+                ]
+            )
+
+    def test_static_cache_task_follows_text_only_substitution(self):
+        """``text-only`` + ``static-cache`` must resolve the *text* task.
+
+        ``build()`` swaps a multimodal ``model_type`` for its text-only
+        registry sibling, so the deferred static-cache task has to be resolved
+        against the substituted type. Resolving against the raw checkpoint type
+        pairs the text-only module with the multimodal task, which then fails
+        looking for sub-modules a text-only module does not have.
+        """
+        from mobius.tasks._gemma4 import Gemma4TextCausalLMTask
+
+        hf_config = mock.MagicMock()
+        hf_config.model_type = "gemma4"
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch("transformers.AutoConfig.from_pretrained", return_value=hf_config),
             mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
             mock.patch("mobius.__main__._save_package"),
         ):
@@ -208,19 +242,18 @@ class TestCLIBuild:
                 [
                     "build",
                     "--model",
-                    "zai-org/GLM-ASR-Nano-2512",
+                    "google/gemma-4-E2B-it",
                     tmpdir,
-                    "--revision",
-                    revision,
                     "--no-weights",
+                    "--features",
+                    "text-only,static-cache",
+                    "--max-seq-len",
+                    "128",
                 ]
             )
 
-        mock_diffusers.assert_called_once_with(
-            "zai-org/GLM-ASR-Nano-2512",
-            revision=revision,
-        )
-        assert mock_build.call_args.kwargs["revision"] == revision
+        task = mock_build.call_args.kwargs["task"]
+        assert isinstance(task, Gemma4TextCausalLMTask)
 
     def test_build_static_cache(self):
         with tempfile.TemporaryDirectory() as tmpdir:

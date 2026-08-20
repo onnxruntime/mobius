@@ -621,7 +621,6 @@ def test_exact_onnx_genai_catalog_and_portable_bundle_serialization() -> None:
             {"decoder": model},
             adapter_target_manifest=manifest,
             adapter_service_options=AdapterServiceOptions(
-                slot_ids="request.slot_ids",
                 active="request.active",
                 max_adapters=2,
                 cache_max_entries=2,
@@ -679,8 +678,6 @@ def test_exact_onnx_genai_catalog_and_portable_bundle_serialization() -> None:
             "onnx-genai-targeted-base-v1:sha256:"
         )
         assert service["selection"] == {
-            "slot_ids": "request.slot_ids",
-            "request_epochs": "request.request_epochs",
             "segments": "request.adapter_segments",
             "adapter_counts": "request.adapter_counts",
             "scales": "request.adapter_scales",
@@ -719,15 +716,9 @@ def test_exact_onnx_genai_catalog_and_portable_bundle_serialization() -> None:
             "stable_buffers": True,
             "invalidate_capture_on_eviction": True,
         }
-        assert metadata["pipeline"]["workflow"]["inputs"]["request.request_epochs"] == {
-            "contract": {"dtype": "int64", "rank": 1, "shape": ["batch"]},
-            "role": {
-                "kind": "runtime",
-                "version": "1.0",
-                "role": "request_epochs",
-            },
-            "source": {"kind": "request"},
-        }
+        assert not any(
+            "request_epochs" in name for name in metadata["pipeline"]["workflow"]["inputs"]
+        )
         artifact = service["artifacts"]["red"]
         assert artifact["index"] == 0
         assert artifact["identity"] == "style-red"

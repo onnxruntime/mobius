@@ -24,6 +24,7 @@ from mobius.integrations.onnx_genai.decoder_metadata import (
     decoder_metadata_from_config,
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
+    _TEXT_RUNTIME_ASSET_NAMES,
     SchedulerConfig,
     _copy_runtime_assets,
     add_adapter_service_to_metadata,
@@ -178,12 +179,31 @@ def _write_clip_tokenizer(
     return path
 
 
-def _write_hf_tokenizer(
-    output_dir: str,
-    source: str | None,
-    *,
-    revision: str | None = None,
-) -> str | None:
+def _write_text_runtime_assets(output_dir: str, source: str | None) -> dict[str, str]:
+    """Emit the tokenizer *and* chat-template assets a text package needs.
+
+    ``tokenizer.json`` alone is not enough for an instruction-tuned decoder: the
+    runtime applies the package's chat template to build the prompt, and without
+    it the raw user text (no leading BOS, no turn markers) reaches the model.
+    Gemma 4 answers such a prompt with unbounded repetition, so shipping the
+    template is a correctness requirement rather than a convenience.
+
+    Args:
+        output_dir: Package directory to write the assets into.
+        source: Hugging Face model id or local directory holding them.
+
+    Returns:
+        A mapping of asset stem to written path for every asset materialized.
+    """
+    artifacts = _copy_runtime_assets(output_dir, source, _TEXT_RUNTIME_ASSET_NAMES)
+    if "tokenizer" not in artifacts:
+        fallback = _write_hf_tokenizer(output_dir, source)
+        if fallback is not None:
+            artifacts["tokenizer"] = fallback
+    return artifacts
+
+
+def _write_hf_tokenizer(output_dir: str, source: str | None) -> str | None:
     """Emit ``tokenizer.json`` for a text-producing package from its HF source.
 
     Decoder-LM, multimodal (VLM / speech-language ASR), and Whisper-style ASR
@@ -500,9 +520,7 @@ def write_onnx_genai_config(
             num_inference_steps=num_inference_steps,
         )
         artifacts = {"inference_metadata": path}
-        tokenizer_path = _write_hf_tokenizer(output_dir, source)
-        if tokenizer_path is not None:
-            artifacts["tokenizer"] = tokenizer_path
+        artifacts.update(_write_text_runtime_assets(output_dir, source))
         return artifacts
 
     if _looks_like_diffusion(pkg):
@@ -624,14 +642,8 @@ def write_onnx_genai_config(
         )
         _add_explicit_io_to_file(path, pkg, resolved_config)
         artifacts = {"inference_metadata": path}
-        tokenizer_path = _write_hf_tokenizer(output_dir, source, revision=revision)
-        if tokenizer_path is not None:
-            artifacts["tokenizer"] = tokenizer_path
-        audio_processor_path = _write_hf_audio_processor(
-            output_dir,
-            source,
-            revision=revision,
-        )
+        artifacts.update(_write_text_runtime_assets(output_dir, source))
+        audio_processor_path = _write_hf_audio_processor(output_dir, source)
         if audio_processor_path is not None:
             artifacts["audio_processor"] = audio_processor_path
         return artifacts
@@ -684,7 +696,5 @@ def write_onnx_genai_config(
         sampler=str(getattr(resolved_config, "workflow_sampler", "greedy")),
     )
     artifacts = {"inference_metadata": path}
-    tokenizer_path = _write_hf_tokenizer(output_dir, source, revision=revision)
-    if tokenizer_path is not None:
-        artifacts["tokenizer"] = tokenizer_path
+    artifacts.update(_write_text_runtime_assets(output_dir, source))
     return artifacts

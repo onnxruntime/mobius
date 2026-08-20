@@ -112,6 +112,28 @@ def attach_policy_components(
     return {name: f"policies/{name}.onnx" for name, _ in selected}
 
 
+#: Element types the ONNX ``ConstantOfShape`` kernel can produce. The narrow
+#: float types are absent, so a policy graph that must materialize an fp8 or
+#: fp4 tensor has to fill a supported dtype and cast the result.
+_CONSTANT_OF_SHAPE_DTYPES = frozenset(
+    {
+        ir.DataType.FLOAT,
+        ir.DataType.FLOAT16,
+        ir.DataType.BFLOAT16,
+        ir.DataType.DOUBLE,
+        ir.DataType.INT8,
+        ir.DataType.INT16,
+        ir.DataType.INT32,
+        ir.DataType.INT64,
+        ir.DataType.UINT8,
+        ir.DataType.UINT16,
+        ir.DataType.UINT32,
+        ir.DataType.UINT64,
+        ir.DataType.BOOL,
+    }
+)
+
+
 def _component(
     contract_id: str,
     graph: ir.Graph,
@@ -803,11 +825,18 @@ def build_decoder_state_initializer(
                     f"dimension {dimension_text!r}"
                 )
         cache_shape = op.Concat(*shape_parts, axis=0)
-        zero = 0.0 if value.dtype.is_floating_point else 0
+        # ``ConstantOfShape`` kernels do not implement the narrow float types, so
+        # an fp8 KV cache must be materialized in a supported dtype and cast.
+        fill_dtype = (
+            value.dtype if value.dtype in _CONSTANT_OF_SHAPE_DTYPES else ir.DataType.FLOAT
+        )
+        zero = 0.0 if fill_dtype.is_floating_point else 0
         empty = op.ConstantOfShape(
             cache_shape,
-            value=ir.tensor([zero], dtype=value.dtype),
+            value=ir.tensor([zero], dtype=fill_dtype),
         )
+        if fill_dtype != value.dtype:
+            empty = op.Cast(empty, to=value.dtype)
         empty.shape = (
             ir.Shape(
                 [

@@ -613,8 +613,6 @@ class AdapterApplication:
 class AdapterServiceOptions:
     """Producer-neutral runtime lifecycle, planning, and artifact format options."""
 
-    slot_ids: str | None = None
-    request_epochs: str | None = None
     segments: str = "request.adapter_segments"
     adapter_counts: str = "request.adapter_counts"
     scales: str = "request.adapter_scales"

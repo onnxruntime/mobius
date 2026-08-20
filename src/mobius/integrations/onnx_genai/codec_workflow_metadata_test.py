@@ -181,17 +181,8 @@ def test_real_qwen3_tts_workflow_carries_trained_transitions_and_kv_state():
     assert workflow["serving"]["state_service"]["groups"]["talker_cache"]["kind"] == (
         "full_attention"
     )
-    assert workflow["inputs"]["package.slot_ids"] == {
-        "contract": {
-            "dtype": "int64",
-            "rank": 1,
-            "shape": ["batch"],
-            "batch_layout": {"kind": "request_aligned", "axis": 0},
-        },
-        "role": {"kind": "opaque"},
-        "source": {"kind": "application", "name": "serving.slot_ids"},
-        "required": True,
-    }
+    # Row identity is runtime-private: no published input carries a slot table.
+    assert not any("slot_ids" in name for name in workflow["inputs"])
     assert workflow["serving"]["state_service"]["groups"]["talker_cache"]["ports"]["talker"][
         "talker_cache_0"
     ]["input"].startswith("past_key_values.")

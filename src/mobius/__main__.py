@@ -157,7 +157,19 @@ def _cmd_build(args: argparse.Namespace) -> None:
     from mobius.tasks import CausalLMTask, ModelTask
 
     def _resolve_static_cache_task(model_type: str) -> ModelTask:
-        """Create the correct static cache task for the given model type."""
+        """Create the correct static cache task for the given model type.
+
+        ``--features text-only`` makes :func:`build` swap the checkpoint's
+        multimodal ``model_type`` for its text-only registry sibling, so the
+        task must be resolved against the *same* substituted type. Resolving
+        against the raw checkpoint type instead pairs a text-only module with a
+        multimodal task, which then fails looking for sub-modules (a vision
+        tower, a separate decoder) that a text-only module does not have.
+        """
+        if args.text_only:
+            from mobius._registry import _TEXT_ONLY_MODEL_TYPE
+
+            model_type = _TEXT_ONLY_MODEL_TYPE.get(model_type, model_type)
         if model_type == "gemma4":
             from mobius.tasks._gemma4 import Gemma4Task
 
@@ -199,6 +211,23 @@ def _cmd_build(args: argparse.Namespace) -> None:
         raise SystemExit(
             "Error: --features static-cache cannot be combined with --task. "
             "Remove --task to use --features static-cache."
+        )
+
+    # Validate static-cache + onnx-genai compatibility.
+    #
+    # A static-cache decoder exposes in-place ring buffers (``key_cache.N`` /
+    # ``updated_key_cache.N``) plus ``write_indices`` and ``nonpad_kv_seqlen``,
+    # and drops the rank-2 attention mask. The onnx-genai workflow decoder
+    # contract is built on ``past_key_values.N`` -> ``present.N`` pairs and that
+    # mask, so the metadata emitter cannot describe a static-cache graph.
+    # Reject the combination up front rather than after exporting the weights.
+    if args.static_cache and args.runtime == "onnx-genai":
+        raise SystemExit(
+            "Error: --features static-cache cannot be combined with "
+            "--runtime onnx-genai. The onnx-genai workflow decoder contract "
+            "requires dynamic past/present KV ports and a rank-2 attention "
+            "mask, which a static-cache graph does not expose. Build without "
+            "--features static-cache, or omit --runtime onnx-genai."
         )
 
     # text-only resolution lives in build() (model_type remap + config

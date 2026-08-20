@@ -954,3 +954,55 @@ def test_capability_driven_attachment_is_model_agnostic():
         "onnx-genai.speculative-verifier@1",
         "onnx-genai.state-update@1",
     }
+
+
+def test_state_initializer_allocates_fp8_cache_through_a_cast(tmp_path):
+    """An fp8 KV cache must not be materialized by ``ConstantOfShape`` directly.
+
+    ORT's ``ConstantOfShape`` kernel has no fp8 output implementation, so an
+    fp8 cache emitted that way fails at session initialization with
+    "Unsupported value attribute datatype: 17". Fill a supported dtype and cast.
+    """
+    inputs = [
+        ir.Value(
+            name="input_ids",
+            type=ir.TensorType(ir.DataType.INT64),
+            shape=ir.Shape(["batch", "sequence"]),
+        ),
+        ir.Value(
+            name="attention_mask",
+            type=ir.TensorType(ir.DataType.INT64),
+            shape=ir.Shape(["batch", "sequence"]),
+        ),
+        ir.Value(
+            name="past_key_values.0.key",
+            type=ir.TensorType(ir.DataType.FLOAT8E4M3FN),
+            shape=ir.Shape(["batch", 2, "past_sequence", 4]),
+        ),
+    ]
+    decoder = ir.Model(ir.Graph(inputs, [], nodes=[], name="decoder"), ir_version=11)
+    initializer = build_decoder_state_initializer(
+        decoder,
+        token_input="input_ids",
+        attention_mask_input="attention_mask",
+        position_ids_input=None,
+        cache_inputs=["past_key_values.0.key"],
+    )
+
+    cache = next(
+        value
+        for value in initializer.model.graph.outputs
+        if value.name == "past_key_values.0.key"
+    )
+    assert cache.dtype == ir.DataType.FLOAT8E4M3FN
+    assert cache.producer().op_type == "Cast"
+    fill = cache.producer().inputs[0].producer()
+    assert fill.op_type == "ConstantOfShape"
+    assert fill.attributes["value"].value.dtype == ir.DataType.FLOAT
+
+    outputs = _run(
+        initializer,
+        tmp_path,
+        {"prompt_tokens": np.array([[3, 4, 5]], np.int64)},
+    )
+    assert outputs[-1].shape == (1, 2, 0, 4)

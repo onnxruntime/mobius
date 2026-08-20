@@ -35,7 +35,7 @@ import math
 import os
 import re
 import shutil
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -59,6 +59,19 @@ _RUNTIME_ASSET_NAMES = (
     "processor_config.json",
     "preprocessor_config.json",
     "image_processor.json",
+)
+
+#: Assets a text-only package needs. Excludes the image/audio processor
+#: contracts, which would advertise media preprocessing a text package's
+#: graphs cannot consume. ``chat_template.jinja`` is required, not optional:
+#: instruction-tuned decoders (Gemma 4, Llama-3-Instruct, Qwen-Instruct)
+#: depend on their turn markers and leading BOS, and degenerate into
+#: repetition when a raw prompt reaches the model instead.
+_TEXT_RUNTIME_ASSET_NAMES = tuple(
+    name
+    for name in _RUNTIME_ASSET_NAMES
+    if name
+    not in {"processor_config.json", "preprocessor_config.json", "image_processor.json"}
 )
 
 
@@ -1652,30 +1665,13 @@ def add_adapter_service_to_metadata(
             }
         if not compatible_input(name, dtype=dtype, shape=shape, role=role):
             raise ValueError(
-                f"adapter {role or 'slot_ids'} must reference a required "
+                f"adapter {role} must reference a required "
                 "request/application-sourced "
                 f"{dtype}{shape} workflow input"
             )
 
-    serving = workflow.get("serving") if workflow is not None else None
-    serving_slot_ids = serving.get("slot_ids") if isinstance(serving, dict) else None
-    slot_ids = options.slot_ids or serving_slot_ids or "request.slot_ids"
-    request_epochs = options.request_epochs or "request.request_epochs"
     active = options.active
     if workflow is not None:
-        ensure_input(
-            slot_ids,
-            dtype="int64",
-            shape=["batch"],
-            role=None,
-            source={"kind": "application", "name": "serving.slot_ids"},
-        )
-        ensure_input(
-            request_epochs,
-            dtype="int64",
-            shape=["batch"],
-            role="request_epochs",
-        )
         ensure_input(
             options.segments,
             dtype="int64",
@@ -1710,8 +1706,6 @@ def add_adapter_service_to_metadata(
         "target_manifest": pkg.adapter_target_manifest_metadata(),
         "discovery_fallback": options.discovery_fallback,
         "selection": {
-            "slot_ids": slot_ids,
-            "request_epochs": request_epochs,
             "segments": options.segments,
             "adapter_counts": options.adapter_counts,
             "scales": options.scales,
@@ -2018,14 +2012,13 @@ def build_native_vlm_package_metadata(
 def _copy_runtime_assets(
     output_dir: str,
     source: str | None,
-    *,
-    revision: str | None = None,
+    names: Sequence[str] = _RUNTIME_ASSET_NAMES,
 ) -> dict[str, str]:
     if not source:
         return {}
     os.makedirs(output_dir, exist_ok=True)
-    for filename in _RUNTIME_ASSET_NAMES:
-        source_path = _source_asset_path(source, filename, revision=revision)
+    for filename in names:
+        source_path = _source_asset_path(source, filename)
         if source_path is not None:
             shutil.copy2(source_path, os.path.join(output_dir, filename))
 
@@ -2065,7 +2058,7 @@ def _copy_runtime_assets(
 
     return {
         Path(filename).stem: os.path.join(output_dir, filename)
-        for filename in _RUNTIME_ASSET_NAMES
+        for filename in names
         if os.path.isfile(os.path.join(output_dir, filename))
     }
 

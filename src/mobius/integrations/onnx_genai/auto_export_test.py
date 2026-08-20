@@ -178,7 +178,6 @@ def test_dispatch_decoder(tmp_path):
         "request.eos_ids",
         "request.eos_lengths",
         "request.row_max_iterations",
-        "package.slot_ids",
         "request.rng_counter",
     }
     assert workflow["inputs"]["request.prompt_lengths"]["default"] == -1
@@ -830,3 +829,39 @@ def test_decoder_without_source_skips_tokenizer(tmp_path):
     artifacts = write_onnx_genai_config(_decoder_package(), str(tmp_path), config=_Cfg())
     assert "tokenizer" not in artifacts
     assert not (tmp_path / "tokenizer.json").exists()
+
+
+def test_decoder_package_ships_chat_template_assets(tmp_path):
+    """A text decoder package must carry the assets needed to build a prompt.
+
+    ``tokenizer.json`` alone leaves the runtime with no chat template, so an
+    instruction-tuned decoder receives raw user text with no BOS and no turn
+    markers. Image/audio processor configs, by contrast, describe media a text
+    package cannot consume and must not be copied.
+    """
+    source = tmp_path / "source"
+    source.mkdir()
+    for filename in (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "chat_template.jinja",
+        "preprocessor_config.json",
+        "image_processor.json",
+    ):
+        (source / filename).write_text("{}", encoding="utf-8")
+
+    output = tmp_path / "output"
+    write_onnx_genai_config(
+        _decoder_package(_Int4Cfg()),
+        str(output),
+        config=_Int4Cfg(),
+        source=str(source),
+    )
+
+    assert (output / "tokenizer.json").is_file()
+    assert (output / "tokenizer_config.json").is_file()
+    assert (output / "special_tokens_map.json").is_file()
+    assert (output / "chat_template.jinja").is_file()
+    assert not (output / "preprocessor_config.json").exists()
+    assert not (output / "image_processor.json").exists()

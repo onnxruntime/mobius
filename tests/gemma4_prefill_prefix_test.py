@@ -378,7 +378,10 @@ def test_metadata_cache_cells_are_runtime_managed_and_request_aligned() -> None:
         # Runtime-private storage: no allocator/paging/slot policy is serialized.
         assert "storage" not in group
         assert "paging" not in group
-        assert group["aliasing"] == "permitted"
+        # This package is exported on the opset-24 ``Attention`` path, whose
+        # cache grows by concatenation, so ``present`` is a fresh tensor rather
+        # than a view onto ``past``.
+        assert group["aliasing"] == "forbidden"
         for ports in group["ports"].values():
             for cell in ports:
                 state = workflow["state"][cell]

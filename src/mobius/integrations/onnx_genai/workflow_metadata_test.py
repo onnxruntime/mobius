@@ -17,6 +17,7 @@ from mobius.integrations.onnx_genai.inference_metadata_test import (
     _VlmConfig,
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
+    _kv_storage_contract,
     build_language_diffusion_pipeline_metadata,
     build_speculative_workflow_metadata,
     build_vlm_workflow_metadata,
@@ -52,7 +53,7 @@ def test_speculative_emit_uses_accepted_prefix_length():
     assert "row_ids" not in emit
     assert "emit_valid_length" in workflow["manifest"]["capabilities"]
     assert "emit_row_identity" not in workflow["manifest"]["capabilities"]
-    assert workflow["inputs"]["request.slot_ids"]["source"]["name"] == "serving.slot_ids"
+    assert not any("slot_ids" in name for name in workflow["inputs"])
     assert workflow["outputs"]["tokens"]["contract"]["shape"][-1] == "accepted_sequence"
     assert workflow["state"]["cache_0"]["recurrence"] == {
         "kind": "bounded",
@@ -106,6 +107,53 @@ def test_vlm_preprocessing_is_explicit_typed_ssa(tmp_path):
     assert "inputs" not in image["transforms"][0]
     assert all("outputs" in transform for transform in image["transforms"])
     assert all(output["source"] in declared for output in image["outputs"])
+
+
+def _decoder_with_capacity_addressable_attention(
+    inputs: list[ir.Value],
+    output_specs: list[tuple[str, ir.DataType, list[int | str]]],
+) -> ir.Model:
+    """Build a decoder whose only cache consumer is ``GroupQueryAttention``.
+
+    Capacity-preallocated KV storage is a property of the attention operator,
+    not of the port names: only an operator that takes the logical cache length
+    as a separate input can ignore the unwritten tail of a capacity-sized
+    buffer. A decoder wired through plain ``Identity`` nodes therefore describes
+    a *dynamic* cache, so an artifact meant to stand in for a shared-buffer
+    decoder has to name the operator that makes sharing sound.
+    """
+    outputs = [_value(*spec) for spec in output_specs]
+    by_name = {output.name: output for output in outputs}
+    logits = outputs[0]
+    past_by_name = {value.name: value for value in inputs}
+    nodes = [ir.Node("", "Identity", [inputs[0]], outputs=[logits], name="emit_logits")]
+    layer = 0
+    while f"past_key_values.{layer}.key" in past_by_name:
+        nodes.append(
+            ir.Node(
+                "com.microsoft",
+                "GroupQueryAttention",
+                [
+                    inputs[0],
+                    past_by_name[f"past_key_values.{layer}.key"],
+                    past_by_name[f"past_key_values.{layer}.value"],
+                ],
+                outputs=[
+                    by_name[f"present.{layer}.key"],
+                    by_name[f"present.{layer}.value"],
+                ],
+                name=f"attention_{layer}",
+            )
+        )
+        layer += 1
+    graph = ir.Graph(
+        inputs=inputs,
+        outputs=outputs,
+        nodes=nodes,
+        name="decoder",
+        opset_imports={"": 21, "com.microsoft": 1},
+    )
+    return ir.Model(graph, ir_version=10)
 
 
 def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
@@ -163,7 +211,7 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
                     present_shape,
                 )
             )
-    decoder = _model("decoder", decoder_inputs, decoder_outputs)
+    decoder = _decoder_with_capacity_addressable_attention(decoder_inputs, decoder_outputs)
     vision = _model(
         "vision_encoder",
         [
@@ -245,6 +293,7 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
         "shape": ["batch", 202048],
         "batch_layout": {"kind": "request_aligned", "axis": 0},
     }
+    # A capacity-preallocated cache binds a mask sized once, up front.
     assert workflow["state"]["attention_mask"]["recurrence"] == {"kind": "invariant"}
     assert workflow["state"]["cache_103"]["recurrence"] == {
         "kind": "bounded",
@@ -326,8 +375,8 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     }
     assert "storage" not in decoder_group
     carried = {item["cell"] for item in workflow["steps"][0]["carried"]}
+    assert not any("slot_ids" in cell for cell in carried)
     assert {
-        "slot_ids",
         "token",
         "logits",
         "generated_lengths",
@@ -559,3 +608,62 @@ def test_speculative_workflow_uses_per_row_ragged_state_and_rng():
         "output": "present.0.key",
     }
     assert any(item["cell"].startswith("cache_") for item in workflow["steps"][0]["carried"])
+
+
+def _decoder_with_cache(domain: str, op_type: str) -> ir.Model:
+    """Minimal decoder whose KV cache is consumed by ``domain::op_type``."""
+    past_key = _value("past_key_values.0.key", ir.DataType.FLOAT, ["batch", 2, "past", 8])
+    past_value = _value("past_key_values.0.value", ir.DataType.FLOAT, ["batch", 2, "past", 8])
+    hidden = _value("hidden", ir.DataType.FLOAT, ["batch", "seq", 16])
+    present_key = _value("present.0.key", ir.DataType.FLOAT, ["batch", 2, "total", 8])
+    present_value = _value("present.0.value", ir.DataType.FLOAT, ["batch", 2, "total", 8])
+    logits = _value("logits", ir.DataType.FLOAT, ["batch", "seq", 32])
+    attention = ir.Node(
+        domain,
+        op_type,
+        [hidden, past_key, past_value],
+        outputs=[logits, present_key, present_value],
+        name="attention",
+    )
+    graph = ir.Graph(
+        inputs=[hidden, past_key, past_value],
+        outputs=[logits, present_key, present_value],
+        nodes=[attention],
+        name="decoder",
+        opset_imports={"": 21, "com.microsoft": 1},
+    )
+    return ir.Model(graph, ir_version=10)
+
+
+def test_capacity_addressable_attention_declares_shared_buffer_storage():
+    # GroupQueryAttention takes seqlens_k/total_sequence_length, so it can safely
+    # read a capacity-sized buffer whose tail is unwritten.
+    contract = _kv_storage_contract(
+        _decoder_with_cache("com.microsoft", "GroupQueryAttention")
+    )
+    assert contract == {"paging": "none", "compaction": True, "storage": "shared_buffer"}
+
+
+def test_standard_attention_declares_dynamic_storage():
+    # The standard ONNX Attention operator derives the total sequence length from
+    # the past tensor's own shape, so a preallocated buffer would both attend over
+    # unwritten slots and contradict an exactly sized attention mask.
+    contract = _kv_storage_contract(_decoder_with_cache("", "Attention"))
+    assert contract == {"paging": "none", "compaction": True, "storage": "dynamic"}
+
+
+def test_unconsumed_cache_ports_are_not_treated_as_capacity_addressable():
+    # A graph that never reads its own cache cannot promise capacity-safe
+    # behaviour it does not exercise.
+    model = _decoder_with_cache("com.microsoft", "GroupQueryAttention")
+    model.graph.node("attention").replace_input_with(1, None)
+    model.graph.node("attention").replace_input_with(2, None)
+    assert _kv_storage_contract(model)["storage"] == "dynamic"
+
+
+def test_paged_cache_inputs_take_precedence_over_operator_derivation():
+    model = _decoder_with_cache("", "Attention")
+    model.graph.inputs.append(_value("block_tables", ir.DataType.INT32, ["batch", "blocks"]))
+    contract = _kv_storage_contract(model)
+    assert contract["paging"] == "paged"
+    assert contract["storage"] == "paged"

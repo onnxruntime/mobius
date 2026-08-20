@@ -478,7 +478,19 @@ def _kv_storage_contract(model: ir.Model) -> dict[str, Any]:
     """Derive physical KV storage from the admitted model interface.
 
     Shared KV is a runtime I/O-binding contract: past and present ports bind the
-    same full-capacity OrtValue. It does not require an attention-node attribute.
+    same full-capacity OrtValue. That is only sound when the graph's attention
+    operator takes the *logical* cache length as a separate input, so it can
+    ignore the unwritten tail of a capacity-sized buffer. ``GroupQueryAttention``
+    does (``seqlens_k`` / ``total_sequence_length``), and a paged layout carries
+    its lengths in the block tables.
+
+    The standard ONNX ``Attention`` operator does not: it concatenates ``past_key``
+    with the current key and *derives* ``total_sequence_length`` from the past
+    tensor's own second-to-last dimension. Binding a capacity-sized buffer there
+    would both attend over unwritten slots and make the attention mask (sized to
+    the real length) disagree with the derived total length, which ORT rejects.
+    Such a graph therefore grows its cache by concatenation and must be declared
+    ``dynamic``.
     """
     input_names = {value.name.lower() for value in model.graph.inputs}
     paged = any(
@@ -487,13 +499,51 @@ def _kv_storage_contract(model: ir.Model) -> dict[str, Any]:
         for marker in ("block_table", "block_tables", "page_table", "page_tables")
     )
     has_cache = bool(_model_cache_pairs(model))
+    if paged:
+        storage = "paged"
+    elif has_cache and _consumes_explicit_cache_length(model):
+        storage = "shared_buffer"
+    else:
+        storage = "dynamic"
     return {
         "paging": "paged" if paged else "none",
         # Row compaction is semantic for every batched KV layout: the runtime
         # applies one row permutation to slot identity, KV, RNG, and loop state.
         "compaction": has_cache,
-        "storage": "paged" if paged else "shared_buffer",
+        "storage": storage,
     }
+
+
+#: Attention operators that accept a capacity-sized KV buffer plus an explicit
+#: logical cache length, and so can be bound to a preallocated shared buffer.
+_CAPACITY_ADDRESSABLE_ATTENTION = frozenset(
+    {
+        ("com.microsoft", "GroupQueryAttention"),
+        ("com.microsoft", "PagedAttention"),
+        ("com.microsoft", "SparseAttention"),
+    }
+)
+
+
+def _consumes_explicit_cache_length(model: ir.Model) -> bool:
+    """Report whether every cache consumer takes the logical cache length as input.
+
+    Returns ``False`` when the model has no cache consumers at all, because a
+    graph that never reads ``past_key_values.*`` cannot promise capacity-safe
+    behaviour it does not exercise.
+    """
+    cache_values = {
+        past.name for past, _ in _model_cache_pairs(model) if past.name is not None
+    }
+    if not cache_values:
+        return False
+    consumers = {
+        (node.domain, node.op_type)
+        for node in ir.traversal.RecursiveGraphIterator(model.graph)
+        for value in node.inputs
+        if value is not None and value.name in cache_values
+    }
+    return bool(consumers) and consumers <= _CAPACITY_ADDRESSABLE_ATTENTION
 
 
 def _aliasing_for_storage(storage: str) -> str:
@@ -866,12 +916,6 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             "source": {"kind": "literal"},
             "required": False,
             "default": True,
-        },
-        "package.slot_ids": {
-            "contract": batch_int,
-            "role": {"kind": "opaque"},
-            "source": {"kind": "application", "name": "serving.slot_ids"},
-            "required": True,
         },
     }
     for iteration in range(num_groups - 2):
@@ -1511,13 +1555,6 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             "initializer": "package.zero_batch",
             "recurrence": {"kind": "invariant"},
         },
-        "slot_ids": {
-            "contract": batch_int,
-            "class": "semantic",
-            "scope": "invocation",
-            "initializer": "package.slot_ids",
-            "recurrence": {"kind": "invariant"},
-        },
         "talker_cache_lengths": {
             "contract": batch_int,
             "class": "semantic",
@@ -1589,13 +1626,6 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
                 else "state.accepted_len.body"
             ),
             "next": "state.accepted_len.final",
-        },
-        {
-            "cell": "slot_ids",
-            "current": "package.slot_ids",
-            "body_input": "state.slot_ids.body",
-            "body_output": "state.slot_ids.body",
-            "next": "state.slot_ids.final",
         },
         {
             "cell": "talker_cache_lengths",
@@ -2891,6 +2921,16 @@ def build_vlm_workflow_metadata(
             "required": False,
             "default": 1,
         },
+        "package.one_step": {
+            # A growing-recurrence increment advances the whole invocation's
+            # state axis by one, so it is an invocation-scoped control scalar,
+            # not a per-row value like ``package.one``/``package.one_token``.
+            "contract": control_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 1,
+        },
         "package.active": {
             "contract": batch_bool,
             "role": {"kind": "opaque"},
@@ -2911,12 +2951,6 @@ def build_vlm_workflow_metadata(
             "source": {"kind": "literal"},
             "required": False,
             "default": 0,
-        },
-        "package.slot_ids": {
-            "contract": batch_int,
-            "role": {"kind": "opaque"},
-            "source": {"kind": "application", "name": "serving.slot_ids"},
-            "required": True,
         },
     }
     inputs.update(
@@ -3089,7 +3123,7 @@ def build_vlm_workflow_metadata(
                 else {
                     "kind": "growing",
                     "axis": 1,
-                    "increment": "package.one",
+                    "increment": "package.one_step",
                     "max": "package.max_context",
                 }
             ),
@@ -3113,13 +3147,6 @@ def build_vlm_workflow_metadata(
             "class": "semantic",
             "scope": "invocation",
             "initializer": "package.zero_batch",
-            "recurrence": {"kind": "invariant"},
-        },
-        "slot_ids": {
-            "contract": batch_int,
-            "class": "semantic",
-            "scope": "invocation",
-            "initializer": "package.slot_ids",
             "recurrence": {"kind": "invariant"},
         },
         "cache_lengths": {
@@ -3193,13 +3220,6 @@ def build_vlm_workflow_metadata(
             "state.accepted_len.body",
             "accepted_len.next",
             "state.accepted_len.final",
-        ),
-        (
-            "slot_ids",
-            "package.slot_ids",
-            "state.slot_ids.body",
-            "state.slot_ids.body",
-            "state.slot_ids.final",
         ),
         (
             "cache_lengths",
@@ -3811,12 +3831,6 @@ def build_speculative_workflow_metadata(
             "required": False,
             "default": True,
         },
-        "request.slot_ids": {
-            "contract": batch_int,
-            "role": {"kind": "opaque"},
-            "source": {"kind": "application", "name": "serving.slot_ids"},
-            "required": True,
-        },
         "request.cache_lengths": {
             "contract": batch_int,
             "role": {"kind": "opaque"},
@@ -4190,13 +4204,6 @@ def build_speculative_workflow_metadata(
             "initializer": "package.zero",
             "recurrence": {"kind": "invariant"},
         },
-        "slot_ids": {
-            "contract": batch_int,
-            "class": "semantic",
-            "scope": "invocation",
-            "initializer": "request.slot_ids",
-            "recurrence": {"kind": "invariant"},
-        },
         "cache_lengths": {
             "contract": batch_int,
             "class": "semantic",
@@ -4240,13 +4247,6 @@ def build_speculative_workflow_metadata(
             "state.accepted_len.body",
             emit_length,
             "state.accepted_len.final",
-        ),
-        (
-            "slot_ids",
-            "request.slot_ids",
-            "state.slot_ids.body",
-            "state.slot_ids.body",
-            "state.slot_ids.final",
         ),
         (
             "cache_lengths",
@@ -4830,6 +4830,16 @@ def _build_autoregressive_workflow_metadata(
                 "required": False,
                 "default": 1,
             },
+            "package.one_step": {
+                # A growing-recurrence increment advances the whole invocation's
+                # state axis by one, so it is an invocation-scoped control scalar,
+                # not a per-row value like ``package.one``/``package.one_token``.
+                "contract": control_int,
+                "role": {"kind": "opaque"},
+                "source": {"kind": "literal"},
+                "required": False,
+                "default": 1,
+            },
             "package.max_context": {
                 "contract": control_int,
                 "role": {"kind": "opaque"},
@@ -4999,12 +5009,6 @@ def _build_autoregressive_workflow_metadata(
                     "required": False,
                     "default": False,
                 },
-                "package.slot_ids": {
-                    "contract": batch_int,
-                    "role": {"kind": "opaque"},
-                    "source": {"kind": "application", "name": "serving.slot_ids"},
-                    "required": True,
-                },
                 "package.cache_lengths": {
                     "contract": batch_int,
                     "role": {"kind": "opaque"},
@@ -5105,13 +5109,6 @@ def _build_autoregressive_workflow_metadata(
                     "initializer": "package.zero_batch",
                     "recurrence": {"kind": "invariant"},
                 },
-                "slot_ids": {
-                    "contract": batch_int,
-                    "class": "semantic",
-                    "scope": "invocation",
-                    "initializer": "package.slot_ids",
-                    "recurrence": {"kind": "invariant"},
-                },
                 "cache_lengths": {
                     "contract": batch_int,
                     "class": "semantic",
@@ -5199,13 +5196,6 @@ def _build_autoregressive_workflow_metadata(
                     "body_output": "accepted_len.next",
                     "next": "state.accepted_len.final",
                 },
-                {
-                    "cell": "slot_ids",
-                    "current": "package.slot_ids",
-                    "body_input": "state.slot_ids.body",
-                    "body_output": "state.slot_ids.body",
-                    "next": "state.slot_ids.final",
-                },
             ]
         )
     if sampler_with_rng:
@@ -5248,7 +5238,7 @@ def _build_autoregressive_workflow_metadata(
                 else {
                     "kind": "growing",
                     "axis": 1,
-                    "increment": "package.one_token",
+                    "increment": "package.one_step",
                     "max": "package.max_context",
                 }
             ),
@@ -5637,7 +5627,7 @@ def _build_autoregressive_workflow_metadata(
                     {
                         "when": "state.active.body",
                         "valid_length": "token.emitted_length",
-                            }
+                    }
                     if cache_pairs
                     else {}
                 ),
