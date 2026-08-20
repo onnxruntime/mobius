@@ -49,6 +49,7 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     add_adapter_service_to_metadata,
     add_policy_components_to_workflow,
     build_native_vlm_package_metadata,
+    declare_request_alignment,
 )
 
 
@@ -236,8 +237,6 @@ def _publish_workflow_v1(workflow: dict[str, Any]) -> dict[str, Any]:
                 result["valid_length"] = rewrite(node["valid_length"])
             if "when" in node:
                 result["when"] = rewrite(node["when"])
-            if "row_ids" in node:
-                result["row_ids"] = rewrite(node["row_ids"])
             return result
         if kind == "branch":
             result = {
@@ -316,7 +315,10 @@ def _publish_workflow_v1(workflow: dict[str, Any]) -> dict[str, Any]:
     collect_carried(graph)
     published = convert(graph)
     workflow["steps"] = published["steps"] if published["kind"] == "sequence" else [published]
+    declare_request_alignment(workflow)
     return workflow
+
+
 
 
 def _name_image_preprocessing_program(image: dict[str, Any]) -> None:
@@ -502,6 +504,7 @@ def _model_cache_pairs(model: ir.Model) -> list[tuple[ir.Value, ir.Value]]:
                 for name in (
                     past.name.replace("past_key_values", "present"),
                     past.name.replace("past.", "present."),
+                    past.name.replace("past_", "present_"),
                 )
                 if name in outputs
             ),
@@ -532,6 +535,41 @@ def _kv_storage_contract(model: ir.Model) -> dict[str, Any]:
         "compaction": has_cache,
         "storage": "paged" if paged else "shared_buffer",
     }
+
+
+def _state_group(
+    *,
+    ports: dict[str, Any],
+    sequence_axis: int,
+    logical_lengths: str | None = None,
+    storage: str = "shared_buffer",
+    kind: str = "full_attention",
+    aliasing: str | None = None,
+    layout: str = "bnsh",
+) -> dict[str, Any]:
+    """Describe one semantic state group of the serving state service.
+
+    ``aliasing`` is a property of the admitted graph, not a runtime preference:
+    a shared full-capacity buffer lets the component write ``present`` straight
+    into the ``past`` binding, while a growable cache returns a fresh, longer
+    tensor each step and must never be aliased onto its own input.
+    """
+    group: dict[str, Any] = {
+        "kind": kind,
+        "sequence_axis": sequence_axis,
+        "layout": layout,
+        "aliasing": (
+            aliasing
+            if aliasing is not None
+            else ("permitted" if storage in ("shared_buffer", "paged") else "forbidden")
+        ),
+        "reuse": {"prefix_reusable": True, "evictable_prefix": False},
+        "capabilities": {"snapshot": True, "fork": True},
+        "ports": ports,
+    }
+    if logical_lengths is not None:
+        group["logical_lengths"] = logical_lengths
+    return group
 
 
 def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
@@ -1625,25 +1663,15 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
                     "active": "active",
                     "done": "done",
                     "accepted_len": "accepted_len",
-                    "slot_ids": "slot_ids",
-                    "kv_service": {
-                        "paging": (
-                            "paged"
-                            if talker_kv["paging"] == "paged"
-                            or predictor_kv["paging"] == "paged"
-                            else "none"
-                        ),
-                        "allocation": "runtime",
-                        "compaction": (talker_kv["compaction"] or predictor_kv["compaction"]),
+                    "state_service": {
                         "groups": {
                             **(
                                 {
-                                    "talker_cache": {
-                                        "sequence_axis": 2,
-                                        "layout": "bnsh",
-                                        "logical_lengths": "talker_cache_lengths",
-                                        "storage": talker_kv["storage"],
-                                        "ports": {
+                                    "talker_cache": _state_group(
+                                        sequence_axis=2,
+                                        logical_lengths="talker_cache_lengths",
+                                        storage=talker_kv["storage"],
+                                        ports={
                                             "talker": {
                                                 f"talker_cache_{index}": {
                                                     "input": past.name,
@@ -1654,19 +1682,18 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
                                                 )
                                             }
                                         },
-                                    }
+                                    )
                                 }
                                 if talker_caches
                                 else {}
                             ),
                             **(
                                 {
-                                    "predictor_cache": {
-                                        "sequence_axis": 2,
-                                        "layout": "bnsh",
-                                        "logical_lengths": "predictor_cache_lengths",
-                                        "storage": predictor_kv["storage"],
-                                        "ports": {
+                                    "predictor_cache": _state_group(
+                                        sequence_axis=2,
+                                        logical_lengths="predictor_cache_lengths",
+                                        storage=predictor_kv["storage"],
+                                        ports={
                                             "code_predictor": {
                                                 f"predictor_cache_{index}": {
                                                     "input": past.name,
@@ -1677,7 +1704,7 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
                                                 )
                                             }
                                         },
-                                    }
+                                    )
                                 }
                                 if predictor_caches
                                 else {}
@@ -3422,7 +3449,6 @@ def build_vlm_workflow_metadata(
                 "mode": "append",
                 "when": "state.active.body",
                 "valid_length": "token.emitted_length",
-                "row_ids": "state.slot_ids.body",
                 "effect_name": "emit",
                 "effect": _effect("emit.0", "emit.1"),
             },
@@ -3473,7 +3499,6 @@ def build_vlm_workflow_metadata(
                 "loop_induction_values",
                 "typed_emit",
                 "emit_valid_length",
-                "emit_row_identity",
                 *(["input_presence"] if text_only_vision is not None else []),
                 *(
                     ["serving_service_contract", "bounded_state_recurrence"]
@@ -3502,14 +3527,10 @@ def build_vlm_workflow_metadata(
                     "active": "active",
                     "done": "done",
                     "accepted_len": "accepted_len",
-                    "slot_ids": "slot_ids",
-                    "kv_service": {
-                        "paging": decoder_kv["paging"],
-                        "allocation": "runtime",
-                        "compaction": decoder_kv["compaction"],
+                    "state_service": {
                         "groups": {
-                            "decoder_cache": {
-                                "sequence_axis": next(
+                            "decoder_cache": _state_group(
+                                sequence_axis=next(
                                     (
                                         axis
                                         for axis, dimension in enumerate(
@@ -3519,10 +3540,9 @@ def build_vlm_workflow_metadata(
                                     ),
                                     2,
                                 ),
-                                "layout": "bnsh",
-                                "logical_lengths": "cache_lengths",
-                                "storage": decoder_kv["storage"],
-                                "ports": {
+                                logical_lengths="cache_lengths",
+                                storage=decoder_kv["storage"],
+                                ports={
                                     "decoder": {
                                         f"cache_{index}": {
                                             "input": past.name,
@@ -3531,7 +3551,7 @@ def build_vlm_workflow_metadata(
                                         for index, (past, present) in enumerate(cache_pairs)
                                     }
                                 },
-                            }
+                            )
                         },
                     },
                 }
@@ -4048,7 +4068,6 @@ def build_speculative_workflow_metadata(
             "valid_length": emit_length,
             "output": "tokens",
             "mode": "append",
-            "row_ids": "state.slot_ids.body",
             "effect_name": "emit",
             "effect": _effect("emit.0", "emit.1"),
         },
@@ -4061,7 +4080,6 @@ def build_speculative_workflow_metadata(
                 "valid_length": "grammar.forced_length",
                 "output": "tokens",
                 "mode": "append",
-                "row_ids": "state.slot_ids.body",
                 "effect_name": "emit",
                 "effect": _effect("emit.1", "emit.2"),
             }
@@ -4291,7 +4309,6 @@ def build_speculative_workflow_metadata(
                 "loop_induction_values",
                 "typed_emit",
                 "emit_valid_length",
-                "emit_row_identity",
                 "bounded_state_recurrence",
                 "serving_service_contract",
             ],
@@ -4318,19 +4335,14 @@ def build_speculative_workflow_metadata(
             "active": "active",
             "done": "done",
             "accepted_len": "accepted_len",
-            "slot_ids": "slot_ids",
-            "kv_service": {
-                "paging": verifier_kv["paging"],
-                "allocation": "runtime",
-                "compaction": verifier_kv["compaction"],
+            "state_service": {
                 "groups": {
-                    "verifier_cache": {
-                        "sequence_axis": kv_sequence_axis,
-                        "layout": "bnsh",
-                        "logical_lengths": "cache_lengths",
-                        "storage": verifier_kv["storage"],
-                        "ports": {"verifier": kv_ports},
-                    }
+                    "verifier_cache": _state_group(
+                        sequence_axis=kv_sequence_axis,
+                        logical_lengths="cache_lengths",
+                        storage=verifier_kv["storage"],
+                        ports={"verifier": kv_ports},
+                    )
                 },
             },
         },
@@ -4389,6 +4401,70 @@ def write_speculative_workflow_metadata(
     return path
 
 
+def _cross_state_bindings(
+    encoder: ir.Model, decoder: ir.Model
+) -> dict[str, tuple[str, ir.Value]]:
+    """Map decoder inputs that a conditioning encoder produces once per request.
+
+    The mapping is purely structural. A decoder input is bound to an encoder
+    output when the names match exactly (``encoder_hidden_states``) or when the
+    decoder's ``past``/``pass``-side spelling rewrites to the encoder's
+    ``present``-side spelling (``past_key_cross_0`` <- ``present_key_cross_0``),
+    which is the same past/present rewrite already used for self-attention KV.
+    No model family, tensor role, or vendor name is consulted.
+    """
+    encoder_outputs = {value.name: value for value in encoder.graph.outputs}
+    bindings: dict[str, tuple[str, ir.Value]] = {}
+    for value in decoder.graph.inputs:
+        if value.name is None:
+            continue
+        candidates = (
+            value.name,
+            value.name.replace("past_key_values", "present"),
+            value.name.replace("past.", "present."),
+            value.name.replace("past_", "present_"),
+        )
+        produced = next(
+            ((name, encoder_outputs[name]) for name in candidates if name in encoder_outputs),
+            None,
+        )
+        if produced is not None:
+            bindings[value.name] = produced
+    return bindings
+
+
+def build_speech_to_text_workflow_metadata(
+    pkg: Any,
+    config: Any,
+    *,
+    sampler: str = "greedy",
+    audio_preprocessing: dict[str, Any] | None = None,
+    artifacts: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Build the typed SSA workflow for an encoder-conditioned decoder package.
+
+    The encoder runs once per request inside the loop ``setup``; every value it
+    produces that the decoder consumes becomes a shape-invariant workflow state
+    cell carried unchanged through the decode loop. That is what keeps encoder
+    states and decoder rows aligned under batching: the cross state is
+    request-aligned on the same axis as the tokens and is permuted by the same
+    compaction that permutes the self-attention cache.
+    """
+    if set(pkg.keys()) != {"encoder", "decoder"}:
+        raise ValueError(
+            "speech-to-text workflow requires exactly encoder and decoder components, "
+            f"got {sorted(pkg.keys())}"
+        )
+    return _build_autoregressive_workflow_metadata(
+        pkg,
+        config,
+        sampler=sampler,
+        encoder_name="encoder",
+        audio_preprocessing=audio_preprocessing,
+        artifacts=artifacts,
+    )
+
+
 def build_decoder_workflow_metadata(
     pkg: Any,
     config: Any,
@@ -4398,7 +4474,38 @@ def build_decoder_workflow_metadata(
     """Build the exact workflow-policy contract for an autoregressive decoder."""
     if len(pkg) != 1:
         raise ValueError("decoder workflow requires exactly one neural component")
-    decoder_name, decoder = next(iter(pkg.items()))
+    return _build_autoregressive_workflow_metadata(pkg, config, sampler=sampler)
+
+
+def _build_autoregressive_workflow_metadata(
+    pkg: Any,
+    config: Any,
+    *,
+    sampler: str = "greedy",
+    encoder_name: str | None = None,
+    audio_preprocessing: dict[str, Any] | None = None,
+    artifacts: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Build an autoregressive decode loop, optionally conditioned by an encoder.
+
+    ``artifacts`` overrides the package-relative ONNX path of a component, which
+    lets an importer describe an existing on-disk layout without renaming files.
+    """
+    encoder = pkg[encoder_name] if encoder_name is not None else None
+    decoder_items = [
+        (name, model) for name, model in pkg.items() if name != encoder_name
+    ]
+    if len(decoder_items) != 1:
+        raise ValueError("workflow requires exactly one autoregressive component")
+    decoder_name, decoder = decoder_items[0]
+    cross_bindings = (
+        _cross_state_bindings(encoder, decoder) if encoder is not None else {}
+    )
+    if encoder is not None and not cross_bindings:
+        raise ValueError(
+            "encoder-conditioned workflow requires at least one decoder input produced "
+            "by the encoder"
+        )
     inputs = list(decoder.graph.inputs)
     outputs = list(decoder.graph.outputs)
     decoder_kv_contract = _kv_storage_contract(decoder)
@@ -4455,9 +4562,12 @@ def build_decoder_workflow_metadata(
     output_by_suffix = {value.name: value for value in outputs}
     cache_pairs: list[tuple[ir.Value, ir.Value]] = []
     for value in inputs:
+        if value.name in cross_bindings:
+            continue
         candidates = [
             value.name.replace("past_key_values", "present"),
             value.name.replace("past.", "present."),
+            value.name.replace("past_", "present_"),
         ]
         present = next(
             (output_by_suffix.get(name) for name in candidates if name in output_by_suffix),
@@ -4479,8 +4589,11 @@ def build_decoder_workflow_metadata(
         (
             value
             for value in integer_rank2
-            if "mask" in value.name
-            or "past" in str(getattr(list(value.shape)[1], "value", list(value.shape)[1]))
+            if value.name not in cross_bindings
+            and (
+                "mask" in value.name
+                or "past" in str(getattr(list(value.shape)[1], "value", list(value.shape)[1]))
+            )
         ),
         None,
     )
@@ -4488,15 +4601,22 @@ def build_decoder_workflow_metadata(
         (
             value
             for value in integer_rank2
-            if value is not attention_input and "position" in value.name
+            if value is not attention_input
+            and value.name not in cross_bindings
+            and "position" in value.name
         ),
-        next((value for value in integer_rank2 if value is not attention_input), None),
+        next(
+            (
+                value
+                for value in integer_rank2
+                if value is not attention_input and value.name not in cross_bindings
+            ),
+            None,
+        ),
     )
-    if attention_input is None:
-        raise ValueError(
-            "standard decoder workflow requires a derived rank-2 attention-mask input"
-        )
-    derived_names = cache_names | {attention_input.name}
+    derived_names = cache_names | set(cross_bindings)
+    if attention_input is not None:
+        derived_names.add(attention_input.name)
     if position_input is not None:
         derived_names.add(position_input.name)
     unsupported = [
@@ -4506,27 +4626,43 @@ def build_decoder_workflow_metadata(
     ]
     if unsupported:
         raise ValueError(f"decoder workflow has unsupported non-request inputs: {unsupported}")
-    fixed_capacity = bool(cache_pairs) and decoder_kv_contract["storage"] == "shared_buffer"
+    # A shared full-capacity KV buffer needs an attention mask to convey each
+    # row's logical length; a mask-free decoder must grow its cache instead.
+    fixed_capacity = (
+        bool(cache_pairs)
+        and decoder_kv_contract["storage"] == "shared_buffer"
+        and attention_input is not None
+    )
     pkg.add_policy_component(
         "decoder_state_initializer",
         build_decoder_state_initializer(
             decoder,
             token_input=token_input.name,
-            attention_mask_input=attention_input.name,
+            attention_mask_input=attention_input.name if attention_input is not None else None,
             position_ids_input=position_input.name if position_input is not None else None,
             cache_inputs=sorted(cache_names),
             fixed_capacity=fixed_capacity,
             ragged=bool(cache_pairs),
         ),
     )
-    pkg.add_policy_component(
-        "decoder_step_update",
-        build_decoder_step_update(
-            attention_dtype=attention_input.dtype,
-            position_dtype=position_input.dtype if position_input is not None else None,
-            fixed_capacity=fixed_capacity,
-        ),
-    )
+    if attention_input is not None:
+        pkg.add_policy_component(
+            "decoder_step_update",
+            build_decoder_step_update(
+                attention_dtype=attention_input.dtype,
+                position_dtype=position_input.dtype if position_input is not None else None,
+                fixed_capacity=fixed_capacity,
+            ),
+        )
+    elif position_input is not None:
+        pkg.add_policy_component(
+            "decoder_step_update",
+            build_decoder_step_update(
+                attention_dtype=None,
+                position_dtype=position_input.dtype,
+                fixed_capacity=False,
+            ),
+        )
     needs_token_cast = token_input.dtype != ir.DataType.INT64
     if needs_token_cast:
         pkg.add_policy_component("model_token_cast", build_model_token_cast(token_input.dtype))
@@ -4557,6 +4693,35 @@ def build_decoder_workflow_metadata(
         setup_decoder_inputs[value.name] = name
         body_decoder_inputs[value.name] = name
 
+    # Encoder inputs are request inputs of the whole workflow: the encoder runs
+    # once in the loop setup and its results persist as invariant state.
+    encoder_invoke_inputs: dict[str, str] = {}
+    encoder_invoke_outputs: dict[str, str] = {}
+    if encoder is not None:
+        assert encoder_name is not None
+        preprocessing_outputs = {
+            binding["name"]: binding
+            for binding in (audio_preprocessing or {}).get("outputs", [])
+        }
+        for value in encoder.graph.inputs:
+            ssa = f"encoder.input.{value.name}"
+            if value.name in preprocessing_outputs:
+                encoder_invoke_inputs[value.name] = preprocessing_outputs[value.name][
+                    "source_value"
+                ]
+                continue
+            workflow_inputs[ssa] = {
+                "contract": _contract(value),
+                "role": {"kind": "opaque"},
+                "source": {"kind": "application", "name": value.name},
+                "required": True,
+                # An application may reuse a previously computed encoder input
+                # instead of recomputing the feature extraction.
+                "externally_suppliable": True,
+            }
+            encoder_invoke_inputs[value.name] = ssa
+        for decoder_input, (encoder_output, _) in sorted(cross_bindings.items()):
+            encoder_invoke_outputs[encoder_output] = f"encoder.{encoder_output}"
     batch_dimension = _shape_metadata(_port(token_input))[0]
     batch_int = {"dtype": "int64", "rank": 1, "shape": [batch_dimension]}
     batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch_dimension]}
@@ -4789,13 +4954,22 @@ def build_decoder_workflow_metadata(
         if value.name in cache_names:
             body_decoder_inputs[value.name] = f"state.{value.name}.body"
             setup_decoder_inputs[value.name] = f"initializer.{value.name}"
-    setup_decoder_inputs[attention_input.name] = f"initializer.{attention_input.name}"
-    body_decoder_inputs[attention_input.name] = (
-        "decoder_step.body_attention_mask" if fixed_capacity else "state.attention_mask.body"
-    )
+    if attention_input is not None:
+        setup_decoder_inputs[attention_input.name] = f"initializer.{attention_input.name}"
+        body_decoder_inputs[attention_input.name] = (
+            "decoder_step.body_attention_mask"
+            if fixed_capacity
+            else "state.attention_mask.body"
+        )
     if position_input is not None:
         setup_decoder_inputs[position_input.name] = f"initializer.{position_input.name}"
         body_decoder_inputs[position_input.name] = "state.position_ids.body"
+    # Cross state is produced once by the encoder and read unchanged by every
+    # decode step, so setup binds the encoder result and the body binds the
+    # invariant carried cell that holds it.
+    for decoder_input, (encoder_output, _) in sorted(cross_bindings.items()):
+        setup_decoder_inputs[decoder_input] = f"encoder.{encoder_output}"
+        body_decoder_inputs[decoder_input] = f"state.cross.{decoder_input}.body"
     body_decoder_inputs[token_input.name] = (
         "model_token.body" if needs_token_cast else "token.body"
     )
@@ -4980,8 +5154,9 @@ def build_decoder_workflow_metadata(
                 "write_effect": _effect("state:rng_counter.read", "state:rng_counter.1"),
             }
         )
-    decoder_state_specs = {
-        "attention_mask": (
+    decoder_state_specs: dict[str, tuple[dict[str, Any], str, str, dict[str, Any]]] = {}
+    if attention_input is not None:
+        decoder_state_specs["attention_mask"] = (
             {
                 "dtype": _contract(attention_input)["dtype"],
                 "rank": 2,
@@ -5003,8 +5178,7 @@ def build_decoder_workflow_metadata(
                     "max": "package.max_context",
                 }
             ),
-        ),
-    }
+        )
     if position_input is not None:
         decoder_state_specs["position_ids"] = (
             {
@@ -5080,9 +5254,45 @@ def build_decoder_workflow_metadata(
             }
         )
 
+    # Cross state: produced once by the encoder, shape-invariant, carried
+    # unchanged. The identity carry keeps the cell request-aligned on the same
+    # axis as the tokens so row compaction permutes encoder state and decoder
+    # rows together.
+    for decoder_input, (encoder_output, encoder_value) in sorted(cross_bindings.items()):
+        cell = f"cross.{decoder_input}"
+        setup_value = f"encoder.{encoder_output}"
+        body_input = f"state.cross.{decoder_input}.body"
+        contract = _contract(encoder_value)
+        contract["batch_layout"] = {"kind": "request_aligned", "axis": 0}
+        state[cell] = {
+            "contract": contract,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": setup_value,
+            "recurrence": {"kind": "invariant"},
+        }
+        effect_name = f"state:{cell}"
+        initial_effects[effect_name] = f"{effect_name}.0"
+        carried.append(
+            {
+                "cell": cell,
+                "current": setup_value,
+                "body_input": body_input,
+                "body_output": body_input,
+                "next": f"state.cross.{decoder_input}.final",
+                "read_effect": _effect(f"{effect_name}.0", f"{effect_name}.read"),
+                "write_effect": _effect(f"{effect_name}.read", f"{effect_name}.1"),
+            }
+        )
+
     setup = {
         "kind": "sequence",
         "nodes": [
+            *(
+                [_invoke(encoder_name, encoder_invoke_inputs, encoder_invoke_outputs)]
+                if encoder is not None
+                else []
+            ),
             _invoke(
                 "decoder_state_initializer",
                 {
@@ -5091,8 +5301,14 @@ def build_decoder_workflow_metadata(
                     **({"max_iterations": "request.max_iterations"} if fixed_capacity else {}),
                 },
                 {
-                    attention_input.name: f"initializer.{attention_input.name}",
-                    "body_attention_mask": "initializer.body_attention_mask",
+                    **(
+                        {
+                            attention_input.name: f"initializer.{attention_input.name}",
+                            "body_attention_mask": "initializer.body_attention_mask",
+                        }
+                        if attention_input is not None
+                        else {}
+                    ),
                     "token_slot": "initializer.token_slot",
                     **(
                         {"generated_lengths": "initializer.generated_lengths"}
@@ -5144,10 +5360,15 @@ def build_decoder_workflow_metadata(
             ),
         ],
     }
+    has_step_update = attention_input is not None or position_input is not None
     decoder_step_invoke = _invoke(
         "decoder_step_update",
         {
-            "attention_mask": "state.attention_mask.body",
+            **(
+                {"attention_mask": "state.attention_mask.body"}
+                if attention_input is not None
+                else {}
+            ),
             **({"logical_length": "state.cache_lengths.body"} if fixed_capacity else {}),
             **(
                 {"position_ids": "state.position_ids.body"}
@@ -5156,7 +5377,11 @@ def build_decoder_workflow_metadata(
             ),
         },
         {
-            "next_attention_mask": "decoder_step.body_attention_mask",
+            **(
+                {"next_attention_mask": "decoder_step.body_attention_mask"}
+                if attention_input is not None
+                else {}
+            ),
             **(
                 {"next_position_ids": "decoder_step.body_position_ids"}
                 if position_input is not None
@@ -5313,27 +5538,29 @@ def build_decoder_workflow_metadata(
                     {
                         "when": "state.active.body",
                         "valid_length": "token.emitted_length",
-                        "row_ids": "state.slot_ids.body",
-                    }
+                            }
                     if cache_pairs
                     else {}
                 ),
                 "effect_name": "emit",
                 "effect": _effect("emit.0", "emit.1"),
             },
-            *([decoder_step_invoke] if fixed_capacity else []),
+            *([decoder_step_invoke] if has_step_update and fixed_capacity else []),
             _invoke(decoder_name, body_decoder_inputs, body_decoder_outputs),
             _invoke(
                 "last_token_logits",
                 {"logits": "decoder.body.logits"},
                 {"last_logits": "decoder.body.last_logits"},
             ),
-            *([] if fixed_capacity else [decoder_step_invoke]),
+            *([decoder_step_invoke] if has_step_update and not fixed_capacity else []),
         ],
     }
 
+    artifacts = artifacts or {}
     use_subfolders = len(pkg) > 1
-    artifact = f"{decoder_name}/model.onnx" if use_subfolders else "model.onnx"
+    artifact = artifacts.get(
+        decoder_name, f"{decoder_name}/model.onnx" if use_subfolders else "model.onnx"
+    )
     workflow = {
         "manifest": {
             "ir_version": "1.0",
@@ -5344,7 +5571,6 @@ def build_decoder_workflow_metadata(
                 "nested_control_flow",
                 "typed_emit",
                 "emit_valid_length",
-                *(["emit_row_identity"] if cache_pairs else []),
                 "loop_induction_values",
                 *(["serving_service_contract"] if cache_pairs else []),
                 *(["bounded_state_recurrence"] if cache_pairs else []),
@@ -5362,7 +5588,19 @@ def build_decoder_workflow_metadata(
                 "stage": "pre_adapter",
             }
         },
-        "components": {decoder_name: _component(decoder, artifact)},
+        "components": {
+            decoder_name: _component(decoder, artifact),
+            **(
+                {
+                    encoder_name: _component(
+                        encoder,
+                        artifacts.get(encoder_name, f"{encoder_name}/model.onnx"),
+                    )
+                }
+                if encoder is not None
+                else {}
+            ),
+        },
         "state": state,
         **(
             {
@@ -5370,19 +5608,18 @@ def build_decoder_workflow_metadata(
                     "active": "active",
                     "done": "done",
                     "accepted_len": "accepted_len",
-                    "slot_ids": "slot_ids",
-                    "kv_service": {
-                        "paging": decoder_kv_contract["paging"],
-                        "allocation": "runtime",
-                        "compaction": decoder_kv_contract["compaction"],
+                    "state_service": {
                         "groups": {
-                            "decoder_cache": {
-                                "sequence_axis": decoder_kv_axis,
-                                "layout": "bnsh",
-                                "logical_lengths": "cache_lengths",
-                                "storage": decoder_kv_contract["storage"],
-                                "ports": {decoder_name: decoder_kv_ports},
-                            }
+                            "decoder_cache": _state_group(
+                                sequence_axis=decoder_kv_axis,
+                                logical_lengths="cache_lengths" if fixed_capacity else None,
+                                storage=(
+                                    decoder_kv_contract["storage"]
+                                    if fixed_capacity
+                                    else "growable"
+                                ),
+                                ports={decoder_name: decoder_kv_ports},
+                            )
                         },
                     },
                 }
@@ -5686,6 +5923,30 @@ def write_decoder_workflow_metadata(
     """Write decoder workflow metadata and policy artifacts."""
     os.makedirs(output_dir, exist_ok=True)
     metadata = build_decoder_workflow_metadata(pkg, config, sampler=sampler)
+    pkg.save_policy_components(output_dir)
+    add_adapter_service_to_metadata(metadata, pkg, output_dir)
+    path = os.path.join(output_dir, "inference_metadata.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        _dump_yaml(metadata, handle)
+    return path
+
+
+def write_speech_to_text_workflow_metadata(
+    pkg: Any,
+    output_dir: str,
+    config: Any,
+    *,
+    sampler: str = "greedy",
+    audio_preprocessing: dict[str, Any] | None = None,
+) -> str:
+    """Write encoder-conditioned decode workflow metadata and policy artifacts."""
+    os.makedirs(output_dir, exist_ok=True)
+    metadata = build_speech_to_text_workflow_metadata(
+        pkg,
+        config,
+        sampler=sampler,
+        audio_preprocessing=audio_preprocessing,
+    )
     pkg.save_policy_components(output_dir)
     add_adapter_service_to_metadata(metadata, pkg, output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")

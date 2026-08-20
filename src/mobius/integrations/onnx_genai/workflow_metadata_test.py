@@ -48,9 +48,7 @@ def test_speculative_emit_uses_accepted_prefix_length():
     ]
     emit = next(node for node in workflow["steps"][0]["steps"] if node["kind"] == "emit")
     assert emit["valid_length"] == "acceptance.length"
-    assert emit["row_ids"] == "slot_ids"
     assert "emit_valid_length" in workflow["manifest"]["capabilities"]
-    assert "emit_row_identity" in workflow["manifest"]["capabilities"]
     assert workflow["inputs"]["request.slot_ids"]["source"]["name"] == "serving.slot_ids"
     assert workflow["outputs"]["tokens"]["contract"]["shape"][-1] == "accepted_sequence"
     assert workflow["state"]["cache_0"]["recurrence"] == {
@@ -236,11 +234,13 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
         "dtype": "bfloat16",
         "rank": 4,
         "shape": ["batch", 2, "past_sequence", 128],
+        "batch_layout": {"kind": "request_aligned", "axis": 0},
     }
     assert workflow["state"]["logits"]["contract"] == {
         "dtype": "float32",
         "rank": 2,
         "shape": ["batch", 202048],
+        "batch_layout": {"kind": "request_aligned", "axis": 0},
     }
     assert workflow["state"]["attention_mask"]["recurrence"] == {"kind": "invariant"}
     assert workflow["state"]["cache_103"]["recurrence"] == {
@@ -292,8 +292,6 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     )
     assert emit["when"] == "active"
     assert emit["valid_length"] == "token.emitted_length"
-    assert emit["row_ids"] == "slot_ids"
-    assert "emit_row_identity" in workflow["manifest"]["capabilities"]
     assert policy_invokes["decoder_step_update"]["inputs"]["logical_length"] == "cache_lengths"
     assert workflow["state"]["attention_mask"]["initializer"] == ("initializer.attention_mask")
     assert any(
@@ -310,9 +308,7 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     assert media_branch["predicate"] == "request.image_present"
     assert set(media_branch["cases"]) == {"true", "false"}
     assert media_branch["cases"]["false"]["component"] == "empty_image_features"
-    kv_service = workflow["serving"]["kv_service"]
-    assert kv_service["paging"] == "none"
-    assert kv_service["compaction"] is True
+    state_service = workflow["serving"]["state_service"]
     carried = {item["cell"] for item in workflow["steps"][0]["carried"]}
     assert {
         "slot_ids",
@@ -327,11 +323,12 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
         "attention_mask",
         "cache_0",
     } <= carried
-    decoder_cache = kv_service["groups"]["decoder_cache"]
+    decoder_cache = state_service["groups"]["decoder_cache"]
     # Shared buffering is expressed by the admitted cache ports and runtime I/O
     # binding, even when the graph has no node-level share-buffer attribute.
     assert all("past_present_share_buffer" not in node.attributes for node in decoder.graph)
-    assert decoder_cache["storage"] == "shared_buffer"
+    assert decoder_cache["aliasing"] == "permitted"
+    assert decoder_cache["kind"] == "full_attention"
     kv_ports = decoder_cache["ports"]["decoder"]
     assert len(kv_ports) == 104
     assert kv_ports["cache_103"] == {
@@ -533,11 +530,10 @@ def test_speculative_workflow_uses_per_row_ragged_state_and_rng():
     assert acceptance["outputs"]["accepted_len"] == "acceptance.length"
     emit = next(node for node in body if node["kind"] == "emit")
     assert emit["valid_length"] == "acceptance.length"
-    assert emit["row_ids"] == "slot_ids"
     assert not any(node["kind"] == "branch" for node in body)
     assert workflow["serving"]["active"] == "active"
     assert workflow["serving"]["done"] == "done"
-    assert workflow["serving"]["kv_service"]["groups"]["verifier_cache"]["ports"]["verifier"][
+    assert workflow["serving"]["state_service"]["groups"]["verifier_cache"]["ports"]["verifier"][
         "cache_0"
     ] == {
         "input": "past_key_values.0.key",

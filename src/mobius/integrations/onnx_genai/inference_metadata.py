@@ -1479,7 +1479,48 @@ def add_policy_components_to_workflow(
             if component.contract.get("role") == "token_sampler":
                 declaration["application_overridable"] = True
         components[name] = declaration
+    declare_request_alignment(workflow)
     return metadata
+
+
+_BATCH_DIMENSION_NAMES = frozenset({"batch", "batch_size", "batch_dim", "b"})
+
+
+def declare_request_alignment(workflow: dict[str, Any]) -> None:
+    """Stamp the request-aligned row axis onto every batch-leading contract.
+
+    The runtime compacts finished rows out of a batch by applying one row
+    permutation to every request-aligned tensor. A contract whose leading axis
+    is the batch symbol but that does not say so is unpermutable, so state,
+    component ports, and outputs would silently drift apart after the first
+    eviction. Deriving the declaration from the admitted graph's own batch
+    symbol keeps alignment a property of the model interface rather than an
+    annotation every workflow builder has to remember.
+    """
+
+    def stamp(contract: Any) -> None:
+        if not isinstance(contract, dict) or "batch_layout" in contract:
+            return
+        shape = contract.get("shape") or []
+        if shape and str(shape[0]) in _BATCH_DIMENSION_NAMES:
+            contract["batch_layout"] = {"kind": "request_aligned", "axis": 0}
+
+    for section in ("inputs", "outputs", "state"):
+        for declaration in (workflow.get(section) or {}).values():
+            if isinstance(declaration, dict):
+                stamp(declaration.get("contract"))
+    for component in (workflow.get("components") or {}).values():
+        ports = component.get("ports", {}) if isinstance(component, dict) else {}
+        for side in ("inputs", "outputs"):
+            for contract in (ports.get(side) or {}).values():
+                stamp(contract)
+    # A cell backed by a state-service group is stored by the runtime, not by
+    # the workflow: the group owns the buffer and the eviction policy, so the
+    # cell also needs an explicit boundary at which the runtime may free it.
+    for declaration in (workflow.get("state") or {}).values():
+        if isinstance(declaration, dict) and declaration.get("service_group"):
+            declaration.setdefault("management", "runtime")
+            declaration.setdefault("release_boundary", declaration.get("scope", "invocation"))
 
 
 def add_adapter_service_to_metadata(

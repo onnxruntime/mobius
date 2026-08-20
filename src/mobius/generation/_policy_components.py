@@ -621,13 +621,18 @@ def build_decoder_state_initializer(
     *,
     token_input: str | None,
     prompt_dtype: ir.DataType | None = None,
-    attention_mask_input: str,
+    attention_mask_input: str | None,
     position_ids_input: str | None,
     cache_inputs: list[str],
     fixed_capacity: bool = False,
     ragged: bool = False,
 ) -> PolicyComponent:
     """Build prompt-derived decoder state, optionally with capture-stable storage."""
+    if fixed_capacity and attention_mask_input is None:
+        raise ValueError(
+            "fixed-capacity decoder state requires an attention-mask input to carry "
+            "each row's logical length"
+        )
     graph, builder = _make_graph("decoder_state_initializer")
     op = builder.op
     decoder_inputs = {value.name: value for value in decoder.graph.inputs}
@@ -687,41 +692,44 @@ def build_decoder_state_initializer(
             attention_shape,
         )
 
-    attention_value = decoder_inputs[attention_mask_input]
-    if fixed_capacity:
-        # Native ORT GenAI binds one persistent full-capacity mask for prefill
-        # and decode, then enables the next logical slot before each decode.
-        attention = op.Cast(
-            op.Less(offsets, op.Unsqueeze(prompt_lengths, [-1])),
-            to=attention_value.dtype,
-        )
-        attention.shape = ir.Shape(["batch", "capacity"])
-        body_attention = op.Identity(attention)
-        body_attention.shape = attention.shape
-    else:
-        offsets = op.Range(
-            op.Constant(value_int=0),
-            sequence_length,
-            op.Constant(value_int=1),
-        )
-        offsets = op.Expand(op.Unsqueeze(offsets, [0]), prompt_shape)
-        attention = op.Cast(
-            op.Less(offsets, op.Unsqueeze(prompt_lengths, [-1])),
-            to=attention_value.dtype,
-        )
-        attention.shape = attention_value.shape
-        body_attention = op.Concat(
-            attention,
-            op.Cast(
-                op.ConstantOfShape(
-                    op.Concat(batch_shape, op.Constant(value_ints=[1]), axis=0),
-                    value=ir.tensor([1]),
-                ),
+    attention = None
+    body_attention = None
+    if attention_mask_input is not None:
+        attention_value = decoder_inputs[attention_mask_input]
+        if fixed_capacity:
+            # Native ORT GenAI binds one persistent full-capacity mask for prefill
+            # and decode, then enables the next logical slot before each decode.
+            attention = op.Cast(
+                op.Less(offsets, op.Unsqueeze(prompt_lengths, [-1])),
                 to=attention_value.dtype,
-            ),
-            axis=1,
-        )
-        body_attention.shape = ir.Shape(["batch", "prompt_sequence + 1"])
+            )
+            attention.shape = ir.Shape(["batch", "capacity"])
+            body_attention = op.Identity(attention)
+            body_attention.shape = attention.shape
+        else:
+            offsets = op.Range(
+                op.Constant(value_int=0),
+                sequence_length,
+                op.Constant(value_int=1),
+            )
+            offsets = op.Expand(op.Unsqueeze(offsets, [0]), prompt_shape)
+            attention = op.Cast(
+                op.Less(offsets, op.Unsqueeze(prompt_lengths, [-1])),
+                to=attention_value.dtype,
+            )
+            attention.shape = attention_value.shape
+            body_attention = op.Concat(
+                attention,
+                op.Cast(
+                    op.ConstantOfShape(
+                        op.Concat(batch_shape, op.Constant(value_ints=[1]), axis=0),
+                        value=ir.tensor([1]),
+                    ),
+                    to=attention_value.dtype,
+                ),
+                axis=1,
+            )
+            body_attention.shape = ir.Shape(["batch", "prompt_sequence + 1"])
     token_slot = op.ConstantOfShape(
         op.Concat(batch_shape, op.Constant(value_ints=[1]), axis=0),
         value=ir.tensor([0], dtype=ir.DataType.INT64),
@@ -747,11 +755,15 @@ def build_decoder_state_initializer(
             [-1],
         )
         body_position.shape = ir.Shape(["batch", 1])
-    builder.add_output(attention, attention_mask_input)
+    if attention_mask_input is not None:
+        assert attention is not None and body_attention is not None
+        builder.add_output(attention, attention_mask_input)
     if position_ids_input is not None:
         assert positions is not None and body_position is not None
         builder.add_output(positions, position_ids_input)
-    builder.add_output(body_attention, "body_attention_mask")
+    if attention_mask_input is not None:
+        assert body_attention is not None
+        builder.add_output(body_attention, "body_attention_mask")
     if position_ids_input is not None:
         builder.add_output(body_position, "body_position_ids")
     builder.add_output(token_slot, "token_slot")
@@ -813,46 +825,53 @@ def build_decoder_state_initializer(
 
 def build_decoder_step_update(
     *,
-    attention_dtype: ir.DataType,
+    attention_dtype: ir.DataType | None,
     position_dtype: ir.DataType | None,
     fixed_capacity: bool = False,
 ) -> PolicyComponent:
     """Build one-token attention-mask and position update."""
+    if attention_dtype is None and position_dtype is None:
+        raise ValueError("decoder step update requires an attention mask or position ids")
+    if attention_dtype is None and fixed_capacity:
+        raise ValueError("fixed-capacity decoder step update requires an attention mask")
     graph, builder = _make_graph("decoder_step_update")
     op = builder.op
-    attention = builder.input(
-        "attention_mask",
-        dtype=attention_dtype,
-        shape=["batch", "context"],
-    )
-    if fixed_capacity:
-        logical_length = builder.input(
-            "logical_length",
-            dtype=ir.DataType.INT64,
-            shape=["batch"],
+    if attention_dtype is not None:
+        attention = builder.input(
+            "attention_mask",
+            dtype=attention_dtype,
+            shape=["batch", "context"],
         )
-        offsets = op.Range(
-            op.Constant(value_int=0),
-            op.Squeeze(op.Shape(attention, start=1, end=2), [0]),
-            op.Constant(value_int=1),
-        )
-        slots = op.Equal(
-            op.Unsqueeze(offsets, [0]),
-            op.Unsqueeze(logical_length, [1]),
-        )
-        next_attention = op.Where(
-            slots,
-            op.CastLike(op.Constant(value_int=1), attention),
-            attention,
-        )
-        next_attention.shape = ir.Shape(["batch", "context"])
-    else:
-        batch_shape = op.Shape(attention, start=0, end=1)
-        one_shape = op.Concat(batch_shape, op.Constant(value_ints=[1]), axis=0)
-        one = op.CastLike(op.ConstantOfShape(one_shape, value=ir.tensor([1])), attention)
-        next_attention = op.Concat(attention, one, axis=1)
-        next_attention.shape = ir.Shape(["batch", "context + 1"])
-    builder.add_output(next_attention, "next_attention_mask")
+        if fixed_capacity:
+            logical_length = builder.input(
+                "logical_length",
+                dtype=ir.DataType.INT64,
+                shape=["batch"],
+            )
+            offsets = op.Range(
+                op.Constant(value_int=0),
+                op.Squeeze(op.Shape(attention, start=1, end=2), [0]),
+                op.Constant(value_int=1),
+            )
+            slots = op.Equal(
+                op.Unsqueeze(offsets, [0]),
+                op.Unsqueeze(logical_length, [1]),
+            )
+            next_attention = op.Where(
+                slots,
+                op.CastLike(op.Constant(value_int=1), attention),
+                attention,
+            )
+            next_attention.shape = ir.Shape(["batch", "context"])
+        else:
+            batch_shape = op.Shape(attention, start=0, end=1)
+            one_shape = op.Concat(batch_shape, op.Constant(value_ints=[1]), axis=0)
+            one = op.CastLike(
+                op.ConstantOfShape(one_shape, value=ir.tensor([1])), attention
+            )
+            next_attention = op.Concat(attention, one, axis=1)
+            next_attention.shape = ir.Shape(["batch", "context + 1"])
+        builder.add_output(next_attention, "next_attention_mask")
     if position_dtype is not None:
         position = builder.input(
             "position_ids",

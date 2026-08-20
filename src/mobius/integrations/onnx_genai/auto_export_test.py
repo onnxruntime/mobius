@@ -208,7 +208,12 @@ def test_dispatch_decoder(tmp_path):
     assert "iteration_increment" not in workflow["components"]
     assert workflow["state"]["token"]["initializer"] == "initializer.token_slot"
     assert workflow["state"]["logits"] == {
-        "contract": {"dtype": "float32", "rank": 2, "shape": ["batch", 128]},
+        "contract": {
+            "dtype": "float32",
+            "rank": 2,
+            "shape": ["batch", 128],
+            "batch_layout": {"kind": "request_aligned", "axis": 0},
+        },
         "scope": "invocation",
         "initializer": "decoder.setup.last_logits",
         "recurrence": {"kind": "invariant"},
@@ -245,11 +250,13 @@ def test_seeded_decoder_sampler_uses_request_controls_and_direct_kv_carry():
         "dtype": "float32",
         "rank": 2,
         "shape": ["batch", "vocabulary"],
+        "batch_layout": {"kind": "request_aligned", "axis": 0},
     }
     assert sampler["ports"]["outputs"]["token"] == {
         "dtype": "int64",
         "rank": 1,
         "shape": ["batch"],
+        "batch_layout": {"kind": "request_aligned", "axis": 0},
     }
     sampler_step = next(
         step
@@ -277,11 +284,8 @@ def test_seeded_decoder_sampler_uses_request_controls_and_direct_kv_carry():
     ]
     assert workflow["state"]["rng_counter"]["class"] == "semantic"
     assert workflow["state"]["rng_counter"]["initializer"] == "request.rng_counter"
-    emit = next(node for node in workflow["steps"][0]["steps"] if node["kind"] == "emit")
-    assert emit["row_ids"] == "slot_ids"
-    assert "emit_row_identity" in workflow["manifest"]["capabilities"]
     assert set(
-        workflow["serving"]["kv_service"]["groups"]["decoder_cache"]["ports"]["model"]
+        workflow["serving"]["state_service"]["groups"]["decoder_cache"]["ports"]["model"]
     ) == {"cache_0", "cache_1"}
     assert workflow["components"]["termination"]["contract"]["version"] == "2"
     assert workflow["components"]["termination"]["contract"]["parameters"] == {
@@ -530,6 +534,7 @@ def test_dispatch_vision_multimodal_pipeline(tmp_path):
         "dtype": "float32",
         "rank": 2,
         "shape": ["batch", 128],
+        "batch_layout": {"kind": "request_aligned", "axis": 0},
     }
     assert workflow["state"]["logits"]["initializer"] == "decoder.setup.last_logits"
     assert (tmp_path / "policies" / "token_sampler.onnx").is_file()

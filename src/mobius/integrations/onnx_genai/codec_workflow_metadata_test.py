@@ -51,6 +51,7 @@ def test_codec_workflow_has_typed_ssa_and_audio_emit():
         "dtype": "float32",
         "rank": 3,
         "shape": ["batch", 1, "audio_samples"],
+        "batch_layout": {"kind": "request_aligned", "axis": 0},
     }
     assert "ports" not in workflow["components"]["encoder"]
     assert "effects" not in workflow["components"]["encoder"]
@@ -177,14 +178,18 @@ def test_real_qwen3_tts_workflow_carries_trained_transitions_and_kv_state():
     assert workflow["state"]["talker_cache_0"]["recurrence"]["kind"] == "bounded"
     assert workflow["state"]["talker_cache_0"]["service_group"] == "talker_cache"
     assert workflow["state"]["predictor_cache_0"]["service_group"] == "predictor_cache"
-    assert workflow["serving"]["kv_service"]["compaction"] is True
     assert workflow["inputs"]["package.slot_ids"] == {
-        "contract": {"dtype": "int64", "rank": 1, "shape": ["batch"]},
+        "contract": {
+            "dtype": "int64",
+            "rank": 1,
+            "shape": ["batch"],
+            "batch_layout": {"kind": "request_aligned", "axis": 0},
+        },
         "role": {"kind": "opaque"},
         "source": {"kind": "application", "name": "serving.slot_ids"},
         "required": True,
     }
-    assert workflow["serving"]["kv_service"]["groups"]["talker_cache"]["ports"]["talker"][
+    assert workflow["serving"]["state_service"]["groups"]["talker_cache"]["ports"]["talker"][
         "talker_cache_0"
     ]["input"].startswith("past_key_values.")
     assert workflow["state"]["predictor_cache_0"]["scope"] == "invocation"

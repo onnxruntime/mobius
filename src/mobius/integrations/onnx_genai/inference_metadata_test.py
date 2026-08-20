@@ -156,6 +156,7 @@ def test_workflow_policy_components_reference_saved_onnx_artifacts(tmp_path):
                 "dtype": "float32",
                 "rank": 2,
                 "shape": ["batch", "vocabulary"],
+                "batch_layout": {"kind": "request_aligned", "axis": 0},
             }
         },
         "outputs": {
@@ -163,6 +164,7 @@ def test_workflow_policy_components_reference_saved_onnx_artifacts(tmp_path):
                 "dtype": "int64",
                 "rank": 1,
                 "shape": ["batch"],
+                "batch_layout": {"kind": "request_aligned", "axis": 0},
             }
         },
     }
