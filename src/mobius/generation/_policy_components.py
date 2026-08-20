@@ -639,6 +639,30 @@ def build_empty_features(dtype: ir.DataType, feature_size: int) -> PolicyCompone
     return _component("mobius.policy.auxiliary@1", graph, {})
 
 
+def rotary_axis_count(position_value: ir.Value) -> int | None:
+    """Number of rotary axes a decoder's ``position_ids`` input carries.
+
+    A plain decoder reads ``(batch, sequence)`` positions and gets ``None``. A
+    decoder with multi-axis rotary embeddings reads
+    ``(sections, batch, sequence)``, where the leading axis is a fixed count of
+    rotary axes and must therefore be a static dimension: it is a property of
+    the exported graph, not of the request.
+    """
+    shape = position_value.shape
+    if shape is None or len(shape) != 3:
+        return None
+    leading = shape[0]
+    sections = getattr(leading, "value", leading)
+    if not isinstance(sections, int):
+        raise TypeError(
+            f"position input {position_value.name!r} declares a rank-3 shape "
+            f"whose leading rotary-axis count {sections!r} is symbolic. The "
+            "number of rotary axes is fixed by the exported graph, so it must "
+            "be a static dimension."
+        )
+    return sections
+
+
 def build_decoder_state_initializer(
     decoder: ir.Model,
     *,
@@ -763,6 +787,7 @@ def build_decoder_state_initializer(
     body_position = None
     if position_ids_input is not None:
         position_value = decoder_inputs[position_ids_input]
+        sections = rotary_axis_count(position_value)
         positions = op.Range(
             op.Constant(value_int=0),
             op.Squeeze(sequence_shape, op.Constant(value_ints=[0])),
@@ -772,12 +797,36 @@ def build_decoder_state_initializer(
             op.Unsqueeze(positions, op.Constant(value_ints=[0])), prompt_shape
         )
         positions = op.Cast(positions, to=position_value.dtype)
-        positions.shape = position_value.shape
+        # (batch, prompt_sequence)
+        positions.shape = ir.Shape(["batch", "prompt_sequence"])
         body_position = op.Unsqueeze(
             op.Cast(prompt_lengths, to=position_value.dtype),
             [-1],
         )
+        # (batch, 1)
         body_position.shape = ir.Shape(["batch", 1])
+        if sections is not None:
+            # A decoder with multi-axis rotary positions reads
+            # (sections, batch, sequence): one position row per rotary axis.
+            # Every axis carries the same sequential position here, which is
+            # what the axes agree on for a pure token stream. A component that
+            # lays media out differently across axes states that layout itself;
+            # this initializer never invents one.
+            positions = op.Expand(
+                op.Unsqueeze(positions, op.Constant(value_ints=[0])),
+                op.Concat(op.Constant(value_ints=[sections]), prompt_shape, axis=0),
+            )
+            positions.shape = ir.Shape([sections, "batch", "prompt_sequence"])
+            body_position = op.Expand(
+                op.Unsqueeze(body_position, op.Constant(value_ints=[0])),
+                op.Concat(
+                    op.Constant(value_ints=[sections]),
+                    batch_shape,
+                    op.Constant(value_ints=[1]),
+                    axis=0,
+                ),
+            )
+            body_position.shape = ir.Shape([sections, "batch", 1])
     if attention_mask_input is not None:
         assert attention is not None and body_attention is not None
         builder.add_output(attention, attention_mask_input)
@@ -858,6 +907,7 @@ def build_decoder_step_update(
     attention_dtype: ir.DataType | None,
     position_dtype: ir.DataType | None,
     fixed_capacity: bool = False,
+    position_sections: int | None = None,
 ) -> PolicyComponent:
     """Build one-token attention-mask and position update."""
     if attention_dtype is None and position_dtype is None:
@@ -901,13 +951,19 @@ def build_decoder_step_update(
             next_attention.shape = ir.Shape(["batch", "context + 1"])
         builder.add_output(next_attention, "next_attention_mask")
     if position_dtype is not None:
+        # A multi-axis rotary decoder carries one position row per rotary axis;
+        # advancing one token advances every axis, so the update is the same
+        # `+1` at either rank and only the declared shape differs.
+        position_shape: list[int | str] = (
+            ["batch", 1] if position_sections is None else [position_sections, "batch", 1]
+        )
         position = builder.input(
             "position_ids",
             dtype=position_dtype,
-            shape=["batch", 1],
+            shape=position_shape,
         )
         next_position = op.Add(position, op.CastLike(op.Constant(value_int=1), position))
-        next_position.shape = ir.Shape(["batch", 1])
+        next_position.shape = ir.Shape(position_shape)
         builder.add_output(next_position, "next_position_ids")
     return _component("mobius.policy.auxiliary@1", graph, {})
 

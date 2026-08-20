@@ -68,6 +68,7 @@ from mobius.generation._policy_components import (
     build_video_latent_permute,
     build_video_latent_unscale,
     build_zeros_like,
+    rotary_axis_count,
 )
 
 __all__ = [
@@ -133,4 +134,5 @@ __all__ = [
     "build_video_latent_permute",
     "build_video_latent_unscale",
     "build_zeros_like",
+    "rotary_axis_count",
 ]

@@ -6,6 +6,7 @@ from __future__ import annotations
 import numpy as np
 import onnx_ir as ir
 import onnxruntime as ort
+import pytest
 
 from mobius._model_package import ModelPackage
 from mobius.generation import (
@@ -46,6 +47,7 @@ from mobius.generation import (
     build_termination_batch_initializer,
     build_token_state_update,
     build_true_cfg,
+    rotary_axis_count,
     build_unpack_latents_2x2,
     build_video_conv_cache_initializer,
     build_video_decode_chunk,
@@ -1374,3 +1376,99 @@ def test_true_cfg_is_identity_at_unit_guidance(tmp_path):
         {"conditional": cond, "unconditional": uncond},
     )
     np.testing.assert_allclose(actual, cond, rtol=1e-5, atol=1e-5)
+
+
+def _multi_axis_decoder(sections) -> ir.Model:
+    """A decoder whose ``position_ids`` carries `sections` rotary axes."""
+    inputs = [
+        ir.Value(
+            name="input_ids",
+            type=ir.TensorType(ir.DataType.INT64),
+            shape=ir.Shape(["batch", "sequence"]),
+        ),
+        ir.Value(
+            name="attention_mask",
+            type=ir.TensorType(ir.DataType.INT64),
+            shape=ir.Shape(["batch", "past_sequence + sequence"]),
+        ),
+        ir.Value(
+            name="position_ids",
+            type=ir.TensorType(ir.DataType.INT64),
+            shape=ir.Shape([sections, "batch", "sequence"]),
+        ),
+        ir.Value(
+            name="past_key_values.0.key",
+            type=ir.TensorType(ir.DataType.FLOAT),
+            shape=ir.Shape(["batch", 2, "past_sequence", 4]),
+        ),
+    ]
+    return ir.Model(ir.Graph(inputs, [], nodes=[], name="decoder"), ir_version=11)
+
+
+def test_rotary_axis_count_reads_the_declared_leading_dimension():
+    decoder = _multi_axis_decoder(3)
+    positions = {value.name: value for value in decoder.graph.inputs}["position_ids"]
+    assert rotary_axis_count(positions) == 3
+
+
+def test_rotary_axis_count_is_none_for_plain_rank_2_positions():
+    # A plain decoder has no rotary-axis dimension to broadcast over, so the
+    # policy graphs keep emitting (batch, sequence) positions.
+    positions = ir.Value(
+        name="position_ids",
+        type=ir.TensorType(ir.DataType.INT64),
+        shape=ir.Shape(["batch", "sequence"]),
+    )
+    assert rotary_axis_count(positions) is None
+
+
+def test_rotary_axis_count_refuses_a_symbolic_axis_count():
+    # The number of rotary axes is fixed by the exported graph. A symbolic
+    # leading dimension means the export did not state it, and guessing would
+    # silently mis-shape every position the decoder reads.
+    positions = ir.Value(
+        name="position_ids",
+        type=ir.TensorType(ir.DataType.INT64),
+        shape=ir.Shape(["sections", "batch", "sequence"]),
+    )
+    with pytest.raises(TypeError, match="symbolic"):
+        rotary_axis_count(positions)
+
+
+def test_multi_axis_positions_are_broadcast_to_every_rotary_axis(tmp_path):
+    # A 3D-rotary decoder reads (sections, batch, sequence) positions. The
+    # prefill range and the per-step increment must be shaped for it, or the
+    # decoder silently reads a rank-2 tensor as one axis of three.
+    initializer = build_decoder_state_initializer(
+        _multi_axis_decoder(3),
+        token_input="input_ids",
+        attention_mask_input="attention_mask",
+        position_ids_input="position_ids",
+        cache_inputs=["past_key_values.0.key"],
+    )
+    outputs = _run(
+        initializer,
+        tmp_path,
+        {"prompt_tokens": np.array([[3, 4, 5]], np.int64)},
+    )
+    prefill_positions, body_positions = outputs[1], outputs[3]
+    assert prefill_positions.shape == (3, 1, 3)
+    np.testing.assert_array_equal(prefill_positions, np.broadcast_to([[0, 1, 2]], (3, 1, 3)))
+    assert body_positions.shape == (3, 1, 1)
+    np.testing.assert_array_equal(body_positions, np.full((3, 1, 1), 3))
+
+    updated = _run(
+        build_decoder_step_update(
+            attention_dtype=ir.DataType.INT64,
+            position_dtype=ir.DataType.INT64,
+            position_sections=3,
+        ),
+        tmp_path,
+        {
+            "attention_mask": outputs[2],
+            "position_ids": body_positions,
+        },
+    )
+    np.testing.assert_array_equal(updated[0], [[1, 1, 1, 1, 1]])
+    assert updated[1].shape == (3, 1, 1)
+    np.testing.assert_array_equal(updated[1], np.full((3, 1, 1), 4))

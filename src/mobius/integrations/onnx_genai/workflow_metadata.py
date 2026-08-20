@@ -66,6 +66,7 @@ from mobius.generation import (
     build_video_latent_permute,
     build_video_latent_unscale,
     build_zeros_like,
+    rotary_axis_count,
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
     _name_image_preprocessing_program,
@@ -2407,6 +2408,8 @@ def _accumulated_contract(contract: dict[str, Any], symbol: str) -> dict[str, An
     shape = list(contract["shape"])
     shape[-1] = symbol
     return {**contract, "shape": shape}
+
+
 def _cache_cell(port: str) -> str:
     """State-cell name for a ``conv_cache.<path>`` decoder port."""
     return "conv_cache_" + port[len("conv_cache.") :].replace(".", "_")
@@ -4058,6 +4061,9 @@ def build_vlm_workflow_metadata(
             attention_dtype=attention_input.dtype,
             position_dtype=position_input.dtype if position_input is not None else None,
             fixed_capacity=fixed_capacity,
+            position_sections=(
+                rotary_axis_count(position_input) if position_input is not None else None
+            ),
         ),
     )
     pkg.add_policy_component("token_sampler", build_seeded_categorical_sampler())
@@ -5962,6 +5968,9 @@ def _build_autoregressive_workflow_metadata(
                 attention_dtype=attention_input.dtype,
                 position_dtype=position_input.dtype if position_input is not None else None,
                 fixed_capacity=fixed_capacity,
+                position_sections=rotary_axis_count(position_input)
+                if position_input is not None
+                else None,
             ),
         )
     elif position_input is not None:
@@ -5971,6 +5980,7 @@ def _build_autoregressive_workflow_metadata(
                 attention_dtype=None,
                 position_dtype=position_input.dtype,
                 fixed_capacity=False,
+                position_sections=rotary_axis_count(position_input),
             ),
         )
     needs_token_cast = token_input.dtype != ir.DataType.INT64
