@@ -20,7 +20,9 @@ __all__ = [
     "FusedGateUpCausalLMModel",
     "ChatGLMCausalLMModel",
     "CodeGenCausalLMModel",
+    "AutoencoderKLCogVideoXModel",
     "CogVideoXTransformer3DModel",
+    "CogVideoXVAEConfig",
     "CohereCausalLMModel",
     "ControlNetModel",
     "Cosmos3EdgeTextModel",
@@ -188,6 +190,10 @@ from mobius.models.blip2 import Blip2Model
 from mobius.models.chatglm import ChatGLMCausalLMModel
 from mobius.models.clip import CLIPVisionModel, SigLIPVisionModel
 from mobius.models.cogvideox import CogVideoXTransformer3DModel
+from mobius.models.cogvideox_vae import (
+    AutoencoderKLCogVideoXModel,
+    CogVideoXVAEConfig,
+)
 from mobius.models.cohere import CohereCausalLMModel
 from mobius.models.controlnet import ControlNetModel
 from mobius.models.cosmos import Cosmos3EdgeTextModel, Cosmos3EdgeVLModel

@@ -4459,6 +4459,77 @@ class TestBuildCogVideoXGraph:
         assert len(sample_input.shape) == 5  # [B, T, C, H, W]
 
 
+class TestBuildCogVideoXVAEGraph:
+    """Verify the CogVideoX causal 3D VAE decoder graph construction."""
+
+    @staticmethod
+    def _config():
+        from mobius.models.cogvideox_vae import CogVideoXVAEConfig
+
+        return CogVideoXVAEConfig(
+            in_channels=3,
+            out_channels=3,
+            latent_channels=4,
+            block_out_channels=(8, 8, 8, 8),
+            layers_per_block=1,
+            norm_num_groups=2,
+            temporal_compression_ratio=4,
+            scaling_factor=1.15258426,
+        )
+
+    def test_video_vae_graph_builds_with_paired_conv_caches(self):
+        from mobius.models.cogvideox_vae import AutoencoderKLCogVideoXModel
+        from mobius.tasks import VideoVAETask
+        from mobius.tasks._video_vae import (
+            CONV_CACHE_INPUT_PREFIX,
+            CONV_CACHE_OUTPUT_PREFIX,
+            CONV_CACHE_SCALE_METADATA,
+        )
+
+        config = self._config()
+        model = VideoVAETask().build(AutoencoderKLCogVideoXModel(config), config)["decoder"]
+
+        assert model.graph is not None
+        latent = next(v for v in model.graph.inputs if v.name == "latent_sample")
+        # [B, C, T, H, W]: the temporal axis is explicit, and the frame count is
+        # a free dimension rather than a baked clip length.
+        assert len(latent.shape) == 5
+        assert str(latent.shape[2]) == "latent_frames"
+
+        sample = next(v for v in model.graph.outputs if v.name == "sample")
+        assert len(sample.shape) == 5
+        assert int(sample.shape[1]) == config.out_channels
+
+        cache_inputs = {
+            v.name[len(CONV_CACHE_INPUT_PREFIX) :]
+            for v in model.graph.inputs
+            if v.name.startswith(CONV_CACHE_INPUT_PREFIX)
+        }
+        cache_outputs = {
+            v.name[len(CONV_CACHE_OUTPUT_PREFIX) :]
+            for v in model.graph.outputs
+            if v.name.startswith(CONV_CACHE_OUTPUT_PREFIX)
+        }
+        # Every cached convolution has to be readable and writable, or a clip
+        # decoded in chunks would silently lose the frames before each chunk.
+        assert cache_inputs
+        assert cache_inputs == cache_outputs
+        for name in cache_inputs:
+            key = f"{CONV_CACHE_SCALE_METADATA}{CONV_CACHE_INPUT_PREFIX}{name}"
+            assert key in model.metadata_props
+
+    def test_video_vae_cache_spec_matches_upsampled_resolutions(self):
+        from mobius.models.cogvideox_vae import AutoencoderKLCogVideoXModel
+
+        config = self._config()
+        module = AutoencoderKLCogVideoXModel(config)
+        scales = {entry.name: entry.spatial_scale for entry in module.conv_cache_spec()}
+        assert scales["conv_in"] == 1
+        # Three upsampling stages for four blocks, so the last cached
+        # convolutions live at the full frame resolution.
+        assert scales["conv_out"] == 2 ** (len(config.block_out_channels) - 1)
+
+
 class TestBuildAdapterGraph:
     """Verify T2I-Adapter and IP-Adapter graph construction."""
 

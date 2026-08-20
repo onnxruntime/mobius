@@ -80,6 +80,7 @@ __all__ = [
     "TTSTask",
     "VAETask",
     "VideoDenoisingTask",
+    "VideoVAETask",
     "VisionLanguageTask",
     "VisionEncoderDecoderTask",
     "WorldModelTask",
@@ -146,6 +147,7 @@ from mobius.tasks._ssm_causal_lm import SSM2CausalLMTask, SSMCausalLMTask
 from mobius.tasks._tts import TTSTask
 from mobius.tasks._vae import VAETask
 from mobius.tasks._video_denoising import VideoDenoisingTask
+from mobius.tasks._video_vae import VideoVAETask
 from mobius.tasks._vision_encoder_decoder import VisionEncoderDecoderTask
 from mobius.tasks._vision_language import Qwen3VLVisionLanguageTask
 from mobius.tasks._vision_language_3model import (
@@ -228,6 +230,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "ssm2-text-generation": SSM2CausalLMTask,
     "tts": TTSTask,
     "video-denoising": VideoDenoisingTask,
+    "video-vae": VideoVAETask,
     "world-model": WorldModelTask,
 }
 
