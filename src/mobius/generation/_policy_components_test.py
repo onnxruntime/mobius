@@ -15,6 +15,7 @@ from mobius.generation import (
     build_batch_minimum,
     build_boolean_not,
     build_code_frame_update,
+    build_counter_rng_normal,
     build_decoder_state_initializer,
     build_decoder_step_update,
     build_empty_features,
@@ -23,17 +24,23 @@ from mobius.generation import (
     build_euler_solver_step,
     build_grammar_logits_processor,
     build_greedy_sampler,
+    build_guidance_combine,
     build_integer_minimum,
     build_integer_row_broadcast,
     build_last_token_logits,
     build_masked_token_update,
     build_model_token_cast,
+    build_multistep_solver_step,
     build_proposal_metrics,
+    build_scalar_constant,
     build_seeded_categorical_sampler,
+    build_shape_constant,
     build_speculative_acceptance,
     build_speculative_state_rollback,
+    build_tensor_scale,
     build_termination_batch_initializer,
     build_token_state_update,
+    build_zeros_like,
 )
 from mobius.generation._policy_components import _make_graph
 
@@ -897,6 +904,163 @@ def test_euler_model_input_scales_by_sigma(tmp_path):
         },
     )
     np.testing.assert_allclose(scaled, 10.0 / np.sqrt(5.0), rtol=1e-6)
+
+
+def test_guidance_combine_extrapolates_per_row(tmp_path):
+    # Classifier-free guidance: uncond + scale * (cond - uncond), with the scale
+    # supplied per request row rather than baked into the graph.
+    unconditional = np.array([[[[1.0]]], [[[2.0]]]], dtype=np.float32)
+    conditional = np.array([[[[3.0]]], [[[-2.0]]]], dtype=np.float32)
+    (guided,) = _run(
+        build_guidance_combine(),
+        tmp_path,
+        {
+            "unconditional": unconditional,
+            "conditional": conditional,
+            "scale": np.array([7.5, 0.0], np.float32),
+        },
+    )
+    np.testing.assert_allclose(
+        guided,
+        unconditional
+        + np.array([7.5, 0.0], np.float32).reshape(2, 1, 1, 1) * (conditional - unconditional),
+        rtol=1e-6,
+    )
+
+
+def test_multistep_solver_matches_dpmsolverpp_second_order(tmp_path):
+    # Reproduces diffusers' DPMSolverMultistepScheduler.step for dpmsolver++
+    # midpoint updates, including the first-order fallback on the first step.
+    schedule = np.array([8.0, 4.0, 1.0, 0.0], np.float32)
+    sample = np.linspace(-1.0, 1.0, 8, dtype=np.float32).reshape(1, 2, 2, 2)
+    estimate = np.linspace(0.5, -0.5, 8, dtype=np.float32).reshape(1, 2, 2, 2)
+    history = np.full_like(sample, 0.25)
+
+    def reference(sample, estimate, history, step, first_order):
+        sigma, sigma_next = schedule[step], schedule[step + 1]
+        alpha = 1.0 / np.sqrt(sigma**2 + 1.0)
+        alpha_next = 1.0 / np.sqrt(sigma_next**2 + 1.0)
+        noise, noise_next = sigma * alpha, sigma_next * alpha_next
+        x0 = (sample - noise * estimate) / alpha
+        ratio = noise_next / noise
+        if first_order:
+            return ratio * sample - alpha_next * (sigma_next / sigma - 1.0) * x0
+        step_size = np.log(sigma) - np.log(sigma_next)
+        previous = np.log(schedule[step - 1]) - np.log(sigma)
+        difference = (step_size / previous) * (x0 - history)
+        return ratio * sample - alpha_next * (sigma_next / sigma - 1.0) * (
+            x0 + 0.5 * difference
+        )
+
+    # Step 0 has no usable history, so the solver must fall back to first order.
+    next_state, next_history = _run(
+        build_multistep_solver_step(),
+        tmp_path,
+        {
+            "sample": sample,
+            "estimate": estimate,
+            "history": history,
+            "step": np.array([0], np.int64),
+            "schedule": schedule,
+        },
+    )
+    np.testing.assert_allclose(
+        next_state, reference(sample, estimate, history, 0, True), rtol=1e-5, atol=1e-6
+    )
+
+    # Step 1 uses the carried estimate; the returned history is the new one.
+    second_state, second_history = _run(
+        build_multistep_solver_step(),
+        tmp_path,
+        {
+            "sample": sample,
+            "estimate": estimate,
+            "history": next_history,
+            "step": np.array([1], np.int64),
+            "schedule": schedule,
+        },
+    )
+    np.testing.assert_allclose(
+        second_state,
+        reference(sample, estimate, next_history, 1, False),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+    # The final step drops back to first order the way lower_order_final does.
+    final_state, _ = _run(
+        build_multistep_solver_step(),
+        tmp_path,
+        {
+            "sample": sample,
+            "estimate": estimate,
+            "history": second_history,
+            "step": np.array([2], np.int64),
+            "schedule": schedule,
+        },
+    )
+    np.testing.assert_allclose(
+        final_state,
+        reference(sample, estimate, second_history, 2, True),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+def test_counter_rng_is_reproducible_and_row_private(tmp_path):
+    component = build_counter_rng_normal()
+    feeds = {
+        "seed": np.array([1234, 4321], np.int64),
+        "offset": np.array([0, 0], np.int64),
+        "row_shape": np.array([4, 8, 8], np.int64),
+    }
+    noise, next_offset = _run(component, tmp_path, feeds)
+    assert noise.shape == (2, 4, 8, 8)
+    np.testing.assert_array_equal(next_offset, [1, 1])
+
+    repeat, _ = _run(component, tmp_path, feeds)
+    np.testing.assert_array_equal(noise, repeat)
+
+    # A row's draw depends only on its own seed, not on its batch position.
+    swapped, _ = _run(
+        component,
+        tmp_path,
+        {**feeds, "seed": np.array([4321, 1234], np.int64)},
+    )
+    np.testing.assert_array_equal(swapped[0], noise[1])
+    np.testing.assert_array_equal(swapped[1], noise[0])
+
+    # Advancing the counter draws a different, decorrelated block.
+    advanced, advanced_offset = _run(
+        component,
+        tmp_path,
+        {**feeds, "offset": np.array([1, 1], np.int64)},
+    )
+    np.testing.assert_array_equal(advanced_offset, [2, 2])
+    assert np.abs(advanced - noise).max() > 1e-3
+    assert abs(float(np.corrcoef(advanced.ravel(), noise.ravel())[0, 1])) < 0.1
+    # Box-Muller output must look standard normal.
+    assert abs(float(noise.mean())) < 0.1
+    assert abs(float(noise.std()) - 1.0) < 0.1
+
+
+def test_tensor_scale_and_zeros_like_shape_from_their_input(tmp_path):
+    sample = np.arange(12, dtype=np.float32).reshape(1, 3, 2, 2)
+    (scaled,) = _run(
+        build_tensor_scale(),
+        tmp_path,
+        {"tensor": sample, "scale": np.array([0.5], np.float32)},
+    )
+    np.testing.assert_allclose(scaled, sample * 0.5)
+    (zeros,) = _run(build_zeros_like(), tmp_path, {"reference": sample})
+    np.testing.assert_array_equal(zeros, np.zeros_like(sample))
+
+
+def test_scalar_and_shape_constants_publish_their_values(tmp_path):
+    (value,) = _run(build_scalar_constant(0.18215), tmp_path, {})
+    np.testing.assert_allclose(value, 0.18215, rtol=1e-6)
+    (shape,) = _run(build_shape_constant([4, 64, 64]), tmp_path, {})
+    np.testing.assert_array_equal(shape, [4, 64, 64])
 
 
 def test_code_frame_update_accepts_scalar_loop_index(tmp_path):

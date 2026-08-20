@@ -78,7 +78,7 @@ def attach_policy_components(
         "greedy": build_greedy_sampler,
         "seeded_categorical": build_seeded_categorical_sampler,
     }
-    solvers = {"euler": build_euler_solver_step}
+    solvers = SOLVER_BUILDERS
     if capabilities.sampler not in {None, *builders}:
         raise ValueError(f"Unsupported sampler policy {capabilities.sampler!r}")
     if capabilities.solver not in {None, *solvers}:
@@ -1524,6 +1524,171 @@ def build_eos_termination(*, row_selective: bool = False) -> PolicyComponent:
     )
 
 
+def build_scalar_constant(value: float) -> PolicyComponent:
+    """Materialize one producer-selected scalar as a rank-1 tensor."""
+    graph, builder = _make_graph("scalar_constant")
+    constant = builder.op.Constant(value=ir.tensor([value], dtype=ir.DataType.FLOAT))
+    constant.shape = ir.Shape([1])
+    builder.add_output(constant, "value")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_shape_constant(dims: list[int]) -> PolicyComponent:
+    """Materialize a producer-selected integer shape vector."""
+    graph, builder = _make_graph("shape_constant")
+    constant = builder.op.Constant(
+        value=ir.tensor([int(dim) for dim in dims], dtype=ir.DataType.INT64)
+    )
+    constant.shape = ir.Shape([len(dims)])
+    builder.add_output(constant, "shape")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_tensor_scale(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponent:
+    """Scale a rank-4 state tensor by a broadcast scalar factor."""
+    graph, builder = _make_graph("tensor_scale")
+    op = builder.op
+    tensor = builder.input("tensor", dtype, ["batch", "channels", "height", "width"])
+    scale = builder.input("scale", ir.DataType.FLOAT, [1])
+    scaled = op.Mul(tensor, op.Cast(scale, to=dtype))
+    scaled.shape = tensor.shape
+    builder.add_output(scaled, "scaled")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_zeros_like(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponent:
+    """Produce a zero tensor shaped like its reference, for state initializers."""
+    graph, builder = _make_graph("zeros_like")
+    op = builder.op
+    reference = builder.input("reference", dtype, ["batch", "channels", "height", "width"])
+    zeros = op.Mul(reference, op.Cast(op.Constant(value_float=0.0), to=dtype))
+    zeros.shape = reference.shape
+    builder.add_output(zeros, "zeros")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_guidance_combine(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponent:
+    """Combine two conditioned estimates by a per-row guidance scale.
+
+    ``estimate = unconditional + scale * (conditional - unconditional)`` is the
+    classifier-free-guidance extrapolation. The scale is an ordinary per-row
+    tensor input, so a caller can vary it per request without a rebuild.
+    """
+    graph, builder = _make_graph("guidance_combine")
+    op = builder.op
+    unconditional = builder.input(
+        "unconditional", dtype, ["batch", "channels", "height", "width"]
+    )
+    conditional = builder.input("conditional", dtype, ["batch", "channels", "height", "width"])
+    scale = builder.input("scale", ir.DataType.FLOAT, ["batch"])
+    # (batch,) -> (batch, 1, 1, 1) so the row scale broadcasts over the latent.
+    factor = op.Unsqueeze(op.Cast(scale, to=dtype), op.Constant(value_ints=[1, 2, 3]))
+    estimate = op.Add(unconditional, op.Mul(factor, op.Sub(conditional, unconditional)))
+    estimate.shape = unconditional.shape
+    builder.add_output(estimate, "estimate")
+    return _component(
+        "onnx-genai.guidance-combine@1",
+        graph,
+        {
+            "role": "guidance_combine",
+            "unconditional": "unconditional",
+            "conditional": "conditional",
+            "scale": "scale",
+            "estimate": "estimate",
+        },
+    )
+
+
+_RNG_MODULUS = 2147483647
+_RNG_MULTIPLIER = 48271
+_RNG_STRIDE = 2654435761
+
+
+def _counter_uniform(op, key, counter):
+    """Map a counter-based ``(key, counter)`` pair onto a uniform in ``(0, 1)``.
+
+    The stream is a pure function of its inputs, so a row's noise depends only
+    on its own seed and offset and never on batch position or iteration order.
+    """
+    modulus = op.Constant(value_int=_RNG_MODULUS)
+    multiplier = op.Constant(value_int=_RNG_MULTIPLIER)
+    state = op.Mod(
+        op.Add(
+            op.Add(key, op.Constant(value_int=1)),
+            op.Mul(counter, op.Constant(value_int=_RNG_STRIDE)),
+        ),
+        modulus,
+        fmod=0,
+    )
+    for _ in range(3):
+        state = op.Mod(op.Mul(state, multiplier), modulus, fmod=0)
+        # Integer division stands in for a right shift: BitShift is unsigned-only.
+        state = op.BitwiseXor(state, op.Div(state, op.Constant(value_int=2048)))
+        state = op.Mod(op.Mul(state, multiplier), modulus, fmod=0)
+    # Shift off zero so the logarithm in the Box-Muller transform stays finite.
+    return op.Div(
+        op.Cast(op.Add(state, op.Constant(value_int=1)), to=ir.DataType.FLOAT),
+        op.Constant(value_float=float(_RNG_MODULUS + 2)),
+    )
+
+
+def build_counter_rng_normal(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponent:
+    """Draw standard-normal noise from explicit counter RNG state.
+
+    Inputs are a per-row ``seed``, a per-row ``offset`` counter, and the target
+    ``shape``. The component is pure: it consumes counter state and returns the
+    advanced counter, so RNG progress is loop-carried workflow state rather than
+    hidden session state inside an operator.
+    """
+    graph, builder = _make_graph("counter_rng_normal")
+    op = builder.op
+    seed = builder.input("seed", ir.DataType.INT64, ["batch"])
+    offset = builder.input("offset", ir.DataType.INT64, ["batch"])
+    row_shape = builder.input("row_shape", ir.DataType.INT64, ["row_rank"])
+
+    # The batch extent comes from the per-row seed, so the draw is always
+    # request-aligned no matter how many rows the runtime batched together.
+    shape = op.Concat(op.Shape(seed), row_shape, axis=0)
+    row_elements = op.ReduceProd(row_shape, keepdims=1)
+    # (row_elements,) counter positions, shared by every row's private stream.
+    positions = op.Range(
+        op.Constant(value_int=0),
+        op.Squeeze(row_elements, op.Constant(value_ints=[0])),
+        op.Constant(value_int=1),
+    )
+    positions = op.Unsqueeze(positions, op.Constant(value_ints=[0]))
+    base = op.Mul(op.Unsqueeze(offset, op.Constant(value_ints=[1])), row_elements)
+    counter = op.Add(base, positions)
+    key = op.Unsqueeze(seed, op.Constant(value_ints=[1]))
+
+    # Box-Muller over two independent counter blocks keeps the draw stateless.
+    uniform_radius = _counter_uniform(op, key, counter)
+    uniform_angle = _counter_uniform(
+        op, key, op.Add(counter, op.Mul(row_elements, op.Constant(value_int=2)))
+    )
+    radius = op.Sqrt(op.Mul(op.Constant(value_float=-2.0), op.Log(uniform_radius)))
+    angle = op.Mul(op.Constant(value_float=6.283185307179586), uniform_angle)
+    flat = op.Mul(radius, op.Cos(angle))
+    noise = op.Cast(op.Reshape(flat, shape), to=dtype)
+    noise.shape = ir.Shape(["batch", "channels", "height", "width"])
+    next_offset = op.Add(offset, op.Constant(value_int=1))
+    next_offset.shape = ir.Shape(["batch"])
+    builder.add_output(noise, "noise")
+    builder.add_output(next_offset, "next_offset")
+    return _component(
+        "onnx-genai.counter-rng@1",
+        graph,
+        {
+            "role": "counter_rng",
+            "seed": "seed",
+            "offset": "offset",
+            "row_shape": "row_shape",
+            "noise": "noise",
+            "next_offset": "next_offset",
+        },
+    )
+
+
 def build_euler_model_input(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponent:
     """Scale a latent for the Euler denoiser input at the current sigma."""
     graph, builder = _make_graph("euler_model_input")
@@ -1582,6 +1747,113 @@ def build_euler_solver_step(
         },
         "solver",
     )
+
+
+def build_multistep_solver_step(
+    dtype: ir.DataType = ir.DataType.FLOAT,
+) -> PolicyComponent:
+    """Build a second-order multistep solver update with explicit history state.
+
+    This is the DPM-Solver++(2M) midpoint update expressed entirely in ONNX. The
+    solver's memory - the previous data-space estimate - is an ordinary tensor
+    port, so the workflow carries it as declared state instead of the runtime
+    holding hidden scheduler attributes.
+
+    ``next = (sig_next/sig_now) * sample - alpha_next * (sig_next/sig_now_ratio - 1)
+    * (D0 + 0.5 * D1)`` where ``D0`` is the current data estimate and ``D1`` the
+    finite difference against the previous one. The first and last steps have no
+    usable history, so ``D1`` is masked to zero there, which reduces the update to
+    the first-order form exactly as a multistep scheme's warm-up and final step do.
+    """
+    graph, builder = _make_graph("multistep_solver_step")
+    op = builder.op
+    sample = builder.input("sample", dtype, ["batch", "channels", "height", "width"])
+    estimate = builder.input("estimate", dtype, ["batch", "channels", "height", "width"])
+    history = builder.input("history", dtype, ["batch", "channels", "height", "width"])
+    step = builder.input("step", ir.DataType.INT64, ["batch"])
+    schedule = builder.input("schedule", ir.DataType.FLOAT, ["schedule_length"])
+
+    one = op.Constant(value_int=1)
+    zero = op.Constant(value_int=0)
+    final_index = op.Sub(op.Shape(schedule, start=0, end=1), op.Constant(value_ints=[1]))
+    next_step = op.Min(op.Add(step, one), final_index)
+    previous_step = op.Max(op.Sub(step, one), zero)
+    sigma_now = op.Gather(schedule, step, axis=0)
+    sigma_next = op.Gather(schedule, next_step, axis=0)
+    sigma_previous = op.Gather(schedule, previous_step, axis=0)
+
+    def alpha(sigma):
+        return op.Div(
+            op.Constant(value_float=1.0),
+            op.Sqrt(op.Add(op.Mul(sigma, sigma), op.Constant(value_float=1.0))),
+        )
+
+    alpha_now = alpha(sigma_now)
+    alpha_next = alpha(sigma_next)
+    # The variance-preserving noise level, sigma_t in the DPM-Solver derivation.
+    noise_now = op.Mul(sigma_now, alpha_now)
+    noise_next = op.Mul(sigma_next, alpha_next)
+
+    def row_scalar(value):
+        return op.Unsqueeze(op.Cast(value, to=dtype), op.Constant(value_ints=[1, 2, 3]))
+
+    # Data-space estimate x0 from the epsilon-space model output.
+    data_estimate = op.Div(
+        op.Sub(sample, op.Mul(row_scalar(noise_now), estimate)),
+        row_scalar(alpha_now),
+    )
+    ratio = op.Div(sigma_next, sigma_now)
+    sample_coefficient = row_scalar(op.Div(noise_next, noise_now))
+    data_coefficient = row_scalar(
+        op.Mul(alpha_next, op.Sub(ratio, op.Constant(value_float=1.0)))
+    )
+
+    # Half-log-SNR spacing ratio; lambda(sigma) = -log(sigma) for this schedule.
+    interval = op.Sub(op.Log(sigma_now), op.Log(sigma_next))
+    previous_interval = op.Sub(op.Log(sigma_previous), op.Log(sigma_now))
+    difference = op.Mul(
+        row_scalar(op.Div(interval, previous_interval)),
+        op.Sub(data_estimate, history),
+    )
+    warm = op.Greater(step, zero)
+    penultimate = op.Less(op.Add(step, one), final_index)
+    usable = op.Unsqueeze(op.And(warm, penultimate), op.Constant(value_ints=[1, 2, 3]))
+    difference = op.Where(usable, difference, op.Cast(op.Constant(value_float=0.0), to=dtype))
+
+    next_state = op.Sub(
+        op.Mul(sample_coefficient, sample),
+        op.Mul(
+            data_coefficient,
+            op.Add(
+                data_estimate,
+                op.Mul(op.Cast(op.Constant(value_float=0.5), to=dtype), difference),
+            ),
+        ),
+    )
+    next_state.shape = sample.shape
+    data_estimate.shape = sample.shape
+    builder.add_output(next_state, "next_state")
+    builder.add_output(data_estimate, "next_history")
+    return _component(
+        "onnx-genai.solver-step@1",
+        graph,
+        {
+            "role": "solver_step",
+            "state": "sample",
+            "estimate": "estimate",
+            "history": "history",
+            "step": "step",
+            "schedule": "schedule",
+            "next_state": "next_state",
+            "next_history": "next_history",
+        },
+    )
+
+
+SOLVER_BUILDERS = {
+    "euler": build_euler_solver_step,
+    "multistep": build_multistep_solver_step,
+}
 
 
 def build_masked_token_update() -> PolicyComponent:

@@ -551,12 +551,100 @@ def test_workflow_vlm_rejects_kv_dtype_override(tmp_path):
         )
 
 
-def test_text_diffusion_requires_explicit_unguided_mode(tmp_path):
-    with pytest.raises(ValueError, match=r"pass guidance_scale=1\.0 explicitly"):
+def test_text_diffusion_requires_explicit_guidance_scale(tmp_path):
+    with pytest.raises(ValueError, match="must declare its guidance"):
         write_onnx_genai_config(
             _diffusion_package(text=True),
             str(tmp_path),
         )
+
+
+def test_guidance_scale_requires_a_text_conditioned_package(tmp_path):
+    with pytest.raises(ValueError, match="requires a text-conditioned diffusion package"):
+        write_onnx_genai_config(
+            _diffusion_package(),
+            str(tmp_path),
+            guidance_scale=7.5,
+        )
+
+
+def test_dispatch_guided_diffusion_runs_the_denoiser_twice(tmp_path):
+    arts = write_onnx_genai_config(
+        _diffusion_package(text=True),
+        str(tmp_path),
+        num_inference_steps=4,
+        guidance_scale=7.5,
+    )
+    with open(arts["inference_metadata"]) as handle:
+        meta = yaml.safe_load(handle)
+    workflow = meta["pipeline"]["workflow"]
+    setup = workflow["steps"][0]["setup"]
+    # The prompt and the negative prompt each get their own conditioning pass.
+    assert [node.get("component") for node in setup].count("text_encoder") == 2
+    negative = next(
+        node
+        for node in setup
+        if node["inputs"].get("input_ids") == "request.negative_input_ids"
+    )
+    assert negative["outputs"]["encoder_hidden_states"] == "conditioning.unconditional"
+    body = workflow["steps"][0]["steps"]
+    denoiser_calls = [node for node in body if node.get("component") == "denoiser"]
+    assert [node["outputs"]["noise_pred"] for node in denoiser_calls] == [
+        "denoiser.unconditional",
+        "denoiser.conditional",
+    ]
+    combine = next(node for node in body if node.get("component") == "guidance_combine")
+    assert combine["inputs"] == {
+        "unconditional": "denoiser.unconditional",
+        "conditional": "denoiser.conditional",
+        "scale": "request.guidance_scale",
+    }
+    assert combine["outputs"] == {"estimate": "denoiser.estimate"}
+    assert (tmp_path / "policies" / "guidance_combine.onnx").is_file()
+
+
+def test_dispatch_multistep_diffusion_carries_solver_history(tmp_path):
+    import json
+
+    source = tmp_path / "ckpt"
+    (source / "scheduler").mkdir(parents=True)
+    (source / "scheduler" / "scheduler_config.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "DPMSolverMultistepScheduler",
+                "beta_schedule": "scaled_linear",
+                "algorithm_type": "dpmsolver++",
+                "solver_order": 2,
+                "solver_type": "midpoint",
+                "lower_order_final": True,
+                "final_sigmas_type": "zero",
+            }
+        )
+    )
+    arts = write_onnx_genai_config(
+        _diffusion_package(text=True),
+        str(tmp_path / "out"),
+        num_inference_steps=4,
+        guidance_scale=1.0,
+        source=str(source),
+    )
+    with open(arts["inference_metadata"]) as handle:
+        meta = yaml.safe_load(handle)
+    workflow = meta["pipeline"]["workflow"]
+    assert "history" in workflow["state"]
+    carried = {carry["cell"]: carry["next"] for carry in workflow["steps"][0]["carried"]}
+    assert "history.body" in carried.values()
+    body = workflow["steps"][0]["steps"]
+    solver = next(node for node in body if node.get("component") == "solver_step")
+    history_cell = next(cell for cell, value in carried.items() if value == "history.body")
+    assert solver["inputs"]["history"] == history_cell
+    assert solver["outputs"]["next_history"] == "history.body"
+    # A variance-preserving sampler feeds its state to the denoiser untouched, so
+    # there is no model-input rescaling component at all.
+    assert not any(node.get("component") == "model_input_scale" for node in body)
+    latent_cell = next(cell for cell, value in carried.items() if value == "latent.body")
+    denoiser = next(node for node in body if node.get("component") == "denoiser")
+    assert denoiser["inputs"]["sample"] == latent_cell
 
 
 def test_dispatch_audio_only_multimodal_pipeline(tmp_path):

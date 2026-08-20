@@ -184,35 +184,114 @@ Only the decoder body runs per generated token.
 
 ```yaml
 steps:
-  - kind: invoke
-    component: initialize_latent
-    inputs: { noise: noise }
-    outputs: { latent: latent.initial }
   - kind: loop
-    setup: []
+    setup:
+      # Schedule, timesteps, and scalar scales are ONNX constant components, so
+      # the solver reads its sigmas from the graph instead of runtime config.
+      - { kind: invoke, component: diffusion_schedule, inputs: {},
+          outputs: { schedule: diffusion.schedule } }
+      - { kind: invoke, component: diffusion_timesteps, inputs: {},
+          outputs: { schedule: diffusion.timesteps } }
+      - { kind: invoke, component: latent_row_shape, inputs: {},
+          outputs: { shape: diffusion.latent_row_shape } }
+      # Counter-based RNG: one private stream per row, seeded by the request.
+      - { kind: invoke, component: latent_noise,
+          inputs: { seed: request.seed, offset: package.rng_offset,
+                    row_shape: diffusion.latent_row_shape },
+          outputs: { noise: diffusion.noise, next_offset: diffusion.rng_offset } }
+      - { kind: invoke, component: text_encoder,
+          inputs: { input_ids: request.input_ids },
+          outputs: { encoder_hidden_states: conditioning.hidden_states } }
+      - { kind: invoke, component: text_encoder,
+          inputs: { input_ids: request.negative_input_ids },
+          outputs: { encoder_hidden_states: conditioning.unconditional } }
+      - { kind: invoke, component: history_initializer,
+          inputs: { reference: diffusion.noise },
+          outputs: { zeros: diffusion.initial_history } }
     steps:
-      - kind: invoke
-        component: denoiser
-        inputs: { sample: latent, step: diffusion_step }
-        outputs: { estimate: estimate }
-      - kind: invoke
-        component: solver
-        inputs: { state: latent, estimate: estimate, step: diffusion_step }
-        outputs: { next_state: latent.next }
-    condition: continue
-    max_iterations: num_steps
+      - { kind: invoke, component: schedule_lookup,
+          inputs: { schedule: diffusion.timesteps, step: loop.iteration },
+          outputs: { timestep: diffusion.timestep } }
+      # Classifier-free guidance is two denoiser invocations, not a doubled batch.
+      - { kind: invoke, component: denoiser,
+          inputs: { sample: latent_state, timestep: diffusion.timestep,
+                    encoder_hidden_states: conditioning.unconditional },
+          outputs: { noise_pred: denoiser.unconditional } }
+      - { kind: invoke, component: denoiser,
+          inputs: { sample: latent_state, timestep: diffusion.timestep,
+                    encoder_hidden_states: conditioning.hidden_states },
+          outputs: { noise_pred: denoiser.conditional } }
+      - { kind: invoke, component: guidance_combine,
+          inputs: { unconditional: denoiser.unconditional,
+                    conditional: denoiser.conditional,
+                    scale: request.guidance_scale },
+          outputs: { estimate: denoiser.estimate } }
+      - { kind: invoke, component: solver_step,
+          inputs: { sample: latent_state, step: loop.iteration,
+                    schedule: diffusion.schedule, estimate: denoiser.estimate,
+                    history: history },
+          outputs: { next_state: latent.body, next_history: history.body } }
+      - { kind: emit, value: denoiser.estimate, output: noise_estimate, mode: append }
+      - { kind: emit, value: latent.body, output: latent_trajectory, mode: append }
+    max_iterations: request.max_iterations
     iteration:
-      value: diffusion_step
-      contract: { dtype: int64, rank: 0, shape: [] }
-    carried: [{ cell: latent, initial: latent.initial, next: latent.next }]
-  - kind: invoke
-    component: vae_decoder
-    inputs: { latent: latent }
-    outputs: { image: image }
-  - kind: emit
-    value: image
-    output: image
-    mode: replace
+      value: loop.iteration
+      contract: { dtype: int64, rank: 1, shape: [batch] }
+    carried:
+      - { cell: latent_state, next: latent.body }
+      - { cell: history, next: history.body }
+  - { kind: invoke, component: tensor_scale,
+      inputs: { tensor: latent_state, scale: diffusion.decoder_scale },
+      outputs: { scaled: diffusion.decoder_input } }
+  - { kind: invoke, component: vae_decoder,
+      inputs: { latent: diffusion.decoder_input },
+      outputs: { image: vae.image } }
+  - { kind: emit, value: latent_state, output: latent, mode: replace }
+  - { kind: emit, value: vae.image, output: image, mode: replace }
+  - { kind: emit, value: diffusion.rng_offset, output: rng_offset, mode: replace }
 ```
 
-Latent initialization and VAE decoding run once; denoiser and solver run per iteration.
+Conditioning, latent sampling, and VAE decoding are structural: they sit outside the
+loop body and therefore run once. Only the denoiser, guidance, and solver run per step.
+
+Carried state is declared under `state`, where each cell names the value that
+initializes it (`latent_state` ← `diffusion.noise`, `history` ←
+`diffusion.initial_history`). Nothing about the loop is expressed as a phase or a
+strategy; frequency falls out of where a step is nested.
+
+#### Policy components
+
+The producer emits the non-network parts of the pipeline as real ONNX graphs so the
+runtime never has to reimplement scheduler math:
+
+| Component | Ports | Purpose |
+|---|---|---|
+| `diffusion_schedule` / `diffusion_timesteps` | → `schedule` | Sigma schedule and timestep table baked in as initializers, so the solver reads its constants from the graph rather than from runtime config. |
+| `decoder_input_scale` | → `value` | Build-time scalar such as `1 / vae_scaling_factor`. |
+| `latent_row_shape` | → `shape` | Per-row latent shape consumed by the noise sampler. |
+| `schedule_lookup` | `schedule`, `step` → `timestep` | Gathers this step's timestep from the table. |
+| `latent_noise` (`onnx-genai.counter-rng@1`) | `seed`, `offset`, `row_shape` → `noise`, `next_offset` | Counter-based Box–Muller normals. Each row draws only from its own seed, so a row's noise does not depend on its batch position, and the advanced counter is returned so the caller can persist it. |
+| `history_initializer` | `reference` → `zeros` | Shape-following zero initializer for solver history. |
+| `guidance_combine` (`onnx-genai.guidance-combine@1`) | `unconditional`, `conditional`, `scale` → `estimate` | `uncond + scale * (cond - uncond)` with a per-row scale. |
+| `tensor_scale` | `tensor`, `scale` → `scaled` | Applies `init_noise_sigma` or the VAE scale. Emitted only when the factor is not 1.0, so no identity multiplies appear in the graph. |
+| `solver_step` (`onnx-genai.solver-step@1`) | `sample`, `estimate`, `history`, `step`, `schedule` → `next_state`, `next_history` | The scheduler update. Euler binds `estimate` to its `derivative` port and leaves the history ports unbound; DPM++ 2M carries the previous `x0` estimate as ordinary loop state and masks itself down to first order on the first and last steps. |
+
+Only components with a stable cross-runtime meaning carry a `contract` id; the constant
+and reshaping helpers are plain ONNX graphs identified structurally by their ports.
+
+#### Why guidance is two invocations
+
+Classifier-free guidance is conventionally implemented by concatenating the
+conditional and unconditional batches and running the denoiser once. The workflow IR
+declares batch semantics through `batch_layout`, which has no kind meaning "k rows per
+request", so a doubled batch cannot be described truthfully — the runtime would be
+unable to attribute a row to a request. Two invocations of the same component plus an
+explicit `guidance_combine` keeps every tensor `request_aligned` and leaves batching
+decisions to the runtime.
+
+#### Append-mode outputs
+
+`mode: append` concatenates chunks along the last axis, so an accumulating output must
+name that axis with a symbol of its own (`noise_estimate_width`, not `width`).
+Reusing the per-step symbol would bind the same symbol to both the chunk width and the
+accumulated width and fail validation.

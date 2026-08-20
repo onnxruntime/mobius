@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import re
 from typing import Any
@@ -16,35 +17,41 @@ import yaml
 
 from mobius._constants import OPSET_VERSION
 from mobius.generation import (
+    SOLVER_BUILDERS,
     PolicyCapabilities,
     attach_policy_components,
     build_boolean_not,
     build_code_frame_update,
     build_code_history_append,
     build_codec_layout_transpose,
+    build_counter_rng_normal,
     build_decoder_state_initializer,
     build_decoder_step_update,
     build_empty_features,
     build_eos_termination,
     build_euler_model_input,
-    build_euler_solver_step,
     build_greedy_sampler,
+    build_guidance_combine,
     build_integer_add,
     build_integer_minimum,
     build_last_token_logits,
     build_model_token_cast,
     build_proposal_metrics,
+    build_scalar_constant,
     build_schedule_constant,
     build_schedule_lookup,
     build_seeded_categorical_sampler,
     build_selective_integer_add,
     build_sequence_length,
+    build_shape_constant,
+    build_tensor_scale,
     build_termination_batch_initializer,
     build_token_state_update,
     build_token_to_slot,
     build_tts_decoder_state_initializer,
     build_tts_decoder_step_update,
     build_tts_state_initializer,
+    build_zeros_like,
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
     _name_image_preprocessing_program,
@@ -55,6 +62,7 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     add_policy_components_to_workflow,
     build_native_vlm_package_metadata,
     declare_request_alignment,
+    request_batch_layout,
 )
 from mobius.tasks._ctc_asr import BATCH_PADDING_SENSITIVE_KEY
 
@@ -104,11 +112,16 @@ def _contract(value: ir.Value) -> dict[str, Any]:
     dtype = {"fp16": "float16", "bf16": "bfloat16", "fp32": "float32"}.get(
         port.dtype, port.dtype
     )
-    return {
+    shape = _shape_metadata(port)
+    contract: dict[str, Any] = {
         "dtype": dtype,
         "rank": port.rank,
-        "shape": _shape_metadata(port),
+        "shape": shape,
     }
+    layout = request_batch_layout(shape)
+    if layout is not None:
+        contract["batch_layout"] = layout
+    return contract
 
 
 def _request_aligned(contract: dict[str, Any], axis: int = 0) -> dict[str, Any]:
@@ -190,6 +203,28 @@ def _publish_workflow_v1(workflow: dict[str, Any]) -> dict[str, Any]:
         source = declaration.get("source")
         if isinstance(source, dict) and source.get("kind") == "request":
             source.pop("field", None)
+
+    # Every workflow value whose leading dimension is the batch symbol holds one
+    # entry per in-flight request, so declare that structurally instead of leaving
+    # a runtime to infer it. Graph-derived contracts already carry the layout;
+    # this covers the hand-written declarations the runtime compares them against
+    # when it validates a carry, a binding, or an emit.
+    def _declare_row_alignment(contract: Any) -> Any:
+        if (
+            isinstance(contract, dict)
+            and "batch_layout" not in contract
+            and request_batch_layout(contract.get("shape")) is not None
+        ):
+            return _request_aligned(contract)
+        return contract
+
+    for section in ("inputs", "outputs", "state"):
+        for declaration in workflow.get(section, {}).values():
+            declaration["contract"] = _declare_row_alignment(declaration.get("contract"))
+    for component in workflow.get("components", {}).values():
+        for ports in component.get("ports", {}).values():
+            for port, contract in ports.items():
+                ports[port] = _declare_row_alignment(contract)
     substitutions: dict[str, str] = {}
     loop_index = 0
     cell_aliases = {
@@ -845,7 +880,7 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             "required": True,
         },
         "package.false": {
-            "contract": batch_bool,
+            "contract": _request_aligned(batch_bool),
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
@@ -2344,16 +2379,50 @@ def _contracts_compatible(left: ir.Value, right: ir.Value) -> bool:
     )
 
 
+def _accumulated_contract(contract: dict[str, Any], symbol: str) -> dict[str, Any]:
+    """Rename the trailing axis of an append-mode output to a private symbol.
+
+    ``mode: append`` emits concatenate chunks along the last axis, so the final
+    workflow value has ``steps * chunk`` entries there. Reusing the chunk's
+    symbol (for example ``width``) would rebind it to the accumulated extent and
+    contradict every other value that shares it, so the accumulating axis gets a
+    symbol of its own.
+    """
+    shape = list(contract["shape"])
+    shape[-1] = symbol
+    return {**contract, "shape": shape}
+
+
 def build_diffusion_workflow_metadata(
     pkg: Any,
     *,
     num_inference_steps: int,
     schedule: list[float] | None = None,
     timesteps: list[float] | None = None,
+    solver: str = "euler",
+    scale_model_input: bool = True,
+    initial_state_scale: float = 1.0,
+    decoder_input_scale: float = 1.0,
+    guidance_scale: float | None = None,
+    latent_source: str = "application",
+    latent_row_shape: list[int] | None = None,
 ) -> dict[str, Any]:
-    """Build a fixed-schedule diffusion workflow with explicit latent state."""
+    """Build a fixed-schedule diffusion workflow with explicit latent state.
+
+    Everything the reference sampler hides in Python attributes becomes an
+    explicit part of the workflow: the sigma schedule and timestep table are
+    constant components, the step index is the loop induction value, a
+    multistep solver's previous data estimate is a declared state cell, and the
+    RNG counter is an ordinary integer tensor. Classifier-free guidance is two
+    denoiser invocations plus a combine component rather than a hidden batch
+    doubling, so every value stays request-aligned on axis 0.
+    """
     if num_inference_steps < 1:
         raise ValueError("num_inference_steps must be >= 1")
+    if solver not in SOLVER_BUILDERS:
+        raise ValueError(f"unsupported diffusion solver {solver!r}")
+    if latent_source not in {"application", "seed"}:
+        raise ValueError(f"unsupported diffusion latent source {latent_source!r}")
     names = set(pkg.keys())
     denoiser_name = next(
         (name for name in ("denoiser", "transformer", "unet") if name in names),
@@ -2384,7 +2453,7 @@ def build_diffusion_workflow_metadata(
     if len(sample_input.shape or []) != 4 or _contract(sample_input) != _contract(
         estimate_output
     ):
-        raise ValueError("Euler diffusion workflow requires matching rank-4 latent/estimate")
+        raise ValueError("diffusion workflow requires matching rank-4 latent/estimate")
     if _contract(vae_input) != _contract(sample_input):
         raise ValueError("VAE latent input must match the solver latent contract")
 
@@ -2413,11 +2482,23 @@ def build_diffusion_workflow_metadata(
             ),
             next(iter(text_encoder.graph.outputs), None),
         )
+    conditioned = text_encoder is not None and conditioning_output is not None
+    if guidance_scale is not None and not conditioned:
+        raise ValueError("classifier-free guidance requires a conditioned denoiser")
+    if latent_source == "seed" and not latent_row_shape:
+        raise ValueError("a seeded latent initializer requires an explicit row shape")
+
+    solver_component = SOLVER_BUILDERS[solver](sample_input.dtype)
+    solver_ports = {value.name for value in solver_component.model.graph.inputs}
+    carries_history = "history" in solver_ports
 
     attach_policy_components(pkg, PolicyCapabilities())
-    pkg.add_policy_component("euler_model_input", build_euler_model_input(sample_input.dtype))
-    pkg.add_policy_component("solver_step", build_euler_solver_step(sample_input.dtype))
+    pkg.add_policy_component("solver_step", solver_component)
     pkg.add_policy_component("continue_predicate", build_boolean_not())
+    if scale_model_input:
+        pkg.add_policy_component(
+            "model_input_scale", build_euler_model_input(sample_input.dtype)
+        )
     schedule_values = schedule or [
         1.0 - index / num_inference_steps for index in range(num_inference_steps + 1)
     ]
@@ -2431,18 +2512,41 @@ def build_diffusion_workflow_metadata(
     pkg.add_policy_component("diffusion_schedule", build_schedule_constant(schedule_values))
     pkg.add_policy_component("diffusion_timesteps", build_schedule_constant(timestep_values))
     pkg.add_policy_component("schedule_lookup", build_schedule_lookup(timestep_input.dtype))
+    # A sampler whose state already lives in the denoiser's space, and a VAE whose
+    # latents are unnormalized, need no rescaling step at all; only emit the
+    # constant and the multiply that the pipeline actually performs.
+    scales_initial_state = not math.isclose(initial_state_scale, 1.0)
+    scales_decoder_input = not math.isclose(decoder_input_scale, 1.0)
+    if scales_initial_state or scales_decoder_input:
+        pkg.add_policy_component("tensor_scale", build_tensor_scale(sample_input.dtype))
+    if scales_initial_state:
+        pkg.add_policy_component(
+            "initial_state_scale", build_scalar_constant(initial_state_scale)
+        )
+    if scales_decoder_input:
+        pkg.add_policy_component(
+            "decoder_input_scale", build_scalar_constant(decoder_input_scale)
+        )
+    if carries_history:
+        pkg.add_policy_component("history_initializer", build_zeros_like(sample_input.dtype))
+    if guidance_scale is not None:
+        pkg.add_policy_component(
+            "guidance_combine", build_guidance_combine(sample_input.dtype)
+        )
+    if latent_source == "seed":
+        pkg.add_policy_component(
+            "latent_row_shape", build_shape_constant(list(latent_row_shape or ()))
+        )
+        pkg.add_policy_component("latent_noise", build_counter_rng_normal(sample_input.dtype))
 
     batch = _contract(sample_input)["shape"][0]
+    latent_contract = _contract(sample_input)
+    row_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": [batch]})
+    row_float = _request_aligned({"dtype": "float32", "rank": 1, "shape": [batch]})
     batch_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": [batch]})
     batch_bool = _request_aligned({"dtype": "bool", "rank": 1, "shape": [batch]})
     control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
     inputs: dict[str, Any] = {
-        "request.latent": {
-            "contract": _contract(sample_input),
-            "role": {"kind": "opaque"},
-            "source": {"kind": "application", "name": "latent"},
-            "required": True,
-        },
         "request.max_iterations": {
             "contract": control_int,
             "role": {"kind": "runtime", "version": "1.0", "role": "max_iterations"},
@@ -2462,8 +2566,100 @@ def build_diffusion_workflow_metadata(
         _invoke("diffusion_schedule", {}, {"schedule": "diffusion.schedule"}),
         _invoke("diffusion_timesteps", {}, {"schedule": "diffusion.timesteps"}),
     ]
+    if scales_initial_state:
+        setup_nodes.append(
+            _invoke("initial_state_scale", {}, {"value": "diffusion.initial_scale"})
+        )
+    if scales_decoder_input:
+        setup_nodes.append(
+            _invoke("decoder_input_scale", {}, {"value": "diffusion.decoder_scale"})
+        )
+    outputs: dict[str, Any] = {
+        "image": {
+            "contract": _contract(vae_output),
+            "role": "image",
+            "stage": "pre_adapter",
+        },
+        "latent": {
+            "contract": latent_contract,
+            "role": "tensor",
+            "stage": "pre_adapter",
+        },
+        "noise_estimate": {
+            "contract": _accumulated_contract(latent_contract, "noise_estimate_width"),
+            "role": "tensor",
+            "stage": "pre_adapter",
+        },
+        "latent_trajectory": {
+            "contract": _accumulated_contract(latent_contract, "trajectory_width"),
+            "role": "tensor",
+            "stage": "pre_adapter",
+        },
+    }
+
+    if latent_source == "application":
+        inputs["request.noise"] = {
+            "contract": latent_contract,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "application", "name": "noise"},
+            "required": True,
+            "externally_suppliable": True,
+        }
+        noise_value = "request.noise"
+    else:
+        inputs["request.seed"] = {
+            "contract": row_int,
+            "role": {"kind": "runtime", "version": "1.0", "role": "seed"},
+            "source": {"kind": "request", "field": "seed"},
+            "required": False,
+            "default": 0,
+            "externally_suppliable": True,
+        }
+        inputs["package.rng_offset"] = {
+            "contract": row_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 0,
+        }
+        noise_value = "diffusion.noise"
+        setup_nodes.append(
+            _invoke("latent_row_shape", {}, {"shape": "diffusion.latent_row_shape"})
+        )
+        setup_nodes.append(
+            _invoke(
+                "latent_noise",
+                {
+                    "seed": "request.seed",
+                    "offset": "package.rng_offset",
+                    "row_shape": "diffusion.latent_row_shape",
+                },
+                {"noise": noise_value, "next_offset": "diffusion.rng_offset"},
+            )
+        )
+        outputs["rng_offset"] = {
+            "contract": row_int,
+            "role": "tensor",
+            "stage": "pre_adapter",
+        }
+
+    initial_state_value = noise_value
+    if scales_initial_state:
+        initial_state_value = "diffusion.initial_state"
+        setup_nodes.append(
+            _invoke(
+                "tensor_scale",
+                {"tensor": noise_value, "scale": "diffusion.initial_scale"},
+                {"scaled": initial_state_value},
+            )
+        )
+
     conditioning_value = None
-    if text_encoder is not None and conditioning_output is not None:
+    unconditional_value = None
+    if conditioned:
+        assert text_encoder is not None
+        assert conditioning_output is not None
+        conditioning_value = "conditioning.hidden_states"
         text_inputs = {}
         for index, value in enumerate(text_encoder.graph.inputs):
             name = f"request.{value.name}"
@@ -2474,24 +2670,93 @@ def build_diffusion_workflow_metadata(
                     if index == 0
                     else {"kind": "opaque"}
                 ),
-                "source": {
-                    "kind": "request" if index == 0 else "application",
-                    "field": "prompt_tokens" if index == 0 else None,
-                    "name": value.name if index else None,
-                },
+                "source": (
+                    {"kind": "request", "field": "prompt_tokens"}
+                    if index == 0
+                    else {"kind": "application", "name": value.name}
+                ),
                 "required": True,
-            }
-            inputs[name]["source"] = {
-                key: item for key, item in inputs[name]["source"].items() if item is not None
+                "externally_suppliable": True,
             }
             text_inputs[value.name] = name
-        conditioning_value = "conditioning.hidden_states"
         setup_nodes.append(
             _invoke(
                 text_name,
                 text_inputs,
                 {conditioning_output.name: conditioning_value},
             )
+        )
+        if guidance_scale is not None:
+            unconditional_value = "conditioning.unconditional"
+            negative_inputs = {}
+            for value in text_encoder.graph.inputs:
+                name = f"request.negative_{value.name}"
+                inputs[name] = {
+                    "contract": _contract(value),
+                    "role": {"kind": "opaque"},
+                    "source": {"kind": "application", "name": f"negative_{value.name}"},
+                    "required": True,
+                    "externally_suppliable": True,
+                }
+                negative_inputs[value.name] = name
+            inputs["request.guidance_scale"] = {
+                "contract": row_float,
+                "role": {"kind": "opaque"},
+                "source": {"kind": "application", "name": "guidance_scale"},
+                "required": False,
+                "default": float(guidance_scale),
+            }
+            setup_nodes.append(
+                _invoke(
+                    text_name,
+                    negative_inputs,
+                    {conditioning_output.name: unconditional_value},
+                )
+            )
+
+    state: dict[str, Any] = {
+        "latent": {
+            "contract": latent_contract,
+            "scope": "invocation",
+            "initializer": initial_state_value,
+            "recurrence": {"kind": "invariant"},
+        }
+    }
+    carried: list[dict[str, Any]] = [
+        {
+            "cell": "latent",
+            "current": initial_state_value,
+            "body_input": "state.latent.body",
+            "body_output": "latent.body",
+            "next": "latent.final",
+            "read_effect": _effect("state:latent.0", "state:latent.read"),
+            "write_effect": _effect("state:latent.read", "state:latent.1"),
+        }
+    ]
+    if carries_history:
+        setup_nodes.append(
+            _invoke(
+                "history_initializer",
+                {"reference": initial_state_value},
+                {"zeros": "diffusion.initial_history"},
+            )
+        )
+        state["history"] = {
+            "contract": latent_contract,
+            "scope": "invocation",
+            "initializer": "diffusion.initial_history",
+            "recurrence": {"kind": "invariant"},
+        }
+        carried.append(
+            {
+                "cell": "history",
+                "current": "diffusion.initial_history",
+                "body_input": "state.history.body",
+                "body_output": "history.body",
+                "next": "history.final",
+                "read_effect": _effect("state:history.0", "state:history.read"),
+                "write_effect": _effect("state:history.read", "state:history.1"),
+            }
         )
     setup_nodes.append(
         _invoke(
@@ -2501,52 +2766,84 @@ def build_diffusion_workflow_metadata(
         )
     )
 
-    denoiser_inputs = {
-        sample_input.name: "diffusion.model_input",
-        timestep_input.name: "diffusion.timestep",
-    }
-    if conditioning_input is not None and conditioning_value is not None:
-        denoiser_inputs[conditioning_input.name] = conditioning_value
-    body_nodes: list[dict[str, Any]] = []
-    body_nodes.append(
+    body_nodes: list[dict[str, Any]] = [
         _invoke(
             "schedule_lookup",
-            {
-                "schedule": "diffusion.timesteps",
-                "step": "loop.iteration",
-            },
+            {"schedule": "diffusion.timesteps", "step": "loop.iteration"},
             {"timestep": "diffusion.timestep"},
         )
-    )
-    body_nodes.append(
-        _invoke(
-            "euler_model_input",
-            {
-                "sample": "state.latent.body",
-                "step": "loop.iteration",
-                "schedule": "diffusion.schedule",
-            },
-            {"model_input": "diffusion.model_input"},
-        )
-    )
-    body_nodes.extend(
-        [
+    ]
+    if scale_model_input:
+        model_input_value = "diffusion.model_input"
+        body_nodes.append(
             _invoke(
-                denoiser_name,
-                denoiser_inputs,
-                {estimate_output.name: "denoiser.estimate"},
-            ),
-            _invoke(
-                "solver_step",
+                "model_input_scale",
                 {
                     "sample": "state.latent.body",
-                    "derivative": "denoiser.estimate",
                     "step": "loop.iteration",
                     "schedule": "diffusion.schedule",
                 },
-                {"next_state": "latent.body"},
-                {"solver": _effect("solver.0", "solver.1")},
-            ),
+                {"model_input": model_input_value},
+            )
+        )
+    else:
+        model_input_value = "state.latent.body"
+
+    def denoiser_call(conditioning: str | None, estimate: str) -> dict[str, Any]:
+        call_inputs = {
+            sample_input.name: model_input_value,
+            timestep_input.name: "diffusion.timestep",
+        }
+        if conditioning_input is not None and conditioning is not None:
+            call_inputs[conditioning_input.name] = conditioning
+        return _invoke(denoiser_name, call_inputs, {estimate_output.name: estimate})
+
+    if guidance_scale is None:
+        body_nodes.append(denoiser_call(conditioning_value, "denoiser.estimate"))
+    else:
+        body_nodes.append(denoiser_call(unconditional_value, "denoiser.unconditional"))
+        body_nodes.append(denoiser_call(conditioning_value, "denoiser.conditional"))
+        body_nodes.append(
+            _invoke(
+                "guidance_combine",
+                {
+                    "unconditional": "denoiser.unconditional",
+                    "conditional": "denoiser.conditional",
+                    "scale": "request.guidance_scale",
+                },
+                {"estimate": "denoiser.estimate"},
+            )
+        )
+
+    solver_inputs = {
+        "sample": "state.latent.body",
+        "step": "loop.iteration",
+        "schedule": "diffusion.schedule",
+    }
+    solver_inputs["estimate" if carries_history else "derivative"] = "denoiser.estimate"
+    solver_outputs = {"next_state": "latent.body"}
+    if carries_history:
+        solver_inputs["history"] = "state.history.body"
+        solver_outputs["next_history"] = "history.body"
+    body_nodes.append(_invoke("solver_step", solver_inputs, solver_outputs))
+    body_nodes.extend(
+        [
+            {
+                "kind": "emit",
+                "value": "denoiser.estimate",
+                "output": "noise_estimate",
+                "mode": "append",
+                "effect_name": "emit",
+                "effect": _effect("emit.0", "emit.1"),
+            },
+            {
+                "kind": "emit",
+                "value": "latent.body",
+                "output": "latent_trajectory",
+                "mode": "append",
+                "effect_name": "emit",
+                "effect": _effect("emit.1", "emit.2"),
+            },
             _invoke(
                 "continue_predicate",
                 {"done": "package.false"},
@@ -2554,7 +2851,55 @@ def build_diffusion_workflow_metadata(
             ),
         ]
     )
-    latent_effect = "state:latent"
+
+    decoder_input_value = "latent.final"
+    tail_nodes: list[dict[str, Any]] = []
+    if scales_decoder_input:
+        decoder_input_value = "diffusion.decoder_input"
+        tail_nodes.append(
+            _invoke(
+                "tensor_scale",
+                {"tensor": "latent.final", "scale": "diffusion.decoder_scale"},
+                {"scaled": decoder_input_value},
+            )
+        )
+    tail_nodes.extend(
+        [
+            _invoke(
+                vae_name,
+                {vae_input.name: decoder_input_value},
+                {vae_output.name: "vae.image"},
+            ),
+            {
+                "kind": "emit",
+                "value": "latent.final",
+                "output": "latent",
+                "mode": "replace",
+                "effect_name": "emit",
+                "effect": _effect("emit.2", "emit.3"),
+            },
+            {
+                "kind": "emit",
+                "value": "vae.image",
+                "output": "image",
+                "mode": "replace",
+                "effect_name": "emit",
+                "effect": _effect("emit.3", "emit.4"),
+            },
+        ]
+    )
+    if latent_source == "seed":
+        tail_nodes.append(
+            {
+                "kind": "emit",
+                "value": "diffusion.rng_offset",
+                "output": "rng_offset",
+                "mode": "replace",
+                "effect_name": "emit",
+                "effect": _effect("emit.4", "emit.5"),
+            }
+        )
+
     workflow = {
         "manifest": {
             "ir_version": "1.0",
@@ -2568,28 +2913,14 @@ def build_diffusion_workflow_metadata(
             ],
         },
         "inputs": inputs,
-        "outputs": {
-            "image": {
-                "contract": _contract(vae_output),
-                "role": "image",
-                "stage": "pre_adapter",
-            }
-        },
+        "outputs": outputs,
         "components": {
             name: _component(model, _artifact(name, len(pkg))) for name, model in pkg.items()
         },
-        "state": {
-            "latent": {
-                "contract": _contract(sample_input),
-                "scope": "invocation",
-                "initializer": "request.latent",
-                "recurrence": {"kind": "invariant"},
-            }
-        },
+        "state": state,
         "initial_effects": {
-            "solver": "solver.0",
-            latent_effect: f"{latent_effect}.0",
             "emit": "emit.0",
+            **{f"state:{cell}": f"state:{cell}.0" for cell in state},
         },
         "graph": {
             "kind": "sequence",
@@ -2601,35 +2932,9 @@ def build_diffusion_workflow_metadata(
                     "condition": "loop.continue",
                     "max_iterations": "request.max_iterations",
                     "iteration": {"value": "loop.iteration", "contract": batch_int},
-                    "carried": [
-                        {
-                            "cell": "latent",
-                            "current": "request.latent",
-                            "body_input": "state.latent.body",
-                            "body_output": "latent.body",
-                            "next": "latent.final",
-                            "read_effect": _effect(
-                                f"{latent_effect}.0", f"{latent_effect}.read"
-                            ),
-                            "write_effect": _effect(
-                                f"{latent_effect}.read", f"{latent_effect}.1"
-                            ),
-                        }
-                    ],
+                    "carried": carried,
                 },
-                _invoke(
-                    vae_name,
-                    {vae_input.name: "latent.final"},
-                    {vae_output.name: "vae.image"},
-                ),
-                {
-                    "kind": "emit",
-                    "value": "vae.image",
-                    "output": "image",
-                    "mode": "replace",
-                    "effect_name": "emit",
-                    "effect": _effect("emit.0", "emit.1"),
-                },
+                *tail_nodes,
             ],
         },
     }
@@ -2648,6 +2953,13 @@ def write_diffusion_workflow_metadata(
     num_inference_steps: int,
     schedule: list[float] | None = None,
     timesteps: list[float] | None = None,
+    solver: str = "euler",
+    scale_model_input: bool = True,
+    initial_state_scale: float = 1.0,
+    decoder_input_scale: float = 1.0,
+    guidance_scale: float | None = None,
+    latent_source: str = "application",
+    latent_row_shape: list[int] | None = None,
 ) -> str:
     os.makedirs(output_dir, exist_ok=True)
     metadata = build_diffusion_workflow_metadata(
@@ -2655,6 +2967,13 @@ def write_diffusion_workflow_metadata(
         num_inference_steps=num_inference_steps,
         schedule=schedule,
         timesteps=timesteps,
+        solver=solver,
+        scale_model_input=scale_model_input,
+        initial_state_scale=initial_state_scale,
+        decoder_input_scale=decoder_input_scale,
+        guidance_scale=guidance_scale,
+        latent_source=latent_source,
+        latent_row_shape=latent_row_shape,
     )
     pkg.save_policy_components(output_dir)
     add_adapter_service_to_metadata(metadata, pkg, output_dir)

@@ -1462,6 +1462,19 @@ def add_explicit_package_io(
     return metadata
 
 
+#: Symbolic leading dimension Mobius emits for every batched ONNX port. A port
+#: that opens with it holds exactly one entry per in-flight request, which is
+#: the structural fact a runtime needs to permute or drop rows.
+REQUEST_AXIS_SYMBOL = "batch"
+
+
+def request_batch_layout(shape: list[Any] | None) -> dict[str, Any] | None:
+    """Return the request-aligned batch layout implied by a port's shape."""
+    if shape and shape[0] == REQUEST_AXIS_SYMBOL:
+        return {"kind": "request_aligned", "axis": 0}
+    return None
+
+
 def add_policy_components_to_workflow(
     metadata: dict[str, Any],
     pkg: Any,
@@ -1530,12 +1543,9 @@ def add_policy_components_to_workflow(
             "rank": port.rank,
             "shape": shape,
         }
-        # Policy components are per-row operators: when the graph's leading
-        # dimension is the batch symbol, axis 0 carries exactly one entry per
-        # in-flight request. Declaring it lets the runtime permute/compact the
-        # batch without the producer serializing any row identity.
-        if shape and shape[0] == _BATCH_DIMENSION:
-            contract["batch_layout"] = {"kind": "request_aligned", "axis": 0}
+        layout = request_batch_layout(shape)
+        if layout is not None:
+            contract["batch_layout"] = layout
         return contract
 
     for name, component in policy_components.items():
@@ -2113,6 +2123,11 @@ class SchedulerConfig:
     time_shift_type: str | None = None
     invert_sigmas: bool = False
     stochastic_sampling: bool = False
+    algorithm_type: str = "dpmsolver++"
+    solver_order: int = 2
+    solver_type: str = "midpoint"
+    lower_order_final: bool = True
+    final_sigmas_type: str = "zero"
 
     def to_metadata(self) -> dict[str, Any]:
         meta: dict[str, Any] = {
@@ -2233,6 +2248,11 @@ class SchedulerConfig:
             ),
             invert_sigmas=bool(config.get("invert_sigmas")),
             stochastic_sampling=bool(config.get("stochastic_sampling")),
+            algorithm_type=str(config.get("algorithm_type", cls.algorithm_type)),
+            solver_order=int(config.get("solver_order", cls.solver_order)),
+            solver_type=str(config.get("solver_type", cls.solver_type)),
+            lower_order_final=bool(config.get("lower_order_final", cls.lower_order_final)),
+            final_sigmas_type=str(config.get("final_sigmas_type", cls.final_sigmas_type)),
         )
 
 
@@ -2282,6 +2302,40 @@ def load_diffusers_scheduler_config(
             "%s; falling back to onnx-genai's default DDIM scheduler metadata", err
         )
         return None
+
+
+def load_diffusers_vae_scaling_factor(source: str | None) -> float | None:
+    """Best-effort load of a diffusers ``vae/config.json`` ``scaling_factor``.
+
+    The latent a diffusion sampler carries is scaled by this factor before the
+    VAE decodes it, so the workflow needs the real value rather than a guess.
+    Returns ``None`` when the config cannot be read, letting the caller decide.
+    """
+    if not source:
+        return None
+    raw: dict[str, Any] | None = None
+    local = os.path.join(source, "vae", "config.json")
+    if os.path.isfile(local):
+        try:
+            with open(local, encoding="utf-8") as handle:
+                raw = json.load(handle)
+        except (OSError, ValueError) as err:
+            _LOGGER.warning("could not read %s: %s", local, err)
+            return None
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
+
+            path = hf_hub_download(source, "vae/config.json")
+            with open(path, encoding="utf-8") as handle:
+                raw = json.load(handle)
+        except Exception as err:
+            _LOGGER.info("no diffusers VAE config for %r (%s)", source, err)
+            return None
+    # ``AutoencoderKL`` defaults this to 0.18215, and diffusers checkpoints that
+    # accept the default omit the key entirely.
+    factor = (raw or {}).get("scaling_factor", 0.18215)
+    return float(factor) if factor else None
 
 
 def build_diffusion_pipeline_metadata(

@@ -32,6 +32,7 @@ from mobius.integrations.onnx_genai.inference_metadata import (
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
     write_audio_codec_workflow_metadata,
+    write_diffusion_workflow_metadata,
     write_language_diffusion_workflow_metadata,
     write_speculative_workflow_metadata,
 )
@@ -744,6 +745,27 @@ def main() -> None:
         directory = args.output / name
         package.save(str(directory), progress_bar=False, check_weights=False)
         write_onnx_genai_config(package, str(directory), **options)
+
+    # A second image-diffusion fixture that exercises every optional part of the
+    # workflow at once: classifier-free guidance from a negative prompt, a
+    # multistep solver with a carried history cell, per-step trajectory emits,
+    # a seeded latent drawn inside the workflow, and a scaled VAE input.
+    guided = _executable_diffusion_package()
+    directory = args.output / "diffusion_guided"
+    guided.save(str(directory), progress_bar=False, check_weights=False)
+    write_diffusion_workflow_metadata(
+        guided,
+        str(directory),
+        num_inference_steps=3,
+        schedule=[8.0, 4.0, 1.0, 0.0],
+        timesteps=[900.0, 600.0, 300.0],
+        solver="multistep",
+        scale_model_input=False,
+        decoder_input_scale=1.0 / 0.18215,
+        guidance_scale=7.5,
+        latent_source="seed",
+        latent_row_shape=[4, 4, 4],
+    )
 
     speculative = _executable_speculative_package()
     directory = args.output / "speculative"

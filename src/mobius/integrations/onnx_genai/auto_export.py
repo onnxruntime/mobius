@@ -28,6 +28,7 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     add_explicit_package_io,
     add_policy_components_to_workflow,
     load_diffusers_scheduler_config,
+    load_diffusers_vae_scaling_factor,
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
     write_audio_codec_workflow_metadata,
@@ -44,15 +45,42 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
 _LOGGER = logging.getLogger(__name__)
 
 
-def _euler_schedule(
+#: Scheduler kind -> (workflow solver component, whether the sampler rescales
+#: the denoiser's input). A sampler that keeps its state variance-preserving
+#: feeds the raw state to the denoiser and starts from unit-variance noise; a
+#: sampler that carries state in sigma space divides by ``sqrt(sigma**2 + 1)``
+#: and starts from ``sigma_max`` scaled noise.
+_DIFFUSION_SOLVERS: dict[str, tuple[str, bool]] = {
+    "euler": ("euler", True),
+    "dpmpp_2m": ("multistep", False),
+}
+
+
+def _diffusion_schedule(
     scheduler: SchedulerConfig, num_inference_steps: int
 ) -> tuple[list[float], list[float]]:
-    """Materialize diffusers-compatible Euler timesteps and sigma values."""
-    if scheduler.kind != "euler" or scheduler.prediction_type != "epsilon":
+    """Materialize diffusers-compatible timesteps and sigma values."""
+    if scheduler.kind not in _DIFFUSION_SOLVERS or scheduler.prediction_type != "epsilon":
         raise ValueError(
-            "workflow diffusion currently supports deterministic Euler epsilon "
-            f"schedulers, got kind={scheduler.kind!r}, "
+            "workflow diffusion currently supports deterministic epsilon schedulers "
+            f"{sorted(_DIFFUSION_SOLVERS)}, got kind={scheduler.kind!r}, "
             f"prediction_type={scheduler.prediction_type!r}"
+        )
+    if scheduler.kind == "dpmpp_2m" and (
+        scheduler.algorithm_type != "dpmsolver++"
+        or scheduler.solver_order != 2
+        or scheduler.solver_type != "midpoint"
+        or not scheduler.lower_order_final
+        or scheduler.final_sigmas_type != "zero"
+    ):
+        raise ValueError(
+            "the workflow multistep solver implements second-order dpmsolver++ with "
+            "midpoint updates, a lower-order final step, and a zero terminal sigma; "
+            f"got algorithm_type={scheduler.algorithm_type!r}, "
+            f"solver_order={scheduler.solver_order}, "
+            f"solver_type={scheduler.solver_type!r}, "
+            f"lower_order_final={scheduler.lower_order_final}, "
+            f"final_sigmas_type={scheduler.final_sigmas_type!r}"
         )
     if scheduler.use_karras_sigmas or scheduler.use_exponential_sigmas:
         raise ValueError(
@@ -80,12 +108,21 @@ def _euler_schedule(
             f"workflow diffusion does not support beta schedule {scheduler.beta_schedule!r}"
         )
     training_sigmas = np.sqrt((1.0 - np.cumprod(1.0 - betas)) / np.cumprod(1.0 - betas))
-    timesteps = np.linspace(
-        scheduler.num_train_timesteps - 1,
-        0,
-        num_inference_steps,
-        dtype=np.float64,
-    )
+    if scheduler.kind == "dpmpp_2m":
+        # Multistep solvers place the boundary at the terminal sigma, so the
+        # linspace spans one extra point and drops the trailing zero timestep.
+        timesteps = (
+            np.linspace(0, scheduler.num_train_timesteps - 1, num_inference_steps + 1)
+            .round()[::-1][:-1]
+            .astype(np.float64)
+        )
+    else:
+        timesteps = np.linspace(
+            scheduler.num_train_timesteps - 1,
+            0,
+            num_inference_steps,
+            dtype=np.float64,
+        )
     sigmas = np.interp(
         timesteps,
         np.arange(scheduler.num_train_timesteps, dtype=np.float64),
@@ -649,25 +686,45 @@ def write_onnx_genai_config(
         derived = _diffusion_component_kwargs(pkg)
         for name, value in derived.items():
             kwargs.setdefault(name, value)
-        if "text_encoder_filename" in kwargs and guidance_scale is None:
-            raise ValueError(
-                "text-conditioned workflow diffusion does not implement "
-                "classifier-free guidance; pass guidance_scale=1.0 explicitly "
-                "to request unguided generation"
-            )
-        if guidance_scale is not None and not np.isclose(guidance_scale, 1.0):
-            raise ValueError(
-                "workflow diffusion requires an explicit classifier-free guidance "
-                "component before guidance_scale can differ from 1.0"
-            )
         resolved_scheduler = scheduler or SchedulerConfig(kind="euler")
-        timesteps, sigma_schedule = _euler_schedule(resolved_scheduler, num_inference_steps)
+        timesteps, sigma_schedule = _diffusion_schedule(
+            resolved_scheduler, num_inference_steps
+        )
+        solver, scale_model_input = _DIFFUSION_SOLVERS[resolved_scheduler.kind]
+        # A sigma-space sampler starts from noise scaled by the largest sigma; a
+        # variance-preserving one starts from the unit-variance draw itself.
+        initial_state_scale = sigma_schedule[0] if scale_model_input else 1.0
+        conditioned = "text_encoder_filename" in kwargs
+        if conditioned and guidance_scale is None:
+            raise ValueError(
+                "a text-conditioned diffusion package must declare its guidance: "
+                "pass guidance_scale=1.0 for unguided generation, or the pipeline's "
+                "classifier-free guidance scale to run the guided denoiser path"
+            )
+        if guidance_scale is not None and not conditioned:
+            raise ValueError(
+                "classifier-free guidance requires a text-conditioned diffusion package"
+            )
+        guidance = (
+            None
+            if guidance_scale is None or np.isclose(guidance_scale, 1.0)
+            else float(guidance_scale)
+        )
+        decoder_input_scale = 1.0
+        scaling_factor = load_diffusers_vae_scaling_factor(source)
+        if scaling_factor:
+            decoder_input_scale = 1.0 / scaling_factor
         path = write_diffusion_workflow_metadata(
             pkg,
             output_dir,
             num_inference_steps=num_inference_steps,
             schedule=sigma_schedule,
             timesteps=timesteps,
+            solver=solver,
+            scale_model_input=scale_model_input,
+            initial_state_scale=initial_state_scale,
+            decoder_input_scale=decoder_input_scale,
+            guidance_scale=guidance,
         )
         artifacts = {"inference_metadata": path}
         # Emit the CLIP tokenizer.json for text-conditioned pipelines so the
