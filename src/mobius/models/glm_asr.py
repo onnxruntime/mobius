@@ -26,6 +26,7 @@ from mobius.components import (
     RMSNorm,
     apply_rotary_pos_emb,
     create_attention_bias,
+    get_activation,
     initialize_rope,
 )
 
@@ -104,7 +105,7 @@ class GlmAsrAudioAttention(nn.Module):
             rotary_embedding_dim=self._rotary_dim,
         )
 
-        attention_output, _, _ = op.Attention(
+        attention_output = op.Attention(
             query_states,
             key_states,
             value_states,
@@ -115,21 +116,21 @@ class GlmAsrAudioAttention(nn.Module):
             kv_num_heads=self._num_key_value_heads,
             scale=self._scale,
             is_causal=0,
-            _outputs=3,
         )
         return self.o_proj(op, attention_output)
 
 
 class GlmAsrAudioMLP(nn.Module):
-    """Bias-enabled GELU feed-forward network used by the audio encoder."""
+    """Bias-enabled feed-forward network used by the audio encoder."""
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self.fc1 = Linear(config.hidden_size, config.intermediate_size, bias=True)
         self.fc2 = Linear(config.intermediate_size, config.hidden_size, bias=True)
+        self._activation = get_activation(config.hidden_act)
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
-        return self.fc2(op, op.Gelu(self.fc1(op, hidden_states)))
+        return self.fc2(op, self._activation(op, self.fc1(op, hidden_states)))
 
 
 class GlmAsrAudioEncoderLayer(nn.Module):
@@ -140,9 +141,7 @@ class GlmAsrAudioEncoderLayer(nn.Module):
         self.self_attn = GlmAsrAudioAttention(config)
         self.mlp = GlmAsrAudioMLP(config)
         self.input_layernorm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LayerNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -236,6 +235,7 @@ class GlmAsrMultiModalProjector(nn.Module):
         projector_hidden_size = config.hidden_size * 2
         self.linear_1 = Linear(projector_input_size, projector_hidden_size, bias=True)
         self.linear_2 = Linear(projector_hidden_size, config.hidden_size, bias=True)
+        self._activation = get_activation(config.projector_hidden_act)
 
     @property
     def merge_factor(self) -> int:
@@ -248,7 +248,7 @@ class GlmAsrMultiModalProjector(nn.Module):
             audio_hidden_states,
             op.Constant(value_ints=[0, -1, self._projector_input_size]),
         )
-        return self.linear_2(op, op.Gelu(self.linear_1(op, merged)))
+        return self.linear_2(op, self._activation(op, self.linear_1(op, merged)))
 
 
 class GlmAsrAudioEncoder(nn.Module):

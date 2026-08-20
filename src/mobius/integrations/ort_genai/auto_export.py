@@ -1298,6 +1298,12 @@ def _validate_ort_genai_compatibility(pkg: ModelPackage) -> None:
             "ORT GenAI does not define a feature-input CTC ASR pipeline; "
             "export Parakeet CTC as ONNX and run it directly with ONNX Runtime."
         )
+    if getattr(config, "model_type", None) in _GLMASR_MODEL_TYPES:
+        raise ValueError(
+            "onnxruntime-genai does not register a GLM-ASR multimodal model type. "
+            "Export without --runtime ort-genai and run the audio_encoder, embedding, "
+            "and decoder models directly with ONNX Runtime."
+        )
     if {"vision_encoder", "decoder"}.issubset(pkg) and "embedding" not in pkg:
         model_type = getattr(config, "model_type", "unknown")
         raise NotImplementedError(

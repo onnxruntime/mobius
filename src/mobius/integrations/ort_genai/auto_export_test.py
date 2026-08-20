@@ -1470,8 +1470,8 @@ class TestExportForOrtGenai:
         assert speech["inputs"]["audio_embeds"] == "input_features"
         assert speech["inputs"]["attention_mask"] == "input_features_mask"
 
-    def test_glmasr_genai_config_describes_all_three_stages(self, tmp_path):
-        """GLM-ASR metadata includes speech, embedding, and cached decoder stages."""
+    def test_glmasr_rejected_until_runtime_registers_model_type(self, tmp_path):
+        """Do not emit metadata that onnxruntime-genai cannot load."""
         import dataclasses
 
         from mobius._model_package import ModelPackage
@@ -1510,21 +1510,8 @@ class TestExportForOrtGenai:
             config=FakeConfig(),
         )
 
-        result = write_ort_genai_config(pkg, str(tmp_path))
-
-        with open(result["genai_config"]) as f:
-            model = json.load(f)["model"]
-        assert model["speech"]["config_filename"] == "audio_processor.json"
-        assert model["speech"]["inputs"] == {
-            "audio_embeds": "input_features",
-            "attention_mask": "input_features_mask",
-        }
-        assert model["embedding"]["filename"] == "embedding/model.onnx"
-        assert model["embedding"]["inputs"] == {
-            "input_ids": "input_ids",
-            "audio_features": "audio_features",
-        }
-        assert model["embedding"]["outputs"] == {"inputs_embeds": "inputs_embeds"}
+        with pytest.raises(ValueError, match="does not register a GLM-ASR"):
+            write_ort_genai_config(pkg, str(tmp_path))
 
     def test_tokenizer_not_copied_without_model_id(self, tmp_path):
         """No tokenizer files copied when hf_model_id=None."""

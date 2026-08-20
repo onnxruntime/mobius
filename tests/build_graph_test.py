@@ -3098,11 +3098,30 @@ class TestBuildGraphGlmAsr:
         assert len(attention_nodes) == config.audio.encoder_layers
         assert all(node.attributes["is_causal"].value == 0 for node in attention_nodes)
         assert all(len(node.inputs) == 3 or node.inputs[3] is None for node in attention_nodes)
+        assert all(len(node.outputs) == 1 for node in attention_nodes)
 
         decoder_inputs = {value.name for value in pkg["decoder"].graph.inputs}
         assert {"inputs_embeds", "attention_mask", "position_ids"} <= decoder_inputs
         assert "past_key_values.0.key" in decoder_inputs
         assert "past_key_values.0.value" in decoder_inputs
+
+    def test_configured_audio_and_projector_activations(self):
+        from mobius.models.glm_asr import GlmAsrForConditionalGeneration
+        from mobius.tasks import GlmAsrSpeechLanguageTask
+
+        config = self._config()
+        assert config.audio is not None
+        config.audio.activation_function = "relu"
+        config.projector_hidden_act = "silu"
+        package = build_from_module(
+            GlmAsrForConditionalGeneration(config),
+            config,
+            task=GlmAsrSpeechLanguageTask(),
+        )
+
+        audio_ops = [node.op_type for node in package["audio_encoder"].graph]
+        assert audio_ops.count("Relu") == config.audio.encoder_layers
+        assert audio_ops.count("Swish") == 1
 
     def test_checkpoint_weight_routing(self):
         import torch

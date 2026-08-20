@@ -18,7 +18,11 @@ from mobius.tasks import GlmAsrSpeechLanguageTask
 def _tiny_hf_model():
     from transformers import (
         GlmAsrConfig as HfGlmAsrConfig,
+    )
+    from transformers import (
         GlmAsrForConditionalGeneration as HfGlmAsrForConditionalGeneration,
+    )
+    from transformers import (
         LlamaConfig,
     )
 
@@ -113,11 +117,9 @@ def test_glmasr_three_stage_synthetic_parity():
 
     input_ids = np.array([[1, 2, *([100] * hf_audio.shape[0]), 3]], dtype=np.int64)
     with torch.no_grad():
-        hf_inputs_embeds = hf_model.model.get_input_embeddings()(
-            torch.from_numpy(input_ids)
-        )
-        audio_mask = torch.from_numpy(input_ids == 100).unsqueeze(-1).expand_as(
-            hf_inputs_embeds
+        hf_inputs_embeds = hf_model.model.get_input_embeddings()(torch.from_numpy(input_ids))
+        audio_mask = (
+            torch.from_numpy(input_ids == 100).unsqueeze(-1).expand_as(hf_inputs_embeds)
         )
         hf_inputs_embeds = hf_inputs_embeds.masked_scatter(
             audio_mask,

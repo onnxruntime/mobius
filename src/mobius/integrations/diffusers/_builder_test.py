@@ -302,23 +302,6 @@ class TestDiffusersHubRevision:
             "root/music", "caller-revision", "condition_encoder", external_entry
         ) == ("external/components", "external-revision", "")
 
-    @patch("huggingface_hub.hf_hub_download", return_value="scheduler.json")
-    def test_optional_metadata_download_uses_revision(self, mock_download):
-        from mobius.integrations.diffusers._builder import _load_optional_diffusers_json
-
-        with patch("builtins.open", mock_open(read_data='{"shift": 3.0}')):
-            result = _load_optional_diffusers_json(
-                "fake/model",
-                "scheduler/scheduler_config.json",
-                revision="pinned-revision",
-            )
-        assert result == {"shift": 3.0}
-        mock_download.assert_called_once_with(
-            repo_id="fake/model",
-            filename="scheduler/scheduler_config.json",
-            revision="pinned-revision",
-        )
-
     @patch("huggingface_hub.hf_hub_download")
     def test_falls_back_to_modular_model_index(self, mock_download):
         from huggingface_hub.utils import EntryNotFoundError

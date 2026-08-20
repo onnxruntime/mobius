@@ -198,7 +198,7 @@ class TestCLIBuild:
         with (
             tempfile.TemporaryDirectory() as tmpdir,
             mock.patch(
-                "mobius._diffusers_builder._load_diffusers_pipeline_index",
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
                 return_value=None,
             ) as mock_diffusers,
             mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
