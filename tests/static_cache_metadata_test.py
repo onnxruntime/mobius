@@ -59,7 +59,6 @@ def _static_package(**overrides):
     return task.build(module, config), config
 
 
-
 def _cache_cells(workflow) -> list[str]:
     """Names of the loop cells the state service publishes as cache buffers."""
     group = next(iter(workflow["serving"]["state_service"]["groups"].values()))
@@ -88,9 +87,7 @@ def mixed():
     # Widen the global head so a collapsed cache group would be observably wrong.
     config.global_head_dim = 32
     module = registry.get("gemma4_text")(config)
-    pkg = Gemma4TextCausalLMTask(static_cache=True, max_seq_len=CAPACITY).build(
-        module, config
-    )
+    pkg = Gemma4TextCausalLMTask(static_cache=True, max_seq_len=CAPACITY).build(module, config)
     return build_decoder_workflow_metadata(pkg, config)
 
 
@@ -177,9 +174,7 @@ class TestStaticCacheWorkflow:
             assert carried[cell].startswith("decoder.body.updated_")
 
     def test_state_service_publishes_an_indexed_scatter_discipline(self, static_workflow):
-        groups = static_workflow["pipeline"]["workflow"]["serving"]["state_service"][
-            "groups"
-        ]
+        groups = static_workflow["pipeline"]["workflow"]["serving"]["state_service"]["groups"]
         assert len(groups) == 1
         group = next(iter(groups.values()))
         assert group["update"] == {
@@ -282,9 +277,7 @@ class TestHeterogeneousStaticCache:
         state = workflow["state"]
 
         full_cell = next(iter(groups["decoder_cache_full_attention"]["ports"]["model"]))
-        sliding_cell = next(
-            iter(groups["decoder_cache_sliding_attention"]["ports"]["model"])
-        )
+        sliding_cell = next(iter(groups["decoder_cache_sliding_attention"]["ports"]["model"]))
         # 1 kv head x global_head_dim 32, flattened into a fixed buffer.
         assert state[full_cell]["contract"]["shape"] == ["batch", CAPACITY, 32]
         # 1 kv head x head_dim 16, still growing.
@@ -354,7 +347,9 @@ class TestFp8KvCacheMetadata:
         # Quantizing the cells changes their dtype, not their update discipline.
         _, metadata = fp8_workflow
         group = next(
-            iter(metadata["pipeline"]["workflow"]["serving"]["state_service"]["groups"].values())
+            iter(
+                metadata["pipeline"]["workflow"]["serving"]["state_service"]["groups"].values()
+            )
         )
         assert group["sequence_axis"] == 2
         assert group["layout"] == "bnsh"
@@ -399,7 +394,9 @@ class TestFeatureCombinations:
         )
         metadata = build_decoder_workflow_metadata(pkg, config)
         group = next(
-            iter(metadata["pipeline"]["workflow"]["serving"]["state_service"]["groups"].values())
+            iter(
+                metadata["pipeline"]["workflow"]["serving"]["state_service"]["groups"].values()
+            )
         )
         assert group["update"]["kind"] == "indexed_scatter"
         assert metadata["model"]["io"]["static_cache"]["key_cache_inputs"] == [
