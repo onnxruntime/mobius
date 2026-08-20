@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 import re
 from typing import Any
@@ -49,11 +50,13 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     _name_image_preprocessing_program,
     _port,
     _shape_metadata,
+    _source_asset_path,
     add_adapter_service_to_metadata,
     add_policy_components_to_workflow,
     build_native_vlm_package_metadata,
     declare_request_alignment,
 )
+from mobius.tasks._ctc_asr import BATCH_PADDING_SENSITIVE_KEY
 
 
 class _NoAliasSafeDumper(yaml.SafeDumper):
@@ -6108,6 +6111,334 @@ def write_language_diffusion_workflow_metadata(
     )
     pkg.save_policy_components(output_dir)
     add_adapter_service_to_metadata(metadata, pkg, output_dir)
+    path = os.path.join(output_dir, "inference_metadata.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        _dump_yaml(metadata, handle)
+    return path
+
+
+_AUDIO_PREPROCESS_ABI = "onnx-genai.audio-preprocess"
+_AUDIO_PREPROCESS_ABI_VERSION = "1"
+
+
+def _audio_preprocess_component(
+    values_contract: dict[str, Any],
+    mask_contract: dict[str, Any],
+) -> dict[str, Any]:
+    """Declare the versioned audio-preprocessing adapter component.
+
+    The adapter turns request-supplied encoded audio bytes into the encoder's
+    waveform tensor and its sample-level validity mask.  Its ports are declared
+    so the runtime can type-check the binding without knowing which model family
+    produced the package.
+    """
+    return {
+        "implementation": {
+            "kind": "adapter",
+            "abi": _AUDIO_PREPROCESS_ABI,
+            "version": _AUDIO_PREPROCESS_ABI_VERSION,
+        },
+        "ports": {
+            "inputs": {
+                "encoded": {"dtype": "uint8", "rank": 1, "shape": ["bytes"]},
+            },
+            "outputs": {
+                "input_values": values_contract,
+                "attention_mask": mask_contract,
+            },
+        },
+        "contract": {
+            "id": _AUDIO_PREPROCESS_ABI,
+            "version": _AUDIO_PREPROCESS_ABI_VERSION,
+            "bindings": {
+                "encoded": "encoded",
+                "input_values": "input_values",
+                "attention_mask": "attention_mask",
+            },
+        },
+        "effects": ["audio_preprocess"],
+    }
+
+
+def _ctc_vocabulary(source: str | None, vocab_size: int) -> dict[str, Any]:
+    """Describe the class-id → string table used to render a transcript.
+
+    The table is inlined when the source checkpoint's ``vocab.json`` is
+    reachable so the document is self-contained; otherwise the profile points at
+    the packaged tokenizer.
+    """
+    vocabulary: dict[str, Any] = {"source": "tokenizer", "size": vocab_size}
+    path = _source_asset_path(source, "vocab.json") if source else None
+    if path is None:
+        return vocabulary
+    try:
+        with open(path, encoding="utf-8") as handle:
+            table = json.load(handle)
+    except (OSError, ValueError):
+        return vocabulary
+    if not isinstance(table, dict) or not table:
+        return vocabulary
+    tokens = [""] * (max(int(index) for index in table.values()) + 1)
+    for token, index in table.items():
+        tokens[int(index)] = token
+    if len(tokens) != vocab_size:
+        return vocabulary
+    vocabulary = {
+        "source": "inline",
+        "size": vocab_size,
+        "tokens": tokens,
+    }
+    if "|" in table:
+        vocabulary["word_delimiter"] = "|"
+    ignored = [token for token in ("<pad>", "<s>", "</s>", "<unk>") if token in table]
+    if ignored:
+        vocabulary["ignored_tokens"] = ignored
+    return vocabulary
+
+
+def build_ctc_asr_workflow_metadata(
+    pkg: Any,
+    config: Any,
+    *,
+    source: str | None = None,
+    artifact: str = "model.onnx",
+) -> dict[str, Any]:
+    """Build one-file metadata for a non-generative CTC ASR package.
+
+    A CTC acoustic model is frame-synchronous: the encoder runs exactly once and
+    emits one class distribution per frame.  The workflow is therefore a plain
+    sequence with no loop and no carried state, and the transcript is recovered
+    by the ``transcription`` profile's decoding contract rather than by a
+    generation loop.
+
+    Args:
+        pkg: The built :class:`ModelPackage`; must hold a single ``model``.
+        config: The resolved architecture config (supplies vocabulary size and
+            the CTC blank id).
+        source: HuggingFace model id or local directory used to inline the
+            decoding vocabulary.
+        artifact: Encoder artifact path relative to the package root.
+
+    Returns:
+        A metadata document with ``preprocessing.audio``, ``profiles`` and a
+        single-step ``pipeline.workflow``.
+    """
+    if "model" not in pkg:
+        raise ValueError("CTC ASR workflow requires a 'model' component")
+    model = pkg["model"]
+
+    graph_inputs = {value.name: value for value in model.graph.inputs}
+    graph_outputs = {value.name: value for value in model.graph.outputs}
+    for required in ("input_values", "attention_mask"):
+        if required not in graph_inputs:
+            raise ValueError(f"CTC ASR encoder must declare input '{required}'")
+    if "logits" not in graph_outputs:
+        raise ValueError("CTC ASR encoder must declare output 'logits'")
+    has_frame_lengths = "frame_lengths" in graph_outputs
+
+    values_contract = _contract(graph_inputs["input_values"])
+    mask_contract = _contract(graph_inputs["attention_mask"])
+    logits_contract = _contract(graph_outputs["logits"])
+
+    sample_rate = int(getattr(getattr(config, "audio", None), "sampling_rate", 0) or 16_000)
+    # Shape inference may leave the class axis unknown (or the whole shape
+    # absent), so fall back to the config rather than emitting a vocabulary
+    # whose declared size silently disagrees with the graph.
+    logits_shape = logits_contract.get("shape") or []
+    inferred_classes = logits_shape[-1] if logits_shape else None
+    vocab_size = int(inferred_classes or getattr(config, "vocab_size", 0) or 0)
+    if vocab_size <= 0:
+        raise ValueError(
+            "CTC ASR metadata requires a vocabulary size; the 'logits' output "
+            "declares no static class axis and the config has no vocab_size"
+        )
+    blank_id = int(getattr(config, "pad_token_id", 0) or 0)
+
+    workflow_outputs = {
+        "logits": {
+            "contract": logits_contract,
+            "role": "tensor",
+            "stage": "post_adapter",
+        }
+    }
+    emit_nodes = [
+        {
+            "kind": "emit",
+            "value": "encoder.logits",
+            "output": "logits",
+            "mode": "replace",
+        }
+    ]
+    profile_outputs = {"logits": "logits"}
+    if has_frame_lengths:
+        workflow_outputs["frame_lengths"] = {
+            "contract": _contract(graph_outputs["frame_lengths"]),
+            "role": "tensor",
+            "stage": "post_adapter",
+        }
+        emit_nodes.append(
+            {
+                "kind": "emit",
+                "value": "encoder.frame_lengths",
+                "output": "frame_lengths",
+                "mode": "replace",
+            }
+        )
+        profile_outputs["frame_lengths"] = "frame_lengths"
+
+    workflow = {
+        "manifest": {
+            "ir_version": "1.0",
+            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
+            "adapter_abis": {_AUDIO_PREPROCESS_ABI: _AUDIO_PREPROCESS_ABI_VERSION},
+            "capabilities": ["workflow_ssa", "linear_effects", "typed_emit"],
+        },
+        "effects": {
+            # Both steps are pure functions of their inputs: decoding audio and
+            # running the encoder observe nothing external, so replay is always
+            # safe.  Speculation safety is irrelevant here because a CTC
+            # workflow has no speculative region, but it is declared explicitly
+            # rather than left to a default.
+            "audio_preprocess": {"retry": "pure", "speculation_safety": {"kind": "clonable"}},
+            "encode": {"retry": "pure", "speculation_safety": {"kind": "clonable"}},
+        },
+        "inputs": {
+            "request.audio": {
+                "contract": {"dtype": "uint8", "rank": 1, "shape": ["bytes"]},
+                "role": {"kind": "runtime", "version": "1.0", "role": "media"},
+                "source": {"kind": "request", "field": "media"},
+                "required": True,
+            }
+        },
+        "outputs": workflow_outputs,
+        "components": {
+            "audio_preprocess": _audio_preprocess_component(values_contract, mask_contract),
+            "encoder": _component(model, artifact, effects=("encode",)),
+        },
+        "initial_effects": {
+            "audio_preprocess": "audio_preprocess.0",
+            "encode": "encode.0",
+        },
+        "graph": {
+            "kind": "sequence",
+            "nodes": [
+                _invoke(
+                    "audio_preprocess",
+                    {"encoded": "request.audio"},
+                    {
+                        "input_values": "audio.input_values",
+                        "attention_mask": "audio.attention_mask",
+                    },
+                ),
+                _invoke(
+                    "encoder",
+                    {
+                        "input_values": "audio.input_values",
+                        "attention_mask": "audio.attention_mask",
+                    },
+                    {
+                        name: f"encoder.{name}"
+                        for name in ("logits", "frame_lengths")
+                        if name in graph_outputs
+                    },
+                ),
+                *emit_nodes,
+            ],
+        },
+    }
+
+    decoding: dict[str, Any] = {
+        "kind": "ctc",
+        "blank_id": blank_id,
+        "collapse_repeats": True,
+        "time_axis": 1,
+        "class_axis": 2,
+        "vocabulary": _ctc_vocabulary(source, vocab_size),
+    }
+    if has_frame_lengths:
+        decoding["lengths"] = "frame_lengths"
+
+    # A feature extractor that reduces over the padded time axis makes a row's
+    # values depend on the width of the batch it was padded into.  The fact is
+    # recorded by the task on the built graph; when nobody stated it we leave
+    # the field absent rather than claim rows are independent.
+    normalization = getattr(config, "feat_extract_norm", None)
+    if normalization == "group":
+        batch_invariance = "padding_sensitive"
+    elif normalization == "layer":
+        batch_invariance = "row_independent"
+    else:
+        recorded = model.metadata_props.get(BATCH_PADDING_SENSITIVE_KEY)
+        batch_invariance = (
+            None
+            if recorded is None
+            else ("padding_sensitive" if recorded == "true" else "row_independent")
+        )
+
+    profile: dict[str, Any] = {
+        "kind": "transcription",
+        "version": "1.0",
+        "requirement": "required",
+        "outputs": profile_outputs,
+        "decoding": decoding,
+    }
+    # The claim is only checkable when the package also publishes per-row
+    # lengths; without them a reader cannot isolate a row's valid region.
+    if batch_invariance == "row_independent" or has_frame_lengths:
+        if batch_invariance is not None:
+            profile["batch_invariance"] = batch_invariance
+
+    return {
+        "schema_version": "v1",
+        "preprocessing": {
+            "audio": {
+                "transforms": [
+                    {"op": "decode", "outputs": ["samples"]},
+                    {"op": "resample", "sample_rate": sample_rate},
+                    {"op": "downmix", "channels": 1},
+                    {"op": "zero_mean_unit_variance", "epsilon": 1e-7},
+                    {
+                        "op": "pad",
+                        "mode": "right",
+                        "pad_value": 0.0,
+                        "outputs": ["values", "sample_mask"],
+                    },
+                ],
+                "outputs": [
+                    {
+                        "name": "input_values",
+                        "source": "values",
+                        "content": "waveform",
+                        "dtype": values_contract["dtype"],
+                        "rank": values_contract["rank"],
+                    },
+                    {
+                        "name": "attention_mask",
+                        "source": "sample_mask",
+                        "content": "validity_mask",
+                        "dtype": mask_contract["dtype"],
+                        "rank": mask_contract["rank"],
+                    },
+                ],
+            }
+        },
+        "profiles": {
+            "transcription": profile,
+        },
+        "pipeline": {"workflow": _publish_workflow_v1(workflow)},
+    }
+
+
+def write_ctc_asr_workflow_metadata(
+    pkg: Any,
+    output_dir: str,
+    config: Any,
+    *,
+    source: str | None = None,
+) -> str:
+    """Write one-file CTC ASR metadata into *output_dir*."""
+    os.makedirs(output_dir, exist_ok=True)
+    metadata = build_ctc_asr_workflow_metadata(pkg, config, source=source)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
         _dump_yaml(metadata, handle)

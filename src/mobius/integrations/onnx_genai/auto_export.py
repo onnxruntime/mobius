@@ -31,6 +31,7 @@ from mobius.integrations.onnx_genai.inference_metadata import (
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
     write_audio_codec_workflow_metadata,
+    write_ctc_asr_workflow_metadata,
     write_decoder_workflow_metadata,
     write_diffusion_workflow_metadata,
     write_language_diffusion_workflow_metadata,
@@ -431,6 +432,33 @@ def _looks_like_speech_to_text(pkg: Any) -> bool:
     return "encoder_hidden_states" in decoder_inputs
 
 
+def _looks_like_ctc_asr(pkg: Any) -> bool:
+    """Detect a non-generative CTC ASR package.
+
+    The signal is structural: a single ``model`` component that consumes a raw
+    waveform plus a sample-level mask and emits per-frame ``logits`` with no KV
+    cache.  The absent cache is what separates CTC from a Whisper-style
+    autoregressive decoder that also emits ``logits``.
+    """
+    try:
+        names = set(pkg.keys())
+    except AttributeError:
+        return False
+    if names != {"model"}:
+        return False
+    try:
+        model = pkg["model"]
+        inputs = {value.name for value in model.graph.inputs}
+        outputs = {value.name for value in model.graph.outputs}
+    except (AttributeError, KeyError):
+        return False
+    if not {"input_values", "attention_mask"} <= inputs:
+        return False
+    if "logits" not in outputs:
+        return False
+    return not any(name.startswith("past_key_values") for name in inputs)
+
+
 def _looks_like_audio_codec(pkg: Any) -> bool:
     """Detect an audio-to-audio neural codec package.
 
@@ -655,6 +683,23 @@ def write_onnx_genai_config(
         # decoder config — emit before the config requirement below.
         path = write_audio_codec_workflow_metadata(pkg, output_dir)
         return {"inference_metadata": path}
+
+    if _looks_like_ctc_asr(pkg):
+        # CTC ASR is frame-synchronous: the encoder runs once and the transcript
+        # comes from the profile's decoding contract, so no decoder/KV metadata
+        # is produced.
+        ctc_config = config if config is not None else getattr(pkg, "config", None)
+        if ctc_config is None:
+            raise ValueError(
+                "CTC ASR metadata requires a model config (pass config=... or a "
+                "package carrying `.config`)"
+            )
+        path = write_ctc_asr_workflow_metadata(pkg, output_dir, ctc_config, source=source)
+        artifacts = {"inference_metadata": path}
+        tokenizer_path = _write_hf_tokenizer(output_dir, source)
+        if tokenizer_path is not None:
+            artifacts["tokenizer"] = tokenizer_path
+        return artifacts
 
     if _looks_like_speculative(pkg):
         if kv_native_dtype is not None:
