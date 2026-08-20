@@ -50,6 +50,13 @@ class VideoDenoisingTask(ModelTask):
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
         )
+        # Unpatchify recomputes the spatial extents from Shape ops, which mints
+        # fresh symbolic dimensions. The prediction is elementwise with the
+        # latent, so the declared contract has to say so: a solver that carries
+        # the latent across steps needs both to unify.
+        noise_pred.shape = ir.Shape(
+            ["batch", "num_frames", config.out_channels, "height", "width"]
+        )
 
         builder.add_output(noise_pred, "noise_pred")
 
