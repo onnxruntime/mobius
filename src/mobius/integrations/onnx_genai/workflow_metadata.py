@@ -30,27 +30,32 @@ from mobius.generation import (
     build_empty_features,
     build_eos_termination,
     build_euler_model_input,
+    build_flow_match_solver_step,
     build_greedy_sampler,
     build_guidance_combine,
     build_integer_add,
     build_integer_minimum,
     build_last_token_logits,
     build_model_token_cast,
+    build_pack_latents_2x2,
     build_proposal_metrics,
     build_scalar_constant,
     build_schedule_constant,
     build_schedule_lookup,
     build_seeded_categorical_sampler,
     build_selective_integer_add,
+    build_sequence_concat,
     build_sequence_length,
     build_shape_constant,
     build_tensor_scale,
     build_termination_batch_initializer,
     build_token_state_update,
     build_token_to_slot,
+    build_true_cfg,
     build_tts_decoder_state_initializer,
     build_tts_decoder_step_update,
     build_tts_state_initializer,
+    build_unpack_latents_2x2,
     build_zeros_like,
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
@@ -2974,6 +2979,341 @@ def write_diffusion_workflow_metadata(
         guidance_scale=guidance_scale,
         latent_source=latent_source,
         latent_row_shape=latent_row_shape,
+    )
+    pkg.save_policy_components(output_dir)
+    add_adapter_service_to_metadata(metadata, pkg, output_dir)
+    path = os.path.join(output_dir, "inference_metadata.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        _dump_yaml(metadata, handle)
+    return path
+
+
+def _application_input(value: ir.Value, name: str | None = None) -> dict[str, Any]:
+    """Declare a workflow input supplied by the host application."""
+    return {
+        "contract": _contract(value),
+        "role": {"kind": "opaque"},
+        "source": {"kind": "application", "name": name or value.name},
+        "required": True,
+    }
+
+
+def build_image_edit_workflow_metadata(
+    pkg: Any,
+    *,
+    num_inference_steps: int,
+    schedule: list[float],
+    timesteps: list[float],
+    guidance_scale: float,
+) -> dict[str, Any]:
+    """Build a flow-matching image-edit workflow with true classifier-free guidance.
+
+    Emitted pipeline (Qwen Image Edit and any package with the same component
+    shape)::
+
+        vae_encoder(source pixels) -> pack -> source tokens          [setup]
+        loop:
+            timestep      = timesteps[i]
+            model_input   = concat([target tokens, source tokens], 1)
+            cond          = denoiser(model_input, positive prompt)
+            uncond        = denoiser(model_input, negative prompt)
+            estimate      = true_cfg(cond, uncond)
+            target tokens = target + (sigma[i+1] - sigma[i]) * estimate
+        unpack(target tokens) -> vae_decoder -> image
+
+    The denoiser slices its own output back to the target token count using the
+    ``target_sequence_length`` port, so the loop state stays rank-3 and the
+    source tokens stay loop-invariant.
+    """
+    if num_inference_steps < 1:
+        raise ValueError("num_inference_steps must be >= 1")
+    if len(schedule) != num_inference_steps + 1:
+        raise ValueError("image-edit schedule must contain num_inference_steps + 1 values")
+    if len(timesteps) != num_inference_steps:
+        raise ValueError("image-edit timesteps must contain num_inference_steps values")
+
+    denoiser_name = "transformer"
+    denoiser = pkg[denoiser_name]
+    encoder = pkg["vae_encoder"]
+    decoder = pkg["vae_decoder"]
+
+    ports = {value.name: value for value in denoiser.graph.inputs}
+    sample_input = ports["sample"]
+    timestep_input = ports["timestep"]
+    estimate_output = denoiser.graph.outputs[0]
+    encoder_input = encoder.graph.inputs[0]
+    encoder_output = encoder.graph.outputs[0]
+    decoder_input = decoder.graph.inputs[0]
+    decoder_output = decoder.graph.outputs[0]
+    dtype = sample_input.dtype
+
+    # Loop state is the target token block only; the denoiser input additionally
+    # carries the source tokens, so the two contracts differ in sequence length.
+    latent_contract = {
+        "dtype": _contract(sample_input)["dtype"],
+        "rank": 3,
+        "shape": ["batch", "target_sequence_length", _contract(sample_input)["shape"][2]],
+    }
+
+    attach_policy_components(pkg, PolicyCapabilities())
+    pkg.add_policy_component("solver_step", build_flow_match_solver_step(dtype))
+    pkg.add_policy_component("continue_predicate", build_boolean_not())
+    pkg.add_policy_component("diffusion_schedule", build_schedule_constant(schedule))
+    pkg.add_policy_component("diffusion_timesteps", build_schedule_constant(timesteps))
+    pkg.add_policy_component("schedule_lookup", build_schedule_lookup(timestep_input.dtype))
+    pkg.add_policy_component("pack_latents", build_pack_latents_2x2(dtype))
+    pkg.add_policy_component("unpack_latents", build_unpack_latents_2x2(dtype))
+    pkg.add_policy_component("sequence_concat", build_sequence_concat(dtype))
+    pkg.add_policy_component("true_cfg", build_true_cfg(dtype, guidance_scale=guidance_scale))
+
+    batch = latent_contract["shape"][0]
+    batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
+    batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch]}
+    control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
+
+    conditioning_ports = ("encoder_hidden_states", "encoder_hidden_states_mask")
+    rotary_ports = ("image_rotary_cos", "image_rotary_sin")
+    text_rotary_ports = ("text_rotary_cos", "text_rotary_sin")
+
+    inputs: dict[str, Any] = {
+        "request.latent": {
+            "contract": latent_contract,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "application", "name": "latent"},
+            "required": True,
+        },
+        "request.source_pixels": _application_input(encoder_input, "source_pixels"),
+        "request.target_sequence_length": _application_input(ports["target_sequence_length"]),
+        "request.latent_height": {
+            "contract": control_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "application", "name": "latent_height"},
+            "required": True,
+        },
+        "request.latent_width": {
+            "contract": control_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "application", "name": "latent_width"},
+            "required": True,
+        },
+        "request.max_iterations": {
+            "contract": control_int,
+            "role": {"kind": "runtime", "version": "1.0", "role": "max_iterations"},
+            "source": {"kind": "request", "field": "max_iterations"},
+            "required": False,
+            "default": num_inference_steps,
+        },
+        "package.false": {
+            "contract": batch_bool,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": False,
+        },
+    }
+    for port_name in rotary_ports:
+        inputs[f"request.{port_name}"] = _application_input(ports[port_name])
+    # Positive and negative conditioning are separate application inputs: the two
+    # prompts tokenize to different lengths, so they cannot share a contract dim.
+    for prefix in ("positive", "negative"):
+        for port_name in conditioning_ports + text_rotary_ports:
+            contract = _contract(ports[port_name])
+            contract["shape"] = [
+                f"{prefix}_text_sequence_length"
+                if isinstance(dim, str) and "text" in dim
+                else dim
+                for dim in contract["shape"]
+            ]
+            inputs[f"request.{prefix}_{port_name}"] = {
+                "contract": contract,
+                "role": {"kind": "opaque"},
+                "source": {"kind": "application", "name": f"{prefix}_{port_name}"},
+                "required": True,
+            }
+
+    setup_nodes: list[dict[str, Any]] = [
+        _invoke("diffusion_schedule", {}, {"schedule": "diffusion.schedule"}),
+        _invoke("diffusion_timesteps", {}, {"schedule": "diffusion.timesteps"}),
+        _invoke(
+            "vae_encoder",
+            {encoder_input.name: "request.source_pixels"},
+            {encoder_output.name: "source.latent"},
+        ),
+        _invoke(
+            "pack_latents",
+            {"latent_sample": "source.latent"},
+            {"packed_latent": "source.tokens"},
+        ),
+        _invoke(
+            "continue_predicate",
+            {"done": "package.false"},
+            {"continue": "setup.continue"},
+        ),
+    ]
+
+    def denoise(prefix: str, output: str) -> dict[str, Any]:
+        feeds = {
+            sample_input.name: "diffusion.model_input",
+            timestep_input.name: "diffusion.timestep",
+            "target_sequence_length": "request.target_sequence_length",
+        }
+        for port_name in rotary_ports:
+            feeds[port_name] = f"request.{port_name}"
+        for port_name in conditioning_ports + text_rotary_ports:
+            feeds[port_name] = f"request.{prefix}_{port_name}"
+        return _invoke(denoiser_name, feeds, {estimate_output.name: output})
+
+    body_nodes: list[dict[str, Any]] = [
+        _invoke(
+            "schedule_lookup",
+            {"schedule": "diffusion.timesteps", "step": "loop.iteration"},
+            {"timestep": "diffusion.timestep"},
+        ),
+        _invoke(
+            "sequence_concat",
+            {"target": "state.latent.body", "source": "source.tokens"},
+            {"sequence": "diffusion.model_input"},
+        ),
+        denoise("positive", "denoiser.conditional"),
+        denoise("negative", "denoiser.unconditional"),
+        _invoke(
+            "true_cfg",
+            {
+                "conditional": "denoiser.conditional",
+                "unconditional": "denoiser.unconditional",
+            },
+            {"estimate": "denoiser.estimate"},
+        ),
+        _invoke(
+            "solver_step",
+            {
+                "sample": "state.latent.body",
+                "derivative": "denoiser.estimate",
+                "step": "loop.iteration",
+                "schedule": "diffusion.schedule",
+            },
+            {"next_state": "latent.body"},
+            {"solver": _effect("solver.0", "solver.1")},
+        ),
+        _invoke(
+            "continue_predicate",
+            {"done": "package.false"},
+            {"continue": "loop.continue"},
+        ),
+    ]
+
+    latent_effect = "state:latent"
+    workflow = {
+        "manifest": {
+            "ir_version": "1.0",
+            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
+            "capabilities": [
+                "workflow_ssa",
+                "linear_effects",
+                "nested_control_flow",
+                "loop_induction_values",
+                "typed_emit",
+            ],
+        },
+        "inputs": inputs,
+        "outputs": {
+            "image": {
+                "contract": _contract(decoder_output),
+                "role": "image",
+                "stage": "pre_adapter",
+            }
+        },
+        "components": {
+            name: _component(model, _artifact(name, len(pkg))) for name, model in pkg.items()
+        },
+        "state": {
+            "latent": {
+                "contract": latent_contract,
+                "scope": "invocation",
+                "initializer": "request.latent",
+                "recurrence": {"kind": "invariant"},
+            }
+        },
+        "initial_effects": {
+            "solver": "solver.0",
+            latent_effect: f"{latent_effect}.0",
+            "emit": "emit.0",
+        },
+        "graph": {
+            "kind": "sequence",
+            "nodes": [
+                {
+                    "kind": "loop",
+                    "setup": {"kind": "sequence", "nodes": setup_nodes},
+                    "body": {"kind": "sequence", "nodes": body_nodes},
+                    "condition": "loop.continue",
+                    "max_iterations": "request.max_iterations",
+                    "iteration": {"value": "loop.iteration", "contract": batch_int},
+                    "carried": [
+                        {
+                            "cell": "latent",
+                            "current": "request.latent",
+                            "body_input": "state.latent.body",
+                            "body_output": "latent.body",
+                            "next": "latent.final",
+                            "read_effect": _effect(
+                                f"{latent_effect}.0", f"{latent_effect}.read"
+                            ),
+                            "write_effect": _effect(
+                                f"{latent_effect}.read", f"{latent_effect}.1"
+                            ),
+                        }
+                    ],
+                },
+                _invoke(
+                    "unpack_latents",
+                    {
+                        "packed_latent": "latent.final",
+                        "height": "request.latent_height",
+                        "width": "request.latent_width",
+                    },
+                    {"latent_sample": "vae.latent"},
+                ),
+                _invoke(
+                    "vae_decoder",
+                    {decoder_input.name: "vae.latent"},
+                    {decoder_output.name: "vae.image"},
+                ),
+                {
+                    "kind": "emit",
+                    "value": "vae.image",
+                    "output": "image",
+                    "mode": "replace",
+                    "effect_name": "emit",
+                    "effect": _effect("emit.0", "emit.1"),
+                },
+            ],
+        },
+    }
+    metadata = {
+        "schema_version": "v1",
+        "pipeline": {"workflow": _publish_workflow_v1(workflow)},
+    }
+    add_policy_components_to_workflow(metadata, pkg)
+    return metadata
+
+
+def write_image_edit_workflow_metadata(
+    pkg: Any,
+    output_dir: str,
+    *,
+    num_inference_steps: int,
+    schedule: list[float],
+    timesteps: list[float],
+    guidance_scale: float,
+) -> str:
+    os.makedirs(output_dir, exist_ok=True)
+    metadata = build_image_edit_workflow_metadata(
+        pkg,
+        num_inference_steps=num_inference_steps,
+        schedule=schedule,
+        timesteps=timesteps,
+        guidance_scale=guidance_scale,
     )
     pkg.save_policy_components(output_dir)
     add_adapter_service_to_metadata(metadata, pkg, output_dir)

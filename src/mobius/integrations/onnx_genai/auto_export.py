@@ -35,6 +35,7 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     write_ctc_asr_workflow_metadata,
     write_decoder_workflow_metadata,
     write_diffusion_workflow_metadata,
+    write_image_edit_workflow_metadata,
     write_language_diffusion_workflow_metadata,
     write_speculative_workflow_metadata,
     write_speech_to_text_workflow_metadata,
@@ -132,6 +133,70 @@ def _diffusion_schedule(
 
 
 _DENOISER_KEYS = ("denoiser", "transformer", "unet")
+
+
+def _flow_match_euler_schedule(
+    scheduler: SchedulerConfig, num_inference_steps: int, image_seq_len: int
+) -> tuple[list[float], list[float]]:
+    """Materialize diffusers ``FlowMatchEulerDiscreteScheduler`` timesteps/sigmas.
+
+    Reproduces ``set_timesteps(sigmas=linspace(1, 1/n, n), mu=calculate_shift(...))``
+    including resolution-dependent dynamic shifting and terminal stretching, so
+    the baked schedule matches the pipeline that produced the reference image.
+    Timesteps are emitted as sigmas (``t / num_train_timesteps``) because the
+    Qwen Image denoiser consumes the normalized timestep directly.
+    """
+    if scheduler.kind != "flow_match_euler":
+        raise ValueError(
+            f"image-edit workflow requires a flow-match Euler scheduler, got {scheduler.kind!r}"
+        )
+    sigmas = np.linspace(1.0, 1.0 / num_inference_steps, num_inference_steps, dtype=np.float64)
+    if scheduler.use_dynamic_shifting:
+        base_seq_len = scheduler.base_image_seq_len or 256
+        max_seq_len = scheduler.max_image_seq_len or 4096
+        base_shift = scheduler.base_shift if scheduler.base_shift is not None else 0.5
+        max_shift = scheduler.max_shift if scheduler.max_shift is not None else 1.15
+        slope = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+        mu = image_seq_len * slope + (base_shift - slope * base_seq_len)
+        if (scheduler.time_shift_type or "exponential") != "exponential":
+            raise ValueError(
+                f"unsupported flow-match time shift {scheduler.time_shift_type!r}"
+            )
+        sigmas = np.exp(mu) / (np.exp(mu) + (1.0 / sigmas - 1.0))
+    elif scheduler.shift is not None:
+        sigmas = scheduler.shift * sigmas / (1.0 + (scheduler.shift - 1.0) * sigmas)
+    if scheduler.shift_terminal is not None:
+        # stretch_shift_to_terminal: map the last sigma onto shift_terminal.
+        one_minus = 1.0 - sigmas
+        sigmas = 1.0 - one_minus / (one_minus[-1] / (1.0 - scheduler.shift_terminal))
+    return sigmas.tolist(), [*sigmas.tolist(), 0.0]
+
+
+def _looks_like_image_edit(pkg: Any) -> bool:
+    """Detect a source-image-conditioned flow-matching editing pipeline.
+
+    Structural signals: a VAE encoder and decoder pair, plus a denoiser that
+    takes rank-3 packed latents and exposes a ``target_sequence_length`` port —
+    i.e. it consumes concatenated target+source tokens and slices its estimate
+    back to the target block.
+    """
+    try:
+        names = set(pkg.keys())
+    except AttributeError:
+        return False
+    if not {"vae_encoder", "vae_decoder"} <= names:
+        return False
+    denoiser_name = next((key for key in _DENOISER_KEYS if key in names), None)
+    if denoiser_name is None:
+        return False
+    inputs = {value.name: value for value in pkg[denoiser_name].graph.inputs}
+    sample = inputs.get("sample")
+    return (
+        "target_sequence_length" in inputs
+        and sample is not None
+        and sample.shape is not None
+        and len(sample.shape) == 3
+    )
 
 
 def _add_explicit_io_to_file(path: str, pkg: Any, config: Any) -> None:
@@ -637,6 +702,7 @@ def write_onnx_genai_config(
     ===================== ============================================ =================================
     Pipeline shape        Structural signal (detector)                 Emitted ``strategy``
     ===================== ============================================ =================================
+    Image edit            VAE pair + denoiser w/ target_sequence_len   typed SSA workflow (edit loop)
     Diffusion             denoiser / VAE present                       ``iterative``
     Audio codec           encoder→``codes``→decoder, no cross-attn     typed SSA workflow
     Multimodal VLM        decoder + vision/audio encoder + fusion      ``composite`` (encoders→fuse→AR)
@@ -668,17 +734,37 @@ def write_onnx_genai_config(
         return artifacts
 
     if _looks_like_diffusion(pkg):
-        is_qwen_image_edit = getattr(getattr(pkg, "config", None), "model_type", None) == (
-            "qwen_image_edit"
-        )
-        if is_qwen_image_edit:
-            raise ValueError(
-                "onnx-genai cannot execute Qwen Image Edit packages: the runtime "
-                "does not support source-latent packing, target/source token "
-                "concatenation, target-only denoiser outputs, or the required "
-                "Qwen true-CFG path. Export the ONNX components without "
-                "--runtime onnx-genai and orchestrate the pipeline directly."
+        is_image_edit = _looks_like_image_edit(pkg)
+        if is_image_edit:
+            if scheduler is None:
+                scheduler = load_diffusers_scheduler_config(source)
+            if scheduler is None:
+                raise ValueError(
+                    "image-edit workflow requires the diffusers scheduler config; "
+                    "pass scheduler=SchedulerConfig(...) or a resolvable source"
+                )
+            image_seq_len = kwargs.pop("image_seq_len", None)
+            if image_seq_len is None:
+                raise ValueError(
+                    "image-edit workflow requires image_seq_len (the packed target "
+                    "token count) to materialize the resolution-dependent schedule"
+                )
+            timesteps, sigma_schedule = _flow_match_euler_schedule(
+                scheduler, num_inference_steps, int(image_seq_len)
             )
+            path = write_image_edit_workflow_metadata(
+                pkg,
+                output_dir,
+                num_inference_steps=num_inference_steps,
+                schedule=sigma_schedule,
+                timesteps=timesteps,
+                guidance_scale=1.0 if guidance_scale is None else guidance_scale,
+            )
+            artifacts = {"inference_metadata": path}
+            tokenizer_path = _write_hf_tokenizer(output_dir, source)
+            if tokenizer_path is not None:
+                artifacts["tokenizer"] = tokenizer_path
+            return artifacts
         if scheduler is None:
             scheduler = load_diffusers_scheduler_config(source, revision=revision)
         # Fill in component filenames from the package layout, letting any

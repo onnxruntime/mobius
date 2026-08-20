@@ -16,6 +16,11 @@ import yaml
 from mobius._configs import QuantizationConfig
 from mobius._model_package import ModelPackage
 from mobius.integrations.onnx_genai import write_onnx_genai_config
+from mobius.integrations.onnx_genai.auto_export import (
+    _flow_match_euler_schedule,
+    _looks_like_image_edit,
+)
+from mobius.integrations.onnx_genai.inference_metadata import SchedulerConfig
 from mobius.integrations.onnx_genai.inference_metadata_test import (
     _decoder_model,
     _model,
@@ -382,53 +387,206 @@ def test_single_diffusion_component_requires_explicit_vae(tmp_path):
         write_onnx_genai_config(pkg, str(tmp_path), num_inference_steps=2)
 
 
-def test_rejects_unsupported_qwen_image_edit_runtime_export(tmp_path):
-    source = tmp_path / "source"
-    output = tmp_path / "output"
-    (source / "scheduler").mkdir(parents=True)
-    (source / "processor").mkdir()
-    (source / "scheduler" / "scheduler_config.json").write_text(
-        json.dumps(
-            {
-                "_class_name": "FlowMatchEulerDiscreteScheduler",
-                "base_image_seq_len": 256,
-                "max_image_seq_len": 8192,
-                "base_shift": 0.5,
-                "max_shift": 0.9,
-                "use_dynamic_shifting": True,
-            }
-        ),
-        encoding="utf-8",
-    )
-    for filename in (
-        "preprocessor_config.json",
-        "video_preprocessor_config.json",
-        "tokenizer_config.json",
-        "tokenizer.json",
-        "chat_template.jinja",
-    ):
-        (source / "processor" / filename).write_text("{}", encoding="utf-8")
+def _image_edit_package():
+    """Build a Qwen-Image-Edit-shaped package with the real port contract.
 
-    pkg = _DiffusionPkg(
+    Mirrors ``QwenImageTask``: rank-3 packed latents, a ``target_sequence_length``
+    slice port, separate image/text rotary tables, and a VAE encoder/decoder pair.
+    """
+    tokens = ["batch", "image_sequence_length", 64]
+    transformer = _model(
+        "transformer",
+        [
+            _value("sample", ir.DataType.FLOAT, tokens),
+            _value("timestep", ir.DataType.FLOAT, ["batch"]),
+            _value(
+                "encoder_hidden_states",
+                ir.DataType.FLOAT,
+                ["batch", "text_sequence_length", 32],
+            ),
+            _value(
+                "encoder_hidden_states_mask",
+                ir.DataType.BOOL,
+                ["batch", "text_sequence_length"],
+            ),
+            _value("image_rotary_cos", ir.DataType.FLOAT, ["image_sequence_length", 8]),
+            _value("image_rotary_sin", ir.DataType.FLOAT, ["image_sequence_length", 8]),
+            _value("text_rotary_cos", ir.DataType.FLOAT, ["text_sequence_length", 8]),
+            _value("text_rotary_sin", ir.DataType.FLOAT, ["text_sequence_length", 8]),
+            _value("target_sequence_length", ir.DataType.INT64, [1]),
+        ],
+        [("noise_pred", ir.DataType.FLOAT, tokens)],
+    )
+    vae_encoder = _model(
+        "vae_encoder",
+        [_value("pixel_values", ir.DataType.FLOAT, ["batch", 3, 1, "height", "width"])],
+        [("latent_sample", ir.DataType.FLOAT, ["batch", 16, 1, "lheight", "lwidth"])],
+    )
+    vae_decoder = _model(
+        "vae_decoder",
+        [_value("latent_sample", ir.DataType.FLOAT, ["batch", 16, 1, "lheight", "lwidth"])],
+        [("image", ir.DataType.FLOAT, ["batch", 3, 1, "height", "width"])],
+    )
+    return ModelPackage(
         {
-            "transformer": object(),
-            "text_encoder": object(),
-            "text_encoder_vision_encoder": object(),
-            "text_encoder_embedding": object(),
-            "vae_encoder": object(),
-            "vae_decoder": object(),
+            "transformer": transformer,
+            "vae_encoder": vae_encoder,
+            "vae_decoder": vae_decoder,
         }
     )
-    pkg.config = SimpleNamespace(
-        model_type="qwen_image_edit",
-        processor_config={"patch_size": 14, "merge_size": 2},
+
+
+_FLOW_MATCH_SCHEDULER = {
+    "_class_name": "FlowMatchEulerDiscreteScheduler",
+    "base_image_seq_len": 256,
+    "max_image_seq_len": 8192,
+    "base_shift": 0.5,
+    "max_shift": 0.9,
+    "shift_terminal": 0.02,
+    "time_shift_type": "exponential",
+    "use_dynamic_shifting": True,
+}
+
+
+def _write_scheduler(source, config=None):
+    (source / "scheduler").mkdir(parents=True, exist_ok=True)
+    (source / "scheduler" / "scheduler_config.json").write_text(
+        json.dumps(_FLOW_MATCH_SCHEDULER if config is None else config), encoding="utf-8"
     )
-    with pytest.raises(ValueError, match="cannot execute Qwen Image Edit"):
+
+
+def test_detects_image_edit_package_structurally():
+    """Structural detection must not depend on model_type strings."""
+    assert _looks_like_image_edit(_image_edit_package())
+    # A plain latent-diffusion package has no VAE encoder and rank-4 samples.
+    assert not _looks_like_image_edit(_diffusion_package(text=True))
+    # A VAE pair alone is not enough without the target-slice denoiser port.
+    pkg = _image_edit_package()
+    del pkg["transformer"]
+    assert not _looks_like_image_edit(pkg)
+
+
+def test_flow_match_schedule_matches_diffusers():
+    """Pin the schedule against the captured Qwen-Image-Edit-2509 reference.
+
+    These are the timesteps ``QwenImageEditPlusPipeline`` produced for the
+    1216x864 reference edit (``image_seq_len=4104``, 8 steps), divided by
+    ``num_train_timesteps`` because the denoiser consumes normalized sigmas.
+    """
+    scheduler = SchedulerConfig(
+        kind="flow_match_euler",
+        use_dynamic_shifting=True,
+        base_image_seq_len=256,
+        max_image_seq_len=8192,
+        base_shift=0.5,
+        max_shift=0.9,
+        shift_terminal=0.02,
+        time_shift_type="exponential",
+    )
+    timesteps, sigmas = _flow_match_euler_schedule(scheduler, 8, 4104)
+    expected = [
+        1.0,
+        0.9160475,
+        0.8200923,
+        0.7093592,
+        0.5801504,
+        0.4274216,
+        0.2441077,
+        0.02,
+    ]
+    assert timesteps == pytest.approx(expected, abs=1e-6)
+    assert sigmas == pytest.approx([*expected, 0.0], abs=1e-6)
+
+
+def test_flow_match_schedule_rejects_wrong_scheduler():
+    with pytest.raises(ValueError, match="flow-match Euler scheduler"):
+        _flow_match_euler_schedule(SchedulerConfig(kind="euler"), 4, 4104)
+
+
+def test_dispatch_image_edit_emits_workflow(tmp_path):
+    """A Qwen-Image-Edit-shaped package must dispatch to the image-edit workflow.
+
+    Asserts the emitted pipeline actually performs the edit: encode the source
+    image, run two guided denoiser passes per step, combine them with true CFG,
+    and decode the target tokens back to pixels.
+    """
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    _write_scheduler(source)
+    arts = write_onnx_genai_config(
+        _image_edit_package(),
+        str(output),
+        source=str(source),
+        num_inference_steps=8,
+        image_seq_len=4104,
+        guidance_scale=4.0,
+    )
+    with open(arts["inference_metadata"]) as handle:
+        meta = yaml.safe_load(handle)
+    workflow = meta["pipeline"]["workflow"]
+
+    loop = next(step for step in workflow["steps"] if step["kind"] == "loop")
+
+    # The source image is encoded and packed once, in the loop's setup block.
+    setup = [node["component"] for node in loop["setup"]]
+    assert setup.index("vae_encoder") < setup.index("pack_latents")
+
+    body = [node["component"] for node in loop["steps"]]
+    # True CFG needs both a positive and a negative denoiser pass per step.
+    assert body.count("transformer") == 2
+    assert "true_cfg" in body
+    assert "sequence_concat" in body
+    assert body.index("true_cfg") < body.index("solver_step")
+    assert loop["max_iterations"] == "request.max_iterations"
+
+    # Source and target tokens are separate: only the target block is carried,
+    # so the loop state's sequence axis is the target length, not the denoiser's
+    # concatenated target+source length.
+    assert [cell["cell"] for cell in loop["carried"]] == ["latent", "loop_0_active"]
+    assert workflow["state"]["latent"]["contract"]["shape"] == [
+        "batch",
+        "target_sequence_length",
+        64,
+    ]
+
+    tail = [step["component"] for step in workflow["steps"] if step["kind"] == "invoke"]
+    assert tail == ["unpack_latents", "vae_decoder"]
+
+    # Positive and negative conditioning cannot share a sequence contract.
+    inputs = workflow["inputs"]
+    assert (
+        inputs["request.positive_encoder_hidden_states"]["contract"]["shape"][1]
+        == "positive_text_sequence_length"
+    )
+    assert (
+        inputs["request.negative_encoder_hidden_states"]["contract"]["shape"][1]
+        == "negative_text_sequence_length"
+    )
+
+    for policy in ("solver_step", "true_cfg", "pack_latents", "unpack_latents"):
+        assert (output / "policies" / f"{policy}.onnx").is_file()
+
+
+def test_image_edit_requires_image_seq_len(tmp_path):
+    """The schedule is resolution dependent, so it cannot be guessed."""
+    source = tmp_path / "source"
+    _write_scheduler(source)
+    with pytest.raises(ValueError, match="requires image_seq_len"):
         write_onnx_genai_config(
-            pkg,
-            str(output),
+            _image_edit_package(),
+            str(tmp_path / "output"),
             source=str(source),
-            num_inference_steps=3,
+            num_inference_steps=8,
+        )
+
+
+def test_image_edit_requires_scheduler_config(tmp_path):
+    with pytest.raises(ValueError, match="requires the diffusers scheduler config"):
+        write_onnx_genai_config(
+            _image_edit_package(),
+            str(tmp_path / "output"),
+            num_inference_steps=8,
+            image_seq_len=4104,
         )
 
 
