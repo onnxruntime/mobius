@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Packed fused MoE experts (Olive/GPTQ/AWQ) survive HF weight renaming
+
+#### Fixed
+
+- MoE exports whose routed experts go through the fused `com.microsoft::QMoE`
+  packer (`qwen3_moe`, Mixtral, OLMoE, Qwen2-MoE, Ernie4.5-MoE, GLM4-MoE) no
+  longer fail on **packed quantized** fused expert tensors.
+  `_rename_moe_expert_weights` matched packed sidecars by substring
+  (`.experts.gate_up_proj` also matches `experts.gate_up_proj_qweight`) and
+  split them as if they were float weights, writing the `qweight`, `scales` and
+  `qzeros` of one projection to the *same* per-expert `.weight` key — so only
+  the last one survived, and the restacked tensor no longer matched the QMoE
+  parameter, aborting the export at weight binding:
+
+  ```
+  ValueError: Weight shape mismatch for 'model.layers.0.mlp.fc1_experts_weights':
+  model expects [4, 64, 32], got [4, 256]
+  ```
+
+  Packed tensors now pass through untouched and reach
+  `pack_qmoe_expert_weights` in the expert-major layout it expects (Qwen3-MoE
+  Olive int4: `[128, 1536, 1024]` uint8 weights + `[128, 1536, 16]` bf16
+  scales). Unquantized fused experts still un-fuse into the dense per-expert
+  fallback.
+
+#### Added
+
+- `mobius._weight_utils.is_packed_quant_key` plus the shared
+  `OLIVE_PACKED_QUANT_SUFFIXES` / `DOTTED_PACKED_QUANT_SUFFIXES` /
+  `PACKED_QUANT_SUFFIXES` constants: one predicate for
+  `_qweight`/`_scales`/`_qzeros` (Olive) and `.qweight`/`.scales`/`.qzeros`
+  (GPTQ/AWQ) sidecar keys, reused by `preprocess_quantized_weights`.
+
+---
+
+### Qwen3-MoE packages load in ONNX Runtime GenAI
+
+#### Fixed
+
+- Exported `qwen3_moe` packages no longer fail to load with
+  `RuntimeError: Unsupported model_type in config.json: qwen3_moe`.
+  `_ORT_GENAI_MODEL_TYPE` had no `qwen3_moe` entry, so `--config` mode wrote
+  the HuggingFace type straight into `genai_config.json` and ORT GenAI
+  rejected it (its LLM type registry has no `qwen3_moe`). Qwen3-MoE now
+  resolves to the accepted `qwen3` type: both `qwen2` and `qwen3` dispatch to
+  ORT GenAI's `DecoderOnly_Model`, but its tokenizer tag fallback
+  (`tokenizer_tag_utils.cpp`) only supplies the Qwen3 reasoning-token IDs
+  (`bor` 151667 / `eor` 151668) for `qwen3` — under `qwen2` they are absent and
+  `tokenizer.bor_token_id` / `eor_token_id` throws. The pre-existing dense
+  `qwen3 -> qwen2` alias is unchanged.
+
+---
+
 ### Qwen3.5/3.6-MoE mixed float/quantized decoder (Olive checkpoints)
 
 #### Fixed

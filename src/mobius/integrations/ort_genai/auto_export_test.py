@@ -122,6 +122,14 @@ class TestResolveOrtGenaiModelType:
         assert _resolve_ort_genai_model_type("phi4_multimodal") == "phi4mm"
         assert _resolve_ort_genai_model_type("phi") == "phi"
 
+    def test_qwen3_moe_maps_to_supported_decoder_type(self):
+        # ORT GenAI's LLM type registry has no "qwen3_moe" entry, so passing
+        # the HF type through fails to load with "Unsupported model_type in
+        # config.json: qwen3_moe". Qwen3-MoE maps to the accepted "qwen3" type
+        # (not the dense "qwen3" -> "qwen2" alias) so ORT GenAI's tokenizer tag
+        # fallback still supplies the Qwen3 reasoning-token IDs.
+        assert _resolve_ort_genai_model_type("qwen3_moe") == "qwen3"
+
     def test_gemma4_unified_model_types(self):
         # The gemma-4-12B unified checkpoint (model_type "gemma4_unified")
         # reuses the multimodal "gemma4" ORT GenAI pipeline; its standalone
@@ -159,6 +167,14 @@ class TestSelectOrtModelType:
 
     def test_decoder_only_falls_back_to_hf_when_config_missing(self):
         assert _select_ort_model_type(None, "qwen3", is_decoder_only=True) == "qwen2"
+
+    def test_decoder_only_qwen3_moe_resolves_to_supported_type(self):
+        # hf_model_id mode: both the package config and the HF config report
+        # "qwen3_moe"; the decoder-only preference must still resolve through
+        # the alias rather than emitting the unsupported HF type.
+        assert (
+            _select_ort_model_type("qwen3_moe", "qwen3_moe", is_decoder_only=True) == "qwen3"
+        )
 
     def test_decoder_only_unknown_config_falls_back_to_hf(self):
         # An unrecognised config.model_type (not in _ORT_GENAI_MODEL_TYPE) must
@@ -1638,6 +1654,25 @@ class TestExportForOrtGenai:
             data = json.load(f)
         # "gemma2" maps to "gemma" in _ORT_GENAI_MODEL_TYPE
         assert data["model"]["type"] == "gemma"
+
+    def test_config_mode_qwen3_moe_emits_supported_decoder_type(self, tmp_path):
+        """Qwen3-MoE --config exports must not emit the unsupported HF type.
+
+        Regression: a decoder-only Qwen3-MoE package wrote
+        ``"type": "qwen3_moe"`` into genai_config.json, and loading it raised
+        ``RuntimeError: Unsupported model_type in config.json: qwen3_moe``
+        because ORT GenAI's LLM registry has no such type. The emitted type is
+        literally ``"qwen3"``: ORT GenAI's tokenizer tag fallback keys the
+        Qwen3 reasoning-token IDs off that name.
+        """
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        pkg = _make_fake_llm_pkg("qwen3_moe")
+        result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+        assert data["model"]["type"] == "qwen3"
 
     def test_config_mode_gemma3_text_vlm_uses_multimodal_model_type(self, tmp_path):
         """Gemma3 VLM --config exports use ORT's multimodal gemma3 type."""

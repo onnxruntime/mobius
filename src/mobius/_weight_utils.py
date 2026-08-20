@@ -24,6 +24,32 @@ from mobius._configs import QuantizationConfig
 
 logger = logging.getLogger(__name__)
 
+# Key suffixes marking a *packed quantized* sidecar tensor rather than a float
+# weight. Olive appends them with an underscore directly to the parameter name
+# (``<pname>_qweight``, see Olive's ``olive/common/quant/state_dict.py``), while
+# GPTQ/AWQ store dotted sibling buffers on the owning module
+# (``<module>.qweight``). Both conventions occur in raw HF checkpoints.
+OLIVE_PACKED_QUANT_SUFFIXES = ("_qweight", "_scales", "_qzeros")
+DOTTED_PACKED_QUANT_SUFFIXES = (".qweight", ".scales", ".qzeros")
+PACKED_QUANT_SUFFIXES = OLIVE_PACKED_QUANT_SUFFIXES + DOTTED_PACKED_QUANT_SUFFIXES
+
+
+def is_packed_quant_key(name: str) -> bool:
+    """Whether ``name`` is a packed-quantization sidecar key.
+
+    Packed keys carry the quantized payload (``qweight``), the per-group
+    ``scales`` or the ``qzeros`` of a quantized parameter, in either the Olive
+    underscore convention (``…experts.gate_up_proj_qweight``) or the GPTQ/AWQ
+    dotted convention (``…gate_proj.qweight``).
+
+    HF→ONNX key rewriting must leave these tensors intact until
+    :func:`preprocess_quantized_weights` unpacks them: they are packed bytes,
+    not float weights, so reshaping or splitting them corrupts the payload —
+    and several sidecars of one projection would collapse onto a single
+    renamed ``.weight`` key.
+    """
+    return name.endswith(PACKED_QUANT_SUFFIXES)
+
 
 def supported_qmoe_quantization(
     quantization: QuantizationConfig | None,
@@ -1077,14 +1103,6 @@ def preprocess_quantized_weights(
         if qmoe_target_path is not None
         else False
     )
-    packed_suffixes = (
-        "_qweight",
-        "_scales",
-        "_qzeros",
-        ".qweight",
-        ".scales",
-        ".qzeros",
-    )
     if (
         use_qmoe
         and quantization is not None
@@ -1107,7 +1125,7 @@ def preprocess_quantized_weights(
         packed_expert_keys = [
             key
             for key in state_dict
-            if qmoe_target_path in key and ".experts." in key and key.endswith(packed_suffixes)
+            if qmoe_target_path in key and ".experts." in key and is_packed_quant_key(key)
         ]
         if packed_expert_keys:
             raise ValueError(
@@ -1121,10 +1139,15 @@ def preprocess_quantized_weights(
                 "supported_qmoe_quantization) for MoE models instead."
             )
 
-    def _is_packed_key(key: str, float_key: str) -> bool:
+    def _is_packed_sidecar_of(key: str, float_key: str) -> bool:
+        """Whether ``key`` is a packed sidecar of the specific ``float_key``.
+
+        Unlike the module-level :func:`is_packed_quant_key` suffix predicate,
+        this matches the *exact* sidecar keys of one named float parameter.
+        """
         owner = float_key.removesuffix(".weight")
-        return any(key == float_key + suffix for suffix in packed_suffixes[:3]) or any(
-            key == owner + suffix for suffix in packed_suffixes[3:]
+        return any(key == float_key + suffix for suffix in OLIVE_PACKED_QUANT_SUFFIXES) or any(
+            key == owner + suffix for suffix in DOTTED_PACKED_QUANT_SUFFIXES
         )
 
     packed_embedding_or_head = (
@@ -1132,7 +1155,8 @@ def preprocess_quantized_weights(
             (
                 key
                 for key in state_dict
-                if _is_packed_key(key, embed_key) or _is_packed_key(key, head_key)
+                if _is_packed_sidecar_of(key, embed_key)
+                or _is_packed_sidecar_of(key, head_key)
             ),
             None,
         )

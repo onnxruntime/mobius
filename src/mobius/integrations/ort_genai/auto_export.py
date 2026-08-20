@@ -69,6 +69,17 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "llama": "llama",
     "qwen2": "qwen2",
     "qwen3": "qwen2",
+    # Qwen3-MoE shares the dense Qwen3 decoder contract (same inputs, position
+    # IDs and KV cache layout); only the MLP differs, and that is fused into
+    # the exported graph. ORT GenAI has no "qwen3_moe" entry in its LLM type
+    # registry (see onnxruntime-genai/src/models/model_type.h), so passing the
+    # HF type through fails to load with "Unsupported model_type in
+    # config.json: qwen3_moe". It maps to "qwen3" rather than reusing the dense
+    # "qwen3" -> "qwen2" alias: both types dispatch to DecoderOnly_Model, but
+    # ORT GenAI's tokenizer tag fallback (tokenizer_tag_utils.cpp) only supplies
+    # Qwen3 reasoning-token IDs (bor 151667 / eor 151668) for "qwen3"; under
+    # "qwen2" those are absent and tokenizer.bor_token_id/eor_token_id throws.
+    "qwen3_moe": "qwen3",
     "phi3": "phi3",
     "phi": "phi",
     "phi4mm": "phi4mm",

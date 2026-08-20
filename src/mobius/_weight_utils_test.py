@@ -10,6 +10,7 @@ import torch
 
 from mobius._configs import QuantizationConfig
 from mobius._weight_utils import (
+    is_packed_quant_key,
     merge_lora_weights,
     preprocess_awq_weights,
     preprocess_gptq_weights,
@@ -1393,3 +1394,43 @@ class TestStackPerExpertMoEWeights:
         assert torch.equal(
             result["model.embed_tokens.weight"], sd["model.embed_tokens.weight"]
         )
+
+
+class TestIsPackedQuantKey:
+    """Shared predicate for packed-quantization sidecar keys."""
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            # Olive underscore convention (suffix on the parameter name).
+            "model.layers.0.mlp.experts.gate_up_proj_qweight",
+            "model.layers.0.mlp.experts.gate_up_proj_scales",
+            "model.layers.0.mlp.experts.down_proj_qzeros",
+            "model.layers.0.self_attn.q_proj.weight_qweight",
+            # GPTQ/AWQ dotted convention (sibling buffers of the module).
+            "model.layers.0.mlp.experts.0.gate_proj.qweight",
+            "model.layers.0.mlp.experts.0.gate_proj.scales",
+            "model.layers.0.mlp.experts.0.gate_proj.qzeros",
+        ],
+    )
+    def test_packed_keys_detected(self, key):
+        assert is_packed_quant_key(key)
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            # Float weights, including the fused MoE tensors that *are* split.
+            "model.layers.0.mlp.experts.gate_up_proj",
+            "model.layers.0.mlp.experts.down_proj",
+            "model.layers.0.mlp.gate.weight",
+            "model.layers.0.self_attn.q_proj.bias",
+            "model.layers.0.block_sparse_moe.input_linear.weight",
+            # Already-unpacked names produced downstream by the preprocessors.
+            "model.layers.0.mlp.fc1_experts_weights",
+            "model.layers.0.self_attn.q_proj.zero_points",
+            # Suffix must be terminal, not merely present.
+            "model.layers.0.mlp.experts.gate_up_proj_qweight.extra",
+        ],
+    )
+    def test_unpacked_keys_rejected(self, key):
+        assert not is_packed_quant_key(key)
