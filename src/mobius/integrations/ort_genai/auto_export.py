@@ -370,7 +370,7 @@ _SPECIAL_TOKEN_FIELDS = {
 def _special_token_ids_from_tokenizer_config(
     output_dir: str, vocab_size: int
 ) -> dict[str, int]:
-    """Read ORT GenAI tool and reasoning delimiter IDs from tokenizer_config.json."""
+    """Read delimiters from tokenizer_config.json already copied to *output_dir*."""
     tc_path = os.path.join(output_dir, "tokenizer_config.json")
     if not os.path.isfile(tc_path):
         return {}
