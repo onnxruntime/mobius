@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 from typing import Any
@@ -4566,15 +4567,11 @@ def _build_autoregressive_workflow_metadata(
     lets an importer describe an existing on-disk layout without renaming files.
     """
     encoder = pkg[encoder_name] if encoder_name is not None else None
-    decoder_items = [
-        (name, model) for name, model in pkg.items() if name != encoder_name
-    ]
+    decoder_items = [(name, model) for name, model in pkg.items() if name != encoder_name]
     if len(decoder_items) != 1:
         raise ValueError("workflow requires exactly one autoregressive component")
     decoder_name, decoder = decoder_items[0]
-    cross_bindings = (
-        _cross_state_bindings(encoder, decoder) if encoder is not None else {}
-    )
+    cross_bindings = _cross_state_bindings(encoder, decoder) if encoder is not None else {}
     if encoder is not None and not cross_bindings:
         raise ValueError(
             "encoder-conditioned workflow requires at least one decoder input produced "
@@ -4771,18 +4768,32 @@ def _build_autoregressive_workflow_metadata(
     # once in the loop setup and its results persist as invariant state.
     encoder_invoke_inputs: dict[str, str] = {}
     encoder_invoke_outputs: dict[str, str] = {}
+    audio_adapter_outputs: dict[str, Any] = {}
+    audio_values: dict[str, str] = {}
+    audio_program: dict[str, Any] | None = None
     if encoder is not None:
         assert encoder_name is not None
-        preprocessing_outputs = {
-            binding["name"]: binding
-            for binding in (audio_preprocessing or {}).get("outputs", [])
-        }
+        encoder_inputs_by_name = {value.name: value for value in encoder.graph.inputs}
+        if audio_preprocessing is not None:
+            audio_program = copy.deepcopy(audio_preprocessing)
+            for binding in audio_program["outputs"]:
+                port_name = binding["name"]
+                if port_name not in encoder_inputs_by_name:
+                    raise ValueError(
+                        f"audio preprocessing output {port_name!r} has no encoder input"
+                    )
+                contract = _contract(encoder_inputs_by_name[port_name])
+                binding["contract"] = contract
+                binding["dtype"] = contract["dtype"]
+                binding["name"] = f"audio.{port_name}"
+                audio_adapter_outputs[port_name] = contract
+                audio_values[port_name] = binding["name"]
         for value in encoder.graph.inputs:
             ssa = f"encoder.input.{value.name}"
-            if value.name in preprocessing_outputs:
-                encoder_invoke_inputs[value.name] = preprocessing_outputs[value.name][
-                    "source_value"
-                ]
+            if value.name in audio_values:
+                # The declared preprocessing program produces this encoder input,
+                # so the workflow consumes decoded audio bytes instead of features.
+                encoder_invoke_inputs[value.name] = audio_values[value.name]
                 continue
             workflow_inputs[ssa] = {
                 "contract": _contract(value),
@@ -4794,8 +4805,17 @@ def _build_autoregressive_workflow_metadata(
                 "externally_suppliable": True,
             }
             encoder_invoke_inputs[value.name] = ssa
-        for decoder_input, (encoder_output, _) in sorted(cross_bindings.items()):
+        for _decoder_input, (encoder_output, _) in sorted(cross_bindings.items()):
             encoder_invoke_outputs[encoder_output] = f"encoder.{encoder_output}"
+    if audio_program is not None:
+        # Raw encoded audio is the request-level input; the adapter decodes and
+        # turns it into the encoder feature tensor declared by the program.
+        workflow_inputs["request.audio"] = {
+            "contract": {"dtype": "uint8", "rank": 1, "shape": ["encoded_bytes"]},
+            "role": {"kind": "runtime", "version": "1.0", "role": "media"},
+            "source": {"kind": "request", "field": "media"},
+            "required": True,
+        }
     batch_dimension = _shape_metadata(_port(token_input))[0]
     batch_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": [batch_dimension]})
     batch_bool = _request_aligned({"dtype": "bool", "rank": 1, "shape": [batch_dimension]})
@@ -5378,6 +5398,17 @@ def _build_autoregressive_workflow_metadata(
         "kind": "sequence",
         "nodes": [
             *(
+                [
+                    _invoke(
+                        "audio_preprocess",
+                        {"encoded": "request.audio"},
+                        dict(audio_values),
+                    )
+                ]
+                if audio_program is not None
+                else []
+            ),
+            *(
                 [_invoke(encoder_name, encoder_invoke_inputs, encoder_invoke_outputs)]
                 if encoder is not None
                 else []
@@ -5654,6 +5685,11 @@ def _build_autoregressive_workflow_metadata(
         "manifest": {
             "ir_version": "1.0",
             "onnx_opsets": {"ai.onnx": OPSET_VERSION},
+            **(
+                {"adapter_abis": {"onnx-genai.audio-preprocess": "1"}}
+                if audio_program is not None
+                else {}
+            ),
             "capabilities": [
                 "workflow_ssa",
                 "linear_effects",
@@ -5661,6 +5697,7 @@ def _build_autoregressive_workflow_metadata(
                 "typed_emit",
                 "emit_valid_length",
                 "loop_induction_values",
+                *(["audio_preprocessing_program"] if audio_program is not None else []),
                 *(["serving_service_contract"] if cache_pairs else []),
                 *(["bounded_state_recurrence"] if cache_pairs else []),
             ],
@@ -5689,6 +5726,29 @@ def _build_autoregressive_workflow_metadata(
                     )
                 }
                 if encoder is not None
+                else {}
+            ),
+            **(
+                {
+                    "audio_preprocess": {
+                        "implementation": {
+                            "kind": "adapter",
+                            "abi": "onnx-genai.audio-preprocess",
+                            "version": "1",
+                        },
+                        "ports": {
+                            "inputs": {
+                                "encoded": {
+                                    "dtype": "uint8",
+                                    "rank": 1,
+                                    "shape": ["encoded_bytes"],
+                                }
+                            },
+                            "outputs": audio_adapter_outputs,
+                        },
+                    }
+                }
+                if audio_program is not None
                 else {}
             ),
         },
@@ -5723,6 +5783,7 @@ def _build_autoregressive_workflow_metadata(
     }
     metadata = {
         "schema_version": "1.0",
+        **({"preprocessing": {"audio": audio_program}} if audio_program is not None else {}),
         "pipeline": {"workflow": _publish_workflow_v1(workflow)},
     }
     add_policy_components_to_workflow(metadata, pkg)

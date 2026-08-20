@@ -617,75 +617,107 @@ class _EncoderDecoderPkg(dict):
     config = _Cfg()
 
 
-def test_dispatch_speech_to_text_pipeline(tmp_path):
+def _speech_package(*, encoder_mask: bool = False):
+    """Whisper-shaped encoder/decoder package with a real cross-attention edge."""
+    encoder_inputs = [
+        _value("input_features", ir.DataType.FLOAT, ["batch", 80, "audio_seq_len"])
+    ]
+    encoder_outputs = [("encoder_hidden_states", ir.DataType.FLOAT, ["batch", 1500, 384])]
+    decoder_inputs = [
+        _value("decoder_input_ids", ir.DataType.INT64, ["batch", "sequence_len"]),
+        _value("encoder_hidden_states", ir.DataType.FLOAT, ["batch", 1500, 384]),
+        _value("position_ids", ir.DataType.INT64, ["batch", "sequence_len"]),
+        _value(
+            "past_key_values.0.key",
+            ir.DataType.FLOAT,
+            ["batch", 6, "past_sequence_len", 64],
+        ),
+        _value(
+            "past_key_values.0.value",
+            ir.DataType.FLOAT,
+            ["batch", 6, "past_sequence_len", 64],
+        ),
+    ]
+    decoder_outputs = [
+        ("logits", ir.DataType.FLOAT, ["batch", "sequence_len", 51865]),
+        ("present.0.key", ir.DataType.FLOAT, ["batch", 6, "total_sequence_len", 64]),
+        ("present.0.value", ir.DataType.FLOAT, ["batch", 6, "total_sequence_len", 64]),
+    ]
+    if encoder_mask:
+        encoder_inputs.append(
+            _value("attention_mask", ir.DataType.INT64, ["batch", "audio_seq_len"])
+        )
+        encoder_outputs.append(("encoder_attention_mask", ir.DataType.INT64, ["batch", 1500]))
+        decoder_inputs.insert(
+            2, _value("encoder_attention_mask", ir.DataType.INT64, ["batch", 1500])
+        )
+    pkg = ModelPackage(
+        {
+            "encoder": _model("encoder", encoder_inputs, encoder_outputs),
+            "decoder": _model("decoder", decoder_inputs, decoder_outputs),
+        }
+    )
+    pkg.config = SimpleNamespace(eos_token_id=50257, max_position_embeddings=448)
+    return pkg
+
+
+def test_dispatch_speech_to_text_workflow(tmp_path):
     # Whisper-style ASR: the decoder consumes encoder_hidden_states (cross-attn).
-    pkg = _EncoderDecoderPkg(
-        {
-            "encoder": _FakeModel(["input_features"], ["encoder_hidden_states"]),
-            "decoder": _FakeModel(["decoder_input_ids", "encoder_hidden_states"], ["logits"]),
-        }
-    )
-    artifacts = write_onnx_genai_config(pkg, str(tmp_path))
+    artifacts = write_onnx_genai_config(_speech_package(), str(tmp_path))
 
     with open(artifacts["inference_metadata"]) as handle:
         metadata = yaml.safe_load(handle)
 
-    # Cache storage representation is derived from the graph, never declared.
+    # The redesigned schema has no legacy pipeline description at all.
     assert "kv_cache" not in metadata
-    pipeline = metadata["pipeline"]
-    assert pipeline["models"]["encoder"]["filename"] == "encoder/model.onnx"
-    assert pipeline["models"]["encoder"]["type"] == "encoder"
-    decoder_model = pipeline["models"]["decoder"]
-    assert decoder_model["filename"] == "decoder/model.onnx"
-    assert decoder_model["type"] == "decoder"
-    assert decoder_model["tokenizer"] == "tokenizer.json"
-    assert decoder_model["io"]["logits_output"] == "logits"
-    assert decoder_model["io"]["kv_ownership"] == "owned"
-    assert pipeline["dataflow"] == [
-        {
-            "from": "encoder.encoder_hidden_states",
-            "to": "decoder.encoder_hidden_states",
-            "dtype": "fp32",
-            "device_transfer": False,
-        }
-    ]
-    stages = pipeline["strategy"]["stages"]
-    assert pipeline["strategy"]["kind"] == "composite"
-    assert [stage["name"] for stage in stages] == ["encode_audio", "decode_transcript"]
-    assert [stage["strategy"]["kind"] for stage in stages] == [
-        "single_pass",
-        "autoregressive",
-    ]
+    assert not {"models", "dataflow", "strategy", "phases"}.intersection(metadata["pipeline"])
+    workflow = metadata["pipeline"]["workflow"]
+    assert {"encoder", "decoder"}.issubset(workflow["components"])
 
-
-def test_dispatch_speech_to_text_routes_encoder_mask(tmp_path):
-    pkg = _EncoderDecoderPkg(
-        {
-            "encoder": _FakeModel(
-                ["input_values", "attention_mask"],
-                ["encoder_hidden_states", "encoder_attention_mask"],
-            ),
-            "decoder": _FakeModel(
-                [
-                    "decoder_input_ids",
-                    "encoder_hidden_states",
-                    "encoder_attention_mask",
-                ],
-                ["logits"],
-            ),
-        }
+    # The encoder runs once in the loop prologue and its output persists as a
+    # loop-invariant, request-aligned state cell the decoder reads every step.
+    loop = next(step for step in workflow["steps"] if step["kind"] == "loop")
+    setup_components = [node["component"] for node in loop["setup"]]
+    # The encoder conditions the prefill, so it must precede the decoder.
+    assert setup_components[0] == "encoder"
+    assert setup_components.index("decoder") > 0
+    cross = workflow["state"]["cross.encoder_hidden_states"]
+    assert cross["contract"]["shape"] == ["batch", 1500, 384]
+    assert cross["contract"]["batch_layout"] == {"kind": "request_aligned", "axis": 0}
+    assert cross["initializer"] == "encoder.encoder_hidden_states"
+    assert cross["recurrence"] == {"kind": "invariant"}
+    carry = next(
+        carry for carry in loop["carried"] if carry["cell"] == "cross.encoder_hidden_states"
     )
-    artifacts = write_onnx_genai_config(pkg, str(tmp_path))
+    assert carry["next"] == "cross.encoder_hidden_states"
+
+    # The self-attention cache is a runtime-served state group; the invariant
+    # cross state is not, because nothing appends to it.
+    groups = workflow["serving"]["state_service"]["groups"]
+    assert set(groups) == {"decoder_cache"}
+    assert groups["decoder_cache"]["ports"]["decoder"]["cache_0"] == {
+        "input": "past_key_values.0.key",
+        "output": "present.0.key",
+    }
+
+
+def test_dispatch_speech_to_text_rejects_kv_dtype_override(tmp_path):
+    with pytest.raises(ValueError, match="derives KV state dtype"):
+        write_onnx_genai_config(_speech_package(), str(tmp_path), kv_native_dtype="bf16")
+
+
+def test_dispatch_speech_to_text_carries_encoder_mask_as_cross_state(tmp_path):
+    artifacts = write_onnx_genai_config(_speech_package(encoder_mask=True), str(tmp_path))
 
     with open(artifacts["inference_metadata"]) as handle:
         metadata = yaml.safe_load(handle)
 
-    assert metadata["pipeline"]["dataflow"][1] == {
-        "from": "encoder.encoder_attention_mask",
-        "to": "decoder.encoder_attention_mask",
-        "dtype": "int64",
-        "device_transfer": False,
-    }
+    workflow = metadata["pipeline"]["workflow"]
+    # Every encoder output the decoder consumes becomes cross state, so an
+    # encoder-side mask needs no special case.
+    assert "cross.encoder_attention_mask" in workflow["state"]
+    assert workflow["state"]["cross.encoder_attention_mask"]["contract"]["dtype"] == "int64"
+    assert "encoder.input.attention_mask" in workflow["inputs"]
 
 
 def test_dispatch_audio_codec_pipeline(tmp_path):

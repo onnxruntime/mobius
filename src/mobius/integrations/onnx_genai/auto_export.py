@@ -20,9 +20,6 @@ import numpy as np
 import onnx_ir as ir
 import yaml
 
-from mobius.integrations.onnx_genai.decoder_metadata import (
-    decoder_metadata_from_config,
-)
 from mobius.integrations.onnx_genai.inference_metadata import (
     _TEXT_RUNTIME_ASSET_NAMES,
     SchedulerConfig,
@@ -31,7 +28,6 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     add_explicit_package_io,
     add_policy_components_to_workflow,
     load_diffusers_scheduler_config,
-    write_speech_to_text_pipeline_metadata,
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
     write_audio_codec_workflow_metadata,
@@ -39,6 +35,7 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     write_diffusion_workflow_metadata,
     write_language_diffusion_workflow_metadata,
     write_speculative_workflow_metadata,
+    write_speech_to_text_workflow_metadata,
     write_tts_workflow_metadata,
     write_vlm_workflow_metadata,
 )
@@ -284,6 +281,88 @@ def _write_hf_audio_processor(
     path = os.path.join(output_dir, "audio_processor.json")
     feature_extractor.to_json_file(path)
     return path
+
+
+def _audio_preprocessing_program(
+    processor_path: str | None, encoder: Any
+) -> dict[str, Any] | None:
+    """Derive a declarative log-mel program from a HF feature-extractor config.
+
+    The program is the executable contract the runtime audio adapter follows:
+    decode -> resample -> pad/trim to the fixed window -> log-mel -> normalize.
+    Its single output binds to the encoder's rank-3 feature input.
+    """
+    if processor_path is None:
+        return None
+    import json
+
+    with open(processor_path, encoding="utf-8") as handle:
+        config = json.load(handle)
+    if config.get("feature_extractor_type") != "WhisperFeatureExtractor":
+        _LOGGER.warning(
+            "Audio feature extractor %r is not a log-mel window extractor; "
+            "skipping declarative audio preprocessing.",
+            config.get("feature_extractor_type"),
+        )
+        return None
+    feature_inputs = [
+        value
+        for value in encoder.graph.inputs
+        if value.shape is not None and len(value.shape) == 3
+    ]
+    if len(feature_inputs) != 1:
+        raise ValueError(
+            "audio preprocessing requires exactly one rank-3 encoder feature input, "
+            f"got {[value.name for value in feature_inputs]}"
+        )
+    sampling_rate = int(config["sampling_rate"])
+    num_mel_bins = int(config["feature_size"])
+    n_fft = int(config["n_fft"])
+    hop_length = int(config["hop_length"])
+    n_samples = int(config.get("n_samples", config["chunk_length"] * sampling_rate))
+    return {
+        "transforms": [
+            {"op": "decode", "outputs": ["samples"]},
+            {
+                "op": "resample",
+                "inputs": ["samples"],
+                "outputs": ["resampled"],
+                "sampling_rate": sampling_rate,
+            },
+            {
+                "op": "pad",
+                "inputs": ["resampled"],
+                "outputs": ["windowed"],
+                "mode": "fixed_window",
+                "target_samples": n_samples,
+                "pad_value": float(config.get("padding_value", 0.0)),
+            },
+            {
+                "op": "log_mel",
+                "inputs": ["windowed"],
+                "outputs": ["mel"],
+                "num_mel_bins": num_mel_bins,
+                "n_fft": n_fft,
+                "hop_length": hop_length,
+                "window": "hann",
+                "mel_scale": "slaney",
+                "sampling_rate": sampling_rate,
+            },
+            {
+                "op": "normalize",
+                "inputs": ["mel"],
+                "outputs": ["features"],
+                "mode": "whisper_log_mel",
+            },
+        ],
+        "outputs": [
+            {
+                "source": "features",
+                "name": feature_inputs[0].name,
+                "content": "audio_features",
+            }
+        ],
+    }
 
 
 def _looks_like_diffusion(pkg: Any) -> bool:
@@ -621,29 +700,24 @@ def write_onnx_genai_config(
         return artifacts
 
     if _looks_like_speech_to_text(pkg):
-        encoder_outputs = {value.name for value in pkg["encoder"].graph.outputs}
-        decoder_inputs = {value.name for value in pkg["decoder"].graph.inputs}
-        kwargs.setdefault(
-            "encoder_attention_mask",
-            "encoder_attention_mask" in encoder_outputs
-            and "encoder_attention_mask" in decoder_inputs,
-        )
         if kv_native_dtype is not None:
             raise ValueError(
-                "speech-to-text export derives KV state dtype from ONNX ports; "
+                "workflow speech-to-text export derives KV state dtype from ONNX ports; "
                 "kv_native_dtype overrides are unsupported"
             )
-        decoder_metadata = decoder_metadata_from_config(resolved_config)
-        path = write_speech_to_text_pipeline_metadata(
-            output_dir,
-            decoder_metadata=decoder_metadata,
-            activation_dtype=_activation_dtype_tag(resolved_config),
-            **kwargs,
-        )
-        _add_explicit_io_to_file(path, pkg, resolved_config)
-        artifacts = {"inference_metadata": path}
-        artifacts.update(_write_text_runtime_assets(output_dir, source))
         audio_processor_path = _write_hf_audio_processor(output_dir, source)
+        path = write_speech_to_text_workflow_metadata(
+            pkg,
+            output_dir,
+            resolved_config,
+            audio_preprocessing=_audio_preprocessing_program(
+                audio_processor_path, pkg["encoder"]
+            ),
+        )
+        artifacts = {"inference_metadata": path}
+        # An ASR decoder is still a text producer: ship its tokenizer and chat
+        # template alongside the audio processor.
+        artifacts.update(_write_text_runtime_assets(output_dir, source))
         if audio_processor_path is not None:
             artifacts["audio_processor"] = audio_processor_path
         return artifacts

@@ -2848,6 +2848,11 @@ class WhisperConfig(SpeechToTextConfig):
                 f"({self.encoder_input_channels}) must equal num_mel_bins "
                 f"({self.num_mel_bins})."
             )
+        # The decoder's learned position table is the model's context bound;
+        # Whisper spells it `max_target_positions`, so mirror it onto the
+        # architecture-wide field consumers read.
+        if self.max_position_embeddings == DEFAULT_INT:
+            self.max_position_embeddings = self.max_target_positions
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> WhisperConfig:
@@ -2880,6 +2885,8 @@ class WhisperConfig(SpeechToTextConfig):
             max_target_positions=getattr(config, "max_target_positions", 448),
             scale_embedding=getattr(config, "scale_embedding", False),
             decoder_start_token_id=getattr(config, "decoder_start_token_id", None),
+            bos_token_id=getattr(config, "bos_token_id", None),
+            eos_token_id=getattr(config, "eos_token_id", None),
         )
 
         # Model dtype
