@@ -53,7 +53,11 @@ def _add_explicit_io_to_file(path: str, pkg: Any, config: Any) -> None:
         yaml.safe_dump(metadata, handle, sort_keys=False)
 
 
-def _write_clip_tokenizer(output_dir: str, source: str | None) -> str | None:
+def _write_clip_tokenizer(
+    output_dir: str,
+    source: str | None,
+    revision: str | None = None,
+) -> str | None:
     """Emit ``tokenizer.json`` for a text-conditioned diffusion package.
 
     Classic Stable Diffusion conditions on a CLIP text encoder, and the
@@ -84,7 +88,12 @@ def _write_clip_tokenizer(output_dir: str, source: str | None) -> str | None:
         )
         return None
     try:
-        tokenizer = AutoTokenizer.from_pretrained(source, subfolder="tokenizer", use_fast=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            source,
+            subfolder="tokenizer",
+            use_fast=True,
+            revision=revision,
+        )
     except Exception as error:  # best-effort; never block the build
         _LOGGER.warning(
             "Could not load a CLIP tokenizer from %r (subfolder 'tokenizer'): %s; "
@@ -106,7 +115,11 @@ def _write_clip_tokenizer(output_dir: str, source: str | None) -> str | None:
     return path
 
 
-def _write_hf_tokenizer(output_dir: str, source: str | None) -> str | None:
+def _write_hf_tokenizer(
+    output_dir: str,
+    source: str | None,
+    revision: str | None = None,
+) -> str | None:
     """Emit ``tokenizer.json`` for a text-producing package from its HF source.
 
     Decoder-LM, multimodal (VLM / speech-language ASR), and Whisper-style ASR
@@ -137,7 +150,11 @@ def _write_hf_tokenizer(output_dir: str, source: str | None) -> str | None:
         )
         return None
     try:
-        tokenizer = AutoTokenizer.from_pretrained(source, use_fast=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            source,
+            use_fast=True,
+            revision=revision,
+        )
     except Exception as error:  # best-effort; never block the build
         _LOGGER.warning(
             "Could not load a tokenizer from %r: %s; skipping tokenizer.json emission.",
@@ -158,7 +175,11 @@ def _write_hf_tokenizer(output_dir: str, source: str | None) -> str | None:
     return path
 
 
-def _write_hf_audio_processor(output_dir: str, source: str | None) -> str | None:
+def _write_hf_audio_processor(
+    output_dir: str,
+    source: str | None,
+    revision: str | None = None,
+) -> str | None:
     """Emit the Hugging Face audio feature-extractor contract for ASR packages."""
     if not source:
         return None
@@ -170,7 +191,10 @@ def _write_hf_audio_processor(output_dir: str, source: str | None) -> str | None
         )
         return None
     try:
-        feature_extractor = AutoFeatureExtractor.from_pretrained(source)
+        feature_extractor = AutoFeatureExtractor.from_pretrained(
+            source,
+            revision=revision,
+        )
     except Exception as error:
         _LOGGER.warning(
             "Could not load an audio processor from %r: %s; "
@@ -414,6 +438,7 @@ def write_onnx_genai_config(
     scheduler: SchedulerConfig | None = None,
     guidance_scale: float | None = None,
     source: str | None = None,
+    revision: str | None = None,
     **kwargs: Any,
 ) -> dict[str, str]:
     """Write ``inference_metadata.yaml`` into ``output_dir`` and return its path.
@@ -458,7 +483,7 @@ def write_onnx_genai_config(
                 "--runtime onnx-genai and orchestrate the pipeline directly."
             )
         if scheduler is None:
-            scheduler = load_diffusers_scheduler_config(source)
+            scheduler = load_diffusers_scheduler_config(source, revision=revision)
         # Fill in component filenames from the package layout, letting any
         # caller-supplied values win.
         derived = _diffusion_component_kwargs(pkg)
@@ -479,7 +504,7 @@ def write_onnx_genai_config(
         # Emit the CLIP tokenizer.json for text-conditioned pipelines so the
         # onnx-genai runners can tokenize prompts from the package alone.
         if "text_encoder_filename" in kwargs:
-            tokenizer_path = _write_clip_tokenizer(output_dir, source)
+            tokenizer_path = _write_clip_tokenizer(output_dir, source, revision)
             if tokenizer_path is not None:
                 artifacts["tokenizer"] = tokenizer_path
         return artifacts
@@ -513,7 +538,7 @@ def write_onnx_genai_config(
         )
         _add_explicit_io_to_file(path, pkg, resolved_config)
         artifacts = {"inference_metadata": path}
-        tokenizer_path = _write_hf_tokenizer(output_dir, source)
+        tokenizer_path = _write_hf_tokenizer(output_dir, source, revision)
         if tokenizer_path is not None:
             artifacts["tokenizer"] = tokenizer_path
         return artifacts
@@ -537,10 +562,10 @@ def write_onnx_genai_config(
         )
         _add_explicit_io_to_file(path, pkg, resolved_config)
         artifacts = {"inference_metadata": path}
-        tokenizer_path = _write_hf_tokenizer(output_dir, source)
+        tokenizer_path = _write_hf_tokenizer(output_dir, source, revision)
         if tokenizer_path is not None:
             artifacts["tokenizer"] = tokenizer_path
-        audio_processor_path = _write_hf_audio_processor(output_dir, source)
+        audio_processor_path = _write_hf_audio_processor(output_dir, source, revision)
         if audio_processor_path is not None:
             artifacts["audio_processor"] = audio_processor_path
         return artifacts
@@ -569,7 +594,7 @@ def write_onnx_genai_config(
         )
         _add_explicit_io_to_file(path, pkg, resolved_config)
         artifacts = {"inference_metadata": path}
-        tokenizer_path = _write_hf_tokenizer(output_dir, source)
+        tokenizer_path = _write_hf_tokenizer(output_dir, source, revision)
         if tokenizer_path is not None:
             artifacts["tokenizer"] = tokenizer_path
         return artifacts
@@ -595,7 +620,7 @@ def write_onnx_genai_config(
     )
     _add_explicit_io_to_file(path, pkg, resolved_config)
     artifacts = {"inference_metadata": path}
-    tokenizer_path = _write_hf_tokenizer(output_dir, source)
+    tokenizer_path = _write_hf_tokenizer(output_dir, source, revision)
     if tokenizer_path is not None:
         artifacts["tokenizer"] = tokenizer_path
     return artifacts

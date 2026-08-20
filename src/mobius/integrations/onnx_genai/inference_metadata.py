@@ -507,22 +507,31 @@ def _cached_source_assets(source: str) -> dict[str, str]:
     return assets
 
 
-def _source_asset_path(source: str, filename: str) -> str | None:
+def _source_asset_path(
+    source: str,
+    filename: str,
+    revision: str | None = None,
+) -> str | None:
     if os.path.isdir(source):
         path = os.path.join(source, filename)
         return path if os.path.isfile(path) else None
-    cached = _cached_source_assets(source).get(filename)
-    if cached is not None and os.path.isfile(cached):
-        return cached
+    if revision is None:
+        cached = _cached_source_assets(source).get(filename)
+        if cached is not None and os.path.isfile(cached):
+            return cached
     try:
         from huggingface_hub import hf_hub_download
 
-        return hf_hub_download(source, filename)
+        return hf_hub_download(source, filename, revision=revision)
     except Exception:
         return None
 
 
-def _processor_values(source: str | None, config: Any) -> dict[str, Any]:
+def _processor_values(
+    source: str | None,
+    config: Any,
+    revision: str | None = None,
+) -> dict[str, Any]:
     """Load plain processor parameters without architecture dispatch."""
     values: dict[str, Any] = {}
     if source:
@@ -532,7 +541,7 @@ def _processor_values(source: str | None, config: Any) -> dict[str, Any]:
             "preprocessor_config.json",
             "image_processor.json",
         ):
-            path = _source_asset_path(source, filename)
+            path = _source_asset_path(source, filename, revision)
             if path is not None:
                 try:
                     with open(path, encoding="utf-8") as handle:
@@ -1369,6 +1378,7 @@ def build_native_vlm_package_metadata(
     *,
     config: Any,
     source: str | None = None,
+    revision: str | None = None,
     decoder_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Emit a native VLM contract by inspecting every component graph.
@@ -1437,7 +1447,7 @@ def build_native_vlm_package_metadata(
         for edge in dataflow
         if edge["to"].startswith(f"{decoder_name}.")
     }
-    processor_values = _processor_values(source, config)
+    processor_values = _processor_values(source, config, revision)
     image_program = _resolve_image_program(pkg["vision_encoder"], processor_values)
     decoder_io, positions = _decoder_io(pkg[decoder_name], routed_decoder_inputs, config)
 
@@ -1600,12 +1610,13 @@ def build_native_vlm_package_metadata(
 def _copy_runtime_assets(
     output_dir: str,
     source: str | None,
+    revision: str | None = None,
 ) -> dict[str, str]:
     if not source:
         return {}
     os.makedirs(output_dir, exist_ok=True)
     for filename in _RUNTIME_ASSET_NAMES:
-        source_path = _source_asset_path(source, filename)
+        source_path = _source_asset_path(source, filename, revision)
         if source_path is not None:
             shutil.copy2(source_path, os.path.join(output_dir, filename))
 
@@ -1625,7 +1636,11 @@ def _copy_runtime_assets(
         try:
             from transformers import AutoTokenizer
 
-            tokenizer = AutoTokenizer.from_pretrained(source, use_fast=True)
+            tokenizer = AutoTokenizer.from_pretrained(
+                source,
+                use_fast=True,
+                revision=revision,
+            )
             backend = getattr(tokenizer, "backend_tokenizer", None)
             if backend is not None:
                 backend.save(tokenizer_path)
@@ -1652,6 +1667,7 @@ def write_native_vlm_package_metadata(
     *,
     config: Any,
     source: str | None = None,
+    revision: str | None = None,
     kv_native_dtype: str | None = None,
     filename: str = "inference_metadata.yaml",
 ) -> dict[str, str]:
@@ -1664,6 +1680,7 @@ def write_native_vlm_package_metadata(
         pkg,
         config=config,
         source=source,
+        revision=revision,
         decoder_metadata=decoder_metadata_from_config(config, kv_native_dtype=kv_native_dtype),
     )
     os.makedirs(directory, exist_ok=True)
@@ -1671,7 +1688,7 @@ def write_native_vlm_package_metadata(
     with open(path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(metadata, handle, sort_keys=False)
     artifacts = {"inference_metadata": path}
-    artifacts.update(_copy_runtime_assets(directory, source))
+    artifacts.update(_copy_runtime_assets(directory, source, revision))
     return artifacts
 
 
@@ -1820,7 +1837,10 @@ class SchedulerConfig:
         )
 
 
-def load_diffusers_scheduler_config(source: str | None) -> SchedulerConfig | None:
+def load_diffusers_scheduler_config(
+    source: str | None,
+    revision: str | None = None,
+) -> SchedulerConfig | None:
     """Best-effort load of a diffusers ``scheduler/scheduler_config.json``.
 
     ``source`` may be a local diffusers checkpoint directory or a Hugging Face
@@ -1845,7 +1865,11 @@ def load_diffusers_scheduler_config(source: str | None) -> SchedulerConfig | Non
         try:
             from huggingface_hub import hf_hub_download
 
-            path = hf_hub_download(source, "scheduler/scheduler_config.json")
+            path = hf_hub_download(
+                source,
+                "scheduler/scheduler_config.json",
+                revision=revision,
+            )
             with open(path, encoding="utf-8") as handle:
                 raw = json.load(handle)
         except Exception as err:

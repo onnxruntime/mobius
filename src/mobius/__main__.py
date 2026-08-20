@@ -264,7 +264,10 @@ def _cmd_build(args: argparse.Namespace) -> None:
     # central build() validation reject a diffusers/unsupported repo rather
     # than silently exporting a diffusion pipeline and ignoring the flag.
     if args.model and not args.config and not args.text_only:
-        pipeline_index = _load_diffusers_pipeline_index(args.model)
+        pipeline_index = _load_diffusers_pipeline_index(
+            args.model,
+            revision=args.revision,
+        )
         if pipeline_index is not None:
             print(
                 f"Detected diffusers pipeline: {pipeline_index.get('_class_name', 'Unknown')}"
@@ -280,6 +283,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 pipeline_components = {max(roots, key=len)} if roots else {component_filter}
             pkg = build_diffusers_pipeline(
                 args.model,
+                revision=args.revision,
                 dtype=dtype_override,
                 load_weights=load_weights,
                 components=pipeline_components,
@@ -297,6 +301,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
         print(f"Detected NeMo archive: {args.model}")
         pkg = build_from_nemo(
             args.model,
+            revision=args.revision,
             dtype=dtype_override,
             execution_provider=execution_provider,
         )
@@ -445,6 +450,7 @@ def _save_package(
 
         config = getattr(pkg, "config", None)
         source = getattr(args, "config", None) or getattr(args, "model", None)
+        revision = getattr(args, "revision", None)
         if is_native_vlm_package(pkg):
             try:
                 artifacts = write_native_vlm_package_metadata(
@@ -452,11 +458,18 @@ def _save_package(
                     output_dir,
                     config=config,
                     source=source,
+                    revision=revision,
                 )
             except ValueError as error:
                 raise SystemExit(f"Error: {error}") from error
         else:
-            artifacts = write_onnx_genai_config(pkg, output_dir, config=config, source=source)
+            artifacts = write_onnx_genai_config(
+                pkg,
+                output_dir,
+                config=config,
+                source=source,
+                revision=revision,
+            )
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
 

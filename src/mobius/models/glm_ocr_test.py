@@ -6,10 +6,12 @@
 from __future__ import annotations
 
 import numpy as np
+import onnx_ir as ir
 import torch
 
-from mobius._config_resolver import _config_from_hf
+from mobius._builder import _cast_module_dtype
 from mobius._testing.ort_inference import OnnxModelSession
+from mobius.integrations.transformers import _config_from_hf
 from mobius.models.glm_ocr import GlmOcrForConditionalGeneration
 from mobius.tasks import GlmOcrVLTask
 
@@ -69,6 +71,9 @@ def test_glm_ocr_synthetic_full_pipeline_matches_huggingface() -> None:
 
     config = _config_from_hf(text_config, parent_config=hf_config)
     module = GlmOcrForConditionalGeneration(config)
+    bf16_module = GlmOcrForConditionalGeneration(config)
+    _cast_module_dtype(bf16_module, ir.DataType.BFLOAT16)
+    assert bf16_module.vision_encoder.visual.rotary_pos_emb.inv_freq.dtype == ir.DataType.FLOAT
     package = GlmOcrVLTask().build(module, config)
     package.apply_weights(module.preprocess_weights(dict(hf_model.state_dict())))
 
@@ -123,6 +128,14 @@ def test_glm_ocr_synthetic_full_pipeline_matches_huggingface() -> None:
             past_key_values=None,
             inputs_embeds=text_embeddings,
         )
+        # The processor accepts extreme-aspect-ratio pages whose patch-grid axis
+        # exceeds 512. Exercise dynamic rotary frequencies past that old table bound.
+        wide_grid_thw = torch.tensor([[1, 2, 514]], dtype=torch.int64)
+        wide_pixel_values = torch.randn(1028, 3 * 2 * 14 * 14)
+        hf_wide_features = hf_model.model.visual(
+            wide_pixel_values,
+            grid_thw=wide_grid_thw,
+        )
 
     vision_session = OnnxModelSession(package["vision_encoder"])
     embedding_session = OnnxModelSession(package["embedding"])
@@ -132,6 +145,12 @@ def test_glm_ocr_synthetic_full_pipeline_matches_huggingface() -> None:
             {
                 "pixel_values": pixel_values.numpy(),
                 "image_grid_thw": image_grid_thw.numpy(),
+            }
+        )["image_features"]
+        wide_image_features = vision_session.run(
+            {
+                "pixel_values": wide_pixel_values.numpy(),
+                "image_grid_thw": wide_grid_thw.numpy(),
             }
         )["image_features"]
         inputs_embeds = embedding_session.run(
@@ -158,6 +177,12 @@ def test_glm_ocr_synthetic_full_pipeline_matches_huggingface() -> None:
     np.testing.assert_allclose(
         logits,
         hf_outputs.logits.detach().numpy(),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+    np.testing.assert_allclose(
+        wide_image_features,
+        hf_wide_features.pooler_output.detach().numpy(),
         rtol=1e-3,
         atol=1e-3,
     )

@@ -10,6 +10,7 @@ RMSNorm, learned 2x2 downsampling, and the GLM gated patch merger.
 
 from __future__ import annotations
 
+import numpy as np
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
@@ -19,7 +20,6 @@ from mobius.components._mlp import GatedMLP
 from mobius.components._qwen25_vl_vision import (
     Qwen25VLVisionAttention,
     Qwen25VLVisionModel,
-    Qwen25VLVisionRotaryEmbedding,
 )
 from mobius.components._rms_norm import RMSNorm
 
@@ -76,6 +76,34 @@ class GlmOcrVisionPatchEmbed(nn.Module):
         return op.Reshape(hidden_states, [-1, self._hidden_size])
 
 
+class GlmOcrVisionRotaryEmbedding(nn.Module):
+    """GLM-OCR 2D rotary embeddings with dynamic float32 frequencies."""
+
+    def __init__(self, dim: int, theta: float = 10_000.0) -> None:
+        super().__init__()
+        self._dim = dim
+        inv_freq = 1.0 / (theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
+        self.inv_freq = nn.Parameter([dim // 2], data=ir.tensor(inv_freq))
+        self.inv_freq._keep_float32 = True
+
+    def forward(
+        self,
+        op: OpBuilder,
+        rotary_pos_ids: ir.Value,
+    ) -> tuple[ir.Value, ir.Value]:
+        # Match HF's unbounded (N, 2, 1) * (dim/2,) formulation instead of
+        # indexing a fixed lookup table, so extreme-aspect-ratio pages remain valid.
+        position_ids = op.Cast(rotary_pos_ids, to=ir.DataType.FLOAT)
+        inv_freq = op.Cast(self.inv_freq, to=ir.DataType.FLOAT)
+        freqs = op.Mul(op.Unsqueeze(position_ids, [-1]), inv_freq)
+        freqs = op.Reshape(freqs, [0, self._dim])  # (N, dim)
+        embeddings = op.Concat(freqs, freqs, axis=-1)
+
+        # HF evaluates GLM-OCR's rotary trigonometry in float32. Keeping Cos/Sin
+        # out of bf16 also avoids unsupported ORT CUDA kernels.
+        return op.Cos(embeddings), op.Sin(embeddings)
+
+
 class GlmOcrVisionAttention(Qwen25VLVisionAttention):
     """GLM-OCR vision attention with per-head Q/K RMSNorm."""
 
@@ -114,13 +142,9 @@ class GlmOcrVisionAttention(Qwen25VLVisionAttention):
         from mobius._build_context import ep_capabilities
 
         if ep_capabilities().supports_packed_multi_head_attention:
-            output = self._emit_packed_mha(
-                op, query, key, value, cu_seqlens, seq_len
-            )
+            output = self._emit_packed_mha(op, query, key, value, cu_seqlens, seq_len)
         else:
-            output = self._emit_standard_attention(
-                op, query, key, value, cu_seqlens, seq_len
-            )
+            output = self._emit_standard_attention(op, query, key, value, cu_seqlens, seq_len)
         return self.proj(op, output)
 
 
@@ -220,7 +244,7 @@ class GlmOcrVisionModel(Qwen25VLVisionModel):
             hidden_size=hidden_size,
         )
         head_dim = hidden_size // num_heads
-        self.rotary_pos_emb = Qwen25VLVisionRotaryEmbedding(head_dim // 2)
+        self.rotary_pos_emb = GlmOcrVisionRotaryEmbedding(head_dim // 2)
         self.blocks = nn.ModuleList(
             [
                 GlmOcrVisionBlock(

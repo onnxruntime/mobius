@@ -154,8 +154,7 @@ class GlmOcrForConditionalGeneration(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Route pinned HuggingFace checkpoint tensors to the three sub-models."""
         if any(
-            key.startswith(("decoder.", "vision_encoder.", "embedding."))
-            for key in state_dict
+            key.startswith(("decoder.", "vision_encoder.", "embedding.")) for key in state_dict
         ):
             return dict(state_dict)
 
