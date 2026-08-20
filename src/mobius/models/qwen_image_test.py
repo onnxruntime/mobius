@@ -365,6 +365,118 @@ def test_edit_vae_matches_diffusers_on_real_source_image():
     np.testing.assert_allclose(actual_image, expected_image, rtol=1e-4, atol=1e-4)
 
 
+def _temporal_vae(dtype: ir.DataType = ir.DataType.FLOAT):
+    """Build a tiny edit VAE whose resamplers own temporal convolutions.
+
+    ``temperal_downsample=(True,)`` is what the real Qwen Image Edit checkpoint
+    uses, and it is the only configuration that instantiates ``time_conv`` in the
+    down/upsample blocks -- the code path the image (single frame) case must skip.
+    """
+    from mobius._diffusers_configs import QwenImageVAEConfig
+    from mobius.models.qwen_image_vae import AutoencoderKLQwenImageModel
+    from mobius.tasks import QwenImageEditVAETask
+
+    config = QwenImageVAEConfig(
+        base_dim=8,
+        z_dim=4,
+        dim_mult=(1, 2),
+        num_res_blocks=1,
+        temperal_downsample=(True,),
+        latents_mean=(-0.2, -0.1, 0.1, 0.2),
+        latents_std=(1.1, 1.2, 1.3, 1.4),
+        dtype=dtype,
+    )
+    module = AutoencoderKLQwenImageModel(config)
+    return config, module, QwenImageEditVAETask().build(module, config)
+
+
+def test_edit_vae_skips_temporal_convolutions_for_single_frame_images():
+    """A T=1 image must not run the temporal resampling branch.
+
+    ``QwenImageResample.forward`` only applies ``time_conv`` (and the temporal
+    pixel shuffle) from the *second* cached chunk onward, so a lone image chunk
+    keeps its frame count. Applying it unconditionally produced a graph whose
+    Conv output dimension collapsed to zero and could not even be loaded, so
+    this pins both the graph shape and the numerical agreement with diffusers.
+    """
+    ort = pytest.importorskip("onnxruntime")
+    torch = pytest.importorskip("torch")
+    diffusers = pytest.importorskip("diffusers")
+
+    means = [-0.2, -0.1, 0.1, 0.2]
+    stds = [1.1, 1.2, 1.3, 1.4]
+    torch.manual_seed(17)
+    hf_vae = diffusers.AutoencoderKLQwenImage(
+        base_dim=8,
+        z_dim=4,
+        dim_mult=[1, 2],
+        num_res_blocks=1,
+        temperal_downsample=[True],
+        latents_mean=means,
+        latents_std=stds,
+    ).eval()
+    _, module, package = _temporal_vae()
+    weights = module.preprocess_weights(dict(hf_vae.state_dict()))
+    apply_weights(package["encoder"], weights)
+    apply_weights(package["decoder"], weights)
+
+    generator = torch.Generator().manual_seed(19)
+    pixels = torch.randn((1, 3, 1, 16, 16), generator=generator)
+    with torch.no_grad():
+        moments = hf_vae._encode(pixels)
+        mean = moments.chunk(2, dim=1)[0]
+        scale = torch.tensor(stds)[None, :, None, None, None]
+        offset = torch.tensor(means)[None, :, None, None, None]
+        expected_latents = (mean - offset) / scale
+        expected_image = hf_vae.decode(expected_latents * scale + offset).sample.numpy()
+
+    with tempfile.TemporaryDirectory() as directory:
+        encoder_path = os.path.join(directory, "encoder.onnx")
+        decoder_path = os.path.join(directory, "decoder.onnx")
+        ir.save(package["encoder"], encoder_path)
+        ir.save(package["decoder"], decoder_path)
+        actual_latents = ort.InferenceSession(
+            encoder_path, providers=["CPUExecutionProvider"]
+        ).run(None, {"sample": pixels.numpy()})[0]
+        actual_image = ort.InferenceSession(
+            decoder_path, providers=["CPUExecutionProvider"]
+        ).run(None, {"latent_sample": actual_latents})[0]
+
+    # The frame axis survives encode and decode: a single image stays a single image.
+    assert actual_latents.shape[2] == 1
+    assert actual_image.shape == (1, 3, 1, 16, 16)
+    np.testing.assert_allclose(actual_latents, expected_latents.numpy(), rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(actual_image, expected_image, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("part", ["encoder", "decoder"])
+def test_edit_vae_bfloat16_graph_has_only_kernel_backed_ops(part):
+    """bfloat16 VAE graphs must avoid ops onnxruntime has no bfloat16 kernel for.
+
+    onnxruntime ships no bfloat16 ``ReduceL2``, ``Resize`` or ``Clip`` kernel on
+    any execution provider, and a single unassignable node aborts session
+    creation outright. The RMS norm reduces in float32, ``Resize`` is sandwiched
+    between casts, and the bfloat16 lowering pass rewrites ``Clip`` into
+    ``Min``/``Max``, so no bfloat16-typed instance of those ops may survive.
+    """
+    from mobius._optimizations import optimize_model
+
+    package = _temporal_vae(ir.DataType.BFLOAT16)[2]
+    model = package[part]
+    optimize_model(model, ep="cuda", dtype=ir.DataType.BFLOAT16, model_role="encoder")
+    unsupported = {"ReduceL2", "Resize", "Clip"}
+    offenders = [
+        node.op_type
+        for node in ir.traversal.RecursiveGraphIterator(model.graph)
+        if node.op_type in unsupported
+        and any(
+            value is not None and value.dtype == ir.DataType.BFLOAT16
+            for value in (*node.inputs, *node.outputs)
+        )
+    ]
+    assert offenders == []
+
+
 @pytest.mark.integration
 @pytest.mark.integration_fast
 def test_deterministic_l4_l5_image_edit_golden():

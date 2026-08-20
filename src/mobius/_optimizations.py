@@ -62,6 +62,7 @@ from mobius._passes import (
 )
 from mobius.functions import register_function_bodies
 from mobius.rewrite_rules import (
+    clip_to_min_max_rules,
     decompose_attention_pass,
     decompose_rope_rules,
     gelu_fusion_rules,
@@ -354,6 +355,13 @@ def _get_optimization_passes(
     # already graph-capture-safe.
     if caps.requires_graph_capture_rewrite:
         lower.append(("StaticEmptyKV", list(static_empty_kv_rules())))
+
+    # --- bfloat16 Clip lowering (all EPs) ---
+    # ORT has no bfloat16 Clip kernel and expands the op's ONNX function body
+    # into Less/Where, which also lack bfloat16 kernels — the unassigned nodes
+    # abort session creation. Min/Max are kernel-backed and exactly equivalent.
+    if dtype == ir.DataType.BFLOAT16:
+        lower.append(("ClipToMinMax", list(clip_to_min_max_rules())))
 
     return fuse, lower
 
