@@ -1040,6 +1040,29 @@ def test_multi_decoder_tts_without_pre_embedder_raises_precise_not_implemented(t
         write_onnx_genai_config(pkg, str(tmp_path))
 
 
+def test_hierarchical_audio_package_is_not_misclassified_as_diffusion(tmp_path):
+    names = {
+        "language_model",
+        "language_model_embedding",
+        "language_model_semantic_embedding",
+        "rvq_depth_decoder",
+        "rvq_depth_decoder_projection",
+        "rvq_depth_decoder_embedding",
+        "rvq_depth_decoder_feedback_embedding",
+        "rvq_depth_decoder_heads",
+        "condition_encoder",
+        "transformer",
+        "vocoder",
+    }
+    pkg = ModelPackage({name: object() for name in names})
+
+    with pytest.raises(
+        NotImplementedError,
+        match="stateless growing-length local codebook loop",
+    ):
+        write_onnx_genai_config(pkg, str(tmp_path))
+
+
 @dataclasses.dataclass
 class _TTSSubCfg:
     num_code_groups: int = 16
