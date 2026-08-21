@@ -15,6 +15,7 @@ from mobius._configs import (
     DEFAULT_INT,
     ArchitectureConfig,
     AudioConfig,
+    GlmAsrConfig,
     MuseGlimmerConfig,
     QuantizationConfig,
     VisionConfig,
@@ -753,6 +754,62 @@ class TestExtractAudioConfig:
         assert result["audio"].d_model == 1280
         assert result["audio"].encoder_layers == 32
         assert result["audio"].audio_token_id == 151646
+
+    def test_glmasr_nested_config(self):
+        """GLM-ASR unwraps its Llama text config and preserves audio metadata."""
+        text_config = SimpleNamespace(
+            model_type="llama",
+            vocab_size=59264,
+            hidden_size=2048,
+            intermediate_size=6144,
+            num_hidden_layers=28,
+            num_attention_heads=16,
+            num_key_value_heads=4,
+            head_dim=128,
+            hidden_act="silu",
+            max_position_embeddings=32768,
+            rms_norm_eps=1e-5,
+            rope_parameters={"rope_type": "default", "rope_theta": 500000.0},
+            tie_word_embeddings=True,
+            pad_token_id=59263,
+        )
+        audio_config = SimpleNamespace(
+            hidden_size=1280,
+            intermediate_size=5120,
+            num_hidden_layers=32,
+            num_attention_heads=20,
+            num_key_value_heads=20,
+            head_dim=64,
+            partial_rotary_factor=0.5,
+            rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+            layer_norm_eps=1e-5,
+            num_mel_bins=128,
+            max_position_embeddings=1500,
+            hidden_act="gelu",
+        )
+        parent = SimpleNamespace(
+            model_type="glmasr",
+            text_config=text_config,
+            audio_config=audio_config,
+            audio_token_id=59260,
+            projector_hidden_act="gelu",
+            tie_word_embeddings=True,
+            dtype="bfloat16",
+        )
+
+        config = GlmAsrConfig.from_transformers(parent)
+
+        assert config.model_type == "glmasr"
+        assert config.hidden_size == 2048
+        assert config.num_hidden_layers == 28
+        assert config.num_key_value_heads == 4
+        assert config.audio_token_id == 59260
+        assert config.audio is not None
+        assert config.audio.d_model == 1280
+        assert config.audio.encoder_head_dim == 64
+        assert config.audio.encoder_partial_rotary_factor == pytest.approx(0.5)
+        assert config.audio.encoder_rope_theta == pytest.approx(10000.0)
+        assert config.audio.output_dim == 2048
 
     def test_phi4mm_audio_token_id(self):
         """phi4mm extracts audio_token_id from audio_config attr."""

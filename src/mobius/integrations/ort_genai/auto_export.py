@@ -115,6 +115,7 @@ _GEMMA4_MODEL_TYPES = frozenset(
 # must preprocess with the HuggingFace processor and feed tensors via
 # ``Generator.set_inputs`` (see examples/gemma4_unified_ort_genai.py).
 _GEMMA4_UNIFIED_MODEL_TYPES = frozenset({"gemma4_unified", "gemma4_unified_text"})
+_GLMASR_MODEL_TYPES = frozenset({"glmasr"})
 _MINICPM_MODEL_TYPES = frozenset({"minicpmv4_6"})
 _LFM2_VL_MODEL_TYPES = frozenset({"lfm2_vl"})
 # gemma-3 multimodal. build() unwraps the composite HF config to its text
@@ -994,6 +995,46 @@ def _write_audio_processor_config(
             }
         }
         proc_filename = "audio_feature_extraction.json"
+    elif model_type in _GLMASR_MODEL_TYPES:
+        # GLM-ASR uses the standard Whisper log-mel contract with 128 mel
+        # bins and a fixed 30-second window. These operation names and attrs
+        # are consumed by OrtxCreateSpeechFeatureExtractor.
+        processor = {
+            "feature_extraction": {
+                "sequence": [
+                    {
+                        "operation": {
+                            "name": "audio_decoder",
+                            "type": "AudioDecoder",
+                        }
+                    },
+                    {
+                        "operation": {
+                            "name": "stft",
+                            "type": "STFTNorm",
+                            "attrs": {
+                                "n_fft": 400,
+                                "frame_length": 400,
+                                "hop_length": 160,
+                            },
+                        }
+                    },
+                    {
+                        "operation": {
+                            "name": "log_mel",
+                            "type": "LogMelSpectrum",
+                            "attrs": {
+                                "chunk_size": 30,
+                                "hop_length": 160,
+                                "n_fft": 400,
+                                "n_mel": 128,
+                            },
+                        }
+                    },
+                ]
+            }
+        }
+        proc_filename = "audio_processor.json"
     else:
         # Generic audio processor — add model-specific branches as needed.
         return None
@@ -1254,6 +1295,12 @@ def _write_genai_config(
                 "audio_embeds": "input_features",
                 "attention_mask": "input_features_mask",
             }
+        elif model_type in _GLMASR_MODEL_TYPES:
+            audio_kwargs["config_filename"] = "audio_processor.json"
+            audio_kwargs["input_names"] = {
+                "audio_embeds": "input_features",
+                "attention_mask": "input_features_mask",
+            }
         else:
             if audio_input_mapping is not None:
                 audio_kwargs["input_names"] = audio_input_mapping
@@ -1262,6 +1309,13 @@ def _write_genai_config(
             boa_token_id=boa_token_id,
             **audio_kwargs,
         )
+        embedding_inputs = _introspect_inputs(pkg, "embedding")
+        embedding_outputs = _introspect_outputs(pkg, "embedding")
+        if embedding_inputs is not None:
+            generator.with_embedding(
+                input_names=embedding_inputs,
+                output_names=embedding_outputs,
+            )
 
     return generator.write(output_dir)
 
@@ -1273,6 +1327,12 @@ def _validate_ort_genai_compatibility(pkg: ModelPackage) -> None:
         raise ValueError(
             "ORT GenAI does not define a feature-input CTC ASR pipeline; "
             "export Parakeet CTC as ONNX and run it directly with ONNX Runtime."
+        )
+    if getattr(config, "model_type", None) in _GLMASR_MODEL_TYPES:
+        raise ValueError(
+            "onnxruntime-genai does not register a GLM-ASR multimodal model type. "
+            "Export without --runtime ort-genai and run the audio_encoder, embedding, "
+            "and decoder models directly with ONNX Runtime."
         )
     if {"vision_encoder", "decoder"}.issubset(pkg) and "embedding" not in pkg:
         model_type = getattr(config, "model_type", "unknown")
@@ -1565,10 +1625,7 @@ def write_ort_genai_config(
     _fix_tokenizer_config(directory)
 
     # Ensure chat_template is in tokenizer_config.json
-    if revision is None:
-        _fix_chat_template(directory, hf_model_id)
-    else:
-        _fix_chat_template(directory, hf_model_id, revision=revision)
+    _fix_chat_template(directory, hf_model_id, revision=revision)
 
     # Correct assets that ship broken from upstream
     apply_asset_patches(directory)
