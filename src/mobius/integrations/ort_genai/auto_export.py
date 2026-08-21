@@ -95,8 +95,16 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "qwen2_vl": "qwen2_5_vl",
     "qwen3_vl": "qwen3_vl",
     "qwen3_vl_text": "qwen3_vl",
-    "qwen3_5": "qwen2_5_vl",
-    "qwen3_5_vl": "qwen2_5_vl",
+    # Qwen3.5 / Qwen3.6 use the Qwen-VL auxiliary vision+embedding pipeline
+    # but a hybrid DeltaNet/full-attention decoder, so they must select the
+    # native ORT GenAI qwen3_5 model type rather than the Qwen2.5-VL decoder.
+    "qwen3_5": "qwen3_5",
+    "qwen3_5_text": "qwen3_5",
+    "qwen3_5_vl": "qwen3_5",
+    "qwen3_5_vl_text": "qwen3_5",
+    "qwen3_5_moe": "qwen3_5",
+    "qwen3_5_moe_text": "qwen3_5",
+    "qwen3_5_moe_vl": "qwen3_5",
     # MiniCPM uses standard 1D decoder position IDs (unlike Qwen-VL MRoPE).
     # The phi3v multimodal runtime provides that contract; callers supply
     # HF-preprocessed packed pixels through Generator.set_inputs().
@@ -1219,7 +1227,17 @@ def _write_genai_config(
                     if model_type == "mage_vl"
                     else "processor_config.json"
                 )
-                if model_type in {"mage_vl", "qwen3_vl", "qwen3_vl_text"}:
+                if model_type in {
+                    "mage_vl",
+                    "qwen3_vl",
+                    "qwen3_vl_text",
+                    "qwen3_5",
+                    "qwen3_5_vl",
+                    "qwen3_5_vl_text",
+                    "qwen3_5_moe",
+                    "qwen3_5_moe_text",
+                    "qwen3_5_moe_vl",
+                }:
                     patch_size = getattr(vision_cfg, "patch_size", None)
                     window_size = getattr(vision_cfg, "window_size", None)
                     if patch_size is not None:
