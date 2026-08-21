@@ -107,12 +107,11 @@ class TestEncoderEmbeddingWorkflow:
         assert profile["kind"] == "embedding"
         assert profile["outputs"] == {"last_hidden_state": "last_hidden_state"}
 
-    def test_mask_aware_pooling_is_declared_against_a_real_input(
-        self, metadata, package
-    ) -> None:
+    def test_pooling_uses_the_sequence_axis(self, metadata) -> None:
         profile = metadata["profiles"]["embedding"]
         workflow = metadata["pipeline"]["workflow"]
-        assert profile["pooling"]["mask"] in workflow["inputs"]
+        assert profile["pooling"] == {"kind": "mean", "axis": 1, "normalize": False}
+        assert "request.attention_mask" in workflow["inputs"]
         assert profile["batch_invariance"] == "row_independent"
 
     def test_every_bound_port_exists_in_the_artifact(self, metadata, package) -> None:
@@ -127,6 +126,15 @@ class TestEncoderEmbeddingWorkflow:
         workflow = metadata["pipeline"]["workflow"]
         invoke = workflow["steps"][0]
         assert set(workflow["inputs"]) == set(invoke["inputs"].values())
+
+    def test_anonymous_dynamic_dimensions_get_stable_names(self, metadata) -> None:
+        workflow = metadata["pipeline"]["workflow"]
+        contracts = [
+            declaration["contract"]
+            for declarations in (workflow["inputs"], workflow["outputs"])
+            for declaration in declarations.values()
+        ]
+        assert all(None not in contract["shape"] for contract in contracts)
 
     def test_the_emitted_value_is_the_invocations_output(self, metadata) -> None:
         invoke, emit = metadata["pipeline"]["workflow"]["steps"]

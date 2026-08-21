@@ -8,10 +8,8 @@ profiles:
       last_hidden_state: last_hidden_state
     pooling:
       kind: mean
-      source: last_hidden_state
-      mask: request.attention_mask
-      time_axis: 1
-      feature_axis: 2
+      axis: 1
+      normalize: false
     batch_invariance: row_independent
 pipeline:
   workflow:
@@ -57,11 +55,10 @@ pipeline:
             kind: request_aligned
             axis: 0
         role:
-          kind: runtime
-          version: '1.0'
-          role: attention_mask
+          kind: opaque
         source:
-          kind: request
+          kind: application
+          name: request.attention_mask
         required: true
       request.token_type_ids:
         contract:
@@ -74,11 +71,10 @@ pipeline:
             kind: request_aligned
             axis: 0
         role:
-          kind: runtime
-          version: '1.0'
-          role: token_type_ids
+          kind: opaque
         source:
-          kind: request
+          kind: application
+          name: request.token_type_ids
         required: true
     outputs:
       last_hidden_state:
@@ -87,7 +83,7 @@ pipeline:
           rank: 3
           shape:
           - batch
-          - null
+          - last_hidden_state_dim_1
           - 64
           batch_layout:
             kind: request_aligned

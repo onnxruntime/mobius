@@ -8153,10 +8153,20 @@ def build_encoder_embedding_workflow_metadata(
     for name, role in _ENCODER_EMBEDDING_INPUT_ROLES.items():
         if name not in graph_inputs:
             continue
+        input_role: dict[str, Any]
+        input_source: dict[str, Any]
+        if role == "prompt_tokens":
+            input_role = {"kind": "runtime", "version": "1.0", "role": role}
+            input_source = {"kind": "request"}
+        else:
+            # The portable runtime-role vocabulary intentionally does not
+            # encode architecture-specific auxiliary graph inputs.
+            input_role = {"kind": "opaque"}
+            input_source = {"kind": "application", "name": f"request.{name}"}
         declaration: dict[str, Any] = {
             "contract": _contract(graph_inputs[name]),
-            "role": {"kind": "runtime", "version": "1.0", "role": role},
-            "source": {"kind": "request"},
+            "role": input_role,
+            "source": input_source,
             # Every port here is a graph input of a single-invocation workflow,
             # so a runtime must bind all of them; none is optional.
             "required": True,
@@ -8218,17 +8228,13 @@ def build_encoder_embedding_workflow_metadata(
         "outputs": profile_outputs,
     }
     if "attention_mask" in graph_inputs:
-        # Mask-aware mean pooling is only well defined when the graph is told
-        # which positions are padding; a reader can then reduce a row over its
-        # own valid region instead of over the width the batch happened to be
-        # padded to. The same fact is what makes rows independent of their
-        # neighbours, so both claims are made together or neither is.
+        # The portable pooling profile describes the supported sequence
+        # reduction; the application remains responsible for supplying the
+        # architecture-specific attention mask to the graph.
         profile["pooling"] = {
             "kind": "mean",
-            "source": "last_hidden_state",
-            "mask": "request.attention_mask",
-            "time_axis": 1,
-            "feature_axis": 2,
+            "axis": 1,
+            "normalize": False,
         }
         profile["batch_invariance"] = "row_independent"
 

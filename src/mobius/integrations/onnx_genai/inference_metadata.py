@@ -134,15 +134,18 @@ _BATCH_DIMENSION = "batch"
 """Symbolic leading dimension mobius uses for per-request batching."""
 
 
-def _shape_metadata(port: _Port) -> list[int | str | None]:
+def _shape_metadata(port: _Port) -> list[int | str]:
     """Return a YAML-safe graph shape without losing symbolic dimensions."""
-    shape: list[int | str | None] = []
-    for dim in port.dims:
+    shape: list[int | str] = []
+    for axis, dim in enumerate(port.dims):
         if isinstance(dim, int):
             shape.append(dim)
             continue
         value = getattr(dim, "value", None)
-        shape.append(str(value) if value is not None else None)
+        # Metadata dimensions cannot be null. Preserve named graph dimensions;
+        # give anonymous dynamic dimensions a stable, port-local name instead
+        # of pretending they are static or serializing an invalid null.
+        shape.append(str(value) if value is not None else f"{port.name}_dim_{axis}")
     return shape
 
 

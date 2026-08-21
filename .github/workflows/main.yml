@@ -23,18 +23,12 @@ jobs:
     - uses: actions/checkout@v7
       with:
         repository: justinchuby/onnx-genai
-        # Pinned by SHA so the contract under test is reproducible.  That
-        # branch is rebased routinely, which twice left this pin naming a
-        # commit reachable from no ref -- GC-eligible, and `actions/checkout`
-        # fails with "reference is not a tree" whenever collection happens to
-        # run.  The tag mobius-pr478-pin in that repository anchors exactly
-        # this commit so it stays reachable across their rebases; do not
-        # delete it while this pin names this SHA.  When bumping, verify
-        # reachability with `git merge-base --is-ancestor <sha> <branch-tip>`,
-        # not with `git ls-remote | grep` (which only lists ref tips) and not
-        # with `gh api .../commits/<sha>` (which answers 200 for unreferenced
-        # objects and so fails open).
-        ref: 4315a94d114a69d6c1464dc48b4aeb53c16da566
+        # Pinned by SHA so the producer/runtime contract under test is
+        # reproducible. PR #828 is maintained by merging main rather than
+        # rebasing, so this commit remains reachable from its branch history.
+        # When bumping, verify reachability with `git merge-base --is-ancestor
+        # <sha> <branch-tip>`.
+        ref: 857d96cf25008cdf229252b9dbea3e01c23fac7f
         path: validation/onnx-genai
     - uses: actions/setup-python@v7
       with:
