@@ -2816,6 +2816,123 @@ class GlmAsrConfig(CausalLMConfig):
 
 
 @dataclasses.dataclass
+class SenseNovaU1Config(CausalLMConfig):
+    """Configuration for SenseNova-U1.5 ``neo_chat`` (NEO-unify) models.
+
+    NEO-unify is a *native* unified any-to-any architecture: a single
+    Qwen3 backbone carries two complete sets of transformer weights
+    ("Mixture of Transformers").  The understanding branch consumes text
+    and reference-image tokens; the ``_mot_gen`` branch consumes noisy
+    image tokens during flow-matching sampling.  The text-decoder fields
+    are lifted from the nested ``llm_config``; the extra fields below
+    describe the spatial rotary axes and the flow-matching image head.
+
+    Attributes:
+        rope_theta_hw: RoPE base for the spatial (height/width) axes.
+            ``rope_theta`` (inherited) drives the temporal/text axis.
+        max_position_embeddings_hw: Position limit for the spatial axes.
+        patch_size: ViT patch size (pixels per patch side).
+        downsample_ratio: Patch-merge ratio; ``1 / downsample_ratio`` is
+            the merge factor applied by the ``dense_embedding`` conv.
+        use_pixel_head: When true the flow-matching head is a
+            pixel-shuffle ``ConvDecoder`` predicting RGB directly (no VAE).
+        fm_head_dim / fm_head_layers / fm_head_mlp_ratio: Geometry of the
+            deep ``SimpleMLPAdaLN`` head, used only when
+            ``fm_head_layers > 2`` (not the case for the released model).
+        add_noise_scale_embedding: Add a second sinusoidal embedder whose
+            input is the resolution-dependent noise scale.
+        noise_scale / noise_scale_mode / noise_scale_base_image_seq_len /
+        noise_scale_max_value: Noise-scale schedule parameters.
+        timestep_shift / time_schedule: Flow-matching timestep warping.
+        t_eps: Lower clamp on ``1 - t`` when converting the head's
+            x0-prediction into a velocity.
+    """
+
+    rope_theta_hw: float = 10_000.0
+    max_position_embeddings_hw: int = 10_000
+    patch_size: int = 16
+    downsample_ratio: float = 0.5
+    use_pixel_head: bool = True
+    fm_head_dim: int = 1536
+    fm_head_layers: int = 2
+    fm_head_mlp_ratio: float = 1.0
+    add_noise_scale_embedding: bool = True
+    noise_scale: float = 1.0
+    noise_scale_mode: str = "resolution"
+    noise_scale_base_image_seq_len: int = 64
+    noise_scale_max_value: float = 16.0
+    timestep_shift: float = 1.0
+    time_schedule: str = "standard"
+    t_eps: float = 0.05
+    frequency_embedding_size: int = 256
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> SenseNovaU1Config:
+        # ``neo_chat`` is a composite config: the Qwen3 text-decoder fields
+        # live under ``llm_config`` while the flow-matching / patchify
+        # fields sit at the top level next to ``vision_config``.
+        composite = parent_config or config
+        llm_config = getattr(composite, "llm_config", None) or config
+        base = ArchitectureConfig.from_transformers(llm_config, parent_config=composite)
+        fields = _shallow_fields(base)
+        fields.update(
+            model_type=getattr(composite, "model_type", "neo_chat"),
+            tie_word_embeddings=bool(getattr(composite, "tie_word_embeddings", False)),
+        )
+        resolved_dtype = _resolve_dtype(composite)
+        if resolved_dtype is not None:
+            fields["dtype"] = resolved_dtype
+
+        vision_config = getattr(composite, "vision_config", None)
+
+        def _pick(name: str, default):
+            # Prefer the top-level value, then the vision sub-config, then
+            # the llm sub-config; the released config.json spreads these
+            # three groups across all three levels.
+            for source in (composite, vision_config, llm_config):
+                if source is None:
+                    continue
+                value = getattr(source, name, None)
+                if value is not None:
+                    return value
+            return default
+
+        return cls(
+            **{
+                **fields,
+                "rope_theta_hw": float(_pick("rope_theta_hw", 10_000.0)),
+                "max_position_embeddings_hw": int(_pick("max_position_embeddings_hw", 10_000)),
+                "patch_size": int(_pick("patch_size", 16)),
+                "downsample_ratio": float(_pick("downsample_ratio", 0.5)),
+                "use_pixel_head": bool(_pick("use_pixel_head", True)),
+                "fm_head_dim": int(_pick("fm_head_dim", 1536)),
+                "fm_head_layers": int(_pick("fm_head_layers", 2)),
+                "fm_head_mlp_ratio": float(_pick("fm_head_mlp_ratio", 1.0)),
+                "add_noise_scale_embedding": bool(_pick("add_noise_scale_embedding", True)),
+                "noise_scale": float(_pick("noise_scale", 1.0)),
+                "noise_scale_mode": str(_pick("noise_scale_mode", "resolution")),
+                "noise_scale_base_image_seq_len": int(
+                    _pick("noise_scale_base_image_seq_len", 64)
+                ),
+                "noise_scale_max_value": float(_pick("noise_scale_max_value", 16.0)),
+                "timestep_shift": float(_pick("timestep_shift", 1.0)),
+                "time_schedule": str(_pick("time_schedule", "standard")),
+                "t_eps": float(_pick("t_eps", 0.05)),
+            }
+        )
+
+    @property
+    def merge_size(self) -> int:
+        """Patch-merge factor applied by ``dense_embedding`` (2 for 0.5)."""
+        return round(1.0 / self.downsample_ratio)
+
+    @property
+    def pixels_per_token(self) -> int:
+        """Image-token stride in pixels (``patch_size * merge_size`` = 32)."""
+        return self.patch_size * self.merge_size
+
+
+@dataclasses.dataclass
 class SpeechToTextConfig(ArchitectureConfig):
     """Shared configuration contract for encoder-decoder speech models."""
 

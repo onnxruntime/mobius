@@ -133,6 +133,7 @@ __all__ = [
     "Qwen3ASRForConditionalGeneration",
     "Qwen3CausalLMModel",
     "Qwen3NextCausalLMModel",
+    "SenseNovaU1Model",
     "SenseVoiceSmallModel",
     "SortformerConfig",
     "SortformerDiarizationModel",
@@ -337,6 +338,7 @@ from mobius.models.qwen_vl import (
     Qwen25VLTextModel,
     Qwen25VLVisionEncoderModel,
 )
+from mobius.models.sensenova_u1 import SenseNovaU1Model
 from mobius.models.sensevoice_small import SenseVoiceSmallModel
 from mobius.models.smollm import SmolLM3CausalLMModel
 from mobius.models.sortformer import SortformerConfig, SortformerDiarizationModel
