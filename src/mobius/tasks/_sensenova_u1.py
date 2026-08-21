@@ -236,7 +236,7 @@ class SenseNovaU1Task(ModelTask):
             batch,
             past_seq_len,
         )
-        predicted_image = module(
+        predicted_image, present_key_values = module(
             op,
             image_embeds,
             position_ids=position_ids,
@@ -244,4 +244,10 @@ class SenseNovaU1Task(ModelTask):
             token_grid=token_grid,
         )
         builder.add_output(predicted_image, "predicted_image")
+        # The sampler never feeds these back — upstream runs the denoise pass
+        # with ``update_cache=False`` so the understanding prefix stays frozen
+        # across flow-matching steps.  They are still registered because the
+        # ORT CUDA Attention kernel requires present_key/present_value outputs
+        # whenever past_key/past_value are supplied.
+        _register_kv_cache_outputs(builder, present_key_values)
         return _make_model(graph)
