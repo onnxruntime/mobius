@@ -812,6 +812,11 @@ def _state_group(
     into the ``past`` binding, while a growable cache returns a fresh, longer
     tensor each step and must never be aliased onto its own input.
     """
+    annotated_ports = {
+        component: {cell: _annotated_alias(alias) for cell, alias in aliases.items()}
+        for component, aliases in ports.items()
+    }
+    _validate_attention_alias_layer_sets({kind: annotated_ports})
     group: dict[str, Any] = {
         "kind": kind,
         "sequence_axis": sequence_axis,
@@ -819,10 +824,7 @@ def _state_group(
         "aliasing": (aliasing if aliasing is not None else _aliasing_for_storage(storage)),
         "reuse": {"prefix_reusable": True, "evictable_prefix": False},
         "capabilities": {"snapshot": True, "fork": True},
-        "ports": {
-            component: {cell: _annotated_alias(alias) for cell, alias in aliases.items()}
-            for component, aliases in ports.items()
-        },
+        "ports": annotated_ports,
     }
     if logical_lengths is not None:
         group["logical_lengths"] = logical_lengths
@@ -894,6 +896,47 @@ def _state_group_kinds(config: Any, cache_pairs: list[tuple[ir.Value, ir.Value]]
     return kinds
 
 
+def _validate_attention_alias_layer_sets(
+    grouped_ports: dict[str, dict[str, dict[str, dict[str, Any]]]],
+) -> None:
+    """Require split key/value aliases to cover the same numeric layers."""
+    for group_name, components in grouped_ports.items():
+        for component, aliases in components.items():
+            layers_by_role: dict[str, dict[int, str]] = {"key": {}, "value": {}}
+            for alias_name, alias in aliases.items():
+                role = alias.get("role")
+                if role not in layers_by_role:
+                    continue
+                layer = alias.get("layer")
+                if not isinstance(layer, int):
+                    raise TypeError(
+                        f"state group {group_name!r} component {component!r} alias "
+                        f"{alias_name!r} declares role {role!r} without a numeric layer"
+                    )
+                previous = layers_by_role[role].get(layer)
+                if previous is not None:
+                    raise ValueError(
+                        f"state group {group_name!r} component {component!r} declares "
+                        f"duplicate {role} aliases for layer {layer}: "
+                        f"{previous!r} and {alias_name!r}"
+                    )
+                layers_by_role[role][layer] = alias_name
+
+            key_layers = set(layers_by_role["key"])
+            value_layers = set(layers_by_role["value"])
+            if not key_layers and not value_layers:
+                continue
+            if key_layers != value_layers:
+                raise ValueError(
+                    f"state group {group_name!r} component {component!r} must declare "
+                    "one key and one value alias for the same attention layers; "
+                    f"key layers are {sorted(key_layers)}, "
+                    f"value layers are {sorted(value_layers)}, "
+                    f"missing value layers are {sorted(key_layers - value_layers)}, "
+                    f"missing key layers are {sorted(value_layers - key_layers)}"
+                )
+
+
 def _state_service_groups(
     *,
     config: Any,
@@ -954,6 +997,7 @@ def _state_service_groups(
             grouped_ports[cell_group[cell]].setdefault(component, {})[cell] = _annotated_alias(
                 alias
             )
+    _validate_attention_alias_layer_sets(grouped_ports)
     groups = {}
     for kind, update in distinct:
         is_scattered = update == "indexed_scatter"

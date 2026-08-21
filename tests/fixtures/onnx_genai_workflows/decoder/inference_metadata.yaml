@@ -725,6 +725,17 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+            past_key_values.0.value:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - 4
+              - past_sequence
+              - 4
+              batch_layout:
+                kind: request_aligned
+                axis: 0
       decoder_step_update:
         implementation:
           kind: onnx
@@ -1121,6 +1132,27 @@ pipeline:
         management: runtime
         release_boundary: invocation
         service_group: decoder_cache
+      cache_1:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 4
+          - past_sequence
+          - 4
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: decoder.setup.present.0.value
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.max_context
+        management: runtime
+        release_boundary: invocation
+        service_group: decoder_cache
     serving:
       active: active
       done: done
@@ -1142,6 +1174,11 @@ pipeline:
                   output: present.0.key
                   role: key
                   layer: 0
+                cache_1:
+                  input: past_key_values.0.value
+                  output: present.0.value
+                  role: value
+                  layer: 0
     steps:
     - kind: loop
       setup:
@@ -1158,16 +1195,19 @@ pipeline:
           position_ids: initializer.position_ids
           body_position_ids: initializer.body_position_ids
           past_key_values.0.key: initializer.past_key_values.0.key
+          past_key_values.0.value: initializer.past_key_values.0.value
       - kind: invoke
         component: model
         inputs:
           input_ids: request.input_ids
           past_key_values.0.key: initializer.past_key_values.0.key
+          past_key_values.0.value: initializer.past_key_values.0.value
           attention_mask: initializer.attention_mask
           position_ids: initializer.position_ids
         outputs:
           logits: decoder.setup.logits
           present.0.key: decoder.setup.present.0.key
+          present.0.value: decoder.setup.present.0.value
       - kind: invoke
         component: termination_batch_initializer
         inputs:
@@ -1277,11 +1317,13 @@ pipeline:
         inputs:
           input_ids: token.body
           past_key_values.0.key: cache_0
+          past_key_values.0.value: cache_1
           attention_mask: attention_mask
           position_ids: position_ids
         outputs:
           logits: decoder.body.logits
           present.0.key: decoder.body.present.0.key
+          present.0.value: decoder.body.present.0.value
       - kind: invoke
         component: last_token_logits
         inputs:
@@ -1321,6 +1363,8 @@ pipeline:
         next: decoder_step.body_position_ids
       - cell: cache_0
         next: decoder.body.present.0.key
+      - cell: cache_1
+        next: decoder.body.present.0.value
       termination: generation_eos
       iteration:
         value: loop.iteration
