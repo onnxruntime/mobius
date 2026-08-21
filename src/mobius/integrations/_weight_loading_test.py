@@ -5,8 +5,8 @@
 
 These tests guard against regressions in the security posture of weight
 loading code. They verify:
-1. Safetensors is preferred over pickle-based formats.
-2. No unguarded ``torch.load`` calls exist in the source.
+1. Safetensors is preferred over legacy PyTorch formats.
+2. Legacy ``torch.load`` calls always use ``weights_only=True``.
 3. Path traversal attacks are blocked in weight file paths.
 4. Temporary files are cleaned up after weight operations.
 5. Corrupted / truncated weight files are handled gracefully.
@@ -28,6 +28,7 @@ import onnx_ir as ir
 import pytest
 import safetensors.torch
 import torch
+from huggingface_hub.utils import EntryNotFoundError
 
 from mobius._builder import build_from_module
 from mobius._model_package import ModelPackage
@@ -77,7 +78,7 @@ def _build_model_with_weights() -> tuple[ir.Model, list[str]]:
 
 
 class TestSafetensorsPreference:
-    """Verify that the codebase only uses safetensors — never pickle."""
+    """Verify that safetensors is preferred and legacy loading is guarded."""
 
     @pytest.mark.parametrize("weight_file", _WEIGHT_FILES, ids=lambda p: p.name)
     def test_no_pickle_import(self, weight_file):
@@ -98,8 +99,8 @@ class TestSafetensorsPreference:
         assert not violations, f"Forbidden pickle imports in {weight_file.name}: {violations}"
 
     @pytest.mark.parametrize("weight_file", _WEIGHT_FILES, ids=lambda p: p.name)
-    def test_no_torch_load(self, weight_file):
-        """Weight loading files must not call torch.load (pickle-based)."""
+    def test_no_unguarded_torch_load(self, weight_file):
+        """Weight loading files must guard torch.load with weights_only=True."""
         if not weight_file.exists():
             pytest.skip(f"{weight_file.name} does not exist yet")
         source = weight_file.read_text(encoding="utf-8")
@@ -113,23 +114,27 @@ class TestSafetensorsPreference:
                     and isinstance(func.value, ast.Name)
                     and func.value.id == "torch"
                 ):
-                    pytest.fail(f"torch.load found in {weight_file.name}:{node.lineno}")
+                    assert any(
+                        kw.arg == "weights_only"
+                        and isinstance(kw.value, ast.Constant)
+                        and kw.value.value is True
+                        for kw in node.keywords
+                    ), f"unguarded torch.load found in {weight_file.name}:{node.lineno}"
 
-    def test_safetensors_is_the_only_format_used(self):
-        """Weight files referenced in weight loading code are .safetensors only."""
+    def test_safetensors_remains_preferred(self):
+        """Safetensors lookup must occur before legacy PyTorch lookup."""
         for weight_file in _WEIGHT_FILES:
             if not weight_file.exists():
                 continue
             source = weight_file.read_text(encoding="utf-8")
             assert "safetensors" in source, f"No safetensors usage in {weight_file.name}"
-            for dangerous_ext in [".bin", ".pkl", ".pickle", ".pt", ".pth"]:
-                assert dangerous_ext not in source, (
-                    f"Found reference to unsafe format '{dangerous_ext}' in {weight_file.name}"
-                )
+            assert source.index("_SINGLE_WEIGHT_NAME") < source.index(
+                "_SINGLE_PYTORCH_WEIGHT_NAME"
+            )
 
-    def test_safetensors_load_file_is_only_weight_loader(self):
-        """safetensors.torch.load_file must be the only weight deserialization call."""
-        forbidden_loaders = {"load", "load_state_dict", "unpickle"}
+    def test_no_other_weight_deserializers(self):
+        """Only safetensors.load_file and guarded torch.load may deserialize weights."""
+        forbidden_loaders = {"load_state_dict", "unpickle"}
         for weight_file in _WEIGHT_FILES:
             if not weight_file.exists():
                 continue
@@ -193,6 +198,21 @@ class TestLocalSafetensorsLoading:
         assert torch.equal(state_dict["a.weight"], shard_a["a.weight"])
         assert torch.equal(state_dict["b.weight"], shard_b["b.weight"])
 
+    def test_local_legacy_pytorch_state_dict_loaded_without_hub(self, tmp_path, monkeypatch):
+        data = {"weight": torch.ones(2, 3)}
+        torch.save(data, tmp_path / "pytorch_model.bin")
+
+        def _unexpected_hub_call(*_args, **_kwargs):
+            raise AssertionError("local checkpoint should not call hf_hub_download")
+
+        monkeypatch.setattr(
+            "mobius.integrations._weight_loading.hf_hub_download", _unexpected_hub_call
+        )
+
+        state_dict = _download_weights(str(tmp_path))
+
+        assert torch.equal(state_dict["weight"], data["weight"])
+
     def test_local_directory_without_safetensors_raises_without_hub(
         self, tmp_path, monkeypatch
     ):
@@ -217,6 +237,32 @@ class TestLocalSafetensorsLoading:
 
         with pytest.raises(ValueError, match="Unsafe weight filename"):
             _download_weights(str(tmp_path))
+
+
+def test_hub_legacy_pytorch_fallback_preserves_revision(tmp_path, monkeypatch):
+    """A Hub repo with no safetensors falls back to pinned PyTorch weights."""
+    weight_path = tmp_path / "pytorch_model.bin"
+    expected = {"weight": torch.arange(6).reshape(2, 3)}
+    torch.save(expected, weight_path)
+    calls = []
+
+    def _download(*, repo_id, filename, revision=None):
+        calls.append((repo_id, filename, revision))
+        if filename == "pytorch_model.bin":
+            return str(weight_path)
+        raise EntryNotFoundError(filename)
+
+    monkeypatch.setattr("mobius.integrations._weight_loading.hf_hub_download", _download)
+
+    state_dict = _download_weights("legacy/model", revision="immutable-sha")
+
+    assert torch.equal(state_dict["weight"], expected["weight"])
+    assert calls == [
+        ("legacy/model", "model.safetensors.index.json", "immutable-sha"),
+        ("legacy/model", "model.safetensors", "immutable-sha"),
+        ("legacy/model", "pytorch_model.bin.index.json", "immutable-sha"),
+        ("legacy/model", "pytorch_model.bin", "immutable-sha"),
+    ]
 
 
 # ===========================================================================
