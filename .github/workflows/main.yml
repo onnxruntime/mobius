@@ -28,7 +28,7 @@ jobs:
         # rebasing, so this commit remains reachable from its branch history.
         # When bumping, verify reachability with `git merge-base --is-ancestor
         # <sha> <branch-tip>`.
-        ref: f26772bd4b29d7d84b9a4af9ff401c8aa9ba48c6
+        ref: 509cd4e9c4471f4cbc59fe44b47168f0ae128fe3
         path: validation/onnx-genai
     - uses: actions/setup-python@v7
       with:
