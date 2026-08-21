@@ -123,7 +123,7 @@ well-formed and validate; only the local kernel is missing.
 
 ### Canonical representation — lowering verified
 
-Against ONNX GenAI `6e2ddc78`, with no `model.io` in any package and no port
+Against ONNX GenAI `52339e10`, with no `model.io` in any package and no port
 contracts on any component that ships an artifact:
 
 | Check | Result |
@@ -137,14 +137,32 @@ write cursor, the valid length and the per-layer buffer pairs; it resolved all
 of them by lowering the workflow, which is what makes removing the second copy
 safe rather than merely tidy.
 
-`7324351a` moved the document-level invariants onto `load_metadata_package`, so
-the package loader — the path the `validate_metadata` binary and every on-disk
-consumer take — now enforces rules that previously only ran for callers holding
-a parsed document. That is a strictness increase applied to the exact entry
+ONNX GenAI later moved the document-level invariants onto
+`load_metadata_package`, so the package loader — the path the
+`validate_metadata` binary and every on-disk consumer take — now enforces rules
+that previously only ran for callers holding a parsed document. That is a strictness increase applied to the exact entry
 point our fixtures go through, and all 11 were re-checked against it rather
 than assumed to be unaffected. They pass because they carry no `model:` block
 at all: a package with one serialized ABI has nothing for a coexistence rule to
 find.
+
+### Why this document names one SHA and not several
+
+The ONNX GenAI branch we validate against is rebased as its own base moves, so
+its commits are rewritten and the old hashes stop being reachable from any ref.
+A citation to one of them does not merely go stale: it becomes unresolvable
+once the unreferenced object is collected. Only `.github/workflows/main.yml`
+pins a hash, because only CI needs to fetch an exact tree, and a bump there is
+gated on re-running both suites. Everywhere else, changes are described by what
+they do.
+
+This is not hypothetical. The pin was verified against the branch head, that
+head was later rebased, and the pinned commit became reachable from no ref —
+`git ls-remote` showed zero matches and no remote ref had it as an ancestor.
+`actions/checkout` would have kept succeeding until the object was collected
+and then failed with `reference is not a tree` on a commit no one could
+inspect. Bumping a pin is therefore checked with `ls-remote` plus an ancestry
+test rather than with an API call that answers just as happily for an orphan.
 
 ### What the fixtures commit, and what they do not
 
