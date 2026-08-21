@@ -45,7 +45,7 @@ class _DuplexConfig:
     initial_token_id: int = 2048
 
 
-def _duplex_package() -> ModelPackage:
+def _duplex_package(*, include_position_ids: bool = True) -> ModelPackage:
     encoder = _model(
         "encoder",
         [_value("waveform", ir.DataType.FLOAT, ["batch", 1, "audio_samples"])],
@@ -59,8 +59,11 @@ def _duplex_package() -> ModelPackage:
     temporal_inputs = [
         _value("input_frame", ir.DataType.INT64, ["batch", _CHANNELS, "sequence_len"]),
         _value("attention_mask", ir.DataType.INT64, ["batch", "context"]),
-        _value("position_ids", ir.DataType.INT64, ["batch", "sequence_len"]),
     ]
+    if include_position_ids:
+        temporal_inputs.append(
+            _value("position_ids", ir.DataType.INT64, ["batch", "sequence_len"])
+        )
     temporal_outputs: list[tuple[str, ir.DataType, list[int | str]]] = [
         ("hidden", ir.DataType.FLOAT, ["batch", "sequence_len", 8]),
         ("text_logits", ir.DataType.FLOAT, ["batch", "sequence_len", 32]),
@@ -195,7 +198,10 @@ def test_duplex_temporal_cache_is_bounded_by_the_context_window() -> None:
             "max": "package.context_limit",
         }
         # A runtime-owned cache must be permutable for batch compaction.
-        assert cell["contract"]["batch_layout"] == {"kind": "request_aligned", "axis": 0}
+        assert cell["contract"]["batch_layout"] == {
+            "kind": "request_aligned",
+            "axis": 0,
+        }
     assert workflow["inputs"]["package.context_limit"]["default"] == _CONTEXT
 
 
@@ -251,6 +257,24 @@ def test_duplex_frame_pipeline_order() -> None:
 def test_duplex_delay_pattern_is_published() -> None:
     workflow = _workflow()
     assert workflow["inputs"]["package.delays"]["default"] == _DELAYS
+
+
+def test_duplex_allows_pruned_temporal_position_ids() -> None:
+    metadata = build_full_duplex_workflow_metadata(
+        _duplex_package(include_position_ids=False), _DuplexConfig()
+    )
+    workflow = metadata["pipeline"]["workflow"]
+    pending = list(workflow["steps"])
+    temporal = None
+    while pending:
+        node = pending.pop()
+        if node.get("component") == "temporal":
+            temporal = node
+            break
+        pending.extend(node.get("steps", []))
+    assert temporal is not None
+    assert "position_ids" not in temporal["inputs"]
+    assert workflow["state"]["position_ids"]["contract"]["dtype"] == "int64"
     assert workflow["inputs"]["package.initial_tokens"]["default"] == [32000] + [2048] * (
         _CHANNELS - 1
     )

@@ -4733,12 +4733,13 @@ class TestBuildMoshiLM:
         for node in gqa_nodes:
             assert node.attributes["local_window_size"].value == full_window
 
-    def test_depformer_io(self):
+    @pytest.mark.parametrize("dep_q", [8, 16])
+    def test_depformer_io(self, dep_q):
         """Depformer model I/O: hidden + prev_token + substep_index -> logits."""
         from mobius.models.moshi import MoshiDepformerModel, moshi_depformer_config
         from mobius.tasks import MoshiDepformerTask
 
-        config = moshi_depformer_config()
+        config = moshi_depformer_config(dep_q=dep_q)
         pkg = build_from_module(MoshiDepformerModel(config), config, task=MoshiDepformerTask())
         model = pkg["model"]
         inputs = {inp.name for inp in model.graph.inputs}
@@ -4748,6 +4749,7 @@ class TestBuildMoshiLM:
         assert "substep_index" in inputs
         assert "logits" in outputs
         assert "present.0.key" in outputs
+        assert model.graph.initializers["depformer_in.weight"].shape[0] == dep_q
 
 
 class TestBuildCodecGraph:
