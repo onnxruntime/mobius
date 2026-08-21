@@ -2541,6 +2541,8 @@ def write_mtp_speculator_metadata(
     filename: str = "inference_metadata.yaml",
     model_path: str = "mtp/model.onnx",
     num_speculative_tokens: int = 1,
+    embedding_weights: str = "model.embed_tokens.weight",
+    lm_head_weights: str = "lm_head.weight",
 ) -> str | None:
     """Add a ``speculator`` block for the exported MTP head to the backbone metadata.
 
@@ -2561,6 +2563,7 @@ def write_mtp_speculator_metadata(
 
     num_layers = getattr(backbone_config, "num_hidden_layers", None)
     hidden_size = getattr(backbone_config, "hidden_size", None)
+    vocab_size = getattr(backbone_config, "vocab_size", None)
     target_hidden_output = (
         f"hidden_states.{int(num_layers) - 1}" if num_layers is not None else None
     )
@@ -2573,11 +2576,18 @@ def write_mtp_speculator_metadata(
         # target's embedding + LM head; it owns a single-layer KV cache.
         "mtp_hidden_output": "mtp_hidden",
         "kv_mode": "hidden_threaded",
+        # The MTP head reuses the backbone's shared embedding + LM head, which
+        # live as initializers in the main ``model.onnx``. Name them so the
+        # runtime can bind the shared tables without duplicating weights.
+        "embedding_weights": embedding_weights,
+        "lm_head_weights": lm_head_weights,
     }
     if target_hidden_output is not None:
         speculator["target_hidden_output"] = target_hidden_output
     if hidden_size is not None:
         speculator["hidden_size"] = int(hidden_size)
+    if vocab_size is not None:
+        speculator["vocab_size"] = int(vocab_size)
 
     metadata["speculator"] = speculator
     with open(path, "w", encoding="utf-8") as handle:

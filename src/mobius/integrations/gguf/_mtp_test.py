@@ -229,6 +229,20 @@ class TestMtpAutoDetect:
         assert head is not None
         output_names = {v.name for v in head["model"].graph.outputs}
         assert "mtp_hidden" in output_names
+        # The backbone must expose the final-layer hidden-state seed
+        # (hidden_states.{num_hidden_layers-1}) that the head consumes.
+        seed = pkg.config.num_hidden_layers - 1
+        main_outputs = {v.name for v in pkg["model"].graph.outputs}
+        assert f"hidden_states.{seed}" in main_outputs
+
+    def test_mtp_survives_dtype_replace(self, qwen35_mtp_gguf: Path):
+        # Regression: an explicit dtype triggers dataclasses.replace on the
+        # config, which drops the private _gguf_* attrs. The builder must
+        # re-attach the MTP metadata so auto-detection still fires.
+        from mobius.integrations.gguf import build_from_gguf
+
+        pkg = build_from_gguf(str(qwen35_mtp_gguf), dtype="bf16")
+        assert getattr(pkg, "mtp_head", None) is not None
 
     def test_text_only_gguf_omits_head_sidecar(self, tmp_path: Path):
         from mobius.integrations.gguf import _builder_test, build_from_gguf

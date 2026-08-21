@@ -209,6 +209,13 @@ class Qwen35TextModel(nn.Module):
         )
         self.norm = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = initialize_rope(config)
+        # Optional intermediate hidden-state capture (e.g. seeding an MTP
+        # self-speculative draft head). Mirrors ``TextModel`` in ``base.py``:
+        # when set, ``forward`` returns the selected per-layer post-residual
+        # hidden states so the task can emit ``hidden_states.{idx}`` outputs.
+        self.output_layer_indices: list[int] | None = (
+            list(getattr(config, "output_layer_indices", None) or []) or None
+        )
 
     def forward(
         self,
@@ -238,6 +245,8 @@ class Qwen35TextModel(nn.Module):
 
         present_key_values: list = []
         past_kvs = past_key_values or [None] * len(self.layers)
+        capture_set = set(self.output_layer_indices or ())
+        captured_by_index: dict[int, ir.Value] = {}
         for layer_idx, (layer, past_kv) in enumerate(zip(self.layers, past_kvs)):
             hidden_states, present_kv = layer(
                 op,
@@ -250,8 +259,13 @@ class Qwen35TextModel(nn.Module):
             # DeepStack injection (see TextModel.forward for the rationale).
             if deepstack_embeds is not None and layer_idx < len(deepstack_embeds):
                 hidden_states = op.Add(hidden_states, deepstack_embeds[layer_idx])
+            if layer_idx in capture_set:
+                captured_by_index[layer_idx] = hidden_states
 
         hidden_states = self.norm(op, hidden_states)
+        if self.output_layer_indices is not None:
+            ordered = [captured_by_index[idx] for idx in self.output_layer_indices]
+            return hidden_states, present_key_values, ordered
         return hidden_states, present_key_values
 
 

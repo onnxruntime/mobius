@@ -376,6 +376,14 @@ def build_from_gguf(
     if model_type is None:
         model_type = GGUF_ARCH_TO_MODEL_TYPE.get(gguf_arch, gguf_arch)
 
+    # ``dataclasses.replace`` below (dtype / quantization) returns a fresh
+    # instance that does NOT carry the private ``_gguf_*`` attributes set by
+    # gguf_to_config (they are plain attributes, not dataclass fields). Capture
+    # the MTP head metadata here — like ``model_type`` above — so it can be
+    # re-attached onto the final config for auto-detection (step 4b).
+    mtp_predict_layers = getattr(config, "_gguf_nextn_predict_layers", 0)
+    mtp_block_indices = list(getattr(config, "_gguf_mtp_block_indices", []) or [])
+
     if dtype is not None:
         resolved = resolve_dtype(dtype)
         if resolved is not None:
@@ -450,6 +458,13 @@ def build_from_gguf(
     # (the head needs the dynamic concat-grow cache), leaving those exports
     # byte-identical to today.
     from mobius.integrations.gguf._mtp import build_mtp_head_from_gguf, has_mtp_head
+
+    # Re-attach the MTP metadata dropped by the dtype/quantization
+    # ``dataclasses.replace`` calls above so auto-detection sees it on the final
+    # config instance (and ``derive_mtp_config`` can read model_type/quant/dtype).
+    config._gguf_model_type = model_type
+    config._gguf_nextn_predict_layers = mtp_predict_layers
+    config._gguf_mtp_block_indices = mtp_block_indices
 
     emit_mtp_head = has_mtp_head(config) and not static_cache
     if has_mtp_head(config) and static_cache:
