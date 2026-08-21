@@ -739,6 +739,12 @@ def main() -> None:
     )
     parser.add_argument("--allow-tf32", action="store_true")
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Sampling seed for reproducible offline and streaming generation.",
+    )
+    parser.add_argument(
         "--dep-q",
         type=int,
         choices=[8, 16],
@@ -769,7 +775,13 @@ def main() -> None:
     if not args.skip_build and not os.path.isdir(os.path.join(args.model_dir, "temporal")):
         _build_models(args.model_dir, args.device, args.lm_dtype)
 
-    moshi = MoshiORT(args.model_dir, args.device, args.allow_tf32, dep_q=args.dep_q)
+    moshi = MoshiORT(
+        args.model_dir,
+        args.device,
+        args.allow_tf32,
+        seed=args.seed,
+        dep_q=args.dep_q,
+    )
 
     if args.mic:
         run_stream_mic(moshi, args)
