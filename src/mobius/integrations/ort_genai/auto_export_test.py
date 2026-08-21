@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import types
 from unittest import mock
 
@@ -2066,6 +2067,194 @@ class TestExportForOrtGenai:
         assert data["model"]["bos_token_id"] == 1
         assert data["model"]["eos_token_id"] == 2
         assert data["model"]["pad_token_id"] == 0
+
+    @pytest.mark.parametrize(
+        ("tokens", "vocab_size", "expected", "filename", "key"),
+        [
+            (
+                {"<tool_call>": 151657, "</tool_call>": 151658},
+                151936,
+                {"bot_token_id": 151657, "eot_token_id": 151658},
+                "tokenizer_config.json",
+                "added_tokens_decoder",
+            ),
+            (
+                {
+                    "<tool_call>": 151657,
+                    "</tool_call>": 151658,
+                    "<think>": 151667,
+                    "</think>": 151668,
+                },
+                151936,
+                {
+                    "bot_token_id": 151657,
+                    "eot_token_id": 151658,
+                    "bor_token_id": 151667,
+                    "eor_token_id": 151668,
+                },
+                "tokenizer.json",
+                "added_tokens",
+            ),
+            (
+                {"<|tool_call|>": 200025, "<|/tool_call|>": 200026},
+                200064,
+                {"bot_token_id": 200025, "eot_token_id": 200026},
+                "tokenizer.json",
+                "added_tokens",
+            ),
+            ({}, 256, {}, "tokenizer_config.json", "added_tokens_decoder"),
+            (
+                {"<tool_call>": 151657, "</tool_call>": 151658},
+                151658,
+                {"bot_token_id": 151657},
+                "tokenizer.json",
+                "added_tokens",
+            ),
+        ],
+    )
+    def test_tool_call_special_tokens_read_from_tokenizer_metadata(
+        self, tmp_path, tokens, vocab_size, expected, filename, key
+    ):
+        """Tool and reasoning delimiters are read from both tokenizer metadata formats."""
+        tokenizer_dir = tmp_path / "tokenizer"
+        tokenizer_dir.mkdir()
+        tokenizer_config = (
+            {str(token_id): {"content": token} for token, token_id in tokens.items()}
+            if key == "added_tokens_decoder"
+            else [{"id": token_id, "content": token} for token, token_id in tokens.items()]
+        )
+        (tokenizer_dir / filename).write_text(json.dumps({key: tokenizer_config}))
+
+        pkg = _make_fake_llm_pkg("llama")
+        pkg.config.vocab_size = vocab_size
+        result = write_ort_genai_config(
+            pkg, str(tmp_path / "output"), local_config_dir=str(tokenizer_dir)
+        )
+        with open(result["genai_config"]) as f:
+            model = json.load(f)["model"]
+
+        assert {name: model[name] for name in expected} == expected
+        for name in {"bot_token_id", "eot_token_id", "bor_token_id", "eor_token_id"} - set(
+            expected
+        ):
+            assert name not in model
+
+    def test_invalid_tokenizer_added_tokens_are_ignored(self, tmp_path):
+        """A malformed added_tokens_decoder does not prevent exporting."""
+        tokenizer_dir = tmp_path / "tokenizer"
+        tokenizer_dir.mkdir()
+        (tokenizer_dir / "tokenizer_config.json").write_text(
+            json.dumps({"added_tokens_decoder": None})
+        )
+
+        result = write_ort_genai_config(
+            _make_fake_llm_pkg("llama"),
+            str(tmp_path / "output"),
+            local_config_dir=str(tokenizer_dir),
+        )
+        with open(result["genai_config"]) as f:
+            model = json.load(f)["model"]
+
+        assert (
+            not {"bot_token_id", "eot_token_id", "bor_token_id", "eor_token_id"} & model.keys()
+        )
+
+    def test_ambiguous_tool_tokens_are_ignored(self, tmp_path):
+        """Conflicting tool delimiter spellings do not choose an arbitrary ID."""
+        tokenizer_dir = tmp_path / "tokenizer"
+        tokenizer_dir.mkdir()
+        (tokenizer_dir / "tokenizer_config.json").write_text(
+            json.dumps(
+                {
+                    "added_tokens_decoder": {
+                        "10": {"content": "<tool_call>"},
+                        "11": {"content": "<|tool_call|>"},
+                    }
+                }
+            )
+        )
+
+        result = write_ort_genai_config(
+            _make_fake_llm_pkg("llama"),
+            str(tmp_path / "output"),
+            local_config_dir=str(tokenizer_dir),
+        )
+        with open(result["genai_config"]) as f:
+            model = json.load(f)["model"]
+
+        assert "bot_token_id" not in model
+
+    def test_conflicting_tokenizer_metadata_is_ignored(self, tmp_path):
+        """Conflicting IDs across tokenizer metadata files do not choose an arbitrary ID."""
+        tokenizer_dir = tmp_path / "tokenizer"
+        tokenizer_dir.mkdir()
+        (tokenizer_dir / "tokenizer_config.json").write_text(
+            json.dumps({"added_tokens_decoder": {"10": {"content": "<tool_call>"}}})
+        )
+        (tokenizer_dir / "tokenizer.json").write_text(
+            json.dumps({"added_tokens": [{"id": 11, "content": "<tool_call>"}]})
+        )
+
+        result = write_ort_genai_config(
+            _make_fake_llm_pkg("llama"),
+            str(tmp_path / "output"),
+            local_config_dir=str(tokenizer_dir),
+        )
+        with open(result["genai_config"]) as f:
+            model = json.load(f)["model"]
+
+        assert "bot_token_id" not in model
+
+    @pytest.mark.integration
+    @pytest.mark.parametrize(
+        ("model_id", "model_type", "vocab_size", "expected"),
+        [
+            (
+                "Qwen/Qwen3-0.6B",
+                "qwen3",
+                151936,
+                {
+                    "bot_token_id": 151657,
+                    "eot_token_id": 151658,
+                    "bor_token_id": 151667,
+                    "eor_token_id": 151668,
+                },
+            ),
+            (
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                "qwen2",
+                151936,
+                {"bot_token_id": 151657, "eot_token_id": 151658},
+            ),
+            (
+                "microsoft/Phi-4-mini-instruct",
+                "phi3",
+                200064,
+                {"bot_token_id": 200025, "eot_token_id": 200026},
+            ),
+        ],
+    )
+    def test_real_hf_tokenizers_emit_tool_call_tokens(
+        self, tmp_path, model_id, model_type, vocab_size, expected
+    ):
+        """Real Hub tokenizer metadata produces the expected ORT-GenAI token IDs."""
+        from huggingface_hub import hf_hub_download
+
+        tokenizer_dir = tmp_path / "tokenizer"
+        tokenizer_dir.mkdir()
+        for filename in ("tokenizer_config.json", "tokenizer.json"):
+            source = hf_hub_download(model_id, filename)
+            shutil.copyfile(source, tokenizer_dir / filename)
+
+        pkg = _make_fake_llm_pkg(model_type)
+        pkg.config.vocab_size = vocab_size
+        result = write_ort_genai_config(
+            pkg, str(tmp_path / "output"), local_config_dir=str(tokenizer_dir)
+        )
+        with open(result["genai_config"], encoding="utf-8") as f:
+            model = json.load(f)["model"]
+
+        assert {name: model[name] for name in expected} == expected
 
     def test_config_mode_eos_token_id_as_list(self, tmp_path):
         """eos_token_id can be a list[int] (e.g. Gemma multi-stop tokens)."""
