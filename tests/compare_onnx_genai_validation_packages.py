@@ -58,6 +58,11 @@ def _model(path: Path) -> dict[str, Any]:
 # it in a form no reviewer can read; ``_artifacts_exist`` below checks that
 # every one the metadata names was actually produced.
 _GENERATED_SUFFIXES = {".onnx", ".data", ".safetensors"}
+_RETIRED_INFERENCE_METADATA_FIELDS = {
+    "sha256",
+    "config_sha256",
+    "base_model_fingerprint",
+}
 
 
 def _reviewable_files(directory: Path) -> set[Path]:
@@ -91,6 +96,60 @@ def _artifacts_exist(committed: Path, generated: Path) -> list[str]:
     return missing
 
 
+def _metadata_invariant_errors(root: Path) -> list[str]:
+    """Check authored metadata invariants on serialized package output."""
+    errors: list[str] = []
+
+    def retired_fields(value: Any, path: str) -> None:
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                field_path = f"{path}.{key}" if path else str(key)
+                if key in _RETIRED_INFERENCE_METADATA_FIELDS:
+                    errors.append(f"{field_path}: retired inference-metadata field")
+                retired_fields(nested, field_path)
+        elif isinstance(value, list):
+            for index, nested in enumerate(value):
+                retired_fields(nested, f"{path}[{index}]")
+
+    for metadata_path in sorted(root.rglob("inference_metadata.yaml")):
+        package = metadata_path.parent.relative_to(root)
+        metadata = yaml.safe_load(metadata_path.read_text(encoding="utf-8"))
+        retired_fields(metadata, str(package))
+        workflow = ((metadata.get("pipeline") or {}).get("workflow")) or {}
+        state_service = (workflow.get("serving") or {}).get("state_service") or {}
+        groups = state_service.get("groups") or {}
+        for group_name, group in groups.items():
+            if not str(group.get("kind", "")).endswith("attention"):
+                continue
+            for component, aliases in (group.get("ports") or {}).items():
+                layers_by_role: dict[str, list[int]] = {"key": [], "value": []}
+                for alias_name, alias in aliases.items():
+                    role = alias.get("role")
+                    if role not in layers_by_role:
+                        continue
+                    layer = alias.get("layer")
+                    if not isinstance(layer, int):
+                        errors.append(
+                            f"{package}: group {group_name!r} component {component!r} "
+                            f"alias {alias_name!r} has role {role!r} without numeric layer"
+                        )
+                        continue
+                    layers_by_role[role].append(layer)
+                key_layers = layers_by_role["key"]
+                value_layers = layers_by_role["value"]
+                if (
+                    len(key_layers) != len(set(key_layers))
+                    or len(value_layers) != len(set(value_layers))
+                    or set(key_layers) != set(value_layers)
+                ):
+                    errors.append(
+                        f"{package}: group {group_name!r} component {component!r} "
+                        f"has key layers {sorted(key_layers)} and "
+                        f"value layers {sorted(value_layers)}"
+                    )
+    return errors
+
+
 def _content(path: Path) -> Any:
     if path.suffix == ".onnx":
         return _model(path)
@@ -116,6 +175,10 @@ def main() -> None:
 
     if absent := _artifacts_exist(args.expected, args.actual):
         raise SystemExit(f"declared artifact was not generated: {absent}")
+
+    for label, root in (("committed", args.expected), ("generated", args.actual)):
+        if errors := _metadata_invariant_errors(root):
+            raise SystemExit(f"{label} inference metadata violates invariants: {errors}")
 
     changed = [
         str(relative)

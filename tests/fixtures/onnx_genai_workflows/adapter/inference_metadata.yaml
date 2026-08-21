@@ -154,7 +154,6 @@ pipeline:
       output: result
       mode: replace
 adapters:
-  base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:702704827be590661fd77676445ddaf1557e4f4d446eaa7bcfb78754466cccdb
   target_manifest:
     targets:
     - id: projection
@@ -193,7 +192,6 @@ adapters:
       index: 0
       identity: blue
       version: '1'
-      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:702704827be590661fd77676445ddaf1557e4f4d446eaa7bcfb78754466cccdb
       rank: 1
       alpha: 1.0
       dtype: float32
@@ -202,7 +200,6 @@ adapters:
       weights:
       - location: adapters/blue/adapter.json
         loader_capability: onnx-genai.adapters.json@1
-        sha256: d9e67499ad74d4c2d62c45a79ceeea8dfa94893afde9615ea6030b79d052ddbe
         scale_encoding: alpha_over_rank
         format: json
       bindings:
@@ -212,7 +209,6 @@ adapters:
       index: 1
       identity: green
       version: '1'
-      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:702704827be590661fd77676445ddaf1557e4f4d446eaa7bcfb78754466cccdb
       rank: 1
       alpha: 1.0
       dtype: float32
@@ -221,7 +217,6 @@ adapters:
       weights:
       - location: adapters/green/adapter.json
         loader_capability: onnx-genai.adapters.json@1
-        sha256: d49ae9a3336884fa1ed8503caca1380699788add893870a670f6290c473bc935
         scale_encoding: alpha_over_rank
         format: json
       bindings:
@@ -231,7 +226,6 @@ adapters:
       index: 2
       identity: peft
       version: '1'
-      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:702704827be590661fd77676445ddaf1557e4f4d446eaa7bcfb78754466cccdb
       rank: 1
       alpha: 1.0
       dtype: float32
@@ -242,14 +236,11 @@ adapters:
       weights:
       - location: adapters/peft/adapter.json
         loader_capability: onnx-genai.adapters.json@1
-        sha256: 4351d2c682e0d1666ca3fdd6e967baaab6ab93c33cf5ace7bf3d6269713e85ce
         scale_encoding: alpha_over_rank
         format: json
       - location: adapters/peft/adapter_model.safetensors
         loader_capability: onnx-genai.adapters.hf-peft@1
-        sha256: c927c136719514dc03fd9f2e11b49ecbca0b4f28a87925a801fb069e29e078d8
         config_location: adapters/peft/adapter_config.json
-        config_sha256: b8419ce55415ad1be8844bd6eaef9a873881f172f427694b1d8e46049a8784df
         scale_encoding: alpha_over_rank
         format: hf_peft
       bindings:
@@ -259,7 +250,6 @@ adapters:
       index: 3
       identity: red
       version: '1'
-      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:702704827be590661fd77676445ddaf1557e4f4d446eaa7bcfb78754466cccdb
       rank: 1
       alpha: 1.0
       dtype: float32
@@ -268,7 +258,6 @@ adapters:
       weights:
       - location: adapters/red/adapter.json
         loader_capability: onnx-genai.adapters.json@1
-        sha256: b4bd656305aa2fea1d518df351af5fd3bf99b3d0a6c8bd8501dfc5107ac278a1
         scale_encoding: alpha_over_rank
         format: json
       bindings:
