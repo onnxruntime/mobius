@@ -123,7 +123,7 @@ well-formed and validate; only the local kernel is missing.
 
 ### Canonical representation — lowering verified
 
-Against ONNX GenAI `7324351a`, with no `model.io` in any package and no port
+Against ONNX GenAI `6e2ddc78`, with no `model.io` in any package and no port
 contracts on any component that ships an artifact:
 
 | Check | Result |
@@ -145,6 +145,26 @@ point our fixtures go through, and all 11 were re-checked against it rather
 than assumed to be unaffected. They pass because they carry no `model:` block
 at all: a package with one serialized ABI has nothing for a coexistence rule to
 find.
+
+### The role a fixed-capacity cache cannot do without
+
+A component named in an `indexed_scatter` group's `write_indices_ports` or
+`kv_length_ports` must declare a sequence role. Those two control ports are
+consumed by exactly one thing — the driver that writes into a preallocated
+buffer at an index — and that driver binds from the resolved decode ABI, every
+field of which is found by role. A component handed the cursor while declaring
+no role is therefore unresolvable as a decoder, and the package degrades to
+inferring ports from shapes.
+
+Nothing upstream rejects that combination, and the reason is worth recording:
+identifying the decoder *requires* a sequence role, so a component that omits
+one is invisible to the check that would have caught it. A validator's
+sole-decoder guard is additionally scoped to workflows with a single ONNX
+component, which no package with policy graphs ever is — ours ship ten. The
+contradiction is only visible to the producer, so
+`test_a_scatter_bound_component_is_always_resolvable_as_a_decoder` asserts it on
+both the built packages and the shipped fixtures. Measured: dropping the role
+from `static_cache` still validates upstream, and fails here.
 
 ### Where the transcription boundary actually falls
 
