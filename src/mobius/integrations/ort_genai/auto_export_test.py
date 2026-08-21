@@ -1276,33 +1276,60 @@ class TestExportForOrtGenai:
         assert model["vision"]["patch_size"] == 16
         assert model["vision"]["window_size"] == 112
         assert model["vision"]["tokens_per_second"] == pytest.approx(2.0)
-        assert model["decoder"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
-            "enable_cuda_graph"
-        ] == "1"
-        assert model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
-            "enable_cuda_graph"
-        ] == "0"
-        assert model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
-            "enable_cuda_graph"
-        ] == "0"
-        assert model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
-            "nv_profile_min_shapes"
-        ] == "input_ids:1x1,image_features:0x1024"
-        assert model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
-            "nv_profile_opt_shapes"
-        ] == "input_ids:1x226,image_features:192x1024"
-        assert model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
-            "nv_profile_max_shapes"
-        ] == "input_ids:1x1024,image_features:2520x1024"
-        assert model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
-            "nv_profile_min_shapes"
-        ] == "pixel_values:600x1536"
-        assert model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
-            "nv_profile_opt_shapes"
-        ] == "pixel_values:600x1536"
-        assert model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
-            "nv_profile_max_shapes"
-        ] == "pixel_values:600x1536"
+        assert (
+            model["decoder"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "enable_cuda_graph"
+            ]
+            == "1"
+        )
+        assert (
+            model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "enable_cuda_graph"
+            ]
+            == "0"
+        )
+        assert (
+            model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "enable_cuda_graph"
+            ]
+            == "0"
+        )
+        assert (
+            model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "nv_profile_min_shapes"
+            ]
+            == "input_ids:1x1,image_features:0x1024"
+        )
+        assert (
+            model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "nv_profile_opt_shapes"
+            ]
+            == "input_ids:1x226,image_features:192x1024"
+        )
+        assert (
+            model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "nv_profile_max_shapes"
+            ]
+            == "input_ids:1x1024,image_features:2520x1024"
+        )
+        assert (
+            model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "nv_profile_min_shapes"
+            ]
+            == "pixel_values:600x1536"
+        )
+        assert (
+            model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "nv_profile_opt_shapes"
+            ]
+            == "pixel_values:600x1536"
+        )
+        assert (
+            model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "nv_profile_max_shapes"
+            ]
+            == "pixel_values:600x1536"
+        )
 
     def test_qwen36_vl_hf_parent_type_maps_to_qwen35_runtime(self, tmp_path):
         import dataclasses
@@ -1360,6 +1387,7 @@ class TestExportForOrtGenai:
                 "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files",
                 return_value=[],
             ),
+            mock.patch("transformers.AutoProcessor.from_pretrained", side_effect=OSError),
         ):
             result = write_ort_genai_config(
                 pkg,
