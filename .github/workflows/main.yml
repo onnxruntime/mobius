@@ -34,7 +34,7 @@ jobs:
         # not with `git ls-remote | grep` (which only lists ref tips) and not
         # with `gh api .../commits/<sha>` (which answers 200 for unreferenced
         # objects and so fails open).
-        ref: 0497c6f4fe746f418ac88ebfdd2865284ece7ce2
+        ref: 4315a94d114a69d6c1464dc48b4aeb53c16da566
         path: validation/onnx-genai
     - uses: actions/setup-python@v7
       with:
