@@ -314,9 +314,13 @@ class _TimestepEmbedder(nn.Module):
         self.freqs = nn.Parameter([self._half], name="freqs", data=_as_tensor(freqs))
 
     def forward(self, op: OpBuilder, timesteps: ir.Value):
-        # timesteps: (N,) float -> (N, frequency_embedding_size)
+        # timesteps: (N,) -> (N, frequency_embedding_size).  Upstream builds
+        # the sinusoidal basis in float32 regardless of model dtype, so the
+        # frequency table is cast up explicitly (``_cast_module_dtype`` will
+        # otherwise have demoted it alongside the real weights).
         t = op.Cast(op.Reshape(timesteps, op.Constant(value_ints=[-1, 1])), to=1)
-        args = op.Mul(t, op.Reshape(self.freqs, op.Constant(value_ints=[1, -1])))
+        freqs = op.Cast(op.Reshape(self.freqs, op.Constant(value_ints=[1, -1])), to=1)
+        args = op.Mul(t, freqs)
         emb = op.Concat(op.Cos(args), op.Sin(args), axis=-1)
         emb = op.Cast(emb, to=self._dtype)
         hidden = self.mlp[0](op, emb)
@@ -911,7 +915,7 @@ class _SenseNovaU1ImageGenDenoiserModel(nn.Module):
         past_key_values: list | None = None,
         token_grid: ir.Value | None = None,
     ):
-        hidden_states, _present = self.model(
+        hidden_states, present = self.model(
             op,
             image_embeds,
             attention_mask=None,
@@ -941,7 +945,7 @@ class _SenseNovaU1ImageGenDenoiserModel(nn.Module):
         )
         feature_map = op.Reshape(hidden_states, shape_4d)
         feature_map = op.Transpose(feature_map, perm=[0, 3, 1, 2])
-        return self.fm_head(op, feature_map)
+        return self.fm_head(op, feature_map), present
 
 
 # ── Top-level package ───────────────────────────────────────────────────

@@ -111,7 +111,16 @@ class TestGraphBuild:
             "position_ids",
             "token_grid",
         ]
-        assert [v.name for v in denoiser.outputs] == ["predicted_image"]
+        outputs = [v.name for v in denoiser.outputs]
+        assert outputs[0] == "predicted_image"
+        # ORT's CUDA Attention kernel requires present_key/present_value
+        # outputs whenever past_key/past_value are provided, even though the
+        # sampler discards them (upstream denoises with update_cache=False).
+        assert outputs[1:] == [
+            name
+            for layer in range(LAYERS)
+            for name in (f"present.{layer}.key", f"present.{layer}.value")
+        ]
 
     @pytest.mark.parametrize(
         "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
