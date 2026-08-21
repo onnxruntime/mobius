@@ -17,11 +17,9 @@ of one never learns that the other said something else. A runtime that wants an
 optimized single-graph path gets it by *lowering* the one-component workflow,
 which is a derivation and cannot disagree with its source.
 
-For that to work the workflow has to carry everything such a lowering needs, so
-every ONNX component declares:
+For that to work the workflow carries what the ONNX artifact cannot say.
+Every ONNX component declares:
 
-* `ports.inputs` / `ports.outputs` — a contract (dtype, rank, shape, batch
-  layout) for every graph input and output, no more and no fewer.
 * `ports.roles` — what the component *does* with a value bound to a port. An
   invocation records which SSA value reaches a port, not whether that port is
   tokens, a mask or logits, and recovering the difference from spelling is the
@@ -34,18 +32,35 @@ every ONNX component declares:
   `audio_features`→`audio_features`. A port outside that vocabulary carries no
   role, because a workflow that guesses is worse than one that stays silent.
 
+The artifact remains authoritative for port names, dtype, rank, shape, and
+opset imports. An ONNX-backed component therefore omits duplicated
+`ports.inputs` / `ports.outputs` contracts. Native adapters and policy
+components still declare contracts when those contracts type workflow SSA
+values and no ONNX artifact exists to supply them.
+
 State ports need no role entry — the group that carries them already names each
 `(input, output)` pair — but they do carry two facts nothing else can recover:
 
 * `role` (`key` / `value` / `combined`) — a layer's key buffer and its value
-  buffer are the same dtype and the same shape.
+  buffer are semantically distinct even when their names, dtype, or shape do
+  not reveal which is which.
 * `layer` — a cell's label is producer-chosen and sorts lexicographically, so
   `cache_10` precedes `cache_2`; pairing per-layer buffers positionally would
   silently transpose two layers' caches.
 
-Both are emitted together or not at all. A recurrent or convolution cache has no
-halves and no layer index to state, and inventing one would corrupt the very
-ordering the index exists to fix.
+When a group has several aliases of one role, every alias declares `layer`;
+the same layer number on its key and value aliases pairs them. Geometry remains
+per-port: different layers may have different KV head counts, and a layer may
+have different K and V head counts. The runtime reads each actual ONNX port
+independently; `layer` orders aliases but never asserts equal shapes. A
+recurrent or convolution cache has no key/value halves and does not invent
+those roles.
+
+The top-level `schema_version` also versions workflow syntax. The workflow
+manifest contains only non-artifact facts such as adapter ABI versions and
+capabilities: it does not duplicate an `ir_version`, and it does not copy a
+package-wide ONNX opset map when every component artifact already carries its
+own exact imports.
 
 `tests/canonical_workflow_contract_test.py` holds this invariant: it asks the
 same shape-agnostic questions of dynamic, static-cache, FP8, heterogeneous and
