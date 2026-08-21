@@ -516,6 +516,7 @@ def gguf_to_config(
 def _gemma2_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
+    model: Any = None,
 ) -> Gemma2Config:
     """Convert a base config to Gemma2Config with architecture-specific fields.
 
