@@ -211,6 +211,7 @@ class GenaiConfigGenerator:
         self._vision: dict[str, Any] | None = None
         self._embedding: dict[str, Any] | None = None
         self._vlm_token_ids: dict[str, int] = {}
+        self._special_token_ids: dict[str, int] = {}
 
         # Optional audio fields (set via with_audio())
         self._audio: dict[str, Any] | None = None
@@ -475,6 +476,14 @@ class GenaiConfigGenerator:
 
         return self
 
+    def with_special_tokens(self, **token_ids: int) -> GenaiConfigGenerator:
+        """Add model-specific special token IDs."""
+        reserved_token_ids = {"bos_token_id", "eos_token_id", "pad_token_id"}
+        if reserved := reserved_token_ids & token_ids.keys():
+            raise ValueError(f"Special tokens cannot override {', '.join(sorted(reserved))}")
+        self._special_token_ids.update(token_ids)
+        return self
+
     def generate(self) -> dict[str, Any]:
         """Generate the full genai_config.json dict."""
         is_multimodal = self._vision is not None or self._audio is not None
@@ -522,6 +531,7 @@ class GenaiConfigGenerator:
             model["eos_token_id"] = self.eos_token_id
         if self.pad_token_id is not None:
             model["pad_token_id"] = self.pad_token_id
+        model.update(self._special_token_ids)
 
         # VLM sections
         if self._vision is not None:
