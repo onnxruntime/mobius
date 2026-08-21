@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import types
 from unittest import mock
 
@@ -2203,6 +2204,57 @@ class TestExportForOrtGenai:
             model = json.load(f)["model"]
 
         assert "bot_token_id" not in model
+
+    @pytest.mark.integration
+    @pytest.mark.parametrize(
+        ("model_id", "model_type", "vocab_size", "expected"),
+        [
+            (
+                "Qwen/Qwen3-0.6B",
+                "qwen3",
+                151936,
+                {
+                    "bot_token_id": 151657,
+                    "eot_token_id": 151658,
+                    "bor_token_id": 151667,
+                    "eor_token_id": 151668,
+                },
+            ),
+            (
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                "qwen2",
+                151936,
+                {"bot_token_id": 151657, "eot_token_id": 151658},
+            ),
+            (
+                "microsoft/Phi-4-mini-instruct",
+                "phi3",
+                200064,
+                {"bot_token_id": 200025, "eot_token_id": 200026},
+            ),
+        ],
+    )
+    def test_real_hf_tokenizers_emit_tool_call_tokens(
+        self, tmp_path, model_id, model_type, vocab_size, expected
+    ):
+        """Real Hub tokenizer metadata produces the expected ORT-GenAI token IDs."""
+        from huggingface_hub import hf_hub_download
+
+        tokenizer_dir = tmp_path / "tokenizer"
+        tokenizer_dir.mkdir()
+        for filename in ("tokenizer_config.json", "tokenizer.json"):
+            source = hf_hub_download(model_id, filename)
+            shutil.copyfile(source, tokenizer_dir / filename)
+
+        pkg = _make_fake_llm_pkg(model_type)
+        pkg.config.vocab_size = vocab_size
+        result = write_ort_genai_config(
+            pkg, str(tmp_path / "output"), local_config_dir=str(tokenizer_dir)
+        )
+        with open(result["genai_config"], encoding="utf-8") as f:
+            model = json.load(f)["model"]
+
+        assert {name: model[name] for name in expected} == expected
 
     def test_config_mode_eos_token_id_as_list(self, tmp_path):
         """eos_token_id can be a list[int] (e.g. Gemma multi-stop tokens)."""
