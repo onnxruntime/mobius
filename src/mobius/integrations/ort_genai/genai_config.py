@@ -390,6 +390,32 @@ class GenaiConfigGenerator:
             self._vlm_token_ids["video_token_id"] = video_token_id
         return self
 
+    def with_embedding(
+        self,
+        *,
+        filename: str = "embedding/model.onnx",
+        input_names: dict[str, str] | None = None,
+        output_names: dict[str, str] | None = None,
+    ) -> GenaiConfigGenerator:
+        """Add a standalone multimodal embedding stage."""
+        self._embedding = {
+            "filename": filename,
+            "inputs": input_names
+            if input_names is not None
+            else {
+                "input_ids": "input_ids",
+                "audio_features": "audio_features",
+            },
+            "outputs": output_names
+            if output_names is not None
+            else {"inputs_embeds": "inputs_embeds"},
+            "session_options": _make_session_options(
+                self.ep,
+                enable_graph_capture=False,
+            ),
+        }
+        return self
+
     def with_audio(
         self,
         *,
@@ -483,7 +509,7 @@ class GenaiConfigGenerator:
             "num_hidden_layers": self.num_hidden_layers,
             "num_key_value_heads": self.num_key_value_heads,
         }
-        if self.model_type == "lfm2":
+        if self.model_type in {"lfm2", "lfm2_vl"}:
             decoder["layer_types"] = self._layer_types or []
             decoder["conv_cache_size"] = (
                 self._conv_cache_size if self._conv_cache_size is not None else 3
@@ -526,7 +552,7 @@ class GenaiConfigGenerator:
             context_length=self.context_length,
             supports_in_place_kv_cache=self._supports_in_place_kv_cache,
         )
-        if self.model_type == "lfm2":
+        if self.model_type in {"lfm2", "lfm2_vl"}:
             # ORT GenAI's LFM2 cache mixes fixed convolution windows with
             # dynamic attention KV; shared in-place KV buffers are unsupported.
             search["past_present_share_buffer"] = False

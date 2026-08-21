@@ -855,6 +855,30 @@ class TestFixChatTemplate:
         assert attrs["hop_length_ms"] == 10.0  # noqa: RUF069
         assert attrs["mel_floor"] == 0.001  # noqa: RUF069
 
+    def test_audio_glmasr_writes_whisper_feature_extraction_json(self, tmp_path):
+        config = mock.MagicMock()
+        config.audio = mock.MagicMock()
+        config.model_type = "glmasr"
+
+        path = _write_audio_processor_config(config, str(tmp_path))
+
+        assert path is not None
+        assert path.endswith("audio_processor.json")
+        with open(path) as f:
+            data = json.load(f)
+        operations = data["feature_extraction"]["sequence"]
+        assert [item["operation"]["type"] for item in operations] == [
+            "AudioDecoder",
+            "STFTNorm",
+            "LogMelSpectrum",
+        ]
+        assert operations[1]["operation"]["attrs"] == {
+            "n_fft": 400,
+            "frame_length": 400,
+            "hop_length": 160,
+        }
+        assert operations[2]["operation"]["attrs"]["n_mel"] == 128
+
     def test_handles_tokenizer_load_error(self, tmp_path):
         """Gracefully handles AutoTokenizer.from_pretrained raising."""
         tc = {"tokenizer_class": "LlamaTokenizer"}
@@ -1450,6 +1474,49 @@ class TestExportForOrtGenai:
         assert speech["inputs"]["audio_embeds"] == "input_features"
         assert speech["inputs"]["attention_mask"] == "input_features_mask"
 
+    def test_glmasr_rejected_until_runtime_registers_model_type(self, tmp_path):
+        """Do not emit metadata that onnxruntime-genai cannot load."""
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeAudio:
+            audio_token_id: int = 59260
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "glmasr"
+            vocab_size: int = 59264
+            hidden_size: int = 2048
+            num_hidden_layers: int = 28
+            num_attention_heads: int = 16
+            num_key_value_heads: int = 4
+            head_dim: int = 128
+            audio_token_id: int = 59260
+            audio: FakeAudio = dataclasses.field(default_factory=FakeAudio)
+
+        pkg = ModelPackage(
+            {
+                "decoder": _mock_model_with_inputs(
+                    ["inputs_embeds", "attention_mask", "position_ids"]
+                ),
+                "audio_encoder": _mock_model(
+                    inputs=["input_features", "input_features_mask"],
+                    outputs=["audio_features", "audio_feature_lengths"],
+                ),
+                "embedding": _mock_model(
+                    inputs=["input_ids", "audio_features"],
+                    outputs=["inputs_embeds"],
+                ),
+            },
+            config=FakeConfig(),
+        )
+
+        with pytest.raises(ValueError, match="does not register a GLM-ASR"):
+            write_ort_genai_config(pkg, str(tmp_path))
+
     def test_tokenizer_not_copied_without_model_id(self, tmp_path):
         """No tokenizer files copied when hf_model_id=None."""
         from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
@@ -1460,6 +1527,45 @@ class TestExportForOrtGenai:
         ) as mock_copy:
             write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
         mock_copy.assert_not_called()
+
+    def test_hub_artifacts_use_pinned_revision(self, tmp_path):
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        pkg = self._make_pkg()
+        revision = "61ba4e0b3309b6656edea3e93e419f7bd5c61957"
+        fake_hf = mock.MagicMock(
+            model_type="llama",
+            bos_token_id=1,
+            eos_token_id=2,
+            pad_token_id=0,
+        )
+        with (
+            mock.patch(
+                "transformers.AutoConfig.from_pretrained",
+                return_value=fake_hf,
+            ) as mock_config,
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files",
+                return_value=[],
+            ) as mock_copy,
+        ):
+            write_ort_genai_config(
+                pkg,
+                str(tmp_path),
+                hf_model_id="zai-org/GLM-ASR-Nano-2512",
+                revision=revision,
+            )
+
+        mock_config.assert_called_once_with(
+            "zai-org/GLM-ASR-Nano-2512",
+            revision=revision,
+            trust_remote_code=False,
+        )
+        mock_copy.assert_called_once_with(
+            "zai-org/GLM-ASR-Nano-2512",
+            str(tmp_path),
+            revision=revision,
+        )
 
     def test_tokenizer_copied_when_model_id_provided(self, tmp_path):
         """Tokenizer files are copied when hf_model_id is provided."""
@@ -2904,6 +3010,71 @@ class TestGemma4RealModel:
         # cpu maps to the portable default build (backward compatible).
         assert captured["execution_provider"] == "default"
         assert captured["text_only"] is False
+
+    def test_auto_export_pins_every_remote_stage(self, tmp_path):
+        revision = "5a414ead75d45db003906d06fb62bd5b6846cec0"
+        build_kwargs: dict[str, object] = {}
+        export_kwargs: dict[str, object] = {}
+
+        def fake_build(model_id, **kwargs):
+            build_kwargs.update(kwargs)
+            return _make_fake_llm_pkg("lfm2_vl")
+
+        def fake_export_package(pkg, output_dir, **kwargs):
+            export_kwargs.update(kwargs)
+            return {"genai_config": os.path.join(output_dir, "genai_config.json")}
+
+        with (
+            mock.patch("mobius.integrations.transformers.build", side_effect=fake_build),
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export.export_package",
+                side_effect=fake_export_package,
+            ),
+        ):
+            auto_export(
+                "LiquidAI/LFM2.5-VL-3B",
+                str(tmp_path),
+                revision=revision,
+            )
+
+        assert build_kwargs["revision"] == revision
+        assert export_kwargs["revision"] == revision
+
+    def test_write_config_pins_remote_assets(self, tmp_path):
+        revision = "5a414ead75d45db003906d06fb62bd5b6846cec0"
+        pkg = _make_fake_llm_pkg("lfm2_vl")
+        fake_hf = mock.MagicMock(
+            model_type="lfm2_vl",
+            bos_token_id=124894,
+            eos_token_id=124900,
+            pad_token_id=124893,
+        )
+        with (
+            mock.patch(
+                "transformers.AutoConfig.from_pretrained", return_value=fake_hf
+            ) as config_loader,
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files",
+                return_value=[],
+            ) as tokenizer_copy,
+        ):
+            write_ort_genai_config(
+                pkg,
+                str(tmp_path),
+                hf_model_id="LiquidAI/LFM2.5-VL-3B",
+                revision=revision,
+            )
+
+        config_loader.assert_called_once_with(
+            "LiquidAI/LFM2.5-VL-3B",
+            trust_remote_code=False,
+            revision=revision,
+        )
+        tokenizer_copy.assert_called_once_with(
+            "LiquidAI/LFM2.5-VL-3B",
+            str(tmp_path),
+            revision=revision,
+        )
 
     def test_auto_export_rejects_mage_vl_before_saving(self, tmp_path):
         pkg = _make_fake_llm_pkg("mage_vl")

@@ -156,6 +156,10 @@
           "type": "integer",
           "description": "End-of-sequence token ID. Overrides the model's default to ensure generation stops correctly."
         },
+        "exact_match": {
+          "type": "boolean",
+          "description": "Require the generated token IDs, sequence length, and decoded text to match the L5 golden exactly."
+        },
         "lang": {
           "type": "string",
           "description": "Target language code for multilingual models (e.g. MMS uses ISO-639-3 codes like 'eng' to pick the per-language adapter)."

@@ -193,6 +193,35 @@ class TestCLIBuild:
         mock_build.assert_called_once()
         assert mock_build.call_args.kwargs.get("text_only") is True
 
+    def test_revision_is_forwarded_to_detection_and_build(self):
+        revision = "61ba4e0b3309b6656edea3e93e419f7bd5c61957"
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
+                return_value=None,
+            ) as mock_diffusers,
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "zai-org/GLM-ASR-Nano-2512",
+                    tmpdir,
+                    "--revision",
+                    revision,
+                    "--no-weights",
+                ]
+            )
+
+        mock_diffusers.assert_called_once_with(
+            "zai-org/GLM-ASR-Nano-2512",
+            revision=revision,
+        )
+        assert mock_build.call_args.kwargs["revision"] == revision
+
     def test_build_static_cache(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             main(
@@ -528,6 +557,32 @@ class TestCLIBuildRuntime:
             )
 
         assert mock_export.call_args.kwargs["trust_remote_code"] is True
+
+    def test_build_propagates_revision(self):
+        revision = "5a414ead75d45db003906d06fb62bd5b6846cec0"
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
+                return_value=None,
+            ) as detect_diffusers,
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as build_model,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "LiquidAI/LFM2.5-VL-3B",
+                    "--revision",
+                    revision,
+                    tmpdir,
+                    "--no-weights",
+                ]
+            )
+
+        detect_diffusers.assert_called_once_with("LiquidAI/LFM2.5-VL-3B", revision=revision)
+        assert build_model.call_args.kwargs["revision"] == revision
 
     def test_runtime_ort_genai_rejects_mage_vl_before_saving(self):
         with (

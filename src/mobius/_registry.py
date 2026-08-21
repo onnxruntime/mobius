@@ -29,6 +29,7 @@ from mobius._configs import (
     Gemma4AssistantConfig,
     Gemma4Config,
     Lfm2Config,
+    Lfm2VlConfig,
     MMSConfig,
     MoonshineConfig,
     MuseGlimmerConfig,
@@ -75,6 +76,7 @@ from mobius.models import (
     InternLM2CausalLMModel,
     LayerNormCausalLMModel,
     Lfm2CausalLMModel,
+    Lfm2VlForConditionalGeneration,
     LLaDAModel,
     Llama4CausalLMModel,
     MageVLForConditionalGeneration,
@@ -130,6 +132,7 @@ from mobius.models.falcon import (
 )
 from mobius.models.fun_asr import FunASRForConditionalGeneration
 from mobius.models.gemma3n import Gemma3nCausalLMModel, Gemma3nMultiModalModel
+from mobius.models.glm_asr import GlmAsrForConditionalGeneration
 from mobius.models.gpt2 import GPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
 from mobius.models.gptj_codegen import CodeGenCausalLMModel, GPTJCausalLMModel
@@ -620,6 +623,11 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "internvl": ModelRegistration(InternVL2Model, task="vision-language"),
     "internvl2": ModelRegistration(InternVL2Model, task="vision-language"),
     "internvl_chat": ModelRegistration(InternVL2Model, task="vision-language"),
+    "lfm2_vl": ModelRegistration(
+        Lfm2VlForConditionalGeneration,
+        task="lfm2-vl",
+        config_class=Lfm2VlConfig,
+    ),
     "mage_vl": ModelRegistration(MageVLForConditionalGeneration, task="mage-vl"),
     "janus": ModelRegistration(LLaVAModel, task="vision-language"),
     "llava": ModelRegistration(LLaVAModel, task="vision-language"),
@@ -680,6 +688,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "fun_asr": ModelRegistration(
         FunASRForConditionalGeneration, task="fun-asr-speech-language"
     ),
+    "glmasr": ModelRegistration(GlmAsrForConditionalGeneration, task="glmasr-speech-language"),
     "qwen3_asr": ModelRegistration(Qwen3ASRForConditionalGeneration, task="speech-language"),
     "qwen3_forced_aligner": ModelRegistration(
         Qwen3ASRForConditionalGeneration, task="speech-language"
@@ -1044,6 +1053,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "molmo": "allenai/MolmoE-1B-0924",
     "mistral3": "mistralai/Ministral-3-3B-Instruct-2512",
     "minicpmv4_6": "openbmb/MiniCPM-V-4.6",
+    "lfm2_vl": "LiquidAI/LFM2.5-VL-3B",
     "aya_vision": "CohereForAI/aya-vision-8b",
     "chameleon": "facebook/chameleon-7b",
     "cohere2_vision": "CohereForAI/c4ai-command-r7b-12-2024",
@@ -1079,6 +1089,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "whisper": "openai/whisper-tiny",
     "qwen3_asr": "Qwen/Qwen3-ASR-0.6B",
     "fun_asr": "justinchuby/Fun-ASR-Nano-2512",
+    "glmasr": "zai-org/GLM-ASR-Nano-2512",
     "sensevoice_small": "mlx-community/SenseVoiceSmall",
     "mms": "facebook/mms-300m",
     "parakeet_ctc": "nvidia/parakeet-ctc-1.1b",
@@ -1252,6 +1263,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "qwen3_asr": "qwen",
     "qwen3_forced_aligner": "qwen",
     "fun_asr": "qwen",
+    "glmasr": "glm",
     "qwen3_tts": "qwen",
     "qwen3_tts_tokenizer_12hz": "qwen",
     "deepseek_v2": "deepseek",
@@ -1267,6 +1279,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "code_llama": "llama",
     "llama4_text": "llama",
     "lfm2": "lfm",
+    "lfm2_vl": "lfm",
     "mllama": "llama",
     "mistral": "mistral",
     "mistral3": "mistral",
@@ -1339,6 +1352,7 @@ _VARIANT_LABELS: dict[str, str] = {
     "jamba": "hybrid-ssm+attn",
     "bamba": "hybrid-mamba2+attn",
     "lfm2": "hybrid-conv+attn",
+    "lfm2_vl": "siglip2-naflex+hybrid-conv+attn",
     "qwen3_next": "moe+linear-attn",
 }
 

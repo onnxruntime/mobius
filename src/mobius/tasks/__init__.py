@@ -46,6 +46,7 @@ __all__ = [
     "Cosmos3EdgeVLTask",
     "HybridQwenVLTask",
     "ImageClassificationTask",
+    "Lfm2VlTask",
     "ModelTask",
     "MllamaVisionLanguageTask",
     "MageVLTask",
@@ -118,6 +119,7 @@ from mobius.tasks._gemma4 import (
     Gemma4UnifiedTask,
 )
 from mobius.tasks._gemma4_assistant import Gemma4AssistantTask
+from mobius.tasks._glmasr_speech_language import GlmAsrSpeechLanguageTask
 from mobius.tasks._hunyuan_vl_mot import HunYuanVLMoTTask
 from mobius.tasks._image_classification import ImageClassificationTask
 from mobius.tasks._masked_diffusion import MaskedDiffusionTask
@@ -149,6 +151,7 @@ from mobius.tasks._vision_language import Qwen3VLVisionLanguageTask
 from mobius.tasks._vision_language_3model import (
     Cosmos3EdgeVLTask,
     HybridQwenVLTask,
+    Lfm2VlTask,
     MageVLTask,
     MiniCPMVLTask,
     MllamaVisionLanguageTask,
@@ -206,6 +209,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "qwen-vl": QwenVLTask,
     "hybrid-qwen-vl": HybridQwenVLTask,
     "minicpm-vl": MiniCPMVLTask,
+    "lfm2-vl": Lfm2VlTask,
     "qwen3-vl-vision-language": Qwen3VLVisionLanguageTask,
     "gemma3n": Gemma3nTask,
     "gemma4": Gemma4Task,
@@ -216,6 +220,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "multimodal": MultiModalTask,
     "phi4mm-multimodal": Phi4MMMultiModalTask,
     "fun-asr-speech-language": FunASRSpeechLanguageTask,
+    "glmasr-speech-language": GlmAsrSpeechLanguageTask,
     "fastconformer-rnnt": RNNTTask,
     "speech-language": SpeechLanguageTask,
     "speech-to-text": SpeechToTextTask,

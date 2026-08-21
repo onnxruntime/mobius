@@ -256,6 +256,12 @@ class OnnxModelSession:
         return dict(zip(self._output_names, (_ort_value_to_numpy(o) for o in raw_outputs)))
 
     def close(self) -> None:
+        # Release ORT resources eagerly (not only at Python GC time) so
+        # long-running GPU test suites do not accumulate session memory. This is
+        # also required for staged CUDA pipelines, where each component's weights
+        # must leave device memory before the next large component is loaded.
+        if hasattr(self, "_session"):
+            del self._session
         self._tmpdir.cleanup()
 
     def __del__(self) -> None:

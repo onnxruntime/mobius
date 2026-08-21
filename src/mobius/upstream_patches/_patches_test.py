@@ -65,7 +65,7 @@ class ApplyAssetPatchesTest(unittest.TestCase):
         self.addCleanup(self._temp.cleanup)
 
     def _write_package(self, template: str = _ORIGINAL, *, tokenizer_config=True):
-        (self.package / "chat_template.jinja").write_text(template, encoding="utf-8")
+        (self.package / "chat_template.jinja").write_bytes(template.encode("utf-8"))
         if tokenizer_config:
             (self.package / "tokenizer_config.json").write_text(
                 json.dumps({"chat_template": template, "model_max_length": 4096}),

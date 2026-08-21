@@ -58,6 +58,7 @@ __all__ = [
     "Gemma4UnifiedModel",
     "GemmaCausalLMModel",
     "Glm4CausalLMModel",
+    "GlmAsrForConditionalGeneration",
     "Glm4MoECausalLMModel",
     "GlmCausalLMModel",
     "GraniteCausalLMModel",
@@ -78,6 +79,7 @@ __all__ = [
     "LLaVAModel",
     "LayerNormCausalLMModel",
     "Lfm2CausalLMModel",
+    "Lfm2VlForConditionalGeneration",
     "LongcatFlashCausalLMModel",
     "MPTCausalLMModel",
     "Mamba2CausalLMModel",
@@ -220,6 +222,7 @@ from mobius.models.gemma4 import (
 )
 from mobius.models.gemma4_assistant import Gemma4AssistantCausalLMModel
 from mobius.models.glm import Glm4CausalLMModel, GlmCausalLMModel
+from mobius.models.glm_asr import GlmAsrForConditionalGeneration
 from mobius.models.gpt2 import GPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
 from mobius.models.gptj_codegen import CodeGenCausalLMModel, GPTJCausalLMModel
@@ -234,6 +237,7 @@ from mobius.models.internvl import InternVL2Model
 from mobius.models.jamba import JambaCausalLMModel
 from mobius.models.jetmoe import JetMoeCausalLMModel
 from mobius.models.lfm2 import Lfm2CausalLMModel
+from mobius.models.lfm2_vl import Lfm2VlForConditionalGeneration
 from mobius.models.llada import LLaDAModel
 from mobius.models.llama4 import Llama4CausalLMModel
 from mobius.models.llava import LLaVAModel
