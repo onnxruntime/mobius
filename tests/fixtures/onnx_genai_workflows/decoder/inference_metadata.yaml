@@ -341,67 +341,6 @@ pipeline:
           kind: onnx
           artifact: model.onnx
         ports:
-          inputs:
-            input_ids:
-              dtype: int64
-              rank: 2
-              shape:
-              - batch
-              - sequence
-              batch_layout:
-                kind: request_aligned
-                axis: 0
-            attention_mask:
-              dtype: int64
-              rank: 2
-              shape:
-              - batch
-              - total_sequence
-              batch_layout:
-                kind: request_aligned
-                axis: 0
-            position_ids:
-              dtype: int64
-              rank: 2
-              shape:
-              - batch
-              - sequence
-              batch_layout:
-                kind: request_aligned
-                axis: 0
-            past_key_values.0.key:
-              dtype: float32
-              rank: 4
-              shape:
-              - batch
-              - 2
-              - past_sequence
-              - 8
-              batch_layout:
-                kind: request_aligned
-                axis: 0
-          outputs:
-            logits:
-              dtype: float32
-              rank: 3
-              shape:
-              - batch
-              - sequence
-              - 128
-              batch_layout:
-                kind: request_aligned
-                axis: 0
-            present.0.key:
-              dtype: float32
-              rank: 4
-              shape:
-              - batch
-              - 2
-              - present_sequence
-              - 8
-              batch_layout:
-                kind: request_aligned
-                axis: 0
           roles:
             input_ids: token_ids
             attention_mask: attention_mask

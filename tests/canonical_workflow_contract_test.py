@@ -24,6 +24,7 @@ checked-in fixture package, and none of them mentions a feature by name.
 
 from __future__ import annotations
 
+import copy
 import glob
 import os
 import re
@@ -152,6 +153,30 @@ def _onnx_components(workflow: dict[str, Any]) -> dict[str, dict[str, Any]]:
     }
 
 
+def _graph_ports(model: ir.Model) -> tuple[set[str], set[str]]:
+    """The ports an artifact actually exposes, which is the only authority."""
+    return (
+        {str(value.name) for value in model.graph.inputs},
+        {str(value.name) for value in model.graph.outputs},
+    )
+
+
+def _artifacts(pkg: Any, workflow: dict[str, Any]) -> dict[str, ir.Model]:
+    """Every ONNX component of *workflow* paired with the graph it references.
+
+    A component names an artifact, and the artifact is what a runtime binds
+    against. Resolving a declaration through this map is what makes these
+    assertions checks of the package rather than checks of the metadata's
+    internal consistency with itself.
+    """
+    policies = {
+        name: component.model
+        for name, component in getattr(pkg, "policy_components", {}).items()
+    }
+    graphs = {**dict(pkg.items()), **policies}
+    return {name: graphs[name] for name in _onnx_components(workflow) if name in graphs}
+
+
 def _walk_steps(steps: list[dict[str, Any]]):
     """Every step of a workflow, including the ones nested in loops and branches."""
     for step in steps:
@@ -187,68 +212,94 @@ class TestOneSerializedContract:
         _, metadata = package
         assert "io" not in (metadata.get("model") or {})
 
-    def test_every_graph_declares_exactly_the_ports_it_has(self, package):
-        """Declared ports are the graph's ports — not a subset, not a superset.
+    def test_an_exported_graph_is_not_transcribed_into_the_workflow(self, package):
+        """A model component declares its roles and nothing the artifact says.
 
-        A subset lets a runtime silently fall back to opening the artifact, and
-        a superset is a promise the graph does not keep. Either way the
-        declaration stops being usable as the single source of truth.
+        The ``.onnx`` file ships inside the package and is authoritative for
+        which ports exist and what each one's dtype, rank and shape is. Copying
+        that into YAML would create a second statement of the same fact with
+        nothing to keep the two in agreement, which is the failure this whole
+        module exists to prevent — the copy just happens to sit one level down
+        from ``model.io`` rather than beside it.
         """
         pkg, metadata = package
         components = _onnx_components(metadata["pipeline"]["workflow"])
-        graphs = {name: pkg[name] for name in components if name in pkg}
-        assert graphs, "a package with no ONNX component describes nothing"
-        for name, model in graphs.items():
-            ports = components[name]["ports"]
-            assert set(ports["inputs"]) == {str(v.name) for v in model.graph.inputs}
-            assert set(ports["outputs"]) == {str(v.name) for v in model.graph.outputs}
+        exported = [name for name in components if name in pkg]
+        assert exported, "a package with no exported graph describes nothing"
+        for name in exported:
+            ports = components[name].get("ports", {})
+            assert not ports.get("inputs")
+            assert not ports.get("outputs")
 
-    def test_declared_contracts_match_the_graph_dtype_and_rank(self, package):
-        """A contract that disagrees with its graph would mis-size every buffer."""
+    def test_a_synthesized_policy_graph_still_types_the_dataflow(self, package):
+        """The producer's own control graphs are the workflow's type annotations.
+
+        A policy graph is not an external interface this producer describes; it
+        is a graph this producer emits to realize the workflow's control flow,
+        and the value an invocation produces takes its dtype, rank and request
+        axis from the port that produced it. A validator reads metadata without
+        the artifacts, so dropping these would leave every derived value
+        untyped — the contract here is load-bearing, not a transcription.
+        """
         pkg, metadata = package
-        dtypes = {
-            ir.DataType.FLOAT: "float32",
-            ir.DataType.FLOAT16: "float16",
-            ir.DataType.BFLOAT16: "bfloat16",
-            ir.DataType.INT64: "int64",
-            ir.DataType.INT32: "int32",
-            ir.DataType.BOOL: "bool",
-            ir.DataType.FLOAT8E4M3FN: "float8_e4m3fn",
-        }
-        components = _onnx_components(metadata["pipeline"]["workflow"])
-        for name in (name for name in components if name in pkg):
-            model = pkg[name]
-            ports = components[name]["ports"]
-            declared = {**ports["inputs"], **ports["outputs"]}
-            for value in (*model.graph.inputs, *model.graph.outputs):
-                contract = declared[str(value.name)]
-                assert contract["rank"] == len(value.shape)
-                if value.dtype in dtypes:
-                    assert contract["dtype"] == dtypes[value.dtype]
-
-    def test_every_invocation_binds_a_declared_port(self, package):
-        """A binding to an undeclared port names nothing a consumer can resolve."""
-        _, metadata = package
         workflow = metadata["pipeline"]["workflow"]
-        components = workflow["components"]
+        components = _onnx_components(workflow)
+        policies = [
+            components[name]
+            for name in getattr(pkg, "policy_components", {})
+            if name in components
+        ]
+        for component in policies:
+            ports = component["ports"]
+            assert ports["inputs"] or ports["outputs"]
+            for contract in (*ports["inputs"].values(), *ports["outputs"].values()):
+                assert contract["rank"] == len(contract["shape"])
+
+    def test_every_declared_role_names_a_port_the_graph_exposes(self, package):
+        """A role is only meaningful if it resolves in the artifact.
+
+        This is what replaces the transcription: rather than restating the
+        graph and checking the restatement against itself, the role is checked
+        against the graph it claims to describe. A role naming a port the file
+        does not expose binds nothing, and is caught here exactly as the
+        runtime would catch it against a live session.
+        """
+        pkg, metadata = package
+        workflow = metadata["pipeline"]["workflow"]
+        components = _onnx_components(workflow)
+        roled = 0
+        for name, model in _artifacts(pkg, workflow).items():
+            inputs, outputs = _graph_ports(model)
+            for port in (components[name].get("ports") or {}).get("roles", {}):
+                assert port in inputs or port in outputs
+                roled += 1
+        assert roled, "no component says what it does with any of its ports"
+
+    def test_every_invocation_binds_a_port_of_the_artifact(self, package):
+        """A binding to a port the graph lacks names nothing a runtime can feed."""
+        pkg, metadata = package
+        workflow = metadata["pipeline"]["workflow"]
+        graphs = _artifacts(pkg, workflow)
         for step in _walk_steps(workflow["steps"]):
-            if step.get("kind") != "invoke":
+            if step.get("kind") != "invoke" or step["component"] not in graphs:
                 continue
-            ports = components[step["component"]]["ports"]
-            assert set(step.get("inputs", {})) <= set(ports["inputs"])
-            assert set(step.get("outputs", {})) <= set(ports["outputs"])
+            inputs, outputs = _graph_ports(graphs[step["component"]])
+            assert set(step.get("inputs", {})) <= inputs
+            assert set(step.get("outputs", {})) <= outputs
 
-    def test_every_state_pair_names_declared_ports(self, package):
-        """State is carried through ports, so both halves have to be declared."""
-        _, metadata = package
+    def test_every_state_pair_names_ports_of_the_artifact(self, package):
+        """State is carried through ports, so both halves have to exist."""
+        pkg, metadata = package
         workflow = metadata["pipeline"]["workflow"]
-        components = workflow["components"]
+        graphs = _artifacts(pkg, workflow)
         for group in _groups(workflow).values():
             for component, aliases in (group.get("ports") or {}).items():
-                ports = components[component]["ports"]
+                if component not in graphs:
+                    continue
+                inputs, outputs = _graph_ports(graphs[component])
                 for alias in aliases.values():
-                    assert alias["input"] in ports["inputs"]
-                    assert alias["output"] in ports["outputs"]
+                    assert alias["input"] in inputs
+                    assert alias["output"] in outputs
 
     def test_split_cache_halves_and_layers_are_stated_not_positional(self, package):
         """A layer's key and value buffers are indistinguishable once listed.
@@ -274,17 +325,18 @@ class TestOneSerializedContract:
                     alias["layer"] for alias in values
                 }
 
-    def test_control_ports_of_a_fixed_capacity_cache_are_declared_ports(self, package):
+    def test_control_ports_of_a_fixed_capacity_cache_exist_in_the_artifact(self, package):
         """A scatter's two control vectors are rank-1 integers, so they must be named.
 
         Nothing distinguishes the write cursor from the valid length by shape.
-        A package that scatters therefore names both against a component that
-        declares both; a package that appends declares no scatter at all, and
-        this assertion is vacuous for it — which is the point, since the same
-        test runs over every shape.
+        A package that scatters therefore names both against a component whose
+        graph exposes both; a package that appends declares no scatter at all,
+        and this assertion is vacuous for it — which is the point, since the
+        same test runs over every shape.
         """
-        _, metadata = package
+        pkg, metadata = package
         workflow = metadata["pipeline"]["workflow"]
+        graphs = _artifacts(pkg, workflow)
         for group in _groups(workflow).values():
             update = group.get("update") or {}
             if update.get("kind") != "indexed_scatter":
@@ -293,9 +345,9 @@ class TestOneSerializedContract:
             assert set(update["write_indices_ports"]) == bound
             assert set(update["kv_length_ports"]) == bound
             for component in bound:
-                declared = workflow["components"][component]["ports"]["inputs"]
-                assert update["write_indices_ports"][component] in declared
-                assert update["kv_length_ports"][component] in declared
+                inputs, _ = _graph_ports(graphs[component])
+                assert update["write_indices_ports"][component] in inputs
+                assert update["kv_length_ports"][component] in inputs
 
     def test_the_decode_step_is_recoverable_from_the_workflow_alone(self, package):
         """Reconstruct the decode ABI the way a runtime lowering would.
@@ -303,32 +355,32 @@ class TestOneSerializedContract:
         This is the assertion that makes removing the second copy safe: if the
         sequence input, the logits output and the per-layer cache pairs can all
         be read off the workflow, then a separate block stating them again was
-        never carrying information — only risk.
+        never carrying information — only risk. Roles are the only thing read
+        here, and every name they yield is checked against the graph, so the
+        reconstruction never falls back to recognizing a spelling.
         """
-        _, metadata = package
+        pkg, metadata = package
         workflow = metadata["pipeline"]["workflow"]
+        graphs = _artifacts(pkg, workflow)
         decoders = []
         for name, component in _onnx_components(workflow).items():
-            roles = component["ports"].get("roles", {})
+            roles = (component.get("ports") or {}).get("roles", {})
             consumes = {"token_ids", "inputs_embeds"} & set(roles.values())
             owns_state = any(
                 name in (group.get("ports") or {}) for group in _groups(workflow).values()
             )
             if consumes and ("logits" in roles.values() or owns_state):
-                decoders.append((name, component, roles))
+                decoders.append((name, roles))
         assert decoders, "no component declares what it does with the sequence"
-        for name, component, roles in decoders:
-            inputs = component["ports"]["inputs"]
-            outputs = component["ports"]["outputs"]
+        for name, roles in decoders:
+            inputs, outputs = _graph_ports(graphs[name])
             sequence = [
                 port
                 for port, role in roles.items()
                 if role in {"token_ids", "inputs_embeds"} and port in inputs
             ]
             assert len(sequence) == 1
-            assert [port for port, role in roles.items() if role == "logits"] == [
-                port for port in outputs if roles.get(port) == "logits"
-            ]
+            assert all(port in outputs for port, role in roles.items() if role == "logits")
             pairs = [
                 alias
                 for group in _groups(workflow).values()
@@ -337,6 +389,229 @@ class TestOneSerializedContract:
             assert all(
                 alias["input"] in inputs and alias["output"] in outputs for alias in pairs
             )
+
+
+def _cell_order(alias: dict[str, Any], label: str) -> tuple[Any, ...]:
+    """Canonical order of a state pair: its layer, then its half."""
+    return (alias.get("layer", 0), alias.get("role", ""), label)
+
+
+def _resolve_decode_abi(workflow: dict[str, Any], component: str) -> dict[str, Any]:
+    """Bind the decode ABI the way a consumer with no port vocabulary must.
+
+    Nothing here looks at how a port is spelled. The sequence and logits ports
+    come from declared roles, and every cache port comes from a state-service
+    alias, ordered by the layer and half the alias states. A consumer that took
+    any other route would be recognizing names — which is the failure mode this
+    resolution exists to make impossible.
+    """
+    declaration = workflow["components"][component]
+    roles = (declaration.get("ports") or {}).get("roles", {})
+    caches: list[tuple[str, str]] = []
+    write_indices: str | None = None
+    kv_length: str | None = None
+    for group in _groups(workflow).values():
+        aliases = (group.get("ports") or {}).get(component) or {}
+        for label in sorted(aliases, key=lambda label: _cell_order(aliases[label], label)):
+            caches.append((aliases[label]["input"], aliases[label]["output"]))
+        update = group.get("update") or {}
+        if update.get("kind") == "indexed_scatter":
+            write_indices = update["write_indices_ports"][component]
+            kv_length = update["kv_length_ports"][component]
+    return {
+        "token_ids": [port for port, role in roles.items() if role == "token_ids"],
+        "inputs_embeds": [port for port, role in roles.items() if role == "inputs_embeds"],
+        "logits": [port for port, role in roles.items() if role == "logits"],
+        "cache_inputs": [pair[0] for pair in caches],
+        "cache_outputs": [pair[1] for pair in caches],
+        "write_indices": write_indices,
+        "kv_sequence_length": kv_length,
+    }
+
+
+def _rename_component_ports(
+    workflow: dict[str, Any], component: str, renames: dict[str, str]
+) -> None:
+    """Rewrite every place the workflow names a port of *component*.
+
+    The four places are the whole surface: the role table, the invocations that
+    bind the ports, the state pairs that carry buffers through them, and the
+    scatter's two control ports.
+    """
+    declaration = workflow["components"][component]
+    ports = declaration.get("ports") or {}
+    if "roles" in ports:
+        ports["roles"] = {renames.get(k, k): v for k, v in ports["roles"].items()}
+    for side in ("inputs", "outputs"):
+        if ports.get(side):
+            ports[side] = {renames.get(k, k): v for k, v in ports[side].items()}
+    for step in _walk_steps(workflow["steps"]):
+        if step.get("kind") != "invoke" or step.get("component") != component:
+            continue
+        for side in ("inputs", "outputs"):
+            if step.get(side):
+                step[side] = {renames.get(k, k): v for k, v in step[side].items()}
+    for group in _groups(workflow).values():
+        for alias in ((group.get("ports") or {}).get(component) or {}).values():
+            alias["input"] = renames.get(alias["input"], alias["input"])
+            alias["output"] = renames.get(alias["output"], alias["output"])
+        update = group.get("update") or {}
+        for key in ("write_indices_ports", "kv_length_ports"):
+            bindings = update.get(key) or {}
+            if component in bindings:
+                bindings[component] = renames.get(bindings[component], bindings[component])
+
+
+class TestRolesAloneCarryTheDecodeAbi:
+    """Omitting the port contracts must not push a consumer back to guessing.
+
+    A component that ships an artifact declares no port contracts, so the only
+    thing left saying what a port *means* is its role. The risk that creates is
+    specific: a consumer that cannot find a role does not fail loudly, it falls
+    back to matching the spelling ``input_ids`` — and then a package that
+    spells it differently binds the wrong tensor with the right shape.
+
+    These tests hold the producer to the side of that contract it owns. Every
+    export shape must declare the roles a consumer needs, and the whole decode
+    ABI must survive renaming every port to an opaque label: if any part of the
+    binding still resolved after that, it was resolving by name.
+    """
+
+    @staticmethod
+    def _roled(workflow: dict[str, Any]) -> list[str]:
+        """Every component that says what any of its ports means."""
+        return [
+            name
+            for name, component in _onnx_components(workflow).items()
+            if ((component.get("ports") or {}).get("roles") or {})
+        ]
+
+    @staticmethod
+    def _decoders(workflow: dict[str, Any]) -> list[str]:
+        """Components that drive a decode step.
+
+        A decoder consumes the sequence and either produces logits or owns
+        cache state. An embedding component consumes tokens too, but it is not
+        the step a runtime specializes.
+        """
+        decoders = []
+        for name, component in _onnx_components(workflow).items():
+            roles = set(((component.get("ports") or {}).get("roles") or {}).values())
+            owns_state = any(
+                name in (group.get("ports") or {}) for group in _groups(workflow).values()
+            )
+            if {"token_ids", "inputs_embeds"} & roles and ("logits" in roles or owns_state):
+                decoders.append(name)
+        return decoders
+
+    def test_a_shipped_artifact_declares_roles_and_no_contracts(self, package):
+        """The omission and the role are one decision, not two.
+
+        Dropping the contracts is only safe because the role is there; a
+        component with neither would be a graph a consumer can only guess at.
+        """
+        pkg, metadata = package
+        workflow = metadata["pipeline"]["workflow"]
+        for name in _artifacts(pkg, workflow):
+            if name not in pkg:
+                continue
+            ports = workflow["components"][name].get("ports") or {}
+            assert not ports.get("inputs") and not ports.get("outputs")
+        assert self._decoders(workflow), "no exported graph says what consumes the sequence"
+
+    def test_the_sequence_port_is_declared_not_spelled(self, package):
+        """``input_ids`` and ``position_ids`` are both rank-2 int64.
+
+        Nothing in a graph distinguishes them, so the producer states which one
+        is the autoregressive sequence rather than leaving a runtime to infer
+        it from a name it has no right to assume. A decode step consumes
+        exactly one sequence — tokens or embeddings, never both.
+        """
+        _, metadata = package
+        workflow = metadata["pipeline"]["workflow"]
+        for name in self._decoders(workflow):
+            abi = _resolve_decode_abi(workflow, name)
+            assert len(abi["token_ids"]) + len(abi["inputs_embeds"]) == 1
+
+    def test_the_whole_abi_survives_renaming_every_port(self, package):
+        """Rename the ports to opaque labels; the ABI must resolve identically.
+
+        This is the assertion with teeth. The renamed package contains no port
+        called ``input_ids``, ``logits`` or ``key_cache.0``, so a resolution
+        that still returns the right ports cannot have been reading names. The
+        answers are compared as positions, because the names deliberately no
+        longer match.
+        """
+        pkg, metadata = package
+        workflow = copy.deepcopy(metadata)["pipeline"]["workflow"]
+        roled = self._roled(workflow)
+        assert roled
+        original = {name: _resolve_decode_abi(workflow, name) for name in roled}
+        renames = {}
+        for index, name in enumerate(sorted(original)):
+            inputs, outputs = _graph_ports(_artifacts(pkg, workflow)[name])
+            mapping = {
+                port: f"c{index}.p{position}"
+                for position, port in enumerate(sorted(inputs | outputs))
+            }
+            renames[name] = mapping
+            _rename_component_ports(workflow, name, mapping)
+        recognizable = {"input_ids", "inputs_embeds", "logits"}
+        for name, before in original.items():
+            after = _resolve_decode_abi(workflow, name)
+            mapping = renames[name]
+            for key, value in before.items():
+                expected = (
+                    [mapping[port] for port in value]
+                    if isinstance(value, list)
+                    else (mapping[value] if value is not None else None)
+                )
+                assert after[key] == expected
+            # Nothing recognizable is left to have matched on.
+            resolved = (*after["token_ids"], *after["inputs_embeds"], *after["logits"])
+            assert not recognizable & set(resolved)
+
+    def test_deleting_the_roles_is_what_breaks_it(self, package):
+        """The mutation that proves the role is doing the work.
+
+        If the sequence port were still recoverable with the role table gone,
+        then something else — a position, a shape, a spelling — was carrying
+        the fact, and these tests would be asserting nothing.
+        """
+        _, metadata = package
+        workflow = copy.deepcopy(metadata)["pipeline"]["workflow"]
+        roled = self._roled(workflow)
+        assert roled
+        for name in roled:
+            workflow["components"][name]["ports"].pop("roles")
+        for name in roled:
+            abi = _resolve_decode_abi(workflow, name)
+            assert abi["token_ids"] == []
+            assert abi["inputs_embeds"] == []
+            assert abi["logits"] == []
+
+    def test_state_pairs_still_bind_without_a_role_table(self, package):
+        """The cache half of the ABI is the state service's, not the role table's.
+
+        Deleting the roles must not disturb it: a runtime that resolved caches
+        through the roles would break on any component whose cache ports carry
+        no role, and the two halves are deliberately independent.
+        """
+        _, metadata = package
+        workflow = copy.deepcopy(metadata)["pipeline"]["workflow"]
+        roled = self._roled(workflow)
+        before = {name: _resolve_decode_abi(workflow, name) for name in roled}
+        for name in roled:
+            workflow["components"][name]["ports"].pop("roles")
+        for name in roled:
+            after = _resolve_decode_abi(workflow, name)
+            for key in (
+                "cache_inputs",
+                "cache_outputs",
+                "write_indices",
+                "kv_sequence_length",
+            ):
+                assert after[key] == before[name][key]
 
 
 def _deep_dynamic() -> dict[str, Any]:
@@ -504,31 +779,66 @@ class TestCheckedInPackagesShareTheShape:
         ) as handle:
             return yaml.safe_load(handle)
 
+    @staticmethod
+    def _ports(directory: str, workflow: dict[str, Any]) -> dict[str, tuple[set, set]]:
+        """Load each shipped artifact and read the ports it really exposes."""
+        ports: dict[str, tuple[set, set]] = {}
+        for name, component in _onnx_components(workflow).items():
+            artifact = os.path.join(directory, component["implementation"]["artifact"])
+            if not os.path.exists(artifact):
+                continue
+            ports[name] = _graph_ports(ir.load(artifact))
+        return ports
+
     def test_describes_itself_only_through_the_workflow(self, directory):
         metadata = self._metadata(directory)
         assert "workflow" in metadata["pipeline"]
         assert "io" not in (metadata.get("model") or {})
 
-    def test_every_onnx_component_declares_its_ports(self, directory):
-        workflow = self._metadata(directory)["pipeline"]["workflow"]
-        for component in _onnx_components(workflow).values():
-            ports = component["ports"]
-            assert ports["inputs"] or ports["outputs"]
-            for contract in (*ports["inputs"].values(), *ports["outputs"].values()):
-                assert contract["rank"] == len(contract["shape"])
+    def test_no_component_transcribes_the_ports_of_its_own_artifact(self, directory):
+        """Whatever a component declares must not be a restatement of its graph.
 
-    def test_every_binding_and_state_pair_resolves(self, directory):
+        A policy graph declares contracts because they type the workflow's
+        dataflow, and a workflow value has no other source for its dtype and
+        request axis. What no component may do is declare a port the artifact
+        does not have, or declare only some of them: either turns the
+        declaration into a partial second truth that drifts silently.
+        """
         workflow = self._metadata(directory)["pipeline"]["workflow"]
-        components = workflow["components"]
-        for step in _walk_steps(workflow["steps"]):
-            if step.get("kind") != "invoke":
+        graphs = self._ports(directory, workflow)
+        assert graphs, "a fixture that ships no artifact proves nothing"
+        for name, component in _onnx_components(workflow).items():
+            ports = component.get("ports") or {}
+            if not (ports.get("inputs") or ports.get("outputs")):
                 continue
-            ports = components[step["component"]]["ports"]
-            assert set(step.get("inputs", {})) <= set(ports["inputs"])
-            assert set(step.get("outputs", {})) <= set(ports["outputs"])
+            inputs, outputs = graphs[name]
+            assert set(ports.get("inputs", {})) == inputs
+            assert set(ports.get("outputs", {})) == outputs
+
+    def test_every_binding_and_state_pair_resolves_in_the_artifact(self, directory):
+        workflow = self._metadata(directory)["pipeline"]["workflow"]
+        graphs = self._ports(directory, workflow)
+        for step in _walk_steps(workflow["steps"]):
+            if step.get("kind") != "invoke" or step["component"] not in graphs:
+                continue
+            inputs, outputs = graphs[step["component"]]
+            assert set(step.get("inputs", {})) <= inputs
+            assert set(step.get("outputs", {})) <= outputs
         for group in _groups(workflow).values():
             for component, aliases in (group.get("ports") or {}).items():
-                ports = components[component]["ports"]
+                if component not in graphs:
+                    continue
+                inputs, outputs = graphs[component]
                 for alias in aliases.values():
-                    assert alias["input"] in ports["inputs"]
-                    assert alias["output"] in ports["outputs"]
+                    assert alias["input"] in inputs
+                    assert alias["output"] in outputs
+
+    def test_every_declared_role_resolves_in_the_artifact(self, directory):
+        workflow = self._metadata(directory)["pipeline"]["workflow"]
+        graphs = self._ports(directory, workflow)
+        for name, component in _onnx_components(workflow).items():
+            if name not in graphs:
+                continue
+            inputs, outputs = graphs[name]
+            for port in (component.get("ports") or {}).get("roles", {}):
+                assert port in inputs or port in outputs

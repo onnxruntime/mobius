@@ -1553,6 +1553,13 @@ def add_policy_components_to_workflow(
         return contract
 
     for name, component in policy_components.items():
+        # A policy graph is synthesized by this producer to realize the
+        # workflow's own control flow, so its port contracts are not a
+        # transcription of an external interface: they are the type annotations
+        # of the workflow's dataflow. A workflow value acquires its dtype, rank
+        # and request axis from the port that produces it, and the validator
+        # reads metadata without the artifacts, so a policy output that states
+        # no contract leaves every value derived from it untyped.
         declaration = {
             "implementation": {
                 "kind": "onnx",

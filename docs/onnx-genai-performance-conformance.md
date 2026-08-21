@@ -123,7 +123,8 @@ well-formed and validate; only the local kernel is missing.
 
 ### Canonical representation — lowering verified
 
-Against ONNX GenAI `2498e0bc`, with no `model.io` in any package:
+Against ONNX GenAI `2498e0bc`, with no `model.io` in any package and no port
+contracts on any component that ships an artifact:
 
 | Check | Result |
 | --- | --- |
@@ -135,6 +136,21 @@ The last row is the one that matters. The fixed-capacity decode path needs the
 write cursor, the valid length and the per-layer buffer pairs; it resolved all
 of them by lowering the workflow, which is what makes removing the second copy
 safe rather than merely tidy.
+
+### Where the transcription boundary actually falls
+
+A component backed by a shipped `.onnx` declares `ports.roles` and nothing else:
+the artifact is authoritative for its ports, and `pipeline_admission` checks
+declarations against the live session, so a YAML copy can only drift.
+
+Policy graphs are the exception, and the boundary was measured rather than
+assumed. A workflow SSA value inherits its dtype, rank and request axis from the
+port that produced it (`validation.rs` binds `value_contracts` from
+`ports.outputs`), so a validator — which reads metadata without the artifacts —
+has no other source. Dropping policy contracts made 4 of the 11 packages invalid
+with `<node>.when is row-wise but <node>.value declares no request_aligned
+batch_layout`. Those contracts type the workflow's own dataflow; they are not a
+description of an external interface, and they stay.
 
 ## Current measured baseline
 

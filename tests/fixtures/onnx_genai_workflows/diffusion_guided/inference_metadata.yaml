@@ -211,27 +211,6 @@ pipeline:
           kind: onnx
           artifact: text_encoder/model.onnx
         ports:
-          inputs:
-            input_ids:
-              dtype: int64
-              rank: 2
-              shape:
-              - batch
-              - prompt_sequence
-              batch_layout:
-                kind: request_aligned
-                axis: 0
-          outputs:
-            encoder_hidden_states:
-              dtype: float32
-              rank: 3
-              shape:
-              - batch
-              - prompt_sequence
-              - 32
-              batch_layout:
-                kind: request_aligned
-                axis: 0
           roles:
             input_ids: token_ids
             encoder_hidden_states: encoder_hidden_states
@@ -240,79 +219,12 @@ pipeline:
           kind: onnx
           artifact: denoiser/model.onnx
         ports:
-          inputs:
-            sample:
-              dtype: float32
-              rank: 4
-              shape:
-              - batch
-              - 4
-              - height
-              - width
-              batch_layout:
-                kind: request_aligned
-                axis: 0
-            timestep:
-              dtype: float32
-              rank: 1
-              shape:
-              - batch
-              batch_layout:
-                kind: request_aligned
-                axis: 0
-            encoder_hidden_states:
-              dtype: float32
-              rank: 3
-              shape:
-              - batch
-              - prompt_sequence
-              - 32
-              batch_layout:
-                kind: request_aligned
-                axis: 0
-          outputs:
-            noise_pred:
-              dtype: float32
-              rank: 4
-              shape:
-              - batch
-              - 4
-              - height
-              - width
-              batch_layout:
-                kind: request_aligned
-                axis: 0
           roles:
             encoder_hidden_states: encoder_hidden_states
       vae_decoder:
         implementation:
           kind: onnx
           artifact: vae_decoder/model.onnx
-        ports:
-          inputs:
-            latent:
-              dtype: float32
-              rank: 4
-              shape:
-              - batch
-              - 4
-              - height
-              - width
-              batch_layout:
-                kind: request_aligned
-                axis: 0
-          outputs:
-            image:
-              dtype: float32
-              rank: 4
-              shape:
-              - batch
-              - 3
-              - height
-              - width
-              batch_layout:
-                kind: request_aligned
-                axis: 0
       solver_step:
         implementation:
           kind: onnx

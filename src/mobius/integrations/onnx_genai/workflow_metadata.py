@@ -191,31 +191,35 @@ def _component(
     *,
     effects: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    """Declare one ONNX-backed workflow component: ports, contracts and roles.
+    """Declare one ONNX-backed workflow component: its artifact and port roles.
 
-    The workflow is the package's only description of itself, so a component
-    states the contract of every port it exposes rather than leaving a consumer
-    to open the artifact and infer one. That is what lets the scatter ABI, the
-    token and logits roles, and the per-layer cache pairs all be resolved from
-    the workflow alone: an integer control vector is indistinguishable from its
-    neighbours by shape, so the binding that names it has to sit next to a
-    declared port for the name to mean anything.
+    A component declares only what its artifact cannot say about itself. The
+    ``.onnx`` file is shipped inside the package and is authoritative for which
+    ports exist and what dtype, rank and shape each one has, so transcribing
+    that into YAML would create a second copy of a fact the package already
+    carries — one that can drift from the graph and that nothing cross-checks
+    at rest. The runtime resolves ports against the live session instead, which
+    catches a name the graph does not expose rather than agreeing with a stale
+    echo of it.
 
-    A contract says what a value *is*; ``roles`` says what the component *does*
-    with it. An invocation binds an SSA value to a port, which records which
-    value arrives but not whether it is tokens, a mask or logits — and that
-    second fact is what a runtime needs before it can specialize a decode step.
-    Only ports in this producer's own vocabulary get a role; state ports never
-    need one, because the group that carries them already names its pairs.
+    What no graph carries is what a port *means*. ``input_ids`` and
+    ``position_ids`` are both rank-2 ``int64``; nothing in the file says which
+    one is the autoregressive sequence. An invocation binds an SSA value to a
+    port, which records which value arrives but not whether it is tokens, a mask
+    or logits — and that second fact is what a runtime needs before it can
+    specialize a decode step. So ``roles`` is the whole declaration here.
+
+    Only ports in this producer's own vocabulary get a role, and state ports
+    never need one: the group that carries them already names its pairs, which
+    is also where the fixed-capacity scatter ABI is stated.
     """
     del effects
-    inputs = {str(value.name): _contract(value) for value in model.graph.inputs}
-    outputs = {str(value.name): _contract(value) for value in model.graph.outputs}
-    roles = {name: _PORT_ROLES[name] for name in (*inputs, *outputs) if name in _PORT_ROLES}
-    ports: dict[str, Any] = {"inputs": inputs, "outputs": outputs}
+    named = [str(value.name) for value in (*model.graph.inputs, *model.graph.outputs)]
+    roles = {name: _PORT_ROLES[name] for name in named if name in _PORT_ROLES}
+    declaration: dict[str, Any] = {"implementation": {"kind": "onnx", "artifact": artifact}}
     if roles:
-        ports["roles"] = roles
-    return {"implementation": {"kind": "onnx", "artifact": artifact}, "ports": ports}
+        declaration["ports"] = {"roles": roles}
+    return declaration
 
 
 def _grammar_adapter_component(action: str) -> dict[str, Any]:
@@ -302,7 +306,10 @@ def _publish_workflow_v1(workflow: dict[str, Any]) -> dict[str, Any]:
         for declaration in workflow.get(section, {}).values():
             declaration["contract"] = _declare_row_alignment(declaration.get("contract"))
     for component in workflow.get("components", {}).values():
-        for ports in component.get("ports", {}).values():
+        for side in ("inputs", "outputs"):
+            ports = component.get("ports", {}).get(side)
+            if not ports:
+                continue
             for port, contract in ports.items():
                 ports[port] = _declare_row_alignment(contract)
     substitutions: dict[str, str] = {}

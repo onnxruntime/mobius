@@ -47,56 +47,10 @@ pipeline:
         implementation:
           kind: onnx
           artifact: encoder/model.onnx
-        ports:
-          inputs:
-            waveform:
-              dtype: float32
-              rank: 3
-              shape:
-              - batch
-              - 1
-              - audio_samples
-              batch_layout:
-                kind: request_aligned
-                axis: 0
-          outputs:
-            codes:
-              dtype: float32
-              rank: 3
-              shape:
-              - batch
-              - 1
-              - audio_samples
-              batch_layout:
-                kind: request_aligned
-                axis: 0
       decoder:
         implementation:
           kind: onnx
           artifact: decoder/model.onnx
-        ports:
-          inputs:
-            codes:
-              dtype: float32
-              rank: 3
-              shape:
-              - batch
-              - 1
-              - audio_samples
-              batch_layout:
-                kind: request_aligned
-                axis: 0
-          outputs:
-            waveform:
-              dtype: float32
-              rank: 3
-              shape:
-              - batch
-              - 1
-              - audio_samples
-              batch_layout:
-                kind: request_aligned
-                axis: 0
     steps:
     - kind: invoke
       component: encoder

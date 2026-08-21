@@ -18,6 +18,9 @@ rather than at runtime.
 
 from __future__ import annotations
 
+from typing import Any
+
+import onnx_ir as ir
 import pytest
 
 from mobius import registry
@@ -88,12 +91,16 @@ def _static_cache_abi(metadata) -> dict:
     driver needs, then the workflow is a complete description and republishing
     the same facts under a second top-level key would only create two truths
     that can disagree.
+
+    Note what it does not read: the component declares no port contracts, so
+    every name here comes from the scatter discipline and the state pairs. The
+    ports themselves are checked against the graph, which is the only thing
+    entitled to say what a port's dtype and shape are.
     """
     workflow = metadata["pipeline"]["workflow"]
     _, group = _scatter_group(metadata)
     update = group["update"]
     component = next(iter(update["write_indices_ports"]))
-    declared = workflow["components"][component]["ports"]
     aliases = group["ports"][component]
     buffers = [
         aliases[cell] for cell in sorted(aliases, key=lambda cell: int(cell.rsplit("_")[-1]))
@@ -105,15 +112,35 @@ def _static_cache_abi(metadata) -> dict:
         "capacity": workflow["inputs"][update["capacity"]]["default"],
         "cache_inputs": [alias["input"] for alias in buffers],
         "cache_outputs": [alias["output"] for alias in buffers],
-        "declared_inputs": declared["inputs"],
-        "declared_outputs": declared["outputs"],
     }
 
 
+def _graph_ports(pkg) -> dict[str, Any]:
+    """Every port of the exported decoder, keyed by name.
+
+    The artifact is authoritative for dtype, rank and shape, so assertions
+    about those resolve here rather than against a transcription in the
+    metadata — a transcription could agree with itself while disagreeing with
+    the graph a runtime actually binds.
+    """
+    model = pkg["model"]
+    return {str(value.name): value for value in (*model.graph.inputs, *model.graph.outputs)}
+
+
 @pytest.fixture(scope="module")
-def static_workflow():
+def static_built():
     pkg, config = _static_package()
-    return build_decoder_workflow_metadata(pkg, config)
+    return pkg, build_decoder_workflow_metadata(pkg, config)
+
+
+@pytest.fixture(scope="module")
+def static_workflow(static_built):
+    return static_built[1]
+
+
+@pytest.fixture(scope="module")
+def static_ports(static_built):
+    return _graph_ports(static_built[0])
 
 
 @pytest.fixture(scope="module")
@@ -145,17 +172,20 @@ class TestStaticCacheAbiLivesOnlyInTheWorkflow:
         assert abi["write_indices_input"] == STATIC_CACHE_WRITE_INDICES
         assert abi["kv_sequence_length_input"] == STATIC_CACHE_KV_SEQUENCE_LENGTH
 
-    def test_control_ports_are_real_ports_of_the_component(self, static_workflow):
-        # Naming a port the component does not expose would bind nothing.
+    def test_control_ports_are_real_ports_of_the_component(
+        self, static_workflow, static_ports
+    ):
+        # Naming a port the component does not expose would bind nothing, and
+        # the graph is the only thing that can settle whether it does.
         abi = _static_cache_abi(static_workflow)
         for role in ("write_indices_input", "kv_sequence_length_input"):
-            contract = abi["declared_inputs"][abi[role]]
+            value = static_ports[abi[role]]
             # Both are per-row integer vectors, which is exactly why they are
             # declared rather than recognized by shape.
-            assert contract["dtype"] == "int64"
-            assert contract["rank"] == 1
+            assert value.dtype == ir.DataType.INT64
+            assert len(value.shape) == 1
 
-    def test_every_buffer_pair_is_declared(self, static_workflow):
+    def test_every_buffer_pair_is_declared(self, static_workflow, static_ports):
         abi = _static_cache_abi(static_workflow)
         assert abi["cache_inputs"] == [
             "key_cache.0",
@@ -165,9 +195,7 @@ class TestStaticCacheAbiLivesOnlyInTheWorkflow:
         ]
         assert abi["cache_outputs"] == [f"updated_{name}" for name in abi["cache_inputs"]]
         for name in (*abi["cache_inputs"], *abi["cache_outputs"]):
-            declared = abi["declared_inputs"] if name in abi["cache_inputs"] else None
-            declared = declared or abi["declared_outputs"]
-            assert declared[name]["shape"][STATIC_CACHE_SEQUENCE_AXIS] == CAPACITY
+            assert static_ports[name].shape[STATIC_CACHE_SEQUENCE_AXIS] == CAPACITY
 
     def test_capacity_is_recoverable(self, static_workflow):
         assert _static_cache_abi(static_workflow)["capacity"] == CAPACITY

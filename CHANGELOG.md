@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An exported graph is no longer transcribed into its own workflow component.
+  A component backed by a shipped `.onnx` file now declares only `ports.roles`;
+  the artifact answers every question about which ports exist and what shape
+  they have, and the runtime resolves them against the live session. The
+  removed block was a second statement of the same ABI with nothing keeping the
+  two in agreement — the same defect as `model.io`, one level down. Package
+  validation and runtime conformance both stay at 11/11 against the pinned ONNX
+  GenAI branch, and the contract tests now resolve every role, invocation
+  binding and state pair against the graph itself rather than against the
+  metadata's agreement with a copy of itself, which is a strictly stronger
+  check.
+
+  Policy graphs keep their contracts, and that boundary was measured rather
+  than assumed: a workflow value inherits its dtype, rank and request axis from
+  the port that produced it, so dropping them left row-wise emits untyped and
+  made 4 of the 11 packages invalid. Those contracts type the workflow's own
+  dataflow; they do not describe an external interface.
+
 - Deep decoders are now covered where the cache layer annotation actually
   matters. Every metadata package built in the test suite had two layers, and
   below ten a cell label sorts identically whether ordered lexicographically,
@@ -49,10 +67,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Added
 
-- Every ONNX component declares `ports.inputs` / `ports.outputs` — a contract
-  (dtype, rank, shape, batch layout) for exactly the graph's inputs and outputs.
-  A subset would let a consumer fall back to opening the artifact; a superset
-  would be a promise the graph does not keep.
+- An ONNX component that ships an artifact declares no port contracts. The
+  `.onnx` file travels inside the package and is authoritative for which ports
+  exist and what each one's dtype, rank and shape is, so transcribing that into
+  YAML would be a second writable statement of one fact — the very thing this
+  section removes — sitting one level below `model.io` rather than beside it.
+  The runtime resolves ports against the live session, which catches a name the
+  graph does not expose instead of agreeing with a stale echo of it. A
+  producer-synthesized policy graph is the exception and states its contracts,
+  because a workflow value takes its dtype, rank and request axis from the port
+  that produced it: those contracts are the dataflow's type annotations, not a
+  description of an external interface.
 - Every ONNX component declares `ports.roles`: what it *does* with a value bound
   to a port. An invocation records which SSA value reaches a port, not whether
   that port is tokens, a mask or logits. Mobius mints these port names in its own

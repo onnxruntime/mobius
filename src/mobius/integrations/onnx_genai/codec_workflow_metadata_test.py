@@ -53,15 +53,11 @@ def test_codec_workflow_has_typed_ssa_and_audio_emit():
         "shape": ["batch", 1, "audio_samples"],
         "batch_layout": {"kind": "request_aligned", "axis": 0},
     }
-    # An ONNX component declares the contract of every port it exposes, so the
-    # workflow describes the package without opening the artifact.
-    assert workflow["components"]["encoder"]["ports"]["inputs"]["waveform"] == {
-        "dtype": "float32",
-        "rank": 3,
-        "shape": ["batch", 1, "audio_samples"],
-        "batch_layout": {"kind": "request_aligned", "axis": 0},
-    }
-    assert set(workflow["components"]["decoder"]["ports"]["outputs"]) == {"waveform"}
+    # An ONNX component does not restate what its artifact already says: the
+    # encoder's ports, dtypes and shapes live in `encoder.onnx`, and the
+    # workflow's own inputs are where the request contract is declared.
+    assert not (workflow["components"]["encoder"].get("ports") or {})
+    assert not (workflow["components"]["decoder"].get("ports") or {})
     assert "effects" not in workflow["components"]["encoder"]
     assert "effects" not in workflow["components"]["decoder"]
 

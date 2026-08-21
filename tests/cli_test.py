@@ -203,6 +203,7 @@ class TestCLIBuild:
         carrying the write cursor and the port carrying the non-pad length, and
         the component those ports belong to declares both.
         """
+        import onnx_ir as ir
         import yaml
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -225,6 +226,16 @@ class TestCLIBuild:
                 os.path.join(tmpdir, "inference_metadata.yaml"), encoding="utf-8"
             ) as handle:
                 metadata = yaml.safe_load(handle)
+            # The exported graph is the authority on which ports exist and what
+            # rank they have, so read it here rather than trusting a copy of it
+            # in the metadata — a copy is what this contract exists to avoid.
+            artifact = metadata["pipeline"]["workflow"]["components"]["model"][
+                "implementation"
+            ]["artifact"]
+            exported = {
+                str(value.name): len(value.shape)
+                for value in ir.load(os.path.join(tmpdir, artifact)).graph.inputs
+            }
 
         # One canonical description: no second copy of the port ABI outside it.
         assert "io" not in metadata.get("model", {})
@@ -240,9 +251,13 @@ class TestCLIBuild:
         assert update["write_indices_ports"] == {"model": "write_indices"}
         assert update["kv_length_ports"] == {"model": "nonpad_kv_seqlen"}
 
-        declared = workflow["components"]["model"]["ports"]["inputs"]
-        assert declared["write_indices"]["rank"] == 1
-        assert declared["nonpad_kv_seqlen"]["rank"] == 1
+        # The component transcribes none of this: it declares the roles a graph
+        # cannot state, and the scatter's control ports are named by the state
+        # group. Both names have to resolve in the artifact.
+        assert not (workflow["components"]["model"]["ports"].get("inputs"))
+        assert workflow["components"]["model"]["ports"]["roles"]["input_ids"] == "token_ids"
+        assert exported["write_indices"] == 1
+        assert exported["nonpad_kv_seqlen"] == 1
 
         group = next(group for group in groups.values() if "update" in group)
         pairs = group["ports"]["model"]

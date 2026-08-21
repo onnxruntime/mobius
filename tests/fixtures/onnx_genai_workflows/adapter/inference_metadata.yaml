@@ -108,27 +108,6 @@ pipeline:
         implementation:
           kind: onnx
           artifact: model.onnx
-        ports:
-          inputs:
-            activations:
-              dtype: float32
-              rank: 2
-              shape:
-              - batch
-              - 2
-              batch_layout:
-                kind: request_aligned
-                axis: 0
-          outputs:
-            projection.output:
-              dtype: float32
-              rank: 2
-              shape:
-              - batch
-              - 2
-              batch_layout:
-                kind: request_aligned
-                axis: 0
       overlay:
         implementation:
           kind: adapter
