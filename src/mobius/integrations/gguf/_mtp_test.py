@@ -217,44 +217,24 @@ class TestBuildMtpHead:
         )
 
 
-class TestIncludeMtpFlag:
-    """The MTP head is opt-in: gated by ``include_mtp`` on ``build_from_gguf``."""
+class TestMtpAutoDetect:
+    """MTP is emitted iff the source GGUF ships the nextn head (no user flag)."""
 
-    def test_default_export_omits_mtp_head(self, qwen35_mtp_gguf: Path):
+    def test_mtp_gguf_auto_emits_head_sidecar(self, qwen35_mtp_gguf: Path):
         from mobius.integrations.gguf import build_from_gguf
 
+        # Source ships the nextn head -> sidecar is auto-attached, no opt-in.
         pkg = build_from_gguf(str(qwen35_mtp_gguf))
-        # Default behavior is unchanged: text-only, no head sidecar attached.
-        assert getattr(pkg, "mtp_head", None) is None
-
-    def test_include_mtp_attaches_head_sidecar(self, qwen35_mtp_gguf: Path):
-        from mobius.integrations.gguf import build_from_gguf
-
-        pkg = build_from_gguf(str(qwen35_mtp_gguf), include_mtp=True)
         head = getattr(pkg, "mtp_head", None)
         assert head is not None
         output_names = {v.name for v in head["model"].graph.outputs}
         assert "mtp_hidden" in output_names
 
-    def test_include_mtp_rejects_static_cache(self, qwen35_mtp_gguf: Path):
-        from mobius.integrations.gguf import build_from_gguf
-
-        with pytest.raises(ValueError, match="static_cache"):
-            build_from_gguf(
-                str(qwen35_mtp_gguf), include_mtp=True, static_cache=True
-            )
-
-    def test_include_mtp_without_head_warns_and_builds_text_only(
-        self, tmp_path: Path, caplog
-    ):
-        import logging
-
+    def test_text_only_gguf_omits_head_sidecar(self, tmp_path: Path):
         from mobius.integrations.gguf import _builder_test, build_from_gguf
 
-        # A plain llama GGUF with no nextn block: include_mtp is a no-op + warn.
+        # A plain GGUF with no nextn block -> nothing to emit, byte-identical.
         path = tmp_path / "no_mtp.gguf"
         _builder_test._write_quantized_gguf(path, projection_quantization="f32")
-        with caplog.at_level(logging.WARNING):
-            pkg = build_from_gguf(str(path), include_mtp=True)
+        pkg = build_from_gguf(str(path))
         assert getattr(pkg, "mtp_head", None) is None
-        assert any("no MTP" in rec.message for rec in caplog.records)

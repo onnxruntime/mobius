@@ -536,10 +536,6 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         raise SystemExit("Error: --max-workers must be a positive integer.")
     if mmproj_path is not None and args.static_cache:
         raise SystemExit("Error: --static-cache cannot be used with --mmproj.")
-    if getattr(args, "include_mtp", False) and args.static_cache:
-        raise SystemExit("Error: --include-mtp cannot be used with --static-cache.")
-    if getattr(args, "include_mtp", False) and mmproj_path is not None:
-        raise SystemExit("Error: --include-mtp cannot be used with --mmproj.")
 
     pkg = build_from_gguf(
         gguf_path,
@@ -549,7 +545,6 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         execution_provider=args.execution_provider,
         static_cache=args.static_cache,
         max_seq_len=args.max_seq_len,
-        include_mtp=getattr(args, "include_mtp", False),
     )
 
     pkg.save(
@@ -946,18 +941,6 @@ def main(argv: list[str] | None = None) -> None:
         help=(
             "Maximum sequence length for static cache buffers. Only used with "
             "--static-cache. Defaults to max_position_embeddings from config."
-        ),
-    )
-    gguf_parser.add_argument(
-        "--include-mtp",
-        action="store_true",
-        help=(
-            "Opt in to exporting the Qwen3.5/3.8 multi-token-prediction (MTP / "
-            "'nextn') self-speculative head. Off by default (text-only export "
-            "unchanged). When set and the GGUF ships a trailing nextn head, "
-            "writes a 'mtp/model.onnx' sidecar plus a SpeculatorConfig "
-            "(proposal_type: mtp) block in inference_metadata.yaml. Cannot be "
-            "combined with --static-cache or --mmproj."
         ),
     )
     gguf_parser.set_defaults(func=_cmd_build_gguf)
