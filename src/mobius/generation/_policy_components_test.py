@@ -794,6 +794,29 @@ def test_ddim_solver_runtime_parity_on_a_video_latent(tmp_path):
     np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
 
 
+def test_ddim_solver_v_prediction_runtime_parity(tmp_path):
+    dims = ["batch", "frames", "channels", "height", "width"]
+    sample = np.linspace(-1.5, 1.5, 24, dtype=np.float32).reshape(1, 3, 2, 2, 2)
+    velocity = np.full_like(sample, 0.25)
+    schedule = np.array([0.4, 0.9, 1.0], np.float32)
+    (actual,) = _run(
+        build_ddim_solver_step(latent_dims=dims, prediction_type="v_prediction"),
+        tmp_path,
+        {
+            "sample": sample,
+            "derivative": velocity,
+            "step": np.array([0], np.int64),
+            "schedule": schedule,
+        },
+    )
+    alpha, alpha_prev = schedule[:2]
+    beta = 1 - alpha
+    pred_original = np.sqrt(alpha) * sample - np.sqrt(beta) * velocity
+    pred_epsilon = np.sqrt(alpha) * velocity + np.sqrt(beta) * sample
+    expected = np.sqrt(alpha_prev) * pred_original + np.sqrt(1 - alpha_prev) * pred_epsilon
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+
 def test_ddim_solver_clips_the_predicted_clean_latent(tmp_path):
     dims = ["batch", "frames", "channels", "height", "width"]
     sample = np.full((1, 1, 1, 1, 1), 8.0, np.float32)

@@ -1642,21 +1642,37 @@ def build_tensor_scale(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponen
     return _component("mobius.policy.auxiliary@1", graph, {})
 
 
+def build_tensor_cast(
+    input_dtype: ir.DataType,
+    output_dtype: ir.DataType,
+    dims: Sequence[str],
+) -> PolicyComponent:
+    """Cast an arbitrary-rank tensor without changing its logical layout."""
+    graph, builder = _make_graph("tensor_cast")
+    tensor = builder.input("tensor", input_dtype, list(dims))
+    cast = builder.op.Cast(tensor, to=output_dtype)
+    cast.shape = tensor.shape
+    builder.add_output(cast, "cast")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
 def build_tensor_clamp(
     dtype: ir.DataType = ir.DataType.FLOAT,
+    dims: Sequence[str] = ("batch", "channels", "height", "width"),
     *,
     minimum: float,
     maximum: float,
 ) -> PolicyComponent:
-    """Clamp a rank-4 tensor to an explicitly declared numeric range."""
+    """Clamp an arbitrary-rank tensor to a declared runtime output range."""
     graph, builder = _make_graph("tensor_clamp")
-    op = builder.op
-    tensor = builder.input("tensor", dtype, ["batch", "channels", "height", "width"])
-    clamped = op.Clip(
-        tensor,
-        op.Cast(op.Constant(value_float=minimum), to=dtype),
-        op.Cast(op.Constant(value_float=maximum), to=dtype),
+    tensor = builder.input("tensor", dtype, list(dims))
+    minimum_value = builder.op.CastLike(
+        builder.op.Constant(value_float=float(minimum)), tensor
     )
+    maximum_value = builder.op.CastLike(
+        builder.op.Constant(value_float=float(maximum)), tensor
+    )
+    clamped = builder.op.Clip(tensor, minimum_value, maximum_value)
     clamped.shape = tensor.shape
     builder.add_output(clamped, "clamped")
     return _component("mobius.policy.auxiliary@1", graph, {})
@@ -1673,7 +1689,10 @@ def build_zeros_like(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponent:
     return _component("mobius.policy.auxiliary@1", graph, {})
 
 
-def build_guidance_combine(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponent:
+def build_guidance_combine(
+    dtype: ir.DataType = ir.DataType.FLOAT,
+    latent_dims: Sequence[str] = ("batch", "channels", "height", "width"),
+) -> PolicyComponent:
     """Combine two conditioned estimates by a per-row guidance scale.
 
     ``estimate = unconditional + scale * (conditional - unconditional)`` is the
@@ -1682,13 +1701,14 @@ def build_guidance_combine(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComp
     """
     graph, builder = _make_graph("guidance_combine")
     op = builder.op
-    unconditional = builder.input(
-        "unconditional", dtype, ["batch", "channels", "height", "width"]
-    )
-    conditional = builder.input("conditional", dtype, ["batch", "channels", "height", "width"])
+    unconditional = builder.input("unconditional", dtype, list(latent_dims))
+    conditional = builder.input("conditional", dtype, list(latent_dims))
     scale = builder.input("scale", ir.DataType.FLOAT, ["batch"])
-    # (batch,) -> (batch, 1, 1, 1) so the row scale broadcasts over the latent.
-    factor = op.Unsqueeze(op.Cast(scale, to=dtype), op.Constant(value_ints=[1, 2, 3]))
+    # (batch,) -> (batch, 1, ..., 1) so the row scale broadcasts over the latent.
+    factor = op.Unsqueeze(
+        op.Cast(scale, to=dtype),
+        op.Constant(value_ints=list(range(1, len(latent_dims)))),
+    )
     estimate = op.Add(unconditional, op.Mul(factor, op.Sub(conditional, unconditional)))
     estimate.shape = unconditional.shape
     builder.add_output(estimate, "estimate")
@@ -2168,8 +2188,9 @@ def build_ddim_solver_step(
     latent_dims: Sequence[str] = _IMAGE_LATENT_DIMS,
     *,
     clip_sample_range: float | None = None,
+    prediction_type: str = "epsilon",
 ) -> PolicyComponent:
-    """Build the deterministic DDIM update (``eta = 0``, epsilon prediction).
+    """Build the deterministic DDIM update (``eta = 0``).
 
     ``schedule`` holds the cumulative alpha of every denoising step followed by
     the alpha of the final step's predecessor, so entry ``i + 1`` is the
@@ -2181,8 +2202,12 @@ def build_ddim_solver_step(
     ``clip_sample_range`` reproduces schedulers configured with
     ``clip_sample=True``, which clamp the predicted clean sample before the
     reverse step. ``latent_dims`` names the latent axes, so the same update
-    serves image and video latents.
+    serves image and video latents. ``prediction_type`` selects the scheduler's
+    architecture-neutral output interpretation: ``epsilon``, ``sample``, or
+    ``v_prediction``.
     """
+    if prediction_type not in {"epsilon", "sample", "v_prediction"}:
+        raise ValueError(f"unsupported DDIM prediction_type {prediction_type!r}")
     graph, builder = _make_graph("ddim_solver_step")
     op = builder.op
     sample = builder.input("sample", dtype, list(latent_dims))
@@ -2197,16 +2222,31 @@ def build_ddim_solver_step(
         op.Cast(op.Gather(schedule, next_step, axis=0), to=dtype), broadcast_axes
     )
     one = op.CastLike(op.Constant(value_float=1.0), sample)
-    # Recover the predicted clean latent, then re-noise it to alpha_prev.
-    pred_original = op.Div(
-        op.Sub(sample, op.Mul(op.Sqrt(op.Sub(one, alpha)), derivative)), op.Sqrt(alpha)
-    )
+    alpha_sqrt = op.Sqrt(alpha)
+    beta_sqrt = op.Sqrt(op.Sub(one, alpha))
+    if prediction_type == "epsilon":
+        pred_original = op.Div(
+            op.Sub(sample, op.Mul(beta_sqrt, derivative)), alpha_sqrt
+        )
+        pred_epsilon = derivative
+    elif prediction_type == "sample":
+        pred_original = derivative
+        pred_epsilon = op.Div(
+            op.Sub(sample, op.Mul(alpha_sqrt, pred_original)), beta_sqrt
+        )
+    else:
+        pred_original = op.Sub(
+            op.Mul(alpha_sqrt, sample), op.Mul(beta_sqrt, derivative)
+        )
+        pred_epsilon = op.Add(
+            op.Mul(alpha_sqrt, derivative), op.Mul(beta_sqrt, sample)
+        )
     if clip_sample_range is not None:
         limit = op.CastLike(op.Constant(value_float=float(clip_sample_range)), sample)
         pred_original = op.Clip(pred_original, op.Neg(limit), limit)
     next_sample = op.Add(
         op.Mul(op.Sqrt(alpha_prev), pred_original),
-        op.Mul(op.Sqrt(op.Sub(one, alpha_prev)), derivative),
+        op.Mul(op.Sqrt(op.Sub(one, alpha_prev)), pred_epsilon),
     )
     _set_public_shape(next_sample, list(latent_dims))
     builder.add_output(next_sample, "next_state")
@@ -2349,6 +2389,7 @@ def build_true_cfg(
 
 
 SOLVER_BUILDERS = {
+    "ddim": build_ddim_solver_step,
     "euler": build_euler_solver_step,
     "multistep": build_multistep_solver_step,
 }
@@ -2737,7 +2778,9 @@ def build_schedule_history_append(dtype: ir.DataType) -> PolicyComponent:
     history = builder.input("history", dtype, ["batch", "history"])
     timestep = builder.input("timestep", dtype, ["batch"])
     updated = op.Concat(history, op.Unsqueeze(timestep, op.Constant(value_ints=[1])), axis=1)
-    _set_public_shape(updated, ["batch", "history"])
+    # Appending changes the temporal extent, so the output must not reuse the
+    # input symbol: runtimes may otherwise preallocate the old zero-length shape.
+    _set_public_shape(updated, ["batch", "next_history"])
     builder.add_output(updated, "next")
     return _component("mobius.policy.auxiliary@1", graph, {})
 
