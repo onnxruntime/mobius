@@ -474,7 +474,7 @@ class GenaiConfigGenerator:
             "num_hidden_layers": self.num_hidden_layers,
             "num_key_value_heads": self.num_key_value_heads,
         }
-        if self.model_type == "lfm2":
+        if self.model_type in {"lfm2", "lfm2_vl"}:
             decoder["layer_types"] = self._layer_types or []
             decoder["conv_cache_size"] = (
                 self._conv_cache_size if self._conv_cache_size is not None else 3
@@ -516,7 +516,7 @@ class GenaiConfigGenerator:
             context_length=self.context_length,
             supports_in_place_kv_cache=self._supports_in_place_kv_cache,
         )
-        if self.model_type == "lfm2":
+        if self.model_type in {"lfm2", "lfm2_vl"}:
             # ORT GenAI's LFM2 cache mixes fixed convolution windows with
             # dynamic attention KV; shared in-place KV buffers are unsupported.
             search["past_present_share_buffer"] = False

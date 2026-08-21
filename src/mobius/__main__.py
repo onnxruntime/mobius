@@ -247,6 +247,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
     else:
         static_cache_params = None
     trust_remote_code = args.trust_remote_code
+    revision = args.revision
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
     dtype_override = resolve_dtype(args.dtype)
@@ -259,7 +260,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
     # central build() validation reject a diffusers/unsupported repo rather
     # than silently exporting a diffusion pipeline and ignoring the flag.
     if args.model and not args.config and not args.text_only:
-        pipeline_index = _load_diffusers_pipeline_index(args.model)
+        pipeline_index = _load_diffusers_pipeline_index(args.model, revision=revision)
         if pipeline_index is not None:
             print(
                 f"Detected diffusers pipeline: {pipeline_index.get('_class_name', 'Unknown')}"
@@ -275,6 +276,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 pipeline_components = {max(roots, key=len)} if roots else {component_filter}
             pkg = build_diffusers_pipeline(
                 args.model,
+                revision=revision,
                 dtype=dtype_override,
                 load_weights=load_weights,
                 components=pipeline_components,
@@ -342,7 +344,9 @@ def _cmd_build(args: argparse.Namespace) -> None:
             import transformers
 
             hf_config = transformers.AutoConfig.from_pretrained(
-                model_id_or_path, trust_remote_code=trust_remote_code
+                model_id_or_path,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
             )
             task = _resolve_static_cache_task(getattr(hf_config, "model_type", ""))
 
@@ -351,6 +355,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             task=task,
             dtype=dtype_override,
             load_weights=load_weights,
+            revision=revision,
             trust_remote_code=trust_remote_code,
             execution_provider=execution_provider,
             text_only=args.text_only,
@@ -424,6 +429,7 @@ def _save_package(
             ep=ep,
             local_config_dir=local_config_dir,
             trust_remote_code=getattr(args, "trust_remote_code", False),
+            revision=getattr(args, "revision", None),
         )
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
@@ -729,6 +735,14 @@ def main(argv: list[str] | None = None) -> None:
         "--trust-remote-code",
         action="store_true",
         help="Trust remote code when loading the HuggingFace model config.",
+    )
+    build_parser.add_argument(
+        "--revision",
+        default=None,
+        help=(
+            "Immutable HuggingFace revision used for config, weights, tokenizer, "
+            "and processor assets."
+        ),
     )
     build_parser.add_argument(
         "--dtype",

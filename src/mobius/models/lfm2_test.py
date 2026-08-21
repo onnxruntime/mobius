@@ -97,7 +97,10 @@ def test_cuda_graph_uses_lfm2_fusions():
 
     counts = Counter((node.domain or "", node.op_type) for node in model.graph)
     assert counts["", "Swish"] == 2
-    assert counts["com.microsoft", "CausalConvWithState"] == 1
+    # CUDA has no CausalConvWithState kernel. Its standard Conv function body
+    # must be inlined or ORT aborts while assigning providers.
+    assert counts["com.microsoft", "CausalConvWithState"] == 0
+    assert counts["", "Conv"] == 1
     assert counts["com.microsoft", "SkipSimplifiedLayerNormalization"] == 4
 
     remaining_norms = [node for node in model.graph if node.op_type == "RMSNormalization"]

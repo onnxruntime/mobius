@@ -452,6 +452,16 @@ def optimize_model(
         # ops like CausalConvWithState and LinearAttention registered per-model.
         if caps.name == "onnx-standard" and func.domain not in _STANDARD_ONNX_DOMAINS:
             return True
+        # ORT's CUDA EP has no CausalConvWithState kernel. Keeping the local
+        # function call causes TransformerMemcpy to inspect a node without a
+        # provider assignment and abort session initialization. Inline its
+        # standard Conv-based body so hybrid decoders run on CUDA.
+        if (
+            caps.name == "cuda"
+            and func.domain == "com.microsoft"
+            and func.name == "CausalConvWithState"
+        ):
+            return True
         if func.domain == "com.microsoft" and func.name in (
             "SkipLayerNormalization",
             "SkipSimplifiedLayerNormalization",
