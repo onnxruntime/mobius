@@ -626,7 +626,12 @@ def test_peft_rank_and_alpha_patterns_emit_heterogeneous_binding_overrides() -> 
             "weight_key": "layers.0.self_attn.v_proj",
         }
         assert len(declaration["weights"]) == 1
-        assert declaration["weights"][0]["format"] == "hf_peft"
+        source_weight = declaration["weights"][0]
+        assert source_weight["format"] == "hf_peft"
+        assert source_weight["config_location"].endswith("adapter_config.json")
+        assert "base_model_fingerprint" not in declaration
+        assert "sha256" not in source_weight
+        assert "config_sha256" not in source_weight
     finally:
         shutil.rmtree(directory)
 
@@ -692,7 +697,7 @@ def test_onnx_adapter_source_can_be_declared_for_native_capability() -> None:
         ]
         copied = output_directory / declared["location"]
         assert copied.read_bytes() == source_path.read_bytes()
-        assert declared["sha256"] == hashlib.sha256(copied.read_bytes()).hexdigest()
+        assert "sha256" not in declared
     finally:
         shutil.rmtree(directory)
 
@@ -765,9 +770,7 @@ def test_exact_onnx_genai_catalog_and_portable_bundle_serialization() -> None:
         add_adapter_service_to_metadata(metadata, package, str(directory))
         service = metadata["adapters"]
         assert "adapters" not in metadata["pipeline"]["workflow"]
-        assert service["base_model_fingerprint"].startswith(
-            "onnx-genai-targeted-base-v1:sha256:"
-        )
+        assert "base_model_fingerprint" not in service
         assert service["selection"] == {
             "segments": "request.adapter_segments",
             "adapter_counts": "request.adapter_counts",
@@ -830,8 +833,20 @@ def test_exact_onnx_genai_catalog_and_portable_bundle_serialization() -> None:
         assert weight["loader_capability"] == "onnx-genai.adapters.json@1"
         assert weight["scale_encoding"] == "alpha_over_rank"
         assert weight["location"] == "adapters/red/adapter.json"
-        assert len(weight["sha256"]) == 64
-        assert weight["sha256"] == hashlib.sha256(payload).hexdigest()
+        assert "sha256" not in weight
+        assert "config_sha256" not in weight
+        forbidden = {"base_model_fingerprint", "sha256", "config_sha256"}
+
+        def assert_hashless(value: object) -> None:
+            if isinstance(value, dict):
+                assert forbidden.isdisjoint(value)
+                for child in value.values():
+                    assert_hashless(child)
+            elif isinstance(value, list):
+                for child in value:
+                    assert_hashless(child)
+
+        assert_hashless(metadata)
         bundle = json.loads(payload)
         assert set(bundle["targets"]) == {"layers.0.self_attn.q_proj"}
         assert len(bundle["targets"]["layers.0.self_attn.q_proj"]["a"]) == 8

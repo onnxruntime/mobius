@@ -1651,7 +1651,6 @@ def add_adapter_service_to_metadata(
     if workflow is not None:
         workflow.pop("adapters", None)
     metadata["adapters"] = {
-        "base_model_fingerprint": manifest.base_fingerprint,
         "target_manifest": pkg.adapter_target_manifest_metadata(),
         "discovery_fallback": options.discovery_fallback,
         "selection": {

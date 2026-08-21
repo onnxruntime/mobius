@@ -20,7 +20,7 @@ from __future__ import annotations
 
 __all__ = ["ModelPackage"]
 
-import hashlib
+
 import inspect
 import logging
 import os
@@ -392,7 +392,6 @@ class ModelPackage(UserDict[str, ir.Model]):
                     {
                         "location": relative_location,
                         "loader_capability": "onnx-genai.adapters.json@1",
-                        "sha256": hashlib.sha256(payload).hexdigest(),
                         "scale_encoding": "alpha_over_rank",
                         "format": "json",
                     }
@@ -406,13 +405,10 @@ class ModelPackage(UserDict[str, ir.Model]):
                     relative_location = f"adapters/{alias}/adapter.onnx_adapter"
                     destination = os.path.join(directory, relative_location)
                     shutil.copyfile(source_path, destination)
-                    with open(destination, "rb") as handle:
-                        payload = handle.read()
                     weight_artifacts.append(
                         {
                             "location": relative_location,
                             "loader_capability": "onnxruntime.lora-adapter@1",
-                            "sha256": hashlib.sha256(payload).hexdigest(),
                             "scale_encoding": "baked",
                             "format": "ort_genai",
                         }
@@ -429,17 +425,11 @@ class ModelPackage(UserDict[str, ir.Model]):
                     config_destination = os.path.join(directory, relative_config)
                     shutil.copyfile(source_weights, destination)
                     shutil.copyfile(source_config, config_destination)
-                    with open(destination, "rb") as handle:
-                        payload = handle.read()
-                    with open(config_destination, "rb") as handle:
-                        config_payload = handle.read()
                     weight_artifacts.append(
                         {
                             "location": relative_location,
                             "loader_capability": "onnx-genai.adapters.hf-peft@1",
-                            "sha256": hashlib.sha256(payload).hexdigest(),
                             "config_location": relative_config,
-                            "config_sha256": hashlib.sha256(config_payload).hexdigest(),
                             "scale_encoding": "alpha_over_rank",
                             "format": "hf_peft",
                         }
@@ -462,7 +452,6 @@ class ModelPackage(UserDict[str, ir.Model]):
                 "index": artifact_index,
                 "identity": artifact.stable_identity,
                 "version": artifact.version,
-                "base_model_fingerprint": artifact.base_fingerprint,
                 "rank": rank,
                 "alpha": alpha,
                 "dtype": dtype,
