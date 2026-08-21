@@ -422,7 +422,7 @@ class _MoTAttention(nn.Module):
         part_hw = norm_hw(op, part_hw)
 
         cos_t, sin_t, cos_h, sin_h, cos_w, sin_w = position_embeddings
-        part_t = _rotate_half_axis(op, part_t, cos_t, sin_t, num_heads, half)
+        part_t = _rotate_half_axis(op, part_t, cos_t, sin_t, half)
         part_h = op.Slice(
             part_hw,
             op.Constant(value_ints=[0]),
@@ -435,8 +435,8 @@ class _MoTAttention(nn.Module):
             op.Constant(value_ints=[half]),
             op.Constant(value_ints=[3]),
         )
-        part_h = _rotate_half_axis(op, part_h, cos_h, sin_h, num_heads, quarter)
-        part_w = _rotate_half_axis(op, part_w, cos_w, sin_w, num_heads, quarter)
+        part_h = _rotate_half_axis(op, part_h, cos_h, sin_h, quarter)
+        part_w = _rotate_half_axis(op, part_w, cos_w, sin_w, quarter)
 
         merged = op.Concat(part_t, part_h, part_w, axis=-1)
         return op.Reshape(
@@ -452,7 +452,6 @@ class _MoTAttention(nn.Module):
         attention_mask: ir.Value | None = None,
         past_key: ir.Value | None = None,
         past_value: ir.Value | None = None,
-        update_cache: bool = True,
     ):
         query = self._p("q_proj")(op, hidden_states)
         key = self._p("k_proj")(op, hidden_states)
@@ -500,7 +499,6 @@ def _rotate_half_axis(
     x: ir.Value,
     cos: ir.Value,
     sin: ir.Value,
-    num_heads: int,
     axis_dim: int,
 ):
     """Half-split (``rotate_half``) RoPE over one axis of every head.
@@ -523,7 +521,6 @@ def _rotate_half_axis(
     )
     cos_b = op.Unsqueeze(cos, op.Constant(value_ints=[2]))
     sin_b = op.Unsqueeze(sin, op.Constant(value_ints=[2]))
-    del num_heads
     rot_first = op.Sub(op.Mul(first, cos_b), op.Mul(second, sin_b))
     rot_second = op.Add(op.Mul(second, cos_b), op.Mul(first, sin_b))
     return op.Concat(rot_first, rot_second, axis=-1)
@@ -560,7 +557,6 @@ class _MoTDecoderLayer(nn.Module):
         attention_mask: ir.Value | None = None,
         past_key: ir.Value | None = None,
         past_value: ir.Value | None = None,
-        update_cache: bool = True,
     ):
         residual = hidden_states
         hidden_states = getattr(self, f"input_layernorm{self.branch}")(op, hidden_states)
@@ -571,7 +567,6 @@ class _MoTDecoderLayer(nn.Module):
             attention_mask=attention_mask,
             past_key=past_key,
             past_value=past_value,
-            update_cache=update_cache,
         )
         hidden_states = op.Add(residual, hidden_states)
 
@@ -722,7 +717,6 @@ class _SenseNovaU1DecoderBody(nn.Module):
         attention_mask: ir.Value | None = None,
         position_ids: ir.Value | None = None,
         past_key_values: list | None = None,
-        update_cache: bool = True,
     ):
         position_embeddings = self.rotary_emb(op, position_ids)
         # Block-causal masking is intrinsic to NEO-unify: image patches that
@@ -751,7 +745,6 @@ class _SenseNovaU1DecoderBody(nn.Module):
                 attention_mask=attention_bias,
                 past_key=past_key,
                 past_value=past_value,
-                update_cache=update_cache,
             )
             present.append((present_key, present_value))
         hidden_states = getattr(self, f"norm{self.branch}")(op, hidden_states)
@@ -780,8 +773,6 @@ class _SenseNovaU1EmbeddingModel(nn.Module):
         if image_features is None:
             return inputs_embeds
         # Scatter image features at ``<IMG_CONTEXT>`` placeholder positions.
-        mask = op.Unsqueeze(image_mask, op.Constant(value_ints=[-1]))
-        mask = op.Expand(mask, op.Shape(inputs_embeds))
         flat_embeds = op.Reshape(
             inputs_embeds, op.Constant(value_ints=[-1, self.config.hidden_size])
         )
@@ -793,7 +784,6 @@ class _SenseNovaU1EmbeddingModel(nn.Module):
             op.Constant(value_ints=[-1, 1]),
         )
         scattered = op.ScatterND(flat_embeds, indices, flat_features)
-        del mask
         return op.Reshape(scattered, op.Shape(inputs_embeds))
 
 
@@ -921,7 +911,6 @@ class _SenseNovaU1ImageGenDenoiserModel(nn.Module):
             attention_mask=None,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            update_cache=False,
         )
         # (B, h*w, hidden) -> (B, hidden, h, w)
         grid_h = op.Slice(
@@ -1022,6 +1011,14 @@ class SenseNovaU1Model(nn.Module):
         for key, value in state_dict.items():
             for target in self._targets_for(key):
                 renamed[target] = value
+        # Tied-embedding variants ship no ``lm_head`` tensor.  The released
+        # 8B checkpoint is untied, but the family is declared with a
+        # ``mot_unified`` variant so smaller tied backbones are plausible.
+        if self.config.tie_word_embeddings:
+            head = "decoder.lm_head.weight"
+            embed = "embedding.embed_tokens.weight"
+            if head not in renamed and embed in renamed:
+                renamed[head] = renamed[embed]
         return renamed
 
     def _targets_for(self, key: str) -> list[str]:

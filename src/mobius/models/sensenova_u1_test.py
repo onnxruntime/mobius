@@ -523,3 +523,29 @@ class TestInferenceMetadataStatus:
         # ships no preprocessor_config.json, so no processor program binds.
         assert "preprocessing metadata" in message
         assert "pixel_values" in message
+
+    def test_tied_embeddings_populate_the_lm_head(self):
+        """Tied variants ship no ``lm_head`` tensor of their own."""
+        import torch
+
+        config = _tiny_config()
+        config.tie_word_embeddings = True
+        module = SenseNovaU1Model(config)
+        weights = module.preprocess_weights(
+            {"language_model.model.embed_tokens.weight": torch.zeros(VOCAB, HIDDEN)}
+        )
+        assert "decoder.lm_head.weight" in weights
+        assert weights["decoder.lm_head.weight"] is weights["embedding.embed_tokens.weight"]
+
+    def test_untied_checkpoint_keeps_its_own_lm_head(self):
+        import torch
+
+        _, module, _ = _build()
+        head = torch.ones(VOCAB, HIDDEN)
+        weights = module.preprocess_weights(
+            {
+                "language_model.model.embed_tokens.weight": torch.zeros(VOCAB, HIDDEN),
+                "language_model.lm_head.weight": head,
+            }
+        )
+        assert weights["decoder.lm_head.weight"] is head
