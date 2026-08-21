@@ -487,6 +487,16 @@ def detect_affected_models(
         # through to the transitive scan below.
         if module_name in registry_map:
             affected.update(registry_map[module_name])
+
+            # Also include directly registered model modules that import this one.
+            # Some architectures are implemented as thin wrappers over another
+            # model module (e.g. importing a base model class).
+            direct_dependents = {
+                mod for mod, deps in import_graph.items() if module_name in deps
+            }
+            for dep_module in direct_dependents:
+                if dep_module in registry_map:
+                    affected.update(registry_map[dep_module])
             continue
 
         # Transitive: find modules that import from this model file.
