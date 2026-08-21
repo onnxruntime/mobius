@@ -1227,6 +1227,180 @@ class TestExportForOrtGenai:
         assert model["vision"]["patch_size"] == 16
         assert model["vision"]["window_size"] == 64
 
+    def test_qwen35_vl_uses_native_qwen35_runtime_type(self, tmp_path):
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 448
+            patch_size: int = 16
+            spatial_merge_size: int = 2
+            window_size: int = 112
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "qwen3_5_vl"
+            vocab_size: int = 248064
+            hidden_size: int = 2048
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 16
+            num_key_value_heads: int = 8
+            head_dim: int = 128
+            image_token_id: int = 248056
+            vision_start_token_id: int = 248053
+            video_token_id: int = 248057
+            tokens_per_second: float = 2.0
+            temporal_patch_size: int = 2
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+
+        pkg = ModelPackage(
+            {
+                "decoder": _mock_model(),
+                "vision_encoder": _mock_model(),
+                "embedding": _mock_model(),
+            },
+            config=FakeConfig(),
+        )
+
+        result = write_ort_genai_config(pkg, str(tmp_path), ep="trt-rtx")
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+        model = data["model"]
+        assert model["type"] == "qwen3_5"
+        assert model["image_token_id"] == 248056
+        assert model["vision_start_token_id"] == 248053
+        assert model["video_token_id"] == 248057
+        assert model["vision"]["patch_size"] == 16
+        assert model["vision"]["window_size"] == 112
+        assert model["vision"]["tokens_per_second"] == pytest.approx(2.0)
+        assert (
+            model["decoder"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "enable_cuda_graph"
+            ]
+            == "1"
+        )
+        assert (
+            model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "enable_cuda_graph"
+            ]
+            == "0"
+        )
+        assert (
+            model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "enable_cuda_graph"
+            ]
+            == "0"
+        )
+        assert (
+            model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "nv_profile_min_shapes"
+            ]
+            == "input_ids:1x1,image_features:0x1024"
+        )
+        assert (
+            model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "nv_profile_opt_shapes"
+            ]
+            == "input_ids:1x226,image_features:192x1024"
+        )
+        assert (
+            model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "nv_profile_max_shapes"
+            ]
+            == "input_ids:1x1024,image_features:2520x1024"
+        )
+        assert (
+            model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "nv_profile_min_shapes"
+            ]
+            == "pixel_values:600x1536"
+        )
+        assert (
+            model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "nv_profile_opt_shapes"
+            ]
+            == "pixel_values:600x1536"
+        )
+        assert (
+            model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "nv_profile_max_shapes"
+            ]
+            == "pixel_values:600x1536"
+        )
+
+    def test_qwen36_vl_hf_parent_type_maps_to_qwen35_runtime(self, tmp_path):
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 448
+            patch_size: int = 16
+            spatial_merge_size: int = 2
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            # build_transformers_model unwraps Qwen3.6 VL to the text sub-config,
+            # but write_ort_genai_config must preserve the multimodal HF parent
+            # type and map it to ORT GenAI's native qwen3_5 runtime.
+            model_type: str = "qwen3_5_moe_text"
+            vocab_size: int = 248064
+            hidden_size: int = 2048
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 16
+            num_key_value_heads: int = 8
+            head_dim: int = 128
+            image_token_id: int = 248056
+            vision_start_token_id: int = 248053
+            video_token_id: int = 248057
+            tokens_per_second: float = 2.0
+            temporal_patch_size: int = 2
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+
+        pkg = ModelPackage(
+            {
+                "decoder": _mock_model(),
+                "vision_encoder": _mock_model(),
+                "embedding": _mock_model(),
+            },
+            config=FakeConfig(),
+        )
+
+        hf_config = mock.MagicMock(
+            model_type="qwen3_5_moe",
+            bos_token_id=248044,
+            eos_token_id=248044,
+            pad_token_id=248044,
+        )
+        with (
+            mock.patch("transformers.AutoConfig.from_pretrained", return_value=hf_config),
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._load_generation_config",
+                return_value=None,
+            ),
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files",
+                return_value=[],
+            ),
+            mock.patch("transformers.AutoProcessor.from_pretrained", side_effect=OSError),
+        ):
+            result = write_ort_genai_config(
+                pkg,
+                str(tmp_path),
+                hf_model_id="Qwen/Qwen3.6-35B-A3B",
+            )
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+        assert data["model"]["type"] == "qwen3_5"
+        assert data["model"]["vision"]["patch_size"] == 16
+
     def test_mage_vl_is_rejected_before_writing_runtime_artifacts(self, tmp_path):
         import dataclasses
 
