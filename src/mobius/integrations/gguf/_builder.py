@@ -21,7 +21,7 @@ __all__ = ["build_from_gguf"]
 import logging
 import re
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -437,6 +437,25 @@ def build_from_gguf(
     else:
         resolved_task = task
 
+    # 4b. If the GGUF ships a trailing MTP / "nextn" self-speculative head,
+    # expose the backbone's final-layer hidden state as a graph output so the
+    # orchestrator can seed the head with it. This must be set before the
+    # module/graph is built. Direct field assignment (not dataclasses.replace)
+    # preserves the ``_gguf_*`` metadata attributes set on the config.
+    from mobius.integrations.gguf._mtp import build_mtp_head_from_gguf, has_mtp_head
+
+    if has_mtp_head(config) and not static_cache:
+        seed_index = int(config.num_hidden_layers) - 1
+        existing = list(config.output_layer_indices or [])
+        if seed_index not in existing:
+            existing.append(seed_index)
+        config.output_layer_indices = existing
+        logger.info(
+            "MTP head present: exposing backbone hidden-state seed output "
+            "hidden_states.%d",
+            seed_index,
+        )
+
     # 5. Build ONNX graph
     module = module_class(config)
     if preserve_quantization:
@@ -495,6 +514,26 @@ def build_from_gguf(
     # 9. Apply weights to ONNX model
     prefix_map = getattr(module, "weight_prefix_map", None)
     pkg.apply_weights(state_dict, prefix_map=prefix_map)
+
+    # 10. Build the trailing MTP / "nextn" self-speculative head sidecar from
+    # the GGUF's ``blk.<nextn>.*`` tensors (dropped by the backbone build) and
+    # attach it to the package so the CLI can save it into a ``mtp/`` subdir.
+    if has_mtp_head(config):
+        try:
+            mtp_pkg = build_mtp_head_from_gguf(
+                gguf_model,
+                config,
+                preserve_quantization=preserve_quantization,
+                execution_provider=execution_provider,
+            )
+        except Exception:  # pragma: no cover - defensive: never fail the backbone
+            logger.exception(
+                "Failed to build the Qwen3.5/3.8 MTP head sidecar; the backbone "
+                "model was exported without a self-speculative drafter."
+            )
+            mtp_pkg = None
+        if mtp_pkg is not None:
+            pkg.mtp_head = mtp_pkg
 
     return pkg
 
@@ -1223,8 +1262,16 @@ def repack_gguf_weight_to_target(
 def _load_dequantized_state_dict(
     gguf_model,
     gguf_arch: str,
+    name_mapper: Callable[[str, str], str | None] | None = None,
+    warn_unmapped: bool = True,
 ) -> dict:
-    """Load all tensors dequantized to float (Phase 1 path)."""
+    """Load all tensors dequantized to float (Phase 1 path).
+
+    ``name_mapper`` maps a GGUF tensor name to its target state-dict key (or
+    ``None`` to skip). Defaults to the main-model mapping; the MTP head builder
+    injects a head-scoped mapper so the trailing ``blk.<mtp>.nextn.*`` /
+    attention block is routed to the head module instead of being dropped.
+    """
     import numpy as np
     import torch
 
@@ -1232,13 +1279,16 @@ def _load_dequantized_state_dict(
         map_gguf_to_hf_names,
     )
 
+    if name_mapper is None:
+        name_mapper = map_gguf_to_hf_names
+
     state_dict = {}
     for gguf_name, np_array in tqdm.tqdm(
         gguf_model.tensor_items(),
         desc="Dequantizing tensors",
         total=len(gguf_model._tensor_index),
     ):
-        hf_name = map_gguf_to_hf_names(gguf_name, gguf_arch)
+        hf_name = name_mapper(gguf_name, gguf_arch)
         if hf_name is not None:
             # F32/F16 tensors are mmap'd read-only views; make
             # writable so PyTorch can mutate if needed.
@@ -1246,7 +1296,8 @@ def _load_dequantized_state_dict(
                 np_array = np.array(np_array)
             state_dict[hf_name] = torch.from_numpy(np_array)
         else:
-            logger.warning("Unmapped GGUF tensor: %s (skipped)", gguf_name)
+            if warn_unmapped:
+                logger.warning("Unmapped GGUF tensor: %s (skipped)", gguf_name)
     return state_dict
 
 
@@ -1255,6 +1306,8 @@ def _load_quantized_state_dict(
     gguf_arch: str,
     module,
     config,
+    name_mapper: Callable[[str, str], str | None] | None = None,
+    warn_unmapped: bool = True,
 ) -> dict:
     """Load tensors, preserving native blocks or normalizing to MatMulNBits.
 
@@ -1290,6 +1343,9 @@ def _load_quantized_state_dict(
     from mobius.integrations.gguf._tensor_processors import (
         _reverse_permute,
     )
+
+    if name_mapper is None:
+        name_mapper = map_gguf_to_hf_names
 
     # Collect module paths that use QuantizedLinear so we know
     # which .weight parameters should receive repacked data.
@@ -1333,9 +1389,10 @@ def _load_quantized_state_dict(
         desc="Repacking tensors",
         total=len(gguf_model._tensor_index),
     ):
-        hf_name = map_gguf_to_hf_names(gguf_name, gguf_arch)
+        hf_name = name_mapper(gguf_name, gguf_arch)
         if hf_name is None:
-            logger.warning("Unmapped GGUF tensor: %s (skipped)", gguf_name)
+            if warn_unmapped:
+                logger.warning("Unmapped GGUF tensor: %s (skipped)", gguf_name)
             continue
 
         # Determine the int value of the quant type for can_repack

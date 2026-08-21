@@ -245,6 +245,8 @@ def gguf_to_config(
     # an extra decoder layer whose linear-attention / GQA initializers have no
     # backing GGUF weights and fail the ``_check_weights`` invariant on save.
     nextn_layers = metadata.get(f"{gguf_arch}.nextn_predict_layers")
+    mtp_predict_layers = 0
+    mtp_block_indices: list[int] = []
     if nextn_layers is not None and int(nextn_layers) > 0:
         mtp_count = int(nextn_layers)
         decoder_layers = int(hf_fields["num_hidden_layers"]) - mtp_count
@@ -255,6 +257,13 @@ def gguf_to_config(
                 f"({mtp_count}) for architecture {gguf_arch}."
             )
         hf_fields["num_hidden_layers"] = decoder_layers
+        # The trailing ``mtp_count`` GGUF blocks (indices ``decoder_layers`` ..
+        # ``decoder_layers + mtp_count - 1``) hold the self-speculative MTP head
+        # weights (``blk.<n>.nextn.*`` plus the head's own attention/FFN block).
+        # Surface them so the builder can emit the MTP sidecar instead of
+        # silently dropping the tensors.
+        mtp_predict_layers = mtp_count
+        mtp_block_indices = list(range(decoder_layers, decoder_layers + mtp_count))
 
     # Derive head_dim if not explicitly provided.
     # Prefer attention.key_length (the actual head dimension) over
@@ -479,6 +488,11 @@ def gguf_to_config(
         config = postprocessor(config, metadata)
         config._gguf_model_type = model_type
         config.model_type = model_type
+
+    # Re-surface after any postprocessor swap so the MTP metadata survives on
+    # the final config instance.
+    config._gguf_nextn_predict_layers = mtp_predict_layers
+    config._gguf_mtp_block_indices = mtp_block_indices
 
     logger.info(
         "Extracted config from GGUF: arch=%s, model_type=%s, "
