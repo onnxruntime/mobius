@@ -404,6 +404,7 @@ class GenaiConfigGenerator:
         filename: str = "embedding/model.onnx",
         input_names: dict[str, str] | None = None,
         output_names: dict[str, str] | None = None,
+        provider_options: dict[str, str] | None = None,
     ) -> GenaiConfigGenerator:
         """Add a standalone multimodal embedding stage."""
         self._embedding = {
@@ -420,6 +421,7 @@ class GenaiConfigGenerator:
             "session_options": _make_session_options(
                 self.ep,
                 enable_graph_capture=False,
+                provider_options=provider_options,
             ),
         }
         return self

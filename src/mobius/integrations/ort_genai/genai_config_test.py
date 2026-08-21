@@ -670,6 +670,35 @@ def test_cuda_decoder_graph_capture_can_be_disabled():
     assert decoder_options[0]["cuda"]["enable_cuda_graph"] == "0"
 
 
+def test_embedding_session_options_can_be_updated():
+    gen = GenaiConfigGenerator(
+        "gemma4",
+        vocab_size=262144,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="trt-rtx",
+    ).with_embedding(
+        provider_options={
+            "nv_profile_min_shapes": "input_ids:1x1,image_features:0x1024",
+            "nv_profile_opt_shapes": "input_ids:1x226,image_features:192x1024",
+        },
+    )
+
+    embedding_options = gen.generate()["model"]["embedding"]["session_options"][
+        "provider_options"
+    ][0]["NvTensorRtRtx"]
+    assert embedding_options["enable_cuda_graph"] == "0"
+    assert embedding_options["nv_profile_min_shapes"] == (
+        "input_ids:1x1,image_features:0x1024"
+    )
+    assert embedding_options["nv_profile_opt_shapes"] == (
+        "input_ids:1x226,image_features:192x1024"
+    )
+
+
 class TestGenaiConfigWrite:
     """Test writing genai_config.json to disk."""
 
