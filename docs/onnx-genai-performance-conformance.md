@@ -157,12 +157,28 @@ gated on re-running both suites. Everywhere else, changes are described by what
 they do.
 
 This is not hypothetical. The pin was verified against the branch head, that
-head was later rebased, and the pinned commit became reachable from no ref —
-`git ls-remote` showed zero matches and no remote ref had it as an ancestor.
+head was later rebased, and the pinned commit became reachable from no ref.
 `actions/checkout` would have kept succeeding until the object was collected
 and then failed with `reference is not a tree` on a commit no one could
-inspect. Bumping a pin is therefore checked with `ls-remote` plus an ancestry
-test rather than with an API call that answers just as happily for an orphan.
+inspect.
+
+Two checks are easy to confuse, and only one of them answers the question:
+
+- `git ls-remote | grep <sha>` asks whether the commit is a ref *tip*. A
+  perfectly healthy pin fails this test the moment one more commit lands on
+  the branch, so a zero here means nothing on its own.
+- `git merge-base --is-ancestor <sha> <branch-tip>` asks whether the commit is
+  *reachable*, which is what decides both whether `checkout` resolves it and
+  whether it can be collected. This is the check that matters.
+- `gh api .../commits/<sha>` answers 200 for unreferenced objects, so it fails
+  open and must not be used for either question.
+
+Because that branch is rebased on someone else's schedule, reachability is not
+ours to rely on. The tag `mobius-pr478-pin` in `justinchuby/onnx-genai` anchors
+the exact commit this workflow pins, so the object survives any rebase of the
+branch it came from. The workflow still pins the SHA rather than the tag: the
+SHA is what makes the run reproducible, and the tag exists only to keep it
+alive. Move the tag when the pin moves, and delete it when nothing pins it.
 
 ### What the fixtures commit, and what they do not
 
