@@ -1455,6 +1455,44 @@ class Lfm2Config(CausalLMConfig):
 
 
 @dataclasses.dataclass
+class Lfm2VlConfig(Lfm2Config):
+    """Configuration for LiquidAI LFM2-VL (SigLIP2 NaFlex + LFM2 decoder).
+
+    The HuggingFace ``Lfm2VlConfig`` is composite: the LFM2 decoder fields
+    live under ``text_config`` (which is what ``config`` refers to here) and
+    the projector knobs sit on the top-level composite, reachable through
+    ``parent_config``.  The SigLIP2 NaFlex geometry is extracted separately
+    into :attr:`ArchitectureConfig.vision`.
+    """
+
+    downsample_factor: int = 2
+    projector_hidden_act: str = "gelu"
+    projector_hidden_size: int = 2048
+    projector_bias: bool = True
+    projector_use_layernorm: bool = False
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Lfm2VlConfig:
+        base = Lfm2Config.from_transformers(config, parent_config)
+        # Projector fields are top-level on the composite config.
+        source = parent_config if parent_config is not None else config
+        result = cls(
+            **_shallow_fields(base),
+            downsample_factor=getattr(source, "downsample_factor", 2),
+            projector_hidden_act=getattr(source, "projector_hidden_act", "gelu"),
+            projector_hidden_size=getattr(source, "projector_hidden_size", base.hidden_size),
+            projector_bias=getattr(source, "projector_bias", True),
+            projector_use_layernorm=getattr(source, "projector_use_layernorm", False),
+        )
+        # Preserve the composite identity; ``config`` is the nested LFM2 text
+        # config and would otherwise report ``model_type="lfm2"``.
+        result.model_type = "lfm2_vl"
+        if result.image_token_id is None:
+            result.image_token_id = getattr(source, "image_token_id", None)
+        return result
+
+
+@dataclasses.dataclass
 class DFlashConfig(CausalLMConfig):
     """Configuration for the DFlash speculative-decoding draft model.
 

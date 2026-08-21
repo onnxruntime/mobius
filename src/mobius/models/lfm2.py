@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import dataclasses
+from typing import TypeVar
 
 import onnx_ir as ir
 import torch
@@ -22,6 +23,45 @@ from mobius.components import (
     initialize_rope,
 )
 from mobius.models.base import CausalLMModel
+
+_ConfigT = TypeVar("_ConfigT", bound=ArchitectureConfig)
+
+
+def apply_lfm2_config_defaults(config: _ConfigT) -> _ConfigT:
+    """Materialise the config knobs that HuggingFace's ``Lfm2`` hardcodes.
+
+    LFM2 always uses per-head Q/K RMSNorm and a SiLU-gated feed-forward
+    block, and ``Lfm2MLP`` adjusts the configured ``intermediate_size`` at
+    construction time. Resolving both here keeps the text-only and
+    vision-language entry points on exactly the same decoder configuration.
+    """
+    updates: dict[str, object] = {
+        "attn_qk_norm": True,
+        "hidden_act": config.hidden_act or "silu",
+    }
+    if isinstance(config, Lfm2Config):
+        updates["intermediate_size"] = config.effective_intermediate_size
+        # The width is now materialized; prevent subsequent consumers from
+        # applying the HuggingFace construction-time adjustment again.
+        updates["block_auto_adjust_ff_dim"] = False
+    return dataclasses.replace(config, **updates)
+
+
+def rename_lfm2_weight_key(key: str) -> str:
+    """Map one upstream LFM2 projection name onto the shared components."""
+    return (
+        key.replace(".self_attn.out_proj.", ".self_attn.o_proj.")
+        .replace(".self_attn.q_layernorm.", ".self_attn.q_norm.")
+        .replace(".self_attn.k_layernorm.", ".self_attn.k_norm.")
+        .replace(".feed_forward.w1.", ".feed_forward.gate_proj.")
+        .replace(".feed_forward.w3.", ".feed_forward.up_proj.")
+        .replace(".feed_forward.w2.", ".feed_forward.down_proj.")
+    )
+
+
+def rename_lfm2_weights(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Map upstream LFM2 projection names to shared mobius components."""
+    return {rename_lfm2_weight_key(key): value for key, value in state_dict.items()}
 
 
 class Lfm2RMSNorm(RMSNorm):
@@ -119,17 +159,24 @@ class Lfm2TextModel(nn.Module):
     def forward(
         self,
         op: OpBuilder,
-        input_ids: ir.Value,
+        input_ids: ir.Value | None,
         attention_mask: ir.Value,
         position_ids: ir.Value,
         past_key_values: list[tuple[ir.Value, ...]] | None = None,
+        inputs_embeds: ir.Value | None = None,
     ) -> tuple[ir.Value, list[tuple[ir.Value, ...]]]:
-        hidden_states = self.embed_tokens(op, input_ids)  # (B, T) -> (B, T, H)
+        # Multimodal callers pre-fuse image features and pass inputs_embeds.
+        if inputs_embeds is None:
+            assert input_ids is not None, "one of input_ids/inputs_embeds is required"
+            inputs_embeds = self.embed_tokens(op, input_ids)  # (B, T) -> (B, T, H)
+        hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(op, position_ids)
         # ONNX Attention applies causality internally; this mask carries padding only.
+        # Only dims 0 and 1 of the first argument are read, so passing the
+        # rank-3 embeddings works for both the token and embeds entry points.
         attention_bias = create_padding_mask(
             op,
-            input_ids=input_ids,
+            input_ids=hidden_states,
             attention_mask=attention_mask,
         )
 
@@ -159,16 +206,7 @@ class Lfm2CausalLMModel(CausalLMModel):
 
     def __init__(self, config: ArchitectureConfig):
         # LFM2 hardcodes per-head Q/K RMSNorm and SiLU-gated feed-forward blocks.
-        updates: dict[str, object] = {
-            "attn_qk_norm": True,
-            "hidden_act": config.hidden_act or "silu",
-        }
-        if isinstance(config, Lfm2Config):
-            updates["intermediate_size"] = config.effective_intermediate_size
-            # The width is now materialized; prevent subsequent consumers from
-            # applying the HuggingFace construction-time adjustment again.
-            updates["block_auto_adjust_ff_dim"] = False
-        config = dataclasses.replace(config, **updates)
+        config = apply_lfm2_config_defaults(config)
         super().__init__(config)
         self.model = Lfm2TextModel(config)
         if config.tie_word_embeddings:
@@ -179,15 +217,4 @@ class Lfm2CausalLMModel(CausalLMModel):
         state_dict: dict[str, torch.Tensor],
     ) -> dict[str, torch.Tensor]:
         """Map upstream LFM2 projection names to shared mobius components."""
-        renamed: dict[str, torch.Tensor] = {}
-        for key, value in state_dict.items():
-            new_key = (
-                key.replace(".self_attn.out_proj.", ".self_attn.o_proj.")
-                .replace(".self_attn.q_layernorm.", ".self_attn.q_norm.")
-                .replace(".self_attn.k_layernorm.", ".self_attn.k_norm.")
-                .replace(".feed_forward.w1.", ".feed_forward.gate_proj.")
-                .replace(".feed_forward.w3.", ".feed_forward.up_proj.")
-                .replace(".feed_forward.w2.", ".feed_forward.down_proj.")
-            )
-            renamed[new_key] = value
-        return super().preprocess_weights(renamed)
+        return super().preprocess_weights(rename_lfm2_weights(state_dict))

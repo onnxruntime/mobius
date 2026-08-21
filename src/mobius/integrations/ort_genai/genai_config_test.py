@@ -100,6 +100,28 @@ class TestGenaiConfigGeneratorLLM:
         assert decoder["outputs"]["present_conv_names"] == "present.%d.conv_state"
         assert gen.generate()["search"]["past_present_share_buffer"] is False
 
+    def test_lfm2_vl_decoder_declares_hybrid_cache(self):
+        gen = GenaiConfigGenerator(
+            "lfm2_vl",
+            vocab_size=128000,
+            hidden_size=2048,
+            num_hidden_layers=4,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            head_dim=64,
+            layer_types=["conv", "conv", "full_attention", "conv"],
+            conv_cache_size=2,
+        )
+        gen.with_vision(image_token_id=124907, spatial_merge_size=None)
+
+        config = gen.generate()
+        decoder = config["model"]["decoder"]
+        assert decoder["layer_types"] == ["conv", "conv", "full_attention", "conv"]
+        assert decoder["conv_cache_size"] == 2
+        assert decoder["inputs"]["past_conv_names"] == "past_key_values.%d.conv_state"
+        assert decoder["outputs"]["present_conv_names"] == "present.%d.conv_state"
+        assert config["search"]["past_present_share_buffer"] is False
+
     def test_lfm2_kernel_one_preserves_zero_width_cache(self):
         gen = GenaiConfigGenerator(
             "lfm2",

@@ -32,6 +32,7 @@ from mobius._configs.per_model import (  # noqa: F401
     _glm_ocr_vision,
     _hunyuan_vl_mot_vision,
     _internvl_vision,
+    _lfm2_vl_vision,
     _mage_vl_vision,
     _minicpmv4_6_vision,
     _muse_glimmer_vision,

@@ -263,6 +263,7 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
             case.model_id,
             dtype=dtype_map[case.dtype],
             device=device,
+            revision=case.revision,
         )
     else:
         model, tokenizer = load_torch_model(
@@ -886,7 +887,9 @@ def _load_speech_language_model(case: TestCase, device: str) -> tuple:
         )
 
         model, _tokenizer, processor = load_torch_multimodal_model(
-            case.model_id, device=device
+            case.model_id,
+            device=device,
+            revision=case.revision,
         )
         forward_model = model
 

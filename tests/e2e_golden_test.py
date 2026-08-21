@@ -320,7 +320,7 @@ def _make_empty_kv_cache(
             ltype = (
                 layer_types[layer_idx] if layer_idx < len(layer_types) else "full_attention"
             )
-            if ltype in ("linear_attention", "mamba", "mamba2"):
+            if ltype in ("conv", "linear_attention", "mamba", "mamba2"):
                 # Fixed-size recurrent state: replace symbolic dims with 1
                 static = [d if isinstance(d, int) and d > 0 else 1 for d in shape]
             else:
@@ -1208,10 +1208,11 @@ def _make_vl_decoder_cache_feeds(
         ltype = layer_types[layer_idx] if layer_idx < len(layer_types) else "full_attention"
         shape = dec_session.get_input_shape(name) or []
 
-        if ltype in ("linear_attention", "mamba", "mamba2"):
+        if ltype in ("conv", "linear_attention", "mamba", "mamba2"):
             # Fixed-size recurrent state: replace symbolic/zero dims with 1
             feeds[name] = np.zeros(
-                [d if isinstance(d, int) and d > 0 else 1 for d in shape], dtype=np.float32
+                [d if isinstance(d, int) and d > 0 else 1 for d in shape],
+                dtype=dec_session.get_input_dtype(name) or np.float32,
             )
         else:
             # Standard KV cache: seq dim starts at 0 (empty)
@@ -1230,7 +1231,9 @@ def _update_vl_cache(
     num_hidden_layers = getattr(config, "num_hidden_layers", 0)
     for i in range(num_hidden_layers):
         ltype = layer_types[i] if i < len(layer_types) else "full_attention"
-        if ltype == "linear_attention":
+        if ltype == "conv":
+            suffixes = ("conv_state",)
+        elif ltype == "linear_attention":
             suffixes = ("conv_state", "recurrent_state")
         elif ltype in ("mamba", "mamba2"):
             suffixes = ("conv_state", "ssm_state")
@@ -2949,6 +2952,11 @@ class TestL5GenerationE2E:
                 f"expected {expected_len}, got {actual_len}"
             )
         if actual_len != expected_len:
+            if tolerances.min_token_match_ratio >= 1.0:
+                pytest.fail(
+                    f"L5 FAIL: exact generation length changed for {case.case_id}: "
+                    f"expected {expected_len}, got {actual_len}"
+                )
             warnings.warn(
                 f"Length mismatch for {case.case_id}: "
                 f"expected {expected_len} tokens, "

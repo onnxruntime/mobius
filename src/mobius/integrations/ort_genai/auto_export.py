@@ -92,6 +92,7 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "mistral": "mistral",
     "mistral3": "mistral3",
     "lfm2": "lfm2",
+    "lfm2_vl": "lfm2_vl",
     # HunYuan-V1 dense / Hy-MT1.5 — generic decoder LLM type accepted by
     # ORT GenAI (see onnxruntime-genai/src/models/model_type.h LLM list).
     "hunyuan_v1_dense": "decoder",
@@ -125,6 +126,7 @@ _GEMMA4_MODEL_TYPES = frozenset(
 # ``Generator.set_inputs`` (see examples/gemma4_unified_ort_genai.py).
 _GEMMA4_UNIFIED_MODEL_TYPES = frozenset({"gemma4_unified", "gemma4_unified_text"})
 _MINICPM_MODEL_TYPES = frozenset({"minicpmv4_6"})
+_LFM2_VL_MODEL_TYPES = frozenset({"lfm2_vl"})
 # gemma-3 multimodal. build() unwraps the composite HF config to its text
 # sub-config, so at export time ``config.model_type`` is "gemma3_text" (not
 # "gemma3").
@@ -168,6 +170,7 @@ _TOKENIZER_FILES = [
     # Preserve HuggingFace processor metadata for VLMs whose preprocessing
     # cannot be represented by an ort-extensions image_processor.json.
     "preprocessor_config.json",
+    "processor_config.json",
 ]
 
 
@@ -613,6 +616,17 @@ def _write_vision_processor_config(
         logger.info(
             "Skipping image_processor.json for %s "
             "(use MiniCPMV4_6Processor + Generator.set_inputs)",
+            model_type,
+        )
+        return None
+    if model_type in _LFM2_VL_MODEL_TYPES:
+        # LFM2-VL uses adaptive tiling, thumbnail insertion, NaFlex patchification,
+        # and prompt-token expansion. No ort-extensions transform implements that
+        # contract; preserve the pinned HF processor_config.json copied above and
+        # require callers to feed its three tensors through set_inputs().
+        logger.info(
+            "Skipping generated image processor for %s "
+            "(use Lfm2VlProcessor + Generator.set_inputs)",
             model_type,
         )
         return None
@@ -1148,6 +1162,11 @@ def _write_genai_config(
                 # MiniCPM performs both 2x2 merges inside the ONNX vision
                 # graph and consumes HF-prepacked pixels, not Qwen grid_thw.
                 vision_kwargs["spatial_merge_size"] = None
+            elif model_type in _LFM2_VL_MODEL_TYPES:
+                # Pixel unshuffle is already part of the ONNX vision encoder;
+                # ORT GenAI must not perform another spatial merge.
+                vision_kwargs["spatial_merge_size"] = None
+                vision_kwargs["config_filename"] = "processor_config.json"
             elif has_speech:
                 vision_kwargs["spatial_merge_size"] = None
                 # Gemma3n shares gemma3's fixed-resize branch in
@@ -1339,6 +1358,8 @@ def write_ort_genai_config(
             directory rather than a HuggingFace model ID.
         trust_remote_code: Allow custom HuggingFace configuration code when
             resolving token IDs and model type.
+        revision: Optional immutable HuggingFace revision used for every remote
+            configuration, tokenizer, and processor request.
 
     Returns:
         Dict mapping artifact name to file path, e.g.::
@@ -1553,8 +1574,8 @@ def write_ort_genai_config(
         config,
         directory,
         hf_model_id=hf_model_id,
-        revision=revision,
         trust_remote_code=trust_remote_code,
+        revision=revision,
     )
     if processor_path:
         result["processor_config"] = processor_path
@@ -1628,6 +1649,8 @@ def export_package(
             when ``hf_model_id`` is ``None``.
         trust_remote_code: Allow custom HuggingFace configuration code when
             resolving token IDs and model type.
+        revision: Optional immutable HuggingFace revision used for remote
+            configuration, tokenizer, and processor requests.
         external_data: External-data format passed to :meth:`ModelPackage.save`
             (``"onnx"`` or ``"safetensors"``).
         progress_bar: Whether to show the save progress bar.
@@ -1733,6 +1756,8 @@ def auto_export(
         external_data: External data format (``"onnx"`` or
             ``"safetensors"``).
         trust_remote_code: Trust remote code for HuggingFace config.
+        revision: Optional immutable HuggingFace revision used for all Hub
+            configuration, weight, tokenizer, and processor requests.
         context_length: Minimum context length for genai_config.json.
         ep: Execution provider for ``session_options`` in
             ``genai_config.json``. Defaults to ``"cpu"``. For non-CPU providers
