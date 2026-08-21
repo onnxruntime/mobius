@@ -73,9 +73,6 @@ preprocessing:
 pipeline:
   workflow:
     manifest:
-      ir_version: '1.0'
-      onnx_opsets:
-        ai.onnx: 24
       adapter_abis:
         onnx-genai.image-preprocess: '1'
       capabilities:

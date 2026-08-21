@@ -864,8 +864,6 @@ def _write_adapter_metadata(package: ModelPackage, directory: Path) -> None:
         "pipeline": {
             "workflow": {
                 "manifest": {
-                    "ir_version": "1.0",
-                    "onnx_opsets": {"ai.onnx": 24},
                     "adapter_abis": {"onnx-genai.parameter-overlay": "1"},
                     "capabilities": [
                         "workflow_ssa",

@@ -165,7 +165,8 @@ def test_dispatch_decoder(tmp_path):
     with open(arts["inference_metadata"]) as handle:
         meta = yaml.safe_load(handle)
     workflow = meta["pipeline"]["workflow"]
-    assert workflow["manifest"]["ir_version"] == "1.0"
+    assert "ir_version" not in workflow["manifest"]
+    assert "onnx_opsets" not in workflow["manifest"]
     assert workflow["components"]["token_sampler"]["contract"]["id"] == (
         "onnx-genai.token-sampler"
     )

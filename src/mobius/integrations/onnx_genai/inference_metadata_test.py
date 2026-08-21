@@ -135,7 +135,7 @@ def test_workflow_policy_components_reference_saved_onnx_artifacts(tmp_path):
     metadata = {
         "pipeline": {
             "workflow": {
-                "manifest": {"ir_version": "1.0"},
+                "manifest": {},
                 "components": {},
                 "graph": {"kind": "sequence", "nodes": []},
             }

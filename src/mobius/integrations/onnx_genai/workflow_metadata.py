@@ -16,7 +16,6 @@ import onnx_ir as ir
 import yaml
 
 from mobius._constants import (
-    OPSET_VERSION,
     STATIC_CACHE_KV_SEQUENCE_LENGTH,
     STATIC_CACHE_LAYOUT,
     STATIC_CACHE_SEQUENCE_AXIS,
@@ -501,8 +500,6 @@ def build_audio_codec_workflow_metadata(pkg: Any) -> dict[str, Any]:
     emit_effect = "audio_emit"
     workflow = {
         "manifest": {
-            "ir_version": "1.0",
-            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
             "capabilities": [
                 "workflow_ssa",
                 "linear_effects",
@@ -2045,8 +2042,6 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
     )
     workflow = {
         "manifest": {
-            "ir_version": "1.0",
-            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
             "capabilities": [
                 "workflow_ssa",
                 "linear_effects",
@@ -2563,8 +2558,6 @@ def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
     )
     workflow = {
         "manifest": {
-            "ir_version": "1.0",
-            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
             "capabilities": [
                 "workflow_ssa",
                 "linear_effects",
@@ -3207,8 +3200,6 @@ def build_diffusion_workflow_metadata(
 
     workflow = {
         "manifest": {
-            "ir_version": "1.0",
-            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
             "capabilities": [
                 "workflow_ssa",
                 "linear_effects",
@@ -3505,8 +3496,6 @@ def build_image_edit_workflow_metadata(
     latent_effect = "state:latent"
     workflow = {
         "manifest": {
-            "ir_version": "1.0",
-            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
             "capabilities": [
                 "workflow_ssa",
                 "linear_effects",
@@ -3977,8 +3966,6 @@ def build_video_diffusion_workflow_metadata(
     frames_contract = _request_aligned(_contract(vae_output))
     workflow = {
         "manifest": {
-            "ir_version": "1.0",
-            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
             "capabilities": [
                 "workflow_ssa",
                 "linear_effects",
@@ -5174,8 +5161,6 @@ def build_vlm_workflow_metadata(
     }
     workflow = {
         "manifest": {
-            "ir_version": "1.0",
-            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
             "adapter_abis": {"onnx-genai.image-preprocess": "1"},
             "capabilities": [
                 "workflow_ssa",
@@ -5943,8 +5928,6 @@ def build_speculative_workflow_metadata(
         )
     workflow = {
         "manifest": {
-            "ir_version": "1.0",
-            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
             "capabilities": [
                 "workflow_ssa",
                 "linear_effects",
@@ -7338,8 +7321,6 @@ def _build_autoregressive_workflow_metadata(
     )
     workflow = {
         "manifest": {
-            "ir_version": "1.0",
-            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
             **(
                 {"adapter_abis": {"onnx-genai.audio-preprocess": "1"}}
                 if audio_program is not None
@@ -7664,8 +7645,6 @@ def build_language_diffusion_pipeline_metadata(
 
     workflow = {
         "manifest": {
-            "ir_version": "1.0",
-            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
             "capabilities": [
                 "workflow_ssa",
                 "linear_effects",
@@ -7940,8 +7919,6 @@ def build_ctc_asr_workflow_metadata(
 
     workflow = {
         "manifest": {
-            "ir_version": "1.0",
-            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
             "adapter_abis": {_AUDIO_PREPROCESS_ABI: _AUDIO_PREPROCESS_ABI_VERSION},
             "capabilities": ["workflow_ssa", "linear_effects", "typed_emit"],
         },
@@ -8199,8 +8176,6 @@ def build_encoder_embedding_workflow_metadata(
 
     workflow = {
         "manifest": {
-            "ir_version": "1.0",
-            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
             "capabilities": ["workflow_ssa", "linear_effects", "typed_emit"],
         },
         "effects": {
@@ -9085,8 +9060,6 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
 
     workflow = {
         "manifest": {
-            "ir_version": "1.0",
-            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
             "capabilities": [
                 "workflow_ssa",
                 "linear_effects",
