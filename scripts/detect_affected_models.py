@@ -478,11 +478,20 @@ def detect_affected_models(
         if not module_name:
             continue
 
-        # Direct: this module's own registered types
+        # A concrete model module should only scope to the model_types it
+        # directly registers. Reverse-dependency expansion is intentionally
+        # skipped here so a change in one model implementation does not
+        # incorrectly cascade to sibling models that happen to import shared
+        # helpers from it. Shared-base modules (e.g. ``models/base.py``) do
+        # not map directly to registered model_types, so they still fall
+        # through to the transitive scan below.
         if module_name in registry_map:
             affected.update(registry_map[module_name])
+            continue
 
-        # Transitive: find modules that import from this model file
+        # Transitive: find modules that import from this model file.
+        # This is only used for infrastructure/shared-model modules without a
+        # direct registration. Example: a base class file used by many models.
         dependents = _find_reverse_dependents(module_name, import_graph)
         for dep_module in dependents:
             if dep_module in registry_map:
