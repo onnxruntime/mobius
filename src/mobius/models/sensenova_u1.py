@@ -956,9 +956,9 @@ class SenseNovaU1Model(nn.Module):
 
     Builds five ONNX graphs that mirror the upstream inference stages:
 
-    ``model``
+    ``decoder``
         Understanding decoder — text generation and VLM understanding.
-    ``vision``
+    ``vision_encoder``
         Reference-image tower feeding the understanding branch.
     ``embedding``
         Token embedding with reference-image feature scatter.
@@ -973,12 +973,12 @@ class SenseNovaU1Model(nn.Module):
     config_class: ClassVar[type[SenseNovaU1Config]] = SenseNovaU1Config
 
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
-        "model": (
+        "decoder": (
             "language_model.model.layers",
             "language_model.model.norm",
             "language_model.lm_head",
         ),
-        "vision": ("vision_model",),
+        "vision_encoder": ("vision_model",),
         "embedding": ("language_model.model.embed_tokens",),
         "image_gen_embedding": (
             "fm_modules.vision_model_mot_gen",
@@ -995,8 +995,8 @@ class SenseNovaU1Model(nn.Module):
     def __init__(self, config: SenseNovaU1Config):
         super().__init__()
         self.config = config
-        self.model = _SenseNovaU1DecoderModel(config)
-        self.vision = _SenseNovaU1VisionModel(config)
+        self.decoder = _SenseNovaU1DecoderModel(config)
+        self.vision_encoder = _SenseNovaU1VisionModel(config)
         self.embedding = _SenseNovaU1EmbeddingModel(config)
         self.image_gen_embedding = _SenseNovaU1ImageGenEmbeddingModel(config)
         self.image_gen_denoiser = _SenseNovaU1ImageGenDenoiserModel(config)
@@ -1004,8 +1004,8 @@ class SenseNovaU1Model(nn.Module):
     def forward(self, op: OpBuilder, **kwargs):
         raise NotImplementedError(
             "SenseNovaU1Model uses SenseNovaU1Task, which builds each "
-            "component (model, vision, embedding, image_gen_embedding, "
-            "image_gen_denoiser) separately."
+            "component (decoder, vision_encoder, embedding, "
+            "image_gen_embedding, image_gen_denoiser) separately."
         )
 
     def preprocess_weights(
@@ -1027,8 +1027,8 @@ class SenseNovaU1Model(nn.Module):
     def _targets_for(self, key: str) -> list[str]:
         """Map one HF key to its ONNX initializer name(s)."""
         if key.startswith("vision_model."):
-            # ``vision_model.embeddings.*`` -> ``vision.embeddings.*``
-            return [f"vision.{key[len('vision_model.') :]}"]
+            # ``vision_model.embeddings.*`` -> ``vision_encoder.embeddings.*``
+            return [f"vision_encoder.{key[len('vision_model.') :]}"]
 
         if key.startswith("fm_modules."):
             suffix = key[len("fm_modules.") :]
@@ -1041,12 +1041,12 @@ class SenseNovaU1Model(nn.Module):
             if suffix.startswith("model.embed_tokens."):
                 return [f"embedding.{suffix[len('model.') :]}"]
             if suffix.startswith("lm_head."):
-                return [f"model.{suffix}"]
+                return [f"decoder.{suffix}"]
             if suffix == "model.norm.weight":
-                return ["model.model.norm.weight"]
+                return ["decoder.model.norm.weight"]
             if suffix == "model.norm_mot_gen.weight":
                 return ["image_gen_denoiser.model.norm_mot_gen.weight"]
             if suffix.startswith("model.layers."):
-                target = "image_gen_denoiser" if "_mot_gen" in suffix else "model"
+                target = "image_gen_denoiser" if "_mot_gen" in suffix else "decoder"
                 return [f"{target}.{suffix}"]
         return []

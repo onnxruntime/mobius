@@ -77,8 +77,8 @@ class TestGraphBuild:
     def test_package_has_five_components(self):
         _, _, package = _build()
         assert set(package.keys()) == {
-            "model",
-            "vision",
+            "decoder",
+            "vision_encoder",
             "embedding",
             "image_gen_embedding",
             "image_gen_denoiser",
@@ -86,7 +86,7 @@ class TestGraphBuild:
 
     def test_decoder_io_contract(self):
         config, _, package = _build()
-        graph = package["model"].graph
+        graph = package["decoder"].graph
         names = [value.name for value in graph.inputs]
         assert names[:3] == ["inputs_embeds", "attention_mask", "position_ids"]
         # Three stacked rotary axes (temporal, height, width).
@@ -127,7 +127,7 @@ class TestGraphBuild:
     )
     def test_builds_for_each_dtype(self, dtype: ir.DataType):
         _, _, package = _build(dtype)
-        assert package["model"].graph.inputs[0].dtype == dtype
+        assert package["decoder"].graph.inputs[0].dtype == dtype
 
     def test_no_protobuf_apis_used(self):
         # ir.Model is the only representation the task returns.
@@ -289,13 +289,13 @@ class TestWeightAlignment:
         _, module, _ = _build()
         und = module._targets_for("language_model.model.layers.0.mlp.gate_proj.weight")
         gen = module._targets_for("language_model.model.layers.0.mlp_mot_gen.gate_proj.weight")
-        assert und == ["model.model.layers.0.mlp.gate_proj.weight"]
+        assert und == ["decoder.model.layers.0.mlp.gate_proj.weight"]
         assert gen == ["image_gen_denoiser.model.layers.0.mlp_mot_gen.gate_proj.weight"]
 
     def test_final_norms_split_across_branches(self):
         _, module, _ = _build()
         assert module._targets_for("language_model.model.norm.weight") == [
-            "model.model.norm.weight"
+            "decoder.model.norm.weight"
         ]
         assert module._targets_for("language_model.model.norm_mot_gen.weight") == [
             "image_gen_denoiser.model.norm_mot_gen.weight"
@@ -345,7 +345,7 @@ class TestExecution:
 
     def test_vision_tower_handles_non_square_grids(self):
         _, _, package = _build()
-        session = self._session(package["vision"])
+        session = self._session(package["vision_encoder"])
         try:
             for grid_h, grid_w in [(4, 4), (2, 6)]:
                 height = grid_h * PATCH
@@ -359,7 +359,7 @@ class TestExecution:
 
     def test_decoder_runs_with_batch_two_and_ragged_padding(self):
         config, _, package = _build()
-        session = self._session(package["model"])
+        session = self._session(package["decoder"])
         try:
             batch, seq = 2, 6
             rng = np.random.default_rng(0)
@@ -394,7 +394,7 @@ class TestExecution:
         independent of later image tokens; block-causal masking must not.
         """
         config, _, package = _build()
-        session = self._session(package["model"])
+        session = self._session(package["decoder"])
         try:
             text_len, n_image = 3, 4
             seq = text_len + n_image
@@ -487,3 +487,39 @@ class TestExecution:
             denoise_session.close()
         # The pixel head reconstructs the full-resolution RGB image.
         assert predicted.shape == (1, 3, height, width)
+
+
+# ── Metadata contract status ────────────────────────────────────────────
+
+
+class TestInferenceMetadataStatus:
+    """Pin the *precise* reason canonical metadata is not yet emissible.
+
+    Export and execution both work; the gaps are in the metadata contract
+    and the runtime.  These assertions fail loudly the moment either gap
+    closes, so the docs and this model's status stay honest.
+    """
+
+    def test_package_is_recognised_as_a_native_vlm_shape(self):
+        from mobius.integrations.onnx_genai.inference_metadata import (
+            is_native_vlm_package,
+        )
+
+        _, _, package = _build()
+        assert is_native_vlm_package(package)
+
+    def test_native_vlm_emission_blocks_on_the_image_processor_contract(self):
+        from mobius.integrations.onnx_genai.inference_metadata import (
+            build_native_vlm_package_metadata,
+        )
+
+        config, _, package = _build()
+        with pytest.raises(ValueError) as excinfo:
+            build_native_vlm_package_metadata(
+                package, config=config, source="sensenova/SenseNova-U1.5-8B-MoT"
+            )
+        message = str(excinfo.value)
+        # The NEO tower takes a plain (1, 3, H, W) image and the Hub repo
+        # ships no preprocessor_config.json, so no processor program binds.
+        assert "preprocessing metadata" in message
+        assert "pixel_values" in message

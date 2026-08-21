@@ -7,7 +7,7 @@ The upstream reference implementation runs two structurally different
 passes over one backbone, so the export mirrors them one-for-one instead
 of forcing a single graph:
 
-``embedding`` + ``vision`` + ``model``
+``embedding`` + ``vision_encoder`` + ``decoder``
     The *understanding* pass.  Text (and reference-image) tokens are
     embedded, run through the understanding branch, and produce both
     ``logits`` (for text / think decoding) and the KV cache that
@@ -50,15 +50,15 @@ class SenseNovaU1Task(ModelTask):
     """Build the five NEO-unify ONNX graphs."""
 
     model_roles: ClassVar[dict[str, str]] = {
-        "model": "decoder",
-        "vision": "encoder",
+        "decoder": "decoder",
+        "vision_encoder": "encoder",
         "embedding": "embedding",
         "image_gen_embedding": "embedding",
         "image_gen_denoiser": "decoder",
     }
     components = ComponentSpec(
-        model="model",
-        vision="vision",
+        decoder="decoder",
+        vision_encoder="vision_encoder",
         embedding="embedding",
         image_gen_embedding="image_gen_embedding",
         image_gen_denoiser="image_gen_denoiser",
@@ -71,8 +71,8 @@ class SenseNovaU1Task(ModelTask):
     ) -> ModelPackage:
         self._validate_components(module)
         models: dict[str, ir.Model] = {
-            "model": self._build_decoder(module.model, config),
-            "vision": self._build_vision(module.vision, config),
+            "decoder": self._build_decoder(module.decoder, config),
+            "vision_encoder": self._build_vision(module.vision_encoder, config),
             "embedding": self._build_embedding(module.embedding, config),
             "image_gen_embedding": self._build_image_gen_embedding(
                 module.image_gen_embedding, config
@@ -136,7 +136,7 @@ class SenseNovaU1Task(ModelTask):
         height = ir.SymbolicDim("height")
         width = ir.SymbolicDim("width")
 
-        graph, builder = _make_graph(name="vision")
+        graph, builder = _make_graph(name="vision_encoder")
         op = builder.op
         pixel_values = builder.input(
             "pixel_values",
