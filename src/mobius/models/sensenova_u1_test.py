@@ -493,12 +493,7 @@ class TestExecution:
 
 
 class TestInferenceMetadataStatus:
-    """Pin the *precise* reason canonical metadata is not yet emissible.
-
-    Export and execution both work; the gaps are in the metadata contract
-    and the runtime.  These assertions fail loudly the moment either gap
-    closes, so the docs and this model's status stay honest.
-    """
+    """Pin the canonical shared-state workflow contract."""
 
     def test_package_is_recognised_as_a_native_vlm_shape(self):
         from mobius.integrations.onnx_genai.inference_metadata import (
@@ -508,21 +503,69 @@ class TestInferenceMetadataStatus:
         _, _, package = _build()
         assert is_native_vlm_package(package)
 
-    def test_native_vlm_emission_blocks_on_the_image_processor_contract(self):
-        from mobius.integrations.onnx_genai.inference_metadata import (
-            build_native_vlm_package_metadata,
+    def test_emits_complete_hashless_shared_state_workflow(self):
+        from mobius.integrations.onnx_genai.shared_state_flow_metadata import (
+            build_shared_state_pixel_flow_workflow_metadata,
         )
 
         config, _, package = _build()
-        with pytest.raises(ValueError) as excinfo:
-            build_native_vlm_package_metadata(
-                package, config=config, source="sensenova/SenseNova-U1.5-8B-MoT"
-            )
-        message = str(excinfo.value)
-        # The NEO tower takes a plain (1, 3, H, W) image and the Hub repo
-        # ships no preprocessor_config.json, so no processor program binds.
-        assert "preprocessing metadata" in message
-        assert "pixel_values" in message
+        metadata = build_shared_state_pixel_flow_workflow_metadata(
+            package, config, num_inference_steps=2
+        )
+        workflow = metadata["pipeline"]["workflow"]
+        assert set(workflow["components"]) >= {
+            "embedding",
+            "vision_encoder",
+            "decoder",
+            "image_gen_embedding",
+            "image_gen_denoiser",
+            "x0_velocity",
+            "guidance_combine",
+            "solver_step",
+        }
+        denoiser_aliases = workflow["serving"]["state_service"]["groups"][
+            "conditional_prefix"
+        ]["ports"]["image_gen_denoiser"]
+        assert all(alias["access"] == "read_only" for alias in denoiser_aliases.values())
+        assert workflow["outputs"]["image"]["value_range"] == "negative_one_to_one"
+        transforms = metadata["preprocessing"]["image"]["transforms"]
+        assert [transform["op"] for transform in transforms] == [
+            "decode_rgb",
+            "resize",
+            "rescale",
+            "normalize",
+        ]
+        assert transforms[1]["size_multiple"] == 32
+        serialized = str(metadata)
+        for forbidden in (
+            "sha256",
+            "config_sha256",
+            "base_model_fingerprint",
+            "ir_version",
+            "onnx_opsets",
+        ):
+            assert forbidden not in serialized
+
+    def test_auto_export_writes_exact_synthesized_processor_asset(self, tmp_path):
+        import json
+
+        from mobius.integrations.onnx_genai import write_onnx_genai_config
+
+        config, _, package = _build()
+        artifacts = write_onnx_genai_config(
+            package,
+            str(tmp_path),
+            config=config,
+            num_inference_steps=2,
+        )
+        processor = json.loads((tmp_path / "preprocessor_config.json").read_text())
+        assert processor["size_multiple"] == 32
+        assert processor["min_pixels"] == 512 * 512
+        assert processor["max_pixels"] == 2048 * 2048
+        assert processor["rescale_factor"] == pytest.approx(1 / 255)
+        assert processor["image_mean"] == [0.485, 0.456, 0.406]
+        assert processor["image_std"] == [0.229, 0.224, 0.225]
+        assert artifacts["inference_metadata"].endswith("inference_metadata.yaml")
 
     def test_tied_embeddings_populate_the_lm_head(self):
         """Tied variants ship no ``lm_head`` tensor of their own."""

@@ -639,6 +639,21 @@ def build_empty_features(dtype: ir.DataType, feature_size: int) -> PolicyCompone
     return _component("mobius.policy.auxiliary@1", graph, {})
 
 
+def build_empty_batched_features(
+    dtype: ir.DataType,
+    feature_size: int,
+) -> PolicyComponent:
+    """Build ``(1, 0, hidden)`` features for an optional single-image path."""
+    graph, builder = _make_graph("empty_batched_features")
+    features = builder.op.ConstantOfShape(
+        builder.op.Constant(value_ints=[1, 0, feature_size]),
+        value=ir.tensor([0.0], dtype=dtype),
+    )
+    features.shape = ir.Shape([1, 0, feature_size])
+    builder.add_output(features, "features")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
 def rotary_axis_count(position_value: ir.Value) -> int | None:
     """Number of rotary axes a decoder's ``position_ids`` input carries.
 
@@ -1668,6 +1683,106 @@ def build_guidance_combine(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComp
             "estimate": "estimate",
         },
     )
+
+
+def build_tensor_cast(
+    source_dtype: ir.DataType,
+    target_dtype: ir.DataType,
+    dims: Sequence[str] = ("batch", "heads", "sequence", "head_dim"),
+) -> PolicyComponent:
+    """Cast a typed tensor at an explicit component precision boundary."""
+    graph, builder = _make_graph("tensor_cast")
+    value = builder.input("value", source_dtype, list(dims))
+    cast = builder.op.Cast(value, to=target_dtype)
+    cast.type = ir.TensorType(target_dtype)
+    _set_public_shape(cast, list(dims))
+    builder.add_output(cast, "cast")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
+def build_x0_flow_velocity(
+    dtype: ir.DataType = ir.DataType.FLOAT,
+    *,
+    t_eps: float = 0.02,
+) -> PolicyComponent:
+    """Convert a clean-sample prediction into flow velocity.
+
+    Unified pixel-space generators commonly predict ``x0`` rather than
+    velocity. Their flow-matching derivative is
+    ``(x0 - sample) / max(1 - timestep, t_eps)``.
+    """
+    graph, builder = _make_graph("x0_flow_velocity")
+    op = builder.op
+    sample = builder.input("sample", dtype, ["batch", "channels", "height", "width"])
+    x0 = builder.input("x0", dtype, ["batch", "channels", "height", "width"])
+    timestep = builder.input("timestep", dtype, ["batch"])
+    one = op.CastLike(op.Constant(value_float=1.0), timestep)
+    epsilon = op.CastLike(op.Constant(value_float=float(t_eps)), timestep)
+    denominator = op.Max(op.Sub(one, timestep), epsilon)
+    denominator = op.Unsqueeze(denominator, op.Constant(value_ints=[1, 2, 3]))
+    velocity = op.Div(op.Sub(x0, sample), denominator)
+    velocity.type = ir.TensorType(dtype)
+    _set_public_shape(velocity, ["batch", "channels", "height", "width"])
+    builder.add_output(velocity, "velocity")
+    return _component("onnx-genai.flow-velocity@1", graph, {})
+
+
+def build_image_grid_positions(
+    dtype: ir.DataType = ir.DataType.FLOAT,
+    *,
+    pixels_per_token: int,
+) -> PolicyComponent:
+    """Derive a three-axis image position grid from a pixel-space latent."""
+    graph, builder = _make_graph("image_grid_positions")
+    op = builder.op
+    latent = builder.input("latent", dtype, ["batch", "channels", "height", "width"])
+    prompt_tokens = builder.input(
+        "prompt_tokens", ir.DataType.INT64, ["batch", "prompt_sequence"]
+    )
+    batch = op.Shape(latent, start=0, end=1)
+    height = op.Div(
+        op.Shape(latent, start=2, end=3),
+        op.Constant(value_ints=[pixels_per_token]),
+    )
+    width = op.Div(
+        op.Shape(latent, start=3, end=4),
+        op.Constant(value_ints=[pixels_per_token]),
+    )
+    count = op.Mul(height, width)
+    flat = op.Range(
+        op.Constant(value_int=0),
+        op.Squeeze(count, op.Constant(value_ints=[0])),
+        op.Constant(value_int=1),
+    )
+    token_shape = op.Concat(batch, count, axis=0)
+    height_positions = op.Expand(
+        op.Unsqueeze(
+            op.Div(flat, op.Squeeze(width, op.Constant(value_ints=[0]))),
+            op.Constant(value_ints=[0]),
+        ),
+        token_shape,
+    )
+    width_positions = op.Expand(
+        op.Unsqueeze(
+            op.Mod(flat, op.Squeeze(width, op.Constant(value_ints=[0])), fmod=0),
+            op.Constant(value_ints=[0]),
+        ),
+        token_shape,
+    )
+    prompt_length = op.Shape(prompt_tokens, start=1, end=2)
+    temporal = op.Expand(prompt_length, token_shape)
+    positions = op.Concat(
+        op.Unsqueeze(temporal, op.Constant(value_ints=[0])),
+        op.Unsqueeze(height_positions, op.Constant(value_ints=[0])),
+        op.Unsqueeze(width_positions, op.Constant(value_ints=[0])),
+        axis=0,
+    )
+    positions.shape = ir.Shape([3, "batch", "image_tokens"])
+    token_grid = op.Concat(height, width, axis=0)
+    token_grid.shape = ir.Shape([2])
+    builder.add_output(positions, "position_ids")
+    builder.add_output(token_grid, "token_grid")
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 _RNG_MODULUS = 2147483647

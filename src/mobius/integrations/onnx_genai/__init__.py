@@ -63,6 +63,11 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     write_multimodal_pipeline_metadata,
     write_speech_to_text_pipeline_metadata,
 )
+from mobius.integrations.onnx_genai.shared_state_flow_metadata import (
+    build_shared_state_pixel_flow_workflow_metadata,
+    is_shared_state_pixel_flow_package,
+    write_shared_state_pixel_flow_workflow_metadata,
+)
 from mobius.integrations.onnx_genai.workflow_metadata import (
     build_audio_codec_workflow_metadata,
     build_decoder_workflow_metadata,
@@ -103,12 +108,14 @@ __all__ = [
     "build_pipeline_metadata_for_workflow",
     "build_speculative_workflow_metadata",
     "build_speech_to_text_pipeline_metadata",
+    "build_shared_state_pixel_flow_workflow_metadata",
     "build_tts_workflow_metadata",
     "build_video_diffusion_workflow_metadata",
     "build_vlm_workflow_metadata",
     "convert_comfyui_workflow",
     "decoder_metadata_from_config",
     "load_diffusers_scheduler_config",
+    "is_shared_state_pixel_flow_package",
     "moe_metadata_from_config",
     "parse_comfyui_workflow",
     "parse_comfyui_workflow_file",
@@ -126,6 +133,7 @@ __all__ = [
     "write_onnx_genai_config",
     "write_speculative_workflow_metadata",
     "write_speech_to_text_pipeline_metadata",
+    "write_shared_state_pixel_flow_workflow_metadata",
     "write_tts_workflow_metadata",
     "write_video_diffusion_workflow_metadata",
     "write_vlm_workflow_metadata",

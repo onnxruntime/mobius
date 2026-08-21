@@ -245,28 +245,28 @@ input; neither is required for correctness.
 ## Runtime / metadata status
 
 Export and execution are complete — all five graphs build, load, and run
-on CPU and CUDA. Canonical inference metadata is **not** emissible today,
-for three distinct and separately-tracked reasons:
+on CPU and CUDA. Mobius now emits canonical hashless metadata for all five
+components plus the exact synthesized processor asset: RGB decode, pixel-area
+resize aligned to 32 in the 512²–2048² range, `1/255` rescaling, and ImageNet
+normalization.
 
-1. **Image-processor contract.** `build_native_vlm_package_metadata`
-   dispatches on the vision graph's input signature. The NEO tower takes
-   a plain `(1, 3, height, width)` float image, and the Hub repo ships no
-   `preprocessor_config.json`, so neither a registered processor program
-   nor declared `image_mean` / `image_std` / `do_resize` values exist for
-   the emitter to bind. This is a *metadata* blocker, not an export one.
-2. **No contract for the generation branch.** The current emitter shapes
-   are diffusion, audio codec, multimodal VLM and speech-to-text. A
-   unified any-to-any package — a text decoder plus a second transformer
-   branch driven by a flow-matching outer loop over a shared KV cache —
-   matches none of them, and emitting plain VLM metadata would describe
-   only half the model.
-3. **Runtime.** ORT GenAI has no pipeline that alternates two weight
-   branches over one KV cache with a sampler loop in between, so even a
-   complete contract would not be executable today.
+The generic workflow writes conditional and unconditional understanding KV
+once, casts the fp16 prefixes to fp32, and lets both CFG generation branches
+read the frozen state. The loop describes per-step image embedding, x0
+prediction, `v = (x0 - z) / max(1 - t, t_eps)`, and Euler integration. This is
+an architecture-neutral shared-state pattern; no model-family dispatch exists
+in the runtime.
 
-Until (1)-(3) are addressed the package is driven directly through
-onnxruntime; the sampler math (schedule, CFG, Euler step) is ~40 lines
-and lives outside the graphs by design, mirroring upstream.
+PR CI uses deterministic tiny graphs to execute text-only, text-to-image, and
+reference-image-edit paths, including mixed precision, shared KV, CFG, and a
+two-step loop. Production evidence remains the pinned H200 run from PR #533:
+revision `1f6ec60423d29939dde4202fd82ae340b144e280`, stage-by-stage L4 parity,
+and L5 text/image/edit outputs. It is intentionally not repeated in ordinary CI
+because the checkpoint is about 50 GB. Before a release, rerun the same pinned
+export on an H200 with `mobius.build(..., revision=<revision>,
+load_weights=True)`, fp16 understanding and fp32 generation components, then
+repeat the shared-latent stage comparison and the three L5 output checks
+recorded in PR #533.
 
 
 ## Dead or misleading upstream details

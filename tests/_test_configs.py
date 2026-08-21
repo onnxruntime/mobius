@@ -47,6 +47,7 @@ from mobius._configs import (
     ParakeetCTCConfig,
     Sam2Config,
     SegformerConfig,
+    SenseNovaU1Config,
     VisionConfig,
     WhisperConfig,
     YolosConfig,
@@ -2234,6 +2235,32 @@ _TINY_MUSE_GLIMMER_VISION = VisionConfig(
 # The test parametrization in build_graph_test.py uses specialised test
 # methods that invoke the correct task and assert the right output models.
 VL_CONFIGS: list[tuple[str, dict, bool]] = [
+    (
+        "neo_chat",
+        {
+            "_config_cls": SenseNovaU1Config,
+            "head_dim": 16,
+            "attn_qk_norm": True,
+            "rope_theta": 5e6,
+            "rope_theta_hw": 1e4,
+            "max_position_embeddings_hw": 512,
+            "patch_size": 4,
+            "downsample_ratio": 0.5,
+            "frequency_embedding_size": 8,
+            "vision": VisionConfig(
+                hidden_size=32,
+                patch_size=4,
+                in_channels=3,
+                spatial_merge_size=2,
+                out_hidden_size=TINY_HIDDEN,
+                rope_theta=1e4,
+                num_position_embeddings=512,
+                num_hidden_layers=0,
+                num_attention_heads=0,
+            ),
+        },
+        True,
+    ),
     # --- Nemotron Parse (C-RADIO + feature neck + cross-attentive decoder) ---
     (
         "nemotron_parse",
