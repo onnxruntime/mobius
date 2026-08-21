@@ -250,6 +250,7 @@ def build_from_gguf(
     mmproj: str | Path | None = None,
     static_cache: bool = False,
     max_seq_len: int | None = None,
+    include_mtp: bool = False,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a GGUF file.
 
@@ -308,6 +309,16 @@ def build_from_gguf(
         max_seq_len: Maximum sequence length for the static cache buffers.
             Only used when ``static_cache=True``. Defaults to the model's
             ``max_position_embeddings``.
+        include_mtp: Opt-in gate for the Qwen3.5/3.8 multi-token-prediction
+            (MTP / "nextn") self-speculative head. Defaults to ``False`` so
+            existing text-only exports are unchanged. When ``True`` *and* the
+            GGUF ships a trailing ``nextn`` head block, the backbone exposes its
+            final-layer hidden state as a seed output and a separate
+            ``mtp/model.onnx`` head sidecar is attached as ``pkg.mtp_head`` (the
+            CLI also writes a ``SpeculatorConfig`` block into
+            ``inference_metadata.yaml``). When ``True`` but the GGUF has no MTP
+            head, a warning is logged and the build proceeds text-only. Cannot
+            be combined with *static_cache*.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -327,6 +338,11 @@ def build_from_gguf(
     if mmproj is not None:
         if static_cache:
             raise ValueError("static_cache=True is not supported with a companion mmproj.")
+        if include_mtp:
+            raise ValueError(
+                "include_mtp=True cannot be combined with a companion mmproj; the "
+                "MTP head is a text-decoder drafter."
+            )
         from mobius.integrations.gguf._mmproj import build_gemma4_vlm_from_gguf
 
         return build_gemma4_vlm_from_gguf(
@@ -358,6 +374,12 @@ def build_from_gguf(
         raise ValueError(
             "static_cache=True cannot be combined with an explicit task "
             "override; the static cache is wired through CausalLMTask."
+        )
+
+    if include_mtp and static_cache:
+        raise ValueError(
+            "include_mtp=True cannot be combined with static_cache=True; the "
+            "MTP self-speculative head requires the dynamic concat-grow cache."
         )
 
     # 1. Parse GGUF file (auto-download from HF Hub when given "owner/repo[:filename]")
@@ -437,21 +459,37 @@ def build_from_gguf(
     else:
         resolved_task = task
 
-    # 4b. If the GGUF ships a trailing MTP / "nextn" self-speculative head,
-    # expose the backbone's final-layer hidden state as a graph output so the
-    # orchestrator can seed the head with it. This must be set before the
-    # module/graph is built. Direct field assignment (not dataclasses.replace)
-    # preserves the ``_gguf_*`` metadata attributes set on the config.
+    # 4b. If the GGUF ships a trailing MTP / "nextn" self-speculative head and
+    # the caller opted in via ``include_mtp``, expose the backbone's final-layer
+    # hidden state as a graph output so the orchestrator can seed the head with
+    # it. This must be set before the module/graph is built. Direct field
+    # assignment (not dataclasses.replace) preserves the ``_gguf_*`` metadata
+    # attributes set on the config. MTP is opt-in: the default text-only export
+    # is unchanged.
     from mobius.integrations.gguf._mtp import build_mtp_head_from_gguf, has_mtp_head
 
-    if has_mtp_head(config) and not static_cache:
+    gguf_has_mtp_head = has_mtp_head(config)
+    emit_mtp_head = include_mtp and gguf_has_mtp_head
+    if include_mtp and not gguf_has_mtp_head:
+        logger.warning(
+            "include_mtp=True was requested but the GGUF ships no MTP/nextn "
+            "head block; building a text-only model."
+        )
+    elif gguf_has_mtp_head and not include_mtp:
+        logger.info(
+            "GGUF ships an MTP/nextn head but include_mtp=False; skipping the "
+            "self-speculative head sidecar (pass include_mtp=True / --include-mtp "
+            "to emit it)."
+        )
+
+    if emit_mtp_head:
         seed_index = int(config.num_hidden_layers) - 1
         existing = list(config.output_layer_indices or [])
         if seed_index not in existing:
             existing.append(seed_index)
         config.output_layer_indices = existing
         logger.info(
-            "MTP head present: exposing backbone hidden-state seed output "
+            "MTP head enabled: exposing backbone hidden-state seed output "
             "hidden_states.%d",
             seed_index,
         )
@@ -518,7 +556,8 @@ def build_from_gguf(
     # 10. Build the trailing MTP / "nextn" self-speculative head sidecar from
     # the GGUF's ``blk.<nextn>.*`` tensors (dropped by the backbone build) and
     # attach it to the package so the CLI can save it into a ``mtp/`` subdir.
-    if has_mtp_head(config):
+    # Only runs when the caller opted in via ``include_mtp`` (see step 4b).
+    if emit_mtp_head:
         try:
             mtp_pkg = build_mtp_head_from_gguf(
                 gguf_model,
