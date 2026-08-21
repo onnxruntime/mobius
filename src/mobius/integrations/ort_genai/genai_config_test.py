@@ -681,15 +681,21 @@ def test_embedding_session_options_can_be_updated():
         head_dim=16,
         ep="trt-rtx",
     ).with_embedding(
+        input_names={"input_ids": "input_ids", "image_features": "image_features"},
         provider_options={
             "nv_profile_min_shapes": "input_ids:1x1,image_features:0x1024",
             "nv_profile_opt_shapes": "input_ids:1x226,image_features:192x1024",
         },
     )
 
-    embedding_options = gen.generate()["model"]["embedding"]["session_options"][
-        "provider_options"
-    ][0]["NvTensorRtRtx"]
+    embedding_config = gen.generate()["model"]["embedding"]
+    embedding_options = embedding_config["session_options"]["provider_options"][0][
+        "NvTensorRtRtx"
+    ]
+    assert embedding_config["inputs"] == {
+        "input_ids": "input_ids",
+        "image_features": "image_features",
+    }
     assert embedding_options["enable_cuda_graph"] == "0"
     assert embedding_options["nv_profile_min_shapes"] == (
         "input_ids:1x1,image_features:0x1024"

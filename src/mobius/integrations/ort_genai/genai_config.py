@@ -339,6 +339,10 @@ class GenaiConfigGenerator:
             tokens_per_second: Video/image timestamp rate for Qwen3-VL.
             patch_size: Vision patch size.
             window_size: Vision window size.
+            vision_provider_options: Provider option overrides merged into
+                the EP defaults for the vision encoder session.
+            embedding_provider_options: Provider option overrides merged into
+                the EP defaults for the embedding session.
 
         Returns self for chaining.
         """
@@ -406,7 +410,19 @@ class GenaiConfigGenerator:
         output_names: dict[str, str] | None = None,
         provider_options: dict[str, str] | None = None,
     ) -> GenaiConfigGenerator:
-        """Add a standalone multimodal embedding stage."""
+        """Add a standalone multimodal embedding stage.
+
+        Args:
+            filename: Embedding ONNX model filename.
+            input_names: Override embedding model input name mapping.
+                Defaults to input_ids + audio_features.
+            output_names: Override embedding model output name mapping.
+                Defaults to inputs_embeds.
+            provider_options: Provider option overrides merged into the EP
+                defaults for the embedding session.
+
+        Returns self for chaining.
+        """
         self._embedding = {
             "filename": filename,
             "inputs": input_names
