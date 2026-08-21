@@ -2544,13 +2544,34 @@ def write_mtp_speculator_metadata(
     embedding_weights: str = "model.embed_tokens.weight",
     lm_head_weights: str = "lm_head.weight",
 ) -> str | None:
-    """Add a ``speculator`` block for the exported MTP head to the backbone metadata.
+    """Add a ``speculative`` block for the exported MTP head to the backbone metadata.
 
     The Qwen3.5/3.8 MTP head is a self-speculative drafter saved next to the
     backbone (``mtp/model.onnx``). It borrows the target's shared embedding /
     LM head and is seeded by the backbone's final-layer hidden state
-    (``hidden_states.<N-1>``). This writes the onnx-genai
-    :class:`SpeculatorConfig`-shaped block that wires the runtime proposer.
+    (``hidden_states.<N-1>``).
+
+    The emitted block conforms exactly to the authoritative onnx-genai runtime
+    schema (``crates/onnx-genai-metadata/src/schema/generation.rs``
+    ``SpeculatorConfig`` + ``parser.rs`` ``resolve_mtp`` +
+    ``config.rs`` ``validate_resolved_mtp_config``):
+
+    - Published under the top-level ``speculative`` key (the runtime
+      deserializes ``InferenceMetadata.speculative``; a bare ``speculator``
+      key is unknown and silently dropped).
+    - ``model`` (not ``model_path``), ``target_hidden_size`` (not
+      ``hidden_size``).
+    - ``kv_mode: proposal_local`` — the only valid ``MtpKvMode`` for this k=1
+      head (``hidden_threaded`` is an engine-internal enum, not a metadata one).
+    - ``embedding`` / ``lm_head`` as ``MtpTargetInitializer`` objects
+      (``source: target_initializer`` + ``name``), not flat name strings.
+    - ``target_hidden_layout: BSH`` because ``hidden_states.<N-1>`` is rank-3
+      ``[batch, seq, hidden]``; ``hc_mult: 1`` is required by ``resolve_mtp``
+      (``hc_mult > 0``) and pinned to 1 for the BSH layout by
+      ``validate_resolved_mtp_config``.
+    - ``mtp_state_output`` is omitted: an ``hc_mult == 1`` head has no recurrent
+      Hyper-Connection state (the sidecar emits only ``mtp_hidden`` +
+      ``present.0.{key,value}``); the runtime looks it up optionally.
 
     The backbone ``inference_metadata.yaml`` must already exist. Returns the
     metadata path, or ``None`` when it is missing.
@@ -2571,25 +2592,29 @@ def write_mtp_speculator_metadata(
     speculator: dict[str, Any] = {
         "proposal_type": "mtp",
         "num_speculative_tokens": int(num_speculative_tokens),
-        "model_path": model_path,
+        "model": model_path,
+        # rank-3 [batch, seq, hidden] seed => BSH layout with a single
+        # Hyper-Connection lane (hc_mult == 1).
+        "target_hidden_layout": "BSH",
+        "hc_mult": 1,
         # The head threads its final hidden state forward and shares the
-        # target's embedding + LM head; it owns a single-layer KV cache.
+        # target's embedding + LM head; k=1 head resets KV each verify step.
         "mtp_hidden_output": "mtp_hidden",
-        "kv_mode": "hidden_threaded",
+        "kv_mode": "proposal_local",
         # The MTP head reuses the backbone's shared embedding + LM head, which
-        # live as initializers in the main ``model.onnx``. Name them so the
-        # runtime can bind the shared tables without duplicating weights.
-        "embedding_weights": embedding_weights,
-        "lm_head_weights": lm_head_weights,
+        # live as initializers in the main ``model.onnx`` (borrowed, not
+        # duplicated).
+        "embedding": {"source": "target_initializer", "name": embedding_weights},
+        "lm_head": {"source": "target_initializer", "name": lm_head_weights},
     }
     if target_hidden_output is not None:
         speculator["target_hidden_output"] = target_hidden_output
     if hidden_size is not None:
-        speculator["hidden_size"] = int(hidden_size)
+        speculator["target_hidden_size"] = int(hidden_size)
     if vocab_size is not None:
         speculator["vocab_size"] = int(vocab_size)
 
-    metadata["speculator"] = speculator
+    metadata["speculative"] = speculator
     with open(path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(metadata, handle, sort_keys=False)
     return path
