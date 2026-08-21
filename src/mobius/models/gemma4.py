@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
 import onnx_ir as ir
@@ -3022,11 +3022,11 @@ class Gemma4Model(nn.Module):
 
     Always produced:
     - ``decoder``: Gemma4 text decoder taking ``inputs_embeds``
-    - ``vision``: SigLIP-style encoder + projector
+    - ``vision_encoder``: SigLIP-style encoder + projector
     - ``embedding``: scaled word embedding + multimodal feature fusion
 
     Added when ``config.audio is not None``:
-    - ``speech``: Conformer audio encoder + projection to text hidden size
+    - ``audio_encoder``: Conformer audio encoder + projection to text hidden size
 
     Covers all Gemma4 variants:
     - Vision-language (26B-A4B, 31B): ``audio=None``
@@ -3037,6 +3037,24 @@ class Gemma4Model(nn.Module):
 
     default_task: str = "gemma4"
     category: str = "Multimodal"
+
+    # Runtime HF ``named_modules()`` sub-trees per ONNX component.
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": (
+            "model.language_model.layers",
+            "model.language_model.norm",
+            "model.language_model.rotary_emb",
+            "lm_head",
+        ),
+        "vision_encoder": ("model.vision_tower", "model.embed_vision"),
+        "audio_encoder": ("model.audio_tower", "model.embed_audio"),
+        "embedding": (
+            "model.language_model.embed_tokens",
+            "model.language_model.embed_tokens_per_layer",
+            "model.language_model.per_layer_model_projection",
+            "model.language_model.per_layer_projection_norm",
+        ),
+    }
 
     def __init__(self, config: Gemma4Config):
         super().__init__()
@@ -3251,6 +3269,19 @@ class Gemma4UnifiedModel(nn.Module):
 
     default_task: str = "gemma4-unified"
     category: str = "Multimodal"
+
+    # Runtime HF sub-trees for the encoder-free unified layout.
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": (
+            "model.language_model.layers",
+            "model.language_model.norm",
+            "model.language_model.rotary_emb",
+            "lm_head",
+        ),
+        "vision_encoder": ("model.vision_embedder", "model.embed_vision"),
+        "audio_encoder": ("model.embed_audio",),
+        "embedding": ("model.language_model.embed_tokens",),
+    }
 
     def __init__(self, config: Gemma4Config):
         super().__init__()

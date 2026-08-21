@@ -65,17 +65,21 @@ _LLAMA_MAPPING: dict[str, str] = {
     "blk.{bid}.ffn_norm": ("model.layers.{bid}.post_attention_layernorm"),
 }
 
-# Gemma2/3 adds pre/post feedforward layernorms.
+# Gemma2 uses the llama.cpp Gemma tensor names (the same norm subset as
+# Gemma3/4, minus the per-head Q/K norms): ``ffn_norm`` is the pre-feedforward
+# norm (overriding the Llama post-attention mapping), ``post_attention_norm`` is
+# the post-attention sandwich norm, and ``post_ffw_norm`` is the post-feedforward
+# norm. The older ``pre_ffn_norm``/``post_ffn_norm`` names never appear in real
+# llama.cpp Gemma2 GGUFs, so mapping them left the sandwich norms unloaded.
 _GEMMA2_EXTRAS: dict[str, str] = {
-    "blk.{bid}.pre_ffn_norm": ("model.layers.{bid}.pre_feedforward_layernorm"),
-    "blk.{bid}.post_ffn_norm": ("model.layers.{bid}.post_feedforward_layernorm"),
+    "blk.{bid}.ffn_norm": ("model.layers.{bid}.pre_feedforward_layernorm"),
+    "blk.{bid}.post_attention_norm": ("model.layers.{bid}.post_attention_layernorm"),
+    "blk.{bid}.post_ffw_norm": ("model.layers.{bid}.post_feedforward_layernorm"),
 }
 
-# Gemma3 uses the llama.cpp Gemma tensor names (same as Gemma4's norm subset),
-# NOT the ``pre_ffn_norm``/``post_ffn_norm`` names in _GEMMA2_EXTRAS: ``ffn_norm``
-# is the pre-feedforward norm (overriding the Llama post-attention mapping),
-# ``post_ffw_norm`` is the post-feedforward norm, ``post_attention_norm`` is the
-# post-attention norm, and each attention block carries per-head Q/K norms.
+# Gemma3 uses the llama.cpp Gemma tensor names (ffn_norm as the pre-feedforward
+# norm, plus post_attention/post_ffw norms) and additionally carries per-head
+# Q/K norms that Gemma2 lacks.
 _GEMMA3_EXTRAS: dict[str, str] = {
     "blk.{bid}.ffn_norm": ("model.layers.{bid}.pre_feedforward_layernorm"),
     "blk.{bid}.post_attention_norm": ("model.layers.{bid}.post_attention_layernorm"),
@@ -292,6 +296,32 @@ _HUNYUAN_EXTRAS: dict[str, str] = {
 
 _HUNYUAN_FAMILY = frozenset({"hunyuan-dense", "hunyuan_v1_dense"})
 
+# Muse Glimmer keeps the Llama projection names but rearranges the norms and
+# adds a sigmoid gate on the attention output.
+#
+# Two GGUF tensors have no HuggingFace counterpart and are deliberately absent
+# from this mapping, which makes `map_gguf_to_hf_names` skip them:
+#
+#   blk.{bid}.attn_q_norm / blk.{bid}.attn_k_norm
+#       Muse Glimmer's QK normalization is scale-free — the HF checkpoint has no
+#       q_norm/k_norm parameters at all. llama.cpp still materializes the tensors
+#       so its generic attention path can multiply by something, so attn_k_norm
+#       is a vector of ones and attn_q_norm is the `qk_scale_factor` scalar
+#       broadcast over head_dim. The scalar is recovered in `_config_mapping`,
+#       which reads it back out of attn_q_norm; dropping the tensors here would
+#       otherwise lose it.
+_MUSE_GLIMMER_EXTRAS: dict[str, str] = {
+    # Muse Glimmer has four norms per block. `ffn_norm` is the *pre*-feedforward
+    # norm, so it overrides the Llama mapping onto post_attention_layernorm.
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.pre_feedforward_layernorm",
+    "blk.{bid}.post_attention_norm": ("model.layers.{bid}.post_attention_layernorm"),
+    "blk.{bid}.post_ffw_norm": ("model.layers.{bid}.post_feedforward_layernorm"),
+    # Sigmoid gate applied to the attention output before o_proj.
+    "blk.{bid}.attn_gate": "model.layers.{bid}.self_attn.gate_proj",
+}
+
+_MUSE_GLIMMER_FAMILY = frozenset({"muse-glimmer", "muse_glimmer"})
+
 _MOE_FAMILY = frozenset(
     {
         "qwen2moe",
@@ -338,9 +368,17 @@ def _build_mapping(
         # the shared _GEMMA_FAMILY path.
         result = dict(_LLAMA_MAPPING)
         result.update(_GEMMA3_EXTRAS)
-    elif arch in _GEMMA_FAMILY:
+    elif arch == "gemma2":
+        # Gemma2 uses the llama.cpp Gemma tensor names (ffn_norm as the
+        # pre-feedforward norm, plus post_attention/post_ffw sandwich norms),
+        # distinct from the plain-Llama norm layout of Gemma v1. It has no
+        # per-head Q/K norms (those are Gemma3+).
         result = dict(_LLAMA_MAPPING)
         result.update(_GEMMA2_EXTRAS)
+    elif arch in _GEMMA_FAMILY:
+        # Gemma v1: standard two-norm (input + post-attention) Llama layout with
+        # no sandwich feedforward norms, so the plain Llama base is correct.
+        result = dict(_LLAMA_MAPPING)
     elif arch == "gemma4":
         # Gemma 4 starts from the Llama base but needs several overrides and
         # many new tensor types for Q/K norms, per-layer scalars, MoE norms,
@@ -359,6 +397,9 @@ def _build_mapping(
     elif arch in _HUNYUAN_FAMILY:
         result = dict(_LLAMA_MAPPING)
         result.update(_HUNYUAN_EXTRAS)
+    elif arch in _MUSE_GLIMMER_FAMILY:
+        result = dict(_LLAMA_MAPPING)
+        result.update(_MUSE_GLIMMER_EXTRAS)
     elif arch in _MOE_FAMILY:
         result = dict(_LLAMA_MAPPING)
         result.update(_MOE_EXTRAS)
@@ -372,6 +413,7 @@ def _build_mapping(
             | _GEMMA_FAMILY
             | _MOE_FAMILY
             | _HUNYUAN_FAMILY
+            | _MUSE_GLIMMER_FAMILY
             | {"deepseek4", "gemma4", "phi3", "falcon", "gpt2", "mamba"}
         )
         raise ValueError(

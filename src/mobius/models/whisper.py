@@ -13,6 +13,7 @@ Implements the Whisper architecture as two separate traceable modules:
 from __future__ import annotations
 
 import math
+from typing import ClassVar
 
 import numpy as np
 import onnx_ir as ir
@@ -183,6 +184,12 @@ class WhisperForConditionalGeneration(nn.Module):
     default_task: str = "speech-to-text"
     category: str = "Speech-to-Text"
     config_class: type = WhisperConfig
+
+    # Runtime HF ``named_modules()`` sub-trees per ONNX component.
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "encoder": ("model.encoder",),
+        "decoder": ("model.decoder", "proj_out"),
+    }
 
     def __init__(self, config: WhisperConfig):
         super().__init__()

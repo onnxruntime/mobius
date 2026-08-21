@@ -809,7 +809,7 @@ class TestMultimodalQuantizationDefault:
 
         expected = mock.sentinel.package
         with mock.patch(
-            "mobius.integrations.gguf._mmproj.build_gemma4_vlm_from_gguf",
+            "mobius.integrations.gguf._mmproj.build_vlm_from_gguf",
             return_value=expected,
         ) as build_multimodal:
             kwargs = {} if keep_quantized else {"keep_quantized": False}

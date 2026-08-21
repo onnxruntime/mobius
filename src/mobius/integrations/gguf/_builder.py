@@ -327,9 +327,9 @@ def build_from_gguf(
     if mmproj is not None:
         if static_cache:
             raise ValueError("static_cache=True is not supported with a companion mmproj.")
-        from mobius.integrations.gguf._mmproj import build_gemma4_vlm_from_gguf
+        from mobius.integrations.gguf._mmproj import build_vlm_from_gguf
 
-        return build_gemma4_vlm_from_gguf(
+        return build_vlm_from_gguf(
             gguf_path,
             mmproj,
             dtype=dtype,

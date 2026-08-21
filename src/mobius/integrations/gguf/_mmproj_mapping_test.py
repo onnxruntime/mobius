@@ -159,3 +159,63 @@ class TestAudioMapping:
 
     def test_stat_tensors_skipped(self):
         assert map_mmproj_audio_to_hf("a.blk.0.attn_q.weight.output_min") is None
+
+
+class TestMuseGlimmerVisionMapping:
+    """Muse Glimmer ``clip`` mmproj → HF vision names.
+
+    Verified against ``unsloth/Muse-Glimmer-30B-GGUF``'s
+    ``mmproj-Muse-Glimmer-30B-BF16.gguf``: all 809 tensors map, and the mapped
+    names are exactly the 809 parameters of the published vision encoder graph.
+    """
+
+    def test_block_tensors_land_on_the_vision_tower_layers(self) -> None:
+        from mobius.integrations.gguf._mmproj_mapping import (
+            map_mmproj_muse_glimmer_vision_to_hf as convert,
+        )
+
+        assert (
+            convert("v.blk.7.attn_q.weight")
+            == "model.vision_tower.layers.7.attn.q_proj.weight"
+        )
+        assert convert("v.blk.7.attn_q.bias") == "model.vision_tower.layers.7.attn.q_proj.bias"
+        assert (
+            convert("v.blk.7.attn_out.weight")
+            == "model.vision_tower.layers.7.attn.proj.weight"
+        )
+        assert convert("v.blk.7.ln1.weight") == "model.vision_tower.layers.7.norm1.weight"
+        assert convert("v.blk.7.ln2.bias") == "model.vision_tower.layers.7.norm2.bias"
+        assert convert("v.blk.7.ffn_up.weight") == "model.vision_tower.layers.7.mlp.fc1.weight"
+        assert convert("v.blk.7.ffn_down.bias") == "model.vision_tower.layers.7.mlp.fc2.bias"
+
+    def test_stem_tensors_and_the_three_projector_matrices(self) -> None:
+        from mobius.integrations.gguf._mmproj_mapping import (
+            map_mmproj_muse_glimmer_vision_to_hf as convert,
+        )
+
+        assert (
+            convert("v.patch_embd.weight")
+            == "model.vision_tower.patch_embedder.patch_embedding.weight"
+        )
+        assert (
+            convert("v.position_embd.weight")
+            == "model.vision_tower.patch_embedder.position_embedding_table.weight"
+        )
+        assert convert("v.pre_ln.bias") == "model.vision_tower.ln_pre.bias"
+        assert convert("v.post_ln.weight") == "model.vision_tower.ln_post.weight"
+        # mm.0/mm.1 are the pixel-shuffle adapter, mm.2 the text projection.
+        assert convert("mm.0.weight") == "model.vision_adapter.fc1.weight"
+        assert convert("mm.1.weight") == "model.vision_adapter.fc2.weight"
+        assert convert("mm.2.weight") == "model.vision_projection.weight"
+
+    def test_stats_and_unknown_tensors_are_skipped(self) -> None:
+        from mobius.integrations.gguf._mmproj_mapping import (
+            map_mmproj_muse_glimmer_vision_to_hf as convert,
+        )
+
+        assert convert("v.blk.0.attn_q.input_max") is None
+        # Muse Glimmer's tower has no SwiGLU gate and no QK norms; a file
+        # carrying them is not this architecture.
+        assert convert("v.blk.0.ffn_gate.weight") is None
+        assert convert("v.blk.0.attn_q_norm.weight") is None
+        assert convert("a.blk.0.attn_q.weight") is None

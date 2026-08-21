@@ -621,6 +621,88 @@ def _reshape_packed_qzeros(value: torch.Tensor, bits: int, n_blocks: int) -> tor
     return flat_uint8[..., :zp_cols]
 
 
+def stack_per_expert_moe_weights(
+    state_dict: dict[str, torch.Tensor],
+    *,
+    qmoe_target_path: str,
+) -> dict[str, torch.Tensor]:
+    """Stack per-expert quantized MoE projections into fused expert-major tensors.
+
+    GPTQ/AWQ MoE checkpoints store every routed expert as a separate module
+    (``…{qmoe_target_path}.experts.{i}.{gate,up,down}_proj.*``). The native QMoE
+    packer (:func:`pack_qmoe_expert_weights`) instead expects the fused
+    expert-major tensors that Olive emits
+    (``…{qmoe_target_path}.experts.gate_up_proj.*`` and ``…experts.down_proj.*``
+    with a leading expert dimension). This bridges the two so a per-expert
+    GPTQ/AWQ checkpoint can drive the fused ``com.microsoft::QMoE`` path.
+
+    Runs on the already-reshaped MatMulNBits layout produced by
+    :func:`preprocess_gptq_weights` / :func:`preprocess_awq_weights` (suffixes
+    ``.weight`` ``[N, n_blocks, blob]``, ``.scales`` ``[N, n_blocks]``,
+    ``.zero_points`` ``[N, zp_cols]``). For each expert, gate and up are
+    concatenated along the output-row dimension in HF-concatenated ``[gate; up]``
+    order (the layout ``_interleave_gate_up_rows`` expects), then all experts are
+    stacked into a new leading dimension. Non-expert keys pass through unchanged;
+    per-expert ``bias`` and ``g_idx`` are dropped (the QMoE ABI carries neither).
+
+    A no-op (returns the input unchanged) when the state dict already holds
+    fused expert-major tensors (e.g. Olive checkpoints), so it is safe to call
+    on any quantized MoE state dict.
+    """
+    experts_root = f"{qmoe_target_path}.experts."
+    projections = ("gate_proj", "up_proj", "down_proj")
+    stack_suffixes = ("weight", "scales", "zero_points")
+
+    # groups[expert_prefix][suffix][proj][expert_index] = tensor
+    groups: dict[str, dict[str, dict[str, dict[int, torch.Tensor]]]] = {}
+    passthrough: dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        marker = experts_root
+        pos = key.find(marker)
+        matched = False
+        if pos != -1:
+            rest = key[pos + len(marker) :]  # e.g. "0.gate_proj.weight"
+            idx_str, _, tail = rest.partition(".")
+            if idx_str.isdigit() and tail:
+                proj, _, suffix = tail.partition(".")
+                if proj in projections:
+                    if suffix in stack_suffixes:
+                        prefix = key[: pos + len(marker) - 1]  # ".../experts"
+                        groups.setdefault(prefix, {}).setdefault(suffix, {}).setdefault(
+                            proj, {}
+                        )[int(idx_str)] = value
+                        matched = True
+                    elif suffix in ("bias", "g_idx"):
+                        # Not carried into the QMoE ABI; drop.
+                        matched = True
+        if not matched:
+            passthrough[key] = value
+
+    if not groups:
+        return state_dict
+
+    def _stack_dense(by_idx: dict[int, torch.Tensor]) -> torch.Tensor:
+        return torch.stack([by_idx[i] for i in range(len(by_idx))], dim=0)
+
+    result = dict(passthrough)
+    for prefix, by_suffix in groups.items():
+        for suffix, by_proj in by_suffix.items():
+            gate = by_proj.get("gate_proj")
+            up = by_proj.get("up_proj")
+            down = by_proj.get("down_proj")
+            if gate is not None and up is not None:
+                if gate.keys() != up.keys():
+                    raise ValueError(f"Mismatched gate/up experts for {prefix} ({suffix})")
+                fused_gate_up = torch.stack(
+                    [torch.cat([gate[i], up[i]], dim=0) for i in range(len(gate))],
+                    dim=0,
+                )
+                result[f"{prefix}.gate_up_proj.{suffix}"] = fused_gate_up
+            if down is not None:
+                result[f"{prefix}.down_proj.{suffix}"] = _stack_dense(down)
+    return result
+
+
 def pack_qmoe_expert_weights(
     state_dict: dict[str, torch.Tensor],
     *,
@@ -1096,6 +1178,9 @@ def preprocess_quantized_weights(
             head_key=head_key,
         )
         if use_qmoe and qmoe_target_path is not None:
+            return_state_dict = stack_per_expert_moe_weights(
+                return_state_dict, qmoe_target_path=qmoe_target_path
+            )
             return_state_dict = pack_qmoe_expert_weights(
                 return_state_dict, target_moe_path=qmoe_target_path
             )
@@ -1109,5 +1194,8 @@ def preprocess_quantized_weights(
     if tie_embeddings and not tied_quantized_table:
         tie_word_embeddings(state_dict, embed_key=embed_key, head_key=head_key)
     if use_qmoe and qmoe_target_path is not None:
+        state_dict = stack_per_expert_moe_weights(
+            state_dict, qmoe_target_path=qmoe_target_path
+        )
         state_dict = pack_qmoe_expert_weights(state_dict, target_moe_path=qmoe_target_path)
     return state_dict

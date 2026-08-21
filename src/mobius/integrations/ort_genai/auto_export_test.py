@@ -373,6 +373,40 @@ class TestWriteProcessorConfig:
             "merge_size": 2,
         }
 
+    def test_qwen35_moe_text_uses_packed_qwen_image_pipeline(self, tmp_path):
+        """Qwen3.6 VL builds unwrap to the MoE text config before processor export."""
+        vision = mock.MagicMock()
+        vision.image_size = 16_777_216
+        vision.patch_size = 16
+        vision.spatial_merge_size = 2
+        config = mock.MagicMock()
+        config.vision = vision
+        config.model_type = "qwen3_5_moe_text"
+        config.spatial_merge_size = 2
+        config.temporal_patch_size = 2
+
+        path = _write_vision_processor_config(config, str(tmp_path))
+        assert path is not None
+        with open(path) as f:
+            data = json.load(f)
+
+        proc = data["processor"]
+        assert proc["name"] == "qwen2_5_image_processor"
+        transforms = proc["transforms"]
+        assert [t["operation"]["type"] for t in transforms] == [
+            "DecodeImage",
+            "Resize",
+            "Rescale",
+            "Normalize",
+            "PatchImage",
+        ]
+        assert transforms[3]["operation"]["attrs"]["qwen2_5_vl"] == 1
+        assert transforms[4]["operation"]["attrs"] == {
+            "patch_size": 16,
+            "temporal_patch_size": 2,
+            "merge_size": 2,
+        }
+
     def test_gemma3_vision_config(self, tmp_path):
         """Gemma3 gets a fixed-size resize + Permute3D (not the generic branch).
 
@@ -980,6 +1014,10 @@ class TestWriteOrtGenaiConfigLocalDir:
                     pad_token_id=0,
                 ),
             ),
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._load_generation_config",
+                return_value=None,
+            ),
         ):
             (out / "tokenizer.json").write_text("{}")  # pretend HF copy happened
             write_ort_genai_config(
@@ -1434,6 +1472,10 @@ class TestExportForOrtGenai:
                 return_value=["tokenizer.json"],
             ) as mock_copy,
             mock.patch("transformers.AutoConfig.from_pretrained") as mock_hf,
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._load_generation_config",
+                return_value=None,
+            ),
         ):
             mock_hf.return_value = mock.MagicMock(
                 model_type="qwen2", bos_token_id=1, eos_token_id=2, pad_token_id=0
@@ -1454,6 +1496,10 @@ class TestExportForOrtGenai:
                 return_value=[],
             ),
             mock.patch("transformers.AutoConfig.from_pretrained") as mock_hf,
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._load_generation_config",
+                return_value=None,
+            ),
         ):
             mock_hf.return_value = mock.MagicMock(
                 model_type="mage_vl", bos_token_id=1, eos_token_id=2, pad_token_id=0
@@ -1466,6 +1512,44 @@ class TestExportForOrtGenai:
             )
 
         mock_hf.assert_called_once_with("microsoft/Mage-VL", trust_remote_code=True)
+
+    def test_generation_config_multi_eos_overrides_model_config(self, tmp_path):
+        """generation_config.json stop tokens take precedence over the model config."""
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        pkg = self._make_pkg()
+        hf_config = mock.MagicMock(
+            model_type="qwen3_5_moe",
+            bos_token_id=248044,
+            eos_token_id=248044,
+            pad_token_id=None,
+        )
+        generation_config = mock.MagicMock(
+            bos_token_id=248044,
+            eos_token_id=[248046, 248044],
+            pad_token_id=248044,
+        )
+        with (
+            mock.patch("transformers.AutoConfig.from_pretrained", return_value=hf_config),
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._load_generation_config",
+                return_value=generation_config,
+            ),
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files",
+                return_value=[],
+            ),
+        ):
+            result = write_ort_genai_config(
+                pkg,
+                str(tmp_path),
+                hf_model_id="Qwen/Qwen3.6-35B-A3B",
+            )
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+        assert data["model"]["eos_token_id"] == [248046, 248044]
+        assert data["model"]["pad_token_id"] == 248044
 
     def test_ep_default_normalizes_to_cpu(self, tmp_path):
         """ep='default' is normalized to cpu (provider_options=[])."""
@@ -2615,6 +2699,10 @@ class TestGemma4RealModel:
         )
         with (
             mock.patch("transformers.AutoConfig.from_pretrained", return_value=fake_hf),
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._load_generation_config",
+                return_value=None,
+            ),
             mock.patch(
                 "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files",
                 return_value=[],

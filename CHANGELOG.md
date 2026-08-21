@@ -33,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Other checkpoint formats retain their previous graph construction; this
     change only aligns Mobius with Olive's module selection.
 
+- Qwen3.6 VL exports now emit the packed Qwen image-processing pipeline when
+  the composite build exposes its unwrapped `qwen3_5_moe_text` config. This
+  adds the required `PatchImage` transform so `pixel_values` matches the
+  vision encoder's rank-2 packed-patch input.
+
 #### Added
 
 - `Qwen2MoELayer(..., shared_expert_gate_class=...)` to override the linear

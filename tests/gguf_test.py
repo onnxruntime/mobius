@@ -440,7 +440,7 @@ class TestGGUFTensorProcessors:
         assert result is sd
 
     def test_gemma_norm_offset(self):
-        """Gemma processor adds 1 to norm weights."""
+        """Gemma processor subtracts 1 from GGUF norm weights."""
         from mobius.integrations.gguf._tensor_processors import (
             process_tensors,
         )
@@ -453,10 +453,10 @@ class TestGGUFTensorProcessors:
             "model.layers.0.self_attn.q_proj.weight": torch.ones(8, 8),
         }
         result = process_tensors(sd, FakeConfig())
-        # Norm weight should have 1 added
+        # Norm weight should have 1 subtracted
         assert torch.allclose(
             result["model.layers.0.input_layernorm.weight"],
-            torch.ones(8),
+            -torch.ones(8),
         )
         # Non-norm weight unchanged
         assert torch.allclose(

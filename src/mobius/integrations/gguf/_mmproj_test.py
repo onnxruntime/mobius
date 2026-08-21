@@ -574,3 +574,282 @@ class TestKeepQuantizedMixedPrecision:
         session = ort.InferenceSession(str(decoder_path), providers=["CPUExecutionProvider"])
         input_names = {graph_input.name for graph_input in session.get_inputs()}
         assert "inputs_embeds" in input_names
+
+
+# Small synthetic Muse Glimmer vision tower dimensions.
+_MG_HIDDEN = 16
+_MG_FFN = 32
+_MG_LAYERS = 6
+_MG_HEADS = 2
+_MG_PATCH = 4
+_MG_GRID = 4
+_MG_MERGE = 2
+_MG_PROJECTOR = 24
+_MG_TEXT_HIDDEN = 32
+
+
+def _write_muse_glimmer_mmproj_gguf(path: Path) -> None:
+    """Write a small synthetic Muse Glimmer ``clip`` mmproj GGUF.
+
+    Mirrors the published ``mmproj-Muse-Glimmer-30B-*.gguf`` layout: biased
+    projections, a plain two-LayerNorm block, no SwiGLU gate, no QK norms, and
+    three positional ``mm.N`` projector matrices.
+    """
+    from gguf import GGUFWriter
+
+    writer = GGUFWriter(str(path), "clip")
+    writer.add_bool("clip.has_vision_encoder", True)
+    writer.add_string("clip.projector_type", "muse-glimmer")
+    writer.add_uint32("clip.vision.embedding_length", _MG_HIDDEN)
+    writer.add_uint32("clip.vision.feed_forward_length", _MG_FFN)
+    writer.add_uint32("clip.vision.block_count", _MG_LAYERS)
+    writer.add_uint32("clip.vision.attention.head_count", _MG_HEADS)
+    writer.add_uint32("clip.vision.image_size", 64)
+    writer.add_uint32("clip.vision.patch_size", _MG_PATCH)
+    writer.add_uint32("clip.vision.projection_dim", _MG_TEXT_HIDDEN)
+    writer.add_uint32("clip.vision.spatial_merge_size", _MG_MERGE)
+    writer.add_float32("clip.vision.attention.layer_norm_epsilon", 1e-5)
+
+    def _f32(name: str, shape: tuple[int, ...]) -> None:
+        writer.add_tensor(name, np.random.randn(*shape).astype(np.float32))
+
+    _f32("v.patch_embd.weight", (_MG_HIDDEN, 3, _MG_PATCH, _MG_PATCH))
+    _f32("v.position_embd.weight", (_MG_GRID * _MG_GRID, _MG_HIDDEN))
+    for stem in ("v.pre_ln", "v.post_ln"):
+        _f32(f"{stem}.weight", (_MG_HIDDEN,))
+        _f32(f"{stem}.bias", (_MG_HIDDEN,))
+    shuffled = _MG_HIDDEN * _MG_MERGE * _MG_MERGE
+    _f32("mm.0.weight", (_MG_PROJECTOR, shuffled))
+    _f32("mm.1.weight", (_MG_PROJECTOR, _MG_PROJECTOR))
+    _f32("mm.2.weight", (_MG_TEXT_HIDDEN, _MG_PROJECTOR))
+
+    for layer in range(_MG_LAYERS):
+        prefix = f"v.blk.{layer}."
+        for norm in ("ln1", "ln2"):
+            _f32(prefix + norm + ".weight", (_MG_HIDDEN,))
+            _f32(prefix + norm + ".bias", (_MG_HIDDEN,))
+        for proj in ("attn_q", "attn_k", "attn_v", "attn_out"):
+            _f32(prefix + proj + ".weight", (_MG_HIDDEN, _MG_HIDDEN))
+            _f32(prefix + proj + ".bias", (_MG_HIDDEN,))
+        _f32(prefix + "ffn_up.weight", (_MG_FFN, _MG_HIDDEN))
+        _f32(prefix + "ffn_up.bias", (_MG_FFN,))
+        _f32(prefix + "ffn_down.weight", (_MG_HIDDEN, _MG_FFN))
+        _f32(prefix + "ffn_down.bias", (_MG_HIDDEN,))
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
+class TestReadMuseGlimmerVisionConfig:
+    """Muse Glimmer vision config extraction from a ``clip`` mmproj."""
+
+    @pytest.fixture
+    def mmproj(self, tmp_path: Path) -> Path:
+        path = tmp_path / "mmproj-muse.gguf"
+        _write_muse_glimmer_mmproj_gguf(path)
+        return path
+
+    def test_reads_metadata_fields(self, mmproj: Path):
+        from mobius.integrations.gguf._mmproj import (
+            read_mmproj_muse_glimmer_vision_config,
+        )
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        config = read_mmproj_muse_glimmer_vision_config(GGUFModel(str(mmproj)))
+
+        assert config is not None
+        assert config.hidden_size == _MG_HIDDEN
+        assert config.intermediate_size == _MG_FFN
+        assert config.num_hidden_layers == _MG_LAYERS
+        assert config.num_attention_heads == _MG_HEADS
+        assert config.patch_size == _MG_PATCH
+        assert config.spatial_merge_size == _MG_MERGE
+        assert config.in_channels == 3
+        assert config.norm_eps == pytest.approx(1e-5)
+        assert config.hidden_act == "gelu"
+
+    def test_recovers_the_fields_gguf_does_not_store(self, mmproj: Path):
+        from mobius.integrations.gguf._mmproj import (
+            read_mmproj_muse_glimmer_vision_config,
+        )
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        config = read_mmproj_muse_glimmer_vision_config(GGUFModel(str(mmproj)))
+
+        assert config is not None
+        # Square position grid, read back from the table's row count.
+        assert config.position_embedding_size == _MG_GRID * _MG_GRID
+        assert config.position_embedding_height == _MG_GRID
+        assert config.position_embedding_width == _MG_GRID
+        # Adapter width comes from mm.0.
+        assert config.projector_intermediate_size == _MG_PROJECTOR
+        # HF's out_hidden_size is the pixel-shuffled width, not the text width.
+        assert config.out_hidden_size == _MG_HIDDEN * _MG_MERGE * _MG_MERGE
+        # Every 4th block is global attention, and so is the last one.
+        assert config.fullatt_block_indexes == [3, 5]
+        # Derived from the patch-embedding weight: llama.cpp stores a plain
+        # Conv2d kernel, i.e. a single temporal frame.
+        assert config.temporal_patch_size == 1
+        assert config.rope_theta == pytest.approx(10_000.0)
+
+    def test_returns_none_without_vision_encoder(self, mmproj: Path):
+        from mobius.integrations.gguf._mmproj import (
+            read_mmproj_muse_glimmer_vision_config,
+        )
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        model = GGUFModel(str(mmproj))
+        model.metadata["clip.has_vision_encoder"] = False
+        assert read_mmproj_muse_glimmer_vision_config(model) is None
+
+    def test_non_square_position_table_is_rejected(self, mmproj: Path):
+        from mobius.integrations.gguf._mmproj import (
+            read_mmproj_muse_glimmer_vision_config,
+        )
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        model = GGUFModel(str(mmproj))
+        with (
+            mock.patch.object(
+                model,
+                "get_tensor",
+                side_effect=lambda name: np.zeros((15, _MG_HIDDEN), dtype=np.float32),
+            ),
+            pytest.raises(ValueError, match="not a square grid"),
+        ):
+            read_mmproj_muse_glimmer_vision_config(model)
+
+    def test_vision_tensors_load_under_hf_names(self, mmproj: Path):
+        from mobius.integrations.gguf._mmproj import _mmproj_muse_glimmer_vision_to_hf
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        state = _mmproj_muse_glimmer_vision_to_hf(GGUFModel(str(mmproj)))
+
+        # The conv patch embedding is flattened into the encoder's Linear.
+        patch = state["model.vision_tower.patch_embedder.patch_embedding.weight"]
+        assert tuple(patch.shape) == (_MG_HIDDEN, 3 * _MG_PATCH * _MG_PATCH)
+        assert tuple(state["model.vision_projection.weight"].shape) == (
+            _MG_TEXT_HIDDEN,
+            _MG_PROJECTOR,
+        )
+        assert "model.vision_tower.layers.5.attn.proj.bias" in state
+        # 6 blocks x 16 tensors + 6 stem tensors + 3 projector matrices.
+        assert len(state) == _MG_LAYERS * 16 + 6 + 3
+
+
+class TestVlmRouting:
+    """The text backbone decides which VLM builder assembles the pair."""
+
+    @pytest.mark.parametrize(
+        ("architecture", "expected"),
+        [
+            ("muse-glimmer", "build_muse_glimmer_vlm_from_gguf"),
+            ("muse_glimmer", "build_muse_glimmer_vlm_from_gguf"),
+            ("gemma4", "build_gemma4_vlm_from_gguf"),
+        ],
+    )
+    def test_routes_on_the_text_architecture(
+        self, tmp_path: Path, architecture: str, expected: str
+    ):
+        from mobius.integrations.gguf._mmproj import build_vlm_from_gguf
+
+        text_path = tmp_path / "text.gguf"
+        _write_minimal_gguf(text_path, architecture)
+        package = mock.sentinel.package
+
+        with mock.patch(
+            f"mobius.integrations.gguf._mmproj.{expected}", return_value=package
+        ) as builder:
+            actual = build_vlm_from_gguf(text_path, "mmproj.gguf", keep_quantized=False)
+
+        assert actual is package
+        builder.assert_called_once_with(
+            text_path,
+            "mmproj.gguf",
+            dtype=None,
+            execution_provider="default",
+            keep_quantized=False,
+        )
+
+
+class TestMuseGlimmerTemporalPatchSize:
+    """The temporal depth is read off the weight, not assumed."""
+
+    def test_conv2d_kernel_means_a_single_frame(self) -> None:
+        from mobius.integrations.gguf._mmproj import _muse_glimmer_temporal_patch_size
+
+        weight = np.zeros((1536, 3, 14, 14), dtype=np.float32)
+        assert _muse_glimmer_temporal_patch_size(weight, patch_size=14) == 1
+
+    def test_conv3d_kernel_keeps_its_temporal_depth(self) -> None:
+        from mobius.integrations.gguf._mmproj import _muse_glimmer_temporal_patch_size
+
+        weight = np.zeros((1536, 3, 2, 14, 14), dtype=np.float32)
+        assert _muse_glimmer_temporal_patch_size(weight, patch_size=14) == 2
+
+    def test_indivisible_kernel_is_rejected(self) -> None:
+        from mobius.integrations.gguf._mmproj import _muse_glimmer_temporal_patch_size
+
+        weight = np.zeros((1536, 3, 13, 14), dtype=np.float32)
+        with pytest.raises(ValueError, match="not divisible"):
+            _muse_glimmer_temporal_patch_size(weight, patch_size=14)
+
+
+class TestMuseGlimmerMediaTokenIds:
+    """A GGUF carries no tokenizer, so the media placeholder ids arrive unset.
+
+    Leaving them unset is not cosmetic. The embedding graph compares
+    ``input_ids`` against them, and the ort-genai exporter drops the field from
+    ``genai_config`` when it is ``None``, so the exported package loses the
+    ability to address video entirely.
+    """
+
+    @staticmethod
+    def _config(**overrides):
+        from mobius._configs import MuseGlimmerConfig
+
+        values = dict(
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_hidden_layers=2,
+            vocab_size=256,
+        )
+        values.update(overrides)
+        return MuseGlimmerConfig(**values)
+
+    def test_fills_in_the_published_ids(self) -> None:
+        from mobius.integrations.gguf._mmproj import _with_muse_glimmer_media_token_ids
+        from mobius.models.muse_glimmer import IMAGE_TOKEN_ID, VIDEO_TOKEN_ID
+
+        config = self._config()
+        assert config.image_token_id is None
+        assert config.video_token_id is None
+
+        result = _with_muse_glimmer_media_token_ids(config)
+
+        assert result.image_token_id == IMAGE_TOKEN_ID
+        assert result.video_token_id == VIDEO_TOKEN_ID
+
+    def test_does_not_override_ids_the_caller_supplied(self) -> None:
+        from mobius.integrations.gguf._mmproj import _with_muse_glimmer_media_token_ids
+
+        result = _with_muse_glimmer_media_token_ids(
+            self._config(image_token_id=7, video_token_id=9)
+        )
+
+        assert result.image_token_id == 7
+        assert result.video_token_id == 9
+
+    def test_the_embedding_graph_never_compares_against_none(self) -> None:
+        from mobius.models.muse_glimmer import (
+            VIDEO_TOKEN_ID,
+            MuseGlimmerEmbeddingModel,
+        )
+
+        module = MuseGlimmerEmbeddingModel(self._config())
+
+        assert module._video_token_id == VIDEO_TOKEN_ID

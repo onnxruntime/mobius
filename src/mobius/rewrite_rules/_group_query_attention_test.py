@@ -900,3 +900,134 @@ class TestGroupQueryAttentionRules:
             assert val is None, (
                 f"Unexpected rotary_embedding_dim on full-RoPE GQA node: {val}"
             )
+class TestSlidingWindowSurvivesFusion:
+    """A window baked into the attention bias must reach ``local_window_size``.
+
+    ``GroupQueryAttention`` ignores the attention bias and rebuilds its mask
+    from ``seqlens_k``/``total_seq_len``, so fusing a windowed ``Attention``
+    without carrying the window over silently turns local attention into global
+    attention. The model still produces fluent text, which is what makes the
+    regression so expensive to find.
+    """
+
+    @staticmethod
+    def _muse_glimmer_config(layer_types: list[str]) -> ArchitectureConfig:
+        from mobius._configs import MuseGlimmerConfig
+
+        return MuseGlimmerConfig(
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            num_hidden_layers=len(layer_types),
+            vocab_size=256,
+            max_position_embeddings=128,
+            hidden_act="silu",
+            layer_types=layer_types,
+            layer_rope_theta=[
+                0.0 if kind == "full_attention" else 500_000.0 for kind in layer_types
+            ],
+            sliding_window=8,
+            pad_token_id=0,
+            rope_type="default",
+            rope_theta=500_000.0,
+            rms_norm_eps=1e-5,
+            dtype=ir.DataType.BFLOAT16,
+        )
+
+    def test_per_layer_window_reaches_the_gqa_nodes(self):
+        from mobius.models.muse_glimmer import MuseGlimmerTextCausalLMModel
+
+        layer_types = ["sliding_attention", "sliding_attention", "full_attention"]
+        config = self._muse_glimmer_config(layer_types)
+        m = build_from_module(MuseGlimmerTextCausalLMModel(config), config)["model"]
+
+        rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
+
+        gqa_nodes = [n for n in m.graph if n.op_type == "GroupQueryAttention"]
+        assert len(gqa_nodes) == len(layer_types)
+        windows = [
+            (
+                n.attributes.get("local_window_size").value
+                if n.attributes.get("local_window_size") is not None
+                else None
+            )
+            for n in gqa_nodes
+        ]
+        # Sliding layers carry the window; the full-attention layer must not.
+        assert windows == [8, 8, None], windows
+
+
+class TestAttentionBiasInspection:
+    """Unit coverage for the bias walk that recovers the window."""
+
+    @staticmethod
+    def _value(name: str) -> ir.Value:
+        return ir.Value(name=name)
+
+    @staticmethod
+    def _const(value: int) -> ir.Value:
+        import numpy as np
+
+        return ir.Value(name=f"const_{value}", const_value=ir.tensor(np.array(value)))
+
+    @classmethod
+    def _op(cls, op_type: str, *inputs: ir.Value) -> ir.Value:
+        node = ir.Node("", op_type, inputs=list(inputs), num_outputs=1)
+        return node.outputs[0]
+
+    def test_sliding_term_is_recovered(self):
+        from mobius.rewrite_rules._group_query_attention import (
+            local_window_from_attention_bias,
+        )
+
+        q_index, kv_index = self._value("q_index"), self._value("kv_index")
+        causal = self._op("GreaterOrEqual", q_index, kv_index)
+        distance = self._op("Sub", q_index, kv_index)
+        within = self._op("Less", distance, self._const(64))
+        bias = self._op("Where", self._op("And", causal, within))
+
+        shape = local_window_from_attention_bias(bias)
+        assert shape.recognized
+        assert shape.window == 64
+
+    def test_padding_comparison_is_not_mistaken_for_a_window(self):
+        from mobius.rewrite_rules._group_query_attention import (
+            local_window_from_attention_bias,
+        )
+
+        # `slot < nonpad_kv_seqlen` is a padding test against a dynamic length,
+        # not a window: no constant bound, and no distance subtraction.
+        slot, seqlen = self._value("slot"), self._value("nonpad_kv_seqlen")
+        bias = self._op("Where", self._op("Less", slot, seqlen))
+
+        shape = local_window_from_attention_bias(bias)
+        assert shape.recognized
+        assert shape.window is None
+
+    def test_plain_causal_bias_has_no_window(self):
+        from mobius.rewrite_rules._group_query_attention import (
+            local_window_from_attention_bias,
+        )
+
+        q_index, kv_index = self._value("q_index"), self._value("kv_index")
+        bias = self._op("Where", self._op("GreaterOrEqual", q_index, kv_index))
+
+        shape = local_window_from_attention_bias(bias)
+        assert shape.recognized
+        assert shape.window is None
+
+    def test_bidirectional_overlay_blocks_fusion(self):
+        from mobius.rewrite_rules._group_query_attention import (
+            local_window_from_attention_bias,
+        )
+
+        q_index, kv_index = self._value("q_index"), self._value("kv_index")
+        causal = self._op("GreaterOrEqual", q_index, kv_index)
+        same_block = self._op("Equal", q_index, kv_index)
+        bias = self._op("Where", self._op("Or", causal, same_block))
+
+        # GQA cannot express an overlay that unmasks non-causal positions, so
+        # the caller must leave the Attention node alone.
+        assert not local_window_from_attention_bias(bias).recognized

@@ -54,6 +54,8 @@ import os
 import shutil
 from typing import TYPE_CHECKING, Any
 
+from mobius.upstream_patches import apply_asset_patches
+
 if TYPE_CHECKING:
     import onnx_ir as ir
 
@@ -137,6 +139,7 @@ _QWEN_VL_MODEL_TYPES = frozenset(
         "qwen3_5",
         "qwen3_5_vl",
         "qwen3_5_moe",
+        "qwen3_5_moe_text",
         "videochat_flash_qwen",
     }
 )
@@ -185,6 +188,19 @@ def _select_ort_model_type(
     if is_decoder_only and config_model_type in _ORT_GENAI_MODEL_TYPE:
         return _ORT_GENAI_MODEL_TYPE[config_model_type]
     return _resolve_ort_genai_model_type(hf_model_type or "unknown")
+
+
+def _load_generation_config(model_id: str):
+    """Load optional Hugging Face generation settings without requiring the file."""
+    import transformers
+
+    try:
+        return transformers.GenerationConfig.from_pretrained(model_id)
+    except OSError:
+        logger.debug(
+            "No generation_config.json found for %s; using model config token IDs", model_id
+        )
+        return None
 
 
 def _graph_input_names(model: ir.Model) -> list[str]:
@@ -1269,6 +1285,8 @@ def write_ort_genai_config(
         directory: Output directory (created if needed).
         hf_model_id: HuggingFace model ID or local model directory. When provided,
             used to fetch token IDs (``bos``/``eos``/``pad``) and copy tokenizer files.
+            Token IDs from ``generation_config.json`` take precedence over model config
+            values because generation configs may define additional stop tokens.
             When ``None``, token IDs are read from ``pkg.config`` fields
             (``bos_token_id``, ``eos_token_id``, ``pad_token_id``) populated
             by :meth:`~mobius._configs.ArchitectureConfig.from_transformers`,
@@ -1400,6 +1418,20 @@ def write_ort_genai_config(
         _pad = getattr(config, "pad_token_id", None)
         pad_token_id = None if (_pad is None or _pad < 0) else _pad
 
+    generation_config_source = hf_model_id or local_config_dir
+    if generation_config_source and (
+        generation_config := _load_generation_config(generation_config_source)
+    ):
+        generation_bos_token_id = getattr(generation_config, "bos_token_id", None)
+        generation_eos_token_id = getattr(generation_config, "eos_token_id", None)
+        generation_pad_token_id = getattr(generation_config, "pad_token_id", None)
+        if generation_bos_token_id is not None:
+            bos_token_id = generation_bos_token_id
+        if generation_eos_token_id is not None:
+            eos_token_id = generation_eos_token_id
+        if generation_pad_token_id is not None:
+            pad_token_id = generation_pad_token_id
+
     # Phi4MM quirk: HF reports model_type='phi' but the model package
     # includes an 'audio_encoder' component that distinguishes it from plain Phi.
     # Override to 'phi4mm' so ORT-GenAI loads the correct pipeline.
@@ -1495,6 +1527,9 @@ def write_ort_genai_config(
 
     # Ensure chat_template is in tokenizer_config.json
     _fix_chat_template(directory, hf_model_id)
+
+    # Correct assets that ship broken from upstream
+    apply_asset_patches(directory)
 
     logger.info("ORT-GenAI artifacts written: %d files", len(result))
     return result
