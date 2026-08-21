@@ -108,6 +108,7 @@ def _make_session_options(
     ep: str,
     *,
     enable_graph_capture: bool | None = None,
+    provider_options: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Return session options with EP-specific provider_options.
 
@@ -117,12 +118,16 @@ def _make_session_options(
     """
     from mobius.integrations.ort_genai.ep_config import make_provider_options
 
+    options = make_provider_options(
+        ep,
+        enable_graph_capture=enable_graph_capture,
+    )
+    if provider_options and options:
+        next(iter(options[0].values())).update(provider_options)
+
     return {
         "log_id": "onnxruntime-genai",
-        "provider_options": make_provider_options(
-            ep,
-            enable_graph_capture=enable_graph_capture,
-        ),
+        "provider_options": options,
     }
 
 
@@ -305,6 +310,8 @@ class GenaiConfigGenerator:
         tokens_per_second: float | None = None,
         patch_size: int | None = None,
         window_size: int | None = None,
+        vision_provider_options: dict[str, str] | None = None,
+        embedding_provider_options: dict[str, str] | None = None,
     ) -> GenaiConfigGenerator:
         """Add VLM vision + embedding sections.
 
@@ -358,6 +365,7 @@ class GenaiConfigGenerator:
             "session_options": _make_session_options(
                 self.ep,
                 enable_graph_capture=False,
+                provider_options=vision_provider_options,
             ),
         }
         if spatial_merge_size is not None:
@@ -380,6 +388,7 @@ class GenaiConfigGenerator:
             "session_options": _make_session_options(
                 self.ep,
                 enable_graph_capture=False,
+                provider_options=embedding_provider_options,
             ),
         }
         self._vlm_token_ids["image_token_id"] = image_token_id

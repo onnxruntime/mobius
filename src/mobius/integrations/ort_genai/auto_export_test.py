@@ -1285,6 +1285,24 @@ class TestExportForOrtGenai:
         assert model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
             "enable_cuda_graph"
         ] == "0"
+        assert model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+            "nv_profile_min_shapes"
+        ] == "input_ids:1x1,image_features:0x1024"
+        assert model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+            "nv_profile_opt_shapes"
+        ] == "input_ids:1x226,image_features:192x1024"
+        assert model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+            "nv_profile_max_shapes"
+        ] == "input_ids:1x1024,image_features:2520x1024"
+        assert model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+            "nv_profile_min_shapes"
+        ] == "pixel_values:600x1536"
+        assert model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+            "nv_profile_opt_shapes"
+        ] == "pixel_values:600x1536"
+        assert model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+            "nv_profile_max_shapes"
+        ] == "pixel_values:600x1536"
 
     def test_qwen36_vl_hf_parent_type_maps_to_qwen35_runtime(self, tmp_path):
         import dataclasses
