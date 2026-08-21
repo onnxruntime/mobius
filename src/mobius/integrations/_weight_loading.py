@@ -250,9 +250,7 @@ def _local_weight_paths(model_dir: pathlib.Path) -> tuple[list[str], str] | None
         try:
             path.relative_to(root)
         except ValueError as exc:
-            raise ValueError(
-                f"Unsafe weight filename in weight index: {filename!r}"
-            ) from exc
+            raise ValueError(f"Unsafe weight filename in weight index: {filename!r}") from exc
         if not path.is_file():
             raise FileNotFoundError(f"Weight file referenced by index not found: {path}")
         paths.append(str(path))
