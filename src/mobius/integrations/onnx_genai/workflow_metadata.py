@@ -3436,6 +3436,8 @@ def build_image_edit_workflow_metadata(
     schedule: list[float],
     timesteps: list[float],
     guidance_scale: float,
+    output_value_range: str = "negative_one_to_one",
+    artifact_paths: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build a flow-matching image-edit workflow with true classifier-free guidance.
 
@@ -3500,6 +3502,20 @@ def build_image_edit_workflow_metadata(
     pkg.add_policy_component("unpack_latents", build_unpack_latents_2x2(dtype))
     pkg.add_policy_component("sequence_concat", build_sequence_concat(dtype))
     pkg.add_policy_component("true_cfg", build_true_cfg(dtype, guidance_scale=guidance_scale))
+    if output_value_range != "negative_one_to_one":
+        raise ValueError("image-edit workflow currently emits negative_one_to_one images")
+    pkg.add_policy_component(
+        "image_output_clamp",
+        build_tensor_clamp(
+            decoder_output.dtype,
+            [
+                "batch" if index == 0 else f"axis_{index}"
+                for index in range(len(decoder_output.shape or []))
+            ],
+            minimum=-1.0,
+            maximum=1.0,
+        ),
+    )
 
     batch = latent_contract["shape"][0]
     batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
@@ -3652,17 +3668,18 @@ def build_image_edit_workflow_metadata(
         "inputs": inputs,
         "outputs": {
             "image": {
-                "contract": _contract(decoder_output),
+                "contract": _request_aligned(_contract(decoder_output)),
                 "role": "image",
-                # Same VAE-decode contract as build_diffusion_workflow_metadata:
-                # Qwen Image Edit (and any package with this component shape)
-                # decodes to pixels normalized to [-1, 1], not [0, 1].
-                "value_range": "negative_one_to_one",
+                "value_range": output_value_range,
                 "stage": "pre_adapter",
             }
         },
         "components": {
-            name: _component(model, _artifact(name, len(pkg))) for name, model in pkg.items()
+            name: _component(
+                model,
+                (artifact_paths or {}).get(name, _artifact(name, len(pkg))),
+            )
+            for name, model in pkg.items()
         },
         "state": {
             "latent": {
@@ -3715,7 +3732,12 @@ def build_image_edit_workflow_metadata(
                 _invoke(
                     "vae_decoder",
                     {decoder_input.name: "vae.latent"},
-                    {decoder_output.name: "vae.image"},
+                    {decoder_output.name: "vae.raw_image"},
+                ),
+                _invoke(
+                    "image_output_clamp",
+                    {"tensor": "vae.raw_image"},
+                    {"clamped": "vae.image"},
                 ),
                 {
                     "kind": "emit",
@@ -3744,6 +3766,7 @@ def write_image_edit_workflow_metadata(
     schedule: list[float],
     timesteps: list[float],
     guidance_scale: float,
+    artifact_paths: dict[str, str] | None = None,
 ) -> str:
     os.makedirs(output_dir, exist_ok=True)
     metadata = build_image_edit_workflow_metadata(
@@ -3752,6 +3775,7 @@ def write_image_edit_workflow_metadata(
         schedule=schedule,
         timesteps=timesteps,
         guidance_scale=guidance_scale,
+        artifact_paths=artifact_paths,
     )
     pkg.save_policy_components(output_dir)
     add_adapter_service_to_metadata(metadata, pkg, output_dir)
