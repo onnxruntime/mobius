@@ -63,6 +63,25 @@ class CLIPTextConfig:
         )
 
 
+class T5TextEncoderConfig:
+    """Adapter for a T5 encoder embedded in a diffusers pipeline."""
+
+    @classmethod
+    def from_diffusers(cls, config: dict) -> ArchitectureConfig:
+        """Create the native Mobius T5 configuration."""
+        import transformers
+
+        from mobius._configs import ArchitectureConfig
+
+        fields = dict(config)
+        fields.pop("architectures", None)
+        fields.pop("transformers_version", None)
+        fields.pop("torch_dtype", None)
+        model_type = fields.pop("model_type", "t5")
+        hf_config = transformers.AutoConfig.for_model(model_type, **fields)
+        return ArchitectureConfig.from_transformers(hf_config)
+
+
 class QwenImageTextEncoderConfig:
     """Adapter for the Qwen2.5-VL prompt encoder bundled with Qwen Image Edit."""
 
@@ -265,6 +284,7 @@ class UNet2DConfig:
     # block). ``None`` = every block has cross-attention (legacy behavior).
     down_block_types: tuple[str, ...] | None = None
     up_block_types: tuple[str, ...] | None = None
+    mid_block_type: str | None = "UNetMidBlock2DCrossAttn"
     addition_embed_type: str | None = None
     addition_time_embed_dim: int | None = None
     projection_class_embeddings_input_dim: int | None = None
@@ -302,6 +322,7 @@ class UNet2DConfig:
                 if config.get("up_block_types") is not None
                 else None
             ),
+            mid_block_type=config.get("mid_block_type", "UNetMidBlock2DCrossAttn"),
             addition_embed_type=config.get("addition_embed_type"),
             addition_time_embed_dim=config.get("addition_time_embed_dim"),
             projection_class_embeddings_input_dim=config.get(

@@ -475,6 +475,40 @@ class T5ForConditionalGeneration(nn.Module):
         return new_state_dict
 
 
+class T5EncoderModel(nn.Module):
+    """Encoder-only T5 model used as a diffusion prompt encoder."""
+
+    default_task = "t5-text-encoding"
+    category = "encoder"
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        self.config = config
+        self.encoder = T5Encoder(config)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        input_ids: ir.Value,
+        attention_mask: ir.Value | None = None,
+    ):
+        return self.encoder(op, input_ids=input_ids, attention_mask=attention_mask)
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        new_state_dict = {}
+        for name, tensor in state_dict.items():
+            new_name = _rename_t5_weight(name)
+            if new_name is not None and new_name.startswith("encoder."):
+                new_state_dict[new_name] = tensor
+        if "encoder.embed_tokens.weight" not in new_state_dict:
+            shared = state_dict.get("shared.weight")
+            if shared is not None:
+                new_state_dict["encoder.embed_tokens.weight"] = shared
+        return new_state_dict
+
+
 # ---------------------------------------------------------------------------
 # Weight name mapping
 # ---------------------------------------------------------------------------

@@ -61,6 +61,7 @@ class TestInitDiffusersClassMap:
             "Qwen2_5_VLForConditionalGeneration",
             "UNet2DConditionModel",
             "CLIPTextModel",
+            "T5EncoderModel",
             "AutoencoderKL",
             "AutoencoderKLQwenImage",
             "AutoencoderKLCogVideoX",
@@ -97,6 +98,7 @@ class TestInitDiffusersClassMap:
             "video-denoising",
             "video-vae",
             "feature-extraction",
+            "t5-text-encoding",
             "minimax-music3-condition",
             "minimax-music3-denoising",
             "minimax-music3-language",
@@ -451,7 +453,7 @@ class TestBuildDiffusersPipelineFiltering:
         mock_load_index.return_value = {
             "_class_name": "FluxPipeline",
             "scheduler": ["diffusers", "EulerDiscreteScheduler"],
-            "text_encoder": ["transformers", "T5EncoderModel"],
+            "text_encoder": ["transformers", "UnsupportedTextEncoderModel"],
         }
         with pytest.raises(ValueError, match="No supported neural network"):
             build_diffusers_pipeline("fake/model", load_weights=False)

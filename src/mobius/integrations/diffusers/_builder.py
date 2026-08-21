@@ -67,6 +67,7 @@ def _init_diffusers_class_map() -> None:
         QwenImageConfig,
         QwenImageTextEncoderConfig,
         QwenImageVAEConfig,
+        T5TextEncoderConfig,
         UNet2DConfig,
         VAEConfig,
     )
@@ -96,6 +97,7 @@ def _init_diffusers_class_map() -> None:
     from mobius.models.qwen_image import QwenImageTransformer2DModel
     from mobius.models.qwen_image_vae import AutoencoderKLQwenImageModel
     from mobius.models.qwen_vl import Qwen25VLCausalLMModel
+    from mobius.models.t5 import T5EncoderModel
     from mobius.models.unet import UNet2DConditionModel
     from mobius.models.vae import AutoencoderKLModel
 
@@ -114,6 +116,11 @@ def _init_diffusers_class_map() -> None:
                 "denoising",
             ),
             "CLIPTextModel": (CLIPTextModel, CLIPTextConfig, "feature-extraction"),
+            "T5EncoderModel": (
+                T5EncoderModel,
+                T5TextEncoderConfig,
+                "t5-text-encoding",
+            ),
             "QwenImageTransformer2DModel": (
                 QwenImageTransformer2DModel,
                 QwenImageConfig,
