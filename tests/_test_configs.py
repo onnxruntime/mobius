@@ -52,6 +52,7 @@ from mobius._configs import (
     YolosConfig,
     Zamba2Config,
 )
+from mobius.models import EsmConfig
 
 # ---------------------------------------------------------------------------
 # Tiny model dimensions shared by all configs
@@ -1465,7 +1466,18 @@ ENCODER_CONFIGS: list[tuple[str, dict, bool]] = [
     ("electra", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
     ("ernie", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
     ("ernie_m", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
-    ("esm", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
+    (
+        "esm",
+        {
+            "_config_cls": EsmConfig,
+            "hidden_act": "gelu",
+            "type_vocab_size": 2,
+            # ESM-2 rotates the whole head dimension with base 10000 and
+            # declares it through ``position_embedding_type`` alone.
+            "partial_rotary_factor": 1.0,
+        },
+        False,
+    ),
     ("flaubert", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
     ("ibert", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
     (

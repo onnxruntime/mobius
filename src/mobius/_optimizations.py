@@ -62,6 +62,7 @@ from mobius._passes import (
 )
 from mobius.functions import register_function_bodies
 from mobius.rewrite_rules import (
+    clip_to_min_max_rules,
     decompose_attention_pass,
     decompose_rope_rules,
     gelu_fusion_rules,
@@ -355,6 +356,13 @@ def _get_optimization_passes(
     if caps.requires_graph_capture_rewrite:
         lower.append(("StaticEmptyKV", list(static_empty_kv_rules())))
 
+    # --- bfloat16 Clip lowering (all EPs) ---
+    # ORT has no bfloat16 Clip kernel and expands the op's ONNX function body
+    # into Less/Where, which also lack bfloat16 kernels — the unassigned nodes
+    # abort session creation. Min/Max are kernel-backed and exactly equivalent.
+    if dtype == ir.DataType.BFLOAT16:
+        lower.append(("ClipToMinMax", list(clip_to_min_max_rules())))
+
     return fuse, lower
 
 
@@ -593,7 +601,28 @@ def optimize_model(
                 stacklevel=4,
             )
         else:
-            Fp8KvCachePass(kv_cache_scales)(model)
+            fp8_pass = Fp8KvCachePass(kv_cache_scales)
+            fp8_pass(model)
+            if fp8_pass.converted == 0:
+                # The gate above tests the *intent* to fuse GQA; only the pass
+                # knows the outcome. FP8 KV storage is a property of the
+                # attention operator, because the scales that dequantize the
+                # cache on read are node inputs: GroupQueryAttention has
+                # ``k_scale``/``v_scale``, ai.onnx ``Attention`` has no such
+                # slot. Retyping a cache that no operator can dequantize would
+                # declare FP8 over data that is read as fp16 — silently wrong
+                # numerics — and quietly leaving the cache at the model dtype
+                # would hand back a package that does not do what was asked.
+                raise ValueError(
+                    "fp8_kv_cache=True was requested but the optimized graph "
+                    "exposes no GroupQueryAttention KV cache to convert. FP8 KV "
+                    "storage needs an attention operator with k_scale/v_scale "
+                    "inputs to dequantize the cache on read; a static-cache "
+                    "export scatters into fixed buffers read by ai.onnx "
+                    "Attention, which has no such inputs. Build without "
+                    "--features fp8-kv-cache, or without --features static-cache "
+                    "so the decoder fuses to GroupQueryAttention."
+                )
 
 
 def fold_initializers_after_weights(model: ir.Model) -> None:

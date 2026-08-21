@@ -157,7 +157,19 @@ def _cmd_build(args: argparse.Namespace) -> None:
     from mobius.tasks import CausalLMTask, ModelTask
 
     def _resolve_static_cache_task(model_type: str) -> ModelTask:
-        """Create the correct static cache task for the given model type."""
+        """Create the correct static cache task for the given model type.
+
+        ``--features text-only`` makes :func:`build` swap the checkpoint's
+        multimodal ``model_type`` for its text-only registry sibling, so the
+        task must be resolved against the *same* substituted type. Resolving
+        against the raw checkpoint type instead pairs a text-only module with a
+        multimodal task, which then fails looking for sub-modules (a vision
+        tower, a separate decoder) that a text-only module does not have.
+        """
+        if args.text_only:
+            from mobius._registry import _TEXT_ONLY_MODEL_TYPE
+
+            model_type = _TEXT_ONLY_MODEL_TYPE.get(model_type, model_type)
         if model_type == "gemma4":
             from mobius.tasks._gemma4 import Gemma4Task
 
@@ -305,9 +317,21 @@ def _cmd_build(args: argparse.Namespace) -> None:
         import transformers
 
         config_path = args.config
-        hf_config = transformers.AutoConfig.from_pretrained(
-            config_path, trust_remote_code=trust_remote_code
-        )
+        try:
+            hf_config = transformers.AutoConfig.from_pretrained(
+                config_path, trust_remote_code=trust_remote_code
+            )
+        except (ValueError, KeyError, OSError):
+            # A checkpoint predating the mandatory ``model_type`` key still
+            # names its architecture; resolve it the same way the HF-id path
+            # does rather than refusing a directory Mobius can build.
+            from mobius.integrations.transformers._config_resolver import (
+                _try_load_config_json,
+            )
+
+            hf_config = _try_load_config_json(config_path)
+            if hf_config is None:
+                raise
         model_type = hf_config.model_type
         parent_config = hf_config
         if hasattr(hf_config, "text_config"):
@@ -435,35 +459,19 @@ def _save_package(
             print(f"  {name}: {path}")
     elif runtime == "onnx-genai":
         from mobius.integrations.onnx_genai import write_onnx_genai_config
-        from mobius.integrations.onnx_genai.inference_metadata import (
-            is_native_vlm_package,
-            write_native_vlm_package_metadata,
-        )
 
         config = getattr(pkg, "config", None)
         source = getattr(args, "config", None) or getattr(args, "model", None)
-        revision_kwargs = (
-            {"revision": args.revision} if getattr(args, "revision", None) is not None else {}
-        )
-        if is_native_vlm_package(pkg):
-            try:
-                artifacts = write_native_vlm_package_metadata(
-                    pkg,
-                    output_dir,
-                    config=config,
-                    source=source,
-                    **revision_kwargs,
-                )
-            except ValueError as error:
-                raise SystemExit(f"Error: {error}") from error
-        else:
+        try:
             artifacts = write_onnx_genai_config(
                 pkg,
                 output_dir,
                 config=config,
                 source=source,
-                **revision_kwargs,
+                revision=getattr(args, "revision", None),
             )
+        except ValueError as error:
+            raise SystemExit(f"Error: {error}") from error
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
 

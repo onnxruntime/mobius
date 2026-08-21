@@ -713,6 +713,12 @@ class Qwen3TTSForConditionalGeneration(nn.Module):
             "talker.model.codec_embedding",
         ),
         "speaker_encoder": ("speaker_encoder",),
+        # Loop-wiring graphs mobius authors itself; no HuggingFace sub-module
+        # backs them, so there is no runtime path to report.
+        "code_predictor_prefill": (),
+        "code_predictor_step_embedder": (),
+        "code_predictor_indices": (),
+        "talker_text_step": (),
     }
 
     def __init__(self, config: ArchitectureConfig):

@@ -1,0 +1,72 @@
+{
+  "kind": "landed_bridge_diagnostic",
+  "producer_commit": "80acfc069f0959f9e6580785fad3172bcc4cc0aa",
+  "metadata_sha256": "8727cb6ab44ff65a4e74b6281c5af9eadba336483f5fa1e6033996c3b99fcced",
+  "decoder_state_initializer_sha256": "77e4eae0e35cc618214476e0776af3c1b7930862924f431edb62724cadb97af7",
+  "measurement_runtime": {
+    "base_head": "b4422f5709fc41ea2545e1de46b849343ace9824",
+    "dirty": true,
+    "log_mtime": "2026-08-14T02:09:47Z",
+    "log_sha256": "d73e93f03086ff9408c12bb10c191678ed19a0f1650ecb738972911f0361d217",
+    "manifest_sha256": "940ccc975d87fe1920666e7ac86dad8d9ad4aafd03fa51ff36f066da3d200915",
+    "five_file_binary_patch_sha256": "53d5643611d760f7a685fa037e7ba7a99faeac35a719af46dbccec8ca6a9a03b"
+  },
+  "landed_runtime": {
+    "head": "9e5757196b98542390ce11f4ff966a58ab3ef578",
+    "intermediate_correctness_commit": "3cf21d15",
+    "binary_patch_sha256": "94845cf46fa8c4c4881d72591881b978b7370ea5a00a96f661857145b5a88449",
+    "clean_runner_sha256": "4b8b092d5fa104f0c6df67c5ba75de7d761c09ffffc50edf07acaab6b6e450bf"
+  },
+  "workload": {
+    "prompt_tokens": 68,
+    "generated_tokens": 128,
+    "warmups": 1,
+    "runs": 3,
+    "decode_skip": 8,
+    "stop_on_eos": false,
+    "image": null
+  },
+  "environment": {
+    "onnxruntime": "1.28.0",
+    "onnxruntime_api_version": 27,
+    "onnxruntime_library_sha256": "018d05f615e96f6e0cfb95d2865f63915681d5d2688dd187f599822b245d27bc",
+    "prompt_ids_sha256": "eab7c0ee593ff2a6331e1678cefadb0969b65cce6f2fad5b75652b8c155399ee",
+    "ONNX_GENAI_CUDA_GRAPH": "1",
+    "ORT_ENABLE_CUDNN_FLASH_ATTENTION": "0"
+  },
+  "metrics": {
+    "ttft_ms": 60.6,
+    "decode_ms_per_token": 24.682,
+    "throughput_tok_s": 40.51,
+    "native_ttft_ms": 49.02172100264579,
+    "native_throughput_tok_s": 63.36527373646786,
+    "throughput_ratio": 0.639
+  },
+  "diagnostics": {
+    "captures": 1,
+    "replays": 510,
+    "synchronizations": 1558,
+    "h2d_calls": 1044,
+    "h2d_bytes": 8352,
+    "d2h_calls": 512,
+    "d2h_bytes": 4096,
+    "d2d_calls": 3068,
+    "d2d_bytes": 17376,
+    "island_elapsed_ms": 2484.875
+  },
+  "token_parity": {
+    "exact": true,
+    "runtime_count": 128,
+    "native_count": 128
+  },
+  "gate": {
+    "required_throughput_ratio": 0.99,
+    "real_multitoken_e2e": true,
+    "paired_performance": false,
+    "upload_allowed": false
+  },
+  "notes": [
+    "The measured dirty bridge is fully represented by the landed runtime diff.",
+    "A clean landed-runtime rerun is still required for final release performance evidence."
+  ]
+}

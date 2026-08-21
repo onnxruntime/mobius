@@ -95,6 +95,7 @@ class TestInitDiffusersClassMap:
             "qwen-image-denoising",
             "qwen-image-text-encoding",
             "video-denoising",
+            "video-vae",
             "feature-extraction",
             "minimax-music3-condition",
             "minimax-music3-denoising",

@@ -20,22 +20,59 @@ from __future__ import annotations
 
 __all__ = ["ModelPackage"]
 
+import hashlib
 import inspect
 import logging
 import os
+import shutil
 import threading
 from collections import UserDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import onnx_ir as ir
+import rfc8785
 import torch
 import tqdm
 
 from mobius._optimizations import fold_initializers_after_weights
+from mobius.adapters import (
+    AdapterArtifact,
+    AdapterServiceOptions,
+    AdapterTargetManifest,
+)
+from mobius.generation import PolicyComponent
 from mobius.integrations._weight_loading import _assign_weight
 
 logger = logging.getLogger(__name__)
+
+
+def _adapter_dtype_name(dtype: ir.DataType) -> str:
+    names = {
+        ir.DataType.FLOAT16: "float16",
+        ir.DataType.FLOAT: "float32",
+        ir.DataType.BFLOAT16: "bfloat16",
+    }
+    try:
+        return names[dtype]
+    except KeyError as error:
+        raise ValueError(
+            f"adapter dtype {dtype.name} must be a floating-point adapter dtype"
+        ) from error
+
+
+def _adapter_source_file(artifact: AdapterArtifact) -> str:
+    if artifact.source.path is None:
+        raise ValueError(
+            f"adapter {artifact.name!r} cannot preserve an in-memory source format"
+        )
+    if artifact.source.format == "onnx_adapter":
+        return artifact.source.path
+    raise ValueError(
+        f"adapter {artifact.name!r} source format {artifact.source.format!r} "
+        "cannot be preserved"
+    )
 
 
 class ModelPackage(UserDict[str, ir.Model]):
@@ -50,9 +87,26 @@ class ModelPackage(UserDict[str, ir.Model]):
         self,
         models: dict[str, ir.Model] | None = None,
         config: object | None = None,
+        policy_components: dict[str, PolicyComponent] | None = None,
+        adapter_artifacts: dict[str, AdapterArtifact] | None = None,
+        adapter_target_manifest: AdapterTargetManifest | None = None,
+        adapter_service_options: AdapterServiceOptions | None = None,
     ) -> None:
         super().__init__(models or {})
         self.config = config
+        self.policy_components = dict(policy_components or {})
+        self.adapter_target_manifest = adapter_target_manifest
+        self.adapter_service_options = adapter_service_options or AdapterServiceOptions()
+        if adapter_target_manifest is not None:
+            adapter_target_manifest.validate(self.data)
+        self.adapter_artifacts: dict[str, AdapterArtifact] = {}
+        for name, artifact in (adapter_artifacts or {}).items():
+            if name != artifact.name:
+                raise ValueError(
+                    f"adapter catalog key {name!r} does not match artifact name "
+                    f"{artifact.name!r}"
+                )
+            self.add_adapter_artifact(artifact)
 
     def __repr__(self) -> str:
         names = ", ".join(repr(k) for k in self.data)
@@ -78,6 +132,8 @@ class ModelPackage(UserDict[str, ir.Model]):
         components: Callable[[str], bool] | None = None,
         progress_bar: bool = True,
         check_weights: bool = True,
+        include_policy_components: bool = True,
+        include_adapter_artifacts: bool = True,
     ) -> None:
         """Save all component models to a directory.
 
@@ -129,6 +185,10 @@ class ModelPackage(UserDict[str, ir.Model]):
             check_weights: Whether to verify that all initializers have
                 weight data before saving.  Defaults to ``True``.
                 Set to ``False`` when saving skeleton models without weights.
+            include_policy_components: Save attached generation-policy ONNX
+                components under ``policies/``. Defaults to ``True``.
+            include_adapter_artifacts: Save attached parameter-adapter bundles
+                under ``adapters/``. Defaults to ``True``.
 
         Raises:
             ValueError: If *external_data* is not ``"onnx"`` or
@@ -161,22 +221,335 @@ class ModelPackage(UserDict[str, ir.Model]):
             else:
                 model_dir = directory
             path = os.path.join(model_dir, "model.onnx")
-            if external_data == "safetensors":
-                ir.save_safetensors(
-                    model,
-                    path,
-                    max_shard_size_bytes=max_shard_size_bytes,
-                    callback=callback,
+            with _namespaced_symbolic_dimensions(model, f"component.{name}") as saved_model:
+                if external_data == "safetensors":
+                    ir.save_safetensors(
+                        saved_model,
+                        path,
+                        max_shard_size_bytes=max_shard_size_bytes,
+                        callback=callback,
+                    )
+                else:
+                    save_kwargs: dict[str, Any] = {
+                        "external_data": "model.onnx.data",
+                        "max_shard_size_bytes": max_shard_size_bytes,
+                        "callback": callback,
+                    }
+                    if "max_workers" in inspect.signature(ir.save).parameters:
+                        save_kwargs["max_workers"] = max_workers
+                    ir.save(saved_model, path, **save_kwargs)
+
+        if include_policy_components:
+            self.save_policy_components(directory, check_weights=check_weights)
+        if include_adapter_artifacts:
+            self.save_adapter_artifacts(directory)
+
+    def add_policy_component(self, name: str, component: PolicyComponent) -> None:
+        """Attach a reusable generation-policy graph to this package."""
+        if not name or "/" in name or "\\" in name:
+            raise ValueError("Policy component name must be a non-empty path segment")
+        self.policy_components[name] = component
+
+    def add_adapter_artifact(
+        self, artifact: AdapterArtifact, *, validate_base: bool = True
+    ) -> None:
+        """Attach a model-agnostic adapter artifact to this package.
+
+        Persistence and ONNX GenAI metadata emission intentionally remain separate
+        until the runtime artifact/schema contract is finalized.
+        """
+        if artifact.name in self.adapter_artifacts:
+            raise ValueError(f"adapter artifact {artifact.name!r} is already attached")
+        if validate_base:
+            artifact.validate_base(
+                self.data,
+                fingerprint_targets=(
+                    self.adapter_target_manifest.targets
+                    if self.adapter_target_manifest is not None
+                    else None
+                ),
+            )
+        if self.adapter_target_manifest is not None:
+            if artifact.base_fingerprint != self.adapter_target_manifest.base_fingerprint:
+                raise ValueError(
+                    f"adapter {artifact.name!r} base fingerprint does not match "
+                    "the authoritative target manifest"
                 )
-            else:
-                save_kwargs: dict[str, Any] = {
-                    "external_data": "model.onnx.data",
-                    "max_shard_size_bytes": max_shard_size_bytes,
-                    "callback": callback,
+            missing = artifact.target_bindings - self.adapter_target_manifest.bindings
+            if missing:
+                raise ValueError(
+                    f"adapter artifact {artifact.name!r} contains targets outside "
+                    f"the authoritative manifest: {sorted(map(str, missing))}"
+                )
+        self.adapter_artifacts[artifact.name] = artifact
+
+    def save_adapter_artifacts(self, directory: str) -> dict[str, dict[str, object]]:
+        """Save exact adapter bundles and return ONNX GenAI catalog entries."""
+        if not self.adapter_artifacts:
+            return {}
+        if self.adapter_target_manifest is None:
+            raise ValueError(
+                "adapter artifacts require an authoritative adapter target manifest"
+            )
+        self.adapter_target_manifest.validate(self.data)
+        adapter_dir = os.path.join(directory, "adapters")
+        os.makedirs(adapter_dir, exist_ok=True)
+        descriptors = {
+            descriptor.target: descriptor
+            for descriptor in self.adapter_target_manifest.targets
+        }
+        manifest_targets = {
+            target["id"]: target
+            for target in self.adapter_target_manifest_metadata()["targets"]
+        }
+        catalog: dict[str, dict[str, object]] = {}
+        identities: set[tuple[str, str]] = set()
+        for artifact_index, (alias, artifact) in enumerate(
+            sorted(self.adapter_artifacts.items())
+        ):
+            identity_version = (artifact.stable_identity, artifact.version)
+            if identity_version in identities:
+                raise ValueError(
+                    f"adapter identity/version {identity_version[0]}@"
+                    f"{identity_version[1]} must be unique"
+                )
+            identities.add(identity_version)
+            ordered_weights = sorted(
+                artifact.weights,
+                key=lambda item: (
+                    item.target.component,
+                    item.target.parameter,
+                    item.target_id or "",
+                ),
+            )
+            dtypes = {weight.dtype for weight in artifact.weights}
+            if len(dtypes) != 1:
+                raise ValueError(
+                    f"adapter {alias!r} has heterogeneous target dtypes, "
+                    "which the ONNX GenAI artifact contract cannot represent"
+                )
+            rank = ordered_weights[0].rank
+            alpha = ordered_weights[0].alpha
+            dtype = _adapter_dtype_name(dtypes.pop())
+            bindings: list[dict[str, object]] = []
+            portable_targets: dict[str, dict[str, list[float]]] = {}
+            for weight in ordered_weights:
+                descriptor = descriptors[weight.target]
+                target_id = weight.target_id or descriptor.semantic_name
+                if target_id not in manifest_targets:
+                    raise ValueError(
+                        f"adapter {alias!r} references target ID {target_id!r} "
+                        "outside the authoritative manifest"
+                    )
+                target_policy = manifest_targets[target_id]
+                if target_policy.get("rank", weight.rank) != weight.rank:
+                    raise ValueError(
+                        f"adapter {alias!r} target {target_id!r} rank {weight.rank} "
+                        f"violates manifest policy {target_policy['rank']}"
+                    )
+                if target_policy.get("alpha", weight.alpha) != weight.alpha:
+                    raise ValueError(
+                        f"adapter {alias!r} target {target_id!r} alpha {weight.alpha} "
+                        f"violates manifest policy {target_policy['alpha']}"
+                    )
+                slice_policy = target_policy.get("output_slice")
+                if isinstance(slice_policy, dict):
+                    if slice_policy.get("rank", weight.rank) != weight.rank:
+                        raise ValueError(
+                            f"adapter {alias!r} target {target_id!r} rank {weight.rank} "
+                            f"violates output-slice policy {slice_policy['rank']}"
+                        )
+                    if slice_policy.get("alpha", weight.alpha) != weight.alpha:
+                        raise ValueError(
+                            f"adapter {alias!r} target {target_id!r} alpha {weight.alpha} "
+                            f"violates output-slice policy {slice_policy['alpha']}"
+                        )
+                weight_key = weight.weight_key or descriptor.semantic_name
+                binding: dict[str, object] = {
+                    "target": target_id,
+                    "weight_key": weight_key,
                 }
-                if "max_workers" in inspect.signature(ir.save).parameters:
-                    save_kwargs["max_workers"] = max_workers
-                ir.save(model, path, **save_kwargs)
+                if weight.rank != rank:
+                    binding["rank"] = weight.rank
+                if weight.alpha != alpha:
+                    binding["alpha"] = weight.alpha
+                bindings.append(binding)
+                portable_targets[weight_key] = {
+                    "a": weight.a.numpy().reshape(-1).astype("float32").tolist(),
+                    "b": weight.b.numpy().reshape(-1).astype("float32").tolist(),
+                }
+
+            artifact_dir = os.path.join(directory, "adapters", alias)
+            os.makedirs(artifact_dir, exist_ok=True)
+            weight_artifacts: list[dict[str, object]] = []
+            if self.adapter_service_options.portable_fallback:
+                relative_location = f"adapters/{alias}/adapter.json"
+                destination = os.path.join(directory, relative_location)
+                payload = rfc8785.dumps({"targets": portable_targets})
+                with open(destination, "wb") as handle:
+                    handle.write(payload)
+                weight_artifacts.append(
+                    {
+                        "location": relative_location,
+                        "loader_capability": "onnx-genai.adapters.json@1",
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                        "scale_encoding": "alpha_over_rank",
+                        "format": "json",
+                    }
+                )
+            if (
+                self.adapter_service_options.preserve_source_format
+                and artifact.source.format != "in_memory"
+            ):
+                if artifact.source.format == "onnx_adapter":
+                    source_path = _adapter_source_file(artifact)
+                    relative_location = f"adapters/{alias}/adapter.onnx_adapter"
+                    destination = os.path.join(directory, relative_location)
+                    shutil.copyfile(source_path, destination)
+                    with open(destination, "rb") as handle:
+                        payload = handle.read()
+                    weight_artifacts.append(
+                        {
+                            "location": relative_location,
+                            "loader_capability": "onnxruntime.lora-adapter@1",
+                            "sha256": hashlib.sha256(payload).hexdigest(),
+                            "scale_encoding": "baked",
+                            "format": "ort_genai",
+                        }
+                    )
+                elif artifact.source.format == "peft_safetensors":
+                    if artifact.source.path is None:
+                        raise ValueError(f"adapter {alias!r} PEFT source path is absent")
+                    source_dir = artifact.source.path
+                    source_weights = os.path.join(source_dir, "adapter_model.safetensors")
+                    source_config = os.path.join(source_dir, "adapter_config.json")
+                    relative_location = f"adapters/{alias}/adapter_model.safetensors"
+                    relative_config = f"adapters/{alias}/adapter_config.json"
+                    destination = os.path.join(directory, relative_location)
+                    config_destination = os.path.join(directory, relative_config)
+                    shutil.copyfile(source_weights, destination)
+                    shutil.copyfile(source_config, config_destination)
+                    with open(destination, "rb") as handle:
+                        payload = handle.read()
+                    with open(config_destination, "rb") as handle:
+                        config_payload = handle.read()
+                    weight_artifacts.append(
+                        {
+                            "location": relative_location,
+                            "loader_capability": "onnx-genai.adapters.hf-peft@1",
+                            "sha256": hashlib.sha256(payload).hexdigest(),
+                            "config_location": relative_config,
+                            "config_sha256": hashlib.sha256(config_payload).hexdigest(),
+                            "scale_encoding": "alpha_over_rank",
+                            "format": "hf_peft",
+                        }
+                    )
+                else:
+                    raise ValueError(
+                        f"adapter {alias!r} source format {artifact.source.format!r} "
+                        "cannot be preserved"
+                    )
+            if not weight_artifacts:
+                raise ValueError(
+                    f"adapter {alias!r} must emit a portable or preserved source artifact"
+                )
+            provenance = {"producer": artifact.source.producer}
+            if artifact.source.base_model:
+                provenance["source"] = artifact.source.base_model
+            if artifact.source.revision:
+                provenance["revision"] = artifact.source.revision
+            catalog[alias] = {
+                "index": artifact_index,
+                "identity": artifact.stable_identity,
+                "version": artifact.version,
+                "base_model_fingerprint": artifact.base_fingerprint,
+                "rank": rank,
+                "alpha": alpha,
+                "dtype": dtype,
+                "provenance": provenance,
+                "weights": weight_artifacts,
+                "bindings": bindings,
+            }
+        return catalog
+
+    def adapter_target_manifest_metadata(self) -> dict[str, object]:
+        """Serialize the authoritative generic LoRA target manifest."""
+        if self.adapter_target_manifest is None:
+            raise ValueError("adapter target manifest is not attached")
+        targets: list[dict[str, object]] = []
+        for descriptor in sorted(
+            self.adapter_target_manifest.targets,
+            key=lambda item: item.semantic_name,
+        ):
+            initializer = self.data[descriptor.target.component].graph.initializers[
+                descriptor.target.parameter
+            ]
+            activation_dtype = _adapter_dtype_name(
+                descriptor.activation_dtype or initializer.dtype
+            )
+            base: dict[str, object] = {
+                "id": descriptor.semantic_name,
+                "component": descriptor.target.component,
+                "initializer": descriptor.target.parameter,
+                "node_name": descriptor.node_name,
+                "output_name": descriptor.output_name,
+                "activation_dtype": activation_dtype,
+                "input_features": descriptor.input_size,
+                "output_features": descriptor.output_size,
+            }
+            if descriptor.layer_index is not None:
+                base["layer_index"] = descriptor.layer_index
+            if descriptor.rank is not None:
+                base["rank"] = descriptor.rank
+            if descriptor.alpha is not None:
+                base["alpha"] = descriptor.alpha
+            if descriptor.graph_input_a is not None:
+                graph_inputs = {
+                    "a": descriptor.graph_input_a,
+                    "b": descriptor.graph_input_b,
+                }
+                if descriptor.graph_input_scale is not None:
+                    graph_inputs["scale"] = descriptor.graph_input_scale
+                base["graph_inputs"] = graph_inputs
+            targets.append(base)
+            for target_slice in descriptor.slices:
+                sliced = dict(base)
+                sliced["id"] = f"{descriptor.semantic_name}.{target_slice.role}"
+                output_slice: dict[str, object] = {
+                    "role": target_slice.role,
+                    "offset": target_slice.offset,
+                    "width": target_slice.width,
+                }
+                if target_slice.rank is not None:
+                    output_slice["rank"] = target_slice.rank
+                if target_slice.alpha is not None:
+                    output_slice["alpha"] = target_slice.alpha
+                sliced["output_slice"] = output_slice
+                targets.append(sliced)
+        return {"targets": targets}
+
+    def save_policy_components(
+        self,
+        directory: str,
+        *,
+        check_weights: bool = True,
+    ) -> dict[str, str]:
+        """Save attached policy graphs and return package-relative artifact paths."""
+        if not self.policy_components:
+            return {}
+        policy_dir = os.path.join(directory, "policies")
+        os.makedirs(policy_dir, exist_ok=True)
+        artifacts: dict[str, str] = {}
+        for name, component in self.policy_components.items():
+            if check_weights:
+                _check_weights(name, component.model)
+            relative_path = f"policies/{name}.onnx"
+            # Policy components are separate ONNX artifacts with public ABI
+            # dimension names such as ``batch``. Namespacing those dimensions
+            # makes an otherwise exact semantic contract ineligible for runtime fusion.
+            ir.save(component.model, os.path.join(directory, relative_path))
+            artifacts[name] = relative_path
+        return artifacts
 
     @classmethod
     def load(cls, directory: str) -> ModelPackage:
@@ -203,13 +576,29 @@ class ModelPackage(UserDict[str, ir.Model]):
             if os.path.isdir(subdir) and os.path.isfile(model_path):
                 models[entry] = ir.load(model_path)
         if models:
-            return cls(models)
+            package = cls(models)
+            package._load_policy_components(directory)
+            return package
         # Fall back to flat layout
         for filename in sorted(os.listdir(directory)):
             if filename.endswith(".onnx"):
                 name = filename.removesuffix(".onnx")
                 models[name] = ir.load(os.path.join(directory, filename))
-        return cls(models)
+        package = cls(models)
+        package._load_policy_components(directory)
+        return package
+
+    def _load_policy_components(self, directory: str) -> None:
+        policy_dir = os.path.join(directory, "policies")
+        if not os.path.isdir(policy_dir):
+            return
+        for filename in sorted(os.listdir(policy_dir)):
+            if not filename.endswith(".onnx"):
+                continue
+            model = ir.load(os.path.join(policy_dir, filename))
+            self.policy_components[filename.removesuffix(".onnx")] = (
+                PolicyComponent.from_model(model)
+            )
 
     # -- Weight application ------------------------------------------------
 
@@ -283,6 +672,58 @@ class ModelPackage(UserDict[str, ir.Model]):
         # be constant-folded once the weight tensors carry their const_value.
         for model in self.data.values():
             fold_initializers_after_weights(model)
+
+
+@contextmanager
+def _namespaced_symbolic_dimensions(
+    model: ir.Model,
+    namespace: str,
+) -> Iterator[ir.Model]:
+    """Namespace interface symbols and discard non-contractual intermediate aliases."""
+    interface_values = {id(value) for value in (*model.graph.inputs, *model.graph.outputs)}
+    values: dict[int, ir.Value] = {}
+    graphs: list[ir.GraphProtocol] = []
+    nodes = ir.traversal.RecursiveGraphIterator(model.graph, enter_graph=graphs.append)
+    for node in nodes:
+        for value in (*node.inputs, *node.outputs):
+            if value is not None:
+                values[id(value)] = value
+    for graph in graphs:
+        for value in (*graph.inputs, *graph.outputs, *graph.initializers.values()):
+            values[id(value)] = value
+
+    originals: list[tuple[ir.Value, ir.Shape]] = []
+    symbols: dict[str, str] = {}
+    try:
+        for value in values.values():
+            if value.shape is None:
+                continue
+            dimensions: list[int | str | ir.SymbolicDim] = []
+            changed = False
+            for dimension in value.shape:
+                if isinstance(dimension, int):
+                    dimensions.append(dimension)
+                    continue
+                if dimension.value is None:
+                    dimensions.append(dimension)
+                    continue
+                if id(value) not in interface_values:
+                    dimensions.append(ir.SymbolicDim(None))
+                    changed = True
+                    continue
+                text = str(dimension)
+                dimensions.append(symbols.setdefault(text, f"{namespace}.{text}"))
+                changed = True
+            if changed:
+                originals.append((value, value.shape))
+                denotations = [
+                    value.shape.get_denotation(index) for index in range(len(value.shape))
+                ]
+                value.shape = ir.Shape(dimensions, denotations)
+        yield model
+    finally:
+        for value, shape in originals:
+            value.shape = shape
 
 
 def _make_progress_callback():

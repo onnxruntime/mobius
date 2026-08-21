@@ -1,0 +1,58 @@
+{
+  "kind": "workflow_release_diagnostic",
+  "producer_commit": "80acfc069f0959f9e6580785fad3172bcc4cc0aa",
+  "runtime_source_head": "568457045ea003e787816995a380bcd9d7443169",
+  "runner_sha256": "fad10c7c8735c56e42acdfc092c4c6c327090c50de823efc45d4f3309b2d4aa9",
+  "overlay_manifest_sha256": "fd77589ffb9333d69efe78909b7f4a489da1071a35affb49b243e87a76330c6a",
+  "metadata_sha256": "8727cb6ab44ff65a4e74b6281c5af9eadba336483f5fa1e6033996c3b99fcced",
+  "decoder_state_initializer_sha256": "77e4eae0e35cc618214476e0776af3c1b7930862924f431edb62724cadb97af7",
+  "workload": {
+    "prompt_tokens": 68,
+    "generated_tokens": 128,
+    "warmups": 1,
+    "runs": 3,
+    "decode_skip": 8,
+    "stop_on_eos": false,
+    "image": null
+  },
+  "metrics": {
+    "ttft_ms": 67.512,
+    "decode_ms_per_token": 29.168,
+    "throughput_tok_s": 34.28,
+    "native_ttft_ms": 49.02172100264579,
+    "native_throughput_tok_s": 63.36527373646786,
+    "throughput_ratio": 0.5409903244885887
+  },
+  "diagnostics": {
+    "captures": 1,
+    "replays": 510,
+    "synchronizations": 2580,
+    "h2d_calls": 1556,
+    "h2d_bytes": 413802656,
+    "d2h_calls": 512,
+    "d2h_bytes": 4096,
+    "d2d_calls": 3068,
+    "d2d_bytes": 17376,
+    "island_elapsed_ms": 2974.922
+  },
+  "token_parity": {
+    "exact": false,
+    "first_difference": {
+      "index": 38,
+      "runtime": 4243,
+      "native": 33386
+    },
+    "runtime_count": 128,
+    "native_count": 128
+  },
+  "gate": {
+    "required_throughput_ratio": 0.99,
+    "correctness": false,
+    "paired_performance": false,
+    "upload_allowed": false
+  },
+  "notes": [
+    "The decoder remained outside the captured policy island.",
+    "This exact prompt-ID runtime still materialized decoder logits through host memory."
+  ]
+}

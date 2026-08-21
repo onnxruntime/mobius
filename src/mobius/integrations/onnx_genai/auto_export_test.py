@@ -14,7 +14,21 @@ import pytest
 import yaml
 
 from mobius._configs import QuantizationConfig
+from mobius._model_package import ModelPackage
 from mobius.integrations.onnx_genai import write_onnx_genai_config
+from mobius.integrations.onnx_genai.auto_export import (
+    _flow_match_euler_schedule,
+    _looks_like_image_edit,
+)
+from mobius.integrations.onnx_genai.inference_metadata import SchedulerConfig
+from mobius.integrations.onnx_genai.inference_metadata_test import (
+    _decoder_model,
+    _model,
+    _value,
+)
+from mobius.integrations.onnx_genai.workflow_metadata import (
+    build_decoder_workflow_metadata,
+)
 
 
 @dataclasses.dataclass
@@ -40,20 +54,315 @@ class _DiffusionPkg(dict):
     pass
 
 
+def _diffusion_package(*, text: bool = False):
+    latent = ["batch", 4, "height", "width"]
+    denoiser_inputs = [
+        _value("sample", ir.DataType.FLOAT, latent),
+        _value("timestep", ir.DataType.FLOAT, ["batch"]),
+    ]
+    components = {}
+    if text:
+        denoiser_inputs.append(
+            _value(
+                "encoder_hidden_states",
+                ir.DataType.FLOAT,
+                ["batch", "prompt_sequence", 32],
+            )
+        )
+        components["text_encoder"] = _model(
+            "text_encoder",
+            [_value("input_ids", ir.DataType.INT64, ["batch", "prompt_sequence"])],
+            [
+                (
+                    "encoder_hidden_states",
+                    ir.DataType.FLOAT,
+                    ["batch", "prompt_sequence", 32],
+                )
+            ],
+        )
+    denoiser = _model(
+        "denoiser",
+        denoiser_inputs,
+        [("noise_pred", ir.DataType.FLOAT, latent)],
+    )
+    vae = _model(
+        "vae_decoder",
+        [_value("latent", ir.DataType.FLOAT, latent)],
+        [("image", ir.DataType.FLOAT, ["batch", 3, "image_height", "image_width"])],
+    )
+    components.update({"denoiser": denoiser, "vae_decoder": vae})
+    return ModelPackage(components)
+
+
 class _MultimodalPkg(dict):
     config = _Cfg()
 
 
+@dataclasses.dataclass
+class _VisionCfg:
+    patch_size: int = 14
+    temporal_patch_size: int = 2
+    merge_size: int = 1
+    spatial_merge_size: int = 1
+    size: dict[str, int] = dataclasses.field(
+        default_factory=lambda: {"shortest_edge": 224, "longest_edge": 224}
+    )
+
+
+@dataclasses.dataclass
+class _VlmCfg(_Cfg):
+    vision: _VisionCfg = dataclasses.field(default_factory=_VisionCfg)
+    image_token_id: int = 32000
+    eos_token_id: int = 2
+
+
+def _vlm_package(*, audio: bool = False):
+    vision = _model(
+        "vision_encoder",
+        [
+            _value("pixel_values", ir.DataType.FLOAT, ["patches", 1176]),
+            _value("grid_thw", ir.DataType.INT64, ["images", 3]),
+        ],
+        [("image_features", ir.DataType.FLOAT, ["batch", 256, 32])],
+    )
+    embedding_inputs = [
+        _value("input_ids", ir.DataType.INT64, ["batch", "sequence"]),
+        _value("image_features", ir.DataType.FLOAT, ["batch", 256, 32]),
+    ]
+    components = {"vision_encoder": vision}
+    if audio:
+        components["audio_encoder"] = _model(
+            "audio_encoder",
+            [_value("input_features", ir.DataType.FLOAT, ["batch", 80, "frames"])],
+            [("audio_features", ir.DataType.FLOAT, ["batch", 64, 32])],
+        )
+        embedding_inputs.append(_value("audio_features", ir.DataType.FLOAT, ["batch", 64, 32]))
+    embedding = _model(
+        "embedding",
+        embedding_inputs,
+        [("inputs_embeds", ir.DataType.FLOAT, ["batch", "sequence", 32])],
+    )
+    decoder = _decoder_model(
+        [("inputs_embeds", ir.DataType.FLOAT, ["batch", "sequence", 32])],
+        position_shape=["batch", "sequence"],
+    )
+    components.update({"embedding": embedding, "decoder": decoder})
+    return ModelPackage(components, config=_VlmCfg())
+
+
+def _decoder_package(config=None):
+    model = _decoder_model(
+        [],
+        position_shape=["batch", "sequence"],
+        raw_token_input=True,
+    )
+    return ModelPackage({"model": model}, config=config or _Cfg())
+
+
 def test_dispatch_decoder(tmp_path):
-    arts = write_onnx_genai_config(object(), str(tmp_path), config=_Int4Cfg())
+    package = _decoder_package(_Int4Cfg())
+    arts = write_onnx_genai_config(package, str(tmp_path), config=_Int4Cfg())
     with open(arts["inference_metadata"]) as handle:
         meta = yaml.safe_load(handle)
-    assert meta["model"]["attention"]["type"] == "grouped_query_attention"
-    assert meta["kv_cache"]["native_dtype"] == "float16"
+    workflow = meta["pipeline"]["workflow"]
+    assert "ir_version" not in workflow["manifest"]
+    assert "onnx_opsets" not in workflow["manifest"]
+    assert workflow["components"]["token_sampler"]["contract"]["id"] == (
+        "onnx-genai.token-sampler"
+    )
+    assert workflow["components"]["termination"]["contract"]["id"] == (
+        "onnx-genai.termination-predicate"
+    )
+    assert workflow["steps"][0]["kind"] == "loop"
+    application_inputs = {
+        name
+        for name, value in workflow["inputs"].items()
+        if value["source"]["kind"] == "application"
+    }
+    assert application_inputs == {
+        "request.prompt_lengths",
+        "request.eos_ids",
+        "request.eos_lengths",
+        "request.row_max_iterations",
+        "request.rng_counter",
+    }
+    assert workflow["inputs"]["request.prompt_lengths"]["default"] == -1
+    assert [node["component"] for node in workflow["steps"][0]["setup"]] == [
+        "decoder_state_initializer",
+        "model",
+        "termination_batch_initializer",
+        "last_token_logits",
+    ]
+    body = workflow["steps"][0]["steps"]
+    assert [node["kind"] for node in body].count("emit") == 1
+    assert next(node for node in body if node["kind"] == "emit")["value"] == "token.body"
+    assert workflow["outputs"]["tokens"]["contract"]["shape"] == [
+        "batch",
+        "generated_sequence",
+    ]
+    assert workflow["steps"][0]["iteration"] == {
+        "value": "loop.iteration",
+        "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+    }
+    assert "iteration" not in workflow["state"]
+    serialized = yaml.safe_dump(workflow)
+    assert "initial_effects" not in serialized
+    assert "read_effect" not in serialized
+    assert "write_effect" not in serialized
+    assert ".read" not in serialized
+    assert "iteration_increment" not in workflow["components"]
+    assert workflow["state"]["token"]["initializer"] == "initializer.token_slot"
+    assert workflow["state"]["logits"] == {
+        "contract": {
+            "dtype": "float32",
+            "rank": 2,
+            "shape": ["batch", 128],
+            "batch_layout": {"kind": "request_aligned", "axis": 0},
+        },
+        "scope": "invocation",
+        "initializer": "decoder.setup.last_logits",
+        "recurrence": {"kind": "invariant"},
+    }
+    assert (tmp_path / "policies" / "token_sampler.onnx").is_file()
+
+
+def test_seeded_decoder_sampler_uses_request_controls_and_direct_kv_carry():
+    workflow = build_decoder_workflow_metadata(
+        _decoder_package(), _Cfg(), sampler="seeded_categorical"
+    )["pipeline"]["workflow"]
+    sampler = workflow["components"]["token_sampler"]
+    assert sampler["application_overridable"] is True
+    assert sampler["contract"]["version"] == "2"
+    assert sampler["contract"]["parameters"] == {
+        "mode": "seeded_stochastic",
+        "batching": "per_row",
+        "inactive_rows": "preserve",
+    }
+    assert sampler["contract"]["bindings"] == {
+        "logits": "logits",
+        "token": "token",
+        "temperature": "temperature",
+        "top_k": "top_k",
+        "top_p": "top_p",
+        "min_p": "min_p",
+        "seed": "seed",
+        "counter": "counter",
+        "next_counter": "next_counter",
+        "active": "active",
+        "done": "done",
+    }
+    assert sampler["ports"]["inputs"]["logits"] == {
+        "dtype": "float32",
+        "rank": 2,
+        "shape": ["batch", "vocabulary"],
+        "batch_layout": {"kind": "request_aligned", "axis": 0},
+    }
+    assert sampler["ports"]["outputs"]["token"] == {
+        "dtype": "int64",
+        "rank": 1,
+        "shape": ["batch"],
+        "batch_layout": {"kind": "request_aligned", "axis": 0},
+    }
+    sampler_step = next(
+        step
+        for step in workflow["steps"][0]["steps"]
+        if step.get("component") == "token_sampler"
+    )
+    assert sampler_step["inputs"] == {
+        "logits": "logits",
+        "temperature": "request.temperature",
+        "top_k": "request.top_k",
+        "top_p": "request.top_p",
+        "min_p": "request.min_p",
+        "seed": "request.seed",
+        "counter": "rng_counter",
+        "active": "active",
+        "done": "done",
+    }
+    for name in ("temperature", "top_k", "top_p", "min_p"):
+        assert workflow["inputs"][f"request.{name}"]["contract"]["shape"] == ["batch"]
+    assert workflow["inputs"]["request.prompt_lengths"]["contract"]["shape"] == ["batch"]
+    assert workflow["inputs"]["request.max_iterations"]["contract"]["shape"] == [1]
+    assert workflow["inputs"]["request.eos_ids"]["contract"]["shape"] == [
+        "batch",
+        "num_eos",
+    ]
+    assert workflow["state"]["rng_counter"]["class"] == "semantic"
+    assert workflow["state"]["rng_counter"]["initializer"] == "request.rng_counter"
+    emit = next(node for node in workflow["steps"][0]["steps"] if node["kind"] == "emit")
+    assert "row_ids" not in emit
+    assert "emit_row_identity" not in workflow["manifest"]["capabilities"]
+    assert set(
+        workflow["serving"]["state_service"]["groups"]["decoder_cache"]["ports"]["model"]
+    ) == {"cache_0", "cache_1"}
+    assert workflow["components"]["termination"]["contract"]["version"] == "2"
+    assert workflow["components"]["termination"]["contract"]["parameters"] == {
+        "batching": "per_row",
+        "inactive_rows": "preserve",
+    }
+    assert set(workflow["components"]["termination"]["contract"]["bindings"]) == {
+        "tokens",
+        "active",
+        "eos_ids",
+        "eos_lengths",
+        "iteration",
+        "max_iterations",
+        "done",
+        "next_active",
+        "continue",
+    }
+    assert workflow["components"]["termination"]["ports"]["inputs"]["iteration"] == {
+        "dtype": "int64",
+        "rank": 1,
+        "shape": [1],
+    }
+    assert workflow["components"]["token_state_update"]["contract"] == {
+        "id": "onnx-genai.state-update",
+        "version": "2",
+        "bindings": {
+            "current": "current",
+            "update": "update",
+            "active": "active",
+            "done": "done",
+            "next": "next",
+        },
+        "parameters": {
+            "batching": "per_row",
+            "inactive_rows": "preserve",
+        },
+    }
+    assert not any("kv_update" in name for name in workflow["components"])
+
+
+def test_dispatch_language_diffusion(tmp_path):
+    package = ModelPackage(
+        {
+            "model": _model(
+                "masked_denoiser",
+                [_value("input_ids", ir.DataType.INT64, ["batch", "sequence"])],
+                [
+                    ("logits", ir.DataType.FLOAT, ["batch", "sequence", 128]),
+                    ("proposed_tokens", ir.DataType.INT64, ["batch", "sequence"]),
+                ],
+            )
+        },
+        config=_Cfg(model_type="llada"),
+    )
+    artifacts = write_onnx_genai_config(
+        package,
+        str(tmp_path),
+        num_inference_steps=12,
+    )
+    with open(artifacts["inference_metadata"]) as handle:
+        metadata = yaml.safe_load(handle)
+    pipeline = metadata["pipeline"]
+    assert set(pipeline) == {"workflow"}
+    assert pipeline["workflow"]["inputs"]["request.max_iterations"]["default"] == 12
+    assert (tmp_path / "policies" / "masked_update.onnx").is_file()
 
 
 def test_dispatch_diffusion(tmp_path):
-    pkg = _DiffusionPkg({"denoiser": object(), "vae": object()})
+    pkg = _diffusion_package()
     arts = write_onnx_genai_config(
         pkg,
         str(tmp_path),
@@ -62,65 +371,223 @@ def test_dispatch_diffusion(tmp_path):
     )
     with open(arts["inference_metadata"]) as handle:
         meta = yaml.safe_load(handle)
-    assert meta["pipeline"]["strategy"]["kind"] == "iterative"
-    assert "vae" in meta["pipeline"]["models"]
+    workflow = meta["pipeline"]["workflow"]
+    assert workflow["steps"][0]["iteration"]["value"] == "loop.iteration"
+    assert workflow["steps"][1]["component"] == "vae_decoder"
+    assert "strategy" not in meta["pipeline"]
+    assert (tmp_path / "policies" / "solver_step.onnx").is_file()
+    assert (tmp_path / "policies" / "schedule_lookup.onnx").is_file()
 
 
-def test_single_diffusion_component_uses_flat_model_path(tmp_path):
+def test_single_diffusion_component_requires_explicit_vae(tmp_path):
     pkg = _DiffusionPkg({"transformer": object()})
-    artifacts = write_onnx_genai_config(pkg, str(tmp_path), num_inference_steps=2)
-    with open(artifacts["inference_metadata"], encoding="utf-8") as handle:
-        metadata = yaml.safe_load(handle)
-    assert metadata["pipeline"]["models"]["denoiser"]["filename"] == "model.onnx"
-
-
-def test_rejects_unsupported_qwen_image_edit_runtime_export(tmp_path):
-    source = tmp_path / "source"
-    output = tmp_path / "output"
-    (source / "scheduler").mkdir(parents=True)
-    (source / "processor").mkdir()
-    (source / "scheduler" / "scheduler_config.json").write_text(
-        json.dumps(
-            {
-                "_class_name": "FlowMatchEulerDiscreteScheduler",
-                "base_image_seq_len": 256,
-                "max_image_seq_len": 8192,
-                "base_shift": 0.5,
-                "max_shift": 0.9,
-                "use_dynamic_shifting": True,
-            }
-        ),
-        encoding="utf-8",
-    )
-    for filename in (
-        "preprocessor_config.json",
-        "video_preprocessor_config.json",
-        "tokenizer_config.json",
-        "tokenizer.json",
-        "chat_template.jinja",
+    with pytest.raises(
+        ValueError,
+        match="diffusion workflow requires distinct denoiser and VAE decoder",
     ):
-        (source / "processor" / filename).write_text("{}", encoding="utf-8")
+        write_onnx_genai_config(pkg, str(tmp_path), num_inference_steps=2)
 
-    pkg = _DiffusionPkg(
+
+def _image_edit_package():
+    """Build a Qwen-Image-Edit-shaped package with the real port contract.
+
+    Mirrors ``QwenImageTask``: rank-3 packed latents, a ``target_sequence_length``
+    slice port, separate image/text rotary tables, and a VAE encoder/decoder pair.
+    """
+    tokens = ["batch", "image_sequence_length", 64]
+    transformer = _model(
+        "transformer",
+        [
+            _value("sample", ir.DataType.FLOAT, tokens),
+            _value("timestep", ir.DataType.FLOAT, ["batch"]),
+            _value(
+                "encoder_hidden_states",
+                ir.DataType.FLOAT,
+                ["batch", "text_sequence_length", 32],
+            ),
+            _value(
+                "encoder_hidden_states_mask",
+                ir.DataType.BOOL,
+                ["batch", "text_sequence_length"],
+            ),
+            _value("image_rotary_cos", ir.DataType.FLOAT, ["image_sequence_length", 8]),
+            _value("image_rotary_sin", ir.DataType.FLOAT, ["image_sequence_length", 8]),
+            _value("text_rotary_cos", ir.DataType.FLOAT, ["text_sequence_length", 8]),
+            _value("text_rotary_sin", ir.DataType.FLOAT, ["text_sequence_length", 8]),
+            _value("target_sequence_length", ir.DataType.INT64, [1]),
+        ],
+        [("noise_pred", ir.DataType.FLOAT, tokens)],
+    )
+    vae_encoder = _model(
+        "vae_encoder",
+        [_value("pixel_values", ir.DataType.FLOAT, ["batch", 3, 1, "height", "width"])],
+        [("latent_sample", ir.DataType.FLOAT, ["batch", 16, 1, "lheight", "lwidth"])],
+    )
+    vae_decoder = _model(
+        "vae_decoder",
+        [_value("latent_sample", ir.DataType.FLOAT, ["batch", 16, 1, "lheight", "lwidth"])],
+        [("image", ir.DataType.FLOAT, ["batch", 3, 1, "height", "width"])],
+    )
+    return ModelPackage(
         {
-            "transformer": object(),
-            "text_encoder": object(),
-            "text_encoder_vision_encoder": object(),
-            "text_encoder_embedding": object(),
-            "vae_encoder": object(),
-            "vae_decoder": object(),
+            "transformer": transformer,
+            "vae_encoder": vae_encoder,
+            "vae_decoder": vae_decoder,
         }
     )
-    pkg.config = SimpleNamespace(
-        model_type="qwen_image_edit",
-        processor_config={"patch_size": 14, "merge_size": 2},
+
+
+_FLOW_MATCH_SCHEDULER = {
+    "_class_name": "FlowMatchEulerDiscreteScheduler",
+    "base_image_seq_len": 256,
+    "max_image_seq_len": 8192,
+    "base_shift": 0.5,
+    "max_shift": 0.9,
+    "shift_terminal": 0.02,
+    "time_shift_type": "exponential",
+    "use_dynamic_shifting": True,
+}
+
+
+def _write_scheduler(source, config=None):
+    (source / "scheduler").mkdir(parents=True, exist_ok=True)
+    (source / "scheduler" / "scheduler_config.json").write_text(
+        json.dumps(_FLOW_MATCH_SCHEDULER if config is None else config), encoding="utf-8"
     )
-    with pytest.raises(ValueError, match="cannot execute Qwen Image Edit"):
+
+
+def test_detects_image_edit_package_structurally():
+    """Structural detection must not depend on model_type strings."""
+    assert _looks_like_image_edit(_image_edit_package())
+    # A plain latent-diffusion package has no VAE encoder and rank-4 samples.
+    assert not _looks_like_image_edit(_diffusion_package(text=True))
+    # A VAE pair alone is not enough without the target-slice denoiser port.
+    pkg = _image_edit_package()
+    del pkg["transformer"]
+    assert not _looks_like_image_edit(pkg)
+
+
+def test_flow_match_schedule_matches_diffusers():
+    """Pin the schedule against the captured Qwen-Image-Edit-2509 reference.
+
+    These are the timesteps ``QwenImageEditPlusPipeline`` produced for the
+    1216x864 reference edit (``image_seq_len=4104``, 8 steps), divided by
+    ``num_train_timesteps`` because the denoiser consumes normalized sigmas.
+    """
+    scheduler = SchedulerConfig(
+        kind="flow_match_euler",
+        use_dynamic_shifting=True,
+        base_image_seq_len=256,
+        max_image_seq_len=8192,
+        base_shift=0.5,
+        max_shift=0.9,
+        shift_terminal=0.02,
+        time_shift_type="exponential",
+    )
+    timesteps, sigmas = _flow_match_euler_schedule(scheduler, 8, 4104)
+    expected = [
+        1.0,
+        0.9160475,
+        0.8200923,
+        0.7093592,
+        0.5801504,
+        0.4274216,
+        0.2441077,
+        0.02,
+    ]
+    assert timesteps == pytest.approx(expected, abs=1e-6)
+    assert sigmas == pytest.approx([*expected, 0.0], abs=1e-6)
+
+
+def test_flow_match_schedule_rejects_wrong_scheduler():
+    with pytest.raises(ValueError, match="flow-match Euler scheduler"):
+        _flow_match_euler_schedule(SchedulerConfig(kind="euler"), 4, 4104)
+
+
+def test_dispatch_image_edit_emits_workflow(tmp_path):
+    """A Qwen-Image-Edit-shaped package must dispatch to the image-edit workflow.
+
+    Asserts the emitted pipeline actually performs the edit: encode the source
+    image, run two guided denoiser passes per step, combine them with true CFG,
+    and decode the target tokens back to pixels.
+    """
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    _write_scheduler(source)
+    arts = write_onnx_genai_config(
+        _image_edit_package(),
+        str(output),
+        source=str(source),
+        num_inference_steps=8,
+        image_seq_len=4104,
+        guidance_scale=4.0,
+    )
+    with open(arts["inference_metadata"]) as handle:
+        meta = yaml.safe_load(handle)
+    workflow = meta["pipeline"]["workflow"]
+
+    loop = next(step for step in workflow["steps"] if step["kind"] == "loop")
+
+    # The source image is encoded and packed once, in the loop's setup block.
+    setup = [node["component"] for node in loop["setup"]]
+    assert setup.index("vae_encoder") < setup.index("pack_latents")
+
+    body = [node["component"] for node in loop["steps"]]
+    # True CFG needs both a positive and a negative denoiser pass per step.
+    assert body.count("transformer") == 2
+    assert "true_cfg" in body
+    assert "sequence_concat" in body
+    assert body.index("true_cfg") < body.index("solver_step")
+    assert loop["max_iterations"] == "request.max_iterations"
+
+    # Source and target tokens are separate: only the target block is carried,
+    # so the loop state's sequence axis is the target length, not the denoiser's
+    # concatenated target+source length.
+    assert [cell["cell"] for cell in loop["carried"]] == ["latent", "loop_0_active"]
+    assert workflow["state"]["latent"]["contract"]["shape"] == [
+        "batch",
+        "target_sequence_length",
+        64,
+    ]
+
+    tail = [step["component"] for step in workflow["steps"] if step["kind"] == "invoke"]
+    assert tail == ["unpack_latents", "vae_decoder"]
+
+    # Positive and negative conditioning cannot share a sequence contract.
+    inputs = workflow["inputs"]
+    assert (
+        inputs["request.positive_encoder_hidden_states"]["contract"]["shape"][1]
+        == "positive_text_sequence_length"
+    )
+    assert (
+        inputs["request.negative_encoder_hidden_states"]["contract"]["shape"][1]
+        == "negative_text_sequence_length"
+    )
+
+    for policy in ("solver_step", "true_cfg", "pack_latents", "unpack_latents"):
+        assert (output / "policies" / f"{policy}.onnx").is_file()
+
+
+def test_image_edit_requires_image_seq_len(tmp_path):
+    """The schedule is resolution dependent, so it cannot be guessed."""
+    source = tmp_path / "source"
+    _write_scheduler(source)
+    with pytest.raises(ValueError, match="requires image_seq_len"):
         write_onnx_genai_config(
-            pkg,
-            str(output),
+            _image_edit_package(),
+            str(tmp_path / "output"),
             source=str(source),
-            num_inference_steps=3,
+            num_inference_steps=8,
+        )
+
+
+def test_image_edit_requires_scheduler_config(tmp_path):
+    with pytest.raises(ValueError, match="requires the diffusers scheduler config"):
+        write_onnx_genai_config(
+            _image_edit_package(),
+            str(tmp_path / "output"),
+            num_inference_steps=8,
+            image_seq_len=4104,
         )
 
 
@@ -142,7 +609,7 @@ def test_dispatch_diffusion_emits_clip_tokenizer(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "transformers.AutoTokenizer.from_pretrained", lambda *args, **kwargs: _Tokenizer()
     )
-    pkg = _DiffusionPkg({"denoiser": object(), "text_encoder": object(), "vae": object()})
+    pkg = _diffusion_package(text=True)
     arts = write_onnx_genai_config(
         pkg,
         str(tmp_path),
@@ -150,6 +617,7 @@ def test_dispatch_diffusion_emits_clip_tokenizer(tmp_path, monkeypatch):
         vae_filename="vae.onnx",
         text_encoder_filename="text_encoder.onnx",
         source="fake/model",
+        guidance_scale=1.0,
     )
     assert "tokenizer" in arts
     assert os.path.basename(arts["tokenizer"]) == "tokenizer.json"
@@ -167,13 +635,14 @@ def test_dispatch_diffusion_tokenizer_skip_is_non_fatal(tmp_path, monkeypatch):
         raise OSError("no tokenizer here")
 
     monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", _boom)
-    pkg = _DiffusionPkg({"denoiser": object(), "text_encoder": object()})
+    pkg = _diffusion_package(text=True)
     arts = write_onnx_genai_config(
         pkg,
         str(tmp_path),
         num_inference_steps=20,
         text_encoder_filename="text_encoder.onnx",
         source="fake/model",
+        guidance_scale=1.0,
     )
     assert "inference_metadata" in arts
     assert "tokenizer" not in arts
@@ -188,7 +657,7 @@ def test_dispatch_diffusion_auto_reads_scheduler_from_source(tmp_path):
         json.dumps({"_class_name": "EulerDiscreteScheduler", "beta_schedule": "scaled_linear"})
     )
     out = tmp_path / "out"
-    pkg = _DiffusionPkg({"denoiser": object()})
+    pkg = _diffusion_package()
     arts = write_onnx_genai_config(
         pkg,
         str(out),
@@ -197,56 +666,175 @@ def test_dispatch_diffusion_auto_reads_scheduler_from_source(tmp_path):
     )
     with open(arts["inference_metadata"]) as handle:
         meta = yaml.safe_load(handle)
-    assert meta["pipeline"]["strategy"]["scheduler_config"]["kind"] == "euler"
+    components = meta["pipeline"]["workflow"]["components"]
+    assert components["diffusion_schedule"]["ports"]["outputs"]["schedule"] == {
+        "dtype": "float32",
+        "rank": 1,
+        "shape": [16],
+    }
+    schedule = ir.load(out / "policies" / "diffusion_schedule.onnx")
+    assert list(schedule.graph.outputs[0].shape) == [16]
 
 
 def test_dispatch_vision_multimodal_pipeline(tmp_path):
-    pkg = _MultimodalPkg(
-        {
-            "decoder": object(),
-            "vision_encoder": object(),
-            "embedding": object(),
-        }
-    )
-    artifacts = write_onnx_genai_config(pkg, str(tmp_path), kv_native_dtype="bf16")
+    pkg = _vlm_package()
+    artifacts = write_onnx_genai_config(pkg, str(tmp_path))
 
     with open(artifacts["inference_metadata"]) as handle:
         metadata = yaml.safe_load(handle)
 
-    assert metadata["required_capabilities"] == [
-        "kv_cache",
-        "grouped_query_attention",
-    ]
-    assert metadata["kv_cache"] == {"native_dtype": "bfloat16"}
     pipeline = metadata["pipeline"]
-    assert pipeline["models"] == {
-        "vision_encoder": {
-            "filename": "vision_encoder/model.onnx",
-            "type": "vision_encoder",
-        },
-        "embedding": {
-            "filename": "embedding/model.onnx",
-            "type": "encoder",
-        },
-        "decoder": {
-            "filename": "decoder/model.onnx",
-            "type": "decoder",
-            "tokenizer": "tokenizer.json",
-        },
+    assert set(pipeline) == {"workflow"}
+    workflow = pipeline["workflow"]
+    assert workflow["manifest"]["adapter_abis"] == {"onnx-genai.image-preprocess": "1"}
+    assert workflow["steps"][0]["setup"][0]["component"] == "image_preprocess"
+    assert workflow["steps"][0]["setup"][1]["component"] == "vision_encoder"
+    assert workflow["steps"][0]["setup"][4]["component"] == "embedding"
+    assert workflow["steps"][0]["iteration"]["value"] == "loop.iteration"
+    assert workflow["state"]["logits"]["contract"] == {
+        "dtype": "float32",
+        "rank": 2,
+        "shape": ["batch", 128],
+        "batch_layout": {"kind": "request_aligned", "axis": 0},
     }
-    assert pipeline["strategy"]["kind"] == "composite"
+    assert workflow["state"]["logits"]["initializer"] == "decoder.setup.last_logits"
+    assert (tmp_path / "policies" / "token_sampler.onnx").is_file()
 
 
-def test_dispatch_audio_only_multimodal_pipeline(tmp_path, monkeypatch):
+def test_workflow_vlm_rejects_kv_dtype_override(tmp_path):
+    with pytest.raises(ValueError, match="kv_native_dtype overrides are unsupported"):
+        write_onnx_genai_config(
+            _vlm_package(),
+            str(tmp_path),
+            kv_native_dtype="bf16",
+        )
+
+
+def test_text_diffusion_requires_explicit_guidance_scale(tmp_path):
+    with pytest.raises(ValueError, match="must declare its guidance"):
+        write_onnx_genai_config(
+            _diffusion_package(text=True),
+            str(tmp_path),
+        )
+
+
+def test_guidance_scale_requires_a_text_conditioned_package(tmp_path):
+    with pytest.raises(ValueError, match="requires a text-conditioned diffusion package"):
+        write_onnx_genai_config(
+            _diffusion_package(),
+            str(tmp_path),
+            guidance_scale=7.5,
+        )
+
+
+def test_dispatch_guided_diffusion_runs_the_denoiser_twice(tmp_path):
+    arts = write_onnx_genai_config(
+        _diffusion_package(text=True),
+        str(tmp_path),
+        num_inference_steps=4,
+        guidance_scale=7.5,
+    )
+    with open(arts["inference_metadata"]) as handle:
+        meta = yaml.safe_load(handle)
+    workflow = meta["pipeline"]["workflow"]
+    setup = workflow["steps"][0]["setup"]
+    # The prompt and the negative prompt each get their own conditioning pass.
+    assert [node.get("component") for node in setup].count("text_encoder") == 2
+    negative = next(
+        node
+        for node in setup
+        if node["inputs"].get("input_ids") == "request.negative_input_ids"
+    )
+    assert negative["outputs"]["encoder_hidden_states"] == "conditioning.unconditional"
+    body = workflow["steps"][0]["steps"]
+    denoiser_calls = [node for node in body if node.get("component") == "denoiser"]
+    assert [node["outputs"]["noise_pred"] for node in denoiser_calls] == [
+        "denoiser.unconditional",
+        "denoiser.conditional",
+    ]
+    combine = next(node for node in body if node.get("component") == "guidance_combine")
+    assert combine["inputs"] == {
+        "unconditional": "denoiser.unconditional",
+        "conditional": "denoiser.conditional",
+        "scale": "request.guidance_scale",
+    }
+    assert combine["outputs"] == {"estimate": "denoiser.estimate"}
+    assert (tmp_path / "policies" / "guidance_combine.onnx").is_file()
+
+
+def test_dispatch_multistep_diffusion_carries_solver_history(tmp_path):
+    import json
+
+    source = tmp_path / "ckpt"
+    (source / "scheduler").mkdir(parents=True)
+    (source / "scheduler" / "scheduler_config.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "DPMSolverMultistepScheduler",
+                "beta_schedule": "scaled_linear",
+                "algorithm_type": "dpmsolver++",
+                "solver_order": 2,
+                "solver_type": "midpoint",
+                "lower_order_final": True,
+                "final_sigmas_type": "zero",
+            }
+        )
+    )
+    arts = write_onnx_genai_config(
+        _diffusion_package(text=True),
+        str(tmp_path / "out"),
+        num_inference_steps=4,
+        guidance_scale=1.0,
+        source=str(source),
+    )
+    with open(arts["inference_metadata"]) as handle:
+        meta = yaml.safe_load(handle)
+    workflow = meta["pipeline"]["workflow"]
+    assert "history" in workflow["state"]
+    carried = {carry["cell"]: carry["next"] for carry in workflow["steps"][0]["carried"]}
+    assert "history.body" in carried.values()
+    body = workflow["steps"][0]["steps"]
+    solver = next(node for node in body if node.get("component") == "solver_step")
+    history_cell = next(cell for cell, value in carried.items() if value == "history.body")
+    assert solver["inputs"]["history"] == history_cell
+    assert solver["outputs"]["next_history"] == "history.body"
+    # A variance-preserving sampler feeds its state to the denoiser untouched, so
+    # there is no model-input rescaling component at all.
+    assert not any(node.get("component") == "model_input_scale" for node in body)
+    latent_cell = next(cell for cell, value in carried.items() if value == "latent.body")
+    denoiser = next(node for node in body if node.get("component") == "denoiser")
+    assert denoiser["inputs"]["sample"] == latent_cell
+
+
+def test_dispatch_audio_only_multimodal_pipeline(tmp_path):
     # The audio-only fusion shape used by speech-language ASR models such as
     # qwen3_asr and fun_asr: audio_encoder -> embedding fusion -> AR decoder.
-    pkg = _MultimodalPkg(
-        {
-            "decoder": object(),
-            "audio_encoder": object(),
-            "embedding": object(),
-        }
-    )
+    pkg = _vlm_package(audio=True)
+    artifacts = write_onnx_genai_config(pkg, str(tmp_path))
+
+    with open(artifacts["inference_metadata"]) as handle:
+        metadata = yaml.safe_load(handle)
+
+    setup = metadata["pipeline"]["workflow"]["steps"][0]["setup"]
+    assert [node["component"] for node in setup[:3]] == [
+        "image_preprocess",
+        "vision_encoder",
+        "audio_encoder",
+    ]
+    embedding = next(node for node in setup if node.get("component") == "embedding")
+    assert embedding["inputs"]["audio_features"] == "audio.audio_features"
+
+
+def test_audio_package_forwards_the_pinned_revision(tmp_path, monkeypatch):
+    """A pinned revision must reach the asset writers, not just the build.
+
+    Every runtime asset beside the graph — tokenizer, audio processor — is
+    fetched from the Hub separately from the weights. If the revision stops
+    being threaded, the package still builds and still validates, but its
+    processor silently comes from whatever the branch tip happens to be, which
+    is the failure a pin exists to prevent.
+    """
+    pkg = _vlm_package(audio=True)
     audio_processor = tmp_path / "audio_processor.json"
     audio_processor.write_text("{}")
     calls: list[tuple[str | None, str | None]] = []
@@ -268,84 +856,21 @@ def test_dispatch_audio_only_multimodal_pipeline(tmp_path, monkeypatch):
     assert artifacts["audio_processor"] == str(audio_processor)
     assert calls == [("zai-org/GLM-ASR-Nano-2512", "pinned-revision")]
 
-    with open(artifacts["inference_metadata"]) as handle:
-        metadata = yaml.safe_load(handle)
-
-    pipeline = metadata["pipeline"]
-    assert pipeline["models"] == {
-        "audio_encoder": {
-            "filename": "audio_encoder/model.onnx",
-            "type": "audio_encoder",
-        },
-        "embedding": {"filename": "embedding/model.onnx", "type": "encoder"},
-        "decoder": {
-            "filename": "decoder/model.onnx",
-            "type": "decoder",
-            "tokenizer": "tokenizer.json",
-        },
-    }
-    assert pipeline["dataflow"] == [
-        {
-            "from": "audio_encoder.audio_features",
-            "to": "embedding.audio_features",
-            "dtype": "fp32",
-            "device_transfer": False,
-        },
-        {
-            "from": "embedding.inputs_embeds",
-            "to": "decoder.inputs_embeds",
-            "dtype": "fp32",
-            "device_transfer": False,
-        },
-    ]
-    assert [stage["name"] for stage in pipeline["strategy"]["stages"]] == [
-        "encode_audio",
-        "fuse_embeddings",
-        "decode",
-    ]
-
 
 def test_dispatch_vision_and_audio_multimodal_pipeline(tmp_path):
-    pkg = _MultimodalPkg(
-        {
-            "decoder": object(),
-            "vision_encoder": object(),
-            "audio_encoder": object(),
-            "embedding": object(),
-        }
-    )
+    pkg = _vlm_package(audio=True)
     artifacts = write_onnx_genai_config(pkg, str(tmp_path))
 
     with open(artifacts["inference_metadata"]) as handle:
         metadata = yaml.safe_load(handle)
 
-    pipeline = metadata["pipeline"]
-    assert pipeline["dataflow"] == [
-        {
-            "from": "vision_encoder.image_features",
-            "to": "embedding.image_features",
-            "dtype": "fp32",
-            "device_transfer": False,
-        },
-        {
-            "from": "audio_encoder.audio_features",
-            "to": "embedding.audio_features",
-            "dtype": "fp32",
-            "device_transfer": False,
-        },
-        {
-            "from": "embedding.inputs_embeds",
-            "to": "decoder.inputs_embeds",
-            "dtype": "fp32",
-            "device_transfer": False,
-        },
-    ]
-    assert [stage["name"] for stage in pipeline["strategy"]["stages"]] == [
-        "encode_vision",
-        "encode_audio",
-        "fuse_embeddings",
-        "decode",
-    ]
+    workflow = metadata["pipeline"]["workflow"]
+    assert set(workflow["components"]) >= {
+        "vision_encoder",
+        "audio_encoder",
+        "embedding",
+        "decoder",
+    }
 
 
 class _FakeValue:
@@ -371,110 +896,134 @@ class _EncoderDecoderPkg(dict):
     config = _Cfg()
 
 
-def test_dispatch_speech_to_text_pipeline(tmp_path):
+def _speech_package(*, encoder_mask: bool = False):
+    """Whisper-shaped encoder/decoder package with a real cross-attention edge."""
+    encoder_inputs = [
+        _value("input_features", ir.DataType.FLOAT, ["batch", 80, "audio_seq_len"])
+    ]
+    encoder_outputs = [("encoder_hidden_states", ir.DataType.FLOAT, ["batch", 1500, 384])]
+    decoder_inputs = [
+        _value("decoder_input_ids", ir.DataType.INT64, ["batch", "sequence_len"]),
+        _value("encoder_hidden_states", ir.DataType.FLOAT, ["batch", 1500, 384]),
+        _value("position_ids", ir.DataType.INT64, ["batch", "sequence_len"]),
+        _value(
+            "past_key_values.0.key",
+            ir.DataType.FLOAT,
+            ["batch", 6, "past_sequence_len", 64],
+        ),
+        _value(
+            "past_key_values.0.value",
+            ir.DataType.FLOAT,
+            ["batch", 6, "past_sequence_len", 64],
+        ),
+    ]
+    decoder_outputs = [
+        ("logits", ir.DataType.FLOAT, ["batch", "sequence_len", 51865]),
+        ("present.0.key", ir.DataType.FLOAT, ["batch", 6, "total_sequence_len", 64]),
+        ("present.0.value", ir.DataType.FLOAT, ["batch", 6, "total_sequence_len", 64]),
+    ]
+    if encoder_mask:
+        encoder_inputs.append(
+            _value("attention_mask", ir.DataType.INT64, ["batch", "audio_seq_len"])
+        )
+        encoder_outputs.append(("encoder_attention_mask", ir.DataType.INT64, ["batch", 1500]))
+        decoder_inputs.insert(
+            2, _value("encoder_attention_mask", ir.DataType.INT64, ["batch", 1500])
+        )
+    pkg = ModelPackage(
+        {
+            "encoder": _model("encoder", encoder_inputs, encoder_outputs),
+            "decoder": _model("decoder", decoder_inputs, decoder_outputs),
+        }
+    )
+    pkg.config = SimpleNamespace(eos_token_id=50257, max_position_embeddings=448)
+    return pkg
+
+
+def test_dispatch_speech_to_text_workflow(tmp_path):
     # Whisper-style ASR: the decoder consumes encoder_hidden_states (cross-attn).
-    pkg = _EncoderDecoderPkg(
-        {
-            "encoder": _FakeModel(["input_features"], ["encoder_hidden_states"]),
-            "decoder": _FakeModel(["decoder_input_ids", "encoder_hidden_states"], ["logits"]),
-        }
-    )
-    artifacts = write_onnx_genai_config(pkg, str(tmp_path), kv_native_dtype="bf16")
+    artifacts = write_onnx_genai_config(_speech_package(), str(tmp_path))
 
     with open(artifacts["inference_metadata"]) as handle:
         metadata = yaml.safe_load(handle)
 
-    assert metadata["kv_cache"] == {"native_dtype": "bfloat16"}
-    pipeline = metadata["pipeline"]
-    assert pipeline["models"]["encoder"]["filename"] == "encoder/model.onnx"
-    assert pipeline["models"]["encoder"]["type"] == "encoder"
-    decoder_model = pipeline["models"]["decoder"]
-    assert decoder_model["filename"] == "decoder/model.onnx"
-    assert decoder_model["type"] == "decoder"
-    assert decoder_model["tokenizer"] == "tokenizer.json"
-    assert decoder_model["io"]["logits_output"] == "logits"
-    assert decoder_model["io"]["kv_ownership"] == "owned"
-    assert pipeline["dataflow"] == [
-        {
-            "from": "encoder.encoder_hidden_states",
-            "to": "decoder.encoder_hidden_states",
-            "dtype": "fp32",
-            "device_transfer": False,
-        }
-    ]
-    stages = pipeline["strategy"]["stages"]
-    assert pipeline["strategy"]["kind"] == "composite"
-    assert [stage["name"] for stage in stages] == ["encode_audio", "decode_transcript"]
-    assert [stage["strategy"]["kind"] for stage in stages] == [
-        "single_pass",
-        "autoregressive",
-    ]
+    # The redesigned schema has no legacy pipeline description at all.
+    assert "kv_cache" not in metadata
+    assert not {"models", "dataflow", "strategy", "phases"}.intersection(metadata["pipeline"])
+    workflow = metadata["pipeline"]["workflow"]
+    assert {"encoder", "decoder"}.issubset(workflow["components"])
 
-
-def test_dispatch_speech_to_text_routes_encoder_mask(tmp_path):
-    pkg = _EncoderDecoderPkg(
-        {
-            "encoder": _FakeModel(
-                ["input_values", "attention_mask"],
-                ["encoder_hidden_states", "encoder_attention_mask"],
-            ),
-            "decoder": _FakeModel(
-                [
-                    "decoder_input_ids",
-                    "encoder_hidden_states",
-                    "encoder_attention_mask",
-                ],
-                ["logits"],
-            ),
-        }
+    # The encoder runs once in the loop prologue and its output persists as a
+    # loop-invariant, request-aligned state cell the decoder reads every step.
+    loop = next(step for step in workflow["steps"] if step["kind"] == "loop")
+    setup_components = [node["component"] for node in loop["setup"]]
+    # The encoder conditions the prefill, so it must precede the decoder.
+    assert setup_components[0] == "encoder"
+    assert setup_components.index("decoder") > 0
+    cross = workflow["state"]["cross.encoder_hidden_states"]
+    assert cross["contract"]["shape"] == ["batch", 1500, 384]
+    assert cross["contract"]["batch_layout"] == {"kind": "request_aligned", "axis": 0}
+    assert cross["initializer"] == "encoder.encoder_hidden_states"
+    assert cross["recurrence"] == {"kind": "invariant"}
+    carry = next(
+        carry for carry in loop["carried"] if carry["cell"] == "cross.encoder_hidden_states"
     )
-    artifacts = write_onnx_genai_config(pkg, str(tmp_path))
+    assert carry["next"] == "cross.encoder_hidden_states"
 
-    with open(artifacts["inference_metadata"]) as handle:
-        metadata = yaml.safe_load(handle)
-
-    assert metadata["pipeline"]["dataflow"][1] == {
-        "from": "encoder.encoder_attention_mask",
-        "to": "decoder.encoder_attention_mask",
-        "dtype": "int64",
-        "device_transfer": False,
+    # The self-attention cache is a runtime-served state group; the invariant
+    # cross state is not, because nothing appends to it.
+    groups = workflow["serving"]["state_service"]["groups"]
+    assert set(groups) == {"decoder_cache"}
+    assert groups["decoder_cache"]["ports"]["decoder"]["cache_0"] == {
+        "input": "past_key_values.0.key",
+        "output": "present.0.key",
+        "role": "key",
+        "layer": 0,
     }
+
+
+def test_dispatch_speech_to_text_rejects_kv_dtype_override(tmp_path):
+    with pytest.raises(ValueError, match="derives KV state dtype"):
+        write_onnx_genai_config(_speech_package(), str(tmp_path), kv_native_dtype="bf16")
+
+
+def test_dispatch_speech_to_text_carries_encoder_mask_as_cross_state(tmp_path):
+    artifacts = write_onnx_genai_config(_speech_package(encoder_mask=True), str(tmp_path))
+
+    with open(artifacts["inference_metadata"]) as handle:
+        metadata = yaml.safe_load(handle)
+
+    workflow = metadata["pipeline"]["workflow"]
+    # Every encoder output the decoder consumes becomes cross state, so an
+    # encoder-side mask needs no special case.
+    assert "cross.encoder_attention_mask" in workflow["state"]
+    assert workflow["state"]["cross.encoder_attention_mask"]["contract"]["dtype"] == "int64"
+    assert "encoder.input.attention_mask" in workflow["inputs"]
 
 
 def test_dispatch_audio_codec_pipeline(tmp_path):
-    # A neural codec: encoder outputs codes consumed by a single-pass decoder,
-    # with no cross-attention. It is a pure tensor pipeline (no decoder config).
-    pkg = _EncoderDecoderPkg(
-        {
-            "encoder": _FakeModel(["waveform"], ["codes"]),
-            "decoder": _FakeModel(["codes"], ["waveform"]),
-        }
+    encoder = _model(
+        "encoder",
+        [_value("waveform", ir.DataType.FLOAT, ["batch", 1, "audio_samples"])],
+        [("codes", ir.DataType.INT64, ["batch", 16, "frames"])],
     )
+    decoder = _model(
+        "decoder",
+        [_value("codes", ir.DataType.INT64, ["batch", 16, "frames"])],
+        [("waveform", ir.DataType.FLOAT, ["batch", 1, "audio_samples"])],
+    )
+    pkg = ModelPackage({"encoder": encoder, "decoder": decoder})
     artifacts = write_onnx_genai_config(pkg, str(tmp_path))
 
     with open(artifacts["inference_metadata"]) as handle:
         metadata = yaml.safe_load(handle)
 
-    # No decoder capabilities (produces tensors, not tokens).
     assert "model" not in metadata
-    pipeline = metadata["pipeline"]
-    assert pipeline["models"] == {
-        "encoder": {"filename": "encoder/model.onnx", "type": "audio_encoder"},
-        "decoder": {"filename": "decoder/model.onnx", "type": "vocoder"},
-    }
-    assert pipeline["dataflow"] == [
-        {
-            "from": "encoder.codes",
-            "to": "decoder.codes",
-            "dtype": "int64",
-            "device_transfer": False,
-        }
-    ]
-    stages = pipeline["strategy"]["stages"]
-    assert [stage["strategy"]["kind"] for stage in stages] == [
-        "single_pass",
-        "single_pass",
-    ]
+    assert not {"models", "dataflow", "strategy", "phases"}.intersection(metadata["pipeline"])
+    workflow = metadata["pipeline"]["workflow"]
+    assert workflow["steps"][0]["outputs"] == {"codes": "codec.codes"}
+    assert workflow["steps"][1]["inputs"] == {"codes": "codec.codes"}
+    assert workflow["outputs"]["waveform"]["stage"] == "post_adapter"
 
 
 def test_multi_decoder_tts_without_pre_embedder_raises_precise_not_implemented(tmp_path):
@@ -487,7 +1036,7 @@ def test_multi_decoder_tts_without_pre_embedder_raises_precise_not_implemented(t
             "embedding": _FakeModel(["text_ids"]),
         }
     )
-    with pytest.raises(NotImplementedError, match="nested_autoregressive"):
+    with pytest.raises(NotImplementedError, match="nested generic workflow loops"):
         write_onnx_genai_config(pkg, str(tmp_path))
 
 
@@ -506,45 +1055,46 @@ class _TTSPkg(dict):
 
 
 def test_dispatch_multi_decoder_tts_with_pre_embedder(tmp_path):
-    # The real Qwen3-TTS shape: talker + code_predictor + talker_step_embedder
-    # (+ talker_prefill_embedder) emits the pre_embedder/prefill-driven
-    # nested_autoregressive contract.
-    pkg = _TTSPkg(
+    pkg = ModelPackage(
         {
-            "talker": _FakeModel(["inputs_embeds"], ["logits", "last_hidden_state"]),
-            "code_predictor": _FakeModel(["inputs_embeds"], ["logits", "codec_embeddings"]),
-            "talker_step_embedder": _FakeModel(["frame_codes"], ["inputs_embeds"]),
-            "talker_prefill_embedder": _FakeModel(
-                ["text_ids"], ["prefill_embeds", "trailing_text_embeds"]
+            "talker": _model(
+                "talker",
+                [_value("inputs_embeds", ir.DataType.FLOAT, ["batch", "sequence", 16])],
+                [("last_hidden_state", ir.DataType.FLOAT, ["batch", 16])],
             ),
-            "embedding": _FakeModel(["text_ids"]),
-        }
+            "code_predictor": _model(
+                "code_predictor",
+                [
+                    _value("last_hidden_state", ir.DataType.FLOAT, ["batch", 16]),
+                    _value("step_index", ir.DataType.INT64, ["batch"]),
+                ],
+                [("logits", ir.DataType.FLOAT, ["batch", 64])],
+            ),
+            "talker_step_embedder": _model(
+                "talker_step_embedder",
+                [_value("frame_codes", ir.DataType.INT64, ["batch", 16])],
+                [("inputs_embeds", ir.DataType.FLOAT, ["batch", 1, 16])],
+            ),
+            "talker_prefill_embedder": _model(
+                "talker_prefill_embedder",
+                [_value("text_ids", ir.DataType.INT64, ["batch", "sequence"])],
+                [("prefill_embeds", ir.DataType.FLOAT, ["batch", "sequence", 16])],
+            ),
+            "codec": _model(
+                "codec",
+                [_value("codes", ir.DataType.INT64, ["batch", 16, "frames"])],
+                [("waveform", ir.DataType.FLOAT, ["batch", 1, "samples"])],
+            ),
+        },
+        config=_TTSCfg(),
     )
     artifacts = write_onnx_genai_config(pkg, str(tmp_path))
-
     with open(artifacts["inference_metadata"]) as handle:
-        metadata = yaml.safe_load(handle)
-
-    pipeline = metadata["pipeline"]
-    assert set(pipeline["models"]) == {
-        "talker",
-        "talker_step_embedder",
-        "code_predictor",
-        "talker_prefill_embedder",
-    }
-    stage = pipeline["strategy"]["stages"][0]["strategy"]
-    assert stage["kind"] == "nested_autoregressive"
-    assert stage["inner_embedding_output"] == "codec_embeddings"
-    assert stage["pre_embedder"]["component"] == "talker_step_embedder"
-    assert stage["prefill_embedder"]["component"] == "talker_prefill_embedder"
-    assert stage["num_code_groups"] == 16
-    assert pipeline["phases"]["talker_prefill_embedder"]["run_on"] == "prompt_only"
-    assert {
-        "from": "talker_step_embedder.inputs_embeds",
-        "to": "talker.inputs_embeds",
-        "dtype": "fp32",
-        "device_transfer": False,
-    } in pipeline["dataflow"]
+        workflow = yaml.safe_load(handle)["pipeline"]["workflow"]
+    outer = workflow["steps"][0]
+    assert outer["iteration"]["value"] == "talker.iteration"
+    assert outer["steps"][2]["iteration"]["value"] == "code.iteration"
+    assert (tmp_path / "policies" / "code_frame_update.onnx").is_file()
 
 
 def test_unrecognized_multi_component_package_fails_loudly(tmp_path):
@@ -580,7 +1130,7 @@ def test_decoder_emits_tokenizer_from_source(tmp_path):
 
     with mock.patch.dict("sys.modules", {"transformers": fake_tf}):
         artifacts = write_onnx_genai_config(
-            object(), str(tmp_path), config=_Cfg(), source="some/model-id"
+            _decoder_package(), str(tmp_path), config=_Cfg(), source="some/model-id"
         )
 
     assert artifacts.get("tokenizer") == str(tmp_path / "tokenizer.json")
@@ -589,6 +1139,42 @@ def test_decoder_emits_tokenizer_from_source(tmp_path):
 
 
 def test_decoder_without_source_skips_tokenizer(tmp_path):
-    artifacts = write_onnx_genai_config(object(), str(tmp_path), config=_Cfg())
+    artifacts = write_onnx_genai_config(_decoder_package(), str(tmp_path), config=_Cfg())
     assert "tokenizer" not in artifacts
     assert not (tmp_path / "tokenizer.json").exists()
+
+
+def test_decoder_package_ships_chat_template_assets(tmp_path):
+    """A text decoder package must carry the assets needed to build a prompt.
+
+    ``tokenizer.json`` alone leaves the runtime with no chat template, so an
+    instruction-tuned decoder receives raw user text with no BOS and no turn
+    markers. Image/audio processor configs, by contrast, describe media a text
+    package cannot consume and must not be copied.
+    """
+    source = tmp_path / "source"
+    source.mkdir()
+    for filename in (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "chat_template.jinja",
+        "preprocessor_config.json",
+        "image_processor.json",
+    ):
+        (source / filename).write_text("{}", encoding="utf-8")
+
+    output = tmp_path / "output"
+    write_onnx_genai_config(
+        _decoder_package(_Int4Cfg()),
+        str(output),
+        config=_Int4Cfg(),
+        source=str(source),
+    )
+
+    assert (output / "tokenizer.json").is_file()
+    assert (output / "tokenizer_config.json").is_file()
+    assert (output / "special_tokens_map.json").is_file()
+    assert (output / "chat_template.jinja").is_file()
+    assert not (output / "preprocessor_config.json").exists()
+    assert not (output / "image_processor.json").exists()

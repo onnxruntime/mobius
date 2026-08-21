@@ -76,6 +76,12 @@ class VAETask(ModelTask):
             hidden_states = module.post_quant_conv(op, hidden_states)
         hidden_states = module.decoder(op, latent_sample=hidden_states)
 
+        # The decoder upsamples by a fixed factor, but the factor is a property of the
+        # configured block stack rather than of the graph, so publish named image dims
+        # instead of anonymous inferred symbols.
+        hidden_states.shape = ir.Shape(
+            ["batch", config.out_channels, "image_height", "image_width"]
+        )
         builder.add_output(hidden_states, "sample")
 
         return _make_model(graph)

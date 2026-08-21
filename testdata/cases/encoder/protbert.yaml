@@ -1,0 +1,23 @@
+model_id: "Rostlab/prot_bert"
+model_type: "bert"
+revision: "7a894481acdc12202f0a415dd567f6cfdb698908"
+task_type: "feature-extraction"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "M K T V R Q E R L K S I V R I L E R S K E P V S G A Q L A E E L S V S R Q V I V Q D I A Y L R S L G Y N I V A T P R G Y V L A G G"
+
+level: "L4"
+
+skip_reason: >-
+  Upstream repo ships pytorch_model.bin only (no safetensors), which mobius
+  does not load, and its config.json predates the mandatory model_type key.
+  Both are resolvable locally -- convert the checkpoint to safetensors and
+  build with --config <dir> -- but neither is reproducible from the hub id
+  alone, so this case cannot run unattended.
+notes: >-
+  ProtBert: BERT-large over a 30-token amino-acid vocabulary, whitespace
+  separated. No licence is declared on the model card. Verified by hand
+  against HuggingFace at revision 7a89448: relative L2 error 1.7e-5 and
+  per-residue cosine > 0.999999 on a padded batch of two proteins.

@@ -20,7 +20,9 @@ __all__ = [
     "FusedGateUpCausalLMModel",
     "ChatGLMCausalLMModel",
     "CodeGenCausalLMModel",
+    "AutoencoderKLCogVideoXModel",
     "CogVideoXTransformer3DModel",
+    "CogVideoXVAEConfig",
     "CohereCausalLMModel",
     "ControlNetModel",
     "Cosmos3EdgeTextModel",
@@ -34,6 +36,8 @@ __all__ = [
     "DiTTransformer2DModel",
     "DiffLlamaCausalLMModel",
     "DistilBertModel",
+    "EsmConfig",
+    "EsmModel",
     "DogeCausalLMModel",
     "EncDecRNNTModel",
     "Ernie45MoECausalLMModel",
@@ -188,6 +192,10 @@ from mobius.models.blip2 import Blip2Model
 from mobius.models.chatglm import ChatGLMCausalLMModel
 from mobius.models.clip import CLIPVisionModel, SigLIPVisionModel
 from mobius.models.cogvideox import CogVideoXTransformer3DModel
+from mobius.models.cogvideox_vae import (
+    AutoencoderKLCogVideoXModel,
+    CogVideoXVAEConfig,
+)
 from mobius.models.cohere import CohereCausalLMModel
 from mobius.models.controlnet import ControlNetModel
 from mobius.models.cosmos import Cosmos3EdgeTextModel, Cosmos3EdgeVLModel
@@ -203,6 +211,7 @@ from mobius.models.dit import DiTTransformer2DModel
 from mobius.models.doge import DogeCausalLMModel
 from mobius.models.eagle3 import Eagle3DraftModel
 from mobius.models.ernie import ErnieCausalLMModel
+from mobius.models.esm import EsmConfig, EsmModel
 from mobius.models.exaone4 import ExaOne4CausalLMModel
 from mobius.models.falcon import (
     BloomCausalLMModel,

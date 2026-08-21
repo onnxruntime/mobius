@@ -2848,6 +2848,11 @@ class WhisperConfig(SpeechToTextConfig):
                 f"({self.encoder_input_channels}) must equal num_mel_bins "
                 f"({self.num_mel_bins})."
             )
+        # The decoder's learned position table is the model's context bound;
+        # Whisper spells it `max_target_positions`, so mirror it onto the
+        # architecture-wide field consumers read.
+        if self.max_position_embeddings == DEFAULT_INT:
+            self.max_position_embeddings = self.max_target_positions
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> WhisperConfig:
@@ -2880,6 +2885,8 @@ class WhisperConfig(SpeechToTextConfig):
             max_target_positions=getattr(config, "max_target_positions", 448),
             scale_embedding=getattr(config, "scale_embedding", False),
             decoder_start_token_id=getattr(config, "decoder_start_token_id", None),
+            bos_token_id=getattr(config, "bos_token_id", None),
+            eos_token_id=getattr(config, "eos_token_id", None),
         )
 
         # Model dtype
@@ -2965,6 +2972,30 @@ class MoonshineConfig(SpeechToTextConfig):
         return cls(**options)
 
 
+def _conv_widths(config, defaults, hidden_size: int) -> tuple[int, ...]:
+    """Per-layer channel widths of a wav2vec2-family convolutional feature encoder.
+
+    ``conv_dim``, ``conv_kernel`` and ``conv_stride`` describe one conv stack, so
+    the depth they imply has to agree. M-CTC-T states its single subsampling
+    convolution through ``conv_kernel``/``conv_stride`` alone and never publishes
+    ``conv_dim``; inheriting wav2vec2's seven-layer default there would describe a
+    stack the checkpoint does not have. Size the widths to the declared depth
+    instead, preferring the checkpoint's own ``conv_channels`` when present.
+    """
+    declared = getattr(config, "conv_dim", None)
+    if declared:
+        return tuple(declared)
+    depth = len(tuple(getattr(config, "conv_kernel", None) or defaults.conv_kernel))
+    if depth == len(defaults.conv_dim):
+        return defaults.conv_dim
+    channels = getattr(config, "conv_channels", None)
+    if channels is None:
+        return (hidden_size,) * depth
+    if isinstance(channels, (list, tuple)):
+        return tuple(channels)
+    return (int(channels),) * depth
+
+
 @dataclasses.dataclass
 class MMSConfig(ArchitectureConfig):
     """Configuration for MMS (Massively Multilingual Speech) CTC models.
@@ -2976,6 +3007,13 @@ class MMSConfig(ArchitectureConfig):
     weights into the model.
 
     HuggingFace class: ``Wav2Vec2ForCTC`` with ``config.model_type == "wav2vec2"``
+
+    The convolutional feature-encoder geometry (``conv_dim``/``conv_kernel``/
+    ``conv_stride``) is *not* boilerplate: it fixes the waveform-to-frame
+    downsampling ratio, so it must come from the checkpoint rather than from a
+    hard-coded default.  ``facebook/wav2vec2-base-960h`` downsamples by 320
+    (``prod(conv_stride)``) and disables conv bias, while
+    ``facebook/mms-1b-all`` enables it.
     """
 
     add_adapter: bool = False
@@ -2984,24 +3022,78 @@ class MMSConfig(ArchitectureConfig):
     adapter_stride: int = 2
     num_adapter_layers: int = 3
 
+    # Convolutional feature encoder (raw waveform → frames).
+    conv_dim: tuple[int, ...] = (512, 512, 512, 512, 512, 512, 512)
+    conv_kernel: tuple[int, ...] = (10, 3, 3, 3, 3, 2, 2)
+    conv_stride: tuple[int, ...] = (5, 2, 2, 2, 2, 2, 2)
+    conv_bias: bool = False
+    feat_extract_norm: str = "group"
+
+    # Transformer encoder shape.
+    do_stable_layer_norm: bool = False
+    num_conv_pos_embeddings: int = 128
+    num_conv_pos_embedding_groups: int = 16
+    layer_norm_eps: float = 1e-5
+
     def __post_init__(self):
         if self.output_hidden_size == 0:
             self.output_hidden_size = self.hidden_size
+        # Normalize sequence fields so downstream code can index them freely
+        # regardless of whether the checkpoint used a list or a tuple.
+        self.conv_dim = tuple(self.conv_dim)
+        self.conv_kernel = tuple(self.conv_kernel)
+        self.conv_stride = tuple(self.conv_stride)
+        if not (len(self.conv_dim) == len(self.conv_kernel) == len(self.conv_stride)):
+            raise ValueError(
+                "conv_dim, conv_kernel and conv_stride must have equal length; got "
+                f"{len(self.conv_dim)}, {len(self.conv_kernel)}, {len(self.conv_stride)}"
+            )
+        if self.feat_extract_norm not in ("group", "layer"):
+            raise ValueError(
+                f"feat_extract_norm must be 'group' or 'layer', got {self.feat_extract_norm!r}"
+            )
+
+    def feature_extract_output_length(self, num_samples: int) -> int:
+        """Return the frame count the conv stack emits for *num_samples*.
+
+        Mirrors ``Wav2Vec2PreTrainedModel._get_feat_extract_output_lengths``:
+        each conv applies ``floor((L - kernel) / stride) + 1``.  Callers use it
+        to segment a padded batch back into per-row transcripts.
+        """
+        length = num_samples
+        for kernel, stride in zip(self.conv_kernel, self.conv_stride):
+            length = (length - kernel) // stride + 1
+        if self.add_adapter:
+            for _ in range(self.num_adapter_layers):
+                length = (length - 1) // self.adapter_stride + 1
+        return length
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> MMSConfig:
         """Extract MMSConfig from a HuggingFace Wav2Vec2Config."""
         base = ArchitectureConfig.from_transformers(config, parent_config=parent_config)
         base_fields = _shallow_fields(base)
+        defaults = cls(hidden_size=1)
         return cls(
             **base_fields,
-            add_adapter=getattr(config, "add_adapter", False),
+            add_adapter=getattr(config, "add_adapter", False) or False,
             output_hidden_size=getattr(
                 config, "output_hidden_size", base_fields["hidden_size"]
             ),
             adapter_kernel_size=getattr(config, "adapter_kernel_size", 3),
             adapter_stride=getattr(config, "adapter_stride", 2),
             num_adapter_layers=getattr(config, "num_adapter_layers", 3),
+            conv_dim=_conv_widths(config, defaults, base_fields["hidden_size"]),
+            conv_kernel=tuple(getattr(config, "conv_kernel", None) or defaults.conv_kernel),
+            conv_stride=tuple(getattr(config, "conv_stride", None) or defaults.conv_stride),
+            conv_bias=bool(getattr(config, "conv_bias", False)),
+            feat_extract_norm=getattr(config, "feat_extract_norm", None) or "group",
+            do_stable_layer_norm=bool(getattr(config, "do_stable_layer_norm", False)),
+            num_conv_pos_embeddings=getattr(config, "num_conv_pos_embeddings", None) or 128,
+            num_conv_pos_embedding_groups=(
+                getattr(config, "num_conv_pos_embedding_groups", None) or 16
+            ),
+            layer_norm_eps=getattr(config, "layer_norm_eps", None) or 1e-5,
         )
 
 

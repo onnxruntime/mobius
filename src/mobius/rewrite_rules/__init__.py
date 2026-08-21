@@ -30,6 +30,7 @@ Example::
 
 __all__ = [
     "bias_gelu_rules",
+    "clip_to_min_max_rules",
     "decompose_attention_pass",
     "decompose_rope_rules",
     "fuse_dense_moe_to_qmoe",
@@ -48,6 +49,7 @@ __all__ = [
 ]
 
 from mobius.rewrite_rules._bias_gelu import bias_gelu_rules
+from mobius.rewrite_rules._clip_to_min_max import clip_to_min_max_rules
 from mobius.rewrite_rules._decompose_attention import decompose_attention_pass
 from mobius.rewrite_rules._decompose_rope import decompose_rope_rules
 from mobius.rewrite_rules._gelu_fusion import gelu_fusion_rules

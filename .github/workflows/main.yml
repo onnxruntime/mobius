@@ -15,6 +15,68 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  onnx-genai-metadata:
+    name: ONNX GenAI metadata
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - uses: actions/checkout@v7
+      with:
+        repository: justinchuby/onnx-genai
+        # Pinned by SHA so the producer/runtime contract under test is
+        # reproducible. PR #828 is maintained by merging main rather than
+        # rebasing, so this commit remains reachable from its branch history.
+        # When bumping, verify reachability with `git merge-base --is-ancestor
+        # <sha> <branch-tip>`.
+        ref: 509cd4e9c4471f4cbc59fe44b47168f0ae128fe3
+        path: validation/onnx-genai
+    - uses: actions/setup-python@v7
+      with:
+        python-version: "3.12"
+    - name: Install dependencies
+      run: |
+        pip install torch --index-url https://download.pytorch.org/whl/cpu
+        pip install -r requirements/ci/requirements.txt
+        pip install onnxruntime==1.28.0
+        pip install -e '.[testing]'
+    - name: Generate representative packages
+      run: |
+        PYTHONPATH=src python tests/generate_onnx_genai_validation_packages.py \
+          validation/generated
+        PYTHONPATH=src python tests/compare_onnx_genai_validation_packages.py \
+          tests/fixtures/onnx_genai_workflows validation/generated
+    - name: Validate package semantics
+      run: |
+        # Report every invalid package, not just the first: the job runs under
+        # `bash -e`, so an unguarded failure inside the loop would abort it and
+        # hide the remaining results.
+        failed=""
+        # The generated tree, not the committed one: validation resolves each
+        # component's artifact from disk, and the graphs are generated rather
+        # than committed.  The step above has already proven the two trees
+        # carry the same metadata.
+        for package in validation/generated/*; do
+          [ -f "$package/inference_metadata.yaml" ] || continue
+          cargo run --quiet \
+            --manifest-path validation/onnx-genai/Cargo.toml \
+            -p onnx-genai-metadata --bin validate_metadata -- "$package" \
+            || failed="$failed $package"
+        done
+        if [ -n "$failed" ]; then
+          echo "Invalid packages:$failed"
+          exit 1
+        fi
+    - name: Execute all workflow packages
+      run: |
+        cp tests/onnx_genai_workflow_conformance.rs \
+          validation/onnx-genai/crates/onnx-genai-engine/tests/mobius_workflow_conformance.rs
+        ORT_LIB="$(python -c \
+          'import onnxruntime, pathlib; print(next((pathlib.Path(onnxruntime.__file__).parent / "capi").glob("libonnxruntime.so*")))')"
+        MOBIUS_WORKFLOW_CONFORMANCE_DIR="$PWD/validation/generated" \
+          ONNX_GENAI_ORT_LIB="$ORT_LIB" \
+          cargo test --manifest-path validation/onnx-genai/Cargo.toml \
+            -p onnx-genai-engine --test mobius_workflow_conformance -- --nocapture
+
   lint:
     name: Lint
     runs-on: ubuntu-latest

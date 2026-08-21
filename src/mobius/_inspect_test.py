@@ -322,7 +322,15 @@ _MULTI_COMPONENT_MODEL_TYPES = [
     "qwen3_tts",
     "fastconformer_rnnt",
 ]
-_EMPTY_SOURCE_PATHS = {("trocr", "encoder")}
+_EMPTY_SOURCE_PATHS = {
+    ("trocr", "encoder"),
+    # Loop-wiring graphs mobius authors itself — no HuggingFace sub-module
+    # backs them.
+    ("qwen3_tts", "code_predictor_prefill"),
+    ("qwen3_tts", "code_predictor_step_embedder"),
+    ("qwen3_tts", "code_predictor_indices"),
+    ("qwen3_tts", "talker_text_step"),
+}
 
 
 @pytest.mark.parametrize("model_type", _MULTI_COMPONENT_MODEL_TYPES)

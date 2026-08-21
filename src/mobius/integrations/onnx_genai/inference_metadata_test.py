@@ -1,6 +1,5 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
-
 """Tests for onnx-genai diffusion inference_metadata generation."""
 
 from __future__ import annotations
@@ -22,24 +21,160 @@ from mobius._pipeline_contract import (
     declare_component_presence,
     declare_optional_input,
 )
+from mobius.generation import build_greedy_sampler
 from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
     _decoder_io,
     _input_source_map,
+    _match_max_token_grid,
     _port,
-    add_explicit_package_io,
+    _processor_values,
+    add_policy_components_to_workflow,
     build_diffusion_pipeline_metadata,
-    build_language_diffusion_pipeline_metadata,
     build_multimodal_pipeline_metadata,
     build_native_vlm_package_metadata,
-    build_tts_pipeline_metadata,
     is_native_vlm_package,
     load_diffusers_scheduler_config,
     validate_executable_closure,
     write_diffusion_pipeline_metadata,
     write_native_vlm_package_metadata,
-    write_tts_pipeline_metadata,
 )
+
+
+def test_ort_extensions_processor_config_supplies_structural_values(tmp_path):
+    (tmp_path / "processor_config.json").write_text(
+        json.dumps(
+            {
+                "processor": {
+                    "transforms": [
+                        {
+                            "operation": {
+                                "type": "Resize",
+                                "attrs": {
+                                    "min_pixels": 784,
+                                    "max_pixels": 2371600,
+                                    "patch_size": 14,
+                                    "merge_size": 2,
+                                },
+                            }
+                        },
+                        {
+                            "operation": {
+                                "type": "Rescale",
+                                "attrs": {"rescale_factor": 1 / 255},
+                            }
+                        },
+                        {
+                            "operation": {
+                                "type": "Normalize",
+                                "attrs": {
+                                    "mean": [0.5, 0.5, 0.5],
+                                    "std": [0.5, 0.5, 0.5],
+                                },
+                            }
+                        },
+                        {
+                            "operation": {
+                                "type": "PatchImage",
+                                "attrs": {"temporal_patch_size": 2},
+                            }
+                        },
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    values = _processor_values(str(tmp_path), object())
+
+    assert values["size"] == {"shortest_edge": 784, "longest_edge": 2371600}
+    assert values["patch_size"] == 14
+    assert values["merge_size"] == 2
+    assert values["temporal_patch_size"] == 2
+    assert values["image_mean"] == [0.5, 0.5, 0.5]
+    assert values["image_std"] == [0.5, 0.5, 0.5]
+
+
+def test_max_token_packed_grid_derives_pixel_area_bounds():
+    program = _match_max_token_grid(
+        [
+            _port(_value("pixel_values", ir.DataType.FLOAT, ["patches", 1176])),
+            _port(_value("image_grid_thw", ir.DataType.INT64, ["images", 3])),
+        ],
+        {
+            "patch_size": 14,
+            "temporal_patch_size": 2,
+            "merge_size": 2,
+            "max_image_tokens": 4096,
+        },
+    )
+
+    assert program is not None
+    resize = next(
+        transform
+        for transform in program.transforms(
+            None,
+            {
+                "patch_size": 14,
+                "temporal_patch_size": 2,
+                "merge_size": 2,
+                "max_image_tokens": 4096,
+            },
+        )
+        if transform["op"] == "resize"
+    )
+    assert resize["min_pixels"] == 784
+    assert resize["max_pixels"] == 3_211_264
+
+
+def test_workflow_policy_components_reference_saved_onnx_artifacts(tmp_path):
+    package = ModelPackage({"model": _model("model", [], [])})
+    package.add_policy_component("sample", build_greedy_sampler())
+    package.save(str(tmp_path))
+    metadata = {
+        "pipeline": {
+            "workflow": {
+                "manifest": {},
+                "components": {},
+                "graph": {"kind": "sequence", "nodes": []},
+            }
+        }
+    }
+
+    add_policy_components_to_workflow(metadata, package)
+
+    component = metadata["pipeline"]["workflow"]["components"]["sample"]
+    assert component["implementation"] == {
+        "kind": "onnx",
+        "artifact": "policies/sample.onnx",
+    }
+    assert component["ports"] == {
+        "inputs": {
+            "logits": {
+                "dtype": "float32",
+                "rank": 2,
+                "shape": ["batch", "vocabulary"],
+                "batch_layout": {"kind": "request_aligned", "axis": 0},
+            }
+        },
+        "outputs": {
+            "token": {
+                "dtype": "int64",
+                "rank": 1,
+                "shape": ["batch"],
+                "batch_layout": {"kind": "request_aligned", "axis": 0},
+            }
+        },
+    }
+    assert component["contract"] == {
+        "id": "onnx-genai.token-sampler",
+        "version": "1",
+        "bindings": {"logits": "logits", "token": "token"},
+        "parameters": {"mode": "greedy"},
+    }
+    assert "effects" not in component
+    assert (tmp_path / component["implementation"]["artifact"]).is_file()
 
 
 def _onnx_genai_schema_path() -> str | None:
@@ -257,112 +392,7 @@ def _static_cache_decoder_model() -> ir.Model:
     return _model("decoder", inputs, outputs)
 
 
-class TestExplicitPackageIo:
-    def test_emits_explicit_dynamic_decoder_roles(self):
-        model = _decoder_model(
-            [],
-            position_shape=["batch", "sequence"],
-            raw_token_input=True,
-            kv_head_dims=[8, 16],
-        )
-        metadata = add_explicit_package_io({"model": {}}, {"model": model}, _VlmConfig())
-        io = metadata["model"]["io"]
-        assert io["token_input"] == "input_ids"
-        assert io["sequence_source"] == "token_ids"
-        assert io["logits_output"] == "logits"
-        assert io["kv_ownership"] == "owned"
-        assert io["kv_inputs"] == [
-            "past_key_values.0.key",
-            "past_key_values.0.value",
-            "past_key_values.1.key",
-            "past_key_values.1.value",
-        ]
-        assert io["kv_outputs"] == [
-            "present.0.key",
-            "present.0.value",
-            "present.1.key",
-            "present.1.value",
-        ]
-
-    def test_emits_explicit_static_cache_roles_in_layer_order(self):
-        metadata = add_explicit_package_io(
-            {"model": {}}, {"model": _static_cache_decoder_model()}, _VlmConfig()
-        )
-        io = metadata["model"]["io"]
-        assert io["static_cache"] == {
-            "write_indices_input": "write_indices",
-            "kv_sequence_length_input": "nonpad_kv_seqlen",
-            "key_cache_inputs": ["key_cache.1", "key_cache.3"],
-            "value_cache_inputs": ["value_cache.1", "value_cache.3"],
-            "key_cache_outputs": ["updated_key_cache.1", "updated_key_cache.3"],
-            "value_cache_outputs": [
-                "updated_value_cache.1",
-                "updated_value_cache.3",
-            ],
-        }
-        assert "kv_inputs" not in io
-
-    @pytest.mark.parametrize(
-        ("encoder_input", "role_field"),
-        [
-            (
-                _value(
-                    "mel_prompt",
-                    ir.DataType.FLOAT,
-                    ["batch", 80, "audio_sequence"],
-                ),
-                "audio_features_input",
-            ),
-            (
-                _value("prompt_tokens", ir.DataType.INT64, ["batch", "sequence"]),
-                "token_input",
-            ),
-        ],
-    )
-    def test_emits_explicit_encoder_prompt_role(self, encoder_input, role_field):
-        encoder = _model(
-            "encoder",
-            [encoder_input],
-            [
-                (
-                    "encoder_hidden_states",
-                    ir.DataType.FLOAT,
-                    ["batch", "encoder_sequence", 64],
-                )
-            ],
-        )
-        decoder = _model(
-            "decoder",
-            [
-                _value("decoder_tokens", ir.DataType.INT64, ["batch", "sequence"]),
-                _value(
-                    "encoder_hidden_states",
-                    ir.DataType.FLOAT,
-                    ["batch", "encoder_sequence", 64],
-                ),
-            ],
-            [("logits", ir.DataType.FLOAT, ["batch", "sequence", 128])],
-        )
-        metadata = {
-            "pipeline": {
-                "models": {
-                    "encoder": {"type": "encoder"},
-                    "decoder": {"type": "decoder"},
-                },
-                "dataflow": [],
-                "strategy": {"kind": "autoregressive", "decoder": "decoder"},
-            }
-        }
-        add_explicit_package_io(
-            metadata, {"encoder": encoder, "decoder": decoder}, _VlmConfig()
-        )
-        encoder_io = metadata["pipeline"]["models"]["encoder"]["io"]
-        assert encoder_io[role_field] == encoder_input.name
-        decoder_io = metadata["pipeline"]["models"]["decoder"]["io"]
-        assert decoder_io["token_input"] == "decoder_tokens"
-        assert decoder_io["encoder_hidden_states_input"] == "encoder_hidden_states"
-        assert decoder_io["logits_output"] == "logits"
-
+class TestCrossAttentionCacheSources:
     def test_cross_attention_cache_inputs_are_loop_state(self):
         inputs = [
             _value("input_ids", ir.DataType.INT64, ["batch", "sequence"]),
@@ -475,42 +505,6 @@ class TestExplicitPackageIo:
                 "strategy": strategy,
             }
         }
-
-    def test_explicit_inner_embedding_output_is_preserved(self):
-        metadata = self._nested_metadata("declared_embedding")
-        package = self._nested_package(
-            [("logits", ir.DataType.FLOAT, ["batch", "sequence", 128])]
-        )
-        add_explicit_package_io(metadata, package, _VlmConfig())
-        assert (
-            metadata["pipeline"]["strategy"]["inner_embedding_output"] == "declared_embedding"
-        )
-
-    def test_missing_inner_embedding_output_is_derived(self):
-        metadata = self._nested_metadata()
-        package = self._nested_package(
-            [
-                ("logits", ir.DataType.FLOAT, ["batch", "sequence", 128]),
-                ("codec_embeddings", ir.DataType.FLOAT, [16, 64]),
-            ]
-        )
-        add_explicit_package_io(metadata, package, _VlmConfig())
-        assert metadata["pipeline"]["strategy"]["inner_embedding_output"] == "codec_embeddings"
-
-    def test_ambiguous_inner_embedding_output_fails_actionably(self):
-        metadata = self._nested_metadata()
-        package = self._nested_package(
-            [
-                ("logits", ir.DataType.FLOAT, ["batch", "sequence", 128]),
-                ("first_embedding", ir.DataType.FLOAT, [16, 64]),
-                ("second_embedding", ir.DataType.FLOAT, [16, 64]),
-            ]
-        )
-        with pytest.raises(
-            ValueError,
-            match=r"pipeline\.strategy\.inner_embedding_output.*no unique",
-        ):
-            add_explicit_package_io(metadata, package, _VlmConfig())
 
 
 def _native_package(
@@ -757,33 +751,8 @@ class TestNativeVlmPackageMetadata:
                 "absent": {"kind": "zeros", "shape": [0, 64]},
             },
         }
-        assert emitted_yaml["pipeline"]["phases"]["vision_encoder"] == {
-            "run_on": "prompt_only",
-            "when_present": "image",
-        }
-        assert emitted_yaml["pipeline"]["phases"]["audio_encoder"] == {
-            "run_on": "prompt_only",
-            "when_present": "audio",
-        }
-        vision_stage = next(
-            stage
-            for stage in metadata["pipeline"]["strategy"]["stages"]
-            if stage["strategy"].get("model") == "vision_encoder"
-        )
-        assert vision_stage["run_on"] == "prompt_only"
-        audio_stage = next(
-            stage
-            for stage in metadata["pipeline"]["strategy"]["stages"]
-            if stage["strategy"].get("model") == "audio_encoder"
-        )
-        assert audio_stage["run_on"] == "prompt_only"
-        assert metadata["pipeline"]["phases"]["embedding"] == {"run_on": "every_step"}
-        embedding_stage = next(
-            stage
-            for stage in metadata["pipeline"]["strategy"]["stages"]
-            if stage["strategy"].get("model") == "embedding"
-        )
-        assert embedding_stage["run_on"] == "every_step"
+        assert "phases" not in emitted_yaml["pipeline"]
+        assert "phases" not in metadata["pipeline"]
         assert metadata["pipeline"]["models"]["embedding"]["io"]["token_input"] == "input_ids"
         assert metadata["pipeline"]["vision"]["token_count_source"] == "from_coordinates"
         assert metadata["pipeline"]["vision"]["token_pooling_factor"] == 9
@@ -795,6 +764,8 @@ class TestNativeVlmPackageMetadata:
             "max_patches": 2520,
             "pooling_kernel_size": 3,
             "interpolation": "bicubic",
+            "inputs": ["image.transform_0"],
+            "outputs": ["image.transform_1"],
         }
         assert (
             next(transform for transform in transforms if transform["op"] == "pad")[
@@ -803,13 +774,15 @@ class TestNativeVlmPackageMetadata:
             == 2520
         )
         assert not any(transform["op"] == "normalize" for transform in transforms)
-        assert metadata["model"]["io"]["token_input"] == "input_ids"
-        assert metadata["model"]["io"]["kv_inputs"] == [
+        assert "model" not in metadata or "io" not in metadata["model"]
+        decoder_io = metadata["pipeline"]["models"]["decoder"]["io"]
+        assert decoder_io["token_input"] == "input_ids"
+        assert decoder_io["kv_inputs"] == [
             f"past_key_values.{layer}.{role}"
             for layer in range(3)
             for role in ("key", "value")
         ]
-        assert metadata["model"]["io"]["kv_outputs"] == [
+        assert decoder_io["kv_outputs"] == [
             f"present.{layer}.{role}" for layer in range(3) for role in ("key", "value")
         ]
         kv_inputs = {
@@ -819,20 +792,23 @@ class TestNativeVlmPackageMetadata:
         }
         assert kv_inputs["past_key_values.1.key"]["shape"][-1] == 16
         image_outputs = metadata["preprocessing"]["image"]["outputs"]
+        # Every output binds the processor-local value that produces it, so the
+        # runtime never has to guess which transform an output came from.
         assert image_outputs == [
             {
                 "name": "vision_encoder.pixel_values",
                 "content": "pixels",
                 "dtype": "fp32",
+                "source": "image.transform_4",
             },
             {
                 "name": "vision_encoder.pixel_position_ids",
                 "content": "patch_coordinates",
                 "dtype": "int64",
                 "pad_value": -1,
+                "source": "image.output_patch_coordinates",
             },
         ]
-
         broken = copy.deepcopy(metadata)
         broken["pipeline"]["dataflow"] = [
             edge
@@ -948,7 +924,7 @@ class TestNativeVlmPackageMetadata:
             "sections": [16, 24, 24],
             "processor_summaries": ["vision_encoder.image_grid_thw"],
         }
-        io = metadata["model"]["io"]
+        io = metadata["pipeline"]["models"]["decoder"]["io"]
         assert io["kv_inputs"] == [
             "past_key_values.0.key",
             "past_key_values.0.value",
@@ -1130,7 +1106,7 @@ class TestNativeVlmPackageMetadata:
         metadata = build_native_vlm_package_metadata(
             package, config=config, source=str(source)
         )
-        io = metadata["model"]["io"]
+        io = metadata["pipeline"]["models"]["decoder"]["io"]
         assert io["kv_update"] == "append"
         assert io["kv_inputs"] == [
             "past_key_values.0.key",
@@ -1366,6 +1342,8 @@ class TestNativeVlmPackageMetadata:
             "max_patches": 2520,
             "pooling_kernel_size": 3,
             "interpolation": "bicubic",
+            "inputs": ["image.transform_0"],
+            "outputs": ["image.transform_1"],
         }
         assert pad["target_length"] == reference["pixel_values"].shape[1] == 2520
         assert patchify["channel_order"] == "channels_last"
@@ -1729,78 +1707,6 @@ class TestBuildDiffusionPipelineMetadata:
         jsonschema.validate(instance=meta, schema=schema)
 
 
-class TestLanguageDiffusionMetadata:
-    def test_minimal_masked_diffusion_pipeline(self):
-        meta = build_language_diffusion_pipeline_metadata(
-            mask_token_id=126336, num_inference_steps=128
-        )
-        pipeline = meta["pipeline"]
-        assert pipeline["models"]["denoiser"] == {
-            "filename": "model.onnx",
-            "type": "denoiser",
-        }
-        # Loop-carried self-edge: logits refine the token sequence.
-        assert pipeline["dataflow"] == [
-            {"from": "denoiser.logits", "to": "denoiser.input_ids"}
-        ]
-        strategy = pipeline["strategy"]
-        assert strategy["kind"] == "iterative"
-        assert strategy["num_steps"] == 128
-        assert strategy["scheduler_config"] == {
-            "kind": "masked_diffusion",
-            "mask_token_id": 126336,
-        }
-        assert "guidance_scale" not in strategy
-
-    def test_semi_autoregressive_with_temperature_and_cfg(self):
-        meta = build_language_diffusion_pipeline_metadata(
-            mask_token_id=5,
-            num_inference_steps=64,
-            block_length=32,
-            temperature=0.2,
-            guidance_scale=2.5,  # LLaDA cfg_scale=1.5 => cfg_scale + 1
-        )
-        strategy = meta["pipeline"]["strategy"]
-        assert strategy["guidance_scale"] == pytest.approx(2.5)
-        assert strategy["scheduler_config"]["block_length"] == 32
-        assert strategy["scheduler_config"]["temperature"] == pytest.approx(0.2)
-
-    def test_custom_ports(self):
-        meta = build_language_diffusion_pipeline_metadata(
-            mask_token_id=1,
-            num_inference_steps=8,
-            model_filename="llada.onnx",
-            input_ids_port="tokens",
-            logits_port="scores",
-        )
-        pipeline = meta["pipeline"]
-        assert pipeline["models"]["denoiser"]["filename"] == "llada.onnx"
-        assert pipeline["dataflow"] == [{"from": "denoiser.scores", "to": "denoiser.tokens"}]
-
-    def test_rejects_zero_steps(self):
-        with pytest.raises(ValueError):
-            build_language_diffusion_pipeline_metadata(mask_token_id=1, num_inference_steps=0)
-
-    def test_matches_onnx_genai_json_schema(self):
-        schema_path = _onnx_genai_schema_path()
-        if schema_path is None:
-            pytest.skip("onnx-genai schema not found (set ONNX_GENAI_SCHEMA)")
-        import json
-
-        import jsonschema
-
-        with open(schema_path) as handle:
-            schema = json.load(handle)
-        meta = build_language_diffusion_pipeline_metadata(
-            mask_token_id=126336,
-            num_inference_steps=64,
-            block_length=32,
-            temperature=0.0,
-            guidance_scale=2.5,
-        )
-        jsonschema.validate(instance=meta, schema=schema)
-
-
 class TestBuildMultimodalPipelineMetadata:
     def test_vision_only_pipeline(self):
         metadata = build_multimodal_pipeline_metadata(
@@ -1844,7 +1750,6 @@ class TestBuildMultimodalPipelineMetadata:
                                 "kind": "single_pass",
                                 "model": "vision_encoder",
                             },
-                            "run_on": "prompt_only",
                         },
                         {
                             "name": "fuse_embeddings",
@@ -1852,7 +1757,6 @@ class TestBuildMultimodalPipelineMetadata:
                                 "kind": "single_pass",
                                 "model": "embedding",
                             },
-                            "run_on": "prompt_only",
                         },
                         {
                             "name": "decode",
@@ -1860,14 +1764,8 @@ class TestBuildMultimodalPipelineMetadata:
                                 "kind": "autoregressive",
                                 "decoder": "decoder",
                             },
-                            "run_on": "every_step",
                         },
                     ],
-                },
-                "phases": {
-                    "vision_encoder": {"run_on": "prompt_only"},
-                    "embedding": {"run_on": "prompt_only"},
-                    "decoder": {"run_on": "every_step"},
                 },
             }
         }
@@ -1919,104 +1817,17 @@ class TestBuildMultimodalPipelineMetadata:
             {
                 "name": "encode_vision",
                 "strategy": {"kind": "single_pass", "model": "vision_encoder"},
-                "run_on": "prompt_only",
             },
             {
                 "name": "encode_audio",
                 "strategy": {"kind": "single_pass", "model": "audio_encoder"},
-                "run_on": "prompt_only",
             },
             {
                 "name": "fuse_embeddings",
                 "strategy": {"kind": "single_pass", "model": "embedding"},
-                "run_on": "prompt_only",
             },
             {
                 "name": "decode",
                 "strategy": {"kind": "autoregressive", "decoder": "decoder"},
-                "run_on": "every_step",
             },
         ]
-
-
-class TestBuildTTSPipelineMetadata:
-    """Pre-embedder-driven multi-decoder TTS (Qwen3-TTS) metadata."""
-
-    def test_minimal_nested_autoregressive_with_pre_embedder(self):
-        meta = build_tts_pipeline_metadata(
-            num_code_groups=16, max_frames=1000, prefill_embedder_filename=None
-        )
-        pipe = meta["pipeline"]
-        assert set(pipe["models"]) == {"talker", "talker_step_embedder", "code_predictor"}
-        assert pipe["models"]["talker"]["type"] == "decoder"
-        assert pipe["models"]["talker"]["tokenizer"] == "tokenizer.json"
-        assert pipe["models"]["talker_step_embedder"]["type"] == "embedding"
-
-        stage = pipe["strategy"]["stages"][0]["strategy"]
-        assert stage["kind"] == "nested_autoregressive"
-        assert stage["outer"] == "talker"
-        assert stage["inner"] == "code_predictor"
-        assert stage["inner_embedding_output"] == "codec_embeddings"
-        assert stage["pre_embedder"]["component"] == "talker_step_embedder"
-        assert stage["pre_embedder"]["frame_codes_input"] == "frame_codes"
-        assert "prefill_embedder" not in stage
-        assert stage["num_code_groups"] == 16
-        assert stage["max_tokens"] == 1000
-
-        # Required pre-embedder feed edge + inner seed edge.
-        assert {
-            "from": "talker_step_embedder.inputs_embeds",
-            "to": "talker.inputs_embeds",
-            "dtype": "fp32",
-            "device_transfer": False,
-        } in pipe["dataflow"]
-        assert {
-            "from": "talker.last_hidden_state",
-            "to": "code_predictor.inputs_embeds",
-            "dtype": "fp32",
-            "device_transfer": False,
-        } in pipe["dataflow"]
-        # No in-package vocoder.
-        assert "vocoder" not in pipe["models"]
-        # Pre-embedder is a loop-internal on_demand component.
-        assert pipe["phases"]["talker_step_embedder"]["run_on"] == "on_demand"
-
-    def test_with_prefill_embedder(self):
-        # Default emits the prefill/trailing-text component (prompt phase).
-        meta = build_tts_pipeline_metadata(num_code_groups=16)
-        pipe = meta["pipeline"]
-        assert "talker_prefill_embedder" in pipe["models"]
-        assert pipe["models"]["talker_prefill_embedder"]["type"] == "embedding"
-        stage = pipe["strategy"]["stages"][0]["strategy"]
-        assert stage["prefill_embedder"]["component"] == "talker_prefill_embedder"
-        assert stage["prefill_embedder"]["prompt_input"] == "text_ids"
-        assert stage["prefill_embedder"]["prefill_output"] == "prefill_embeds"
-        assert stage["prefill_embedder"]["trailing_output"] == "trailing_text_embeds"
-        assert pipe["phases"]["talker_prefill_embedder"]["run_on"] == "prompt_only"
-
-    def test_rejects_invalid_code_groups(self):
-        with pytest.raises(ValueError, match="num_code_groups"):
-            build_tts_pipeline_metadata(num_code_groups=0)
-
-    def test_write_roundtrip(self, tmp_path):
-        path = write_tts_pipeline_metadata(str(tmp_path), num_code_groups=8)
-        with open(path) as handle:
-            loaded = yaml.safe_load(handle)
-        stage = loaded["pipeline"]["strategy"]["stages"][0]["strategy"]
-        assert stage["pre_embedder"]["component"] == "talker_step_embedder"
-        assert stage["pre_embedder"]["frame_codes_input"] == "frame_codes"
-        assert stage["num_code_groups"] == 8
-
-    def test_matches_onnx_genai_json_schema(self):
-        """Emitted TTS metadata validates against onnx-genai's published schema."""
-        schema_path = _onnx_genai_schema_path()
-        if schema_path is None:
-            pytest.skip("onnx-genai schema not found (set ONNX_GENAI_SCHEMA)")
-        import json
-
-        import jsonschema
-
-        with open(schema_path) as handle:
-            schema = json.load(handle)
-        meta = build_tts_pipeline_metadata(num_code_groups=16, max_frames=2000)
-        jsonschema.validate(instance=meta, schema=schema)
