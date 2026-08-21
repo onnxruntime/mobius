@@ -221,6 +221,11 @@ __marimo__/
 # them; tests get them from the materialized_workflow_packages fixture.
 tests/fixtures/onnx_genai_workflows/**/*.safetensors
 
+# Where CI and the test fixture materialize those packages in full.  Nothing
+# here is reviewable input: it is the regenerated output the validate and
+# conformance steps consume.
+validation/
+
 # Common test dirs
 output/**
 cache_dir/**
