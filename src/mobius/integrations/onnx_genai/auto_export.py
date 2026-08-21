@@ -31,6 +31,7 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     write_ctc_asr_workflow_metadata,
     write_decoder_workflow_metadata,
     write_diffusion_workflow_metadata,
+    write_encoder_embedding_workflow_metadata,
     write_image_edit_workflow_metadata,
     write_language_diffusion_workflow_metadata,
     write_speculative_workflow_metadata,
@@ -560,6 +561,34 @@ def _looks_like_ctc_asr(pkg: Any) -> bool:
     return not any(name.startswith("past_key_values") for name in inputs)
 
 
+def _looks_like_encoder_embedding(pkg: Any) -> bool:
+    """Detect a bidirectional encoder that returns embeddings, not tokens.
+
+    The signal is structural: a single ``model`` component that consumes
+    ``input_ids`` and emits ``last_hidden_state`` with no ``logits`` port and
+    no KV cache.  The absent ``logits`` is what separates an embedding encoder
+    from every generative package -- there is nothing to sample, so there is no
+    decode step to describe.
+    """
+    try:
+        names = set(pkg.keys())
+    except AttributeError:
+        return False
+    if names != {"model"}:
+        return False
+    try:
+        model = pkg["model"]
+        inputs = {value.name for value in model.graph.inputs}
+        outputs = {value.name for value in model.graph.outputs}
+    except (AttributeError, KeyError):
+        return False
+    if "input_ids" not in inputs or "last_hidden_state" not in outputs:
+        return False
+    if any(name == "logits" or str(name).startswith("present") for name in outputs):
+        return False
+    return not any(str(name).startswith("past_key_values") for name in inputs)
+
+
 def _looks_like_audio_codec(pkg: Any) -> bool:
     """Detect an audio-to-audio neural codec package.
 
@@ -838,6 +867,17 @@ def write_onnx_genai_config(
                 "package carrying `.config`)"
             )
         path = write_ctc_asr_workflow_metadata(pkg, output_dir, ctc_config, source=source)
+        artifacts = {"inference_metadata": path}
+        tokenizer_path = _write_hf_tokenizer(output_dir, source, revision=revision)
+        if tokenizer_path is not None:
+            artifacts["tokenizer"] = tokenizer_path
+        return artifacts
+
+    if _looks_like_encoder_embedding(pkg):
+        # A bidirectional encoder has no logits and no cache: it runs once and
+        # returns one hidden vector per position.  Emit before the config
+        # requirement below because nothing here needs a decoder config.
+        path = write_encoder_embedding_workflow_metadata(pkg, output_dir, config)
         artifacts = {"inference_metadata": path}
         tokenizer_path = _write_hf_tokenizer(output_dir, source, revision=revision)
         if tokenizer_path is not None:

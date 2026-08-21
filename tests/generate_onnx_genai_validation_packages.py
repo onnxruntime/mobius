@@ -12,6 +12,7 @@ from onnxscript import GraphBuilder
 from safetensors.numpy import save_file
 
 from mobius._model_package import ModelPackage
+from mobius._passes import RemoveDeadGraphInputsPass
 from mobius.adapter_io import load_peft_adapter
 from mobius.adapters import (
     AdapterArtifact,
@@ -33,13 +34,18 @@ from mobius.integrations.onnx_genai.inference_metadata import (
 from mobius.integrations.onnx_genai.workflow_metadata import (
     write_audio_codec_workflow_metadata,
     write_diffusion_workflow_metadata,
+    write_encoder_embedding_workflow_metadata,
     write_language_diffusion_workflow_metadata,
     write_speculative_workflow_metadata,
     write_video_diffusion_workflow_metadata,
 )
+from mobius.models.bert import BertModel
+from mobius.models.bert_test import PROTBERT_TINY_CONFIG
+from mobius.models.esm import EsmModel
+from mobius.models.esm_test import TINY_CONFIG as ESM2_TINY_CONFIG
 from mobius.models.qwen3_tts import Qwen3TTSForConditionalGeneration
 from mobius.models.qwen3_tts_test import _TINY_CONFIG
-from mobius.tasks import TTSTask
+from mobius.tasks import FeatureExtractionTask, TTSTask
 
 
 def _materialize_deterministic_initializers(package: ModelPackage) -> None:
@@ -680,6 +686,35 @@ def _executable_masked_package() -> ModelPackage:
     return ModelPackage({"model": ir.Model(graph, ir_version=11)})
 
 
+def _esm2_embedding_package() -> ModelPackage:
+    """A tiny but real ESM-2 protein encoder.
+
+    Built from the same producer path as ``facebook/esm2_t6_8M_UR50D`` so the
+    fixture exercises rotary positions, pre-norm blocks and the token-dropout
+    rescale rather than a stand-in graph. ESM-2 has no token-type embedding, so
+    the saved artifact carries only ``input_ids`` and ``attention_mask`` -- the
+    asymmetry against ProtBert below is the point of shipping both.
+    """
+    config = ESM2_TINY_CONFIG
+    package = FeatureExtractionTask().build(EsmModel(config), config)
+    # The feature-extraction task offers ``token_type_ids`` to every encoder,
+    # but ESM-2 has no token-type embedding and never reads it. The real export
+    # path drops the dead input during optimization, so drop it here too --
+    # otherwise the committed metadata would declare a port the shipped
+    # artifact does not expose.
+    RemoveDeadGraphInputsPass()(package["model"])
+    _materialize_deterministic_initializers(package)
+    return package
+
+
+def _protbert_embedding_package() -> ModelPackage:
+    """A tiny but real ProtBert-shaped encoder (BERT with an amino-acid vocab)."""
+    config = PROTBERT_TINY_CONFIG
+    package = FeatureExtractionTask().build(BertModel(config), config)
+    _materialize_deterministic_initializers(package)
+    return package
+
+
 def _executable_codec_package() -> ModelPackage:
     encoder_graph, encoder_builder = _graph("encoder")
     waveform = encoder_builder.input(
@@ -1029,6 +1064,20 @@ def generate_packages(output: Path) -> Path:
     codec.save(str(directory), progress_bar=False, check_weights=False)
     write_audio_codec_workflow_metadata(codec, str(directory))
 
+    # Two encoder-embedding packages rather than one: ESM-2 has no token-type
+    # embedding and ProtBert does, so together they pin down that the producer
+    # declares the ports the artifact actually exposes instead of the ports the
+    # feature-extraction task signature offers.
+    esm2 = _esm2_embedding_package()
+    directory = args.output / "esm2_protein_embeddings"
+    esm2.save(str(directory), progress_bar=False, check_weights=False)
+    write_encoder_embedding_workflow_metadata(esm2, str(directory), ESM2_TINY_CONFIG)
+
+    protbert = _protbert_embedding_package()
+    directory = args.output / "protbert_protein_embeddings"
+    protbert.save(str(directory), progress_bar=False, check_weights=False)
+    write_encoder_embedding_workflow_metadata(protbert, str(directory), PROTBERT_TINY_CONFIG)
+
     directory = args.output / "adapter"
     source_root = directory / ".sources"
     adapter = _adapter_package(source_root)
@@ -1053,10 +1102,13 @@ graphs use the `materialized_workflow_packages` fixture.
 
 The decoder, VLM, diffusion, masked diffusion, speculative, and codec packages
 contain executable synthetic models. The TTS fixture uses the real tiny
-Qwen3-TTS producer graphs with deterministic synthetic weights. No downloaded
-model weights are included. The adapter fixture covers authoritative target
-metadata, portable artifacts, ordered heterogeneous composition, inactive rows,
-compaction, and request-epoch slot reuse.
+Qwen3-TTS producer graphs with deterministic synthetic weights. The two
+protein-encoder fixtures use the real tiny ESM-2 and ProtBert producer graphs,
+also with deterministic synthetic weights; they cover the non-generative
+embedding shape, which has one invocation, no carried state and no sampler.
+No downloaded model weights are included. The adapter fixture covers
+authoritative target metadata, portable artifacts, ordered heterogeneous
+composition, inactive rows, compaction, and request-epoch slot reuse.
 """,
         encoding="utf-8",
     )

@@ -8097,6 +8097,162 @@ def write_ctc_asr_workflow_metadata(
     return path
 
 
+_ENCODER_EMBEDDING_INPUT_ROLES: dict[str, str] = {
+    "input_ids": "prompt_tokens",
+    "attention_mask": "attention_mask",
+    "token_type_ids": "token_type_ids",
+    "position_ids": "position_ids",
+}
+
+
+def build_encoder_embedding_workflow_metadata(
+    pkg: Any,
+    config: Any = None,
+    *,
+    artifact: str = "model.onnx",
+) -> dict[str, Any]:
+    """Build one-file metadata for a bidirectional encoder that emits embeddings.
+
+    An encoder such as BERT, ESM-2 or ProtBert is not generative: it reads the
+    whole sequence at once and returns one hidden vector per position. There is
+    no next-token step, no KV cache and nothing to sample, so the workflow is a
+    plain sequence with a single invocation and no carried state. Describing
+    such a package with decoder metadata would publish a generation loop that
+    the artifact cannot execute -- it has no ``logits`` port to sample and
+    re-feeding its output would be meaningless -- so this builder exists to
+    keep the metadata a truthful description of the graph.
+
+    Args:
+        pkg: The built :class:`ModelPackage`; must hold a single ``model``.
+        config: The resolved architecture config. Unused today; accepted so the
+            dispatch site can pass it uniformly with the other builders.
+        artifact: Encoder artifact path relative to the package root.
+
+    Returns:
+        A metadata document with an ``embedding`` profile and a single-step
+        ``pipeline.workflow``.
+    """
+    del config
+    if "model" not in pkg:
+        raise ValueError("encoder embedding workflow requires a 'model' component")
+    model = pkg["model"]
+
+    graph_inputs = {str(value.name): value for value in model.graph.inputs}
+    graph_outputs = {str(value.name): value for value in model.graph.outputs}
+    if "input_ids" not in graph_inputs:
+        raise ValueError("encoder embedding graph must declare input 'input_ids'")
+    if "last_hidden_state" not in graph_outputs:
+        raise ValueError("encoder embedding graph must declare output 'last_hidden_state'")
+
+    # Declare exactly the ports the artifact exposes. ESM-2 has no token type
+    # embedding, so its graph carries no ``token_type_ids``; BERT-family
+    # encoders do. Reading the graph rather than the task signature is what
+    # keeps the two packages describable by one builder.
+    workflow_inputs: dict[str, Any] = {}
+    invoke_inputs: dict[str, str] = {}
+    for name, role in _ENCODER_EMBEDDING_INPUT_ROLES.items():
+        if name not in graph_inputs:
+            continue
+        declaration: dict[str, Any] = {
+            "contract": _contract(graph_inputs[name]),
+            "role": {"kind": "runtime", "version": "1.0", "role": role},
+            "source": {"kind": "request"},
+            # Every port here is a graph input of a single-invocation workflow,
+            # so a runtime must bind all of them; none is optional.
+            "required": True,
+        }
+        workflow_inputs[f"request.{name}"] = declaration
+        invoke_inputs[name] = f"request.{name}"
+
+    workflow_outputs: dict[str, Any] = {}
+    invoke_outputs: dict[str, str] = {}
+    emit_nodes: list[dict[str, Any]] = []
+    profile_outputs: dict[str, str] = {}
+    for name in ("last_hidden_state", "pooler_output"):
+        if name not in graph_outputs:
+            continue
+        workflow_outputs[name] = {
+            "contract": _contract(graph_outputs[name]),
+            "role": "tensor",
+            "stage": "post_adapter",
+        }
+        invoke_outputs[name] = f"encoder.{name}"
+        emit_nodes.append(
+            {
+                "kind": "emit",
+                "value": f"encoder.{name}",
+                "output": name,
+                "mode": "replace",
+            }
+        )
+        profile_outputs[name] = name
+
+    workflow = {
+        "manifest": {
+            "ir_version": "1.0",
+            "onnx_opsets": {"ai.onnx": OPSET_VERSION},
+            "capabilities": ["workflow_ssa", "linear_effects", "typed_emit"],
+        },
+        "effects": {
+            # One pure call: the encoder observes nothing outside its inputs,
+            # so a retry replays it exactly and a speculative clone is safe.
+            "encode": {"retry": "pure", "speculation_safety": {"kind": "clonable"}},
+        },
+        "inputs": workflow_inputs,
+        "outputs": workflow_outputs,
+        "components": {"encoder": _component(model, artifact, effects=("encode",))},
+        "initial_effects": {"encode": "encode.0"},
+        "graph": {
+            "kind": "sequence",
+            "nodes": [
+                _invoke("encoder", invoke_inputs, invoke_outputs),
+                *emit_nodes,
+            ],
+        },
+    }
+
+    profile: dict[str, Any] = {
+        "kind": "embedding",
+        "version": "1.0",
+        "requirement": "required",
+        "outputs": profile_outputs,
+    }
+    if "attention_mask" in graph_inputs:
+        # Mask-aware mean pooling is only well defined when the graph is told
+        # which positions are padding; a reader can then reduce a row over its
+        # own valid region instead of over the width the batch happened to be
+        # padded to. The same fact is what makes rows independent of their
+        # neighbours, so both claims are made together or neither is.
+        profile["pooling"] = {
+            "kind": "mean",
+            "source": "last_hidden_state",
+            "mask": "request.attention_mask",
+            "time_axis": 1,
+            "feature_axis": 2,
+        }
+        profile["batch_invariance"] = "row_independent"
+
+    return {
+        "schema_version": "v1",
+        "profiles": {"embedding": profile},
+        "pipeline": {"workflow": _publish_workflow_v1(workflow)},
+    }
+
+
+def write_encoder_embedding_workflow_metadata(
+    pkg: Any,
+    output_dir: str,
+    config: Any = None,
+) -> str:
+    """Write one-file encoder-embedding metadata into *output_dir*."""
+    os.makedirs(output_dir, exist_ok=True)
+    metadata = build_encoder_embedding_workflow_metadata(pkg, config)
+    path = os.path.join(output_dir, "inference_metadata.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        _dump_yaml(metadata, handle)
+    return path
+
+
 def _ir_dtype(value: ir.Value) -> ir.DataType:
     """Return the exact ONNX element type of a graph port."""
     dtype = value.dtype

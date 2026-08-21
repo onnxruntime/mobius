@@ -1,0 +1,119 @@
+schema_version: v1
+profiles:
+  embedding:
+    kind: embedding
+    version: '1.0'
+    requirement: required
+    outputs:
+      last_hidden_state: last_hidden_state
+    pooling:
+      kind: mean
+      source: last_hidden_state
+      mask: request.attention_mask
+      time_axis: 1
+      feature_axis: 2
+    batch_invariance: row_independent
+pipeline:
+  workflow:
+    manifest:
+      ir_version: '1.0'
+      onnx_opsets:
+        ai.onnx: 24
+      capabilities:
+      - workflow_ssa
+      - linear_effects
+      - typed_emit
+    effects:
+      encode:
+        retry: pure
+        speculation_safety:
+          kind: clonable
+    inputs:
+      request.input_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - sequence_len
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: prompt_tokens
+        source:
+          kind: request
+        required: true
+      request.attention_mask:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - sequence_len
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: attention_mask
+        source:
+          kind: request
+        required: true
+      request.token_type_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - sequence_len
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: token_type_ids
+        source:
+          kind: request
+        required: true
+    outputs:
+      last_hidden_state:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - batch
+          - null
+          - 64
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: post_adapter
+    components:
+      encoder:
+        implementation:
+          kind: onnx
+          artifact: model.onnx
+        ports:
+          roles:
+            input_ids: token_ids
+            attention_mask: attention_mask
+            last_hidden_state: hidden_states
+    steps:
+    - kind: invoke
+      component: encoder
+      inputs:
+        input_ids: request.input_ids
+        attention_mask: request.attention_mask
+        token_type_ids: request.token_type_ids
+      outputs:
+        last_hidden_state: encoder.last_hidden_state
+    - kind: emit
+      value: encoder.last_hidden_state
+      output: last_hidden_state
+      mode: replace

@@ -230,6 +230,41 @@ Two consequences:
 
 ## Compact examples
 
+### Encoder embeddings
+
+A bidirectional encoder — BERT, ESM-2, ProtBert — is not generative. It reads
+the whole sequence once and returns one hidden vector per position, so its
+workflow has no loop, no carried state, no KV cache and no sampler.
+
+```yaml
+profiles:
+  embedding:
+    kind: embedding
+    outputs: { last_hidden_state: last_hidden_state }
+    pooling: { kind: mean, source: last_hidden_state,
+               mask: request.attention_mask, time_axis: 1, feature_axis: 2 }
+    batch_invariance: row_independent
+steps:
+  - kind: invoke
+    component: encoder
+    inputs: { input_ids: request.input_ids, attention_mask: request.attention_mask }
+    outputs: { last_hidden_state: encoder.last_hidden_state }
+  - kind: emit
+    value: encoder.last_hidden_state
+    output: last_hidden_state
+    mode: replace
+```
+
+The declared inputs are read from the artifact, not from the task signature:
+ESM-2 has no token-type embedding, so its graph exposes only `input_ids` and
+`attention_mask`, while ProtBert's also exposes `token_type_ids`.
+
+`batch_invariance: row_independent` is claimed only when the graph consumes an
+attention mask, because that is what makes a row's values independent of the
+width the batch happened to be padded to. It is also what makes
+`pooling.kind: mean` well defined — a reader reduces each row over its own
+valid region rather than over the padded extent.
+
 ### Decoder
 
 ```yaml

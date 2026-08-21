@@ -36,6 +36,8 @@ __all__ = [
     "DiTTransformer2DModel",
     "DiffLlamaCausalLMModel",
     "DistilBertModel",
+    "EsmConfig",
+    "EsmModel",
     "DogeCausalLMModel",
     "EncDecRNNTModel",
     "Ernie45MoECausalLMModel",
@@ -209,6 +211,7 @@ from mobius.models.dit import DiTTransformer2DModel
 from mobius.models.doge import DogeCausalLMModel
 from mobius.models.eagle3 import Eagle3DraftModel
 from mobius.models.ernie import ErnieCausalLMModel
+from mobius.models.esm import EsmConfig, EsmModel
 from mobius.models.exaone4 import ExaOne4CausalLMModel
 from mobius.models.falcon import (
     BloomCausalLMModel,

@@ -125,6 +125,7 @@ from mobius.models.cohere import CohereCausalLMModel
 from mobius.models.ctrl import CTRLCausalLMModel
 from mobius.models.depth_anything import DepthAnythingForDepthEstimation
 from mobius.models.distilbert import DistilBertModel
+from mobius.models.esm import EsmConfig, EsmModel
 from mobius.models.falcon import (
     BloomCausalLMModel,
     FalconCausalLMModel,
@@ -719,7 +720,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "electra": ModelRegistration(BertModel, task="feature-extraction"),
     "ernie": ModelRegistration(BertModel, task="feature-extraction"),
     "ernie_m": ModelRegistration(BertModel, task="feature-extraction"),
-    "esm": ModelRegistration(BertModel, task="feature-extraction"),
+    "esm": ModelRegistration(EsmModel, task="feature-extraction", config_class=EsmConfig),
     "flaubert": ModelRegistration(BertModel, task="feature-extraction"),
     "ibert": ModelRegistration(BertModel, task="feature-extraction"),
     "layoutlm": ModelRegistration(BertModel, task="feature-extraction"),

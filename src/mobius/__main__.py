@@ -317,9 +317,21 @@ def _cmd_build(args: argparse.Namespace) -> None:
         import transformers
 
         config_path = args.config
-        hf_config = transformers.AutoConfig.from_pretrained(
-            config_path, trust_remote_code=trust_remote_code
-        )
+        try:
+            hf_config = transformers.AutoConfig.from_pretrained(
+                config_path, trust_remote_code=trust_remote_code
+            )
+        except (ValueError, KeyError, OSError):
+            # A checkpoint predating the mandatory ``model_type`` key still
+            # names its architecture; resolve it the same way the HF-id path
+            # does rather than refusing a directory Mobius can build.
+            from mobius.integrations.transformers._config_resolver import (
+                _try_load_config_json,
+            )
+
+            hf_config = _try_load_config_json(config_path)
+            if hf_config is None:
+                raise
         model_type = hf_config.model_type
         parent_config = hf_config
         if hasattr(hf_config, "text_config"):

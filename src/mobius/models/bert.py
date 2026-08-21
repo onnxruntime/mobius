@@ -24,7 +24,12 @@ from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._activations import ACT2FN
-from mobius.components._common import Embedding, LayerNorm, Linear
+from mobius.components._common import (
+    Embedding,
+    LayerNorm,
+    Linear,
+    create_padding_mask,
+)
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -73,6 +78,12 @@ class _BertAttention(nn.Module):
         self.output = _BertAttentionOutput(hidden_size, eps, bias)
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value, attention_mask: ir.Value):
+        """Bidirectional self-attention.
+
+        ``attention_mask`` is the 4D bool padding mask
+        ``(batch, 1, seq, seq)`` prepared once per forward by
+        :meth:`BertModel.forward`, not the raw rank-2 request mask.
+        """
         self_attn = self.self
         query = self_attn.query(op, hidden_states)
         key = self_attn.key(op, hidden_states)
@@ -235,7 +246,11 @@ class BertModel(nn.Module):
         token_type_ids: ir.Value,
     ):
         hidden_states = self.embeddings(op, input_ids, token_type_ids)
-        hidden_states = self.encoder(op, hidden_states, attention_mask)
+        # The raw request mask is (batch, seq) int64; ONNX ``Attention`` needs a
+        # mask broadcastable to (batch, heads, q, kv). Building it once here
+        # keeps a single copy in the graph instead of one per layer.
+        padding_mask = create_padding_mask(op, input_ids, attention_mask)
+        hidden_states = self.encoder(op, hidden_states, padding_mask)
         return hidden_states
 
     def preprocess_weights(

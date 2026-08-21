@@ -14,7 +14,10 @@ graphs use the `materialized_workflow_packages` fixture.
 
 The decoder, VLM, diffusion, masked diffusion, speculative, and codec packages
 contain executable synthetic models. The TTS fixture uses the real tiny
-Qwen3-TTS producer graphs with deterministic synthetic weights. No downloaded
-model weights are included. The adapter fixture covers authoritative target
-metadata, portable artifacts, ordered heterogeneous composition, inactive rows,
-compaction, and request-epoch slot reuse.
+Qwen3-TTS producer graphs with deterministic synthetic weights. The two
+protein-encoder fixtures use the real tiny ESM-2 and ProtBert producer graphs,
+also with deterministic synthetic weights; they cover the non-generative
+embedding shape, which has one invocation, no carried state and no sampler.
+No downloaded model weights are included. The adapter fixture covers
+authoritative target metadata, portable artifacts, ordered heterogeneous
+composition, inactive rows, compaction, and request-epoch slot reuse.

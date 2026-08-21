@@ -79,21 +79,29 @@ def _default_task_for_model(model_type: str) -> str:
 def _try_load_config_json(model_id: str, revision: str | None = None):
     """Try to load config.json directly for models not in transformers.
 
-    Returns a ``PretrainedConfig``-like object with attribute access,
-    or ``None`` if the file cannot be downloaded/parsed.
+    Accepts a Hugging Face repo id or a local directory. Returns a
+    ``PretrainedConfig``-like object with attribute access, or ``None`` if the
+    file cannot be downloaded/parsed.
     """
     import json
+    import os
 
     from huggingface_hub import hf_hub_download
 
-    try:
-        kwargs = {"repo_id": model_id, "filename": "config.json"}
-        if revision is not None:
-            kwargs["revision"] = revision
-        path = hf_hub_download(**kwargs)
-    except (OSError, ValueError) as e:
-        logger.debug("Failed to download config.json for %s: %s", model_id, e)
-        return None
+    if os.path.isdir(model_id):
+        path = os.path.join(model_id, "config.json")
+        if not os.path.isfile(path):
+            logger.debug("No config.json in local directory %s", model_id)
+            return None
+    else:
+        try:
+            kwargs = {"repo_id": model_id, "filename": "config.json"}
+            if revision is not None:
+                kwargs["revision"] = revision
+            path = hf_hub_download(**kwargs)
+        except (OSError, ValueError) as e:
+            logger.debug("Failed to download config.json for %s: %s", model_id, e)
+            return None
 
     try:
         with open(path) as f:
@@ -104,9 +112,43 @@ def _try_load_config_json(model_id: str, revision: str | None = None):
 
     model_type = config_dict.get("model_type")
     if not model_type:
-        return None
+        model_type = _model_type_from_architectures(config_dict.get("architectures"))
+        if not model_type:
+            return None
+        logger.info(
+            "config.json for %s declares no model_type; inferred '%s' from architectures=%s",
+            model_id,
+            model_type,
+            config_dict.get("architectures"),
+        )
+        config_dict = {**config_dict, "model_type": model_type}
 
     return _dict_to_pretrained_config(config_dict)
+
+
+def _model_type_from_architectures(architectures) -> str | None:
+    """Recover a HuggingFace ``model_type`` from a config's ``architectures``.
+
+    Checkpoints published before ``model_type`` became mandatory omit the key
+    (``Rostlab/prot_bert`` is one), which makes ``AutoConfig`` refuse the repo
+    even though the architecture is a plain, fully supported one. The
+    architecture class name is not a guess in that situation: ``transformers``
+    exports it, and the class states its own config class, which states the
+    model type. Anything that does not resolve through that chain returns
+    ``None`` so an unknown repo still fails loudly.
+    """
+    if not architectures:
+        return None
+
+    import transformers
+
+    for architecture in architectures:
+        model_class = getattr(transformers, str(architecture), None)
+        config_class = getattr(model_class, "config_class", None)
+        model_type = getattr(config_class, "model_type", None)
+        if model_type:
+            return str(model_type)
+    return None
 
 
 def _dict_to_pretrained_config(d: dict):
