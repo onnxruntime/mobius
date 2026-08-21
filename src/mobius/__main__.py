@@ -451,7 +451,13 @@ def _save_package(
         config = getattr(pkg, "config", None)
         source = getattr(args, "config", None) or getattr(args, "model", None)
         try:
-            artifacts = write_onnx_genai_config(pkg, output_dir, config=config, source=source)
+            artifacts = write_onnx_genai_config(
+                pkg,
+                output_dir,
+                config=config,
+                source=source,
+                revision=getattr(args, "revision", None),
+            )
         except ValueError as error:
             raise SystemExit(f"Error: {error}") from error
         for name, path in artifacts.items():

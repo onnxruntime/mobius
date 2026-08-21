@@ -824,6 +824,38 @@ def test_dispatch_audio_only_multimodal_pipeline(tmp_path):
     assert embedding["inputs"]["audio_features"] == "audio.audio_features"
 
 
+def test_audio_package_forwards_the_pinned_revision(tmp_path, monkeypatch):
+    """A pinned revision must reach the asset writers, not just the build.
+
+    Every runtime asset beside the graph — tokenizer, audio processor — is
+    fetched from the Hub separately from the weights. If the revision stops
+    being threaded, the package still builds and still validates, but its
+    processor silently comes from whatever the branch tip happens to be, which
+    is the failure a pin exists to prevent.
+    """
+    pkg = _vlm_package(audio=True)
+    audio_processor = tmp_path / "audio_processor.json"
+    audio_processor.write_text("{}")
+    calls: list[tuple[str | None, str | None]] = []
+
+    def fake_audio_processor(output_dir, source, *, revision=None):
+        calls.append((source, revision))
+        return str(audio_processor)
+
+    monkeypatch.setattr(
+        "mobius.integrations.onnx_genai.auto_export._write_hf_audio_processor",
+        fake_audio_processor,
+    )
+    artifacts = write_onnx_genai_config(
+        pkg,
+        str(tmp_path),
+        source="zai-org/GLM-ASR-Nano-2512",
+        revision="pinned-revision",
+    )
+    assert artifacts["audio_processor"] == str(audio_processor)
+    assert calls == [("zai-org/GLM-ASR-Nano-2512", "pinned-revision")]
+
+
 def test_dispatch_vision_and_audio_multimodal_pipeline(tmp_path):
     pkg = _vlm_package(audio=True)
     artifacts = write_onnx_genai_config(pkg, str(tmp_path))

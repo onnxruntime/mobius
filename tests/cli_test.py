@@ -193,6 +193,35 @@ class TestCLIBuild:
         mock_build.assert_called_once()
         assert mock_build.call_args.kwargs.get("text_only") is True
 
+    def test_revision_is_forwarded_to_detection_and_build(self):
+        revision = "61ba4e0b3309b6656edea3e93e419f7bd5c61957"
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
+                return_value=None,
+            ) as mock_diffusers,
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "zai-org/GLM-ASR-Nano-2512",
+                    tmpdir,
+                    "--revision",
+                    revision,
+                    "--no-weights",
+                ]
+            )
+
+        mock_diffusers.assert_called_once_with(
+            "zai-org/GLM-ASR-Nano-2512",
+            revision=revision,
+        )
+        assert mock_build.call_args.kwargs["revision"] == revision
+
     def test_static_cache_with_onnx_genai_runtime_emits_scatter_abi(self):
         """A static-cache export is describable, so the CLI must describe it.
 
@@ -727,6 +756,7 @@ class TestCLIBuildRuntime:
             tmpdir,
             config=pkg.config,
             source="/models/vlm",
+            revision=None,
         )
 
     def test_runtime_onnx_genai_does_not_fallback_for_unsupported_vlm(self):

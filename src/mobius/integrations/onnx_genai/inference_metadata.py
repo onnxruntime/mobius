@@ -1964,12 +1964,14 @@ def _copy_runtime_assets(
     output_dir: str,
     source: str | None,
     names: Sequence[str] = _RUNTIME_ASSET_NAMES,
+    *,
+    revision: str | None = None,
 ) -> dict[str, str]:
     if not source:
         return {}
     os.makedirs(output_dir, exist_ok=True)
     for filename in names:
-        source_path = _source_asset_path(source, filename)
+        source_path = _source_asset_path(source, filename, revision=revision)
         if source_path is not None:
             shutil.copy2(source_path, os.path.join(output_dir, filename))
 
@@ -2020,6 +2022,7 @@ def write_native_vlm_package_metadata(
     *,
     config: Any,
     source: str | None = None,
+    revision: str | None = None,
     filename: str = "inference_metadata.yaml",
 ) -> dict[str, str]:
     """Write native VLM metadata and the runtime's tokenizer/processor assets."""

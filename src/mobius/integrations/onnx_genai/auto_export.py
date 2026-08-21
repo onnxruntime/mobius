@@ -195,7 +195,12 @@ def _looks_like_image_edit(pkg: Any) -> bool:
     )
 
 
-def _write_clip_tokenizer(output_dir: str, source: str | None) -> str | None:
+def _write_clip_tokenizer(
+    output_dir: str,
+    source: str | None,
+    *,
+    revision: str | None = None,
+) -> str | None:
     """Emit ``tokenizer.json`` for a text-conditioned diffusion package.
 
     Classic Stable Diffusion conditions on a CLIP text encoder, and the
@@ -253,7 +258,12 @@ def _write_clip_tokenizer(output_dir: str, source: str | None) -> str | None:
     return path
 
 
-def _write_text_runtime_assets(output_dir: str, source: str | None) -> dict[str, str]:
+def _write_text_runtime_assets(
+    output_dir: str,
+    source: str | None,
+    *,
+    revision: str | None = None,
+) -> dict[str, str]:
     """Emit the tokenizer *and* chat-template assets a text package needs.
 
     ``tokenizer.json`` alone is not enough for an instruction-tuned decoder: the
@@ -269,15 +279,22 @@ def _write_text_runtime_assets(output_dir: str, source: str | None) -> dict[str,
     Returns:
         A mapping of asset stem to written path for every asset materialized.
     """
-    artifacts = _copy_runtime_assets(output_dir, source, _TEXT_RUNTIME_ASSET_NAMES)
+    artifacts = _copy_runtime_assets(
+        output_dir, source, _TEXT_RUNTIME_ASSET_NAMES, revision=revision
+    )
     if "tokenizer" not in artifacts:
-        fallback = _write_hf_tokenizer(output_dir, source)
+        fallback = _write_hf_tokenizer(output_dir, source, revision=revision)
         if fallback is not None:
             artifacts["tokenizer"] = fallback
     return artifacts
 
 
-def _write_hf_tokenizer(output_dir: str, source: str | None) -> str | None:
+def _write_hf_tokenizer(
+    output_dir: str,
+    source: str | None,
+    *,
+    revision: str | None = None,
+) -> str | None:
     """Emit ``tokenizer.json`` for a text-producing package from its HF source.
 
     Decoder-LM, multimodal (VLM / speech-language ASR), and Whisper-style ASR
@@ -486,6 +503,14 @@ def _looks_like_multimodal(pkg: Any) -> bool:
     )
 
 
+def _has_audio_encoder(pkg: Any) -> bool:
+    """Whether a package fuses audio, and so needs a feature extractor."""
+    try:
+        return "audio_encoder" in set(pkg.keys())
+    except AttributeError:
+        return False
+
+
 def _looks_like_speech_to_text(pkg: Any) -> bool:
     """Detect a cross-attention encoder-decoder ASR package (e.g. Whisper).
 
@@ -663,6 +688,7 @@ def write_onnx_genai_config(
     scheduler: SchedulerConfig | None = None,
     guidance_scale: float | None = None,
     source: str | None = None,
+    revision: str | None = None,
     grammar_guidance: bool = False,
     adaptive_k_max: int | None = None,
     **kwargs: Any,
@@ -704,7 +730,7 @@ def write_onnx_genai_config(
             num_inference_steps=num_inference_steps,
         )
         artifacts = {"inference_metadata": path}
-        artifacts.update(_write_text_runtime_assets(output_dir, source))
+        artifacts.update(_write_text_runtime_assets(output_dir, source, revision=revision))
         return artifacts
 
     if _looks_like_diffusion(pkg):
@@ -735,7 +761,7 @@ def write_onnx_genai_config(
                 guidance_scale=1.0 if guidance_scale is None else guidance_scale,
             )
             artifacts = {"inference_metadata": path}
-            tokenizer_path = _write_hf_tokenizer(output_dir, source)
+            tokenizer_path = _write_hf_tokenizer(output_dir, source, revision=revision)
             if tokenizer_path is not None:
                 artifacts["tokenizer"] = tokenizer_path
             return artifacts
@@ -813,7 +839,7 @@ def write_onnx_genai_config(
             )
         path = write_ctc_asr_workflow_metadata(pkg, output_dir, ctc_config, source=source)
         artifacts = {"inference_metadata": path}
-        tokenizer_path = _write_hf_tokenizer(output_dir, source)
+        tokenizer_path = _write_hf_tokenizer(output_dir, source, revision=revision)
         if tokenizer_path is not None:
             artifacts["tokenizer"] = tokenizer_path
         return artifacts
@@ -854,11 +880,21 @@ def write_onnx_genai_config(
         # A multimodal package needs the processor assets as well as the
         # tokenizer, because the runtime resolves image/audio preprocessing
         # parameters from them.
-        artifacts.update(_copy_runtime_assets(output_dir, source))
+        artifacts.update(_copy_runtime_assets(output_dir, source, revision=revision))
         if "tokenizer" not in artifacts:
-            tokenizer_path = _write_hf_tokenizer(output_dir, source)
+            tokenizer_path = _write_hf_tokenizer(output_dir, source, revision=revision)
             if tokenizer_path is not None:
                 artifacts["tokenizer"] = tokenizer_path
+        # A speech-language package fuses audio embeddings, so it needs the
+        # feature extractor too: the runtime cannot turn a waveform into the
+        # encoder's input without it, and no other asset carries those
+        # parameters.
+        if _has_audio_encoder(pkg):
+            audio_processor_path = _write_hf_audio_processor(
+                output_dir, source, revision=revision
+            )
+            if audio_processor_path is not None:
+                artifacts["audio_processor"] = audio_processor_path
         return artifacts
 
     if _looks_like_speech_to_text(pkg):
@@ -867,7 +903,7 @@ def write_onnx_genai_config(
                 "workflow speech-to-text export derives KV state dtype from ONNX ports; "
                 "kv_native_dtype overrides are unsupported"
             )
-        audio_processor_path = _write_hf_audio_processor(output_dir, source)
+        audio_processor_path = _write_hf_audio_processor(output_dir, source, revision=revision)
         path = write_speech_to_text_workflow_metadata(
             pkg,
             output_dir,
@@ -879,7 +915,7 @@ def write_onnx_genai_config(
         artifacts = {"inference_metadata": path}
         # An ASR decoder is still a text producer: ship its tokenizer and chat
         # template alongside the audio processor.
-        artifacts.update(_write_text_runtime_assets(output_dir, source))
+        artifacts.update(_write_text_runtime_assets(output_dir, source, revision=revision))
         if audio_processor_path is not None:
             artifacts["audio_processor"] = audio_processor_path
         return artifacts
@@ -932,5 +968,5 @@ def write_onnx_genai_config(
         sampler=str(getattr(resolved_config, "workflow_sampler", "greedy")),
     )
     artifacts = {"inference_metadata": path}
-    artifacts.update(_write_text_runtime_assets(output_dir, source))
+    artifacts.update(_write_text_runtime_assets(output_dir, source, revision=revision))
     return artifacts
