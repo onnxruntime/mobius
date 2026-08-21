@@ -829,22 +829,58 @@ class TestCheckedInPackagesShareTheShape:
             return yaml.safe_load(handle)
 
     @staticmethod
-    def _ports(directory: str, workflow: dict[str, Any]) -> dict[str, tuple[set, set]]:
-        """Load each shipped artifact and read the ports it really exposes."""
+    def _artifact_root(directory: str, materialized: str) -> str:
+        """Where this package's graphs live once they have been generated."""
+        return os.path.join(materialized, os.path.basename(directory))
+
+    @classmethod
+    def _ports(
+        cls, directory: str, workflow: dict[str, Any], materialized: str
+    ) -> dict[str, tuple[set, set]]:
+        """Read the ports each graph really exposes.
+
+        The metadata under review is the committed one; the graph it describes
+        is generated, because it is a deterministic function of the producer
+        and committing it would store bytes no reviewer reads. Resolving the
+        committed declaration against the generated graph is what makes this an
+        assertion about the artifact rather than about a copy of itself.
+        """
+        root = cls._artifact_root(directory, materialized)
         ports: dict[str, tuple[set, set]] = {}
         for name, component in _onnx_components(workflow).items():
-            artifact = os.path.join(directory, component["implementation"]["artifact"])
-            if not os.path.exists(artifact):
-                continue
+            artifact = os.path.join(root, component["implementation"]["artifact"])
+            assert os.path.exists(artifact), (
+                f"{os.path.basename(directory)} declares component {name!r} backed by "
+                f"{component['implementation']['artifact']!r}, but the generator emitted "
+                f"no such file. Two of the assertions below skip components they cannot "
+                f"resolve, so a missing graph would quietly turn them into no-ops."
+            )
             ports[name] = _graph_ports(ir.load(artifact))
         return ports
 
     def test_describes_itself_only_through_the_workflow(self, directory):
+        """One serialized representation of the executable ABI, not two.
+
+        The runtime resolves the workflow first and never consults a second
+        declaration when one is present, so a surviving ``model.io`` or
+        ``pipeline.models`` would not be a redundant copy that merely risks
+        drifting: it would be inert, and nothing would say so. ONNX GenAI
+        rejects a package that carries both rather than silently picking one.
+        """
         metadata = self._metadata(directory)
         assert "workflow" in metadata["pipeline"]
-        assert "io" not in (metadata.get("model") or {})
+        assert "model" not in metadata or "io" not in metadata["model"], (
+            "model.io declares the same executable ABI as the workflow; the "
+            "workflow is canonical, so this one would be discarded at load"
+        )
+        assert "models" not in metadata["pipeline"], (
+            "pipeline.models is the legacy composite ABI, superseded by "
+            "pipeline.workflow's components and invoke bindings"
+        )
 
-    def test_no_component_transcribes_the_ports_of_its_own_artifact(self, directory):
+    def test_no_component_transcribes_the_ports_of_its_own_artifact(
+        self, directory, materialized_workflow_packages
+    ):
         """Whatever a component declares must not be a restatement of its graph.
 
         A policy graph declares contracts because they type the workflow's
@@ -854,7 +890,7 @@ class TestCheckedInPackagesShareTheShape:
         declaration into a partial second truth that drifts silently.
         """
         workflow = self._metadata(directory)["pipeline"]["workflow"]
-        graphs = self._ports(directory, workflow)
+        graphs = self._ports(directory, workflow, materialized_workflow_packages)
         assert graphs, "a fixture that ships no artifact proves nothing"
         for name, component in _onnx_components(workflow).items():
             ports = component.get("ports") or {}
@@ -864,9 +900,11 @@ class TestCheckedInPackagesShareTheShape:
             assert set(ports.get("inputs", {})) == inputs
             assert set(ports.get("outputs", {})) == outputs
 
-    def test_every_binding_and_state_pair_resolves_in_the_artifact(self, directory):
+    def test_every_binding_and_state_pair_resolves_in_the_artifact(
+        self, directory, materialized_workflow_packages
+    ):
         workflow = self._metadata(directory)["pipeline"]["workflow"]
-        graphs = self._ports(directory, workflow)
+        graphs = self._ports(directory, workflow, materialized_workflow_packages)
         for step in _walk_steps(workflow["steps"]):
             if step.get("kind") != "invoke" or step["component"] not in graphs:
                 continue
@@ -882,9 +920,11 @@ class TestCheckedInPackagesShareTheShape:
                     assert alias["input"] in inputs
                     assert alias["output"] in outputs
 
-    def test_every_declared_role_resolves_in_the_artifact(self, directory):
+    def test_every_declared_role_resolves_in_the_artifact(
+        self, directory, materialized_workflow_packages
+    ):
         workflow = self._metadata(directory)["pipeline"]["workflow"]
-        graphs = self._ports(directory, workflow)
+        graphs = self._ports(directory, workflow, materialized_workflow_packages)
         for name, component in _onnx_components(workflow).items():
             if name not in graphs:
                 continue

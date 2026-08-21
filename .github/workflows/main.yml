@@ -46,7 +46,11 @@ jobs:
         # `bash -e`, so an unguarded failure inside the loop would abort it and
         # hide the remaining results.
         failed=""
-        for package in tests/fixtures/onnx_genai_workflows/*; do
+        # The generated tree, not the committed one: validation resolves each
+        # component's artifact from disk, and the graphs are generated rather
+        # than committed.  The step above has already proven the two trees
+        # carry the same metadata.
+        for package in validation/generated/*; do
           [ -f "$package/inference_metadata.yaml" ] || continue
           cargo run --quiet \
             --manifest-path validation/onnx-genai/Cargo.toml \
@@ -63,7 +67,7 @@ jobs:
           validation/onnx-genai/crates/onnx-genai-engine/tests/mobius_workflow_conformance.rs
         ORT_LIB="$(python -c \
           'import onnxruntime, pathlib; print(next((pathlib.Path(onnxruntime.__file__).parent / "capi").glob("libonnxruntime.so*")))')"
-        MOBIUS_WORKFLOW_CONFORMANCE_DIR="$PWD/tests/fixtures/onnx_genai_workflows" \
+        MOBIUS_WORKFLOW_CONFORMANCE_DIR="$PWD/validation/generated" \
           ONNX_GENAI_ORT_LIB="$ORT_LIB" \
           cargo test --manifest-path validation/onnx-genai/Cargo.toml \
             -p onnx-genai-engine --test mobius_workflow_conformance -- --nocapture

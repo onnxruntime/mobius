@@ -876,8 +876,8 @@ def _static_cache_io(
             missing.append(f"input.{control}")
     if missing:
         raise ValueError(
-            "Cannot emit model.io.static_cache because the exported TensorScatter "
-            f"ABI is incomplete: {missing}"
+            "Cannot describe the static-cache ABI because the exported "
+            f"TensorScatter ports are incomplete: {missing}"
         )
     return {
         "write_indices_input": STATIC_CACHE_WRITE_INDICES,
@@ -1389,81 +1389,6 @@ def validate_executable_closure(pkg: Any, metadata: dict[str, Any]) -> None:
                     f"the source category {kind!r} is not executable.",
                     "use external, generated, stateful, defaulted, or dataflow.",
                 )
-
-
-def add_explicit_package_io(
-    metadata: dict[str, Any],
-    pkg: Any,
-    config: Any,
-) -> dict[str, Any]:
-    """Attach explicit graph-port roles to emitted decoder and encoder models."""
-    pipeline = metadata.get("pipeline")
-    if not isinstance(pipeline, dict):
-        component_names = list(pkg.keys())
-        if len(component_names) != 1:
-            raise ValueError("bare decoder metadata requires exactly one graph component")
-        io, _ = _decoder_io(pkg[component_names[0]], set(), config)
-        metadata.setdefault("model", {})["io"] = io
-        return metadata
-
-    models = pipeline.get("models", {})
-    routed_inputs: dict[str, set[str]] = {}
-    for edge in pipeline.get("dataflow", []):
-        target = edge.get("to", "")
-        component, separator, port = target.partition(".")
-        if separator:
-            routed_inputs.setdefault(component, set()).add(port)
-
-    component_ios: dict[str, dict[str, Any]] = {}
-    for name, model_spec in models.items():
-        if name not in pkg:
-            continue
-        if model_spec.get("type") == "decoder":
-            io, _ = _decoder_io(pkg[name], routed_inputs.get(name, set()), config)
-        else:
-            inputs = [_port(value) for value in pkg[name].graph.inputs]
-            outputs = [_port(value) for value in pkg[name].graph.outputs]
-            io = {
-                "inputs": [_port_metadata(port) for port in inputs],
-                "outputs": [_port_metadata(port) for port in outputs],
-            }
-            if model_spec.get("type") in {"encoder", "audio_encoder"}:
-                audio_prompt = _select_one(
-                    inputs, lambda port: _is_float(port) and port.rank == 3
-                )
-                token_prompt = _select_one(
-                    inputs, lambda port: _is_integer(port) and port.rank == 2
-                )
-                if audio_prompt is not None:
-                    io["audio_features_input"] = audio_prompt.name
-                elif token_prompt is not None:
-                    io["token_input"] = token_prompt.name
-                    io["sequence_source"] = "token_ids"
-        model_spec["io"] = io
-        component_ios[name] = io
-
-    def annotate_strategy(strategy: dict[str, Any]) -> None:
-        if strategy.get("kind") == "nested_autoregressive" and not strategy.get(
-            "inner_embedding_output"
-        ):
-            inner_name = strategy.get("inner")
-            inner_io = component_ios.get(inner_name, {})
-            hidden_output = inner_io.get("hidden_output")
-            if not hidden_output:
-                raise ValueError(
-                    "Cannot emit pipeline.strategy.inner_embedding_output: the inner "
-                    f"decoder {inner_name!r} has no unique non-logits float output"
-                )
-            strategy["inner_embedding_output"] = hidden_output
-        for stage in strategy.get("stages", []):
-            nested = stage.get("strategy")
-            if isinstance(nested, dict):
-                annotate_strategy(nested)
-
-    strategy = pipeline.get("strategy")
-    if isinstance(strategy, dict):
-        annotate_strategy(strategy)
-    return metadata
 
 
 #: Symbolic leading dimension Mobius emits for every batched ONNX port. A port

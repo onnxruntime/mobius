@@ -29,7 +29,6 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     _match_max_token_grid,
     _port,
     _processor_values,
-    add_explicit_package_io,
     add_policy_components_to_workflow,
     build_diffusion_pipeline_metadata,
     build_multimodal_pipeline_metadata,
@@ -393,112 +392,7 @@ def _static_cache_decoder_model() -> ir.Model:
     return _model("decoder", inputs, outputs)
 
 
-class TestExplicitPackageIo:
-    def test_emits_explicit_dynamic_decoder_roles(self):
-        model = _decoder_model(
-            [],
-            position_shape=["batch", "sequence"],
-            raw_token_input=True,
-            kv_head_dims=[8, 16],
-        )
-        metadata = add_explicit_package_io({"model": {}}, {"model": model}, _VlmConfig())
-        io = metadata["model"]["io"]
-        assert io["token_input"] == "input_ids"
-        assert io["sequence_source"] == "token_ids"
-        assert io["logits_output"] == "logits"
-        assert io["kv_ownership"] == "owned"
-        assert io["kv_inputs"] == [
-            "past_key_values.0.key",
-            "past_key_values.0.value",
-            "past_key_values.1.key",
-            "past_key_values.1.value",
-        ]
-        assert io["kv_outputs"] == [
-            "present.0.key",
-            "present.0.value",
-            "present.1.key",
-            "present.1.value",
-        ]
-
-    def test_emits_explicit_static_cache_roles_in_layer_order(self):
-        metadata = add_explicit_package_io(
-            {"model": {}}, {"model": _static_cache_decoder_model()}, _VlmConfig()
-        )
-        io = metadata["model"]["io"]
-        assert io["static_cache"] == {
-            "write_indices_input": "write_indices",
-            "kv_sequence_length_input": "nonpad_kv_seqlen",
-            "key_cache_inputs": ["key_cache.1", "key_cache.3"],
-            "value_cache_inputs": ["value_cache.1", "value_cache.3"],
-            "key_cache_outputs": ["updated_key_cache.1", "updated_key_cache.3"],
-            "value_cache_outputs": [
-                "updated_value_cache.1",
-                "updated_value_cache.3",
-            ],
-        }
-        assert "kv_inputs" not in io
-
-    @pytest.mark.parametrize(
-        ("encoder_input", "role_field"),
-        [
-            (
-                _value(
-                    "mel_prompt",
-                    ir.DataType.FLOAT,
-                    ["batch", 80, "audio_sequence"],
-                ),
-                "audio_features_input",
-            ),
-            (
-                _value("prompt_tokens", ir.DataType.INT64, ["batch", "sequence"]),
-                "token_input",
-            ),
-        ],
-    )
-    def test_emits_explicit_encoder_prompt_role(self, encoder_input, role_field):
-        encoder = _model(
-            "encoder",
-            [encoder_input],
-            [
-                (
-                    "encoder_hidden_states",
-                    ir.DataType.FLOAT,
-                    ["batch", "encoder_sequence", 64],
-                )
-            ],
-        )
-        decoder = _model(
-            "decoder",
-            [
-                _value("decoder_tokens", ir.DataType.INT64, ["batch", "sequence"]),
-                _value(
-                    "encoder_hidden_states",
-                    ir.DataType.FLOAT,
-                    ["batch", "encoder_sequence", 64],
-                ),
-            ],
-            [("logits", ir.DataType.FLOAT, ["batch", "sequence", 128])],
-        )
-        metadata = {
-            "pipeline": {
-                "models": {
-                    "encoder": {"type": "encoder"},
-                    "decoder": {"type": "decoder"},
-                },
-                "dataflow": [],
-                "strategy": {"kind": "autoregressive", "decoder": "decoder"},
-            }
-        }
-        add_explicit_package_io(
-            metadata, {"encoder": encoder, "decoder": decoder}, _VlmConfig()
-        )
-        encoder_io = metadata["pipeline"]["models"]["encoder"]["io"]
-        assert encoder_io[role_field] == encoder_input.name
-        decoder_io = metadata["pipeline"]["models"]["decoder"]["io"]
-        assert decoder_io["token_input"] == "decoder_tokens"
-        assert decoder_io["encoder_hidden_states_input"] == "encoder_hidden_states"
-        assert decoder_io["logits_output"] == "logits"
-
+class TestCrossAttentionCacheSources:
     def test_cross_attention_cache_inputs_are_loop_state(self):
         inputs = [
             _value("input_ids", ir.DataType.INT64, ["batch", "sequence"]),
@@ -611,42 +505,6 @@ class TestExplicitPackageIo:
                 "strategy": strategy,
             }
         }
-
-    def test_explicit_inner_embedding_output_is_preserved(self):
-        metadata = self._nested_metadata("declared_embedding")
-        package = self._nested_package(
-            [("logits", ir.DataType.FLOAT, ["batch", "sequence", 128])]
-        )
-        add_explicit_package_io(metadata, package, _VlmConfig())
-        assert (
-            metadata["pipeline"]["strategy"]["inner_embedding_output"] == "declared_embedding"
-        )
-
-    def test_missing_inner_embedding_output_is_derived(self):
-        metadata = self._nested_metadata()
-        package = self._nested_package(
-            [
-                ("logits", ir.DataType.FLOAT, ["batch", "sequence", 128]),
-                ("codec_embeddings", ir.DataType.FLOAT, [16, 64]),
-            ]
-        )
-        add_explicit_package_io(metadata, package, _VlmConfig())
-        assert metadata["pipeline"]["strategy"]["inner_embedding_output"] == "codec_embeddings"
-
-    def test_ambiguous_inner_embedding_output_fails_actionably(self):
-        metadata = self._nested_metadata()
-        package = self._nested_package(
-            [
-                ("logits", ir.DataType.FLOAT, ["batch", "sequence", 128]),
-                ("first_embedding", ir.DataType.FLOAT, [16, 64]),
-                ("second_embedding", ir.DataType.FLOAT, [16, 64]),
-            ]
-        )
-        with pytest.raises(
-            ValueError,
-            match=r"pipeline\.strategy\.inner_embedding_output.*no unique",
-        ):
-            add_explicit_package_io(metadata, package, _VlmConfig())
 
 
 def _native_package(

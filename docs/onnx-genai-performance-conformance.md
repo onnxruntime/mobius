@@ -128,7 +128,7 @@ contracts on any component that ships an artifact:
 
 | Check | Result |
 | --- | --- |
-| `validate_metadata` over the checked-in fixtures | 11/11 valid |
+| `validate_metadata` over the generated packages | 11/11 valid |
 | `mobius_workflow_conformance` (engine executes each package) | 11/11 passed |
 | `mobius_static_cache_workflow_executes` specifically | passed |
 
@@ -145,6 +145,35 @@ point our fixtures go through, and all 11 were re-checked against it rather
 than assumed to be unaffected. They pass because they carry no `model:` block
 at all: a package with one serialized ABI has nothing for a coexistence rule to
 find.
+
+### What the fixtures commit, and what they do not
+
+Only the metadata is committed. The graphs and the adapter weight file are a
+deterministic function of `tests/generate_onnx_genai_validation_packages.py`,
+and committing them stored 146 files and roughly 14 MB — including a 5 MB
+weight blob — restating in unreadable bytes what the script already says. CI
+already regenerated the whole tree and compared it, so the committed copies
+were never the thing under test.
+
+Textproto was the other option and is the right one for ONNX GenAI's own
+fixtures, which are 26 KB synthetic graphs. It is the wrong one here: these
+carry real weight blobs, a text encoding would grow rather than shrink them,
+and this repository does not use the protobuf APIs a textproto writer needs.
+
+Regeneration takes about four seconds for all eleven packages, so tests that
+need a graph build them once per session through the
+`materialized_workflow_packages` fixture.
+
+The change has a consequence worth stating plainly, because it decides where
+CI must point: a package whose artifacts are absent does not validate. A
+checkout of the committed tree alone fails with `component
+'cache_length_update' artifact ... cannot be opened`. That is correct — a
+workflow claims to be a complete description of something executable, and it
+should not pass when the executable part is missing. Validation and
+conformance therefore run against the regenerated tree, and the comparison
+step additionally asserts that every artifact the committed metadata names was
+really produced, so a generator that quietly stopped emitting one would be
+caught rather than leaving an assertion with nothing to check.
 
 ### The role a fixed-capacity cache cannot do without
 

@@ -14,12 +14,19 @@ use onnx_genai_ort::{DataType, Value};
 use std::path::PathBuf;
 
 fn root(name: &str) -> anyhow::Result<PathBuf> {
+    // No default: the packages are generated rather than committed, so there
+    // is no fixed path to fall back to.  A relative guess would resolve inside
+    // the ONNX GenAI checkout this file is copied into and fail with a missing
+    // package rather than a missing directory.
     let root = std::env::var_os("MOBIUS_WORKFLOW_CONFORMANCE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../tests/fixtures/onnx_genai_workflows")
-        });
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "set MOBIUS_WORKFLOW_CONFORMANCE_DIR to a directory of generated \
+                 packages, e.g. `python tests/generate_onnx_genai_validation_packages.py \
+                 validation/generated` from a Mobius checkout"
+            )
+        })?;
     Ok(root.join(name))
 }
 

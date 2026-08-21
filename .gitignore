@@ -212,8 +212,14 @@ __marimo__/
 *.onnx
 *.onnx.data
 *.gguf
-!tests/fixtures/onnx_genai_workflows/**/*.onnx
-!tests/fixtures/onnx_genai_workflows/**/*.onnx.data
+
+# Generated conformance-package artifacts.  The metadata beside them is the
+# contract under review and is committed; the graphs and adapter weights are a
+# deterministic function of
+# tests/generate_onnx_genai_validation_packages.py, so committing them would
+# store megabytes of bytes no reviewer reads.  CI regenerates and validates
+# them; tests get them from the materialized_workflow_packages fixture.
+tests/fixtures/onnx_genai_workflows/**/*.safetensors
 
 # Common test dirs
 output/**
