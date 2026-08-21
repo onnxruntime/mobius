@@ -236,6 +236,7 @@ mobius build --model meta-llama/Llama-3.2-1B output/ \
 |--------|-------------|
 | `--task TASK` | Model task (auto-detected if not specified). Use `mobius list tasks` to see available tasks. |
 | `--dtype DTYPE` | Target dtype for model weights: `f16`, `bf16`, `f32` (also accepts `float16`, `bfloat16`, `float32`). If omitted, the dtype is auto-detected from the HuggingFace config (`torch_dtype`); provide `--dtype` to override it. Weights are cast at save time. |
+| `--revision REVISION` | Immutable HuggingFace revision used consistently for config, weights, tokenizer, processor, and runtime metadata artifacts. |
 | `--no-weights` | Export graph structure only, without weight data. Useful for inspection or testing. |
 | `--external-data FORMAT` | External data format: `onnx` (default) or `safetensors`. |
 | `--max-shard-size SIZE` | Maximum shard size for safetensors external data (e.g. `5GB`). Only used with `--external-data safetensors`. |

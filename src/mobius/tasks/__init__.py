@@ -119,6 +119,7 @@ from mobius.tasks._gemma4 import (
     Gemma4UnifiedTask,
 )
 from mobius.tasks._gemma4_assistant import Gemma4AssistantTask
+from mobius.tasks._glmasr_speech_language import GlmAsrSpeechLanguageTask
 from mobius.tasks._hunyuan_vl_mot import HunYuanVLMoTTask
 from mobius.tasks._image_classification import ImageClassificationTask
 from mobius.tasks._masked_diffusion import MaskedDiffusionTask
@@ -219,6 +220,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "multimodal": MultiModalTask,
     "phi4mm-multimodal": Phi4MMMultiModalTask,
     "fun-asr-speech-language": FunASRSpeechLanguageTask,
+    "glmasr-speech-language": GlmAsrSpeechLanguageTask,
     "fastconformer-rnnt": RNNTTask,
     "speech-language": SpeechLanguageTask,
     "speech-to-text": SpeechToTextTask,
