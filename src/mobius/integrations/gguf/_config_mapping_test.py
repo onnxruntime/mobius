@@ -145,3 +145,164 @@ class TestDefaultActivation:
         from mobius.integrations.gguf._config_mapping import _default_activation
 
         assert _default_activation(model_type) == "silu"
+
+
+class TestMuseGlimmerPostprocess:
+    """Muse Glimmer config postprocessing.
+
+    Ground truth is the published Muse-Glimmer-30B text config: a stride-4
+    sliding-window pattern, NoPE on the full-attention layers,
+    ``qk_scale_factor`` 3.87 and ``output_multiplier`` 0.19611613513818404.
+    """
+
+    @staticmethod
+    def _base_config():
+        from mobius._configs import ArchitectureConfig
+
+        return ArchitectureConfig(
+            hidden_size=6656,
+            num_hidden_layers=8,
+            num_attention_heads=32,
+            num_key_value_heads=2,
+            vocab_size=202048,
+            intermediate_size=19968,
+            rope_theta=500000.0,
+        )
+
+    @staticmethod
+    def _metadata():
+        return {
+            "muse-glimmer.attention.sliding_window": 2048,
+            "muse-glimmer.attention.sliding_window_pattern": 4,
+            "muse-glimmer.final_logit_softcapping": 20.0,
+            "muse-glimmer.logit_scale": 0.1961161345243454,
+        }
+
+    class _FakeModel:
+        """Stands in for GGUFModel, exposing only what the mapping reads."""
+
+        def __init__(self, q_norm):
+            self._q_norm = q_norm
+
+        def get_tensor(self, name: str):
+            import numpy as np
+
+            if name == "blk.0.attn_q_norm.weight":
+                if self._q_norm is None:
+                    raise KeyError(name)
+                return np.asarray(self._q_norm, dtype=np.float32)
+            raise KeyError(name)
+
+    def test_layer_types_and_nope_layers_follow_the_stride(self) -> None:
+        from mobius.integrations.gguf._config_mapping import _muse_glimmer_postprocess
+
+        result = _muse_glimmer_postprocess(
+            self._base_config(),
+            self._metadata(),
+            self._FakeModel([3.87] * 128),
+        )
+
+        assert result.layer_types == [
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
+        ]
+        # Full-attention layers are the NoPE layers.
+        assert result.no_rope_layers == [3, 7]
+        assert result.layer_rope_theta == [
+            500000.0,
+            500000.0,
+            500000.0,
+            0,
+            500000.0,
+            500000.0,
+            500000.0,
+            0,
+        ]
+        assert result.sliding_window == 2048
+
+    def test_scalars_come_from_metadata_and_the_q_norm_tensor(self) -> None:
+        from mobius.integrations.gguf._config_mapping import _muse_glimmer_postprocess
+
+        result = _muse_glimmer_postprocess(
+            self._base_config(),
+            self._metadata(),
+            self._FakeModel([3.87] * 128),
+        )
+
+        assert result.qk_scale_factor == pytest.approx(3.87)
+        assert result.output_multiplier == pytest.approx(0.19611613513818404)
+        assert result.final_logit_softcapping == pytest.approx(20.0)
+        # GGUF has no key for post_norm_eps; the checkpoint default stands.
+        assert result.post_norm_eps == pytest.approx(1e-8)
+        assert result.attn_qk_norm is True
+
+    def test_missing_q_norm_falls_back_to_the_default_scale(self) -> None:
+        from mobius.integrations.gguf._config_mapping import _muse_glimmer_postprocess
+
+        result = _muse_glimmer_postprocess(
+            self._base_config(),
+            self._metadata(),
+            self._FakeModel(None),
+        )
+
+        assert result.qk_scale_factor == pytest.approx(3.87)
+
+    def test_non_constant_q_norm_is_rejected(self) -> None:
+        from mobius.integrations.gguf._config_mapping import _muse_glimmer_postprocess
+
+        with pytest.raises(ValueError, match="not a constant vector"):
+            _muse_glimmer_postprocess(
+                self._base_config(),
+                self._metadata(),
+                self._FakeModel([3.87] * 127 + [1.0]),
+            )
+
+    def test_underscore_spelled_architecture_is_read_the_same_way(self) -> None:
+        """Both ``muse-glimmer`` and ``muse_glimmer`` name the same architecture.
+
+        The metadata prefix follows whatever the file calls itself, so the
+        postprocessor has to take the prefix from the model rather than assume
+        the hyphenated spelling.
+        """
+        from mobius.integrations.gguf._config_mapping import (
+            _ARCH_KEY_MAPS,
+            _muse_glimmer_postprocess,
+        )
+
+        model = self._FakeModel([3.87] * 128)
+        model.architecture = "muse_glimmer"
+        metadata = {
+            key.replace("muse-glimmer.", "muse_glimmer."): value
+            for key, value in self._metadata().items()
+        }
+
+        result = _muse_glimmer_postprocess(self._base_config(), metadata, model)
+
+        assert result.sliding_window == 2048
+        assert result.no_rope_layers == [3, 7]
+        assert result.output_multiplier == pytest.approx(0.19611613513818404)
+        # The key map is what turns attention.key_length into head_dim, so it
+        # has to answer to both spellings too.
+        assert _ARCH_KEY_MAPS["muse_glimmer"] == _ARCH_KEY_MAPS["muse-glimmer"]
+
+    def test_a_missing_sliding_window_pattern_is_rejected(self) -> None:
+        """Guessing the stride would yield a different architecture.
+
+        Without it every layer is left sliding and rotated, which loads and
+        runs and is not Muse Glimmer. Refusing is the only honest answer.
+        """
+        from mobius.integrations.gguf._config_mapping import _muse_glimmer_postprocess
+
+        metadata = self._metadata()
+        del metadata["muse-glimmer.attention.sliding_window_pattern"]
+
+        with pytest.raises(ValueError, match="sliding_window_pattern"):
+            _muse_glimmer_postprocess(
+                self._base_config(), metadata, self._FakeModel([3.87] * 128)
+            )

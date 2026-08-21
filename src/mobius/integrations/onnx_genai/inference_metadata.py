@@ -43,6 +43,7 @@ from typing import Any
 import yaml
 
 from mobius._pipeline_contract import component_presence, optional_input_contract
+from mobius.upstream_patches import apply_asset_patches
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -1653,6 +1654,8 @@ def _copy_runtime_assets(
             _LOGGER.warning(
                 "Could not materialize tokenizer assets from %r: %s", source, error
             )
+
+    apply_asset_patches(output_dir)
 
     return {
         Path(filename).stem: os.path.join(output_dir, filename)

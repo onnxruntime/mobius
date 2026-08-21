@@ -13,11 +13,13 @@ which the previous top-level-only scan missed.
 
 from __future__ import annotations
 
+import tempfile
+
 import onnx_ir as ir
 import pytest
 
 from mobius._flags import flags
-from mobius._testing.ort_inference import _MAX_EP_OPSET, _should_lower_opset
+from mobius._testing.ort_inference import _MAX_EP_OPSET, OnnxModelSession, _should_lower_opset
 
 
 def _make_value(name: str) -> ir.Value:
@@ -108,3 +110,13 @@ def test_opset_at_or_below_max_not_lowered(lowering_enabled: None) -> None:
     model = _model_with(_graph_with([node], opset=_MAX_EP_OPSET))
 
     assert _should_lower_opset(model, device="cuda") is False
+
+
+def test_close_releases_session_reference() -> None:
+    session = OnnxModelSession.__new__(OnnxModelSession)
+    session._session = object()  # type: ignore[attr-defined]
+    session._tmpdir = tempfile.TemporaryDirectory()  # type: ignore[attr-defined]
+
+    session.close()
+
+    assert not hasattr(session, "_session")

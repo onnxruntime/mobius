@@ -345,17 +345,17 @@ def _cmd_build(args: argparse.Namespace) -> None:
 
             hf_config = transformers.AutoConfig.from_pretrained(
                 model_id_or_path,
-                revision=revision,
                 trust_remote_code=trust_remote_code,
+                revision=revision,
             )
             task = _resolve_static_cache_task(getattr(hf_config, "model_type", ""))
 
         pkg = build(
             model_id_or_path,
             task=task,
-            revision=revision,
             dtype=dtype_override,
             load_weights=load_weights,
+            revision=revision,
             trust_remote_code=trust_remote_code,
             execution_provider=execution_provider,
             text_only=args.text_only,
@@ -718,14 +718,6 @@ def main(argv: list[str] | None = None) -> None:
         help="Model task (auto-detected if not specified). Use 'mobius list tasks' to see available tasks.",
     )
     build_parser.add_argument(
-        "--revision",
-        default=None,
-        help=(
-            "Immutable HuggingFace revision used for config, weights, tokenizer, "
-            "processor, and runtime metadata artifacts."
-        ),
-    )
-    build_parser.add_argument(
         "--external-data",
         choices=["onnx", "safetensors"],
         default="onnx",
@@ -753,6 +745,14 @@ def main(argv: list[str] | None = None) -> None:
         "--trust-remote-code",
         action="store_true",
         help="Trust remote code when loading the HuggingFace model config.",
+    )
+    build_parser.add_argument(
+        "--revision",
+        default=None,
+        help=(
+            "Immutable HuggingFace revision used for config, weights, tokenizer, "
+            "and processor assets."
+        ),
     )
     build_parser.add_argument(
         "--dtype",
@@ -865,7 +865,8 @@ def main(argv: list[str] | None = None) -> None:
             "Path to a companion 'clip' mmproj GGUF (vision/audio encoder). "
             "When set, builds a full multimodal package (decoder + "
             "vision_encoder + embedding) instead of a text-only model. "
-            "Currently supports Gemma4 vision; audio is experimental."
+            "Currently supports Gemma4 and Muse Glimmer vision; audio is "
+            "experimental."
         ),
     )
     quantization_group = gguf_parser.add_mutually_exclusive_group()

@@ -28,7 +28,13 @@ from typing import Any
 
 import numpy as np
 
-from mobius._configs import ArchitectureConfig, Gemma4Config
+from mobius._configs import (
+    ArchitectureConfig,
+    Gemma2Config,
+    Gemma4Config,
+    MuseGlimmerConfig,
+    _shallow_fields,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +67,8 @@ GGUF_ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "hunyuan-dense": "hunyuan_v1_dense",
     "deepseek4": "deepseek_v4",
     "deci": "llama",  # DeciLM uses Llama architecture
+    "muse-glimmer": "muse_glimmer_text",
+    "muse_glimmer": "muse_glimmer_text",
 }
 
 
@@ -91,7 +99,16 @@ _DEFAULT_KEY_MAP: dict[str, str] = {
     "ssm.conv_kernel": "linear_conv_kernel_dim",
 }
 
+# Muse Glimmer has no rope.dimension_count; head_dim comes from key_length.
+_MUSE_GLIMMER_KEY_MAP = {
+    "attention.key_length": "head_dim",
+    "attention.sliding_window": "sliding_window",
+}
+
 _ARCH_KEY_MAPS: dict[str, dict[str, str]] = {
+    # Both spellings are accepted wherever muse-glimmer is recognized.
+    "muse-glimmer": _MUSE_GLIMMER_KEY_MAP,
+    "muse_glimmer": _MUSE_GLIMMER_KEY_MAP,
     "deepseek4": {
         "attention.key_length": "head_dim",
         "rope.dimension_count": "qk_rope_head_dim",
@@ -115,7 +132,7 @@ _ARCH_KEY_MAPS: dict[str, dict[str, str]] = {
         "hyper_connection.sinkhorn_iterations": "hc_sinkhorn_iters",
         "hyper_connection.epsilon": "hc_eps",
         "hash_layer_count": "num_hash_layers",
-    }
+    },
 }
 
 
@@ -443,9 +460,11 @@ def gguf_to_config(
 
     # Apply architecture-specific postprocessing to produce the correct
     # config subclass (e.g. Gemma4Config instead of plain ArchitectureConfig).
+    # Postprocessors take the GGUF model too, because a few architectures store
+    # config scalars inside tensors rather than in the key-value metadata.
     postprocessor = _CONFIG_POSTPROCESSORS.get(model_type)
     if postprocessor is not None:
-        config = postprocessor(config, metadata)
+        config = postprocessor(config, metadata, model)
         config._gguf_model_type = model_type
         config.model_type = model_type
 
@@ -463,9 +482,64 @@ def gguf_to_config(
     return config
 
 
+def _gemma2_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+) -> Gemma2Config:
+    """Convert a base config to Gemma2Config with architecture-specific fields.
+
+    Gemma2 applies tanh soft-capping to both the attention logits and the final
+    logits, and uses ``query_pre_attn_scalar`` for the attention scale. These
+    fields live on :class:`Gemma2Config`; without this postprocessor the GGUF
+    path hands the Gemma2 module a plain :class:`ArchitectureConfig` and crashes
+    in ``Gemma2Attention.__init__`` on ``config.query_pre_attn_scalar`` /
+    ``config.attn_logit_softcapping``.
+
+    GGUF key mapping (``gemma2.`` prefix omitted for readability):
+
+    =================================== ======================================
+    GGUF key                            Gemma2Config field
+    =================================== ======================================
+    attn_logit_softcapping              attn_logit_softcapping
+    final_logit_softcapping             final_logit_softcapping
+    attention.key_length                head_dim (already on the base config)
+    =================================== ======================================
+
+    GGUF does not carry ``query_pre_attn_scalar``. For every released Gemma2
+    checkpoint except 27B it equals ``head_dim``, so the default
+    ``1/sqrt(head_dim)`` scale is numerically exact; we therefore leave it
+    ``None`` (which selects that default) unless a checkpoint provides the key.
+    """
+    arch = "gemma2"
+    attn_logit_softcapping = metadata.get(f"{arch}.attn_logit_softcapping")
+    final_logit_softcapping = metadata.get(f"{arch}.final_logit_softcapping")
+    query_pre_attn_scalar = metadata.get(f"{arch}.attention.query_pre_attn_scalar")
+
+    # Gemma2 always uses standard (default) RoPE, but its GGUF omits every
+    # ``rope.*`` key (llama.cpp hardcodes theta=10000). The base extractor only
+    # promotes ``rope_type`` to ``"default"`` when ``rope.freq_base`` is present,
+    # so it is left as ``None`` here — which would disable RoPE and make
+    # ``initialize_rope`` return ``None``. Force the default variant; the base
+    # ``rope_theta`` default (10000.0) already matches the architecture.
+    if config.rope_type is None:
+        config = dataclasses.replace(config, rope_type="default")
+
+    return Gemma2Config(
+        # Inherit all base ArchitectureConfig fields
+        **{f.name: getattr(config, f.name) for f in dataclasses.fields(ArchitectureConfig)},
+        # Gemma2-specific fields
+        attn_logit_softcapping=float(attn_logit_softcapping or 0.0),
+        final_logit_softcapping=float(final_logit_softcapping or 0.0),
+        query_pre_attn_scalar=float(query_pre_attn_scalar)
+        if query_pre_attn_scalar is not None
+        else None,
+    )
+
+
 def _gemma4_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
+    model: Any = None,
 ) -> Gemma4Config:
     """Convert a base config to Gemma4Config with architecture-specific fields.
 
@@ -680,6 +754,7 @@ _GEMMA3_DEFAULT_SLIDING_WINDOW_PATTERN = 6
 def _gemma3_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
+    model: Any = None,
 ) -> ArchitectureConfig:
     """Populate Gemma3 fields that GGUF omits.
 
@@ -719,12 +794,139 @@ def _gemma3_postprocess(
     return config
 
 
+def _muse_glimmer_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> MuseGlimmerConfig:
+    """Convert a base config to :class:`MuseGlimmerConfig`.
+
+    GGUF key mapping (``muse-glimmer.`` prefix omitted for readability):
+
+    ===================================  ====================================
+    GGUF key                             MuseGlimmerConfig field
+    ===================================  ====================================
+    logit_scale                          output_multiplier
+    final_logit_softcapping              final_logit_softcapping
+    attention.sliding_window             sliding_window
+    attention.sliding_window_pattern     layer_types, layer_rope_theta
+    ===================================  ====================================
+
+    Two values are not in the metadata at all:
+
+    ``qk_scale_factor``
+        Recovered from the ``blk.0.attn_q_norm`` tensor. Muse Glimmer's QK
+        normalization is scale-free, so llama.cpp materializes the constant as
+        a head_dim-wide vector rather than storing a scalar in the metadata.
+
+    ``post_norm_eps``
+        Not represented in GGUF; the dataclass default (1e-8, matching the
+        published checkpoints) is kept.
+    """
+    arch = getattr(model, "architecture", None) or "muse-glimmer"
+
+    # --- Layer types and NoPE layers from the sliding-window pattern ---
+    # Unlike Gemma 4, which stores a per-layer bool array, Muse Glimmer stores a
+    # single stride: every `pattern`-th layer is a full-attention layer and the
+    # rest are sliding. Full-attention layers are also the NoPE layers -- the HF
+    # checkpoint expresses this as layer_rope_theta[i] == 0.
+    #
+    # There is no defensible fallback if the stride is missing. Guessing leaves
+    # every layer sliding and rotated, which is a different architecture that
+    # happens to load, so refuse the conversion instead of emitting one.
+    key = f"{arch}.attention.sliding_window_pattern"
+    pattern = metadata.get(key)
+    if pattern is None:
+        raise ValueError(
+            f"GGUF metadata is missing {key}. Muse Glimmer needs it to place "
+            f"the full-attention and NoPE layers; without it the converted "
+            f"model would silently be a different architecture."
+        )
+    pattern = int(pattern)
+    if pattern <= 0:
+        raise ValueError(f"GGUF metadata {key} must be positive, got {pattern}.")
+    layer_types = [
+        "full_attention" if (index + 1) % pattern == 0 else "sliding_attention"
+        for index in range(config.num_hidden_layers)
+    ]
+    layer_rope_theta: list[float | int] = [
+        0 if layer_type == "full_attention" else config.rope_theta
+        for layer_type in layer_types
+    ]
+    config = dataclasses.replace(
+        config,
+        layer_types=layer_types,
+        no_rope_layers=[index for index, theta in enumerate(layer_rope_theta) if theta == 0],
+    )
+
+    sliding_window = metadata.get(f"{arch}.attention.sliding_window")
+    if sliding_window is not None:
+        config = dataclasses.replace(config, sliding_window=int(sliding_window))
+
+    config = dataclasses.replace(config, attn_qk_norm=True)
+
+    defaults = MuseGlimmerConfig()
+    softcapping = metadata.get(f"{arch}.final_logit_softcapping")
+    logit_scale = metadata.get(f"{arch}.logit_scale")
+
+    return MuseGlimmerConfig(
+        **_shallow_fields(config),
+        qk_scale_factor=_muse_glimmer_qk_scale_factor(model, defaults.qk_scale_factor),
+        output_multiplier=(
+            float(logit_scale) if logit_scale is not None else defaults.output_multiplier
+        ),
+        final_logit_softcapping=(
+            float(softcapping) if softcapping is not None else defaults.final_logit_softcapping
+        ),
+        post_norm_eps=defaults.post_norm_eps,
+        layer_rope_theta=layer_rope_theta,
+    )
+
+
+def _muse_glimmer_qk_scale_factor(model: Any, default: float) -> float:
+    """Read Muse Glimmer's ``qk_scale_factor`` out of ``blk.0.attn_q_norm``.
+
+    Muse Glimmer normalizes Q and K without a learned scale and then multiplies
+    Q by a single constant. llama.cpp has no place for that constant in the
+    metadata, so it broadcasts it across a head_dim-wide ``attn_q_norm`` tensor
+    (``attn_k_norm`` is the matching all-ones vector). Reading element 0 back is
+    therefore the only way to recover the value from a GGUF file.
+
+    Falls back to *default* when the tensor is missing, and rejects a tensor
+    that is not constant, because a non-constant vector would mean the file
+    carries a genuine per-channel norm this importer would silently drop.
+    """
+    if model is None:
+        return default
+    try:
+        weight = model.get_tensor("blk.0.attn_q_norm.weight")
+    except (KeyError, ValueError):
+        logger.warning(
+            "Muse Glimmer GGUF has no blk.0.attn_q_norm tensor; "
+            "falling back to qk_scale_factor=%s",
+            default,
+        )
+        return default
+    values = np.asarray(weight, dtype=np.float32).reshape(-1)
+    if values.size == 0:
+        return default
+    if not np.allclose(values, values[0]):
+        raise ValueError(
+            "Muse Glimmer blk.0.attn_q_norm is not a constant vector "
+            f"(min={values.min()}, max={values.max()}), so it carries a real "
+            "per-channel QK norm that this importer does not model."
+        )
+    return float(values[0])
+
+
 # Architecture-specific config postprocessors.
 # Each takes a base ArchitectureConfig + raw metadata and returns
 # an architecture-specific config subclass.
 _CONFIG_POSTPROCESSORS: dict[str, Any] = {
+    "gemma2": _gemma2_postprocess,
     "gemma3_text": _gemma3_postprocess,
     "gemma4_text": _gemma4_postprocess,
+    "muse_glimmer_text": _muse_glimmer_postprocess,
 }
 
 

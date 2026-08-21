@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 # rope and store Q/K in plain HF row order — applying the permute to them
 # scrambles the attention heads and produces garbage output. They must
 # NOT be reverse-permuted.
-LLAMA_QK_PERMUTE_MODEL_TYPES = frozenset({"llama", "mistral"})
+LLAMA_QK_PERMUTE_MODEL_TYPES = frozenset({"llama", "mistral", "muse_glimmer_text"})
 
 
 def needs_llama_qk_permute(model_type: str | None) -> bool:
@@ -161,15 +161,19 @@ def _process_gemma(
     state_dict: dict[str, torch.Tensor],
     config: Any,
 ) -> dict[str, torch.Tensor]:
-    """Restore Gemma2/3 norm weights.
+    """Restore Gemma norm weights to the HF convention.
 
-    GGUF stores ``w_gguf = w_hf - 1`` for all norm weights.
-    Reference: ``Gemma2TensorProcessor`` in HF's
-    ``modeling_gguf_pytorch_utils.py``.
+    llama.cpp bakes the Gemma ``(1 + w)`` RMSNorm offset into the stored
+    weights: ``w_gguf = w_hf + 1``. The mobius Gemma graph normalizes with
+    :class:`OffsetRMSNorm`, which re-applies ``(1 + weight)`` at runtime, so the
+    initializer it consumes must be the raw ``w_hf``. Subtract 1 to undo the
+    llama.cpp offset (matching HF's ``Gemma2TensorProcessor`` in
+    ``modeling_gguf_pytorch_utils.py``); otherwise the offset is applied twice
+    and every norm — hence the whole model — is corrupted.
     """
     for name in list(state_dict):
         if "norm" in name and name.endswith(".weight"):
-            state_dict[name] = state_dict[name] + 1
+            state_dict[name] = state_dict[name] - 1
     return state_dict
 
 
@@ -185,6 +189,40 @@ def _process_nemotron(
     for name in list(state_dict):
         if "norm" in name and name.endswith(".weight"):
             state_dict[name] = state_dict[name] + 1
+    return state_dict
+
+
+def _process_muse_glimmer(
+    state_dict: dict[str, torch.Tensor],
+    config: Any,
+) -> dict[str, torch.Tensor]:
+    """Restore Muse Glimmer's centered per-block norm weights.
+
+    Muse Glimmer's four per-block norms are *centered*: the HF checkpoint stores
+    ``w`` and the model multiplies by ``w + 1``. llama.cpp folds the ``+ 1`` in
+    at conversion time so its generic RMSNorm can use the tensor directly, so a
+    GGUF file holds ``w_gguf = w_hf + 1`` and importing it needs the offset
+    removed. This is the opposite direction from Gemma/Nemotron, which store
+    ``w_hf - 1``.
+
+    The final ``model.norm`` is a plain RMSNorm in this architecture and is
+    stored uncentered, so it must be left alone -- verified against the
+    published checkpoint, where ``model.norm.weight`` is centered on 0 while the
+    per-block norms are centered on 1.
+
+    Muse Glimmer's llama.cpp converter also stores Q/K with the interleaved-rope
+    permutation, on every layer including the NoPE (full-attention) ones, so the
+    llama reverse-permute has to run as well.
+    """
+    state_dict = _process_llama(state_dict, config)
+    for name in list(state_dict):
+        if not name.endswith(".weight"):
+            continue
+        if ".layers." not in name:
+            continue
+        if "layernorm" not in name:
+            continue
+        state_dict[name] = state_dict[name] - 1
     return state_dict
 
 
@@ -242,6 +280,7 @@ _PROCESSORS: dict[str, Any] = {
     "gemma2": _process_gemma,
     "gemma3": _process_gemma,
     "nemotron": _process_nemotron,
+    "muse_glimmer_text": _process_muse_glimmer,
     "gpt2": _process_gpt2,
     "mamba": _process_mamba,
 }
