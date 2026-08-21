@@ -757,14 +757,6 @@ def main(argv: list[str] | None = None) -> None:
         help="Trust remote code when loading the HuggingFace model config.",
     )
     build_parser.add_argument(
-        "--revision",
-        default=None,
-        help=(
-            "Immutable HuggingFace revision used for config, weights, tokenizer, "
-            "and processor assets."
-        ),
-    )
-    build_parser.add_argument(
         "--dtype",
         choices=sorted(DTYPE_MAP),
         default=None,
