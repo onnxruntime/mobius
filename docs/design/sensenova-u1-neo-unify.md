@@ -221,6 +221,27 @@ differently under conversion:
 Mixing the two is supported end to end: the sampler casts the fp16 KV
 cache to the generation branch's dtype once, after prefill.
 
+### GQA fusion does not apply
+
+Both decoder graphs keep plain opset-24 `Attention` nodes after
+CUDA/fp16 optimization, and Mobius emits its "GQA fusion expected"
+warning for each. That is expected here, not a defect — three
+independent guards each decline for a correct reason:
+
+* `decoder`'s attention bias is block-causal, so it contains an `Or`.
+  `local_window_from_attention_bias` treats any `Or` in the bias walk as
+  unrecognized and `AttentionToGQA` bails.
+* `image_gen_denoiser` has no `attention_mask` graph input at all (the
+  generation pass is unmasked), and `AttentionToGQA` needs one to
+  synthesize `seqlens_k`.
+* RoPE here is three independent axes with different bases, hand-built
+  from Slice/Mul/Add rather than `op.RotaryEmbedding`, so
+  `RotaryAttentionToGQA` cannot match either.
+
+Closing this would need `local_window_from_attention_bias` to learn the
+block-causal `Or` pattern and the denoiser to gain an explicit mask
+input; neither is required for correctness.
+
 ## Runtime / metadata status
 
 Export and execution are complete — all five graphs build, load, and run
