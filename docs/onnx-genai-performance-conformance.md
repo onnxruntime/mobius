@@ -123,7 +123,7 @@ well-formed and validate; only the local kernel is missing.
 
 ### Canonical representation — lowering verified
 
-Against ONNX GenAI `0d1f1702`, with no `model.io` in any package and no port
+Against ONNX GenAI `7324351a`, with no `model.io` in any package and no port
 contracts on any component that ships an artifact:
 
 | Check | Result |
@@ -136,6 +136,15 @@ The last row is the one that matters. The fixed-capacity decode path needs the
 write cursor, the valid length and the per-layer buffer pairs; it resolved all
 of them by lowering the workflow, which is what makes removing the second copy
 safe rather than merely tidy.
+
+`7324351a` moved the document-level invariants onto `load_metadata_package`, so
+the package loader — the path the `validate_metadata` binary and every on-disk
+consumer take — now enforces rules that previously only ran for callers holding
+a parsed document. That is a strictness increase applied to the exact entry
+point our fixtures go through, and all 11 were re-checked against it rather
+than assumed to be unaffected. They pass because they carry no `model:` block
+at all: a package with one serialized ABI has nothing for a coexistence rule to
+find.
 
 ### Where the transcription boundary actually falls
 
