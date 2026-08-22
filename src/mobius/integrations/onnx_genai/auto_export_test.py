@@ -1132,10 +1132,16 @@ def test_hierarchical_audio_package_is_not_misclassified_as_diffusion(tmp_path):
         "delivery": "buffered",
     }
     assert len(workflow["serving"]["state_service"]["groups"]) == 1
+    expanded = {"kind": "request_expanded", "axis": 0, "factor": 2}
+    assert workflow["inputs"]["request.prompt_tokens"]["contract"]["batch_layout"] == expanded
+    assert workflow["state"]["global_logits"]["contract"]["batch_layout"] == expanded
+    assert workflow["state"]["global_hidden"]["contract"]["batch_layout"] == expanded
     serialized = yaml.safe_dump(workflow["steps"])
     assert serialized.count("cell: global_cache_") == 1
     assert "local_cache" not in serialized
     assert (tmp_path / "speech_processor.json").is_file()
+    with open(tmp_path / "speech_processor.json") as handle:
+        assert json.load(handle)["max_output_units"] == 9000
 
 
 @dataclasses.dataclass

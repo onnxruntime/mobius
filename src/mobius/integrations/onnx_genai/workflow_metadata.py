@@ -692,6 +692,26 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
     scalar_int = {"dtype": "int64", "rank": 0, "shape": []}
     control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
     prompt_contract = _contract(pkg["language_model_embedding"].graph.inputs[0])
+    prompt_contract["batch_layout"] = {
+        "kind": "request_expanded",
+        "axis": 0,
+        "factor": 2,
+    }
+    global_logits_contract = _contract(decoder_outputs["logits"])
+    global_hidden_contract = _contract(hidden)
+    global_mask_contract = _contract(decoder_inputs["attention_mask"])
+    global_position_contract = _contract(decoder_inputs["position_ids"])
+    for contract in (
+        global_logits_contract,
+        global_hidden_contract,
+        global_mask_contract,
+        global_position_contract,
+    ):
+        contract["batch_layout"] = {
+            "kind": "request_expanded",
+            "axis": 0,
+            "factor": 2,
+        }
     inputs: dict[str, Any] = {
         "request.prompt_tokens": {
             "contract": prompt_contract,
@@ -1442,19 +1462,19 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
 
     state: dict[str, Any] = {
         "global_logits": {
-            "contract": _contract(decoder_outputs["logits"]),
+            "contract": global_logits_contract,
             "scope": "invocation",
             "initializer": "global.setup.logits",
             "recurrence": {"kind": "bounded", "axis": 1, "max": "package.global_context"},
         },
         "global_hidden": {
-            "contract": _contract(hidden),
+            "contract": global_hidden_contract,
             "scope": "invocation",
             "initializer": "global.setup.hidden",
             "recurrence": {"kind": "bounded", "axis": 1, "max": "package.global_context"},
         },
         "global_mask": {
-            "contract": _contract(decoder_inputs["attention_mask"]),
+            "contract": global_mask_contract,
             "scope": "invocation",
             "initializer": "global.initial.body_attention_mask",
             "recurrence": {
@@ -1466,8 +1486,8 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
         },
         "global_position": {
             "contract": {
-                **_contract(decoder_inputs["position_ids"]),
-                "shape": [_contract(decoder_inputs["position_ids"])["shape"][0], 1],
+                **global_position_contract,
+                "shape": [global_position_contract["shape"][0], 1],
             },
             "scope": "invocation",
             "initializer": "global.initial.body_position_ids",
@@ -4207,6 +4227,7 @@ def build_diffusion_workflow_metadata(
         "image": {
             "contract": _contract(vae_output),
             "role": "image",
+            "value_range": "negative_one_to_one",
             "stage": "pre_adapter",
         },
         "latent": {
@@ -4840,6 +4861,7 @@ def build_image_edit_workflow_metadata(
             "image": {
                 "contract": _contract(decoder_output),
                 "role": "image",
+                "value_range": "negative_one_to_one",
                 "stage": "pre_adapter",
             }
         },

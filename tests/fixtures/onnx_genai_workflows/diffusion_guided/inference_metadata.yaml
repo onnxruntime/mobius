@@ -148,6 +148,7 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: image
+        value_range: negative_one_to_one
         stage: pre_adapter
       latent:
         contract:
@@ -549,7 +550,7 @@ pipeline:
               dtype: int64
               rank: 1
               shape:
-              - row_rank
+              - 3
           outputs:
             noise:
               dtype: float32

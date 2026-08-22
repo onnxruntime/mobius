@@ -652,7 +652,6 @@ def build_shared_state_pixel_flow_workflow_metadata(
             group_ports[branch][denoiser_name][alias] = {
                 "input": generation_past.name,
                 "output": generation_present.name,
-                "access": "read_only",
                 "role": role,
                 "layer": index // 2,
             }

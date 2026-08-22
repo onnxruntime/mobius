@@ -965,13 +965,11 @@ pipeline:
                 conditional_cache_0:
                   input: past_key_values.0.key
                   output: present.0.key
-                  access: read_only
                   role: key
                   layer: 0
                 conditional_cache_1:
                   input: past_key_values.0.value
                   output: present.0.value
-                  access: read_only
                   role: value
                   layer: 0
           unconditional_prefix:
@@ -996,13 +994,11 @@ pipeline:
                 unconditional_cache_0:
                   input: past_key_values.0.key
                   output: present.0.key
-                  access: read_only
                   role: key
                   layer: 0
                 unconditional_cache_1:
                   input: past_key_values.0.value
                   output: present.0.value
-                  access: read_only
                   role: value
                   layer: 0
     steps:
