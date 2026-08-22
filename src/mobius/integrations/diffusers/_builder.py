@@ -15,6 +15,7 @@ __all__ = [
 
 import json
 import logging
+import os
 
 import onnx_ir as ir
 import torch
@@ -179,6 +180,14 @@ def _load_diffusers_pipeline_index(
     from huggingface_hub import hf_hub_download
     from huggingface_hub.utils import EntryNotFoundError
 
+    if os.path.isdir(model_id):
+        for filename in ("model_index.json", "modular_model_index.json"):
+            path = os.path.join(model_id, filename)
+            if os.path.isfile(path):
+                with open(path) as f:
+                    return json.load(f)
+        return None
+
     path = None
     for filename in ("model_index.json", "modular_model_index.json"):
         try:
@@ -223,15 +232,26 @@ def _download_diffusers_component_weights(
     weight_basenames = ["diffusion_pytorch_model", "pytorch_model", "model"]
 
     all_files = None
+    local_root = model_id if os.path.isdir(model_id) else None
     for ext in ("safetensors", "bin"):
         # Sharded weights: <basename>.<ext>.index.json maps params -> shard files.
         for basename in weight_basenames:
+            local_index = (
+                os.path.join(local_root, prefix, f"{basename}.{ext}.index.json")
+                if local_root
+                else None
+            )
             try:
-                index_path = hf_hub_download(
-                    repo_id=model_id,
-                    filename=f"{prefix}{basename}.{ext}.index.json",
-                    revision=revision,
-                )
+                if local_index is not None:
+                    if not os.path.isfile(local_index):
+                        continue
+                    index_path = local_index
+                else:
+                    index_path = hf_hub_download(
+                        repo_id=model_id,
+                        filename=f"{prefix}{basename}.{ext}.index.json",
+                        revision=revision,
+                    )
                 with open(index_path) as f:
                     index = json.load(f)
                 all_files = sorted(set(index["weight_map"].values()))
@@ -242,12 +262,19 @@ def _download_diffusers_component_weights(
             break
         # Single-file weights.
         for basename in weight_basenames:
+            local_weight = (
+                os.path.join(local_root, prefix, f"{basename}.{ext}") if local_root else None
+            )
             try:
-                hf_hub_download(
-                    repo_id=model_id,
-                    filename=f"{prefix}{basename}.{ext}",
-                    revision=revision,
-                )
+                if local_weight is not None:
+                    if not os.path.isfile(local_weight):
+                        continue
+                else:
+                    hf_hub_download(
+                        repo_id=model_id,
+                        filename=f"{prefix}{basename}.{ext}",
+                        revision=revision,
+                    )
                 all_files = [f"{basename}.{ext}"]
                 break
             except EntryNotFoundError:
@@ -261,11 +288,15 @@ def _download_diffusers_component_weights(
             f"in '{model_id}'. Tried {weight_basenames} with .safetensors and .bin."
         )
 
-    paths = _parallel_download(
-        model_id,
-        [f"{prefix}{f}" for f in all_files],
-        revision=revision,
-        desc=f"{component_name} weights",
+    paths = (
+        [os.path.join(model_id, prefix, filename) for filename in all_files]
+        if local_root
+        else _parallel_download(
+            model_id,
+            [f"{prefix}{f}" for f in all_files],
+            revision=revision,
+            desc=f"{component_name} weights",
+        )
     )
 
     state_dict: dict[str, torch.Tensor] = {}
@@ -289,10 +320,15 @@ def _load_diffusers_component_config(
 
     resolved_subfolder = component_name if subfolder is None else subfolder
     filename = f"{resolved_subfolder}/config.json" if resolved_subfolder else "config.json"
-    path = hf_hub_download(
-        repo_id=model_id,
-        filename=filename,
-        revision=revision,
+    local_path = os.path.join(model_id, filename)
+    path = (
+        local_path
+        if os.path.isdir(model_id) and os.path.isfile(local_path)
+        else hf_hub_download(
+            repo_id=model_id,
+            filename=filename,
+            revision=revision,
+        )
     )
     with open(path) as f:
         return json.load(f)
@@ -325,6 +361,10 @@ def _resolve_diffusers_component_source(
     subfolder = metadata.get("subfolder") if "subfolder" in metadata else component_name
     if subfolder is None:
         subfolder = ""
+    if os.path.isdir(root_model_id) and os.path.isfile(
+        os.path.join(root_model_id, subfolder, "config.json")
+    ):
+        return root_model_id, None, subfolder
     return component_model_id, component_revision, subfolder
 
 
@@ -336,7 +376,13 @@ def _load_optional_diffusers_json(
     from huggingface_hub.utils import EntryNotFoundError
 
     try:
-        path = hf_hub_download(repo_id=model_id, filename=filename, revision=revision)
+        local_path = os.path.join(model_id, filename)
+        if os.path.isdir(model_id):
+            if not os.path.isfile(local_path):
+                return {}
+            path = local_path
+        else:
+            path = hf_hub_download(repo_id=model_id, filename=filename, revision=revision)
     except EntryNotFoundError:
         return {}
     with open(path) as f:

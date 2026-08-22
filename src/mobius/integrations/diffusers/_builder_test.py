@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import mock_open, patch
 
 import onnx_ir as ir
@@ -170,6 +171,54 @@ class TestDiffusersHubRevision:
             filename="model_index.json",
             revision="pinned-revision",
         )
+
+
+class TestLocalDiffusersPackage:
+    def test_loads_modular_index_without_hub_access(self, tmp_path):
+        index = {"_class_name": "LocalModularPipeline"}
+        (tmp_path / "modular_model_index.json").write_text(json.dumps(index))
+
+        with patch("huggingface_hub.hf_hub_download") as download:
+            assert _load_diffusers_pipeline_index(str(tmp_path)) == index
+
+        download.assert_not_called()
+
+    def test_resolves_root_component_to_local_subfolder(self, tmp_path):
+        component = tmp_path / "transformer"
+        component.mkdir()
+        (component / "config.json").write_text("{}")
+        info = [
+            "diffusers",
+            "Transformer",
+            {
+                "pretrained_model_name_or_path": "upstream/model",
+                "revision": "upstream-revision",
+                "subfolder": "transformer",
+            },
+        ]
+
+        assert _resolve_diffusers_component_source(
+            str(tmp_path), "ignored-local-revision", "transformer", info
+        ) == (str(tmp_path), None, "transformer")
+
+    def test_loads_local_component_and_optional_configs(self, tmp_path):
+        component = tmp_path / "transformer"
+        scheduler = tmp_path / "scheduler"
+        component.mkdir()
+        scheduler.mkdir()
+        (component / "config.json").write_text('{"width": 64}')
+        (scheduler / "scheduler_config.json").write_text('{"steps": 30}')
+
+        with patch("huggingface_hub.hf_hub_download") as download:
+            assert _load_diffusers_component_config(str(tmp_path), "transformer") == {
+                "width": 64
+            }
+            assert _load_optional_diffusers_json(
+                str(tmp_path), "scheduler/scheduler_config.json"
+            ) == {"steps": 30}
+            assert _load_optional_diffusers_json(str(tmp_path), "missing.json") == {}
+
+        download.assert_not_called()
 
     @patch("huggingface_hub.hf_hub_download", return_value="config.json")
     def test_component_config_download_uses_revision(self, mock_download):
