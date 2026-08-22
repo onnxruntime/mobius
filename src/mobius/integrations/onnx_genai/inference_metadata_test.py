@@ -37,6 +37,7 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     load_diffusers_scheduler_config,
     validate_executable_closure,
     write_diffusion_pipeline_metadata,
+    write_mtp_speculator_metadata,
     write_native_vlm_package_metadata,
 )
 
@@ -1831,3 +1832,90 @@ class TestBuildMultimodalPipelineMetadata:
                 "strategy": {"kind": "autoregressive", "decoder": "decoder"},
             },
         ]
+
+
+@dataclasses.dataclass
+class _MtpBackboneConfig:
+    num_hidden_layers: int = 64
+    hidden_size: int = 5120
+    vocab_size: int = 248320
+
+
+def _seed_backbone_metadata(directory: Path) -> str:
+    """Write a minimal backbone inference_metadata.yaml for the MTP writer.
+
+    Deliberately empty: the writer only *appends* a ``speculative`` block, and
+    the runtime schema rejects unknown top-level properties, so seeding a
+    convenience key such as ``model_type`` would fail schema validation for a
+    reason that has nothing to do with the speculator block under test.
+    """
+    path = directory / "inference_metadata.yaml"
+    path.write_text(yaml.safe_dump({}), encoding="utf-8")
+    return str(path)
+
+
+class TestMtpSpeculatorMetadata:
+    """The emitted ``speculative`` block conforms to the onnx-genai runtime schema.
+
+    Authoritative source: onnx-genai
+    ``crates/onnx-genai-metadata/src/schema/generation.rs`` (``SpeculatorConfig``,
+    ``MtpKvMode``, ``MtpHiddenLayout``, ``MtpTargetInitializer``) +
+    ``parser.rs`` (``resolve_mtp``) + ``config.rs``
+    (``validate_resolved_mtp_config``).
+    """
+
+    def _write(self, tmp_path: Path) -> dict:
+        _seed_backbone_metadata(tmp_path)
+        out = write_mtp_speculator_metadata(
+            str(tmp_path), backbone_config=_MtpBackboneConfig()
+        )
+        assert out is not None
+        with open(out, encoding="utf-8") as handle:
+            return yaml.safe_load(handle)
+
+    def test_top_level_key_is_speculative(self, tmp_path):
+        meta = self._write(tmp_path)
+        # The runtime deserializes InferenceMetadata.speculative; a bare
+        # ``speculator`` key is unknown and silently dropped.
+        assert "speculative" in meta
+        assert "speculator" not in meta
+
+    def test_exact_schema_keys_and_values(self, tmp_path):
+        spec = self._write(tmp_path)["speculative"]
+        assert spec == {
+            "proposal_type": "mtp",
+            "num_speculative_tokens": 1,
+            "model": "mtp/model.onnx",
+            "target_hidden_layout": "BSH",
+            "hc_mult": 1,
+            "mtp_hidden_output": "mtp_hidden",
+            "kv_mode": "proposal_local",
+            "embedding": {
+                "source": "target_initializer",
+                "name": "model.embed_tokens.weight",
+            },
+            "lm_head": {
+                "source": "target_initializer",
+                "name": "lm_head.weight",
+            },
+            "target_hidden_output": "hidden_states.63",
+            "target_hidden_size": 5120,
+            "vocab_size": 248320,
+        }
+
+    def test_no_legacy_field_names(self, tmp_path):
+        spec = self._write(tmp_path)["speculative"]
+        # Field names the runtime cannot parse must not appear.
+        for banned in ("model_path", "hidden_size", "embedding_weights", "lm_head_weights"):
+            assert banned not in spec
+        assert spec["kv_mode"] != "hidden_threaded"
+
+    def test_matches_onnx_genai_json_schema(self, tmp_path):
+        """Emitted metadata validates against onnx-genai's published schema."""
+        schema_path = _onnx_genai_schema_path()
+        if schema_path is None:
+            pytest.skip("onnx-genai schema not found (set ONNX_GENAI_SCHEMA)")
+        with open(schema_path) as handle:
+            schema = json.load(handle)
+        meta = self._write(tmp_path)
+        jsonschema.validate(instance=meta, schema=schema)

@@ -230,9 +230,7 @@ def _reconstruct_tokenizer_from_ggml(gguf_path: Path, output_dir: str | Path) ->
             if split_patterns:
                 tokenizer.pre_tokenizer = pre_tokenizers.Sequence(
                     [
-                        pre_tokenizers.Split(
-                            pattern=Regex(pattern), behavior="isolated"
-                        )
+                        pre_tokenizers.Split(pattern=Regex(pattern), behavior="isolated")
                         for pattern in split_patterns
                     ]
                     + [byte_level_pre]
