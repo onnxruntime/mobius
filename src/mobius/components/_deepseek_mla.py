@@ -20,6 +20,7 @@ from mobius.components._common import Linear
 from mobius.components._rms_norm import RMSNorm
 from mobius.components._rotary_embedding import (
     apply_rotary_pos_emb,
+    yarn_apply_mscale,
 )
 
 if TYPE_CHECKING:
@@ -94,12 +95,18 @@ class DeepSeekMLA(nn.Module):
             bias=False,
         )
 
-        # Attention scale: 1/sqrt(qk_head_dim).
-        # YaRN mscale is handled by the cos/sin cache (attention_factor
-        # is applied to cos/sin in YarnRope), so no additional scaling
-        # is needed here. The cos/sin scaling produces attention_factor^2
-        # effect on the attention logits automatically.
-        self.scaling = scale if scale is not None else self.qk_head_dim**-0.5
+        # Attention scale: 1/sqrt(qk_head_dim), with an additional YaRN
+        # mscale^2 softmax-scale correction when YaRN is active (see
+        # ``yarn_apply_mscale``). This is separate from the RoPE cos/sin
+        # ``attention_factor`` applied inside YarnRope, which only rescales
+        # the rope portion of Q/K, not the full attention logit.
+        self.scaling = (
+            scale
+            if scale is not None
+            else yarn_apply_mscale(
+                config.rope_type, config.rope_scaling, self.qk_head_dim**-0.5
+            )
+        )
 
         # Whether RoPE uses interleaved layout (DeepSeek-V3 uses this)
         self._rope_interleave = config.rope_interleave
