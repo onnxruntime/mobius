@@ -897,9 +897,9 @@ class TestGroupQueryAttentionRules:
 
         for node in gqa_nodes:
             val = node.attributes.get("rotary_embedding_dim")
-            assert val is None, (
-                f"Unexpected rotary_embedding_dim on full-RoPE GQA node: {val}"
-            )
+            assert val is None, f"Unexpected rotary_embedding_dim on full-RoPE GQA node: {val}"
+
+
 class TestSlidingWindowSurvivesFusion:
     """A window baked into the attention bias must reach ``local_window_size``.
 

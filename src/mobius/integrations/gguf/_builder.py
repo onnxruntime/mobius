@@ -812,35 +812,31 @@ def _reorder_deltanet_v_heads(state_dict: dict, config) -> dict:
         dtype=torch.long,
     )
 
-    def _expand(perm: "torch.Tensor", stride: int) -> "torch.Tensor":
+    def _expand(perm: torch.Tensor, stride: int) -> torch.Tensor:
         # Expand a per-head permutation into a per-row/-channel index.
         base = (perm * stride).unsqueeze(1) + torch.arange(stride)
         return base.reshape(-1)
 
     v_rows = _expand(head_perm, head_v_dim)  # length value_dim
 
-    def _index_dim0(t: "torch.Tensor", idx: "torch.Tensor") -> "torch.Tensor":
+    def _index_dim0(t: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
         return t.index_select(0, idx)
 
-    def _index_dim1(t: "torch.Tensor", idx: "torch.Tensor") -> "torch.Tensor":
+    def _index_dim1(t: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
         return t.index_select(1, idx)
 
-    def _apply_rows(stem: str, idx: "torch.Tensor") -> None:
+    def _apply_rows(stem: str, idx: torch.Tensor) -> None:
         # Permute axis 0 of a float weight or a quantized triplet in place.
         for suffix in (".weight", ".scales", ".zero_points"):
             key = stem + suffix
             if key in state_dict:
                 state_dict[key] = _index_dim0(state_dict[key], idx)
 
-    def _apply_bare(key: str, idx: "torch.Tensor") -> None:
+    def _apply_bare(key: str, idx: torch.Tensor) -> None:
         if key in state_dict:
             state_dict[key] = _index_dim0(state_dict[key], idx)
 
-    layer_stems = {
-        k.rsplit(".", 1)[0]
-        for k in state_dict
-        if ".linear_attn." in k
-    }
+    layer_stems = {k.rsplit(".", 1)[0] for k in state_dict if ".linear_attn." in k}
     for stem in layer_stems:
         name = stem.rsplit(".", 1)[-1]
         if name == "in_proj_z":
@@ -857,7 +853,7 @@ def _reorder_deltanet_v_heads(state_dict: dict, config) -> dict:
 
     # Bare (non-".weight") linear_attn parameters.
     for k in list(state_dict):
-        if k.endswith(".linear_attn.A_log") or k.endswith(".linear_attn.dt_bias"):
+        if k.endswith((".linear_attn.A_log", ".linear_attn.dt_bias")):
             _apply_bare(k, head_perm)
         elif k.endswith(".linear_attn.conv1d.weight"):
             conv = state_dict[k]
@@ -869,9 +865,7 @@ def _reorder_deltanet_v_heads(state_dict: dict, config) -> dict:
     return state_dict
 
 
-def _reorder_out_proj_cols(
-    state_dict: dict, stem: str, head_perm, head_v_dim: int
-) -> None:
+def _reorder_out_proj_cols(state_dict: dict, stem: str, head_perm, head_v_dim: int) -> None:
     """Permute the quantized ``out_proj`` input (K) axis by V-head.
 
     ``out_proj`` maps ``value_dim -> hidden``; its input columns are the V

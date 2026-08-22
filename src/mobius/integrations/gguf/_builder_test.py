@@ -1190,7 +1190,7 @@ class TestReorderDeltaNetVHeads:
         shape = list(tensor.shape)
         if dim < 0:
             dim += len(shape)
-        new_shape = shape[:dim] + [num_k_heads, num_v_per_k, head_dim] + shape[dim + 1 :]
+        new_shape = [*shape[:dim], num_k_heads, num_v_per_k, head_dim, *shape[dim + 1 :]]
         tensor = tensor.reshape(*new_shape)
         perm = list(range(len(new_shape)))
         perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
@@ -1278,8 +1278,12 @@ class TestReorderDeltaNetVHeads:
         }
         blocks_per_head = n_blocks // n_v  # 2
         tiled = {
-            f"{p}out_proj.weight": self._converter_reorder(gw, 1, n_k, v_per_k, blocks_per_head),
-            f"{p}out_proj.scales": self._converter_reorder(gs, 1, n_k, v_per_k, blocks_per_head),
+            f"{p}out_proj.weight": self._converter_reorder(
+                gw, 1, n_k, v_per_k, blocks_per_head
+            ),
+            f"{p}out_proj.scales": self._converter_reorder(
+                gs, 1, n_k, v_per_k, blocks_per_head
+            ),
             f"{p}out_proj.zero_points": self._converter_reorder(
                 gz, 1, n_k, v_per_k, blocks_per_head // 2
             ),

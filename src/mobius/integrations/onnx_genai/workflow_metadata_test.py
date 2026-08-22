@@ -20,6 +20,8 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     _kv_storage_contract,
     _static_cache_ports,
     _validate_attention_alias_layer_sets,
+    build_diffusion_workflow_metadata,
+    build_image_edit_workflow_metadata,
     build_language_diffusion_pipeline_metadata,
     build_speculative_workflow_metadata,
     build_video_diffusion_workflow_metadata,
@@ -590,6 +592,105 @@ def test_video_diffusion_requires_paired_conv_caches():
         build_video_diffusion_workflow_metadata(
             _video_package(cache_ports=False), num_inference_steps=2
         )
+
+
+def _diffusion_package() -> ModelPackage:
+    """Minimal rank-4 denoiser/VAE pair shaped for ``build_diffusion_workflow_metadata``."""
+    latent_shape: list[int | str] = ["batch", 4, "height", "width"]
+    denoiser = _model(
+        "denoiser",
+        [
+            _value("sample", ir.DataType.FLOAT, latent_shape),
+            _value("timestep", ir.DataType.FLOAT, ["batch"]),
+        ],
+        [("noise_pred", ir.DataType.FLOAT, latent_shape)],
+    )
+    vae_decoder = _model(
+        "vae_decoder",
+        [_value("latent", ir.DataType.FLOAT, latent_shape)],
+        [("image", ir.DataType.FLOAT, ["batch", 3, "height", "width"])],
+    )
+    return ModelPackage({"denoiser": denoiser, "vae_decoder": vae_decoder})
+
+
+def _image_edit_package() -> ModelPackage:
+    """Qwen-Image-Edit-shaped package for ``build_image_edit_workflow_metadata``.
+
+    Rank-3 packed latents, a ``target_sequence_length`` slice port, separate
+    image/text rotary tables, and a VAE encoder/decoder pair -- the port shape
+    the real Qwen Image Edit export produces.
+    """
+    tokens = ["batch", "image_sequence_length", 64]
+    transformer = _model(
+        "transformer",
+        [
+            _value("sample", ir.DataType.FLOAT, tokens),
+            _value("timestep", ir.DataType.FLOAT, ["batch"]),
+            _value(
+                "encoder_hidden_states",
+                ir.DataType.FLOAT,
+                ["batch", "text_sequence_length", 32],
+            ),
+            _value(
+                "encoder_hidden_states_mask",
+                ir.DataType.BOOL,
+                ["batch", "text_sequence_length"],
+            ),
+            _value("image_rotary_cos", ir.DataType.FLOAT, ["image_sequence_length", 8]),
+            _value("image_rotary_sin", ir.DataType.FLOAT, ["image_sequence_length", 8]),
+            _value("text_rotary_cos", ir.DataType.FLOAT, ["text_sequence_length", 8]),
+            _value("text_rotary_sin", ir.DataType.FLOAT, ["text_sequence_length", 8]),
+            _value("target_sequence_length", ir.DataType.INT64, [1]),
+        ],
+        [("noise_pred", ir.DataType.FLOAT, tokens)],
+    )
+    vae_encoder = _model(
+        "vae_encoder",
+        [_value("pixel_values", ir.DataType.FLOAT, ["batch", 3, 1, "height", "width"])],
+        [("latent_sample", ir.DataType.FLOAT, ["batch", 16, 1, "lheight", "lwidth"])],
+    )
+    vae_decoder = _model(
+        "vae_decoder",
+        [_value("latent_sample", ir.DataType.FLOAT, ["batch", 16, 1, "lheight", "lwidth"])],
+        [("image", ir.DataType.FLOAT, ["batch", 3, 1, "height", "width"])],
+    )
+    return ModelPackage(
+        {
+            "transformer": transformer,
+            "vae_encoder": vae_encoder,
+            "vae_decoder": vae_decoder,
+        }
+    )
+
+
+def test_diffusion_workflow_declares_image_value_range():
+    """Assert value_range directly on the built metadata dict.
+
+    Producer conformance requires every ``role: image`` output to declare
+    an explicit ``value_range``; check this directly rather than through a
+    committed fixture snapshot.
+    """
+    metadata = build_diffusion_workflow_metadata(_diffusion_package(), num_inference_steps=2)
+    published = metadata["pipeline"]["workflow"]["outputs"]["image"]
+    assert published["role"] == "image"
+    assert published["value_range"] == "negative_one_to_one"
+
+
+def test_image_edit_workflow_declares_image_value_range():
+    """Same producer-conformance contract as the diffusion workflow.
+
+    The image-edit workflow's ``image`` output must also declare its range.
+    """
+    metadata = build_image_edit_workflow_metadata(
+        _image_edit_package(),
+        num_inference_steps=2,
+        schedule=[1.0, 0.5, 0.0],
+        timesteps=[1.0, 0.5],
+        guidance_scale=4.0,
+    )
+    published = metadata["pipeline"]["workflow"]["outputs"]["image"]
+    assert published["role"] == "image"
+    assert published["value_range"] == "negative_one_to_one"
 
 
 def test_language_diffusion_rejects_zero_steps():
