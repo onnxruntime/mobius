@@ -513,6 +513,7 @@ class TestInferenceMetadataStatus:
             package, config, num_inference_steps=2
         )
         workflow = metadata["pipeline"]["workflow"]
+        assert "linear_effects" in workflow["manifest"]["capabilities"]
         assert set(workflow["components"]) >= {
             "embedding",
             "vision_encoder",

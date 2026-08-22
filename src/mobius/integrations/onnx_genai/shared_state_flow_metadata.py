@@ -831,6 +831,7 @@ def build_shared_state_pixel_flow_workflow_metadata(
             "adapter_abis": {"onnx-genai.image-preprocess": "1"},
             "capabilities": [
                 "workflow_ssa",
+                "linear_effects",
                 "typed_emit",
                 "nested_control_flow",
                 "loop_induction_values",
