@@ -714,36 +714,49 @@ class TestRepackQ6K:
         emission groups, and a 16-entry scale table. Every plausible-looking
         wrong permutation still produces finite numbers of the right magnitude,
         so only an exact comparison against the reference implementation can
-        distinguish a correct unpack from a subtly transposed one.
+        distinguish a correct unpack from a subtly transposed one -- and the
+        lossy requantization that follows would mask the difference, which is
+        why this compares the dequantized floats directly.
         """
         gguf_quants = pytest.importorskip("gguf.quants")
         from gguf.constants import GGMLQuantizationType
 
-        from mobius.integrations.gguf._repacker import _repack_q6_k
+        from mobius.integrations.gguf._repacker import _dequantize_q6_k
 
         rng = np.random.default_rng(0)
-        n_out, k_in = 4, 256
-        n_super = n_out * k_in // 256
-        raw = rng.integers(0, 256, size=n_super * 210, dtype=np.uint8)
+        n_super = 8
+        blocks = rng.integers(0, 256, size=(n_super, 210), dtype=np.uint8)
         # Keep `d` finite and non-denormal so the comparison is about layout.
-        blocks = raw.reshape(n_super, 210)
         blocks[:, 208:210] = np.frombuffer(
             np.float16([1.5] * n_super).tobytes(), dtype=np.uint8
         ).reshape(n_super, 2)
 
         expected = gguf_quants.dequantize(
             blocks.reshape(-1).copy(), GGMLQuantizationType.Q6_K
-        ).astype(np.float32).ravel()[: n_out * k_in]
+        ).astype(np.float32).ravel()
+        got = _dequantize_q6_k(blocks)
 
-        # Reach the dequantized values through the public repack path by
-        # inverting the affine requantization it emits.
+        np.testing.assert_array_equal(got, expected)
+
+    def test_repack_stays_within_half_a_block_scale(self):
+        """The 4-bit requantization is lossy, but bounded by its own scale."""
+        from mobius.integrations.gguf._repacker import _dequantize_q6_k, _repack_q6_k
+
+        rng = np.random.default_rng(1)
+        n_out, k_in = 4, 256
+        n_super = n_out * k_in // 256
+        blocks = rng.integers(0, 256, size=(n_super, 210), dtype=np.uint8)
+        blocks[:, 208:210] = np.frombuffer(
+            np.float16([1.5] * n_super).tobytes(), dtype=np.uint8
+        ).reshape(n_super, 2)
+
+        reference = _dequantize_q6_k(blocks)[: n_out * k_in].reshape(n_out, k_in)
         result = _repack_q6_k(blocks, n_out, k_in)
-        assert result.weight.shape[0] == n_out
-        # The requantization is lossy by construction, but must stay within
-        # half a block scale of the reference for every element.
         got = _dequantize_repacked_q4(result, k_in)
+
+        assert result.weight.shape[0] == n_out
         max_scale = float(result.scales.max())
-        assert np.max(np.abs(got - expected.reshape(n_out, k_in))) <= max_scale * 0.51 + 1e-6
+        assert np.max(np.abs(got - reference)) <= max_scale * 0.51 + 1e-6
 
     def test_super_block_byte_and_element_counts(self):
         """Q6_K is 210 bytes per 256 elements; a wrong size mis-slices silently."""

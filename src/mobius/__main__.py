@@ -531,15 +531,6 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         )
         raise SystemExit(1)
 
-    if getattr(args, "runtime", None) == "ort-genai":
-        raise SystemExit(
-            "Error: mobius build-gguf does not yet support --runtime ort-genai. "
-            "The command cannot emit a valid genai_config.json until the selected "
-            "GGUF architecture's cache and tokenizer contracts have passed real "
-            "ORT GenAI generation. Use --runtime onnx-genai where supported, or "
-            "omit --runtime and run the ONNX model directly."
-        )
-
     mmproj_path = getattr(args, "mmproj", None)
     keep_quantized = not args.dequantize
 
@@ -584,14 +575,15 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             path = os.path.join(output_dir, "model.onnx")
         print(f"Saved {name} to {path}")
 
-    if getattr(args, "runtime", None) == "onnx-genai":
+    runtime = getattr(args, "runtime", None)
+    if runtime in ("onnx-genai", "ort-genai"):
         from mobius.integrations.gguf import write_gguf_runtime_package
 
         # The graph is already saved above; this adds the tokenizer (rebuilt
         # from the GGUF's embedded ggml metadata, since a GGUF checkpoint has
-        # no Hugging Face source directory) and the inference metadata.
+        # no Hugging Face source directory) and the runtime's own contract.
         artifacts = write_gguf_runtime_package(
-            pkg, gguf_path, output_dir, save_model=False
+            pkg, gguf_path, output_dir, runtime=runtime, save_model=False
         )
         for name, path in artifacts.items():
             print(f"  {name}: {path}")

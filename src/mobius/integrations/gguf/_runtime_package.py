@@ -1,26 +1,29 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Emit a runnable onnx-genai package from a GGUF build.
+"""Emit a runnable package from a GGUF build.
 
 Saving the ONNX graph is not enough to run a model: the runtime also needs a
-tokenizer and the inference metadata contract. Those come from two different
-places — the tokenizer from the GGUF's embedded ggml metadata, the metadata
+tokenizer and its own configuration contract. Those come from two different
+places — the tokenizer from the GGUF's embedded ggml metadata, the contract
 from the built package — so a caller that saves the graph and stops produces a
 directory that loads nowhere.
 
 This module is the single place that knows the full artifact set, so the CLI
-and the Python API cannot drift apart on what a complete package contains.
+and the Python API cannot drift apart on what a complete package contains, and
+so both supported runtimes are reachable from one entry point.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from mobius.integrations.gguf._tokenizer import write_gguf_tokenizer_json
 
 __all__ = ["write_gguf_runtime_package"]
+
+Runtime = Literal["onnx-genai", "ort-genai"]
 
 
 def write_gguf_runtime_package(
@@ -28,14 +31,15 @@ def write_gguf_runtime_package(
     gguf_path: str | Path,
     output_dir: str | Path,
     *,
+    runtime: Runtime = "onnx-genai",
     save_model: bool = True,
     **save_kwargs: Any,
 ) -> dict[str, str]:
-    """Write a complete, loadable onnx-genai package for a GGUF-built model.
+    """Write a complete, loadable package for a GGUF-built model.
 
     Emits the ONNX graph (unless it is already saved), a ``tokenizer.json``
-    reconstructed from the GGUF's embedded ggml metadata, and the
-    ``inference_metadata.yaml`` runtime contract.
+    reconstructed from the GGUF's embedded ggml metadata, and the selected
+    runtime's configuration contract.
 
     Args:
         pkg: The :class:`~mobius.ModelPackage` returned by
@@ -44,6 +48,9 @@ def write_gguf_runtime_package(
             from it because a GGUF checkpoint has no Hugging Face source
             directory to copy one from.
         output_dir: Destination directory.
+        runtime: Which runtime contract to emit. ``"onnx-genai"`` writes
+            ``inference_metadata.yaml``; ``"ort-genai"`` writes
+            ``genai_config.json``.
         save_model: Save the ONNX graph too. Pass ``False`` when the caller has
             already saved it and only wants the runtime artifacts.
         **save_kwargs: Forwarded to :meth:`ModelPackage.save`.
@@ -51,8 +58,14 @@ def write_gguf_runtime_package(
     Returns:
         Mapping of artifact name to written path. The ``tokenizer`` key is
         absent when the GGUF carries no tokenizer metadata to rebuild from.
+
+    Raises:
+        ValueError: If ``runtime`` is not a supported runtime name.
     """
-    from mobius.integrations.onnx_genai import write_onnx_genai_config
+    if runtime not in ("onnx-genai", "ort-genai"):
+        raise ValueError(
+            f"Unknown runtime {runtime!r}; expected 'onnx-genai' or 'ort-genai'."
+        )
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -65,9 +78,19 @@ def write_gguf_runtime_package(
     if tokenizer_path is not None:
         artifacts["tokenizer"] = tokenizer_path
 
-    artifacts.update(
-        write_onnx_genai_config(
-            pkg, str(output_dir), config=getattr(pkg, "config", None), source=None
+    if runtime == "ort-genai":
+        from mobius.integrations.ort_genai import write_ort_genai_config
+
+        # A GGUF checkpoint has no Hugging Face source, so there is no
+        # `hf_model_id` or local config directory to copy tokenizer files from;
+        # the tokenizer written above is the one this package ships.
+        artifacts.update(write_ort_genai_config(pkg, str(output_dir)))
+    else:
+        from mobius.integrations.onnx_genai import write_onnx_genai_config
+
+        artifacts.update(
+            write_onnx_genai_config(
+                pkg, str(output_dir), config=getattr(pkg, "config", None), source=None
+            )
         )
-    )
     return artifacts

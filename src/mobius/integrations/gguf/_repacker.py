@@ -509,35 +509,30 @@ def _repack_q4_k(
     return repack_dequantized_tensor(values, bits=4, block_size=_BLOCK_SIZE)
 
 
-def _repack_q6_k(
-    blocks: np.ndarray,
-    n_out: int,
-    k_in: int,
-) -> RepackedTensor:
-    """Dequantize Q6_K super-blocks and requantize to MatMulNBits.
+def _dequantize_q6_k(blocks: np.ndarray) -> np.ndarray:
+    """Reconstruct float values from Q6_K super-blocks.
 
     Q6_K stores 256-element super-blocks as
     ``[ql: 128B][qh: 64B][scales: 16B int8][d: 2B fp16]`` and reconstructs
     ``value = d * scales[is] * (q - 32)`` where the 6-bit ``q`` is assembled
     from a low nibble in ``ql`` and a high 2-bit field in ``qh``.
 
-    The 6-bit width has no MatMulNBits equivalent, and a mixed preset such as
-    Q4_K_M must use one MatMulNBits configuration across the whole graph, so
-    the super-blocks are reference-dequantized and affine-requantized to the
-    model's common 4-bit/32 layout — the same treatment Q4_K already receives.
-
     The element interleave follows ggml's ``dequantize_row_q6_K`` exactly: each
     128-element half consumes 64 ``ql`` bytes, 32 ``qh`` bytes and 8 scales,
     and emits four 32-element groups whose scales are ``sc[is], sc[is+2],
     sc[is+4], sc[is+6]`` with ``is = l // 16``.
 
+    Split out from [`_repack_q6_k`] so the interleave can be compared against
+    the reference dequantizer *exactly*. Every plausible-but-wrong permutation
+    of this layout still yields finite values of the right magnitude, so an
+    approximate check cannot tell a correct unpack from a transposed one, and
+    the lossy requantization that follows would mask the difference.
+
     Args:
         blocks: uint8 array, shape ``(total_super_blocks, 210)``.
-        n_out: Number of output rows (N dimension).
-        k_in: Number of input columns (K dimension).
 
     Returns:
-        A ``RepackedTensor`` with ``block_size=32`` and ``bits=4``.
+        Flat float32 array of ``total_super_blocks * 256`` values.
     """
     total = blocks.shape[0]
 
@@ -564,13 +559,34 @@ def _repack_q6_k(
 
     # `is = l // 16` splits each 32-element group into two 16-element halves
     # taking consecutive scales; group g uses sc[is + 2*g].
-    sc_idx = np.array(
-        [[0, 1], [2, 3], [4, 5], [6, 7]], dtype=np.intp
-    )  # (4 groups, 2 halves)
-    sub_scales = sc_h[:, :, sc_idx]  # (total, 2, 4, 2)
-    sub_scales = np.repeat(sub_scales, 16, axis=3)  # (total, 2, 4, 32)
+    sc_idx = np.array([[0, 1], [2, 3], [4, 5], [6, 7]], dtype=np.intp)
+    sub_scales = np.repeat(sc_h[:, :, sc_idx], 16, axis=3)  # (total, 2, 4, 32)
 
-    dequantized = (d[:, None, None, None] * sub_scales * q).reshape(-1)
+    return (d[:, None, None, None] * sub_scales * q).reshape(-1)
+
+
+def _repack_q6_k(
+    blocks: np.ndarray,
+    n_out: int,
+    k_in: int,
+) -> RepackedTensor:
+    """Dequantize Q6_K super-blocks and requantize to MatMulNBits.
+
+    The 6-bit width has no MatMulNBits equivalent, and a mixed preset such as
+    Q4_K_M must use one MatMulNBits configuration across the whole graph, so
+    the super-blocks are reference-dequantized (see [`_dequantize_q6_k`]) and
+    affine-requantized to the model's common 4-bit/32 layout — the same
+    treatment Q4_K already receives. The requantization is lossy.
+
+    Args:
+        blocks: uint8 array, shape ``(total_super_blocks, 210)``.
+        n_out: Number of output rows (N dimension).
+        k_in: Number of input columns (K dimension).
+
+    Returns:
+        A ``RepackedTensor`` with ``block_size=32`` and ``bits=4``.
+    """
+    dequantized = _dequantize_q6_k(blocks)
 
     logical_elements = n_out * k_in
     if dequantized.size < logical_elements:

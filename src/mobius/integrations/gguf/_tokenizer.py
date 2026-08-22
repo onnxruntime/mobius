@@ -152,10 +152,14 @@ def _reconstruct_tokenizer_from_ggml(gguf_path: Path, output_dir: str | Path) ->
 
     Fallback for GGUF architectures whose tokenizer ``transformers`` does not yet
     support (e.g. ``gemma4``). Reconstructs the fast BPE tokenizer from the
-    embedded tokens + merges + special-token ids and validates it with an
-    encode→decode round-trip. Best-effort: logs a warning and returns ``None``
-    (never raising) if the required metadata or libraries are missing, or the
-    round-trip fails.
+    embedded tokens + merges + special-token ids.
+
+    Best-effort: logs a warning and returns ``None`` (never raising) when the
+    required metadata or libraries are missing. A failed encode→decode
+    round-trip is reported but **not** fatal — the ids are correct by
+    construction from the ggml ordering, and a small or byte-incomplete vocab
+    cannot necessarily represent arbitrary probe text, so the tokenizer is
+    still written.
     """
     try:
         from tokenizers import Regex, Tokenizer, decoders, pre_tokenizers, processors
