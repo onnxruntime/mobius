@@ -579,6 +579,18 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             path = os.path.join(output_dir, "model.onnx")
         print(f"Saved {name} to {path}")
 
+    # Save the trailing MTP / "nextn" self-speculative head sidecar (when the
+    # GGUF shipped one) into a ``mtp/`` subdirectory next to the backbone.
+    mtp_head = getattr(pkg, "mtp_head", None)
+    if mtp_head is not None:
+        mtp_dir = os.path.join(output_dir, "mtp")
+        mtp_head.save(
+            mtp_dir,
+            external_data=args.external_data,
+            max_workers=args.max_workers,
+        )
+        print(f"Saved mtp head to {os.path.join(mtp_dir, 'model.onnx')}")
+
     runtime = getattr(args, "runtime", None)
     if runtime in ("onnx-genai", "ort-genai"):
         from mobius.integrations.gguf import write_gguf_runtime_package
@@ -591,6 +603,16 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         )
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
+        if mtp_head is not None:
+            from mobius.integrations.onnx_genai.inference_metadata import (
+                write_mtp_speculator_metadata,
+            )
+
+            spec_path = write_mtp_speculator_metadata(
+                output_dir, backbone_config=getattr(pkg, "config", None)
+            )
+            if spec_path is not None:
+                print(f"  speculator: {spec_path}")
 
 
 def _cmd_convert_comfyui(args: argparse.Namespace) -> None:
