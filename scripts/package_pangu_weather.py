@@ -12,17 +12,15 @@ import json
 import platform
 import time
 import urllib.request
+from importlib import metadata as importlib_metadata
 from pathlib import Path
-from typing import Any
 
 import numpy as np
-import onnx
+import onnx_ir as ir
 import onnxruntime as ort
 import yaml
 
-MODEL_URL = (
-    "https://paddle-org.bj.bcebos.com/paddlescience/models/Pangu/pangu_weather_1.onnx"
-)
+MODEL_URL = "https://paddle-org.bj.bcebos.com/paddlescience/models/Pangu/pangu_weather_1.onnx"
 MODEL_SHA256 = "179e5029c453ae459dfd52f14610a6c5f5ad39f1371985744ea0ce6c546fda2a"
 UPSTREAM_REVISION = "72bdd99096721e1a1f8912c37a9a3aff9ff0a4f2"
 EXPECTED_PORTS = {
@@ -45,17 +43,16 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _shape(value: Any) -> list[int | str]:
-    return [
-        dimension.dim_value or dimension.dim_param
-        for dimension in value.type.tensor_type.shape.dim
-    ]
+def _shape(value: ir.Value) -> list[int | str | None]:
+    if value.shape is None:
+        raise ValueError(f"Graph value {value.name!r} has no shape")
+    return [getattr(dimension, "value", dimension) for dimension in value.shape]
 
 
-def _inspect_graph(path: Path) -> dict[str, Any]:
-    model = onnx.load(path, load_external_data=False)
-    inputs = {value.name: _shape(value) for value in model.graph.input}
-    outputs = {value.name: _shape(value) for value in model.graph.output}
+def _inspect_graph(path: Path) -> dict[str, object]:
+    model = ir.load(path)
+    inputs = {value.name: _shape(value) for value in model.graph.inputs}
+    outputs = {value.name: _shape(value) for value in model.graph.outputs}
     if inputs != EXPECTED_PORTS["inputs"] or outputs != EXPECTED_PORTS["outputs"]:
         raise ValueError(
             f"Unexpected Pangu-Weather graph ports: inputs={inputs}, outputs={outputs}"
@@ -63,8 +60,8 @@ def _inspect_graph(path: Path) -> dict[str, Any]:
     return {
         "ir_version": model.ir_version,
         "opsets": [
-            {"domain": opset.domain or "ai.onnx", "version": opset.version}
-            for opset in model.opset_import
+            {"domain": domain or "ai.onnx", "version": version}
+            for domain, version in model.opset_imports.items()
         ],
         "inputs": inputs,
         "outputs": outputs,
@@ -72,9 +69,7 @@ def _inspect_graph(path: Path) -> dict[str, Any]:
 
 
 def _download(path: Path) -> None:
-    request = urllib.request.Request(
-        MODEL_URL, headers={"User-Agent": "mobius-catalogue"}
-    )
+    request = urllib.request.Request(MODEL_URL, headers={"User-Agent": "mobius-catalogue"})
     with urllib.request.urlopen(request) as response, path.open("wb") as output:
         while chunk := response.read(8 << 20):
             output.write(chunk)
@@ -95,7 +90,7 @@ def _request() -> tuple[np.ndarray, np.ndarray]:
     return upper, surface
 
 
-def _stats(array: np.ndarray) -> dict[str, Any]:
+def _stats(array: np.ndarray) -> dict[str, object]:
     return {
         "shape": list(array.shape),
         "dtype": str(array.dtype),
@@ -109,9 +104,9 @@ def _stats(array: np.ndarray) -> dict[str, Any]:
 
 def _run(
     model_path: Path, provider: str
-) -> tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[dict[str, object], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     upper, surface = _request()
-    providers: list[Any]
+    providers: list[str | tuple[str, dict[str, str]]]
     if provider == "cuda":
         providers = [
             ("CUDAExecutionProvider", {"arena_extend_strategy": "kSameAsRequested"}),
@@ -122,14 +117,10 @@ def _run(
     options = ort.SessionOptions()
     options.enable_mem_pattern = False
     start = time.perf_counter()
-    session = ort.InferenceSession(
-        str(model_path), sess_options=options, providers=providers
-    )
+    session = ort.InferenceSession(str(model_path), sess_options=options, providers=providers)
     init_seconds = time.perf_counter() - start
     start = time.perf_counter()
-    output, output_surface = session.run(
-        None, {"input": upper, "input_surface": surface}
-    )
+    output, output_surface = session.run(None, {"input": upper, "input_surface": surface})
     inference_seconds = time.perf_counter() - start
     runtime = {
         "session_init_seconds": init_seconds,
@@ -178,9 +169,7 @@ def main() -> None:
     graph = _inspect_graph(model_path)
 
     runtime, upper, surface, output, output_surface = _run(model_path, args.provider)
-    np.savez_compressed(
-        args.output_dir / "request.npz", input=upper, input_surface=surface
-    )
+    np.savez_compressed(args.output_dir / "request.npz", input=upper, input_surface=surface)
     np.savez_compressed(
         args.output_dir / "output.npz", output=output, output_surface=output_surface
     )
@@ -214,9 +203,7 @@ def main() -> None:
         "schema_version": "v1",
         "pipeline": {
             "workflow": {
-                "manifest": {
-                    "capabilities": ["workflow_ssa", "linear_effects", "typed_emit"]
-                },
+                "manifest": {"capabilities": ["workflow_ssa", "linear_effects", "typed_emit"]},
                 "effects": {
                     "forecast": {
                         "retry": "pure",
@@ -378,7 +365,8 @@ def main() -> None:
     versions = {
         "python": platform.python_version(),
         "numpy": np.__version__,
-        "onnx": onnx.__version__,
+        "onnx": importlib_metadata.version("onnx"),
+        "onnx_ir": importlib_metadata.version("onnx-ir"),
         "onnxruntime": ort.__version__,
         "onnx_ir_version": graph["ir_version"],
         "onnx_opsets": graph["opsets"],
