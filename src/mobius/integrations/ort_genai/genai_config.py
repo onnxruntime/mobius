@@ -108,6 +108,7 @@ def _make_session_options(
     ep: str,
     *,
     enable_graph_capture: bool | None = None,
+    provider_options: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Return session options with EP-specific provider_options.
 
@@ -117,12 +118,16 @@ def _make_session_options(
     """
     from mobius.integrations.ort_genai.ep_config import make_provider_options
 
+    options = make_provider_options(
+        ep,
+        enable_graph_capture=enable_graph_capture,
+    )
+    if provider_options and options:
+        next(iter(options[0].values())).update(provider_options)
+
     return {
         "log_id": "onnxruntime-genai",
-        "provider_options": make_provider_options(
-            ep,
-            enable_graph_capture=enable_graph_capture,
-        ),
+        "provider_options": options,
     }
 
 
@@ -306,6 +311,8 @@ class GenaiConfigGenerator:
         tokens_per_second: float | None = None,
         patch_size: int | None = None,
         window_size: int | None = None,
+        vision_provider_options: dict[str, str] | None = None,
+        embedding_provider_options: dict[str, str] | None = None,
     ) -> GenaiConfigGenerator:
         """Add VLM vision + embedding sections.
 
@@ -333,6 +340,10 @@ class GenaiConfigGenerator:
             tokens_per_second: Video/image timestamp rate for Qwen3-VL.
             patch_size: Vision patch size.
             window_size: Vision window size.
+            vision_provider_options: Provider option overrides merged into
+                the EP defaults for the vision encoder session.
+            embedding_provider_options: Provider option overrides merged into
+                the EP defaults for the embedding session.
 
         Returns self for chaining.
         """
@@ -359,6 +370,7 @@ class GenaiConfigGenerator:
             "session_options": _make_session_options(
                 self.ep,
                 enable_graph_capture=False,
+                provider_options=vision_provider_options,
             ),
         }
         if spatial_merge_size is not None:
@@ -381,6 +393,7 @@ class GenaiConfigGenerator:
             "session_options": _make_session_options(
                 self.ep,
                 enable_graph_capture=False,
+                provider_options=embedding_provider_options,
             ),
         }
         self._vlm_token_ids["image_token_id"] = image_token_id
@@ -396,8 +409,21 @@ class GenaiConfigGenerator:
         filename: str = "embedding/model.onnx",
         input_names: dict[str, str] | None = None,
         output_names: dict[str, str] | None = None,
+        provider_options: dict[str, str] | None = None,
     ) -> GenaiConfigGenerator:
-        """Add a standalone multimodal embedding stage."""
+        """Add a standalone multimodal embedding stage.
+
+        Args:
+            filename: Embedding ONNX model filename.
+            input_names: Override embedding model input name mapping.
+                Defaults to input_ids + audio_features.
+            output_names: Override embedding model output name mapping.
+                Defaults to inputs_embeds.
+            provider_options: Provider option overrides merged into the EP
+                defaults for the embedding session.
+
+        Returns self for chaining.
+        """
         self._embedding = {
             "filename": filename,
             "inputs": input_names
@@ -412,6 +438,7 @@ class GenaiConfigGenerator:
             "session_options": _make_session_options(
                 self.ep,
                 enable_graph_capture=False,
+                provider_options=provider_options,
             ),
         }
         return self
