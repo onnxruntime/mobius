@@ -15,14 +15,19 @@ from mobius.generation import (
     PolicyCapabilities,
     attach_policy_components,
     build_boolean_not,
+    build_counter_rng_normal,
     build_decoder_state_initializer,
     build_empty_batched_features,
     build_euler_solver_step,
     build_guidance_combine,
+    build_image_dimensions,
     build_image_grid_positions,
+    build_image_noise_geometry,
     build_schedule_constant,
     build_schedule_lookup,
     build_tensor_cast,
+    build_tensor_clamp,
+    build_tensor_scale,
     build_x0_flow_velocity,
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
@@ -191,9 +196,6 @@ def build_shared_state_pixel_flow_workflow_metadata(
     timestep = next(
         value for value in generation_embedding.graph.inputs if value.name == "timestep"
     )
-    noise_scale = next(
-        value for value in generation_embedding.graph.inputs if value.name == "noise_scale"
-    )
     image_embeds = next(
         value for value in generation_embedding.graph.outputs if value.name == "image_embeds"
     )
@@ -226,7 +228,27 @@ def build_shared_state_pixel_flow_workflow_metadata(
             pixels_per_token=int(getattr(config, "pixels_per_token", 32)),
         ),
     )
-    schedule = [1.0 - index / num_inference_steps for index in range(num_inference_steps + 1)]
+    pkg.add_policy_component("image_dimensions", build_image_dimensions(generation_dtype))
+    pkg.add_policy_component(
+        "image_noise_geometry",
+        build_image_noise_geometry(
+            token_stride=int(getattr(config, "pixels_per_token", 32)),
+            base_image_sequence_length=int(
+                getattr(config, "noise_scale_base_image_seq_len", 64)
+            ),
+            noise_scale=float(getattr(config, "noise_scale", 1.0)),
+            maximum_noise_scale=float(getattr(config, "noise_scale_max_value", 16.0)),
+        ),
+    )
+    pkg.add_policy_component("image_noise", build_counter_rng_normal(generation_dtype))
+    pkg.add_policy_component("latent_scale", build_tensor_scale(generation_dtype))
+    pkg.add_policy_component(
+        "image_output_clamp",
+        build_tensor_clamp(generation_dtype, minimum=-1.0, maximum=1.0),
+    )
+    # The head predicts x0, so velocity points from the current noisy sample
+    # toward x0 over the remaining interval. Integrate from t=0 to t=1.
+    schedule = [index / num_inference_steps for index in range(num_inference_steps + 1)]
     pkg.add_policy_component("flow_schedule", build_schedule_constant(schedule))
     pkg.add_policy_component("schedule_lookup", build_schedule_lookup(timestep.dtype))
     pkg.add_policy_component("guidance_combine", build_guidance_combine(generation_dtype))
@@ -291,6 +313,10 @@ def build_shared_state_pixel_flow_workflow_metadata(
         "shape": ["batch"],
         "batch_layout": {"kind": "request_aligned", "axis": 0},
     }
+    negative_prompt_contract = _contract(prompt)
+    negative_prompt_contract["shape"] = ["batch", "negative_sequence_len"]
+    negative_image_mask_contract = _contract(image_mask)
+    negative_image_mask_contract["shape"] = ["batch", "negative_sequence_len"]
     inputs: dict[str, Any] = {
         "request.prompt_tokens": {
             "contract": _contract(prompt),
@@ -298,9 +324,13 @@ def build_shared_state_pixel_flow_workflow_metadata(
             "source": {"kind": "request"},
         },
         "request.negative_prompt_tokens": {
-            "contract": _contract(prompt),
-            "role": {"kind": "opaque"},
-            "source": {"kind": "application", "name": "negative_prompt_tokens"},
+            "contract": negative_prompt_contract,
+            "role": {
+                "kind": "runtime",
+                "version": "1.0",
+                "role": "negative_prompt_tokens",
+            },
+            "source": {"kind": "request"},
         },
         "request.image": {
             "contract": {"dtype": "uint8", "rank": 1, "shape": ["encoded_bytes"]},
@@ -317,7 +347,7 @@ def build_shared_state_pixel_flow_workflow_metadata(
             "default": False,
         },
         "request.negative_image_mask": {
-            "contract": _contract(image_mask),
+            "contract": negative_image_mask_contract,
             "role": {"kind": "opaque"},
             "source": {"kind": "application", "name": "negative_image_mask"},
             "required": False,
@@ -327,14 +357,35 @@ def build_shared_state_pixel_flow_workflow_metadata(
             "contract": _contract(latent),
             "role": {"kind": "opaque"},
             "source": {"kind": "application", "name": "latent"},
+            "required": False,
+            "present_as": "request.latent_present",
             "externally_suppliable": True,
         },
-        "request.noise_scale": {
-            "contract": _contract(noise_scale),
-            "role": {"kind": "opaque"},
-            "source": {"kind": "application", "name": "noise_scale"},
+        "request.seed": {
+            "contract": {
+                "dtype": "int64",
+                "rank": 1,
+                "shape": ["batch"],
+                "batch_layout": {"kind": "request_aligned", "axis": 0},
+            },
+            "role": {"kind": "runtime", "version": "1.0", "role": "seed"},
+            "source": {"kind": "request"},
             "required": False,
-            "default": 1.0,
+            "default": 0,
+        },
+        "request.width": {
+            "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+            "role": {"kind": "runtime", "version": "1.0", "role": "width"},
+            "source": {"kind": "request"},
+            "required": False,
+            "default": 512,
+        },
+        "request.height": {
+            "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+            "role": {"kind": "runtime", "version": "1.0", "role": "height"},
+            "source": {"kind": "request"},
+            "required": False,
+            "default": 512,
         },
         "request.guidance_scale": {
             "contract": {
@@ -343,8 +394,12 @@ def build_shared_state_pixel_flow_workflow_metadata(
                 "shape": ["batch"],
                 "batch_layout": {"kind": "request_aligned", "axis": 0},
             },
-            "role": {"kind": "opaque"},
-            "source": {"kind": "application", "name": "guidance_scale"},
+            "role": {
+                "kind": "runtime",
+                "version": "1.0",
+                "role": "guidance_scale",
+            },
+            "source": {"kind": "request"},
             "required": False,
             "default": float(guidance_scale),
         },
@@ -388,6 +443,25 @@ def build_shared_state_pixel_flow_workflow_metadata(
             "required": False,
             "default": 1,
         },
+        "package.rng_offset": {
+            "contract": {
+                "dtype": "int64",
+                "rank": 1,
+                "shape": ["batch"],
+                "batch_layout": {"kind": "request_aligned", "axis": 0},
+            },
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 0,
+        },
+        "package.one": {
+            "contract": {"dtype": "float32", "rank": 1, "shape": [1]},
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 1.0,
+        },
     }
     outputs = {
         "logits": {
@@ -414,6 +488,81 @@ def build_shared_state_pixel_flow_workflow_metadata(
 
     setup: list[dict[str, Any]] = [
         _invoke("flow_schedule", {}, {"schedule": "flow.schedule"}),
+        _invoke(
+            "image_noise_geometry",
+            {"height": "request.height", "width": "request.width"},
+            {
+                "row_shape": "noise.row_shape",
+                "token_height": "noise.token_height",
+                "token_width": "noise.token_width",
+                "noise_scale": "noise.noise_scale",
+            },
+        ),
+        {
+            "kind": "branch",
+            "predicate": "request.latent_present",
+            "cases": {
+                "true": _invoke(
+                    "latent_scale",
+                    {"tensor": "request.latent", "scale": "package.one"},
+                    {"scaled": "latent.provided"},
+                ),
+                "false": {
+                    "kind": "sequence",
+                    "nodes": [
+                        _invoke(
+                            "image_noise",
+                            {
+                                "seed": "request.seed",
+                                "offset": "package.rng_offset",
+                                "row_shape": "noise.row_shape",
+                            },
+                            {
+                                "noise": "latent.standard_normal",
+                                "next_offset": "image.next_rng_offset",
+                            },
+                        ),
+                        _invoke(
+                            "latent_scale",
+                            {
+                                "tensor": "latent.standard_normal",
+                                "scale": "noise.noise_scale",
+                            },
+                            {"scaled": "latent.generated"},
+                        ),
+                    ],
+                },
+            },
+            "outputs": {
+                "latent.initial": {
+                    "cases": {
+                        "true": "latent.provided",
+                        "false": "latent.generated",
+                    }
+                }
+            },
+        },
+        _invoke(
+            "image_dimensions",
+            {"tensor": "latent.initial"},
+            {
+                "height": "image.actual_height",
+                "width": "image.actual_width",
+            },
+        ),
+        _invoke(
+            "image_noise_geometry",
+            {
+                "height": "image.actual_height",
+                "width": "image.actual_width",
+            },
+            {
+                "row_shape": "image.row_shape",
+                "token_height": "image.token_height",
+                "token_width": "image.token_width",
+                "noise_scale": "image.noise_scale",
+            },
+        ),
         {
             "kind": "branch",
             "predicate": "request.image_present",
@@ -475,30 +624,34 @@ def build_shared_state_pixel_flow_workflow_metadata(
 
     state: dict[str, Any] = {}
     carried: list[dict[str, Any]] = []
-    decoder_state_outputs: dict[str, str] = {
-        "attention_mask": "prefix.attention_mask",
-        "position_ids": "prefix.position_ids",
-        "body_attention_mask": "prefix.body_attention_mask",
-        "body_position_ids": "prefix.body_position_ids",
-        "token_slot": "prefix.token_slot",
-        **{name: f"prefix.empty.{name}" for name in cache_input_names},
-    }
-    setup.append(
-        _invoke(
-            "prefix_initializer",
-            {"prompt_tokens": "request.prompt_tokens"},
-            decoder_state_outputs,
-        )
-    )
-    for branch, embeds in (
-        ("conditional", "prefix.conditional.embeds"),
-        ("unconditional", "prefix.unconditional.embeds"),
+    for branch, prompt_tokens, embeds in (
+        ("conditional", "request.prompt_tokens", "prefix.conditional.embeds"),
+        (
+            "unconditional",
+            "request.negative_prompt_tokens",
+            "prefix.unconditional.embeds",
+        ),
     ):
+        decoder_state_outputs: dict[str, str] = {
+            "attention_mask": f"prefix.{branch}.attention_mask",
+            "position_ids": f"prefix.{branch}.position_ids",
+            "body_attention_mask": f"prefix.{branch}.body_attention_mask",
+            "body_position_ids": f"prefix.{branch}.body_position_ids",
+            "token_slot": f"prefix.{branch}.token_slot",
+            **{name: f"prefix.{branch}.empty.{name}" for name in cache_input_names},
+        }
+        setup.append(
+            _invoke(
+                "prefix_initializer",
+                {"prompt_tokens": prompt_tokens},
+                decoder_state_outputs,
+            )
+        )
         decoder_call_inputs = {
             "inputs_embeds": embeds,
-            "attention_mask": "prefix.attention_mask",
-            "position_ids": "prefix.position_ids",
-            **{name: f"prefix.empty.{name}" for name in cache_input_names},
+            "attention_mask": f"prefix.{branch}.attention_mask",
+            "position_ids": f"prefix.{branch}.position_ids",
+            **{name: f"prefix.{branch}.empty.{name}" for name in cache_input_names},
         }
         decoder_call_outputs = {
             "logits": f"prefix.{branch}.logits",
@@ -519,8 +672,18 @@ def build_shared_state_pixel_flow_workflow_metadata(
                 )
             )
             cell = f"{branch}_cache_{index}"
+            state_contract = _contract(generation_past)
+            if state_contract.get("shape") is not None:
+                state_contract["shape"] = [
+                    (
+                        f"{branch}_{dimension}"
+                        if dimension == "past_sequence_len"
+                        else dimension
+                    )
+                    for dimension in state_contract["shape"]
+                ]
             state[cell] = {
-                "contract": _contract(generation_past),
+                "contract": state_contract,
                 "scope": "invocation",
                 "initializer": initial,
                 "recurrence": {"kind": "invariant"},
@@ -549,27 +712,33 @@ def build_shared_state_pixel_flow_workflow_metadata(
             {
                 "latent": "latent",
                 "timestep": "flow.timestep",
-                "noise_scale": "request.noise_scale",
+                "noise_scale": "image.noise_scale",
             },
             {"image_embeds": "flow.image_embeds"},
         ),
-        _invoke(
-            "image_grid_positions",
-            {
-                "latent": "latent",
-                "prompt_tokens": "request.prompt_tokens",
-            },
-            {
-                "position_ids": "flow.position_ids",
-                "token_grid": "flow.token_grid",
-            },
-        ),
     ]
-    for branch in ("conditional", "unconditional"):
+    branch_prompts = {
+        "conditional": "request.prompt_tokens",
+        "unconditional": "request.negative_prompt_tokens",
+    }
+    for branch, prompt_tokens in branch_prompts.items():
+        body.append(
+            _invoke(
+                "image_grid_positions",
+                {
+                    "latent": "latent",
+                    "prompt_tokens": prompt_tokens,
+                },
+                {
+                    "position_ids": f"flow.{branch}.position_ids",
+                    "token_grid": f"flow.{branch}.token_grid",
+                },
+            )
+        )
         denoiser_inputs = {
             "image_embeds": "flow.image_embeds",
-            "position_ids": "flow.position_ids",
-            "token_grid": "flow.token_grid",
+            "position_ids": f"flow.{branch}.position_ids",
+            "token_grid": f"flow.{branch}.token_grid",
         }
         denoiser_outputs = {"predicted_image": f"flow.{branch}.x0"}
         for index, (generation_past, generation_present) in enumerate(denoiser_pairs):
@@ -618,14 +787,14 @@ def build_shared_state_pixel_flow_workflow_metadata(
     state["latent"] = {
         "contract": _contract(latent),
         "scope": "invocation",
-        "initializer": "request.latent",
+        "initializer": "latent.initial",
         "recurrence": {"kind": "invariant"},
     }
     carried.insert(
         0,
         {
             "cell": "latent",
-            "current": "request.latent",
+            "current": "latent.initial",
             "body_input": "latent",
             "body_output": "latent.next",
             "next": "latent.final",
@@ -710,9 +879,14 @@ def build_shared_state_pixel_flow_workflow_metadata(
                                     },
                                     "carried": carried,
                                 },
+                                _invoke(
+                                    "image_output_clamp",
+                                    {"tensor": "latent"},
+                                    {"clamped": "image.clamped"},
+                                ),
                                 {
                                     "kind": "emit",
-                                    "value": "latent",
+                                    "value": "image.clamped",
                                     "output": "image",
                                     "mode": "replace",
                                     "effect_name": "emit",

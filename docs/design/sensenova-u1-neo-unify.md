@@ -255,18 +255,31 @@ once, casts the fp16 prefixes to fp32, and lets both CFG generation branches
 read the frozen state. The loop describes per-step image embedding, x0
 prediction, `v = (x0 - z) / max(1 - t, t_eps)`, and Euler integration. This is
 an architecture-neutral shared-state pattern; no model-family dispatch exists
-in the runtime.
+in the runtime. Each CFG branch derives its image temporal positions from its
+own prompt length, so unequal positive and negative prefixes remain valid.
 
 PR CI uses deterministic tiny graphs to execute text-only, text-to-image, and
-reference-image-edit paths, including mixed precision, shared KV, CFG, and a
-two-step loop. Production evidence remains the pinned H200 run from PR #533:
-revision `1f6ec60423d29939dde4202fd82ae340b144e280`, stage-by-stage L4 parity,
-and L5 text/image/edit outputs. It is intentionally not repeated in ordinary CI
-because the checkpoint is about 50 GB. Before a release, rerun the same pinned
-export on an H200 with `mobius.build(..., revision=<revision>,
-load_weights=True)`, fp16 understanding and fp32 generation components, then
-repeat the shared-latent stage comparison and the three L5 output checks
-recorded in PR #533.
+reference-image-edit paths, including mixed precision, shared KV, CFG, seeded
+noise, and a two-step loop. The workflow also accepts an optional external
+latent for controlled parity. When supplied, its actual tensor dimensions
+determine downstream resolution-dependent noise-scale conditioning instead of
+silently trusting potentially inconsistent request dimensions.
+
+The pinned production exports from PR #533 were subsequently assembled into
+the same canonical metadata package and executed by ONNX GenAI's generic
+metadata engine on H200. Revision
+`1f6ec60423d29939dde4202fd82ae340b144e280` produced fp16 text-prefill logits,
+a 512x512 text-to-image result in 6.99 seconds, and a 512x512 reference-image
+edit in 16.68 seconds for 20-step requests. Peak observed device memory was
+91,256 MiB. The published 49 GB package, typed requests, raw outputs, PNGs,
+timings, and VRAM samples are at
+<https://huggingface.co/justinchuby/sensenova-u1.5-8b-mot-onnx-canonical>.
+
+The earlier #533 controlled-latent evidence remains the numerical L4/L5
+reference (final-image Pearson 0.998606 and PSNR 36.42 dB). The canonical run
+uses the portable counter RNG rather than PyTorch's RNG, so its seeded final
+image is not falsely presented as a same-latent numerical comparison.
+Ordinary CI never downloads the approximately 50 GB production package.
 
 
 ## Dead or misleading upstream details
