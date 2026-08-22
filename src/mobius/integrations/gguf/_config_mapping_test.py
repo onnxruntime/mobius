@@ -147,6 +147,132 @@ class TestDefaultActivation:
         assert _default_activation(model_type) == "silu"
 
 
+class TestQwen35MtpBlockExclusion:
+    """Qwen3.5/3.8 GGUF ``block_count`` includes trailing MTP (nextn) blocks.
+
+    ``gguf_to_config`` must subtract ``nextn_predict_layers`` so the decoder
+    builds only the real transformer layers; otherwise it fabricates an extra
+    layer whose weights are missing from the GGUF (the ``blk.<n>.nextn.*``
+    prediction head is skipped during tensor mapping).
+    """
+
+    def _fake_model(self, metadata: dict) -> object:
+        class _FakeGGUF:
+            architecture = "qwen35"
+
+            def __init__(self, md: dict) -> None:
+                self.metadata = md
+
+            def get_metadata(self, key, default=None):
+                return self.metadata.get(key, default)
+
+            @property
+            def tensor_names(self) -> list[str]:
+                return ["output.weight", "blk.0.attn_q.weight"]
+
+        return _FakeGGUF(metadata)
+
+    def _base_metadata(self, block_count: int) -> dict:
+        return {
+            "qwen35.embedding_length": 5120,
+            "qwen35.block_count": block_count,
+            "qwen35.attention.head_count": 24,
+            "qwen35.attention.head_count_kv": 4,
+            "qwen35.attention.key_length": 256,
+            "qwen35.attention.value_length": 256,
+            "qwen35.feed_forward_length": 17408,
+            "qwen35.vocab_size": 248320,
+            "qwen35.full_attention_interval": 4,
+            "qwen35.rope.dimension_count": 64,
+        }
+
+    def test_nextn_layers_excluded_from_decoder_count(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        md = self._base_metadata(block_count=65)
+        md["qwen35.nextn_predict_layers"] = 1
+        config = gguf_to_config(self._fake_model(md))
+
+        assert config.num_hidden_layers == 64
+        assert config.layer_types is not None
+        assert len(config.layer_types) == 64
+        # 3 linear + 1 full pattern (full at every 4th, 1-indexed).
+        assert config.layer_types[3] == "full_attention"
+        assert config.layer_types[0] == "linear_attention"
+
+    def test_no_nextn_metadata_leaves_count_unchanged(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        md = self._base_metadata(block_count=64)
+        config = gguf_to_config(self._fake_model(md))
+
+        assert config.num_hidden_layers == 64
+
+    def test_nextn_not_greater_than_block_count(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        md = self._base_metadata(block_count=1)
+        md["qwen35.nextn_predict_layers"] = 1
+        with pytest.raises(ValueError, match="nextn_predict_layers"):
+            gguf_to_config(self._fake_model(md))
+
+
+class TestQwen35RopeInterleave:
+    """``rope.dimension_sections`` is M-RoPE section metadata, not a GPT-J
+    adjacent-pair rotation signal.
+
+    Qwen3.5/3.8 rotate with split-half (NEOX) semantics. Deriving the flat
+    ``rope_interleave`` from section presence corrupts RoPE — the exported
+    GroupQueryAttention/RotaryEmbedding gets ``rotary_interleaved=1`` and the
+    full-attention layers emit garbage tokens. The mapping must keep
+    ``rope_interleave`` False for section-carrying non-interleaving arches.
+    """
+
+    def _fake_model(self, metadata: dict, architecture: str = "qwen35") -> object:
+        class _FakeGGUF:
+            def __init__(self, md: dict, arch: str) -> None:
+                self.metadata = md
+                self.architecture = arch
+
+            def get_metadata(self, key, default=None):
+                return self.metadata.get(key, default)
+
+            @property
+            def tensor_names(self) -> list[str]:
+                return ["output.weight", "blk.0.attn_q.weight"]
+
+        return _FakeGGUF(metadata, architecture)
+
+    def _base_metadata(self) -> dict:
+        return {
+            "qwen35.embedding_length": 5120,
+            "qwen35.block_count": 64,
+            "qwen35.attention.head_count": 24,
+            "qwen35.attention.head_count_kv": 4,
+            "qwen35.attention.key_length": 256,
+            "qwen35.attention.value_length": 256,
+            "qwen35.feed_forward_length": 17408,
+            "qwen35.vocab_size": 248320,
+            "qwen35.full_attention_interval": 4,
+            "qwen35.rope.dimension_count": 64,
+            "qwen35.rope.freq_base": 1e7,
+        }
+
+    def test_dimension_sections_do_not_force_interleave(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        md = self._base_metadata()
+        md["qwen35.rope.dimension_sections"] = [11, 11, 10, 0]
+        config = gguf_to_config(self._fake_model(md))
+
+        assert config.rope_interleave is False
+
+    def test_no_sections_still_not_interleaved(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        config = gguf_to_config(self._fake_model(self._base_metadata()))
+
+        assert config.rope_interleave is False
 class TestMuseGlimmerPostprocess:
     """Muse Glimmer config postprocessing.
 

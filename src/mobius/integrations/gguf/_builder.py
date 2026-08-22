@@ -486,7 +486,7 @@ def build_from_gguf(
     # This converts GGUF tensor quirks (stacked experts, 1D gates, 2D
     # conv weights, suffix artifacts) into the shapes that HF models
     # produce, so preprocess_weights only needs to handle HF→ONNX.
-    state_dict = _normalize_gguf_weights(state_dict)
+    state_dict = _normalize_gguf_weights(state_dict, gguf_arch, config)
 
     # 8. Run model-specific preprocess_weights (HF → ONNX names)
     if hasattr(module, "preprocess_weights"):
@@ -612,8 +612,26 @@ def _replace_native_block_linears(module, gguf_model, gguf_arch: str) -> None:
         )
 
 
+#: GGUF architectures whose transformer RMSNorms are zero-centered
+#: (``output = norm(x) * (1 + weight)``, mobius :class:`OffsetRMSNorm`). Their
+#: llama.cpp converter bakes the ``+1`` into every ``*norm.weight`` *except* the
+#: Gated-DeltaNet internal ``linear_attn.norm`` (a plain gated RMSNorm), so the
+#: GGUF path must undo it — see :func:`_normalize_gguf_weights`.
+_OFFSET_NORM_GGUF_ARCHS: frozenset[str] = frozenset({"qwen35", "qwen35moe"})
+
+#: GGUF architectures whose llama.cpp converter reorders Gated-DeltaNet V-heads
+#: from HuggingFace *grouped* order (``head = group * v_per_k + j``) into ggml
+#: *tiled* order (``head = j * num_k_heads + group``) whenever the linear layer
+#: is grouped (``num_value_heads != num_key_heads``). mobius's ``GatedDeltaNet``
+#: forward consumes the HF grouped order, so the GGUF path must undo the tiling —
+#: see :func:`_reorder_deltanet_v_heads`.
+_V_HEAD_REORDER_GGUF_ARCHS: frozenset[str] = frozenset({"qwen35", "qwen35moe"})
+
+
 def _normalize_gguf_weights(
     state_dict: dict,
+    gguf_arch: str | None = None,
+    config=None,
 ) -> dict:
     """Normalize GGUF-specific weight shapes to match HF conventions.
 
@@ -635,8 +653,32 @@ def _normalize_gguf_weights(
     - **dt_bias suffix**: GGUF ``ssm_dt.bias`` maps to
       ``dt_bias.bias`` after suffix splitting, but the model parameter
       is just ``dt_bias`` (an ``nn.Parameter``, not a module bias).
+    - **DeltaNet A_log**: GGUF stores the SSM decay pre-transformed as
+      ``ssm_a = -exp(A_log)``; mobius's ``GatedDeltaNet`` re-derives
+      ``-exp(A_log)`` at runtime, so the raw log is recovered via
+      ``A_log = log(-ssm_a)`` (scoped to ``linear_attn.A_log``).
+    - **Zero-centered RMSNorm** (``gguf_arch`` in
+      :data:`_OFFSET_NORM_GGUF_ARCHS`): the converter bakes ``+1`` into every
+      ``*norm.weight`` except ``linear_attn.norm.weight``; mobius applies the
+      ``1 +`` at runtime via :class:`OffsetRMSNorm`, so subtract ``1`` back out
+      to avoid double-counting.
+    - **Gated-DeltaNet V-head tiling** (``gguf_arch`` in
+      :data:`_V_HEAD_REORDER_GGUF_ARCHS`, grouped linear attention): the
+      converter reorders every V-indexed ``linear_attn`` tensor from HF grouped
+      order into ggml tiled order; mobius consumes grouped order, so the tiling
+      is undone via :func:`_reorder_deltanet_v_heads`.
+
+    Args:
+        state_dict: Dequantized GGUF weights keyed by HF tensor names.
+        gguf_arch: The source GGUF architecture string (e.g. ``"qwen35"``),
+            used to gate architecture-specific value transforms such as the
+            zero-centered RMSNorm offset.
+        config: The resolved :class:`ArchitectureConfig`; supplies the
+            Gated-DeltaNet head counts / dims used to undo the V-head tiling.
     """
     import torch
+
+    offset_norms = gguf_arch in _OFFSET_NORM_GGUF_ARCHS
 
     result: dict[str, torch.Tensor] = {}
     for key, value in state_dict.items():
@@ -668,6 +710,36 @@ def _normalize_gguf_weights(
             result[key[: -len(".bias")]] = value
             continue
 
+        # DeltaNet A_log: undo the converter's pre-transform. GGUF's converter
+        # stores the SSM decay already transformed as ``ssm_a = -exp(A_log)``
+        # (llama.cpp applies ``-torch.exp`` to every ``.A_log`` tensor and the
+        # reference then uses it *directly* as the decay coefficient ``a`` in
+        # ``a * softplus(dt)``). mobius's ``GatedDeltaNet`` parameter is the raw
+        # ``A_log`` and recomputes ``g = -exp(A_log) * softplus(...)`` at
+        # runtime, so feeding it the already-negated-exp value squashes every
+        # head's decay to ``-exp(-exp(A_log)) ≈ -1`` and the linear-attention
+        # recurrence emits garbage. Invert to recover the raw log parameter,
+        # ``A_log = log(-ssm_a)``, so mobius's ``-exp(A_log)`` reproduces the
+        # original ``ssm_a`` exactly. Scoped to the GatedDeltaNet ``linear_attn``
+        # projection so Mamba/PLaMo SSM modules (which consume ``A = -exp(A_log)``
+        # directly) are left untouched.
+        if key.endswith(".linear_attn.A_log"):
+            result[key] = torch.log(-value)
+            continue
+
+        # Zero-centered RMSNorm: undo the converter's baked-in ``+1`` so
+        # mobius's OffsetRMSNorm (which adds it back at runtime) does not
+        # double-count. The DeltaNet internal ``linear_attn.norm`` is a plain
+        # gated RMSNorm (no offset) and is excluded — mirroring exactly which
+        # tensors the llama.cpp converter transforms.
+        if (
+            offset_norms
+            and key.endswith("norm.weight")
+            and not key.endswith(".linear_attn.norm.weight")
+        ):
+            result[key] = value - 1.0
+            continue
+
         # layer_scalar.weight → layer_scalar (Gemma4 per-layer output scale is an
         # nn.Parameter, not a module weight). GGUF stores it as
         # blk.{i}.layer_output_scale.weight, which the tensor mapping renames to
@@ -678,7 +750,171 @@ def _normalize_gguf_weights(
 
         result[key] = value
 
+    # DeltaNet V-head tiling: undo the converter's grouped→tiled permutation of
+    # every V-indexed linear_attn tensor so mobius's GatedDeltaNet (which expects
+    # HF grouped order) reads consistent heads. Runs last so it operates on the
+    # already-normalized keys/shapes (renamed dt_bias, unsqueezed conv1d, ...).
+    if gguf_arch in _V_HEAD_REORDER_GGUF_ARCHS:
+        result = _reorder_deltanet_v_heads(result, config)
+
     return result
+
+
+def _reorder_deltanet_v_heads(state_dict: dict, config) -> dict:
+    """Undo the GGUF converter's grouped→tiled V-head permutation.
+
+    llama.cpp's ``_LinearAttentionVReorderBase`` reorders every V-indexed
+    Gated-DeltaNet tensor from HuggingFace *grouped* order (V-head
+    ``s = group * v_per_k + j``) into ggml *tiled* order
+    (``t = j * num_k_heads + group``) whenever the linear layer is grouped
+    (``num_value_heads != num_key_heads``). mobius's ``GatedDeltaNet`` forward
+    reshapes the value stream as ``num_value_heads`` contiguous ``head_v_dim``
+    blocks in the original grouped order, so the GGUF tensors must be permuted
+    back: grouped position ``s`` is fetched from tiled slot
+    ``perm[s] = (s % v_per_k) * num_key_heads + (s // v_per_k)``.
+
+    The permutation is applied (all derived from ``config`` — no hardcoded head
+    counts) to:
+
+    - ``in_proj_qkv`` output rows — V rows only (after ``2 * key_dim``);
+    - ``in_proj_z`` output rows — all rows;
+    - ``in_proj_a`` / ``in_proj_b`` output rows — one row per V-head;
+    - ``A_log`` / ``dt_bias`` — one element per V-head;
+    - ``conv1d`` channels — V channels only (after ``2 * key_dim``);
+    - ``out_proj`` input columns — all columns (a block-granular permutation of
+      the quantized ``K`` axis).
+
+    Quantized projections are stored as MatMulNBits triplets
+    (``weight`` ``[N, K/block, block/2]``, ``scales`` ``[N, K/block]``,
+    ``zero_points`` ``[N, K/block/2]``). Output-row permutations reindex axis 0
+    of all three; the ``out_proj`` input permutation reindexes the block axis
+    (axis 1), valid because ``head_v_dim`` is a whole number of quant blocks.
+    """
+    import torch
+
+    num_k_heads = getattr(config, "linear_num_key_heads", None)
+    num_v_heads = getattr(config, "linear_num_value_heads", None)
+    head_k_dim = getattr(config, "linear_key_head_dim", None)
+    head_v_dim = getattr(config, "linear_value_head_dim", None)
+    # Nothing to do unless this is a grouped linear-attention model.
+    if not (num_k_heads and num_v_heads and head_k_dim and head_v_dim):
+        return state_dict
+    if num_v_heads == num_k_heads or num_v_heads % num_k_heads != 0:
+        return state_dict
+
+    v_per_k = num_v_heads // num_k_heads
+    key_dim = head_k_dim * num_k_heads
+    v_offset = 2 * key_dim  # in_proj_qkv / conv1d layout is [Q | K | V]
+
+    # perm[s] = tiled slot holding grouped V-head s.
+    head_perm = torch.tensor(
+        [(s % v_per_k) * num_k_heads + (s // v_per_k) for s in range(num_v_heads)],
+        dtype=torch.long,
+    )
+
+    def _expand(perm: "torch.Tensor", stride: int) -> "torch.Tensor":
+        # Expand a per-head permutation into a per-row/-channel index.
+        base = (perm * stride).unsqueeze(1) + torch.arange(stride)
+        return base.reshape(-1)
+
+    v_rows = _expand(head_perm, head_v_dim)  # length value_dim
+
+    def _index_dim0(t: "torch.Tensor", idx: "torch.Tensor") -> "torch.Tensor":
+        return t.index_select(0, idx)
+
+    def _index_dim1(t: "torch.Tensor", idx: "torch.Tensor") -> "torch.Tensor":
+        return t.index_select(1, idx)
+
+    def _apply_rows(stem: str, idx: "torch.Tensor") -> None:
+        # Permute axis 0 of a float weight or a quantized triplet in place.
+        for suffix in (".weight", ".scales", ".zero_points"):
+            key = stem + suffix
+            if key in state_dict:
+                state_dict[key] = _index_dim0(state_dict[key], idx)
+
+    def _apply_bare(key: str, idx: "torch.Tensor") -> None:
+        if key in state_dict:
+            state_dict[key] = _index_dim0(state_dict[key], idx)
+
+    layer_stems = {
+        k.rsplit(".", 1)[0]
+        for k in state_dict
+        if ".linear_attn." in k
+    }
+    for stem in layer_stems:
+        name = stem.rsplit(".", 1)[-1]
+        if name == "in_proj_z":
+            _apply_rows(stem, v_rows)
+        elif name in ("in_proj_a", "in_proj_b"):
+            _apply_rows(stem, head_perm)
+        elif name == "in_proj_qkv":
+            n_rows = state_dict[stem + ".weight"].shape[0]
+            full = torch.cat([torch.arange(v_offset), v_offset + v_rows])
+            assert full.numel() == n_rows, (n_rows, full.numel())
+            _apply_rows(stem, full)
+        elif name == "out_proj":
+            _reorder_out_proj_cols(state_dict, stem, head_perm, head_v_dim)
+
+    # Bare (non-".weight") linear_attn parameters.
+    for k in list(state_dict):
+        if k.endswith(".linear_attn.A_log") or k.endswith(".linear_attn.dt_bias"):
+            _apply_bare(k, head_perm)
+        elif k.endswith(".linear_attn.conv1d.weight"):
+            conv = state_dict[k]
+            n_ch = conv.shape[0]
+            full = torch.cat([torch.arange(v_offset), v_offset + v_rows])
+            assert full.numel() == n_ch, (n_ch, full.numel())
+            state_dict[k] = _index_dim0(conv, full)
+
+    return state_dict
+
+
+def _reorder_out_proj_cols(
+    state_dict: dict, stem: str, head_perm, head_v_dim: int
+) -> None:
+    """Permute the quantized ``out_proj`` input (K) axis by V-head.
+
+    ``out_proj`` maps ``value_dim -> hidden``; its input columns are the V
+    stream, so they carry the same head tiling. In MatMulNBits form the K axis is
+    the block axis (axis 1) of ``weight``/``scales`` and the packed block axis of
+    ``zero_points`` (two 4-bit blocks per byte). ``head_v_dim`` spans a whole
+    number of blocks, so the permutation is block-granular and lossless.
+    """
+    import torch
+
+    weight = state_dict.get(stem + ".weight")
+    if weight is None or weight.dim() < 2:
+        return
+    n_blocks = weight.shape[1]
+    if n_blocks % head_perm.numel() != 0:
+        raise ValueError(
+            f"{stem}: cannot map {n_blocks} quant blocks onto "
+            f"{head_perm.numel()} V-heads for column reorder"
+        )
+    blocks_per_head = n_blocks // head_perm.numel()
+
+    def _expand(perm, stride):
+        base = (perm * stride).unsqueeze(1) + torch.arange(stride)
+        return base.reshape(-1)
+
+    blk_idx = _expand(head_perm, blocks_per_head)
+    state_dict[stem + ".weight"] = weight.index_select(1, blk_idx)
+
+    scales = state_dict.get(stem + ".scales")
+    if scales is not None:
+        state_dict[stem + ".scales"] = scales.index_select(1, blk_idx)
+
+    zp = state_dict.get(stem + ".zero_points")
+    if zp is not None and zp.dim() >= 2:
+        # zero_points pack two 4-bit blocks per byte along the block axis.
+        if blocks_per_head % 2 != 0:
+            raise ValueError(
+                f"{stem}: {blocks_per_head} blocks/head is not byte-aligned for "
+                "packed zero_points reorder"
+            )
+        zp_bytes_per_head = blocks_per_head // 2
+        zp_idx = _expand(head_perm, zp_bytes_per_head)
+        state_dict[stem + ".zero_points"] = zp.index_select(1, zp_idx)
 
 
 def _has_quantized_weights(gguf_model, gguf_arch: str) -> bool:
