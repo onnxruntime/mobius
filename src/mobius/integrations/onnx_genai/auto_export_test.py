@@ -17,8 +17,10 @@ from mobius._configs import QuantizationConfig
 from mobius._model_package import ModelPackage
 from mobius.integrations.onnx_genai import write_onnx_genai_config
 from mobius.integrations.onnx_genai.auto_export import (
+    _ddim_alpha_schedule,
     _flow_match_euler_schedule,
     _looks_like_image_edit,
+    _looks_like_video_diffusion,
 )
 from mobius.integrations.onnx_genai.inference_metadata import SchedulerConfig
 from mobius.integrations.onnx_genai.inference_metadata_test import (
@@ -92,6 +94,65 @@ def _diffusion_package(*, text: bool = False):
     )
     components.update({"denoiser": denoiser, "vae_decoder": vae})
     return ModelPackage(components)
+
+
+def _video_diffusion_package() -> ModelPackage:
+    latent = ["batch", "frames", 4, "height", "width"]
+    transformer = _model(
+        "transformer",
+        [
+            _value("sample", ir.DataType.FLOAT, latent),
+            _value("timestep", ir.DataType.FLOAT, ["batch"]),
+            _value(
+                "encoder_hidden_states",
+                ir.DataType.FLOAT,
+                ["batch", "prompt_sequence", 32],
+            ),
+        ],
+        [("noise_pred", ir.DataType.FLOAT, latent)],
+    )
+    text_encoder = _model(
+        "text_encoder",
+        [_value("input_ids", ir.DataType.INT64, ["batch", "prompt_sequence"])],
+        [
+            (
+                "encoder_hidden_states",
+                ir.DataType.FLOAT,
+                ["batch", "prompt_sequence", 32],
+            )
+        ],
+    )
+    vae = _model(
+        "vae_decoder",
+        [
+            _value(
+                "latent_sample",
+                ir.DataType.FLOAT,
+                ["batch", 4, "latent_frames", "height", "width"],
+            ),
+            _value(
+                "conv_cache.conv_in",
+                ir.DataType.FLOAT,
+                ["batch", 4, "cache_frames", "height", "width"],
+            ),
+        ],
+        [
+            ("sample", ir.DataType.FLOAT, ["batch", 3, "video_frames", "height", "width"]),
+            (
+                "conv_cache_out.conv_in",
+                ir.DataType.FLOAT,
+                ["batch", 4, "cache_frames", "height", "width"],
+            ),
+        ],
+    )
+    vae.metadata_props["mobius.conv_cache.spatial_scale.conv_cache.conv_in"] = "1"
+    return ModelPackage(
+        {
+            "transformer": transformer,
+            "text_encoder": text_encoder,
+            "vae_decoder": vae,
+        }
+    )
 
 
 class _MultimodalPkg(dict):
@@ -379,6 +440,37 @@ def test_dispatch_diffusion(tmp_path):
     assert (tmp_path / "policies" / "schedule_lookup.onnx").is_file()
 
 
+def test_dispatch_video_diffusion_uses_typed_ddim(tmp_path, monkeypatch):
+    package = _video_diffusion_package()
+    assert _looks_like_video_diffusion(package)
+    scheduler = SchedulerConfig(
+        kind="ddim",
+        prediction_type="v_prediction",
+        timestep_spacing="trailing",
+        rescale_betas_zero_snr=True,
+        snr_shift_scale=3.0,
+    )
+    monkeypatch.setattr(
+        "mobius.integrations.onnx_genai.auto_export._write_hf_tokenizer",
+        lambda *args, **kwargs: None,
+    )
+    artifacts = write_onnx_genai_config(
+        package,
+        str(tmp_path),
+        scheduler=scheduler,
+        num_inference_steps=2,
+        guidance_scale=6.0,
+    )
+    with open(artifacts["inference_metadata"]) as handle:
+        metadata = yaml.safe_load(handle)
+    workflow = metadata["pipeline"]["workflow"]
+    assert workflow["outputs"]["video"]["contract"]["rank"] == 5
+    loop = next(step for step in workflow["steps"] if step["kind"] == "loop")
+    assert [node["component"] for node in loop["steps"]].count("transformer") == 2
+    _, schedule = _ddim_alpha_schedule(scheduler, 2)
+    assert schedule[0] < schedule[1] <= schedule[2]
+
+
 def test_single_diffusion_component_requires_explicit_vae(tmp_path):
     pkg = _DiffusionPkg({"transformer": object()})
     with pytest.raises(
@@ -521,10 +613,15 @@ def test_dispatch_image_edit_emits_workflow(tmp_path):
         num_inference_steps=8,
         image_seq_len=4104,
         guidance_scale=4.0,
+        artifact_paths={"transformer": "models/transformer.onnx"},
     )
     with open(arts["inference_metadata"]) as handle:
         meta = yaml.safe_load(handle)
     workflow = meta["pipeline"]["workflow"]
+    assert (
+        workflow["components"]["transformer"]["implementation"]["artifact"]
+        == "models/transformer.onnx"
+    )
 
     loop = next(step for step in workflow["steps"] if step["kind"] == "loop")
 

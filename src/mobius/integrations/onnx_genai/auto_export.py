@@ -42,6 +42,7 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     write_speculative_workflow_metadata,
     write_speech_to_text_workflow_metadata,
     write_tts_workflow_metadata,
+    write_video_diffusion_workflow_metadata,
     write_vlm_workflow_metadata,
 )
 
@@ -132,6 +133,61 @@ def _diffusion_schedule(
         training_sigmas,
     )
     return timesteps.tolist(), [*sigmas.tolist(), 0.0]
+
+
+def _ddim_alpha_schedule(
+    scheduler: SchedulerConfig, num_inference_steps: int
+) -> tuple[list[float], list[float]]:
+    """Materialize DDIM timesteps and cumulative alphas from diffusers config."""
+    if scheduler.kind != "ddim":
+        raise ValueError(f"video workflow requires a DDIM scheduler, got {scheduler.kind!r}")
+    if num_inference_steps > scheduler.num_train_timesteps:
+        raise ValueError("num_inference_steps exceeds the DDIM training schedule")
+    if scheduler.beta_schedule == "scaled_linear":
+        betas = (
+            np.linspace(
+                np.sqrt(scheduler.beta_start),
+                np.sqrt(scheduler.beta_end),
+                scheduler.num_train_timesteps,
+                dtype=np.float64,
+            )
+            ** 2
+        )
+    elif scheduler.beta_schedule == "linear":
+        betas = np.linspace(
+            scheduler.beta_start,
+            scheduler.beta_end,
+            scheduler.num_train_timesteps,
+            dtype=np.float64,
+        )
+    else:
+        raise ValueError(f"unsupported DDIM beta schedule {scheduler.beta_schedule!r}")
+    alphas_cumprod = np.cumprod(1.0 - betas)
+    alphas_cumprod = alphas_cumprod / (
+        scheduler.snr_shift_scale + (1.0 - scheduler.snr_shift_scale) * alphas_cumprod
+    )
+    if scheduler.rescale_betas_zero_snr:
+        alpha_sqrt = np.sqrt(alphas_cumprod)
+        first, last = alpha_sqrt[0], alpha_sqrt[-1]
+        alpha_sqrt = (alpha_sqrt - last) * first / (first - last)
+        alphas_cumprod = alpha_sqrt**2
+    if scheduler.timestep_spacing == "linspace":
+        timesteps = np.linspace(
+            0, scheduler.num_train_timesteps - 1, num_inference_steps
+        ).round()[::-1]
+    elif scheduler.timestep_spacing == "leading":
+        step_ratio = scheduler.num_train_timesteps // num_inference_steps
+        timesteps = (np.arange(num_inference_steps) * step_ratio).round()[::-1]
+        timesteps += scheduler.steps_offset
+    elif scheduler.timestep_spacing == "trailing":
+        step_ratio = scheduler.num_train_timesteps / num_inference_steps
+        timesteps = np.round(np.arange(scheduler.num_train_timesteps, 0, -step_ratio)) - 1
+    else:
+        raise ValueError(f"unsupported DDIM timestep spacing {scheduler.timestep_spacing!r}")
+    timesteps = timesteps.astype(np.int64)
+    final_alpha = 1.0 if scheduler.set_alpha_to_one else float(alphas_cumprod[0])
+    schedule = [*(float(alphas_cumprod[index]) for index in timesteps), final_alpha]
+    return timesteps.astype(np.float64).tolist(), schedule
 
 
 _DENOISER_KEYS = ("denoiser", "transformer", "unet")
@@ -473,6 +529,19 @@ def _looks_like_diffusion(pkg: Any) -> bool:
     return any(k in names for k in _DENOISER_KEYS) or any(
         k in names for k in ("vae", "vae_decoder", "vae_encoder")
     )
+
+
+def _looks_like_video_diffusion(pkg: Any) -> bool:
+    try:
+        denoiser = next(pkg[name] for name in _DENOISER_KEYS if name in pkg)
+        sample = next(
+            value
+            for value in denoiser.graph.inputs
+            if value.name in {"sample", "latent", "hidden_states"}
+        )
+    except (AttributeError, KeyError, StopIteration, TypeError):
+        return False
+    return sample.shape is not None and len(sample.shape) == 5
 
 
 def _looks_like_language_diffusion(pkg: Any) -> bool:
@@ -834,6 +903,40 @@ def write_onnx_genai_config(
                 schedule=sigma_schedule,
                 timesteps=timesteps,
                 guidance_scale=1.0 if guidance_scale is None else guidance_scale,
+                artifact_paths=kwargs.pop("artifact_paths", None),
+            )
+            artifacts = {"inference_metadata": path}
+            tokenizer_path = _write_hf_tokenizer(output_dir, source, revision=revision)
+            if tokenizer_path is not None:
+                artifacts["tokenizer"] = tokenizer_path
+            return artifacts
+        if _looks_like_video_diffusion(pkg):
+            if scheduler is None:
+                scheduler = load_diffusers_scheduler_config(source, revision=revision)
+            resolved_scheduler = scheduler or SchedulerConfig(kind="ddim")
+            timesteps, alpha_schedule = _ddim_alpha_schedule(
+                resolved_scheduler, num_inference_steps
+            )
+            scaling_factor = load_diffusers_vae_scaling_factor(source) or 1.0
+            path = write_video_diffusion_workflow_metadata(
+                pkg,
+                output_dir,
+                num_inference_steps=num_inference_steps,
+                schedule=alpha_schedule,
+                timesteps=timesteps,
+                solver="ddim",
+                prediction_type=resolved_scheduler.prediction_type,
+                clip_sample_range=(
+                    resolved_scheduler.clip_sample_range
+                    if resolved_scheduler.clip_sample
+                    else None
+                ),
+                scaling_factor=scaling_factor,
+                guidance_scale=(
+                    None
+                    if guidance_scale is None or np.isclose(guidance_scale, 1.0)
+                    else float(guidance_scale)
+                ),
             )
             artifacts = {"inference_metadata": path}
             tokenizer_path = _write_hf_tokenizer(output_dir, source, revision=revision)

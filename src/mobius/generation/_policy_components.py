@@ -2220,8 +2220,11 @@ def build_ddim_solver_step(
         pred_epsilon = derivative
     elif prediction_type == "sample":
         pred_original = derivative
-        pred_epsilon = op.Div(
-            op.Sub(sample, op.Mul(alpha_sqrt, pred_original)), beta_sqrt
+        epsilon_numerator = op.Sub(sample, op.Mul(alpha_sqrt, pred_original))
+        pred_epsilon = op.Where(
+            op.Greater(beta_sqrt, op.CastLike(op.Constant(value_float=0.0), sample)),
+            op.Div(epsilon_numerator, beta_sqrt),
+            op.CastLike(op.Constant(value_float=0.0), sample),
         )
     else:
         pred_original = op.Sub(
@@ -2774,7 +2777,10 @@ def build_schedule_history_append(dtype: ir.DataType) -> PolicyComponent:
     return _component("mobius.policy.auxiliary@1", graph, {})
 
 
-def build_video_decode_chunk_count(latent_frame_axis: int = 2) -> PolicyComponent:
+def build_video_decode_chunk_count(
+    latent_frame_axis: int = 2,
+    dtype: ir.DataType = ir.DataType.FLOAT,
+) -> PolicyComponent:
     """Number of causal decode chunks a latent clip is split into.
 
     Mirrors ``AutoencoderKLCogVideoX._decode``: ``max(latent_frames // 2, 1)``.
@@ -2783,7 +2789,7 @@ def build_video_decode_chunk_count(latent_frame_axis: int = 2) -> PolicyComponen
     op = builder.op
     latent = builder.input(
         "latent",
-        ir.DataType.FLOAT,
+        dtype,
         ["batch", "channels", "latent_frames", "height", "width"],
     )
     frames = op.Shape(latent, start=latent_frame_axis, end=latent_frame_axis + 1)
@@ -2796,7 +2802,10 @@ def build_video_decode_chunk_count(latent_frame_axis: int = 2) -> PolicyComponen
     return _component("mobius.policy.auxiliary@1", graph, {})
 
 
-def build_video_decode_chunk(latent_frame_axis: int = 2) -> PolicyComponent:
+def build_video_decode_chunk(
+    latent_frame_axis: int = 2,
+    dtype: ir.DataType = ir.DataType.FLOAT,
+) -> PolicyComponent:
     """Slice the latent frames belonging to one causal decode chunk.
 
     Reproduces the reference chunk walk, where the odd frame left over by the
@@ -2810,7 +2819,7 @@ def build_video_decode_chunk(latent_frame_axis: int = 2) -> PolicyComponent:
     op = builder.op
     latent = builder.input(
         "latent",
-        ir.DataType.FLOAT,
+        dtype,
         ["batch", "channels", "latent_frames", "height", "width"],
     )
     step = builder.input("step", ir.DataType.INT64, ["batch"])
@@ -2878,7 +2887,10 @@ def build_video_conv_cache_initializer(
     return _component("mobius.policy.auxiliary@1", graph, {})
 
 
-def build_video_latent_permute(perm: list[int]) -> PolicyComponent:
+def build_video_latent_permute(
+    perm: list[int],
+    dtype: ir.DataType = ir.DataType.FLOAT,
+) -> PolicyComponent:
     """Reorder a video latent between the denoiser and VAE layouts.
 
     CogVideoX denoises ``[batch, frames, channels, height, width]`` but decodes
@@ -2887,22 +2899,21 @@ def build_video_latent_permute(perm: list[int]) -> PolicyComponent:
     """
     graph, builder = _make_graph("video_latent_permute")
     op = builder.op
-    source = builder.input(
-        "latent", ir.DataType.FLOAT, ["batch", "frames", "channels", "height", "width"]
-    )
+    source = builder.input("latent", dtype, ["batch", "frames", "channels", "height", "width"])
     permuted = op.Transpose(source, perm=perm)
     _set_public_shape(permuted, ["batch", "channels", "frames", "height", "width"])
     builder.add_output(permuted, "permuted")
     return _component("mobius.policy.auxiliary@1", graph, {})
 
 
-def build_video_latent_unscale(scaling_factor: float) -> PolicyComponent:
+def build_video_latent_unscale(
+    scaling_factor: float,
+    dtype: ir.DataType = ir.DataType.FLOAT,
+) -> PolicyComponent:
     """Undo the autoencoder's latent scaling before decoding."""
     graph, builder = _make_graph("video_latent_unscale")
     op = builder.op
-    latent = builder.input(
-        "latent", ir.DataType.FLOAT, ["batch", "channels", "frames", "height", "width"]
-    )
+    latent = builder.input("latent", dtype, ["batch", "channels", "frames", "height", "width"])
     unscaled = op.Div(latent, op.CastLike(op.Constant(value_float=scaling_factor), latent))
     _set_public_shape(unscaled, ["batch", "channels", "frames", "height", "width"])
     builder.add_output(unscaled, "unscaled")

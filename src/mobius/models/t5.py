@@ -332,6 +332,19 @@ class T5Encoder(nn.Module):
             max_distance=self._max_distance,
             num_heads=self._num_heads,
         )
+        if attention_mask is not None:
+            # HF T5 adds a broadcastable padding bias to the learned relative
+            # bias: [B, S] -> [B, 1, 1, S]. Masked keys receive a large
+            # negative value so every query ignores padding tokens.
+            valid = op.CastLike(attention_mask, position_bias)
+            padding = op.Mul(
+                op.Sub(op.CastLike(op.Constant(value_float=1.0), position_bias), valid),
+                op.CastLike(op.Constant(value_float=-10000.0), position_bias),
+            )
+            position_bias = op.Add(
+                position_bias,
+                op.Unsqueeze(padding, op.Constant(value_ints=[1, 2])),
+            )
         for block in self.block:
             hidden_states = block(op, hidden_states, attention_bias=position_bias)
         hidden_states = self.final_layer_norm(op, hidden_states)

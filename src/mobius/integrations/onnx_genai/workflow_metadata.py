@@ -3900,7 +3900,12 @@ def build_video_diffusion_workflow_metadata(
 
     if solver not in ("euler", "ddim"):
         raise ValueError("video solver must be 'euler' or 'ddim'")
+    if solver == "euler" and prediction_type != "epsilon":
+        raise ValueError("video Euler solver only supports epsilon prediction")
+    if solver == "ddim" and schedule is None:
+        raise ValueError("video DDIM requires an explicit cumulative-alpha schedule")
     latent_dims = ["batch", "frames", "channels", "height", "width"]
+    vae_dims = ["batch", "channels", "frames", "height", "width"]
     attach_policy_components(pkg, PolicyCapabilities())
     if solver == "ddim":
         # DDIM defines scale_model_input as the identity and consumes cumulative
@@ -3929,24 +3934,57 @@ def build_video_diffusion_workflow_metadata(
         pkg.add_policy_component(
             "guidance_combine", build_guidance_combine(estimate_output.dtype, latent_dims)
         )
+    conditioning_cast = (
+        conditioning_output is not None
+        and conditioning_input is not None
+        and conditioning_output.dtype != conditioning_input.dtype
+    )
+    if conditioning_cast:
+        pkg.add_policy_component(
+            "conditioning_cast",
+            build_tensor_cast(
+                conditioning_output.dtype,
+                conditioning_input.dtype,
+                _contract(conditioning_input)["shape"],
+            ),
+        )
     pkg.add_policy_component(
         "video_latent_init",
-        build_video_latent_initializer(sample_input.dtype, init_noise_sigma),
+        build_video_latent_initializer(
+            sample_input.dtype,
+            init_noise_sigma,
+            history_dtype=timestep_input.dtype,
+        ),
     )
     pkg.add_policy_component(
         "schedule_history_append", build_schedule_history_append(timestep_input.dtype)
     )
     pkg.add_policy_component(
         "video_latent_permute",
-        build_video_latent_permute(latent_permutation or [0, 2, 1, 3, 4]),
+        build_video_latent_permute(
+            latent_permutation or [0, 2, 1, 3, 4],
+            sample_input.dtype,
+        ),
+    )
+    vae_cast = sample_input.dtype != vae_input.dtype
+    if vae_cast:
+        pkg.add_policy_component(
+            "video_vae_cast",
+            build_tensor_cast(sample_input.dtype, vae_input.dtype, vae_dims),
+        )
+    pkg.add_policy_component(
+        "video_latent_unscale",
+        build_video_latent_unscale(scaling_factor, vae_input.dtype),
     )
     pkg.add_policy_component(
-        "video_latent_unscale", build_video_latent_unscale(scaling_factor)
+        "video_decode_chunks", build_video_decode_chunk_count(dtype=vae_input.dtype)
     )
-    pkg.add_policy_component("video_decode_chunks", build_video_decode_chunk_count())
-    pkg.add_policy_component("video_decode_chunk", build_video_decode_chunk())
     pkg.add_policy_component(
-        "video_conv_cache_init", build_video_conv_cache_initializer(cache_entries)
+        "video_decode_chunk", build_video_decode_chunk(dtype=vae_input.dtype)
+    )
+    pkg.add_policy_component(
+        "video_conv_cache_init",
+        build_video_conv_cache_initializer(cache_entries, vae_input.dtype),
     )
 
     schedule_values = schedule or [
@@ -4069,18 +4107,43 @@ def build_video_diffusion_workflow_metadata(
                     "externally_suppliable": True,
                 }
                 negative_text_inputs[value.name] = negative_name
-        conditioning_value = "conditioning.hidden_states"
-        setup_nodes.append(
-            _invoke(text_name, text_inputs, {conditioning_output.name: conditioning_value})
+        raw_conditioning_value = "conditioning.raw_hidden_states"
+        conditioning_value = (
+            "conditioning.hidden_states" if conditioning_cast else raw_conditioning_value
         )
+        setup_nodes.append(
+            _invoke(text_name, text_inputs, {conditioning_output.name: raw_conditioning_value})
+        )
+        if conditioning_cast:
+            setup_nodes.append(
+                _invoke(
+                    "conditioning_cast",
+                    {"value": raw_conditioning_value},
+                    {"cast": conditioning_value},
+                )
+            )
         if guidance_scale is not None:
+            raw_negative_value = "conditioning.raw_negative_hidden_states"
+            negative_value = (
+                "conditioning.negative_hidden_states"
+                if conditioning_cast
+                else raw_negative_value
+            )
             setup_nodes.append(
                 _invoke(
                     text_name,
                     negative_text_inputs,
-                    {conditioning_output.name: "conditioning.negative_hidden_states"},
+                    {conditioning_output.name: raw_negative_value},
                 )
             )
+            if conditioning_cast:
+                setup_nodes.append(
+                    _invoke(
+                        "conditioning_cast",
+                        {"value": raw_negative_value},
+                        {"cast": negative_value},
+                    )
+                )
             inputs["request.guidance_scale"] = {
                 "contract": row_float,
                 "role": {
@@ -4147,9 +4210,7 @@ def build_video_diffusion_workflow_metadata(
     else:
         negative_denoiser_inputs = dict(denoiser_inputs)
         assert conditioning_input is not None
-        negative_denoiser_inputs[conditioning_input.name] = (
-            "conditioning.negative_hidden_states"
-        )
+        negative_denoiser_inputs[conditioning_input.name] = negative_value
         body_nodes.extend(
             [
                 _invoke(
@@ -4357,9 +4418,24 @@ def build_video_diffusion_workflow_metadata(
                     {"latent": "latent.final"},
                     {"permuted": "decode.latent_permuted"},
                 ),
+                *(
+                    [
+                        _invoke(
+                            "video_vae_cast",
+                            {"value": "decode.latent_permuted"},
+                            {"cast": "decode.latent_cast"},
+                        )
+                    ]
+                    if vae_cast
+                    else []
+                ),
                 _invoke(
                     "video_latent_unscale",
-                    {"latent": "decode.latent_permuted"},
+                    {
+                        "latent": (
+                            "decode.latent_cast" if vae_cast else "decode.latent_permuted"
+                        )
+                    },
                     {"unscaled": "decode.latent"},
                 ),
                 _invoke(

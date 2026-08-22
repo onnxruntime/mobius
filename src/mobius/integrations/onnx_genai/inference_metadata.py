@@ -2057,6 +2057,13 @@ class SchedulerConfig:
     beta_end: float = 0.012
     beta_schedule: str = "scaled_linear"
     prediction_type: str = "epsilon"
+    clip_sample: bool = False
+    clip_sample_range: float = 1.0
+    set_alpha_to_one: bool = True
+    steps_offset: int = 0
+    timestep_spacing: str = "leading"
+    rescale_betas_zero_snr: bool = False
+    snr_shift_scale: float = 1.0
     use_karras_sigmas: bool = False
     use_exponential_sigmas: bool = False
     shift: float | None = None
@@ -2086,6 +2093,13 @@ class SchedulerConfig:
                 beta_start=self.beta_start,
                 beta_end=self.beta_end,
                 beta_schedule=self.beta_schedule,
+                clip_sample=self.clip_sample,
+                clip_sample_range=self.clip_sample_range,
+                set_alpha_to_one=self.set_alpha_to_one,
+                steps_offset=self.steps_offset,
+                timestep_spacing=self.timestep_spacing,
+                rescale_betas_zero_snr=self.rescale_betas_zero_snr,
+                snr_shift_scale=self.snr_shift_scale,
             )
         if self.use_karras_sigmas:
             meta["use_karras_sigmas"] = True
@@ -2162,6 +2176,13 @@ class SchedulerConfig:
                     "flow_prediction" if kind == "flow_match_euler" else "epsilon",
                 )
             ),
+            clip_sample=bool(config.get("clip_sample")),
+            clip_sample_range=float(config.get("clip_sample_range", 1.0)),
+            set_alpha_to_one=bool(config.get("set_alpha_to_one", True)),
+            steps_offset=int(config.get("steps_offset", 0)),
+            timestep_spacing=str(config.get("timestep_spacing", "leading")),
+            rescale_betas_zero_snr=bool(config.get("rescale_betas_zero_snr")),
+            snr_shift_scale=float(config.get("snr_shift_scale", 1.0)),
             use_karras_sigmas=bool(config.get("use_karras_sigmas")),
             use_exponential_sigmas=bool(config.get("use_exponential_sigmas")),
             shift=float(config["shift"]) if config.get("shift") is not None else None,

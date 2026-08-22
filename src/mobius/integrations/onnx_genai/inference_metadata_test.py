@@ -1592,6 +1592,24 @@ class TestBuildDiffusionPipelineMetadata:
         assert sched.kind == "ddim"
         assert sched.beta_end == pytest.approx(0.02)
 
+    def test_scheduler_preserves_cogvideox_ddim_equation_fields(self):
+        sched = SchedulerConfig.from_diffusers(
+            {
+                "_class_name": "CogVideoXDDIMScheduler",
+                "prediction_type": "v_prediction",
+                "clip_sample": False,
+                "set_alpha_to_one": True,
+                "timestep_spacing": "trailing",
+                "rescale_betas_zero_snr": True,
+                "snr_shift_scale": 3.0,
+            }
+        )
+        assert sched.kind == "ddim"
+        assert sched.prediction_type == "v_prediction"
+        assert sched.timestep_spacing == "trailing"
+        assert sched.rescale_betas_zero_snr
+        assert sched.snr_shift_scale == pytest.approx(3.0)
+
     def test_scheduler_maps_euler_class(self):
         sched = SchedulerConfig.from_diffusers(
             {"_class_name": "EulerDiscreteScheduler", "beta_schedule": "scaled_linear"}
