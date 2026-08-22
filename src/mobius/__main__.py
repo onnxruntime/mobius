@@ -531,15 +531,6 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         )
         raise SystemExit(1)
 
-    if getattr(args, "runtime", None) == "ort-genai":
-        raise SystemExit(
-            "Error: mobius build-gguf does not yet support --runtime ort-genai. "
-            "The command cannot emit a valid genai_config.json until the selected "
-            "GGUF architecture's cache and tokenizer contracts have passed real "
-            "ORT GenAI generation. Use --runtime onnx-genai where supported, or "
-            "omit --runtime and run the ONNX model directly."
-        )
-
     mmproj_path = getattr(args, "mmproj", None)
     keep_quantized = not args.dequantize
 
@@ -584,21 +575,40 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             path = os.path.join(output_dir, "model.onnx")
         print(f"Saved {name} to {path}")
 
-    if getattr(args, "runtime", None) == "onnx-genai":
-        from mobius.integrations.gguf import write_gguf_tokenizer_json
-        from mobius.integrations.onnx_genai import write_onnx_genai_config
+    # Save the trailing MTP / "nextn" self-speculative head sidecar (when the
+    # GGUF shipped one) into a ``mtp/`` subdirectory next to the backbone.
+    mtp_head = getattr(pkg, "mtp_head", None)
+    if mtp_head is not None:
+        mtp_dir = os.path.join(output_dir, "mtp")
+        mtp_head.save(
+            mtp_dir,
+            external_data=args.external_data,
+            max_workers=args.max_workers,
+        )
+        print(f"Saved mtp head to {os.path.join(mtp_dir, 'model.onnx')}")
 
-        # A GGUF checkpoint has no Hugging Face source directory, so the
-        # tokenizer is reconstructed from the file's embedded ggml metadata
-        # rather than copied from a `source`.
-        tokenizer_path = write_gguf_tokenizer_json(gguf_path, output_dir)
-        if tokenizer_path is not None:
-            print(f"  tokenizer: {tokenizer_path}")
-        artifacts = write_onnx_genai_config(
-            pkg, output_dir, config=getattr(pkg, "config", None), source=None
+    runtime = getattr(args, "runtime", None)
+    if runtime in ("onnx-genai", "ort-genai"):
+        from mobius.integrations.gguf import write_gguf_runtime_package
+
+        # The graph is already saved above; this adds the tokenizer (rebuilt
+        # from the GGUF's embedded ggml metadata, since a GGUF checkpoint has
+        # no Hugging Face source directory) and the runtime's own contract.
+        artifacts = write_gguf_runtime_package(
+            pkg, gguf_path, output_dir, runtime=runtime, save_model=False
         )
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
+        if mtp_head is not None:
+            from mobius.integrations.onnx_genai.inference_metadata import (
+                write_mtp_speculator_metadata,
+            )
+
+            spec_path = write_mtp_speculator_metadata(
+                output_dir, backbone_config=getattr(pkg, "config", None)
+            )
+            if spec_path is not None:
+                print(f"  speculator: {spec_path}")
 
 
 def _cmd_convert_comfyui(args: argparse.Namespace) -> None:

@@ -228,10 +228,14 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
 
 
 def build_app(
-    model_dir: str, device: str, allow_tf32: bool, tokenizer_path: str | None = None
+    model_dir: str,
+    device: str,
+    allow_tf32: bool,
+    tokenizer_path: str | None = None,
+    dep_q: int | None = None,
 ) -> web.Application:
     print(f"[server] loading Moshi ONNX models from {model_dir} on {device}...")
-    moshi = MoshiORT(model_dir, device, allow_tf32)
+    moshi = MoshiORT(model_dir, device, allow_tf32, dep_q=dep_q)
     print("[server] models loaded.")
 
     tokenizer = None
@@ -270,6 +274,13 @@ def main() -> None:
         default=None,
         help="path to tokenizer_spm_32k_3.model (default: download from HF)",
     )
+    parser.add_argument(
+        "--dep-q",
+        type=int,
+        choices=[8, 16],
+        default=None,
+        help="expected depformer width; default infers it from the ONNX package",
+    )
     args = parser.parse_args()
 
     if not os.path.isdir(os.path.join(args.model_dir, "temporal")):
@@ -278,7 +289,13 @@ def main() -> None:
             "(see this file's module docstring)."
         )
 
-    app = build_app(args.model_dir, args.device, args.allow_tf32, args.tokenizer)
+    app = build_app(
+        args.model_dir,
+        args.device,
+        args.allow_tf32,
+        args.tokenizer,
+        dep_q=args.dep_q,
+    )
     print(f"[server] listening on http://{args.host}:{args.port}  (open / in a browser)")
     web.run_app(app, host=args.host, port=args.port, print=None)
 

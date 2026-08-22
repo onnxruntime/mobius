@@ -196,6 +196,15 @@ def build_moshi_lm(
     logger.info("Loading Moshi LM checkpoint: %s", ckpt_path)
     state_dict = load_file(ckpt_path)
     logger.info("Loaded %d Moshi LM parameters", len(state_dict))
+    dep_q = sum(
+        key.startswith("depformer_in.") and key.endswith(".weight") for key in state_dict
+    )
+    if dep_q not in (8, 16):
+        raise ValueError(
+            "Unsupported Moshi depformer step count inferred from checkpoint: "
+            f"{dep_q}; expected public Moshi/Moshiko (8) or PersonaPlex (16)"
+        )
+    logger.info("Detected %d Moshi depformer codebook steps", dep_q)
 
     resolved = resolve_dtype(dtype) if dtype is not None else None
 
@@ -208,5 +217,7 @@ def build_moshi_lm(
         return pkg
 
     temporal = _build(moshi_temporal_config(), MoshiTemporalModel, MoshiTemporalTask())
-    depformer = _build(moshi_depformer_config(), MoshiDepformerModel, MoshiDepformerTask())
+    depformer = _build(
+        moshi_depformer_config(dep_q=dep_q), MoshiDepformerModel, MoshiDepformerTask()
+    )
     return {"temporal": temporal, "depformer": depformer}
