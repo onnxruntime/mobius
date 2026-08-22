@@ -5665,6 +5665,10 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "llava_onevision",
     "mistral3",
     "molmo",
+    # SenseNova-U1.5 NEO-unify (co-located src/mobius/models/sensenova_u1_test.py):
+    # a unified any-to-any package whose five components include an
+    # image-generation branch, so it does not fit the generic VLM harness.
+    "neo_chat",
     "ovis2",
     "paligemma",
     "pixtral",

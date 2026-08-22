@@ -12,6 +12,7 @@ iterative pipeline. This is the onnx-genai analogue of
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any
@@ -25,6 +26,10 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     _copy_runtime_assets,
     load_diffusers_scheduler_config,
     load_diffusers_vae_scaling_factor,
+)
+from mobius.integrations.onnx_genai.shared_state_flow_metadata import (
+    is_shared_state_pixel_flow_package,
+    write_shared_state_pixel_flow_workflow_metadata,
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
     write_audio_codec_workflow_metadata,
@@ -752,6 +757,47 @@ def write_onnx_genai_config(
     ``scheduler`` / ``guidance_scale`` set the loop.
     """
     os.makedirs(output_dir, exist_ok=True)
+    if is_shared_state_pixel_flow_package(pkg):
+        resolved_config = config if config is not None else getattr(pkg, "config", None)
+        if resolved_config is None:
+            raise ValueError("shared-state pixel-flow metadata requires a model config")
+        path = write_shared_state_pixel_flow_workflow_metadata(
+            pkg,
+            resolved_config,
+            output_dir,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=4.0 if guidance_scale is None else guidance_scale,
+        )
+        artifacts = {"inference_metadata": path}
+        artifacts.update(_copy_runtime_assets(output_dir, source, revision=revision))
+        processor_path = os.path.join(output_dir, "preprocessor_config.json")
+        if not os.path.isfile(processor_path):
+            with open(processor_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "do_convert_rgb": True,
+                        "do_resize": True,
+                        "min_pixels": 512 * 512,
+                        "max_pixels": 2048 * 2048,
+                        "size_multiple": 32,
+                        "resample": "lanczos3",
+                        "do_rescale": True,
+                        "rescale_factor": 1.0 / 255.0,
+                        "do_normalize": True,
+                        "image_mean": [0.485, 0.456, 0.406],
+                        "image_std": [0.229, 0.224, 0.225],
+                    },
+                    handle,
+                    indent=2,
+                )
+                handle.write("\n")
+            artifacts["preprocessor_config"] = processor_path
+        if "tokenizer" not in artifacts:
+            tokenizer_path = _write_hf_tokenizer(output_dir, source, revision=revision)
+            if tokenizer_path is not None:
+                artifacts["tokenizer"] = tokenizer_path
+        return artifacts
+
     if _looks_like_language_diffusion(pkg):
         path = write_language_diffusion_workflow_metadata(
             pkg,
