@@ -1571,8 +1571,14 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
         },
     }
     for index, (_, present) in enumerate(cache_pairs):
+        cache_contract = _contract(present)
+        cache_contract["batch_layout"] = {
+            "kind": "request_expanded",
+            "axis": 0,
+            "factor": 2,
+        }
         state[f"global_cache_{index}"] = {
-            "contract": _contract(present),
+            "contract": cache_contract,
             "class": "semantic",
             "scope": "invocation",
             "initializer": f"global.setup.cache_{index}",
