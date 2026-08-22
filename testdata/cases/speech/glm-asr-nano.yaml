@@ -1,0 +1,25 @@
+model_id: "zai-org/GLM-ASR-Nano-2512"
+model_type: "glmasr"
+revision: "61ba4e0b3309b6656edea3e93e419f7bd5c61957"
+task_type: "speech-language"
+dtype: "float16"
+trust_remote_code: false
+
+inputs:
+  prompts:
+    - "Please transcribe this audio into text"
+  audio:
+    - "bcn_weather.mp3"
+
+generation:
+  max_new_tokens: 100
+  do_sample: false
+  exact_match: true
+
+level: "L4+L5"
+
+notes: >
+  GLM-ASR-Nano speech recognition with the complete audio_encoder -> embedding
+  -> decoder path. The nonzero speech fixture is bcn_weather.mp3 from
+  eustlb/audio-samples at immutable revision
+  1045238c3afdc0254472ecdde5dae95370d621e4.

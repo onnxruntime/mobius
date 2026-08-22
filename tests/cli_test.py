@@ -193,6 +193,149 @@ class TestCLIBuild:
         mock_build.assert_called_once()
         assert mock_build.call_args.kwargs.get("text_only") is True
 
+    def test_revision_is_forwarded_to_detection_and_build(self):
+        revision = "61ba4e0b3309b6656edea3e93e419f7bd5c61957"
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
+                return_value=None,
+            ) as mock_diffusers,
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "zai-org/GLM-ASR-Nano-2512",
+                    tmpdir,
+                    "--revision",
+                    revision,
+                    "--no-weights",
+                ]
+            )
+
+        mock_diffusers.assert_called_once_with(
+            "zai-org/GLM-ASR-Nano-2512",
+            revision=revision,
+        )
+        assert mock_build.call_args.kwargs["revision"] == revision
+
+    def test_static_cache_with_onnx_genai_runtime_emits_scatter_abi(self):
+        """A static-cache export is describable, so the CLI must describe it.
+
+        The two control ports are rank-1 integer vectors and are therefore
+        shape-indistinguishable from one another, which is exactly why the ABI
+        is *declared* rather than inferred. It is declared once, in the
+        workflow: the state group that scatters into the buffers names the port
+        carrying the write cursor and the port carrying the non-pad length, and
+        the component those ports belong to declares both.
+        """
+        import onnx_ir as ir
+        import yaml
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main(
+                [
+                    "build",
+                    "--model",
+                    "Qwen/Qwen2.5-0.5B",
+                    tmpdir,
+                    "--no-weights",
+                    "--features",
+                    "static-cache",
+                    "--max-seq-len",
+                    "128",
+                    "--runtime",
+                    "onnx-genai",
+                ]
+            )
+            with open(
+                os.path.join(tmpdir, "inference_metadata.yaml"), encoding="utf-8"
+            ) as handle:
+                metadata = yaml.safe_load(handle)
+            # The exported graph is the authority on which ports exist and what
+            # rank they have, so read it here rather than trusting a copy of it
+            # in the metadata — a copy is what this contract exists to avoid.
+            artifact = metadata["pipeline"]["workflow"]["components"]["model"][
+                "implementation"
+            ]["artifact"]
+            exported = {
+                str(value.name): len(value.shape)
+                for value in ir.load(os.path.join(tmpdir, artifact)).graph.inputs
+            }
+
+        # One canonical description: no second copy of the port ABI outside it.
+        assert "io" not in metadata.get("model", {})
+
+        workflow = metadata["pipeline"]["workflow"]
+        assert workflow["inputs"]["package.cache_capacity"]["default"] == 128
+        groups = workflow["serving"]["state_service"]["groups"]
+        update = next(group["update"] for group in groups.values() if "update" in group)
+        assert update["kind"] == "indexed_scatter"
+        assert update["capacity"] == "package.cache_capacity"
+        # The write cursor and the logical length are the same quantity.
+        assert update["write_indices"] == "cache_lengths"
+        assert update["write_indices_ports"] == {"model": "write_indices"}
+        assert update["kv_length_ports"] == {"model": "nonpad_kv_seqlen"}
+
+        # The component transcribes none of this: it declares the roles a graph
+        # cannot state, and the scatter's control ports are named by the state
+        # group. Both names have to resolve in the artifact.
+        assert not (workflow["components"]["model"]["ports"].get("inputs"))
+        assert workflow["components"]["model"]["ports"]["roles"]["input_ids"] == "token_ids"
+        assert exported["write_indices"] == 1
+        assert exported["nonpad_kv_seqlen"] == 1
+
+        group = next(group for group in groups.values() if "update" in group)
+        pairs = group["ports"]["model"]
+        assert {alias["output"] for alias in pairs.values()} == {
+            f"updated_{alias['input']}" for alias in pairs.values()
+        }
+        assert pairs["cache_0"] == {
+            "input": "key_cache.0",
+            "output": "updated_key_cache.0",
+            "role": "key",
+            "layer": 0,
+        }
+
+    def test_static_cache_task_follows_text_only_substitution(self):
+        """``text-only`` + ``static-cache`` must resolve the *text* task.
+
+        ``build()`` swaps a multimodal ``model_type`` for its text-only
+        registry sibling, so the deferred static-cache task has to be resolved
+        against the substituted type. Resolving against the raw checkpoint type
+        pairs the text-only module with the multimodal task, which then fails
+        looking for sub-modules a text-only module does not have.
+        """
+        from mobius.tasks._gemma4 import Gemma4TextCausalLMTask
+
+        hf_config = mock.MagicMock()
+        hf_config.model_type = "gemma4"
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch("transformers.AutoConfig.from_pretrained", return_value=hf_config),
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "google/gemma-4-E2B-it",
+                    tmpdir,
+                    "--no-weights",
+                    "--features",
+                    "text-only,static-cache",
+                    "--max-seq-len",
+                    "128",
+                ]
+            )
+
+        task = mock_build.call_args.kwargs["task"]
+        assert isinstance(task, Gemma4TextCausalLMTask)
+
     def test_build_static_cache(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             main(
@@ -529,6 +672,32 @@ class TestCLIBuildRuntime:
 
         assert mock_export.call_args.kwargs["trust_remote_code"] is True
 
+    def test_build_propagates_revision(self):
+        revision = "5a414ead75d45db003906d06fb62bd5b6846cec0"
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
+                return_value=None,
+            ) as detect_diffusers,
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as build_model,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "LiquidAI/LFM2.5-VL-3B",
+                    "--revision",
+                    revision,
+                    tmpdir,
+                    "--no-weights",
+                ]
+            )
+
+        detect_diffusers.assert_called_once_with("LiquidAI/LFM2.5-VL-3B", revision=revision)
+        assert build_model.call_args.kwargs["revision"] == revision
+
     def test_runtime_ort_genai_rejects_mage_vl_before_saving(self):
         with (
             tempfile.TemporaryDirectory() as tmpdir,
@@ -557,10 +726,11 @@ class TestCLIBuildRuntime:
         save.assert_not_called()
         config_writer.assert_not_called()
 
-    def test_runtime_onnx_genai_uses_native_vlm_emitter(self):
+    def test_runtime_onnx_genai_routes_vlm_through_workflow_emitter(self):
+        """A VLM package emits the workflow IR, not a legacy composite pipeline."""
         pkg = mock.MagicMock()
         pkg.items.return_value = []
-        pkg.__iter__.return_value = iter(())
+        pkg.__iter__.return_value = iter(("vision_encoder", "embedding", "decoder"))
         pkg.config = object()
         args = SimpleNamespace(
             max_shard_size=None,
@@ -575,27 +745,19 @@ class TestCLIBuildRuntime:
         with (
             tempfile.TemporaryDirectory() as tmpdir,
             mock.patch(
-                "mobius.integrations.onnx_genai.inference_metadata.is_native_vlm_package",
-                return_value=True,
-            ),
-            mock.patch(
-                "mobius.integrations.onnx_genai.inference_metadata."
-                "write_native_vlm_package_metadata",
+                "mobius.integrations.onnx_genai.write_onnx_genai_config",
                 return_value={},
-            ) as native_writer,
-            mock.patch(
-                "mobius.integrations.onnx_genai.write_onnx_genai_config"
-            ) as generic_writer,
+            ) as writer,
         ):
             _save_package(pkg, tmpdir, args, None, None)
 
-        native_writer.assert_called_once_with(
+        writer.assert_called_once_with(
             pkg,
             tmpdir,
             config=pkg.config,
             source="/models/vlm",
+            revision=None,
         )
-        generic_writer.assert_not_called()
 
     def test_runtime_onnx_genai_does_not_fallback_for_unsupported_vlm(self):
         pkg = mock.MagicMock()
@@ -615,25 +777,16 @@ class TestCLIBuildRuntime:
         with (
             tempfile.TemporaryDirectory() as tmpdir,
             mock.patch(
-                "mobius.integrations.onnx_genai.inference_metadata.is_native_vlm_package",
-                return_value=True,
-            ),
-            mock.patch(
-                "mobius.integrations.onnx_genai.inference_metadata."
-                "write_native_vlm_package_metadata",
+                "mobius.integrations.onnx_genai.write_onnx_genai_config",
                 side_effect=ValueError(
                     "unsupported VLM signature; regenerate processor assets or register it"
                 ),
-            ) as native_writer,
-            mock.patch(
-                "mobius.integrations.onnx_genai.write_onnx_genai_config"
-            ) as generic_writer,
+            ) as writer,
             pytest.raises(SystemExit, match=r"regenerate.*register"),
         ):
             _save_package(pkg, tmpdir, args, None, None)
 
-        native_writer.assert_called_once()
-        generic_writer.assert_not_called()
+        writer.assert_called_once()
 
     def test_no_runtime_does_not_call_write_ort_genai_config(self):
         """Omitting --runtime does NOT call write_ort_genai_config()."""

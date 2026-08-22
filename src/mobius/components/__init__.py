@@ -69,6 +69,8 @@ __all__ = [
     "ScaleFreeRMSNorm",
     "SelectiveScan",
     "SiLU",
+    "Siglip2NaFlexVisionEmbeddings",
+    "Siglip2NaFlexVisionModel",
     "SigmoidTopKGate",
     "SnakeBeta",
     "SoftmaxTopKGate",
@@ -94,6 +96,7 @@ __all__ = [
     "get_activation",
     "initialize_rope",
     "make_quantized_linear_factory",
+    "siglip2_naflex_attention_mask",
 ]
 
 from mobius.components._activations import SiLU, get_activation
@@ -293,6 +296,11 @@ from mobius.components._sanm_attention import (
     SANMEncoderLayer as SANMEncoderLayer,
 )
 from mobius.components._short_conv import GatedShortConv
+from mobius.components._siglip2_naflex import (
+    Siglip2NaFlexVisionEmbeddings,
+    Siglip2NaFlexVisionModel,
+    siglip2_naflex_attention_mask,
+)
 from mobius.components._ssm import (
     JambaSelectiveScan as JambaSelectiveScan,
 )

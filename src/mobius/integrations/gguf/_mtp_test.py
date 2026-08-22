@@ -105,8 +105,7 @@ class TestMtpNameMapping:
             == "pre_fc_norm_hidden.weight"
         )
         assert (
-            map_gguf_mtp_to_hf_names("blk.1.nextn.shared_head_norm.weight", 1)
-            == "norm.weight"
+            map_gguf_mtp_to_hf_names("blk.1.nextn.shared_head_norm.weight", 1) == "norm.weight"
         )
 
     def test_maps_attention_and_ffn_onto_layer_zero(self):
@@ -148,9 +147,7 @@ class TestMtpConfigSurfacing:
         assert config._gguf_mtp_block_indices == [1]
         assert has_mtp_head(config)
 
-    def test_derive_mtp_config_forces_single_full_attention_layer(
-        self, qwen35_mtp_gguf: Path
-    ):
+    def test_derive_mtp_config_forces_single_full_attention_layer(self, qwen35_mtp_gguf: Path):
         from mobius.integrations.gguf._config_mapping import gguf_to_config
         from mobius.integrations.gguf._reader import GGUFModel
 
@@ -173,9 +170,7 @@ class TestBuildMtpHead:
         gguf_model = GGUFModel(str(qwen35_mtp_gguf))
         config = gguf_to_config(gguf_model)
 
-        head = build_mtp_head_from_gguf(
-            gguf_model, config, preserve_quantization=False
-        )
+        head = build_mtp_head_from_gguf(gguf_model, config, preserve_quantization=False)
         assert head is not None
 
         model = head["model"]

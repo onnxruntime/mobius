@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from mobius._registry import (
+    _TEXT_ONLY_MODEL_TYPE,
     ModelRegistration,
     _detect_fallback_registration,
     registry,
@@ -174,3 +175,51 @@ class TestRegistryBasics:
         """Very different strings don't produce suggestions."""
         with pytest.raises(KeyError, match=r"Use registry\.register"):
             registry.get("zzzzzzzzz_not_a_model")
+
+
+class TestTextOnlyModelTypeOverrides:
+    """``build(..., text_only=True)`` resolution table.
+
+    Every multimodal ``model_type`` whose text backbone can be exported alone
+    needs an entry here; the CLI surfaces this as ``--features text-only``.
+    """
+
+    def test_every_target_is_registered(self):
+        for source, target in _TEXT_ONLY_MODEL_TYPE.items():
+            assert target in registry, (
+                f"text-only override {source!r} -> {target!r} names an unregistered model_type"
+            )
+
+    def test_mapping_is_idempotent(self):
+        """Applying the override twice must be a no-op."""
+        for target in set(_TEXT_ONLY_MODEL_TYPE.values()):
+            assert _TEXT_ONLY_MODEL_TYPE.get(target) == target, (
+                f"text-only target {target!r} is missing a self-mapping, so "
+                "text_only=True fails once the type is already text-only"
+            )
+
+    @pytest.mark.parametrize(
+        "model_type",
+        # Shipped Gemma 4 checkpoints declare model_type="gemma4" with a
+        # nested text_config of model_type="gemma4_text"; both must resolve.
+        ["gemma4", "gemma4_text"],
+    )
+    def test_gemma4_resolves_to_text_backbone(self, model_type):
+        assert _TEXT_ONLY_MODEL_TYPE[model_type] == "gemma4_text"
+
+    def test_nested_text_config_type_is_mapped(self):
+        """A VL type and its nested ``text_config`` type must agree.
+
+        ``build(text_only=True)`` may resolve either the outer multimodal
+        ``model_type`` or the nested ``text_config.model_type`` depending on how
+        the checkpoint is loaded, so both spellings must land on the same
+        backbone.
+        """
+        for source, target in _TEXT_ONLY_MODEL_TYPE.items():
+            if not source.endswith("_text"):
+                continue
+            outer = source[: -len("_text")]
+            if outer in _TEXT_ONLY_MODEL_TYPE:
+                assert _TEXT_ONLY_MODEL_TYPE[outer] == target, (
+                    f"{outer!r} and {source!r} resolve to different backbones"
+                )

@@ -157,7 +157,19 @@ def _cmd_build(args: argparse.Namespace) -> None:
     from mobius.tasks import CausalLMTask, ModelTask
 
     def _resolve_static_cache_task(model_type: str) -> ModelTask:
-        """Create the correct static cache task for the given model type."""
+        """Create the correct static cache task for the given model type.
+
+        ``--features text-only`` makes :func:`build` swap the checkpoint's
+        multimodal ``model_type`` for its text-only registry sibling, so the
+        task must be resolved against the *same* substituted type. Resolving
+        against the raw checkpoint type instead pairs a text-only module with a
+        multimodal task, which then fails looking for sub-modules (a vision
+        tower, a separate decoder) that a text-only module does not have.
+        """
+        if args.text_only:
+            from mobius._registry import _TEXT_ONLY_MODEL_TYPE
+
+            model_type = _TEXT_ONLY_MODEL_TYPE.get(model_type, model_type)
         if model_type == "gemma4":
             from mobius.tasks._gemma4 import Gemma4Task
 
@@ -247,6 +259,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
     else:
         static_cache_params = None
     trust_remote_code = args.trust_remote_code
+    revision = args.revision
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
     dtype_override = resolve_dtype(args.dtype)
@@ -259,7 +272,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
     # central build() validation reject a diffusers/unsupported repo rather
     # than silently exporting a diffusion pipeline and ignoring the flag.
     if args.model and not args.config and not args.text_only:
-        pipeline_index = _load_diffusers_pipeline_index(args.model)
+        pipeline_index = _load_diffusers_pipeline_index(args.model, revision=revision)
         if pipeline_index is not None:
             print(
                 f"Detected diffusers pipeline: {pipeline_index.get('_class_name', 'Unknown')}"
@@ -275,6 +288,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 pipeline_components = {max(roots, key=len)} if roots else {component_filter}
             pkg = build_diffusers_pipeline(
                 args.model,
+                revision=revision,
                 dtype=dtype_override,
                 load_weights=load_weights,
                 components=pipeline_components,
@@ -303,9 +317,21 @@ def _cmd_build(args: argparse.Namespace) -> None:
         import transformers
 
         config_path = args.config
-        hf_config = transformers.AutoConfig.from_pretrained(
-            config_path, trust_remote_code=trust_remote_code
-        )
+        try:
+            hf_config = transformers.AutoConfig.from_pretrained(
+                config_path, trust_remote_code=trust_remote_code
+            )
+        except (ValueError, KeyError, OSError):
+            # A checkpoint predating the mandatory ``model_type`` key still
+            # names its architecture; resolve it the same way the HF-id path
+            # does rather than refusing a directory Mobius can build.
+            from mobius.integrations.transformers._config_resolver import (
+                _try_load_config_json,
+            )
+
+            hf_config = _try_load_config_json(config_path)
+            if hf_config is None:
+                raise
         model_type = hf_config.model_type
         parent_config = hf_config
         if hasattr(hf_config, "text_config"):
@@ -342,7 +368,9 @@ def _cmd_build(args: argparse.Namespace) -> None:
             import transformers
 
             hf_config = transformers.AutoConfig.from_pretrained(
-                model_id_or_path, trust_remote_code=trust_remote_code
+                model_id_or_path,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
             )
             task = _resolve_static_cache_task(getattr(hf_config, "model_type", ""))
 
@@ -351,6 +379,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             task=task,
             dtype=dtype_override,
             load_weights=load_weights,
+            revision=revision,
             trust_remote_code=trust_remote_code,
             execution_provider=execution_provider,
             text_only=args.text_only,
@@ -424,30 +453,25 @@ def _save_package(
             ep=ep,
             local_config_dir=local_config_dir,
             trust_remote_code=getattr(args, "trust_remote_code", False),
+            revision=getattr(args, "revision", None),
         )
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
     elif runtime == "onnx-genai":
         from mobius.integrations.onnx_genai import write_onnx_genai_config
-        from mobius.integrations.onnx_genai.inference_metadata import (
-            is_native_vlm_package,
-            write_native_vlm_package_metadata,
-        )
 
         config = getattr(pkg, "config", None)
         source = getattr(args, "config", None) or getattr(args, "model", None)
-        if is_native_vlm_package(pkg):
-            try:
-                artifacts = write_native_vlm_package_metadata(
-                    pkg,
-                    output_dir,
-                    config=config,
-                    source=source,
-                )
-            except ValueError as error:
-                raise SystemExit(f"Error: {error}") from error
-        else:
-            artifacts = write_onnx_genai_config(pkg, output_dir, config=config, source=source)
+        try:
+            artifacts = write_onnx_genai_config(
+                pkg,
+                output_dir,
+                config=config,
+                source=source,
+                revision=getattr(args, "revision", None),
+            )
+        except ValueError as error:
+            raise SystemExit(f"Error: {error}") from error
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
 
@@ -507,15 +531,6 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         )
         raise SystemExit(1)
 
-    if getattr(args, "runtime", None) == "ort-genai":
-        raise SystemExit(
-            "Error: mobius build-gguf does not yet support --runtime ort-genai. "
-            "The command cannot emit a valid genai_config.json until the selected "
-            "GGUF architecture's cache and tokenizer contracts have passed real "
-            "ORT GenAI generation. Use --runtime onnx-genai where supported, or "
-            "omit --runtime and run the ONNX model directly."
-        )
-
     mmproj_path = getattr(args, "mmproj", None)
     keep_quantized = not args.dequantize
 
@@ -572,18 +587,15 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         )
         print(f"Saved mtp head to {os.path.join(mtp_dir, 'model.onnx')}")
 
-    if getattr(args, "runtime", None) == "onnx-genai":
-        from mobius.integrations.gguf import write_gguf_tokenizer_json
-        from mobius.integrations.onnx_genai import write_onnx_genai_config
+    runtime = getattr(args, "runtime", None)
+    if runtime in ("onnx-genai", "ort-genai"):
+        from mobius.integrations.gguf import write_gguf_runtime_package
 
-        # A GGUF checkpoint has no Hugging Face source directory, so the
-        # tokenizer is reconstructed from the file's embedded ggml metadata
-        # rather than copied from a `source`.
-        tokenizer_path = write_gguf_tokenizer_json(gguf_path, output_dir)
-        if tokenizer_path is not None:
-            print(f"  tokenizer: {tokenizer_path}")
-        artifacts = write_onnx_genai_config(
-            pkg, output_dir, config=getattr(pkg, "config", None), source=None
+        # The graph is already saved above; this adds the tokenizer (rebuilt
+        # from the GGUF's embedded ggml metadata, since a GGUF checkpoint has
+        # no Hugging Face source directory) and the runtime's own contract.
+        artifacts = write_gguf_runtime_package(
+            pkg, gguf_path, output_dir, runtime=runtime, save_model=False
         )
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
@@ -753,6 +765,14 @@ def main(argv: list[str] | None = None) -> None:
         help="Trust remote code when loading the HuggingFace model config.",
     )
     build_parser.add_argument(
+        "--revision",
+        default=None,
+        help=(
+            "Immutable HuggingFace revision used for config, weights, tokenizer, "
+            "and processor assets."
+        ),
+    )
+    build_parser.add_argument(
         "--dtype",
         choices=sorted(DTYPE_MAP),
         default=None,
@@ -863,7 +883,8 @@ def main(argv: list[str] | None = None) -> None:
             "Path to a companion 'clip' mmproj GGUF (vision/audio encoder). "
             "When set, builds a full multimodal package (decoder + "
             "vision_encoder + embedding) instead of a text-only model. "
-            "Currently supports Gemma4 vision; audio is experimental."
+            "Currently supports Gemma4 and Muse Glimmer vision; audio is "
+            "experimental."
         ),
     )
     quantization_group = gguf_parser.add_mutually_exclusive_group()

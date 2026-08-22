@@ -36,7 +36,7 @@ class DenoisingTask(ModelTask):
             dtype=ir.DataType.FLOAT,
             shape=["batch", config.in_channels, "height", "width"],
         )
-        timestep = builder.input("timestep", dtype=ir.DataType.INT64, shape=["batch"])
+        timestep = builder.input("timestep", dtype=ir.DataType.FLOAT, shape=["batch"])
         encoder_hidden_states = builder.input(
             "encoder_hidden_states",
             dtype=ir.DataType.FLOAT,
@@ -62,6 +62,16 @@ class DenoisingTask(ModelTask):
             **extra_kwargs,
         )
 
+        # The denoiser is spatially shape preserving, so republish the latent's named
+        # dimensions on the estimate instead of leaving the anonymous symbols shape
+        # inference produces, which no consumer can relate back to the inputs. A
+        # denoiser that learns the variance emits twice the latent channels.
+        out_channels = getattr(config, "out_channels", None)
+        if out_channels is None:
+            out_channels = config.in_channels * (
+                2 if getattr(config, "learn_sigma", False) else 1
+            )
+        noise_pred.shape = ir.Shape(["batch", out_channels, "height", "width"])
         builder.add_output(noise_pred, "noise_pred")
 
         return ModelPackage({"model": _make_model(graph)}, config=config)

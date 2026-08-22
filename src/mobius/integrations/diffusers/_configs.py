@@ -334,6 +334,7 @@ class CogVideoXConfig:
     max_text_seq_length: int = 226
     spatial_interpolation_scale: float = 1.875
     temporal_interpolation_scale: float = 1.0
+    use_learned_positional_embeddings: bool = False
     norm_eps: float = 1e-5
     # cross_attention_dim used by VideoDenoisingTask for text conditioning
     cross_attention_dim: int = 4096
@@ -363,6 +364,9 @@ class CogVideoXConfig:
             max_text_seq_length=config.get("max_text_seq_length", 226),
             spatial_interpolation_scale=config.get("spatial_interpolation_scale", 1.875),
             temporal_interpolation_scale=config.get("temporal_interpolation_scale", 1.0),
+            use_learned_positional_embeddings=bool(
+                config.get("use_learned_positional_embeddings", False)
+            ),
             norm_eps=config.get("norm_eps", 1e-5),
             cross_attention_dim=text_dim,
         )

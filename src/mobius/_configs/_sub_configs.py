@@ -226,6 +226,11 @@ class AudioConfig:
     encoder_layers: int | None = None
     encoder_attention_heads: int | None = None
     encoder_ffn_dim: int | None = None
+    encoder_head_dim: int | None = None
+    encoder_num_key_value_heads: int | None = None
+    encoder_partial_rotary_factor: float | None = None
+    encoder_rope_theta: float | None = None
+    encoder_layer_norm_eps: float | None = None
     num_mel_bins: int | None = None
     max_source_positions: int | None = None
     downsample_hidden_size: int | None = None

@@ -11,6 +11,8 @@ MuP (maximal update parameterization) scaling.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
@@ -1277,6 +1279,15 @@ class Phi4MMMultiModalModel(nn.Module):
 
     default_task: str = "phi4mm-multimodal"
     category: str = "Multimodal"
+
+    # Runtime HF ``named_modules()`` sub-trees per ONNX component. The speech
+    # component's ModelPackage key is ``audio_encoder``.
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "vision_encoder": ("model.embed_tokens_extend.image_embed",),
+        "audio_encoder": ("model.embed_tokens_extend.audio_embed",),
+        "embedding": ("model.embed_tokens",),
+        "decoder": ("model.layers", "model.norm", "lm_head"),
+    }
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()

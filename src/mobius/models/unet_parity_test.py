@@ -18,6 +18,21 @@ import numpy as np
 import pytest
 
 
+def _run_onnx(model, *feeds):
+    import onnx_ir
+    import onnxruntime as ort
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        model_path = str(Path(temp_dir) / "model.onnx")
+        onnx_ir.save(model, model_path)
+        session = ort.InferenceSession(model_path)
+        try:
+            return [session.run(None, feed)[0] for feed in feeds]
+        finally:
+            # Windows keeps the model mapped until the session is released.
+            del session
+
+
 def _remap_transformer(state_dict: dict) -> dict:
     out = {}
     for key, value in state_dict.items():
@@ -32,7 +47,6 @@ def _remap_transformer(state_dict: dict) -> dict:
 def test_cross_attention_block_matches_diffusers():
     pytest.importorskip("diffusers")
     import onnx_ir
-    import onnxruntime as ort
     import torch
     from diffusers.models.transformers.transformer_2d import Transformer2DModel
 
@@ -64,19 +78,12 @@ def test_cross_attention_block_matches_diffusers():
     model = _make_model(graph)
     apply_weights(model, _remap_transformer(hf.state_dict()))
 
-    # Windows keeps the ORT model file mapped; ignore cleanup errors so the dir can be removed.
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
-        model_path = Path(temp_dir) / "model.onnx"
-        onnx_ir.save(model, model_path)
-        session = ort.InferenceSession(model_path)
-        actual = session.run(None, {"hidden": hidden.numpy(), "context": context.numpy()})[0]
+    (actual,) = _run_onnx(model, {"hidden": hidden.numpy(), "context": context.numpy()})
     assert np.abs(actual - expected).max() < 1e-4
 
 
 def test_unet_matches_diffusers():
     pytest.importorskip("diffusers")
-    import onnx_ir
-    import onnxruntime as ort
     import torch
     from diffusers import UNet2DConditionModel as HFUNet
 
@@ -118,19 +125,14 @@ def test_unet_matches_diffusers():
     model = DenoisingTask().build(module, config)["model"]
     apply_weights(model, module.preprocess_weights(dict(hf.state_dict())))
 
-    # Windows keeps the ORT model file mapped; ignore cleanup errors so the dir can be removed.
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
-        model_path = Path(temp_dir) / "model.onnx"
-        onnx_ir.save(model, model_path)
-        session = ort.InferenceSession(model_path)
-        actual = session.run(
-            None,
-            {
-                "sample": sample.numpy(),
-                "timestep": timestep.numpy().astype(np.int64),
-                "encoder_hidden_states": encoder_hidden_states.numpy(),
-            },
-        )[0]
+    (actual,) = _run_onnx(
+        model,
+        {
+            "sample": sample.numpy(),
+            "timestep": timestep.numpy().astype(np.float32),
+            "encoder_hidden_states": encoder_hidden_states.numpy(),
+        },
+    )
     assert np.abs(actual - expected).max() < 2e-4
 
 
@@ -143,8 +145,6 @@ def test_unet_sd1x_mixed_block_types_matches_diffusers():
     so cross-attention is present only where diffusers places it.
     """
     pytest.importorskip("diffusers")
-    import onnx_ir
-    import onnxruntime as ort
     import torch
     from diffusers import UNet2DConditionModel as HFUNet
 
@@ -190,19 +190,14 @@ def test_unet_sd1x_mixed_block_types_matches_diffusers():
     model = DenoisingTask().build(module, config)["model"]
     apply_weights(model, module.preprocess_weights(dict(hf.state_dict())))
 
-    # Windows keeps the ORT model file mapped; ignore cleanup errors so the dir can be removed.
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
-        model_path = Path(temp_dir) / "model.onnx"
-        onnx_ir.save(model, model_path)
-        session = ort.InferenceSession(model_path)
-        actual = session.run(
-            None,
-            {
-                "sample": sample.numpy(),
-                "timestep": timestep.numpy().astype(np.int64),
-                "encoder_hidden_states": encoder_hidden_states.numpy(),
-            },
-        )[0]
+    (actual,) = _run_onnx(
+        model,
+        {
+            "sample": sample.numpy(),
+            "timestep": timestep.numpy().astype(np.float32),
+            "encoder_hidden_states": encoder_hidden_states.numpy(),
+        },
+    )
     assert np.abs(actual - expected).max() < 2e-4
 
 
@@ -210,8 +205,6 @@ def test_unet_lora_gate_parity():
     """Runtime LoRA parity: gate=0 == diffusers base, gate=1 == diffusers+LoRA."""
     pytest.importorskip("diffusers")
     pytest.importorskip("peft")
-    import onnx_ir
-    import onnxruntime as ort
     import torch
     from diffusers import UNet2DConditionModel as HFUNet
     from diffusers.utils import convert_state_dict_to_diffusers
@@ -278,18 +271,16 @@ def test_unet_lora_gate_parity():
     weights.update(remap_diffusers_unet_lora(lora_state, "test"))
     apply_weights(model, weights)
 
-    # Windows keeps the ORT model file mapped; ignore cleanup errors so the dir can be removed.
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
-        model_path = Path(temp_dir) / "model.onnx"
-        onnx_ir.save(model, model_path)
-        session = ort.InferenceSession(model_path)
-        feed = {
-            "sample": sample.numpy(),
-            "timestep": timestep.numpy().astype(np.int64),
-            "encoder_hidden_states": encoder_hidden_states.numpy(),
-        }
-        off = session.run(None, {**feed, "lora_gate.test": np.array(0.0, dtype=np.float32)})[0]
-        on = session.run(None, {**feed, "lora_gate.test": np.array(1.0, dtype=np.float32)})[0]
+    feed = {
+        "sample": sample.numpy(),
+        "timestep": timestep.numpy().astype(np.float32),
+        "encoder_hidden_states": encoder_hidden_states.numpy(),
+    }
+    off, on = _run_onnx(
+        model,
+        {**feed, "lora_gate.test": np.array(0.0, dtype=np.float32)},
+        {**feed, "lora_gate.test": np.array(1.0, dtype=np.float32)},
+    )
 
     # gate=0 disables the adapter (base); gate=1 applies it (diffusers+LoRA).
     assert np.abs(off - base_out).max() < 2e-4, np.abs(off - base_out).max()

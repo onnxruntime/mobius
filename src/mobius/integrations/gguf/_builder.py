@@ -327,9 +327,9 @@ def build_from_gguf(
     if mmproj is not None:
         if static_cache:
             raise ValueError("static_cache=True is not supported with a companion mmproj.")
-        from mobius.integrations.gguf._mmproj import build_gemma4_vlm_from_gguf
+        from mobius.integrations.gguf._mmproj import build_vlm_from_gguf
 
-        return build_gemma4_vlm_from_gguf(
+        return build_vlm_from_gguf(
             gguf_path,
             mmproj,
             dtype=dtype,
@@ -881,35 +881,28 @@ def _reorder_deltanet_v_heads(state_dict: dict, config) -> dict:
         dtype=torch.long,
     )
 
-    def _expand(perm: "torch.Tensor", stride: int) -> "torch.Tensor":
+    def _expand(perm: torch.Tensor, stride: int) -> torch.Tensor:
         # Expand a per-head permutation into a per-row/-channel index.
         base = (perm * stride).unsqueeze(1) + torch.arange(stride)
         return base.reshape(-1)
 
     v_rows = _expand(head_perm, head_v_dim)  # length value_dim
 
-    def _index_dim0(t: "torch.Tensor", idx: "torch.Tensor") -> "torch.Tensor":
+    def _index_dim0(t: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
         return t.index_select(0, idx)
 
-    def _index_dim1(t: "torch.Tensor", idx: "torch.Tensor") -> "torch.Tensor":
-        return t.index_select(1, idx)
-
-    def _apply_rows(stem: str, idx: "torch.Tensor") -> None:
+    def _apply_rows(stem: str, idx: torch.Tensor) -> None:
         # Permute axis 0 of a float weight or a quantized triplet in place.
         for suffix in (".weight", ".scales", ".zero_points"):
             key = stem + suffix
             if key in state_dict:
                 state_dict[key] = _index_dim0(state_dict[key], idx)
 
-    def _apply_bare(key: str, idx: "torch.Tensor") -> None:
+    def _apply_bare(key: str, idx: torch.Tensor) -> None:
         if key in state_dict:
             state_dict[key] = _index_dim0(state_dict[key], idx)
 
-    layer_stems = {
-        k.rsplit(".", 1)[0]
-        for k in state_dict
-        if ".linear_attn." in k
-    }
+    layer_stems = {k.rsplit(".", 1)[0] for k in state_dict if ".linear_attn." in k}
     for stem in layer_stems:
         name = stem.rsplit(".", 1)[-1]
         if name == "in_proj_z":
@@ -926,7 +919,7 @@ def _reorder_deltanet_v_heads(state_dict: dict, config) -> dict:
 
     # Bare (non-".weight") linear_attn parameters.
     for k in list(state_dict):
-        if k.endswith(".linear_attn.A_log") or k.endswith(".linear_attn.dt_bias"):
+        if k.endswith((".linear_attn.A_log", ".linear_attn.dt_bias")):
             _apply_bare(k, head_perm)
         elif k.endswith(".linear_attn.conv1d.weight"):
             conv = state_dict[k]
@@ -938,9 +931,7 @@ def _reorder_deltanet_v_heads(state_dict: dict, config) -> dict:
     return state_dict
 
 
-def _reorder_out_proj_cols(
-    state_dict: dict, stem: str, head_perm, head_v_dim: int
-) -> None:
+def _reorder_out_proj_cols(state_dict: dict, stem: str, head_perm, head_v_dim: int) -> None:
     """Permute the quantized ``out_proj`` input (K) axis by V-head.
 
     ``out_proj`` maps ``value_dim -> hidden``; its input columns are the V
@@ -1042,10 +1033,17 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
     # Emit those zero_points explicitly: GatherBlockQuantized has diverging
     # CPU/CUDA defaults when the input is omitted, which corrupts embeddings
     # on CUDA before the first decoder layer runs.
+    # Whether the repacked form can omit zero points. Every entry here is a
+    # *repack target* property, not a source-format property: Q4_K and Q6_K both
+    # requantize through the asymmetric affine path, so both need zero points
+    # even though Q6_K's source form is symmetric around 32.
+    # Keep in sync with `_REPACK_PARAMS` in `_repacker.py` — a type that can be
+    # repacked but is missing here raises `KeyError` at build time.
     type_can_omit_zero_points: dict = {
         GGMLQuantizationType.Q4_0: False,
         GGMLQuantizationType.Q4_1: False,
         GGMLQuantizationType.Q4_K: False,
+        GGMLQuantizationType.Q6_K: False,
         GGMLQuantizationType.Q8_0: False,
         GGMLQuantizationType.Q1_0: False,
     }

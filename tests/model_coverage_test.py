@@ -144,6 +144,9 @@ def _all_registered_with_test_id() -> dict[str, str]:
 #
 _COVERAGE_SKIP: dict[str, str] = {
     # --- Specialized-test models (covered by a co-located test class) ---
+    "neo_chat": "SenseNova U1.5 is a 17.5B (~50 GB) five-component package; "
+    "L1-L3 use the tiny config and co-located tests, while pinned L4/L5 text, "
+    "image, and edit evidence requires the documented H200 validation.",
     "llada": "Masked-diffusion LM — covered by src/mobius/models/llada_test.py "
     "(graph build + diffusers-parity + bidirectionality); no small public "
     "checkpoint and non-standard I/O (no attention_mask/KV cache/golden data)",
@@ -190,6 +193,9 @@ _COVERAGE_SKIP: dict[str, str] = {
     "qwen3_vl": "VL model — requires image inputs",
     # --- Audio / speech models (require audio inputs) ---
     "data2vec-audio": "Audio model — requires audio inputs",
+    "fun_asr": "Golden YAML uses the upstream FunAudioLLM checkpoint, which lacks "
+    "config.json model_type metadata; L2 config validation uses the metadata-enabled "
+    "justinchuby mirror",
     "hubert": "Audio model — requires audio inputs",
     "musicgen": "Audio model — requires audio inputs",
     "seamless_m4t": "Audio model — requires audio inputs",

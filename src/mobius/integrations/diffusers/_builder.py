@@ -74,6 +74,10 @@ def _init_diffusers_class_map() -> None:
     from mobius.models.cogvideox import (
         CogVideoXTransformer3DModel,
     )
+    from mobius.models.cogvideox_vae import (
+        AutoencoderKLCogVideoXModel,
+        CogVideoXVAEConfig,
+    )
     from mobius.models.dit import DiTConfig, DiTTransformer2DModel
     from mobius.models.flux_sd3 import (
         FluxConfig,
@@ -94,7 +98,6 @@ def _init_diffusers_class_map() -> None:
     from mobius.models.qwen_vl import Qwen25VLCausalLMModel
     from mobius.models.unet import UNet2DConditionModel
     from mobius.models.vae import AutoencoderKLModel
-    from mobius.models.video_vae import VideoAutoencoderModel, VideoVAEConfig
 
     _DIFFUSERS_CLASS_MAP.update(
         {
@@ -128,9 +131,9 @@ def _init_diffusers_class_map() -> None:
                 "qwen-image-vae",
             ),
             "AutoencoderKLCogVideoX": (
-                VideoAutoencoderModel,
-                VideoVAEConfig,
-                "vae",
+                AutoencoderKLCogVideoXModel,
+                CogVideoXVAEConfig,
+                "video-vae",
             ),
             "CogVideoXTransformer3DModel": (
                 CogVideoXTransformer3DModel,

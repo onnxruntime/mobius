@@ -12,7 +12,7 @@ from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import FCMLP
-from mobius.components._common import Embedding, LayerNorm
+from mobius.components._common import Embedding, LayerNorm, create_padding_mask
 from mobius.components._encoder import EncoderAttention
 
 if TYPE_CHECKING:
@@ -61,9 +61,20 @@ class _DistilBertEncoderLayer(nn.Module):
         )
         self.output_layer_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, op: OpBuilder, hidden_states: ir.Value):
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        attention_mask: ir.Value | None = None,
+    ):
+        """One encoder block.
+
+        ``attention_mask`` is the 4D bool padding mask ``(batch, 1, seq, seq)``
+        prepared once per forward by :meth:`DistilBertModel.forward`, not the
+        raw rank-2 request mask.
+        """
         # Self-attention with post-norm
-        attn_output = self.attention(op, hidden_states)
+        attn_output = self.attention(op, hidden_states, attention_mask)
         hidden_states = self.sa_layer_norm(op, op.Add(hidden_states, attn_output))
 
         # FFN with post-norm
@@ -98,7 +109,13 @@ class DistilBertModel(nn.Module):
         token_type_ids: ir.Value | None = None,
     ):
         hidden_states = self.embeddings(op, input_ids)
-        hidden_states = self.transformer(op, hidden_states)
+        # Build the 4D bool padding mask once and share it across layers: the
+        # raw rank-2 request mask is INT64 and does not broadcast to
+        # ``(batch, heads, q, kv)``, so feeding it to ``op.Attention`` fails
+        # outright for batch > 1 and adds a 0/1 bias -- not a mask -- at
+        # batch 1.
+        padding_mask = create_padding_mask(op, input_ids, attention_mask)
+        hidden_states = self.transformer(op, hidden_states, padding_mask)
         return hidden_states
 
     def preprocess_weights(
@@ -121,9 +138,14 @@ class _DistilBertEncoder(nn.Module):
             [_DistilBertEncoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
 
-    def forward(self, op: OpBuilder, hidden_states: ir.Value):
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        attention_mask: ir.Value | None = None,
+    ):
         for layer in self.layer:
-            hidden_states = layer(op, hidden_states)
+            hidden_states = layer(op, hidden_states, attention_mask)
         return hidden_states
 
 

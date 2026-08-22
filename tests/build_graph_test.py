@@ -846,6 +846,76 @@ class TestBuildGraphQuantized:
         expected = 1 * self.NUM_PROJECTIONS_PER_LAYER
         assert len(matmulnbits) == expected
 
+    def _shared_moe_config(self, model_type, quantization=None):
+        overrides = dict(
+            num_hidden_layers=1,
+            num_local_experts=8,
+            num_experts_per_tok=2,
+            moe_intermediate_size=32,
+            intermediate_size=32,
+            shared_expert_intermediate_size=32,
+            hidden_size=64,
+        )
+        if quantization is not None:
+            overrides["quantization"] = quantization
+        return _base_config(**overrides)
+
+    def test_qwen2_moe_int4_quantizes_shared_expert(self):
+        """int4 Qwen2-MoE builds shared-expert projections as MatMulNBits (mobius#513).
+
+        The GPTQ Qwen1.5-MoE-A2.7B-Int4 checkpoint quantizes
+        ``mlp.shared_expert.{gate,up,down}_proj`` (they appear in
+        ``modules_in_block_to_quantize``). Before the fix ``Qwen2MoEDecoderLayer``
+        built ``Qwen2MoELayer`` without a ``linear_class``, so the shared expert was
+        a dense ``MLP`` whose ``Linear`` layers expected an unpacked ``[hidden,inter]``
+        weight and failed to load the packed GPTQ tensor. The shared-expert MLP must
+        use the quantization-aware factory (three MatMulNBits: gate/up/down), while
+        the tiny ``shared_expert_gate`` (hidden -> 1) stays dense.
+        """
+        from mobius._configs import QuantizationConfig
+
+        qc = QuantizationConfig(bits=4, group_size=32, quant_method="gptq", sym=False)
+        module = registry.get("qwen2_moe")(self._shared_moe_config("qwen2_moe", qc))
+        layer = module.model.layers[0]
+        # Attention projections must also use the quantized factory: the MoE
+        # decoder path previously built dense Attention, so a GPTQ checkpoint's
+        # packed self_attn weights could not load (mobius#513).
+        assert type(layer.self_attn.q_proj).__name__ == "QuantizedLinear"
+        assert type(layer.mlp.shared_expert.gate_proj).__name__ == "QuantizedLinear"
+        assert type(layer.mlp.shared_expert.up_proj).__name__ == "QuantizedLinear"
+        assert type(layer.mlp.shared_expert.down_proj).__name__ == "QuantizedLinear"
+        # Routing projection stays dense (excluded from quantization in the source).
+        assert type(layer.mlp.shared_expert_gate).__name__ == "Linear"
+
+        pkg = CausalLMTask().build(module, module.config)
+        model = pkg["model"]
+        qmoe = [n for n in model.graph if n.op_type == "QMoE"]
+        nbits = [n for n in model.graph if n.op_type == "MatMulNBits"]
+        assert len(qmoe) == 1, f"routed experts must fuse to one QMoE, got {len(qmoe)}"
+        assert len(nbits) >= 3, (
+            f"shared expert must emit >=3 MatMulNBits (gate/up/down), got {len(nbits)}"
+        )
+
+    def test_qwen2_moe_dense_shared_expert_stays_linear(self):
+        """Without quantization the Qwen2-MoE shared expert stays a dense MLP."""
+        module = registry.get("qwen2_moe")(self._shared_moe_config("qwen2_moe"))
+        layer = module.model.layers[0]
+        assert type(layer.mlp.shared_expert.down_proj).__name__ == "Linear"
+        assert type(layer.mlp.shared_expert_gate).__name__ == "Linear"
+
+    def test_glm4_moe_int4_quantizes_shared_expert(self):
+        """int4 GLM4-MoE (ungated shared expert) quantizes its shared expert too.
+
+        Same mobius#513 class of bug in ``UngatedSharedMoELayer`` (Ernie4.5 / GLM4),
+        which built the shared expert with a dense ``MLP`` regardless of quantization.
+        """
+        from mobius._configs import QuantizationConfig
+
+        qc = QuantizationConfig(bits=4, group_size=32, quant_method="gptq", sym=False)
+        module = registry.get("glm4_moe")(self._shared_moe_config("glm4_moe", qc))
+        layer = module.model.layers[0]
+        assert type(layer.mlp.shared_expert.down_proj).__name__ == "QuantizedLinear"
+
 
 class TestBuildGraphVisionLanguage:
     """Verify multimodal models build correctly."""
@@ -3042,6 +3112,190 @@ class TestBuildGraphMoonshine:
         assert "Sigmoid" not in decoder_ops
 
 
+class TestBuildGraphGlmAsr:
+    """Verify GLM-ASR's audio encoder, projector, embedding, and decoder split."""
+
+    def _config(self):
+        from mobius._configs import GlmAsrConfig
+
+        return _base_config(
+            _config_cls=GlmAsrConfig,
+            audio_token_id=100,
+            audio=AudioConfig(
+                d_model=64,
+                encoder_layers=2,
+                encoder_attention_heads=4,
+                encoder_ffn_dim=256,
+                encoder_head_dim=16,
+                encoder_num_key_value_heads=4,
+                encoder_partial_rotary_factor=0.5,
+                encoder_rope_theta=10_000.0,
+                encoder_layer_norm_eps=1e-5,
+                num_mel_bins=128,
+                max_source_positions=256,
+                output_dim=64,
+                activation_function="gelu",
+                audio_token_id=100,
+            ),
+        )
+
+    def _build(self):
+        from mobius.models.glm_asr import GlmAsrForConditionalGeneration
+        from mobius.tasks import GlmAsrSpeechLanguageTask
+
+        config = self._config()
+        module = GlmAsrForConditionalGeneration(config)
+        return (
+            config,
+            module,
+            build_from_module(module, config, task=GlmAsrSpeechLanguageTask()),
+        )
+
+    def test_package_contract_and_attention(self):
+        config, _, pkg = self._build()
+
+        assert set(pkg) == {"audio_encoder", "embedding", "decoder"}
+        audio = pkg["audio_encoder"]
+        assert {value.name for value in audio.graph.inputs} == {
+            "input_features",
+            "input_features_mask",
+        }
+        assert {value.name for value in audio.graph.outputs} == {
+            "audio_features",
+            "audio_feature_lengths",
+        }
+        attention_nodes = [node for node in audio.graph if node.op_type == "Attention"]
+        assert len(attention_nodes) == config.audio.encoder_layers
+        assert all(node.attributes["is_causal"].value == 0 for node in attention_nodes)
+        assert all(len(node.inputs) == 3 or node.inputs[3] is None for node in attention_nodes)
+        assert all(len(node.outputs) == 1 for node in attention_nodes)
+
+        decoder_inputs = {value.name for value in pkg["decoder"].graph.inputs}
+        assert {"inputs_embeds", "attention_mask", "position_ids"} <= decoder_inputs
+        assert "past_key_values.0.key" in decoder_inputs
+        assert "past_key_values.0.value" in decoder_inputs
+
+    def test_configured_audio_and_projector_activations(self):
+        from mobius.models.glm_asr import GlmAsrForConditionalGeneration
+        from mobius.tasks import GlmAsrSpeechLanguageTask
+
+        config = self._config()
+        assert config.audio is not None
+        config.audio.activation_function = "relu"
+        config.projector_hidden_act = "silu"
+        package = build_from_module(
+            GlmAsrForConditionalGeneration(config),
+            config,
+            task=GlmAsrSpeechLanguageTask(),
+        )
+
+        audio_ops = [node.op_type for node in package["audio_encoder"].graph]
+        assert audio_ops.count("Relu") == config.audio.encoder_layers
+        assert audio_ops.count("Swish") == 1
+
+    def test_checkpoint_weight_routing(self):
+        import torch
+
+        _, module, _ = self._build()
+        tensor = torch.ones(1)
+        routed = module.preprocess_weights(
+            {
+                "audio_tower.conv1.weight": tensor,
+                "multi_modal_projector.linear_1.weight": tensor,
+                "language_model.model.embed_tokens.weight": tensor,
+                "language_model.model.layers.0.self_attn.q_proj.weight": tensor,
+                "language_model.model.norm.weight": tensor,
+                "language_model.lm_head.weight": tensor,
+            }
+        )
+
+        assert set(routed) == {
+            "audio_encoder.audio_tower.conv1.weight",
+            "audio_encoder.multi_modal_projector.linear_1.weight",
+            "embedding.embed_tokens.weight",
+            "decoder.layers.0.self_attn.q_proj.weight",
+            "decoder.norm.weight",
+            "decoder.lm_head.weight",
+        }
+
+    def test_cuda_build_preserves_standard_decoder_attention(self):
+        from mobius.models.glm_asr import GlmAsrForConditionalGeneration
+        from mobius.tasks import GlmAsrSpeechLanguageTask
+
+        config = self._config()
+        config.dtype = ir.DataType.FLOAT16
+        package = build_from_module(
+            GlmAsrForConditionalGeneration(config),
+            config,
+            task=GlmAsrSpeechLanguageTask(),
+            execution_provider="cuda",
+        )
+        decoder_ops = [node.op_type for node in package["decoder"].graph]
+        assert decoder_ops.count("Attention") == config.num_hidden_layers
+        assert "GroupQueryAttention" not in decoder_ops
+
+    def test_three_stage_pipeline_runs_with_ort(self):
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.rewrite_rules._testing_utils import fill_random_weights
+
+        config, _, pkg = self._build()
+        for model in pkg.values():
+            fill_random_weights(model)
+
+        mel_sequence = 32
+        audio_session = OnnxModelSession(pkg["audio_encoder"])
+        audio_outputs = audio_session.run(
+            {
+                "input_features": np.random.default_rng(0)
+                .standard_normal((1, 128, mel_sequence))
+                .astype(np.float32),
+                "input_features_mask": np.ones((1, mel_sequence), dtype=np.int64),
+            }
+        )
+        audio_session.close()
+        assert audio_outputs["audio_feature_lengths"].tolist() == [4]
+        audio_features = audio_outputs["audio_features"].reshape(-1, config.hidden_size)
+
+        input_ids = np.array(
+            [[1, 2, *([config.audio_token_id] * audio_features.shape[0]), 3]],
+            dtype=np.int64,
+        )
+        embedding_session = OnnxModelSession(pkg["embedding"])
+        inputs_embeds = embedding_session.run(
+            {"input_ids": input_ids, "audio_features": audio_features}
+        )["inputs_embeds"]
+        embedding_session.close()
+
+        sequence_length = input_ids.shape[1]
+        decoder_inputs = {
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": np.ones_like(input_ids),
+            "position_ids": np.arange(sequence_length, dtype=np.int64)[None, :],
+        }
+        for layer in range(config.num_hidden_layers):
+            for cache_kind in ("key", "value"):
+                decoder_inputs[f"past_key_values.{layer}.{cache_kind}"] = np.zeros(
+                    (1, config.num_key_value_heads, 0, config.head_dim),
+                    dtype=np.float32,
+                )
+        decoder_session = OnnxModelSession(pkg["decoder"])
+        decoder_outputs = decoder_session.run(decoder_inputs)
+        decoder_session.close()
+
+        assert decoder_outputs["logits"].shape == (
+            1,
+            sequence_length,
+            config.vocab_size,
+        )
+        assert decoder_outputs["present.0.key"].shape[2] == sequence_length
+
+    def test_registry_lookup(self):
+        from mobius.models.glm_asr import GlmAsrForConditionalGeneration
+
+        assert registry.get("glmasr") is GlmAsrForConditionalGeneration
+        assert _default_task_for_model("glmasr") == "glmasr-speech-language"
+
+
 class TestBuildGraphQwen3ASR:
     """Verify Qwen3-ASR 3-model split with SpeechLanguageTask."""
 
@@ -4205,6 +4459,77 @@ class TestBuildCogVideoXGraph:
         assert len(sample_input.shape) == 5  # [B, T, C, H, W]
 
 
+class TestBuildCogVideoXVAEGraph:
+    """Verify the CogVideoX causal 3D VAE decoder graph construction."""
+
+    @staticmethod
+    def _config():
+        from mobius.models.cogvideox_vae import CogVideoXVAEConfig
+
+        return CogVideoXVAEConfig(
+            in_channels=3,
+            out_channels=3,
+            latent_channels=4,
+            block_out_channels=(8, 8, 8, 8),
+            layers_per_block=1,
+            norm_num_groups=2,
+            temporal_compression_ratio=4,
+            scaling_factor=1.15258426,
+        )
+
+    def test_video_vae_graph_builds_with_paired_conv_caches(self):
+        from mobius.models.cogvideox_vae import AutoencoderKLCogVideoXModel
+        from mobius.tasks import VideoVAETask
+        from mobius.tasks._video_vae import (
+            CONV_CACHE_INPUT_PREFIX,
+            CONV_CACHE_OUTPUT_PREFIX,
+            CONV_CACHE_SCALE_METADATA,
+        )
+
+        config = self._config()
+        model = VideoVAETask().build(AutoencoderKLCogVideoXModel(config), config)["decoder"]
+
+        assert model.graph is not None
+        latent = next(v for v in model.graph.inputs if v.name == "latent_sample")
+        # [B, C, T, H, W]: the temporal axis is explicit, and the frame count is
+        # a free dimension rather than a baked clip length.
+        assert len(latent.shape) == 5
+        assert str(latent.shape[2]) == "latent_frames"
+
+        sample = next(v for v in model.graph.outputs if v.name == "sample")
+        assert len(sample.shape) == 5
+        assert int(sample.shape[1]) == config.out_channels
+
+        cache_inputs = {
+            v.name[len(CONV_CACHE_INPUT_PREFIX) :]
+            for v in model.graph.inputs
+            if v.name.startswith(CONV_CACHE_INPUT_PREFIX)
+        }
+        cache_outputs = {
+            v.name[len(CONV_CACHE_OUTPUT_PREFIX) :]
+            for v in model.graph.outputs
+            if v.name.startswith(CONV_CACHE_OUTPUT_PREFIX)
+        }
+        # Every cached convolution has to be readable and writable, or a clip
+        # decoded in chunks would silently lose the frames before each chunk.
+        assert cache_inputs
+        assert cache_inputs == cache_outputs
+        for name in cache_inputs:
+            key = f"{CONV_CACHE_SCALE_METADATA}{CONV_CACHE_INPUT_PREFIX}{name}"
+            assert key in model.metadata_props
+
+    def test_video_vae_cache_spec_matches_upsampled_resolutions(self):
+        from mobius.models.cogvideox_vae import AutoencoderKLCogVideoXModel
+
+        config = self._config()
+        module = AutoencoderKLCogVideoXModel(config)
+        scales = {entry.name: entry.spatial_scale for entry in module.conv_cache_spec()}
+        assert scales["conv_in"] == 1
+        # Three upsampling stages for four blocks, so the last cached
+        # convolutions live at the full frame resolution.
+        assert scales["conv_out"] == 2 ** (len(config.block_out_channels) - 1)
+
+
 class TestBuildAdapterGraph:
     """Verify T2I-Adapter and IP-Adapter graph construction."""
 
@@ -5340,6 +5665,10 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "llava_onevision",
     "mistral3",
     "molmo",
+    # SenseNova-U1.5 NEO-unify (co-located src/mobius/models/sensenova_u1_test.py):
+    # a unified any-to-any package whose five components include an
+    # image-generation branch, so it does not fit the generic VLM harness.
+    "neo_chat",
     "ovis2",
     "paligemma",
     "pixtral",

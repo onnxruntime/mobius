@@ -25,14 +25,14 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
 import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
-from mobius._build_context import ep_capabilities
+from mobius._build_context import ep_capabilities, is_prefill_prefix_pruning_enabled
 from mobius._configs import ArchitectureConfig, Gemma4Config
 from mobius._weight_utils import vlm_decoder_weights, vlm_embedding_weights
 from mobius.components import (
@@ -99,6 +99,39 @@ def _split_per_layer_projection_weight(
 def _typed_scalar_constant(op: OpBuilder, value: float, dtype: ir.DataType) -> ir.Value:
     """Create a scalar constant directly in the model compute dtype."""
     return op.Constant(value=ir.tensor(np.asarray(value, dtype=dtype.numpy())))
+
+
+def _retain_last_position_embedding(
+    op: OpBuilder, position_embeddings: tuple[ir.Value, ir.Value] | None
+) -> tuple[ir.Value, ir.Value] | None:
+    """Narrow a RoPE ``(cos, sin)`` pair to its final sequence position.
+
+    Both caches are ``[B, S, rot_dim]`` and are indexed by query position, so
+    they must shrink in lockstep with the hidden states when prefill-prefix
+    pruning drops every position but the last.  ``RotaryEmbedding`` requires
+    the cache sequence length to equal the query sequence length exactly.
+    """
+    if position_embeddings is None:
+        return None
+    narrowed = []
+    for cache in position_embeddings:
+        # (B, S, rot_dim) -> gather last position -> (B, rot_dim) -> (B, 1, rot_dim)
+        last = op.Gather(cache, op.Constant(value_int=-1), axis=1)
+        narrowed.append(op.Unsqueeze(last, op.Constant(value_ints=[1])))
+    return (narrowed[0], narrowed[1])
+
+
+def _retain_last_bias_query_row(op: OpBuilder, bias: ir.Value | None) -> ir.Value | None:
+    """Narrow a ``[B, 1, S_q, S_kv]`` additive attention bias to its last query row.
+
+    The key axis is left untouched: a pruned query still attends over the whole
+    key/value prefix, it just contributes a single query row.
+    """
+    if bias is None:
+        return None
+    # (B, 1, S_q, S_kv) -> gather last query row -> (B, 1, S_kv) -> (B, 1, 1, S_kv)
+    last = op.Gather(bias, op.Constant(value_int=-1), axis=2)
+    return op.Unsqueeze(last, op.Constant(value_ints=[2]))
 
 
 def _text_quantization_config(config: Gemma4Config):
@@ -953,8 +986,15 @@ class Gemma4TextAttention(nn.Module):
             # ``o_proj``'s MatMul fail shape inference at model-load time. The
             # source shares the same KV-head/head-dim configuration as this
             # layer, so pin the known 4D BNSH shape to restore inference.
+            #
+            # Only an UNKNOWN shape may be pinned. A static-cache source hands
+            # over its rank-3 ``[batch, capacity, kv_heads * head_dim]`` scatter
+            # buffer, which is fully known; overwriting that with a 4D BNSH
+            # guess both mislabels the graph's declared cache output and defeats
+            # the rank-3 test below, which would then transpose a rank-3 tensor
+            # as if it were BNSH.
             for _kv in (src_key, src_value):
-                if _kv.shape is None or len(_kv.shape) != 4:
+                if _kv.shape is None:
                     _kv.shape = ir.Shape(
                         [
                             "batch",
@@ -2210,6 +2250,30 @@ class Gemma4TextModel(nn.Module):
         ):
             if i == self._first_kv_shared_layer and i < len(self.layers):
                 hidden_states = _retain_last_sequence_token(op, hidden_states)
+                if is_prefill_prefix_pruning_enabled():
+                    # The stack has just narrowed to a single query position.
+                    # Every per-layer tensor indexed by query position must
+                    # narrow with it or the KV-shared layers receive an S-row
+                    # RoPE cache / attention bias for a 1-row query.  The GQA
+                    # path is exempt: GroupQueryAttention derives its rotary
+                    # offset from total_seq_len - q_len and takes a full-length
+                    # cos/sin cache, so it already handles the narrowed query.
+                    shared_pos_dict = fallback_pos_dict is position_embeddings_dict
+                    position_embeddings_dict = {
+                        key: _retain_last_position_embedding(op, value)
+                        for key, value in position_embeddings_dict.items()
+                    }
+                    if shared_pos_dict:
+                        fallback_pos_dict = position_embeddings_dict
+                    else:
+                        fallback_pos_dict = {
+                            key: _retain_last_position_embedding(op, value)
+                            for key, value in fallback_pos_dict.items()
+                        }
+                    fallback_bias_dict = {
+                        key: _retain_last_bias_query_row(op, value)
+                        for key, value in fallback_bias_dict.items()
+                    }
             per_layer_input = per_layer_list[i] if per_layer_list is not None else None
 
             # Per-layer cache/attention dispatch:
@@ -3022,11 +3086,11 @@ class Gemma4Model(nn.Module):
 
     Always produced:
     - ``decoder``: Gemma4 text decoder taking ``inputs_embeds``
-    - ``vision``: SigLIP-style encoder + projector
+    - ``vision_encoder``: SigLIP-style encoder + projector
     - ``embedding``: scaled word embedding + multimodal feature fusion
 
     Added when ``config.audio is not None``:
-    - ``speech``: Conformer audio encoder + projection to text hidden size
+    - ``audio_encoder``: Conformer audio encoder + projection to text hidden size
 
     Covers all Gemma4 variants:
     - Vision-language (26B-A4B, 31B): ``audio=None``
@@ -3037,6 +3101,24 @@ class Gemma4Model(nn.Module):
 
     default_task: str = "gemma4"
     category: str = "Multimodal"
+
+    # Runtime HF ``named_modules()`` sub-trees per ONNX component.
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": (
+            "model.language_model.layers",
+            "model.language_model.norm",
+            "model.language_model.rotary_emb",
+            "lm_head",
+        ),
+        "vision_encoder": ("model.vision_tower", "model.embed_vision"),
+        "audio_encoder": ("model.audio_tower", "model.embed_audio"),
+        "embedding": (
+            "model.language_model.embed_tokens",
+            "model.language_model.embed_tokens_per_layer",
+            "model.language_model.per_layer_model_projection",
+            "model.language_model.per_layer_projection_norm",
+        ),
+    }
 
     def __init__(self, config: Gemma4Config):
         super().__init__()
@@ -3251,6 +3333,19 @@ class Gemma4UnifiedModel(nn.Module):
 
     default_task: str = "gemma4-unified"
     category: str = "Multimodal"
+
+    # Runtime HF sub-trees for the encoder-free unified layout.
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": (
+            "model.language_model.layers",
+            "model.language_model.norm",
+            "model.language_model.rotary_emb",
+            "lm_head",
+        ),
+        "vision_encoder": ("model.vision_embedder", "model.embed_vision"),
+        "audio_encoder": ("model.embed_audio",),
+        "embedding": ("model.language_model.embed_tokens",),
+    }
 
     def __init__(self, config: Gemma4Config):
         super().__init__()

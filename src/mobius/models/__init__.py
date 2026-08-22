@@ -20,7 +20,9 @@ __all__ = [
     "FusedGateUpCausalLMModel",
     "ChatGLMCausalLMModel",
     "CodeGenCausalLMModel",
+    "AutoencoderKLCogVideoXModel",
     "CogVideoXTransformer3DModel",
+    "CogVideoXVAEConfig",
     "CohereCausalLMModel",
     "ControlNetModel",
     "Cosmos3EdgeTextModel",
@@ -34,6 +36,8 @@ __all__ = [
     "DiTTransformer2DModel",
     "DiffLlamaCausalLMModel",
     "DistilBertModel",
+    "EsmConfig",
+    "EsmModel",
     "DogeCausalLMModel",
     "EncDecRNNTModel",
     "Ernie45MoECausalLMModel",
@@ -58,6 +62,7 @@ __all__ = [
     "Gemma4UnifiedModel",
     "GemmaCausalLMModel",
     "Glm4CausalLMModel",
+    "GlmAsrForConditionalGeneration",
     "Glm4MoECausalLMModel",
     "GlmCausalLMModel",
     "GraniteCausalLMModel",
@@ -78,6 +83,7 @@ __all__ = [
     "LLaVAModel",
     "LayerNormCausalLMModel",
     "Lfm2CausalLMModel",
+    "Lfm2VlForConditionalGeneration",
     "LongcatFlashCausalLMModel",
     "MPTCausalLMModel",
     "Mamba2CausalLMModel",
@@ -131,6 +137,7 @@ __all__ = [
     "Qwen3ASRForConditionalGeneration",
     "Qwen3CausalLMModel",
     "Qwen3NextCausalLMModel",
+    "SenseNovaU1Model",
     "SenseVoiceSmallModel",
     "SortformerConfig",
     "SortformerDiarizationModel",
@@ -186,6 +193,10 @@ from mobius.models.blip2 import Blip2Model
 from mobius.models.chatglm import ChatGLMCausalLMModel
 from mobius.models.clip import CLIPVisionModel, SigLIPVisionModel
 from mobius.models.cogvideox import CogVideoXTransformer3DModel
+from mobius.models.cogvideox_vae import (
+    AutoencoderKLCogVideoXModel,
+    CogVideoXVAEConfig,
+)
 from mobius.models.cohere import CohereCausalLMModel
 from mobius.models.controlnet import ControlNetModel
 from mobius.models.cosmos import Cosmos3EdgeTextModel, Cosmos3EdgeVLModel
@@ -201,6 +212,7 @@ from mobius.models.dit import DiTTransformer2DModel
 from mobius.models.doge import DogeCausalLMModel
 from mobius.models.eagle3 import Eagle3DraftModel
 from mobius.models.ernie import ErnieCausalLMModel
+from mobius.models.esm import EsmConfig, EsmModel
 from mobius.models.exaone4 import ExaOne4CausalLMModel
 from mobius.models.falcon import (
     BloomCausalLMModel,
@@ -220,6 +232,7 @@ from mobius.models.gemma4 import (
 )
 from mobius.models.gemma4_assistant import Gemma4AssistantCausalLMModel
 from mobius.models.glm import Glm4CausalLMModel, GlmCausalLMModel
+from mobius.models.glm_asr import GlmAsrForConditionalGeneration
 from mobius.models.gpt2 import GPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
 from mobius.models.gptj_codegen import CodeGenCausalLMModel, GPTJCausalLMModel
@@ -234,6 +247,7 @@ from mobius.models.internvl import InternVL2Model
 from mobius.models.jamba import JambaCausalLMModel
 from mobius.models.jetmoe import JetMoeCausalLMModel
 from mobius.models.lfm2 import Lfm2CausalLMModel
+from mobius.models.lfm2_vl import Lfm2VlForConditionalGeneration
 from mobius.models.llada import LLaDAModel
 from mobius.models.llama4 import Llama4CausalLMModel
 from mobius.models.llava import LLaVAModel
@@ -333,6 +347,7 @@ from mobius.models.qwen_vl import (
     Qwen25VLTextModel,
     Qwen25VLVisionEncoderModel,
 )
+from mobius.models.sensenova_u1 import SenseNovaU1Model
 from mobius.models.sensevoice_small import SenseVoiceSmallModel
 from mobius.models.smollm import SmolLM3CausalLMModel
 from mobius.models.sortformer import SortformerConfig, SortformerDiarizationModel

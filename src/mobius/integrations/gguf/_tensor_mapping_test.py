@@ -102,13 +102,20 @@ class TestMapGGUFToHFNames:
     # ---- Gemma family ----
 
     def test_gemma2_extras(self) -> None:
+        # Gemma2 GGUF uses the llama.cpp Gemma tensor names (like Gemma3/4):
+        # ffn_norm is the pre-feedforward norm, post_ffw_norm the post-
+        # feedforward norm, post_attention_norm the post-attention sandwich norm.
         assert (
-            map_gguf_to_hf_names("blk.0.pre_ffn_norm.weight", "gemma2")
+            map_gguf_to_hf_names("blk.0.ffn_norm.weight", "gemma2")
             == "model.layers.0.pre_feedforward_layernorm.weight"
         )
         assert (
-            map_gguf_to_hf_names("blk.0.post_ffn_norm.weight", "gemma2")
+            map_gguf_to_hf_names("blk.0.post_ffw_norm.weight", "gemma2")
             == "model.layers.0.post_feedforward_layernorm.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("blk.0.post_attention_norm.weight", "gemma2")
+            == "model.layers.0.post_attention_layernorm.weight"
         )
 
     def test_gemma2_inherits_llama_base(self) -> None:
@@ -356,3 +363,47 @@ class TestBuildGGUFToHFMap:
 
     def test_empty_input(self) -> None:
         assert build_gguf_to_hf_map([], "llama") == {}
+
+
+class TestMuseGlimmerMapping:
+    """Tests for the Muse Glimmer GGUF tensor names."""
+
+    def test_projections_and_gate(self) -> None:
+        expected = {
+            "token_embd.weight": "model.embed_tokens.weight",
+            "output.weight": "lm_head.weight",
+            "output_norm.weight": "model.norm.weight",
+            "blk.3.attn_q.weight": "model.layers.3.self_attn.q_proj.weight",
+            "blk.3.attn_output.weight": "model.layers.3.self_attn.o_proj.weight",
+            "blk.3.attn_gate.weight": "model.layers.3.self_attn.gate_proj.weight",
+            "blk.3.ffn_down.weight": "model.layers.3.mlp.down_proj.weight",
+        }
+        for source, target in expected.items():
+            assert map_gguf_to_hf_names(source, "muse-glimmer") == target
+
+    def test_four_block_norms(self) -> None:
+        # ffn_norm is the *pre*-feedforward norm here, not the post-attention
+        # norm it maps to in the Llama base mapping.
+        expected = {
+            "blk.7.attn_norm.weight": "model.layers.7.input_layernorm.weight",
+            "blk.7.post_attention_norm.weight": (
+                "model.layers.7.post_attention_layernorm.weight"
+            ),
+            "blk.7.ffn_norm.weight": ("model.layers.7.pre_feedforward_layernorm.weight"),
+            "blk.7.post_ffw_norm.weight": ("model.layers.7.post_feedforward_layernorm.weight"),
+        }
+        for source, target in expected.items():
+            assert map_gguf_to_hf_names(source, "muse-glimmer") == target
+
+    def test_qk_norms_are_dropped(self) -> None:
+        # Muse Glimmer's QK normalization is scale-free: the HF checkpoint has
+        # no q_norm/k_norm parameters, so these llama.cpp-only tensors have no
+        # target. The scale they encode is recovered by the config mapping.
+        assert map_gguf_to_hf_names("blk.0.attn_q_norm.weight", "muse-glimmer") is None
+        assert map_gguf_to_hf_names("blk.0.attn_k_norm.weight", "muse-glimmer") is None
+
+    def test_underscore_spelling_is_accepted(self) -> None:
+        assert (
+            map_gguf_to_hf_names("blk.1.attn_gate.weight", "muse_glimmer")
+            == "model.layers.1.self_attn.gate_proj.weight"
+        )

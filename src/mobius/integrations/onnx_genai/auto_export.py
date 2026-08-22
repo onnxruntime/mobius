@@ -12,48 +12,201 @@ iterative pipeline. This is the onnx-genai analogue of
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any
 
-import yaml
+import numpy as np
+import onnx_ir as ir
 
-from mobius.integrations.onnx_genai.decoder_metadata import (
-    decoder_metadata_from_config,
-    write_decoder_metadata,
-)
 from mobius.integrations.onnx_genai.inference_metadata import (
+    _TEXT_RUNTIME_ASSET_NAMES,
     SchedulerConfig,
-    add_explicit_package_io,
+    _copy_runtime_assets,
     load_diffusers_scheduler_config,
-    write_audio_codec_pipeline_metadata,
-    write_diffusion_pipeline_metadata,
-    write_multimodal_pipeline_metadata,
-    write_speech_to_text_pipeline_metadata,
-    write_tts_pipeline_metadata,
+    load_diffusers_vae_scaling_factor,
+)
+from mobius.integrations.onnx_genai.shared_state_flow_metadata import (
+    is_shared_state_pixel_flow_package,
+    write_shared_state_pixel_flow_workflow_metadata,
+)
+from mobius.integrations.onnx_genai.workflow_metadata import (
+    write_audio_codec_workflow_metadata,
+    write_ctc_asr_workflow_metadata,
+    write_decoder_workflow_metadata,
+    write_diffusion_workflow_metadata,
+    write_encoder_embedding_workflow_metadata,
+    write_image_edit_workflow_metadata,
+    write_language_diffusion_workflow_metadata,
+    write_speculative_workflow_metadata,
+    write_speech_to_text_workflow_metadata,
+    write_tts_workflow_metadata,
+    write_vlm_workflow_metadata,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
+
+#: Scheduler kind -> (workflow solver component, whether the sampler rescales
+#: the denoiser's input). A sampler that keeps its state variance-preserving
+#: feeds the raw state to the denoiser and starts from unit-variance noise; a
+#: sampler that carries state in sigma space divides by ``sqrt(sigma**2 + 1)``
+#: and starts from ``sigma_max`` scaled noise.
+_DIFFUSION_SOLVERS: dict[str, tuple[str, bool]] = {
+    "euler": ("euler", True),
+    "dpmpp_2m": ("multistep", False),
+}
+
+
+def _diffusion_schedule(
+    scheduler: SchedulerConfig, num_inference_steps: int
+) -> tuple[list[float], list[float]]:
+    """Materialize diffusers-compatible timesteps and sigma values."""
+    if scheduler.kind not in _DIFFUSION_SOLVERS or scheduler.prediction_type != "epsilon":
+        raise ValueError(
+            "workflow diffusion currently supports deterministic epsilon schedulers "
+            f"{sorted(_DIFFUSION_SOLVERS)}, got kind={scheduler.kind!r}, "
+            f"prediction_type={scheduler.prediction_type!r}"
+        )
+    if scheduler.kind == "dpmpp_2m" and (
+        scheduler.algorithm_type != "dpmsolver++"
+        or scheduler.solver_order != 2
+        or scheduler.solver_type != "midpoint"
+        or not scheduler.lower_order_final
+        or scheduler.final_sigmas_type != "zero"
+    ):
+        raise ValueError(
+            "the workflow multistep solver implements second-order dpmsolver++ with "
+            "midpoint updates, a lower-order final step, and a zero terminal sigma; "
+            f"got algorithm_type={scheduler.algorithm_type!r}, "
+            f"solver_order={scheduler.solver_order}, "
+            f"solver_type={scheduler.solver_type!r}, "
+            f"lower_order_final={scheduler.lower_order_final}, "
+            f"final_sigmas_type={scheduler.final_sigmas_type!r}"
+        )
+    if scheduler.use_karras_sigmas or scheduler.use_exponential_sigmas:
+        raise ValueError(
+            "workflow diffusion does not yet materialize Karras or exponential sigmas"
+        )
+    if scheduler.beta_schedule == "scaled_linear":
+        betas = (
+            np.linspace(
+                np.sqrt(scheduler.beta_start),
+                np.sqrt(scheduler.beta_end),
+                scheduler.num_train_timesteps,
+                dtype=np.float64,
+            )
+            ** 2
+        )
+    elif scheduler.beta_schedule == "linear":
+        betas = np.linspace(
+            scheduler.beta_start,
+            scheduler.beta_end,
+            scheduler.num_train_timesteps,
+            dtype=np.float64,
+        )
+    else:
+        raise ValueError(
+            f"workflow diffusion does not support beta schedule {scheduler.beta_schedule!r}"
+        )
+    training_sigmas = np.sqrt((1.0 - np.cumprod(1.0 - betas)) / np.cumprod(1.0 - betas))
+    if scheduler.kind == "dpmpp_2m":
+        # Multistep solvers place the boundary at the terminal sigma, so the
+        # linspace spans one extra point and drops the trailing zero timestep.
+        timesteps = (
+            np.linspace(0, scheduler.num_train_timesteps - 1, num_inference_steps + 1)
+            .round()[::-1][:-1]
+            .astype(np.float64)
+        )
+    else:
+        timesteps = np.linspace(
+            scheduler.num_train_timesteps - 1,
+            0,
+            num_inference_steps,
+            dtype=np.float64,
+        )
+    sigmas = np.interp(
+        timesteps,
+        np.arange(scheduler.num_train_timesteps, dtype=np.float64),
+        training_sigmas,
+    )
+    return timesteps.tolist(), [*sigmas.tolist(), 0.0]
+
+
 _DENOISER_KEYS = ("denoiser", "transformer", "unet")
 
 
-def _add_explicit_io_to_file(path: str, pkg: Any, config: Any) -> None:
-    """Augment an emitted sidecar with roles derived from the actual ONNX ports."""
+def _flow_match_euler_schedule(
+    scheduler: SchedulerConfig, num_inference_steps: int, image_seq_len: int
+) -> tuple[list[float], list[float]]:
+    """Materialize diffusers ``FlowMatchEulerDiscreteScheduler`` timesteps/sigmas.
+
+    Reproduces ``set_timesteps(sigmas=linspace(1, 1/n, n), mu=calculate_shift(...))``
+    including resolution-dependent dynamic shifting and terminal stretching, so
+    the baked schedule matches the pipeline that produced the reference image.
+    Timesteps are emitted as sigmas (``t / num_train_timesteps``) because the
+    Qwen Image denoiser consumes the normalized timestep directly.
+    """
+    if scheduler.kind != "flow_match_euler":
+        raise ValueError(
+            f"image-edit workflow requires a flow-match Euler scheduler, got {scheduler.kind!r}"
+        )
+    sigmas = np.linspace(1.0, 1.0 / num_inference_steps, num_inference_steps, dtype=np.float64)
+    if scheduler.use_dynamic_shifting:
+        base_seq_len = scheduler.base_image_seq_len or 256
+        max_seq_len = scheduler.max_image_seq_len or 4096
+        base_shift = scheduler.base_shift if scheduler.base_shift is not None else 0.5
+        max_shift = scheduler.max_shift if scheduler.max_shift is not None else 1.15
+        slope = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+        mu = image_seq_len * slope + (base_shift - slope * base_seq_len)
+        if (scheduler.time_shift_type or "exponential") != "exponential":
+            raise ValueError(
+                f"unsupported flow-match time shift {scheduler.time_shift_type!r}"
+            )
+        sigmas = np.exp(mu) / (np.exp(mu) + (1.0 / sigmas - 1.0))
+    elif scheduler.shift is not None:
+        sigmas = scheduler.shift * sigmas / (1.0 + (scheduler.shift - 1.0) * sigmas)
+    if scheduler.shift_terminal is not None:
+        # stretch_shift_to_terminal: map the last sigma onto shift_terminal.
+        one_minus = 1.0 - sigmas
+        sigmas = 1.0 - one_minus / (one_minus[-1] / (1.0 - scheduler.shift_terminal))
+    return sigmas.tolist(), [*sigmas.tolist(), 0.0]
+
+
+def _looks_like_image_edit(pkg: Any) -> bool:
+    """Detect a source-image-conditioned flow-matching editing pipeline.
+
+    Structural signals: a VAE encoder and decoder pair, plus a denoiser that
+    takes rank-3 packed latents and exposes a ``target_sequence_length`` port —
+    i.e. it consumes concatenated target+source tokens and slices its estimate
+    back to the target block.
+    """
     try:
-        models = list(pkg.values())
+        names = set(pkg.keys())
     except AttributeError:
-        return
-    if not models or any(not hasattr(model, "graph") for model in models):
-        return
-    with open(path, encoding="utf-8") as handle:
-        metadata = yaml.safe_load(handle)
-    add_explicit_package_io(metadata, pkg, config)
-    with open(path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(metadata, handle, sort_keys=False)
+        return False
+    if not {"vae_encoder", "vae_decoder"} <= names:
+        return False
+    denoiser_name = next((key for key in _DENOISER_KEYS if key in names), None)
+    if denoiser_name is None:
+        return False
+    inputs = {value.name: value for value in pkg[denoiser_name].graph.inputs}
+    sample = inputs.get("sample")
+    return (
+        "target_sequence_length" in inputs
+        and sample is not None
+        and sample.shape is not None
+        and len(sample.shape) == 3
+    )
 
 
-def _write_clip_tokenizer(output_dir: str, source: str | None) -> str | None:
+def _write_clip_tokenizer(
+    output_dir: str,
+    source: str | None,
+    *,
+    revision: str | None = None,
+) -> str | None:
     """Emit ``tokenizer.json`` for a text-conditioned diffusion package.
 
     Classic Stable Diffusion conditions on a CLIP text encoder, and the
@@ -84,7 +237,12 @@ def _write_clip_tokenizer(output_dir: str, source: str | None) -> str | None:
         )
         return None
     try:
-        tokenizer = AutoTokenizer.from_pretrained(source, subfolder="tokenizer", use_fast=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            source,
+            subfolder="tokenizer",
+            use_fast=True,
+            revision=revision,
+        )
     except Exception as error:  # best-effort; never block the build
         _LOGGER.warning(
             "Could not load a CLIP tokenizer from %r (subfolder 'tokenizer'): %s; "
@@ -106,7 +264,43 @@ def _write_clip_tokenizer(output_dir: str, source: str | None) -> str | None:
     return path
 
 
-def _write_hf_tokenizer(output_dir: str, source: str | None) -> str | None:
+def _write_text_runtime_assets(
+    output_dir: str,
+    source: str | None,
+    *,
+    revision: str | None = None,
+) -> dict[str, str]:
+    """Emit the tokenizer *and* chat-template assets a text package needs.
+
+    ``tokenizer.json`` alone is not enough for an instruction-tuned decoder: the
+    runtime applies the package's chat template to build the prompt, and without
+    it the raw user text (no leading BOS, no turn markers) reaches the model.
+    Gemma 4 answers such a prompt with unbounded repetition, so shipping the
+    template is a correctness requirement rather than a convenience.
+
+    Args:
+        output_dir: Package directory to write the assets into.
+        source: Hugging Face model id or local directory holding them.
+
+    Returns:
+        A mapping of asset stem to written path for every asset materialized.
+    """
+    artifacts = _copy_runtime_assets(
+        output_dir, source, _TEXT_RUNTIME_ASSET_NAMES, revision=revision
+    )
+    if "tokenizer" not in artifacts:
+        fallback = _write_hf_tokenizer(output_dir, source, revision=revision)
+        if fallback is not None:
+            artifacts["tokenizer"] = fallback
+    return artifacts
+
+
+def _write_hf_tokenizer(
+    output_dir: str,
+    source: str | None,
+    *,
+    revision: str | None = None,
+) -> str | None:
     """Emit ``tokenizer.json`` for a text-producing package from its HF source.
 
     Decoder-LM, multimodal (VLM / speech-language ASR), and Whisper-style ASR
@@ -137,7 +331,7 @@ def _write_hf_tokenizer(output_dir: str, source: str | None) -> str | None:
         )
         return None
     try:
-        tokenizer = AutoTokenizer.from_pretrained(source, use_fast=True)
+        tokenizer = AutoTokenizer.from_pretrained(source, use_fast=True, revision=revision)
     except Exception as error:  # best-effort; never block the build
         _LOGGER.warning(
             "Could not load a tokenizer from %r: %s; skipping tokenizer.json emission.",
@@ -158,7 +352,12 @@ def _write_hf_tokenizer(output_dir: str, source: str | None) -> str | None:
     return path
 
 
-def _write_hf_audio_processor(output_dir: str, source: str | None) -> str | None:
+def _write_hf_audio_processor(
+    output_dir: str,
+    source: str | None,
+    *,
+    revision: str | None = None,
+) -> str | None:
     """Emit the Hugging Face audio feature-extractor contract for ASR packages."""
     if not source:
         return None
@@ -170,7 +369,7 @@ def _write_hf_audio_processor(output_dir: str, source: str | None) -> str | None
         )
         return None
     try:
-        feature_extractor = AutoFeatureExtractor.from_pretrained(source)
+        feature_extractor = AutoFeatureExtractor.from_pretrained(source, revision=revision)
     except Exception as error:
         _LOGGER.warning(
             "Could not load an audio processor from %r: %s; "
@@ -184,6 +383,88 @@ def _write_hf_audio_processor(output_dir: str, source: str | None) -> str | None
     return path
 
 
+def _audio_preprocessing_program(
+    processor_path: str | None, encoder: Any
+) -> dict[str, Any] | None:
+    """Derive a declarative log-mel program from a HF feature-extractor config.
+
+    The program is the executable contract the runtime audio adapter follows:
+    decode -> resample -> pad/trim to the fixed window -> log-mel -> normalize.
+    Its single output binds to the encoder's rank-3 feature input.
+    """
+    if processor_path is None:
+        return None
+    import json
+
+    with open(processor_path, encoding="utf-8") as handle:
+        config = json.load(handle)
+    if config.get("feature_extractor_type") != "WhisperFeatureExtractor":
+        _LOGGER.warning(
+            "Audio feature extractor %r is not a log-mel window extractor; "
+            "skipping declarative audio preprocessing.",
+            config.get("feature_extractor_type"),
+        )
+        return None
+    feature_inputs = [
+        value
+        for value in encoder.graph.inputs
+        if value.shape is not None and len(value.shape) == 3
+    ]
+    if len(feature_inputs) != 1:
+        raise ValueError(
+            "audio preprocessing requires exactly one rank-3 encoder feature input, "
+            f"got {[value.name for value in feature_inputs]}"
+        )
+    sampling_rate = int(config["sampling_rate"])
+    num_mel_bins = int(config["feature_size"])
+    n_fft = int(config["n_fft"])
+    hop_length = int(config["hop_length"])
+    n_samples = int(config.get("n_samples", config["chunk_length"] * sampling_rate))
+    return {
+        "transforms": [
+            {"op": "decode", "outputs": ["samples"]},
+            {
+                "op": "resample",
+                "inputs": ["samples"],
+                "outputs": ["resampled"],
+                "sampling_rate": sampling_rate,
+            },
+            {
+                "op": "pad",
+                "inputs": ["resampled"],
+                "outputs": ["windowed"],
+                "mode": "fixed_window",
+                "target_samples": n_samples,
+                "pad_value": float(config.get("padding_value", 0.0)),
+            },
+            {
+                "op": "log_mel",
+                "inputs": ["windowed"],
+                "outputs": ["mel"],
+                "num_mel_bins": num_mel_bins,
+                "n_fft": n_fft,
+                "hop_length": hop_length,
+                "window": "hann",
+                "mel_scale": "slaney",
+                "sampling_rate": sampling_rate,
+            },
+            {
+                "op": "normalize",
+                "inputs": ["mel"],
+                "outputs": ["features"],
+                "mode": "whisper_log_mel",
+            },
+        ],
+        "outputs": [
+            {
+                "source": "features",
+                "name": feature_inputs[0].name,
+                "content": "audio_features",
+            }
+        ],
+    }
+
+
 def _looks_like_diffusion(pkg: Any) -> bool:
     try:
         names = set(pkg.keys())
@@ -191,6 +472,25 @@ def _looks_like_diffusion(pkg: Any) -> bool:
         return False
     return any(k in names for k in _DENOISER_KEYS) or any(
         k in names for k in ("vae", "vae_decoder", "vae_encoder")
+    )
+
+
+def _looks_like_language_diffusion(pkg: Any) -> bool:
+    """Detect a full-sequence token denoiser with an executable proposal output."""
+    try:
+        if len(pkg) != 1:
+            return False
+        model = next(iter(pkg.values()))
+        inputs = list(model.graph.inputs)
+        outputs = list(model.graph.outputs)
+    except (AttributeError, TypeError):
+        return False
+    return (
+        len(inputs) == 1
+        and inputs[0].dtype in {ir.DataType.INT32, ir.DataType.INT64}
+        and inputs[0].shape is not None
+        and len(inputs[0].shape) == 2
+        and {"logits", "proposed_tokens"} <= {value.name for value in outputs}
     )
 
 
@@ -207,6 +507,14 @@ def _looks_like_multimodal(pkg: Any) -> bool:
         and "embedding" in names
         and bool(names & {"vision_encoder", "audio_encoder"})
     )
+
+
+def _has_audio_encoder(pkg: Any) -> bool:
+    """Whether a package fuses audio, and so needs a feature extractor."""
+    try:
+        return "audio_encoder" in set(pkg.keys())
+    except AttributeError:
+        return False
 
 
 def _looks_like_speech_to_text(pkg: Any) -> bool:
@@ -229,6 +537,61 @@ def _looks_like_speech_to_text(pkg: Any) -> bool:
     except AttributeError:
         return False
     return "encoder_hidden_states" in decoder_inputs
+
+
+def _looks_like_ctc_asr(pkg: Any) -> bool:
+    """Detect a non-generative CTC ASR package.
+
+    The signal is structural: a single ``model`` component that consumes a raw
+    waveform plus a sample-level mask and emits per-frame ``logits`` with no KV
+    cache.  The absent cache is what separates CTC from a Whisper-style
+    autoregressive decoder that also emits ``logits``.
+    """
+    try:
+        names = set(pkg.keys())
+    except AttributeError:
+        return False
+    if names != {"model"}:
+        return False
+    try:
+        model = pkg["model"]
+        inputs = {value.name for value in model.graph.inputs}
+        outputs = {value.name for value in model.graph.outputs}
+    except (AttributeError, KeyError):
+        return False
+    if not {"input_values", "attention_mask"} <= inputs:
+        return False
+    if "logits" not in outputs:
+        return False
+    return not any(name.startswith("past_key_values") for name in inputs)
+
+
+def _looks_like_encoder_embedding(pkg: Any) -> bool:
+    """Detect a bidirectional encoder that returns embeddings, not tokens.
+
+    The signal is structural: a single ``model`` component that consumes
+    ``input_ids`` and emits ``last_hidden_state`` with no ``logits`` port and
+    no KV cache.  The absent ``logits`` is what separates an embedding encoder
+    from every generative package -- there is nothing to sample, so there is no
+    decode step to describe.
+    """
+    try:
+        names = set(pkg.keys())
+    except AttributeError:
+        return False
+    if names != {"model"}:
+        return False
+    try:
+        model = pkg["model"]
+        inputs = {value.name for value in model.graph.inputs}
+        outputs = {value.name for value in model.graph.outputs}
+    except (AttributeError, KeyError):
+        return False
+    if "input_ids" not in inputs or "last_hidden_state" not in outputs:
+        return False
+    if any(name == "logits" or str(name).startswith("present") for name in outputs):
+        return False
+    return not any(str(name).startswith("past_key_values") for name in inputs)
 
 
 def _looks_like_audio_codec(pkg: Any) -> bool:
@@ -258,33 +621,8 @@ def _looks_like_audio_codec(pkg: Any) -> bool:
     )
 
 
-def _audio_codec_codes_dtype(pkg: Any) -> str:
-    """Return the metadata dtype of the codec ``codes`` tensor (default int64)."""
-    # ONNX elem-type names -> onnx-genai metadata dtype tags. Float codes keep
-    # their precision (fp16/bf16/fp32) so the runtime binds the right buffer type.
-    float_dtypes = {"FLOAT": "fp32", "FLOAT16": "fp16", "BFLOAT16": "bf16"}
-    try:
-        for value in pkg["decoder"].graph.inputs:
-            if value.name == "codes" and value.dtype is not None:
-                return float_dtypes.get(value.dtype.name, "int64")
-    except (AttributeError, KeyError):
-        # Missing/partial codec structure: fall back to the documented default.
-        return "int64"
-    return "int64"
-
-
 def _looks_like_multi_decoder_tts(pkg: Any) -> bool:
-    """Detect a nested multi-decoder TTS package (e.g. Qwen3-TTS).
-
-    The defining signal is a ``talker`` plus a ``code_predictor`` decoder — a
-    dual, nested autoregressive shape (the code_predictor expands each talker
-    frame's residual codebooks). When the package also carries the
-    ``talker_step_embedder`` pre-embedder (see :func:`_has_tts_pre_embedder`),
-    the dispatcher emits a runnable ``pre_embedder``-driven
-    ``nested_autoregressive`` contract; without it the component graph is not yet
-    mappable, so detection triggers a precise, actionable error rather than
-    mis-emitting (see DESIGN.md §20.3).
-    """
+    """Detect a nested multi-decoder TTS package (e.g. Qwen3-TTS)."""
     try:
         names = set(pkg.keys())
     except AttributeError:
@@ -292,13 +630,19 @@ def _looks_like_multi_decoder_tts(pkg: Any) -> bool:
     return {"talker", "code_predictor"} <= names
 
 
+def _looks_like_speculative(pkg: Any) -> bool:
+    try:
+        return {"proposer", "verifier"} <= set(pkg.keys())
+    except AttributeError:
+        return False
+
+
 def _has_tts_pre_embedder(pkg: Any) -> bool:
     """True when a multi-decoder TTS package carries the pre-embedder component.
 
     The ``talker_step_embedder`` materializes the talker's per-step
-    ``inputs_embeds`` (``frame_codes [+ text_embed] -> inputs_embeds``); its
-    presence is what makes the package emittable to the ``pre_embedder``-driven
-    ``nested_autoregressive`` contract.
+    ``inputs_embeds`` (``frame_codes [+ text_embed] -> inputs_embeds``). It is
+    necessary, but not sufficient until generic loops expose induction SSA.
     """
     try:
         names = set(pkg.keys())
@@ -307,44 +651,8 @@ def _has_tts_pre_embedder(pkg: Any) -> bool:
     return "talker_step_embedder" in names
 
 
-def _tts_component_kwargs(pkg: Any, config: Any) -> dict[str, Any]:
-    """Derive pre-embedder-driven TTS metadata kwargs from a package + config.
-
-    Mobius saves each component into ``<component>/model.onnx``. ``num_code_groups``
-    comes from the TTS config (the RVQ residual count per frame).
-    """
-    tts = getattr(config, "tts", None)
-    num_code_groups = getattr(tts, "num_code_groups", None) if tts is not None else None
-    if not num_code_groups:
-        raise ValueError(
-            "TTS metadata requires config.tts.num_code_groups (RVQ codes per frame)"
-        )
-    kwargs: dict[str, Any] = {
-        "num_code_groups": num_code_groups,
-        "talker_filename": "talker/model.onnx",
-        "code_predictor_filename": "code_predictor/model.onnx",
-        "pre_embedder_filename": "talker_step_embedder/model.onnx",
-    }
-    # Emit the prefill/trailing-text component only when the package carries it;
-    # otherwise the prefill-less shape (talker frame 0 + zero text_embed) is used.
-    try:
-        names = set(pkg.keys())
-    except (AttributeError, TypeError):
-        names = set()
-    kwargs["prefill_embedder_filename"] = (
-        "talker_prefill_embedder/model.onnx" if "talker_prefill_embedder" in names else None
-    )
-    kwargs["activation_dtype"] = _activation_dtype_tag(config)
-    return kwargs
-
-
 def _activation_dtype_tag(config: Any) -> str:
-    """Map a model config's activation dtype to the metadata dtype tag.
-
-    The composite dataflow edges (inputs_embeds, encoder_hidden_states, …) carry
-    the model's activation dtype, so metadata must reflect it (fp16/bf16 builds
-    would otherwise be mislabeled fp32).
-    """
+    """Map a model config's activation dtype to the metadata dtype tag."""
     dtype = getattr(config, "dtype", None)
     name = getattr(dtype, "name", "") or ""
     return {"FLOAT16": "fp16", "BFLOAT16": "bf16"}.get(name.upper(), "fp32")
@@ -414,6 +722,9 @@ def write_onnx_genai_config(
     scheduler: SchedulerConfig | None = None,
     guidance_scale: float | None = None,
     source: str | None = None,
+    revision: str | None = None,
+    grammar_guidance: bool = False,
+    adaptive_k_max: int | None = None,
     **kwargs: Any,
 ) -> dict[str, str]:
     """Write ``inference_metadata.yaml`` into ``output_dir`` and return its path.
@@ -425,8 +736,9 @@ def write_onnx_genai_config(
     ===================== ============================================ =================================
     Pipeline shape        Structural signal (detector)                 Emitted ``strategy``
     ===================== ============================================ =================================
+    Image edit            VAE pair + denoiser w/ target_sequence_len   typed SSA workflow (edit loop)
     Diffusion             denoiser / VAE present                       ``iterative``
-    Audio codec           encoder→``codes``→decoder, no cross-attn     ``composite`` (two single_pass)
+    Audio codec           encoder→``codes``→decoder, no cross-attn     typed SSA workflow
     Multimodal VLM        decoder + vision/audio encoder + fusion      ``composite`` (encoders→fuse→AR)
     Speech-to-text (ASR)  decoder consumes ``encoder_hidden_states``   ``composite`` (encode→AR)
     Decoder LM            fallback (a config is required)              bare decoder (``kv_cache`` + attn)
@@ -445,41 +757,141 @@ def write_onnx_genai_config(
     ``scheduler`` / ``guidance_scale`` set the loop.
     """
     os.makedirs(output_dir, exist_ok=True)
-    if _looks_like_diffusion(pkg):
-        is_qwen_image_edit = getattr(getattr(pkg, "config", None), "model_type", None) == (
-            "qwen_image_edit"
+    if is_shared_state_pixel_flow_package(pkg):
+        resolved_config = config if config is not None else getattr(pkg, "config", None)
+        if resolved_config is None:
+            raise ValueError("shared-state pixel-flow metadata requires a model config")
+        path = write_shared_state_pixel_flow_workflow_metadata(
+            pkg,
+            resolved_config,
+            output_dir,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=4.0 if guidance_scale is None else guidance_scale,
         )
-        if is_qwen_image_edit:
-            raise ValueError(
-                "onnx-genai cannot execute Qwen Image Edit packages: the runtime "
-                "does not support source-latent packing, target/source token "
-                "concatenation, target-only denoiser outputs, or the required "
-                "Qwen true-CFG path. Export the ONNX components without "
-                "--runtime onnx-genai and orchestrate the pipeline directly."
+        artifacts = {"inference_metadata": path}
+        artifacts.update(_copy_runtime_assets(output_dir, source, revision=revision))
+        processor_path = os.path.join(output_dir, "preprocessor_config.json")
+        if not os.path.isfile(processor_path):
+            with open(processor_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "do_convert_rgb": True,
+                        "do_resize": True,
+                        "min_pixels": 512 * 512,
+                        "max_pixels": 2048 * 2048,
+                        "size_multiple": 32,
+                        "resample": "lanczos3",
+                        "do_rescale": True,
+                        "rescale_factor": 1.0 / 255.0,
+                        "do_normalize": True,
+                        "image_mean": [0.485, 0.456, 0.406],
+                        "image_std": [0.229, 0.224, 0.225],
+                    },
+                    handle,
+                    indent=2,
+                )
+                handle.write("\n")
+            artifacts["preprocessor_config"] = processor_path
+        if "tokenizer" not in artifacts:
+            tokenizer_path = _write_hf_tokenizer(output_dir, source, revision=revision)
+            if tokenizer_path is not None:
+                artifacts["tokenizer"] = tokenizer_path
+        return artifacts
+
+    if _looks_like_language_diffusion(pkg):
+        path = write_language_diffusion_workflow_metadata(
+            pkg,
+            output_dir,
+            num_inference_steps=num_inference_steps,
+        )
+        artifacts = {"inference_metadata": path}
+        artifacts.update(_write_text_runtime_assets(output_dir, source, revision=revision))
+        return artifacts
+
+    if _looks_like_diffusion(pkg):
+        is_image_edit = _looks_like_image_edit(pkg)
+        if is_image_edit:
+            if scheduler is None:
+                scheduler = load_diffusers_scheduler_config(source)
+            if scheduler is None:
+                raise ValueError(
+                    "image-edit workflow requires the diffusers scheduler config; "
+                    "pass scheduler=SchedulerConfig(...) or a resolvable source"
+                )
+            image_seq_len = kwargs.pop("image_seq_len", None)
+            if image_seq_len is None:
+                raise ValueError(
+                    "image-edit workflow requires image_seq_len (the packed target "
+                    "token count) to materialize the resolution-dependent schedule"
+                )
+            timesteps, sigma_schedule = _flow_match_euler_schedule(
+                scheduler, num_inference_steps, int(image_seq_len)
             )
+            path = write_image_edit_workflow_metadata(
+                pkg,
+                output_dir,
+                num_inference_steps=num_inference_steps,
+                schedule=sigma_schedule,
+                timesteps=timesteps,
+                guidance_scale=1.0 if guidance_scale is None else guidance_scale,
+            )
+            artifacts = {"inference_metadata": path}
+            tokenizer_path = _write_hf_tokenizer(output_dir, source, revision=revision)
+            if tokenizer_path is not None:
+                artifacts["tokenizer"] = tokenizer_path
+            return artifacts
         if scheduler is None:
-            scheduler = load_diffusers_scheduler_config(source)
+            scheduler = load_diffusers_scheduler_config(source, revision=revision)
         # Fill in component filenames from the package layout, letting any
         # caller-supplied values win.
         derived = _diffusion_component_kwargs(pkg)
         for name, value in derived.items():
             kwargs.setdefault(name, value)
-        # Classic text-conditioned diffusion (a text encoder is present) uses
-        # classifier-free guidance by default; SD's canonical scale is 7.5.
-        if guidance_scale is None and "text_encoder_filename" in kwargs:
-            guidance_scale = 7.5
-        path = write_diffusion_pipeline_metadata(
+        resolved_scheduler = scheduler or SchedulerConfig(kind="euler")
+        timesteps, sigma_schedule = _diffusion_schedule(
+            resolved_scheduler, num_inference_steps
+        )
+        solver, scale_model_input = _DIFFUSION_SOLVERS[resolved_scheduler.kind]
+        # A sigma-space sampler starts from noise scaled by the largest sigma; a
+        # variance-preserving one starts from the unit-variance draw itself.
+        initial_state_scale = sigma_schedule[0] if scale_model_input else 1.0
+        conditioned = "text_encoder_filename" in kwargs
+        if conditioned and guidance_scale is None:
+            raise ValueError(
+                "a text-conditioned diffusion package must declare its guidance: "
+                "pass guidance_scale=1.0 for unguided generation, or the pipeline's "
+                "classifier-free guidance scale to run the guided denoiser path"
+            )
+        if guidance_scale is not None and not conditioned:
+            raise ValueError(
+                "classifier-free guidance requires a text-conditioned diffusion package"
+            )
+        guidance = (
+            None
+            if guidance_scale is None or np.isclose(guidance_scale, 1.0)
+            else float(guidance_scale)
+        )
+        decoder_input_scale = 1.0
+        scaling_factor = load_diffusers_vae_scaling_factor(source)
+        if scaling_factor:
+            decoder_input_scale = 1.0 / scaling_factor
+        path = write_diffusion_workflow_metadata(
+            pkg,
             output_dir,
             num_inference_steps=num_inference_steps,
-            scheduler=scheduler,
-            guidance_scale=guidance_scale,
-            **kwargs,
+            schedule=sigma_schedule,
+            timesteps=timesteps,
+            solver=solver,
+            scale_model_input=scale_model_input,
+            initial_state_scale=initial_state_scale,
+            decoder_input_scale=decoder_input_scale,
+            guidance_scale=guidance,
         )
         artifacts = {"inference_metadata": path}
         # Emit the CLIP tokenizer.json for text-conditioned pipelines so the
         # onnx-genai runners can tokenize prompts from the package alone.
         if "text_encoder_filename" in kwargs:
-            tokenizer_path = _write_clip_tokenizer(output_dir, source)
+            tokenizer_path = _write_clip_tokenizer(output_dir, source, revision=revision)
             if tokenizer_path is not None:
                 artifacts["tokenizer"] = tokenizer_path
         return artifacts
@@ -487,8 +899,48 @@ def write_onnx_genai_config(
     if _looks_like_audio_codec(pkg):
         # A neural codec produces tensors (waveform), not tokens, so it needs no
         # decoder config — emit before the config requirement below.
-        path = write_audio_codec_pipeline_metadata(
-            output_dir, codes_dtype=_audio_codec_codes_dtype(pkg)
+        path = write_audio_codec_workflow_metadata(pkg, output_dir)
+        return {"inference_metadata": path}
+
+    if _looks_like_ctc_asr(pkg):
+        # CTC ASR is frame-synchronous: the encoder runs once and the transcript
+        # comes from the profile's decoding contract, so no decoder/KV metadata
+        # is produced.
+        ctc_config = config if config is not None else getattr(pkg, "config", None)
+        if ctc_config is None:
+            raise ValueError(
+                "CTC ASR metadata requires a model config (pass config=... or a "
+                "package carrying `.config`)"
+            )
+        path = write_ctc_asr_workflow_metadata(pkg, output_dir, ctc_config, source=source)
+        artifacts = {"inference_metadata": path}
+        tokenizer_path = _write_hf_tokenizer(output_dir, source, revision=revision)
+        if tokenizer_path is not None:
+            artifacts["tokenizer"] = tokenizer_path
+        return artifacts
+
+    if _looks_like_encoder_embedding(pkg):
+        # A bidirectional encoder has no logits and no cache: it runs once and
+        # returns one hidden vector per position.  Emit before the config
+        # requirement below because nothing here needs a decoder config.
+        path = write_encoder_embedding_workflow_metadata(pkg, output_dir, config)
+        artifacts = {"inference_metadata": path}
+        tokenizer_path = _write_hf_tokenizer(output_dir, source, revision=revision)
+        if tokenizer_path is not None:
+            artifacts["tokenizer"] = tokenizer_path
+        return artifacts
+
+    if _looks_like_speculative(pkg):
+        if kv_native_dtype is not None:
+            raise ValueError(
+                "workflow speculative export derives KV state dtype from ONNX ports; "
+                "kv_native_dtype overrides are unsupported"
+            )
+        path = write_speculative_workflow_metadata(
+            pkg,
+            output_dir,
+            grammar_guidance=grammar_guidance,
+            adaptive_k_max=adaptive_k_max,
         )
         return {"inference_metadata": path}
 
@@ -499,80 +951,80 @@ def write_onnx_genai_config(
             "or a package carrying `.config`)"
         )
     if _looks_like_multimodal(pkg):
-        derived = _multimodal_component_kwargs(pkg)
-        for name, value in derived.items():
-            kwargs.setdefault(name, value)
-        decoder_metadata = decoder_metadata_from_config(
-            resolved_config, kv_native_dtype=kv_native_dtype
-        )
-        path = write_multimodal_pipeline_metadata(
+        if kv_native_dtype is not None:
+            raise ValueError(
+                "workflow VLM export derives KV state dtype from ONNX ports; "
+                "kv_native_dtype overrides are unsupported"
+            )
+        path = write_vlm_workflow_metadata(
+            pkg,
             output_dir,
-            decoder_metadata=decoder_metadata,
-            activation_dtype=_activation_dtype_tag(resolved_config),
-            **kwargs,
+            resolved_config,
+            source=source,
         )
-        _add_explicit_io_to_file(path, pkg, resolved_config)
         artifacts = {"inference_metadata": path}
-        tokenizer_path = _write_hf_tokenizer(output_dir, source)
-        if tokenizer_path is not None:
-            artifacts["tokenizer"] = tokenizer_path
+        # A multimodal package needs the processor assets as well as the
+        # tokenizer, because the runtime resolves image/audio preprocessing
+        # parameters from them.
+        artifacts.update(_copy_runtime_assets(output_dir, source, revision=revision))
+        if "tokenizer" not in artifacts:
+            tokenizer_path = _write_hf_tokenizer(output_dir, source, revision=revision)
+            if tokenizer_path is not None:
+                artifacts["tokenizer"] = tokenizer_path
+        # A speech-language package fuses audio embeddings, so it needs the
+        # feature extractor too: the runtime cannot turn a waveform into the
+        # encoder's input without it, and no other asset carries those
+        # parameters.
+        if _has_audio_encoder(pkg):
+            audio_processor_path = _write_hf_audio_processor(
+                output_dir, source, revision=revision
+            )
+            if audio_processor_path is not None:
+                artifacts["audio_processor"] = audio_processor_path
         return artifacts
 
     if _looks_like_speech_to_text(pkg):
-        encoder_outputs = {value.name for value in pkg["encoder"].graph.outputs}
-        decoder_inputs = {value.name for value in pkg["decoder"].graph.inputs}
-        kwargs.setdefault(
-            "encoder_attention_mask",
-            "encoder_attention_mask" in encoder_outputs
-            and "encoder_attention_mask" in decoder_inputs,
-        )
-        decoder_metadata = decoder_metadata_from_config(
-            resolved_config, kv_native_dtype=kv_native_dtype
-        )
-        path = write_speech_to_text_pipeline_metadata(
+        if kv_native_dtype is not None:
+            raise ValueError(
+                "workflow speech-to-text export derives KV state dtype from ONNX ports; "
+                "kv_native_dtype overrides are unsupported"
+            )
+        audio_processor_path = _write_hf_audio_processor(output_dir, source, revision=revision)
+        path = write_speech_to_text_workflow_metadata(
+            pkg,
             output_dir,
-            decoder_metadata=decoder_metadata,
-            activation_dtype=_activation_dtype_tag(resolved_config),
-            **kwargs,
+            resolved_config,
+            audio_preprocessing=_audio_preprocessing_program(
+                audio_processor_path, pkg["encoder"]
+            ),
         )
-        _add_explicit_io_to_file(path, pkg, resolved_config)
         artifacts = {"inference_metadata": path}
-        tokenizer_path = _write_hf_tokenizer(output_dir, source)
-        if tokenizer_path is not None:
-            artifacts["tokenizer"] = tokenizer_path
-        audio_processor_path = _write_hf_audio_processor(output_dir, source)
+        # An ASR decoder is still a text producer: ship its tokenizer and chat
+        # template alongside the audio processor.
+        artifacts.update(_write_text_runtime_assets(output_dir, source, revision=revision))
         if audio_processor_path is not None:
             artifacts["audio_processor"] = audio_processor_path
         return artifacts
 
-    # A nested multi-decoder TTS stack (talker + code_predictor) uses the
-    # nested_autoregressive strategy. When the package also carries the
-    # `talker_step_embedder` pre-embedder (the real Qwen3-TTS shape), emit the
-    # pre-embedder-driven contract the onnx-genai runtime executes; otherwise the
-    # component graph is not yet mappable, so fail with a precise, actionable error.
+    # A nested multi-decoder TTS stack requires the generic workflow loop to expose
+    # its induction value. The current producer contract cannot wire step_index or
+    # per-group embedding selection without host preprocessing, so the workflow
+    # writer reports that exact contract defect.
     if _looks_like_multi_decoder_tts(pkg):
+        if kv_native_dtype is not None:
+            raise ValueError(
+                "workflow TTS export derives KV state dtype from ONNX ports; "
+                "kv_native_dtype overrides are unsupported"
+            )
         if not _has_tts_pre_embedder(pkg):
             raise NotImplementedError(
                 "Multi-decoder TTS packages (talker + code_predictor, e.g. Qwen3-TTS) "
-                "use the nested_autoregressive strategy. This package lacks the "
+                "require nested generic workflow loops. This package lacks the "
                 "`talker_step_embedder` pre-embedder that materializes the talker "
-                "inputs_embeds, so it cannot yet be mapped to the runtime contract — "
-                "see onnx-genai docs/DESIGN.md §20.3 'Multi-decoder TTS'."
+                "inputs_embeds, so it cannot be mapped to the workflow contract."
             )
-        decoder_metadata = decoder_metadata_from_config(
-            resolved_config, kv_native_dtype=kv_native_dtype
-        )
-        path = write_tts_pipeline_metadata(
-            output_dir,
-            decoder_metadata=decoder_metadata,
-            **_tts_component_kwargs(pkg, resolved_config),
-        )
-        _add_explicit_io_to_file(path, pkg, resolved_config)
-        artifacts = {"inference_metadata": path}
-        tokenizer_path = _write_hf_tokenizer(output_dir, source)
-        if tokenizer_path is not None:
-            artifacts["tokenizer"] = tokenizer_path
-        return artifacts
+        path = write_tts_workflow_metadata(pkg, output_dir, resolved_config)
+        return {"inference_metadata": path}
 
     # Fallback: a single-component decoder language model. A multi-component
     # package that matched none of the composite shapes above would be silently
@@ -590,12 +1042,17 @@ def write_onnx_genai_config(
             "Multi-decoder pipelines such as TTS require a dedicated emitter."
         )
 
-    path = write_decoder_metadata(
-        output_dir, config=resolved_config, kv_native_dtype=kv_native_dtype
+    if kv_native_dtype is not None:
+        raise ValueError(
+            "workflow decoder export derives KV state dtype from ONNX ports; "
+            "kv_native_dtype overrides are unsupported"
+        )
+    path = write_decoder_workflow_metadata(
+        pkg,
+        output_dir,
+        resolved_config,
+        sampler=str(getattr(resolved_config, "workflow_sampler", "greedy")),
     )
-    _add_explicit_io_to_file(path, pkg, resolved_config)
     artifacts = {"inference_metadata": path}
-    tokenizer_path = _write_hf_tokenizer(output_dir, source)
-    if tokenizer_path is not None:
-        artifacts["tokenizer"] = tokenizer_path
+    artifacts.update(_write_text_runtime_assets(output_dir, source, revision=revision))
     return artifacts

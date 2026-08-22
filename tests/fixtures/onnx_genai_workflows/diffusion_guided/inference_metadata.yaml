@@ -1,0 +1,782 @@
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      capabilities:
+      - workflow_ssa
+      - linear_effects
+      - nested_control_flow
+      - loop_induction_values
+      - typed_emit
+    inputs:
+      request.max_iterations:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: runtime
+          version: '1.0'
+          role: max_iterations
+        source:
+          kind: request
+        required: false
+        default: 3
+      package.false:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: false
+      request.seed:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: seed
+        source:
+          kind: request
+        required: false
+        default: 0
+        externally_suppliable: true
+      package.rng_offset:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0
+      request.input_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - prompt_sequence
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: prompt_tokens
+        source:
+          kind: request
+        required: true
+        externally_suppliable: true
+      request.negative_input_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - prompt_sequence
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: negative_input_ids
+        required: true
+        externally_suppliable: true
+      request.guidance_scale:
+        contract:
+          dtype: float32
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: guidance_scale
+        required: false
+        default: 7.5
+      package.loop_0_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+    outputs:
+      image:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 3
+          - height
+          - width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: image
+        value_range: negative_one_to_one
+        stage: pre_adapter
+      latent:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 4
+          - height
+          - width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+      noise_estimate:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 4
+          - height
+          - noise_estimate_width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+      latent_trajectory:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 4
+          - height
+          - trajectory_width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+      rng_offset:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+    components:
+      text_encoder:
+        implementation:
+          kind: onnx
+          artifact: text_encoder/model.onnx
+        ports:
+          roles:
+            input_ids: token_ids
+            encoder_hidden_states: encoder_hidden_states
+      denoiser:
+        implementation:
+          kind: onnx
+          artifact: denoiser/model.onnx
+        ports:
+          roles:
+            encoder_hidden_states: encoder_hidden_states
+      vae_decoder:
+        implementation:
+          kind: onnx
+          artifact: vae_decoder/model.onnx
+      solver_step:
+        implementation:
+          kind: onnx
+          artifact: policies/solver_step.onnx
+        ports:
+          inputs:
+            sample:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            estimate:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            history:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            step:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            schedule:
+              dtype: float32
+              rank: 1
+              shape:
+              - schedule_length
+          outputs:
+            next_state:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            next_history:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+        contract:
+          id: onnx-genai.solver-step
+          version: '1'
+          bindings:
+            state: sample
+            estimate: estimate
+            history: history
+            step: step
+            schedule: schedule
+            next_state: next_state
+            next_history: next_history
+      continue_predicate:
+        implementation:
+          kind: onnx
+          artifact: policies/continue_predicate.onnx
+        ports:
+          inputs:
+            done:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            continue:
+              dtype: bool
+              rank: 1
+              shape:
+              - 1
+      diffusion_schedule:
+        implementation:
+          kind: onnx
+          artifact: policies/diffusion_schedule.onnx
+        ports:
+          inputs: {}
+          outputs:
+            schedule:
+              dtype: float32
+              rank: 1
+              shape:
+              - 4
+      diffusion_timesteps:
+        implementation:
+          kind: onnx
+          artifact: policies/diffusion_timesteps.onnx
+        ports:
+          inputs: {}
+          outputs:
+            schedule:
+              dtype: float32
+              rank: 1
+              shape:
+              - 3
+      schedule_lookup:
+        implementation:
+          kind: onnx
+          artifact: policies/schedule_lookup.onnx
+        ports:
+          inputs:
+            schedule:
+              dtype: float32
+              rank: 1
+              shape:
+              - schedule_length
+            step:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            timestep:
+              dtype: float32
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      tensor_scale:
+        implementation:
+          kind: onnx
+          artifact: policies/tensor_scale.onnx
+        ports:
+          inputs:
+            tensor:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            scale:
+              dtype: float32
+              rank: 1
+              shape:
+              - 1
+          outputs:
+            scaled:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      decoder_input_scale:
+        implementation:
+          kind: onnx
+          artifact: policies/decoder_input_scale.onnx
+        ports:
+          inputs: {}
+          outputs:
+            value:
+              dtype: float32
+              rank: 1
+              shape:
+              - 1
+      history_initializer:
+        implementation:
+          kind: onnx
+          artifact: policies/history_initializer.onnx
+        ports:
+          inputs:
+            reference:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            zeros:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      guidance_combine:
+        implementation:
+          kind: onnx
+          artifact: policies/guidance_combine.onnx
+        ports:
+          inputs:
+            unconditional:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            conditional:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            scale:
+              dtype: float32
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            estimate:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+        contract:
+          id: onnx-genai.guidance-combine
+          version: '1'
+          bindings:
+            unconditional: unconditional
+            conditional: conditional
+            scale: scale
+            estimate: estimate
+      latent_row_shape:
+        implementation:
+          kind: onnx
+          artifact: policies/latent_row_shape.onnx
+        ports:
+          inputs: {}
+          outputs:
+            shape:
+              dtype: int64
+              rank: 1
+              shape:
+              - 3
+      latent_noise:
+        implementation:
+          kind: onnx
+          artifact: policies/latent_noise.onnx
+        ports:
+          inputs:
+            seed:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            offset:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            row_shape:
+              dtype: int64
+              rank: 1
+              shape:
+              - row_rank
+          outputs:
+            noise:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            next_offset:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+        contract:
+          id: onnx-genai.counter-rng
+          version: '1'
+          bindings:
+            seed: seed
+            offset: offset
+            row_shape: row_shape
+            noise: noise
+            next_offset: next_offset
+    state:
+      latent_state:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 4
+          - height
+          - width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: diffusion.noise
+        recurrence:
+          kind: invariant
+      history:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 4
+          - height
+          - width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: diffusion.initial_history
+        recurrence:
+          kind: invariant
+      loop_0_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        scope: invocation
+        initializer: package.loop_0_active
+        recurrence:
+          kind: invariant
+    steps:
+    - kind: loop
+      setup:
+      - kind: invoke
+        component: diffusion_schedule
+        inputs: {}
+        outputs:
+          schedule: diffusion.schedule
+      - kind: invoke
+        component: diffusion_timesteps
+        inputs: {}
+        outputs:
+          schedule: diffusion.timesteps
+      - kind: invoke
+        component: decoder_input_scale
+        inputs: {}
+        outputs:
+          value: diffusion.decoder_scale
+      - kind: invoke
+        component: latent_row_shape
+        inputs: {}
+        outputs:
+          shape: diffusion.latent_row_shape
+      - kind: invoke
+        component: latent_noise
+        inputs:
+          seed: request.seed
+          offset: package.rng_offset
+          row_shape: diffusion.latent_row_shape
+        outputs:
+          noise: diffusion.noise
+          next_offset: diffusion.rng_offset
+      - kind: invoke
+        component: text_encoder
+        inputs:
+          input_ids: request.input_ids
+        outputs:
+          encoder_hidden_states: conditioning.hidden_states
+      - kind: invoke
+        component: text_encoder
+        inputs:
+          input_ids: request.negative_input_ids
+        outputs:
+          encoder_hidden_states: conditioning.unconditional
+      - kind: invoke
+        component: history_initializer
+        inputs:
+          reference: diffusion.noise
+        outputs:
+          zeros: diffusion.initial_history
+      - kind: invoke
+        component: continue_predicate
+        inputs:
+          done: package.false
+        outputs:
+          continue: setup.continue
+      steps:
+      - kind: invoke
+        component: schedule_lookup
+        inputs:
+          schedule: diffusion.timesteps
+          step: loop.iteration
+        outputs:
+          timestep: diffusion.timestep
+      - kind: invoke
+        component: denoiser
+        inputs:
+          sample: latent_state
+          timestep: diffusion.timestep
+          encoder_hidden_states: conditioning.unconditional
+        outputs:
+          noise_pred: denoiser.unconditional
+      - kind: invoke
+        component: denoiser
+        inputs:
+          sample: latent_state
+          timestep: diffusion.timestep
+          encoder_hidden_states: conditioning.hidden_states
+        outputs:
+          noise_pred: denoiser.conditional
+      - kind: invoke
+        component: guidance_combine
+        inputs:
+          unconditional: denoiser.unconditional
+          conditional: denoiser.conditional
+          scale: request.guidance_scale
+        outputs:
+          estimate: denoiser.estimate
+      - kind: invoke
+        component: solver_step
+        inputs:
+          sample: latent_state
+          step: loop.iteration
+          schedule: diffusion.schedule
+          estimate: denoiser.estimate
+          history: history
+        outputs:
+          next_state: latent.body
+          next_history: history.body
+      - kind: emit
+        value: denoiser.estimate
+        output: noise_estimate
+        mode: append
+      - kind: emit
+        value: latent.body
+        output: latent_trajectory
+        mode: append
+      - kind: invoke
+        component: continue_predicate
+        inputs:
+          done: package.false
+        outputs:
+          continue: loop.continue
+      continue_when: loop_0_active
+      max_iterations: request.max_iterations
+      carried:
+      - cell: latent_state
+        next: latent.body
+      - cell: history
+        next: history.body
+      - cell: loop_0_active
+        next: loop.continue
+      iteration:
+        value: loop.iteration
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+    - kind: invoke
+      component: tensor_scale
+      inputs:
+        tensor: latent_state
+        scale: diffusion.decoder_scale
+      outputs:
+        scaled: diffusion.decoder_input
+    - kind: invoke
+      component: vae_decoder
+      inputs:
+        latent: diffusion.decoder_input
+      outputs:
+        image: vae.image
+    - kind: emit
+      value: latent_state
+      output: latent
+      mode: replace
+    - kind: emit
+      value: vae.image
+      output: image
+      mode: replace
+    - kind: emit
+      value: diffusion.rng_offset
+      output: rng_offset
+      mode: replace

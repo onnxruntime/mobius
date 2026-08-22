@@ -120,6 +120,110 @@ def _get_3d_sincos_pos_embed(
     return np.concatenate([pos_temporal, pos_spatial], axis=-1)
 
 
+def _sincos_omega(embed_dim: int) -> np.ndarray:
+    """Inverse frequency vector of a 1D sincos embedding, shape ``[embed_dim/2]``."""
+    omega = np.arange(embed_dim // 2, dtype=np.float64)
+    omega /= embed_dim / 2.0
+    return (1.0 / (10000**omega)).astype(np.float32)
+
+
+def _sincos_in_graph(
+    op: OpBuilder,
+    embed_dim: int,
+    count: ir.Value,
+    scale: float,
+) -> ir.Value:
+    """1D sincos embedding for ``count`` positions, evaluated inside the graph.
+
+    ``count`` is a 1-D int64 tensor holding a single (possibly dynamic) extent, so
+    the table follows the real number of latent frames / patch rows / patch columns
+    instead of the sizes recorded in the checkpoint config.
+
+    Returns:
+        Value of shape ``[count, embed_dim]``.
+    """
+    positions = op.Range(
+        op.Constant(value_int=0),
+        op.Squeeze(count, op.Constant(value_ints=[0])),
+        op.Constant(value_int=1),
+    )  # (count,) int64
+    positions = op.Cast(positions, to=ir.DataType.FLOAT)
+    if not math.isclose(scale, 1.0):
+        positions = op.Div(positions, op.Constant(value_float=float(scale)))
+    # (count, 1) * (embed_dim/2,) -> (count, embed_dim/2)
+    angles = op.Mul(
+        op.Unsqueeze(positions, op.Constant(value_ints=[-1])),
+        op.Constant(value_floats=_sincos_omega(embed_dim).tolist()),
+    )
+    return op.Concat(op.Sin(angles), op.Cos(angles), axis=-1)  # (count, embed_dim)
+
+
+def _sincos_3d_in_graph(
+    op: OpBuilder,
+    embed_dim: int,
+    num_frames: ir.Value,
+    height: ir.Value,
+    width: ir.Value,
+    spatial_scale: float,
+    temporal_scale: float,
+) -> ir.Value:
+    """3D sincos positional embedding built from runtime extents.
+
+    Mirrors ``_get_3d_sincos_pos_embed`` (and diffusers' ``get_3d_sincos_pos_embed``)
+    but keeps the frame count and patch grid dynamic, so one exported graph serves
+    every video length and resolution.
+
+    Returns:
+        Value of shape ``[1, num_frames*height*width, embed_dim]``.
+    """
+    dim_spatial = 3 * embed_dim // 4
+    dim_temporal = embed_dim // 4
+    half_spatial = dim_spatial // 2
+
+    # diffusers meshgrid(grid_w, grid_h, indexing="xy") puts the width index in
+    # grid[0] and the height index in grid[1]; the 2D helper embeds grid[0] first.
+    w_table = _sincos_in_graph(op, half_spatial, width, spatial_scale)  # (W, ds/2)
+    h_table = _sincos_in_graph(op, half_spatial, height, spatial_scale)  # (H, ds/2)
+    grid_shape = op.Concat(height, width, op.Constant(value_ints=[half_spatial]), axis=0)
+    # (1, W, ds/2) -> (H, W, ds/2) and (H, 1, ds/2) -> (H, W, ds/2)
+    w_grid = op.Expand(op.Unsqueeze(w_table, op.Constant(value_ints=[0])), grid_shape)
+    h_grid = op.Expand(op.Unsqueeze(h_table, op.Constant(value_ints=[1])), grid_shape)
+    spatial = op.Concat(w_grid, h_grid, axis=-1)  # (H, W, ds)
+    spatial = op.Reshape(
+        spatial,
+        op.Concat(
+            op.Constant(value_ints=[1]),
+            op.Mul(height, width),
+            op.Constant(value_ints=[dim_spatial]),
+            axis=0,
+        ),
+    )  # (1, H*W, ds)
+
+    temporal = _sincos_in_graph(op, dim_temporal, num_frames, temporal_scale)  # (T, dt)
+    temporal = op.Unsqueeze(temporal, op.Constant(value_ints=[1]))  # (T, 1, dt)
+
+    patches = op.Mul(height, width)
+    spatial = op.Expand(
+        spatial,
+        op.Concat(num_frames, patches, op.Constant(value_ints=[dim_spatial]), axis=0),
+    )
+    temporal = op.Expand(
+        temporal,
+        op.Concat(num_frames, patches, op.Constant(value_ints=[dim_temporal]), axis=0),
+    )
+    # Temporal channels come first, matching get_3d_sincos_pos_embed.
+    pos = op.Concat(temporal, spatial, axis=-1)  # (T, H*W, D)
+    return op.Reshape(
+        pos,
+        op.Concat(
+            op.Constant(value_ints=[1]),
+            op.Mul(num_frames, patches),
+            op.Constant(value_ints=[embed_dim]),
+            axis=0,
+        ),
+    )  # (1, T*H*W, D)
+
+
 # ---------------------------------------------------------------------------
 # Model building blocks
 # ---------------------------------------------------------------------------
@@ -393,34 +497,25 @@ class _CogVideoXPatchEmbed(nn.Module):
 
         self._patch_size = p
         self._in_channels = in_ch
+        self._embed_dim = embed_dim
+        self._spatial_scale = config.spatial_interpolation_scale
+        self._temporal_scale = config.temporal_interpolation_scale
+        self._learned_pos = config.use_learned_positional_embeddings
 
-        # Pre-compute 3D sincos positional embedding as nn.Parameter
         post_patch_h = config.sample_height // p
         post_patch_w = config.sample_width // p
         num_time_patches = (config.sample_frames - 1) // config.temporal_compression_ratio + 1
 
-        pos_embed = _get_3d_sincos_pos_embed(
-            embed_dim,
-            (post_patch_w, post_patch_h),
-            num_time_patches,
-            spatial_scale=config.spatial_interpolation_scale,
-            temporal_scale=config.temporal_interpolation_scale,
-        )  # [T, H'*W', D]
-        pos_embed = pos_embed.reshape(-1, embed_dim)  # [T*H'*W', D]
-
-        # Prepend zeros for text tokens (no positional embedding)
-        text_zeros = np.zeros((config.max_text_seq_length, embed_dim), dtype=np.float32)
-        # [max_text_seq + T*H'*W', D]
-        full_pos = np.concatenate([text_zeros, pos_embed], axis=0)
-        total_seq = full_pos.shape[0]
-        # [1, total_seq, D] for broadcasting with batch dim
-        full_pos = full_pos.reshape(1, total_seq, embed_dim)
-
-        self.pos_embedding = nn.Parameter(
-            [1, total_seq, embed_dim],
-            name="patch_embed.pos_embedding.pos_embedding",
-            data=ir.tensor(full_pos),
-        )
+        if self._learned_pos:
+            # I2V checkpoints ship a trained joint table, which is inherently tied
+            # to the sample resolution and frame count recorded in the config.
+            total_seq = (
+                config.max_text_seq_length + num_time_patches * post_patch_h * post_patch_w
+            )
+            self.pos_embedding = nn.Parameter(
+                [1, total_seq, embed_dim],
+                name="patch_embed.pos_embedding",
+            )
 
     def forward(
         self,
@@ -471,11 +566,25 @@ class _CogVideoXPatchEmbed(nn.Module):
         # Project text
         text = self.text_proj(op, text_embeds)  # [B, seq, hidden]
 
-        # Concatenate text + video and add positional embedding
-        embeds = op.Concat(text, video, axis=1)  # [B, total_seq, hidden]
-        embeds = op.Add(embeds, self.pos_embedding)
+        if self._learned_pos:
+            # Learned table covers text + video positions jointly.
+            embeds = op.Concat(text, video, axis=1)
+            return op.Add(embeds, self.pos_embedding)
 
-        return embeds
+        # Sincos positions are zero over the text prefix in diffusers, so adding
+        # them to the video stream alone is exact and keeps the text length free.
+        pos = _sincos_3d_in_graph(
+            op,
+            self._embed_dim,
+            num_frames,
+            h_patches,
+            w_patches,
+            self._spatial_scale,
+            self._temporal_scale,
+        )  # [1, T*H'*W', hidden]
+        video = op.Add(video, op.CastLike(pos, video))
+
+        return op.Concat(text, video, axis=1)  # [B, total_seq, hidden]
 
 
 # ---------------------------------------------------------------------------
@@ -648,11 +757,27 @@ class CogVideoXTransformer3DModel(nn.Module):
         Renames:
         - ``ff.net.0.proj.*`` → ``ff.gelu_proj.*``
         - ``ff.net.2.*`` → ``ff.linear_out.*``
+
+        Reshapes:
+        - ``patch_embed.proj.weight`` from the HuggingFace ``Conv2d`` layout
+          ``[embed_dim, C, p, p]`` to the flattened ``Linear`` layout
+          ``[embed_dim, C * p * p]``. A stride-``p`` ``Conv2d`` with a ``p x p``
+          kernel is exactly a linear map over each ``(C, p, p)`` patch, and this
+          module patchifies to ``[B, T * H' * W', C * p * p]`` with the same
+          ``(C, p_h, p_w)`` element order, so a plain reshape is the correct
+          weight transform.
         """
-        return rename_weight_keys(
+        state_dict = rename_weight_keys(
             state_dict,
             [
                 (".ff.net.0.proj.", ".ff.gelu_proj."),
                 (".ff.net.2.", ".ff.linear_out."),
             ],
         )
+        proj_weight = state_dict.get("patch_embed.proj.weight")
+        if proj_weight is not None and proj_weight.ndim == 4:
+            state_dict = dict(state_dict)
+            state_dict["patch_embed.proj.weight"] = proj_weight.reshape(
+                proj_weight.shape[0], -1
+            )
+        return state_dict

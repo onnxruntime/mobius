@@ -54,6 +54,8 @@ import os
 import shutil
 from typing import TYPE_CHECKING, Any
 
+from mobius.upstream_patches import apply_asset_patches
+
 if TYPE_CHECKING:
     import onnx_ir as ir
 
@@ -84,6 +86,7 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "mistral": "mistral",
     "mistral3": "mistral3",
     "lfm2": "lfm2",
+    "lfm2_vl": "lfm2_vl",
     # HunYuan-V1 dense / Hy-MT1.5 — generic decoder LLM type accepted by
     # ORT GenAI (see onnxruntime-genai/src/models/model_type.h LLM list).
     "hunyuan_v1_dense": "decoder",
@@ -92,8 +95,16 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "qwen2_vl": "qwen2_5_vl",
     "qwen3_vl": "qwen3_vl",
     "qwen3_vl_text": "qwen3_vl",
-    "qwen3_5": "qwen2_5_vl",
-    "qwen3_5_vl": "qwen2_5_vl",
+    # Qwen3.5 / Qwen3.6 use the Qwen-VL auxiliary vision+embedding pipeline
+    # but a hybrid DeltaNet/full-attention decoder, so they must select the
+    # native ORT GenAI qwen3_5 model type rather than the Qwen2.5-VL decoder.
+    "qwen3_5": "qwen3_5",
+    "qwen3_5_text": "qwen3_5",
+    "qwen3_5_vl": "qwen3_5",
+    "qwen3_5_vl_text": "qwen3_5",
+    "qwen3_5_moe": "qwen3_5",
+    "qwen3_5_moe_text": "qwen3_5",
+    "qwen3_5_moe_vl": "qwen3_5",
     # MiniCPM uses standard 1D decoder position IDs (unlike Qwen-VL MRoPE).
     # The phi3v multimodal runtime provides that contract; callers supply
     # HF-preprocessed packed pixels through Generator.set_inputs().
@@ -112,7 +123,9 @@ _GEMMA4_MODEL_TYPES = frozenset(
 # must preprocess with the HuggingFace processor and feed tensors via
 # ``Generator.set_inputs`` (see examples/gemma4_unified_ort_genai.py).
 _GEMMA4_UNIFIED_MODEL_TYPES = frozenset({"gemma4_unified", "gemma4_unified_text"})
+_GLMASR_MODEL_TYPES = frozenset({"glmasr"})
 _MINICPM_MODEL_TYPES = frozenset({"minicpmv4_6"})
+_LFM2_VL_MODEL_TYPES = frozenset({"lfm2_vl"})
 # gemma-3 multimodal. build() unwraps the composite HF config to its text
 # sub-config, so at export time ``config.model_type`` is "gemma3_text" (not
 # "gemma3").
@@ -136,10 +149,33 @@ _QWEN_VL_MODEL_TYPES = frozenset(
         "qwen3_vl_text",
         "qwen3_5",
         "qwen3_5_vl",
+        "qwen3_5_vl_text",
         "qwen3_5_moe",
+        "qwen3_5_moe_vl",
+        "qwen3_5_moe_text",
         "videochat_flash_qwen",
     }
 )
+_QWEN35_VL_MODEL_TYPES = frozenset(
+    {
+        "qwen3_5",
+        "qwen3_5_vl",
+        "qwen3_5_vl_text",
+        "qwen3_5_moe",
+        "qwen3_5_moe_text",
+        "qwen3_5_moe_vl",
+    }
+)
+_QWEN35_TRT_RTX_EMBEDDING_PROVIDER_OPTIONS = {
+    "nv_profile_min_shapes": "input_ids:1x1,image_features:0x1024",
+    "nv_profile_opt_shapes": "input_ids:1x226,image_features:192x1024",
+    "nv_profile_max_shapes": "input_ids:1x1024,image_features:2520x1024",
+}
+_QWEN35_TRT_RTX_VISION_PROVIDER_OPTIONS = {
+    "nv_profile_min_shapes": "pixel_values:600x1536",
+    "nv_profile_opt_shapes": "pixel_values:600x1536",
+    "nv_profile_max_shapes": "pixel_values:600x1536",
+}
 
 _TOKENIZER_FILES = [
     "tokenizer.json",
@@ -153,6 +189,7 @@ _TOKENIZER_FILES = [
     # Preserve HuggingFace processor metadata for VLMs whose preprocessing
     # cannot be represented by an ort-extensions image_processor.json.
     "preprocessor_config.json",
+    "processor_config.json",
 ]
 
 
@@ -185,6 +222,19 @@ def _select_ort_model_type(
     if is_decoder_only and config_model_type in _ORT_GENAI_MODEL_TYPE:
         return _ORT_GENAI_MODEL_TYPE[config_model_type]
     return _resolve_ort_genai_model_type(hf_model_type or "unknown")
+
+
+def _load_generation_config(model_id: str):
+    """Load optional Hugging Face generation settings without requiring the file."""
+    import transformers
+
+    try:
+        return transformers.GenerationConfig.from_pretrained(model_id)
+    except OSError:
+        logger.debug(
+            "No generation_config.json found for %s; using model config token IDs", model_id
+        )
+        return None
 
 
 def _graph_input_names(model: ir.Model) -> list[str]:
@@ -253,6 +303,8 @@ def _introspect_outputs(pkg: ModelPackage, key: str) -> dict[str, str] | None:
 def _copy_tokenizer_files(
     model_id: str,
     output_dir: str,
+    *,
+    revision: str | None = None,
 ) -> list[str]:
     """Download and copy tokenizer files from HuggingFace Hub.
 
@@ -262,9 +314,10 @@ def _copy_tokenizer_files(
     from huggingface_hub.utils import EntryNotFoundError
 
     copied: list[str] = []
+    download_kwargs = {} if revision is None else {"revision": revision}
     for filename in _TOKENIZER_FILES:
         try:
-            src = hf_hub_download(model_id, filename)
+            src = hf_hub_download(model_id, filename, **download_kwargs)
             dst = os.path.join(output_dir, filename)
             shutil.copy2(src, dst)
             copied.append(filename)
@@ -341,7 +394,68 @@ def _fix_tokenizer_config(output_dir: str) -> bool:
     return True
 
 
-def _fix_chat_template(output_dir: str, hf_model_id: str | None) -> bool:
+_SPECIAL_TOKEN_FIELDS = {
+    "<tool_call>": "bot_token_id",
+    "</tool_call>": "eot_token_id",
+    "<|tool_call|>": "bot_token_id",
+    "<|/tool_call|>": "eot_token_id",
+    "<think>": "bor_token_id",
+    "</think>": "eor_token_id",
+}
+
+
+def _special_token_ids_from_tokenizer_config(
+    output_dir: str, vocab_size: int
+) -> dict[str, int]:
+    """Read delimiter IDs from copied tokenizer_config.json or tokenizer.json."""
+    special_token_ids: dict[str, int] = {}
+    ambiguous_fields: set[str] = set()
+    token_sources = (
+        ("tokenizer_config.json", "added_tokens_decoder"),
+        ("tokenizer.json", "added_tokens"),
+    )
+    for filename, added_tokens_key in token_sources:
+        path = os.path.join(output_dir, filename)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                added_tokens = json.load(f).get(added_tokens_key, {})
+        except (OSError, json.JSONDecodeError, AttributeError):
+            logger.warning("Could not read special tokens from %s", path, exc_info=True)
+            continue
+        if isinstance(added_tokens, dict):
+            entries = added_tokens.items()
+        elif isinstance(added_tokens, list):
+            entries = (
+                (token.get("id"), token) for token in added_tokens if isinstance(token, dict)
+            )
+        else:
+            continue
+        for raw_token_id, token in entries:
+            if not isinstance(token, dict):
+                continue
+            field = _SPECIAL_TOKEN_FIELDS.get(token.get("content"))
+            try:
+                token_id = int(raw_token_id)
+            except (TypeError, ValueError):
+                continue
+            if field is None or not 0 <= token_id < vocab_size or field in ambiguous_fields:
+                continue
+            if field in special_token_ids and special_token_ids[field] != token_id:
+                special_token_ids.pop(field)
+                ambiguous_fields.add(field)
+            else:
+                special_token_ids[field] = token_id
+    return special_token_ids
+
+
+def _fix_chat_template(
+    output_dir: str,
+    hf_model_id: str | None,
+    *,
+    revision: str | None = None,
+) -> bool:
     """Ensure chat_template is present in tokenizer_config.json.
 
     Some HuggingFace models don't store ``chat_template`` in the
@@ -370,7 +484,8 @@ def _fix_chat_template(output_dir: str, hf_model_id: str | None) -> bool:
     try:
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(hf_model_id)
+        tokenizer_kwargs = {} if revision is None else {"revision": revision}
+        tokenizer = AutoTokenizer.from_pretrained(hf_model_id, **tokenizer_kwargs)
         template = getattr(tokenizer, "chat_template", None)
         if template:
             tc["chat_template"] = template
@@ -510,6 +625,7 @@ def _write_vision_processor_config(
     *,
     hf_model_id: str | None = None,
     trust_remote_code: bool = False,
+    revision: str | None = None,
 ) -> str | None:
     """Write the vision processor config file for VLM models.
 
@@ -577,6 +693,17 @@ def _write_vision_processor_config(
             model_type,
         )
         return None
+    if model_type in _LFM2_VL_MODEL_TYPES:
+        # LFM2-VL uses adaptive tiling, thumbnail insertion, NaFlex patchification,
+        # and prompt-token expansion. No ort-extensions transform implements that
+        # contract; preserve the pinned HF processor_config.json copied above and
+        # require callers to feed its three tensors through set_inputs().
+        logger.info(
+            "Skipping generated image processor for %s "
+            "(use Lfm2VlProcessor + Generator.set_inputs)",
+            model_type,
+        )
+        return None
 
     vision_model_type = getattr(vision, "model_type", None)
     is_pixtral = vision_model_type == "pixtral" or model_type in _PIXTRAL_MODEL_TYPES
@@ -641,10 +768,10 @@ def _write_vision_processor_config(
             try:
                 from transformers import AutoProcessor
 
-                hf_proc = AutoProcessor.from_pretrained(
-                    hf_model_id,
-                    trust_remote_code=trust_remote_code,
-                )
+                processor_kwargs: dict[str, Any] = {"trust_remote_code": trust_remote_code}
+                if revision is not None:
+                    processor_kwargs["revision"] = revision
+                hf_proc = AutoProcessor.from_pretrained(hf_model_id, **processor_kwargs)
                 ip = getattr(hf_proc, "image_processor", None)
                 if ip is not None:
                     image_mean = list(getattr(ip, "image_mean", image_mean))
@@ -744,10 +871,10 @@ def _write_vision_processor_config(
             try:
                 from transformers import AutoProcessor
 
-                hf_proc = AutoProcessor.from_pretrained(
-                    hf_model_id,
-                    trust_remote_code=trust_remote_code,
-                )
+                processor_kwargs = {"trust_remote_code": trust_remote_code}
+                if revision is not None:
+                    processor_kwargs["revision"] = revision
+                hf_proc = AutoProcessor.from_pretrained(hf_model_id, **processor_kwargs)
                 ip = getattr(hf_proc, "image_processor", None)
                 if ip is not None:
                     image_mean = list(getattr(ip, "image_mean", image_mean))
@@ -954,6 +1081,46 @@ def _write_audio_processor_config(
             }
         }
         proc_filename = "audio_feature_extraction.json"
+    elif model_type in _GLMASR_MODEL_TYPES:
+        # GLM-ASR uses the standard Whisper log-mel contract with 128 mel
+        # bins and a fixed 30-second window. These operation names and attrs
+        # are consumed by OrtxCreateSpeechFeatureExtractor.
+        processor = {
+            "feature_extraction": {
+                "sequence": [
+                    {
+                        "operation": {
+                            "name": "audio_decoder",
+                            "type": "AudioDecoder",
+                        }
+                    },
+                    {
+                        "operation": {
+                            "name": "stft",
+                            "type": "STFTNorm",
+                            "attrs": {
+                                "n_fft": 400,
+                                "frame_length": 400,
+                                "hop_length": 160,
+                            },
+                        }
+                    },
+                    {
+                        "operation": {
+                            "name": "log_mel",
+                            "type": "LogMelSpectrum",
+                            "attrs": {
+                                "chunk_size": 30,
+                                "hop_length": 160,
+                                "n_fft": 400,
+                                "n_mel": 128,
+                            },
+                        }
+                    },
+                ]
+            }
+        }
+        proc_filename = "audio_processor.json"
     else:
         # Generic audio processor — add model-specific branches as needed.
         return None
@@ -1075,6 +1242,9 @@ def _write_genai_config(
         supports_in_place_kv_cache=supports_in_place_kv_cache,
         num_cache_layer_slots=_count_cache_layer_slots(decoder_model),
     )
+    generator.with_special_tokens(
+        **_special_token_ids_from_tokenizer_config(output_dir, config.vocab_size)
+    )
 
     if is_vlm:
         image_token_id = getattr(config, "image_token_id", None)
@@ -1100,6 +1270,11 @@ def _write_genai_config(
                 # MiniCPM performs both 2x2 merges inside the ONNX vision
                 # graph and consumes HF-prepacked pixels, not Qwen grid_thw.
                 vision_kwargs["spatial_merge_size"] = None
+            elif model_type in _LFM2_VL_MODEL_TYPES:
+                # Pixel unshuffle is already part of the ONNX vision encoder;
+                # ORT GenAI must not perform another spatial merge.
+                vision_kwargs["spatial_merge_size"] = None
+                vision_kwargs["config_filename"] = "processor_config.json"
             elif has_speech:
                 vision_kwargs["spatial_merge_size"] = None
                 # Gemma3n shares gemma3's fixed-resize branch in
@@ -1133,7 +1308,10 @@ def _write_genai_config(
                     if model_type == "mage_vl"
                     else "processor_config.json"
                 )
-                if model_type in {"mage_vl", "qwen3_vl", "qwen3_vl_text"}:
+                if (
+                    model_type in {"mage_vl", "qwen3_vl", "qwen3_vl_text"}
+                    or model_type in _QWEN35_VL_MODEL_TYPES
+                ):
                     patch_size = getattr(vision_cfg, "patch_size", None)
                     window_size = getattr(vision_cfg, "window_size", None)
                     if patch_size is not None:
@@ -1142,6 +1320,13 @@ def _write_genai_config(
                         vision_kwargs["window_size"] = window_size
                     vision_kwargs["tokens_per_second"] = float(
                         getattr(config, "tokens_per_second", 2.0)
+                    )
+                if ep == "trt-rtx" and model_type in _QWEN35_VL_MODEL_TYPES:
+                    vision_kwargs["embedding_provider_options"] = (
+                        _QWEN35_TRT_RTX_EMBEDDING_PROVIDER_OPTIONS
+                    )
+                    vision_kwargs["vision_provider_options"] = (
+                        _QWEN35_TRT_RTX_VISION_PROVIDER_OPTIONS
                     )
 
             if vision_input_mapping is not None:
@@ -1209,6 +1394,12 @@ def _write_genai_config(
                 "audio_embeds": "input_features",
                 "attention_mask": "input_features_mask",
             }
+        elif model_type in _GLMASR_MODEL_TYPES:
+            audio_kwargs["config_filename"] = "audio_processor.json"
+            audio_kwargs["input_names"] = {
+                "audio_embeds": "input_features",
+                "attention_mask": "input_features_mask",
+            }
         else:
             if audio_input_mapping is not None:
                 audio_kwargs["input_names"] = audio_input_mapping
@@ -1217,6 +1408,13 @@ def _write_genai_config(
             boa_token_id=boa_token_id,
             **audio_kwargs,
         )
+        embedding_inputs = _introspect_inputs(pkg, "embedding")
+        embedding_outputs = _introspect_outputs(pkg, "embedding")
+        if embedding_inputs is not None:
+            generator.with_embedding(
+                input_names=embedding_inputs,
+                output_names=embedding_outputs,
+            )
 
     return generator.write(output_dir)
 
@@ -1228,6 +1426,12 @@ def _validate_ort_genai_compatibility(pkg: ModelPackage) -> None:
         raise ValueError(
             "ORT GenAI does not define a feature-input CTC ASR pipeline; "
             "export Parakeet CTC as ONNX and run it directly with ONNX Runtime."
+        )
+    if getattr(config, "model_type", None) in _GLMASR_MODEL_TYPES:
+        raise ValueError(
+            "onnxruntime-genai does not register a GLM-ASR multimodal model type. "
+            "Export without --runtime ort-genai and run the audio_encoder, embedding, "
+            "and decoder models directly with ONNX Runtime."
         )
     if {"vision_encoder", "decoder"}.issubset(pkg) and "embedding" not in pkg:
         model_type = getattr(config, "model_type", "unknown")
@@ -1254,6 +1458,7 @@ def write_ort_genai_config(
     context_length: int = 4096,
     local_config_dir: str | None = None,
     trust_remote_code: bool = False,
+    revision: str | None = None,
 ) -> dict[str, str]:
     """Generate ORT-GenAI config artifacts for an already-built ModelPackage.
 
@@ -1269,6 +1474,8 @@ def write_ort_genai_config(
         directory: Output directory (created if needed).
         hf_model_id: HuggingFace model ID or local model directory. When provided,
             used to fetch token IDs (``bos``/``eos``/``pad``) and copy tokenizer files.
+            Token IDs from ``generation_config.json`` take precedence over model config
+            values because generation configs may define additional stop tokens.
             When ``None``, token IDs are read from ``pkg.config`` fields
             (``bos_token_id``, ``eos_token_id``, ``pad_token_id``) populated
             by :meth:`~mobius._configs.ArchitectureConfig.from_transformers`,
@@ -1286,6 +1493,8 @@ def write_ort_genai_config(
             directory rather than a HuggingFace model ID.
         trust_remote_code: Allow custom HuggingFace configuration code when
             resolving token IDs and model type.
+        revision: Optional immutable HuggingFace revision used for every remote
+            configuration, tokenizer, and processor request.
 
     Returns:
         Dict mapping artifact name to file path, e.g.::
@@ -1339,9 +1548,10 @@ def write_ort_genai_config(
     if hf_model_id is not None:
         import transformers
 
-        hf_config = transformers.AutoConfig.from_pretrained(
-            hf_model_id, trust_remote_code=trust_remote_code
-        )
+        config_kwargs: dict[str, Any] = {"trust_remote_code": trust_remote_code}
+        if revision is not None:
+            config_kwargs["revision"] = revision
+        hf_config = transformers.AutoConfig.from_pretrained(hf_model_id, **config_kwargs)
         model_type = hf_config.model_type
         cfg_model_type = getattr(config, "model_type", None)
         # See _select_ort_model_type: decoder-only packages prefer the package's
@@ -1400,28 +1610,27 @@ def write_ort_genai_config(
         _pad = getattr(config, "pad_token_id", None)
         pad_token_id = None if (_pad is None or _pad < 0) else _pad
 
+    generation_config_source = hf_model_id or local_config_dir
+    if generation_config_source and (
+        generation_config := _load_generation_config(generation_config_source)
+    ):
+        generation_bos_token_id = getattr(generation_config, "bos_token_id", None)
+        generation_eos_token_id = getattr(generation_config, "eos_token_id", None)
+        generation_pad_token_id = getattr(generation_config, "pad_token_id", None)
+        if generation_bos_token_id is not None:
+            bos_token_id = generation_bos_token_id
+        if generation_eos_token_id is not None:
+            eos_token_id = generation_eos_token_id
+        if generation_pad_token_id is not None:
+            pad_token_id = generation_pad_token_id
+
     # Phi4MM quirk: HF reports model_type='phi' but the model package
     # includes an 'audio_encoder' component that distinguishes it from plain Phi.
     # Override to 'phi4mm' so ORT-GenAI loads the correct pipeline.
     if ort_model_type == "phi" and has_speech:
         ort_model_type = "phi4mm"
 
-    logger.info("Generating genai_config.json for %s (ep=%s)", ort_model_type, ep)
-    genai_path = _write_genai_config(
-        config,
-        directory,
-        pkg=pkg,
-        ort_model_type=ort_model_type,
-        ep=ep,
-        context_length=context_length,
-        bos_token_id=bos_token_id,
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        is_vlm=is_vlm,
-        has_speech=has_speech,
-    )
-
-    result: dict[str, str] = {"genai_config": genai_path}
+    result: dict[str, str] = {}
 
     if "mtp" in pkg:
         mtp_model = pkg["mtp"]
@@ -1459,7 +1668,12 @@ def write_ort_genai_config(
             tokenizer_files = _copy_tokenizer_files_from_local(hf_model_id, directory)
         else:
             logger.info("Copying tokenizer files from %s", hf_model_id)
-            tokenizer_files = _copy_tokenizer_files(hf_model_id, directory)
+            if revision is None:
+                tokenizer_files = _copy_tokenizer_files(hf_model_id, directory)
+            else:
+                tokenizer_files = _copy_tokenizer_files(
+                    hf_model_id, directory, revision=revision
+                )
         for tf in tokenizer_files:
             result[tf] = os.path.join(directory, tf)
     elif local_config_dir is not None:
@@ -1475,12 +1689,29 @@ def write_ort_genai_config(
         for tf in tokenizer_files:
             result[tf] = os.path.join(directory, tf)
 
+    logger.info("Generating genai_config.json for %s (ep=%s)", ort_model_type, ep)
+    genai_path = _write_genai_config(
+        config,
+        directory,
+        pkg=pkg,
+        ort_model_type=ort_model_type,
+        ep=ep,
+        context_length=context_length,
+        bos_token_id=bos_token_id,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        is_vlm=is_vlm,
+        has_speech=has_speech,
+    )
+    result["genai_config"] = genai_path
+
     # Write processor config for VLMs
     processor_path = _write_vision_processor_config(
         config,
         directory,
         hf_model_id=hf_model_id,
         trust_remote_code=trust_remote_code,
+        revision=revision,
     )
     if processor_path:
         result["processor_config"] = processor_path
@@ -1494,7 +1725,10 @@ def write_ort_genai_config(
     _fix_tokenizer_config(directory)
 
     # Ensure chat_template is in tokenizer_config.json
-    _fix_chat_template(directory, hf_model_id)
+    _fix_chat_template(directory, hf_model_id, revision=revision)
+
+    # Correct assets that ship broken from upstream
+    apply_asset_patches(directory)
 
     logger.info("ORT-GenAI artifacts written: %d files", len(result))
     return result
@@ -1509,6 +1743,7 @@ def export_package(
     context_length: int = 4096,
     local_config_dir: str | None = None,
     trust_remote_code: bool = False,
+    revision: str | None = None,
     external_data: str = "onnx",
     progress_bar: bool = True,
 ) -> dict[str, str]:
@@ -1548,6 +1783,8 @@ def export_package(
             when ``hf_model_id`` is ``None``.
         trust_remote_code: Allow custom HuggingFace configuration code when
             resolving token IDs and model type.
+        revision: Optional immutable HuggingFace revision used for remote
+            configuration, tokenizer, and processor requests.
         external_data: External-data format passed to :meth:`ModelPackage.save`
             (``"onnx"`` or ``"safetensors"``).
         progress_bar: Whether to show the save progress bar.
@@ -1605,6 +1842,7 @@ def export_package(
         context_length=context_length,
         local_config_dir=local_config_dir,
         trust_remote_code=trust_remote_code,
+        revision=revision,
     )
 
     # 3. Add ONNX paths to the manifest
@@ -1626,6 +1864,7 @@ def auto_export(
     task: str | None = None,
     external_data: str = "onnx",
     trust_remote_code: bool = False,
+    revision: str | None = None,
     context_length: int = 4096,
     ep: str = "cpu",
     progress_bar: bool = True,
@@ -1650,6 +1889,8 @@ def auto_export(
         external_data: External data format (``"onnx"`` or
             ``"safetensors"``).
         trust_remote_code: Trust remote code for HuggingFace config.
+        revision: Optional immutable HuggingFace revision used for all Hub
+            configuration, weight, tokenizer, and processor requests.
         context_length: Minimum context length for genai_config.json.
         ep: Execution provider for ``session_options`` in
             ``genai_config.json``. Defaults to ``"cpu"``. For non-CPU providers
@@ -1691,6 +1932,7 @@ def auto_export(
         model_id,
         task=task,
         dtype=dtype,
+        revision=revision,
         load_weights=True,
         trust_remote_code=trust_remote_code,
         execution_provider=build_ep,
@@ -1713,6 +1955,7 @@ def auto_export(
         ep=ep,
         context_length=context_length,
         trust_remote_code=trust_remote_code,
+        revision=revision,
         external_data=external_data,
         progress_bar=progress_bar,
     )

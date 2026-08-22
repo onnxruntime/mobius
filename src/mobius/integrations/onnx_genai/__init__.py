@@ -15,9 +15,13 @@ model families Mobius builds:
   composite encoder/fusion/autoregressive-decoder pipeline.
 * **Speech-to-text (ASR)** — :func:`write_speech_to_text_pipeline_metadata` emits
   a Whisper-style cross-attention encode→decode pipeline.
-* **Audio codec / multi-decoder TTS** — :func:`write_audio_codec_pipeline_metadata`
-  and :func:`write_tts_pipeline_metadata` emit audio-to-audio and
-  ``pre_embedder``-driven ``nested_autoregressive`` (Qwen3-TTS) pipelines.
+* **Full-duplex speech-to-speech** — :func:`write_full_duplex_workflow_metadata`
+  emits one-event-per-invocation SSA with session-scoped conversational state
+  (Moshi / PersonaPlex).
+* **Audio codec / multi-decoder TTS** —
+  :func:`write_audio_codec_workflow_metadata` emits typed codec SSA, while
+  :func:`write_tts_workflow_metadata` reports the current nested-loop induction
+  contract blocker precisely.
 * **Diffusion pipelines** — :func:`write_diffusion_pipeline_metadata` emits an
   iterative pipeline for a denoiser plus optional VAE / text encoder.
 
@@ -50,45 +54,87 @@ from mobius.integrations.onnx_genai.decoder_metadata import (
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
-    build_audio_codec_pipeline_metadata,
+    add_policy_components_to_workflow,
     build_diffusion_pipeline_metadata,
-    build_language_diffusion_pipeline_metadata,
     build_multimodal_pipeline_metadata,
     build_speech_to_text_pipeline_metadata,
-    build_tts_pipeline_metadata,
     load_diffusers_scheduler_config,
-    write_audio_codec_pipeline_metadata,
     write_diffusion_pipeline_metadata,
     write_multimodal_pipeline_metadata,
     write_speech_to_text_pipeline_metadata,
-    write_tts_pipeline_metadata,
+)
+from mobius.integrations.onnx_genai.shared_state_flow_metadata import (
+    build_shared_state_pixel_flow_workflow_metadata,
+    is_shared_state_pixel_flow_package,
+    write_shared_state_pixel_flow_workflow_metadata,
+)
+from mobius.integrations.onnx_genai.workflow_metadata import (
+    build_audio_codec_workflow_metadata,
+    build_decoder_workflow_metadata,
+    build_diffusion_workflow_metadata,
+    build_full_duplex_workflow_metadata,
+    build_image_edit_workflow_metadata,
+    build_language_diffusion_pipeline_metadata,
+    build_speculative_workflow_metadata,
+    build_tts_workflow_metadata,
+    build_video_diffusion_workflow_metadata,
+    build_vlm_workflow_metadata,
+    write_audio_codec_workflow_metadata,
+    write_decoder_workflow_metadata,
+    write_diffusion_workflow_metadata,
+    write_full_duplex_workflow_metadata,
+    write_image_edit_workflow_metadata,
+    write_language_diffusion_workflow_metadata,
+    write_speculative_workflow_metadata,
+    write_tts_workflow_metadata,
+    write_video_diffusion_workflow_metadata,
+    write_vlm_workflow_metadata,
 )
 
 __all__ = [
     "ComfyUIWorkflow",
     "ConversionResult",
     "SchedulerConfig",
+    "add_policy_components_to_workflow",
+    "build_audio_codec_workflow_metadata",
+    "build_full_duplex_workflow_metadata",
     "build_decoder_metadata",
+    "build_decoder_workflow_metadata",
     "build_diffusion_pipeline_metadata",
+    "build_diffusion_workflow_metadata",
+    "build_image_edit_workflow_metadata",
     "build_language_diffusion_pipeline_metadata",
-    "build_audio_codec_pipeline_metadata",
     "build_multimodal_pipeline_metadata",
     "build_pipeline_metadata_for_workflow",
+    "build_speculative_workflow_metadata",
     "build_speech_to_text_pipeline_metadata",
-    "build_tts_pipeline_metadata",
+    "build_shared_state_pixel_flow_workflow_metadata",
+    "build_tts_workflow_metadata",
+    "build_video_diffusion_workflow_metadata",
+    "build_vlm_workflow_metadata",
     "convert_comfyui_workflow",
     "decoder_metadata_from_config",
-    "moe_metadata_from_config",
     "load_diffusers_scheduler_config",
+    "is_shared_state_pixel_flow_package",
+    "moe_metadata_from_config",
     "parse_comfyui_workflow",
     "parse_comfyui_workflow_file",
     "translate_comfyui_workflow",
     "translate_comfyui_workflow_file",
+    "write_audio_codec_workflow_metadata",
+    "write_full_duplex_workflow_metadata",
     "write_decoder_metadata",
+    "write_decoder_workflow_metadata",
     "write_diffusion_pipeline_metadata",
-    "write_audio_codec_pipeline_metadata",
+    "write_diffusion_workflow_metadata",
+    "write_image_edit_workflow_metadata",
+    "write_language_diffusion_workflow_metadata",
     "write_multimodal_pipeline_metadata",
-    "write_speech_to_text_pipeline_metadata",
-    "write_tts_pipeline_metadata",
     "write_onnx_genai_config",
+    "write_speculative_workflow_metadata",
+    "write_speech_to_text_pipeline_metadata",
+    "write_shared_state_pixel_flow_workflow_metadata",
+    "write_tts_workflow_metadata",
+    "write_video_diffusion_workflow_metadata",
+    "write_vlm_workflow_metadata",
 ]

@@ -1,0 +1,1371 @@
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      capabilities:
+      - workflow_ssa
+      - linear_effects
+      - nested_control_flow
+      - loop_induction_values
+      - typed_emit
+      - emit_valid_length
+      - bounded_state_recurrence
+      - serving_service_contract
+      - grammar_guidance_adapter
+      - adaptive_proposal_budget
+      - advisory_state
+      adapter_abis:
+        onnx-genai.grammar-guidance: '1'
+    inputs:
+      request.tokens:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - 4
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: prompt_tokens
+        source:
+          kind: request
+        required: true
+      request.seed:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: seed
+        source:
+          kind: request
+        required: false
+        default: 0
+      request.max_iterations:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: runtime
+          version: '1.0'
+          role: max_output_tokens
+        source:
+          kind: request
+        required: true
+      package.zero:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0
+      package.one:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 1
+      package.max_context:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 4096
+      package.false:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: false
+      package.active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+      request.cache_lengths:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: serving.cache_lengths
+        required: false
+        default: 0
+      request.grammar_state:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: grammar.initial_state
+        required: true
+      request.grammar_transition_table:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - grammar_states
+          - vocabulary
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: grammar.transition_table
+        required: true
+      request.adaptive_k:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: adaptive.current_k
+        required: false
+        default: 1
+      request.adaptive_estimates:
+        contract:
+          dtype: float32
+          rank: 2
+          shape:
+          - batch
+          - 24
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: adaptive.estimates
+        required: false
+        default: 0.0
+      request.draft_ms:
+        contract:
+          dtype: float32
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: telemetry.draft_ms
+        required: true
+      request.target_ms:
+        contract:
+          dtype: float32
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: telemetry.target_ms
+        required: true
+      request.verifier.past_key_values.0.key:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 2
+          - past_sequence
+          - 8
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: verifier.past_key_values.0.key
+        required: true
+      request.verifier.past_key_values.0.value:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 4
+          - past_sequence
+          - 4
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: verifier.past_key_values.0.value
+        required: true
+    outputs:
+      tokens:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - accepted_sequence
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tokens
+        stage: pre_adapter
+    components:
+      proposer:
+        implementation:
+          kind: onnx
+          artifact: proposer/model.onnx
+      verifier:
+        implementation:
+          kind: onnx
+          artifact: verifier/model.onnx
+      grammar_clone:
+        implementation:
+          kind: adapter
+          abi: onnx-genai.grammar-guidance
+          version: '1'
+        ports:
+          inputs:
+            state:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - proposal
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            valid_length:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            transition_table:
+              dtype: int64
+              rank: 2
+              shape:
+              - grammar_states
+              - vocabulary
+          outputs:
+            next_state:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            consumed_length:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            logits_mask:
+              dtype: bool
+              rank: 2
+              shape:
+              - batch
+              - vocabulary
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            forced_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            forced_length:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+        contract:
+          id: onnx-genai.grammar-guidance
+          version: '1'
+          bindings:
+            state: state
+            tokens: tokens
+            valid_length: valid_length
+            transition_table: transition_table
+            next_state: next_state
+            consumed_length: consumed_length
+            logits_mask: logits_mask
+            forced_tokens: forced_tokens
+            forced_length: forced_length
+          parameters:
+            action: clone
+        effects:
+        - grammar
+        row_scope:
+          axis: 0
+          stateful: true
+      grammar_lookahead:
+        implementation:
+          kind: adapter
+          abi: onnx-genai.grammar-guidance
+          version: '1'
+        ports:
+          inputs:
+            state:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - proposal
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            valid_length:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            transition_table:
+              dtype: int64
+              rank: 2
+              shape:
+              - grammar_states
+              - vocabulary
+          outputs:
+            next_state:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            consumed_length:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            logits_mask:
+              dtype: bool
+              rank: 2
+              shape:
+              - batch
+              - vocabulary
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            forced_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            forced_length:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+        contract:
+          id: onnx-genai.grammar-guidance
+          version: '1'
+          bindings:
+            state: state
+            tokens: tokens
+            valid_length: valid_length
+            transition_table: transition_table
+            next_state: next_state
+            consumed_length: consumed_length
+            logits_mask: logits_mask
+            forced_tokens: forced_tokens
+            forced_length: forced_length
+          parameters:
+            action: lookahead
+        effects:
+        - grammar
+        row_scope:
+          axis: 0
+          stateful: true
+      grammar_commit:
+        implementation:
+          kind: adapter
+          abi: onnx-genai.grammar-guidance
+          version: '1'
+        ports:
+          inputs:
+            state:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - proposal
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            valid_length:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            transition_table:
+              dtype: int64
+              rank: 2
+              shape:
+              - grammar_states
+              - vocabulary
+          outputs:
+            next_state:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            consumed_length:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            logits_mask:
+              dtype: bool
+              rank: 2
+              shape:
+              - batch
+              - vocabulary
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            forced_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            forced_length:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+        contract:
+          id: onnx-genai.grammar-guidance
+          version: '1'
+          bindings:
+            state: state
+            tokens: tokens
+            valid_length: valid_length
+            transition_table: transition_table
+            next_state: next_state
+            consumed_length: consumed_length
+            logits_mask: logits_mask
+            forced_tokens: forced_tokens
+            forced_length: forced_length
+          parameters:
+            action: commit
+        effects:
+        - grammar
+        row_scope:
+          axis: 0
+          stateful: true
+      speculative_acceptance:
+        implementation:
+          kind: onnx
+          artifact: policies/speculative_acceptance.onnx
+        ports:
+          inputs:
+            target_scores:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - draft_sequence
+              - vocabulary
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            proposed_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - draft_sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            seed:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            offset:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            accepted_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - draft_sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            accepted_len:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            done:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            next_offset:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            rollback_len:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            continue:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+        contract:
+          id: onnx-genai.speculative-verifier
+          version: '1'
+          bindings:
+            target_scores: target_scores
+            proposed_tokens: proposed_tokens
+            accepted_tokens: accepted_tokens
+            accepted_len: accepted_len
+            done: done
+            continue: continue
+            seed: seed
+            offset: offset
+            next_offset: next_offset
+      grammar_guidance:
+        implementation:
+          kind: onnx
+          artifact: policies/grammar_guidance.onnx
+        ports:
+          inputs:
+            logits:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - vocabulary
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            logits_mask:
+              dtype: bool
+              rank: 2
+              shape:
+              - batch
+              - vocabulary
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            forced_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            forced_length:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            token:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      adaptive_k:
+        implementation:
+          kind: onnx
+          artifact: policies/adaptive_k.onnx
+        ports:
+          inputs:
+            current_k:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            accepted:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            evaluated:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            committed_tokens:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            filled_proposal_budget:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            draft_ms:
+              dtype: float32
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            target_ms:
+              dtype: float32
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            estimates:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - 24
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            next_k:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            next_estimates:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - 24
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+        contract:
+          id: onnx-genai.adaptive-proposal-budget
+          version: '1'
+          bindings:
+            current_k: current_k
+            accepted: accepted
+            evaluated: evaluated
+            committed_tokens: committed_tokens
+            filled_proposal_budget: filled_proposal_budget
+            draft_ms: draft_ms
+            target_ms: target_ms
+            estimates: estimates
+            next_k: next_k
+            next_estimates: next_estimates
+      grammar_length:
+        implementation:
+          kind: onnx
+          artifact: policies/grammar_length.onnx
+        ports:
+          inputs:
+            left:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            right:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            minimum:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      grammar_sampler_logits:
+        implementation:
+          kind: onnx
+          artifact: policies/grammar_sampler_logits.onnx
+        ports:
+          inputs:
+            logits:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - sequence
+              - vocabulary
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            last_logits:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - vocabulary
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      proposal_metrics:
+        implementation:
+          kind: onnx
+          artifact: policies/proposal_metrics.onnx
+        ports:
+          inputs:
+            proposed_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - proposal
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            requested_k:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            evaluated:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            filled_proposal_budget:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      cache_length_update:
+        implementation:
+          kind: onnx
+          artifact: policies/cache_length_update.onnx
+        ports:
+          inputs:
+            left:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            right:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            total:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+    state:
+      tokens_state:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - 4
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: request.tokens
+        recurrence:
+          kind: invariant
+      rng_offset:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.zero
+        recurrence:
+          kind: invariant
+      active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.active
+        recurrence:
+          kind: invariant
+      done:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.false
+        recurrence:
+          kind: invariant
+      accepted_len:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.zero
+        recurrence:
+          kind: invariant
+      cache_lengths:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: request.cache_lengths
+        recurrence:
+          kind: invariant
+      grammar:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: request.grammar_state
+        recurrence:
+          kind: invariant
+      proposal_k:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: advisory
+        scope: invocation
+        initializer: request.adaptive_k
+        recurrence:
+          kind: invariant
+      adaptive_estimates:
+        contract:
+          dtype: float32
+          rank: 2
+          shape:
+          - batch
+          - 24
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: advisory
+        scope: invocation
+        initializer: request.adaptive_estimates
+        recurrence:
+          kind: invariant
+      cache_0:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 2
+          - past_sequence
+          - 8
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: request.verifier.past_key_values.0.key
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.max_context
+        service_group: verifier_cache
+        management: runtime
+        release_boundary: invocation
+      cache_1:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 4
+          - past_sequence
+          - 4
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: request.verifier.past_key_values.0.value
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.max_context
+        service_group: verifier_cache
+        management: runtime
+        release_boundary: invocation
+    serving:
+      active: active
+      done: done
+      accepted_len: accepted_len
+      state_service:
+        groups:
+          verifier_cache:
+            kind: full_attention
+            sequence_axis: 2
+            layout: bnsh
+            aliasing: forbidden
+            reuse:
+              prefix_reusable: true
+              evictable_prefix: false
+            capabilities:
+              snapshot: true
+              fork: true
+            ports:
+              verifier:
+                cache_0:
+                  input: past_key_values.0.key
+                  output: present.0.key
+                  role: key
+                  layer: 0
+                cache_1:
+                  input: past_key_values.0.value
+                  output: present.0.value
+                  role: value
+                  layer: 0
+            logical_lengths: cache_lengths
+    effects:
+      grammar:
+        retry: transactional
+        speculation_safety:
+          kind: clonable
+    steps:
+    - kind: loop
+      setup: []
+      steps:
+      - kind: invoke
+        component: proposer
+        inputs:
+          tokens: tokens_state
+          proposal_budget: proposal_k
+        outputs:
+          proposed_tokens: proposal.tokens
+          proposal_scores: proposal.scores
+      - kind: invoke
+        component: proposal_metrics
+        inputs:
+          proposed_tokens: proposal.tokens
+          requested_k: proposal_k
+        outputs:
+          evaluated: proposal.evaluated
+          filled_proposal_budget: proposal.filled_budget
+      - kind: invoke
+        component: grammar_clone
+        inputs:
+          state: grammar
+          tokens: proposal.tokens
+          valid_length: package.zero
+          transition_table: request.grammar_transition_table
+        outputs:
+          next_state: grammar.clone.state
+          consumed_length: grammar.clone.consumed
+          logits_mask: grammar.clone.mask
+          forced_tokens: grammar.clone.forced
+          forced_length: grammar.clone.forced_length
+      - kind: invoke
+        component: grammar_lookahead
+        inputs:
+          state: grammar.clone.state
+          tokens: proposal.tokens
+          valid_length: proposal.evaluated
+          transition_table: request.grammar_transition_table
+        outputs:
+          next_state: grammar.lookahead.state
+          consumed_length: grammar.valid_length
+          logits_mask: grammar.lookahead.mask
+          forced_tokens: grammar.lookahead.forced
+          forced_length: grammar.lookahead.forced_length
+      - kind: invoke
+        component: verifier
+        inputs:
+          proposed_tokens: proposal.tokens
+          past_key_values.0.key: cache_0
+          past_key_values.0.value: cache_1
+        outputs:
+          target_scores: target.scores
+          present.0.key: verifier.present.0.key
+          present.0.value: verifier.present.0.value
+      - kind: invoke
+        component: speculative_acceptance
+        inputs:
+          target_scores: target.scores
+          proposed_tokens: proposal.tokens
+          seed: request.seed
+          offset: rng_offset
+        outputs:
+          accepted_tokens: acceptance.tokens
+          accepted_len: acceptance.length
+          done: acceptance.done
+          continue: acceptance.continue
+          next_offset: rng_offset.body
+          rollback_len: acceptance.rollback_length
+      - kind: invoke
+        component: grammar_length
+        inputs:
+          left: acceptance.length
+          right: grammar.valid_length
+        outputs:
+          minimum: grammar.committed_length
+      - kind: invoke
+        component: grammar_commit
+        inputs:
+          state: grammar
+          tokens: acceptance.tokens
+          valid_length: grammar.committed_length
+          transition_table: request.grammar_transition_table
+        outputs:
+          next_state: grammar.next
+          consumed_length: grammar.committed
+          logits_mask: grammar.mask
+          forced_tokens: grammar.forced
+          forced_length: grammar.forced_length
+      - kind: invoke
+        component: grammar_sampler_logits
+        inputs:
+          logits: target.scores
+        outputs:
+          last_logits: grammar.sampler_logits
+      - kind: invoke
+        component: grammar_guidance
+        inputs:
+          logits: grammar.sampler_logits
+          logits_mask: grammar.mask
+          forced_tokens: grammar.forced
+          forced_length: grammar.forced_length
+        outputs:
+          token: grammar.token
+      - kind: invoke
+        component: cache_length_update
+        inputs:
+          left: cache_lengths
+          right: grammar.committed_length
+        outputs:
+          total: cache_lengths.next
+      - kind: invoke
+        component: adaptive_k
+        inputs:
+          current_k: proposal_k
+          accepted: grammar.committed_length
+          evaluated: proposal.evaluated
+          committed_tokens: grammar.committed_length
+          filled_proposal_budget: proposal.filled_budget
+          draft_ms: request.draft_ms
+          target_ms: request.target_ms
+          estimates: adaptive_estimates
+        outputs:
+          next_k: adaptive.next_k
+          next_estimates: adaptive.next_estimates
+      - kind: emit
+        value: acceptance.tokens
+        output: tokens
+        mode: append
+        valid_length: grammar.committed_length
+      - kind: emit
+        value: grammar.token
+        output: tokens
+        mode: append
+        valid_length: grammar.forced_length
+      continue_when: active
+      max_iterations: request.max_iterations
+      carried:
+      - cell: tokens_state
+        next: acceptance.tokens
+      - cell: rng_offset
+        next: rng_offset.body
+      - cell: active
+        next: acceptance.continue
+      - cell: done
+        next: acceptance.done
+      - cell: accepted_len
+        next: grammar.committed_length
+      - cell: cache_lengths
+        next: cache_lengths.next
+      - cell: grammar
+        next: grammar.next
+      - cell: proposal_k
+        next: adaptive.next_k
+      - cell: adaptive_estimates
+        next: adaptive.next_estimates
+      - cell: cache_0
+        next: verifier.present.0.key
+      - cell: cache_1
+        next: verifier.present.0.value
+      iteration:
+        value: speculative.iteration
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0

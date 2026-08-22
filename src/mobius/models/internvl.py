@@ -27,7 +27,7 @@ HuggingFace weight names:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from onnxscript import OpBuilder, nn
@@ -546,6 +546,51 @@ class InternVL2Model(nn.Module):
 
     default_task: str = "vision-language"
     category: str = "Multimodal"
+
+    # Runtime ``InternVLChatModel.named_modules()`` sub-trees per ONNX component.
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": (
+            "language_model.model.layers",
+            "language_model.model.norm",
+            "language_model.model.rotary_emb",
+            "language_model.lm_head",
+        ),
+        "vision_encoder": ("vision_model", "mlp1"),
+        "embedding": ("language_model.model.embed_tokens",),
+    }
+    _INTERNLM2_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": (
+            "language_model.model.layers",
+            "language_model.model.norm",
+            "language_model.output",
+        ),
+        "vision_encoder": ("vision_model", "mlp1"),
+        "embedding": ("language_model.model.tok_embeddings",),
+    }
+
+    @classmethod
+    def get_hf_component_sources(
+        cls,
+        *,
+        model_type: str,
+        hf_config: object,
+    ) -> dict[str, tuple[str, ...]]:
+        """Return paths for the verified OpenGVLab remote-code runtime."""
+        llm_config = getattr(hf_config, "llm_config", None)
+        llm_model_type = getattr(llm_config, "model_type", None)
+        if llm_model_type == "internlm2":
+            return cls._INTERNLM2_COMPONENT_SOURCES
+        if llm_model_type in {"llama", "qwen2"}:
+            return cls.HF_COMPONENT_SOURCES
+        if llm_model_type is not None:
+            return {}
+        architectures = getattr(hf_config, "architectures", None) or ()
+        if (
+            model_type in {"internvl", "internvl2", "internvl_chat"}
+            or "InternVLChatModel" in architectures
+        ):
+            return cls.HF_COMPONENT_SOURCES
+        return {}
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()

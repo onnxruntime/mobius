@@ -1,0 +1,265 @@
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      adapter_abis:
+        onnx-genai.parameter-overlay: '1'
+      capabilities:
+      - workflow_ssa
+      - typed_emit
+      - parameter_adapters
+      - heterogeneous_adapter_batching
+    inputs:
+      request.active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: adapter_active
+        source:
+          kind: request
+      activations:
+        contract:
+          dtype: float32
+          rank: 2
+          shape:
+          - batch
+          - 2
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: activations
+      request.adapter_segments:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - 2
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: adapter_segments
+        source:
+          kind: request
+      request.adapter_counts:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: adapter_counts
+        source:
+          kind: request
+      request.adapter_scales:
+        contract:
+          dtype: float32
+          rank: 2
+          shape:
+          - batch
+          - 2
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: adapter_scales
+        source:
+          kind: request
+    outputs:
+      result:
+        contract:
+          dtype: float32
+          rank: 2
+          shape:
+          - batch
+          - 2
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+    components:
+      decoder:
+        implementation:
+          kind: onnx
+          artifact: model.onnx
+      overlay:
+        implementation:
+          kind: adapter
+          abi: onnx-genai.parameter-overlay
+          version: '1'
+        ports:
+          inputs:
+            input:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - 2
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            output:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - 2
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+        contract:
+          id: onnx-genai.parameter-overlay
+          version: '1'
+          bindings:
+            input: input
+            output: output
+          parameters:
+            action: apply
+            component: decoder
+            parameter: projection
+    state: {}
+    steps:
+    - kind: invoke
+      component: overlay
+      inputs:
+        input: activations
+      outputs:
+        output: adapted
+    - kind: emit
+      value: adapted
+      output: result
+      mode: replace
+adapters:
+  target_manifest:
+    targets:
+    - id: projection
+      component: decoder
+      initializer: projection
+      node_name: projection
+      output_name: projection.output
+      activation_dtype: float32
+      input_features: 2
+      output_features: 2
+      layer_index: 0
+      rank: 1
+      alpha: 1.0
+      graph_inputs:
+        a: lora.projection.a
+        b: lora.projection.b
+        scale: lora.projection.scale
+  discovery_fallback: disabled
+  selection:
+    segments: request.adapter_segments
+    adapter_counts: request.adapter_counts
+    scales: request.adapter_scales
+    active: request.active
+    max_adapters: 2
+  application_capability: onnx-genai.adapters@1
+  portable_fallback: true
+  cache:
+    max_entries: 2
+    eviction: lru
+  planning:
+    bucket_by_adapter_set: true
+    stable_buffers: true
+    invalidate_capture_on_eviction: true
+  artifacts:
+    blue:
+      index: 0
+      identity: blue
+      version: '1'
+      rank: 1
+      alpha: 1.0
+      dtype: float32
+      provenance:
+        producer: mobius
+      weights:
+      - location: adapters/blue/adapter.json
+        loader_capability: onnx-genai.adapters.json@1
+        scale_encoding: alpha_over_rank
+        format: json
+      bindings:
+      - target: projection
+        weight_key: projection
+    green:
+      index: 1
+      identity: green
+      version: '1'
+      rank: 1
+      alpha: 1.0
+      dtype: float32
+      provenance:
+        producer: mobius
+      weights:
+      - location: adapters/green/adapter.json
+        loader_capability: onnx-genai.adapters.json@1
+        scale_encoding: alpha_over_rank
+        format: json
+      bindings:
+      - target: projection
+        weight_key: projection
+    peft:
+      index: 2
+      identity: peft
+      version: '1'
+      rank: 1
+      alpha: 1.0
+      dtype: float32
+      provenance:
+        producer: mobius
+        source: synthetic/adapter-base
+        revision: synthetic-revision
+      weights:
+      - location: adapters/peft/adapter.json
+        loader_capability: onnx-genai.adapters.json@1
+        scale_encoding: alpha_over_rank
+        format: json
+      - location: adapters/peft/adapter_model.safetensors
+        loader_capability: onnx-genai.adapters.hf-peft@1
+        config_location: adapters/peft/adapter_config.json
+        scale_encoding: alpha_over_rank
+        format: hf_peft
+      bindings:
+      - target: projection
+        weight_key: projection
+    red:
+      index: 3
+      identity: red
+      version: '1'
+      rank: 1
+      alpha: 1.0
+      dtype: float32
+      provenance:
+        producer: mobius
+      weights:
+      - location: adapters/red/adapter.json
+        loader_capability: onnx-genai.adapters.json@1
+        scale_encoding: alpha_over_rank
+        format: json
+      bindings:
+      - target: projection
+        weight_key: projection

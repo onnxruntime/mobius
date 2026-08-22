@@ -29,10 +29,12 @@ from mobius._configs import (
     Gemma3nConfig,
     Gemma3nMultiModalConfig,
     Gemma4Config,
+    GlmAsrConfig,
     GraniteMoeHybridConfig,
     JambaConfig,
     JetMoeConfig,
     Lfm2Config,
+    Lfm2VlConfig,
     LongcatFlashConfig,
     Mamba2Config,
     MambaConfig,
@@ -45,11 +47,13 @@ from mobius._configs import (
     ParakeetCTCConfig,
     Sam2Config,
     SegformerConfig,
+    SenseNovaU1Config,
     VisionConfig,
     WhisperConfig,
     YolosConfig,
     Zamba2Config,
 )
+from mobius.models import EsmConfig
 
 # ---------------------------------------------------------------------------
 # Tiny model dimensions shared by all configs
@@ -1463,7 +1467,18 @@ ENCODER_CONFIGS: list[tuple[str, dict, bool]] = [
     ("electra", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
     ("ernie", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
     ("ernie_m", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
-    ("esm", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
+    (
+        "esm",
+        {
+            "_config_cls": EsmConfig,
+            "hidden_act": "gelu",
+            "type_vocab_size": 2,
+            # ESM-2 rotates the whole head dimension with base 10000 and
+            # declares it through ``position_embedding_type`` alone.
+            "partial_rotary_factor": 1.0,
+        },
+        False,
+    ),
     ("flaubert", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
     ("ibert", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
     (
@@ -2220,6 +2235,32 @@ _TINY_MUSE_GLIMMER_VISION = VisionConfig(
 # The test parametrization in build_graph_test.py uses specialised test
 # methods that invoke the correct task and assert the right output models.
 VL_CONFIGS: list[tuple[str, dict, bool]] = [
+    (
+        "neo_chat",
+        {
+            "_config_cls": SenseNovaU1Config,
+            "head_dim": 16,
+            "attn_qk_norm": True,
+            "rope_theta": 5e6,
+            "rope_theta_hw": 1e4,
+            "max_position_embeddings_hw": 512,
+            "patch_size": 4,
+            "downsample_ratio": 0.5,
+            "frequency_embedding_size": 8,
+            "vision": VisionConfig(
+                hidden_size=32,
+                patch_size=4,
+                in_channels=3,
+                spatial_merge_size=2,
+                out_hidden_size=TINY_HIDDEN,
+                rope_theta=1e4,
+                num_position_embeddings=512,
+                num_hidden_layers=0,
+                num_attention_heads=0,
+            ),
+        },
+        True,
+    ),
     # --- Nemotron Parse (C-RADIO + feature neck + cross-attentive decoder) ---
     (
         "nemotron_parse",
@@ -2246,6 +2287,36 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
     ),
     # --- LLaVA family (vision-language, 3-model split) ---
     ("llava", {"vision": _TINY_VISION, "image_token_id": 32000}, True),
+    (
+        "lfm2_vl",
+        {
+            "_config_cls": Lfm2VlConfig,
+            "layer_types": ["conv", "full_attention"],
+            "attn_qk_norm": True,
+            "block_auto_adjust_ff_dim": False,
+            "tie_word_embeddings": True,
+            "image_token_id": 250,
+            "downsample_factor": 2,
+            "projector_hidden_act": "gelu",
+            "projector_hidden_size": TINY_HIDDEN,
+            "projector_bias": True,
+            "projector_use_layernorm": False,
+            "vision": VisionConfig(
+                model_type="siglip2_naflex",
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=16,
+                patch_size=4,
+                norm_eps=1e-6,
+                in_channels=3,
+                num_position_embeddings=16,
+                hidden_act="gelu_pytorch_tanh",
+            ),
+        },
+        True,
+    ),
     (
         "muse_glimmer",
         {
@@ -2731,6 +2802,31 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
             "max_source_positions": 100,
             "max_target_positions": 50,
             "scale_embedding": True,
+        },
+        True,
+    ),
+    # --- GLM-ASR-Nano (speech-language, partial-RoPE audio encoder) ---
+    (
+        "glmasr",
+        {
+            "_config_cls": GlmAsrConfig,
+            "audio_token_id": 100,
+            "audio": AudioConfig(
+                d_model=64,
+                encoder_layers=2,
+                encoder_attention_heads=4,
+                encoder_ffn_dim=256,
+                encoder_head_dim=16,
+                encoder_num_key_value_heads=4,
+                encoder_partial_rotary_factor=0.5,
+                encoder_rope_theta=10_000.0,
+                encoder_layer_norm_eps=1e-5,
+                num_mel_bins=128,
+                max_source_positions=256,
+                output_dim=64,
+                activation_function="gelu",
+                audio_token_id=100,
+            ),
         },
         True,
     ),

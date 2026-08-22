@@ -1,0 +1,1596 @@
+schema_version: v1
+preprocessing:
+  image:
+    transforms:
+    - op: decode_rgb
+      outputs:
+      - image.decoded
+    - op: resize
+      inputs:
+      - image.decoded
+      outputs:
+      - image.resized
+      mode: pixel_area
+      interpolation: lanczos3
+      min_pixels: 262144
+      max_pixels: 4194304
+      size_multiple: 32
+    - op: rescale
+      inputs:
+      - image.resized
+      outputs:
+      - image.rescaled
+      scale: 0.00392156862745098
+    - op: normalize
+      inputs:
+      - image.rescaled
+      outputs:
+      - image.normalized
+      mean:
+      - 0.485
+      - 0.456
+      - 0.406
+      std:
+      - 0.229
+      - 0.224
+      - 0.225
+    outputs:
+    - source: image.normalized
+      name: image.pixel_values
+      content: pixels
+      dtype: float16
+      contract:
+        dtype: float16
+        rank: 4
+        shape:
+        - 1
+        - 3
+        - source_image_height
+        - source_image_width
+pipeline:
+  workflow:
+    manifest:
+      adapter_abis:
+        onnx-genai.image-preprocess: '1'
+      capabilities:
+      - workflow_ssa
+      - linear_effects
+      - typed_emit
+      - nested_control_flow
+      - loop_induction_values
+      - serving_service_contract
+      - input_presence
+    inputs:
+      request.prompt_tokens:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - sequence_len
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: prompt_tokens
+        source:
+          kind: request
+      request.negative_prompt_tokens:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - negative_sequence_len
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: negative_prompt_tokens
+        source:
+          kind: request
+      request.image:
+        contract:
+          dtype: uint8
+          rank: 1
+          shape:
+          - encoded_bytes
+        role:
+          kind: runtime
+          version: '1.0'
+          role: media
+        source:
+          kind: request
+        required: false
+        present_as: request.image_present
+      request.image_mask:
+        contract:
+          dtype: bool
+          rank: 2
+          shape:
+          - batch
+          - sequence_len
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: image_mask
+        required: false
+        default: false
+      request.negative_image_mask:
+        contract:
+          dtype: bool
+          rank: 2
+          shape:
+          - batch
+          - negative_sequence_len
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: negative_image_mask
+        required: false
+        default: false
+      request.latent:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 3
+          - height
+          - width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: latent
+        required: false
+        present_as: request.latent_present
+        externally_suppliable: true
+      request.seed:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: seed
+        source:
+          kind: request
+        required: false
+        default: 0
+      request.width:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: runtime
+          version: '1.0'
+          role: width
+        source:
+          kind: request
+        required: false
+        default: 512
+      request.height:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: runtime
+          version: '1.0'
+          role: height
+        source:
+          kind: request
+        required: false
+        default: 512
+      request.guidance_scale:
+        contract:
+          dtype: float32
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: guidance_scale
+        source:
+          kind: request
+        required: false
+        default: 2.0
+      request.max_iterations:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: runtime
+          version: '1.0'
+          role: max_iterations
+        source:
+          kind: request
+        required: false
+        default: 2
+      request.text_only:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: text_only
+        required: false
+        default: false
+      package.active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+      package.false:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: false
+      package.accepted_len:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 1
+      package.rng_offset:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0
+      package.one:
+        contract:
+          dtype: float32
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 1.0
+      package.loop_0_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+    outputs:
+      logits:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - batch
+          - sequence_len
+          - 64
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+      image:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 3
+          - height
+          - width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: image
+        value_range: negative_one_to_one
+        stage: pre_adapter
+    components:
+      embedding:
+        implementation:
+          kind: onnx
+          artifact: embedding/model.onnx
+        ports:
+          roles:
+            input_ids: token_ids
+            inputs_embeds: inputs_embeds
+      vision_encoder:
+        implementation:
+          kind: onnx
+          artifact: vision_encoder/model.onnx
+      decoder:
+        implementation:
+          kind: onnx
+          artifact: decoder/model.onnx
+        ports:
+          roles:
+            inputs_embeds: inputs_embeds
+            attention_mask: attention_mask
+            position_ids: position_ids
+            logits: logits
+      image_gen_embedding:
+        implementation:
+          kind: onnx
+          artifact: image_gen_embedding/model.onnx
+      image_gen_denoiser:
+        implementation:
+          kind: onnx
+          artifact: image_gen_denoiser/model.onnx
+        ports:
+          roles:
+            position_ids: position_ids
+      image_preprocess:
+        implementation:
+          kind: adapter
+          abi: onnx-genai.image-preprocess
+          version: '1'
+        ports:
+          inputs:
+            encoded:
+              dtype: uint8
+              rank: 1
+              shape:
+              - encoded_bytes
+          outputs:
+            pixel_values:
+              dtype: float16
+              rank: 4
+              shape:
+              - 1
+              - 3
+              - source_image_height
+              - source_image_width
+        contract:
+          id: onnx-genai.image-preprocess
+          version: '1'
+          bindings:
+            encoded: encoded
+            pixel_values: pixel_values
+      prefix_initializer:
+        implementation:
+          kind: onnx
+          artifact: policies/prefix_initializer.onnx
+        ports:
+          inputs:
+            prompt_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - prompt_sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            attention_mask:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - total_sequence_len
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            position_ids:
+              dtype: int64
+              rank: 3
+              shape:
+              - 3
+              - batch
+              - prompt_sequence
+            body_attention_mask:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - prompt_sequence + 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            body_position_ids:
+              dtype: int64
+              rank: 3
+              shape:
+              - 3
+              - batch
+              - 1
+            token_slot:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            past_key_values.0.key:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - 2
+              - past_sequence_len
+              - 8
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            past_key_values.0.value:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - 2
+              - past_sequence_len
+              - 8
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      empty_image_features:
+        implementation:
+          kind: onnx
+          artifact: policies/empty_image_features.onnx
+        ports:
+          inputs: {}
+          outputs:
+            features:
+              dtype: float16
+              rank: 3
+              shape:
+              - 1
+              - 0
+              - 32
+      image_grid_positions:
+        implementation:
+          kind: onnx
+          artifact: policies/image_grid_positions.onnx
+        ports:
+          inputs:
+            latent:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            prompt_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - prompt_sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            position_ids:
+              dtype: int64
+              rank: 3
+              shape:
+              - 3
+              - batch
+              - image_tokens
+            token_grid:
+              dtype: int64
+              rank: 1
+              shape:
+              - 2
+      image_dimensions:
+        implementation:
+          kind: onnx
+          artifact: policies/image_dimensions.onnx
+        ports:
+          inputs:
+            tensor:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            height:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
+            width:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
+      image_noise_geometry:
+        implementation:
+          kind: onnx
+          artifact: policies/image_noise_geometry.onnx
+        ports:
+          inputs:
+            height:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
+            width:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
+          outputs:
+            row_shape:
+              dtype: int64
+              rank: 1
+              shape:
+              - 3
+            token_height:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
+            token_width:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
+            noise_scale:
+              dtype: float32
+              rank: 1
+              shape:
+              - 1
+      image_noise:
+        implementation:
+          kind: onnx
+          artifact: policies/image_noise.onnx
+        ports:
+          inputs:
+            seed:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            offset:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            row_shape:
+              dtype: int64
+              rank: 1
+              shape:
+              - row_rank
+          outputs:
+            noise:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            next_offset:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+        contract:
+          id: onnx-genai.counter-rng
+          version: '1'
+          bindings:
+            seed: seed
+            offset: offset
+            row_shape: row_shape
+            noise: noise
+            next_offset: next_offset
+      latent_scale:
+        implementation:
+          kind: onnx
+          artifact: policies/latent_scale.onnx
+        ports:
+          inputs:
+            tensor:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            scale:
+              dtype: float32
+              rank: 1
+              shape:
+              - 1
+          outputs:
+            scaled:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      image_output_clamp:
+        implementation:
+          kind: onnx
+          artifact: policies/image_output_clamp.onnx
+        ports:
+          inputs:
+            tensor:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            clamped:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      flow_schedule:
+        implementation:
+          kind: onnx
+          artifact: policies/flow_schedule.onnx
+        ports:
+          inputs: {}
+          outputs:
+            schedule:
+              dtype: float32
+              rank: 1
+              shape:
+              - 3
+      schedule_lookup:
+        implementation:
+          kind: onnx
+          artifact: policies/schedule_lookup.onnx
+        ports:
+          inputs:
+            schedule:
+              dtype: float32
+              rank: 1
+              shape:
+              - schedule_length
+            step:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            timestep:
+              dtype: float32
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      guidance_combine:
+        implementation:
+          kind: onnx
+          artifact: policies/guidance_combine.onnx
+        ports:
+          inputs:
+            unconditional:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            conditional:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            scale:
+              dtype: float32
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            estimate:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+        contract:
+          id: onnx-genai.guidance-combine
+          version: '1'
+          bindings:
+            unconditional: unconditional
+            conditional: conditional
+            scale: scale
+            estimate: estimate
+      x0_velocity:
+        implementation:
+          kind: onnx
+          artifact: policies/x0_velocity.onnx
+        ports:
+          inputs:
+            sample:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            x0:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            timestep:
+              dtype: float32
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            velocity:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      solver_step:
+        implementation:
+          kind: onnx
+          artifact: policies/solver_step.onnx
+        ports:
+          inputs:
+            sample:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            derivative:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            step:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            schedule:
+              dtype: float32
+              rank: 1
+              shape:
+              - schedule_length
+          outputs:
+            next_state:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+        contract:
+          id: onnx-genai.solver-step
+          version: '1'
+          bindings:
+            state: sample
+            estimate: derivative
+            step: step
+            schedule: schedule
+            next_state: next_state
+      continue_predicate:
+        implementation:
+          kind: onnx
+          artifact: policies/continue_predicate.onnx
+        ports:
+          inputs:
+            done:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            continue:
+              dtype: bool
+              rank: 1
+              shape:
+              - 1
+      cache_cast_0:
+        implementation:
+          kind: onnx
+          artifact: policies/cache_cast_0.onnx
+        ports:
+          inputs:
+            value:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            cast:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      cache_freeze_0:
+        implementation:
+          kind: onnx
+          artifact: policies/cache_freeze_0.onnx
+        ports:
+          inputs:
+            value:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            cast:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      cache_cast_1:
+        implementation:
+          kind: onnx
+          artifact: policies/cache_cast_1.onnx
+        ports:
+          inputs:
+            value:
+              dtype: float16
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            cast:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      cache_freeze_1:
+        implementation:
+          kind: onnx
+          artifact: policies/cache_freeze_1.onnx
+        ports:
+          inputs:
+            value:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            cast:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - heads
+              - sequence
+              - head_dim
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+    state:
+      conditional_cache_0:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 2
+          - conditional_past_sequence_len
+          - 8
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: prefix.conditional.cache.0
+        recurrence:
+          kind: invariant
+        management: runtime
+        release_boundary: invocation
+        service_group: conditional_prefix
+      conditional_cache_1:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 2
+          - conditional_past_sequence_len
+          - 8
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: prefix.conditional.cache.1
+        recurrence:
+          kind: invariant
+        management: runtime
+        release_boundary: invocation
+        service_group: conditional_prefix
+      unconditional_cache_0:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 2
+          - unconditional_past_sequence_len
+          - 8
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: prefix.unconditional.cache.0
+        recurrence:
+          kind: invariant
+        management: runtime
+        release_boundary: invocation
+        service_group: unconditional_prefix
+      unconditional_cache_1:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 2
+          - unconditional_past_sequence_len
+          - 8
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: prefix.unconditional.cache.1
+        recurrence:
+          kind: invariant
+        management: runtime
+        release_boundary: invocation
+        service_group: unconditional_prefix
+      latent:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 3
+          - height
+          - width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: latent.initial
+        recurrence:
+          kind: invariant
+      loop_0_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        scope: invocation
+        initializer: package.loop_0_active
+        recurrence:
+          kind: invariant
+    serving:
+      active: package.active
+      done: package.false
+      accepted_len: package.accepted_len
+      state_service:
+        groups:
+          conditional_prefix:
+            kind: full_attention
+            sequence_axis: 2
+            layout: bnsh
+            update:
+              kind: append
+            ports:
+              decoder:
+                conditional_cache_0:
+                  input: past_key_values.0.key
+                  output: present.0.key
+                  role: key
+                  layer: 0
+                conditional_cache_1:
+                  input: past_key_values.0.value
+                  output: present.0.value
+                  role: value
+                  layer: 0
+              image_gen_denoiser:
+                conditional_cache_0:
+                  input: past_key_values.0.key
+                  output: present.0.key
+                  access: read_only
+                  role: key
+                  layer: 0
+                conditional_cache_1:
+                  input: past_key_values.0.value
+                  output: present.0.value
+                  access: read_only
+                  role: value
+                  layer: 0
+          unconditional_prefix:
+            kind: full_attention
+            sequence_axis: 2
+            layout: bnsh
+            update:
+              kind: append
+            ports:
+              decoder:
+                unconditional_cache_0:
+                  input: past_key_values.0.key
+                  output: present.0.key
+                  role: key
+                  layer: 0
+                unconditional_cache_1:
+                  input: past_key_values.0.value
+                  output: present.0.value
+                  role: value
+                  layer: 0
+              image_gen_denoiser:
+                unconditional_cache_0:
+                  input: past_key_values.0.key
+                  output: present.0.key
+                  access: read_only
+                  role: key
+                  layer: 0
+                unconditional_cache_1:
+                  input: past_key_values.0.value
+                  output: present.0.value
+                  access: read_only
+                  role: value
+                  layer: 0
+    steps:
+    - kind: invoke
+      component: flow_schedule
+      inputs: {}
+      outputs:
+        schedule: flow.schedule
+    - kind: invoke
+      component: image_noise_geometry
+      inputs:
+        height: request.height
+        width: request.width
+      outputs:
+        row_shape: noise.row_shape
+        token_height: noise.token_height
+        token_width: noise.token_width
+        noise_scale: noise.noise_scale
+    - kind: branch
+      predicate: request.latent_present
+      cases:
+        'true':
+          kind: invoke
+          component: latent_scale
+          inputs:
+            tensor: request.latent
+            scale: package.one
+          outputs:
+            scaled: latent.provided
+        'false':
+          kind: sequence
+          steps:
+          - kind: invoke
+            component: image_noise
+            inputs:
+              seed: request.seed
+              offset: package.rng_offset
+              row_shape: noise.row_shape
+            outputs:
+              noise: latent.standard_normal
+              next_offset: image.next_rng_offset
+          - kind: invoke
+            component: latent_scale
+            inputs:
+              tensor: latent.standard_normal
+              scale: noise.noise_scale
+            outputs:
+              scaled: latent.generated
+      outputs:
+        latent.initial:
+          cases:
+            'true': latent.provided
+            'false': latent.generated
+    - kind: invoke
+      component: image_dimensions
+      inputs:
+        tensor: latent.initial
+      outputs:
+        height: image.actual_height
+        width: image.actual_width
+    - kind: invoke
+      component: image_noise_geometry
+      inputs:
+        height: image.actual_height
+        width: image.actual_width
+      outputs:
+        row_shape: image.row_shape
+        token_height: image.token_height
+        token_width: image.token_width
+        noise_scale: image.noise_scale
+    - kind: branch
+      predicate: request.image_present
+      cases:
+        'true':
+          kind: sequence
+          steps:
+          - kind: invoke
+            component: image_preprocess
+            inputs:
+              encoded: request.image
+            outputs:
+              pixel_values: image.pixel_values
+          - kind: invoke
+            component: vision_encoder
+            inputs:
+              pixel_values: image.pixel_values
+            outputs:
+              image_features: image.features.present
+        'false':
+          kind: invoke
+          component: empty_image_features
+          inputs: {}
+          outputs:
+            features: image.features.empty
+      outputs:
+        image.features:
+          cases:
+            'true': image.features.present
+            'false': image.features.empty
+    - kind: invoke
+      component: empty_image_features
+      inputs: {}
+      outputs:
+        features: image.features.unconditional
+    - kind: invoke
+      component: embedding
+      inputs:
+        input_ids: request.prompt_tokens
+        image_features: image.features
+        image_mask: request.image_mask
+      outputs:
+        inputs_embeds: prefix.conditional.embeds
+    - kind: invoke
+      component: embedding
+      inputs:
+        input_ids: request.negative_prompt_tokens
+        image_features: image.features.unconditional
+        image_mask: request.negative_image_mask
+      outputs:
+        inputs_embeds: prefix.unconditional.embeds
+    - kind: invoke
+      component: prefix_initializer
+      inputs:
+        prompt_tokens: request.prompt_tokens
+      outputs:
+        attention_mask: prefix.conditional.attention_mask
+        position_ids: prefix.conditional.position_ids
+        body_attention_mask: prefix.conditional.body_attention_mask
+        body_position_ids: prefix.conditional.body_position_ids
+        token_slot: prefix.conditional.token_slot
+        past_key_values.0.key: prefix.conditional.empty.past_key_values.0.key
+        past_key_values.0.value: prefix.conditional.empty.past_key_values.0.value
+    - kind: invoke
+      component: decoder
+      inputs:
+        inputs_embeds: prefix.conditional.embeds
+        attention_mask: prefix.conditional.attention_mask
+        position_ids: prefix.conditional.position_ids
+        past_key_values.0.key: prefix.conditional.empty.past_key_values.0.key
+        past_key_values.0.value: prefix.conditional.empty.past_key_values.0.value
+      outputs:
+        logits: prefix.conditional.logits
+        present.0.key: prefix.conditional.present.0.key
+        present.0.value: prefix.conditional.present.0.value
+    - kind: invoke
+      component: cache_cast_0
+      inputs:
+        value: prefix.conditional.present.0.key
+      outputs:
+        cast: prefix.conditional.cache.0
+    - kind: invoke
+      component: cache_cast_1
+      inputs:
+        value: prefix.conditional.present.0.value
+      outputs:
+        cast: prefix.conditional.cache.1
+    - kind: invoke
+      component: prefix_initializer
+      inputs:
+        prompt_tokens: request.negative_prompt_tokens
+      outputs:
+        attention_mask: prefix.unconditional.attention_mask
+        position_ids: prefix.unconditional.position_ids
+        body_attention_mask: prefix.unconditional.body_attention_mask
+        body_position_ids: prefix.unconditional.body_position_ids
+        token_slot: prefix.unconditional.token_slot
+        past_key_values.0.key: prefix.unconditional.empty.past_key_values.0.key
+        past_key_values.0.value: prefix.unconditional.empty.past_key_values.0.value
+    - kind: invoke
+      component: decoder
+      inputs:
+        inputs_embeds: prefix.unconditional.embeds
+        attention_mask: prefix.unconditional.attention_mask
+        position_ids: prefix.unconditional.position_ids
+        past_key_values.0.key: prefix.unconditional.empty.past_key_values.0.key
+        past_key_values.0.value: prefix.unconditional.empty.past_key_values.0.value
+      outputs:
+        logits: prefix.unconditional.logits
+        present.0.key: prefix.unconditional.present.0.key
+        present.0.value: prefix.unconditional.present.0.value
+    - kind: invoke
+      component: cache_cast_0
+      inputs:
+        value: prefix.unconditional.present.0.key
+      outputs:
+        cast: prefix.unconditional.cache.0
+    - kind: invoke
+      component: cache_cast_1
+      inputs:
+        value: prefix.unconditional.present.0.value
+      outputs:
+        cast: prefix.unconditional.cache.1
+    - kind: branch
+      predicate: request.text_only
+      cases:
+        'true':
+          kind: emit
+          value: prefix.conditional.logits
+          output: logits
+          mode: replace
+        'false':
+          kind: sequence
+          steps:
+          - kind: loop
+            setup: []
+            steps:
+            - kind: invoke
+              component: schedule_lookup
+              inputs:
+                schedule: flow.schedule
+                step: loop.iteration
+              outputs:
+                timestep: flow.timestep
+            - kind: invoke
+              component: image_gen_embedding
+              inputs:
+                latent: latent
+                timestep: flow.timestep
+                noise_scale: image.noise_scale
+              outputs:
+                image_embeds: flow.image_embeds
+            - kind: invoke
+              component: image_grid_positions
+              inputs:
+                latent: latent
+                prompt_tokens: request.prompt_tokens
+              outputs:
+                position_ids: flow.conditional.position_ids
+                token_grid: flow.conditional.token_grid
+            - kind: invoke
+              component: cache_freeze_0
+              inputs:
+                value: conditional_cache_0
+              outputs:
+                cast: conditional_cache_0.next
+            - kind: invoke
+              component: cache_freeze_1
+              inputs:
+                value: conditional_cache_1
+              outputs:
+                cast: conditional_cache_1.next
+            - kind: invoke
+              component: image_gen_denoiser
+              inputs:
+                image_embeds: flow.image_embeds
+                position_ids: flow.conditional.position_ids
+                token_grid: flow.conditional.token_grid
+                past_key_values.0.key: conditional_cache_0
+                past_key_values.0.value: conditional_cache_1
+              outputs:
+                predicted_image: flow.conditional.x0
+                present.0.key: flow.discard.conditional.0
+                present.0.value: flow.discard.conditional.1
+            - kind: invoke
+              component: image_grid_positions
+              inputs:
+                latent: latent
+                prompt_tokens: request.negative_prompt_tokens
+              outputs:
+                position_ids: flow.unconditional.position_ids
+                token_grid: flow.unconditional.token_grid
+            - kind: invoke
+              component: cache_freeze_0
+              inputs:
+                value: unconditional_cache_0
+              outputs:
+                cast: unconditional_cache_0.next
+            - kind: invoke
+              component: cache_freeze_1
+              inputs:
+                value: unconditional_cache_1
+              outputs:
+                cast: unconditional_cache_1.next
+            - kind: invoke
+              component: image_gen_denoiser
+              inputs:
+                image_embeds: flow.image_embeds
+                position_ids: flow.unconditional.position_ids
+                token_grid: flow.unconditional.token_grid
+                past_key_values.0.key: unconditional_cache_0
+                past_key_values.0.value: unconditional_cache_1
+              outputs:
+                predicted_image: flow.unconditional.x0
+                present.0.key: flow.discard.unconditional.0
+                present.0.value: flow.discard.unconditional.1
+            - kind: invoke
+              component: guidance_combine
+              inputs:
+                unconditional: flow.unconditional.x0
+                conditional: flow.conditional.x0
+                scale: request.guidance_scale
+              outputs:
+                estimate: flow.x0
+            - kind: invoke
+              component: x0_velocity
+              inputs:
+                sample: latent
+                x0: flow.x0
+                timestep: flow.timestep
+              outputs:
+                velocity: flow.velocity
+            - kind: invoke
+              component: solver_step
+              inputs:
+                sample: latent
+                derivative: flow.velocity
+                step: loop.iteration
+                schedule: flow.schedule
+              outputs:
+                next_state: latent.next
+            continue_when: loop_0_active
+            max_iterations: request.max_iterations
+            carried:
+            - cell: latent
+              next: latent.next
+            - cell: conditional_cache_0
+              next: conditional_cache_0.next
+            - cell: conditional_cache_1
+              next: conditional_cache_1.next
+            - cell: unconditional_cache_0
+              next: unconditional_cache_0.next
+            - cell: unconditional_cache_1
+              next: unconditional_cache_1.next
+            - cell: loop_0_active
+              next: package.active
+            iteration:
+              value: loop.iteration
+              contract:
+                dtype: int64
+                rank: 1
+                shape:
+                - 1
+          - kind: invoke
+            component: image_output_clamp
+            inputs:
+              tensor: latent
+            outputs:
+              clamped: image.clamped
+          - kind: emit
+            value: image.clamped
+            output: image
+            mode: replace
+      outputs: {}

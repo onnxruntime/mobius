@@ -702,7 +702,7 @@ class TestBuildQuantizedGguf:
         bits, block_size, is_sym = _detect_quant_params(_MixedModel(), "llama")
         assert (bits, block_size, is_sym) == (4, 32, False)
 
-    def test_pure_q6_k_requires_explicit_dequantization(self):
+    def test_unsupported_quant_type_requires_explicit_dequantization(self):
         """Unsupported quantized inputs fail instead of silently becoming float."""
         from gguf import GGMLQuantizationType
 
@@ -713,7 +713,7 @@ class TestBuildQuantizedGguf:
                 yield (
                     "blk.0.ffn_down.weight",
                     np.empty(0, dtype=np.uint8),
-                    GGMLQuantizationType.Q6_K,
+                    GGMLQuantizationType.Q5_K,
                     (64, 128),
                 )
 
@@ -721,11 +721,37 @@ class TestBuildQuantizedGguf:
             ValueError,
             match=(
                 r"No supported quantized preservation target for GGUF weight "
-                r"types: Q6_K. Use keep_quantized=False \(API\) or "
+                r"types: Q5_K. Use keep_quantized=False \(API\) or "
                 r"--dequantize \(CLI\) for explicit float import."
             ),
         ):
             _detect_quant_params(_UnsupportedModel(), "llama")
+
+    def test_q6_k_selects_the_asymmetric_four_bit_repack_target(self):
+        """Q6_K repacks to the same 4-bit/32 target as Q4_K, with zero points.
+
+        Q6_K's source form is symmetric around 32, but it reaches MatMulNBits
+        through the asymmetric affine requantizer, so zero points are required.
+        A missing entry in `type_can_omit_zero_points` raises `KeyError` here
+        rather than producing a wrong model.
+        """
+        from gguf import GGMLQuantizationType
+
+        from mobius.integrations.gguf._builder import _detect_quant_params
+
+        class _Q6KModel:
+            def tensor_items_raw(self):
+                yield (
+                    "blk.0.ffn_down.weight",
+                    np.empty(0, dtype=np.uint8),
+                    GGMLQuantizationType.Q6_K,
+                    (64, 128),
+                )
+
+        bits, block_size, is_sym = _detect_quant_params(_Q6KModel(), "llama")
+
+        assert (bits, block_size) == (4, 32)
+        assert is_sym is False
 
     def test_runtime_unsupported_format_does_not_select_native_op(self):
         """A GGUF type outside the runtime contract remains on the fallback."""
@@ -809,7 +835,7 @@ class TestMultimodalQuantizationDefault:
 
         expected = mock.sentinel.package
         with mock.patch(
-            "mobius.integrations.gguf._mmproj.build_gemma4_vlm_from_gguf",
+            "mobius.integrations.gguf._mmproj.build_vlm_from_gguf",
             return_value=expected,
         ) as build_multimodal:
             kwargs = {} if keep_quantized else {"keep_quantized": False}
@@ -1164,7 +1190,7 @@ class TestReorderDeltaNetVHeads:
         shape = list(tensor.shape)
         if dim < 0:
             dim += len(shape)
-        new_shape = shape[:dim] + [num_k_heads, num_v_per_k, head_dim] + shape[dim + 1 :]
+        new_shape = [*shape[:dim], num_k_heads, num_v_per_k, head_dim, *shape[dim + 1 :]]
         tensor = tensor.reshape(*new_shape)
         perm = list(range(len(new_shape)))
         perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
@@ -1252,8 +1278,12 @@ class TestReorderDeltaNetVHeads:
         }
         blocks_per_head = n_blocks // n_v  # 2
         tiled = {
-            f"{p}out_proj.weight": self._converter_reorder(gw, 1, n_k, v_per_k, blocks_per_head),
-            f"{p}out_proj.scales": self._converter_reorder(gs, 1, n_k, v_per_k, blocks_per_head),
+            f"{p}out_proj.weight": self._converter_reorder(
+                gw, 1, n_k, v_per_k, blocks_per_head
+            ),
+            f"{p}out_proj.scales": self._converter_reorder(
+                gs, 1, n_k, v_per_k, blocks_per_head
+            ),
             f"{p}out_proj.zero_points": self._converter_reorder(
                 gz, 1, n_k, v_per_k, blocks_per_head // 2
             ),

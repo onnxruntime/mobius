@@ -410,7 +410,7 @@ class TestDenoisingTask:
         model = pkg["model"]
         inputs_by_name = {v.name: v for v in model.graph.inputs}
         assert inputs_by_name["sample"].dtype == ir.DataType.FLOAT
-        assert inputs_by_name["timestep"].dtype == ir.DataType.INT64
+        assert inputs_by_name["timestep"].dtype == ir.DataType.FLOAT
         assert inputs_by_name["encoder_hidden_states"].dtype == ir.DataType.FLOAT
 
     def test_outputs(self):

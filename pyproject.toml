@@ -19,6 +19,7 @@ dependencies = [
     "onnx_ir>=1.0.0",
     "onnx-shape-inference>=0.3.1",
     "onnxscript>=0.7.1",
+    "rfc8785",
     "safetensors",
     "torch>=2.1.0",
     "tqdm",
@@ -56,6 +57,9 @@ docs = ["furo", "myst-parser", "sphinx", "sphinx_copybutton"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"mobius.upstream_patches" = ["data/*/*/*.patch", "data/*/*/*.json", "data/*/*/*.md"]
 
 [tool.setuptools.dynamic]
 version = { attr = "mobius.__version__" }
