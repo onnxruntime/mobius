@@ -313,24 +313,31 @@ class SequenceSelectiveScan(SelectiveScan):
 
         body = _build_sequence_scan_body()
 
+        # Transpose to time-major for the Scan. `scan_input_axes` could name
+        # axis 1 directly and skip these, but several execution providers
+        # (e.g. the MLX plugin EP) only claim Scan nodes that iterate axis 0,
+        # and falling back to CPU for the recurrence costs far more than the
+        # transposes do.
+        dt_t = op.Transpose(dt, perm=[1, 0, 2])  # (seq_len, batch, d_inner)
+        b_t = op.Transpose(b_f32, perm=[1, 0, 2])  # (seq_len, batch, d_state)
+        c_t = op.Transpose(c_f32, perm=[1, 0, 2])  # (seq_len, batch, d_state)
+        x_t = op.Transpose(x_f32, perm=[1, 0, 2])  # (seq_len, batch, d_inner)
+
         # `a_neg` rides along as a pass-through carry so the body never has to
         # reach into the enclosing graph's scope for an initializer.
         _final_state, _a_out, y = op.Scan(
             initial_state,
             a_neg,
-            dt,
-            b_f32,
-            c_f32,
-            x_f32,
+            dt_t,
+            b_t,
+            c_t,
+            x_t,
             body=body,
             num_scan_inputs=4,
-            # Sequence axis is 1 for every scan input and for the scan output,
-            # so no pre/post transposes are needed.
-            scan_input_axes=[1, 1, 1, 1],
-            scan_output_axes=[1],
             _outputs=3,
         )
-        # y: (batch, seq_len, d_inner)
+        # y: (seq_len, batch, d_inner) — restore batch-major.
+        y = op.Transpose(y, perm=[1, 0, 2])  # (batch, seq_len, d_inner)
 
         # --- Skip connection: y += D * x ---
         y = op.Add(y, op.Mul(op.Cast(self.D, to=ir.DataType.FLOAT), x_f32))

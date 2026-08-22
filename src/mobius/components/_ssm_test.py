@@ -142,8 +142,13 @@ class TestSequenceSelectiveScan:
         # ssm_state_out + a_neg_out carries, then the per-step output.
         assert len(body.outputs) == 3
 
-    def test_scan_iterates_over_the_sequence_axis(self):
-        """Sequence axis is 1 on both the scan inputs and the scan output."""
+    def test_scan_iterates_over_axis_zero(self):
+        """Inputs are made time-major so the Scan iterates axis 0.
+
+        Several execution providers (e.g. the MLX plugin EP) only claim
+        Scan nodes with the default axes; naming axis 1 instead would send
+        the whole recurrence back to CPU.
+        """
         ssm = SequenceSelectiveScan(d_inner=16, d_state=4, dt_rank=2)
         test_builder, op, graph = create_test_builder()
         x = create_test_input(test_builder, "x", [1, 3, 16])
@@ -151,8 +156,13 @@ class TestSequenceSelectiveScan:
         ssm(op, x)
 
         scan = next(node for node in graph if node.op_type == "Scan")
-        assert list(scan.attributes["scan_input_axes"].value) == [1, 1, 1, 1]
-        assert list(scan.attributes["scan_output_axes"].value) == [1]
+        assert "scan_input_axes" not in scan.attributes
+        assert "scan_output_axes" not in scan.attributes
+        # Each scan input arrives through a batch<->time transpose.
+        for scan_input in scan.inputs[2:]:
+            producer = scan_input.producer()
+            assert producer.op_type == "Transpose"
+            assert list(producer.attributes["perm"].value) == [1, 0, 2]
 
     def test_recurrence_runs_in_float32(self):
         """The scan body stays in float32 even for a float16 activation."""

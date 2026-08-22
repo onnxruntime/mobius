@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+
 import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
@@ -48,8 +49,8 @@ from mobius._configs import BaseModelConfig
 from mobius._model_package import ModelPackage
 from mobius.components import Conv2d, LayerNorm, Linear, SequenceMambaBlock
 
-# Slice "end" sentinel meaning "to the end of the axis".
-_INT64_MAX = 9223372036854775807
+# Slice "start" sentinel for a reverse (negative-step) slice.
+_INT64_MIN = -9223372036854775808
 
 
 # ---------------------------------------------------------------------------
@@ -388,12 +389,8 @@ class _Decoder(nn.Module):
         hid = config.hid_feature
         eps = config.norm_epsilon
         self.dense_block = DenseBlock(config, depth=config.dense_depth)
-        self.up_conv1 = _norm_act_stage(
-            _SPConvTranspose2d(hid, hid, (1, 3), 2), hid, eps
-        )
-        self.up_conv2 = _norm_act_stage(
-            _SPConvTranspose2d(hid, hid, (1, 3), 4), hid, eps
-        )
+        self.up_conv1 = _norm_act_stage(_SPConvTranspose2d(hid, hid, (1, 3), 2), hid, eps)
+        self.up_conv2 = _norm_act_stage(_SPConvTranspose2d(hid, hid, (1, 3), 4), hid, eps)
 
     def _trunk(self, op: OpBuilder, x: ir.Value) -> ir.Value:
         x = self.dense_block(op, x)
@@ -410,9 +407,7 @@ class MagDecoder(_Decoder):
 
     def __init__(self, config: ReUseConfig):
         super().__init__(config)
-        self.final_conv = Conv2d(
-            config.hid_feature, config.output_channel, kernel_size=(1, 1)
-        )
+        self.final_conv = Conv2d(config.hid_feature, config.output_channel, kernel_size=(1, 1))
 
     def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
         return self.final_conv(op, self._trunk(op, x))  # (B, 1, T'*4, F'*2)
@@ -474,11 +469,18 @@ class BiMambaBlock(nn.Module):
         # x: (batch, seq_len, d_model)
         out_fw = op.Add(self.forward_blocks(op, x), x)
 
-        # Reverse along the sequence axis (ONNX has no Flip; a negative-step
-        # Slice is the standard spelling).
-        x_rev = op.Slice(x, [-1], [_INT64_MAX * -1 - 1], [1], [-1])
+        # Reverse along the sequence axis. ONNX has no Flip, and a
+        # negative-step Slice is the standard spelling.
+        #
+        # ReverseSequence is the obvious "more supported" alternative and is
+        # ~4x faster in isolation, but do not switch: on the MLX plugin EP the
+        # reverse Slice is unclaimable and therefore splits the graph into one
+        # small compilable subgraph per block. Claiming the reverse instead
+        # merges all 30 blocks into a single subgraph that the EP runs
+        # eagerly, which measured 70s vs 0.83s end to end.
+        x_rev = op.Slice(x, [-1], [_INT64_MIN], [1], [-1])
         out_bw = op.Add(self.backward_blocks(op, x_rev), x_rev)
-        out_bw = op.Slice(out_bw, [-1], [_INT64_MAX * -1 - 1], [1], [-1])
+        out_bw = op.Slice(out_bw, [-1], [_INT64_MIN], [1], [-1])
 
         out = op.Concat(out_fw, out_bw, axis=-1)  # (batch, seq_len, 2*d_model)
         return self.norm(op, self.output_proj(op, out))
@@ -542,9 +544,7 @@ class SEMambaSpeechEnhancementModel(nn.Module):
         super().__init__()
         self.config = config
         self.dense_encoder = DenseEncoder(config)
-        self.TSMamba = nn.ModuleList(
-            [TFMambaBlock(config) for _ in range(config.num_tfmamba)]
-        )
+        self.TSMamba = nn.ModuleList([TFMambaBlock(config) for _ in range(config.num_tfmamba)])
         self.mask_decoder = MagDecoder(config)
         self.phase_decoder = PhaseDecoder(config)
 

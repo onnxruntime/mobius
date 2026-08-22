@@ -304,9 +304,7 @@ class TestAtan2:
 
         from mobius._constants import OPSET_VERSION
 
-        graph = ir.Graph(
-            [], [], nodes=[], name="g", opset_imports={"": OPSET_VERSION}
-        )
+        graph = ir.Graph([], [], nodes=[], name="g", opset_imports={"": OPSET_VERSION})
         builder = GraphBuilder(graph)
         y = builder.input("y", dtype=ir.DataType.FLOAT, shape=["n"])
         x = builder.input("x", dtype=ir.DataType.FLOAT, shape=["n"])
@@ -356,9 +354,7 @@ class TestBuildReUse:
 
         graph = pkg["model"].graph
         unfilled = [
-            name
-            for name, value in graph.initializers.items()
-            if value.const_value is None
+            name for name, value in graph.initializers.items() if value.const_value is None
         ]
         assert unfilled == []
         assert [inp.name for inp in graph.inputs] == ["noisy_mag", "noisy_pha"]
@@ -368,3 +364,52 @@ class TestBuildReUse:
         pkg = build_reuse(str(self._checkpoint_dir(tmp_path)), load_weights=False)
 
         assert "model" in pkg
+
+
+class TestExecutionProviderPartitioning:
+    """Lock in graph shapes that plugin EPs need in order to claim the SSM.
+
+    Both assertions here look like arbitrary spelling choices but were
+    measured on the MLX plugin EP (Apple M1 Max, 2s of audio): getting
+    either wrong costs between 2x and 80x.
+    """
+
+    def test_scan_iterates_axis_zero(self):
+        """Scan must iterate axis 0, not name a `scan_input_axes` of 1.
+
+        The MLX EP rejects any Scan whose scan axis is not 0
+        ("only scan_input_axes=0 is supported"), which sends all 120
+        recurrences back to CPU and erases the speedup.
+        """
+        _config, pkg = _build()
+
+        scans = [node for node in pkg["model"].graph if node.op_type == "Scan"]
+        assert scans
+        for scan in scans:
+            assert "scan_input_axes" not in scan.attributes
+            assert "scan_output_axes" not in scan.attributes
+
+    def test_sequence_reverse_uses_negative_step_slice(self):
+        """The backward branch must reverse with a negative-step Slice.
+
+        ReverseSequence is faster in isolation, but the MLX EP cannot claim
+        a reverse Slice, and that unclaimable node is what splits the model
+        into one small compilable subgraph per block. Claiming the reverse
+        instead collapses all 30 blocks into a single subgraph that the EP
+        runs eagerly: 70s versus 0.5s end to end.
+        """
+        _config, pkg = _build()
+
+        reverse_slices = [
+            node
+            for node in pkg["model"].graph
+            if node.op_type == "Slice"
+            and len(node.inputs) == 5
+            and node.inputs[4] is not None
+            and node.inputs[4].const_value is not None
+            and node.inputs[4].const_value.numpy().tolist() == [-1]
+        ]
+        # Two reversals (in and out) per bidirectional block, and each
+        # TFMambaBlock has a time-axis and a frequency-axis block.
+        assert len(reverse_slices) == _tiny_config().num_tfmamba * 2 * 2
+        assert not any(node.op_type == "ReverseSequence" for node in pkg["model"].graph)
