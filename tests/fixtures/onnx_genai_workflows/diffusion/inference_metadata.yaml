@@ -101,6 +101,7 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: image
+        value_range: negative_one_to_one
         stage: pre_adapter
       latent:
         contract:
