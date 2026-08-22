@@ -313,7 +313,7 @@ class LongRope(BaseRope):
         return self._cast_embeddings(op, cos, sin)
 
 
-def yarn_apply_mscale(rope_type: str, rope_scaling: dict | None, scaling: float) -> float:
+def yarn_apply_mscale(rope_type: str | None, rope_scaling: dict | None, scaling: float) -> float:
     """Apply the DeepSeek-V2/V3 YaRN attention-softmax scale correction.
 
     This mirrors HuggingFace's ``yarn_apply_mscale`` in
