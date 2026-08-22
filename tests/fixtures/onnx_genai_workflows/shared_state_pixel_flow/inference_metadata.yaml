@@ -82,7 +82,7 @@ pipeline:
           rank: 2
           shape:
           - batch
-          - sequence_len
+          - negative_sequence_len
           batch_layout:
             kind: request_aligned
             axis: 0
@@ -128,7 +128,7 @@ pipeline:
           rank: 2
           shape:
           - batch
-          - sequence_len
+          - negative_sequence_len
           batch_layout:
             kind: request_aligned
             axis: 0
@@ -156,20 +156,54 @@ pipeline:
         source:
           kind: application
           name: latent
+        required: false
+        present_as: request.latent_present
         externally_suppliable: true
-      request.noise_scale:
+      request.seed:
         contract:
-          dtype: float32
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: seed
+        source:
+          kind: request
+        required: false
+        default: 0
+      request.width:
+        contract:
+          dtype: int64
           rank: 1
           shape:
           - 1
         role:
-          kind: opaque
+          kind: runtime
+          version: '1.0'
+          role: width
         source:
-          kind: application
-          name: noise_scale
+          kind: request
         required: false
-        default: 1.0
+        default: 512
+      request.height:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: runtime
+          version: '1.0'
+          role: height
+        source:
+          kind: request
+        required: false
+        default: 512
       request.guidance_scale:
         contract:
           dtype: float32
@@ -258,6 +292,33 @@ pipeline:
           kind: literal
         required: false
         default: 1
+      package.rng_offset:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0
+      package.one:
+        contract:
+          dtype: float32
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 1.0
       package.loop_0_active:
         contract:
           dtype: bool
@@ -492,6 +553,162 @@ pipeline:
               rank: 1
               shape:
               - 2
+      image_noise_geometry:
+        implementation:
+          kind: onnx
+          artifact: policies/image_noise_geometry.onnx
+        ports:
+          inputs:
+            height:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
+            width:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
+          outputs:
+            row_shape:
+              dtype: int64
+              rank: 1
+              shape:
+              - 3
+            token_height:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
+            token_width:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
+            noise_scale:
+              dtype: float32
+              rank: 1
+              shape:
+              - 1
+      image_noise:
+        implementation:
+          kind: onnx
+          artifact: policies/image_noise.onnx
+        ports:
+          inputs:
+            seed:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            offset:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            row_shape:
+              dtype: int64
+              rank: 1
+              shape:
+              - row_rank
+          outputs:
+            noise:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            next_offset:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+        contract:
+          id: onnx-genai.counter-rng
+          version: '1'
+          bindings:
+            seed: seed
+            offset: offset
+            row_shape: row_shape
+            noise: noise
+            next_offset: next_offset
+      latent_scale:
+        implementation:
+          kind: onnx
+          artifact: policies/latent_scale.onnx
+        ports:
+          inputs:
+            tensor:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            scale:
+              dtype: float32
+              rank: 1
+              shape:
+              - 1
+          outputs:
+            scaled:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      image_output_clamp:
+        implementation:
+          kind: onnx
+          artifact: policies/image_output_clamp.onnx
+        ports:
+          inputs:
+            tensor:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            clamped:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
       flow_schedule:
         implementation:
           kind: onnx
@@ -842,7 +1059,7 @@ pipeline:
           shape:
           - batch
           - 2
-          - past_sequence_len
+          - conditional_past_sequence_len
           - 8
           batch_layout:
             kind: request_aligned
@@ -861,7 +1078,7 @@ pipeline:
           shape:
           - batch
           - 2
-          - past_sequence_len
+          - conditional_past_sequence_len
           - 8
           batch_layout:
             kind: request_aligned
@@ -880,7 +1097,7 @@ pipeline:
           shape:
           - batch
           - 2
-          - past_sequence_len
+          - unconditional_past_sequence_len
           - 8
           batch_layout:
             kind: request_aligned
@@ -899,7 +1116,7 @@ pipeline:
           shape:
           - batch
           - 2
-          - past_sequence_len
+          - unconditional_past_sequence_len
           - 8
           batch_layout:
             kind: request_aligned
@@ -924,7 +1141,7 @@ pipeline:
             kind: request_aligned
             axis: 0
         scope: invocation
-        initializer: request.latent
+        initializer: latent.initial
         recurrence:
           kind: invariant
       loop_0_active:
@@ -1011,6 +1228,51 @@ pipeline:
       inputs: {}
       outputs:
         schedule: flow.schedule
+    - kind: invoke
+      component: image_noise_geometry
+      inputs:
+        height: request.height
+        width: request.width
+      outputs:
+        row_shape: image.row_shape
+        token_height: image.token_height
+        token_width: image.token_width
+        noise_scale: image.noise_scale
+    - kind: branch
+      predicate: request.latent_present
+      cases:
+        'true':
+          kind: invoke
+          component: latent_scale
+          inputs:
+            tensor: request.latent
+            scale: package.one
+          outputs:
+            scaled: latent.provided
+        'false':
+          kind: sequence
+          steps:
+          - kind: invoke
+            component: image_noise
+            inputs:
+              seed: request.seed
+              offset: package.rng_offset
+              row_shape: image.row_shape
+            outputs:
+              noise: latent.standard_normal
+              next_offset: image.next_rng_offset
+          - kind: invoke
+            component: latent_scale
+            inputs:
+              tensor: latent.standard_normal
+              scale: image.noise_scale
+            outputs:
+              scaled: latent.generated
+      outputs:
+        latent.initial:
+          cases:
+            'true': latent.provided
+            'false': latent.generated
     - kind: branch
       predicate: request.image_present
       cases:
@@ -1066,21 +1328,21 @@ pipeline:
       inputs:
         prompt_tokens: request.prompt_tokens
       outputs:
-        attention_mask: prefix.attention_mask
-        position_ids: prefix.position_ids
-        body_attention_mask: prefix.body_attention_mask
-        body_position_ids: prefix.body_position_ids
-        token_slot: prefix.token_slot
-        past_key_values.0.key: prefix.empty.past_key_values.0.key
-        past_key_values.0.value: prefix.empty.past_key_values.0.value
+        attention_mask: prefix.conditional.attention_mask
+        position_ids: prefix.conditional.position_ids
+        body_attention_mask: prefix.conditional.body_attention_mask
+        body_position_ids: prefix.conditional.body_position_ids
+        token_slot: prefix.conditional.token_slot
+        past_key_values.0.key: prefix.conditional.empty.past_key_values.0.key
+        past_key_values.0.value: prefix.conditional.empty.past_key_values.0.value
     - kind: invoke
       component: decoder
       inputs:
         inputs_embeds: prefix.conditional.embeds
-        attention_mask: prefix.attention_mask
-        position_ids: prefix.position_ids
-        past_key_values.0.key: prefix.empty.past_key_values.0.key
-        past_key_values.0.value: prefix.empty.past_key_values.0.value
+        attention_mask: prefix.conditional.attention_mask
+        position_ids: prefix.conditional.position_ids
+        past_key_values.0.key: prefix.conditional.empty.past_key_values.0.key
+        past_key_values.0.value: prefix.conditional.empty.past_key_values.0.value
       outputs:
         logits: prefix.conditional.logits
         present.0.key: prefix.conditional.present.0.key
@@ -1098,13 +1360,25 @@ pipeline:
       outputs:
         cast: prefix.conditional.cache.1
     - kind: invoke
+      component: prefix_initializer
+      inputs:
+        prompt_tokens: request.negative_prompt_tokens
+      outputs:
+        attention_mask: prefix.unconditional.attention_mask
+        position_ids: prefix.unconditional.position_ids
+        body_attention_mask: prefix.unconditional.body_attention_mask
+        body_position_ids: prefix.unconditional.body_position_ids
+        token_slot: prefix.unconditional.token_slot
+        past_key_values.0.key: prefix.unconditional.empty.past_key_values.0.key
+        past_key_values.0.value: prefix.unconditional.empty.past_key_values.0.value
+    - kind: invoke
       component: decoder
       inputs:
         inputs_embeds: prefix.unconditional.embeds
-        attention_mask: prefix.attention_mask
-        position_ids: prefix.position_ids
-        past_key_values.0.key: prefix.empty.past_key_values.0.key
-        past_key_values.0.value: prefix.empty.past_key_values.0.value
+        attention_mask: prefix.unconditional.attention_mask
+        position_ids: prefix.unconditional.position_ids
+        past_key_values.0.key: prefix.unconditional.empty.past_key_values.0.key
+        past_key_values.0.value: prefix.unconditional.empty.past_key_values.0.value
       outputs:
         logits: prefix.unconditional.logits
         present.0.key: prefix.unconditional.present.0.key
@@ -1147,7 +1421,7 @@ pipeline:
               inputs:
                 latent: latent
                 timestep: flow.timestep
-                noise_scale: request.noise_scale
+                noise_scale: image.noise_scale
               outputs:
                 image_embeds: flow.image_embeds
             - kind: invoke
@@ -1253,8 +1527,14 @@ pipeline:
                 rank: 1
                 shape:
                 - 1
+          - kind: invoke
+            component: image_output_clamp
+            inputs:
+              tensor: latent
+            outputs:
+              clamped: image.clamped
           - kind: emit
-            value: latent
+            value: image.clamped
             output: image
             mode: replace
       outputs: {}

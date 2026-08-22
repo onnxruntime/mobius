@@ -522,7 +522,31 @@ class TestInferenceMetadataStatus:
             "x0_velocity",
             "guidance_combine",
             "solver_step",
+            "image_noise_geometry",
+            "image_noise",
+            "latent_scale",
         }
+        assert workflow["inputs"]["request.seed"]["role"]["role"] == "seed"
+        assert workflow["inputs"]["request.width"]["role"]["role"] == "width"
+        assert workflow["inputs"]["request.height"]["role"]["role"] == "height"
+        assert workflow["inputs"]["request.negative_prompt_tokens"]["contract"]["shape"] == [
+            "batch",
+            "negative_sequence_len",
+        ]
+        assert workflow["inputs"]["request.latent"]["required"] is False
+        assert workflow["inputs"]["request.latent"]["present_as"] == "request.latent_present"
+        latent_branch = workflow["steps"][2]
+        assert latent_branch["predicate"] == "request.latent_present"
+        prefix_initializers = [
+            step for step in workflow["steps"] if step.get("component") == "prefix_initializer"
+        ]
+        assert len(prefix_initializers) == 2
+        np.testing.assert_array_equal(
+            package.policy_components["flow_schedule"]
+            .model.graph.outputs[0]
+            .const_value.numpy(),
+            [0.0, 0.5, 1.0],
+        )
         denoiser_aliases = workflow["serving"]["state_service"]["groups"][
             "conditional_prefix"
         ]["ports"]["image_gen_denoiser"]

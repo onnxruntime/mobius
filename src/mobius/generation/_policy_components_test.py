@@ -28,6 +28,7 @@ from mobius.generation import (
     build_grammar_logits_processor,
     build_greedy_sampler,
     build_guidance_combine,
+    build_image_noise_geometry,
     build_integer_minimum,
     build_integer_row_broadcast,
     build_last_token_logits,
@@ -43,6 +44,7 @@ from mobius.generation import (
     build_shape_constant,
     build_speculative_acceptance,
     build_speculative_state_rollback,
+    build_tensor_clamp,
     build_tensor_scale,
     build_termination_batch_initializer,
     build_token_state_update,
@@ -1155,6 +1157,21 @@ def test_counter_rng_is_reproducible_and_row_private(tmp_path):
     assert abs(float(noise.std()) - 1.0) < 0.1
 
 
+def test_image_noise_geometry_resolves_shape_grid_and_scale(tmp_path):
+    row_shape, token_height, token_width, noise_scale = _run(
+        build_image_noise_geometry(),
+        tmp_path,
+        {
+            "height": np.array([512], np.int64),
+            "width": np.array([768], np.int64),
+        },
+    )
+    np.testing.assert_array_equal(row_shape, [3, 512, 768])
+    np.testing.assert_array_equal(token_height, [16])
+    np.testing.assert_array_equal(token_width, [24])
+    np.testing.assert_allclose(noise_scale, [np.sqrt(384 / 64)], rtol=1e-6)
+
+
 def test_tensor_scale_and_zeros_like_shape_from_their_input(tmp_path):
     sample = np.arange(12, dtype=np.float32).reshape(1, 3, 2, 2)
     (scaled,) = _run(
@@ -1165,6 +1182,19 @@ def test_tensor_scale_and_zeros_like_shape_from_their_input(tmp_path):
     np.testing.assert_allclose(scaled, sample * 0.5)
     (zeros,) = _run(build_zeros_like(), tmp_path, {"reference": sample})
     np.testing.assert_array_equal(zeros, np.zeros_like(sample))
+
+
+def test_tensor_clamp_enforces_declared_range(tmp_path):
+    sample = np.array([[[[-2.0, -0.5], [0.5, 2.0]]]], dtype=np.float32)
+    (clamped,) = _run(
+        build_tensor_clamp(minimum=-1.0, maximum=1.0),
+        tmp_path,
+        {"tensor": sample},
+    )
+    np.testing.assert_array_equal(
+        clamped,
+        np.array([[[[-1.0, -0.5], [0.5, 1.0]]]], dtype=np.float32),
+    )
 
 
 def test_scalar_and_shape_constants_publish_their_values(tmp_path):
