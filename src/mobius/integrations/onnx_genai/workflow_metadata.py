@@ -775,6 +775,20 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
             "required": False,
             "default": 10240,
         },
+        "package.carry_length": {
+            "contract": scalar_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 172,
+        },
+        "package.max_waveform_samples": {
+            "contract": scalar_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 15_876_000,
+        },
         "package.flow_steps": {
             "contract": scalar_int,
             "role": {"kind": "opaque"},
@@ -1431,13 +1445,13 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
             "contract": _contract(decoder_outputs["logits"]),
             "scope": "invocation",
             "initializer": "global.setup.logits",
-            "recurrence": {"kind": "invariant"},
+            "recurrence": {"kind": "bounded", "axis": 1, "max": "package.global_context"},
         },
         "global_hidden": {
             "contract": _contract(hidden),
             "scope": "invocation",
             "initializer": "global.setup.hidden",
-            "recurrence": {"kind": "invariant"},
+            "recurrence": {"kind": "bounded", "axis": 1, "max": "package.global_context"},
         },
         "global_mask": {
             "contract": _contract(decoder_inputs["attention_mask"]),
@@ -1451,7 +1465,10 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
             },
         },
         "global_position": {
-            "contract": _contract(decoder_inputs["position_ids"]),
+            "contract": {
+                **_contract(decoder_inputs["position_ids"]),
+                "shape": [_contract(decoder_inputs["position_ids"])["shape"][0], 1],
+            },
             "scope": "invocation",
             "initializer": "global.initial.body_position_ids",
             "recurrence": {"kind": "invariant"},
@@ -1547,13 +1564,13 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
             "contract": {"dtype": dtype_name, "rank": 3, "shape": [1, 128, "carry_length"]},
             "scope": "invocation",
             "initializer": "audio.initial_previous_latent",
-            "recurrence": {"kind": "invariant"},
+            "recurrence": {"kind": "bounded", "axis": 2, "max": "package.carry_length"},
         },
         "previous_condition": {
             "contract": {"dtype": dtype_name, "rank": 3, "shape": [1, "carry_length", 2048]},
             "scope": "invocation",
             "initializer": "audio.initial_previous_condition",
-            "recurrence": {"kind": "invariant"},
+            "recurrence": {"kind": "bounded", "axis": 1, "max": "package.carry_length"},
         },
         "waveform": {
             "contract": _request_aligned(
@@ -1561,7 +1578,11 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
             ),
             "scope": "invocation",
             "initializer": "audio.initial_waveform",
-            "recurrence": {"kind": "invariant"},
+            "recurrence": {
+                "kind": "bounded",
+                "axis": 2,
+                "max": "package.max_waveform_samples",
+            },
         },
         "flow_rng": {
             "contract": batch_int,
