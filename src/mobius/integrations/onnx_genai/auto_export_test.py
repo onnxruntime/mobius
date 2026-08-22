@@ -551,7 +551,7 @@ def test_dispatch_image_edit_emits_workflow(tmp_path):
     ]
 
     tail = [step["component"] for step in workflow["steps"] if step["kind"] == "invoke"]
-    assert tail == ["unpack_latents", "vae_decoder"]
+    assert tail == ["unpack_latents", "vae_decoder", "image_output_clamp"]
 
     # Positive and negative conditioning cannot share a sequence contract.
     inputs = workflow["inputs"]

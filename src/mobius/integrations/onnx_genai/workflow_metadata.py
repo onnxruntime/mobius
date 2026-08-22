@@ -3086,7 +3086,7 @@ def build_diffusion_workflow_metadata(
             setup_nodes.append(
                 _invoke(
                     "conditioning_cast",
-                    {"tensor": conditional_encoder_value},
+                    {"value": conditional_encoder_value},
                     {"cast": conditioning_value},
                 )
             )
@@ -3142,7 +3142,7 @@ def build_diffusion_workflow_metadata(
                 setup_nodes.append(
                     _invoke(
                         "conditioning_cast",
-                        {"tensor": unconditional_encoder_value},
+                        {"value": unconditional_encoder_value},
                         {"cast": unconditional_value},
                     )
                 )

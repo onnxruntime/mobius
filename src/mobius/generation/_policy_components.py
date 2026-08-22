@@ -1642,20 +1642,6 @@ def build_tensor_scale(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponen
     return _component("mobius.policy.auxiliary@1", graph, {})
 
 
-def build_tensor_cast(
-    input_dtype: ir.DataType,
-    output_dtype: ir.DataType,
-    dims: Sequence[str],
-) -> PolicyComponent:
-    """Cast an arbitrary-rank tensor without changing its logical layout."""
-    graph, builder = _make_graph("tensor_cast")
-    tensor = builder.input("tensor", input_dtype, list(dims))
-    cast = builder.op.Cast(tensor, to=output_dtype)
-    cast.shape = tensor.shape
-    builder.add_output(cast, "cast")
-    return _component("mobius.policy.auxiliary@1", graph, {})
-
-
 def build_tensor_clamp(
     dtype: ir.DataType = ir.DataType.FLOAT,
     dims: Sequence[str] = ("batch", "channels", "height", "width"),
@@ -1733,7 +1719,7 @@ def build_tensor_cast(
     target_dtype: ir.DataType,
     dims: Sequence[str] = ("batch", "heads", "sequence", "head_dim"),
 ) -> PolicyComponent:
-    """Cast a typed tensor at an explicit component precision boundary."""
+    """Cast an arbitrary-rank tensor at an explicit component precision boundary."""
     graph, builder = _make_graph("tensor_cast")
     value = builder.input("value", source_dtype, list(dims))
     cast = builder.op.Cast(value, to=target_dtype)
