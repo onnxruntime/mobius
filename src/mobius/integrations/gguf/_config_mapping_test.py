@@ -273,6 +273,8 @@ class TestQwen35RopeInterleave:
         config = gguf_to_config(self._fake_model(self._base_metadata()))
 
         assert config.rope_interleave is False
+
+
 class TestMuseGlimmerPostprocess:
     """Muse Glimmer config postprocessing.
 

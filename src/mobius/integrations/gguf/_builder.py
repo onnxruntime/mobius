@@ -836,11 +836,7 @@ def _reorder_deltanet_v_heads(state_dict: dict, config) -> dict:
         if key in state_dict:
             state_dict[key] = _index_dim0(state_dict[key], idx)
 
-    layer_stems = {
-        k.rsplit(".", 1)[0]
-        for k in state_dict
-        if ".linear_attn." in k
-    }
+    layer_stems = {k.rsplit(".", 1)[0] for k in state_dict if ".linear_attn." in k}
     for stem in layer_stems:
         name = stem.rsplit(".", 1)[-1]
         if name == "in_proj_z":
@@ -869,9 +865,7 @@ def _reorder_deltanet_v_heads(state_dict: dict, config) -> dict:
     return state_dict
 
 
-def _reorder_out_proj_cols(
-    state_dict: dict, stem: str, head_perm, head_v_dim: int
-) -> None:
+def _reorder_out_proj_cols(state_dict: dict, stem: str, head_perm, head_v_dim: int) -> None:
     """Permute the quantized ``out_proj`` input (K) axis by V-head.
 
     ``out_proj`` maps ``value_dim -> hidden``; its input columns are the V

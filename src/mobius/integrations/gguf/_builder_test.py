@@ -1252,8 +1252,12 @@ class TestReorderDeltaNetVHeads:
         }
         blocks_per_head = n_blocks // n_v  # 2
         tiled = {
-            f"{p}out_proj.weight": self._converter_reorder(gw, 1, n_k, v_per_k, blocks_per_head),
-            f"{p}out_proj.scales": self._converter_reorder(gs, 1, n_k, v_per_k, blocks_per_head),
+            f"{p}out_proj.weight": self._converter_reorder(
+                gw, 1, n_k, v_per_k, blocks_per_head
+            ),
+            f"{p}out_proj.scales": self._converter_reorder(
+                gs, 1, n_k, v_per_k, blocks_per_head
+            ),
             f"{p}out_proj.zero_points": self._converter_reorder(
                 gz, 1, n_k, v_per_k, blocks_per_head // 2
             ),
