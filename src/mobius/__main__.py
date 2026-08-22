@@ -205,6 +205,9 @@ def _cmd_build(args: argparse.Namespace) -> None:
         raise SystemExit("Error: --max-length can only be used with --runtime onnx-genai.")
     if max_length is not None and max_length <= 0:
         raise SystemExit("Error: --max-length must be a positive integer.")
+    guidance_scale = getattr(args, "guidance_scale", None)
+    if guidance_scale is not None and args.runtime != "onnx-genai":
+        raise SystemExit("Error: --guidance-scale can only be used with --runtime onnx-genai.")
 
     # Validate static-cache + --task compatibility.
     if args.static_cache and args.task is not None:
@@ -469,6 +472,7 @@ def _save_package(
                 config=config,
                 source=source,
                 revision=getattr(args, "revision", None),
+                guidance_scale=getattr(args, "guidance_scale", None),
             )
         except ValueError as error:
             raise SystemExit(f"Error: {error}") from error
@@ -531,15 +535,6 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         )
         raise SystemExit(1)
 
-    if getattr(args, "runtime", None) == "ort-genai":
-        raise SystemExit(
-            "Error: mobius build-gguf does not yet support --runtime ort-genai. "
-            "The command cannot emit a valid genai_config.json until the selected "
-            "GGUF architecture's cache and tokenizer contracts have passed real "
-            "ORT GenAI generation. Use --runtime onnx-genai where supported, or "
-            "omit --runtime and run the ONNX model directly."
-        )
-
     mmproj_path = getattr(args, "mmproj", None)
     keep_quantized = not args.dequantize
 
@@ -584,21 +579,40 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             path = os.path.join(output_dir, "model.onnx")
         print(f"Saved {name} to {path}")
 
-    if getattr(args, "runtime", None) == "onnx-genai":
-        from mobius.integrations.gguf import write_gguf_tokenizer_json
-        from mobius.integrations.onnx_genai import write_onnx_genai_config
+    # Save the trailing MTP / "nextn" self-speculative head sidecar (when the
+    # GGUF shipped one) into a ``mtp/`` subdirectory next to the backbone.
+    mtp_head = getattr(pkg, "mtp_head", None)
+    if mtp_head is not None:
+        mtp_dir = os.path.join(output_dir, "mtp")
+        mtp_head.save(
+            mtp_dir,
+            external_data=args.external_data,
+            max_workers=args.max_workers,
+        )
+        print(f"Saved mtp head to {os.path.join(mtp_dir, 'model.onnx')}")
 
-        # A GGUF checkpoint has no Hugging Face source directory, so the
-        # tokenizer is reconstructed from the file's embedded ggml metadata
-        # rather than copied from a `source`.
-        tokenizer_path = write_gguf_tokenizer_json(gguf_path, output_dir)
-        if tokenizer_path is not None:
-            print(f"  tokenizer: {tokenizer_path}")
-        artifacts = write_onnx_genai_config(
-            pkg, output_dir, config=getattr(pkg, "config", None), source=None
+    runtime = getattr(args, "runtime", None)
+    if runtime in ("onnx-genai", "ort-genai"):
+        from mobius.integrations.gguf import write_gguf_runtime_package
+
+        # The graph is already saved above; this adds the tokenizer (rebuilt
+        # from the GGUF's embedded ggml metadata, since a GGUF checkpoint has
+        # no Hugging Face source directory) and the runtime's own contract.
+        artifacts = write_gguf_runtime_package(
+            pkg, gguf_path, output_dir, runtime=runtime, save_model=False
         )
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
+        if mtp_head is not None:
+            from mobius.integrations.onnx_genai.inference_metadata import (
+                write_mtp_speculator_metadata,
+            )
+
+            spec_path = write_mtp_speculator_metadata(
+                output_dir, backbone_config=getattr(pkg, "config", None)
+            )
+            if spec_path is not None:
+                print(f"  speculator: {spec_path}")
 
 
 def _cmd_convert_comfyui(args: argparse.Namespace) -> None:
@@ -612,6 +626,7 @@ def _cmd_convert_comfyui(args: argparse.Namespace) -> None:
         args.checkpoint,
         args.output,
         sdxl=getattr(args, "sdxl", False),
+        revision=args.revision,
     )
     wf = result.workflow
     print(f"Converted ComfyUI workflow -> {result.output_dir}")
@@ -837,6 +852,18 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     build_parser.add_argument(
+        "--guidance-scale",
+        type=float,
+        default=None,
+        metavar="SCALE",
+        help=(
+            "Classifier-free guidance scale for --runtime onnx-genai diffusion "
+            "metadata. Required for conditioned diffusion pipelines so export does "
+            "not guess a source pipeline's generation default; pass 1.0 explicitly "
+            "for unguided generation."
+        ),
+    )
+    build_parser.add_argument(
         "--kv-cache-scale-file",
         dest="kv_cache_scale_file",
         default=None,
@@ -994,6 +1021,11 @@ def main(argv: list[str] | None = None) -> None:
         help="Optional diffusers directory or Hugging Face model id whose "
         "scheduler config supplies the noise-schedule betas (Stable Diffusion "
         "defaults are used when omitted).",
+    )
+    comfy_parser.add_argument(
+        "--revision",
+        default=None,
+        help="Pinned Hugging Face revision used to resolve the checkpoint scheduler config.",
     )
     comfy_parser.add_argument(
         "--output", "-o", required=True, help="Output directory for the pipeline metadata."

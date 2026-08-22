@@ -15,6 +15,8 @@ from mobius.integrations.onnx_genai.comfyui import (
     translate_comfyui_workflow,
     translate_comfyui_workflow_file,
 )
+from mobius.integrations.onnx_genai.convert import convert_comfyui_workflow
+from mobius.integrations.onnx_genai.inference_metadata import SchedulerConfig
 
 # ComfyUI's canonical "default" text-to-image API-format workflow (trimmed).
 _DEFAULT_TXT2IMG = {
@@ -73,6 +75,29 @@ def test_parse_recovers_full_run_params():
     assert wf.sampler_name == "euler"
     assert wf.scheduler_kind == "euler"
     assert wf.checkpoint == "v1-5.safetensors"
+
+
+def test_conversion_forwards_revision_to_scheduler_loader(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_scheduler(source, *, revision=None):
+        calls.append((source, revision))
+        return SchedulerConfig(kind="euler")
+
+    monkeypatch.setattr(
+        "mobius.integrations.onnx_genai.convert.load_diffusers_scheduler_config",
+        fake_scheduler,
+    )
+
+    convert_comfyui_workflow(
+        _DEFAULT_TXT2IMG,
+        "nota-ai/bk-sdm-small",
+        str(tmp_path),
+        revision="pinned-revision",
+        compute_timesteps=False,
+    )
+
+    assert calls == [("nota-ai/bk-sdm-small", "pinned-revision")]
 
 
 def test_parse_traces_checkpoint_through_lora():

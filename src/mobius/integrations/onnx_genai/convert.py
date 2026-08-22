@@ -52,14 +52,21 @@ class ConversionResult:
 
 
 def _scheduler_for_workflow(
-    workflow: ComfyUIWorkflow, checkpoint_source: str | None
+    workflow: ComfyUIWorkflow,
+    checkpoint_source: str | None,
+    *,
+    revision: str | None = None,
 ) -> SchedulerConfig:
     """Build the scheduler config from the workflow + diffusers checkpoint config.
 
     Sampler *kind*/*spacing* come from the ComfyUI graph; the noise *schedule*
     (betas) from the diffusers checkpoint config (SD defaults if unavailable).
     """
-    base = load_diffusers_scheduler_config(checkpoint_source) if checkpoint_source else None
+    base = (
+        load_diffusers_scheduler_config(checkpoint_source, revision=revision)
+        if checkpoint_source
+        else None
+    )
     return SchedulerConfig(
         kind=workflow.scheduler_kind,
         num_train_timesteps=base.num_train_timesteps if base else 1000,
@@ -174,6 +181,7 @@ def convert_comfyui_workflow(
     *,
     sdxl: bool = False,
     compute_timesteps: bool = True,
+    revision: str | None = None,
 ) -> ConversionResult:
     """Translate a ComfyUI workflow into an onnx-genai pipeline metadata directory.
 
@@ -193,6 +201,8 @@ def convert_comfyui_workflow(
             conditioning edges).
         compute_timesteps: Whether to precompute the diffusers inference timesteps
             (requires ``diffusers``); when False they are omitted.
+        revision: Optional pinned Hugging Face revision for the checkpoint's
+            scheduler config.
 
     Returns:
         A :class:`ConversionResult` with the written paths and parsed workflow.
@@ -201,7 +211,11 @@ def convert_comfyui_workflow(
     os.makedirs(output_dir, exist_ok=True)
     use_karras = parsed_workflow.scheduler_spacing == "karras"
     use_exponential = parsed_workflow.scheduler_spacing == "exponential"
-    scheduler = _scheduler_for_workflow(parsed_workflow, checkpoint_source)
+    scheduler = _scheduler_for_workflow(
+        parsed_workflow,
+        checkpoint_source,
+        revision=revision,
+    )
 
     timesteps = None
     if compute_timesteps:

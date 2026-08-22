@@ -28,6 +28,9 @@ from mobius.generation import (
     build_grammar_logits_processor,
     build_greedy_sampler,
     build_guidance_combine,
+    build_image_dimensions,
+    build_image_grid_positions,
+    build_image_noise_geometry,
     build_integer_minimum,
     build_integer_row_broadcast,
     build_last_token_logits,
@@ -43,6 +46,7 @@ from mobius.generation import (
     build_shape_constant,
     build_speculative_acceptance,
     build_speculative_state_rollback,
+    build_tensor_clamp,
     build_tensor_scale,
     build_termination_batch_initializer,
     build_token_state_update,
@@ -70,6 +74,20 @@ def _run_model(model, tmp_path, feeds):
     ir.save(model, path)
     session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
     return session.run(None, feeds)
+
+
+def test_tensor_clamp_can_cast_bfloat16_output_to_float32(tmp_path):
+    component = build_tensor_clamp(
+        ir.DataType.BFLOAT16,
+        ["batch", "channels"],
+        minimum=-1.0,
+        maximum=1.0,
+        output_dtype=ir.DataType.FLOAT,
+    )
+    assert component.model.graph.outputs[0].dtype == ir.DataType.FLOAT
+    path = tmp_path / "bfloat16_tensor_clamp.onnx"
+    ir.save(component.model, path)
+    ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
 
 
 def test_grammar_logits_processor_applies_mask_and_forced_tokens(tmp_path):
@@ -576,6 +594,18 @@ def test_batched_policy_v2_ports_use_exact_public_shapes():
         assert {port.name: [str(dim) for dim in port.shape] for port in ports} == expected[
             name
         ]
+    assert {
+        port.name: port.dtype
+        for component in components.values()
+        for port in component.model.graph.outputs
+    } == {
+        "token": ir.DataType.INT64,
+        "next_counter": ir.DataType.INT64,
+        "done": ir.DataType.BOOL,
+        "next_active": ir.DataType.BOOL,
+        "continue": ir.DataType.BOOL,
+        "next": ir.DataType.INT64,
+    }
 
 
 def test_seeded_sampler_applies_request_top_k(tmp_path):
@@ -788,6 +818,68 @@ def test_ddim_solver_runtime_parity_on_a_video_latent(tmp_path):
         + np.sqrt(1 - alpha_prev) * estimate
     )
     np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_ddim_solver_v_prediction_runtime_parity(tmp_path):
+    dims = ["batch", "frames", "channels", "height", "width"]
+    sample = np.linspace(-1.5, 1.5, 24, dtype=np.float32).reshape(1, 3, 2, 2, 2)
+    velocity = np.full_like(sample, 0.25)
+    schedule = np.array([0.4, 0.9, 1.0], np.float32)
+    (actual,) = _run(
+        build_ddim_solver_step(latent_dims=dims, prediction_type="v_prediction"),
+        tmp_path,
+        {
+            "sample": sample,
+            "derivative": velocity,
+            "step": np.array([0], np.int64),
+            "schedule": schedule,
+        },
+    )
+    alpha, alpha_prev = schedule[:2]
+    beta = 1 - alpha
+    pred_original = np.sqrt(alpha) * sample - np.sqrt(beta) * velocity
+    pred_epsilon = np.sqrt(alpha) * velocity + np.sqrt(beta) * sample
+    expected = np.sqrt(alpha_prev) * pred_original + np.sqrt(1 - alpha_prev) * pred_epsilon
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_ddim_solver_sample_prediction_runtime_parity(tmp_path):
+    dims = ["batch", "frames", "channels", "height", "width"]
+    sample = np.linspace(-1.0, 1.0, 24, dtype=np.float32).reshape(1, 3, 2, 2, 2)
+    pred_original = np.full_like(sample, 0.25)
+    schedule = np.array([0.4, 0.9, 1.0], np.float32)
+    (actual,) = _run(
+        build_ddim_solver_step(latent_dims=dims, prediction_type="sample"),
+        tmp_path,
+        {
+            "sample": sample,
+            "derivative": pred_original,
+            "step": np.array([0], np.int64),
+            "schedule": schedule,
+        },
+    )
+    alpha, alpha_prev = schedule[:2]
+    pred_epsilon = (sample - np.sqrt(alpha) * pred_original) / np.sqrt(1 - alpha)
+    expected = np.sqrt(alpha_prev) * pred_original + np.sqrt(1 - alpha_prev) * pred_epsilon
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_ddim_solver_sample_prediction_handles_unit_alpha(tmp_path):
+    sample = np.full((1, 1, 1, 1, 1), 0.25, np.float32)
+    (actual,) = _run(
+        build_ddim_solver_step(
+            latent_dims=["batch", "frames", "channels", "height", "width"],
+            prediction_type="sample",
+        ),
+        tmp_path,
+        {
+            "sample": sample,
+            "derivative": sample,
+            "step": np.array([0], np.int64),
+            "schedule": np.array([1.0, 1.0], np.float32),
+        },
+    )
+    np.testing.assert_allclose(actual, sample)
 
 
 def test_ddim_solver_clips_the_predicted_clean_latent(tmp_path):
@@ -1039,6 +1131,25 @@ def test_guidance_combine_extrapolates_per_row(tmp_path):
     )
 
 
+def test_guidance_combine_broadcasts_over_video_latents(tmp_path):
+    dims = ["batch", "frames", "channels", "height", "width"]
+    unconditional = np.ones((2, 3, 2, 2, 2), dtype=np.float32)
+    conditional = np.full_like(unconditional, 3.0)
+    (guided,) = _run(
+        build_guidance_combine(latent_dims=dims),
+        tmp_path,
+        {
+            "unconditional": unconditional,
+            "conditional": conditional,
+            "scale": np.array([2.0, 0.5], np.float32),
+        },
+    )
+    expected = unconditional + np.array([2.0, 0.5], np.float32).reshape(2, 1, 1, 1, 1) * (
+        conditional - unconditional
+    )
+    np.testing.assert_allclose(guided, expected, rtol=1e-6)
+
+
 def test_multistep_solver_matches_dpmsolverpp_second_order(tmp_path):
     # Reproduces diffusers' DPMSolverMultistepScheduler.step for dpmsolver++
     # midpoint updates, including the first-order fallback on the first step.
@@ -1155,6 +1266,54 @@ def test_counter_rng_is_reproducible_and_row_private(tmp_path):
     assert abs(float(noise.std()) - 1.0) < 0.1
 
 
+def test_image_noise_geometry_resolves_shape_grid_and_scale(tmp_path):
+    row_shape, token_height, token_width, noise_scale = _run(
+        build_image_noise_geometry(),
+        tmp_path,
+        {
+            "height": np.array([512], np.int64),
+            "width": np.array([768], np.int64),
+        },
+    )
+    np.testing.assert_array_equal(row_shape, [3, 512, 768])
+    np.testing.assert_array_equal(token_height, [16])
+    np.testing.assert_array_equal(token_width, [24])
+    np.testing.assert_allclose(noise_scale, [np.sqrt(384 / 64)], rtol=1e-6)
+
+
+def test_image_positions_and_dimensions_follow_their_actual_inputs(tmp_path):
+    latent = np.zeros((1, 3, 64, 96), dtype=np.float32)
+    conditional_positions, conditional_grid = _run(
+        build_image_grid_positions(pixels_per_token=32),
+        tmp_path,
+        {
+            "latent": latent,
+            "prompt_tokens": np.zeros((1, 5), dtype=np.int64),
+        },
+    )
+    unconditional_positions, unconditional_grid = _run(
+        build_image_grid_positions(pixels_per_token=32),
+        tmp_path,
+        {
+            "latent": latent,
+            "prompt_tokens": np.zeros((1, 2), dtype=np.int64),
+        },
+    )
+    np.testing.assert_array_equal(conditional_positions[0], 5)
+    np.testing.assert_array_equal(unconditional_positions[0], 2)
+    np.testing.assert_array_equal(conditional_positions[1:], unconditional_positions[1:])
+    np.testing.assert_array_equal(conditional_grid, [2, 3])
+    np.testing.assert_array_equal(unconditional_grid, [2, 3])
+
+    height, width = _run(
+        build_image_dimensions(),
+        tmp_path,
+        {"tensor": np.zeros((1, 3, 256, 384), dtype=np.float32)},
+    )
+    np.testing.assert_array_equal(height, [256])
+    np.testing.assert_array_equal(width, [384])
+
+
 def test_tensor_scale_and_zeros_like_shape_from_their_input(tmp_path):
     sample = np.arange(12, dtype=np.float32).reshape(1, 3, 2, 2)
     (scaled,) = _run(
@@ -1165,6 +1324,19 @@ def test_tensor_scale_and_zeros_like_shape_from_their_input(tmp_path):
     np.testing.assert_allclose(scaled, sample * 0.5)
     (zeros,) = _run(build_zeros_like(), tmp_path, {"reference": sample})
     np.testing.assert_array_equal(zeros, np.zeros_like(sample))
+
+
+def test_tensor_clamp_enforces_declared_range(tmp_path):
+    sample = np.array([[[[-2.0, -0.5], [0.5, 2.0]]]], dtype=np.float32)
+    (clamped,) = _run(
+        build_tensor_clamp(minimum=-1.0, maximum=1.0),
+        tmp_path,
+        {"tensor": sample},
+    )
+    np.testing.assert_array_equal(
+        clamped,
+        np.array([[[[-1.0, -0.5], [0.5, 1.0]]]], dtype=np.float32),
+    )
 
 
 def test_scalar_and_shape_constants_publish_their_values(tmp_path):

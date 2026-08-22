@@ -21,7 +21,7 @@ __all__ = ["build_from_gguf"]
 import logging
 import re
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -376,6 +376,14 @@ def build_from_gguf(
     if model_type is None:
         model_type = GGUF_ARCH_TO_MODEL_TYPE.get(gguf_arch, gguf_arch)
 
+    # ``dataclasses.replace`` below (dtype / quantization) returns a fresh
+    # instance that does NOT carry the private ``_gguf_*`` attributes set by
+    # gguf_to_config (they are plain attributes, not dataclass fields). Capture
+    # the MTP head metadata here — like ``model_type`` above — so it can be
+    # re-attached onto the final config for auto-detection (step 4b).
+    mtp_predict_layers = getattr(config, "_gguf_nextn_predict_layers", 0)
+    mtp_block_indices = list(getattr(config, "_gguf_mtp_block_indices", []) or [])
+
     if dtype is not None:
         resolved = resolve_dtype(dtype)
         if resolved is not None:
@@ -437,6 +445,46 @@ def build_from_gguf(
     else:
         resolved_task = task
 
+    # 4b. Auto-detect the Qwen3.5/3.8 MTP / "nextn" self-speculative head: if
+    # the source GGUF ships the trailing nextn head block (surfaced by
+    # ``has_mtp_head`` from ``<arch>.nextn_predict_layers`` > 0 + the
+    # ``blk.<N>.nextn.*`` tensors), always emit the MTP sidecar — it is a purely
+    # additive artifact that text-only consumers ignore. No opt-in flag: the
+    # decision is driven entirely by presence in the source. When present, expose
+    # the backbone's final-layer hidden state as a graph output so the
+    # orchestrator can seed the head with it (must be set before the graph is
+    # built). Direct field assignment (not dataclasses.replace) preserves the
+    # ``_gguf_*`` metadata attributes on the config. Skipped under static_cache
+    # (the head needs the dynamic concat-grow cache), leaving those exports
+    # byte-identical to today.
+    from mobius.integrations.gguf._mtp import build_mtp_head_from_gguf, has_mtp_head
+
+    # Re-attach the MTP metadata dropped by the dtype/quantization
+    # ``dataclasses.replace`` calls above so auto-detection sees it on the final
+    # config instance (and ``derive_mtp_config`` can read model_type/quant/dtype).
+    config._gguf_model_type = model_type
+    config._gguf_nextn_predict_layers = mtp_predict_layers
+    config._gguf_mtp_block_indices = mtp_block_indices
+
+    emit_mtp_head = has_mtp_head(config) and not static_cache
+    if has_mtp_head(config) and static_cache:
+        logger.info(
+            "GGUF ships an MTP/nextn head but static_cache=True is incompatible "
+            "with the head's dynamic cache; skipping the self-speculative sidecar."
+        )
+
+    if emit_mtp_head:
+        seed_index = int(config.num_hidden_layers) - 1
+        existing = list(config.output_layer_indices or [])
+        if seed_index not in existing:
+            existing.append(seed_index)
+        config.output_layer_indices = existing
+        logger.info(
+            "MTP head detected in source: exposing backbone hidden-state seed "
+            "output hidden_states.%d",
+            seed_index,
+        )
+
     # 5. Build ONNX graph
     module = module_class(config)
     if preserve_quantization:
@@ -495,6 +543,27 @@ def build_from_gguf(
     # 9. Apply weights to ONNX model
     prefix_map = getattr(module, "weight_prefix_map", None)
     pkg.apply_weights(state_dict, prefix_map=prefix_map)
+
+    # 10. Build the trailing MTP / "nextn" self-speculative head sidecar from
+    # the GGUF's ``blk.<nextn>.*`` tensors (dropped by the backbone build) and
+    # attach it to the package so the CLI can save it into a ``mtp/`` subdir.
+    # Auto-detected from source-tensor presence (see step 4b).
+    if emit_mtp_head:
+        try:
+            mtp_pkg = build_mtp_head_from_gguf(
+                gguf_model,
+                config,
+                preserve_quantization=preserve_quantization,
+                execution_provider=execution_provider,
+            )
+        except Exception:  # pragma: no cover - defensive: never fail the backbone
+            logger.exception(
+                "Failed to build the Qwen3.5/3.8 MTP head sidecar; the backbone "
+                "model was exported without a self-speculative drafter."
+            )
+            mtp_pkg = None
+        if mtp_pkg is not None:
+            pkg.mtp_head = mtp_pkg
 
     return pkg
 
@@ -812,35 +881,28 @@ def _reorder_deltanet_v_heads(state_dict: dict, config) -> dict:
         dtype=torch.long,
     )
 
-    def _expand(perm: "torch.Tensor", stride: int) -> "torch.Tensor":
+    def _expand(perm: torch.Tensor, stride: int) -> torch.Tensor:
         # Expand a per-head permutation into a per-row/-channel index.
         base = (perm * stride).unsqueeze(1) + torch.arange(stride)
         return base.reshape(-1)
 
     v_rows = _expand(head_perm, head_v_dim)  # length value_dim
 
-    def _index_dim0(t: "torch.Tensor", idx: "torch.Tensor") -> "torch.Tensor":
+    def _index_dim0(t: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
         return t.index_select(0, idx)
 
-    def _index_dim1(t: "torch.Tensor", idx: "torch.Tensor") -> "torch.Tensor":
-        return t.index_select(1, idx)
-
-    def _apply_rows(stem: str, idx: "torch.Tensor") -> None:
+    def _apply_rows(stem: str, idx: torch.Tensor) -> None:
         # Permute axis 0 of a float weight or a quantized triplet in place.
         for suffix in (".weight", ".scales", ".zero_points"):
             key = stem + suffix
             if key in state_dict:
                 state_dict[key] = _index_dim0(state_dict[key], idx)
 
-    def _apply_bare(key: str, idx: "torch.Tensor") -> None:
+    def _apply_bare(key: str, idx: torch.Tensor) -> None:
         if key in state_dict:
             state_dict[key] = _index_dim0(state_dict[key], idx)
 
-    layer_stems = {
-        k.rsplit(".", 1)[0]
-        for k in state_dict
-        if ".linear_attn." in k
-    }
+    layer_stems = {k.rsplit(".", 1)[0] for k in state_dict if ".linear_attn." in k}
     for stem in layer_stems:
         name = stem.rsplit(".", 1)[-1]
         if name == "in_proj_z":
@@ -857,7 +919,7 @@ def _reorder_deltanet_v_heads(state_dict: dict, config) -> dict:
 
     # Bare (non-".weight") linear_attn parameters.
     for k in list(state_dict):
-        if k.endswith(".linear_attn.A_log") or k.endswith(".linear_attn.dt_bias"):
+        if k.endswith((".linear_attn.A_log", ".linear_attn.dt_bias")):
             _apply_bare(k, head_perm)
         elif k.endswith(".linear_attn.conv1d.weight"):
             conv = state_dict[k]
@@ -869,9 +931,7 @@ def _reorder_deltanet_v_heads(state_dict: dict, config) -> dict:
     return state_dict
 
 
-def _reorder_out_proj_cols(
-    state_dict: dict, stem: str, head_perm, head_v_dim: int
-) -> None:
+def _reorder_out_proj_cols(state_dict: dict, stem: str, head_perm, head_v_dim: int) -> None:
     """Permute the quantized ``out_proj`` input (K) axis by V-head.
 
     ``out_proj`` maps ``value_dim -> hidden``; its input columns are the V
@@ -973,10 +1033,17 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
     # Emit those zero_points explicitly: GatherBlockQuantized has diverging
     # CPU/CUDA defaults when the input is omitted, which corrupts embeddings
     # on CUDA before the first decoder layer runs.
+    # Whether the repacked form can omit zero points. Every entry here is a
+    # *repack target* property, not a source-format property: Q4_K and Q6_K both
+    # requantize through the asymmetric affine path, so both need zero points
+    # even though Q6_K's source form is symmetric around 32.
+    # Keep in sync with `_REPACK_PARAMS` in `_repacker.py` — a type that can be
+    # repacked but is missing here raises `KeyError` at build time.
     type_can_omit_zero_points: dict = {
         GGMLQuantizationType.Q4_0: False,
         GGMLQuantizationType.Q4_1: False,
         GGMLQuantizationType.Q4_K: False,
+        GGMLQuantizationType.Q6_K: False,
         GGMLQuantizationType.Q8_0: False,
         GGMLQuantizationType.Q1_0: False,
     }
@@ -1223,8 +1290,16 @@ def repack_gguf_weight_to_target(
 def _load_dequantized_state_dict(
     gguf_model,
     gguf_arch: str,
+    name_mapper: Callable[[str, str], str | None] | None = None,
+    warn_unmapped: bool = True,
 ) -> dict:
-    """Load all tensors dequantized to float (Phase 1 path)."""
+    """Load all tensors dequantized to float (Phase 1 path).
+
+    ``name_mapper`` maps a GGUF tensor name to its target state-dict key (or
+    ``None`` to skip). Defaults to the main-model mapping; the MTP head builder
+    injects a head-scoped mapper so the trailing ``blk.<mtp>.nextn.*`` /
+    attention block is routed to the head module instead of being dropped.
+    """
     import numpy as np
     import torch
 
@@ -1232,13 +1307,16 @@ def _load_dequantized_state_dict(
         map_gguf_to_hf_names,
     )
 
+    if name_mapper is None:
+        name_mapper = map_gguf_to_hf_names
+
     state_dict = {}
     for gguf_name, np_array in tqdm.tqdm(
         gguf_model.tensor_items(),
         desc="Dequantizing tensors",
         total=len(gguf_model._tensor_index),
     ):
-        hf_name = map_gguf_to_hf_names(gguf_name, gguf_arch)
+        hf_name = name_mapper(gguf_name, gguf_arch)
         if hf_name is not None:
             # F32/F16 tensors are mmap'd read-only views; make
             # writable so PyTorch can mutate if needed.
@@ -1246,7 +1324,8 @@ def _load_dequantized_state_dict(
                 np_array = np.array(np_array)
             state_dict[hf_name] = torch.from_numpy(np_array)
         else:
-            logger.warning("Unmapped GGUF tensor: %s (skipped)", gguf_name)
+            if warn_unmapped:
+                logger.warning("Unmapped GGUF tensor: %s (skipped)", gguf_name)
     return state_dict
 
 
@@ -1255,6 +1334,8 @@ def _load_quantized_state_dict(
     gguf_arch: str,
     module,
     config,
+    name_mapper: Callable[[str, str], str | None] | None = None,
+    warn_unmapped: bool = True,
 ) -> dict:
     """Load tensors, preserving native blocks or normalizing to MatMulNBits.
 
@@ -1290,6 +1371,9 @@ def _load_quantized_state_dict(
     from mobius.integrations.gguf._tensor_processors import (
         _reverse_permute,
     )
+
+    if name_mapper is None:
+        name_mapper = map_gguf_to_hf_names
 
     # Collect module paths that use QuantizedLinear so we know
     # which .weight parameters should receive repacked data.
@@ -1333,9 +1417,10 @@ def _load_quantized_state_dict(
         desc="Repacking tensors",
         total=len(gguf_model._tensor_index),
     ):
-        hf_name = map_gguf_to_hf_names(gguf_name, gguf_arch)
+        hf_name = name_mapper(gguf_name, gguf_arch)
         if hf_name is None:
-            logger.warning("Unmapped GGUF tensor: %s (skipped)", gguf_name)
+            if warn_unmapped:
+                logger.warning("Unmapped GGUF tensor: %s (skipped)", gguf_name)
             continue
 
         # Determine the int value of the quant type for can_repack

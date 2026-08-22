@@ -13,9 +13,9 @@ This module builds the ONNX graphs for the Moshi LM used by
   emits the post-norm hidden state plus text logits.
 
 * **Depformer** (:class:`MoshiDepformerModel`): a small 6-layer transformer
-  that autoregressively predicts the 16 audio codebooks for a single temporal
-  step.  It is *not* built here yet (added in a follow-up); this file currently
-  implements the temporal stack and its native-checkpoint weight loader.
+  that autoregressively predicts one frame of audio codebooks. Public
+  Moshi/Moshiko checkpoints use 8 substeps; PersonaPlex uses 16. This module
+  builds both variants and maps their native per-step weights.
 
 The checkpoint is the native Kyutai ``safetensors`` format (no HuggingFace
 ``config.json``); :func:`moshi_temporal_config` reproduces the fixed
@@ -59,13 +59,13 @@ _AUDIO_CARD = 2048  # audio codebook size; embedding table has card + 1 rows
 _TEXT_CARD = 32000  # text vocabulary; embedding table has card + 1 rows
 _TEXT_VOCAB = 32000  # text_linear output (logits) size
 
-# --- Depformer dimensions (personaplex-7b-v1) ---
+# --- Depformer dimensions ---
 _D_DIM = 1024
 _D_LAYERS = 6
 _D_HEADS = 16
 _D_HEAD_DIM = 64
 _D_GATE_HIDDEN = 2816  # SwiGLU hidden = (2 * int(4.125 * 1024)) // 3
-_D_Q = 16  # number of audio codebooks predicted (weights_per_step)
+_D_Q = 16  # PersonaPlex predicts 16 codebooks; public Moshi predicts 8.
 _D_RMS_EPS = 1e-8
 
 
@@ -179,7 +179,9 @@ def moshi_temporal_config() -> ArchitectureConfig:
 # ---------------------------------------------------------------------------
 
 
-def _preprocess_moshi_temporal_weights(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+def _preprocess_moshi_temporal_weights(
+    sd: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
     """Map native Kyutai temporal-transformer weights onto mobius names.
 
     * ``text_emb`` / ``emb.{i}`` -> ``embed.text_emb`` / ``embed.emb.{i}``;
@@ -231,20 +233,20 @@ def _preprocess_moshi_temporal_weights(sd: dict[str, torch.Tensor]) -> dict[str,
 # Depformer: autoregressive per-substep audio codebook predictor.
 # ===========================================================================
 #
-# The depformer predicts the 16 audio codebooks for a single temporal step,
-# one substep at a time.  It is exported as a ONE-SUBSTEP graph: given the
+# The depformer predicts one frame of audio codebooks, one substep at a time.
+# It is exported as a ONE-SUBSTEP graph: given the
 # temporal hidden state, the previously sampled token, the substep index, and
 # the intra-frame KV cache, it produces the logits for one codebook and the
 # updated KV cache.  The deployment loop (see the ORT example) calls this graph
-# 16 times per frame, feeding each substep the token sampled at the previous
-# substep; the KV cache is reset at the start of every temporal frame.
+# 8 times for Moshi/Moshiko or 16 times for PersonaPlex, feeding each substep
+# the token sampled previously; the cache resets at each temporal frame.
 #
 # ``weights_per_step``: the attention in/out projections, the SwiGLU gating,
 # the per-codebook input projection, and the output head all use a different
-# weight slice for each of the 16 substeps, selected by ``substep_index`` via
+# weight slice for each of the 8 or 16 substeps, selected by ``substep_index`` via
 # a runtime Gather over a stacked weight tensor.  The two RMSNorms are shared
 # across substeps.  The depformer uses NO positional embedding (no RoPE) and
-# full causal attention over the (at most 16) cached substeps.
+# full causal attention over the cached substeps.
 
 
 class _PerStepLinear(nn.Module):
@@ -268,16 +270,16 @@ class _PerStepLinear(nn.Module):
 class _DepformerLayer(nn.Module):
     """One depformer transformer layer (per-step attention + gating)."""
 
-    def __init__(self):
+    def __init__(self, dep_q: int):
         super().__init__()
         self.norm1 = RMSNorm(_D_DIM, eps=_D_RMS_EPS)
         # Fused QKV per step: out = 3 * dim.
-        self.in_proj = _PerStepLinear(_D_Q, _D_DIM, 3 * _D_DIM)
-        self.out_proj = _PerStepLinear(_D_Q, _D_DIM, _D_DIM)
+        self.in_proj = _PerStepLinear(dep_q, _D_DIM, 3 * _D_DIM)
+        self.out_proj = _PerStepLinear(dep_q, _D_DIM, _D_DIM)
         self.norm2 = RMSNorm(_D_DIM, eps=_D_RMS_EPS)
         # SwiGLU gating per step: linear_in -> 2 * hidden, linear_out -> dim.
-        self.gating_in = _PerStepLinear(_D_Q, _D_DIM, 2 * _D_GATE_HIDDEN)
-        self.gating_out = _PerStepLinear(_D_Q, _D_GATE_HIDDEN, _D_DIM)
+        self.gating_in = _PerStepLinear(dep_q, _D_DIM, 2 * _D_GATE_HIDDEN)
+        self.gating_out = _PerStepLinear(dep_q, _D_GATE_HIDDEN, _D_DIM)
         self._scale = 1.0 / (_D_HEAD_DIM**0.5)
 
     def forward(
@@ -328,7 +330,7 @@ class MoshiDepformerModel(nn.Module):
           frame.
         - ``prev_token``: (batch, 1) INT64 token sampled at the previous
           substep (the temporal text token for substep 0).
-        - ``substep_index``: scalar INT64 in ``[0, 15]`` selecting the
+        - ``substep_index``: scalar INT64 in ``[0, dep_q - 1]`` selecting the
           per-step weights and the input-embedding table.
         - per-layer KV cache (6 layers).
 
@@ -346,15 +348,20 @@ class MoshiDepformerModel(nn.Module):
     def __init__(self, config: ArchitectureConfig | None = None):
         super().__init__()
         self.config = config
+        self.dep_q = config.max_position_embeddings if config is not None else _D_Q
+        if self.dep_q not in (8, 16):
+            raise ValueError(
+                f"dep_q must be 8 (Moshi/Moshiko) or 16 (PersonaPlex), got {self.dep_q}"
+            )
         # Per-codebook input projection (temporal dim -> depformer dim).
-        self.depformer_in = _PerStepLinear(_D_Q, _T_DIM, _D_DIM)
+        self.depformer_in = _PerStepLinear(self.dep_q, _T_DIM, _D_DIM)
         # Previous-token embeddings: text table (substep 0) + audio tables
-        # (substeps 1..15 use audio table substep-1).
+        # (substeps 1..dep_q-1 use audio table substep-1).
         self.text_emb = Embedding(_TEXT_CARD + 1, _D_DIM)
-        self.audio_emb = nn.Parameter([_D_Q - 1, _AUDIO_CARD + 1, _D_DIM])
-        self.layers = nn.ModuleList([_DepformerLayer() for _ in range(_D_LAYERS)])
+        self.audio_emb = nn.Parameter([self.dep_q - 1, _AUDIO_CARD + 1, _D_DIM])
+        self.layers = nn.ModuleList([_DepformerLayer(self.dep_q) for _ in range(_D_LAYERS)])
         # Output heads (depformer dim -> audio codebook logits).
-        self.linears = _PerStepLinear(_D_Q, _D_DIM, _AUDIO_CARD)
+        self.linears = _PerStepLinear(self.dep_q, _D_DIM, _AUDIO_CARD)
 
     def _embed_prev(
         self, op: OpBuilder, prev_token: ir.Value, substep_index: ir.Value
@@ -400,11 +407,13 @@ class MoshiDepformerModel(nn.Module):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        return _preprocess_moshi_depformer_weights(state_dict)
+        return _preprocess_moshi_depformer_weights(state_dict, dep_q=self.dep_q)
 
 
-def moshi_depformer_config() -> ArchitectureConfig:
-    """Fixed :class:`ArchitectureConfig` for the Moshi depformer."""
+def moshi_depformer_config(dep_q: int = _D_Q) -> ArchitectureConfig:
+    """Return the fixed-size Moshi (8) or PersonaPlex (16) depformer config."""
+    if dep_q not in (8, 16):
+        raise ValueError(f"dep_q must be 8 (Moshi/Moshiko) or 16 (PersonaPlex), got {dep_q}")
     return ArchitectureConfig(
         model_type="moshi_depformer",
         hidden_size=_D_DIM,
@@ -414,7 +423,7 @@ def moshi_depformer_config() -> ArchitectureConfig:
         head_dim=_D_HEAD_DIM,
         intermediate_size=_D_GATE_HIDDEN,
         vocab_size=_AUDIO_CARD,
-        max_position_embeddings=_D_Q,
+        max_position_embeddings=dep_q,
         rms_norm_eps=_D_RMS_EPS,
         rope_type=None,
         hidden_act="silu",
@@ -424,6 +433,8 @@ def moshi_depformer_config() -> ArchitectureConfig:
 
 def _preprocess_moshi_depformer_weights(
     sd: dict[str, torch.Tensor],
+    *,
+    dep_q: int = _D_Q,
 ) -> dict[str, torch.Tensor]:
     """Map native Kyutai depformer weights onto mobius parameter names.
 
@@ -431,24 +442,26 @@ def _preprocess_moshi_depformer_weights(
     ``(steps * 3 * dim, in)`` for fused QKV) are reshaped to
     ``(steps, out, in)``; the shared RMSNorm ``alpha`` tensors are squeezed.
     """
+    if dep_q not in (8, 16):
+        raise ValueError(f"dep_q must be 8 (Moshi/Moshiko) or 16 (PersonaPlex), got {dep_q}")
     out: dict[str, torch.Tensor] = {}
 
     # Per-codebook input projections: depformer_in.{i}.weight (1024, 4096).
     in_proj = torch.stack(
-        [sd[f"depformer_in.{i}.weight"] for i in range(_D_Q)], dim=0
-    )  # (16, 1024, 4096)
+        [sd[f"depformer_in.{i}.weight"] for i in range(dep_q)], dim=0
+    )  # (dep_q, 1024, 4096)
     out["depformer_in.weight"] = in_proj
 
     # Previous-token embeddings.
     out["text_emb.weight"] = sd["depformer_text_emb.weight"]
     out["audio_emb"] = torch.stack(
-        [sd[f"depformer_emb.{i}.weight"] for i in range(_D_Q - 1)], dim=0
-    )  # (15, 2049, 1024)
+        [sd[f"depformer_emb.{i}.weight"] for i in range(dep_q - 1)], dim=0
+    )  # (dep_q - 1, 2049, 1024)
 
     # Output heads: linears.{i}.weight (2048, 1024).
     out["linears.weight"] = torch.stack(
-        [sd[f"linears.{i}.weight"] for i in range(_D_Q)], dim=0
-    )  # (16, 2048, 1024)
+        [sd[f"linears.{i}.weight"] for i in range(dep_q)], dim=0
+    )  # (dep_q, 2048, 1024)
 
     # Transformer layers.
     for i in range(_D_LAYERS):
@@ -457,19 +470,21 @@ def _preprocess_moshi_depformer_weights(
         # Shared RMSNorm alpha (1, 1, D) -> (D,).
         out[f"{dst}.norm1.weight"] = sd[f"{src}.norm1.alpha"].reshape(-1)
         out[f"{dst}.norm2.weight"] = sd[f"{src}.norm2.alpha"].reshape(-1)
-        # Per-step fused QKV: (16 * 3 * 1024, 1024) -> (16, 3 * 1024, 1024).
+        # Per-step fused QKV: (dep_q * 3 * 1024, 1024)
+        # -> (dep_q, 3 * 1024, 1024).
         in_w = sd[f"{src}.self_attn.in_proj_weight"]
-        out[f"{dst}.in_proj.weight"] = in_w.reshape(_D_Q, 3 * _D_DIM, _D_DIM)
-        # Per-step output projection: (16 * 1024, 1024) -> (16, 1024, 1024).
+        out[f"{dst}.in_proj.weight"] = in_w.reshape(dep_q, 3 * _D_DIM, _D_DIM)
+        # Per-step output projection: (dep_q * 1024, 1024)
+        # -> (dep_q, 1024, 1024).
         out_w = sd[f"{src}.self_attn.out_proj.weight"]
-        out[f"{dst}.out_proj.weight"] = out_w.reshape(_D_Q, _D_DIM, _D_DIM)
+        out[f"{dst}.out_proj.weight"] = out_w.reshape(dep_q, _D_DIM, _D_DIM)
         # Per-step SwiGLU gating.
         gin = torch.stack(
-            [sd[f"{src}.gating.{t}.linear_in.weight"] for t in range(_D_Q)], dim=0
-        )  # (16, 2 * hidden, 1024)
+            [sd[f"{src}.gating.{t}.linear_in.weight"] for t in range(dep_q)], dim=0
+        )  # (dep_q, 2 * hidden, 1024)
         gout = torch.stack(
-            [sd[f"{src}.gating.{t}.linear_out.weight"] for t in range(_D_Q)], dim=0
-        )  # (16, 1024, hidden)
+            [sd[f"{src}.gating.{t}.linear_out.weight"] for t in range(dep_q)], dim=0
+        )  # (dep_q, 1024, hidden)
         out[f"{dst}.gating_in.weight"] = gin
         out[f"{dst}.gating_out.weight"] = gout
 

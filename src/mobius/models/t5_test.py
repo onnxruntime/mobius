@@ -13,6 +13,29 @@ import pytest
 from mobius.models.t5 import _rename_t5_weight
 
 
+def test_t5_encoder_is_public_and_consumes_attention_mask():
+    from mobius._configs import ArchitectureConfig
+    from mobius.models import T5EncoderModel
+    from mobius.tasks import T5TextEncoderTask
+
+    config = ArchitectureConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=8,
+        hidden_act="relu",
+        relative_attention_num_buckets=8,
+        relative_attention_max_distance=16,
+    )
+    graph = T5TextEncoderTask().build(T5EncoderModel(config), config)["model"].graph
+    attention_mask = next(value for value in graph.inputs if value.name == "attention_mask")
+    assert list(attention_mask.uses())
+    assert any(node.op_type == "Unsqueeze" for node in graph)
+
+
 class TestRelativePositionBucket:
     """Test T5 log-linear bucket computation against reference NumPy impl."""
 

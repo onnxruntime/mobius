@@ -2057,6 +2057,13 @@ class SchedulerConfig:
     beta_end: float = 0.012
     beta_schedule: str = "scaled_linear"
     prediction_type: str = "epsilon"
+    clip_sample: bool = False
+    clip_sample_range: float = 1.0
+    set_alpha_to_one: bool = True
+    steps_offset: int = 0
+    timestep_spacing: str = "leading"
+    rescale_betas_zero_snr: bool = False
+    snr_shift_scale: float = 1.0
     use_karras_sigmas: bool = False
     use_exponential_sigmas: bool = False
     shift: float | None = None
@@ -2086,6 +2093,13 @@ class SchedulerConfig:
                 beta_start=self.beta_start,
                 beta_end=self.beta_end,
                 beta_schedule=self.beta_schedule,
+                clip_sample=self.clip_sample,
+                clip_sample_range=self.clip_sample_range,
+                set_alpha_to_one=self.set_alpha_to_one,
+                steps_offset=self.steps_offset,
+                timestep_spacing=self.timestep_spacing,
+                rescale_betas_zero_snr=self.rescale_betas_zero_snr,
+                snr_shift_scale=self.snr_shift_scale,
             )
         if self.use_karras_sigmas:
             meta["use_karras_sigmas"] = True
@@ -2162,6 +2176,13 @@ class SchedulerConfig:
                     "flow_prediction" if kind == "flow_match_euler" else "epsilon",
                 )
             ),
+            clip_sample=bool(config.get("clip_sample")),
+            clip_sample_range=float(config.get("clip_sample_range", 1.0)),
+            set_alpha_to_one=bool(config.get("set_alpha_to_one", True)),
+            steps_offset=int(config.get("steps_offset", 0)),
+            timestep_spacing=str(config.get("timestep_spacing", "leading")),
+            rescale_betas_zero_snr=bool(config.get("rescale_betas_zero_snr")),
+            snr_shift_scale=float(config.get("snr_shift_scale", 1.0)),
             use_karras_sigmas=bool(config.get("use_karras_sigmas")),
             use_exponential_sigmas=bool(config.get("use_exponential_sigmas")),
             shift=float(config["shift"]) if config.get("shift") is not None else None,
@@ -2250,7 +2271,11 @@ def load_diffusers_scheduler_config(
         return None
 
 
-def load_diffusers_vae_scaling_factor(source: str | None) -> float | None:
+def load_diffusers_vae_scaling_factor(
+    source: str | None,
+    *,
+    revision: str | None = None,
+) -> float | None:
     """Best-effort load of a diffusers ``vae/config.json`` ``scaling_factor``.
 
     The latent a diffusion sampler carries is scaled by this factor before the
@@ -2272,7 +2297,7 @@ def load_diffusers_vae_scaling_factor(source: str | None) -> float | None:
         try:
             from huggingface_hub import hf_hub_download
 
-            path = hf_hub_download(source, "vae/config.json")
+            path = hf_hub_download(source, "vae/config.json", revision=revision)
             with open(path, encoding="utf-8") as handle:
                 raw = json.load(handle)
         except Exception as err:
@@ -2641,6 +2666,92 @@ def write_diffusion_pipeline_metadata(
     metadata = build_diffusion_pipeline_metadata(**kwargs)
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, filename)
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(metadata, handle, sort_keys=False)
+    return path
+
+
+def write_mtp_speculator_metadata(
+    directory: str,
+    *,
+    backbone_config: Any | None = None,
+    filename: str = "inference_metadata.yaml",
+    model_path: str = "mtp/model.onnx",
+    num_speculative_tokens: int = 1,
+    embedding_weights: str = "model.embed_tokens.weight",
+    lm_head_weights: str = "lm_head.weight",
+) -> str | None:
+    """Add a ``speculative`` block for the exported MTP head to the backbone metadata.
+
+    The Qwen3.5/3.8 MTP head is a self-speculative drafter saved next to the
+    backbone (``mtp/model.onnx``). It borrows the target's shared embedding /
+    LM head and is seeded by the backbone's final-layer hidden state
+    (``hidden_states.<N-1>``).
+
+    The emitted block conforms exactly to the authoritative onnx-genai runtime
+    schema (``crates/onnx-genai-metadata/src/schema/generation.rs``
+    ``SpeculatorConfig`` + ``parser.rs`` ``resolve_mtp`` +
+    ``config.rs`` ``validate_resolved_mtp_config``):
+
+    - Published under the top-level ``speculative`` key (the runtime
+      deserializes ``InferenceMetadata.speculative``; a bare ``speculator``
+      key is unknown and silently dropped).
+    - ``model`` (not ``model_path``), ``target_hidden_size`` (not
+      ``hidden_size``).
+    - ``kv_mode: proposal_local`` — the only valid ``MtpKvMode`` for this k=1
+      head (``hidden_threaded`` is an engine-internal enum, not a metadata one).
+    - ``embedding`` / ``lm_head`` as ``MtpTargetInitializer`` objects
+      (``source: target_initializer`` + ``name``), not flat name strings.
+    - ``target_hidden_layout: BSH`` because ``hidden_states.<N-1>`` is rank-3
+      ``[batch, seq, hidden]``; ``hc_mult: 1`` is required by ``resolve_mtp``
+      (``hc_mult > 0``) and pinned to 1 for the BSH layout by
+      ``validate_resolved_mtp_config``.
+    - ``mtp_state_output`` is omitted: an ``hc_mult == 1`` head has no recurrent
+      Hyper-Connection state (the sidecar emits only ``mtp_hidden`` +
+      ``present.0.{key,value}``); the runtime looks it up optionally.
+
+    The backbone ``inference_metadata.yaml`` must already exist. Returns the
+    metadata path, or ``None`` when it is missing.
+    """
+    path = os.path.join(directory, filename)
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as handle:
+        metadata = yaml.safe_load(handle) or {}
+
+    num_layers = getattr(backbone_config, "num_hidden_layers", None)
+    hidden_size = getattr(backbone_config, "hidden_size", None)
+    vocab_size = getattr(backbone_config, "vocab_size", None)
+    target_hidden_output = (
+        f"hidden_states.{int(num_layers) - 1}" if num_layers is not None else None
+    )
+
+    speculator: dict[str, Any] = {
+        "proposal_type": "mtp",
+        "num_speculative_tokens": int(num_speculative_tokens),
+        "model": model_path,
+        # rank-3 [batch, seq, hidden] seed => BSH layout with a single
+        # Hyper-Connection lane (hc_mult == 1).
+        "target_hidden_layout": "BSH",
+        "hc_mult": 1,
+        # The head threads its final hidden state forward and shares the
+        # target's embedding + LM head; k=1 head resets KV each verify step.
+        "mtp_hidden_output": "mtp_hidden",
+        "kv_mode": "proposal_local",
+        # The MTP head reuses the backbone's shared embedding + LM head, which
+        # live as initializers in the main ``model.onnx`` (borrowed, not
+        # duplicated).
+        "embedding": {"source": "target_initializer", "name": embedding_weights},
+        "lm_head": {"source": "target_initializer", "name": lm_head_weights},
+    }
+    if target_hidden_output is not None:
+        speculator["target_hidden_output"] = target_hidden_output
+    if hidden_size is not None:
+        speculator["target_hidden_size"] = int(hidden_size)
+    if vocab_size is not None:
+        speculator["vocab_size"] = int(vocab_size)
+
+    metadata["speculative"] = speculator
     with open(path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(metadata, handle, sort_keys=False)
     return path

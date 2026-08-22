@@ -20,6 +20,8 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     _kv_storage_contract,
     _static_cache_ports,
     _validate_attention_alias_layer_sets,
+    build_diffusion_workflow_metadata,
+    build_image_edit_workflow_metadata,
     build_language_diffusion_pipeline_metadata,
     build_speculative_workflow_metadata,
     build_video_diffusion_workflow_metadata,
@@ -473,16 +475,21 @@ def test_language_diffusion_uses_exclusive_ssa_workflow():
     assert graph["steps"][1]["mode"] == "replace"
 
 
-def _video_package(*, cache_ports: bool = True, latent_rank: int = 5) -> ModelPackage:
+def _video_package(
+    *,
+    cache_ports: bool = True,
+    latent_rank: int = 5,
+    dtype: ir.DataType = ir.DataType.FLOAT,
+    timestep_dtype: ir.DataType = ir.DataType.INT64,
+    text_encoder_dtype: ir.DataType | None = None,
+) -> ModelPackage:
     latent_shape: list[int | str] = ["batch", "num_frames", 4, "height", "width"]
     if latent_rank == 4:
         latent_shape = ["batch", 4, "height", "width"]
-    sample = _value("sample", ir.DataType.FLOAT, latent_shape)
-    timestep = _value("timestep", ir.DataType.INT64, ["batch"])
-    conditioning = _value(
-        "encoder_hidden_states", ir.DataType.FLOAT, ["batch", "prompt_sequence", 32]
-    )
-    noise_pred = _value("noise_pred", ir.DataType.FLOAT, latent_shape)
+    sample = _value("sample", dtype, latent_shape)
+    timestep = _value("timestep", timestep_dtype, ["batch"])
+    conditioning = _value("encoder_hidden_states", dtype, ["batch", "prompt_sequence", 32])
+    noise_pred = _value("noise_pred", dtype, latent_shape)
     denoiser = ir.Graph(
         inputs=[sample, timestep, conditioning],
         outputs=[noise_pred],
@@ -493,12 +500,12 @@ def _video_package(*, cache_ports: bool = True, latent_rank: int = 5) -> ModelPa
 
     latent_sample = _value(
         "latent_sample",
-        ir.DataType.FLOAT,
+        dtype,
         ["batch", 4, "latent_frames", "latent_height", "latent_width"],
     )
     frames = _value(
         "sample",
-        ir.DataType.FLOAT,
+        dtype,
         ["batch", 3, "frames", "2*latent_height", "2*latent_width"],
     )
     vae_inputs = [latent_sample]
@@ -507,14 +514,14 @@ def _video_package(*, cache_ports: bool = True, latent_rank: int = 5) -> ModelPa
         vae_inputs.append(
             _value(
                 "conv_cache.conv_in",
-                ir.DataType.FLOAT,
+                dtype,
                 ["batch", 4, "cache_frames", "latent_height", "latent_width"],
             )
         )
         vae_outputs.append(
             _value(
                 "conv_cache_out.conv_in",
-                ir.DataType.FLOAT,
+                dtype,
                 ["batch", 4, "cache_frames", "latent_height", "latent_width"],
             )
         )
@@ -527,17 +534,35 @@ def _video_package(*, cache_ports: bool = True, latent_rank: int = 5) -> ModelPa
     )
     vae_model = ir.Model(vae, ir_version=11)
     vae_model.metadata_props["mobius.conv_cache.spatial_scale.conv_cache.conv_in"] = "1"
-    return ModelPackage(
-        {
-            "transformer": ir.Model(denoiser, ir_version=11),
-            "vae_decoder": vae_model,
-        }
-    )
+    components = {
+        "transformer": ir.Model(denoiser, ir_version=11),
+        "vae_decoder": vae_model,
+    }
+    if text_encoder_dtype is not None:
+        text_graph = ir.Graph(
+            inputs=[_value("input_ids", ir.DataType.INT64, ["batch", "prompt_sequence"])],
+            outputs=[
+                _value(
+                    "encoder_hidden_states",
+                    text_encoder_dtype,
+                    ["batch", "prompt_sequence", 32],
+                )
+            ],
+            nodes=[],
+            name="text_encoder",
+            opset_imports={"": 24},
+        )
+        components["text_encoder"] = ir.Model(text_graph, ir_version=11)
+    return ModelPackage(components)
 
 
 def test_video_diffusion_keeps_the_temporal_axis_through_every_stage():
     metadata = build_video_diffusion_workflow_metadata(
-        _video_package(), num_inference_steps=2, solver="ddim"
+        _video_package(),
+        num_inference_steps=2,
+        solver="ddim",
+        schedule=[0.4, 0.9, 1.0],
+        timesteps=[1, 0],
     )
     workflow = metadata["pipeline"]["workflow"]
 
@@ -589,6 +614,145 @@ def test_video_diffusion_requires_paired_conv_caches():
     with pytest.raises(ValueError, match="conv_cache"):
         build_video_diffusion_workflow_metadata(
             _video_package(cache_ports=False), num_inference_steps=2
+        )
+
+
+def _diffusion_package() -> ModelPackage:
+    """Minimal rank-4 denoiser/VAE pair shaped for ``build_diffusion_workflow_metadata``."""
+    latent_shape: list[int | str] = ["batch", 4, "height", "width"]
+    denoiser = _model(
+        "denoiser",
+        [
+            _value("sample", ir.DataType.FLOAT, latent_shape),
+            _value("timestep", ir.DataType.FLOAT, ["batch"]),
+        ],
+        [("noise_pred", ir.DataType.FLOAT, latent_shape)],
+    )
+    vae_decoder = _model(
+        "vae_decoder",
+        [_value("latent", ir.DataType.FLOAT, latent_shape)],
+        [("image", ir.DataType.FLOAT, ["batch", 3, "height", "width"])],
+    )
+    return ModelPackage({"denoiser": denoiser, "vae_decoder": vae_decoder})
+
+
+def _image_edit_package() -> ModelPackage:
+    """Qwen-Image-Edit-shaped package for ``build_image_edit_workflow_metadata``.
+
+    Rank-3 packed latents, a ``target_sequence_length`` slice port, separate
+    image/text rotary tables, and a VAE encoder/decoder pair -- the port shape
+    the real Qwen Image Edit export produces.
+    """
+    tokens = ["batch", "image_sequence_length", 64]
+    transformer = _model(
+        "transformer",
+        [
+            _value("sample", ir.DataType.FLOAT, tokens),
+            _value("timestep", ir.DataType.FLOAT, ["batch"]),
+            _value(
+                "encoder_hidden_states",
+                ir.DataType.FLOAT,
+                ["batch", "text_sequence_length", 32],
+            ),
+            _value(
+                "encoder_hidden_states_mask",
+                ir.DataType.BOOL,
+                ["batch", "text_sequence_length"],
+            ),
+            _value("image_rotary_cos", ir.DataType.FLOAT, ["image_sequence_length", 8]),
+            _value("image_rotary_sin", ir.DataType.FLOAT, ["image_sequence_length", 8]),
+            _value("text_rotary_cos", ir.DataType.FLOAT, ["text_sequence_length", 8]),
+            _value("text_rotary_sin", ir.DataType.FLOAT, ["text_sequence_length", 8]),
+            _value("target_sequence_length", ir.DataType.INT64, [1]),
+        ],
+        [("noise_pred", ir.DataType.FLOAT, tokens)],
+    )
+    vae_encoder = _model(
+        "vae_encoder",
+        [_value("pixel_values", ir.DataType.FLOAT, ["batch", 3, 1, "height", "width"])],
+        [("latent_sample", ir.DataType.FLOAT, ["batch", 16, 1, "lheight", "lwidth"])],
+    )
+    vae_decoder = _model(
+        "vae_decoder",
+        [_value("latent_sample", ir.DataType.FLOAT, ["batch", 16, 1, "lheight", "lwidth"])],
+        [("image", ir.DataType.FLOAT, ["batch", 3, 1, "height", "width"])],
+    )
+    return ModelPackage(
+        {
+            "transformer": transformer,
+            "vae_encoder": vae_encoder,
+            "vae_decoder": vae_decoder,
+        }
+    )
+
+
+def test_diffusion_workflow_declares_image_value_range():
+    """Assert value_range directly on the built metadata dict.
+
+    Producer conformance requires every ``role: image`` output to declare
+    an explicit ``value_range``; check this directly rather than through a
+    committed fixture snapshot.
+    """
+    metadata = build_diffusion_workflow_metadata(_diffusion_package(), num_inference_steps=2)
+    published = metadata["pipeline"]["workflow"]["outputs"]["image"]
+    assert published["role"] == "image"
+    assert published["value_range"] == "negative_one_to_one"
+
+
+def test_image_edit_workflow_declares_image_value_range():
+    """Same producer-conformance contract as the diffusion workflow.
+
+    The image-edit workflow's ``image`` output must also declare its range.
+    """
+    metadata = build_image_edit_workflow_metadata(
+        _image_edit_package(),
+        num_inference_steps=2,
+        schedule=[1.0, 0.5, 0.0],
+        timesteps=[1.0, 0.5],
+        guidance_scale=4.0,
+    )
+    published = metadata["pipeline"]["workflow"]["outputs"]["image"]
+    assert published["role"] == "image"
+    assert published["value_range"] == "negative_one_to_one"
+
+
+def test_video_diffusion_cfg_and_reduced_precision_contracts():
+    package = _video_package(
+        dtype=ir.DataType.FLOAT16,
+        timestep_dtype=ir.DataType.FLOAT,
+        text_encoder_dtype=ir.DataType.FLOAT,
+    )
+    metadata = build_video_diffusion_workflow_metadata(
+        package,
+        num_inference_steps=2,
+        solver="ddim",
+        schedule=[0.4, 0.9, 1.0],
+        timesteps=[1, 0],
+        guidance_scale=6.0,
+    )
+    workflow = metadata["pipeline"]["workflow"]
+    loop = next(step for step in workflow["steps"] if step["kind"] == "loop")
+    components = [node["component"] for node in loop["steps"] if node["kind"] == "invoke"]
+    assert components.count("transformer") == 2
+    assert "guidance_combine" in components
+    assert [node["component"] for node in loop["setup"]].count("conditioning_cast") == 2
+    assert (
+        workflow["inputs"]["request.negative_input_ids"]["role"]["role"]
+        == "negative_prompt_tokens"
+    )
+    assert (
+        package.policy_components["video_latent_init"].model.graph.outputs[1].dtype
+        == ir.DataType.FLOAT
+    )
+    for name in (
+        "video_latent_permute",
+        "video_latent_unscale",
+        "video_decode_chunks",
+        "video_decode_chunk",
+        "video_conv_cache_init",
+    ):
+        assert (
+            package.policy_components[name].model.graph.inputs[0].dtype == ir.DataType.FLOAT16
         )
 
 

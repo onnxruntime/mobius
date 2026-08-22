@@ -66,6 +66,8 @@ from mobius.generation import (
     build_sequence_concat,
     build_sequence_length,
     build_shape_constant,
+    build_tensor_cast,
+    build_tensor_clamp,
     build_tensor_scale,
     build_termination_batch_initializer,
     build_token_state_update,
@@ -564,7 +566,10 @@ def build_audio_codec_workflow_metadata(pkg: Any) -> dict[str, Any]:
             ],
         },
     }
-    return {"schema_version": "v1", "pipeline": {"workflow": _publish_workflow_v1(workflow)}}
+    return {
+        "schema_version": "v1",
+        "pipeline": {"workflow": _publish_workflow_v1(workflow)},
+    }
 
 
 def write_audio_codec_workflow_metadata(pkg: Any, output_dir: str) -> str:
@@ -1565,7 +1570,9 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
                 {"inputs_embeds": "predictor.body.inputs_embeds"},
             ),
             _invoke(
-                "code_predictor", predictor_body_inputs, predictor_outputs("predictor.body")
+                "code_predictor",
+                predictor_body_inputs,
+                predictor_outputs("predictor.body"),
             ),
             _invoke(
                 "last_token_logits",
@@ -1671,10 +1678,12 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
                 "body_output": f"predictor.body.{present.name}",
                 "next": f"predictor.cache_{index}.final",
                 "read_effect": _effect(
-                    f"state:predictor_cache_{index}.0", f"state:predictor_cache_{index}.read"
+                    f"state:predictor_cache_{index}.0",
+                    f"state:predictor_cache_{index}.read",
                 ),
                 "write_effect": _effect(
-                    f"state:predictor_cache_{index}.read", f"state:predictor_cache_{index}.1"
+                    f"state:predictor_cache_{index}.read",
+                    f"state:predictor_cache_{index}.1",
                 ),
             }
         )
@@ -1814,7 +1823,11 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             "recurrence": {"kind": "invariant"},
         },
         "history": {
-            "contract": {"dtype": "int64", "rank": 3, "shape": [batch, "frames", num_groups]},
+            "contract": {
+                "dtype": "int64",
+                "rank": 3,
+                "shape": [batch, "frames", num_groups],
+            },
             "scope": "invocation",
             "initializer": "history.setup",
             "recurrence": {
@@ -2072,7 +2085,9 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
     final_nodes.extend(
         [
             _invoke(
-                codec_name, {codec_input.name: codec_value}, {waveform.name: "tts.waveform"}
+                codec_name,
+                {codec_input.name: codec_value},
+                {waveform.name: "tts.waveform"},
             ),
             {
                 "kind": "emit",
@@ -2748,6 +2763,7 @@ def build_diffusion_workflow_metadata(
     guidance_scale: float | None = None,
     latent_source: str = "application",
     latent_row_shape: list[int] | None = None,
+    output_value_range: str = "negative_one_to_one",
 ) -> dict[str, Any]:
     """Build a fixed-schedule diffusion workflow with explicit latent state.
 
@@ -2792,11 +2808,11 @@ def build_diffusion_workflow_metadata(
     assert estimate_output is not None
     assert vae_input is not None
     assert vae_output is not None
-    if len(sample_input.shape or []) != 4 or _contract(sample_input) != _contract(
-        estimate_output
+    if len(sample_input.shape or []) != 4 or not _contracts_compatible(
+        sample_input, estimate_output
     ):
         raise ValueError("diffusion workflow requires matching rank-4 latent/estimate")
-    if _contract(vae_input) != _contract(sample_input):
+    if not _contracts_compatible(vae_input, sample_input):
         raise ValueError("VAE latent input must match the solver latent contract")
 
     text_name = next(
@@ -2820,11 +2836,17 @@ def build_diffusion_workflow_metadata(
             (
                 value
                 for value in text_encoder.graph.outputs
-                if _contract(value) == _contract(conditioning_input)
+                if _contracts_compatible(value, conditioning_input)
             ),
             next(iter(text_encoder.graph.outputs), None),
         )
     conditioned = text_encoder is not None and conditioning_output is not None
+    casts_conditioning = (
+        conditioned
+        and conditioning_input is not None
+        and conditioning_output is not None
+        and conditioning_output.dtype != conditioning_input.dtype
+    )
     if guidance_scale is not None and not conditioned:
         raise ValueError("classifier-free guidance requires a conditioned denoiser")
     if latent_source == "seed" and not latent_row_shape:
@@ -2875,6 +2897,34 @@ def build_diffusion_workflow_metadata(
         pkg.add_policy_component(
             "guidance_combine", build_guidance_combine(sample_input.dtype)
         )
+    if output_value_range != "negative_one_to_one":
+        raise ValueError("diffusion workflow currently emits negative_one_to_one images")
+    pkg.add_policy_component(
+        "image_output_clamp",
+        build_tensor_clamp(
+            vae_output.dtype,
+            [
+                "batch" if index == 0 else f"axis_{index}"
+                for index in range(len(vae_output.shape or []))
+            ],
+            minimum=-1.0,
+            maximum=1.0,
+        ),
+    )
+    if casts_conditioning:
+        assert conditioning_input is not None
+        assert conditioning_output is not None
+        pkg.add_policy_component(
+            "conditioning_cast",
+            build_tensor_cast(
+                conditioning_output.dtype,
+                conditioning_input.dtype,
+                [
+                    "batch" if index == 0 else f"axis_{index}"
+                    for index in range(len(conditioning_output.shape or []))
+                ],
+            ),
+        )
     if latent_source == "seed":
         pkg.add_policy_component(
             "latent_row_shape", build_shape_constant(list(latent_row_shape or ()))
@@ -2882,7 +2932,7 @@ def build_diffusion_workflow_metadata(
         pkg.add_policy_component("latent_noise", build_counter_rng_normal(sample_input.dtype))
 
     batch = _contract(sample_input)["shape"][0]
-    latent_contract = _contract(sample_input)
+    latent_contract = _request_aligned(_contract(sample_input))
     row_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": [batch]})
     row_float = _request_aligned({"dtype": "float32", "rank": 1, "shape": [batch]})
     batch_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": [batch]})
@@ -2918,8 +2968,9 @@ def build_diffusion_workflow_metadata(
         )
     outputs: dict[str, Any] = {
         "image": {
-            "contract": _contract(vae_output),
+            "contract": _request_aligned(_contract(vae_output)),
             "role": "image",
+            "value_range": output_value_range,
             "stage": "pre_adapter",
         },
         "latent": {
@@ -3002,6 +3053,9 @@ def build_diffusion_workflow_metadata(
         assert text_encoder is not None
         assert conditioning_output is not None
         conditioning_value = "conditioning.hidden_states"
+        conditional_encoder_value = (
+            "conditioning.hidden_states_raw" if casts_conditioning else conditioning_value
+        )
         text_inputs = {}
         for index, value in enumerate(text_encoder.graph.inputs):
             name = f"request.{value.name}"
@@ -3025,26 +3079,53 @@ def build_diffusion_workflow_metadata(
             _invoke(
                 text_name,
                 text_inputs,
-                {conditioning_output.name: conditioning_value},
+                {conditioning_output.name: conditional_encoder_value},
             )
         )
+        if casts_conditioning:
+            setup_nodes.append(
+                _invoke(
+                    "conditioning_cast",
+                    {"value": conditional_encoder_value},
+                    {"cast": conditioning_value},
+                )
+            )
         if guidance_scale is not None:
             unconditional_value = "conditioning.unconditional"
+            unconditional_encoder_value = (
+                "conditioning.unconditional_raw" if casts_conditioning else unconditional_value
+            )
             negative_inputs = {}
-            for value in text_encoder.graph.inputs:
+            for index, value in enumerate(text_encoder.graph.inputs):
                 name = f"request.negative_{value.name}"
                 inputs[name] = {
                     "contract": _contract(value),
-                    "role": {"kind": "opaque"},
-                    "source": {"kind": "application", "name": f"negative_{value.name}"},
+                    "role": (
+                        {
+                            "kind": "runtime",
+                            "version": "1.0",
+                            "role": "negative_prompt_tokens",
+                        }
+                        if index == 0
+                        else {"kind": "opaque"}
+                    ),
+                    "source": (
+                        {"kind": "request", "field": "negative_prompt_tokens"}
+                        if index == 0
+                        else {"kind": "application", "name": f"negative_{value.name}"}
+                    ),
                     "required": True,
                     "externally_suppliable": True,
                 }
                 negative_inputs[value.name] = name
             inputs["request.guidance_scale"] = {
                 "contract": row_float,
-                "role": {"kind": "opaque"},
-                "source": {"kind": "application", "name": "guidance_scale"},
+                "role": {
+                    "kind": "runtime",
+                    "version": "1.0",
+                    "role": "guidance_scale",
+                },
+                "source": {"kind": "request", "field": "guidance_scale"},
                 "required": False,
                 "default": float(guidance_scale),
             }
@@ -3052,9 +3133,17 @@ def build_diffusion_workflow_metadata(
                 _invoke(
                     text_name,
                     negative_inputs,
-                    {conditioning_output.name: unconditional_value},
+                    {conditioning_output.name: unconditional_encoder_value},
                 )
             )
+            if casts_conditioning:
+                setup_nodes.append(
+                    _invoke(
+                        "conditioning_cast",
+                        {"value": unconditional_encoder_value},
+                        {"cast": unconditional_value},
+                    )
+                )
 
     state: dict[str, Any] = {
         "latent": {
@@ -3210,7 +3299,12 @@ def build_diffusion_workflow_metadata(
             _invoke(
                 vae_name,
                 {vae_input.name: decoder_input_value},
-                {vae_output.name: "vae.image"},
+                {vae_output.name: "vae.raw_image"},
+            ),
+            _invoke(
+                "image_output_clamp",
+                {"tensor": "vae.raw_image"},
+                {"clamped": "vae.image"},
             ),
             {
                 "kind": "emit",
@@ -3340,6 +3434,8 @@ def build_image_edit_workflow_metadata(
     schedule: list[float],
     timesteps: list[float],
     guidance_scale: float,
+    output_value_range: str = "negative_one_to_one",
+    artifact_paths: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build a flow-matching image-edit workflow with true classifier-free guidance.
 
@@ -3387,7 +3483,11 @@ def build_image_edit_workflow_metadata(
     latent_contract = {
         "dtype": _contract(sample_input)["dtype"],
         "rank": 3,
-        "shape": ["batch", "target_sequence_length", _contract(sample_input)["shape"][2]],
+        "shape": [
+            "batch",
+            "target_sequence_length",
+            _contract(sample_input)["shape"][2],
+        ],
     }
 
     attach_policy_components(pkg, PolicyCapabilities())
@@ -3400,6 +3500,22 @@ def build_image_edit_workflow_metadata(
     pkg.add_policy_component("unpack_latents", build_unpack_latents_2x2(dtype))
     pkg.add_policy_component("sequence_concat", build_sequence_concat(dtype))
     pkg.add_policy_component("true_cfg", build_true_cfg(dtype, guidance_scale=guidance_scale))
+    if output_value_range != "negative_one_to_one":
+        raise ValueError("image-edit workflow currently emits negative_one_to_one images")
+    pkg.add_policy_component(
+        "image_output_clamp",
+        build_tensor_clamp(
+            decoder_output.dtype,
+            [
+                "batch" if index == 0 else f"axis_{index}"
+                for index in range(len(decoder_output.shape or []))
+            ],
+            minimum=-1.0,
+            maximum=1.0,
+            output_dtype=ir.DataType.FLOAT,
+        ),
+    )
+    clamp_output = pkg.policy_components["image_output_clamp"].model.graph.outputs[0]
 
     batch = latent_contract["shape"][0]
     batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
@@ -3551,13 +3667,18 @@ def build_image_edit_workflow_metadata(
         "inputs": inputs,
         "outputs": {
             "image": {
-                "contract": _contract(decoder_output),
+                "contract": _request_aligned(_contract(clamp_output)),
                 "role": "image",
+                "value_range": output_value_range,
                 "stage": "pre_adapter",
             }
         },
         "components": {
-            name: _component(model, _artifact(name, len(pkg))) for name, model in pkg.items()
+            name: _component(
+                model,
+                (artifact_paths or {}).get(name, _artifact(name, len(pkg))),
+            )
+            for name, model in pkg.items()
         },
         "state": {
             "latent": {
@@ -3610,7 +3731,12 @@ def build_image_edit_workflow_metadata(
                 _invoke(
                     "vae_decoder",
                     {decoder_input.name: "vae.latent"},
-                    {decoder_output.name: "vae.image"},
+                    {decoder_output.name: "vae.raw_image"},
+                ),
+                _invoke(
+                    "image_output_clamp",
+                    {"tensor": "vae.raw_image"},
+                    {"clamped": "vae.image"},
                 ),
                 {
                     "kind": "emit",
@@ -3639,6 +3765,7 @@ def write_image_edit_workflow_metadata(
     schedule: list[float],
     timesteps: list[float],
     guidance_scale: float,
+    artifact_paths: dict[str, str] | None = None,
 ) -> str:
     os.makedirs(output_dir, exist_ok=True)
     metadata = build_image_edit_workflow_metadata(
@@ -3647,6 +3774,7 @@ def write_image_edit_workflow_metadata(
         schedule=schedule,
         timesteps=timesteps,
         guidance_scale=guidance_scale,
+        artifact_paths=artifact_paths,
     )
     pkg.save_policy_components(output_dir)
     add_adapter_service_to_metadata(metadata, pkg, output_dir)
@@ -3667,6 +3795,8 @@ def build_video_diffusion_workflow_metadata(
     latent_permutation: list[int] | None = None,
     solver: str = "euler",
     clip_sample_range: float | None = None,
+    prediction_type: str = "epsilon",
+    guidance_scale: float | None = None,
 ) -> dict[str, Any]:
     """Build a text-to-video diffusion workflow over rank-5 temporal latents.
 
@@ -3763,10 +3893,17 @@ def build_video_diffusion_workflow_metadata(
             ),
             next(iter(text_encoder.graph.outputs), None),
         )
+    if guidance_scale is not None and (text_encoder is None or conditioning_output is None):
+        raise ValueError("video classifier-free guidance requires a text encoder")
 
     if solver not in ("euler", "ddim"):
         raise ValueError("video solver must be 'euler' or 'ddim'")
+    if solver == "euler" and prediction_type != "epsilon":
+        raise ValueError("video Euler solver only supports epsilon prediction")
+    if solver == "ddim" and schedule is None:
+        raise ValueError("video DDIM requires an explicit cumulative-alpha schedule")
     latent_dims = ["batch", "frames", "channels", "height", "width"]
+    vae_dims = ["batch", "channels", "frames", "height", "width"]
     attach_policy_components(pkg, PolicyCapabilities())
     if solver == "ddim":
         # DDIM defines scale_model_input as the identity and consumes cumulative
@@ -3777,7 +3914,10 @@ def build_video_diffusion_workflow_metadata(
         pkg.add_policy_component(
             "solver_step",
             build_ddim_solver_step(
-                sample_input.dtype, latent_dims, clip_sample_range=clip_sample_range
+                sample_input.dtype,
+                latent_dims,
+                clip_sample_range=clip_sample_range,
+                prediction_type=prediction_type,
             ),
         )
     else:
@@ -3788,24 +3928,61 @@ def build_video_diffusion_workflow_metadata(
             "solver_step", build_euler_solver_step(sample_input.dtype, latent_dims)
         )
     pkg.add_policy_component("continue_predicate", build_boolean_not())
+    if guidance_scale is not None:
+        pkg.add_policy_component(
+            "guidance_combine", build_guidance_combine(estimate_output.dtype, latent_dims)
+        )
+    conditioning_cast = (
+        conditioning_output is not None
+        and conditioning_input is not None
+        and conditioning_output.dtype != conditioning_input.dtype
+    )
+    if conditioning_cast:
+        pkg.add_policy_component(
+            "conditioning_cast",
+            build_tensor_cast(
+                conditioning_output.dtype,
+                conditioning_input.dtype,
+                _contract(conditioning_input)["shape"],
+            ),
+        )
     pkg.add_policy_component(
         "video_latent_init",
-        build_video_latent_initializer(sample_input.dtype, init_noise_sigma),
+        build_video_latent_initializer(
+            sample_input.dtype,
+            init_noise_sigma,
+            history_dtype=timestep_input.dtype,
+        ),
     )
     pkg.add_policy_component(
         "schedule_history_append", build_schedule_history_append(timestep_input.dtype)
     )
     pkg.add_policy_component(
         "video_latent_permute",
-        build_video_latent_permute(latent_permutation or [0, 2, 1, 3, 4]),
+        build_video_latent_permute(
+            latent_permutation or [0, 2, 1, 3, 4],
+            sample_input.dtype,
+        ),
+    )
+    vae_cast = sample_input.dtype != vae_input.dtype
+    if vae_cast:
+        pkg.add_policy_component(
+            "video_vae_cast",
+            build_tensor_cast(sample_input.dtype, vae_input.dtype, vae_dims),
+        )
+    pkg.add_policy_component(
+        "video_latent_unscale",
+        build_video_latent_unscale(scaling_factor, vae_input.dtype),
     )
     pkg.add_policy_component(
-        "video_latent_unscale", build_video_latent_unscale(scaling_factor)
+        "video_decode_chunks", build_video_decode_chunk_count(dtype=vae_input.dtype)
     )
-    pkg.add_policy_component("video_decode_chunks", build_video_decode_chunk_count())
-    pkg.add_policy_component("video_decode_chunk", build_video_decode_chunk())
     pkg.add_policy_component(
-        "video_conv_cache_init", build_video_conv_cache_initializer(cache_entries)
+        "video_decode_chunk", build_video_decode_chunk(dtype=vae_input.dtype)
+    )
+    pkg.add_policy_component(
+        "video_conv_cache_init",
+        build_video_conv_cache_initializer(cache_entries, vae_input.dtype),
     )
 
     schedule_values = schedule or [
@@ -3824,6 +4001,7 @@ def build_video_diffusion_workflow_metadata(
     batch = latent_contract["shape"][0]
     batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
     batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch]}
+    row_float = {"dtype": "float32", "rank": 1, "shape": [batch]}
     control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
     history_contract = _request_aligned(
         {
@@ -3884,6 +4062,7 @@ def build_video_diffusion_workflow_metadata(
     conditioning_value = None
     if text_encoder is not None and conditioning_output is not None:
         text_inputs = {}
+        negative_text_inputs = {}
         for index, value in enumerate(text_encoder.graph.inputs):
             name = f"request.{value.name}"
             inputs[name] = {
@@ -3901,10 +4080,80 @@ def build_video_diffusion_workflow_metadata(
                 "required": True,
             }
             text_inputs[value.name] = name
-        conditioning_value = "conditioning.hidden_states"
-        setup_nodes.append(
-            _invoke(text_name, text_inputs, {conditioning_output.name: conditioning_value})
+            if guidance_scale is not None:
+                negative_name = f"request.negative_{value.name}"
+                inputs[negative_name] = {
+                    "contract": _request_aligned(_contract(value)),
+                    "role": (
+                        {
+                            "kind": "runtime",
+                            "version": "1.0",
+                            "role": "negative_prompt_tokens",
+                        }
+                        if index == 0
+                        else {"kind": "opaque"}
+                    ),
+                    "source": (
+                        {"kind": "request", "field": "negative_prompt_tokens"}
+                        if index == 0
+                        else {
+                            "kind": "application",
+                            "name": f"negative_{value.name}",
+                        }
+                    ),
+                    "required": True,
+                    "externally_suppliable": True,
+                }
+                negative_text_inputs[value.name] = negative_name
+        raw_conditioning_value = "conditioning.raw_hidden_states"
+        conditioning_value = (
+            "conditioning.hidden_states" if conditioning_cast else raw_conditioning_value
         )
+        setup_nodes.append(
+            _invoke(text_name, text_inputs, {conditioning_output.name: raw_conditioning_value})
+        )
+        if conditioning_cast:
+            setup_nodes.append(
+                _invoke(
+                    "conditioning_cast",
+                    {"value": raw_conditioning_value},
+                    {"cast": conditioning_value},
+                )
+            )
+        if guidance_scale is not None:
+            raw_negative_value = "conditioning.raw_negative_hidden_states"
+            negative_value = (
+                "conditioning.negative_hidden_states"
+                if conditioning_cast
+                else raw_negative_value
+            )
+            setup_nodes.append(
+                _invoke(
+                    text_name,
+                    negative_text_inputs,
+                    {conditioning_output.name: raw_negative_value},
+                )
+            )
+            if conditioning_cast:
+                setup_nodes.append(
+                    _invoke(
+                        "conditioning_cast",
+                        {"value": raw_negative_value},
+                        {"cast": negative_value},
+                    )
+                )
+            inputs["request.guidance_scale"] = {
+                "contract": row_float,
+                "role": {
+                    "kind": "runtime",
+                    "version": "1.0",
+                    "role": "guidance_scale",
+                },
+                "source": {"kind": "request", "field": "guidance_scale"},
+                "required": False,
+                "default": guidance_scale,
+                "externally_suppliable": True,
+            }
     if conditioning_input is not None and conditioning_value is None:
         # No text encoder ships with the package, so the prompt embedding is
         # supplied by the application. Conditioning stays a declared input
@@ -3947,29 +4196,70 @@ def build_video_diffusion_workflow_metadata(
             },
             {"model_input": "diffusion.model_input"},
         ),
-        _invoke(denoiser_name, denoiser_inputs, {estimate_output.name: "denoiser.estimate"}),
-        _invoke(
-            "solver_step",
-            {
-                "sample": "state.latent.body",
-                "derivative": "denoiser.estimate",
-                "step": "loop.iteration",
-                "schedule": "diffusion.schedule",
-            },
-            {"next_state": "latent.body"},
-            {"solver": _effect("solver.0", "solver.1")},
-        ),
-        _invoke(
-            "schedule_history_append",
-            {"history": "state.scheduler_history.body", "timestep": "diffusion.timestep"},
-            {"next": "scheduler_history.body"},
-        ),
-        _invoke(
-            "continue_predicate",
-            {"done": "package.false"},
-            {"continue": "loop.continue"},
-        ),
     ]
+    if guidance_scale is None:
+        body_nodes.append(
+            _invoke(
+                denoiser_name,
+                denoiser_inputs,
+                {estimate_output.name: "denoiser.estimate"},
+            )
+        )
+    else:
+        negative_denoiser_inputs = dict(denoiser_inputs)
+        assert conditioning_input is not None
+        negative_denoiser_inputs[conditioning_input.name] = negative_value
+        body_nodes.extend(
+            [
+                _invoke(
+                    denoiser_name,
+                    negative_denoiser_inputs,
+                    {estimate_output.name: "denoiser.unconditional"},
+                ),
+                _invoke(
+                    denoiser_name,
+                    denoiser_inputs,
+                    {estimate_output.name: "denoiser.conditional"},
+                ),
+                _invoke(
+                    "guidance_combine",
+                    {
+                        "unconditional": "denoiser.unconditional",
+                        "conditional": "denoiser.conditional",
+                        "scale": "request.guidance_scale",
+                    },
+                    {"estimate": "denoiser.estimate"},
+                ),
+            ]
+        )
+    body_nodes.extend(
+        [
+            _invoke(
+                "solver_step",
+                {
+                    "sample": "state.latent.body",
+                    "derivative": "denoiser.estimate",
+                    "step": "loop.iteration",
+                    "schedule": "diffusion.schedule",
+                },
+                {"next_state": "latent.body"},
+                {"solver": _effect("solver.0", "solver.1")},
+            ),
+            _invoke(
+                "schedule_history_append",
+                {
+                    "history": "state.scheduler_history.body",
+                    "timestep": "diffusion.timestep",
+                },
+                {"next": "scheduler_history.body"},
+            ),
+            _invoke(
+                "continue_predicate",
+                {"done": "package.false"},
+                {"continue": "loop.continue"},
+            ),
+        ]
+    )
 
     decode_body: list[dict[str, Any]] = [
         _invoke(
@@ -4082,7 +4372,10 @@ def build_video_diffusion_workflow_metadata(
                 _invoke(
                     "video_latent_init",
                     {"noise": "request.noise"},
-                    {"latent": "latent.initial", "history": "scheduler.history.initial"},
+                    {
+                        "latent": "latent.initial",
+                        "history": "scheduler.history.initial",
+                    },
                 ),
                 {
                     "kind": "loop",
@@ -4108,10 +4401,12 @@ def build_video_diffusion_workflow_metadata(
                             "body_output": "scheduler_history.body",
                             "next": "scheduler_history.final",
                             "read_effect": _effect(
-                                "state:scheduler_history.0", "state:scheduler_history.read"
+                                "state:scheduler_history.0",
+                                "state:scheduler_history.read",
                             ),
                             "write_effect": _effect(
-                                "state:scheduler_history.read", "state:scheduler_history.1"
+                                "state:scheduler_history.read",
+                                "state:scheduler_history.1",
                             ),
                         },
                     ],
@@ -4121,9 +4416,24 @@ def build_video_diffusion_workflow_metadata(
                     {"latent": "latent.final"},
                     {"permuted": "decode.latent_permuted"},
                 ),
+                *(
+                    [
+                        _invoke(
+                            "video_vae_cast",
+                            {"value": "decode.latent_permuted"},
+                            {"cast": "decode.latent_cast"},
+                        )
+                    ]
+                    if vae_cast
+                    else []
+                ),
                 _invoke(
                     "video_latent_unscale",
-                    {"latent": "decode.latent_permuted"},
+                    {
+                        "latent": (
+                            "decode.latent_cast" if vae_cast else "decode.latent_permuted"
+                        )
+                    },
                     {"unscaled": "decode.latent"},
                 ),
                 _invoke(
@@ -6925,7 +7235,12 @@ def _build_autoregressive_workflow_metadata(
             "decoder_step.body_position_ids",
             {"kind": "invariant"},
         )
-    for cell, (contract, current, body_output, recurrence) in decoder_state_specs.items():
+    for cell, (
+        contract,
+        current,
+        body_output,
+        recurrence,
+    ) in decoder_state_specs.items():
         effect_name = f"state:{cell}"
         initial_effects[effect_name] = f"{effect_name}.0"
         state[cell] = {
@@ -7972,7 +8287,10 @@ def build_ctc_asr_workflow_metadata(
             # safe.  Speculation safety is irrelevant here because a CTC
             # workflow has no speculative region, but it is declared explicitly
             # rather than left to a default.
-            "audio_preprocess": {"retry": "pure", "speculation_safety": {"kind": "clonable"}},
+            "audio_preprocess": {
+                "retry": "pure",
+                "speculation_safety": {"kind": "clonable"},
+            },
             "encode": {"retry": "pure", "speculation_safety": {"kind": "clonable"}},
         },
         "inputs": {
@@ -8361,7 +8679,6 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
         waveform_output,
         input_frame,
         temporal_mask,
-        temporal_position,
         hidden,
         text_logits,
         dep_hidden,
@@ -8371,6 +8688,15 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
     )
     if any(port is None for port in ports):
         raise ValueError("full-duplex workflow is missing a required component port")
+    position_contract = (
+        _contract(temporal_position)
+        if temporal_position is not None
+        else {
+            "dtype": "int64",
+            "rank": 2,
+            "shape": [_contract(input_frame)["shape"][0], 1],
+        }
+    )
     temporal_caches = _model_cache_pairs(temporal)
     depformer_caches = _model_cache_pairs(depformer)
     if not temporal_caches:
@@ -8421,7 +8747,11 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
     }
     loop_flag = {"dtype": "bool", "rank": 1, "shape": [1]}
     frame_contract = {"dtype": "int64", "rank": 2, "shape": [batch, channels]}
-    ring_contract = {"dtype": "int64", "rank": 3, "shape": [batch, channels, cache_length]}
+    ring_contract = {
+        "dtype": "int64",
+        "rank": 3,
+        "shape": [batch, channels, cache_length],
+    }
     ring_flags = {"dtype": "bool", "rank": 3, "shape": [batch, channels, cache_length]}
 
     inputs: dict[str, Any] = {
@@ -8566,7 +8896,7 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
             },
         ),
         "position_ids": session_cell(
-            _contract(temporal_position), "package.position_ids_init", invariant
+            position_contract, "package.position_ids_init", invariant
         ),
         "user_waveform": session_cell(
             {
@@ -8625,7 +8955,7 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
         ("package.token_cache_init", ring_contract),
         ("package.token_provided_init", ring_flags),
         ("package.attention_mask_init", state["attention_mask"]["contract"]),
-        ("package.position_ids_init", _contract(temporal_position)),
+        ("package.position_ids_init", position_contract),
         ("package.user_waveform_init", state["user_waveform"]["contract"]),
         ("package.agent_codes_init", state["agent_codes"]["contract"]),
     ):
@@ -8853,12 +9183,13 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
     temporal_inputs = {
         input_frame.name: "duplex.input_frame",
         temporal_mask.name: "state.attention_mask.body",
-        temporal_position.name: "state.position_ids.body",
         **{
             past.name: f"state.temporal_cache_{index}.body"
             for index, (past, _) in enumerate(temporal_caches)
         },
     }
+    if temporal_position is not None:
+        temporal_inputs[temporal_position.name] = "state.position_ids.body"
     temporal_outputs = {
         hidden.name: "duplex.hidden",
         text_logits.name: "duplex.text_logits",
@@ -9042,7 +9373,11 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
             )
             for index in range(len(temporal_caches))
         ],
-        ("temporal_cache_lengths", "package.zero_batch", "duplex.temporal_cache_lengths"),
+        (
+            "temporal_cache_lengths",
+            "package.zero_batch",
+            "duplex.temporal_cache_lengths",
+        ),
     ]
     frame_body.append(
         _invoke(
@@ -9091,7 +9426,11 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
         "step_update",
         build_decoder_step_update(
             attention_dtype=_ir_dtype(temporal_mask),
-            position_dtype=_ir_dtype(temporal_position),
+            position_dtype=(
+                _ir_dtype(temporal_position)
+                if temporal_position is not None
+                else ir.DataType.INT64
+            ),
         ),
     )
     inputs["package.text_stream"] = {

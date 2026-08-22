@@ -619,6 +619,53 @@ class TestCLIInfo:
         assert "Supported" in out
 
 
+class TestCLIConvertComfyUI:
+    def test_revision_is_forwarded_to_conversion(self, tmp_path):
+        workflow_path = tmp_path / "workflow.json"
+        workflow_path.write_text("{}", encoding="utf-8")
+        result = SimpleNamespace(
+            output_dir=str(tmp_path / "output"),
+            metadata_path=str(tmp_path / "output" / "inference_metadata.yaml"),
+            run_params_path=str(tmp_path / "output" / "run.json"),
+            workflow=SimpleNamespace(
+                steps=20,
+                cfg=7.5,
+                sampler_name="euler",
+                scheduler_kind="euler",
+                width=512,
+                height=512,
+                loras=[],
+                prompt="a cat",
+                negative_prompt="",
+                seed=42,
+            ),
+        )
+        with mock.patch(
+            "mobius.integrations.onnx_genai.convert_comfyui_workflow",
+            return_value=result,
+        ) as convert:
+            main(
+                [
+                    "convert-comfyui",
+                    str(workflow_path),
+                    "--checkpoint",
+                    "nota-ai/bk-sdm-small",
+                    "--revision",
+                    "pinned-revision",
+                    "--output",
+                    str(tmp_path / "output"),
+                ]
+            )
+
+        convert.assert_called_once_with(
+            {},
+            "nota-ai/bk-sdm-small",
+            str(tmp_path / "output"),
+            sdxl=False,
+            revision="pinned-revision",
+        )
+
+
 class TestCLIBuildRuntime:
     """Test the ``--runtime`` flag on the ``build`` subcommand."""
 
@@ -757,7 +804,37 @@ class TestCLIBuildRuntime:
             config=pkg.config,
             source="/models/vlm",
             revision=None,
+            guidance_scale=None,
         )
+
+    def test_runtime_onnx_genai_forwards_guidance_scale(self):
+        pkg = mock.MagicMock()
+        pkg.items.return_value = []
+        pkg.__iter__.return_value = iter(("transformer", "text_encoder", "vae_decoder"))
+        pkg.config = object()
+        args = SimpleNamespace(
+            max_shard_size=None,
+            max_workers=8,
+            external_data="onnx",
+            execution_provider="cpu",
+            no_weights=True,
+            runtime="onnx-genai",
+            config="/models/video",
+            model=None,
+            guidance_scale=6.0,
+            revision="pinned-revision",
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.onnx_genai.write_onnx_genai_config",
+                return_value={},
+            ) as writer,
+        ):
+            _save_package(pkg, tmpdir, args, None, None)
+
+        assert writer.call_args.kwargs["guidance_scale"] == pytest.approx(6.0)
+        assert writer.call_args.kwargs["revision"] == "pinned-revision"
 
     def test_runtime_onnx_genai_does_not_fallback_for_unsupported_vlm(self):
         pkg = mock.MagicMock()

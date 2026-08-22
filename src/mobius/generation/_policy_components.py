@@ -228,6 +228,7 @@ def build_boolean_not() -> PolicyComponent:
         keepdims=1,
     )
     continued = builder.op.Equal(any_done, builder.op.Constant(value_int=0))
+    continued.dtype = ir.DataType.BOOL
     continued.shape = ir.Shape([1])
     builder.add_output(continued, "continue")
     return _component("mobius.policy.auxiliary@1", graph, {})
@@ -1255,6 +1256,7 @@ def build_adaptive_k_policy(*, max_k: int = 16, min_k: int = 1) -> PolicyCompone
     )
     next_k = op.Where(valid, computed_k, current_k)
     next_estimates = op.Where(valid_col, computed_estimates, estimates)
+    next_k.dtype = ir.DataType.INT64
     next_k.shape = ir.Shape(["batch"])
     next_estimates.shape = ir.Shape(["batch", estimate_slots])
     builder.add_output(next_k, "next_k")
@@ -1471,6 +1473,8 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
         op.Add(counter, op.Constant(value_int=1)),
         counter,
     )
+    token_ids.dtype = ir.DataType.INT64
+    next_counter.dtype = ir.DataType.INT64
     _set_public_shape(logits, ["batch", "vocabulary"])
     for value in (temperature, top_k, top_p, min_p, seed, counter, active, done):
         _set_public_shape(value, ["batch"])
@@ -1573,6 +1577,9 @@ def build_eos_termination(*, row_selective: bool = False) -> PolicyComponent:
         _set_public_shape(active, ["batch"])
         _set_public_shape(done, ["batch"])
         _set_public_shape(next_active, ["batch"])
+        next_active.dtype = ir.DataType.BOOL
+    done.dtype = ir.DataType.BOOL
+    continued.dtype = ir.DataType.BOOL
     _set_public_shape(continued, [1])
     builder.add_output(done, "done")
     if row_selective:
@@ -1642,6 +1649,31 @@ def build_tensor_scale(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponen
     return _component("mobius.policy.auxiliary@1", graph, {})
 
 
+def build_tensor_clamp(
+    dtype: ir.DataType = ir.DataType.FLOAT,
+    dims: Sequence[str] = ("batch", "channels", "height", "width"),
+    *,
+    minimum: float,
+    maximum: float,
+    output_dtype: ir.DataType | None = None,
+) -> PolicyComponent:
+    """Clamp an arbitrary-rank tensor to a declared runtime output range."""
+    graph, builder = _make_graph("tensor_clamp")
+    tensor = builder.input("tensor", dtype, list(dims))
+    output_dtype = output_dtype or dtype
+    clamp_input = tensor if output_dtype == dtype else builder.op.Cast(tensor, to=output_dtype)
+    minimum_value = builder.op.CastLike(
+        builder.op.Constant(value_float=float(minimum)), clamp_input
+    )
+    maximum_value = builder.op.CastLike(
+        builder.op.Constant(value_float=float(maximum)), clamp_input
+    )
+    clamped = builder.op.Clip(clamp_input, minimum_value, maximum_value)
+    clamped.shape = tensor.shape
+    builder.add_output(clamped, "clamped")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
 def build_zeros_like(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponent:
     """Produce a zero tensor shaped like its reference, for state initializers."""
     graph, builder = _make_graph("zeros_like")
@@ -1653,7 +1685,10 @@ def build_zeros_like(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponent:
     return _component("mobius.policy.auxiliary@1", graph, {})
 
 
-def build_guidance_combine(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponent:
+def build_guidance_combine(
+    dtype: ir.DataType = ir.DataType.FLOAT,
+    latent_dims: Sequence[str] = ("batch", "channels", "height", "width"),
+) -> PolicyComponent:
     """Combine two conditioned estimates by a per-row guidance scale.
 
     ``estimate = unconditional + scale * (conditional - unconditional)`` is the
@@ -1662,13 +1697,14 @@ def build_guidance_combine(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComp
     """
     graph, builder = _make_graph("guidance_combine")
     op = builder.op
-    unconditional = builder.input(
-        "unconditional", dtype, ["batch", "channels", "height", "width"]
-    )
-    conditional = builder.input("conditional", dtype, ["batch", "channels", "height", "width"])
+    unconditional = builder.input("unconditional", dtype, list(latent_dims))
+    conditional = builder.input("conditional", dtype, list(latent_dims))
     scale = builder.input("scale", ir.DataType.FLOAT, ["batch"])
-    # (batch,) -> (batch, 1, 1, 1) so the row scale broadcasts over the latent.
-    factor = op.Unsqueeze(op.Cast(scale, to=dtype), op.Constant(value_ints=[1, 2, 3]))
+    # (batch,) -> (batch, 1, ..., 1) so the row scale broadcasts over the latent.
+    factor = op.Unsqueeze(
+        op.Cast(scale, to=dtype),
+        op.Constant(value_ints=list(range(1, len(latent_dims)))),
+    )
     estimate = op.Add(unconditional, op.Mul(factor, op.Sub(conditional, unconditional)))
     estimate.shape = unconditional.shape
     builder.add_output(estimate, "estimate")
@@ -1690,7 +1726,7 @@ def build_tensor_cast(
     target_dtype: ir.DataType,
     dims: Sequence[str] = ("batch", "heads", "sequence", "head_dim"),
 ) -> PolicyComponent:
-    """Cast a typed tensor at an explicit component precision boundary."""
+    """Cast an arbitrary-rank tensor at an explicit component precision boundary."""
     graph, builder = _make_graph("tensor_cast")
     value = builder.input("value", source_dtype, list(dims))
     cast = builder.op.Cast(value, to=target_dtype)
@@ -1785,9 +1821,67 @@ def build_image_grid_positions(
     return _component("mobius.policy.auxiliary@1", graph, {})
 
 
+def build_image_dimensions(
+    dtype: ir.DataType = ir.DataType.FLOAT,
+) -> PolicyComponent:
+    """Read pixel height and width from a rank-4 image tensor."""
+    graph, builder = _make_graph("image_dimensions")
+    op = builder.op
+    tensor = builder.input("tensor", dtype, ["batch", "channels", "height", "width"])
+    height = op.Shape(tensor, start=2, end=3)
+    width = op.Shape(tensor, start=3, end=4)
+    height.shape = width.shape = ir.Shape([1])
+    builder.add_output(height, "height")
+    builder.add_output(width, "width")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
 _RNG_MODULUS = 2147483647
 _RNG_MULTIPLIER = 48271
 _RNG_STRIDE = 2654435761
+
+
+def build_image_noise_geometry(
+    *,
+    channels: int = 3,
+    token_stride: int = 32,
+    base_image_sequence_length: int = 64,
+    noise_scale: float = 1.0,
+    maximum_noise_scale: float = 16.0,
+) -> PolicyComponent:
+    """Derive image-noise shape, token grid, and resolution-dependent scale."""
+    graph, builder = _make_graph("image_noise_geometry")
+    op = builder.op
+    height = builder.input("height", ir.DataType.INT64, [1])
+    width = builder.input("width", ir.DataType.INT64, [1])
+
+    row_shape = op.Concat(
+        op.Constant(value_ints=[channels]),
+        height,
+        width,
+        axis=0,
+    )
+    row_shape.shape = ir.Shape([3])
+    token_height = op.Div(height, op.Constant(value_int=token_stride))
+    token_width = op.Div(width, op.Constant(value_int=token_stride))
+    token_height.shape = token_width.shape = ir.Shape([1])
+
+    image_sequence_length = op.Mul(token_height, token_width)
+    relative_length = op.Div(
+        op.Cast(image_sequence_length, to=ir.DataType.FLOAT),
+        op.Constant(value_float=float(base_image_sequence_length)),
+    )
+    resolved_scale = op.Min(
+        op.Mul(op.Sqrt(relative_length), op.Constant(value_float=noise_scale)),
+        op.Constant(value_float=maximum_noise_scale),
+    )
+    resolved_scale.shape = ir.Shape([1])
+
+    builder.add_output(row_shape, "row_shape")
+    builder.add_output(token_height, "token_height")
+    builder.add_output(token_width, "token_width")
+    builder.add_output(resolved_scale, "noise_scale")
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 def _counter_uniform(op, key, counter):
@@ -2090,8 +2184,9 @@ def build_ddim_solver_step(
     latent_dims: Sequence[str] = _IMAGE_LATENT_DIMS,
     *,
     clip_sample_range: float | None = None,
+    prediction_type: str = "epsilon",
 ) -> PolicyComponent:
-    """Build the deterministic DDIM update (``eta = 0``, epsilon prediction).
+    """Build the deterministic DDIM update (``eta = 0``).
 
     ``schedule`` holds the cumulative alpha of every denoising step followed by
     the alpha of the final step's predecessor, so entry ``i + 1`` is the
@@ -2103,8 +2198,12 @@ def build_ddim_solver_step(
     ``clip_sample_range`` reproduces schedulers configured with
     ``clip_sample=True``, which clamp the predicted clean sample before the
     reverse step. ``latent_dims`` names the latent axes, so the same update
-    serves image and video latents.
+    serves image and video latents. ``prediction_type`` selects the scheduler's
+    architecture-neutral output interpretation: ``epsilon``, ``sample``, or
+    ``v_prediction``.
     """
+    if prediction_type not in {"epsilon", "sample", "v_prediction"}:
+        raise ValueError(f"unsupported DDIM prediction_type {prediction_type!r}")
     graph, builder = _make_graph("ddim_solver_step")
     op = builder.op
     sample = builder.input("sample", dtype, list(latent_dims))
@@ -2119,16 +2218,28 @@ def build_ddim_solver_step(
         op.Cast(op.Gather(schedule, next_step, axis=0), to=dtype), broadcast_axes
     )
     one = op.CastLike(op.Constant(value_float=1.0), sample)
-    # Recover the predicted clean latent, then re-noise it to alpha_prev.
-    pred_original = op.Div(
-        op.Sub(sample, op.Mul(op.Sqrt(op.Sub(one, alpha)), derivative)), op.Sqrt(alpha)
-    )
+    alpha_sqrt = op.Sqrt(alpha)
+    beta_sqrt = op.Sqrt(op.Sub(one, alpha))
+    if prediction_type == "epsilon":
+        pred_original = op.Div(op.Sub(sample, op.Mul(beta_sqrt, derivative)), alpha_sqrt)
+        pred_epsilon = derivative
+    elif prediction_type == "sample":
+        pred_original = derivative
+        epsilon_numerator = op.Sub(sample, op.Mul(alpha_sqrt, pred_original))
+        pred_epsilon = op.Where(
+            op.Greater(beta_sqrt, op.CastLike(op.Constant(value_float=0.0), sample)),
+            op.Div(epsilon_numerator, beta_sqrt),
+            op.CastLike(op.Constant(value_float=0.0), sample),
+        )
+    else:
+        pred_original = op.Sub(op.Mul(alpha_sqrt, sample), op.Mul(beta_sqrt, derivative))
+        pred_epsilon = op.Add(op.Mul(alpha_sqrt, derivative), op.Mul(beta_sqrt, sample))
     if clip_sample_range is not None:
         limit = op.CastLike(op.Constant(value_float=float(clip_sample_range)), sample)
         pred_original = op.Clip(pred_original, op.Neg(limit), limit)
     next_sample = op.Add(
         op.Mul(op.Sqrt(alpha_prev), pred_original),
-        op.Mul(op.Sqrt(op.Sub(one, alpha_prev)), derivative),
+        op.Mul(op.Sqrt(op.Sub(one, alpha_prev)), pred_epsilon),
     )
     _set_public_shape(next_sample, list(latent_dims))
     builder.add_output(next_sample, "next_state")
@@ -2271,6 +2382,7 @@ def build_true_cfg(
 
 
 SOLVER_BUILDERS = {
+    "ddim": build_ddim_solver_step,
     "euler": build_euler_solver_step,
     "multistep": build_multistep_solver_step,
 }
@@ -2659,12 +2771,17 @@ def build_schedule_history_append(dtype: ir.DataType) -> PolicyComponent:
     history = builder.input("history", dtype, ["batch", "history"])
     timestep = builder.input("timestep", dtype, ["batch"])
     updated = op.Concat(history, op.Unsqueeze(timestep, op.Constant(value_ints=[1])), axis=1)
-    _set_public_shape(updated, ["batch", "history"])
+    # Appending changes the temporal extent, so the output must not reuse the
+    # input symbol: runtimes may otherwise preallocate the old zero-length shape.
+    _set_public_shape(updated, ["batch", "next_history"])
     builder.add_output(updated, "next")
     return _component("mobius.policy.auxiliary@1", graph, {})
 
 
-def build_video_decode_chunk_count(latent_frame_axis: int = 2) -> PolicyComponent:
+def build_video_decode_chunk_count(
+    latent_frame_axis: int = 2,
+    dtype: ir.DataType = ir.DataType.FLOAT,
+) -> PolicyComponent:
     """Number of causal decode chunks a latent clip is split into.
 
     Mirrors ``AutoencoderKLCogVideoX._decode``: ``max(latent_frames // 2, 1)``.
@@ -2673,7 +2790,7 @@ def build_video_decode_chunk_count(latent_frame_axis: int = 2) -> PolicyComponen
     op = builder.op
     latent = builder.input(
         "latent",
-        ir.DataType.FLOAT,
+        dtype,
         ["batch", "channels", "latent_frames", "height", "width"],
     )
     frames = op.Shape(latent, start=latent_frame_axis, end=latent_frame_axis + 1)
@@ -2686,7 +2803,10 @@ def build_video_decode_chunk_count(latent_frame_axis: int = 2) -> PolicyComponen
     return _component("mobius.policy.auxiliary@1", graph, {})
 
 
-def build_video_decode_chunk(latent_frame_axis: int = 2) -> PolicyComponent:
+def build_video_decode_chunk(
+    latent_frame_axis: int = 2,
+    dtype: ir.DataType = ir.DataType.FLOAT,
+) -> PolicyComponent:
     """Slice the latent frames belonging to one causal decode chunk.
 
     Reproduces the reference chunk walk, where the odd frame left over by the
@@ -2700,7 +2820,7 @@ def build_video_decode_chunk(latent_frame_axis: int = 2) -> PolicyComponent:
     op = builder.op
     latent = builder.input(
         "latent",
-        ir.DataType.FLOAT,
+        dtype,
         ["batch", "channels", "latent_frames", "height", "width"],
     )
     step = builder.input("step", ir.DataType.INT64, ["batch"])
@@ -2768,7 +2888,10 @@ def build_video_conv_cache_initializer(
     return _component("mobius.policy.auxiliary@1", graph, {})
 
 
-def build_video_latent_permute(perm: list[int]) -> PolicyComponent:
+def build_video_latent_permute(
+    perm: list[int],
+    dtype: ir.DataType = ir.DataType.FLOAT,
+) -> PolicyComponent:
     """Reorder a video latent between the denoiser and VAE layouts.
 
     CogVideoX denoises ``[batch, frames, channels, height, width]`` but decodes
@@ -2777,22 +2900,21 @@ def build_video_latent_permute(perm: list[int]) -> PolicyComponent:
     """
     graph, builder = _make_graph("video_latent_permute")
     op = builder.op
-    source = builder.input(
-        "latent", ir.DataType.FLOAT, ["batch", "frames", "channels", "height", "width"]
-    )
+    source = builder.input("latent", dtype, ["batch", "frames", "channels", "height", "width"])
     permuted = op.Transpose(source, perm=perm)
     _set_public_shape(permuted, ["batch", "channels", "frames", "height", "width"])
     builder.add_output(permuted, "permuted")
     return _component("mobius.policy.auxiliary@1", graph, {})
 
 
-def build_video_latent_unscale(scaling_factor: float) -> PolicyComponent:
+def build_video_latent_unscale(
+    scaling_factor: float,
+    dtype: ir.DataType = ir.DataType.FLOAT,
+) -> PolicyComponent:
     """Undo the autoencoder's latent scaling before decoding."""
     graph, builder = _make_graph("video_latent_unscale")
     op = builder.op
-    latent = builder.input(
-        "latent", ir.DataType.FLOAT, ["batch", "channels", "frames", "height", "width"]
-    )
+    latent = builder.input("latent", dtype, ["batch", "channels", "frames", "height", "width"])
     unscaled = op.Div(latent, op.CastLike(op.Constant(value_float=scaling_factor), latent))
     _set_public_shape(unscaled, ["batch", "channels", "frames", "height", "width"])
     builder.add_output(unscaled, "unscaled")
