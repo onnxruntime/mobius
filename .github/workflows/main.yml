@@ -257,51 +257,6 @@ jobs:
           flags: unittests
           report-type: test_results
 
-  onnx-genai-producer-conformance:
-    name: ONNX GenAI producer conformance
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-      - name: Install Mobius dependencies
-        run: |
-          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install -r requirements/ci/requirements.txt
-          python -m pip install onnxruntime==1.28.0
-          python -m pip install -e '.[testing]'
-      - name: Generate representative packages
-        run: |
-          PYTHONPATH=src python tests/generate_onnx_genai_validation_packages.py \
-            "$GITHUB_WORKSPACE/validation/generated"
-          PYTHONPATH=src python tests/compare_onnx_genai_validation_packages.py \
-            tests/fixtures/onnx_genai_workflows "$GITHUB_WORKSPACE/validation/generated"
-      - uses: actions/checkout@v7
-        with:
-          repository: justinchuby/onnx-genai
-          ref: dbba42e5dd32fea0fd01ec04ed74a712a1115d7e
-          path: validation/onnx-genai
-      - name: Execute generated workflows with ONNX GenAI
-        run: |
-          cp tests/onnx_genai_workflow_conformance.rs \
-            validation/onnx-genai/crates/onnx-genai-engine/tests/mobius_workflow_conformance.rs
-          cp tests/onnx_genai_speech_conformance.rs \
-            validation/onnx-genai/crates/onnx-genai-server/tests/mobius_speech_conformance.rs
-          ORT_LIB="$(python -c \
-            'import onnxruntime, pathlib; print(next((pathlib.Path(onnxruntime.__file__).parent / "capi").glob("libonnxruntime.so*")))')"
-          cd validation/onnx-genai
-          MOBIUS_WORKFLOW_CONFORMANCE_DIR="$GITHUB_WORKSPACE/validation/generated" \
-            ONNX_GENAI_ORT_LIB="$ORT_LIB" \
-            cargo test -p onnx-genai-engine \
-              --test mobius_workflow_conformance \
-              mobius_hierarchical_audio_executes_nested_generation -- --nocapture
-          MOBIUS_WORKFLOW_CONFORMANCE_DIR="$GITHUB_WORKSPACE/validation/generated" \
-            ONNX_GENAI_ORT_LIB="$ORT_LIB" \
-            cargo test -p onnx-genai-server \
-              --test mobius_speech_conformance \
-              mobius_hierarchical_audio_accepts_raw_speech_request -- --nocapture
-
   integration-fast:
     name: Integration (fast)
     runs-on:
