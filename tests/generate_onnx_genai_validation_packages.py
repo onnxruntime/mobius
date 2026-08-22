@@ -99,10 +99,15 @@ def _executable_decoder_package() -> ModelPackage:
     input_ids = builder.input("input_ids", ir.DataType.INT64, ["batch", "sequence"])
     builder.input("attention_mask", ir.DataType.INT64, ["batch", "total_sequence"])
     builder.input("position_ids", ir.DataType.INT64, ["batch", "sequence"])
-    past = builder.input(
+    past_key = builder.input(
         "past_key_values.0.key",
         ir.DataType.FLOAT,
         ["batch", 2, "past_sequence", 8],
+    )
+    past_value = builder.input(
+        "past_key_values.0.value",
+        ir.DataType.FLOAT,
+        ["batch", 4, "past_sequence", 4],
     )
     shape = builder.op.Shape(input_ids)
     logits = builder.op.ConstantOfShape(
@@ -111,22 +116,35 @@ def _executable_decoder_package() -> ModelPackage:
     )
     batch = builder.op.Shape(input_ids, start=0, end=1)
     sequence = builder.op.Shape(input_ids, start=1, end=2)
-    cache_shape = builder.op.Concat(
+    key_update_shape = builder.op.Concat(
         batch,
         builder.op.Constant(value_ints=[2]),
         sequence,
         builder.op.Constant(value_ints=[8]),
         axis=0,
     )
-    update = builder.op.ConstantOfShape(cache_shape, value=ir.tensor([0.0]))
-    present = builder.op.Concat(past, update, axis=2)
+    value_update_shape = builder.op.Concat(
+        batch,
+        builder.op.Constant(value_ints=[4]),
+        sequence,
+        builder.op.Constant(value_ints=[4]),
+        axis=0,
+    )
+    key_update = builder.op.ConstantOfShape(key_update_shape, value=ir.tensor([0.0]))
+    value_update = builder.op.ConstantOfShape(value_update_shape, value=ir.tensor([0.0]))
+    present_key = builder.op.Concat(past_key, key_update, axis=2)
+    present_value = builder.op.Concat(past_value, value_update, axis=2)
     builder.add_output(
         _typed(logits, ir.DataType.FLOAT, ["batch", "sequence", 128]),
         "logits",
     )
     builder.add_output(
-        _typed(present, ir.DataType.FLOAT, ["batch", 2, "present_sequence", 8]),
+        _typed(present_key, ir.DataType.FLOAT, ["batch", 2, "present_sequence", 8]),
         "present.0.key",
+    )
+    builder.add_output(
+        _typed(present_value, ir.DataType.FLOAT, ["batch", 4, "present_sequence", 4]),
+        "present.0.value",
     )
     config = _Cfg()
     config.eos_token_id = 127
@@ -785,10 +803,15 @@ def _executable_speculative_package() -> ModelPackage:
 
     verifier_graph, verifier_builder = _graph("verifier")
     proposed = verifier_builder.input("proposed_tokens", ir.DataType.INT64, ["batch", 4])
-    past = verifier_builder.input(
+    past_key = verifier_builder.input(
         "past_key_values.0.key",
         ir.DataType.FLOAT,
         ["batch", 2, "past_sequence", 8],
+    )
+    past_value = verifier_builder.input(
+        "past_key_values.0.value",
+        ir.DataType.FLOAT,
+        ["batch", 4, "past_sequence", 4],
     )
     batch = verifier_builder.op.Shape(proposed, start=0, end=1)
     row = verifier_builder.op.Range(
@@ -817,7 +840,7 @@ def _executable_speculative_package() -> ModelPackage:
         verifier_builder.op.Constant(value_floats=[0.0, 1.0]),
         axis=-1,
     )
-    cache_update = verifier_builder.op.ConstantOfShape(
+    key_update = verifier_builder.op.ConstantOfShape(
         verifier_builder.op.Concat(
             batch,
             verifier_builder.op.Constant(value_ints=[2, 4, 8]),
@@ -825,18 +848,35 @@ def _executable_speculative_package() -> ModelPackage:
         ),
         value=ir.tensor([0.0]),
     )
-    present = verifier_builder.op.Concat(past, cache_update, axis=2)
+    value_update = verifier_builder.op.ConstantOfShape(
+        verifier_builder.op.Concat(
+            batch,
+            verifier_builder.op.Constant(value_ints=[4, 4, 4]),
+            axis=0,
+        ),
+        value=ir.tensor([0.0]),
+    )
+    present_key = verifier_builder.op.Concat(past_key, key_update, axis=2)
+    present_value = verifier_builder.op.Concat(past_value, value_update, axis=2)
     verifier_builder.add_output(
         _typed(target_scores, ir.DataType.FLOAT, ["batch", 4, 32]),
         "target_scores",
     )
     verifier_builder.add_output(
         _typed(
-            present,
+            present_key,
             ir.DataType.FLOAT,
             ["batch", 2, "past_sequence + 4", 8],
         ),
         "present.0.key",
+    )
+    verifier_builder.add_output(
+        _typed(
+            present_value,
+            ir.DataType.FLOAT,
+            ["batch", 4, "past_sequence + 4", 4],
+        ),
+        "present.0.value",
     )
     return ModelPackage(
         {

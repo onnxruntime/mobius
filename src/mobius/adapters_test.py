@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import shutil
 import uuid
@@ -30,13 +29,23 @@ from mobius import (
     AdapterWeights,
     ModelPackage,
     adapter_source_from_onnx_adapter,
+    attach_peft_adapter,
     compose_adapter_deltas,
     fingerprint_model_weights,
     load_peft_adapter,
 )
+from mobius.adapter_io import _restore_peft_weight_orientation
 from mobius.integrations.onnx_genai.inference_metadata import (
     add_adapter_service_to_metadata,
 )
+
+
+def _mapping_keys(value: object) -> set[str]:
+    if isinstance(value, dict):
+        return set(value) | {key for nested in value.values() for key in _mapping_keys(nested)}
+    if isinstance(value, list):
+        return {key for nested in value for key in _mapping_keys(nested)}
+    return set()
 
 
 def _model(weight: np.ndarray | None = None) -> ir.Model:
@@ -163,6 +172,95 @@ def test_targeted_fingerprint_excludes_unrelated_weights_and_includes_consumers(
         "producer_contract", 1
     )
     assert fingerprint_model_weights({"decoder": model}, (target,)) != fingerprint
+
+
+def test_restore_folded_peft_weight_orientation() -> None:
+    x = ir.val(
+        "x",
+        type=ir.TensorType(ir.DataType.FLOAT),
+        shape=ir.Shape([2, 4]),
+    )
+    folded = ir.Value(
+        name="projection.weight_t",
+        const_value=ir.tensor(np.arange(12, dtype=np.float32).reshape(4, 3)),
+        type=ir.TensorType(ir.DataType.FLOAT),
+        shape=ir.Shape([4, 3]),
+    )
+    matmul = ir.Node("", "MatMul", [x, folded], name="projection")
+    graph = ir.Graph(
+        inputs=[x],
+        outputs=[matmul.outputs[0]],
+        nodes=[matmul],
+        initializers=[folded],
+        name="folded_adapter_target",
+        opset_imports={"": 24},
+    )
+    model = ir.Model(graph, ir_version=11)
+
+    parameter_name, transpose = _restore_peft_weight_orientation(model, "projection.weight_t")
+
+    assert parameter_name == "projection.weight"
+    assert list(model.graph.initializers[parameter_name].shape) == [3, 4]
+    assert transpose.op_type == "Transpose"
+    assert matmul.inputs[1] is transpose.outputs[0]
+    np.testing.assert_array_equal(
+        model.graph.initializers[parameter_name].const_value.numpy(),
+        np.arange(12, dtype=np.float32).reshape(4, 3).T,
+    )
+
+
+def test_attach_peft_adapter_restores_folded_target_and_casts_factors(
+    tmp_path: Path,
+) -> None:
+    x = ir.val(
+        "x",
+        type=ir.TensorType(ir.DataType.FLOAT16),
+        shape=ir.Shape([2, 4]),
+    )
+    folded = ir.Value(
+        name="projection.weight_t",
+        const_value=ir.tensor(np.arange(12, dtype=np.float16).reshape(4, 3)),
+        type=ir.TensorType(ir.DataType.FLOAT16),
+        shape=ir.Shape([4, 3]),
+    )
+    matmul = ir.Node("", "MatMul", [x, folded], name="projection")
+    model = ir.Model(
+        ir.Graph(
+            inputs=[x],
+            outputs=[matmul.outputs[0]],
+            nodes=[matmul],
+            initializers=[folded],
+            name="folded_adapter_target",
+            opset_imports={"": 24},
+        ),
+        ir_version=11,
+    )
+    (tmp_path / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "base_model_name_or_path": "example/base",
+                "r": 2,
+                "lora_alpha": 4,
+                "target_modules": ["projection"],
+            }
+        )
+    )
+    save_file(
+        {
+            "base_model.model.projection.lora_A.weight": np.ones((2, 4), dtype=np.float32),
+            "base_model.model.projection.lora_B.weight": np.ones((3, 2), dtype=np.float32),
+        },
+        tmp_path / "adapter_model.safetensors",
+    )
+    package = ModelPackage({"model": model})
+
+    artifact = attach_peft_adapter(package, tmp_path, name="example")
+
+    assert "projection.weight" in model.graph.initializers
+    assert "projection.weight_t" not in model.graph.initializers
+    assert artifact.weights[0].dtype == ir.DataType.FLOAT16
+    assert package.adapter_target_manifest is not None
+    package.adapter_target_manifest.validate(package)
 
 
 def test_authoritative_target_manifest_validates_exact_graph_binding() -> None:
@@ -535,7 +633,12 @@ def test_peft_rank_and_alpha_patterns_emit_heterogeneous_binding_overrides() -> 
             "weight_key": "layers.0.self_attn.v_proj",
         }
         assert len(declaration["weights"]) == 1
-        assert declaration["weights"][0]["format"] == "hf_peft"
+        source_weight = declaration["weights"][0]
+        assert source_weight["format"] == "hf_peft"
+        assert source_weight["config_location"].endswith("adapter_config.json")
+        assert "base_model_fingerprint" not in declaration
+        assert "sha256" not in source_weight
+        assert "config_sha256" not in source_weight
     finally:
         shutil.rmtree(directory)
 
@@ -601,7 +704,7 @@ def test_onnx_adapter_source_can_be_declared_for_native_capability() -> None:
         ]
         copied = output_directory / declared["location"]
         assert copied.read_bytes() == source_path.read_bytes()
-        assert declared["sha256"] == hashlib.sha256(copied.read_bytes()).hexdigest()
+        assert "sha256" not in declared
     finally:
         shutil.rmtree(directory)
 
@@ -674,9 +777,11 @@ def test_exact_onnx_genai_catalog_and_portable_bundle_serialization() -> None:
         add_adapter_service_to_metadata(metadata, package, str(directory))
         service = metadata["adapters"]
         assert "adapters" not in metadata["pipeline"]["workflow"]
-        assert service["base_model_fingerprint"].startswith(
-            "onnx-genai-targeted-base-v1:sha256:"
-        )
+        assert {
+            "sha256",
+            "config_sha256",
+            "base_model_fingerprint",
+        }.isdisjoint(_mapping_keys(metadata))
         assert service["selection"] == {
             "segments": "request.adapter_segments",
             "adapter_counts": "request.adapter_counts",
@@ -739,8 +844,6 @@ def test_exact_onnx_genai_catalog_and_portable_bundle_serialization() -> None:
         assert weight["loader_capability"] == "onnx-genai.adapters.json@1"
         assert weight["scale_encoding"] == "alpha_over_rank"
         assert weight["location"] == "adapters/red/adapter.json"
-        assert len(weight["sha256"]) == 64
-        assert weight["sha256"] == hashlib.sha256(payload).hexdigest()
         bundle = json.loads(payload)
         assert set(bundle["targets"]) == {"layers.0.self_attn.q_proj"}
         assert len(bundle["targets"]["layers.0.self_attn.q_proj"]["a"]) == 8
