@@ -527,9 +527,6 @@ def _cmd_list(args: argparse.Namespace) -> None:
 
 def _cmd_build_gguf(args: argparse.Namespace) -> None:
     """Execute the 'build-gguf' subcommand."""
-    if args.runtime == "ort-genai":
-        raise SystemExit("build-gguf does not yet support --runtime ort-genai")
-
     try:
         from mobius.integrations.gguf import build_from_gguf
     except ImportError:
