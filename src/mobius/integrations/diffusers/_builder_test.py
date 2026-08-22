@@ -20,9 +20,17 @@ from mobius.integrations.diffusers._builder import (
     _load_diffusers_component_config,
     _load_diffusers_pipeline_index,
     _load_optional_diffusers_json,
-    _load_source_workflow_config,
     _resolve_diffusers_component_source,
+    _resolve_hierarchical_workflow_config,
     build_diffusers_pipeline,
+)
+from mobius.integrations.diffusers._configs import (
+    MINIMAX_MUSIC3_AUDIO_CODE_OFFSET,
+    MINIMAX_MUSIC3_AUDIO_END_TOKEN_ID,
+    MINIMAX_MUSIC3_GLOBAL_CONTEXT,
+    MINIMAX_MUSIC3_SEMANTIC_VOCAB_SIZE,
+    MINIMAX_MUSIC3_UNCONDITIONAL_TOKEN_ID,
+    MiniMaxMusic3WorkflowConfig,
 )
 from mobius.integrations.onnx_genai import HierarchicalAudioWorkflowConfig
 
@@ -116,53 +124,96 @@ def test_hierarchical_workflow_config_fails_closed_on_invalid_input(overrides, m
         _hierarchical_workflow_config(**overrides)
 
 
-def test_load_source_workflow_config_reads_pinned_asset():
-    """A pinned source-model asset supplies the semantic facts; roles come from graphs."""
+def test_minimax_workflow_adapter_applies_owned_defaults():
+    """The mobius adapter fills the typed config from Music 3 defaults it owns."""
     roles = _hierarchical_workflow_config().components
-    asset = {
-        "semantic_vocabulary_start": 2048,
-        "semantic_vocabulary_size": 32,
-        "stop_token_id": 7,
-        "unconditional_token_id": 9,
-        "semantic_guidance_scale": 2.0,
-        "local_guidance_scale": 1.5,
-        "flow_guidance_scale": 1.7,
-        "sampling_top_k": 40,
-        "chunk_frames": 150,
-        "chunk_hop": 75,
-        "flow_steps": 12,
-        "carry_length": 100,
-        "crop_left_latents": 50,
-        "crop_right_latents": 150,
-        "max_prompt_tokens": 4000,
-        "max_audio_frames": 8000,
-        "global_context": 256,
-        "target_sample_rate": 44100,
-        "unconditional_replace_from": 1,
-        "unconditional_preserve_trailing": 2,
-        "prompt_segments": [{"literal": "<audio>"}],
-    }
-    with patch(
-        "mobius.integrations.diffusers._builder._load_optional_diffusers_json",
-        return_value=asset,
-    ):
-        resolved = _load_source_workflow_config("fake/model", dict(roles), revision=None)
+    config = MiniMaxMusic3WorkflowConfig.from_diffusers(
+        components=dict(roles),
+        component_configs={"decoder": {"max_position_embeddings": 4096}},
+    )
+    assert isinstance(config, HierarchicalAudioWorkflowConfig)
+    # Semantic constants come from the mobius-owned defaults, not the writer.
+    assert config.semantic_vocabulary_start == MINIMAX_MUSIC3_AUDIO_CODE_OFFSET
+    assert config.semantic_vocabulary_size == MINIMAX_MUSIC3_SEMANTIC_VOCAB_SIZE
+    assert config.stop_token_id == MINIMAX_MUSIC3_AUDIO_END_TOKEN_ID
+    assert config.unconditional_token_id == MINIMAX_MUSIC3_UNCONDITIONAL_TOKEN_ID
+    # The context window is derived from the source language config.
+    assert config.global_context == 4096
+    assert config.components == dict(roles)
+    assert config.prompt_segments  # non-empty prompt template
+
+
+@pytest.mark.parametrize("max_positions", [2048, 8192])
+def test_minimax_workflow_adapter_generalizes_context(max_positions):
+    """A divergent language config flows through to the derived context window."""
+    roles = _hierarchical_workflow_config().components
+    config = MiniMaxMusic3WorkflowConfig.from_diffusers(
+        components=dict(roles),
+        component_configs={"decoder": {"max_position_embeddings": max_positions}},
+    )
+    assert config.global_context == max_positions
+
+
+def test_minimax_workflow_adapter_context_fallback():
+    """When the source omits the context window the adapter uses its named default."""
+    roles = _hierarchical_workflow_config().components
+    config = MiniMaxMusic3WorkflowConfig.from_diffusers(
+        components=dict(roles),
+        component_configs={},
+    )
+    assert config.global_context == MINIMAX_MUSIC3_GLOBAL_CONTEXT
+
+
+def test_resolve_workflow_config_explicit_argument_overrides_defaults():
+    """An explicit caller config wins over the mobius adapter defaults."""
+    roles = _hierarchical_workflow_config().components
+    override = _hierarchical_workflow_config(
+        semantic_vocabulary_start=2048,
+        stop_token_id=7,
+        flow_steps=12,
+        target_sample_rate=44100,
+    )
+    resolved = _resolve_hierarchical_workflow_config(
+        "MiniMaxMusic3ModularPipeline",
+        dict(roles),
+        {"decoder": {"max_position_embeddings": 4096}},
+        override,
+    )
     assert resolved is not None
+    # The caller's divergent values survive; the adapter defaults are not used.
     assert resolved.semantic_vocabulary_start == 2048
+    assert resolved.stop_token_id == 7
     assert resolved.flow_steps == 12
     assert resolved.target_sample_rate == 44100
-    # The structural role map is supplied by the builder, not the asset.
+    # The built graphs' structural role map is authoritative.
     assert resolved.components == dict(roles)
 
 
-def test_load_source_workflow_config_returns_none_when_asset_absent():
-    """No asset means fail closed at the caller, not an invented default."""
+def test_resolve_workflow_config_uses_adapter_defaults():
+    """Without an explicit config, mobius supplies the pipeline's owned defaults."""
     roles = _hierarchical_workflow_config().components
-    with patch(
-        "mobius.integrations.diffusers._builder._load_optional_diffusers_json",
-        return_value={},
-    ):
-        assert _load_source_workflow_config("fake/model", dict(roles), revision=None) is None
+    resolved = _resolve_hierarchical_workflow_config(
+        "MiniMaxMusic3ModularPipeline",
+        dict(roles),
+        {"decoder": {"max_position_embeddings": 4096}},
+        None,
+    )
+    assert resolved is not None
+    assert resolved.semantic_vocabulary_start == MINIMAX_MUSIC3_AUDIO_CODE_OFFSET
+    assert resolved.global_context == 4096
+    assert resolved.components == dict(roles)
+
+
+def test_resolve_workflow_config_fails_closed_for_unknown_pipeline():
+    """A hierarchical topology with no registered adapter fails closed (None)."""
+    roles = _hierarchical_workflow_config().components
+    resolved = _resolve_hierarchical_workflow_config(
+        "SomeUnknownAudioPipeline",
+        dict(roles),
+        {"decoder": {"max_position_embeddings": 4096}},
+        None,
+    )
+    assert resolved is None
 
 
 def _fake_pipeline_index(

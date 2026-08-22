@@ -6,11 +6,13 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import onnx_ir as ir
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from mobius._configs import ArchitectureConfig
     from mobius.integrations.onnx_genai import HierarchicalAudioWorkflowConfig
 
@@ -19,6 +21,75 @@ MINIMAX_MUSIC3_AUDIO_CODE_OFFSET = 151675
 MINIMAX_MUSIC3_SEMANTIC_VOCAB_SIZE = 16384
 MINIMAX_MUSIC3_NUM_CODEBOOKS = 8
 MINIMAX_MUSIC3_FEEDBACK_SCALE = MINIMAX_MUSIC3_NUM_CODEBOOKS**-0.5
+
+# --- MiniMax Music 3 hierarchical-audio workflow defaults --------------------
+# Runtime-behaviour facts the checkpoint author publishes for Music 3's nested
+# autoregressive / residual-vector-quantized / flow-matching / vocoder pipeline.
+# They cannot be read back from the exported neural graphs, so mobius owns them
+# here as the canonical model registry -- exactly like the token constants above
+# and every other ``from_diffusers`` default in this module. They are applied
+# through :class:`MiniMaxMusic3WorkflowConfig`, which fills a typed, generic
+# :class:`~mobius.integrations.onnx_genai.HierarchicalAudioWorkflowConfig`; the
+# generic metadata writer that consumes that structure never sees a MiniMax
+# literal, and a divergent checkpoint overrides any of these by field.
+
+#: ``<|audio_cfg|>`` special token spliced into classifier-free-guidance rows.
+MINIMAX_MUSIC3_UNCONDITIONAL_TOKEN_ID = 151654
+#: Classifier-free-guidance scales for the global-semantic, local-codebook and
+#: flow-matching stages respectively.
+MINIMAX_MUSIC3_SEMANTIC_GUIDANCE_SCALE = 1.5
+MINIMAX_MUSIC3_LOCAL_GUIDANCE_SCALE = 1.5
+MINIMAX_MUSIC3_FLOW_GUIDANCE_SCALE = 1.7
+#: Top-k used when sampling semantic tokens from the global decoder.
+MINIMAX_MUSIC3_SAMPLING_TOP_K = 50
+#: Chunked flow-matching plan: frames per chunk, chunk stride, solver steps and
+#: the overlap latents carried and cropped between consecutive chunks.
+MINIMAX_MUSIC3_CHUNK_FRAMES = 200
+MINIMAX_MUSIC3_CHUNK_HOP = 100
+MINIMAX_MUSIC3_FLOW_STEPS = 30
+MINIMAX_MUSIC3_CARRY_LENGTH = 172
+MINIMAX_MUSIC3_CROP_LEFT_LATENTS = 86
+MINIMAX_MUSIC3_CROP_RIGHT_LATENTS = 258
+#: Prompt-processor input-token and output-frame ceilings.
+MINIMAX_MUSIC3_MAX_PROMPT_TOKENS = 5000
+MINIMAX_MUSIC3_MAX_AUDIO_FRAMES = 9000
+#: Delivered waveform sample rate in Hz (independent of the vocoder's native
+#: rate, which the metadata writer reads from the vocoder component config).
+MINIMAX_MUSIC3_TARGET_SAMPLE_RATE = 32000
+#: Classifier-free-guidance row assembly: first prompt row replaced by the
+#: unconditional token and the number of trailing prompt rows preserved.
+MINIMAX_MUSIC3_UNCONDITIONAL_REPLACE_FROM = 1
+MINIMAX_MUSIC3_UNCONDITIONAL_PRESERVE_TRAILING = 2
+#: Fallback global-decoder context window used only when the source language
+#: config omits ``max_position_embeddings`` (normally it is read from there).
+MINIMAX_MUSIC3_GLOBAL_CONTEXT = 10240
+
+#: Ordered prompt-assembly template. Literal chat/lyrics markup is interleaved
+#: with request-field transforms; the writer emits it verbatim so the runtime
+#: reconstructs Music 3's ``caption``/``lyrics`` prompt exactly.
+MINIMAX_MUSIC3_PROMPT_SEGMENTS: tuple[dict, ...] = (
+    {"literal": "<|im_start|><|caption_start|>"},
+    {
+        "field": "instructions",
+        "transforms": (
+            {"kind": "rewrite_delimited_tags", "open": "<|", "close": "|>"},
+            {"kind": "strip_markdown"},
+            {"kind": "collapse_newlines"},
+        ),
+    },
+    {"literal": "<|caption_end|><|lyrics_start|>[start]\n"},
+    {
+        "field": "input",
+        "transforms": (
+            {"kind": "keep_leading_bracket_tags"},
+            {"kind": "replace", "from": "] ", "to": "]\n"},
+            {"kind": "replace", "from": " [", "to": "\n["},
+            {"kind": "replace", "from": " ^ ", "to": "\n"},
+            {"kind": "lowercase_bracket_tags"},
+        ),
+    },
+    {"literal": "<|lyrics_end|><|im_end|><|audio_start|>"},
+)
 
 
 class CLIPTextConfig:
@@ -120,6 +191,85 @@ class MiniMaxMusic3LanguageConfig:
         return ArchitectureConfig.from_transformers(hf_config)
 
 
+class MiniMaxMusic3WorkflowConfig:
+    """Adapter that builds Music 3's hierarchical-audio workflow description.
+
+    Mirrors the ``from_diffusers`` component adapters above, but at the pipeline
+    level: it maps the source pipeline's component configs plus the Mobius-owned
+    Music 3 defaults declared at the top of this module onto the typed, generic
+    :class:`~mobius.integrations.onnx_genai.HierarchicalAudioWorkflowConfig` that
+    the ONNX GenAI metadata writer consumes.
+
+    Owning the defaults here -- not in the writer and not in a checked-in JSON
+    contract -- keeps the writer fully model-agnostic while letting mobius act as
+    the canonical model-name -> model-information registry. The structural role
+    map (``components``) and the global-decoder context window are derived from
+    the built graphs and source configs; everything else comes from the named
+    ``MINIMAX_MUSIC3_*`` defaults, so a divergent checkpoint can override any
+    single field without touching the generic writer.
+    """
+
+    @classmethod
+    def from_diffusers(
+        cls,
+        *,
+        components: Mapping[str, str],
+        component_configs: Mapping[str, dict],
+    ) -> HierarchicalAudioWorkflowConfig:
+        """Build the workflow config from structural roles and source configs.
+
+        Args:
+            components: Structural role -> exported graph name, produced by the
+                builder from the graphs it actually emitted.
+            component_configs: Component name -> parsed source config. The global
+                decoder's ``max_position_embeddings`` supplies the context window;
+                the remaining semantic values come from the Music 3 defaults.
+
+        Returns:
+            A populated :class:`HierarchicalAudioWorkflowConfig`.
+        """
+        from mobius.integrations.onnx_genai import HierarchicalAudioWorkflowConfig
+
+        language_config = component_configs.get(components["global_decoder"], {})
+        global_context = int(
+            language_config.get("max_position_embeddings", MINIMAX_MUSIC3_GLOBAL_CONTEXT)
+        )
+        return HierarchicalAudioWorkflowConfig(
+            components=dict(components),
+            semantic_vocabulary_start=MINIMAX_MUSIC3_AUDIO_CODE_OFFSET,
+            semantic_vocabulary_size=MINIMAX_MUSIC3_SEMANTIC_VOCAB_SIZE,
+            stop_token_id=MINIMAX_MUSIC3_AUDIO_END_TOKEN_ID,
+            unconditional_token_id=MINIMAX_MUSIC3_UNCONDITIONAL_TOKEN_ID,
+            semantic_guidance_scale=MINIMAX_MUSIC3_SEMANTIC_GUIDANCE_SCALE,
+            local_guidance_scale=MINIMAX_MUSIC3_LOCAL_GUIDANCE_SCALE,
+            flow_guidance_scale=MINIMAX_MUSIC3_FLOW_GUIDANCE_SCALE,
+            sampling_top_k=MINIMAX_MUSIC3_SAMPLING_TOP_K,
+            chunk_frames=MINIMAX_MUSIC3_CHUNK_FRAMES,
+            chunk_hop=MINIMAX_MUSIC3_CHUNK_HOP,
+            flow_steps=MINIMAX_MUSIC3_FLOW_STEPS,
+            carry_length=MINIMAX_MUSIC3_CARRY_LENGTH,
+            crop_left_latents=MINIMAX_MUSIC3_CROP_LEFT_LATENTS,
+            crop_right_latents=MINIMAX_MUSIC3_CROP_RIGHT_LATENTS,
+            max_prompt_tokens=MINIMAX_MUSIC3_MAX_PROMPT_TOKENS,
+            max_audio_frames=MINIMAX_MUSIC3_MAX_AUDIO_FRAMES,
+            global_context=global_context,
+            target_sample_rate=MINIMAX_MUSIC3_TARGET_SAMPLE_RATE,
+            unconditional_replace_from=MINIMAX_MUSIC3_UNCONDITIONAL_REPLACE_FROM,
+            unconditional_preserve_trailing=MINIMAX_MUSIC3_UNCONDITIONAL_PRESERVE_TRAILING,
+            prompt_segments=[
+                _copy_prompt_segment(segment) for segment in MINIMAX_MUSIC3_PROMPT_SEGMENTS
+            ],
+        )
+
+
+def _copy_prompt_segment(segment: Mapping[str, Any]) -> dict:
+    """Deep-copy a prompt-segment template entry into plain mutable dicts."""
+    copied = dict(segment)
+    if "transforms" in copied:
+        copied["transforms"] = [dict(transform) for transform in copied["transforms"]]
+    return copied
+
+
 @dataclasses.dataclass
 class DiffusersPipelineConfig:
     """Non-neural diffusers pipeline metadata retained on a ModelPackage."""
@@ -129,8 +279,9 @@ class DiffusersPipelineConfig:
     component_configs: dict[str, dict]
     scheduler_config: dict
     processor_config: dict
-    #: A typed, model-agnostic workflow config supplied by the caller or a
-    #: source-model asset. ``None`` when no authoritative config was resolved.
+    #: A typed, model-agnostic workflow config supplied by an explicit
+    #: ``build_diffusers_pipeline`` argument or by the pipeline's mobius config
+    #: adapter. ``None`` when no authoritative config was resolved.
     workflow_config: HierarchicalAudioWorkflowConfig | None = None
     #: Structural workflow kind detected from the built graph topology, set even
     #: when no ``workflow_config`` could be resolved so metadata emission can

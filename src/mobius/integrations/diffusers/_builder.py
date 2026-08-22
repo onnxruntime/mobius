@@ -56,37 +56,54 @@ _PIPELINE_MODEL_TYPES: dict[str, str] = {
     "QwenImageEditPlusPipeline": "qwen_image_edit",
 }
 
-#: Optional source-model asset naming a pipeline's model-agnostic workflow
-#: configuration. When present at the requested revision it supplies the
-#: semantic facts a hierarchical-audio workflow cannot derive from its graphs.
-#: The builder never ships or defaults these values; the checkpoint publisher
-#: does, keeping the config out of mobius and off any model/class-name branch.
-HIERARCHICAL_AUDIO_WORKFLOW_ASSET = "mobius_workflow.json"
 
+def _pipeline_workflow_adapters() -> dict[str, type]:
+    """Map a pipeline class to the mobius adapter that owns its workflow config.
 
-def _load_source_workflow_config(
-    model_id: str,
-    roles: dict[str, str],
-    *,
-    revision: str | None,
-) -> HierarchicalAudioWorkflowConfig | None:
-    """Load a hierarchical-audio workflow config from a source-model asset.
-
-    Reads a well-defined :data:`HIERARCHICAL_AUDIO_WORKFLOW_ASSET` from the
-    source repository at the requested revision. The asset carries only the
-    model-agnostic semantic fields; the structural role map is supplied by the
-    builder from the graphs it actually produced. Returns ``None`` when no asset
-    is present so the caller can fail closed instead of inventing defaults.
+    A hierarchical-audio pipeline cannot describe its ONNX GenAI execution from
+    the exported graphs alone (semantic-token boundary, guidance schedule,
+    chunked flow plan, prompt template). Mobius owns those model-specific
+    defaults in the config-adapter layer -- exactly like the ``from_diffusers``
+    component adapters -- and selects the adapter here by pipeline class, so the
+    generic metadata writer stays model-agnostic. Returned lazily to keep the
+    ``_configs`` import off module load.
     """
-    from mobius.integrations.onnx_genai import HierarchicalAudioWorkflowConfig
+    from mobius.integrations.diffusers._configs import MiniMaxMusic3WorkflowConfig
 
-    data = _load_optional_diffusers_json(
-        model_id, HIERARCHICAL_AUDIO_WORKFLOW_ASSET, revision=revision
-    )
-    if not data:
-        return None
-    fields = {key: value for key, value in data.items() if key not in ("kind", "components")}
-    return HierarchicalAudioWorkflowConfig(components=dict(roles), **fields)
+    return {"MiniMaxMusic3ModularPipeline": MiniMaxMusic3WorkflowConfig}
+
+
+def _resolve_hierarchical_workflow_config(
+    pipeline_class: str,
+    workflow_roles: dict[str, str],
+    component_configs: dict[str, dict],
+    workflow_config: HierarchicalAudioWorkflowConfig | None,
+) -> HierarchicalAudioWorkflowConfig | None:
+    """Resolve the workflow config for a hierarchical-audio pipeline.
+
+    Precedence:
+
+    1. An explicit caller ``workflow_config`` always wins (override).
+    2. Otherwise mobius supplies the defaults it owns for a recognised pipeline
+       through its config adapter, selected by pipeline class.
+    3. When neither is available the result is ``None`` so the caller can fail
+       closed rather than invent semantic values.
+
+    In every non-``None`` case the built graphs' structural role map is
+    authoritative and replaces the config's ``components`` field, so the caller
+    can pass a config whose roles are placeholders.
+    """
+    resolved = workflow_config
+    if resolved is None:
+        adapter = _pipeline_workflow_adapters().get(pipeline_class)
+        if adapter is not None:
+            resolved = adapter.from_diffusers(
+                components=dict(workflow_roles),
+                component_configs=component_configs,
+            )
+    if resolved is not None:
+        resolved = dataclasses.replace(resolved, components=dict(workflow_roles))
+    return resolved
 
 
 def _init_diffusers_class_map() -> None:
@@ -495,12 +512,13 @@ def build_diffusers_pipeline(
         execution_provider: Target execution provider for EP-aware graph optimization.
         workflow_config: Optional typed, model-agnostic workflow description for
             pipelines whose ONNX GenAI execution cannot be derived from the graphs
-            alone (currently hierarchical audio). When omitted, the builder looks
-            for a source-model workflow asset at the requested revision. When
-            neither is available the graphs are still built, but the package is
-            marked so ONNX GenAI metadata emission fails closed with an
-            instruction to supply the config rather than being misclassified.
-            Never selected by pipeline/model/class name.
+            alone (currently hierarchical audio). When omitted, mobius supplies the
+            defaults it owns for a recognised pipeline via its config adapter. When
+            neither a caller argument nor a registered adapter is available the
+            graphs are still built, but the package is marked so ONNX GenAI
+            metadata emission fails closed with an instruction to supply the config
+            rather than being misclassified. The generic metadata writer never
+            selects values by pipeline/model/class name.
 
     Returns:
         A :class:`ModelPackage` containing the built component model(s).
@@ -645,9 +663,9 @@ def build_diffusers_pipeline(
 
     # Structural role extraction (model-building layer): map each recognized
     # component class to the structural role it plays so a hierarchical-audio
-    # pipeline's graphs can be wired to a workflow. This never selects semantic
-    # values by class name -- those come only from ``workflow_config`` or a
-    # source-model asset below.
+    # pipeline's graphs can be wired to a workflow. This maps only class -> role;
+    # the semantic values come from an explicit ``workflow_config`` argument or
+    # the pipeline's mobius config adapter resolved below.
     role_specs = {
         "Qwen3ForCausalLM": {
             "global_decoder": "",
@@ -675,24 +693,21 @@ def build_diffusers_pipeline(
     from mobius.integrations.onnx_genai import HIERARCHICAL_AUDIO_ROLES
 
     # A complete role set means the built graphs form a hierarchical-audio
-    # topology. Resolve the workflow config only from an explicit argument or a
-    # pinned source-model asset -- never a mobius default or a class-name
-    # lookup. When neither is available the graphs still build and
-    # ``workflow_kind`` marks the package so ONNX GenAI metadata emission fails
-    # closed with an instruction to supply the config.
+    # topology. An explicit ``workflow_config`` argument always wins (caller
+    # override); otherwise mobius supplies the model-specific defaults it owns as
+    # the canonical registry, selecting the config adapter by pipeline class --
+    # never by a class-name branch inside the generic metadata writer. When no
+    # adapter is registered for the pipeline and no argument was given, the
+    # graphs still build and ``workflow_kind`` marks the package so ONNX GenAI
+    # metadata emission fails closed with an instruction to supply the config.
     is_hierarchical_audio = workflow_roles.keys() >= HIERARCHICAL_AUDIO_ROLES
-    resolved_workflow_config = workflow_config
-    if is_hierarchical_audio:
-        if resolved_workflow_config is None:
-            resolved_workflow_config = _load_source_workflow_config(
-                model_id, workflow_roles, revision=revision
-            )
-        if resolved_workflow_config is not None:
-            # The graph names the builder produced are authoritative, so wire
-            # the structural role map onto whatever semantic config was supplied.
-            resolved_workflow_config = dataclasses.replace(
-                resolved_workflow_config, components=dict(workflow_roles)
-            )
+    resolved_workflow_config = (
+        _resolve_hierarchical_workflow_config(
+            pipeline_class, workflow_roles, component_configs, workflow_config
+        )
+        if is_hierarchical_audio
+        else None
+    )
 
     package.config = DiffusersPipelineConfig(
         source_model_id=model_id,

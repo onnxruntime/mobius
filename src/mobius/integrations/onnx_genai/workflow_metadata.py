@@ -530,9 +530,10 @@ class HierarchicalAudioWorkflowConfig:
     metadata producer can emit an executable workflow.
 
     It is deliberately model-agnostic. It names no model or checkpoint, ships no
-    default semantic values, and is populated by the caller — an explicit
-    :func:`build_diffusers_pipeline` argument or a source-model workflow asset —
-    rather than selected by pipeline/model/class name. Every field is validated
+    default semantic values, and is populated outside the writer -- either by an
+    explicit :func:`build_diffusers_pipeline` argument or by the mobius config
+    adapter that owns a recognised pipeline's model-specific defaults -- rather
+    than selected by pipeline/model/class name here. Every field is validated
     on construction, so a producer that cannot fully describe its workflow fails
     closed here instead of emitting partial metadata. The two token-id fields
     are additionally validated by the producer against the built graph's global
@@ -677,7 +678,8 @@ def _hierarchical_audio_config(pkg: Any) -> tuple[dict[str, str], dict[str, Any]
         # targeted instruction instead of emitting partial or misclassified data.
         raise ValueError(
             "hierarchical audio metadata requires a workflow config; supply one via "
-            "build_diffusers_pipeline(workflow_config=...) or a source-model workflow asset"
+            "build_diffusers_pipeline(workflow_config=...) or register a mobius config "
+            "adapter that provides the pipeline's defaults"
         )
     if not isinstance(config_obj, HierarchicalAudioWorkflowConfig):
         raise TypeError(

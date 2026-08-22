@@ -31,6 +31,7 @@ from mobius.integrations.diffusers._configs import (
     MiniMaxMusic3RVQConfig,
     MiniMaxMusic3TransformerConfig,
     MiniMaxMusic3VocoderConfig,
+    MiniMaxMusic3WorkflowConfig,
 )
 from mobius.integrations.onnx_genai import write_onnx_genai_config
 from mobius.integrations.onnx_genai.auto_export_test import (
@@ -41,7 +42,6 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     add_adapter_service_to_metadata,
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
-    HierarchicalAudioWorkflowConfig,
     write_audio_codec_workflow_metadata,
     write_diffusion_workflow_metadata,
     write_encoder_embedding_workflow_metadata,
@@ -154,16 +154,24 @@ def _hierarchical_audio_package() -> ModelPackage:
             "vocoder": vocoder["model"],
         }
     )
-    package.config = SimpleNamespace(
-        component_configs={
-            "condition_encoder": {
-                "input_sampling_rate": condition_config.input_sampling_rate,
-                "input_hop_length": condition_config.input_hop_length,
-                "output_hop_length": condition_config.output_hop_length,
-            },
-            "vocoder": {"sampling_rate": vocoder_config.sampling_rate},
+    component_configs = {
+        "language_model": {
+            "max_position_embeddings": language_config.max_position_embeddings,
         },
-        workflow_config=HierarchicalAudioWorkflowConfig(
+        "condition_encoder": {
+            "input_sampling_rate": condition_config.input_sampling_rate,
+            "input_hop_length": condition_config.input_hop_length,
+            "output_hop_length": condition_config.output_hop_length,
+        },
+        "vocoder": {"sampling_rate": vocoder_config.sampling_rate},
+    }
+    package.config = SimpleNamespace(
+        component_configs=component_configs,
+        # Build the workflow config the way production does: through the mobius
+        # MiniMax config adapter, which owns the Music 3 defaults and derives the
+        # context window from the language config. This proves the adapter emits
+        # the checked-in fixture end to end.
+        workflow_config=MiniMaxMusic3WorkflowConfig.from_diffusers(
             components={
                 "global_decoder": "language_model",
                 "global_embedding": "language_model_embedding",
@@ -177,53 +185,7 @@ def _hierarchical_audio_package() -> ModelPackage:
                 "flow_transformer": "transformer",
                 "vocoder": "vocoder",
             },
-            semantic_vocabulary_start=151675,
-            semantic_vocabulary_size=16384,
-            stop_token_id=151670,
-            unconditional_token_id=151654,
-            semantic_guidance_scale=1.5,
-            local_guidance_scale=1.5,
-            flow_guidance_scale=1.7,
-            sampling_top_k=50,
-            chunk_frames=200,
-            chunk_hop=100,
-            flow_steps=30,
-            carry_length=172,
-            crop_left_latents=86,
-            crop_right_latents=258,
-            max_prompt_tokens=5000,
-            max_audio_frames=9000,
-            global_context=language_config.max_position_embeddings,
-            target_sample_rate=32000,
-            unconditional_replace_from=1,
-            unconditional_preserve_trailing=2,
-            prompt_segments=[
-                {"literal": "<|im_start|><|caption_start|>"},
-                {
-                    "field": "instructions",
-                    "transforms": [
-                        {
-                            "kind": "rewrite_delimited_tags",
-                            "open": "<|",
-                            "close": "|>",
-                        },
-                        {"kind": "strip_markdown"},
-                        {"kind": "collapse_newlines"},
-                    ],
-                },
-                {"literal": "<|caption_end|><|lyrics_start|>[start]\n"},
-                {
-                    "field": "input",
-                    "transforms": [
-                        {"kind": "keep_leading_bracket_tags"},
-                        {"kind": "replace", "from": "] ", "to": "]\n"},
-                        {"kind": "replace", "from": " [", "to": "\n["},
-                        {"kind": "replace", "from": " ^ ", "to": "\n"},
-                        {"kind": "lowercase_bracket_tags"},
-                    ],
-                },
-                {"literal": "<|lyrics_end|><|im_end|><|audio_start|>"},
-            ],
+            component_configs=component_configs,
         ),
     )
     _materialize_deterministic_initializers(package)
