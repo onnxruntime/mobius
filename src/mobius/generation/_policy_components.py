@@ -228,6 +228,7 @@ def build_boolean_not() -> PolicyComponent:
         keepdims=1,
     )
     continued = builder.op.Equal(any_done, builder.op.Constant(value_int=0))
+    continued.dtype = ir.DataType.BOOL
     continued.shape = ir.Shape([1])
     builder.add_output(continued, "continue")
     return _component("mobius.policy.auxiliary@1", graph, {})
@@ -1255,6 +1256,7 @@ def build_adaptive_k_policy(*, max_k: int = 16, min_k: int = 1) -> PolicyCompone
     )
     next_k = op.Where(valid, computed_k, current_k)
     next_estimates = op.Where(valid_col, computed_estimates, estimates)
+    next_k.dtype = ir.DataType.INT64
     next_k.shape = ir.Shape(["batch"])
     next_estimates.shape = ir.Shape(["batch", estimate_slots])
     builder.add_output(next_k, "next_k")
@@ -1471,6 +1473,8 @@ def build_seeded_categorical_sampler() -> PolicyComponent:
         op.Add(counter, op.Constant(value_int=1)),
         counter,
     )
+    token_ids.dtype = ir.DataType.INT64
+    next_counter.dtype = ir.DataType.INT64
     _set_public_shape(logits, ["batch", "vocabulary"])
     for value in (temperature, top_k, top_p, min_p, seed, counter, active, done):
         _set_public_shape(value, ["batch"])
@@ -1573,6 +1577,9 @@ def build_eos_termination(*, row_selective: bool = False) -> PolicyComponent:
         _set_public_shape(active, ["batch"])
         _set_public_shape(done, ["batch"])
         _set_public_shape(next_active, ["batch"])
+        next_active.dtype = ir.DataType.BOOL
+    done.dtype = ir.DataType.BOOL
+    continued.dtype = ir.DataType.BOOL
     _set_public_shape(continued, [1])
     builder.add_output(done, "done")
     if row_selective:
@@ -2214,9 +2221,7 @@ def build_ddim_solver_step(
     alpha_sqrt = op.Sqrt(alpha)
     beta_sqrt = op.Sqrt(op.Sub(one, alpha))
     if prediction_type == "epsilon":
-        pred_original = op.Div(
-            op.Sub(sample, op.Mul(beta_sqrt, derivative)), alpha_sqrt
-        )
+        pred_original = op.Div(op.Sub(sample, op.Mul(beta_sqrt, derivative)), alpha_sqrt)
         pred_epsilon = derivative
     elif prediction_type == "sample":
         pred_original = derivative
@@ -2227,12 +2232,8 @@ def build_ddim_solver_step(
             op.CastLike(op.Constant(value_float=0.0), sample),
         )
     else:
-        pred_original = op.Sub(
-            op.Mul(alpha_sqrt, sample), op.Mul(beta_sqrt, derivative)
-        )
-        pred_epsilon = op.Add(
-            op.Mul(alpha_sqrt, derivative), op.Mul(beta_sqrt, sample)
-        )
+        pred_original = op.Sub(op.Mul(alpha_sqrt, sample), op.Mul(beta_sqrt, derivative))
+        pred_epsilon = op.Add(op.Mul(alpha_sqrt, derivative), op.Mul(beta_sqrt, sample))
     if clip_sample_range is not None:
         limit = op.CastLike(op.Constant(value_float=float(clip_sample_range)), sample)
         pred_original = op.Clip(pred_original, op.Neg(limit), limit)

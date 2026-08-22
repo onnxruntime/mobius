@@ -594,6 +594,18 @@ def test_batched_policy_v2_ports_use_exact_public_shapes():
         assert {port.name: [str(dim) for dim in port.shape] for port in ports} == expected[
             name
         ]
+    assert {
+        port.name: port.dtype
+        for component in components.values()
+        for port in component.model.graph.outputs
+    } == {
+        "token": ir.DataType.INT64,
+        "next_counter": ir.DataType.INT64,
+        "done": ir.DataType.BOOL,
+        "next_active": ir.DataType.BOOL,
+        "continue": ir.DataType.BOOL,
+        "next": ir.DataType.INT64,
+    }
 
 
 def test_seeded_sampler_applies_request_top_k(tmp_path):

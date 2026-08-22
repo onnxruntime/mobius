@@ -731,9 +731,11 @@ class TestRepackQ6K:
             np.float16([1.5] * n_super).tobytes(), dtype=np.uint8
         ).reshape(n_super, 2)
 
-        expected = gguf_quants.dequantize(
-            blocks.reshape(-1).copy(), GGMLQuantizationType.Q6_K
-        ).astype(np.float32).ravel()
+        expected = (
+            gguf_quants.dequantize(blocks.reshape(-1).copy(), GGMLQuantizationType.Q6_K)
+            .astype(np.float32)
+            .ravel()
+        )
         got = _dequantize_q6_k(blocks)
 
         np.testing.assert_array_equal(got, expected)

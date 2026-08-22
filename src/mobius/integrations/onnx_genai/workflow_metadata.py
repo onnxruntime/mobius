@@ -66,9 +66,9 @@ from mobius.generation import (
     build_sequence_concat,
     build_sequence_length,
     build_shape_constant,
-    build_tensor_scale,
     build_tensor_cast,
     build_tensor_clamp,
+    build_tensor_scale,
     build_termination_batch_initializer,
     build_token_state_update,
     build_token_to_slot,
@@ -3093,9 +3093,7 @@ def build_diffusion_workflow_metadata(
         if guidance_scale is not None:
             unconditional_value = "conditioning.unconditional"
             unconditional_encoder_value = (
-                "conditioning.unconditional_raw"
-                if casts_conditioning
-                else unconditional_value
+                "conditioning.unconditional_raw" if casts_conditioning else unconditional_value
             )
             negative_inputs = {}
             for index, value in enumerate(text_encoder.graph.inputs):
@@ -3522,7 +3520,6 @@ def build_image_edit_workflow_metadata(
     batch = latent_contract["shape"][0]
     batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
     batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch]}
-    row_float = {"dtype": "float32", "rank": 1, "shape": [batch]}
     control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
 
     conditioning_ports = ("encoder_hidden_states", "encoder_hidden_states_mask")
@@ -4237,30 +4234,30 @@ def build_video_diffusion_workflow_metadata(
         )
     body_nodes.extend(
         [
-        _invoke(
-            "solver_step",
-            {
-                "sample": "state.latent.body",
-                "derivative": "denoiser.estimate",
-                "step": "loop.iteration",
-                "schedule": "diffusion.schedule",
-            },
-            {"next_state": "latent.body"},
-            {"solver": _effect("solver.0", "solver.1")},
-        ),
-        _invoke(
-            "schedule_history_append",
-            {
-                "history": "state.scheduler_history.body",
-                "timestep": "diffusion.timestep",
-            },
-            {"next": "scheduler_history.body"},
-        ),
-        _invoke(
-            "continue_predicate",
-            {"done": "package.false"},
-            {"continue": "loop.continue"},
-        ),
+            _invoke(
+                "solver_step",
+                {
+                    "sample": "state.latent.body",
+                    "derivative": "denoiser.estimate",
+                    "step": "loop.iteration",
+                    "schedule": "diffusion.schedule",
+                },
+                {"next_state": "latent.body"},
+                {"solver": _effect("solver.0", "solver.1")},
+            ),
+            _invoke(
+                "schedule_history_append",
+                {
+                    "history": "state.scheduler_history.body",
+                    "timestep": "diffusion.timestep",
+                },
+                {"next": "scheduler_history.body"},
+            ),
+            _invoke(
+                "continue_predicate",
+                {"done": "package.false"},
+                {"continue": "loop.continue"},
+            ),
         ]
     )
 
