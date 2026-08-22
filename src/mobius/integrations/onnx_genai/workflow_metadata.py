@@ -564,7 +564,10 @@ def build_audio_codec_workflow_metadata(pkg: Any) -> dict[str, Any]:
             ],
         },
     }
-    return {"schema_version": "v1", "pipeline": {"workflow": _publish_workflow_v1(workflow)}}
+    return {
+        "schema_version": "v1",
+        "pipeline": {"workflow": _publish_workflow_v1(workflow)},
+    }
 
 
 def write_audio_codec_workflow_metadata(pkg: Any, output_dir: str) -> str:
@@ -1565,7 +1568,9 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
                 {"inputs_embeds": "predictor.body.inputs_embeds"},
             ),
             _invoke(
-                "code_predictor", predictor_body_inputs, predictor_outputs("predictor.body")
+                "code_predictor",
+                predictor_body_inputs,
+                predictor_outputs("predictor.body"),
             ),
             _invoke(
                 "last_token_logits",
@@ -1671,10 +1676,12 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
                 "body_output": f"predictor.body.{present.name}",
                 "next": f"predictor.cache_{index}.final",
                 "read_effect": _effect(
-                    f"state:predictor_cache_{index}.0", f"state:predictor_cache_{index}.read"
+                    f"state:predictor_cache_{index}.0",
+                    f"state:predictor_cache_{index}.read",
                 ),
                 "write_effect": _effect(
-                    f"state:predictor_cache_{index}.read", f"state:predictor_cache_{index}.1"
+                    f"state:predictor_cache_{index}.read",
+                    f"state:predictor_cache_{index}.1",
                 ),
             }
         )
@@ -1814,7 +1821,11 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             "recurrence": {"kind": "invariant"},
         },
         "history": {
-            "contract": {"dtype": "int64", "rank": 3, "shape": [batch, "frames", num_groups]},
+            "contract": {
+                "dtype": "int64",
+                "rank": 3,
+                "shape": [batch, "frames", num_groups],
+            },
             "scope": "invocation",
             "initializer": "history.setup",
             "recurrence": {
@@ -2072,7 +2083,9 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
     final_nodes.extend(
         [
             _invoke(
-                codec_name, {codec_input.name: codec_value}, {waveform.name: "tts.waveform"}
+                codec_name,
+                {codec_input.name: codec_value},
+                {waveform.name: "tts.waveform"},
             ),
             {
                 "kind": "emit",
@@ -3396,7 +3409,11 @@ def build_image_edit_workflow_metadata(
     latent_contract = {
         "dtype": _contract(sample_input)["dtype"],
         "rank": 3,
-        "shape": ["batch", "target_sequence_length", _contract(sample_input)["shape"][2]],
+        "shape": [
+            "batch",
+            "target_sequence_length",
+            _contract(sample_input)["shape"][2],
+        ],
     }
 
     attach_policy_components(pkg, PolicyCapabilities())
@@ -3974,7 +3991,10 @@ def build_video_diffusion_workflow_metadata(
         ),
         _invoke(
             "schedule_history_append",
-            {"history": "state.scheduler_history.body", "timestep": "diffusion.timestep"},
+            {
+                "history": "state.scheduler_history.body",
+                "timestep": "diffusion.timestep",
+            },
             {"next": "scheduler_history.body"},
         ),
         _invoke(
@@ -4095,7 +4115,10 @@ def build_video_diffusion_workflow_metadata(
                 _invoke(
                     "video_latent_init",
                     {"noise": "request.noise"},
-                    {"latent": "latent.initial", "history": "scheduler.history.initial"},
+                    {
+                        "latent": "latent.initial",
+                        "history": "scheduler.history.initial",
+                    },
                 ),
                 {
                     "kind": "loop",
@@ -4121,10 +4144,12 @@ def build_video_diffusion_workflow_metadata(
                             "body_output": "scheduler_history.body",
                             "next": "scheduler_history.final",
                             "read_effect": _effect(
-                                "state:scheduler_history.0", "state:scheduler_history.read"
+                                "state:scheduler_history.0",
+                                "state:scheduler_history.read",
                             ),
                             "write_effect": _effect(
-                                "state:scheduler_history.read", "state:scheduler_history.1"
+                                "state:scheduler_history.read",
+                                "state:scheduler_history.1",
                             ),
                         },
                     ],
@@ -6938,7 +6963,12 @@ def _build_autoregressive_workflow_metadata(
             "decoder_step.body_position_ids",
             {"kind": "invariant"},
         )
-    for cell, (contract, current, body_output, recurrence) in decoder_state_specs.items():
+    for cell, (
+        contract,
+        current,
+        body_output,
+        recurrence,
+    ) in decoder_state_specs.items():
         effect_name = f"state:{cell}"
         initial_effects[effect_name] = f"{effect_name}.0"
         state[cell] = {
@@ -7985,7 +8015,10 @@ def build_ctc_asr_workflow_metadata(
             # safe.  Speculation safety is irrelevant here because a CTC
             # workflow has no speculative region, but it is declared explicitly
             # rather than left to a default.
-            "audio_preprocess": {"retry": "pure", "speculation_safety": {"kind": "clonable"}},
+            "audio_preprocess": {
+                "retry": "pure",
+                "speculation_safety": {"kind": "clonable"},
+            },
             "encode": {"retry": "pure", "speculation_safety": {"kind": "clonable"}},
         },
         "inputs": {
@@ -8374,7 +8407,6 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
         waveform_output,
         input_frame,
         temporal_mask,
-        temporal_position,
         hidden,
         text_logits,
         dep_hidden,
@@ -8384,6 +8416,15 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
     )
     if any(port is None for port in ports):
         raise ValueError("full-duplex workflow is missing a required component port")
+    position_contract = (
+        _contract(temporal_position)
+        if temporal_position is not None
+        else {
+            "dtype": "int64",
+            "rank": 2,
+            "shape": [_contract(input_frame)["shape"][0], 1],
+        }
+    )
     temporal_caches = _model_cache_pairs(temporal)
     depformer_caches = _model_cache_pairs(depformer)
     if not temporal_caches:
@@ -8434,7 +8475,11 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
     }
     loop_flag = {"dtype": "bool", "rank": 1, "shape": [1]}
     frame_contract = {"dtype": "int64", "rank": 2, "shape": [batch, channels]}
-    ring_contract = {"dtype": "int64", "rank": 3, "shape": [batch, channels, cache_length]}
+    ring_contract = {
+        "dtype": "int64",
+        "rank": 3,
+        "shape": [batch, channels, cache_length],
+    }
     ring_flags = {"dtype": "bool", "rank": 3, "shape": [batch, channels, cache_length]}
 
     inputs: dict[str, Any] = {
@@ -8579,7 +8624,7 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
             },
         ),
         "position_ids": session_cell(
-            _contract(temporal_position), "package.position_ids_init", invariant
+            position_contract, "package.position_ids_init", invariant
         ),
         "user_waveform": session_cell(
             {
@@ -8638,7 +8683,7 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
         ("package.token_cache_init", ring_contract),
         ("package.token_provided_init", ring_flags),
         ("package.attention_mask_init", state["attention_mask"]["contract"]),
-        ("package.position_ids_init", _contract(temporal_position)),
+        ("package.position_ids_init", position_contract),
         ("package.user_waveform_init", state["user_waveform"]["contract"]),
         ("package.agent_codes_init", state["agent_codes"]["contract"]),
     ):
@@ -8866,12 +8911,13 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
     temporal_inputs = {
         input_frame.name: "duplex.input_frame",
         temporal_mask.name: "state.attention_mask.body",
-        temporal_position.name: "state.position_ids.body",
         **{
             past.name: f"state.temporal_cache_{index}.body"
             for index, (past, _) in enumerate(temporal_caches)
         },
     }
+    if temporal_position is not None:
+        temporal_inputs[temporal_position.name] = "state.position_ids.body"
     temporal_outputs = {
         hidden.name: "duplex.hidden",
         text_logits.name: "duplex.text_logits",
@@ -9055,7 +9101,11 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
             )
             for index in range(len(temporal_caches))
         ],
-        ("temporal_cache_lengths", "package.zero_batch", "duplex.temporal_cache_lengths"),
+        (
+            "temporal_cache_lengths",
+            "package.zero_batch",
+            "duplex.temporal_cache_lengths",
+        ),
     ]
     frame_body.append(
         _invoke(
@@ -9104,7 +9154,11 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
         "step_update",
         build_decoder_step_update(
             attention_dtype=_ir_dtype(temporal_mask),
-            position_dtype=_ir_dtype(temporal_position),
+            position_dtype=(
+                _ir_dtype(temporal_position)
+                if temporal_position is not None
+                else ir.DataType.INT64
+            ),
         ),
     )
     inputs["package.text_stream"] = {
