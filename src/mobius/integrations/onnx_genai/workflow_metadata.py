@@ -3514,6 +3514,7 @@ def build_image_edit_workflow_metadata(
             ],
             minimum=-1.0,
             maximum=1.0,
+            output_dtype=ir.DataType.FLOAT,
         ),
     )
 

@@ -76,6 +76,20 @@ def _run_model(model, tmp_path, feeds):
     return session.run(None, feeds)
 
 
+def test_tensor_clamp_can_cast_bfloat16_output_to_float32(tmp_path):
+    component = build_tensor_clamp(
+        ir.DataType.BFLOAT16,
+        ["batch", "channels"],
+        minimum=-1.0,
+        maximum=1.0,
+        output_dtype=ir.DataType.FLOAT,
+    )
+    assert component.model.graph.outputs[0].dtype == ir.DataType.FLOAT
+    path = tmp_path / "bfloat16_tensor_clamp.onnx"
+    ir.save(component.model, path)
+    ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+
+
 def test_grammar_logits_processor_applies_mask_and_forced_tokens(tmp_path):
     logits = np.array([[1.0, 4.0, 3.0], [5.0, 2.0, 1.0]], np.float32)
     (tokens,) = _run(

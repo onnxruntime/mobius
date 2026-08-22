@@ -1662,17 +1662,20 @@ def build_tensor_clamp(
     *,
     minimum: float,
     maximum: float,
+    output_dtype: ir.DataType | None = None,
 ) -> PolicyComponent:
     """Clamp an arbitrary-rank tensor to a declared runtime output range."""
     graph, builder = _make_graph("tensor_clamp")
     tensor = builder.input("tensor", dtype, list(dims))
+    output_dtype = output_dtype or dtype
+    clamp_input = tensor if output_dtype == dtype else builder.op.Cast(tensor, to=output_dtype)
     minimum_value = builder.op.CastLike(
-        builder.op.Constant(value_float=float(minimum)), tensor
+        builder.op.Constant(value_float=float(minimum)), clamp_input
     )
     maximum_value = builder.op.CastLike(
-        builder.op.Constant(value_float=float(maximum)), tensor
+        builder.op.Constant(value_float=float(maximum)), clamp_input
     )
-    clamped = builder.op.Clip(tensor, minimum_value, maximum_value)
+    clamped = builder.op.Clip(clamp_input, minimum_value, maximum_value)
     clamped.shape = tensor.shape
     builder.add_output(clamped, "clamped")
     return _component("mobius.policy.auxiliary@1", graph, {})
