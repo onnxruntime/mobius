@@ -332,21 +332,26 @@ def _remap_moe_expert_weights(
         # output scaling, so bake each expert's scalar into its output weights:
         # ``fc2[e] *= per_expert_scale[e]``. (Equivalent because both scale the
         # per-expert contribution by the same scalar before the weighted sum.)
+        folded_prefixes: set[str] = set()
         for key in list(state_dict.keys()):
             if key.endswith(".fc2_experts_weights"):
-                pes = pes_by_prefix.get(key[: -len(".fc2_experts_weights")])
+                prefix = key[: -len(".fc2_experts_weights")]
+                pes = pes_by_prefix.get(prefix)
                 if pes is not None:
                     fc2 = state_dict[key]
                     state_dict[key] = fc2 * pes.to(fc2.dtype).reshape(-1, 1, 1)
-        # per_expert_scale is now baked into fc2. Neutralize the router copy to
-        # ones so the unfused fallback path — which reads
+                    folded_prefixes.add(prefix)
+        # per_expert_scale is now baked into fc2. Neutralize ONLY the router
+        # copies we actually folded, so the unfused fallback path — which reads
         # ``self.router.per_expert_scale`` and multiplies it into the routing
         # weights — does not apply the scale a second time. The fused path never
-        # reads it. (The parameter is kept, not dropped, so weight loading still
-        # binds it.)
-        for key in list(state_dict.keys()):
-            if key.endswith(".router.per_expert_scale"):
-                state_dict[key] = torch.ones_like(state_dict[key])
+        # reads it. A partial state_dict that supplies ``router.per_expert_scale``
+        # without the matching ``fc2_experts_weights`` is left untouched: its
+        # scale is neither double-applied nor silently dropped. The parameter is
+        # kept, not popped, so weight loading still binds it.
+        for prefix in folded_prefixes:
+            pes_key = f"{prefix}.router.per_expert_scale"
+            state_dict[pes_key] = torch.ones_like(state_dict[pes_key])
 
 
 # ---------------------------------------------------------------------------
@@ -1432,10 +1437,13 @@ class Gemma4DecoderLayer(nn.Module):
             _moe_act = (config.hidden_act or "").lower()
             self._moe_swiglu_alpha = 1.702 if "gelu" in _moe_act else 1.0
             # The unfused fallback (EPs without a fused MoE op) uses explicit
-            # ONNX ops, so it can apply the EXACT expert activation instead of
-            # the swiglu approximation. Gemma 4 experts use ``gelu_pytorch_tanh``
-            # (``act_fn(gate) * up``); non-gelu experts use silu/Swish.
-            self._moe_is_gelu = "gelu" in _moe_act
+            # ONNX ops, so it applies the EXACT expert activation via the shared
+            # ACT2FN mapping instead of the swiglu approximation. This keeps
+            # ``gelu`` (erf) distinct from the tanh-approx variants
+            # (``gelu_pytorch_tanh``/``gelu_new``/``gelu_fast``) and ``silu`` ->
+            # Swish, faithfully matching HuggingFace's ``act_fn(gate) * up`` for
+            # whatever ``hidden_act`` the checkpoint declares.
+            self._moe_act_fn = get_activation(config.hidden_act)
             moe_inter = config.moe_intermediate_size
 
             self.router = _Gemma4MoeRouter(
@@ -1687,7 +1695,10 @@ class Gemma4DecoderLayer(nn.Module):
         # Dense per-expert gate/up projections: [T, H] x [E, moe_inter, H] -> [T, E, moe_inter]
         gate = op.Einsum(normed_flat, gate_w, equation="th,eih->tei")
         up = op.Einsum(normed_flat, up_w, equation="th,eih->tei")
-        activated = op.Gelu(gate, approximate="tanh") if self._moe_is_gelu else op.Swish(gate)
+        # Exact expert activation via ACT2FN: ``gelu_pytorch_tanh`` -> tanh-approx
+        # GELU, bare ``gelu`` -> erf GELU, ``silu``/``swish`` -> Swish, etc. This
+        # avoids the swiglu approximation used on the fused path.
+        activated = self._moe_act_fn(op, gate)
         inter = op.Mul(activated, up)  # [T, E, moe_inter]
 
         # Down projection: [T, E, moe_inter] x [E, H, moe_inter] -> [T, E, H]

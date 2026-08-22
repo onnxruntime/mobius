@@ -468,3 +468,163 @@ class TestGemma4UnifiedConfigHooks:
         assert audio_cfg.hidden_size == 640
         assert audio_cfg.output_proj_dims == 640
         assert audio_cfg.audio_token_id == 258881
+
+
+def _tiny_gemma4_text_moe_config(**overrides) -> Gemma4Config:
+    """Minimal text-only Gemma4 config with the parallel MoE block enabled.
+
+    The graph builds on CPU, which has no fused ``com.microsoft::MoE`` op, so
+    ``Gemma4DecoderLayer`` emits the vectorized unfused fallback — the path that
+    applies the exact expert activation.
+    """
+    defaults = dict(
+        model_type="gemma4",
+        num_hidden_layers=2,
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        head_dim=16,
+        vocab_size=256,
+        rms_norm_eps=1e-6,
+        hidden_act="gelu_pytorch_tanh",
+        attn_qk_norm=True,
+        layer_types=["sliding_attention", "full_attention"],
+        sliding_window=8,
+        global_head_dim=16,
+        global_rope_theta=10_000.0,
+        global_partial_rotary_factor=0.25,
+        final_logit_softcapping=0.0,
+        hidden_size_per_layer_input=0,
+        pad_token_id=0,
+        tie_word_embeddings=True,
+        enable_moe_block=True,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+    )
+    defaults.update(overrides)
+    return Gemma4Config(**defaults)
+
+
+def _build_gemma4_text(config: Gemma4Config) -> ir.Model:
+    from mobius._registry import registry
+    from mobius.integrations.transformers._config_resolver import _default_task_for_model
+    from mobius.tasks import get_task
+
+    module = registry.get("gemma4_text")(config)
+    task = get_task(_default_task_for_model("gemma4_text"))
+    return task.build(module, config)["model"]
+
+
+class TestGemma4MoeFallbackActivation:
+    """The unfused MoE fallback must apply the EXACT ``hidden_act`` (ACT2FN).
+
+    ``gelu`` maps to the erf GELU while only the tanh/fast/new variants use the
+    tanh approximation, so ``hidden_act="gelu"`` must NOT silently become
+    ``Gelu(approximate="tanh")`` on the fallback path.
+    """
+
+    def _activation_nodes(self, model: ir.Model):
+        acts = []
+        for node in model.graph:
+            if node.op_type in ("Gelu", "Swish"):
+                attrs = {a.name: a.value for a in node.attributes.values()}
+                acts.append((node.op_type, attrs.get("approximate")))
+        return acts
+
+    def test_silu_uses_swish(self):
+        model = _build_gemma4_text(_tiny_gemma4_text_moe_config(hidden_act="silu"))
+        acts = self._activation_nodes(model)
+        assert acts, "MoE fallback must emit an activation op"
+        assert all(op == "Swish" for op, _ in acts), acts
+
+    def test_gelu_uses_erf_not_tanh(self):
+        model = _build_gemma4_text(_tiny_gemma4_text_moe_config(hidden_act="gelu"))
+        acts = self._activation_nodes(model)
+        assert acts, "MoE fallback must emit an activation op"
+        assert all(op == "Gelu" for op, _ in acts), acts
+        # erf GELU => the ``approximate`` attribute must be absent/"none".
+        assert all(approx in (None, "none") for _, approx in acts), acts
+
+    def test_gelu_pytorch_tanh_uses_tanh_approx(self):
+        model = _build_gemma4_text(
+            _tiny_gemma4_text_moe_config(hidden_act="gelu_pytorch_tanh")
+        )
+        acts = self._activation_nodes(model)
+        assert acts, "MoE fallback must emit an activation op"
+        assert all(op == "Gelu" and approx == "tanh" for op, approx in acts), acts
+
+
+class TestGemma4OutputLayerIndices:
+    """``output_layer_indices`` taps the post-final-norm hidden as ``hidden_states.{idx}``.
+
+    A borrowed-KV speculative drafter consumes this as its folded-carry seed.
+    ``None``/empty must preserve the legacy output contract (no extra port).
+    """
+
+    def test_none_keeps_legacy_output_contract(self):
+        model = _build_gemma4_text(_tiny_gemma4_text_moe_config())
+        names = {o.name for o in model.graph.outputs}
+        assert "logits" in names
+        assert not any(n.startswith("hidden_states.") for n in names)
+
+    def test_index_emits_hidden_states_port(self):
+        # Last decoder layer index (num_hidden_layers - 1) — the post-norm slot.
+        config = _tiny_gemma4_text_moe_config(output_layer_indices=[1])
+        model = _build_gemma4_text(config)
+        names = {o.name for o in model.graph.outputs}
+        assert "hidden_states.1" in names
+        assert "logits" in names
+
+    def test_hidden_states_port_reuses_lm_head_input(self):
+        """The emitted hidden must be the exact lm_head input (post-final-norm)."""
+        config = _tiny_gemma4_text_moe_config(output_layer_indices=[1])
+        model = _build_gemma4_text(config)
+        hs_out = next(o for o in model.graph.outputs if o.name == "hidden_states.1")
+        logits_out = next(o for o in model.graph.outputs if o.name == "logits")
+        # lm_head is a MatMul/Gemm consuming the post-norm hidden; the emitted
+        # port and the lm_head input must trace back to the same producer value.
+        lm_head_node = logits_out.producer()
+        assert lm_head_node is not None
+        assert hs_out in set(lm_head_node.inputs), (
+            "hidden_states port must be the value fed into lm_head (post-final-norm)"
+        )
+
+
+class TestGemma4PerExpertScalePartialStateDict:
+    """Neutralization of ``router.per_expert_scale`` is scoped to folded prefixes.
+
+    A partial state_dict that supplies ``router.per_expert_scale`` without the
+    matching ``fc2_experts_weights`` must keep its scale intact (no silent drop).
+    """
+
+    def test_scale_preserved_when_fc2_absent(self):
+        config = _tiny_gemma4_config()
+        model = Gemma4CausalLMModel(config)
+        pes = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        fake_sd = {"model.layers.0.router.per_expert_scale": pes.clone()}
+        result = model.preprocess_weights(fake_sd)
+        key = "model.layers.0.router.per_expert_scale"
+        assert key in result
+        assert torch.allclose(result[key], pes), (
+            "per_expert_scale must be preserved when its fc2 pair is missing"
+        )
+
+    def test_scale_folded_and_neutralized_when_fc2_present(self):
+        config = _tiny_gemma4_config()
+        model = Gemma4CausalLMModel(config)
+        pes = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        fc2 = torch.ones(4, 64, 32)
+        fake_sd = {
+            "model.layers.0.router.per_expert_scale": pes.clone(),
+            "model.layers.0.experts.down_proj": fc2.clone(),
+        }
+        result = model.preprocess_weights(fake_sd)
+        # Router copy neutralized to ones (scale now baked into fc2).
+        neutralized = result["model.layers.0.router.per_expert_scale"]
+        assert torch.allclose(neutralized, torch.ones(4))
+        # fc2[e] scaled by per_expert_scale[e].
+        folded = result["model.layers.0.fc2_experts_weights"]
+        expected = fc2 * pes.reshape(-1, 1, 1)
+        assert torch.allclose(folded, expected)
