@@ -218,8 +218,7 @@ class TestQwen35MtpBlockExclusion:
 
 
 class TestQwen35RopeInterleave:
-    """``rope.dimension_sections`` is M-RoPE section metadata, not a GPT-J
-    adjacent-pair rotation signal.
+    """M-RoPE section metadata is not a GPT-J adjacent-pair rotation signal.
 
     Qwen3.5/3.8 rotate with split-half (NEOX) semantics. Deriving the flat
     ``rope_interleave`` from section presence corrupts RoPE — the exported
