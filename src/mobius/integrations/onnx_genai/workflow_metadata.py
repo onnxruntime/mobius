@@ -10363,6 +10363,290 @@ def build_encoder_embedding_workflow_metadata(
     }
 
 
+#: Graph inputs of a spectral speech-enhancement model, in binding order.
+_SPEECH_ENHANCEMENT_INPUTS: tuple[str, ...] = ("noisy_mag", "noisy_pha")
+
+#: Graph outputs, in the order the enhancement task publishes them.
+_SPEECH_ENHANCEMENT_OUTPUTS: tuple[str, ...] = (
+    "denoised_mag",
+    "denoised_pha",
+    "denoised_com",
+)
+
+
+def _stft_preprocess_component(
+    mag_contract: dict[str, Any],
+    pha_contract: dict[str, Any],
+) -> dict[str, Any]:
+    """Declare the audio-preprocessing adapter that produces the noisy STFT.
+
+    The enhancement graph consumes a spectrum, not a waveform, so the adapter
+    turns request-supplied encoded audio bytes into the magnitude and phase
+    the model was trained on. Declaring its ports lets a runtime type-check
+    the binding without knowing which model family produced the package.
+    """
+    return {
+        "implementation": {
+            "kind": "adapter",
+            "abi": _AUDIO_PREPROCESS_ABI,
+            "version": _AUDIO_PREPROCESS_ABI_VERSION,
+        },
+        "ports": {
+            "inputs": {
+                "encoded": {"dtype": "uint8", "rank": 1, "shape": ["bytes"]},
+            },
+            "outputs": {"noisy_mag": mag_contract, "noisy_pha": pha_contract},
+        },
+        "contract": {
+            "id": _AUDIO_PREPROCESS_ABI,
+            "version": _AUDIO_PREPROCESS_ABI_VERSION,
+            "bindings": {
+                "encoded": "encoded",
+                "noisy_mag": "noisy_mag",
+                "noisy_pha": "noisy_pha",
+            },
+        },
+        "effects": ["audio_preprocess"],
+    }
+
+
+def _stft_transforms(config: Any) -> list[dict[str, Any]] | None:
+    """Describe the STFT front-end the enhancement model was trained with.
+
+    Returns ``None`` when the config does not carry the STFT geometry, so a
+    package is never given an invented transform program.
+    """
+    geometry = {
+        "sample_rate": getattr(config, "sampling_rate", None),
+        "n_fft": getattr(config, "n_fft", None),
+        "hop_length": getattr(config, "hop_size", None),
+        "win_length": getattr(config, "win_size", None),
+    }
+    if any(not isinstance(value, int) for value in geometry.values()):
+        return None
+
+    transforms: list[dict[str, Any]] = [
+        {"op": "decode", "outputs": ["samples"]},
+        {"op": "resample", "sample_rate": geometry["sample_rate"]},
+        {"op": "downmix", "channels": 1},
+        {
+            "op": "spectrogram",
+            "n_fft": geometry["n_fft"],
+            "hop_length": geometry["hop_length"],
+            "win_length": geometry["win_length"],
+            "window": "hann",
+            "outputs": ["magnitude", "phase"],
+        },
+    ]
+
+    # RE-USE trains on log1p-compressed magnitudes; a caller that skips the
+    # compression feeds the model a different distribution. The transform
+    # vocabulary is open for extension values, so the compression is declared
+    # rather than left as an undocumented assumption.
+    compression = getattr(config, "compress_factor", None)
+    if isinstance(compression, str) and compression.endswith("log1p"):
+        transforms.append({"op": "log1p", "inputs": ["magnitude"], "outputs": ["magnitude"]})
+    return transforms
+
+
+def build_speech_enhancement_workflow_metadata(
+    pkg: Any,
+    config: Any = None,
+    *,
+    artifact: str = "model.onnx",
+) -> dict[str, Any]:
+    """Build one-file metadata for a spectral speech-enhancement model.
+
+    An enhancement model such as RE-USE / SEMamba maps a noisy STFT to a clean
+    one. It is not generative: it reads the whole spectrogram at once, carries
+    no state between calls and has no ``logits`` to sample, so the workflow is
+    a single pure invocation. Describing it with decoder metadata would
+    publish a generation loop the artifact cannot execute.
+
+    The STFT lives outside the graph, so when the config carries the STFT
+    geometry it is published as an audio preprocessing program and the
+    workflow accepts encoded audio. Reconstructing a waveform from the emitted
+    spectrum is left to the caller: the document schema describes input
+    preprocessing only, so the inverse transform is deliberately not implied
+    here.
+
+    Args:
+        pkg: The built :class:`ModelPackage`; must hold a single ``model``.
+        config: The resolved architecture config. When it carries STFT
+            geometry (``sampling_rate``, ``n_fft``, ``hop_size``,
+            ``win_size``) the workflow takes encoded audio and declares the
+            transform program; otherwise the spectra are request-supplied.
+        artifact: Model artifact path relative to the package root.
+
+    Returns:
+        A metadata document with a ``speech_enhancement`` profile and a
+        single-invocation ``pipeline.workflow``.
+    """
+    if "model" not in pkg:
+        raise ValueError("speech enhancement workflow requires a 'model' component")
+    model = pkg["model"]
+
+    graph_inputs = {str(value.name): value for value in model.graph.inputs}
+    graph_outputs = {str(value.name): value for value in model.graph.outputs}
+    missing = [n for n in _SPEECH_ENHANCEMENT_INPUTS if n not in graph_inputs]
+    if missing:
+        raise ValueError(f"speech enhancement graph must declare inputs {missing}")
+    emitted = [n for n in _SPEECH_ENHANCEMENT_OUTPUTS if n in graph_outputs]
+    if not emitted:
+        raise ValueError(
+            "speech enhancement graph must declare at least one of "
+            f"{list(_SPEECH_ENHANCEMENT_OUTPUTS)}"
+        )
+
+    mag_contract = _contract(graph_inputs["noisy_mag"])
+    pha_contract = _contract(graph_inputs["noisy_pha"])
+    transforms = _stft_transforms(config)
+
+    workflow_outputs: dict[str, Any] = {}
+    emit_nodes: list[dict[str, Any]] = []
+    profile_outputs: dict[str, str] = {}
+    for name in emitted:
+        workflow_outputs[name] = {
+            "contract": _contract(graph_outputs[name]),
+            "role": "tensor",
+            "stage": "post_adapter",
+        }
+        emit_nodes.append(
+            {
+                "kind": "emit",
+                "value": f"enhancer.{name}",
+                "output": name,
+                "mode": "replace",
+            }
+        )
+        profile_outputs[name] = name
+    invoke_outputs = {name: f"enhancer.{name}" for name in emitted}
+
+    effects: dict[str, Any] = {
+        # One pure call: the model observes nothing outside its inputs, so a
+        # retry replays it exactly and a speculative clone is safe.
+        "enhance": {"retry": "pure", "speculation_safety": {"kind": "clonable"}},
+    }
+    components: dict[str, Any] = {
+        "enhancer": _component(model, artifact, effects=("enhance",))
+    }
+    initial_effects: dict[str, str] = {"enhance": "enhance.0"}
+    nodes: list[dict[str, Any]] = []
+
+    if transforms is not None:
+        effects["audio_preprocess"] = {
+            "retry": "pure",
+            "speculation_safety": {"kind": "clonable"},
+        }
+        components["audio_preprocess"] = _stft_preprocess_component(mag_contract, pha_contract)
+        initial_effects["audio_preprocess"] = "audio_preprocess.0"
+        workflow_inputs = {
+            "request.audio": {
+                "contract": {"dtype": "uint8", "rank": 1, "shape": ["bytes"]},
+                "role": {"kind": "runtime", "version": "1.0", "role": "media"},
+                "source": {"kind": "request", "field": "media"},
+                "required": True,
+            }
+        }
+        nodes.append(
+            _invoke(
+                "audio_preprocess",
+                {"encoded": "request.audio"},
+                {"noisy_mag": "audio.noisy_mag", "noisy_pha": "audio.noisy_pha"},
+            )
+        )
+        invoke_inputs = {
+            "noisy_mag": "audio.noisy_mag",
+            "noisy_pha": "audio.noisy_pha",
+        }
+    else:
+        # Without the STFT geometry we cannot state how a waveform becomes a
+        # spectrum, so the caller supplies the spectra directly. The portable
+        # role vocabulary has no term for a magnitude or phase spectrogram,
+        # so these stay opaque rather than being mislabelled as audio.
+        workflow_inputs = {
+            f"request.{name}": {
+                "contract": _contract(graph_inputs[name]),
+                "role": {"kind": "opaque"},
+                "source": {"kind": "application", "name": f"request.{name}"},
+                "required": True,
+            }
+            for name in _SPEECH_ENHANCEMENT_INPUTS
+        }
+        invoke_inputs = {name: f"request.{name}" for name in _SPEECH_ENHANCEMENT_INPUTS}
+
+    nodes.append(_invoke("enhancer", invoke_inputs, invoke_outputs))
+    nodes.extend(emit_nodes)
+
+    workflow = {
+        "manifest": {
+            "capabilities": ["workflow_ssa", "linear_effects", "typed_emit"],
+        },
+        "effects": effects,
+        "inputs": workflow_inputs,
+        "outputs": workflow_outputs,
+        "components": components,
+        "initial_effects": initial_effects,
+        "graph": {"kind": "sequence", "nodes": nodes},
+    }
+
+    profile: dict[str, Any] = {
+        "kind": "speech_enhancement",
+        "version": "1.0",
+        "requirement": "required",
+        "outputs": profile_outputs,
+        # Each row is enhanced from its own spectrogram and nothing reduces
+        # across the batch, so a row's values never depend on its co-tenants.
+        "batch_invariance": "row_independent",
+    }
+
+    metadata: dict[str, Any] = {"schema_version": "v1"}
+    if transforms is not None:
+        metadata["preprocessing"] = {
+            "audio": {
+                "transforms": transforms,
+                # The full contract is published alongside dtype/rank because
+                # this package declares a `pipeline.workflow`, whose binding
+                # the runtime type-checks against these ports.
+                "outputs": [
+                    {
+                        "name": "noisy_mag",
+                        "source": "magnitude",
+                        "content": "features",
+                        "dtype": mag_contract["dtype"],
+                        "rank": mag_contract["rank"],
+                        "contract": mag_contract,
+                    },
+                    {
+                        "name": "noisy_pha",
+                        "source": "phase",
+                        "content": "features",
+                        "dtype": pha_contract["dtype"],
+                        "rank": pha_contract["rank"],
+                        "contract": pha_contract,
+                    },
+                ],
+            }
+        }
+    metadata["profiles"] = {"speech_enhancement": profile}
+    metadata["pipeline"] = {"workflow": _publish_workflow_v1(workflow)}
+    return metadata
+
+
+def write_speech_enhancement_workflow_metadata(
+    pkg: Any,
+    output_dir: str,
+    config: Any = None,
+) -> str:
+    """Write one-file speech-enhancement metadata into *output_dir*."""
+    os.makedirs(output_dir, exist_ok=True)
+    metadata = build_speech_enhancement_workflow_metadata(pkg, config)
+    path = os.path.join(output_dir, "inference_metadata.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        _dump_yaml(metadata, handle)
+    return path
+
+
 def write_encoder_embedding_workflow_metadata(
     pkg: Any,
     output_dir: str,
