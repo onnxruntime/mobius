@@ -40,6 +40,14 @@ from mobius.integrations.onnx_genai.inference_metadata import (
 )
 
 
+def _mapping_keys(value: object) -> set[str]:
+    if isinstance(value, dict):
+        return set(value) | {key for nested in value.values() for key in _mapping_keys(nested)}
+    if isinstance(value, list):
+        return {key for nested in value for key in _mapping_keys(nested)}
+    return set()
+
+
 def _model(weight: np.ndarray | None = None) -> ir.Model:
     values = np.arange(12, dtype=np.float32).reshape(3, 4) if weight is None else weight
     initializer = ir.Value(
@@ -769,7 +777,11 @@ def test_exact_onnx_genai_catalog_and_portable_bundle_serialization() -> None:
         add_adapter_service_to_metadata(metadata, package, str(directory))
         service = metadata["adapters"]
         assert "adapters" not in metadata["pipeline"]["workflow"]
-        assert "base_model_fingerprint" not in service
+        assert {
+            "sha256",
+            "config_sha256",
+            "base_model_fingerprint",
+        }.isdisjoint(_mapping_keys(metadata))
         assert service["selection"] == {
             "segments": "request.adapter_segments",
             "adapter_counts": "request.adapter_counts",
@@ -832,20 +844,6 @@ def test_exact_onnx_genai_catalog_and_portable_bundle_serialization() -> None:
         assert weight["loader_capability"] == "onnx-genai.adapters.json@1"
         assert weight["scale_encoding"] == "alpha_over_rank"
         assert weight["location"] == "adapters/red/adapter.json"
-        assert "sha256" not in weight
-        assert "config_sha256" not in weight
-        forbidden = {"base_model_fingerprint", "sha256", "config_sha256"}
-
-        def assert_hashless(value: object) -> None:
-            if isinstance(value, dict):
-                assert forbidden.isdisjoint(value)
-                for child in value.values():
-                    assert_hashless(child)
-            elif isinstance(value, list):
-                for child in value:
-                    assert_hashless(child)
-
-        assert_hashless(metadata)
         bundle = json.loads(payload)
         assert set(bundle["targets"]) == {"layers.0.self_attn.q_proj"}
         assert len(bundle["targets"]["layers.0.self_attn.q_proj"]["a"]) == 8

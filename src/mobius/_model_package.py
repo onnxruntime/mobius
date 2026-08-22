@@ -20,7 +20,6 @@ from __future__ import annotations
 
 __all__ = ["ModelPackage"]
 
-
 import inspect
 import logging
 import os

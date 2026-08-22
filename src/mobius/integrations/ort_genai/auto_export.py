@@ -95,8 +95,16 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "qwen2_vl": "qwen2_5_vl",
     "qwen3_vl": "qwen3_vl",
     "qwen3_vl_text": "qwen3_vl",
-    "qwen3_5": "qwen2_5_vl",
-    "qwen3_5_vl": "qwen2_5_vl",
+    # Qwen3.5 / Qwen3.6 use the Qwen-VL auxiliary vision+embedding pipeline
+    # but a hybrid DeltaNet/full-attention decoder, so they must select the
+    # native ORT GenAI qwen3_5 model type rather than the Qwen2.5-VL decoder.
+    "qwen3_5": "qwen3_5",
+    "qwen3_5_text": "qwen3_5",
+    "qwen3_5_vl": "qwen3_5",
+    "qwen3_5_vl_text": "qwen3_5",
+    "qwen3_5_moe": "qwen3_5",
+    "qwen3_5_moe_text": "qwen3_5",
+    "qwen3_5_moe_vl": "qwen3_5",
     # MiniCPM uses standard 1D decoder position IDs (unlike Qwen-VL MRoPE).
     # The phi3v multimodal runtime provides that contract; callers supply
     # HF-preprocessed packed pixels through Generator.set_inputs().
@@ -141,11 +149,33 @@ _QWEN_VL_MODEL_TYPES = frozenset(
         "qwen3_vl_text",
         "qwen3_5",
         "qwen3_5_vl",
+        "qwen3_5_vl_text",
         "qwen3_5_moe",
+        "qwen3_5_moe_vl",
         "qwen3_5_moe_text",
         "videochat_flash_qwen",
     }
 )
+_QWEN35_VL_MODEL_TYPES = frozenset(
+    {
+        "qwen3_5",
+        "qwen3_5_vl",
+        "qwen3_5_vl_text",
+        "qwen3_5_moe",
+        "qwen3_5_moe_text",
+        "qwen3_5_moe_vl",
+    }
+)
+_QWEN35_TRT_RTX_EMBEDDING_PROVIDER_OPTIONS = {
+    "nv_profile_min_shapes": "input_ids:1x1,image_features:0x1024",
+    "nv_profile_opt_shapes": "input_ids:1x226,image_features:192x1024",
+    "nv_profile_max_shapes": "input_ids:1x1024,image_features:2520x1024",
+}
+_QWEN35_TRT_RTX_VISION_PROVIDER_OPTIONS = {
+    "nv_profile_min_shapes": "pixel_values:600x1536",
+    "nv_profile_opt_shapes": "pixel_values:600x1536",
+    "nv_profile_max_shapes": "pixel_values:600x1536",
+}
 
 _TOKENIZER_FILES = [
     "tokenizer.json",
@@ -1278,7 +1308,10 @@ def _write_genai_config(
                     if model_type == "mage_vl"
                     else "processor_config.json"
                 )
-                if model_type in {"mage_vl", "qwen3_vl", "qwen3_vl_text"}:
+                if (
+                    model_type in {"mage_vl", "qwen3_vl", "qwen3_vl_text"}
+                    or model_type in _QWEN35_VL_MODEL_TYPES
+                ):
                     patch_size = getattr(vision_cfg, "patch_size", None)
                     window_size = getattr(vision_cfg, "window_size", None)
                     if patch_size is not None:
@@ -1287,6 +1320,13 @@ def _write_genai_config(
                         vision_kwargs["window_size"] = window_size
                     vision_kwargs["tokens_per_second"] = float(
                         getattr(config, "tokens_per_second", 2.0)
+                    )
+                if ep == "trt-rtx" and model_type in _QWEN35_VL_MODEL_TYPES:
+                    vision_kwargs["embedding_provider_options"] = (
+                        _QWEN35_TRT_RTX_EMBEDDING_PROVIDER_OPTIONS
+                    )
+                    vision_kwargs["vision_provider_options"] = (
+                        _QWEN35_TRT_RTX_VISION_PROVIDER_OPTIONS
                     )
 
             if vision_input_mapping is not None:

@@ -19,6 +19,7 @@ from mobius.integrations.onnx_genai.inference_metadata_test import (
 from mobius.integrations.onnx_genai.workflow_metadata import (
     _kv_storage_contract,
     _static_cache_ports,
+    _validate_attention_alias_layer_sets,
     build_language_diffusion_pipeline_metadata,
     build_speculative_workflow_metadata,
     build_video_diffusion_workflow_metadata,
@@ -396,6 +397,11 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     assert all("past_present_share_buffer" not in node.attributes for node in decoder.graph)
     kv_ports = decoder_cache["ports"]["decoder"]
     assert len(kv_ports) == 104
+    layers_by_role = {
+        role: {alias["layer"] for alias in kv_ports.values() if alias["role"] == role}
+        for role in ("key", "value")
+    }
+    assert layers_by_role["key"] == layers_by_role["value"] == set(range(52))
     assert kv_ports["cache_103"] == {
         "input": "past_key_values.51.value",
         "output": "present.51.value",
@@ -636,6 +642,11 @@ def _speculative_package(
                 ir.DataType.FLOAT,
                 ["batch", 2, "past_sequence", 8],
             ),
+            _value(
+                "past_key_values.0.value",
+                ir.DataType.FLOAT,
+                ["batch", 4, "past_sequence", 4],
+            ),
         ],
         [
             _value("target_scores", ir.DataType.FLOAT, ["batch", 4, 32]),
@@ -643,6 +654,11 @@ def _speculative_package(
                 "present.0.key",
                 ir.DataType.FLOAT,
                 ["batch", 2, "past_sequence + 4", 8],
+            ),
+            _value(
+                "present.0.value",
+                ir.DataType.FLOAT,
+                ["batch", 4, "past_sequence + 4", 4],
             ),
         ],
     )
@@ -724,15 +740,70 @@ def test_speculative_workflow_uses_per_row_ragged_state_and_rng():
         "full_attention"
     )
     assert "slot_ids" not in workflow["serving"]
-    assert workflow["serving"]["state_service"]["groups"]["verifier_cache"]["ports"][
+    verifier_ports = workflow["serving"]["state_service"]["groups"]["verifier_cache"]["ports"][
         "verifier"
-    ]["cache_0"] == {
+    ]
+    assert verifier_ports["cache_0"] == {
         "input": "past_key_values.0.key",
         "output": "present.0.key",
         "role": "key",
         "layer": 0,
     }
+    assert verifier_ports["cache_1"] == {
+        "input": "past_key_values.0.value",
+        "output": "present.0.value",
+        "role": "value",
+        "layer": 0,
+    }
     assert any(item["cell"].startswith("cache_") for item in workflow["steps"][0]["carried"])
+
+
+def test_attention_state_group_rejects_mismatched_key_value_layers():
+    verifier = _graph_model(
+        "verifier",
+        [
+            _value("proposed_tokens", ir.DataType.INT64, ["batch", 4]),
+            _value(
+                "past_key_values.0.key",
+                ir.DataType.FLOAT,
+                ["batch", 2, "past_sequence", 8],
+            ),
+        ],
+        [
+            _value("target_scores", ir.DataType.FLOAT, ["batch", 4, 32]),
+            _value(
+                "present.0.key",
+                ir.DataType.FLOAT,
+                ["batch", 2, "past_sequence + 4", 8],
+            ),
+        ],
+    )
+    package = _speculative_package()
+    package["verifier"] = verifier
+    with pytest.raises(
+        ValueError,
+        match=r"key layers are \[0\].*value layers are \[\]",
+    ):
+        build_speculative_workflow_metadata(package)
+
+
+def test_attention_state_group_rejects_equal_count_mismatched_layer_sets():
+    with pytest.raises(
+        ValueError,
+        match=r"key layers are \[0, 1\].*value layers are \[0, 2\]",
+    ):
+        _validate_attention_alias_layer_sets(
+            {
+                "full_attention": {
+                    "decoder": {
+                        "key_0": {"role": "key", "layer": 0},
+                        "key_1": {"role": "key", "layer": 1},
+                        "value_0": {"role": "value", "layer": 0},
+                        "value_2": {"role": "value", "layer": 2},
+                    }
+                }
+            }
+        )
 
 
 def _decoder_with_cache(domain: str, op_type: str) -> ir.Model:
