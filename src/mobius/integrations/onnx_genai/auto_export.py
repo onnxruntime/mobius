@@ -886,7 +886,7 @@ def write_onnx_genai_config(
                     "pass guidance_scale explicitly using the source pipeline's default"
                 )
             if scheduler is None:
-                scheduler = load_diffusers_scheduler_config(source)
+                scheduler = load_diffusers_scheduler_config(source, revision=revision)
             if scheduler is None:
                 raise ValueError(
                     "image-edit workflow requires the diffusers scheduler config; "
@@ -928,7 +928,9 @@ def write_onnx_genai_config(
                     "pass guidance_scale=1.0 for unguided generation, or the source "
                     "pipeline's classifier-free guidance default"
                 )
-            scaling_factor = load_diffusers_vae_scaling_factor(source) or 1.0
+            scaling_factor = (
+                load_diffusers_vae_scaling_factor(source, revision=revision) or 1.0
+            )
             path = write_video_diffusion_workflow_metadata(
                 pkg,
                 output_dir,
@@ -986,7 +988,7 @@ def write_onnx_genai_config(
             else float(guidance_scale)
         )
         decoder_input_scale = 1.0
-        scaling_factor = load_diffusers_vae_scaling_factor(source)
+        scaling_factor = load_diffusers_vae_scaling_factor(source, revision=revision)
         if scaling_factor:
             decoder_input_scale = 1.0 / scaling_factor
         path = write_diffusion_workflow_metadata(

@@ -481,6 +481,45 @@ def test_video_diffusion_requires_explicit_guidance(tmp_path):
         )
 
 
+def test_video_diffusion_forwards_revision_to_semantic_config_loaders(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_scheduler(source, *, revision=None):
+        calls.append(("scheduler", source, revision))
+        return SchedulerConfig(kind="ddim")
+
+    def fake_vae_scaling(source, *, revision=None):
+        calls.append(("vae", source, revision))
+        return 0.13025
+
+    monkeypatch.setattr(
+        "mobius.integrations.onnx_genai.auto_export.load_diffusers_scheduler_config",
+        fake_scheduler,
+    )
+    monkeypatch.setattr(
+        "mobius.integrations.onnx_genai.auto_export.load_diffusers_vae_scaling_factor",
+        fake_vae_scaling,
+    )
+    monkeypatch.setattr(
+        "mobius.integrations.onnx_genai.auto_export._write_hf_tokenizer",
+        lambda *args, **kwargs: None,
+    )
+
+    write_onnx_genai_config(
+        _video_diffusion_package(),
+        str(tmp_path),
+        source="zai-org/CogVideoX-2b",
+        revision="pinned-revision",
+        num_inference_steps=2,
+        guidance_scale=6.0,
+    )
+
+    assert calls == [
+        ("scheduler", "zai-org/CogVideoX-2b", "pinned-revision"),
+        ("vae", "zai-org/CogVideoX-2b", "pinned-revision"),
+    ]
+
+
 def test_single_diffusion_component_requires_explicit_vae(tmp_path):
     pkg = _DiffusionPkg({"transformer": object()})
     with pytest.raises(
@@ -688,6 +727,35 @@ def test_image_edit_requires_explicit_guidance(tmp_path):
         )
 
 
+def test_image_edit_forwards_revision_to_scheduler_loader(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_scheduler(source, *, revision=None):
+        calls.append((source, revision))
+        return SchedulerConfig.from_diffusers(_FLOW_MATCH_SCHEDULER)
+
+    monkeypatch.setattr(
+        "mobius.integrations.onnx_genai.auto_export.load_diffusers_scheduler_config",
+        fake_scheduler,
+    )
+    monkeypatch.setattr(
+        "mobius.integrations.onnx_genai.auto_export._write_hf_tokenizer",
+        lambda *args, **kwargs: None,
+    )
+
+    write_onnx_genai_config(
+        _image_edit_package(),
+        str(tmp_path),
+        source="Qwen/Qwen-Image-Edit-2509",
+        revision="pinned-revision",
+        num_inference_steps=2,
+        image_seq_len=4104,
+        guidance_scale=4.0,
+    )
+
+    assert calls == [("Qwen/Qwen-Image-Edit-2509", "pinned-revision")]
+
+
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
 def test_image_edit_contract_uses_float_clamp_output(tmp_path, dtype):
     source = tmp_path / "source"
@@ -821,6 +889,40 @@ def test_dispatch_diffusion_auto_reads_scheduler_from_source(tmp_path):
     }
     schedule = ir.load(out / "policies" / "diffusion_schedule.onnx")
     assert list(schedule.graph.outputs[0].shape) == [16]
+
+
+def test_diffusion_forwards_revision_to_semantic_config_loaders(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_scheduler(source, *, revision=None):
+        calls.append(("scheduler", source, revision))
+        return SchedulerConfig(kind="euler")
+
+    def fake_vae_scaling(source, *, revision=None):
+        calls.append(("vae", source, revision))
+        return 0.18215
+
+    monkeypatch.setattr(
+        "mobius.integrations.onnx_genai.auto_export.load_diffusers_scheduler_config",
+        fake_scheduler,
+    )
+    monkeypatch.setattr(
+        "mobius.integrations.onnx_genai.auto_export.load_diffusers_vae_scaling_factor",
+        fake_vae_scaling,
+    )
+
+    write_onnx_genai_config(
+        _diffusion_package(),
+        str(tmp_path),
+        source="nota-ai/bk-sdm-small",
+        revision="pinned-revision",
+        num_inference_steps=2,
+    )
+
+    assert calls == [
+        ("scheduler", "nota-ai/bk-sdm-small", "pinned-revision"),
+        ("vae", "nota-ai/bk-sdm-small", "pinned-revision"),
+    ]
 
 
 def test_dispatch_vision_multimodal_pipeline(tmp_path):

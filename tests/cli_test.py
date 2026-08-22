@@ -775,6 +775,7 @@ class TestCLIBuildRuntime:
             config="/models/video",
             model=None,
             guidance_scale=6.0,
+            revision="pinned-revision",
         )
         with (
             tempfile.TemporaryDirectory() as tmpdir,
@@ -786,6 +787,7 @@ class TestCLIBuildRuntime:
             _save_package(pkg, tmpdir, args, None, None)
 
         assert writer.call_args.kwargs["guidance_scale"] == pytest.approx(6.0)
+        assert writer.call_args.kwargs["revision"] == "pinned-revision"
 
     def test_runtime_onnx_genai_does_not_fallback_for_unsupported_vlm(self):
         pkg = mock.MagicMock()

@@ -2271,7 +2271,11 @@ def load_diffusers_scheduler_config(
         return None
 
 
-def load_diffusers_vae_scaling_factor(source: str | None) -> float | None:
+def load_diffusers_vae_scaling_factor(
+    source: str | None,
+    *,
+    revision: str | None = None,
+) -> float | None:
     """Best-effort load of a diffusers ``vae/config.json`` ``scaling_factor``.
 
     The latent a diffusion sampler carries is scaled by this factor before the
@@ -2293,7 +2297,7 @@ def load_diffusers_vae_scaling_factor(source: str | None) -> float | None:
         try:
             from huggingface_hub import hf_hub_download
 
-            path = hf_hub_download(source, "vae/config.json")
+            path = hf_hub_download(source, "vae/config.json", revision=revision)
             with open(path, encoding="utf-8") as handle:
                 raw = json.load(handle)
         except Exception as err:
