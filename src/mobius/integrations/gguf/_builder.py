@@ -964,10 +964,17 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
     # Emit those zero_points explicitly: GatherBlockQuantized has diverging
     # CPU/CUDA defaults when the input is omitted, which corrupts embeddings
     # on CUDA before the first decoder layer runs.
+    # Whether the repacked form can omit zero points. Every entry here is a
+    # *repack target* property, not a source-format property: Q4_K and Q6_K both
+    # requantize through the asymmetric affine path, so both need zero points
+    # even though Q6_K's source form is symmetric around 32.
+    # Keep in sync with `_REPACK_PARAMS` in `_repacker.py` — a type that can be
+    # repacked but is missing here raises `KeyError` at build time.
     type_can_omit_zero_points: dict = {
         GGMLQuantizationType.Q4_0: False,
         GGMLQuantizationType.Q4_1: False,
         GGMLQuantizationType.Q4_K: False,
+        GGMLQuantizationType.Q6_K: False,
         GGMLQuantizationType.Q8_0: False,
         GGMLQuantizationType.Q1_0: False,
     }
