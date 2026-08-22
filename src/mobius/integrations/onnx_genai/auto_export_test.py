@@ -1281,6 +1281,35 @@ def test_hierarchical_audio_package_is_not_misclassified_as_diffusion(
         policy_path = tmp_path / artifact
         assert policy_path.is_file(), artifact
         ir.load(policy_path)
+    original_stop = pkg.config.workflow_config["stop_token_id"]
+    original_unconditional = pkg.config.workflow_config["unconditional_token_id"]
+    policy_names = set(pkg.policy_components)
+    invalid_tokens = [
+        ("negative-stop", "stop_token_id", -1),
+        ("stop-at-semantic-start", "stop_token_id", semantic_start),
+        ("stop-inside-semantic-range", "stop_token_id", semantic_start + 1),
+        ("stop-above-logits", "stop_token_id", 170000),
+        (
+            "unconditional-inside-semantic-range",
+            "unconditional_token_id",
+            semantic_start + 1,
+        ),
+        ("negative-unconditional", "unconditional_token_id", -1),
+        ("unconditional-above-logits", "unconditional_token_id", 170000),
+    ]
+    for label, field, invalid_value in invalid_tokens:
+        pkg.config.workflow_config["stop_token_id"] = original_stop
+        pkg.config.workflow_config["unconditional_token_id"] = original_unconditional
+        pkg.config.workflow_config[field] = invalid_value
+        with pytest.raises(ValueError, match=field):
+            build_hierarchical_audio_workflow_metadata(pkg)
+        invalid_dir = tmp_path / label
+        with pytest.raises(ValueError, match=field):
+            write_onnx_genai_config(pkg, str(invalid_dir))
+        assert not list(invalid_dir.rglob("*"))
+        assert set(pkg.policy_components) == policy_names
+    pkg.config.workflow_config["stop_token_id"] = original_stop
+    pkg.config.workflow_config["unconditional_token_id"] = original_unconditional
     del pkg.config.workflow_config["max_audio_frames"]
     with pytest.raises(ValueError, match="max_audio_frames"):
         build_hierarchical_audio_workflow_metadata(pkg)

@@ -558,6 +558,8 @@ def _hierarchical_audio_config(pkg: Any) -> tuple[dict[str, str], dict[str, Any]
             "prompt_segments",
             "unconditional_replace_from",
             "unconditional_preserve_trailing",
+            "stop_token_id",
+            "unconditional_token_id",
         }
     )
     for field in positive_integer_fields:
@@ -565,6 +567,10 @@ def _hierarchical_audio_config(pkg: Any) -> tuple[dict[str, str], dict[str, Any]
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
             raise ValueError(f"hierarchical audio workflow_config.{field} must be >= 1")
     for field in ("unconditional_replace_from", "unconditional_preserve_trailing"):
+        value = config[field]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"hierarchical audio workflow_config.{field} must be >= 0")
+    for field in ("stop_token_id", "unconditional_token_id"):
         value = config[field]
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ValueError(f"hierarchical audio workflow_config.{field} must be >= 0")
@@ -637,11 +643,22 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
         raise ValueError("vocoder latent channels must match flow latent channels")
     logits_vocab = list(decoder_outputs["logits"].shape or [])[-1]
     vocabulary_end = config["semantic_vocabulary_start"] + config["semantic_vocabulary_size"]
-    if (
-        not isinstance(logits_vocab, int)
-        or max(vocabulary_end, config["stop_token_id"] + 1) > logits_vocab
-    ):
-        raise ValueError("semantic vocabulary and stop token must fit global logits")
+    if not isinstance(logits_vocab, int):
+        raise TypeError("global logits vocabulary size must be static")
+    if vocabulary_end > logits_vocab:
+        raise ValueError("semantic vocabulary must fit global logits")
+    semantic_start = config["semantic_vocabulary_start"]
+    for field in ("stop_token_id", "unconditional_token_id"):
+        token_id = config[field]
+        if token_id >= logits_vocab:
+            raise ValueError(
+                f"hierarchical audio workflow_config.{field} must fit global logits"
+            )
+        if token_id >= semantic_start:
+            raise ValueError(
+                f"hierarchical audio workflow_config.{field} must be below "
+                "semantic_vocabulary_start"
+            )
     vocoder_config = getattr(pkg.config, "component_configs", {}).get(roles["vocoder"], {})
     condition_config = getattr(pkg.config, "component_configs", {}).get(
         roles["condition_encoder"], {}
