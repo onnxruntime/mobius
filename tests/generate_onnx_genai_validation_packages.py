@@ -99,10 +99,15 @@ def _executable_decoder_package() -> ModelPackage:
     input_ids = builder.input("input_ids", ir.DataType.INT64, ["batch", "sequence"])
     builder.input("attention_mask", ir.DataType.INT64, ["batch", "total_sequence"])
     builder.input("position_ids", ir.DataType.INT64, ["batch", "sequence"])
-    past = builder.input(
+    past_key = builder.input(
         "past_key_values.0.key",
         ir.DataType.FLOAT,
         ["batch", 2, "past_sequence", 8],
+    )
+    past_value = builder.input(
+        "past_key_values.0.value",
+        ir.DataType.FLOAT,
+        ["batch", 4, "past_sequence", 4],
     )
     shape = builder.op.Shape(input_ids)
     logits = builder.op.ConstantOfShape(
@@ -111,22 +116,35 @@ def _executable_decoder_package() -> ModelPackage:
     )
     batch = builder.op.Shape(input_ids, start=0, end=1)
     sequence = builder.op.Shape(input_ids, start=1, end=2)
-    cache_shape = builder.op.Concat(
+    key_update_shape = builder.op.Concat(
         batch,
         builder.op.Constant(value_ints=[2]),
         sequence,
         builder.op.Constant(value_ints=[8]),
         axis=0,
     )
-    update = builder.op.ConstantOfShape(cache_shape, value=ir.tensor([0.0]))
-    present = builder.op.Concat(past, update, axis=2)
+    value_update_shape = builder.op.Concat(
+        batch,
+        builder.op.Constant(value_ints=[4]),
+        sequence,
+        builder.op.Constant(value_ints=[4]),
+        axis=0,
+    )
+    key_update = builder.op.ConstantOfShape(key_update_shape, value=ir.tensor([0.0]))
+    value_update = builder.op.ConstantOfShape(value_update_shape, value=ir.tensor([0.0]))
+    present_key = builder.op.Concat(past_key, key_update, axis=2)
+    present_value = builder.op.Concat(past_value, value_update, axis=2)
     builder.add_output(
         _typed(logits, ir.DataType.FLOAT, ["batch", "sequence", 128]),
         "logits",
     )
     builder.add_output(
-        _typed(present, ir.DataType.FLOAT, ["batch", 2, "present_sequence", 8]),
+        _typed(present_key, ir.DataType.FLOAT, ["batch", 2, "present_sequence", 8]),
         "present.0.key",
+    )
+    builder.add_output(
+        _typed(present_value, ir.DataType.FLOAT, ["batch", 4, "present_sequence", 4]),
+        "present.0.value",
     )
     config = _Cfg()
     config.eos_token_id = 127
@@ -294,6 +312,192 @@ def _executable_vlm_package() -> ModelPackage:
             "decoder": ir.Model(decoder_graph, ir_version=11),
         },
         config=_VlmCfg(),
+    )
+
+
+def _executable_shared_state_pixel_flow_package() -> ModelPackage:
+    """Tiny mixed-precision package for alternating shared-state execution."""
+    vision_graph, vision = _graph("vision_encoder")
+    pixels = vision.input("pixel_values", ir.DataType.FLOAT16, [1, 3, "height", "width"])
+    feature_scalar = vision.op.ReduceMean(pixels, [0, 1, 2, 3], keepdims=0)
+    features = vision.op.Expand(
+        feature_scalar,
+        vision.op.Constant(value_ints=[1, 256, 32]),
+    )
+    vision.add_output(
+        _typed(features, ir.DataType.FLOAT16, [1, "image_tokens", 32]),
+        "image_features",
+    )
+
+    embedding_graph, embedding = _graph("embedding")
+    tokens = embedding.input("input_ids", ir.DataType.INT64, ["batch", "sequence_len"])
+    image_features = embedding.input(
+        "image_features", ir.DataType.FLOAT16, [1, "image_tokens", 32]
+    )
+    image_mask = embedding.input("image_mask", ir.DataType.BOOL, ["batch", "sequence_len"])
+    token_values = embedding.op.Cast(
+        embedding.op.Unsqueeze(tokens, [2]), to=ir.DataType.FLOAT16
+    )
+    token_shape = embedding.op.Concat(
+        embedding.op.Shape(tokens),
+        embedding.op.Constant(value_ints=[32]),
+        axis=0,
+    )
+    token_values = embedding.op.Expand(token_values, token_shape)
+    image_value = embedding.op.Expand(
+        embedding.op.ReduceMean(image_features, [0, 1, 2], keepdims=0),
+        token_shape,
+    )
+    embeds = embedding.op.Where(
+        embedding.op.Unsqueeze(image_mask, [2]),
+        image_value,
+        token_values,
+    )
+    embedding.add_output(
+        _typed(embeds, ir.DataType.FLOAT16, ["batch", "sequence_len", 32]),
+        "inputs_embeds",
+    )
+
+    decoder_graph, decoder = _graph("decoder")
+    embeds = decoder.input("inputs_embeds", ir.DataType.FLOAT16, ["batch", "sequence_len", 32])
+    decoder.input("attention_mask", ir.DataType.INT64, ["batch", "total_sequence_len"])
+    decoder.input("position_ids", ir.DataType.INT64, [3, "batch", "sequence_len"])
+    past_key = decoder.input(
+        "past_key_values.0.key",
+        ir.DataType.FLOAT16,
+        ["batch", 2, "past_sequence_len", 8],
+    )
+    past_value = decoder.input(
+        "past_key_values.0.value",
+        ir.DataType.FLOAT16,
+        ["batch", 2, "past_sequence_len", 8],
+    )
+    sequence = decoder.op.Shape(embeds, start=1, end=2)
+    logits = decoder.op.Expand(
+        decoder.op.Cast(decoder.op.ReduceMean(embeds), to=ir.DataType.FLOAT),
+        decoder.op.Concat(
+            decoder.op.Shape(embeds, start=0, end=1),
+            sequence,
+            decoder.op.Constant(value_ints=[64]),
+            axis=0,
+        ),
+    )
+    update = decoder.op.Expand(
+        decoder.op.ReduceMean(embeds),
+        decoder.op.Concat(
+            decoder.op.Concat(
+                decoder.op.Shape(embeds, start=0, end=1),
+                decoder.op.Constant(value_ints=[2]),
+                axis=0,
+            ),
+            sequence,
+            decoder.op.Constant(value_ints=[8]),
+            axis=0,
+        ),
+    )
+    decoder.add_output(
+        _typed(logits, ir.DataType.FLOAT, ["batch", "sequence_len", 64]), "logits"
+    )
+    decoder.add_output(
+        _typed(
+            decoder.op.Concat(past_key, update, axis=2),
+            ir.DataType.FLOAT16,
+            ["batch", 2, "present_sequence_len", 8],
+        ),
+        "present.0.key",
+    )
+    decoder.add_output(
+        _typed(
+            decoder.op.Concat(past_value, update, axis=2),
+            ir.DataType.FLOAT16,
+            ["batch", 2, "present_sequence_len", 8],
+        ),
+        "present.0.value",
+    )
+
+    generation_embedding_graph, generation_embedding = _graph("image_gen_embedding")
+    latent = generation_embedding.input(
+        "latent", ir.DataType.FLOAT, ["batch", 3, "height", "width"]
+    )
+    timestep = generation_embedding.input("timestep", ir.DataType.FLOAT, [1])
+    noise_scale = generation_embedding.input("noise_scale", ir.DataType.FLOAT, [1])
+    image_embeds = generation_embedding.op.Expand(
+        generation_embedding.op.Add(
+            generation_embedding.op.ReduceMean(latent, [0, 1, 2, 3], keepdims=0),
+            generation_embedding.op.Add(timestep, noise_scale),
+        ),
+        generation_embedding.op.Concat(
+            generation_embedding.op.Shape(latent, start=0, end=1),
+            generation_embedding.op.Constant(value_ints=[1, 32]),
+            axis=0,
+        ),
+    )
+    generation_embedding.add_output(
+        _typed(image_embeds, ir.DataType.FLOAT, ["batch", "image_tokens", 32]),
+        "image_embeds",
+    )
+
+    denoiser_graph, denoiser = _graph("image_gen_denoiser")
+    image_embeds = denoiser.input(
+        "image_embeds", ir.DataType.FLOAT, ["batch", "image_tokens", 32]
+    )
+    denoiser.input("position_ids", ir.DataType.INT64, [3, "batch", "image_tokens"])
+    denoiser.input("token_grid", ir.DataType.INT64, [2])
+    past_key = denoiser.input(
+        "past_key_values.0.key", ir.DataType.FLOAT, ["batch", 2, "past_sequence_len", 8]
+    )
+    past_value = denoiser.input(
+        "past_key_values.0.value", ir.DataType.FLOAT, ["batch", 2, "past_sequence_len", 8]
+    )
+    prediction = denoiser.op.Expand(
+        denoiser.op.Add(
+            denoiser.op.ReduceMean(image_embeds, [0, 1, 2], keepdims=0),
+            denoiser.op.Add(
+                denoiser.op.ReduceMean(past_key, [0, 1, 2, 3], keepdims=0),
+                denoiser.op.ReduceMean(past_value, [0, 1, 2, 3], keepdims=0),
+            ),
+        ),
+        denoiser.op.Concat(
+            denoiser.op.Shape(image_embeds, start=0, end=1),
+            denoiser.op.Constant(value_ints=[3, 32, 32]),
+            axis=0,
+        ),
+    )
+    denoiser.add_output(
+        _typed(prediction, ir.DataType.FLOAT, ["batch", 3, "height", "width"]),
+        "predicted_image",
+    )
+    denoiser.add_output(
+        _typed(
+            denoiser.op.Identity(past_key),
+            ir.DataType.FLOAT,
+            ["batch", 2, "past_sequence_len", 8],
+        ),
+        "present.0.key",
+    )
+    denoiser.add_output(
+        _typed(
+            denoiser.op.Identity(past_value),
+            ir.DataType.FLOAT,
+            ["batch", 2, "past_sequence_len", 8],
+        ),
+        "present.0.value",
+    )
+
+    class Config:
+        pixels_per_token = 32
+        t_eps = 0.02
+        vocab_size = 64
+
+    return ModelPackage(
+        {
+            "embedding": ir.Model(embedding_graph, ir_version=11),
+            "vision_encoder": ir.Model(vision_graph, ir_version=11),
+            "decoder": ir.Model(decoder_graph, ir_version=11),
+            "image_gen_embedding": ir.Model(generation_embedding_graph, ir_version=11),
+            "image_gen_denoiser": ir.Model(denoiser_graph, ir_version=11),
+        },
+        config=Config(),
     )
 
 
@@ -599,10 +803,15 @@ def _executable_speculative_package() -> ModelPackage:
 
     verifier_graph, verifier_builder = _graph("verifier")
     proposed = verifier_builder.input("proposed_tokens", ir.DataType.INT64, ["batch", 4])
-    past = verifier_builder.input(
+    past_key = verifier_builder.input(
         "past_key_values.0.key",
         ir.DataType.FLOAT,
         ["batch", 2, "past_sequence", 8],
+    )
+    past_value = verifier_builder.input(
+        "past_key_values.0.value",
+        ir.DataType.FLOAT,
+        ["batch", 4, "past_sequence", 4],
     )
     batch = verifier_builder.op.Shape(proposed, start=0, end=1)
     row = verifier_builder.op.Range(
@@ -631,7 +840,7 @@ def _executable_speculative_package() -> ModelPackage:
         verifier_builder.op.Constant(value_floats=[0.0, 1.0]),
         axis=-1,
     )
-    cache_update = verifier_builder.op.ConstantOfShape(
+    key_update = verifier_builder.op.ConstantOfShape(
         verifier_builder.op.Concat(
             batch,
             verifier_builder.op.Constant(value_ints=[2, 4, 8]),
@@ -639,18 +848,35 @@ def _executable_speculative_package() -> ModelPackage:
         ),
         value=ir.tensor([0.0]),
     )
-    present = verifier_builder.op.Concat(past, cache_update, axis=2)
+    value_update = verifier_builder.op.ConstantOfShape(
+        verifier_builder.op.Concat(
+            batch,
+            verifier_builder.op.Constant(value_ints=[4, 4, 4]),
+            axis=0,
+        ),
+        value=ir.tensor([0.0]),
+    )
+    present_key = verifier_builder.op.Concat(past_key, key_update, axis=2)
+    present_value = verifier_builder.op.Concat(past_value, value_update, axis=2)
     verifier_builder.add_output(
         _typed(target_scores, ir.DataType.FLOAT, ["batch", 4, 32]),
         "target_scores",
     )
     verifier_builder.add_output(
         _typed(
-            present,
+            present_key,
             ir.DataType.FLOAT,
             ["batch", 2, "past_sequence + 4", 8],
         ),
         "present.0.key",
+    )
+    verifier_builder.add_output(
+        _typed(
+            present_value,
+            ir.DataType.FLOAT,
+            ["batch", 4, "past_sequence + 4", 4],
+        ),
+        "present.0.value",
     )
     return ModelPackage(
         {
@@ -992,6 +1218,10 @@ def generate_packages(output: Path) -> Path:
         "decoder": (decoder, {"config": decoder.config}),
         "static_cache": (static_cache, {"config": static_cache.config}),
         "vlm": (_executable_vlm_package(), {}),
+        "shared_state_pixel_flow": (
+            _executable_shared_state_pixel_flow_package(),
+            {"num_inference_steps": 2, "guidance_scale": 2.0},
+        ),
         "diffusion": (
             _executable_diffusion_package(),
             {"guidance_scale": 1.0},
@@ -1083,32 +1313,9 @@ def generate_packages(output: Path) -> Path:
     _write_adapter_metadata(adapter, directory)
     shutil.rmtree(source_root)
 
-    (args.output / "README.md").write_text(
-        """# ONNX GenAI workflow conformance fixtures
-
-Generated by `tests/generate_onnx_genai_validation_packages.py` for semantic
-validation and runtime conformance. The ONNX GenAI revision these are checked
-against is pinned in `.github/workflows/main.yml`; it is not restated here,
-because a second copy of a SHA only ever drifts from the first.
-
-Only the metadata is committed under `tests/fixtures/onnx_genai_workflows`.
-The graphs and adapter weights are a deterministic function of this script, so
-committing them would store megabytes of bytes no reviewer can read. CI
-regenerates them, compares the metadata against the committed copy, and runs
-validation and conformance against the regenerated tree. Tests that need the
-graphs use the `materialized_workflow_packages` fixture.
-
-The decoder, VLM, diffusion, masked diffusion, speculative, and codec packages
-contain executable synthetic models. The TTS fixture uses the real tiny
-Qwen3-TTS producer graphs with deterministic synthetic weights. The two
-protein-encoder fixtures use the real tiny ESM-2 and ProtBert producer graphs,
-also with deterministic synthetic weights; they cover the non-generative
-embedding shape, which has one invocation, no carried state and no sampler.
-No downloaded model weights are included. The adapter fixture covers
-authoritative target metadata, portable artifacts, ordered heterogeneous
-composition, inactive rows, compaction, and request-epoch slot reuse.
-""",
-        encoding="utf-8",
+    shutil.copyfile(
+        Path(__file__).parent / "fixtures/onnx_genai_workflows/README.md",
+        args.output / "README.md",
     )
     return args.output
 

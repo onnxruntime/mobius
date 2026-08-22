@@ -51,6 +51,7 @@ __all__ = [
     "YolosConfig",
     "apply_weights",
     "adapter_source_from_onnx_adapter",
+    "attach_peft_adapter",
     "build",
     "build_context",
     "build_diffusers_pipeline",
@@ -114,7 +115,11 @@ from mobius._registry import (
     ModelRegistry,
     registry,
 )
-from mobius.adapter_io import adapter_source_from_onnx_adapter, load_peft_adapter
+from mobius.adapter_io import (
+    adapter_source_from_onnx_adapter,
+    attach_peft_adapter,
+    load_peft_adapter,
+)
 from mobius.adapters import (
     AdapterApplication,
     AdapterArtifact,
