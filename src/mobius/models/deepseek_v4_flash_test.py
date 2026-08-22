@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import onnx_ir as ir
+import pytest
 import torch
 
 from mobius._builder import build_from_module
@@ -219,7 +220,9 @@ def test_parameter_shapes_match_v4_projections():
     assert list(attn.kv_proj.weight.shape) == [16, 32]
     assert list(attn.o_a_proj.weight.shape) == [16, 16]
     assert list(attn.o_b_proj.weight.shape) == [32, 16]
-    assert list(model.model.layers[0].mlp.gate.bias.shape) == [config.num_local_experts]
+    # DeepSeekV4MoE composes the shared MoELayer, so the gate now lives at
+    # mlp.moe.gate (see DeepSeekV4MoE.__init__).
+    assert list(model.model.layers[0].mlp.moe.gate.bias.shape) == [config.num_local_experts]
 
 
 def test_four_and_eight_bit_graphs_use_matmul_nbits():
@@ -239,6 +242,65 @@ def test_four_and_eight_bit_graphs_use_matmul_nbits():
         assert "model.layers.0.self_attn.compressor.wkv.scales" in graph.initializers
         model = DeepSeekV4CausalLMModel(config)
         assert model.model.layers[0].self_attn.compressor.wkv._gguf_quantized_linear
+
+
+def test_qmoe_eligible_quantization_fuses_routed_experts_into_one_qmoe_per_layer():
+    """gptq/awq/olive int4 quantization must fuse each layer's routed experts.
+
+    QMoE's native ABI must collapse every layer's routed experts into a single
+    QMoE node -- not one MatMulNBits set per expert -- while the shared expert (untouched by this change) still emits
+    its own MatMulNBits/dense projections, and hash-routed layers keep using
+    DeepSeekV4Gate's Gather-based lookup rather than TopK.
+
+    The structural proof is that QMoE count == num_hidden_layers and, unlike
+    the old per-expert dense loop, MatMulNBits count for the *routed* experts
+    does not scale with num_local_experts: doubling num_local_experts must
+    not change the graph's total MatMulNBits count, since QMoE folds all
+    experts' weights into its own initializers instead of one MatMulNBits
+    triple per expert.
+    """
+    num_hidden_layers = 2
+
+    def _build(num_local_experts):
+        config = _tiny_config(
+            num_hidden_layers=num_hidden_layers,
+            compress_ratios=[4, 4],
+            num_hash_layers=1,  # layer 0 hash-routed, layer 1 learned top-k.
+            num_local_experts=num_local_experts,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=16,
+                quant_method="gptq",
+                sym=True,
+            ),
+        )
+        model = DeepSeekV4CausalLMModel(config)
+        for layer in model.model.layers:
+            assert layer.mlp.moe.experts is None, (
+                "quantized routed experts must take the QMoE path"
+            )
+        return build_from_module(model, config)["model"].graph
+
+    graph_2_experts = _build(2)
+    graph_8_experts = _build(8)
+
+    for graph in (graph_2_experts, graph_8_experts):
+        assert count_op_type(graph, "QMoE") == num_hidden_layers
+        # Hash-routed layer 0 still uses the Gather-based tid2eid lookup,
+        # learned top-k layer 1 still uses TopK -- selection algorithm is
+        # unchanged by fusing the expert compute into QMoE.
+        assert count_op_type(graph, "TopK") >= 1
+        assert count_op_type(graph, "Gather") >= 1
+
+    matmul_nbits_2 = count_op_type(graph_2_experts, "MatMulNBits")
+    matmul_nbits_8 = count_op_type(graph_8_experts, "MatMulNBits")
+    assert matmul_nbits_2 == matmul_nbits_8, (
+        "MatMulNBits count must not scale with num_local_experts once routed "
+        "experts are fused into QMoE"
+    )
+    # Only the shared expert's own gate/up/down projections remain as
+    # individually quantized MatMulNBits, one triple per layer.
+    assert matmul_nbits_2 >= num_hidden_layers * 3
 
 
 def test_official_weight_names_are_remapped():
@@ -266,10 +328,53 @@ def test_official_weight_names_are_remapped():
     result = model.preprocess_weights(weights)
     assert "model.embed_tokens.weight" in result
     assert "model.layers.0.self_attn.q_a_proj.weight" in result
-    assert "model.layers.0.mlp.experts.0.gate_proj.weight" in result
+    # Dense (unquantized) fallback: experts live under the shared MoELayer's
+    # ModuleList (mlp.moe.experts.*), unlike the QMoE path below.
+    assert "model.layers.0.mlp.moe.experts.0.gate_proj.weight" in result
     assert "model.layers.0.hc_attn_base" in result
     assert "model.layers.2.self_attn.attn_sink" in result
     assert "model.layers.2.self_attn.compressor.ape" in result
     assert "model.layers.2.self_attn.indexer.weights_proj.weight" in result
     assert "mtp.0.e_proj.weight" in result
     assert "mtp.0.hc_head_fn.weight" in result
+
+
+def test_preprocess_weights_rejects_hash_table_with_duplicate_expert_per_token():
+    """Fail loudly on a corrupted/malformed hash table.
+
+    QMoE export requires ``_scatter_selected_to_full``'s
+    distinct-experts-per-token invariant; a corrupted/malformed tid2eid
+    table must fail at weight load time instead of silently dropping a
+    contribution at inference time.
+    """
+    config = _tiny_config(
+        num_hidden_layers=1,
+        num_hash_layers=1,
+        num_experts_per_tok=2,
+        quantization=QuantizationConfig(bits=4, group_size=16, quant_method="gptq", sym=True),
+    )
+    model = DeepSeekV4CausalLMModel(config)
+    tid2eid = torch.stack(
+        [torch.arange(config.num_experts_per_tok, dtype=torch.int32)] * config.vocab_size
+    )  # every token starts distinct: row i = [0, 1]
+    tid2eid[5] = torch.tensor([1, 1], dtype=torch.int32)  # duplicate expert for token 5
+    weights = {"layers.0.ffn.gate.tid2eid": tid2eid}
+    with pytest.raises(ValueError, match="duplicate expert"):
+        model.preprocess_weights(weights)
+
+
+def test_preprocess_weights_accepts_hash_table_with_distinct_experts_per_token():
+    config = _tiny_config(
+        num_hidden_layers=1,
+        num_hash_layers=1,
+        num_experts_per_tok=2,
+        quantization=QuantizationConfig(bits=4, group_size=16, quant_method="gptq", sym=True),
+    )
+    model = DeepSeekV4CausalLMModel(config)
+    tid2eid = torch.stack(
+        [torch.arange(config.num_experts_per_tok, dtype=torch.int32)] * config.vocab_size
+    )  # every token distinct: row i = [0, 1]
+    tid2eid[5] = torch.tensor([1, 0], dtype=torch.int32)
+    weights = {"layers.0.ffn.gate.tid2eid": tid2eid}
+    result = model.preprocess_weights(weights)
+    assert torch.equal(result["model.layers.0.mlp.moe.gate.tid2eid"], tid2eid)

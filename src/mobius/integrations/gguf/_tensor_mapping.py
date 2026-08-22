@@ -251,9 +251,12 @@ _DEEPSEEK4_MAPPING: dict[str, str] = {
     ),
     "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
     "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
-    "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.mlp.gate",
-    "blk.{bid}.exp_probs_b": "model.layers.{bid}.mlp.gate",
-    "blk.{bid}.ffn_gate_tid2eid": "model.layers.{bid}.mlp.gate.tid2eid@",
+    # DeepSeekV4MoE now composes the shared MoELayer (mobius.components._moe),
+    # so the gate lives one level deeper at mlp.moe.gate.* than the bare
+    # mlp.gate.* used before the QMoE export change.
+    "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.mlp.moe.gate",
+    "blk.{bid}.exp_probs_b": "model.layers.{bid}.mlp.moe.gate",
+    "blk.{bid}.ffn_gate_tid2eid": "model.layers.{bid}.mlp.moe.gate.tid2eid@",
     "blk.{bid}.ffn_gate_exps": "model.layers.{bid}.mlp.experts.gate_proj",
     "blk.{bid}.ffn_up_exps": "model.layers.{bid}.mlp.experts.up_proj",
     "blk.{bid}.ffn_down_exps": "model.layers.{bid}.mlp.experts.down_proj",

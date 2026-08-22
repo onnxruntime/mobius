@@ -108,7 +108,21 @@ class DeepSeekMoEGate(nn.Module):
         return routing_weights, selected_experts
 
     def qmoe_routing(self, op: OpBuilder, hidden_states: ir.Value):
-        """Return distinct expert-selection and aggregation scores for QMoE."""
+        """Return distinct expert-selection and aggregation scores for QMoE.
+
+        CPU-only correctness: selection uses ``scores_for_choice`` (bias
+        for V3, unbiased for V2) but aggregation weights come from the
+        separate, unbiased ``scores`` tensor via QMoE's ``router_weights``
+        input -- honored by CPU QMoE but ignored by CUDA QMoE, which always
+        derives weights by softmax-top-k over ``router_probs``
+        (``scores_for_choice``) itself. There is no ``router_probs``
+        encoding that reproduces the correct (unbiased) weights through
+        CUDA's forced internal recompute. Tracked upstream at
+        https://github.com/microsoft/onnxruntime/pull/31570 (adds CUDA
+        ``router_weights`` support); until that lands, this path is
+        CPU-EP-correct only. See ``_scatter_selected_to_full`` in
+        ``mobius.components._moe`` for the same limitation on DeepSeek-V4.
+        """
         scores, scores_for_choice = self._routing_scores(op, hidden_states)
         # QMoE's router_probs/router_weights inputs share type constraint "T"
         # with hidden_states (see contrib_defs.cc). _routing_scores computes
