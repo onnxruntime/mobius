@@ -585,17 +585,13 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         print(f"Saved {name} to {path}")
 
     if getattr(args, "runtime", None) == "onnx-genai":
-        from mobius.integrations.gguf import write_gguf_tokenizer_json
-        from mobius.integrations.onnx_genai import write_onnx_genai_config
+        from mobius.integrations.gguf import write_gguf_runtime_package
 
-        # A GGUF checkpoint has no Hugging Face source directory, so the
-        # tokenizer is reconstructed from the file's embedded ggml metadata
-        # rather than copied from a `source`.
-        tokenizer_path = write_gguf_tokenizer_json(gguf_path, output_dir)
-        if tokenizer_path is not None:
-            print(f"  tokenizer: {tokenizer_path}")
-        artifacts = write_onnx_genai_config(
-            pkg, output_dir, config=getattr(pkg, "config", None), source=None
+        # The graph is already saved above; this adds the tokenizer (rebuilt
+        # from the GGUF's embedded ggml metadata, since a GGUF checkpoint has
+        # no Hugging Face source directory) and the inference metadata.
+        artifacts = write_gguf_runtime_package(
+            pkg, gguf_path, output_dir, save_model=False
         )
         for name, path in artifacts.items():
             print(f"  {name}: {path}")

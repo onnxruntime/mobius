@@ -166,6 +166,35 @@ def _write_gguf_with_bpe_tokenizer(path):
     writer.close()
 
 
+def _write_gguf_with_byte_level_tokenizer(path, *, pre: str | None = None):
+    """Write a minimal GGUF carrying a GPT-2 style byte-level BPE tokenizer.
+
+    Byte-level vocabularies encode a leading space as 'Ġ', not as '▁'.
+    """
+    from gguf import GGUFWriter
+
+    writer = GGUFWriter(str(path), "llama")
+    writer.add_context_length(8)
+    writer.add_embedding_length(8)
+    writer.add_block_count(1)
+    writer.add_head_count(1)
+    tokens = ["<pad>", "<eos>", "<bos>", "h", "i", "Ġ", "w", "hi", "Ġw"]
+    types = [3, 3, 3, 1, 1, 1, 1, 1, 1]
+    merges = ["h i", "Ġ w"]
+    writer.add_tokenizer_model("gpt2")
+    if pre is not None:
+        writer.add_tokenizer_pre(pre)
+    writer.add_token_list(tokens)
+    writer.add_token_types(types)
+    writer.add_token_merges(merges)
+    writer.add_bos_token_id(2)
+    writer.add_eos_token_id(1)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
 class TestReconstructTokenizerFromGgml:
     """Fallback reconstruction of tokenizer.json from GGUF ggml metadata."""
 
@@ -191,3 +220,75 @@ class TestReconstructTokenizerFromGgml:
         enc = tok.encode("hi")
         assert enc.ids[0] == 2  # <bos>
         assert tok.decode(enc.ids) == "hi"
+
+    def test_byte_level_tokenizer_preserves_spaces(self, tmp_path):
+        """A ``gpt2`` GGUF must not be decoded with SentencePiece semantics.
+
+        Byte-level vocabularies spell a leading space as 'Ġ'. Applying the
+        Metaspace pre-tokenizer/decoder (which looks for '▁') silently drops
+        every inter-word space, so the text round-trips as "hiw" rather than
+        "hi w" — a corruption that never raises.
+        """
+        from tokenizers import Tokenizer
+
+        from mobius.integrations.gguf._tokenizer import _reconstruct_tokenizer_from_ggml
+
+        gguf_path = tmp_path / "tok.gguf"
+        _write_gguf_with_byte_level_tokenizer(gguf_path)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+
+        result = _reconstruct_tokenizer_from_ggml(gguf_path, out_dir)
+
+        tok = Tokenizer.from_file(result)
+        assert tok.decode(tok.encode("hi w").ids) == "hi w"
+        # The space must be carried by the 'Ġw' piece, not dropped.
+        assert tok.encode("hi w").tokens == ["hi", "Ġw"]
+
+    def test_byte_level_family_split_rules_are_applied(self, tmp_path):
+        """``tokenizer.ggml.pre`` selects the family's split regexes.
+
+        The split rule is not implied by the byte-level model: families differ
+        on how digits, CJK, and punctuation are grouped. A mismatch still
+        round-trips, so it is only observable at the id level.
+        """
+        import json
+
+        from mobius.integrations.gguf._tokenizer import _reconstruct_tokenizer_from_ggml
+
+        gguf_path = tmp_path / "tok.gguf"
+        _write_gguf_with_byte_level_tokenizer(gguf_path, pre="hunyuan-dense")
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+
+        result = _reconstruct_tokenizer_from_ggml(gguf_path, out_dir)
+
+        spec = json.loads(Path(result).read_text(encoding="utf-8"))
+        pre_tok = spec["pre_tokenizer"]
+        assert pre_tok["type"] == "Sequence"
+        # Family splits run first, then a byte-level step with its own regex
+        # disabled so it does not re-split what the family rules produced.
+        assert [p["type"] for p in pre_tok["pretokenizers"]] == [
+            "Split",
+            "Split",
+            "Split",
+            "ByteLevel",
+        ]
+        assert pre_tok["pretokenizers"][-1]["use_regex"] is False
+
+    def test_unknown_byte_level_family_falls_back_to_gpt2_regex(self, tmp_path):
+        """An unlisted family keeps the stock GPT-2 behaviour rather than failing."""
+        import json
+
+        from mobius.integrations.gguf._tokenizer import _reconstruct_tokenizer_from_ggml
+
+        gguf_path = tmp_path / "tok.gguf"
+        _write_gguf_with_byte_level_tokenizer(gguf_path, pre="some-future-family")
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+
+        result = _reconstruct_tokenizer_from_ggml(gguf_path, out_dir)
+
+        spec = json.loads(Path(result).read_text(encoding="utf-8"))
+        assert spec["pre_tokenizer"]["type"] == "ByteLevel"
+        assert spec["pre_tokenizer"]["use_regex"] is True
