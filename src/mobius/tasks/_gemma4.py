@@ -375,19 +375,31 @@ class Gemma4TextCausalLMTask(ModelTask):
             )
 
         with prefill_prefix_pruning(self._prune_prefill_prefix):
-            logits, present_key_values = module(
+            result = module(
                 op,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
             )
+        if len(result) == 3:
+            logits, present_key_values, hidden_outputs = result
+        else:
+            logits, present_key_values = result
+            hidden_outputs = None
         builder.add_output(logits, "logits")
 
         if static:
             _register_hybrid_cache_outputs(builder, present_key_values, config)
         else:
             _register_kv_cache_outputs(builder, present_key_values)
+
+        # Post-final-norm hidden states (== HF hidden_states[-1]) requested via
+        # config.output_layer_indices, named hidden_states.{idx}. A borrowed-KV
+        # speculative drafter reads this as its folded-carry seed.
+        if hidden_outputs is not None and config.output_layer_indices:
+            for idx, hs in zip(config.output_layer_indices, hidden_outputs):
+                builder.add_output(hs, f"hidden_states.{idx}")
 
         return ModelPackage({"model": _make_model(graph)}, config=config)
 

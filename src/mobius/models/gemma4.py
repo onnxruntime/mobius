@@ -2366,6 +2366,17 @@ class Gemma4CausalLMModel(CausalLMModel):
         self.config = config
         self.model = Gemma4TextModel(config)
         self.lm_head = _make_lm_head(config)
+        # When set, additionally emit the post-final-norm hidden state (the
+        # lm_head input, == HF ``output_hidden_states=True`` ``hidden_states[-1]``)
+        # as ``hidden_states.{idx}`` for each requested index. A borrowed-KV
+        # speculative drafter (E2B-it-assistant) reads this as its folded-carry
+        # seed. gemma4 emits the FINAL post-norm hidden (not per-layer
+        # pre-norm), so the requested index should be the last decoder layer
+        # (``num_hidden_layers - 1``), matching the HF ``hidden_states[k+1]``
+        # convention where the last slot is the normalized output.
+        self.output_layer_indices: list[int] | None = (
+            list(getattr(config, "output_layer_indices", None) or []) or None
+        )
 
     def forward(
         self,
@@ -2375,7 +2386,7 @@ class Gemma4CausalLMModel(CausalLMModel):
         position_ids: ir.Value,
         past_key_values: list | None = None,
         inputs_embeds: ir.Value | None = None,
-    ) -> tuple[ir.Value, list]:
+    ) -> tuple[ir.Value, list] | tuple[ir.Value, list, list]:
         hidden_states, present_key_values = self.model(
             op,
             input_ids=input_ids,
@@ -2384,6 +2395,8 @@ class Gemma4CausalLMModel(CausalLMModel):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
         )
+        # ``hidden_states`` here is post-final-norm (``Gemma4TextModel`` applies
+        # ``self.norm`` before returning) — i.e. the exact lm_head input.
         hidden_states = _retain_last_sequence_token(op, hidden_states)
         logits = self.lm_head(op, hidden_states)
         # Optional final logit soft-capping (tanh scaled): logit_cap * tanh(x / logit_cap)
@@ -2392,6 +2405,14 @@ class Gemma4CausalLMModel(CausalLMModel):
                 op, self.config.final_logit_softcapping, self.config.dtype
             )
             logits = op.Mul(op.Tanh(op.Div(logits, cap)), cap)
+        if self.output_layer_indices:
+            # Emit the post-final-norm hidden (== HF hidden_states[-1]) as
+            # hidden_states.{idx}. The task registers it via
+            # config.output_layer_indices. Borrowed-KV drafters consume it as
+            # the folded-carry seed. Same tensor for each requested index
+            # because gemma4 exposes only the final normalized hidden.
+            hidden_outputs = [hidden_states for _ in self.output_layer_indices]
+            return logits, present_key_values, hidden_outputs
         return logits, present_key_values
 
     def preprocess_weights(
