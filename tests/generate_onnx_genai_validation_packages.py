@@ -383,6 +383,11 @@ def _executable_diffusion_package() -> ModelPackage:
         vae_builder.op.Constant(value_ints=[3]),
         vae_builder.op.Constant(value_ints=[1]),
     )
+    # Standard VAE decoder semantic: bound the decoded pixels to [-1, 1] with
+    # Tanh so the graph's numeric output actually honors the workflow
+    # metadata's declared `value_range: negative_one_to_one` for this
+    # synthetic conformance package (not just a documentation claim).
+    image = vae_builder.op.Tanh(image)
     vae_builder.add_output(
         _typed(
             image,
