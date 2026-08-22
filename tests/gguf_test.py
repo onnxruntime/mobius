@@ -544,20 +544,38 @@ class TestCLIBuildGGUF:
             )
         assert exc_info.value.code == 2
 
-    def test_ort_genai_runtime_is_rejected_before_artifacts(self, tmp_path):
-        """build-gguf must not silently ignore an ORT GenAI runtime request."""
+    def test_ort_genai_runtime_is_forwarded_to_package_writer(self, tmp_path):
+        """build-gguf forwards the selected runtime after saving the graph."""
         from mobius.__main__ import main
 
+        package = mock.MagicMock()
+        package.__iter__.return_value = iter(())
         output_dir = tmp_path / "output"
-        with pytest.raises(SystemExit, match="does not yet support --runtime ort-genai"):
+        with (
+            mock.patch(
+                "mobius.integrations.gguf.build_from_gguf",
+                return_value=package,
+            ),
+            mock.patch(
+                "mobius.integrations.gguf.write_gguf_runtime_package",
+                return_value={"genai_config": str(output_dir / "genai_config.json")},
+            ) as write_runtime,
+        ):
             main(
                 [
                     "build-gguf",
-                    str(tmp_path / "not-downloaded.gguf"),
+                    str(tmp_path / "model.gguf"),
                     "--runtime",
                     "ort-genai",
                     "--output",
                     str(output_dir),
                 ]
             )
-        assert not output_dir.exists()
+
+        write_runtime.assert_called_once_with(
+            package,
+            str(tmp_path / "model.gguf"),
+            str(output_dir),
+            runtime="ort-genai",
+            save_model=False,
+        )

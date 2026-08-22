@@ -361,7 +361,7 @@ pipeline:
               rank: 2
               shape:
               - batch
-              - history
+              - next_history
               batch_layout:
                 kind: request_aligned
                 axis: 0

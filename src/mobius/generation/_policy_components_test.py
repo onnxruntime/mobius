@@ -76,6 +76,20 @@ def _run_model(model, tmp_path, feeds):
     return session.run(None, feeds)
 
 
+def test_tensor_clamp_can_cast_bfloat16_output_to_float32(tmp_path):
+    component = build_tensor_clamp(
+        ir.DataType.BFLOAT16,
+        ["batch", "channels"],
+        minimum=-1.0,
+        maximum=1.0,
+        output_dtype=ir.DataType.FLOAT,
+    )
+    assert component.model.graph.outputs[0].dtype == ir.DataType.FLOAT
+    path = tmp_path / "bfloat16_tensor_clamp.onnx"
+    ir.save(component.model, path)
+    ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+
+
 def test_grammar_logits_processor_applies_mask_and_forced_tokens(tmp_path):
     logits = np.array([[1.0, 4.0, 3.0], [5.0, 2.0, 1.0]], np.float32)
     (tokens,) = _run(
@@ -580,6 +594,18 @@ def test_batched_policy_v2_ports_use_exact_public_shapes():
         assert {port.name: [str(dim) for dim in port.shape] for port in ports} == expected[
             name
         ]
+    assert {
+        port.name: port.dtype
+        for component in components.values()
+        for port in component.model.graph.outputs
+    } == {
+        "token": ir.DataType.INT64,
+        "next_counter": ir.DataType.INT64,
+        "done": ir.DataType.BOOL,
+        "next_active": ir.DataType.BOOL,
+        "continue": ir.DataType.BOOL,
+        "next": ir.DataType.INT64,
+    }
 
 
 def test_seeded_sampler_applies_request_top_k(tmp_path):
@@ -792,6 +818,68 @@ def test_ddim_solver_runtime_parity_on_a_video_latent(tmp_path):
         + np.sqrt(1 - alpha_prev) * estimate
     )
     np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_ddim_solver_v_prediction_runtime_parity(tmp_path):
+    dims = ["batch", "frames", "channels", "height", "width"]
+    sample = np.linspace(-1.5, 1.5, 24, dtype=np.float32).reshape(1, 3, 2, 2, 2)
+    velocity = np.full_like(sample, 0.25)
+    schedule = np.array([0.4, 0.9, 1.0], np.float32)
+    (actual,) = _run(
+        build_ddim_solver_step(latent_dims=dims, prediction_type="v_prediction"),
+        tmp_path,
+        {
+            "sample": sample,
+            "derivative": velocity,
+            "step": np.array([0], np.int64),
+            "schedule": schedule,
+        },
+    )
+    alpha, alpha_prev = schedule[:2]
+    beta = 1 - alpha
+    pred_original = np.sqrt(alpha) * sample - np.sqrt(beta) * velocity
+    pred_epsilon = np.sqrt(alpha) * velocity + np.sqrt(beta) * sample
+    expected = np.sqrt(alpha_prev) * pred_original + np.sqrt(1 - alpha_prev) * pred_epsilon
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_ddim_solver_sample_prediction_runtime_parity(tmp_path):
+    dims = ["batch", "frames", "channels", "height", "width"]
+    sample = np.linspace(-1.0, 1.0, 24, dtype=np.float32).reshape(1, 3, 2, 2, 2)
+    pred_original = np.full_like(sample, 0.25)
+    schedule = np.array([0.4, 0.9, 1.0], np.float32)
+    (actual,) = _run(
+        build_ddim_solver_step(latent_dims=dims, prediction_type="sample"),
+        tmp_path,
+        {
+            "sample": sample,
+            "derivative": pred_original,
+            "step": np.array([0], np.int64),
+            "schedule": schedule,
+        },
+    )
+    alpha, alpha_prev = schedule[:2]
+    pred_epsilon = (sample - np.sqrt(alpha) * pred_original) / np.sqrt(1 - alpha)
+    expected = np.sqrt(alpha_prev) * pred_original + np.sqrt(1 - alpha_prev) * pred_epsilon
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_ddim_solver_sample_prediction_handles_unit_alpha(tmp_path):
+    sample = np.full((1, 1, 1, 1, 1), 0.25, np.float32)
+    (actual,) = _run(
+        build_ddim_solver_step(
+            latent_dims=["batch", "frames", "channels", "height", "width"],
+            prediction_type="sample",
+        ),
+        tmp_path,
+        {
+            "sample": sample,
+            "derivative": sample,
+            "step": np.array([0], np.int64),
+            "schedule": np.array([1.0, 1.0], np.float32),
+        },
+    )
+    np.testing.assert_allclose(actual, sample)
 
 
 def test_ddim_solver_clips_the_predicted_clean_latent(tmp_path):
@@ -1041,6 +1129,25 @@ def test_guidance_combine_extrapolates_per_row(tmp_path):
         + np.array([7.5, 0.0], np.float32).reshape(2, 1, 1, 1) * (conditional - unconditional),
         rtol=1e-6,
     )
+
+
+def test_guidance_combine_broadcasts_over_video_latents(tmp_path):
+    dims = ["batch", "frames", "channels", "height", "width"]
+    unconditional = np.ones((2, 3, 2, 2, 2), dtype=np.float32)
+    conditional = np.full_like(unconditional, 3.0)
+    (guided,) = _run(
+        build_guidance_combine(latent_dims=dims),
+        tmp_path,
+        {
+            "unconditional": unconditional,
+            "conditional": conditional,
+            "scale": np.array([2.0, 0.5], np.float32),
+        },
+    )
+    expected = unconditional + np.array([2.0, 0.5], np.float32).reshape(2, 1, 1, 1, 1) * (
+        conditional - unconditional
+    )
+    np.testing.assert_allclose(guided, expected, rtol=1e-6)
 
 
 def test_multistep_solver_matches_dpmsolverpp_second_order(tmp_path):

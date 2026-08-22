@@ -100,10 +100,11 @@ pipeline:
             kind: request_aligned
             axis: 0
         role:
-          kind: opaque
+          kind: runtime
+          version: '1.0'
+          role: negative_prompt_tokens
         source:
-          kind: application
-          name: negative_input_ids
+          kind: request
         required: true
         externally_suppliable: true
       request.guidance_scale:
@@ -116,10 +117,11 @@ pipeline:
             kind: request_aligned
             axis: 0
         role:
-          kind: opaque
+          kind: runtime
+          version: '1.0'
+          role: guidance_scale
         source:
-          kind: application
-          name: guidance_scale
+          kind: request
         required: false
         default: 7.5
       package.loop_0_active:
@@ -512,6 +514,35 @@ pipeline:
             conditional: conditional
             scale: scale
             estimate: estimate
+      image_output_clamp:
+        implementation:
+          kind: onnx
+          artifact: policies/image_output_clamp.onnx
+        ports:
+          inputs:
+            tensor:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - axis_1
+              - axis_2
+              - axis_3
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            clamped:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - axis_1
+              - axis_2
+              - axis_3
+              batch_layout:
+                kind: request_aligned
+                axis: 0
       latent_row_shape:
         implementation:
           kind: onnx
@@ -767,7 +798,13 @@ pipeline:
       inputs:
         latent: diffusion.decoder_input
       outputs:
-        image: vae.image
+        image: vae.raw_image
+    - kind: invoke
+      component: image_output_clamp
+      inputs:
+        tensor: vae.raw_image
+      outputs:
+        clamped: vae.image
     - kind: emit
       value: latent_state
       output: latent

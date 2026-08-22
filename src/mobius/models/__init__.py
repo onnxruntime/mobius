@@ -162,6 +162,7 @@ __all__ = [
     "StarCoder2CausalLMModel",
     "T2IAdapterModel",
     "T5ForConditionalGeneration",
+    "T5EncoderModel",
     "UNet2DConditionModel",
     "load_unet_lora_safetensors",
     "remap_diffusers_unet_lora",
@@ -352,7 +353,7 @@ from mobius.models.sensevoice_small import SenseVoiceSmallModel
 from mobius.models.smollm import SmolLM3CausalLMModel
 from mobius.models.sortformer import SortformerConfig, SortformerDiarizationModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
-from mobius.models.t5 import T5ForConditionalGeneration
+from mobius.models.t5 import T5EncoderModel, T5ForConditionalGeneration
 from mobius.models.unet import (
     UNet2DConditionModel,
     load_unet_lora_safetensors,
