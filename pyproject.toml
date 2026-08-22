@@ -60,6 +60,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "mobius.upstream_patches" = ["data/*/*/*.patch", "data/*/*/*.json", "data/*/*/*.md"]
+"mobius.integrations.diffusers" = ["workflow_contracts/*.json"]
 
 [tool.setuptools.dynamic]
 version = { attr = "mobius.__version__" }

@@ -179,7 +179,7 @@ pipeline:
         source:
           kind: literal
         required: false
-        default: 10240
+        default: 64
       package.carry_length:
         contract:
           dtype: int64

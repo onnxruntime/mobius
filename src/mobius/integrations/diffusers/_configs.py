@@ -109,6 +109,7 @@ class DiffusersPipelineConfig:
     component_configs: dict[str, dict]
     scheduler_config: dict
     processor_config: dict
+    workflow_config: dict | None = None
     model_type: str = "diffusers"
 
 

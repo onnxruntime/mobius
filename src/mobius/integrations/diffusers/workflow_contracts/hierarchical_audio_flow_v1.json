@@ -1,0 +1,84 @@
+{
+  "kind": "hierarchical_audio",
+  "source": {
+    "repository": "huggingface/diffusers",
+    "revision": "dafe3733fcfdbf3c48915fe77be3aef65b5d6a2d",
+    "files": [
+      "src/diffusers/modular_pipelines/minimax_music3/encoders.py",
+      "src/diffusers/modular_pipelines/minimax_music3/before_denoise.py",
+      "src/diffusers/modular_pipelines/minimax_music3/denoise.py",
+      "src/diffusers/modular_pipelines/minimax_music3/decoders.py"
+    ]
+  },
+  "semantic_vocabulary_size": 16384,
+  "semantic_guidance_scale": 1.5,
+  "local_guidance_scale": 1.5,
+  "flow_guidance_scale": 1.7,
+  "sampling_top_k": 50,
+  "chunk_frames": 200,
+  "chunk_hop": 100,
+  "flow_steps": 30,
+  "carry_length": 172,
+  "crop_left_latents": 86,
+  "crop_right_latents": 258,
+  "max_prompt_tokens": 5000,
+  "max_audio_frames": 9000,
+  "target_sample_rate": 32000,
+  "tokens": {
+    "stop": "<|audio_end|>",
+    "unconditional": "<|audio_cfg|>"
+  },
+  "prompt_segments": [
+    {
+      "literal": "<|im_start|><|caption_start|>"
+    },
+    {
+      "field": "instructions",
+      "transforms": [
+        {
+          "kind": "rewrite_delimited_tags",
+          "open": "<|",
+          "close": "|>"
+        },
+        {
+          "kind": "strip_markdown"
+        },
+        {
+          "kind": "collapse_newlines"
+        }
+      ]
+    },
+    {
+      "literal": "<|caption_end|><|lyrics_start|>[start]\n"
+    },
+    {
+      "field": "input",
+      "transforms": [
+        {
+          "kind": "keep_leading_bracket_tags"
+        },
+        {
+          "kind": "replace",
+          "from": "] ",
+          "to": "]\n"
+        },
+        {
+          "kind": "replace",
+          "from": " [",
+          "to": "\n["
+        },
+        {
+          "kind": "replace",
+          "from": " ^ ",
+          "to": "\n"
+        },
+        {
+          "kind": "lowercase_bracket_tags"
+        }
+      ]
+    },
+    {
+      "literal": "<|lyrics_end|><|im_end|><|audio_start|>"
+    }
+  ]
+}

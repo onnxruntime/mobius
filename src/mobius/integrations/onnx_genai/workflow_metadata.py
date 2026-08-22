@@ -493,26 +493,93 @@ def _invoke(
     }
 
 
-def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
-    """Build canonical nested AR/RVQ/flow/vocoder metadata for hierarchical audio."""
-    required = {
-        "language_model",
-        "language_model_embedding",
-        "language_model_semantic_embedding",
-        "rvq_depth_decoder",
-        "rvq_depth_decoder_projection",
-        "rvq_depth_decoder_embedding",
-        "rvq_depth_decoder_feedback_embedding",
-        "rvq_depth_decoder_heads",
+def _hierarchical_audio_config(pkg: Any) -> tuple[dict[str, str], dict[str, Any]]:
+    """Return the graph-role map and validated execution contract."""
+    package_config = getattr(pkg, "config", None)
+    config = getattr(package_config, "workflow_config", None)
+    if not isinstance(config, dict) or config.get("kind") != "hierarchical_audio":
+        raise ValueError(
+            "hierarchical audio metadata requires pkg.config.workflow_config "
+            "with kind='hierarchical_audio'"
+        )
+    roles = config.get("components")
+    if not isinstance(roles, dict):
+        raise TypeError("hierarchical audio workflow_config.components must be an object")
+    required_roles = {
+        "global_decoder",
+        "global_embedding",
+        "semantic_embedding",
+        "local_decoder",
+        "local_projection",
+        "local_embedding",
+        "local_feedback_embedding",
+        "local_heads",
         "condition_encoder",
-        "transformer",
+        "flow_transformer",
         "vocoder",
     }
-    missing = sorted(required.difference(pkg.keys()))
-    if missing:
+    if missing := sorted(required_roles.difference(roles)):
+        raise ValueError(f"hierarchical audio workflow is missing component roles: {missing}")
+    if len(set(roles.values())) != len(roles):
+        raise ValueError("hierarchical audio component roles must resolve to distinct graphs")
+    if missing := sorted(set(roles.values()).difference(pkg.keys())):
         raise ValueError(f"hierarchical audio workflow is missing components: {missing}")
 
-    decoder = pkg["language_model"]
+    required_values = {
+        "semantic_vocabulary_start",
+        "semantic_vocabulary_size",
+        "stop_token_id",
+        "unconditional_token_id",
+        "semantic_guidance_scale",
+        "local_guidance_scale",
+        "flow_guidance_scale",
+        "sampling_top_k",
+        "chunk_frames",
+        "chunk_hop",
+        "flow_steps",
+        "carry_length",
+        "crop_left_latents",
+        "crop_right_latents",
+        "max_prompt_tokens",
+        "max_audio_frames",
+        "global_context",
+        "target_sample_rate",
+        "prompt_segments",
+    }
+    if missing := sorted(required_values.difference(config)):
+        raise ValueError(f"hierarchical audio workflow_config is missing fields: {missing}")
+    positive_integer_fields = required_values.difference(
+        {
+            "semantic_guidance_scale",
+            "local_guidance_scale",
+            "flow_guidance_scale",
+            "prompt_segments",
+        }
+    )
+    for field in positive_integer_fields:
+        value = config[field]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"hierarchical audio workflow_config.{field} must be >= 1")
+    for field in (
+        "semantic_guidance_scale",
+        "local_guidance_scale",
+        "flow_guidance_scale",
+    ):
+        if not isinstance(config[field], (int, float)) or config[field] <= 0:
+            raise ValueError(f"hierarchical audio workflow_config.{field} must be positive")
+    if not isinstance(config["prompt_segments"], list) or not config["prompt_segments"]:
+        raise ValueError(
+            "hierarchical audio workflow_config.prompt_segments must be a non-empty list"
+        )
+    if config["chunk_hop"] > config["chunk_frames"]:
+        raise ValueError("hierarchical audio chunk_hop cannot exceed chunk_frames")
+    return roles, config
+
+
+def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
+    """Build canonical nested AR/RVQ/flow/vocoder metadata for hierarchical audio."""
+    roles, config = _hierarchical_audio_config(pkg)
+    decoder = pkg[roles["global_decoder"]]
     decoder_inputs = {value.name: value for value in decoder.graph.inputs}
     decoder_outputs = {value.name: value for value in decoder.graph.outputs}
     cache_pairs = _model_cache_pairs(decoder)
@@ -525,10 +592,61 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
         raise TypeError("global decoder hidden size must be statically known")
     dtype = embeds.dtype
     dtype_name = _contract(embeds)["dtype"]
-    fused_hidden_size = hidden_size * 8
-    latent_channels = 128
-    condition_size = 2048
-    residual_codebooks = 7
+    local_heads = pkg[roles["local_heads"]]
+    heads_output = next(iter(local_heads.graph.outputs))
+    if heads_output.shape is None:
+        raise ValueError("local heads must expose a static codebook/vocabulary shape")
+    heads_shape = list(heads_output.shape)
+    residual_codebooks, codebook_size = heads_shape[0], heads_shape[-1]
+    if not isinstance(residual_codebooks, int) or not isinstance(codebook_size, int):
+        raise TypeError("local heads codebook count and vocabulary size must be static")
+    num_codebooks = residual_codebooks + 1
+    fused_hidden_size = hidden_size * num_codebooks
+    condition_encoder = pkg[roles["condition_encoder"]]
+    condition_input = next(iter(condition_encoder.graph.inputs))
+    if list(condition_input.shape or [])[-1:] != [fused_hidden_size]:
+        raise ValueError(
+            "condition encoder input width must equal global hidden size times codebooks"
+        )
+
+    flow = pkg[roles["flow_transformer"]]
+    flow_inputs = {value.name: value for value in flow.graph.inputs}
+    latent_channels = list(flow_inputs["hidden_states"].shape or [])[-2]
+    condition_size = list(flow_inputs["encoder_hidden_states"].shape or [])[-1]
+    if not isinstance(latent_channels, int) or not isinstance(condition_size, int):
+        raise TypeError("flow latent channels and condition width must be static")
+    condition_output = next(iter(condition_encoder.graph.outputs))
+    if list(condition_output.shape or [])[-1:] != [condition_size]:
+        raise ValueError("condition encoder output width must match flow condition width")
+    vocoder = pkg[roles["vocoder"]]
+    waveform_output = next(iter(vocoder.graph.outputs))
+    waveform_shape = list(waveform_output.shape or [])
+    output_channels = waveform_shape[-2]
+    if not isinstance(output_channels, int):
+        raise TypeError("vocoder output channel count must be static")
+    vocoder_input_channels = list(next(iter(vocoder.graph.inputs)).shape or [])[-2]
+    if vocoder_input_channels != latent_channels:
+        raise ValueError("vocoder latent channels must match flow latent channels")
+    logits_vocab = list(decoder_outputs["logits"].shape or [])[-1]
+    vocabulary_end = config["semantic_vocabulary_start"] + config["semantic_vocabulary_size"]
+    if (
+        not isinstance(logits_vocab, int)
+        or max(vocabulary_end, config["stop_token_id"] + 1) > logits_vocab
+    ):
+        raise ValueError("semantic vocabulary and stop token must fit global logits")
+    vocoder_config = getattr(pkg.config, "component_configs", {}).get(roles["vocoder"], {})
+    condition_config = getattr(pkg.config, "component_configs", {}).get(
+        roles["condition_encoder"], {}
+    )
+    source_sample_rate = vocoder_config.get("sampling_rate")
+    latent_hop_length = condition_config.get("output_hop_length")
+    if not isinstance(source_sample_rate, int) or source_sample_rate < 1:
+        raise ValueError("vocoder component config must declare sampling_rate")
+    if not isinstance(latent_hop_length, int) or latent_hop_length < 1:
+        raise ValueError("condition encoder config must declare output_hop_length")
+    for field in ("input_sampling_rate", "input_hop_length"):
+        if not isinstance(condition_config.get(field), int) or condition_config[field] < 1:
+            raise ValueError(f"condition encoder config must declare positive {field}")
 
     pkg.add_policy_component(
         "global_initializer",
@@ -556,11 +674,11 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
     pkg.add_policy_component(
         "guided_vocabulary",
         build_guided_vocabulary_slice(
-            vocabulary_start=151675,
-            vocabulary_size=16384,
-            stop_token_id=151670,
-            guidance_scale=1.5,
-            conditional_top_k=50,
+            vocabulary_start=config["semantic_vocabulary_start"],
+            vocabulary_size=config["semantic_vocabulary_size"],
+            stop_token_id=config["stop_token_id"],
+            guidance_scale=config["semantic_guidance_scale"],
+            conditional_top_k=config["sampling_top_k"],
             dtype=decoder_outputs["logits"].dtype,
         ),
     )
@@ -568,9 +686,9 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
     pkg.add_policy_component(
         "candidate_map",
         build_candidate_token_map(
-            vocabulary_start=151675,
-            vocabulary_size=16384,
-            stop_token_id=151670,
+            vocabulary_start=config["semantic_vocabulary_start"],
+            vocabulary_size=config["semantic_vocabulary_size"],
+            stop_token_id=config["stop_token_id"],
         ),
     )
     pkg.add_policy_component("continue_predicate", build_request_continue())
@@ -585,11 +703,11 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
     pkg.add_policy_component("codebook_index", build_scalar_integer_add())
     pkg.add_policy_component(
         "local_logits",
-        build_local_codebook_select(dtype, guidance_scale=1.5),
+        build_local_codebook_select(dtype, guidance_scale=config["local_guidance_scale"]),
     )
     pkg.add_policy_component(
         "embedding_id",
-        build_codebook_embedding_id(codebook_size=1024),
+        build_codebook_embedding_id(codebook_size=codebook_size),
     )
     pkg.add_policy_component(
         "local_append",
@@ -597,7 +715,7 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
     )
     pkg.add_policy_component(
         "frame_append",
-        build_frame_hidden_append(dtype, hidden_size=hidden_size, num_codebooks=8),
+        build_frame_hidden_append(dtype, hidden_size=hidden_size, num_codebooks=num_codebooks),
     )
     pkg.add_policy_component(
         "acoustic_frame",
@@ -616,8 +734,8 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
         build_chunk_plan(
             dtype,
             fused_hidden_size=fused_hidden_size,
-            chunk_frames=200,
-            chunk_hop=100,
+            chunk_frames=config["chunk_frames"],
+            chunk_hop=config["chunk_hop"],
             latent_channels=latent_channels,
             condition_size=condition_size,
         ),
@@ -627,8 +745,8 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
         build_chunk_slice(
             dtype,
             fused_hidden_size=fused_hidden_size,
-            chunk_frames=200,
-            chunk_hop=100,
+            chunk_frames=config["chunk_frames"],
+            chunk_hop=config["chunk_hop"],
         ),
     )
     pkg.add_policy_component(
@@ -648,7 +766,9 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
     )
     pkg.add_policy_component(
         "flow_schedule",
-        build_schedule_constant([index / 30.0 for index in range(31)]),
+        build_schedule_constant(
+            [index / config["flow_steps"] for index in range(config["flow_steps"] + 1)]
+        ),
     )
     pkg.add_policy_component("flow_timestep", build_schedule_lookup(dtype))
     pkg.add_policy_component(
@@ -661,7 +781,11 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
     )
     pkg.add_policy_component(
         "flow_guidance",
-        build_flow_guidance(dtype, latent_channels=latent_channels, guidance_scale=1.7),
+        build_flow_guidance(
+            dtype,
+            latent_channels=latent_channels,
+            guidance_scale=config["flow_guidance_scale"],
+        ),
     )
     pkg.add_policy_component(
         "flow_solver",
@@ -673,16 +797,16 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
             dtype,
             latent_channels=latent_channels,
             condition_size=condition_size,
-            carry_length=172,
+            carry_length=config["carry_length"],
         ),
     )
     pkg.add_policy_component(
         "waveform_stitch",
         build_waveform_stitch(
-            dtype=next(iter(pkg["vocoder"].graph.outputs)).dtype,
-            latent_hop_length=512,
-            crop_left_latents=86,
-            crop_right_latents=258,
+            dtype=waveform_output.dtype,
+            latent_hop_length=latent_hop_length,
+            crop_left_latents=config["crop_left_latents"],
+            crop_right_latents=config["crop_right_latents"],
         ),
     )
 
@@ -691,7 +815,7 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
     batch_bool = _request_aligned({"dtype": "bool", "rank": 1, "shape": ["batch"]})
     scalar_int = {"dtype": "int64", "rank": 0, "shape": []}
     control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
-    prompt_contract = _contract(pkg["language_model_embedding"].graph.inputs[0])
+    prompt_contract = _contract(pkg[roles["global_embedding"]].graph.inputs[0])
     prompt_contract["batch_layout"] = {
         "kind": "request_expanded",
         "axis": 0,
@@ -744,7 +868,7 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
-            "default": 50,
+            "default": config["sampling_top_k"],
         },
         "package.top_p": {
             "contract": batch_float,
@@ -779,42 +903,45 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
-            "default": 7,
+            "default": residual_codebooks,
         },
         "package.local_context": {
             "contract": scalar_int,
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
-            "default": 9,
+            "default": num_codebooks + 1,
         },
         "package.global_context": {
             "contract": scalar_int,
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
-            "default": 10240,
+            "default": config["global_context"],
         },
         "package.carry_length": {
             "contract": scalar_int,
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
-            "default": 172,
+            "default": config["carry_length"],
         },
         "package.max_waveform_samples": {
             "contract": scalar_int,
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
-            "default": 15_876_000,
+            "default": config["max_audio_frames"]
+            * source_sample_rate
+            * condition_config["input_hop_length"]
+            // condition_config["input_sampling_rate"],
         },
         "package.flow_steps": {
             "contract": scalar_int,
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
-            "default": 30,
+            "default": config["flow_steps"],
         },
         "package.flow_rng_offset": {
             "contract": batch_int,
@@ -831,14 +958,28 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
         prefix: str,
         output_bindings: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        model = pkg[name]
+        role_by_logical_name = {
+            "language_model": "global_decoder",
+            "language_model_embedding": "global_embedding",
+            "language_model_semantic_embedding": "semantic_embedding",
+            "rvq_depth_decoder": "local_decoder",
+            "rvq_depth_decoder_projection": "local_projection",
+            "rvq_depth_decoder_embedding": "local_embedding",
+            "rvq_depth_decoder_feedback_embedding": "local_feedback_embedding",
+            "rvq_depth_decoder_heads": "local_heads",
+            "condition_encoder": "condition_encoder",
+            "transformer": "flow_transformer",
+            "vocoder": "vocoder",
+        }
+        component = roles[role_by_logical_name[name]]
+        model = pkg[component]
         for value in model.graph.inputs:
             if value.name not in bindings:
-                raise ValueError(f"{name} input {value.name!r} is not bound")
+                raise ValueError(f"{component} input {value.name!r} is not bound")
         outputs = dict(output_bindings or {})
         for value in model.graph.outputs:
             outputs.setdefault(value.name, f"{prefix}.{value.name}")
-        return _invoke(name, bindings, outputs)
+        return _invoke(component, bindings, outputs)
 
     sample_inputs = {
         "logits": "frame.candidate_logits",
@@ -1575,26 +1716,42 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
             "recurrence": {"kind": "invariant"},
         },
         "flow_latents": {
-            "contract": {"dtype": dtype_name, "rank": 3, "shape": [1, 128, "latent_length"]},
+            "contract": {
+                "dtype": dtype_name,
+                "rank": 3,
+                "shape": [1, latent_channels, "latent_length"],
+            },
             "scope": "invocation",
             "initializer": "chunk.initial_noise",
             "recurrence": {"kind": "invariant"},
         },
         "previous_latent": {
-            "contract": {"dtype": dtype_name, "rank": 3, "shape": [1, 128, "carry_length"]},
+            "contract": {
+                "dtype": dtype_name,
+                "rank": 3,
+                "shape": [1, latent_channels, "carry_length"],
+            },
             "scope": "invocation",
             "initializer": "audio.initial_previous_latent",
             "recurrence": {"kind": "bounded", "axis": 2, "max": "package.carry_length"},
         },
         "previous_condition": {
-            "contract": {"dtype": dtype_name, "rank": 3, "shape": [1, "carry_length", 2048]},
+            "contract": {
+                "dtype": dtype_name,
+                "rank": 3,
+                "shape": [1, "carry_length", condition_size],
+            },
             "scope": "invocation",
             "initializer": "audio.initial_previous_condition",
             "recurrence": {"kind": "bounded", "axis": 1, "max": "package.carry_length"},
         },
         "waveform": {
             "contract": _request_aligned(
-                {"dtype": "float32", "rank": 3, "shape": ["batch", 2, "samples"]}
+                {
+                    "dtype": _contract(waveform_output)["dtype"],
+                    "rank": 3,
+                    "shape": ["batch", output_channels, "samples"],
+                }
             ),
             "scope": "invocation",
             "initializer": "audio.initial_waveform",
@@ -1658,16 +1815,20 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
         "outputs": {
             "audio": {
                 "contract": _request_aligned(
-                    {"dtype": "float32", "rank": 3, "shape": ["batch", 2, "samples"]}
+                    {
+                        "dtype": _contract(waveform_output)["dtype"],
+                        "rank": 3,
+                        "shape": ["batch", output_channels, "samples"],
+                    }
                 ),
                 "role": "audio",
                 "stage": "pre_adapter",
                 "media": {
                     "container": "wav",
                     "encoding": "pcm_s16_le",
-                    "sample_rate_hz": 32000,
-                    "source_sample_rate_hz": 44100,
-                    "channels": 2,
+                    "sample_rate_hz": config["target_sample_rate"],
+                    "source_sample_rate_hz": source_sample_rate,
+                    "channels": output_channels,
                     "delivery": "buffered",
                 },
             }
@@ -1690,7 +1851,7 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
                             "evictable_prefix": False,
                         },
                         "ports": {
-                            "language_model": {
+                            roles["global_decoder"]: {
                                 f"global_cache_{index}": {
                                     "input": past.name,
                                     "output": present.name,
@@ -1738,38 +1899,17 @@ def write_hierarchical_audio_workflow_metadata(pkg: Any, output_dir: str) -> str
     # neural components before metadata generation, so persist these newly
     # registered artifacts here rather than publishing dangling references.
     pkg.save_policy_components(output_dir)
+    _, config = _hierarchical_audio_config(pkg)
     processor = {
-        "max_input_tokens": 5000,
-        "max_output_units": 9000,
+        "max_input_tokens": config["max_prompt_tokens"],
+        "max_output_units": config["max_audio_frames"],
         "state_advance_units": 1,
         "guidance_rows": {
-            "unconditional_token_id": 151654,
-            "replace_from": 1,
-            "preserve_trailing": 2,
+            "unconditional_token_id": config["unconditional_token_id"],
+            "replace_from": config.get("unconditional_replace_from", 1),
+            "preserve_trailing": config.get("unconditional_preserve_trailing", 2),
         },
-        "segments": [
-            {"literal": "<|im_start|><|caption_start|>"},
-            {
-                "field": "instructions",
-                "transforms": [
-                    {"kind": "rewrite_delimited_tags", "open": "<|", "close": "|>"},
-                    {"kind": "strip_markdown"},
-                    {"kind": "collapse_newlines"},
-                ],
-            },
-            {"literal": "<|caption_end|><|lyrics_start|>[start]\n"},
-            {
-                "field": "input",
-                "transforms": [
-                    {"kind": "keep_leading_bracket_tags"},
-                    {"kind": "replace", "from": "] ", "to": "]\n"},
-                    {"kind": "replace", "from": " [", "to": "\n["},
-                    {"kind": "replace", "from": " ^ ", "to": "\n"},
-                    {"kind": "lowercase_bracket_tags"},
-                ],
-            },
-            {"literal": "<|lyrics_end|><|im_end|><|audio_start|>"},
-        ],
+        "segments": config["prompt_segments"],
     }
     with open(
         os.path.join(output_dir, "speech_processor.json"), "w", encoding="utf-8"

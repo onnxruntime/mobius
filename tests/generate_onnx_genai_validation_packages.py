@@ -4,6 +4,7 @@ import argparse
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import onnx_ir as ir
@@ -151,6 +152,77 @@ def _hierarchical_audio_package() -> ModelPackage:
             "transformer": transformer["model"],
             "vocoder": vocoder["model"],
         }
+    )
+    package.config = SimpleNamespace(
+        component_configs={
+            "condition_encoder": {
+                "input_sampling_rate": condition_config.input_sampling_rate,
+                "input_hop_length": condition_config.input_hop_length,
+                "output_hop_length": condition_config.output_hop_length,
+            },
+            "vocoder": {"sampling_rate": vocoder_config.sampling_rate},
+        },
+        workflow_config={
+            "kind": "hierarchical_audio",
+            "components": {
+                "global_decoder": "language_model",
+                "global_embedding": "language_model_embedding",
+                "semantic_embedding": "language_model_semantic_embedding",
+                "local_decoder": "rvq_depth_decoder",
+                "local_projection": "rvq_depth_decoder_projection",
+                "local_embedding": "rvq_depth_decoder_embedding",
+                "local_feedback_embedding": "rvq_depth_decoder_feedback_embedding",
+                "local_heads": "rvq_depth_decoder_heads",
+                "condition_encoder": "condition_encoder",
+                "flow_transformer": "transformer",
+                "vocoder": "vocoder",
+            },
+            "semantic_vocabulary_start": 151675,
+            "semantic_vocabulary_size": 16384,
+            "stop_token_id": 151670,
+            "unconditional_token_id": 151654,
+            "semantic_guidance_scale": 1.5,
+            "local_guidance_scale": 1.5,
+            "flow_guidance_scale": 1.7,
+            "sampling_top_k": 50,
+            "chunk_frames": 200,
+            "chunk_hop": 100,
+            "flow_steps": 30,
+            "carry_length": 172,
+            "crop_left_latents": 86,
+            "crop_right_latents": 258,
+            "max_prompt_tokens": 5000,
+            "max_audio_frames": 9000,
+            "global_context": language_config.max_position_embeddings,
+            "target_sample_rate": 32000,
+            "prompt_segments": [
+                {"literal": "<|im_start|><|caption_start|>"},
+                {
+                    "field": "instructions",
+                    "transforms": [
+                        {
+                            "kind": "rewrite_delimited_tags",
+                            "open": "<|",
+                            "close": "|>",
+                        },
+                        {"kind": "strip_markdown"},
+                        {"kind": "collapse_newlines"},
+                    ],
+                },
+                {"literal": "<|caption_end|><|lyrics_start|>[start]\n"},
+                {
+                    "field": "input",
+                    "transforms": [
+                        {"kind": "keep_leading_bracket_tags"},
+                        {"kind": "replace", "from": "] ", "to": "]\n"},
+                        {"kind": "replace", "from": " [", "to": "\n["},
+                        {"kind": "replace", "from": " ^ ", "to": "\n"},
+                        {"kind": "lowercase_bracket_tags"},
+                    ],
+                },
+                {"literal": "<|lyrics_end|><|im_end|><|audio_start|>"},
+            ],
+        },
     )
     _materialize_deterministic_initializers(package)
     for model in package.values():
