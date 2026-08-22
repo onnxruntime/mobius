@@ -1054,7 +1054,16 @@ def test_hierarchical_audio_package_is_not_misclassified_as_diffusion(tmp_path):
         "transformer",
         "vocoder",
     }
-    pkg = ModelPackage({name: object() for name in names})
+    pkg = ModelPackage(
+        {
+            name: _model(
+                name,
+                [_value("input", ir.DataType.FLOAT, [1])],
+                [("output", ir.DataType.FLOAT, [1])],
+            )
+            for name in names
+        }
+    )
 
     with pytest.raises(
         NotImplementedError,
