@@ -160,10 +160,19 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # Gemma3 VL: same QK-norm FP accumulation as gemma3_text (~0.045 max diff).
     # argmax_match=True (near-tie), cosine=0.996 — functionally correct.
     "gemma3": 0.05,
-    # DeepSeek-V3: sigmoid-gated MoE with fused expert weights. Sequential vs batched
-    # expert dispatch produces FP accumulation differences → ~0.034 max diff.
-    # Near-tie argmax, cosine=0.996 — functionally correct.
-    "deepseek_v3": 0.04,
+    # DeepSeek-V3: previously carried a 0.04 override attributed to "MoE
+    # dispatch FP accumulation", but that was masking a real bug: the
+    # DeepSeek-V2/V3 MLA softmax scale was missing the YaRN
+    # mscale_all_dim^2 correction HF applies (see
+    # ``mobius.components._rotary_embedding.yarn_apply_mscale``). Fixed in
+    # ``_deepseek_mla.py``. Post-fix, remaining diff is genuine FP-order
+    # noise from parallel MoE dispatch: ~3.5e-5 measured via a standalone
+    # interpreter, ~1.2e-3 measured under this pytest process (both
+    # reproducible in their own harness — the residual gap is ORT
+    # intra-op thread-schedule dependent, not seed-dependent). 0.0025
+    # keeps ~2x headroom over the higher measurement while staying 16x
+    # tighter than the old 0.04.
+    "deepseek_v3": 0.0025,
     # dots1: same DeepSeek V3 architecture (sigmoid routing + shared experts).
     # MoE dispatch accumulation differences → similar tolerance needed.
     "dots1": 0.04,
