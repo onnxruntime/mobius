@@ -32,6 +32,7 @@ import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
 from mobius.components._common import Linear
+from mobius.components._scan_utils import create_body_graph, rename_subgraph_values
 
 
 class SelectiveScan(nn.Module):
@@ -241,6 +242,160 @@ class JambaSelectiveScan(SelectiveScan):
             op.CastLike(output, x),
             op.CastLike(op.Squeeze(present_state, [-1]), ssm_state),
         )
+
+
+class SequenceSelectiveScan(SelectiveScan):
+    """Selective scan (S6) over a whole sequence, with no carried state.
+
+    Unlike :class:`SelectiveScan`, which advances one token per call and
+    threads ``ssm_state`` through the graph for autoregressive decode, this
+    variant consumes the full ``(batch, seq_len, d_inner)`` activation in a
+    single ONNX ``Scan`` and starts from a zero state.  It is the right
+    building block for non-autoregressive encoders (speech enhancement,
+    audio/vision Mamba backbones) that see the entire sequence at once.
+
+    The recurrence body computes ``dA`` and ``dBx`` per step rather than
+    materialising them for all timesteps up front.  Precomputing them would
+    require two ``(batch, seq_len, d_inner, d_state)`` tensors, which for a
+    typical audio backbone is orders of magnitude larger than the
+    ``(batch, seq_len, d_inner)`` activations themselves.
+
+    Parameters are identical to :class:`SelectiveScan` (``x_proj``,
+    ``dt_proj``, ``A_log``, ``D``), so the two share checkpoints.
+
+    Precision: the recurrence runs in float32 regardless of model dtype,
+    matching the reference CUDA ``selective_scan_fn`` which accumulates the
+    state in float32.
+    """
+
+    def forward(  # type: ignore[override]
+        self,
+        op: OpBuilder,
+        x: ir.Value,
+    ):
+        """Run the selective scan over an entire sequence.
+
+        Args:
+            op: ONNX op builder.
+            x: (batch, seq_len, d_inner) — input after conv1d + activation.
+
+        Returns:
+            y: (batch, seq_len, d_inner) — scan output including the ``D``
+            skip connection.
+        """
+        # --- Project x to get dt, B, C for every timestep ---
+        # x_db: (batch, seq_len, dt_rank + 2*d_state)
+        x_db = self.x_proj(op, x)
+        dt_raw, b_mat, c_mat = self._project_ssm_params(op, x_db)
+
+        # dt: (batch, seq_len, d_inner). Upcast before softplus so the whole
+        # recurrence (softplus/exp/state accumulation) stays in float32.
+        dt = op.Softplus(op.Cast(self.dt_proj(op, dt_raw), to=ir.DataType.FLOAT))
+        b_f32 = op.Cast(b_mat, to=ir.DataType.FLOAT)  # (batch, seq_len, d_state)
+        c_f32 = op.Cast(c_mat, to=ir.DataType.FLOAT)  # (batch, seq_len, d_state)
+        x_f32 = op.Cast(x, to=ir.DataType.FLOAT)  # (batch, seq_len, d_inner)
+
+        # a_neg = -exp(A_log): (d_inner, d_state), the continuous-time decay.
+        a_neg = op.Neg(op.Exp(op.Cast(self.A_log, to=ir.DataType.FLOAT)))
+
+        # Zero initial state: (batch, d_inner, d_state). The batch dim is
+        # dynamic, so build the shape from the activation at run time.
+        batch_dim = op.Shape(x, start=0, end=1)
+        state_shape = op.Concat(
+            batch_dim,
+            op.Constant(value_ints=[self.d_inner, self.d_state]),
+            axis=0,
+        )
+        initial_state = op.ConstantOfShape(
+            state_shape,
+            value=ir.tensor([0.0], dtype=ir.DataType.FLOAT),
+        )
+
+        body = _build_sequence_scan_body()
+
+        # `a_neg` rides along as a pass-through carry so the body never has to
+        # reach into the enclosing graph's scope for an initializer.
+        _final_state, _a_out, y = op.Scan(
+            initial_state,
+            a_neg,
+            dt,
+            b_f32,
+            c_f32,
+            x_f32,
+            body=body,
+            num_scan_inputs=4,
+            # Sequence axis is 1 for every scan input and for the scan output,
+            # so no pre/post transposes are needed.
+            scan_input_axes=[1, 1, 1, 1],
+            scan_output_axes=[1],
+            _outputs=3,
+        )
+        # y: (batch, seq_len, d_inner)
+
+        # --- Skip connection: y += D * x ---
+        y = op.Add(y, op.Mul(op.Cast(self.D, to=ir.DataType.FLOAT), x_f32))
+
+        return op.CastLike(y, x)
+
+
+def _build_sequence_scan_body() -> ir.Graph:
+    """Build the ``Scan`` body for one timestep of the sequence selective scan.
+
+    Body inputs (in order):
+        1. ``state``: (batch, d_inner, d_state) — carry
+        2. ``a_neg``: (d_inner, d_state) — carry, passed through unchanged
+        3. ``dt_t``: (batch, d_inner) — scan input
+        4. ``b_t``: (batch, d_state) — scan input
+        5. ``c_t``: (batch, d_state) — scan input
+        6. ``x_t``: (batch, d_inner) — scan input
+
+    Body outputs:
+        1. ``new_state``: (batch, d_inner, d_state) — carry
+        2. ``a_neg_out``: (d_inner, d_state) — carry
+        3. ``y_t``: (batch, d_inner) — scan output
+    """
+    f32 = ir.TensorType(ir.DataType.FLOAT)
+    state_in = ir.Value(name="ssm_state", type=f32)
+    a_in = ir.Value(name="a_neg", type=f32)
+    dt_t = ir.Value(name="dt_t", type=f32)
+    b_t = ir.Value(name="b_t", type=f32)
+    c_t = ir.Value(name="c_t", type=f32)
+    x_t = ir.Value(name="x_t", type=f32)
+
+    body_graph, body_builder = create_body_graph(
+        state_inputs=[state_in, a_in],
+        scan_inputs=[dt_t, b_t, c_t, x_t],
+        name="selective_scan_step",
+    )
+    bop = body_builder.op
+
+    # dt_col: (batch, d_inner, 1) — broadcasts over the d_state axis.
+    dt_col = bop.Unsqueeze(dt_t, [-1])
+
+    # Discretised decay dA = exp(dt * A): (batch, d_inner, d_state).
+    da = bop.Exp(bop.Mul(dt_col, bop.Unsqueeze(a_in, [0])))
+
+    # Input contribution dBx = (dt * x) ⊗ B: (batch, d_inner, d_state).
+    dbx = bop.Mul(
+        bop.Mul(dt_col, bop.Unsqueeze(x_t, [-1])),
+        bop.Unsqueeze(b_t, [1]),
+    )
+
+    # State update: h = dA * h_prev + dBx.
+    new_state = bop.Add(bop.Mul(da, state_in), dbx)
+
+    # Readout: y = C · h, summing over d_state → (batch, d_inner).
+    y_t = bop.ReduceSum(bop.Mul(new_state, bop.Unsqueeze(c_t, [1])), [-1], keepdims=False)
+
+    # The pass-through carry must be a distinct value from the graph input.
+    a_out = bop.Identity(a_in)
+
+    new_state.name = "ssm_state_out"
+    a_out.name = "a_neg_out"
+    y_t.name = "y_t"
+    body_graph.outputs.extend([new_state, a_out, y_t])
+    rename_subgraph_values(body_graph, "seq_scan_")
+    return body_graph
 
 
 class Mamba2Scan(nn.Module):

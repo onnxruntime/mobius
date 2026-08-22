@@ -99,6 +99,7 @@ __all__ = [
     "SSM2CausalLMTask",
     "SSMCausalLMTask",
     "Seq2SeqTask",
+    "SpeechEnhancementTask",
     "SpeechLanguageTask",
     "SpeechToTextTask",
     "TASK_REGISTRY",
@@ -196,6 +197,7 @@ from mobius.tasks._qwen_image_vae import QwenImageEditVAETask, QwenImageVAETask
 from mobius.tasks._rnnt import RNNTTask
 from mobius.tasks._sensenova_u1 import SenseNovaU1Task
 from mobius.tasks._seq2seq import Seq2SeqTask
+from mobius.tasks._speech_enhancement import SpeechEnhancementTask
 from mobius.tasks._speech_language import SpeechLanguageTask
 from mobius.tasks._speech_to_text import SpeechToTextTask
 from mobius.tasks._ssm_causal_lm import SSM2CausalLMTask, SSMCausalLMTask
@@ -301,6 +303,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "fun-asr-speech-language": FunASRSpeechLanguageTask,
     "glmasr-speech-language": GlmAsrSpeechLanguageTask,
     "fastconformer-rnnt": RNNTTask,
+    "speech-enhancement": SpeechEnhancementTask,
     "speech-language": SpeechLanguageTask,
     "speech-to-text": SpeechToTextTask,
     "ssm-text-generation": SSMCausalLMTask,

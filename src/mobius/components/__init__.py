@@ -116,6 +116,8 @@ __all__ = [
     "RmsNorm2d",
     "ScaleFreeRMSNorm",
     "SelectiveScan",
+    "SequenceMambaBlock",
+    "SequenceSelectiveScan",
     "SiLU",
     "Siglip2NaFlexVisionEmbeddings",
     "Siglip2NaFlexVisionModel",
@@ -280,6 +282,7 @@ from mobius.components._llama4_vision import Llama4VisionTower
 from mobius.components._lora import LoRALinear
 from mobius.components._mamba_block import Mamba2Block as Mamba2Block
 from mobius.components._mamba_block import MambaBlock as MambaBlock
+from mobius.components._mamba_block import SequenceMambaBlock
 from mobius.components._mimo_minimax_vision import (
     DualTemporalPatchEmbedding as MiMoDualTemporalPatchEmbedding,
 )
@@ -467,6 +470,7 @@ from mobius.components._ssm import (
 )
 from mobius.components._ssm import (
     SelectiveScan,
+    SequenceSelectiveScan,
 )
 from mobius.components._vision import (
     PatchEmbedding,

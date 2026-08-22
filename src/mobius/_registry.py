@@ -152,6 +152,8 @@ from mobius.models import (
     QwenCausalLMModel,
     RND1Model,
     SmallThinkerGGUFCausalLMModel,
+    ReUseConfig,
+    SEMambaSpeechEnhancementModel,
     SmolLM3CausalLMModel,
     SortformerDiarizationModel,
     WhisperForConditionalGeneration,
@@ -1066,6 +1068,16 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     ),
     "fastconformer_rnnt": ModelRegistration(EncDecRNNTModel, task="fastconformer-rnnt"),
     "sortformer": ModelRegistration(SortformerDiarizationModel, task="diarization"),
+    "reuse": ModelRegistration(
+        SEMambaSpeechEnhancementModel,
+        task="speech-enhancement",
+        config_class=ReUseConfig,
+    ),
+    "semamba": ModelRegistration(
+        SEMambaSpeechEnhancementModel,
+        task="speech-enhancement",
+        config_class=ReUseConfig,
+    ),
 }
 
 

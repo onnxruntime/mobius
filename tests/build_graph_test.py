@@ -6167,6 +6167,12 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "falcon_mamba",
     "mamba",
     "mamba2",
+    # Speech enhancement: bespoke IO contract (noisy magnitude + phase
+    # spectrograms instead of input_ids/audio features), so the generic
+    # config matrices can't drive it. Covered by
+    # src/mobius/models/reuse_test.py.
+    "reuse",
+    "semamba",
     # Hybrid SSM+Attention dedicated tests
     "bamba",
     "jamba",
