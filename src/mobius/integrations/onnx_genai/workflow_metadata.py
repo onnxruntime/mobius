@@ -3517,6 +3517,7 @@ def build_image_edit_workflow_metadata(
             output_dtype=ir.DataType.FLOAT,
         ),
     )
+    clamp_output = pkg.policy_components["image_output_clamp"].model.graph.outputs[0]
 
     batch = latent_contract["shape"][0]
     batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
@@ -3669,7 +3670,7 @@ def build_image_edit_workflow_metadata(
         "inputs": inputs,
         "outputs": {
             "image": {
-                "contract": _request_aligned(_contract(decoder_output)),
+                "contract": _request_aligned(_contract(clamp_output)),
                 "role": "image",
                 "value_range": output_value_range,
                 "stage": "pre_adapter",

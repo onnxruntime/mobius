@@ -757,7 +757,35 @@ class TestCLIBuildRuntime:
             config=pkg.config,
             source="/models/vlm",
             revision=None,
+            guidance_scale=None,
         )
+
+    def test_runtime_onnx_genai_forwards_guidance_scale(self):
+        pkg = mock.MagicMock()
+        pkg.items.return_value = []
+        pkg.__iter__.return_value = iter(("transformer", "text_encoder", "vae_decoder"))
+        pkg.config = object()
+        args = SimpleNamespace(
+            max_shard_size=None,
+            max_workers=8,
+            external_data="onnx",
+            execution_provider="cpu",
+            no_weights=True,
+            runtime="onnx-genai",
+            config="/models/video",
+            model=None,
+            guidance_scale=6.0,
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.onnx_genai.write_onnx_genai_config",
+                return_value={},
+            ) as writer,
+        ):
+            _save_package(pkg, tmpdir, args, None, None)
+
+        assert writer.call_args.kwargs["guidance_scale"] == pytest.approx(6.0)
 
     def test_runtime_onnx_genai_does_not_fallback_for_unsupported_vlm(self):
         pkg = mock.MagicMock()

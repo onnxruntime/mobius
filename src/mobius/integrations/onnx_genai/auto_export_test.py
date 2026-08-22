@@ -471,6 +471,16 @@ def test_dispatch_video_diffusion_uses_typed_ddim(tmp_path, monkeypatch):
     assert schedule[0] < schedule[1] <= schedule[2]
 
 
+def test_video_diffusion_requires_explicit_guidance(tmp_path):
+    with pytest.raises(ValueError, match="video diffusion workflow must declare"):
+        write_onnx_genai_config(
+            _video_diffusion_package(),
+            str(tmp_path),
+            scheduler=SchedulerConfig(kind="ddim"),
+            num_inference_steps=2,
+        )
+
+
 def test_single_diffusion_component_requires_explicit_vae(tmp_path):
     pkg = _DiffusionPkg({"transformer": object()})
     with pytest.raises(
@@ -480,7 +490,7 @@ def test_single_diffusion_component_requires_explicit_vae(tmp_path):
         write_onnx_genai_config(pkg, str(tmp_path), num_inference_steps=2)
 
 
-def _image_edit_package():
+def _image_edit_package(dtype: ir.DataType = ir.DataType.FLOAT):
     """Build a Qwen-Image-Edit-shaped package with the real port contract.
 
     Mirrors ``QwenImageTask``: rank-3 packed latents, a ``target_sequence_length``
@@ -490,11 +500,11 @@ def _image_edit_package():
     transformer = _model(
         "transformer",
         [
-            _value("sample", ir.DataType.FLOAT, tokens),
+            _value("sample", dtype, tokens),
             _value("timestep", ir.DataType.FLOAT, ["batch"]),
             _value(
                 "encoder_hidden_states",
-                ir.DataType.FLOAT,
+                dtype,
                 ["batch", "text_sequence_length", 32],
             ),
             _value(
@@ -502,23 +512,23 @@ def _image_edit_package():
                 ir.DataType.BOOL,
                 ["batch", "text_sequence_length"],
             ),
-            _value("image_rotary_cos", ir.DataType.FLOAT, ["image_sequence_length", 8]),
-            _value("image_rotary_sin", ir.DataType.FLOAT, ["image_sequence_length", 8]),
-            _value("text_rotary_cos", ir.DataType.FLOAT, ["text_sequence_length", 8]),
-            _value("text_rotary_sin", ir.DataType.FLOAT, ["text_sequence_length", 8]),
+            _value("image_rotary_cos", dtype, ["image_sequence_length", 8]),
+            _value("image_rotary_sin", dtype, ["image_sequence_length", 8]),
+            _value("text_rotary_cos", dtype, ["text_sequence_length", 8]),
+            _value("text_rotary_sin", dtype, ["text_sequence_length", 8]),
             _value("target_sequence_length", ir.DataType.INT64, [1]),
         ],
-        [("noise_pred", ir.DataType.FLOAT, tokens)],
+        [("noise_pred", dtype, tokens)],
     )
     vae_encoder = _model(
         "vae_encoder",
-        [_value("pixel_values", ir.DataType.FLOAT, ["batch", 3, 1, "height", "width"])],
-        [("latent_sample", ir.DataType.FLOAT, ["batch", 16, 1, "lheight", "lwidth"])],
+        [_value("pixel_values", dtype, ["batch", 3, 1, "height", "width"])],
+        [("latent_sample", dtype, ["batch", 16, 1, "lheight", "lwidth"])],
     )
     vae_decoder = _model(
         "vae_decoder",
-        [_value("latent_sample", ir.DataType.FLOAT, ["batch", 16, 1, "lheight", "lwidth"])],
-        [("image", ir.DataType.FLOAT, ["batch", 3, 1, "height", "width"])],
+        [_value("latent_sample", dtype, ["batch", 16, 1, "lheight", "lwidth"])],
+        [("image", dtype, ["batch", 3, 1, "height", "width"])],
     )
     return ModelPackage(
         {
@@ -665,6 +675,44 @@ def test_dispatch_image_edit_emits_workflow(tmp_path):
         assert (output / "policies" / f"{policy}.onnx").is_file()
 
 
+def test_image_edit_requires_explicit_guidance(tmp_path):
+    source = tmp_path / "source"
+    _write_scheduler(source)
+    with pytest.raises(ValueError, match="image-edit workflow must declare"):
+        write_onnx_genai_config(
+            _image_edit_package(),
+            str(tmp_path / "output"),
+            source=str(source),
+            num_inference_steps=8,
+            image_seq_len=4104,
+        )
+
+
+@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
+def test_image_edit_contract_uses_float_clamp_output(tmp_path, dtype):
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    package = _image_edit_package(dtype)
+    _write_scheduler(source)
+    artifacts = write_onnx_genai_config(
+        package,
+        str(output),
+        source=str(source),
+        num_inference_steps=2,
+        image_seq_len=4104,
+        guidance_scale=4.0,
+    )
+    with open(artifacts["inference_metadata"]) as handle:
+        workflow = yaml.safe_load(handle)["pipeline"]["workflow"]
+
+    assert package["vae_decoder"].graph.outputs[0].dtype == dtype
+    assert (
+        package.policy_components["image_output_clamp"].model.graph.outputs[0].dtype
+        == ir.DataType.FLOAT
+    )
+    assert workflow["outputs"]["image"]["contract"]["dtype"] == "float32"
+
+
 def test_image_edit_requires_image_seq_len(tmp_path):
     """The schedule is resolution dependent, so it cannot be guessed."""
     source = tmp_path / "source"
@@ -675,6 +723,7 @@ def test_image_edit_requires_image_seq_len(tmp_path):
             str(tmp_path / "output"),
             source=str(source),
             num_inference_steps=8,
+            guidance_scale=4.0,
         )
 
 
@@ -685,6 +734,7 @@ def test_image_edit_requires_scheduler_config(tmp_path):
             str(tmp_path / "output"),
             num_inference_steps=8,
             image_seq_len=4104,
+            guidance_scale=4.0,
         )
 
 

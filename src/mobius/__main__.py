@@ -205,6 +205,9 @@ def _cmd_build(args: argparse.Namespace) -> None:
         raise SystemExit("Error: --max-length can only be used with --runtime onnx-genai.")
     if max_length is not None and max_length <= 0:
         raise SystemExit("Error: --max-length must be a positive integer.")
+    guidance_scale = getattr(args, "guidance_scale", None)
+    if guidance_scale is not None and args.runtime != "onnx-genai":
+        raise SystemExit("Error: --guidance-scale can only be used with --runtime onnx-genai.")
 
     # Validate static-cache + --task compatibility.
     if args.static_cache and args.task is not None:
@@ -469,6 +472,7 @@ def _save_package(
                 config=config,
                 source=source,
                 revision=getattr(args, "revision", None),
+                guidance_scale=getattr(args, "guidance_scale", None),
             )
         except ValueError as error:
             raise SystemExit(f"Error: {error}") from error
@@ -822,6 +826,18 @@ def main(argv: list[str] | None = None) -> None:
             "document for LLMs, or an iterative pipeline document for diffusion). "
             "When used with --model, tokenizer files are downloaded from HuggingFace; "
             "with --config (local directory), they are copied from that directory."
+        ),
+    )
+    build_parser.add_argument(
+        "--guidance-scale",
+        type=float,
+        default=None,
+        metavar="SCALE",
+        help=(
+            "Classifier-free guidance scale for --runtime onnx-genai diffusion "
+            "metadata. Required for conditioned diffusion pipelines so export does "
+            "not guess a source pipeline's generation default; pass 1.0 explicitly "
+            "for unguided generation."
         ),
     )
     build_parser.add_argument(

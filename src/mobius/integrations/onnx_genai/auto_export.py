@@ -880,6 +880,11 @@ def write_onnx_genai_config(
     if _looks_like_diffusion(pkg):
         is_image_edit = _looks_like_image_edit(pkg)
         if is_image_edit:
+            if guidance_scale is None:
+                raise ValueError(
+                    "image-edit workflow must declare its true-CFG guidance: "
+                    "pass guidance_scale explicitly using the source pipeline's default"
+                )
             if scheduler is None:
                 scheduler = load_diffusers_scheduler_config(source)
             if scheduler is None:
@@ -902,7 +907,7 @@ def write_onnx_genai_config(
                 num_inference_steps=num_inference_steps,
                 schedule=sigma_schedule,
                 timesteps=timesteps,
-                guidance_scale=1.0 if guidance_scale is None else guidance_scale,
+                guidance_scale=guidance_scale,
                 artifact_paths=kwargs.pop("artifact_paths", None),
             )
             artifacts = {"inference_metadata": path}
@@ -917,6 +922,12 @@ def write_onnx_genai_config(
             timesteps, alpha_schedule = _ddim_alpha_schedule(
                 resolved_scheduler, num_inference_steps
             )
+            if guidance_scale is None:
+                raise ValueError(
+                    "video diffusion workflow must declare its guidance: "
+                    "pass guidance_scale=1.0 for unguided generation, or the source "
+                    "pipeline's classifier-free guidance default"
+                )
             scaling_factor = load_diffusers_vae_scaling_factor(source) or 1.0
             path = write_video_diffusion_workflow_metadata(
                 pkg,
