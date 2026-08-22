@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import onnx_ir as ir
+import pytest
 import torch
 
 from mobius._configs import AudioConfig, Gemma4Config
@@ -559,8 +560,12 @@ class TestGemma4MoeFallbackActivation:
 class TestGemma4OutputLayerIndices:
     """``output_layer_indices`` taps the post-final-norm hidden as ``hidden_states.{idx}``.
 
-    A borrowed-KV speculative drafter consumes this as its folded-carry seed.
-    ``None``/empty must preserve the legacy output contract (no extra port).
+    Gemma4 exposes ONLY the final post-final-norm hidden (== HF
+    ``hidden_states[-1]``, the lm_head input), which a borrowed-KV speculative
+    drafter consumes as its folded-carry seed. It is faithful only for the last
+    decoder layer, so exactly one index == ``num_hidden_layers - 1`` is allowed;
+    duplicate/out-of-range/negative/multiple/non-last indices are rejected.
+    ``None``/empty preserves the legacy output contract (no extra port).
     """
 
     def test_none_keeps_legacy_output_contract(self):
@@ -569,7 +574,13 @@ class TestGemma4OutputLayerIndices:
         assert "logits" in names
         assert not any(n.startswith("hidden_states.") for n in names)
 
-    def test_index_emits_hidden_states_port(self):
+    def test_empty_list_keeps_legacy_output_contract(self):
+        model = _build_gemma4_text(_tiny_gemma4_text_moe_config(output_layer_indices=[]))
+        names = {o.name for o in model.graph.outputs}
+        assert "logits" in names
+        assert not any(n.startswith("hidden_states.") for n in names)
+
+    def test_last_index_emits_hidden_states_port(self):
         # Last decoder layer index (num_hidden_layers - 1) — the post-norm slot.
         config = _tiny_gemma4_text_moe_config(output_layer_indices=[1])
         model = _build_gemma4_text(config)
@@ -577,19 +588,61 @@ class TestGemma4OutputLayerIndices:
         assert "hidden_states.1" in names
         assert "logits" in names
 
-    def test_hidden_states_port_reuses_lm_head_input(self):
-        """The emitted hidden must be the exact lm_head input (post-final-norm)."""
+    def test_hidden_states_port_is_identity_of_lm_head_input(self):
+        """The emitted hidden is a DISTINCT Identity of the exact lm_head input.
+
+        Distinctness prevents the in-place-rename collapse that would occur if a
+        single shared Value were passed to ``add_output`` more than once, while
+        the Identity's input being the lm_head input proves the post-final-norm
+        faithfulness.
+        """
         config = _tiny_gemma4_text_moe_config(output_layer_indices=[1])
         model = _build_gemma4_text(config)
         hs_out = next(o for o in model.graph.outputs if o.name == "hidden_states.1")
         logits_out = next(o for o in model.graph.outputs if o.name == "logits")
-        # lm_head is a MatMul/Gemm consuming the post-norm hidden; the emitted
-        # port and the lm_head input must trace back to the same producer value.
         lm_head_node = logits_out.producer()
         assert lm_head_node is not None
-        assert hs_out in set(lm_head_node.inputs), (
-            "hidden_states port must be the value fed into lm_head (post-final-norm)"
+        # The output port is its own Identity node (unique name, no in-place
+        # rename of the internal lm_head input value).
+        id_node = hs_out.producer()
+        assert id_node is not None and id_node.op_type == "Identity"
+        # ...and its input is the exact post-final-norm value fed into lm_head.
+        assert id_node.inputs[0] in set(lm_head_node.inputs), (
+            "hidden_states port must be an Identity of the lm_head input (post-final-norm)"
         )
+
+    def test_multiple_indices_rejected(self):
+        with pytest.raises(ValueError, match="exactly"):
+            Gemma4CausalLMModel(_tiny_gemma4_text_moe_config(output_layer_indices=[0, 1]))
+
+    def test_non_last_index_rejected(self):
+        # num_hidden_layers=2 => only [1] is valid; [0] is a non-last index.
+        with pytest.raises(ValueError, match="exactly"):
+            Gemma4CausalLMModel(_tiny_gemma4_text_moe_config(output_layer_indices=[0]))
+
+    def test_duplicate_indices_rejected(self):
+        with pytest.raises(ValueError, match="duplicate"):
+            Gemma4CausalLMModel(_tiny_gemma4_text_moe_config(output_layer_indices=[1, 1]))
+
+    def test_out_of_range_index_rejected(self):
+        # num_hidden_layers=2 => valid indices are [0, 2); 2 is out of range.
+        with pytest.raises(ValueError, match="out of range"):
+            Gemma4CausalLMModel(_tiny_gemma4_text_moe_config(output_layer_indices=[2]))
+
+    def test_negative_index_rejected(self):
+        with pytest.raises(ValueError, match="out of range"):
+            Gemma4CausalLMModel(_tiny_gemma4_text_moe_config(output_layer_indices=[-1]))
+
+    def test_valid_index_scales_with_num_hidden_layers(self):
+        # The accepted index tracks the config (no hardcoded layer count/name).
+        config = _tiny_gemma4_text_moe_config(
+            num_hidden_layers=3,
+            layer_types=["sliding_attention", "full_attention", "sliding_attention"],
+            output_layer_indices=[2],
+        )
+        model = _build_gemma4_text(config)
+        names = {o.name for o in model.graph.outputs}
+        assert "hidden_states.2" in names
 
 
 class TestGemma4PerExpertScalePartialStateDict:

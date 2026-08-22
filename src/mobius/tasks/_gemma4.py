@@ -394,11 +394,19 @@ class Gemma4TextCausalLMTask(ModelTask):
         else:
             _register_kv_cache_outputs(builder, present_key_values)
 
-        # Post-final-norm hidden states (== HF hidden_states[-1]) requested via
+        # Post-final-norm hidden state (== HF hidden_states[-1]) requested via
         # config.output_layer_indices, named hidden_states.{idx}. A borrowed-KV
-        # speculative drafter reads this as its folded-carry seed.
-        if hidden_outputs is not None and config.output_layer_indices:
-            for idx, hs in zip(config.output_layer_indices, hidden_outputs):
+        # speculative drafter reads this as its folded-carry seed. The model
+        # validates/normalizes the indices (exactly the last decoder layer) and
+        # returns one distinct Identity value per index, so names never collide.
+        if hidden_outputs is not None:
+            output_indices = getattr(module, "output_layer_indices", None) or []
+            if len(output_indices) != len(hidden_outputs):
+                raise ValueError(
+                    f"Gemma4 returned {len(hidden_outputs)} hidden-state tensor(s) "
+                    f"but output_layer_indices has {len(output_indices)} entr(y/ies)."
+                )
+            for idx, hs in zip(output_indices, hidden_outputs):
                 builder.add_output(hs, f"hidden_states.{idx}")
 
         return ModelPackage({"model": _make_model(graph)}, config=config)

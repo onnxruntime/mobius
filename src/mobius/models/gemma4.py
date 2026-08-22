@@ -2355,6 +2355,59 @@ class Gemma4TextModel(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def _validate_gemma4_output_layer_indices(config: Gemma4Config) -> list[int] | None:
+    """Validate ``config.output_layer_indices`` for the Gemma4 text model.
+
+    Unlike the generic :class:`~mobius.models.base.TextModel` — which captures a
+    distinct *pre*-final-norm tensor for every requested decoder layer — Gemma4's
+    ``forward`` exposes only the FINAL post-final-norm hidden state (the exact
+    ``lm_head`` input, == HuggingFace ``output_hidden_states=True``
+    ``hidden_states[-1]``). A borrowed-KV speculative drafter consumes that value
+    as its folded-carry seed. It is faithful ONLY for the last decoder layer, so
+    rather than pretending general per-layer support, Gemma4 accepts exactly one
+    index equal to ``num_hidden_layers - 1``.
+
+    Index convention follows :attr:`ArchitectureConfig.output_layer_indices`:
+    non-negative, 0-based, where ``hidden_states.{k}`` == HF
+    ``hidden_states[k + 1]`` (so the post-norm final slot ``hidden_states[-1]``
+    is ``k = num_hidden_layers - 1``). Duplicate, out-of-range (including
+    negative), multiple, or non-last indices are rejected with a clear error.
+    ``None``/empty returns ``None`` and preserves the legacy 2-tuple output
+    contract (existing exports stay byte-identical).
+
+    Returns:
+        ``[num_hidden_layers - 1]`` for a valid request, else ``None``.
+
+    Raises:
+        ValueError: on duplicate, out-of-range/negative, multiple, or non-last
+            indices, naming the only supported value.
+    """
+    raw = getattr(config, "output_layer_indices", None)
+    if not raw:
+        return None
+    indices = list(raw)
+    num_layers = config.num_hidden_layers
+    # Match the generic TextModel validation order: duplicates, then range.
+    if len(set(indices)) != len(indices):
+        raise ValueError(f"output_layer_indices must not contain duplicates: {indices}")
+    out_of_range = [i for i in indices if not 0 <= i < num_layers]
+    if out_of_range:
+        raise ValueError(
+            f"output_layer_indices {out_of_range} out of range [0, {num_layers}) "
+            "(negative indices are not supported)"
+        )
+    last = num_layers - 1
+    if indices != [last]:
+        raise ValueError(
+            "Gemma4 exposes only the post-final-norm last hidden state "
+            "(== HuggingFace output_hidden_states[-1], the lm_head input) as the "
+            "speculative folded-carry seed; per-layer pre-norm hidden states are "
+            f"not available. output_layer_indices must be exactly [{last}] "
+            f"(num_hidden_layers - 1), got {indices}."
+        )
+    return indices
+
+
 class Gemma4CausalLMModel(CausalLMModel):
     """Gemma 4 text-only causal language model.
 
@@ -2377,16 +2430,16 @@ class Gemma4CausalLMModel(CausalLMModel):
         self.config = config
         self.model = Gemma4TextModel(config)
         self.lm_head = _make_lm_head(config)
-        # When set, additionally emit the post-final-norm hidden state (the
-        # lm_head input, == HF ``output_hidden_states=True`` ``hidden_states[-1]``)
-        # as ``hidden_states.{idx}`` for each requested index. A borrowed-KV
-        # speculative drafter (E2B-it-assistant) reads this as its folded-carry
-        # seed. gemma4 emits the FINAL post-norm hidden (not per-layer
-        # pre-norm), so the requested index should be the last decoder layer
-        # (``num_hidden_layers - 1``), matching the HF ``hidden_states[k+1]``
-        # convention where the last slot is the normalized output.
-        self.output_layer_indices: list[int] | None = (
-            list(getattr(config, "output_layer_indices", None) or []) or None
+        # Speculative folded-carry seed: when requested, additionally emit the
+        # post-final-norm hidden state (the lm_head input, == HF
+        # ``output_hidden_states[-1]``) as ``hidden_states.{idx}``. Gemma4 exposes
+        # only this final normalized hidden (not per-layer pre-norm), so a valid
+        # request is exactly one index == ``num_hidden_layers - 1``; the helper
+        # validates and rejects duplicate/out-of-range/negative/multiple/non-last
+        # indices. ``None``/empty keeps the legacy 2-tuple contract (existing
+        # exports byte-identical).
+        self.output_layer_indices: list[int] | None = _validate_gemma4_output_layer_indices(
+            config
         )
 
     def forward(
@@ -2417,12 +2470,13 @@ class Gemma4CausalLMModel(CausalLMModel):
             )
             logits = op.Mul(op.Tanh(op.Div(logits, cap)), cap)
         if self.output_layer_indices:
-            # Emit the post-final-norm hidden (== HF hidden_states[-1]) as
-            # hidden_states.{idx}. The task registers it via
-            # config.output_layer_indices. Borrowed-KV drafters consume it as
-            # the folded-carry seed. Same tensor for each requested index
-            # because gemma4 exposes only the final normalized hidden.
-            hidden_outputs = [hidden_states for _ in self.output_layer_indices]
+            # Materialize a distinct Identity per requested index so each graph
+            # output owns a unique name and never renames the internal lm_head
+            # input value in place (a shared Value passed to ``add_output`` twice
+            # would collapse). Validation restricts this to exactly the last-layer
+            # index, but the per-index Identity keeps the contract robust and
+            # mirrors the generic "one distinct Value per output" shape.
+            hidden_outputs = [op.Identity(hidden_states) for _ in self.output_layer_indices]
             return logits, present_key_values, hidden_outputs
         return logits, present_key_values
 
