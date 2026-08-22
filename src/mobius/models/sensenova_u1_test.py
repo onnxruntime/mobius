@@ -525,6 +525,7 @@ class TestInferenceMetadataStatus:
             "image_noise_geometry",
             "image_noise",
             "latent_scale",
+            "image_output_clamp",
         }
         assert workflow["inputs"]["request.seed"]["role"]["role"] == "seed"
         assert workflow["inputs"]["request.width"]["role"]["role"] == "width"
