@@ -45,9 +45,7 @@ class TestWriteGgufRuntimePackage:
             ) as write_tok,
             mock.patch(
                 "mobius.integrations.onnx_genai.write_onnx_genai_config",
-                return_value={
-                    "inference_metadata": str(out / "inference_metadata.yaml")
-                },
+                return_value={"inference_metadata": str(out / "inference_metadata.yaml")},
             ) as write_cfg,
         ):
             artifacts = write_gguf_runtime_package(pkg, tmp_path / "m.gguf", out)

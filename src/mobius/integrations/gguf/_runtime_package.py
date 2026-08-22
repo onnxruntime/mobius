@@ -63,9 +63,7 @@ def write_gguf_runtime_package(
         ValueError: If ``runtime`` is not a supported runtime name.
     """
     if runtime not in ("onnx-genai", "ort-genai"):
-        raise ValueError(
-            f"Unknown runtime {runtime!r}; expected 'onnx-genai' or 'ort-genai'."
-        )
+        raise ValueError(f"Unknown runtime {runtime!r}; expected 'onnx-genai' or 'ort-genai'.")
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
