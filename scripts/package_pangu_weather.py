@@ -242,14 +242,6 @@ def main() -> None:
                 "components": {
                     "forecast": {
                         "implementation": {"kind": "onnx", "artifact": "model.onnx"},
-                        "ports": {
-                            "roles": {
-                                "input": "weather_upper_air",
-                                "input_surface": "weather_surface",
-                                "output": "weather_upper_air_forecast",
-                                "output_surface": "weather_surface_forecast",
-                            }
-                        },
                     }
                 },
                 "steps": [
