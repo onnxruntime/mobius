@@ -140,6 +140,7 @@ from mobius.tasks._qwen_image import QwenImageDenoisingTask
 from mobius.tasks._qwen_image_text_encoder import QwenImageTextEncoderTask
 from mobius.tasks._qwen_image_vae import QwenImageEditVAETask, QwenImageVAETask
 from mobius.tasks._rnnt import RNNTTask
+from mobius.tasks._sensenova_u1 import SenseNovaU1Task
 from mobius.tasks._seq2seq import Seq2SeqTask
 from mobius.tasks._speech_language import SpeechLanguageTask
 from mobius.tasks._speech_to_text import SpeechToTextTask
@@ -219,6 +220,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "gemma4-unified": Gemma4UnifiedTask,
     "gemma4-assistant": Gemma4AssistantTask,
     "hunyuan-vl-mot": HunYuanVLMoTTask,
+    "sensenova-u1": SenseNovaU1Task,
     "multimodal": MultiModalTask,
     "phi4mm-multimodal": Phi4MMMultiModalTask,
     "fun-asr-speech-language": FunASRSpeechLanguageTask,

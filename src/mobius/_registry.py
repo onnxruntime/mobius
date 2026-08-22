@@ -35,6 +35,7 @@ from mobius._configs import (
     MuseGlimmerConfig,
     NemotronParseConfig,
     ParakeetCTCConfig,
+    SenseNovaU1Config,
     WhisperConfig,
 )
 from mobius.models import (
@@ -161,6 +162,7 @@ from mobius.models.qwen3_tts import Qwen3TTSForConditionalGeneration
 from mobius.models.qwen3_tts_tokenizer import Qwen3TTSTokenizerV2Model
 from mobius.models.sam2 import Sam2VisionModel
 from mobius.models.segformer import SegformerForSemanticSegmentation
+from mobius.models.sensenova_u1 import SenseNovaU1Model
 from mobius.models.sensevoice_small import SenseVoiceSmallModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5ForConditionalGeneration
@@ -617,6 +619,13 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "glm4v_text": ModelRegistration(Glm4CausalLMModel),
     "got_ocr2": ModelRegistration(LLaVAModel, task="vision-language"),
     "hunyuan_vl_mot": ModelRegistration(HunYuanVLMoTModel, task="hunyuan-vl-mot"),
+    "neo_chat": ModelRegistration(
+        SenseNovaU1Model,
+        task="sensenova-u1",
+        config_class=SenseNovaU1Config,
+        family="sensenova",
+        variant="mot_unified",
+    ),
     "idefics2": ModelRegistration(LLaVAModel, task="vision-language"),
     "idefics3": ModelRegistration(LLaVAModel, task="vision-language"),
     "instructblip": ModelRegistration(LLaVAModel, task="vision-language"),
@@ -1074,6 +1083,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "glm4v_text": "THUDM/glm-4v-9b",
     "got_ocr2": "stepfun-ai/GOT-OCR2_0",
     "hunyuan_vl_mot": "tencent/HY-Embodied-0.5-X",
+    "neo_chat": "sensenova/SenseNova-U1.5-8B-MoT",
     "instructblipvideo": "Salesforce/instructblip-flan-t5-xl",
     "internvl": "OpenGVLab/InternVL2-1B",
     "internvl_chat": "OpenGVLab/InternVL-Chat-V1-5",

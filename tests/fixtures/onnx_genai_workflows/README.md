@@ -12,8 +12,8 @@ regenerates them, compares the metadata against the committed copy, and runs
 validation and conformance against the regenerated tree. Tests that need the
 graphs use the `materialized_workflow_packages` fixture.
 
-The decoder, VLM, diffusion, masked diffusion, speculative, and codec packages
-contain executable synthetic models. The TTS fixture uses the real tiny
+The decoder, VLM, shared-state pixel-flow, diffusion, masked diffusion,
+speculative, and codec packages contain executable synthetic models. The TTS fixture uses the real tiny
 Qwen3-TTS producer graphs with deterministic synthetic weights. The two
 protein-encoder fixtures use the real tiny ESM-2 and ProtBert producer graphs,
 also with deterministic synthetic weights; they cover the non-generative
@@ -21,3 +21,15 @@ embedding shape, which has one invocation, no carried state and no sampler.
 No downloaded model weights are included. The adapter fixture covers
 authoritative target metadata, portable artifacts, ordered heterogeneous
 composition, inactive rows, compaction, and request-epoch slot reuse.
+
+## Shared-state pixel flow
+
+`shared_state_pixel_flow/` is the lightweight five-component producer gate for
+unified any-to-any architectures. It covers text-only understanding,
+text-to-image generation, reference-image editing, fp16-to-fp32 prefix casts,
+conditional/unconditional frozen state groups, classifier-free guidance, x0
+prediction, and the flow update `v = (x0 - z) / max(1 - t, t_eps)`. The graphs
+are tiny and deterministic; ordinary CI never downloads production weights.
+
+SHA-256 of `shared_state_pixel_flow/inference_metadata.yaml`:
+`588f07726503c19805108f684f4d4119bbe4b3703b6abdbf52dcdc715204c1f4`.
