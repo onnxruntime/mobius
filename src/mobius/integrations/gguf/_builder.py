@@ -822,9 +822,6 @@ def _reorder_deltanet_v_heads(state_dict: dict, config) -> dict:
     def _index_dim0(t: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
         return t.index_select(0, idx)
 
-    def _index_dim1(t: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-        return t.index_select(1, idx)
-
     def _apply_rows(stem: str, idx: torch.Tensor) -> None:
         # Permute axis 0 of a float weight or a quantized triplet in place.
         for suffix in (".weight", ".scales", ".zero_points"):
