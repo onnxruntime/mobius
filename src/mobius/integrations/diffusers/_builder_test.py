@@ -20,10 +20,114 @@ from mobius.integrations.diffusers._builder import (
     _load_diffusers_pipeline_index,
     _load_optional_diffusers_json,
     _resolve_diffusers_component_source,
+    _resolve_hierarchical_workflow_config,
+    _tokenizer_id_ceiling,
     build_diffusers_pipeline,
 )
 
 # ── Helpers ──────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("tokenizer", "expected"),
+    [
+        (
+            {
+                "model": {"vocab": {"base-a": 10, "base-b": 900}},
+                "added_tokens": [{"content": "<special>", "id": 20}],
+            },
+            900,
+        ),
+        (
+            {
+                "model": {"vocab": {"base-a": 4, "base-b": 5}},
+                "added_tokens": [{"content": "<special>", "id": 901}],
+            },
+            901,
+        ),
+    ],
+)
+def test_tokenizer_id_ceiling_covers_base_and_added_vocabularies(tokenizer, expected):
+    assert _tokenizer_id_ceiling(tokenizer) == expected
+
+
+@pytest.mark.parametrize(
+    "tokenizer",
+    [
+        {},
+        {"model": {"vocab": {"bad": -1}}},
+        {"model": {"vocab": {"bad": "1"}}},
+        {"added_tokens": [{"content": "<bad>", "id": True}]},
+    ],
+)
+def test_tokenizer_id_ceiling_fails_closed(tokenizer):
+    assert _tokenizer_id_ceiling(tokenizer) is None
+
+
+def _workflow_resolution_inputs(base_max: int, added_max: int):
+    roles = {
+        "global_decoder": "decoder",
+        "global_embedding": "embedding",
+        "semantic_embedding": "semantic",
+        "local_decoder": "local",
+        "local_projection": "projection",
+        "local_embedding": "local_embedding",
+        "local_feedback_embedding": "feedback",
+        "local_heads": "heads",
+        "condition_encoder": "condition",
+        "flow_transformer": "flow",
+        "vocoder": "vocoder",
+    }
+    contract = {
+        "kind": "hierarchical_audio",
+        "semantic_vocabulary_size": 16,
+        "tokens": {"stop": "<stop>", "unconditional": "<cfg>"},
+        "prompt_segments": [{"literal": "<prompt>"}],
+        "unconditional_replace_from": 1,
+        "unconditional_preserve_trailing": 2,
+    }
+    tokenizer = {
+        "model": {"vocab": {"base": base_max}},
+        "added_tokens": [
+            {"content": "<prompt>", "id": 3},
+            {"content": "<stop>", "id": 4},
+            {"content": "<cfg>", "id": added_max},
+        ],
+    }
+    configs = {
+        "decoder": {
+            "vocab_size": max(base_max, added_max) + 17,
+            "max_position_embeddings": 128,
+        }
+    }
+    return roles, configs, tokenizer, contract
+
+
+@pytest.mark.parametrize(("base_max", "added_max"), [(900, 20), (20, 900)])
+def test_hierarchical_workflow_semantic_boundary_uses_full_tokenizer(base_max, added_max):
+    roles, configs, tokenizer, contract = _workflow_resolution_inputs(base_max, added_max)
+    resolved = _resolve_hierarchical_workflow_config(
+        roles=roles,
+        component_configs=configs,
+        tokenizer_data=tokenizer,
+        contract=contract,
+    )
+    assert resolved is not None
+    assert resolved["semantic_vocabulary_start"] == max(base_max, added_max) + 1
+
+
+def test_hierarchical_workflow_omits_inconsistent_candidate_range():
+    roles, configs, tokenizer, contract = _workflow_resolution_inputs(900, 20)
+    configs["decoder"]["vocab_size"] = 916
+    assert (
+        _resolve_hierarchical_workflow_config(
+            roles=roles,
+            component_configs=configs,
+            tokenizer_data=tokenizer,
+            contract=contract,
+        )
+        is None
+    )
 
 
 def _fake_pipeline_index(

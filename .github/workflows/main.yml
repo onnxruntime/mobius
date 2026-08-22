@@ -286,6 +286,8 @@ jobs:
         run: |
           cp tests/onnx_genai_workflow_conformance.rs \
             validation/onnx-genai/crates/onnx-genai-engine/tests/mobius_workflow_conformance.rs
+          cp tests/onnx_genai_speech_conformance.rs \
+            validation/onnx-genai/crates/onnx-genai-server/tests/mobius_speech_conformance.rs
           ORT_LIB="$(python -c \
             'import onnxruntime, pathlib; print(next((pathlib.Path(onnxruntime.__file__).parent / "capi").glob("libonnxruntime.so*")))')"
           cd validation/onnx-genai
@@ -294,6 +296,11 @@ jobs:
             cargo test -p onnx-genai-engine \
               --test mobius_workflow_conformance \
               mobius_hierarchical_audio_executes_nested_generation -- --nocapture
+          MOBIUS_WORKFLOW_CONFORMANCE_DIR="$GITHUB_WORKSPACE/validation/generated" \
+            ONNX_GENAI_ORT_LIB="$ORT_LIB" \
+            cargo test -p onnx-genai-server \
+              --test mobius_speech_conformance \
+              mobius_hierarchical_audio_accepts_raw_speech_request -- --nocapture
 
   integration-fast:
     name: Integration (fast)

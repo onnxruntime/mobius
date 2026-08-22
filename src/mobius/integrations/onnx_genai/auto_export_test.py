@@ -1055,10 +1055,12 @@ def test_multi_decoder_tts_without_pre_embedder_raises_precise_not_implemented(t
         "semantic_size",
         "stop_token",
         "flow_steps",
+        "replace_from",
+        "preserve_trailing",
     ),
     [
-        (8, 7, 1024, 128, 2048, 2, 44100, 32000, 151675, 16384, 151670, 30),
-        (12, 3, 257, 24, 96, 1, 48000, 24000, 700, 301, 699, 11),
+        (8, 7, 1024, 128, 2048, 2, 44100, 32000, 151675, 16384, 151670, 30, 1, 2),
+        (12, 3, 257, 24, 96, 1, 48000, 24000, 700, 301, 699, 11, 0, 4),
     ],
 )
 def test_hierarchical_audio_package_is_not_misclassified_as_diffusion(
@@ -1075,6 +1077,8 @@ def test_hierarchical_audio_package_is_not_misclassified_as_diffusion(
     semantic_size,
     stop_token,
     flow_steps,
+    replace_from,
+    preserve_trailing,
 ):
     float_type = ir.DataType.FLOAT
     pkg = ModelPackage(
@@ -1219,6 +1223,8 @@ def test_hierarchical_audio_package_is_not_misclassified_as_diffusion(
             "max_audio_frames": 9000,
             "global_context": 10240,
             "target_sample_rate": target_rate,
+            "unconditional_replace_from": replace_from,
+            "unconditional_preserve_trailing": preserve_trailing,
             "prompt_segments": [{"literal": "<audio>"}],
         },
     )
@@ -1258,6 +1264,8 @@ def test_hierarchical_audio_package_is_not_misclassified_as_diffusion(
         processor = json.load(handle)
     assert processor["max_output_units"] == 9000
     assert processor["guidance_rows"]["unconditional_token_id"] == stop_token - 1
+    assert processor["guidance_rows"]["replace_from"] == replace_from
+    assert processor["guidance_rows"]["preserve_trailing"] == preserve_trailing
     if hidden_size != 8:
         full_metadata = yaml.safe_dump(workflow)
         assert "151675" not in full_metadata

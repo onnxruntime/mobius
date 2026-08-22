@@ -24,6 +24,8 @@
   "max_prompt_tokens": 5000,
   "max_audio_frames": 9000,
   "target_sample_rate": 32000,
+  "unconditional_replace_from": 1,
+  "unconditional_preserve_trailing": 2,
   "tokens": {
     "stop": "<|audio_end|>",
     "unconditional": "<|audio_cfg|>"

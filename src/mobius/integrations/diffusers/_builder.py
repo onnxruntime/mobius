@@ -54,6 +54,103 @@ _PIPELINE_MODEL_TYPES: dict[str, str] = {
 }
 
 
+def _tokenizer_id_ceiling(tokenizer_data: dict) -> int | None:
+    """Return the largest validated ID represented by a tokenizer.json."""
+    ids: list[int] = []
+    model = tokenizer_data.get("model")
+    if isinstance(model, dict):
+        vocabulary = model.get("vocab")
+        if isinstance(vocabulary, dict):
+            ids.extend(vocabulary.values())
+        elif isinstance(vocabulary, list):
+            for entry in vocabulary:
+                if isinstance(entry, list) and len(entry) >= 2:
+                    ids.append(entry[1])
+    for token in tokenizer_data.get("added_tokens", []):
+        if isinstance(token, dict) and "id" in token:
+            ids.append(token["id"])
+    if not ids or any(
+        not isinstance(token_id, int) or isinstance(token_id, bool) for token_id in ids
+    ):
+        return None
+    if min(ids) < 0:
+        return None
+    return max(ids)
+
+
+def _resolve_hierarchical_workflow_config(
+    *,
+    roles: dict[str, str],
+    component_configs: dict[str, dict],
+    tokenizer_data: dict,
+    contract: dict,
+) -> dict | None:
+    """Resolve tokenizer-dependent workflow facts or fail closed."""
+    required_roles = {
+        "global_decoder",
+        "global_embedding",
+        "semantic_embedding",
+        "local_decoder",
+        "local_projection",
+        "local_embedding",
+        "local_feedback_embedding",
+        "local_heads",
+        "condition_encoder",
+        "flow_transformer",
+        "vocoder",
+    }
+    if not required_roles <= roles.keys():
+        return None
+    global_component = roles["global_decoder"]
+    global_config = component_configs.get(global_component)
+    if not isinstance(global_config, dict):
+        return None
+    global_vocabulary_size = global_config.get("vocab_size")
+    global_context = global_config.get("max_position_embeddings")
+    if not isinstance(global_vocabulary_size, int) or not isinstance(global_context, int):
+        return None
+
+    added_tokens = {
+        token.get("content"): token.get("id")
+        for token in tokenizer_data.get("added_tokens", [])
+        if isinstance(token, dict)
+    }
+    required_tokens = set(
+        re.findall(
+            r"<\|[^|]+\|>",
+            "".join(segment.get("literal", "") for segment in contract["prompt_segments"]),
+        )
+    )
+    required_tokens.update(contract["tokens"].values())
+    if not required_tokens <= added_tokens.keys():
+        return None
+    tokenizer_ceiling = _tokenizer_id_ceiling(tokenizer_data)
+    if tokenizer_ceiling is None:
+        return None
+    semantic_start = tokenizer_ceiling + 1
+    stop_token_id = added_tokens[contract["tokens"]["stop"]]
+    unconditional_token_id = added_tokens[contract["tokens"]["unconditional"]]
+    semantic_size = contract["semantic_vocabulary_size"]
+    if (
+        not isinstance(stop_token_id, int)
+        or not isinstance(unconditional_token_id, int)
+        or stop_token_id >= semantic_start
+        or unconditional_token_id >= semantic_start
+        or not isinstance(semantic_size, int)
+        or semantic_size < 1
+        or semantic_start + semantic_size > global_vocabulary_size
+    ):
+        return None
+    return {
+        **contract,
+        "components": roles,
+        "semantic_vocabulary_start": semantic_start,
+        "stop_token_id": stop_token_id,
+        "unconditional_token_id": unconditional_token_id,
+        "global_context": global_context,
+    }
+
+
 def _init_diffusers_class_map() -> None:
     """Lazily populate the diffusers class map on first use."""
     if _DIFFUSERS_CLASS_MAP:
@@ -619,20 +716,6 @@ def build_diffusers_pipeline(
             continue
         for role, suffix in role_specs.get(component_info[1], {}).items():
             workflow_roles[role] = f"{component_name}{suffix}"
-    hierarchical_roles = {
-        "global_decoder",
-        "global_embedding",
-        "semantic_embedding",
-        "local_decoder",
-        "local_projection",
-        "local_embedding",
-        "local_feedback_embedding",
-        "local_heads",
-        "condition_encoder",
-        "flow_transformer",
-        "vocoder",
-    }
-    global_component = workflow_roles.get("global_decoder")
     contract_path = resources.files("mobius.integrations.diffusers").joinpath(
         "workflow_contracts/hierarchical_audio_flow_v1.json"
     )
@@ -643,35 +726,6 @@ def build_diffusers_pipeline(
         if "tokenizer" in pipeline_index
         else {}
     )
-    added_tokens = {
-        token.get("content"): token.get("id")
-        for token in tokenizer_data.get("added_tokens", [])
-        if isinstance(token, dict)
-    }
-    required_audio_tokens = set(
-        re.findall(
-            r"<\|[^|]+\|>",
-            "".join(
-                segment.get("literal", "")
-                for segment in hierarchical_contract["prompt_segments"]
-            ),
-        )
-    )
-    required_audio_tokens.update(hierarchical_contract["tokens"].values())
-    tokenizer_contract_available = required_audio_tokens <= added_tokens.keys()
-    semantic_vocabulary_start = (
-        max(int(token_id) for token_id in added_tokens.values()) + 1
-        if tokenizer_contract_available
-        else None
-    )
-    global_vocabulary_size = (
-        component_configs.get(global_component, {}).get("vocab_size")
-        if global_component is not None
-        else None
-    )
-    semantic_vocabulary_size = hierarchical_contract["semantic_vocabulary_size"]
-    token_contract = hierarchical_contract["tokens"]
-
     package.config = DiffusersPipelineConfig(
         source_model_id=model_id,
         pipeline_class=pipeline_class,
@@ -686,24 +740,11 @@ def build_diffusers_pipeline(
             if "processor" in pipeline_index
             else {}
         ),
-        workflow_config=(
-            {
-                **hierarchical_contract,
-                "components": workflow_roles,
-                "semantic_vocabulary_start": semantic_vocabulary_start,
-                "stop_token_id": added_tokens[token_contract["stop"]],
-                "unconditional_token_id": added_tokens[token_contract["unconditional"]],
-                "global_context": component_configs[global_component][
-                    "max_position_embeddings"
-                ],
-            }
-            if hierarchical_roles <= workflow_roles.keys()
-            and global_component in component_configs
-            and tokenizer_contract_available
-            and isinstance(global_vocabulary_size, int)
-            and isinstance(semantic_vocabulary_start, int)
-            and global_vocabulary_size >= semantic_vocabulary_start + semantic_vocabulary_size
-            else None
+        workflow_config=_resolve_hierarchical_workflow_config(
+            roles=workflow_roles,
+            component_configs=component_configs,
+            tokenizer_data=tokenizer_data,
+            contract=hierarchical_contract,
         ),
         model_type=_PIPELINE_MODEL_TYPES.get(pipeline_class, "diffusers"),
     )

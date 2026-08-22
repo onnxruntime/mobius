@@ -195,6 +195,8 @@ def _hierarchical_audio_package() -> ModelPackage:
             "max_audio_frames": 9000,
             "global_context": language_config.max_position_embeddings,
             "target_sample_rate": 32000,
+            "unconditional_replace_from": 1,
+            "unconditional_preserve_trailing": 2,
             "prompt_segments": [
                 {"literal": "<|im_start|><|caption_start|>"},
                 {
@@ -231,6 +233,52 @@ def _hierarchical_audio_package() -> ModelPackage:
                 shape = [int(dimension) for dimension in value.shape]
                 value.const_value = ir.tensor(np.full(shape, 1e-4, dtype=value.dtype.numpy()))
     return package
+
+
+def _write_hierarchical_audio_tokenizer(directory: Path) -> None:
+    """Write a sparse-ID tokenizer that exercises the raw speech request path."""
+    special_tokens = {
+        "<|audio_cfg|>": 151654,
+        "<|im_start|>": 151667,
+        "<|im_end|>": 151668,
+        "<|audio_start|>": 151669,
+        "<|audio_end|>": 151670,
+        "<|caption_start|>": 151671,
+        "<|caption_end|>": 151672,
+        "<|lyrics_start|>": 151673,
+        "<|lyrics_end|>": 151674,
+    }
+    vocabulary = {
+        "[UNK]": 0,
+        "music": 1,
+        "[start]": 2,
+        "[verse]": 3,
+        "hello": 4,
+        **special_tokens,
+    }
+    tokenizer = {
+        "version": "1.0",
+        "truncation": None,
+        "padding": None,
+        "added_tokens": [
+            {
+                "id": token_id,
+                "content": token,
+                "single_word": False,
+                "lstrip": False,
+                "rstrip": False,
+                "normalized": False,
+                "special": True,
+            }
+            for token, token_id in special_tokens.items()
+        ],
+        "normalizer": {"type": "Lowercase"},
+        "pre_tokenizer": {"type": "Whitespace"},
+        "post_processor": None,
+        "decoder": None,
+        "model": {"type": "WordLevel", "vocab": vocabulary, "unk_token": "[UNK]"},
+    }
+    (directory / "tokenizer.json").write_text(json.dumps(tokenizer, indent=2) + "\n")
 
 
 def _materialize_deterministic_initializers(package: ModelPackage) -> None:
@@ -1466,6 +1514,7 @@ def generate_packages(output: Path) -> Path:
     hierarchical_audio = _hierarchical_audio_package()
     directory = args.output / "hierarchical_audio"
     write_hierarchical_audio_workflow_metadata(hierarchical_audio, str(directory))
+    _write_hierarchical_audio_tokenizer(directory)
     hierarchical_audio.save(str(directory), progress_bar=False, check_weights=False)
 
     # A second image-diffusion fixture that exercises every optional part of the

@@ -544,6 +544,8 @@ def _hierarchical_audio_config(pkg: Any) -> tuple[dict[str, str], dict[str, Any]
         "max_audio_frames",
         "global_context",
         "target_sample_rate",
+        "unconditional_replace_from",
+        "unconditional_preserve_trailing",
         "prompt_segments",
     }
     if missing := sorted(required_values.difference(config)):
@@ -554,12 +556,18 @@ def _hierarchical_audio_config(pkg: Any) -> tuple[dict[str, str], dict[str, Any]
             "local_guidance_scale",
             "flow_guidance_scale",
             "prompt_segments",
+            "unconditional_replace_from",
+            "unconditional_preserve_trailing",
         }
     )
     for field in positive_integer_fields:
         value = config[field]
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
             raise ValueError(f"hierarchical audio workflow_config.{field} must be >= 1")
+    for field in ("unconditional_replace_from", "unconditional_preserve_trailing"):
+        value = config[field]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"hierarchical audio workflow_config.{field} must be >= 0")
     for field in (
         "semantic_guidance_scale",
         "local_guidance_scale",
@@ -1906,8 +1914,8 @@ def write_hierarchical_audio_workflow_metadata(pkg: Any, output_dir: str) -> str
         "state_advance_units": 1,
         "guidance_rows": {
             "unconditional_token_id": config["unconditional_token_id"],
-            "replace_from": config.get("unconditional_replace_from", 1),
-            "preserve_trailing": config.get("unconditional_preserve_trailing", 2),
+            "replace_from": config["unconditional_replace_from"],
+            "preserve_trailing": config["unconditional_preserve_trailing"],
         },
         "segments": config["prompt_segments"],
     }
