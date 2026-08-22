@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from unittest.mock import mock_open, patch
 
@@ -19,115 +20,149 @@ from mobius.integrations.diffusers._builder import (
     _load_diffusers_component_config,
     _load_diffusers_pipeline_index,
     _load_optional_diffusers_json,
+    _load_source_workflow_config,
     _resolve_diffusers_component_source,
-    _resolve_hierarchical_workflow_config,
-    _tokenizer_id_ceiling,
     build_diffusers_pipeline,
 )
+from mobius.integrations.onnx_genai import HierarchicalAudioWorkflowConfig
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize(
-    ("tokenizer", "expected"),
-    [
-        (
-            {
-                "model": {"vocab": {"base-a": 10, "base-b": 900}},
-                "added_tokens": [{"content": "<special>", "id": 20}],
-            },
-            900,
-        ),
-        (
-            {
-                "model": {"vocab": {"base-a": 4, "base-b": 5}},
-                "added_tokens": [{"content": "<special>", "id": 901}],
-            },
-            901,
-        ),
-    ],
-)
-def test_tokenizer_id_ceiling_covers_base_and_added_vocabularies(tokenizer, expected):
-    assert _tokenizer_id_ceiling(tokenizer) == expected
+def _hierarchical_workflow_config(**overrides) -> HierarchicalAudioWorkflowConfig:
+    """Construct a valid hierarchical-audio workflow config for tests.
 
-
-@pytest.mark.parametrize(
-    "tokenizer",
-    [
-        {},
-        {"model": {"vocab": {"bad": -1}}},
-        {"model": {"vocab": {"bad": "1"}}},
-        {"added_tokens": [{"content": "<bad>", "id": True}]},
-    ],
-)
-def test_tokenizer_id_ceiling_fails_closed(tokenizer):
-    assert _tokenizer_id_ceiling(tokenizer) is None
-
-
-def _workflow_resolution_inputs(base_max: int, added_max: int):
-    roles = {
-        "global_decoder": "decoder",
-        "global_embedding": "embedding",
-        "semantic_embedding": "semantic",
-        "local_decoder": "local",
-        "local_projection": "projection",
-        "local_embedding": "local_embedding",
-        "local_feedback_embedding": "feedback",
-        "local_heads": "heads",
-        "condition_encoder": "condition",
-        "flow_transformer": "flow",
-        "vocoder": "vocoder",
-    }
-    contract = {
-        "kind": "hierarchical_audio",
+    The values are illustrative structural/semantic facts, not a checked-in
+    model contract; callers override individual fields to prove the metadata
+    producer follows its typed input rather than any default.
+    """
+    fields = {
+        "components": {
+            "global_decoder": "decoder",
+            "global_embedding": "embedding",
+            "semantic_embedding": "semantic",
+            "local_decoder": "local",
+            "local_projection": "projection",
+            "local_embedding": "local_embedding",
+            "local_feedback_embedding": "feedback",
+            "local_heads": "heads",
+            "condition_encoder": "condition",
+            "flow_transformer": "flow",
+            "vocoder": "vocoder",
+        },
+        "semantic_vocabulary_start": 901,
         "semantic_vocabulary_size": 16,
-        "tokens": {"stop": "<stop>", "unconditional": "<cfg>"},
-        "prompt_segments": [{"literal": "<prompt>"}],
+        "stop_token_id": 4,
+        "unconditional_token_id": 5,
+        "semantic_guidance_scale": 1.5,
+        "local_guidance_scale": 1.5,
+        "flow_guidance_scale": 1.7,
+        "sampling_top_k": 50,
+        "chunk_frames": 200,
+        "chunk_hop": 100,
+        "flow_steps": 30,
+        "carry_length": 172,
+        "crop_left_latents": 86,
+        "crop_right_latents": 258,
+        "max_prompt_tokens": 5000,
+        "max_audio_frames": 9000,
+        "global_context": 128,
+        "target_sample_rate": 32000,
         "unconditional_replace_from": 1,
         "unconditional_preserve_trailing": 2,
+        "prompt_segments": [{"literal": "<prompt>"}],
     }
-    tokenizer = {
-        "model": {"vocab": {"base": base_max}},
-        "added_tokens": [
-            {"content": "<prompt>", "id": 3},
-            {"content": "<stop>", "id": 4},
-            {"content": "<cfg>", "id": added_max},
-        ],
-    }
-    configs = {
-        "decoder": {
-            "vocab_size": max(base_max, added_max) + 17,
-            "max_position_embeddings": 128,
-        }
-    }
-    return roles, configs, tokenizer, contract
+    fields.update(overrides)
+    return HierarchicalAudioWorkflowConfig(**fields)
 
 
-@pytest.mark.parametrize(("base_max", "added_max"), [(900, 20), (20, 900)])
-def test_hierarchical_workflow_semantic_boundary_uses_full_tokenizer(base_max, added_max):
-    roles, configs, tokenizer, contract = _workflow_resolution_inputs(base_max, added_max)
-    resolved = _resolve_hierarchical_workflow_config(
-        roles=roles,
-        component_configs=configs,
-        tokenizer_data=tokenizer,
-        contract=contract,
+@pytest.mark.parametrize(
+    ("semantic_start", "flow_steps", "target_sample_rate"),
+    [(901, 30, 32000), (2048, 12, 44100)],
+)
+def test_hierarchical_workflow_config_records_explicit_inputs(
+    semantic_start, flow_steps, target_sample_rate
+):
+    """Two explicit configs prove emitted policy/template fields follow input."""
+    config = _hierarchical_workflow_config(
+        semantic_vocabulary_start=semantic_start,
+        flow_steps=flow_steps,
+        target_sample_rate=target_sample_rate,
     )
+    assert config.semantic_vocabulary_start == semantic_start
+    assert config.flow_steps == flow_steps
+    assert config.target_sample_rate == target_sample_rate
+    # asdict is the boundary the producer consumes; every field must survive it.
+    as_dict = dataclasses.asdict(config)
+    assert as_dict["semantic_vocabulary_start"] == semantic_start
+    assert as_dict["flow_steps"] == flow_steps
+    assert as_dict["target_sample_rate"] == target_sample_rate
+    assert as_dict["prompt_segments"] == [{"literal": "<prompt>"}]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"components": {"global_decoder": "decoder"}}, "missing component roles"),
+        ({"flow_steps": 0}, "flow_steps"),
+        ({"chunk_hop": 500}, "chunk_hop cannot exceed chunk_frames"),
+        ({"semantic_guidance_scale": 0.0}, "semantic_guidance_scale"),
+        ({"prompt_segments": []}, "prompt_segments"),
+    ],
+)
+def test_hierarchical_workflow_config_fails_closed_on_invalid_input(overrides, match):
+    """The typed config refuses to describe an under-specified workflow."""
+    with pytest.raises((ValueError, TypeError), match=match):
+        _hierarchical_workflow_config(**overrides)
+
+
+def test_load_source_workflow_config_reads_pinned_asset():
+    """A pinned source-model asset supplies the semantic facts; roles come from graphs."""
+    roles = _hierarchical_workflow_config().components
+    asset = {
+        "semantic_vocabulary_start": 2048,
+        "semantic_vocabulary_size": 32,
+        "stop_token_id": 7,
+        "unconditional_token_id": 9,
+        "semantic_guidance_scale": 2.0,
+        "local_guidance_scale": 1.5,
+        "flow_guidance_scale": 1.7,
+        "sampling_top_k": 40,
+        "chunk_frames": 150,
+        "chunk_hop": 75,
+        "flow_steps": 12,
+        "carry_length": 100,
+        "crop_left_latents": 50,
+        "crop_right_latents": 150,
+        "max_prompt_tokens": 4000,
+        "max_audio_frames": 8000,
+        "global_context": 256,
+        "target_sample_rate": 44100,
+        "unconditional_replace_from": 1,
+        "unconditional_preserve_trailing": 2,
+        "prompt_segments": [{"literal": "<audio>"}],
+    }
+    with patch(
+        "mobius.integrations.diffusers._builder._load_optional_diffusers_json",
+        return_value=asset,
+    ):
+        resolved = _load_source_workflow_config("fake/model", dict(roles), revision=None)
     assert resolved is not None
-    assert resolved["semantic_vocabulary_start"] == max(base_max, added_max) + 1
+    assert resolved.semantic_vocabulary_start == 2048
+    assert resolved.flow_steps == 12
+    assert resolved.target_sample_rate == 44100
+    # The structural role map is supplied by the builder, not the asset.
+    assert resolved.components == dict(roles)
 
 
-def test_hierarchical_workflow_omits_inconsistent_candidate_range():
-    roles, configs, tokenizer, contract = _workflow_resolution_inputs(900, 20)
-    configs["decoder"]["vocab_size"] = 916
-    assert (
-        _resolve_hierarchical_workflow_config(
-            roles=roles,
-            component_configs=configs,
-            tokenizer_data=tokenizer,
-            contract=contract,
-        )
-        is None
-    )
+def test_load_source_workflow_config_returns_none_when_asset_absent():
+    """No asset means fail closed at the caller, not an invented default."""
+    roles = _hierarchical_workflow_config().components
+    with patch(
+        "mobius.integrations.diffusers._builder._load_optional_diffusers_json",
+        return_value={},
+    ):
+        assert _load_source_workflow_config("fake/model", dict(roles), revision=None) is None
 
 
 def _fake_pipeline_index(

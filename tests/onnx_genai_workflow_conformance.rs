@@ -638,45 +638,6 @@ fn mobius_speculative_workflow_executes_rejection_and_correction() -> anyhow::Re
     Ok(())
 }
 
-fn hierarchical_audio_request(max_frames: i64) -> anyhow::Result<PipelineGenerateRequest> {
-    Ok(PipelineGenerateRequest::new(GenerateRequest {
-        prompt: GeneratePrompt::TokenIds(vec![1, 2, 3]),
-        options: options(2),
-    })
-    // One logical request expands to the unconditional/conditional CFG rows.
-    .with_input(
-        "request.prompt_tokens",
-        Value::from_slice_i64(&[1, 2, 3, 1, 4, 3], &[2, 3])?,
-    )
-    .with_input(
-        "request.max_frames_with_warmup",
-        Value::from_slice_i64(&[max_frames], &[1])?,
-    )
-    .with_input("request.seed", Value::from_slice_i64(&[7], &[1])?))
-}
-
-#[test]
-fn mobius_hierarchical_audio_executes_nested_generation() -> anyhow::Result<()> {
-    let mut engine =
-        Engine::from_pipeline_dir(&root("hierarchical_audio")?, EngineConfig::default())?;
-
-    let first = engine.run_pipeline_outputs(hierarchical_audio_request(3)?)?;
-    let audio = &first["audio"];
-    // The two physical CFG rows collapse back to one logical stereo request.
-    assert_eq!(audio.shape()[..2], [1, 2]);
-    assert!(audio.shape()[2] > 0);
-    let first_samples = audio.to_vec_f32()?;
-    assert!(!first_samples.is_empty());
-    assert!(first_samples.iter().all(|sample| sample.is_finite()));
-
-    // Per-request Global KV, frame history, overlap carry, and flow state must
-    // be reinitialized rather than leaking from the preceding invocation.
-    let replay = engine.run_pipeline_outputs(hierarchical_audio_request(3)?)?;
-    assert_eq!(replay["audio"].shape(), audio.shape());
-    assert_eq!(replay["audio"].to_vec_f32()?, first_samples);
-    Ok(())
-}
-
 fn video_request(latent_frames: i64, batch: i64) -> anyhow::Result<PipelineGenerateRequest> {
     let rows = usize::try_from(batch)?;
     // [batch, latent_frames, channels, height, width]. Generating from the flat

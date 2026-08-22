@@ -41,6 +41,7 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     add_adapter_service_to_metadata,
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
+    HierarchicalAudioWorkflowConfig,
     write_audio_codec_workflow_metadata,
     write_diffusion_workflow_metadata,
     write_encoder_embedding_workflow_metadata,
@@ -162,9 +163,8 @@ def _hierarchical_audio_package() -> ModelPackage:
             },
             "vocoder": {"sampling_rate": vocoder_config.sampling_rate},
         },
-        workflow_config={
-            "kind": "hierarchical_audio",
-            "components": {
+        workflow_config=HierarchicalAudioWorkflowConfig(
+            components={
                 "global_decoder": "language_model",
                 "global_embedding": "language_model_embedding",
                 "semantic_embedding": "language_model_semantic_embedding",
@@ -177,27 +177,27 @@ def _hierarchical_audio_package() -> ModelPackage:
                 "flow_transformer": "transformer",
                 "vocoder": "vocoder",
             },
-            "semantic_vocabulary_start": 151675,
-            "semantic_vocabulary_size": 16384,
-            "stop_token_id": 151670,
-            "unconditional_token_id": 151654,
-            "semantic_guidance_scale": 1.5,
-            "local_guidance_scale": 1.5,
-            "flow_guidance_scale": 1.7,
-            "sampling_top_k": 50,
-            "chunk_frames": 200,
-            "chunk_hop": 100,
-            "flow_steps": 30,
-            "carry_length": 172,
-            "crop_left_latents": 86,
-            "crop_right_latents": 258,
-            "max_prompt_tokens": 5000,
-            "max_audio_frames": 9000,
-            "global_context": language_config.max_position_embeddings,
-            "target_sample_rate": 32000,
-            "unconditional_replace_from": 1,
-            "unconditional_preserve_trailing": 2,
-            "prompt_segments": [
+            semantic_vocabulary_start=151675,
+            semantic_vocabulary_size=16384,
+            stop_token_id=151670,
+            unconditional_token_id=151654,
+            semantic_guidance_scale=1.5,
+            local_guidance_scale=1.5,
+            flow_guidance_scale=1.7,
+            sampling_top_k=50,
+            chunk_frames=200,
+            chunk_hop=100,
+            flow_steps=30,
+            carry_length=172,
+            crop_left_latents=86,
+            crop_right_latents=258,
+            max_prompt_tokens=5000,
+            max_audio_frames=9000,
+            global_context=language_config.max_position_embeddings,
+            target_sample_rate=32000,
+            unconditional_replace_from=1,
+            unconditional_preserve_trailing=2,
+            prompt_segments=[
                 {"literal": "<|im_start|><|caption_start|>"},
                 {
                     "field": "instructions",
@@ -224,7 +224,7 @@ def _hierarchical_audio_package() -> ModelPackage:
                 },
                 {"literal": "<|lyrics_end|><|im_end|><|audio_start|>"},
             ],
-        },
+        ),
     )
     _materialize_deterministic_initializers(package)
     for model in package.values():

@@ -13,11 +13,11 @@ __all__ = [
     "build_diffusers_pipeline",
 ]
 
+import dataclasses
 import json
 import logging
 import os
-import re
-from importlib import resources
+from typing import TYPE_CHECKING
 
 import onnx_ir as ir
 import torch
@@ -27,6 +27,9 @@ from mobius._builder import build_from_module, resolve_dtype
 from mobius._model_package import ModelPackage
 from mobius._optimizations import fold_initializers_after_weights
 from mobius.integrations._weight_loading import _parallel_download, apply_weights
+
+if TYPE_CHECKING:
+    from mobius.integrations.onnx_genai import HierarchicalAudioWorkflowConfig
 
 logger = logging.getLogger(__name__)
 
@@ -53,102 +56,37 @@ _PIPELINE_MODEL_TYPES: dict[str, str] = {
     "QwenImageEditPlusPipeline": "qwen_image_edit",
 }
 
-
-def _tokenizer_id_ceiling(tokenizer_data: dict) -> int | None:
-    """Return the largest validated ID represented by a tokenizer.json."""
-    ids: list[int] = []
-    model = tokenizer_data.get("model")
-    if isinstance(model, dict):
-        vocabulary = model.get("vocab")
-        if isinstance(vocabulary, dict):
-            ids.extend(vocabulary.values())
-        elif isinstance(vocabulary, list):
-            for entry in vocabulary:
-                if isinstance(entry, list) and len(entry) >= 2:
-                    ids.append(entry[1])
-    for token in tokenizer_data.get("added_tokens", []):
-        if isinstance(token, dict) and "id" in token:
-            ids.append(token["id"])
-    if not ids or any(
-        not isinstance(token_id, int) or isinstance(token_id, bool) for token_id in ids
-    ):
-        return None
-    if min(ids) < 0:
-        return None
-    return max(ids)
+#: Optional source-model asset naming a pipeline's model-agnostic workflow
+#: configuration. When present at the requested revision it supplies the
+#: semantic facts a hierarchical-audio workflow cannot derive from its graphs.
+#: The builder never ships or defaults these values; the checkpoint publisher
+#: does, keeping the config out of mobius and off any model/class-name branch.
+HIERARCHICAL_AUDIO_WORKFLOW_ASSET = "mobius_workflow.json"
 
 
-def _resolve_hierarchical_workflow_config(
-    *,
+def _load_source_workflow_config(
+    model_id: str,
     roles: dict[str, str],
-    component_configs: dict[str, dict],
-    tokenizer_data: dict,
-    contract: dict,
-) -> dict | None:
-    """Resolve tokenizer-dependent workflow facts or fail closed."""
-    required_roles = {
-        "global_decoder",
-        "global_embedding",
-        "semantic_embedding",
-        "local_decoder",
-        "local_projection",
-        "local_embedding",
-        "local_feedback_embedding",
-        "local_heads",
-        "condition_encoder",
-        "flow_transformer",
-        "vocoder",
-    }
-    if not required_roles <= roles.keys():
-        return None
-    global_component = roles["global_decoder"]
-    global_config = component_configs.get(global_component)
-    if not isinstance(global_config, dict):
-        return None
-    global_vocabulary_size = global_config.get("vocab_size")
-    global_context = global_config.get("max_position_embeddings")
-    if not isinstance(global_vocabulary_size, int) or not isinstance(global_context, int):
-        return None
+    *,
+    revision: str | None,
+) -> HierarchicalAudioWorkflowConfig | None:
+    """Load a hierarchical-audio workflow config from a source-model asset.
 
-    added_tokens = {
-        token.get("content"): token.get("id")
-        for token in tokenizer_data.get("added_tokens", [])
-        if isinstance(token, dict)
-    }
-    required_tokens = set(
-        re.findall(
-            r"<\|[^|]+\|>",
-            "".join(segment.get("literal", "") for segment in contract["prompt_segments"]),
-        )
+    Reads a well-defined :data:`HIERARCHICAL_AUDIO_WORKFLOW_ASSET` from the
+    source repository at the requested revision. The asset carries only the
+    model-agnostic semantic fields; the structural role map is supplied by the
+    builder from the graphs it actually produced. Returns ``None`` when no asset
+    is present so the caller can fail closed instead of inventing defaults.
+    """
+    from mobius.integrations.onnx_genai import HierarchicalAudioWorkflowConfig
+
+    data = _load_optional_diffusers_json(
+        model_id, HIERARCHICAL_AUDIO_WORKFLOW_ASSET, revision=revision
     )
-    required_tokens.update(contract["tokens"].values())
-    if not required_tokens <= added_tokens.keys():
+    if not data:
         return None
-    tokenizer_ceiling = _tokenizer_id_ceiling(tokenizer_data)
-    if tokenizer_ceiling is None:
-        return None
-    semantic_start = tokenizer_ceiling + 1
-    stop_token_id = added_tokens[contract["tokens"]["stop"]]
-    unconditional_token_id = added_tokens[contract["tokens"]["unconditional"]]
-    semantic_size = contract["semantic_vocabulary_size"]
-    if (
-        not isinstance(stop_token_id, int)
-        or not isinstance(unconditional_token_id, int)
-        or stop_token_id >= semantic_start
-        or unconditional_token_id >= semantic_start
-        or not isinstance(semantic_size, int)
-        or semantic_size < 1
-        or semantic_start + semantic_size > global_vocabulary_size
-    ):
-        return None
-    return {
-        **contract,
-        "components": roles,
-        "semantic_vocabulary_start": semantic_start,
-        "stop_token_id": stop_token_id,
-        "unconditional_token_id": unconditional_token_id,
-        "global_context": global_context,
-    }
+    fields = {key: value for key, value in data.items() if key not in ("kind", "components")}
+    return HierarchicalAudioWorkflowConfig(components=dict(roles), **fields)
 
 
 def _init_diffusers_class_map() -> None:
@@ -531,6 +469,7 @@ def build_diffusers_pipeline(
     unet_loras: dict | None = None,
     components: set[str] | None = None,
     execution_provider: str = "default",
+    workflow_config: HierarchicalAudioWorkflowConfig | None = None,
 ) -> ModelPackage:
     """Build ONNX models for all supported components in a diffusers pipeline.
 
@@ -554,6 +493,14 @@ def build_diffusers_pipeline(
         components: Optional component-name allowlist. Non-neural pipeline metadata
             is still retained so a single-component export preserves its contract.
         execution_provider: Target execution provider for EP-aware graph optimization.
+        workflow_config: Optional typed, model-agnostic workflow description for
+            pipelines whose ONNX GenAI execution cannot be derived from the graphs
+            alone (currently hierarchical audio). When omitted, the builder looks
+            for a source-model workflow asset at the requested revision. When
+            neither is available the graphs are still built, but the package is
+            marked so ONNX GenAI metadata emission fails closed with an
+            instruction to supply the config rather than being misclassified.
+            Never selected by pipeline/model/class name.
 
     Returns:
         A :class:`ModelPackage` containing the built component model(s).
@@ -622,16 +569,12 @@ def build_diffusers_pipeline(
         config = config_class.from_diffusers(component_config_dict)
 
         if dtype is not None and hasattr(config, "dtype"):
-            import dataclasses
-
             config = dataclasses.replace(config, dtype=dtype)
 
         # Runtime LoRA: bake the requested adapters into the UNet denoiser and
         # merge their (remapped) weights alongside the base weights.
         lora_weights: dict = {}
         if unet_loras and task_name == "denoising" and hasattr(config, "lora_adapters"):
-            import dataclasses
-
             adapters, lora_weights = _prepare_unet_loras(unet_loras)
             config = dataclasses.replace(config, lora_adapters=adapters)
 
@@ -700,6 +643,11 @@ def build_diffusers_pipeline(
             revision=source_revision,
         )
 
+    # Structural role extraction (model-building layer): map each recognized
+    # component class to the structural role it plays so a hierarchical-audio
+    # pipeline's graphs can be wired to a workflow. This never selects semantic
+    # values by class name -- those come only from ``workflow_config`` or a
+    # source-model asset below.
     role_specs = {
         "Qwen3ForCausalLM": {
             "global_decoder": "",
@@ -723,16 +671,29 @@ def build_diffusers_pipeline(
             continue
         for role, suffix in role_specs.get(component_info[1], {}).items():
             workflow_roles[role] = f"{component_name}{suffix}"
-    contract_path = resources.files("mobius.integrations.diffusers").joinpath(
-        "workflow_contracts/hierarchical_audio_flow_v1.json"
-    )
-    with contract_path.open(encoding="utf-8") as handle:
-        hierarchical_contract = json.load(handle)
-    tokenizer_data = (
-        load_optional_component_json("tokenizer", "tokenizer.json")
-        if "tokenizer" in pipeline_index
-        else {}
-    )
+
+    from mobius.integrations.onnx_genai import HIERARCHICAL_AUDIO_ROLES
+
+    # A complete role set means the built graphs form a hierarchical-audio
+    # topology. Resolve the workflow config only from an explicit argument or a
+    # pinned source-model asset -- never a mobius default or a class-name
+    # lookup. When neither is available the graphs still build and
+    # ``workflow_kind`` marks the package so ONNX GenAI metadata emission fails
+    # closed with an instruction to supply the config.
+    is_hierarchical_audio = workflow_roles.keys() >= HIERARCHICAL_AUDIO_ROLES
+    resolved_workflow_config = workflow_config
+    if is_hierarchical_audio:
+        if resolved_workflow_config is None:
+            resolved_workflow_config = _load_source_workflow_config(
+                model_id, workflow_roles, revision=revision
+            )
+        if resolved_workflow_config is not None:
+            # The graph names the builder produced are authoritative, so wire
+            # the structural role map onto whatever semantic config was supplied.
+            resolved_workflow_config = dataclasses.replace(
+                resolved_workflow_config, components=dict(workflow_roles)
+            )
+
     package.config = DiffusersPipelineConfig(
         source_model_id=model_id,
         pipeline_class=pipeline_class,
@@ -747,12 +708,8 @@ def build_diffusers_pipeline(
             if "processor" in pipeline_index
             else {}
         ),
-        workflow_config=_resolve_hierarchical_workflow_config(
-            roles=workflow_roles,
-            component_configs=component_configs,
-            tokenizer_data=tokenizer_data,
-            contract=hierarchical_contract,
-        ),
+        workflow_config=resolved_workflow_config,
+        workflow_kind="hierarchical_audio" if is_hierarchical_audio else None,
         model_type=_PIPELINE_MODEL_TYPES.get(pipeline_class, "diffusers"),
     )
     return package

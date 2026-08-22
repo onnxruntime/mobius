@@ -802,15 +802,26 @@ def build_shared_state_pixel_flow_workflow_metadata(
     )
 
     group_ports: dict[str, dict[str, Any]] = {
-        branch: {decoder_name: {}} for branch in ("conditional", "unconditional")
+        branch: {decoder_name: {}, denoiser_name: {}}
+        for branch in ("conditional", "unconditional")
     }
-    for index, (decoder_past, decoder_present) in enumerate(decoder_pairs):
+    for index, (
+        (decoder_past, decoder_present),
+        (generation_past, generation_present),
+    ) in enumerate(zip(decoder_pairs, denoiser_pairs)):
         role = "key" if decoder_past.name.endswith(".key") else "value"
         for branch in ("conditional", "unconditional"):
             alias = f"{branch}_cache_{index}"
             group_ports[branch][decoder_name][alias] = {
                 "input": decoder_past.name,
                 "output": decoder_present.name,
+                "role": role,
+                "layer": index // 2,
+            }
+            group_ports[branch][denoiser_name][alias] = {
+                "input": generation_past.name,
+                "output": generation_present.name,
+                "access": "read_only",
                 "role": role,
                 "layer": index // 2,
             }

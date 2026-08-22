@@ -6,11 +6,13 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import math
 import os
 import re
-from typing import Any
+from collections.abc import Mapping, Sequence
+from typing import Any, ClassVar
 
 import onnx_ir as ir
 import yaml
@@ -495,19 +497,11 @@ def _invoke(
     }
 
 
-def _hierarchical_audio_config(pkg: Any) -> tuple[dict[str, str], dict[str, Any]]:
-    """Return the graph-role map and validated execution contract."""
-    package_config = getattr(pkg, "config", None)
-    config = getattr(package_config, "workflow_config", None)
-    if not isinstance(config, dict) or config.get("kind") != "hierarchical_audio":
-        raise ValueError(
-            "hierarchical audio metadata requires pkg.config.workflow_config "
-            "with kind='hierarchical_audio'"
-        )
-    roles = config.get("components")
-    if not isinstance(roles, dict):
-        raise TypeError("hierarchical audio workflow_config.components must be an object")
-    required_roles = {
+#: The eleven structural roles a hierarchical-audio workflow wires together:
+#: the global autoregressive decoder plus its embeddings, the local RVQ depth
+#: decoder stack, the condition encoder, the flow transformer and the vocoder.
+HIERARCHICAL_AUDIO_ROLES: frozenset[str] = frozenset(
+    {
         "global_decoder",
         "global_embedding",
         "semantic_embedding",
@@ -520,21 +514,90 @@ def _hierarchical_audio_config(pkg: Any) -> tuple[dict[str, str], dict[str, Any]
         "flow_transformer",
         "vocoder",
     }
-    if missing := sorted(required_roles.difference(roles)):
-        raise ValueError(f"hierarchical audio workflow is missing component roles: {missing}")
-    if len(set(roles.values())) != len(roles):
-        raise ValueError("hierarchical audio component roles must resolve to distinct graphs")
-    if missing := sorted(set(roles.values()).difference(pkg.keys())):
-        raise ValueError(f"hierarchical audio workflow is missing components: {missing}")
+)
 
-    required_values = {
+
+@dataclasses.dataclass(frozen=True)
+class HierarchicalAudioWorkflowConfig:
+    """Typed, model-agnostic description of a hierarchical-audio workflow.
+
+    A nested autoregressive / residual-vector-quantized / flow-matching /
+    vocoder pipeline (for example text-and-lyrics to music) cannot describe its
+    own execution from the exported neural graphs alone: the semantic-token
+    vocabulary boundary, the classifier-free-guidance schedule, the chunked
+    flow-matching plan and the prompt-assembly template are runtime facts that
+    live outside the graphs. This structure carries exactly those facts so the
+    metadata producer can emit an executable workflow.
+
+    It is deliberately model-agnostic. It names no model or checkpoint, ships no
+    default semantic values, and is populated by the caller — an explicit
+    :func:`build_diffusers_pipeline` argument or a source-model workflow asset —
+    rather than selected by pipeline/model/class name. Every field is validated
+    on construction, so a producer that cannot fully describe its workflow fails
+    closed here instead of emitting partial metadata. The two token-id fields
+    are additionally validated by the producer against the built graph's global
+    logits width (a fact only the graph knows).
+
+    Attributes:
+        components: Structural role -> exported graph name for the eleven
+            :data:`HIERARCHICAL_AUDIO_ROLES`.
+        semantic_vocabulary_start: First global-logits column that is a semantic
+            audio token; columns below it are text tokens.
+        semantic_vocabulary_size: Count of contiguous semantic audio tokens.
+        stop_token_id: Text-region token that ends semantic generation.
+        unconditional_token_id: Text-region token spliced in for classifier-free
+            guidance rows.
+        semantic_guidance_scale: CFG scale applied to global semantic logits.
+        local_guidance_scale: CFG scale applied to local codebook logits.
+        flow_guidance_scale: CFG scale applied inside flow matching.
+        sampling_top_k: Default top-k used when sampling semantic tokens.
+        chunk_frames: Frames per flow-matching chunk.
+        chunk_hop: Frame stride between consecutive chunks (<= chunk_frames).
+        flow_steps: Number of flow-matching solver steps per chunk.
+        carry_length: Latent frames carried between chunks for overlap blending.
+        crop_left_latents: Latent frames cropped from a chunk's left overlap.
+        crop_right_latents: Latent frames cropped from a chunk's right overlap.
+        max_prompt_tokens: Prompt-processor input-token ceiling.
+        max_audio_frames: Prompt-processor output-frame ceiling.
+        global_context: Global decoder context window (positions).
+        target_sample_rate: Delivered waveform sample rate in Hz.
+        unconditional_replace_from: First prompt row replaced by the
+            unconditional token when building CFG guidance rows.
+        unconditional_preserve_trailing: Trailing prompt rows preserved when
+            building CFG guidance rows.
+        prompt_segments: Ordered prompt-assembly template (literals and
+            request-field transforms) emitted verbatim into the processor.
+    """
+
+    components: Mapping[str, str]
+    semantic_vocabulary_start: int
+    semantic_vocabulary_size: int
+    stop_token_id: int
+    unconditional_token_id: int
+    semantic_guidance_scale: float
+    local_guidance_scale: float
+    flow_guidance_scale: float
+    sampling_top_k: int
+    chunk_frames: int
+    chunk_hop: int
+    flow_steps: int
+    carry_length: int
+    crop_left_latents: int
+    crop_right_latents: int
+    max_prompt_tokens: int
+    max_audio_frames: int
+    global_context: int
+    target_sample_rate: int
+    unconditional_replace_from: int
+    unconditional_preserve_trailing: int
+    prompt_segments: Sequence[Mapping[str, Any]]
+
+    #: Positive-integer fields (>= 1). Token ids and guidance-row indices are
+    #: nonnegative, guidance scales are positive floats, and the token bounds
+    #: relative to the vocabulary and graph logits are enforced by the producer.
+    _POSITIVE_INTEGER_FIELDS: ClassVar[tuple[str, ...]] = (
         "semantic_vocabulary_start",
         "semantic_vocabulary_size",
-        "stop_token_id",
-        "unconditional_token_id",
-        "semantic_guidance_scale",
-        "local_guidance_scale",
-        "flow_guidance_scale",
         "sampling_top_k",
         "chunk_frames",
         "chunk_hop",
@@ -546,49 +609,88 @@ def _hierarchical_audio_config(pkg: Any) -> tuple[dict[str, str], dict[str, Any]
         "max_audio_frames",
         "global_context",
         "target_sample_rate",
-        "unconditional_replace_from",
-        "unconditional_preserve_trailing",
-        "prompt_segments",
-    }
-    if missing := sorted(required_values.difference(config)):
-        raise ValueError(f"hierarchical audio workflow_config is missing fields: {missing}")
-    positive_integer_fields = required_values.difference(
-        {
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.components, Mapping):
+            raise TypeError("hierarchical audio workflow_config.components must be a mapping")
+        if missing := sorted(HIERARCHICAL_AUDIO_ROLES.difference(self.components)):
+            raise ValueError(
+                f"hierarchical audio workflow is missing component roles: {missing}"
+            )
+        if len(set(self.components.values())) != len(self.components):
+            raise ValueError(
+                "hierarchical audio component roles must resolve to distinct graphs"
+            )
+        for field in self._POSITIVE_INTEGER_FIELDS:
+            value = getattr(self, field)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"hierarchical audio workflow_config.{field} must be >= 1")
+        for field in ("unconditional_replace_from", "unconditional_preserve_trailing"):
+            value = getattr(self, field)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"hierarchical audio workflow_config.{field} must be >= 0")
+        for field in ("stop_token_id", "unconditional_token_id"):
+            value = getattr(self, field)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(
+                    f"hierarchical audio workflow_config.{field} must be an integer"
+                )
+        for field in (
             "semantic_guidance_scale",
             "local_guidance_scale",
             "flow_guidance_scale",
-            "prompt_segments",
-            "unconditional_replace_from",
-            "unconditional_preserve_trailing",
-            "stop_token_id",
-            "unconditional_token_id",
-        }
-    )
-    for field in positive_integer_fields:
-        value = config[field]
-        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-            raise ValueError(f"hierarchical audio workflow_config.{field} must be >= 1")
-    for field in ("unconditional_replace_from", "unconditional_preserve_trailing"):
-        value = config[field]
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            raise ValueError(f"hierarchical audio workflow_config.{field} must be >= 0")
-    for field in ("stop_token_id", "unconditional_token_id"):
-        value = config[field]
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            raise ValueError(f"hierarchical audio workflow_config.{field} must be >= 0")
-    for field in (
-        "semantic_guidance_scale",
-        "local_guidance_scale",
-        "flow_guidance_scale",
-    ):
-        if not isinstance(config[field], (int, float)) or config[field] <= 0:
-            raise ValueError(f"hierarchical audio workflow_config.{field} must be positive")
-    if not isinstance(config["prompt_segments"], list) or not config["prompt_segments"]:
+        ):
+            value = getattr(self, field)
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+                raise ValueError(
+                    f"hierarchical audio workflow_config.{field} must be positive"
+                )
+        if (
+            not isinstance(self.prompt_segments, Sequence)
+            or isinstance(self.prompt_segments, (str, bytes))
+            or not self.prompt_segments
+        ):
+            raise ValueError(
+                "hierarchical audio workflow_config.prompt_segments must be a non-empty list"
+            )
+        if self.chunk_hop > self.chunk_frames:
+            raise ValueError("hierarchical audio chunk_hop cannot exceed chunk_frames")
+
+
+def _hierarchical_audio_config(pkg: Any) -> tuple[dict[str, str], dict[str, Any]]:
+    """Return the graph-role map and validated execution contract.
+
+    The workflow config must arrive as a fully typed, self-validated
+    :class:`HierarchicalAudioWorkflowConfig`; the producer refuses to emit
+    metadata for a package that cannot describe its own workflow. The only
+    checks left here are the ones that need the built package: that every role
+    resolves to a graph the package actually exposes, and that the two control
+    token ids are nonnegative (their upper bounds are validated against the
+    graph logits in :func:`build_hierarchical_audio_workflow_metadata`).
+    """
+    package_config = getattr(pkg, "config", None)
+    config_obj = getattr(package_config, "workflow_config", None)
+    if config_obj is None:
+        # Fail closed: a structurally-hierarchical package whose workflow config
+        # could not be resolved gets here so metadata emission stops with a
+        # targeted instruction instead of emitting partial or misclassified data.
         raise ValueError(
-            "hierarchical audio workflow_config.prompt_segments must be a non-empty list"
+            "hierarchical audio metadata requires a workflow config; supply one via "
+            "build_diffusers_pipeline(workflow_config=...) or a source-model workflow asset"
         )
-    if config["chunk_hop"] > config["chunk_frames"]:
-        raise ValueError("hierarchical audio chunk_hop cannot exceed chunk_frames")
+    if not isinstance(config_obj, HierarchicalAudioWorkflowConfig):
+        raise TypeError(
+            "hierarchical audio pkg.config.workflow_config must be a "
+            "HierarchicalAudioWorkflowConfig"
+        )
+    config = dataclasses.asdict(config_obj)
+    roles = config["components"]
+    if missing := sorted(set(roles.values()).difference(pkg.keys())):
+        raise ValueError(f"hierarchical audio workflow is missing components: {missing}")
+    for field in ("stop_token_id", "unconditional_token_id"):
+        if config[field] < 0:
+            raise ValueError(f"hierarchical audio workflow_config.{field} must be >= 0")
     return roles, config
 
 

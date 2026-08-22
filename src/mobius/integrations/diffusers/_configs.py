@@ -12,6 +12,7 @@ import onnx_ir as ir
 
 if TYPE_CHECKING:
     from mobius._configs import ArchitectureConfig
+    from mobius.integrations.onnx_genai import HierarchicalAudioWorkflowConfig
 
 MINIMAX_MUSIC3_AUDIO_END_TOKEN_ID = 151670
 MINIMAX_MUSIC3_AUDIO_CODE_OFFSET = 151675
@@ -128,7 +129,14 @@ class DiffusersPipelineConfig:
     component_configs: dict[str, dict]
     scheduler_config: dict
     processor_config: dict
-    workflow_config: dict | None = None
+    #: A typed, model-agnostic workflow config supplied by the caller or a
+    #: source-model asset. ``None`` when no authoritative config was resolved.
+    workflow_config: HierarchicalAudioWorkflowConfig | None = None
+    #: Structural workflow kind detected from the built graph topology, set even
+    #: when no ``workflow_config`` could be resolved so metadata emission can
+    #: fail closed with a targeted instruction instead of misclassifying the
+    #: package.
+    workflow_kind: str | None = None
     model_type: str = "diffusers"
 
 

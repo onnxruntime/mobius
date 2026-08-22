@@ -529,10 +529,6 @@ class TestInferenceMetadataStatus:
             "latent_scale",
             "image_output_clamp",
         }
-        group_ports = workflow["serving"]["state_service"]["groups"]["conditional_prefix"][
-            "ports"
-        ]
-        assert "image_gen_denoiser" not in group_ports
         assert workflow["inputs"]["request.seed"]["role"]["role"] == "seed"
         assert workflow["inputs"]["request.width"]["role"]["role"] == "width"
         assert workflow["inputs"]["request.height"]["role"]["role"] == "height"
@@ -601,6 +597,10 @@ class TestInferenceMetadataStatus:
             .const_value.numpy(),
             [0.0, 0.5, 1.0],
         )
+        denoiser_aliases = workflow["serving"]["state_service"]["groups"][
+            "conditional_prefix"
+        ]["ports"]["image_gen_denoiser"]
+        assert all(alias["access"] == "read_only" for alias in denoiser_aliases.values())
         assert workflow["outputs"]["image"]["value_range"] == "negative_one_to_one"
         transforms = metadata["preprocessing"]["image"]["transforms"]
         assert [transform["op"] for transform in transforms] == [

@@ -29,6 +29,7 @@ from mobius.integrations.onnx_genai.inference_metadata_test import (
     _value,
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
+    HierarchicalAudioWorkflowConfig,
     build_decoder_workflow_metadata,
     build_hierarchical_audio_workflow_metadata,
 )
@@ -1439,9 +1440,8 @@ def test_hierarchical_audio_package_is_not_misclassified_as_diffusion(
             },
             "vocoder": {"sampling_rate": source_rate},
         },
-        workflow_config={
-            "kind": "hierarchical_audio",
-            "components": {
+        workflow_config=HierarchicalAudioWorkflowConfig(
+            components={
                 "global_decoder": "language_model",
                 "global_embedding": "language_model_embedding",
                 "semantic_embedding": "language_model_semantic_embedding",
@@ -1454,28 +1454,28 @@ def test_hierarchical_audio_package_is_not_misclassified_as_diffusion(
                 "flow_transformer": "transformer",
                 "vocoder": "vocoder",
             },
-            "semantic_vocabulary_start": semantic_start,
-            "semantic_vocabulary_size": semantic_size,
-            "stop_token_id": stop_token,
-            "unconditional_token_id": stop_token - 1,
-            "semantic_guidance_scale": 1.5,
-            "local_guidance_scale": 1.5,
-            "flow_guidance_scale": 1.7,
-            "sampling_top_k": 50,
-            "chunk_frames": 200,
-            "chunk_hop": 100,
-            "flow_steps": flow_steps,
-            "carry_length": 172,
-            "crop_left_latents": 86,
-            "crop_right_latents": 258,
-            "max_prompt_tokens": 5000,
-            "max_audio_frames": 9000,
-            "global_context": 10240,
-            "target_sample_rate": target_rate,
-            "unconditional_replace_from": replace_from,
-            "unconditional_preserve_trailing": preserve_trailing,
-            "prompt_segments": [{"literal": "<audio>"}],
-        },
+            semantic_vocabulary_start=semantic_start,
+            semantic_vocabulary_size=semantic_size,
+            stop_token_id=stop_token,
+            unconditional_token_id=stop_token - 1,
+            semantic_guidance_scale=1.5,
+            local_guidance_scale=1.5,
+            flow_guidance_scale=1.7,
+            sampling_top_k=50,
+            chunk_frames=200,
+            chunk_hop=100,
+            flow_steps=flow_steps,
+            carry_length=172,
+            crop_left_latents=86,
+            crop_right_latents=258,
+            max_prompt_tokens=5000,
+            max_audio_frames=9000,
+            global_context=10240,
+            target_sample_rate=target_rate,
+            unconditional_replace_from=replace_from,
+            unconditional_preserve_trailing=preserve_trailing,
+            prompt_segments=[{"literal": "<audio>"}],
+        ),
     )
 
     # Match the CLI order: neural graphs are saved before metadata generation
@@ -1530,9 +1530,12 @@ def test_hierarchical_audio_package_is_not_misclassified_as_diffusion(
         policy_path = tmp_path / artifact
         assert policy_path.is_file(), artifact
         ir.load(policy_path)
-    original_stop = pkg.config.workflow_config["stop_token_id"]
-    original_unconditional = pkg.config.workflow_config["unconditional_token_id"]
+    base_config = pkg.config.workflow_config
     policy_names = set(pkg.policy_components)
+    # The metadata writer -- not the typed config -- is the authority on the two
+    # control-token bounds, because the upper bounds depend on the built graph's
+    # global logits width. Each invalid token is a well-formed config the writer
+    # must still reject before writing any artifact or registering any policy.
     invalid_tokens = [
         ("negative-stop", "stop_token_id", -1),
         ("stop-at-semantic-start", "stop_token_id", semantic_start),
@@ -1547,9 +1550,7 @@ def test_hierarchical_audio_package_is_not_misclassified_as_diffusion(
         ("unconditional-above-logits", "unconditional_token_id", 170000),
     ]
     for label, field, invalid_value in invalid_tokens:
-        pkg.config.workflow_config["stop_token_id"] = original_stop
-        pkg.config.workflow_config["unconditional_token_id"] = original_unconditional
-        pkg.config.workflow_config[field] = invalid_value
+        pkg.config.workflow_config = dataclasses.replace(base_config, **{field: invalid_value})
         with pytest.raises(ValueError, match=field):
             build_hierarchical_audio_workflow_metadata(pkg)
         invalid_dir = tmp_path / label
@@ -1557,11 +1558,25 @@ def test_hierarchical_audio_package_is_not_misclassified_as_diffusion(
             write_onnx_genai_config(pkg, str(invalid_dir))
         assert not list(invalid_dir.rglob("*"))
         assert set(pkg.policy_components) == policy_names
-    pkg.config.workflow_config["stop_token_id"] = original_stop
-    pkg.config.workflow_config["unconditional_token_id"] = original_unconditional
-    del pkg.config.workflow_config["max_audio_frames"]
+    pkg.config.workflow_config = base_config
+
+    # Completeness of the remaining fields fails closed at construction: the
+    # typed config refuses to describe a workflow whose frame ceiling is absent.
     with pytest.raises(ValueError, match="max_audio_frames"):
-        build_hierarchical_audio_workflow_metadata(pkg)
+        dataclasses.replace(base_config, max_audio_frames=0)
+
+    # Fail closed on an unresolved config: a structurally-hierarchical package
+    # (marked by ``workflow_kind``) whose workflow config could not be resolved
+    # must still be routed to the hierarchical writer -- never misclassified as
+    # diffusion -- and refuse to emit metadata with a targeted instruction,
+    # leaving no artifacts or policy components behind.
+    pkg.config.workflow_config = None
+    pkg.config.workflow_kind = "hierarchical_audio"
+    unresolved_dir = tmp_path / "unresolved-config"
+    with pytest.raises(ValueError, match="build_diffusers_pipeline"):
+        write_onnx_genai_config(pkg, str(unresolved_dir))
+    assert not list(unresolved_dir.rglob("*"))
+    assert set(pkg.policy_components) == policy_names
 
 
 @dataclasses.dataclass
