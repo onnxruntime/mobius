@@ -1041,35 +1041,101 @@ def test_multi_decoder_tts_without_pre_embedder_raises_precise_not_implemented(t
 
 
 def test_hierarchical_audio_package_is_not_misclassified_as_diffusion(tmp_path):
-    names = {
-        "language_model",
-        "language_model_embedding",
-        "language_model_semantic_embedding",
-        "rvq_depth_decoder",
-        "rvq_depth_decoder_projection",
-        "rvq_depth_decoder_embedding",
-        "rvq_depth_decoder_feedback_embedding",
-        "rvq_depth_decoder_heads",
-        "condition_encoder",
-        "transformer",
-        "vocoder",
-    }
+    float_type = ir.DataType.FLOAT
     pkg = ModelPackage(
         {
-            name: _model(
-                name,
-                [_value("input", ir.DataType.FLOAT, [1])],
-                [("output", ir.DataType.FLOAT, [1])],
-            )
-            for name in names
+            "language_model": _model(
+                "language_model",
+                [
+                    _value("inputs_embeds", float_type, [2, "sequence", 8]),
+                    _value("attention_mask", ir.DataType.INT64, [2, "context"]),
+                    _value("position_ids", ir.DataType.INT64, [2, "sequence"]),
+                    _value("past_key_values.0.key", float_type, [2, 1, "past_sequence", 4]),
+                ],
+                [
+                    ("logits", float_type, [2, "sequence", 170000]),
+                    ("last_hidden_state", float_type, [2, "sequence", 8]),
+                    ("present.0.key", float_type, [2, 1, "past_sequence", 4]),
+                ],
+            ),
+            "language_model_embedding": _model(
+                "language_model_embedding",
+                [_value("input_ids", ir.DataType.INT64, [2, "sequence"])],
+                [("inputs_embeds", float_type, [2, "sequence", 8])],
+            ),
+            "language_model_semantic_embedding": _model(
+                "language_model_semantic_embedding",
+                [_value("semantic_codes", ir.DataType.INT64, [2, 1])],
+                [("semantic_feedback_embedding", float_type, [2, 1, 8])],
+            ),
+            "rvq_depth_decoder": _model(
+                "rvq_depth_decoder",
+                [_value("inputs_embeds", float_type, [2, "steps", 8])],
+                [("hidden_states", float_type, [2, "steps", 8])],
+            ),
+            "rvq_depth_decoder_projection": _model(
+                "rvq_depth_decoder_projection",
+                [_value("hidden_states", float_type, [2, "steps", 8])],
+                [("projected_states", float_type, [2, "steps", 8])],
+            ),
+            "rvq_depth_decoder_embedding": _model(
+                "rvq_depth_decoder_embedding",
+                [_value("code_ids", ir.DataType.INT64, [2, 1])],
+                [("code_embeddings", float_type, [2, 1, 8])],
+            ),
+            "rvq_depth_decoder_feedback_embedding": _model(
+                "rvq_depth_decoder_feedback_embedding",
+                [_value("acoustic_codes", ir.DataType.INT64, [2, 1, 7])],
+                [("acoustic_feedback_embedding", float_type, [2, 1, 8])],
+            ),
+            "rvq_depth_decoder_heads": _model(
+                "rvq_depth_decoder_heads",
+                [_value("hidden_states", float_type, [2, "steps", 8])],
+                [("all_codebook_logits", float_type, [7, 2, "steps", 1024])],
+            ),
+            "condition_encoder": _model(
+                "condition_encoder",
+                [_value("hidden_states", float_type, [1, "frames", 64])],
+                [("encoder_hidden_states", float_type, [1, "latent_length", 2048])],
+            ),
+            "transformer": _model(
+                "transformer",
+                [
+                    _value("hidden_states", float_type, [2, 128, "latent_length"]),
+                    _value("timestep", float_type, [2]),
+                    _value(
+                        "encoder_hidden_states",
+                        float_type,
+                        [2, "latent_length", 2048],
+                    ),
+                ],
+                [("sample", float_type, [2, 128, "latent_length"])],
+            ),
+            "vocoder": _model(
+                "vocoder",
+                [_value("latents", float_type, [1, 128, "latent_length"])],
+                [("waveform", float_type, [1, 2, "samples"])],
+            ),
         }
     )
 
-    with pytest.raises(
-        NotImplementedError,
-        match="stateless growing-length local codebook loop",
-    ):
-        write_onnx_genai_config(pkg, str(tmp_path))
+    artifacts = write_onnx_genai_config(pkg, str(tmp_path))
+    with open(artifacts["inference_metadata"]) as handle:
+        workflow = yaml.safe_load(handle)["pipeline"]["workflow"]
+
+    assert workflow["outputs"]["audio"]["media"] == {
+        "container": "wav",
+        "encoding": "pcm_s16_le",
+        "sample_rate_hz": 32000,
+        "source_sample_rate_hz": 44100,
+        "channels": 2,
+        "delivery": "buffered",
+    }
+    assert len(workflow["serving"]["state_service"]["groups"]) == 1
+    serialized = yaml.safe_dump(workflow["steps"])
+    assert serialized.count("cell: global_cache_") == 1
+    assert "local_cache" not in serialized
+    assert (tmp_path / "speech_processor.json").is_file()
 
 
 @dataclasses.dataclass

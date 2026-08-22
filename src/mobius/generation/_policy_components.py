@@ -1638,7 +1638,13 @@ def build_zeros_like(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponent:
     return _component("mobius.policy.auxiliary@1", graph, {})
 
 
-def build_guidance_combine(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponent:
+_IMAGE_LATENT_DIMS: tuple[str, ...] = ("batch", "channels", "height", "width")
+
+
+def build_guidance_combine(
+    dtype: ir.DataType = ir.DataType.FLOAT,
+    latent_dims: Sequence[str] = _IMAGE_LATENT_DIMS,
+) -> PolicyComponent:
     """Combine two conditioned estimates by a per-row guidance scale.
 
     ``estimate = unconditional + scale * (conditional - unconditional)`` is the
@@ -1647,13 +1653,14 @@ def build_guidance_combine(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComp
     """
     graph, builder = _make_graph("guidance_combine")
     op = builder.op
-    unconditional = builder.input(
-        "unconditional", dtype, ["batch", "channels", "height", "width"]
-    )
-    conditional = builder.input("conditional", dtype, ["batch", "channels", "height", "width"])
+    unconditional = builder.input("unconditional", dtype, list(latent_dims))
+    conditional = builder.input("conditional", dtype, list(latent_dims))
     scale = builder.input("scale", ir.DataType.FLOAT, ["batch"])
-    # (batch,) -> (batch, 1, 1, 1) so the row scale broadcasts over the latent.
-    factor = op.Unsqueeze(op.Cast(scale, to=dtype), op.Constant(value_ints=[1, 2, 3]))
+    # Expand the per-row scale over every non-batch latent axis.
+    factor = op.Unsqueeze(
+        op.Cast(scale, to=dtype),
+        op.Constant(value_ints=list(range(1, len(latent_dims)))),
+    )
     estimate = op.Add(unconditional, op.Mul(factor, op.Sub(conditional, unconditional)))
     estimate.shape = unconditional.shape
     builder.add_output(estimate, "estimate")
@@ -1703,7 +1710,10 @@ def _counter_uniform(op, key, counter):
     )
 
 
-def build_counter_rng_normal(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponent:
+def build_counter_rng_normal(
+    dtype: ir.DataType = ir.DataType.FLOAT,
+    latent_dims: Sequence[str] = _IMAGE_LATENT_DIMS,
+) -> PolicyComponent:
     """Draw standard-normal noise from explicit counter RNG state.
 
     Inputs are a per-row ``seed``, a per-row ``offset`` counter, and the target
@@ -1715,7 +1725,11 @@ def build_counter_rng_normal(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyCo
     op = builder.op
     seed = builder.input("seed", ir.DataType.INT64, ["batch"])
     offset = builder.input("offset", ir.DataType.INT64, ["batch"])
-    row_shape = builder.input("row_shape", ir.DataType.INT64, ["row_rank"])
+    if len(latent_dims) < 2 or latent_dims[0] != "batch":
+        raise ValueError(
+            "counter RNG latent_dims must begin with batch and include one data axis"
+        )
+    row_shape = builder.input("row_shape", ir.DataType.INT64, [len(latent_dims) - 1])
 
     # The batch extent comes from the per-row seed, so the draw is always
     # request-aligned no matter how many rows the runtime batched together.
@@ -1741,7 +1755,7 @@ def build_counter_rng_normal(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyCo
     angle = op.Mul(op.Constant(value_float=6.283185307179586), uniform_angle)
     flat = op.Mul(radius, op.Cos(angle))
     noise = op.Cast(op.Reshape(flat, shape), to=dtype)
-    noise.shape = ir.Shape(["batch", "channels", "height", "width"])
+    noise.shape = ir.Shape(list(latent_dims))
     next_offset = op.Add(offset, op.Constant(value_int=1))
     next_offset.shape = ir.Shape(["batch"])
     builder.add_output(noise, "noise")
@@ -1758,9 +1772,6 @@ def build_counter_rng_normal(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyCo
             "next_offset": "next_offset",
         },
     )
-
-
-_IMAGE_LATENT_DIMS: tuple[str, ...] = ("batch", "channels", "height", "width")
 
 
 def build_euler_model_input(

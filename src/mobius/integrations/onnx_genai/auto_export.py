@@ -32,6 +32,7 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     write_decoder_workflow_metadata,
     write_diffusion_workflow_metadata,
     write_encoder_embedding_workflow_metadata,
+    write_hierarchical_audio_workflow_metadata,
     write_image_edit_workflow_metadata,
     write_language_diffusion_workflow_metadata,
     write_speculative_workflow_metadata,
@@ -789,13 +790,10 @@ def write_onnx_genai_config(
         return artifacts
 
     if _looks_like_hierarchical_audio_generation(pkg):
-        raise NotImplementedError(
-            "Hierarchical audio generation metadata requires a canonical workflow for the "
-            "global frame loop, the stateless growing-length local codebook loop, global KV "
-            "state, per-frame hidden-state fusion, chunked flow matching with overlap carry, "
-            "vocoder decode, output resampling, and buffered WAV encoding. Emitting this package "
-            "as an ordinary diffusion workflow would omit required neural stages and is refused."
-        )
+        path = write_hierarchical_audio_workflow_metadata(pkg, output_dir)
+        artifacts = {"inference_metadata": path}
+        artifacts.update(_write_text_runtime_assets(output_dir, source, revision=revision))
+        return artifacts
 
     if _looks_like_diffusion(pkg):
         is_image_edit = _looks_like_image_edit(pkg)

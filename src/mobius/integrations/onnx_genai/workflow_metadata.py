@@ -25,14 +25,23 @@ from mobius.generation import (
     SOLVER_BUILDERS,
     PolicyCapabilities,
     attach_policy_components,
+    build_acoustic_code_frame,
+    build_autoregressive_audio_initializer,
     build_boolean_not,
+    build_candidate_token_map,
+    build_chunk_carry_update,
+    build_chunk_overlap_prepare,
+    build_chunk_plan,
+    build_chunk_slice,
     build_code_frame_update,
     build_code_history_append,
+    build_codebook_embedding_id,
     build_codec_layout_transpose,
     build_counter_rng_normal,
     build_ddim_solver_step,
     build_decoder_state_initializer,
     build_decoder_step_update,
+    build_drop_first_frame,
     build_duplex_agent_frame_select,
     build_duplex_cell_to_frame,
     build_duplex_frame_assemble,
@@ -42,20 +51,31 @@ from mobius.generation import (
     build_duplex_teacher_select,
     build_duplex_user_stream_merge,
     build_duplex_waveform_append,
+    build_embedding_sum,
     build_empty_features,
     build_eos_termination,
     build_euler_model_input,
     build_euler_solver_step,
+    build_flow_guidance,
     build_flow_match_solver_step,
+    build_flow_model_inputs,
+    build_frame_hidden_append,
     build_greedy_sampler,
     build_guidance_combine,
+    build_guided_vocabulary_slice,
     build_identity_model_input,
     build_integer_add,
     build_integer_minimum,
+    build_last_sequence_value,
     build_last_token_logits,
+    build_local_codebook_select,
+    build_local_rvq_append,
+    build_local_rvq_initializer,
     build_model_token_cast,
+    build_overlap_blend,
     build_pack_latents_2x2,
     build_proposal_metrics,
+    build_request_continue,
     build_scalar_constant,
     build_scalar_integer_add,
     build_schedule_constant,
@@ -81,6 +101,7 @@ from mobius.generation import (
     build_video_latent_initializer,
     build_video_latent_permute,
     build_video_latent_unscale,
+    build_waveform_stitch,
     build_zeros_like,
     rotary_axis_count,
 )
@@ -470,6 +491,1245 @@ def _invoke(
         "inputs": inputs,
         "outputs": outputs,
     }
+
+
+def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
+    """Build canonical nested AR/RVQ/flow/vocoder metadata for hierarchical audio."""
+    required = {
+        "language_model",
+        "language_model_embedding",
+        "language_model_semantic_embedding",
+        "rvq_depth_decoder",
+        "rvq_depth_decoder_projection",
+        "rvq_depth_decoder_embedding",
+        "rvq_depth_decoder_feedback_embedding",
+        "rvq_depth_decoder_heads",
+        "condition_encoder",
+        "transformer",
+        "vocoder",
+    }
+    missing = sorted(required.difference(pkg.keys()))
+    if missing:
+        raise ValueError(f"hierarchical audio workflow is missing components: {missing}")
+
+    decoder = pkg["language_model"]
+    decoder_inputs = {value.name: value for value in decoder.graph.inputs}
+    decoder_outputs = {value.name: value for value in decoder.graph.outputs}
+    cache_pairs = _model_cache_pairs(decoder)
+    embeds = decoder_inputs["inputs_embeds"]
+    hidden = decoder_outputs["last_hidden_state"]
+    if embeds.dtype is None or embeds.shape is None or hidden.shape is None:
+        raise ValueError("global decoder must expose typed embedding and hidden-state ports")
+    hidden_size = list(hidden.shape)[-1]
+    if not isinstance(hidden_size, int):
+        raise TypeError("global decoder hidden size must be statically known")
+    dtype = embeds.dtype
+    dtype_name = _contract(embeds)["dtype"]
+    fused_hidden_size = hidden_size * 8
+    latent_channels = 128
+    condition_size = 2048
+    residual_codebooks = 7
+
+    pkg.add_policy_component(
+        "global_initializer",
+        build_decoder_state_initializer(
+            decoder,
+            token_input=None,
+            prompt_dtype=ir.DataType.INT64,
+            attention_mask_input="attention_mask",
+            position_ids_input="position_ids",
+            cache_inputs=[past.name for past, _ in cache_pairs],
+        ),
+    )
+    pkg.add_policy_component(
+        "global_step_update",
+        build_decoder_step_update(
+            attention_dtype=decoder_inputs["attention_mask"].dtype,
+            position_dtype=decoder_inputs["position_ids"].dtype,
+        ),
+    )
+    pkg.add_policy_component(
+        "ar_initializer",
+        build_autoregressive_audio_initializer(dtype, fused_hidden_size=fused_hidden_size),
+    )
+    pkg.add_policy_component("length_step", build_integer_add())
+    pkg.add_policy_component(
+        "guided_vocabulary",
+        build_guided_vocabulary_slice(
+            vocabulary_start=151675,
+            vocabulary_size=16384,
+            stop_token_id=151670,
+            guidance_scale=1.5,
+            conditional_top_k=50,
+            dtype=decoder_outputs["logits"].dtype,
+        ),
+    )
+    pkg.add_policy_component("sampler", build_seeded_categorical_sampler())
+    pkg.add_policy_component(
+        "candidate_map",
+        build_candidate_token_map(
+            vocabulary_start=151675,
+            vocabulary_size=16384,
+            stop_token_id=151670,
+        ),
+    )
+    pkg.add_policy_component("continue_predicate", build_request_continue())
+    pkg.add_policy_component(
+        "last_global_hidden",
+        build_last_sequence_value(dtype, rows=2, channels=hidden_size),
+    )
+    pkg.add_policy_component(
+        "local_initializer",
+        build_local_rvq_initializer(dtype, hidden_size=hidden_size),
+    )
+    pkg.add_policy_component("codebook_index", build_scalar_integer_add())
+    pkg.add_policy_component(
+        "local_logits",
+        build_local_codebook_select(dtype, guidance_scale=1.5),
+    )
+    pkg.add_policy_component(
+        "embedding_id",
+        build_codebook_embedding_id(codebook_size=1024),
+    )
+    pkg.add_policy_component(
+        "local_append",
+        build_local_rvq_append(dtype, hidden_size=hidden_size),
+    )
+    pkg.add_policy_component(
+        "frame_append",
+        build_frame_hidden_append(dtype, hidden_size=hidden_size, num_codebooks=8),
+    )
+    pkg.add_policy_component(
+        "acoustic_frame",
+        build_acoustic_code_frame(num_residual_codebooks=residual_codebooks),
+    )
+    pkg.add_policy_component(
+        "feedback_sum",
+        build_embedding_sum(dtype, hidden_size=hidden_size),
+    )
+    pkg.add_policy_component(
+        "finalize_frames",
+        build_drop_first_frame(dtype, fused_hidden_size=fused_hidden_size),
+    )
+    pkg.add_policy_component(
+        "chunk_plan",
+        build_chunk_plan(
+            dtype,
+            fused_hidden_size=fused_hidden_size,
+            chunk_frames=200,
+            chunk_hop=100,
+            latent_channels=latent_channels,
+            condition_size=condition_size,
+        ),
+    )
+    pkg.add_policy_component(
+        "chunk_slice",
+        build_chunk_slice(
+            dtype,
+            fused_hidden_size=fused_hidden_size,
+            chunk_frames=200,
+            chunk_hop=100,
+        ),
+    )
+    pkg.add_policy_component(
+        "overlap_prepare",
+        build_chunk_overlap_prepare(
+            dtype,
+            latent_channels=latent_channels,
+            condition_size=condition_size,
+        ),
+    )
+    pkg.add_policy_component(
+        "latent_noise",
+        build_counter_rng_normal(
+            dtype,
+            latent_dims=("batch", "channels", "latent_length"),
+        ),
+    )
+    pkg.add_policy_component(
+        "flow_schedule",
+        build_schedule_constant([index / 30.0 for index in range(31)]),
+    )
+    pkg.add_policy_component("flow_timestep", build_schedule_lookup(dtype))
+    pkg.add_policy_component(
+        "overlap_blend",
+        build_overlap_blend(dtype, latent_channels=latent_channels),
+    )
+    pkg.add_policy_component(
+        "flow_inputs",
+        build_flow_model_inputs(dtype, latent_channels=latent_channels),
+    )
+    pkg.add_policy_component(
+        "flow_guidance",
+        build_flow_guidance(dtype, latent_channels=latent_channels, guidance_scale=1.7),
+    )
+    pkg.add_policy_component(
+        "flow_solver",
+        build_flow_match_solver_step(dtype),
+    )
+    pkg.add_policy_component(
+        "chunk_update",
+        build_chunk_carry_update(
+            dtype,
+            latent_channels=latent_channels,
+            condition_size=condition_size,
+            carry_length=172,
+        ),
+    )
+    pkg.add_policy_component(
+        "waveform_stitch",
+        build_waveform_stitch(
+            dtype=next(iter(pkg["vocoder"].graph.outputs)).dtype,
+            latent_hop_length=512,
+            crop_left_latents=86,
+            crop_right_latents=258,
+        ),
+    )
+
+    batch_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": ["batch"]})
+    batch_float = _request_aligned({"dtype": "float32", "rank": 1, "shape": ["batch"]})
+    batch_bool = _request_aligned({"dtype": "bool", "rank": 1, "shape": ["batch"]})
+    scalar_int = {"dtype": "int64", "rank": 0, "shape": []}
+    control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
+    prompt_contract = _contract(pkg["language_model_embedding"].graph.inputs[0])
+    inputs: dict[str, Any] = {
+        "request.prompt_tokens": {
+            "contract": prompt_contract,
+            "role": {"kind": "runtime", "version": "1.0", "role": "prompt_tokens"},
+            "source": {"kind": "request", "field": "prompt_tokens"},
+            "required": True,
+        },
+        "request.max_frames_with_warmup": {
+            "contract": control_int,
+            "role": {"kind": "runtime", "version": "1.0", "role": "max_output_tokens"},
+            "source": {"kind": "request", "field": "max_output_tokens"},
+            "required": True,
+        },
+        "request.seed": {
+            "contract": batch_int,
+            "role": {"kind": "runtime", "version": "1.0", "role": "seed"},
+            "source": {"kind": "request", "field": "seed"},
+            "required": False,
+            "default": 0,
+        },
+        "package.temperature": {
+            "contract": batch_float,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 1.0,
+        },
+        "package.top_k": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 50,
+        },
+        "package.top_p": {
+            "contract": batch_float,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 1.0,
+        },
+        "package.min_p": {
+            "contract": batch_float,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 0.0,
+        },
+        "package.one": {
+            "contract": scalar_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 1,
+        },
+        "package.one_batch": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 1,
+        },
+        "package.local_steps": {
+            "contract": scalar_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 7,
+        },
+        "package.local_context": {
+            "contract": scalar_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 9,
+        },
+        "package.global_context": {
+            "contract": scalar_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 10240,
+        },
+        "package.flow_steps": {
+            "contract": scalar_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 30,
+        },
+        "package.flow_rng_offset": {
+            "contract": batch_int,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": 0,
+        },
+    }
+
+    def invoke_model(
+        name: str,
+        bindings: dict[str, str],
+        prefix: str,
+        output_bindings: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        model = pkg[name]
+        for value in model.graph.inputs:
+            if value.name not in bindings:
+                raise ValueError(f"{name} input {value.name!r} is not bound")
+        outputs = dict(output_bindings or {})
+        for value in model.graph.outputs:
+            outputs.setdefault(value.name, f"{prefix}.{value.name}")
+        return _invoke(name, bindings, outputs)
+
+    sample_inputs = {
+        "logits": "frame.candidate_logits",
+        "temperature": "package.temperature",
+        "top_k": "package.top_k",
+        "top_p": "package.top_p",
+        "min_p": "package.min_p",
+        "seed": "request.seed",
+        "counter": "state.rng.outer",
+        "active": "state.active.outer",
+        "done": "state.done.outer",
+    }
+    local_sample_inputs = dict(sample_inputs)
+    local_sample_inputs.update(
+        logits="local.guided_logits",
+        counter="state.local_rng.inner",
+    )
+
+    inner_loop = {
+        "kind": "loop",
+        "setup": {"kind": "sequence", "nodes": []},
+        "body": {
+            "kind": "sequence",
+            "nodes": [
+                _invoke(
+                    "codebook_index",
+                    {"left": "local.iteration", "right": "package.one"},
+                    {"total": "local.codebook_index"},
+                ),
+                invoke_model(
+                    "rvq_depth_decoder",
+                    {"inputs_embeds": "state.local_sequence.inner"},
+                    "local.decoder",
+                    {"hidden_states": "local.hidden_states"},
+                ),
+                invoke_model(
+                    "rvq_depth_decoder_heads",
+                    {"hidden_states": "local.hidden_states"},
+                    "local.heads",
+                    {"all_codebook_logits": "local.all_logits"},
+                ),
+                _invoke(
+                    "local_logits",
+                    {
+                        "all_codebook_logits": "local.all_logits",
+                        "codebook_index": "local.codebook_index",
+                    },
+                    {"logits": "local.guided_logits"},
+                ),
+                _invoke(
+                    "sampler",
+                    local_sample_inputs,
+                    {"token": "local.token", "next_counter": "local.next_rng"},
+                ),
+                _invoke(
+                    "embedding_id",
+                    {
+                        "token": "local.token",
+                        "codebook_index": "local.codebook_index",
+                    },
+                    {"embedding_ids": "local.embedding_ids"},
+                ),
+                invoke_model(
+                    "rvq_depth_decoder_embedding",
+                    {"code_ids": "local.embedding_ids"},
+                    "local.embedding",
+                    {"code_embeddings": "local.code_embedding"},
+                ),
+                invoke_model(
+                    "rvq_depth_decoder_projection",
+                    {"hidden_states": "local.code_embedding"},
+                    "local.code_projection",
+                    {"projected_states": "local.projected_embedding"},
+                ),
+                _invoke(
+                    "local_append",
+                    {
+                        "sequence": "state.local_sequence.inner",
+                        "projected_embedding": "local.projected_embedding",
+                        "acoustic_codes": "state.local_codes.inner",
+                        "token": "local.token",
+                        "hidden_states": "local.hidden_states",
+                        "local_hidden_parts": "state.local_hidden.inner",
+                    },
+                    {
+                        "next_sequence": "local.next_sequence",
+                        "next_acoustic_codes": "local.next_codes",
+                        "next_local_hidden_parts": "local.next_hidden",
+                    },
+                ),
+            ],
+        },
+        "condition": "state.active.outer",
+        "max_iterations": "package.local_steps",
+        "iteration": {"value": "local.iteration", "contract": scalar_int},
+        "carried": [
+            {
+                "cell": "local_sequence",
+                "current": "local.initial_sequence",
+                "body_input": "state.local_sequence.inner",
+                "body_output": "local.next_sequence",
+                "next": "local.sequence.final",
+            },
+            {
+                "cell": "local_codes",
+                "current": "local.initial_codes",
+                "body_input": "state.local_codes.inner",
+                "body_output": "local.next_codes",
+                "next": "local.codes.final",
+            },
+            {
+                "cell": "local_hidden",
+                "current": "local.initial_hidden",
+                "body_input": "state.local_hidden.inner",
+                "body_output": "local.next_hidden",
+                "next": "local.hidden.final",
+            },
+            {
+                "cell": "local_rng",
+                "current": "frame.next_rng",
+                "body_input": "state.local_rng.inner",
+                "body_output": "local.next_rng",
+                "next": "local.rng.final",
+            },
+        ],
+    }
+
+    cache_setup_bindings = {
+        "inputs_embeds": "global.prompt_embeds",
+        "attention_mask": "global.initial.attention_mask",
+        "position_ids": "global.initial.position_ids",
+        **{past.name: f"global.initial.{past.name}" for past, _ in cache_pairs},
+    }
+    cache_body_bindings = {
+        "inputs_embeds": "frame.feedback",
+        "attention_mask": "state.global_mask.outer",
+        "position_ids": "state.global_position.outer",
+        **{
+            past.name: f"state.global_cache_{index}.outer"
+            for index, (past, _) in enumerate(cache_pairs)
+        },
+    }
+    setup_decoder_outputs = {
+        "logits": "global.setup.logits",
+        "last_hidden_state": "global.setup.hidden",
+        **{
+            present.name: f"global.setup.cache_{index}"
+            for index, (_, present) in enumerate(cache_pairs)
+        },
+    }
+    body_decoder_outputs = {
+        "logits": "global.next.logits",
+        "last_hidden_state": "global.next.hidden",
+        **{
+            present.name: f"global.next.cache_{index}"
+            for index, (_, present) in enumerate(cache_pairs)
+        },
+    }
+    outer_body_nodes = [
+        _invoke(
+            "guided_vocabulary",
+            {"logits": "state.global_logits.outer"},
+            {"candidate_logits": "frame.candidate_logits"},
+        ),
+        _invoke(
+            "sampler",
+            sample_inputs,
+            {"token": "frame.candidate", "next_counter": "frame.next_rng"},
+        ),
+        _invoke(
+            "candidate_map",
+            {"candidate": "frame.candidate"},
+            {
+                "token": "frame.token",
+                "semantic_code": "frame.semantic_code",
+                "semantic_token": "frame.semantic_token",
+                "is_stop": "frame.is_stop",
+            },
+        ),
+        _invoke(
+            "continue_predicate",
+            {"done": "frame.is_stop"},
+            {"continue": "frame.continue"},
+        ),
+        _invoke(
+            "last_global_hidden",
+            {"value": "state.global_hidden.outer"},
+            {"last": "frame.global_hidden"},
+        ),
+        invoke_model(
+            "language_model_embedding",
+            {"input_ids": "frame.semantic_token"},
+            "frame.raw_semantic",
+            {"inputs_embeds": "frame.raw_semantic_embedding"},
+        ),
+        invoke_model(
+            "rvq_depth_decoder_projection",
+            {"hidden_states": "frame.global_hidden"},
+            "frame.global_projection",
+            {"projected_states": "frame.projected_global"},
+        ),
+        invoke_model(
+            "rvq_depth_decoder_projection",
+            {"hidden_states": "frame.raw_semantic_embedding"},
+            "frame.semantic_projection",
+            {"projected_states": "frame.projected_semantic"},
+        ),
+        _invoke(
+            "local_initializer",
+            {
+                "global_hidden": "frame.projected_global",
+                "semantic_embedding": "frame.projected_semantic",
+            },
+            {
+                "sequence": "local.initial_sequence",
+                "acoustic_codes": "local.initial_codes",
+                "local_hidden_parts": "local.initial_hidden",
+            },
+        ),
+        inner_loop,
+        _invoke(
+            "frame_append",
+            {
+                "history": "state.frame_history.outer",
+                "global_hidden": "frame.global_hidden",
+                "local_hidden_parts": "local.hidden.final",
+            },
+            {"next_history": "frame.history.next"},
+        ),
+        _invoke(
+            "acoustic_frame",
+            {"acoustic_codes": "local.codes.final"},
+            {"framed_acoustic_codes": "frame.acoustic_codes"},
+        ),
+        invoke_model(
+            "language_model_semantic_embedding",
+            {"semantic_codes": "frame.semantic_code"},
+            "frame.semantic_feedback",
+            {"semantic_feedback_embedding": "frame.semantic_feedback"},
+        ),
+        invoke_model(
+            "rvq_depth_decoder_feedback_embedding",
+            {"acoustic_codes": "frame.acoustic_codes"},
+            "frame.acoustic_feedback",
+            {"acoustic_feedback_embedding": "frame.acoustic_feedback"},
+        ),
+        _invoke(
+            "feedback_sum",
+            {
+                "semantic": "frame.semantic_feedback",
+                "acoustic": "frame.acoustic_feedback",
+            },
+            {"feedback": "frame.feedback"},
+        ),
+        invoke_model(
+            "language_model",
+            cache_body_bindings,
+            "global.next",
+            body_decoder_outputs,
+        ),
+        _invoke(
+            "global_step_update",
+            {
+                "attention_mask": "state.global_mask.outer",
+                "position_ids": "state.global_position.outer",
+            },
+            {
+                "next_attention_mask": "global.mask.next",
+                "next_position_ids": "global.position.next",
+            },
+        ),
+        _invoke(
+            "length_step",
+            {
+                "left": "state.global_length.outer",
+                "right": "package.one_batch",
+            },
+            {"total": "global.length.next"},
+        ),
+    ]
+    outer_carried = [
+        {
+            "cell": "global_logits",
+            "current": "global.setup.logits",
+            "body_input": "state.global_logits.outer",
+            "body_output": "global.next.logits",
+            "next": "global.logits.final",
+        },
+        {
+            "cell": "global_hidden",
+            "current": "global.setup.hidden",
+            "body_input": "state.global_hidden.outer",
+            "body_output": "global.next.hidden",
+            "next": "global.hidden.final",
+        },
+        {
+            "cell": "global_mask",
+            "current": "global.initial.body_attention_mask",
+            "body_input": "state.global_mask.outer",
+            "body_output": "global.mask.next",
+            "next": "global.mask.final",
+        },
+        {
+            "cell": "global_position",
+            "current": "global.initial.body_position_ids",
+            "body_input": "state.global_position.outer",
+            "body_output": "global.position.next",
+            "next": "global.position.final",
+        },
+        {
+            "cell": "frame_history",
+            "current": "ar.initial.history",
+            "body_input": "state.frame_history.outer",
+            "body_output": "frame.history.next",
+            "next": "frame.history.final",
+        },
+        {
+            "cell": "rng",
+            "current": "ar.initial.counter",
+            "body_input": "state.rng.outer",
+            "body_output": "local.rng.final",
+            "next": "ar.rng.final",
+        },
+        {
+            "cell": "active",
+            "current": "ar.initial.active",
+            "body_input": "state.active.outer",
+            "body_output": "frame.continue",
+            "next": "ar.active.final",
+        },
+        {
+            "cell": "done",
+            "current": "ar.initial.done",
+            "body_input": "state.done.outer",
+            "body_output": "frame.is_stop",
+            "next": "ar.done.final",
+        },
+        {
+            "cell": "global_length",
+            "current": "ar.initial.counter",
+            "body_input": "state.global_length.outer",
+            "body_output": "global.length.next",
+            "next": "global.length.final",
+        },
+    ]
+    for index, (_, _present) in enumerate(cache_pairs):
+        outer_carried.append(
+            {
+                "cell": f"global_cache_{index}",
+                "current": f"global.setup.cache_{index}",
+                "body_input": f"state.global_cache_{index}.outer",
+                "body_output": f"global.next.cache_{index}",
+                "next": f"global.cache_{index}.final",
+            }
+        )
+
+    ar_loop = {
+        "kind": "loop",
+        "setup": {
+            "kind": "sequence",
+            "nodes": [
+                _invoke(
+                    "global_initializer",
+                    {"prompt_tokens": "request.prompt_tokens"},
+                    {
+                        "attention_mask": "global.initial.attention_mask",
+                        "position_ids": "global.initial.position_ids",
+                        "body_attention_mask": "global.initial.body_attention_mask",
+                        "body_position_ids": "global.initial.body_position_ids",
+                        "token_slot": "global.initial.token_slot",
+                        **{
+                            past.name: f"global.initial.{past.name}" for past, _ in cache_pairs
+                        },
+                    },
+                ),
+                invoke_model(
+                    "language_model_embedding",
+                    {"input_ids": "request.prompt_tokens"},
+                    "global.embedding",
+                    {"inputs_embeds": "global.prompt_embeds"},
+                ),
+                invoke_model(
+                    "language_model",
+                    cache_setup_bindings,
+                    "global.setup",
+                    setup_decoder_outputs,
+                ),
+                _invoke(
+                    "ar_initializer",
+                    {},
+                    {
+                        "frame_history": "ar.initial.history",
+                        "rng_counter": "ar.initial.counter",
+                        "active": "ar.initial.active",
+                        "done": "ar.initial.done",
+                    },
+                ),
+            ],
+        },
+        "body": {"kind": "sequence", "nodes": outer_body_nodes},
+        "condition": "state.active.outer",
+        "max_iterations": "request.max_frames_with_warmup",
+        "iteration": {"value": "frame.iteration", "contract": scalar_int},
+        "carried": outer_carried,
+    }
+
+    flow_loop = {
+        "kind": "loop",
+        "setup": {"kind": "sequence", "nodes": []},
+        "body": {
+            "kind": "sequence",
+            "nodes": [
+                _invoke(
+                    "flow_timestep",
+                    {"schedule": "flow.schedule", "step": "flow.iteration"},
+                    {"timestep": "flow.timestep.value"},
+                ),
+                _invoke(
+                    "overlap_blend",
+                    {
+                        "latents": "state.flow_latents.inner",
+                        "initial_noise": "chunk.initial_noise",
+                        "previous_latent": "state.previous_latent.chunk",
+                        "overlap": "chunk.overlap",
+                        "timestep": "flow.timestep.value",
+                    },
+                    {"blended_latents": "flow.blended"},
+                ),
+                _invoke(
+                    "flow_inputs",
+                    {
+                        "latents": "flow.blended",
+                        "timestep": "flow.timestep.value",
+                    },
+                    {
+                        "guided_latents": "flow.guided_latents",
+                        "guided_timestep": "flow.guided_timestep",
+                    },
+                ),
+                invoke_model(
+                    "transformer",
+                    {
+                        "hidden_states": "flow.guided_latents",
+                        "timestep": "flow.guided_timestep",
+                        "encoder_hidden_states": "chunk.guided_condition",
+                    },
+                    "flow.transformer",
+                    {"sample": "flow.sample"},
+                ),
+                _invoke(
+                    "flow_guidance",
+                    {"sample": "flow.sample"},
+                    {"velocity": "flow.velocity"},
+                ),
+                _invoke(
+                    "flow_solver",
+                    {
+                        "sample": "flow.blended",
+                        "derivative": "flow.velocity",
+                        "schedule": "flow.schedule",
+                        "step": "flow.iteration",
+                    },
+                    {"next_state": "flow.next_latents"},
+                ),
+            ],
+        },
+        "condition": "state.active.outer",
+        "max_iterations": "package.flow_steps",
+        "iteration": {"value": "flow.iteration", "contract": batch_int},
+        "carried": [
+            {
+                "cell": "flow_latents",
+                "current": "chunk.initial_noise",
+                "body_input": "state.flow_latents.inner",
+                "body_output": "flow.next_latents",
+                "next": "flow.latents.final",
+            }
+        ],
+    }
+
+    chunk_loop = {
+        "kind": "loop",
+        "setup": {
+            "kind": "sequence",
+            "nodes": [
+                _invoke(
+                    "finalize_frames",
+                    {
+                        "history": "frame.history.final",
+                        "stopped": "ar.done.final",
+                    },
+                    {"frame_hiddens": "audio.frame_hiddens"},
+                ),
+                _invoke(
+                    "chunk_plan",
+                    {"frame_hiddens": "audio.frame_hiddens"},
+                    {
+                        "chunk_count": "audio.chunk_count",
+                        "waveform": "audio.initial_waveform",
+                        "previous_latent": "audio.initial_previous_latent",
+                        "previous_condition": "audio.initial_previous_condition",
+                    },
+                ),
+                _invoke(
+                    "flow_schedule",
+                    {},
+                    {"schedule": "flow.schedule"},
+                ),
+            ],
+        },
+        "body": {
+            "kind": "sequence",
+            "nodes": [
+                _invoke(
+                    "chunk_slice",
+                    {
+                        "frame_hiddens": "audio.frame_hiddens",
+                        "chunk_index": "chunk.iteration",
+                    },
+                    {"frame_chunk": "chunk.frame_hiddens"},
+                ),
+                invoke_model(
+                    "condition_encoder",
+                    {"hidden_states": "chunk.frame_hiddens"},
+                    "chunk.condition_encoder",
+                    {"encoder_hidden_states": "chunk.condition"},
+                ),
+                _invoke(
+                    "overlap_prepare",
+                    {
+                        "condition": "chunk.condition",
+                        "previous_condition": "state.previous_condition.chunk",
+                        "previous_latent": "state.previous_latent.chunk",
+                    },
+                    {
+                        "guided_condition": "chunk.guided_condition",
+                        "spliced_condition": "chunk.spliced_condition",
+                        "overlap": "chunk.overlap",
+                        "noise_row_shape": "chunk.noise_shape",
+                    },
+                ),
+                _invoke(
+                    "latent_noise",
+                    {
+                        "seed": "request.seed",
+                        "offset": "state.flow_rng.chunk",
+                        "row_shape": "chunk.noise_shape",
+                    },
+                    {
+                        "noise": "chunk.initial_noise",
+                        "next_offset": "chunk.next_rng",
+                    },
+                ),
+                flow_loop,
+                _invoke(
+                    "chunk_update",
+                    {
+                        "latents": "flow.latents.final",
+                        "previous_latent": "state.previous_latent.chunk",
+                        "condition": "chunk.spliced_condition",
+                        "overlap": "chunk.overlap",
+                    },
+                    {
+                        "restored_latents": "chunk.restored_latents",
+                        "next_previous_latent": "chunk.next_previous_latent",
+                        "next_previous_condition": "chunk.next_previous_condition",
+                    },
+                ),
+                invoke_model(
+                    "vocoder",
+                    {"latents": "chunk.restored_latents"},
+                    "chunk.vocoder",
+                    {"waveform": "chunk.waveform"},
+                ),
+                _invoke(
+                    "waveform_stitch",
+                    {
+                        "waveform": "chunk.waveform",
+                        "history": "state.waveform.chunk",
+                        "chunk_index": "chunk.iteration",
+                        "chunk_count": "audio.chunk_count",
+                    },
+                    {"next_history": "chunk.waveform.next"},
+                ),
+            ],
+        },
+        "condition": "ar.initial.active",
+        "max_iterations": "audio.chunk_count",
+        "iteration": {"value": "chunk.iteration", "contract": scalar_int},
+        "carried": [
+            {
+                "cell": "previous_latent",
+                "current": "audio.initial_previous_latent",
+                "body_input": "state.previous_latent.chunk",
+                "body_output": "chunk.next_previous_latent",
+                "next": "audio.previous_latent.final",
+            },
+            {
+                "cell": "previous_condition",
+                "current": "audio.initial_previous_condition",
+                "body_input": "state.previous_condition.chunk",
+                "body_output": "chunk.next_previous_condition",
+                "next": "audio.previous_condition.final",
+            },
+            {
+                "cell": "waveform",
+                "current": "audio.initial_waveform",
+                "body_input": "state.waveform.chunk",
+                "body_output": "chunk.waveform.next",
+                "next": "audio.waveform",
+            },
+            {
+                "cell": "flow_rng",
+                "current": "package.flow_rng_offset",
+                "body_input": "state.flow_rng.chunk",
+                "body_output": "chunk.next_rng",
+                "next": "audio.flow_rng.final",
+            },
+        ],
+    }
+
+    state: dict[str, Any] = {
+        "global_logits": {
+            "contract": _contract(decoder_outputs["logits"]),
+            "scope": "invocation",
+            "initializer": "global.setup.logits",
+            "recurrence": {"kind": "invariant"},
+        },
+        "global_hidden": {
+            "contract": _contract(hidden),
+            "scope": "invocation",
+            "initializer": "global.setup.hidden",
+            "recurrence": {"kind": "invariant"},
+        },
+        "global_mask": {
+            "contract": _contract(decoder_inputs["attention_mask"]),
+            "scope": "invocation",
+            "initializer": "global.initial.body_attention_mask",
+            "recurrence": {
+                "kind": "growing",
+                "axis": 1,
+                "increment": "package.one",
+                "max": "package.global_context",
+            },
+        },
+        "global_position": {
+            "contract": _contract(decoder_inputs["position_ids"]),
+            "scope": "invocation",
+            "initializer": "global.initial.body_position_ids",
+            "recurrence": {"kind": "invariant"},
+        },
+        "frame_history": {
+            "contract": {
+                "dtype": dtype_name,
+                "rank": 3,
+                "shape": [1, "frames", fused_hidden_size],
+            },
+            "scope": "invocation",
+            "initializer": "ar.initial.history",
+            "recurrence": {
+                "kind": "growing",
+                "axis": 1,
+                "increment": "package.one",
+                "max": "request.max_frames_with_warmup",
+            },
+        },
+        "rng": {
+            "contract": batch_int,
+            "scope": "invocation",
+            "initializer": "ar.initial.counter",
+            "recurrence": {"kind": "invariant"},
+        },
+        "active": {
+            "contract": batch_bool,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": "ar.initial.active",
+            "recurrence": {"kind": "invariant"},
+        },
+        "done": {
+            "contract": batch_bool,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": "ar.initial.done",
+            "recurrence": {"kind": "invariant"},
+        },
+        "global_length": {
+            "contract": batch_int,
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": "ar.initial.counter",
+            "recurrence": {"kind": "invariant"},
+        },
+        "local_sequence": {
+            "contract": {"dtype": dtype_name, "rank": 3, "shape": [2, "steps", hidden_size]},
+            "scope": "invocation",
+            "initializer": "local.initial_sequence",
+            "recurrence": {
+                "kind": "growing",
+                "axis": 1,
+                "increment": "package.one",
+                "max": "package.local_context",
+            },
+        },
+        "local_codes": {
+            "contract": {"dtype": "int64", "rank": 2, "shape": [2, "codes"]},
+            "scope": "invocation",
+            "initializer": "local.initial_codes",
+            "recurrence": {
+                "kind": "growing",
+                "axis": 1,
+                "increment": "package.one",
+                "max": "package.local_steps",
+            },
+        },
+        "local_hidden": {
+            "contract": {"dtype": dtype_name, "rank": 3, "shape": [1, "parts", hidden_size]},
+            "scope": "invocation",
+            "initializer": "local.initial_hidden",
+            "recurrence": {
+                "kind": "growing",
+                "axis": 1,
+                "increment": "package.one",
+                "max": "package.local_steps",
+            },
+        },
+        "local_rng": {
+            "contract": batch_int,
+            "scope": "invocation",
+            "initializer": "frame.next_rng",
+            "recurrence": {"kind": "invariant"},
+        },
+        "flow_latents": {
+            "contract": {"dtype": dtype_name, "rank": 3, "shape": [1, 128, "latent_length"]},
+            "scope": "invocation",
+            "initializer": "chunk.initial_noise",
+            "recurrence": {"kind": "invariant"},
+        },
+        "previous_latent": {
+            "contract": {"dtype": dtype_name, "rank": 3, "shape": [1, 128, "carry_length"]},
+            "scope": "invocation",
+            "initializer": "audio.initial_previous_latent",
+            "recurrence": {"kind": "invariant"},
+        },
+        "previous_condition": {
+            "contract": {"dtype": dtype_name, "rank": 3, "shape": [1, "carry_length", 2048]},
+            "scope": "invocation",
+            "initializer": "audio.initial_previous_condition",
+            "recurrence": {"kind": "invariant"},
+        },
+        "waveform": {
+            "contract": _request_aligned(
+                {"dtype": "float32", "rank": 3, "shape": ["batch", 2, "samples"]}
+            ),
+            "scope": "invocation",
+            "initializer": "audio.initial_waveform",
+            "recurrence": {"kind": "invariant"},
+        },
+        "flow_rng": {
+            "contract": batch_int,
+            "scope": "invocation",
+            "initializer": "package.flow_rng_offset",
+            "recurrence": {"kind": "invariant"},
+        },
+    }
+    for index, (_, present) in enumerate(cache_pairs):
+        state[f"global_cache_{index}"] = {
+            "contract": _contract(present),
+            "class": "semantic",
+            "scope": "invocation",
+            "initializer": f"global.setup.cache_{index}",
+            "recurrence": {"kind": "bounded", "axis": 2, "max": "package.global_context"},
+            "service_group": "global_cache",
+            "management": "runtime",
+            "release_boundary": "invocation",
+        }
+
+    components = {
+        name: _component(model, _artifact(name, len(pkg))) for name, model in pkg.items()
+    }
+    components["speech_text_assembly"] = {
+        "implementation": {
+            "kind": "adapter",
+            "abi": "onnx-genai.text-assembly",
+            "version": "1",
+            "artifact": "speech_processor.json",
+        },
+        "contract": {"id": "onnx-genai.text-assembly", "version": "1"},
+    }
+    workflow = {
+        "manifest": {
+            "adapter_abis": {"onnx-genai.text-assembly": "1"},
+            "capabilities": [
+                "workflow_ssa",
+                "nested_control_flow",
+                "loop_induction_values",
+                "loop_carried_state",
+                "typed_emit",
+                "serving_service_contract",
+                "bounded_state_recurrence",
+            ],
+        },
+        "inputs": inputs,
+        "outputs": {
+            "audio": {
+                "contract": _request_aligned(
+                    {"dtype": "float32", "rank": 3, "shape": ["batch", 2, "samples"]}
+                ),
+                "role": "audio",
+                "stage": "pre_adapter",
+                "media": {
+                    "container": "wav",
+                    "encoding": "pcm_s16_le",
+                    "sample_rate_hz": 32000,
+                    "source_sample_rate_hz": 44100,
+                    "channels": 2,
+                    "delivery": "buffered",
+                },
+            }
+        },
+        "components": components,
+        "state": state,
+        "serving": {
+            "active": "active",
+            "done": "done",
+            "accepted_len": "global_length",
+            "state_service": {
+                "groups": {
+                    "global_cache": {
+                        "kind": "full_attention",
+                        "sequence_axis": 2,
+                        "layout": "bnsh",
+                        "aliasing": "forbidden",
+                        "reuse": {
+                            "prefix_reusable": True,
+                            "evictable_prefix": False,
+                        },
+                        "ports": {
+                            "language_model": {
+                                f"global_cache_{index}": {
+                                    "input": past.name,
+                                    "output": present.name,
+                                    "role": (
+                                        "key"
+                                        if (past.name or "").endswith(".key")
+                                        else "value"
+                                    ),
+                                    "layer": index // 2,
+                                }
+                                for index, (past, present) in enumerate(cache_pairs)
+                            }
+                        },
+                    }
+                }
+            },
+        },
+        "graph": {
+            "kind": "sequence",
+            "nodes": [
+                ar_loop,
+                chunk_loop,
+                {
+                    "kind": "emit",
+                    "value": "audio.waveform",
+                    "output": "audio",
+                    "mode": "replace",
+                },
+            ],
+        },
+    }
+    metadata = {
+        "schema_version": "v1",
+        "pipeline": {"workflow": _publish_workflow_v1(workflow)},
+    }
+    add_policy_components_to_workflow(metadata, pkg)
+    return metadata
+
+
+def write_hierarchical_audio_workflow_metadata(pkg: Any, output_dir: str) -> str:
+    """Write canonical hierarchical-audio workflow and exact prompt processor."""
+    os.makedirs(output_dir, exist_ok=True)
+    metadata = build_hierarchical_audio_workflow_metadata(pkg)
+    processor = {
+        "max_input_tokens": 5000,
+        "max_output_units": 9000,
+        "state_advance_units": 1,
+        "guidance_rows": {
+            "unconditional_token_id": 151654,
+            "replace_from": 1,
+            "preserve_trailing": 2,
+        },
+        "segments": [
+            {"literal": "<|im_start|><|caption_start|>"},
+            {
+                "field": "instructions",
+                "transforms": [
+                    {"kind": "rewrite_delimited_tags", "open": "<|", "close": "|>"},
+                    {"kind": "strip_markdown"},
+                    {"kind": "collapse_newlines"},
+                ],
+            },
+            {"literal": "<|caption_end|><|lyrics_start|>[start]\n"},
+            {
+                "field": "input",
+                "transforms": [
+                    {"kind": "keep_leading_bracket_tags"},
+                    {"kind": "replace", "from": "] ", "to": "]\n"},
+                    {"kind": "replace", "from": " [", "to": "\n["},
+                    {"kind": "replace", "from": " ^ ", "to": "\n"},
+                    {"kind": "lowercase_bracket_tags"},
+                ],
+            },
+            {"literal": "<|lyrics_end|><|im_end|><|audio_start|>"},
+        ],
+    }
+    with open(
+        os.path.join(output_dir, "speech_processor.json"), "w", encoding="utf-8"
+    ) as handle:
+        json.dump(processor, handle, indent=2)
+        handle.write("\n")
+    add_adapter_service_to_metadata(metadata, pkg, output_dir)
+    path = os.path.join(output_dir, "inference_metadata.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        _dump_yaml(metadata, handle)
+    return path
 
 
 def build_audio_codec_workflow_metadata(pkg: Any) -> dict[str, Any]:
