@@ -205,6 +205,9 @@ def _cmd_build(args: argparse.Namespace) -> None:
         raise SystemExit("Error: --max-length can only be used with --runtime onnx-genai.")
     if max_length is not None and max_length <= 0:
         raise SystemExit("Error: --max-length must be a positive integer.")
+    guidance_scale = getattr(args, "guidance_scale", None)
+    if guidance_scale is not None and args.runtime != "onnx-genai":
+        raise SystemExit("Error: --guidance-scale can only be used with --runtime onnx-genai.")
 
     # Validate static-cache + --task compatibility.
     if args.static_cache and args.task is not None:
@@ -469,6 +472,7 @@ def _save_package(
                 config=config,
                 source=source,
                 revision=getattr(args, "revision", None),
+                guidance_scale=getattr(args, "guidance_scale", None),
             )
         except ValueError as error:
             raise SystemExit(f"Error: {error}") from error
@@ -622,6 +626,7 @@ def _cmd_convert_comfyui(args: argparse.Namespace) -> None:
         args.checkpoint,
         args.output,
         sdxl=getattr(args, "sdxl", False),
+        revision=args.revision,
     )
     wf = result.workflow
     print(f"Converted ComfyUI workflow -> {result.output_dir}")
@@ -847,6 +852,18 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     build_parser.add_argument(
+        "--guidance-scale",
+        type=float,
+        default=None,
+        metavar="SCALE",
+        help=(
+            "Classifier-free guidance scale for --runtime onnx-genai diffusion "
+            "metadata. Required for conditioned diffusion pipelines so export does "
+            "not guess a source pipeline's generation default; pass 1.0 explicitly "
+            "for unguided generation."
+        ),
+    )
+    build_parser.add_argument(
         "--kv-cache-scale-file",
         dest="kv_cache_scale_file",
         default=None,
@@ -1004,6 +1021,11 @@ def main(argv: list[str] | None = None) -> None:
         help="Optional diffusers directory or Hugging Face model id whose "
         "scheduler config supplies the noise-schedule betas (Stable Diffusion "
         "defaults are used when omitted).",
+    )
+    comfy_parser.add_argument(
+        "--revision",
+        default=None,
+        help="Pinned Hugging Face revision used to resolve the checkpoint scheduler config.",
     )
     comfy_parser.add_argument(
         "--output", "-o", required=True, help="Output directory for the pipeline metadata."

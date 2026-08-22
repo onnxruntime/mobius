@@ -44,6 +44,28 @@ def _remap_transformer(state_dict: dict) -> dict:
     return out
 
 
+def test_unet_without_mid_block_builds_complete_graph():
+    from mobius.integrations.diffusers._configs import UNet2DConfig
+    from mobius.models.unet import UNet2DConditionModel
+    from mobius.tasks._denoising import DenoisingTask
+
+    config = UNet2DConfig(
+        in_channels=4,
+        out_channels=4,
+        block_out_channels=(32, 64),
+        layers_per_block=1,
+        norm_num_groups=32,
+        cross_attention_dim=16,
+        attention_head_dim=8,
+        down_block_types=("CrossAttnDownBlock2D", "DownBlock2D"),
+        up_block_types=("UpBlock2D", "CrossAttnUpBlock2D"),
+        mid_block_type=None,
+    )
+    model = DenoisingTask().build(UNet2DConditionModel(config), config)["model"]
+    assert [value.name for value in model.graph.outputs] == ["noise_pred"]
+    assert not any(name.startswith("mid_block.") for name in model.graph.initializers)
+
+
 def test_cross_attention_block_matches_diffusers():
     pytest.importorskip("diffusers")
     import onnx_ir

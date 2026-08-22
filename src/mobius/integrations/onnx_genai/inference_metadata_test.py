@@ -35,6 +35,7 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     build_native_vlm_package_metadata,
     is_native_vlm_package,
     load_diffusers_scheduler_config,
+    load_diffusers_vae_scaling_factor,
     validate_executable_closure,
     write_diffusion_pipeline_metadata,
     write_mtp_speculator_metadata,
@@ -1593,6 +1594,24 @@ class TestBuildDiffusionPipelineMetadata:
         assert sched.kind == "ddim"
         assert sched.beta_end == pytest.approx(0.02)
 
+    def test_scheduler_preserves_cogvideox_ddim_equation_fields(self):
+        sched = SchedulerConfig.from_diffusers(
+            {
+                "_class_name": "CogVideoXDDIMScheduler",
+                "prediction_type": "v_prediction",
+                "clip_sample": False,
+                "set_alpha_to_one": True,
+                "timestep_spacing": "trailing",
+                "rescale_betas_zero_snr": True,
+                "snr_shift_scale": 3.0,
+            }
+        )
+        assert sched.kind == "ddim"
+        assert sched.prediction_type == "v_prediction"
+        assert sched.timestep_spacing == "trailing"
+        assert sched.rescale_betas_zero_snr
+        assert sched.snr_shift_scale == pytest.approx(3.0)
+
     def test_scheduler_maps_euler_class(self):
         sched = SchedulerConfig.from_diffusers(
             {"_class_name": "EulerDiscreteScheduler", "beta_schedule": "scaled_linear"}
@@ -1673,6 +1692,25 @@ class TestBuildDiffusionPipelineMetadata:
         # Unsupported scheduler must not raise from the loader; returns None so
         # the caller falls back to the DDIM default.
         assert load_diffusers_scheduler_config(str(tmp_path)) is None
+
+    def test_load_vae_scaling_factor_forwards_revision(self, tmp_path, monkeypatch):
+        config = tmp_path / "vae_config.json"
+        config.write_text(json.dumps({"scaling_factor": 0.13025}), encoding="utf-8")
+        calls = []
+
+        def fake_download(source, filename, *, revision=None):
+            calls.append((source, filename, revision))
+            return str(config)
+
+        monkeypatch.setattr("huggingface_hub.hf_hub_download", fake_download)
+
+        factor = load_diffusers_vae_scaling_factor(
+            "zai-org/CogVideoX-2b",
+            revision="pinned-revision",
+        )
+
+        assert factor == pytest.approx(0.13025)
+        assert calls == [("zai-org/CogVideoX-2b", "vae/config.json", "pinned-revision")]
 
     def test_rejects_zero_steps(self):
         with pytest.raises(ValueError):

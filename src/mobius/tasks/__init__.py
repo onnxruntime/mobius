@@ -78,6 +78,7 @@ __all__ = [
     "SpeechToTextTask",
     "TASK_REGISTRY",
     "TTSTask",
+    "T5TextEncoderTask",
     "VAETask",
     "VideoDenoisingTask",
     "VideoVAETask",
@@ -145,6 +146,7 @@ from mobius.tasks._seq2seq import Seq2SeqTask
 from mobius.tasks._speech_language import SpeechLanguageTask
 from mobius.tasks._speech_to_text import SpeechToTextTask
 from mobius.tasks._ssm_causal_lm import SSM2CausalLMTask, SSMCausalLMTask
+from mobius.tasks._t5_text_encoder import T5TextEncoderTask
 from mobius.tasks._tts import TTSTask
 from mobius.tasks._vae import VAETask
 from mobius.tasks._video_denoising import VideoDenoisingTask
@@ -192,6 +194,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "moshi-depformer": MoshiDepformerTask,
     "moshi-temporal": MoshiTemporalTask,
     "text-generation": CausalLMTask,
+    "t5-text-encoding": T5TextEncoderTask,
     "deepseek-v4": DeepSeekV4Task,
     "hybrid-text-generation": HybridCausalLMTask,
     "dflash-draft": DFlashDraftTask,
