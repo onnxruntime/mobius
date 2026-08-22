@@ -604,6 +604,7 @@ def _cmd_convert_comfyui(args: argparse.Namespace) -> None:
         args.checkpoint,
         args.output,
         sdxl=getattr(args, "sdxl", False),
+        revision=args.revision,
     )
     wf = result.workflow
     print(f"Converted ComfyUI workflow -> {result.output_dir}")
@@ -998,6 +999,11 @@ def main(argv: list[str] | None = None) -> None:
         help="Optional diffusers directory or Hugging Face model id whose "
         "scheduler config supplies the noise-schedule betas (Stable Diffusion "
         "defaults are used when omitted).",
+    )
+    comfy_parser.add_argument(
+        "--revision",
+        default=None,
+        help="Pinned Hugging Face revision used to resolve the checkpoint scheduler config.",
     )
     comfy_parser.add_argument(
         "--output", "-o", required=True, help="Output directory for the pipeline metadata."

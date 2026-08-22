@@ -619,6 +619,53 @@ class TestCLIInfo:
         assert "Supported" in out
 
 
+class TestCLIConvertComfyUI:
+    def test_revision_is_forwarded_to_conversion(self, tmp_path):
+        workflow_path = tmp_path / "workflow.json"
+        workflow_path.write_text("{}", encoding="utf-8")
+        result = SimpleNamespace(
+            output_dir=str(tmp_path / "output"),
+            metadata_path=str(tmp_path / "output" / "inference_metadata.yaml"),
+            run_params_path=str(tmp_path / "output" / "run.json"),
+            workflow=SimpleNamespace(
+                steps=20,
+                cfg=7.5,
+                sampler_name="euler",
+                scheduler_kind="euler",
+                width=512,
+                height=512,
+                loras=[],
+                prompt="a cat",
+                negative_prompt="",
+                seed=42,
+            ),
+        )
+        with mock.patch(
+            "mobius.integrations.onnx_genai.convert_comfyui_workflow",
+            return_value=result,
+        ) as convert:
+            main(
+                [
+                    "convert-comfyui",
+                    str(workflow_path),
+                    "--checkpoint",
+                    "nota-ai/bk-sdm-small",
+                    "--revision",
+                    "pinned-revision",
+                    "--output",
+                    str(tmp_path / "output"),
+                ]
+            )
+
+        convert.assert_called_once_with(
+            {},
+            "nota-ai/bk-sdm-small",
+            str(tmp_path / "output"),
+            sdxl=False,
+            revision="pinned-revision",
+        )
+
+
 class TestCLIBuildRuntime:
     """Test the ``--runtime`` flag on the ``build`` subcommand."""
 
