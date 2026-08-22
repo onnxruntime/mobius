@@ -4751,6 +4751,13 @@ class TestBuildMoshiLM:
         assert "present.0.key" in outputs
         assert model.graph.initializers["depformer_in.weight"].shape[0] == dep_q
 
+    @pytest.mark.parametrize("dep_q", [0, 1, 2, 7, 9, 17])
+    def test_depformer_rejects_unsupported_width(self, dep_q):
+        from mobius.models.moshi import moshi_depformer_config
+
+        with pytest.raises(ValueError, match=r"dep_q must be 8 .* or 16"):
+            moshi_depformer_config(dep_q)
+
 
 class TestBuildCodecGraph:
     """Verify codec tokenizer (Qwen3-TTS-Tokenizer-12Hz) graph construction."""

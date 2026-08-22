@@ -18,14 +18,14 @@ via :func:`mobius.integrations.moshi.build_mimi` /
 * **Mimi encoder** ``waveform (B,1,T) -> codes (B,8,Tf)``
 * **Moshi temporal** ``frame (B,17,S) -> hidden + text_logits + KV``
 * **Moshi depformer** ``hidden + prev_token + substep_index + KV -> logits``
-  (stepped 16 times per frame, once per audio codebook)
+  (stepped 8 times for public Moshi/Moshiko or 16 times for PersonaPlex)
 * **Mimi decoder** ``codes (B,8,Tf) -> waveform (B,1,T)``
 
 The generation loop is a faithful NumPy port of Kyutai ``LMGen.step``: a ring
 cache with per-codebook delays, the temporal step, greedy text sampling, the
-16-substep autoregressive depformer, and delayed output collection. The user
-audio stream is fed as the 8 "other" codebooks (``k = 9..16``); the assistant
-(Moshi) audio is generated as codebooks ``k = 1..8`` and decoded by Mimi.
+configurable autoregressive depformer, and delayed output collection. The
+user audio stream is fed as the 8 "other" codebooks (``k = 9..16``); the
+assistant audio uses the first 8 generated codebooks and is decoded by Mimi.
 
 Prerequisites::
 
@@ -67,6 +67,7 @@ import os
 import time
 
 import numpy as np
+import onnx_ir as ir
 
 _MODEL_ID = "nvidia/personaplex-7b-v1"
 
@@ -165,6 +166,35 @@ def encode_persona(tokenizer, persona_text: str) -> list[int]:
     return list(tokenizer.encode(text))
 
 
+def _model_path(model_dir: str, name: str) -> str:
+    path = os.path.join(model_dir, name, "model.onnx")
+    if not os.path.isfile(path) and name.startswith("mimi_"):
+        path = os.path.join(model_dir, name.removeprefix("mimi_"), "model.onnx")
+    if not os.path.isfile(path):
+        path = os.path.join(model_dir, f"{name}.onnx")
+    return path
+
+
+def _infer_dep_q(model_path: str) -> int:
+    """Read the depformer step count from raw or quantized ONNX weights."""
+    model = ir.load(model_path)
+    widths = {
+        int(value.shape[0])
+        for name, value in model.graph.initializers.items()
+        if name == "depformer_in.weight" or name.startswith("depformer_in.weight_")
+    }
+    if len(widths) != 1:
+        raise ValueError(
+            f"Cannot infer depformer width from {model_path!r}: found widths {sorted(widths)}"
+        )
+    dep_q = widths.pop()
+    if dep_q not in (8, 16):
+        raise ValueError(
+            f"Unsupported depformer width {dep_q} in {model_path!r}; expected 8 or 16"
+        )
+    return dep_q
+
+
 class MoshiORT:
     """Full-duplex Moshi generation driven by four ONNX Runtime sessions."""
 
@@ -179,19 +209,23 @@ class MoshiORT:
         temp_audio: float = 0.8,
         top_k_audio: int = 250,
         seed: int | None = None,
-        dep_q: int = DEP_Q,
+        dep_q: int | None = None,
     ):
+        depformer_path = _model_path(model_dir, "depformer")
+        inferred_dep_q = _infer_dep_q(depformer_path)
+        if dep_q is not None and dep_q != inferred_dep_q:
+            raise ValueError(
+                f"Requested dep_q={dep_q}, but {depformer_path!r} contains "
+                f"{inferred_dep_q} depformer steps"
+            )
+        dep_q = inferred_dep_q
+
         import onnxruntime as ort
 
         providers = _provider(device, allow_tf32)
 
         def _load(name: str):
-            path = os.path.join(model_dir, name, "model.onnx")
-            if not os.path.isfile(path) and name.startswith("mimi_"):
-                path = os.path.join(model_dir, name.removeprefix("mimi_"), "model.onnx")
-            if not os.path.isfile(path):
-                path = os.path.join(model_dir, f"{name}.onnx")
-            return ort.InferenceSession(path, providers=providers)
+            return ort.InferenceSession(_model_path(model_dir, name), providers=providers)
 
         self.enc = _load("mimi_encoder")
         self.dec = _load("mimi_decoder")
@@ -391,13 +425,13 @@ class MoshiORT:
         self._tpos += s
         return hidden[:, -1:], text_logits[0, -1]
 
-    # --- Depformer: 16 autoregressive substeps --------------------------
+    # --- Depformer: 8 or 16 autoregressive substeps ---------------------
     def _depformer_step(self, text_token, hidden, audio_target, audio_provided):
-        """Generate the 16 audio codebooks for one frame.
+        """Generate one frame of depformer tokens.
 
         ``audio_target`` / ``audio_provided``: (16,) teacher-forcing of the
-        16 audio codebooks (used for the user stream at k=9..16 and any forced
-        Moshi tokens). Returns sampled (16,) int64.
+        temporal audio channels (used for the user stream at k=9..16 and any
+        forced Moshi tokens). Returns sampled ``(dep_q,)`` int64.
         """
         past = [
             (
@@ -748,8 +782,8 @@ def main() -> None:
         "--dep-q",
         type=int,
         choices=[8, 16],
-        default=DEP_Q,
-        help="Depformer codebooks: 8 for public Moshi/Moshiko, 16 for PersonaPlex.",
+        default=None,
+        help="Expected depformer width; default infers 8 or 16 from the ONNX package.",
     )
     parser.add_argument("--save-to", default=None, help="dir to write assistant.wav")
     parser.add_argument("--skip-build", action="store_true", help="reuse existing --model-dir")
