@@ -4961,6 +4961,51 @@ class TestBuildCodecGraph:
         weights = self._conv_encoder_weights(CodecEncoderConfig(hidden_size=32, num_filters=4))
         assert weights["encoder.layers.14.conv.weight"][0] == 32
 
+    def test_default_config_rvq_projections_match_checkpoint(self):
+        """Encoder RVQ projections must match the real checkpoint's shapes.
+
+        The RVQ consumes ``hidden_size``-wide features and projects to
+        ``codebook_dim``, mirroring HF ``MimiResidualVectorQuantizer``.
+        Deriving these from ``codebook_dim`` alone produced projections
+        that could not load the checkpoint's weights at all.
+        """
+        from mobius._configs import CodecEncoderConfig
+        from mobius.models.qwen3_tts_tokenizer import Qwen3TTSCodecEncoderModel
+
+        config = ArchitectureConfig(
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=8,
+            intermediate_size=64,
+            vocab_size=256,
+            max_position_embeddings=128,
+            codec_encoder=CodecEncoderConfig(),
+        )
+        module = Qwen3TTSCodecEncoderModel(config)
+        shapes = {
+            name: tuple(param.shape)
+            for name, param in module.named_parameters()
+            if "_proj.weight" in name and "quantizer" in name
+        }
+
+        # Matches Qwen/Qwen3-TTS-Tokenizer-12Hz encoder.quantizer.* weights.
+        for prefix in (
+            "quantizer.semantic_residual_vector_quantizer",
+            "quantizer.acoustic_residual_vector_quantizer",
+        ):
+            assert shapes[f"{prefix}.input_proj.weight"] == (256, 512, 1)
+            assert shapes[f"{prefix}.output_proj.weight"] == (512, 256, 1)
+
+        # Codebooks are codebook_dim-wide, matching codebook.embed_sum.
+        codebooks = {
+            tuple(param.shape)
+            for name, param in module.named_parameters()
+            if name.endswith("codebook.embedding")
+        }
+        assert codebooks == {(2048, 256)}
+
     def test_registry_lookup(self):
         """Verify qwen3_tts_tokenizer_12hz is registered with codec task."""
         model_cls = registry.get("qwen3_tts_tokenizer_12hz")
