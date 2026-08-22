@@ -2920,6 +2920,13 @@ def build_diffusion_workflow_metadata(
         "image": {
             "contract": _contract(vae_output),
             "role": "image",
+            # The VAE decoder graph applies no bounding activation itself (the
+            # synthetic fixture just slices the latent), but the port plays
+            # the semantic role of a diffusers-style VAE decode: by
+            # convention those pixels are normalized to [-1, 1], with the
+            # [0, 1]/uint8 rescale happening downstream in an image
+            # processor, never inside the decoder graph.
+            "value_range": "negative_one_to_one",
             "stage": "pre_adapter",
         },
         "latent": {
