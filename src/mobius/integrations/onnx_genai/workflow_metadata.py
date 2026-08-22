@@ -1734,6 +1734,10 @@ def write_hierarchical_audio_workflow_metadata(pkg: Any, output_dir: str) -> str
     """Write canonical hierarchical-audio workflow and exact prompt processor."""
     os.makedirs(output_dir, exist_ok=True)
     metadata = build_hierarchical_audio_workflow_metadata(pkg)
+    # Building the workflow registers its generic policy graphs. The CLI saves
+    # neural components before metadata generation, so persist these newly
+    # registered artifacts here rather than publishing dangling references.
+    pkg.save_policy_components(output_dir)
     processor = {
         "max_input_tokens": 5000,
         "max_output_units": 9000,

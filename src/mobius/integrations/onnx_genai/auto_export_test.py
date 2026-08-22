@@ -1119,6 +1119,9 @@ def test_hierarchical_audio_package_is_not_misclassified_as_diffusion(tmp_path):
         }
     )
 
+    # Match the CLI order: neural graphs are saved before metadata generation
+    # registers the workflow policy components.
+    pkg.save(str(tmp_path), progress_bar=False, check_weights=False)
     artifacts = write_onnx_genai_config(pkg, str(tmp_path))
     with open(artifacts["inference_metadata"]) as handle:
         workflow = yaml.safe_load(handle)["pipeline"]["workflow"]
@@ -1142,6 +1145,17 @@ def test_hierarchical_audio_package_is_not_misclassified_as_diffusion(tmp_path):
     assert (tmp_path / "speech_processor.json").is_file()
     with open(tmp_path / "speech_processor.json") as handle:
         assert json.load(handle)["max_output_units"] == 9000
+    policy_artifacts = {
+        component["implementation"]["artifact"]
+        for component in workflow["components"].values()
+        if component["implementation"].get("kind") == "onnx"
+        and component["implementation"]["artifact"].startswith("policies/")
+    }
+    assert policy_artifacts
+    for artifact in policy_artifacts:
+        policy_path = tmp_path / artifact
+        assert policy_path.is_file(), artifact
+        ir.load(policy_path)
 
 
 @dataclasses.dataclass
