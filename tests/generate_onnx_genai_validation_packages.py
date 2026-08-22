@@ -534,6 +534,15 @@ def _executable_shared_state_pixel_flow_package() -> ModelPackage:
     )
     timestep = generation_embedding.input("timestep", ir.DataType.FLOAT, [1])
     noise_scale = generation_embedding.input("noise_scale", ir.DataType.FLOAT, [1])
+    token_height = generation_embedding.op.Div(
+        generation_embedding.op.Shape(latent, start=2, end=3),
+        generation_embedding.op.Constant(value_ints=[32]),
+    )
+    token_width = generation_embedding.op.Div(
+        generation_embedding.op.Shape(latent, start=3, end=4),
+        generation_embedding.op.Constant(value_ints=[32]),
+    )
+    image_tokens = generation_embedding.op.Mul(token_height, token_width)
     image_embeds = generation_embedding.op.Expand(
         generation_embedding.op.Add(
             generation_embedding.op.ReduceMean(latent, [0, 1, 2, 3], keepdims=0),
@@ -541,7 +550,8 @@ def _executable_shared_state_pixel_flow_package() -> ModelPackage:
         ),
         generation_embedding.op.Concat(
             generation_embedding.op.Shape(latent, start=0, end=1),
-            generation_embedding.op.Constant(value_ints=[1, 32]),
+            image_tokens,
+            generation_embedding.op.Constant(value_ints=[32]),
             axis=0,
         ),
     )
@@ -554,25 +564,55 @@ def _executable_shared_state_pixel_flow_package() -> ModelPackage:
     image_embeds = denoiser.input(
         "image_embeds", ir.DataType.FLOAT, ["batch", "image_tokens", 32]
     )
-    denoiser.input("position_ids", ir.DataType.INT64, [3, "batch", "image_tokens"])
-    denoiser.input("token_grid", ir.DataType.INT64, [2])
+    position_ids = denoiser.input(
+        "position_ids", ir.DataType.INT64, [3, "batch", "image_tokens"]
+    )
+    token_grid = denoiser.input("token_grid", ir.DataType.INT64, [2])
     past_key = denoiser.input(
         "past_key_values.0.key", ir.DataType.FLOAT, ["batch", 2, "past_sequence_len", 8]
     )
     past_value = denoiser.input(
         "past_key_values.0.value", ir.DataType.FLOAT, ["batch", 2, "past_sequence_len", 8]
     )
-    prediction = denoiser.op.Expand(
+    temporal_position = denoiser.op.ReduceMean(
+        denoiser.op.Cast(
+            denoiser.op.Gather(
+                position_ids,
+                denoiser.op.Constant(value_ints=[0]),
+                axis=0,
+            ),
+            to=ir.DataType.FLOAT,
+        ),
+        [0, 1, 2],
+        keepdims=0,
+    )
+    grid_extent = denoiser.op.ReduceSum(
+        denoiser.op.Cast(token_grid, to=ir.DataType.FLOAT),
+        [0],
+        keepdims=0,
+    )
+    prediction_scalar = denoiser.op.Mul(
         denoiser.op.Add(
             denoiser.op.ReduceMean(image_embeds, [0, 1, 2], keepdims=0),
             denoiser.op.Add(
-                denoiser.op.ReduceMean(past_key, [0, 1, 2, 3], keepdims=0),
-                denoiser.op.ReduceMean(past_value, [0, 1, 2, 3], keepdims=0),
+                denoiser.op.Add(
+                    denoiser.op.ReduceMean(past_key, [0, 1, 2, 3], keepdims=0),
+                    denoiser.op.ReduceMean(past_value, [0, 1, 2, 3], keepdims=0),
+                ),
+                denoiser.op.Add(temporal_position, grid_extent),
             ),
         ),
+        denoiser.op.Constant(value_float=0.02),
+    )
+    prediction = denoiser.op.Expand(
+        prediction_scalar,
         denoiser.op.Concat(
             denoiser.op.Shape(image_embeds, start=0, end=1),
-            denoiser.op.Constant(value_ints=[3, 32, 32]),
+            denoiser.op.Constant(value_ints=[3]),
+            denoiser.op.Mul(
+                token_grid,
+                denoiser.op.Constant(value_ints=[32, 32]),
+            ),
             axis=0,
         ),
     )
@@ -682,6 +722,11 @@ def _executable_diffusion_package() -> ModelPackage:
         vae_builder.op.Constant(value_ints=[3]),
         vae_builder.op.Constant(value_ints=[1]),
     )
+    # Standard VAE decoder semantic: bound the decoded pixels to [-1, 1] with
+    # Tanh so the graph's numeric output actually honors the workflow
+    # metadata's declared `value_range: negative_one_to_one` for this
+    # synthetic conformance package (not just a documentation claim).
+    image = vae_builder.op.Tanh(image)
     vae_builder.add_output(
         _typed(
             image,

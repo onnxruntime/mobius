@@ -1642,6 +1642,26 @@ def build_tensor_scale(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponen
     return _component("mobius.policy.auxiliary@1", graph, {})
 
 
+def build_tensor_clamp(
+    dtype: ir.DataType = ir.DataType.FLOAT,
+    *,
+    minimum: float,
+    maximum: float,
+) -> PolicyComponent:
+    """Clamp a rank-4 tensor to an explicitly declared numeric range."""
+    graph, builder = _make_graph("tensor_clamp")
+    op = builder.op
+    tensor = builder.input("tensor", dtype, ["batch", "channels", "height", "width"])
+    clamped = op.Clip(
+        tensor,
+        op.Cast(op.Constant(value_float=minimum), to=dtype),
+        op.Cast(op.Constant(value_float=maximum), to=dtype),
+    )
+    clamped.shape = tensor.shape
+    builder.add_output(clamped, "clamped")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
 def build_zeros_like(dtype: ir.DataType = ir.DataType.FLOAT) -> PolicyComponent:
     """Produce a zero tensor shaped like its reference, for state initializers."""
     graph, builder = _make_graph("zeros_like")
@@ -1792,9 +1812,67 @@ def build_image_grid_positions(
     return _component("mobius.policy.auxiliary@1", graph, {})
 
 
+def build_image_dimensions(
+    dtype: ir.DataType = ir.DataType.FLOAT,
+) -> PolicyComponent:
+    """Read pixel height and width from a rank-4 image tensor."""
+    graph, builder = _make_graph("image_dimensions")
+    op = builder.op
+    tensor = builder.input("tensor", dtype, ["batch", "channels", "height", "width"])
+    height = op.Shape(tensor, start=2, end=3)
+    width = op.Shape(tensor, start=3, end=4)
+    height.shape = width.shape = ir.Shape([1])
+    builder.add_output(height, "height")
+    builder.add_output(width, "width")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
 _RNG_MODULUS = 2147483647
 _RNG_MULTIPLIER = 48271
 _RNG_STRIDE = 2654435761
+
+
+def build_image_noise_geometry(
+    *,
+    channels: int = 3,
+    token_stride: int = 32,
+    base_image_sequence_length: int = 64,
+    noise_scale: float = 1.0,
+    maximum_noise_scale: float = 16.0,
+) -> PolicyComponent:
+    """Derive image-noise shape, token grid, and resolution-dependent scale."""
+    graph, builder = _make_graph("image_noise_geometry")
+    op = builder.op
+    height = builder.input("height", ir.DataType.INT64, [1])
+    width = builder.input("width", ir.DataType.INT64, [1])
+
+    row_shape = op.Concat(
+        op.Constant(value_ints=[channels]),
+        height,
+        width,
+        axis=0,
+    )
+    row_shape.shape = ir.Shape([3])
+    token_height = op.Div(height, op.Constant(value_int=token_stride))
+    token_width = op.Div(width, op.Constant(value_int=token_stride))
+    token_height.shape = token_width.shape = ir.Shape([1])
+
+    image_sequence_length = op.Mul(token_height, token_width)
+    relative_length = op.Div(
+        op.Cast(image_sequence_length, to=ir.DataType.FLOAT),
+        op.Constant(value_float=float(base_image_sequence_length)),
+    )
+    resolved_scale = op.Min(
+        op.Mul(op.Sqrt(relative_length), op.Constant(value_float=noise_scale)),
+        op.Constant(value_float=maximum_noise_scale),
+    )
+    resolved_scale.shape = ir.Shape([1])
+
+    builder.add_output(row_shape, "row_shape")
+    builder.add_output(token_height, "token_height")
+    builder.add_output(token_width, "token_width")
+    builder.add_output(resolved_scale, "noise_scale")
+    return _component("mobius.policy.auxiliary@1", graph, {})
 
 
 def _counter_uniform(op, key, counter):
