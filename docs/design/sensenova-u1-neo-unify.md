@@ -255,12 +255,15 @@ once, casts the fp16 prefixes to fp32, and lets both CFG generation branches
 read the frozen state. The loop describes per-step image embedding, x0
 prediction, `v = (x0 - z) / max(1 - t, t_eps)`, and Euler integration. This is
 an architecture-neutral shared-state pattern; no model-family dispatch exists
-in the runtime.
+in the runtime. Each CFG branch derives its image temporal positions from its
+own prompt length, so unequal positive and negative prefixes remain valid.
 
 PR CI uses deterministic tiny graphs to execute text-only, text-to-image, and
 reference-image-edit paths, including mixed precision, shared KV, CFG, seeded
 noise, and a two-step loop. The workflow also accepts an optional external
-latent for controlled parity.
+latent for controlled parity. When supplied, its actual tensor dimensions
+determine downstream resolution-dependent noise-scale conditioning instead of
+silently trusting potentially inconsistent request dimensions.
 
 The pinned production exports from PR #533 were subsequently assembled into
 the same canonical metadata package and executed by ONNX GenAI's generic

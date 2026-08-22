@@ -32,4 +32,4 @@ prediction, and the flow update `v = (x0 - z) / max(1 - t, t_eps)`. The graphs
 are tiny and deterministic; ordinary CI never downloads production weights.
 
 SHA-256 of `shared_state_pixel_flow/inference_metadata.yaml`:
-`b57ee052fee12ad685fa510e72e5446e51dd07f9fa52981765772651bbb076b8`.
+`9dd15af58703f0ef163abb17f7008e92f58b3c7a4071784b1b8e53c05b411abd`.

@@ -1805,6 +1805,21 @@ def build_image_grid_positions(
     return _component("mobius.policy.auxiliary@1", graph, {})
 
 
+def build_image_dimensions(
+    dtype: ir.DataType = ir.DataType.FLOAT,
+) -> PolicyComponent:
+    """Read pixel height and width from a rank-4 image tensor."""
+    graph, builder = _make_graph("image_dimensions")
+    op = builder.op
+    tensor = builder.input("tensor", dtype, ["batch", "channels", "height", "width"])
+    height = op.Shape(tensor, start=2, end=3)
+    width = op.Shape(tensor, start=3, end=4)
+    height.shape = width.shape = ir.Shape([1])
+    builder.add_output(height, "height")
+    builder.add_output(width, "width")
+    return _component("mobius.policy.auxiliary@1", graph, {})
+
+
 _RNG_MODULUS = 2147483647
 _RNG_MULTIPLIER = 48271
 _RNG_STRIDE = 2654435761

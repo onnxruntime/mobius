@@ -20,6 +20,7 @@ from mobius.generation import (
     build_empty_batched_features,
     build_euler_solver_step,
     build_guidance_combine,
+    build_image_dimensions,
     build_image_grid_positions,
     build_image_noise_geometry,
     build_schedule_constant,
@@ -227,6 +228,7 @@ def build_shared_state_pixel_flow_workflow_metadata(
             pixels_per_token=int(getattr(config, "pixels_per_token", 32)),
         ),
     )
+    pkg.add_policy_component("image_dimensions", build_image_dimensions(generation_dtype))
     pkg.add_policy_component(
         "image_noise_geometry",
         build_image_noise_geometry(
@@ -490,10 +492,10 @@ def build_shared_state_pixel_flow_workflow_metadata(
             "image_noise_geometry",
             {"height": "request.height", "width": "request.width"},
             {
-                "row_shape": "image.row_shape",
-                "token_height": "image.token_height",
-                "token_width": "image.token_width",
-                "noise_scale": "image.noise_scale",
+                "row_shape": "noise.row_shape",
+                "token_height": "noise.token_height",
+                "token_width": "noise.token_width",
+                "noise_scale": "noise.noise_scale",
             },
         ),
         {
@@ -513,7 +515,7 @@ def build_shared_state_pixel_flow_workflow_metadata(
                             {
                                 "seed": "request.seed",
                                 "offset": "package.rng_offset",
-                                "row_shape": "image.row_shape",
+                                "row_shape": "noise.row_shape",
                             },
                             {
                                 "noise": "latent.standard_normal",
@@ -524,7 +526,7 @@ def build_shared_state_pixel_flow_workflow_metadata(
                             "latent_scale",
                             {
                                 "tensor": "latent.standard_normal",
-                                "scale": "image.noise_scale",
+                                "scale": "noise.noise_scale",
                             },
                             {"scaled": "latent.generated"},
                         ),
@@ -540,6 +542,27 @@ def build_shared_state_pixel_flow_workflow_metadata(
                 }
             },
         },
+        _invoke(
+            "image_dimensions",
+            {"tensor": "latent.initial"},
+            {
+                "height": "image.actual_height",
+                "width": "image.actual_width",
+            },
+        ),
+        _invoke(
+            "image_noise_geometry",
+            {
+                "height": "image.actual_height",
+                "width": "image.actual_width",
+            },
+            {
+                "row_shape": "image.row_shape",
+                "token_height": "image.token_height",
+                "token_width": "image.token_width",
+                "noise_scale": "image.noise_scale",
+            },
+        ),
         {
             "kind": "branch",
             "predicate": "request.image_present",
@@ -693,23 +716,29 @@ def build_shared_state_pixel_flow_workflow_metadata(
             },
             {"image_embeds": "flow.image_embeds"},
         ),
-        _invoke(
-            "image_grid_positions",
-            {
-                "latent": "latent",
-                "prompt_tokens": "request.prompt_tokens",
-            },
-            {
-                "position_ids": "flow.position_ids",
-                "token_grid": "flow.token_grid",
-            },
-        ),
     ]
-    for branch in ("conditional", "unconditional"):
+    branch_prompts = {
+        "conditional": "request.prompt_tokens",
+        "unconditional": "request.negative_prompt_tokens",
+    }
+    for branch, prompt_tokens in branch_prompts.items():
+        body.append(
+            _invoke(
+                "image_grid_positions",
+                {
+                    "latent": "latent",
+                    "prompt_tokens": prompt_tokens,
+                },
+                {
+                    "position_ids": f"flow.{branch}.position_ids",
+                    "token_grid": f"flow.{branch}.token_grid",
+                },
+            )
+        )
         denoiser_inputs = {
             "image_embeds": "flow.image_embeds",
-            "position_ids": "flow.position_ids",
-            "token_grid": "flow.token_grid",
+            "position_ids": f"flow.{branch}.position_ids",
+            "token_grid": f"flow.{branch}.token_grid",
         }
         denoiser_outputs = {"predicted_image": f"flow.{branch}.x0"}
         for index, (generation_past, generation_present) in enumerate(denoiser_pairs):

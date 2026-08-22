@@ -28,6 +28,8 @@ from mobius.generation import (
     build_grammar_logits_processor,
     build_greedy_sampler,
     build_guidance_combine,
+    build_image_dimensions,
+    build_image_grid_positions,
     build_image_noise_geometry,
     build_integer_minimum,
     build_integer_row_broadcast,
@@ -1170,6 +1172,39 @@ def test_image_noise_geometry_resolves_shape_grid_and_scale(tmp_path):
     np.testing.assert_array_equal(token_height, [16])
     np.testing.assert_array_equal(token_width, [24])
     np.testing.assert_allclose(noise_scale, [np.sqrt(384 / 64)], rtol=1e-6)
+
+
+def test_image_positions_and_dimensions_follow_their_actual_inputs(tmp_path):
+    latent = np.zeros((1, 3, 64, 96), dtype=np.float32)
+    conditional_positions, conditional_grid = _run(
+        build_image_grid_positions(pixels_per_token=32),
+        tmp_path,
+        {
+            "latent": latent,
+            "prompt_tokens": np.zeros((1, 5), dtype=np.int64),
+        },
+    )
+    unconditional_positions, unconditional_grid = _run(
+        build_image_grid_positions(pixels_per_token=32),
+        tmp_path,
+        {
+            "latent": latent,
+            "prompt_tokens": np.zeros((1, 2), dtype=np.int64),
+        },
+    )
+    np.testing.assert_array_equal(conditional_positions[0], 5)
+    np.testing.assert_array_equal(unconditional_positions[0], 2)
+    np.testing.assert_array_equal(conditional_positions[1:], unconditional_positions[1:])
+    np.testing.assert_array_equal(conditional_grid, [2, 3])
+    np.testing.assert_array_equal(unconditional_grid, [2, 3])
+
+    height, width = _run(
+        build_image_dimensions(),
+        tmp_path,
+        {"tensor": np.zeros((1, 3, 256, 384), dtype=np.float32)},
+    )
+    np.testing.assert_array_equal(height, [256])
+    np.testing.assert_array_equal(width, [384])
 
 
 def test_tensor_scale_and_zeros_like_shape_from_their_input(tmp_path):

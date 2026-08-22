@@ -522,6 +522,7 @@ class TestInferenceMetadataStatus:
             "x0_velocity",
             "guidance_combine",
             "solver_step",
+            "image_dimensions",
             "image_noise_geometry",
             "image_noise",
             "latent_scale",
@@ -538,10 +539,57 @@ class TestInferenceMetadataStatus:
         assert workflow["inputs"]["request.latent"]["present_as"] == "request.latent_present"
         latent_branch = workflow["steps"][2]
         assert latent_branch["predicate"] == "request.latent_present"
+        generated_latent_scale = latent_branch["cases"]["false"]["steps"][1]
+        assert generated_latent_scale["inputs"]["scale"] == "noise.noise_scale"
+        image_dimensions = next(
+            step for step in workflow["steps"] if step.get("component") == "image_dimensions"
+        )
+        assert image_dimensions["inputs"]["tensor"] == "latent.initial"
+        resolved_geometry = [
+            step
+            for step in workflow["steps"]
+            if step.get("component") == "image_noise_geometry"
+        ][1]
+        assert resolved_geometry["inputs"] == {
+            "height": "image.actual_height",
+            "width": "image.actual_width",
+        }
+        assert resolved_geometry["outputs"]["noise_scale"] == "image.noise_scale"
         prefix_initializers = [
             step for step in workflow["steps"] if step.get("component") == "prefix_initializer"
         ]
         assert len(prefix_initializers) == 2
+        generation_steps = workflow["steps"][-1]["cases"]["false"]["steps"]
+        loop_body = generation_steps[0]["steps"]
+        grid_invocations = [
+            step for step in loop_body if step.get("component") == "image_grid_positions"
+        ]
+        assert len(grid_invocations) == 2
+        assert {
+            step["inputs"]["prompt_tokens"]: step["outputs"]["position_ids"]
+            for step in grid_invocations
+        } == {
+            "request.prompt_tokens": "flow.conditional.position_ids",
+            "request.negative_prompt_tokens": "flow.unconditional.position_ids",
+        }
+        denoiser_invocations = [
+            step for step in loop_body if step.get("component") == "image_gen_denoiser"
+        ]
+        denoisers_by_output = {
+            step["outputs"]["predicted_image"]: step for step in denoiser_invocations
+        }
+        assert (
+            denoisers_by_output["flow.conditional.x0"]["inputs"]["position_ids"]
+            == "flow.conditional.position_ids"
+        )
+        assert (
+            denoisers_by_output["flow.unconditional.x0"]["inputs"]["position_ids"]
+            == "flow.unconditional.position_ids"
+        )
+        generation_embedding = next(
+            step for step in loop_body if step.get("component") == "image_gen_embedding"
+        )
+        assert generation_embedding["inputs"]["noise_scale"] == "image.noise_scale"
         np.testing.assert_array_equal(
             package.policy_components["flow_schedule"]
             .model.graph.outputs[0]

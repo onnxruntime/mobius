@@ -87,10 +87,11 @@ pipeline:
             kind: request_aligned
             axis: 0
         role:
-          kind: opaque
+          kind: runtime
+          version: '1.0'
+          role: negative_prompt_tokens
         source:
-          kind: application
-          name: negative_prompt_tokens
+          kind: request
       request.image:
         contract:
           dtype: uint8
@@ -214,10 +215,11 @@ pipeline:
             kind: request_aligned
             axis: 0
         role:
-          kind: opaque
+          kind: runtime
+          version: '1.0'
+          role: guidance_scale
         source:
-          kind: application
-          name: guidance_scale
+          kind: request
         required: false
         default: 2.0
       request.max_iterations:
@@ -553,6 +555,34 @@ pipeline:
               rank: 1
               shape:
               - 2
+      image_dimensions:
+        implementation:
+          kind: onnx
+          artifact: policies/image_dimensions.onnx
+        ports:
+          inputs:
+            tensor:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - channels
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            height:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
+            width:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
       image_noise_geometry:
         implementation:
           kind: onnx
@@ -1234,10 +1264,10 @@ pipeline:
         height: request.height
         width: request.width
       outputs:
-        row_shape: image.row_shape
-        token_height: image.token_height
-        token_width: image.token_width
-        noise_scale: image.noise_scale
+        row_shape: noise.row_shape
+        token_height: noise.token_height
+        token_width: noise.token_width
+        noise_scale: noise.noise_scale
     - kind: branch
       predicate: request.latent_present
       cases:
@@ -1257,7 +1287,7 @@ pipeline:
             inputs:
               seed: request.seed
               offset: package.rng_offset
-              row_shape: image.row_shape
+              row_shape: noise.row_shape
             outputs:
               noise: latent.standard_normal
               next_offset: image.next_rng_offset
@@ -1265,7 +1295,7 @@ pipeline:
             component: latent_scale
             inputs:
               tensor: latent.standard_normal
-              scale: image.noise_scale
+              scale: noise.noise_scale
             outputs:
               scaled: latent.generated
       outputs:
@@ -1273,6 +1303,23 @@ pipeline:
           cases:
             'true': latent.provided
             'false': latent.generated
+    - kind: invoke
+      component: image_dimensions
+      inputs:
+        tensor: latent.initial
+      outputs:
+        height: image.actual_height
+        width: image.actual_width
+    - kind: invoke
+      component: image_noise_geometry
+      inputs:
+        height: image.actual_height
+        width: image.actual_width
+      outputs:
+        row_shape: image.row_shape
+        token_height: image.token_height
+        token_width: image.token_width
+        noise_scale: image.noise_scale
     - kind: branch
       predicate: request.image_present
       cases:
@@ -1430,8 +1477,8 @@ pipeline:
                 latent: latent
                 prompt_tokens: request.prompt_tokens
               outputs:
-                position_ids: flow.position_ids
-                token_grid: flow.token_grid
+                position_ids: flow.conditional.position_ids
+                token_grid: flow.conditional.token_grid
             - kind: invoke
               component: cache_freeze_0
               inputs:
@@ -1448,14 +1495,22 @@ pipeline:
               component: image_gen_denoiser
               inputs:
                 image_embeds: flow.image_embeds
-                position_ids: flow.position_ids
-                token_grid: flow.token_grid
+                position_ids: flow.conditional.position_ids
+                token_grid: flow.conditional.token_grid
                 past_key_values.0.key: conditional_cache_0
                 past_key_values.0.value: conditional_cache_1
               outputs:
                 predicted_image: flow.conditional.x0
                 present.0.key: flow.discard.conditional.0
                 present.0.value: flow.discard.conditional.1
+            - kind: invoke
+              component: image_grid_positions
+              inputs:
+                latent: latent
+                prompt_tokens: request.negative_prompt_tokens
+              outputs:
+                position_ids: flow.unconditional.position_ids
+                token_grid: flow.unconditional.token_grid
             - kind: invoke
               component: cache_freeze_0
               inputs:
@@ -1472,8 +1527,8 @@ pipeline:
               component: image_gen_denoiser
               inputs:
                 image_embeds: flow.image_embeds
-                position_ids: flow.position_ids
-                token_grid: flow.token_grid
+                position_ids: flow.unconditional.position_ids
+                token_grid: flow.unconditional.token_grid
                 past_key_values.0.key: unconditional_cache_0
                 past_key_values.0.value: unconditional_cache_1
               outputs:
