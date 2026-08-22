@@ -387,6 +387,35 @@ pipeline:
               rank: 1
               shape:
               - 1
+      image_output_clamp:
+        implementation:
+          kind: onnx
+          artifact: policies/image_output_clamp.onnx
+        ports:
+          inputs:
+            tensor:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - axis_1
+              - axis_2
+              - axis_3
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            clamped:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - axis_1
+              - axis_2
+              - axis_3
+              batch_layout:
+                kind: request_aligned
+                axis: 0
     state:
       latent_state:
         contract:
@@ -520,7 +549,13 @@ pipeline:
       inputs:
         latent: latent_state
       outputs:
-        image: vae.image
+        image: vae.raw_image
+    - kind: invoke
+      component: image_output_clamp
+      inputs:
+        tensor: vae.raw_image
+      outputs:
+        clamped: vae.image
     - kind: emit
       value: latent_state
       output: latent
