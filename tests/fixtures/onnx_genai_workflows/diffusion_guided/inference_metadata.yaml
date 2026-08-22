@@ -581,7 +581,7 @@ pipeline:
               dtype: int64
               rank: 1
               shape:
-              - row_rank
+              - 3
           outputs:
             noise:
               dtype: float32

@@ -4,6 +4,7 @@ import argparse
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import onnx_ir as ir
@@ -11,6 +12,7 @@ import yaml
 from onnxscript import GraphBuilder
 from safetensors.numpy import save_file
 
+from mobius import build_from_module
 from mobius._model_package import ModelPackage
 from mobius._passes import RemoveDeadGraphInputsPass
 from mobius.adapter_io import load_peft_adapter
@@ -22,6 +24,14 @@ from mobius.adapters import (
     AdapterTargetManifest,
     AdapterWeights,
     fingerprint_model_weights,
+)
+from mobius.integrations.diffusers._configs import (
+    MiniMaxMusic3ConditionConfig,
+    MiniMaxMusic3LanguageConfig,
+    MiniMaxMusic3RVQConfig,
+    MiniMaxMusic3TransformerConfig,
+    MiniMaxMusic3VocoderConfig,
+    MiniMaxMusic3WorkflowConfig,
 )
 from mobius.integrations.onnx_genai import write_onnx_genai_config
 from mobius.integrations.onnx_genai.auto_export_test import (
@@ -35,6 +45,7 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     write_audio_codec_workflow_metadata,
     write_diffusion_workflow_metadata,
     write_encoder_embedding_workflow_metadata,
+    write_hierarchical_audio_workflow_metadata,
     write_language_diffusion_workflow_metadata,
     write_speculative_workflow_metadata,
     write_video_diffusion_workflow_metadata,
@@ -43,9 +54,193 @@ from mobius.models.bert import BertModel
 from mobius.models.bert_test import PROTBERT_TINY_CONFIG
 from mobius.models.esm import EsmModel
 from mobius.models.esm_test import TINY_CONFIG as ESM2_TINY_CONFIG
+from mobius.models.minimax_music3 import (
+    MiniMaxMusic3ConditionEncoder,
+    MiniMaxMusic3LanguageModel,
+    MiniMaxMusic3RVQDepthDecoder,
+    MiniMaxMusic3Transformer1DModel,
+    MiniMaxMusic3Vocoder,
+)
 from mobius.models.qwen3_tts import Qwen3TTSForConditionalGeneration
 from mobius.models.qwen3_tts_test import _TINY_CONFIG
 from mobius.tasks import FeatureExtractionTask, TTSTask
+
+
+def _hierarchical_audio_package() -> ModelPackage:
+    language_config = MiniMaxMusic3LanguageConfig.from_diffusers(
+        {
+            "model_type": "qwen3",
+            "vocab_size": 168060,
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "max_position_embeddings": 64,
+            "rms_norm_eps": 1e-6,
+            "rope_parameters": {"rope_theta": 1_000_000, "rope_type": "default"},
+            "tie_word_embeddings": False,
+            "hidden_act": "silu",
+        }
+    )
+    language = build_from_module(
+        MiniMaxMusic3LanguageModel(language_config),
+        language_config,
+        "minimax-music3-language",
+    )
+    rvq_config = MiniMaxMusic3RVQConfig(
+        hidden_size=8,
+        num_layers=1,
+        num_attention_heads=2,
+        intermediate_size=16,
+        audio_vocab_size=1024,
+        num_codebooks=8,
+        max_position_embeddings=8,
+    )
+    rvq = build_from_module(
+        MiniMaxMusic3RVQDepthDecoder(rvq_config),
+        rvq_config,
+        "minimax-music3-rvq",
+    )
+    condition_config = MiniMaxMusic3ConditionConfig(
+        condition_hidden_dim=8,
+        num_condition_layers=8,
+        out_dim=2048,
+    )
+    condition = build_from_module(
+        MiniMaxMusic3ConditionEncoder(condition_config),
+        condition_config,
+        "minimax-music3-condition",
+    )
+    transformer_config = MiniMaxMusic3TransformerConfig(
+        in_channels=128,
+        condition_dim=2048,
+        num_layers=1,
+        num_attention_heads=2,
+        attention_head_dim=4,
+        ff_inner_dim=16,
+        rotary_dim=4,
+        fourier_embedding_dim=8,
+    )
+    transformer = build_from_module(
+        MiniMaxMusic3Transformer1DModel(transformer_config),
+        transformer_config,
+        "minimax-music3-denoising",
+    )
+    vocoder_config = MiniMaxMusic3VocoderConfig(
+        latent_channels=128,
+        decoder_input_dim=8,
+        decoder_hidden_dim=16,
+        upsampling_ratios=(2,),
+    )
+    vocoder = build_from_module(
+        MiniMaxMusic3Vocoder(vocoder_config),
+        vocoder_config,
+        "minimax-music3-vocoder",
+    )
+    package = ModelPackage(
+        {
+            "language_model": language["model"],
+            "language_model_embedding": language["embedding"],
+            "language_model_semantic_embedding": language["semantic_embedding"],
+            "rvq_depth_decoder": rvq["model"],
+            "rvq_depth_decoder_projection": rvq["projection"],
+            "rvq_depth_decoder_embedding": rvq["embedding"],
+            "rvq_depth_decoder_feedback_embedding": rvq["feedback_embedding"],
+            "rvq_depth_decoder_heads": rvq["heads"],
+            "condition_encoder": condition["model"],
+            "transformer": transformer["model"],
+            "vocoder": vocoder["model"],
+        }
+    )
+    component_configs = {
+        "language_model": {
+            "max_position_embeddings": language_config.max_position_embeddings,
+        },
+        "condition_encoder": {
+            "input_sampling_rate": condition_config.input_sampling_rate,
+            "input_hop_length": condition_config.input_hop_length,
+            "output_hop_length": condition_config.output_hop_length,
+        },
+        "vocoder": {"sampling_rate": vocoder_config.sampling_rate},
+    }
+    package.config = SimpleNamespace(
+        component_configs=component_configs,
+        # Build the workflow config the way production does: through the mobius
+        # MiniMax config adapter, which owns the Music 3 defaults and derives the
+        # context window from the language config. This proves the adapter emits
+        # the checked-in fixture end to end.
+        workflow_config=MiniMaxMusic3WorkflowConfig.from_diffusers(
+            components={
+                "global_decoder": "language_model",
+                "global_embedding": "language_model_embedding",
+                "semantic_embedding": "language_model_semantic_embedding",
+                "local_decoder": "rvq_depth_decoder",
+                "local_projection": "rvq_depth_decoder_projection",
+                "local_embedding": "rvq_depth_decoder_embedding",
+                "local_feedback_embedding": "rvq_depth_decoder_feedback_embedding",
+                "local_heads": "rvq_depth_decoder_heads",
+                "condition_encoder": "condition_encoder",
+                "flow_transformer": "transformer",
+                "vocoder": "vocoder",
+            },
+            component_configs=component_configs,
+        ),
+    )
+    _materialize_deterministic_initializers(package)
+    for model in package.values():
+        for value in model.graph.initializers.values():
+            if value.dtype.is_floating_point():
+                shape = [int(dimension) for dimension in value.shape]
+                value.const_value = ir.tensor(np.full(shape, 1e-4, dtype=value.dtype.numpy()))
+    return package
+
+
+def _write_hierarchical_audio_tokenizer(directory: Path) -> None:
+    """Write a sparse-ID tokenizer that exercises the raw speech request path."""
+    special_tokens = {
+        "<|audio_cfg|>": 151654,
+        "<|im_start|>": 151667,
+        "<|im_end|>": 151668,
+        "<|audio_start|>": 151669,
+        "<|audio_end|>": 151670,
+        "<|caption_start|>": 151671,
+        "<|caption_end|>": 151672,
+        "<|lyrics_start|>": 151673,
+        "<|lyrics_end|>": 151674,
+    }
+    vocabulary = {
+        "[UNK]": 0,
+        "music": 1,
+        "[start]": 2,
+        "[verse]": 3,
+        "hello": 4,
+        **special_tokens,
+    }
+    tokenizer = {
+        "version": "1.0",
+        "truncation": None,
+        "padding": None,
+        "added_tokens": [
+            {
+                "id": token_id,
+                "content": token,
+                "single_word": False,
+                "lstrip": False,
+                "rstrip": False,
+                "normalized": False,
+                "special": True,
+            }
+            for token, token_id in special_tokens.items()
+        ],
+        "normalizer": {"type": "Lowercase"},
+        "pre_tokenizer": {"type": "Whitespace"},
+        "post_processor": None,
+        "decoder": None,
+        "model": {"type": "WordLevel", "vocab": vocabulary, "unk_token": "[UNK]"},
+    }
+    (directory / "tokenizer.json").write_text(json.dumps(tokenizer, indent=2) + "\n")
 
 
 def _materialize_deterministic_initializers(package: ModelPackage) -> None:
@@ -1277,6 +1472,12 @@ def generate_packages(output: Path) -> Path:
         directory = args.output / name
         package.save(str(directory), progress_bar=False, check_weights=False)
         write_onnx_genai_config(package, str(directory), **options)
+
+    hierarchical_audio = _hierarchical_audio_package()
+    directory = args.output / "hierarchical_audio"
+    write_hierarchical_audio_workflow_metadata(hierarchical_audio, str(directory))
+    _write_hierarchical_audio_tokenizer(directory)
+    hierarchical_audio.save(str(directory), progress_bar=False, check_weights=False)
 
     # A second image-diffusion fixture that exercises every optional part of the
     # workflow at once: classifier-free guidance from a negative prompt, a
