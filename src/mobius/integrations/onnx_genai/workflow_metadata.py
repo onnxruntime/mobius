@@ -3560,6 +3560,10 @@ def build_image_edit_workflow_metadata(
             "image": {
                 "contract": _contract(decoder_output),
                 "role": "image",
+                # Same VAE-decode contract as build_diffusion_workflow_metadata:
+                # Qwen Image Edit (and any package with this component shape)
+                # decodes to pixels normalized to [-1, 1], not [0, 1].
+                "value_range": "negative_one_to_one",
                 "stage": "pre_adapter",
             }
         },
