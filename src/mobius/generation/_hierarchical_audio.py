@@ -37,7 +37,6 @@ def build_guided_vocabulary_slice(
         op.Constant(value_ints=[1]),
     )
     stop = op.Gather(last, op.Constant(value_ints=[stop_token_id]), axis=1)
-    stop = op.Unsqueeze(stop, op.Constant(value_ints=[1]))
     candidates = op.Concat(semantic, stop, axis=1)
     conditional = op.Slice(
         candidates,

@@ -16,6 +16,7 @@ from mobius.generation import (
     build_chunk_slice,
     build_drop_first_frame,
     build_flow_guidance,
+    build_guided_vocabulary_slice,
     build_overlap_blend,
     build_waveform_stitch,
 )
@@ -71,6 +72,27 @@ def test_candidate_map_preserves_semantic_rows_and_stop_token(tmp_path):
     token, _, _, is_stop = _run(component, tmp_path, {"candidate": np.array([4])})
     np.testing.assert_array_equal(token, [999])
     np.testing.assert_array_equal(is_stop, [True])
+
+
+def test_guided_vocabulary_slice_appends_one_stop_candidate(tmp_path):
+    logits = np.zeros((2, 1, 8), dtype=np.float32)
+    logits[0, 0, 2:6] = [1, 4, 3, 2]
+    logits[1, 0, 2:6] = [0, 1, 2, 3]
+    logits[:, 0, 7] = [5, 1]
+    (guided,) = _run(
+        build_guided_vocabulary_slice(
+            vocabulary_start=2,
+            vocabulary_size=4,
+            stop_token_id=7,
+            guidance_scale=1.5,
+            conditional_top_k=5,
+            dtype=ir.DataType.FLOAT,
+        ),
+        tmp_path,
+        {"logits": logits},
+    )
+    assert guided.shape == (1, 5)
+    np.testing.assert_allclose(guided[0], [1.5, 5.5, 3.5, 1.5, 7.0])
 
 
 def test_chunk_plan_and_slice_follow_200_100_contract(tmp_path):
