@@ -53,28 +53,23 @@ _DATA_FILE = "llamacpp_pin.json"
 class UpstreamArchitecture:
     """One ``LLM_ARCH_NAMES`` entry as it exists at the pinned commit.
 
+    Only the facts the registry reasons about are vendored; the full 24-column
+    survey stays out of the repository.
+
     Attributes:
         gguf_arch: The ``general.architecture`` string.
-        cohort: Survey cohort, e.g. ``"C01-dense-transformer"``.
-        rope_type: ``llama_model_rope_type`` for the architecture.
-        topology: ``"dense"``, ``"moe"``, ``"recurrent"``, and similar.
-        moe_mode: Whether tensor shapes switch on ``expert_count``.
-        recurrent: Whether the architecture uses a recurrent state cache.
-        hybrid: Whether attention and SSM blocks interleave per layer.
+        cohort: Survey cohort, e.g. ``"C01-dense-transformer"``. Used to tell a
+            caller which family an unimported architecture belongs to.
         cpp_loader: Whether a ``llama_model_*`` class exists. ``gptj`` is the
-            one architecture where this is ``False``.
-        converter: Whether a ``convert_hf_to_gguf.py`` registration exists.
+            one architecture where this is ``False``, so no tool can load it.
+        dual_moe: Whether tensor shapes switch on ``expert_count`` rather than
+            on the architecture name. True for 47 architectures.
     """
 
     gguf_arch: str
     cohort: str
-    rope_type: str
-    topology: str
-    moe_mode: str
-    recurrent: bool
-    hybrid: bool
     cpp_loader: bool
-    converter: bool
+    dual_moe: bool
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -86,14 +81,13 @@ class UpstreamQuantType:
 
     Attributes:
         ggml_type_id: Numeric enum value.
-        enum_name: C enum name, e.g. ``"GGML_TYPE_Q4_K"``.
+        enum_name: C enum name, e.g. ``"GGML_TYPE_Q4_K"``. Removed slots have no
+            type name, so this is what identifies them in a message.
         name: Lower-case type name, empty for removed slots.
-        status: ``"active"`` or ``"removed"``.
         role: Upstream storage role string.
         block_elements: ``blck_size``. ``0`` for removed slots.
         block_bytes: ``type_size``. ``0`` for removed slots.
         readable: Whether the GGUF parse layer accepts the type.
-        has_to_float: Whether ggml can expand the type to float.
         dequant_impl: Whether ``gguf-py`` ships a Python dequantizer, which is
             what the mobius float import path actually calls.
         removed_note: Upstream deprecation note, when present.
@@ -102,12 +96,10 @@ class UpstreamQuantType:
     ggml_type_id: int
     enum_name: str
     name: str
-    status: str
     role: str
     block_elements: int
     block_bytes: int
     readable: bool
-    has_to_float: bool
     dequant_impl: bool
     removed_note: str
 
@@ -142,12 +134,10 @@ def upstream_quant_types() -> dict[int, UpstreamQuantType]:
             ggml_type_id=int(type_id),
             enum_name=fields["enum"],
             name=fields["name"],
-            status=fields["status"],
             role=fields["role"],
             block_elements=fields["block_elements"],
             block_bytes=fields["block_bytes"],
             readable=fields["readable"],
-            has_to_float=fields["has_to_float"],
             dequant_impl=fields["dequant_impl"],
             removed_note=fields["removed_note"],
         )

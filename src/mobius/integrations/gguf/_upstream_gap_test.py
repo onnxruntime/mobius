@@ -51,7 +51,7 @@ class TestPinIntegrity:
         # clip is the mmproj sidecar cohort.
         assert archs["clip"].cohort == "C08-multimodal-projector"
         # 47 architectures switch tensor shape on expert_count rather than on name.
-        dual = [a for a in archs.values() if a.moe_mode.startswith("dual")]
+        dual = [a for a in archs.values() if a.dual_moe]
         assert len(dual) == 47
 
 
