@@ -121,6 +121,12 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     declare_request_alignment,
     request_batch_layout,
 )
+from mobius.integrations.onnx_genai.package_facts import (
+    MEDIA_TOKEN_ROLES,
+    TEXT_TOKEN_ROLES,
+    attach_package_facts,
+    source_declared_value,
+)
 from mobius.tasks._ctc_asr import BATCH_PADDING_SENSITIVE_KEY
 
 
@@ -135,25 +141,7 @@ def _dump_yaml(metadata: dict[str, Any], handle: Any) -> None:
 
 def _source_model_value(source: str | None, name: str, fallback: Any) -> Any:
     """Resolve a value from packaged runtime metadata when available."""
-    candidates: list[tuple[str, tuple[str, ...]]] = []
-    if source and os.path.isdir(source):
-        candidates = [
-            (os.path.join(source, "genai_config.json"), ("model", name)),
-            (os.path.join(source, "tokenizer_config.json"), (name,)),
-        ]
-    for path, keys in candidates:
-        if not os.path.isfile(path):
-            continue
-        try:
-            with open(path, encoding="utf-8") as handle:
-                value: Any = yaml.safe_load(handle)
-            for key in keys:
-                value = value[key]
-        except (OSError, TypeError, KeyError):
-            continue
-        fallback = value
-        break
-    return fallback
+    return source_declared_value(source, name, fallback)
 
 
 def _source_token_id(source: str | None, name: str, fallback: Any) -> int:
@@ -7161,6 +7149,16 @@ def build_vlm_workflow_metadata(
         "preprocessing": preprocessing,
         "pipeline": {"workflow": _publish_workflow_v1(workflow)},
     }
+    # A multimodal package must state which prompt token an image replaces, or a
+    # front end can preprocess the image and then have nowhere to put it. That
+    # is an ordinary tokenizer fact keyed by semantic role, so it travels with
+    # the rest of them rather than in a vision-specific section.
+    attach_package_facts(
+        metadata,
+        source,
+        config,
+        roles=(*TEXT_TOKEN_ROLES, *MEDIA_TOKEN_ROLES),
+    )
     add_policy_components_to_workflow(metadata, pkg)
     return metadata
 
@@ -7174,6 +7172,13 @@ def write_vlm_workflow_metadata(
 ) -> str:
     os.makedirs(output_dir, exist_ok=True)
     metadata = build_vlm_workflow_metadata(pkg, config, source=source)
+    attach_package_facts(
+        metadata,
+        source,
+        config,
+        roles=(*TEXT_TOKEN_ROLES, *MEDIA_TOKEN_ROLES),
+        package_dir=output_dir,
+    )
     pkg.save_policy_components(output_dir)
     add_adapter_service_to_metadata(metadata, pkg, output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
@@ -7188,6 +7193,7 @@ def build_speculative_workflow_metadata(
     *,
     grammar_guidance: bool = False,
     adaptive_k_max: int | None = None,
+    source: str | None = None,
 ) -> dict[str, Any]:
     """Build proposer/verifier workflow with branch phi and effect joins."""
     config = config or getattr(pkg, "config", None)
@@ -7952,6 +7958,9 @@ def build_speculative_workflow_metadata(
         "schema_version": "v1",
         "pipeline": {"workflow": _publish_workflow_v1(workflow)},
     }
+    # Proposer and verifier are two views of one vocabulary: the acceptance test
+    # compares their ids directly, so the package states that vocabulary once.
+    attach_package_facts(metadata, source, config)
     add_policy_components_to_workflow(metadata, pkg)
     return metadata
 
@@ -7962,12 +7971,17 @@ def write_speculative_workflow_metadata(
     *,
     grammar_guidance: bool = False,
     adaptive_k_max: int | None = None,
+    source: str | None = None,
 ) -> str:
     os.makedirs(output_dir, exist_ok=True)
     metadata = build_speculative_workflow_metadata(
         pkg,
         grammar_guidance=grammar_guidance,
         adaptive_k_max=adaptive_k_max,
+        source=source,
+    )
+    attach_package_facts(
+        metadata, source, getattr(pkg, "config", None), package_dir=output_dir
     )
     pkg.save_policy_components(output_dir)
     add_adapter_service_to_metadata(metadata, pkg, output_dir)
@@ -8016,6 +8030,7 @@ def build_speech_to_text_workflow_metadata(
     sampler: str = "greedy",
     audio_preprocessing: dict[str, Any] | None = None,
     artifacts: dict[str, str] | None = None,
+    source: str | None = None,
 ) -> dict[str, Any]:
     """Build the typed SSA workflow for an encoder-conditioned decoder package.
 
@@ -8038,6 +8053,7 @@ def build_speech_to_text_workflow_metadata(
         encoder_name="encoder",
         audio_preprocessing=audio_preprocessing,
         artifacts=artifacts,
+        source=source,
     )
 
 
@@ -8046,11 +8062,12 @@ def build_decoder_workflow_metadata(
     config: Any,
     *,
     sampler: str = "greedy",
+    source: str | None = None,
 ) -> dict[str, Any]:
     """Build the exact workflow-policy contract for an autoregressive decoder."""
     if len(pkg) != 1:
         raise ValueError("decoder workflow requires exactly one neural component")
-    return _build_autoregressive_workflow_metadata(pkg, config, sampler=sampler)
+    return _build_autoregressive_workflow_metadata(pkg, config, sampler=sampler, source=source)
 
 
 def _build_autoregressive_workflow_metadata(
@@ -8061,6 +8078,7 @@ def _build_autoregressive_workflow_metadata(
     encoder_name: str | None = None,
     audio_preprocessing: dict[str, Any] | None = None,
     artifacts: dict[str, str] | None = None,
+    source: str | None = None,
 ) -> dict[str, Any]:
     """Build an autoregressive decode loop, optionally conditioned by an encoder.
 
@@ -8272,14 +8290,14 @@ def _build_autoregressive_workflow_metadata(
                 "version": "1.0",
                 "role": "prompt_tokens",
             }
-            source = {"kind": "request", "field": "prompt_tokens"}
+            input_source = {"kind": "request", "field": "prompt_tokens"}
         else:
             role = {"kind": "opaque"}
-            source = {"kind": "application", "name": value.name}
+            input_source = {"kind": "application", "name": value.name}
         workflow_inputs[name] = {
             "contract": _contract(value),
             "role": role,
-            "source": source,
+            "source": input_source,
             "required": True,
         }
         setup_decoder_inputs[value.name] = name
@@ -8341,10 +8359,10 @@ def _build_autoregressive_workflow_metadata(
     batch_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": [batch_dimension]})
     batch_bool = _request_aligned({"dtype": "bool", "rank": 1, "shape": [batch_dimension]})
     control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
-    eos_token_id = getattr(config, "eos_token_id", 0)
-    if isinstance(eos_token_id, list):
-        eos_token_id = eos_token_id[0] if eos_token_id else 0
-    eos_token_id = int(eos_token_id or 0)
+    # The published `special_tokens.eos` fact is resolved the same way, so a
+    # repackaged checkpoint cannot state one stop id for its termination policy
+    # and a different one for the same role.
+    eos_token_id = _source_token_id(source, "eos_token_id", getattr(config, "eos_token_id", 0))
     workflow_inputs.update(
         {
             "request.max_iterations": {
@@ -9363,6 +9381,9 @@ def _build_autoregressive_workflow_metadata(
         **({"preprocessing": {"audio": audio_program}} if audio_program is not None else {}),
         "pipeline": {"workflow": _publish_workflow_v1(workflow)},
     }
+    # The loop terminates on a stop id and emits ids a caller has to render, so
+    # the vocabulary contract those ids belong to is part of the package.
+    attach_package_facts(metadata, source, config)
     add_policy_components_to_workflow(metadata, pkg)
     return metadata
 
@@ -9633,10 +9654,12 @@ def write_decoder_workflow_metadata(
     config: Any,
     *,
     sampler: str = "greedy",
+    source: str | None = None,
 ) -> str:
     """Write decoder workflow metadata and policy artifacts."""
     os.makedirs(output_dir, exist_ok=True)
-    metadata = build_decoder_workflow_metadata(pkg, config, sampler=sampler)
+    metadata = build_decoder_workflow_metadata(pkg, config, sampler=sampler, source=source)
+    attach_package_facts(metadata, source, config, package_dir=output_dir)
     pkg.save_policy_components(output_dir)
     add_adapter_service_to_metadata(metadata, pkg, output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
@@ -9652,6 +9675,7 @@ def write_speech_to_text_workflow_metadata(
     *,
     sampler: str = "greedy",
     audio_preprocessing: dict[str, Any] | None = None,
+    source: str | None = None,
 ) -> str:
     """Write encoder-conditioned decode workflow metadata and policy artifacts."""
     os.makedirs(output_dir, exist_ok=True)
@@ -9660,7 +9684,9 @@ def write_speech_to_text_workflow_metadata(
         config,
         sampler=sampler,
         audio_preprocessing=audio_preprocessing,
+        source=source,
     )
+    attach_package_facts(metadata, source, config, package_dir=output_dir)
     pkg.save_policy_components(output_dir)
     add_adapter_service_to_metadata(metadata, pkg, output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
@@ -9961,7 +9987,7 @@ def build_ctc_asr_workflow_metadata(
         if batch_invariance is not None:
             profile["batch_invariance"] = batch_invariance
 
-    return {
+    metadata: dict[str, Any] = {
         "schema_version": "v1",
         "preprocessing": {
             "audio": {
@@ -10000,6 +10026,11 @@ def build_ctc_asr_workflow_metadata(
         },
         "pipeline": {"workflow": _publish_workflow_v1(workflow)},
     }
+    # The transcript is rendered from class ids, so the class table is the
+    # package's tokenizer. Publishing it under the same roles a decoder uses
+    # means ``blank_id`` above and the ``pad`` role name one id, not two.
+    attach_package_facts(metadata, source, config)
+    return metadata
 
 
 def write_ctc_asr_workflow_metadata(
@@ -10012,6 +10043,7 @@ def write_ctc_asr_workflow_metadata(
     """Write one-file CTC ASR metadata into *output_dir*."""
     os.makedirs(output_dir, exist_ok=True)
     metadata = build_ctc_asr_workflow_metadata(pkg, config, source=source)
+    attach_package_facts(metadata, source, config, package_dir=output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
         _dump_yaml(metadata, handle)

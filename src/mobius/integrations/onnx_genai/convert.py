@@ -38,6 +38,7 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
     build_diffusion_pipeline_metadata,
     load_diffusers_scheduler_config,
+    load_diffusers_vae_scaling_factor,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -85,6 +86,8 @@ def build_pipeline_metadata_for_workflow(
     *,
     sdxl: bool = False,
     timesteps: list[float] | None = None,
+    vae_scaling_factor: float | None = None,
+    package: Any | None = None,
 ) -> dict[str, Any]:
     """Reconcile a parsed workflow with a scheduler config into pipeline metadata.
 
@@ -92,8 +95,9 @@ def build_pipeline_metadata_for_workflow(
     *schedule* comes from ``scheduler`` (read from the checkpoint's diffusers
     config — the ComfyUI JSON never carries betas).
     """
-    has_vae = "vae" in workflow.metadata["pipeline"]["models"]
-    has_text = "text_encoder" in workflow.metadata["pipeline"]["models"]
+    components = workflow.metadata["pipeline"]["workflow"]["components"]
+    has_vae = "vae" in components
+    has_text = "text_encoder" in components
     guidance = workflow.cfg if not math.isclose(workflow.cfg, 1.0) else None
     # SDXL routes two conditioning edges (concatenated hidden states + pooled
     # text_embeds); its time_ids is an external denoiser input the driver supplies.
@@ -114,6 +118,8 @@ def build_pipeline_metadata_for_workflow(
         vae_latent_input="latent",
         text_encoder_filename="text_encoder.onnx" if has_text else None,
         text_encoder_edges=text_encoder_edges,
+        vae_scaling_factor=vae_scaling_factor,
+        package=package,
     )
 
 
@@ -209,6 +215,14 @@ def convert_comfyui_workflow(
     """
     parsed_workflow = parse_comfyui_workflow(workflow)
     os.makedirs(output_dir, exist_ok=True)
+    from mobius._model_package import ModelPackage
+
+    # Deliberately a fresh package rather than ``parsed_workflow.policy_components``:
+    # the checkpoint's scheduler config can reconcile to a different solver than
+    # the ComfyUI sampler implied, and reusing the parse-time package would leave
+    # that run's components (say Euler's ``model_input_scale``) behind for a DDIM
+    # document that never references them.
+    package = ModelPackage({})
     use_karras = parsed_workflow.scheduler_spacing == "karras"
     use_exponential = parsed_workflow.scheduler_spacing == "exponential"
     scheduler = _scheduler_for_workflow(
@@ -227,9 +241,24 @@ def convert_comfyui_workflow(
             use_exponential,
         )
     metadata = build_pipeline_metadata_for_workflow(
-        parsed_workflow, scheduler, sdxl=sdxl, timesteps=timesteps
+        parsed_workflow,
+        scheduler,
+        sdxl=sdxl,
+        timesteps=timesteps,
+        # The VAE normalizes its latents, so the decoder input has to be scaled
+        # back before decoding; the factor lives in the checkpoint, never in the
+        # ComfyUI JSON.
+        vae_scaling_factor=(
+            load_diffusers_vae_scaling_factor(checkpoint_source, revision=revision)
+            if checkpoint_source
+            else None
+        ),
+        package=package,
     )
 
+    # The emitted workflow references the sampler policy components as ONNX
+    # artifacts, so they ship next to the document that declares them.
+    package.save_policy_components(output_dir)
     metadata_path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(metadata_path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(metadata, handle, sort_keys=False)

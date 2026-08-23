@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import os
 
 import jsonschema
 import onnx_ir as ir
@@ -15,6 +14,7 @@ import yaml
 from mobius._model_package import ModelPackage
 from mobius.integrations.onnx_genai.inference_metadata_test import (
     _model,
+    _onnx_genai_schema_path,
     _value,
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
@@ -93,10 +93,7 @@ def test_codec_workflow_roundtrips_yaml(tmp_path):
 
 
 def test_codec_workflow_matches_producer_schema():
-    schema_path = os.environ.get("ONNX_GENAI_SCHEMA")
-    if not schema_path:
-        pytest.skip("set ONNX_GENAI_SCHEMA to the producer-contract schema")
-    with open(schema_path, encoding="utf-8") as handle:
+    with open(_onnx_genai_schema_path(), encoding="utf-8") as handle:
         schema = json.load(handle)
     jsonschema.validate(build_audio_codec_workflow_metadata(_codec_package()), schema)
 

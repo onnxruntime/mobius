@@ -22,8 +22,9 @@ model families Mobius builds:
   :func:`write_audio_codec_workflow_metadata` emits typed codec SSA, while
   :func:`write_tts_workflow_metadata` reports the current nested-loop induction
   contract blocker precisely.
-* **Diffusion pipelines** — :func:`write_diffusion_pipeline_metadata` emits an
-  iterative pipeline for a denoiser plus optional VAE / text encoder.
+* **Diffusion pipelines** — :func:`write_diffusion_pipeline_metadata` emits a
+  typed SSA denoise loop for a denoiser plus VAE and optional text encoder,
+  shipping the sampler's solver/schedule components alongside it.
 
 :func:`write_onnx_genai_config` is the unified entry point: it inspects the
 built package and dispatches to the matching writer, so
@@ -63,6 +64,17 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     write_multimodal_pipeline_metadata,
     write_speech_to_text_pipeline_metadata,
 )
+from mobius.integrations.onnx_genai.package_facts import (
+    IMAGE_PLACEHOLDER_ROLE,
+    MEDIA_TOKEN_ROLES,
+    TEXT_TOKEN_ROLES,
+    PackageFacts,
+    SpecialTokenFact,
+    SpecialTokenRole,
+    TokenizerArtifact,
+    TokenizerFacts,
+    build_tokenizer_facts,
+)
 from mobius.integrations.onnx_genai.shared_state_flow_metadata import (
     build_shared_state_pixel_flow_workflow_metadata,
     is_shared_state_pixel_flow_package,
@@ -99,8 +111,16 @@ __all__ = [
     "ComfyUIWorkflow",
     "ConversionResult",
     "HIERARCHICAL_AUDIO_ROLES",
+    "IMAGE_PLACEHOLDER_ROLE",
+    "MEDIA_TOKEN_ROLES",
+    "TEXT_TOKEN_ROLES",
     "HierarchicalAudioWorkflowConfig",
+    "PackageFacts",
     "SchedulerConfig",
+    "SpecialTokenFact",
+    "SpecialTokenRole",
+    "TokenizerArtifact",
+    "TokenizerFacts",
     "add_policy_components_to_workflow",
     "build_audio_codec_workflow_metadata",
     "build_full_duplex_workflow_metadata",
@@ -116,6 +136,7 @@ __all__ = [
     "build_speculative_workflow_metadata",
     "build_speech_to_text_pipeline_metadata",
     "build_shared_state_pixel_flow_workflow_metadata",
+    "build_tokenizer_facts",
     "build_tts_workflow_metadata",
     "build_video_diffusion_workflow_metadata",
     "build_vlm_workflow_metadata",

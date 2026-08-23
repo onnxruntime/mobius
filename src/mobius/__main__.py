@@ -23,6 +23,7 @@ from mobius._builder import (
     build_from_module,
     resolve_dtype,
 )
+from mobius._optimizations import strip_debug_metadata
 from mobius._registry import registry
 from mobius.integrations.transformers import (
     _config_from_hf,
@@ -41,6 +42,7 @@ _BUILD_FEATURES: dict[str, str] = {
     "fp8-kv-cache": "fp8_kv_cache",
     "prune-prefill-prefix": "prune_prefill_prefix",
     "text-only": "text_only",
+    "glm-full-attention": "glm_full_attention",
 }
 
 
@@ -342,6 +344,13 @@ def _cmd_build(args: argparse.Namespace) -> None:
         config = _config_from_hf(hf_config, parent_config=parent_config)
         if dtype_override is not None:
             config = dataclasses.replace(config, dtype=dtype_override)
+        if args.glm_full_attention:
+            if model_type != "glm_moe_dsa":
+                raise SystemExit(
+                    "Error: --features glm-full-attention is only supported for "
+                    f"model_type 'glm_moe_dsa' (got '{model_type}')."
+                )
+            config = dataclasses.replace(config, use_dsa=False)
         if static_cache_params is not None:
             task = _resolve_static_cache_task(model_type)
         elif task is None:
@@ -389,6 +398,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             fp8_kv_cache=fp8_kv_cache,
             kv_cache_scales=kv_cache_scales,
             prune_prefill_prefix=prune_prefill_prefix,
+            glm_full_attention=args.glm_full_attention,
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)
@@ -414,6 +424,11 @@ def _save_package(
         if components is not None and not components(name):
             continue
         _apply_optimize(model, optimize)
+        if args.release:
+            # Last thing before saving, so metadata that later stages read (and
+            # that rewrite rules add as they run) is still present while they
+            # need it.
+            strip_debug_metadata(model)
 
     max_shard_size_bytes = _parse_size(args.max_shard_size) if args.max_shard_size else None
 
@@ -566,6 +581,10 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         max_seq_len=args.max_seq_len,
     )
 
+    if args.release:
+        for model in pkg.values():
+            strip_debug_metadata(model)
+
     pkg.save(
         output_dir,
         external_data=args.external_data,
@@ -710,8 +729,82 @@ def _cmd_info(args: argparse.Namespace) -> None:
             print(f"  {field}: {val}")
 
 
-def main(argv: list[str] | None = None) -> None:
-    """Entry point for the CLI."""
+def _add_release_argument(parser: argparse.ArgumentParser) -> None:
+    """Add ``--release`` to a build-like subcommand.
+
+    Shared rather than duplicated so ``build`` and ``build-gguf`` cannot drift
+    into meaning different things by the same name.
+    """
+    parser.add_argument(
+        "--release",
+        action="store_true",
+        help=(
+            "Strip build-time debug metadata from the graph before saving. "
+            "Removes the per-node provenance onnxscript records (source module "
+            "path, class hierarchy, name scopes, originating rewrite rule) and "
+            "symbolic-shape-inference internals — roughly 35-40%% of the "
+            "serialized graph, weights excluded. Nothing reads it at inference "
+            "time; keep it off while debugging a graph in Netron."
+        ),
+    )
+
+
+def _add_shared_build_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the options that mean exactly the same thing on every build command.
+
+    These were previously declared once per subcommand and had already drifted:
+    ``--dtype`` and ``--ep`` documented the same behaviour in different words,
+    which is how a real difference in behaviour eventually hides. Options whose
+    semantics genuinely differ per command (``--runtime``, which ``build-gguf``
+    restricts) stay declared locally, so a divergence has to be written down on
+    purpose.
+    """
+    parser.add_argument(
+        "--dtype",
+        choices=sorted(DTYPE_MAP),
+        default=None,
+        help="Target dtype for model weights (default: f32). Weights are cast at save time.",
+    )
+    parser.add_argument(
+        "--external-data",
+        choices=["onnx", "safetensors"],
+        default="onnx",
+        help="External data format (default: onnx).",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=8,
+        metavar="N",
+        help=(
+            "Number of threads used to write ONNX external data "
+            "(default: 8; use 1 for serial saves)."
+        ),
+    )
+    parser.add_argument(
+        "--ep",
+        "--execution-provider",
+        dest="execution_provider",
+        default="default",
+        metavar="EP",
+        help=(
+            "Target execution provider for EP-aware optimizations "
+            "(default: 'default' → portable ONNX, no vendor fusions). "
+            "Use 'mobius list eps' to see available EPs. "
+            "Examples: default, cpu, cuda, dml, webgpu, trt-rtx."
+        ),
+    )
+    _add_release_argument(parser)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the full CLI parser.
+
+    Split out of :func:`main` so the argument surface can be tested without
+    running a command. It previously lived inside ``main``, which meant a test
+    could only reach it by invoking ``--help`` and catching ``SystemExit`` — an
+    assertion that holds regardless of what the arguments actually do.
+    """
     parser = argparse.ArgumentParser(
         prog="mobius",
         description="Build ONNX models for GenAI from HuggingFace model architectures.",
@@ -741,23 +834,10 @@ def main(argv: list[str] | None = None) -> None:
         help="Model task (auto-detected if not specified). Use 'mobius list tasks' to see available tasks.",
     )
     build_parser.add_argument(
-        "--external-data",
-        choices=["onnx", "safetensors"],
-        default="onnx",
-        help="External data format (default: onnx).",
-    )
-    build_parser.add_argument(
         "--max-shard-size",
         metavar="SIZE",
         default=None,
         help="Maximum external-data shard size (e.g. '5GB'). Used by both ONNX and safetensors.",
-    )
-    build_parser.add_argument(
-        "--max-workers",
-        type=int,
-        default=8,
-        metavar="N",
-        help="Number of threads used to write ONNX external data (default: 8; use 1 for serial saves).",
     )
     build_parser.add_argument(
         "--no-weights",
@@ -776,12 +856,6 @@ def main(argv: list[str] | None = None) -> None:
             "Immutable HuggingFace revision used for config, weights, tokenizer, "
             "and processor assets."
         ),
-    )
-    build_parser.add_argument(
-        "--dtype",
-        choices=sorted(DTYPE_MAP),
-        default=None,
-        help="Target dtype for model weights (default: f32). Weights are cast at save time.",
     )
     build_parser.add_argument(
         "--optimize",
@@ -825,19 +899,6 @@ def main(argv: list[str] | None = None) -> None:
         "Defaults to max_position_embeddings from config.",
     )
     build_parser.add_argument(
-        "--ep",
-        "--execution-provider",
-        dest="execution_provider",
-        default="default",
-        metavar="EP",
-        help=(
-            "Target execution provider for EP-aware optimizations "
-            "(default: 'default' → portable ONNX, no vendor fusions). "
-            "Use 'mobius list eps' to see available EPs. "
-            "Examples: default, cpu, cuda, dml, webgpu, trt-rtx."
-        ),
-    )
-    build_parser.add_argument(
         "--runtime",
         default=None,
         choices=["ort-genai", "onnx-genai"],
@@ -875,6 +936,7 @@ def main(argv: list[str] | None = None) -> None:
             "without it all layers use a unit scale of 1.0."
         ),
     )
+    _add_shared_build_arguments(build_parser)
     build_parser.set_defaults(func=_cmd_build)
 
     # --- build-gguf ---
@@ -919,37 +981,6 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     gguf_parser.add_argument(
-        "--dtype",
-        choices=sorted(DTYPE_MAP),
-        default=None,
-        help="Target dtype for model weights.",
-    )
-    gguf_parser.add_argument(
-        "--external-data",
-        choices=["onnx", "safetensors"],
-        default="onnx",
-        help="External data format (default: onnx).",
-    )
-    gguf_parser.add_argument(
-        "--max-workers",
-        type=int,
-        default=8,
-        metavar="N",
-        help="Number of threads used to write ONNX external data (default: 8; use 1 for serial saves).",
-    )
-    gguf_parser.add_argument(
-        "--ep",
-        "--execution-provider",
-        dest="execution_provider",
-        default="default",
-        metavar="EP",
-        help=(
-            "Target execution provider for EP-aware graph optimisations "
-            "(e.g. 'cpu' to apply the GroupQueryAttention rewrite). "
-            "Defaults to 'default' (portable ONNX, no vendor fusions)."
-        ),
-    )
-    gguf_parser.add_argument(
         "--runtime",
         choices=["ort-genai", "onnx-genai"],
         default=None,
@@ -981,6 +1012,7 @@ def main(argv: list[str] | None = None) -> None:
             "--static-cache. Defaults to max_position_embeddings from config."
         ),
     )
+    _add_shared_build_arguments(gguf_parser)
     gguf_parser.set_defaults(func=_cmd_build_gguf)
 
     # --- list ---
@@ -1037,7 +1069,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     comfy_parser.set_defaults(func=_cmd_convert_comfyui)
 
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Entry point for the CLI."""
+    args = build_parser().parse_args(argv)
     args.func(args)
 
 

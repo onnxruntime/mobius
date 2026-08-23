@@ -495,6 +495,30 @@ class ArchitectureConfig(BaseModelConfig):
     swiglu_limit: float = 0.0
     num_nextn_predict_layers: int = 0
 
+    # GLM-5.2 (``glm_moe_dsa``) DeepSeek Sparse Attention (DSA).
+    #
+    # ``use_dsa`` is not an upstream HF field -- it is a Mobius export-time
+    # toggle (default True) flipped to False by ``--glm-full-attention`` /
+    # ``config_overrides={"use_dsa": False}`` to fall back to plain dense MLA
+    # (reusing ``DeepSeekV3TextModel`` unchanged) on runtimes that cannot yet
+    # execute ``pkg.nxrt::IndexShare``.
+    use_dsa: bool = True
+    # Per-layer indexer schedule ("full" runs the indexer; "shared" reuses the
+    # top-k selection from the closest preceding "full" layer). When the
+    # checkpoint config omits this list, it is derived from
+    # ``index_topk_freq`` / ``index_skip_topk_offset`` -- see
+    # ``mobius.models.glm_moe_dsa._indexer_types``, which mirrors HF
+    # ``GlmMoeDsaConfig.__post_init__`` exactly.
+    indexer_types: list[str] | None = None
+    index_topk_freq: int | None = None
+    index_skip_topk_offset: int | None = None
+    indexer_rope_interleave: bool = False
+    # Whether the (currently unexported, see ``glm_moe_dsa.py``) MTP layer is
+    # meant to reuse the target's shared top-k indices rather than running its
+    # own indexer pass. Recorded for round-tripping/documentation; not yet
+    # acted on since MTP export itself is out of scope this cycle.
+    index_share_for_mtp_iteration: bool = False
+
     # Vision shared fields (accessed as top-level config.X by tasks)
     mm_tokens_per_image: int | None = None
     image_token_id: int | None = None
@@ -897,8 +921,20 @@ class ArchitectureConfig(BaseModelConfig):
             n_group=getattr(config, "n_group", 1),
             topk_group=getattr(config, "topk_group", 1),
             routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
-            scoring_func=getattr(config, "scoring_func", "softmax"),
-            topk_method=getattr(config, "topk_method", "greedy"),
+            # ``scoring_func``/``topk_method`` are not real HF dataclass
+            # fields on ``GlmMoeDsaConfig`` -- transformers hardcodes
+            # sigmoid + e_score_correction_bias + (degenerate, n_group=1)
+            # top-k routing for GLM-5.2 rather than exposing it as a config
+            # knob. A checkpoint that omits these keys entirely (unlike the
+            # real zai-org/GLM-5.2 config.json, which sets them explicitly)
+            # would otherwise silently default to the wrong (softmax/greedy)
+            # DeepSeek-V2 routing.
+            scoring_func=getattr(
+                config, "scoring_func", "sigmoid" if model_type == "glm_moe_dsa" else "softmax"
+            ),
+            topk_method=getattr(
+                config, "topk_method", "noaux_tc" if model_type == "glm_moe_dsa" else "greedy"
+            ),
             first_k_dense_replace=getattr(config, "first_k_dense_replace", 0),
             n_shared_experts=getattr(config, "n_shared_experts", None),
             # Multi-head Latent Attention (MLA)
@@ -927,6 +963,21 @@ class ArchitectureConfig(BaseModelConfig):
             ),
             swiglu_limit=getattr(config, "swiglu_limit", 0.0),
             num_nextn_predict_layers=getattr(config, "num_nextn_predict_layers", 0),
+            # GLM-5.2 DSA. ``use_dsa`` has no HF equivalent -- every checkpoint
+            # defaults to the sparse path; ``--glm-full-attention`` overrides
+            # it afterwards via ``dataclasses.replace``/``config_overrides``.
+            use_dsa=getattr(config, "use_dsa", True),
+            indexer_types=(
+                list(config.indexer_types)
+                if getattr(config, "indexer_types", None) is not None
+                else None
+            ),
+            index_topk_freq=getattr(config, "index_topk_freq", None),
+            index_skip_topk_offset=getattr(config, "index_skip_topk_offset", None),
+            indexer_rope_interleave=getattr(config, "indexer_rope_interleave", False),
+            index_share_for_mtp_iteration=getattr(
+                config, "index_share_for_mtp_iteration", False
+            ),
             # Encoder-specific
             type_vocab_size=getattr(config, "type_vocab_size", 0),
             # Encoder-decoder
@@ -1218,6 +1269,29 @@ class ArchitectureConfig(BaseModelConfig):
             )
 
 
+def _as_attribute_config(value: object) -> object:
+    """Recursively give a plain ``dict`` HF sub-config attribute access.
+
+    ``transformers`` 5.x increasingly leaves nested sub-configs (a decoder,
+    a vision tower) as plain dicts on the parent config rather than as
+    ``PretrainedConfig`` instances. Every ``from_transformers`` here reads its
+    input with ``getattr``, so a dict silently degrades: ``getattr(d, "x", None)``
+    is always ``None``, which turns into a wrong default rather than an error,
+    or into ``AttributeError`` on a required field.
+
+    Non-dict values, including real config objects, are returned unchanged.
+    """
+    import types
+
+    if isinstance(value, dict):
+        return types.SimpleNamespace(
+            **{key: _as_attribute_config(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return [_as_attribute_config(item) for item in value]
+    return value
+
+
 def _shallow_fields(config) -> dict:
     """Extract fields from a dataclass without recursive conversion.
 
@@ -1312,18 +1386,8 @@ class NemotronParseConfig(ArchitectureConfig):
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> NemotronParseConfig:
         del parent_config
-        import types
 
-        def _namespace(value):
-            if isinstance(value, dict):
-                return types.SimpleNamespace(
-                    **{key: _namespace(item) for key, item in value.items()}
-                )
-            if isinstance(value, list):
-                return [_namespace(item) for item in value]
-            return value
-
-        decoder = _namespace(getattr(config, "decoder", None))
+        decoder = _as_attribute_config(getattr(config, "decoder", None))
         if decoder is None:
             raise ValueError("Nemotron Parse config is missing its decoder sub-config")
         base = ArchitectureConfig.from_transformers(decoder, parent_config=config)
@@ -1349,7 +1413,7 @@ class NemotronParseConfig(ArchitectureConfig):
         else:
             image_height, image_width = (int(raw_image_size[0]), int(raw_image_size[1]))
 
-        encoder = _namespace(getattr(config, "encoder", None))
+        encoder = _as_attribute_config(getattr(config, "encoder", None))
         patch_size = int(getattr(encoder, "patch_size", 16))
         max_resolution = int(
             getattr(encoder, "max_resolution", max(image_height, image_width))

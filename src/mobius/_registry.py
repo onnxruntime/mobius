@@ -68,6 +68,7 @@ from mobius.models import (
     Glm4CausalLMModel,
     Glm4MoECausalLMModel,
     GlmCausalLMModel,
+    GlmMoeDsaCausalLMModel,
     GPTOSSCausalLMModel,
     GraniteCausalLMModel,
     GraniteMoECausalLMModel,
@@ -582,6 +583,8 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "deepseek_v3": ModelRegistration(DeepSeekV3CausalLMModel),
     "deepseek_v4": ModelRegistration(DeepSeekV4CausalLMModel, task="deepseek-v4"),
     "deepseek_vl_v2": ModelRegistration(DeepSeekOCR2CausalLMModel),
+    # --- GLM-5.2 (MLA + DeepSeek Sparse Attention (DSA) + MoE) ---
+    "glm_moe_dsa": ModelRegistration(GlmMoeDsaCausalLMModel, task="glm-moe-dsa"),
     # --- SSM (Mamba / Mamba2) ---
     "falcon_mamba": ModelRegistration(MambaCausalLMModel),
     "mamba": ModelRegistration(MambaCausalLMModel),
@@ -1027,6 +1030,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "deepseek_v2_moe": "deepseek-ai/DeepSeek-V2-Lite",
     "deepseek_v3": "deepseek-ai/DeepSeek-V3",
     "deepseek_v4": "deepseek-ai/DeepSeek-V4-Flash",
+    # --- GLM-5.2 (MLA + DSA + MoE) ---
+    "glm_moe_dsa": "zai-org/GLM-5.2",
 
     # --- SSM (Mamba) ---
     "mamba": "state-spaces/mamba-130m-hf",
@@ -1079,7 +1084,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "fuyu": "adept/fuyu-8b",
     "glm4v": "THUDM/glm-4v-9b",
     "glm4v_moe": "THUDM/glm-4v-9b",
-    "glm4v_moe_text": "THUDM/glm-4v-9b",
+    "glm4v_moe_text": "zai-org/GLM-4.5V",
     "glm4v_text": "THUDM/glm-4v-9b",
     "got_ocr2": "stepfun-ai/GOT-OCR2_0",
     "hunyuan_vl_mot": "tencent/HY-Embodied-0.5-X",
@@ -1288,6 +1293,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "deepseek_v3": "deepseek",
     "deepseek_v4": "deepseek",
     "deepseek_vl_v2": "deepseek",
+    "glm_moe_dsa": "glm",
     "olmo": "olmo",
     "olmo2": "olmo",
     "olmo3": "olmo",
@@ -1361,6 +1367,7 @@ _VARIANT_LABELS: dict[str, str] = {
     "deepseek_v2_moe": "mla+moe",
     "deepseek_v3": "mla+moe",
     "deepseek_v4": "dense-csa-fallback+mtp+moe+hc",
+    "glm_moe_dsa": "mla+dsa-indexshare+full-attention-fallback+moe",
     "phi3small": "blocksparse",
     "falcon_h1": "hybrid-ssm",
     "mamba": "ssm",

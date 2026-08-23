@@ -650,6 +650,47 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         True,
     ),
+    # glm_moe_dsa (zai-org/GLM-5.2): DeepSeekV3CausalLMModel subclass adding
+    # DeepSeek Sparse Attention (DSA) indexers on top of MLA. Field values
+    # below are shape-shrunk from the real zai-org/GLM-5.2 config.json
+    # (n_group=1, topk_group=1, routed_scaling_factor=2.5, sigmoid/noaux_tc,
+    # index_n_heads=32->2, index_head_dim=128->8, index_topk=2048->4). The
+    # real checkpoint config also sets num_nextn_predict_layers=1 (it ships
+    # model.layers.<num_hidden_layers>.* MTP weights), but the reference
+    # transformers.models.glm_moe_dsa modeling code only builds
+    # range(num_hidden_layers) decoder layers and has no MTP module, so those
+    # weights are unused/unexpected keys under from_pretrained -- see
+    # glm_moe_dsa.py for the matching drop-with-capability-message behavior.
+    (
+        "glm_moe_dsa",
+        {
+            # MLA: kv heads must equal attn heads (see MLA note near top of file).
+            "num_key_value_heads": TINY_HEADS,
+            "q_lora_rank": 32,
+            "kv_lora_rank": 16,
+            "qk_nope_head_dim": 16,
+            "qk_rope_head_dim": 8,
+            "v_head_dim": 16,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "n_group": 1,
+            "topk_group": 1,
+            "routed_scaling_factor": 2.5,
+            "scoring_func": "sigmoid",
+            "topk_method": "noaux_tc",
+            "first_k_dense_replace": 1,
+            "n_shared_experts": 1,
+            "rope_interleave": True,
+            "index_n_heads": 2,
+            "index_head_dim": 8,
+            "index_topk": 4,
+            "index_topk_freq": None,
+            "indexer_types": ["full", "shared"],
+            "num_nextn_predict_layers": 1,
+        },
+        True,
+    ),
     (
         "deepseek_v4",
         {

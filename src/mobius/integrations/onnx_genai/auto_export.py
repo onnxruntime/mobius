@@ -1058,11 +1058,16 @@ def write_onnx_genai_config(
                 "CTC ASR metadata requires a model config (pass config=... or a "
                 "package carrying `.config`)"
             )
-        path = write_ctc_asr_workflow_metadata(pkg, output_dir, ctc_config, source=source)
-        artifacts = {"inference_metadata": path}
+        # The package's own tokenizer assets are materialized first: the
+        # metadata declares their package-relative locations, so they have to
+        # exist before the document that names them is written.
+        artifacts: dict[str, str] = {}
         tokenizer_path = _write_hf_tokenizer(output_dir, source, revision=revision)
         if tokenizer_path is not None:
             artifacts["tokenizer"] = tokenizer_path
+        artifacts["inference_metadata"] = write_ctc_asr_workflow_metadata(
+            pkg, output_dir, ctc_config, source=source
+        )
         return artifacts
 
     if _looks_like_encoder_embedding(pkg):
@@ -1087,6 +1092,7 @@ def write_onnx_genai_config(
             output_dir,
             grammar_guidance=grammar_guidance,
             adaptive_k_max=adaptive_k_max,
+            source=source,
         )
         return {"inference_metadata": path}
 
@@ -1102,17 +1108,14 @@ def write_onnx_genai_config(
                 "workflow VLM export derives KV state dtype from ONNX ports; "
                 "kv_native_dtype overrides are unsupported"
             )
-        path = write_vlm_workflow_metadata(
-            pkg,
-            output_dir,
-            resolved_config,
-            source=source,
-        )
-        artifacts = {"inference_metadata": path}
+        # The package's own tokenizer and processor assets are materialized
+        # first: the metadata declares their package-relative locations, so they
+        # have to exist before the document that names them is written.
+        #
         # A multimodal package needs the processor assets as well as the
         # tokenizer, because the runtime resolves image/audio preprocessing
         # parameters from them.
-        artifacts.update(_copy_runtime_assets(output_dir, source, revision=revision))
+        artifacts = _copy_runtime_assets(output_dir, source, revision=revision)
         if "tokenizer" not in artifacts:
             tokenizer_path = _write_hf_tokenizer(output_dir, source, revision=revision)
             if tokenizer_path is not None:
@@ -1127,6 +1130,12 @@ def write_onnx_genai_config(
             )
             if audio_processor_path is not None:
                 artifacts["audio_processor"] = audio_processor_path
+        artifacts["inference_metadata"] = write_vlm_workflow_metadata(
+            pkg,
+            output_dir,
+            resolved_config,
+            source=source,
+        )
         return artifacts
 
     if _looks_like_speech_to_text(pkg):
@@ -1136,20 +1145,20 @@ def write_onnx_genai_config(
                 "kv_native_dtype overrides are unsupported"
             )
         audio_processor_path = _write_hf_audio_processor(output_dir, source, revision=revision)
-        path = write_speech_to_text_workflow_metadata(
+        # An ASR decoder is still a text producer: ship its tokenizer and chat
+        # template alongside the audio processor, before the metadata names them.
+        artifacts = _write_text_runtime_assets(output_dir, source, revision=revision)
+        if audio_processor_path is not None:
+            artifacts["audio_processor"] = audio_processor_path
+        artifacts["inference_metadata"] = write_speech_to_text_workflow_metadata(
             pkg,
             output_dir,
             resolved_config,
             audio_preprocessing=_audio_preprocessing_program(
                 audio_processor_path, pkg["encoder"]
             ),
+            source=source,
         )
-        artifacts = {"inference_metadata": path}
-        # An ASR decoder is still a text producer: ship its tokenizer and chat
-        # template alongside the audio processor.
-        artifacts.update(_write_text_runtime_assets(output_dir, source, revision=revision))
-        if audio_processor_path is not None:
-            artifacts["audio_processor"] = audio_processor_path
         return artifacts
 
     # A nested multi-decoder TTS stack requires the generic workflow loop to expose
@@ -1193,12 +1202,15 @@ def write_onnx_genai_config(
             "workflow decoder export derives KV state dtype from ONNX ports; "
             "kv_native_dtype overrides are unsupported"
         )
-    path = write_decoder_workflow_metadata(
+    # The package's own tokenizer and chat-template assets are materialized
+    # first: the metadata declares their package-relative locations, so they
+    # have to exist before the document that names them is written.
+    artifacts = _write_text_runtime_assets(output_dir, source, revision=revision)
+    artifacts["inference_metadata"] = write_decoder_workflow_metadata(
         pkg,
         output_dir,
         resolved_config,
         sampler=str(getattr(resolved_config, "workflow_sampler", "greedy")),
+        source=source,
     )
-    artifacts = {"inference_metadata": path}
-    artifacts.update(_write_text_runtime_assets(output_dir, source, revision=revision))
     return artifacts

@@ -320,9 +320,38 @@ def _remap_moe_expert_weights(
     # Fold hidden_size^-0.5 into router.scale
     if config.enable_moe_block:
         scale_factor = float(config.hidden_size**-0.5)
+        pes_by_prefix: dict[str, torch.Tensor] = {}
         for key in list(state_dict.keys()):
             if ".router.scale" in key and ".per_expert_scale" not in key:
                 state_dict[key] = state_dict[key] * scale_factor
+            if key.endswith(".router.per_expert_scale"):
+                pes_by_prefix[key[: -len(".router.per_expert_scale")]] = state_dict[key]
+        # Fold per_expert_scale into the expert down projection (fc2). HF's router
+        # applies ``top_k_weights *= per_expert_scale[top_k_index]`` after
+        # renormalization; the fused ``com.microsoft::MoE`` op has no per-expert
+        # output scaling, so bake each expert's scalar into its output weights:
+        # ``fc2[e] *= per_expert_scale[e]``. (Equivalent because both scale the
+        # per-expert contribution by the same scalar before the weighted sum.)
+        folded_prefixes: set[str] = set()
+        for key in list(state_dict.keys()):
+            if key.endswith(".fc2_experts_weights"):
+                prefix = key[: -len(".fc2_experts_weights")]
+                pes = pes_by_prefix.get(prefix)
+                if pes is not None:
+                    fc2 = state_dict[key]
+                    state_dict[key] = fc2 * pes.to(fc2.dtype).reshape(-1, 1, 1)
+                    folded_prefixes.add(prefix)
+        # per_expert_scale is now baked into fc2. Neutralize ONLY the router
+        # copies we actually folded, so the unfused fallback path — which reads
+        # ``self.router.per_expert_scale`` and multiplies it into the routing
+        # weights — does not apply the scale a second time. The fused path never
+        # reads it. A partial state_dict that supplies ``router.per_expert_scale``
+        # without the matching ``fc2_experts_weights`` is left untouched: its
+        # scale is neither double-applied nor silently dropped. The parameter is
+        # kept, not popped, so weight loading still binds it.
+        for prefix in folded_prefixes:
+            pes_key = f"{prefix}.router.per_expert_scale"
+            state_dict[pes_key] = torch.ones_like(state_dict[pes_key])
 
 
 # ---------------------------------------------------------------------------
@@ -1398,6 +1427,23 @@ class Gemma4DecoderLayer(nn.Module):
             self._num_experts = config.num_local_experts
             self._moe_intermediate_size = config.moe_intermediate_size
             self._hidden_size = config.hidden_size
+            # The fused com.microsoft::MoE op's only GATED activation is
+            # ``swiglu`` = ``x * sigmoid(activation_alpha * x) * up``. Gemma 4
+            # experts use ``act_fn(gate) * up`` where ``act_fn`` is the config's
+            # ``hidden_act`` (``gelu_pytorch_tanh`` for the 26B-A4B / 31B MoE
+            # checkpoints), NOT silu. Since ``x * sigmoid(1.702 * x)`` closely
+            # approximates gelu, gelu-family activations map to
+            # ``activation_alpha=1.702``; a genuine silu expert maps to 1.0.
+            _moe_act = (config.hidden_act or "").lower()
+            self._moe_swiglu_alpha = 1.702 if "gelu" in _moe_act else 1.0
+            # The unfused fallback (EPs without a fused MoE op) uses explicit
+            # ONNX ops, so it applies the EXACT expert activation via the shared
+            # ACT2FN mapping instead of the swiglu approximation. This keeps
+            # ``gelu`` (erf) distinct from the tanh-approx variants
+            # (``gelu_pytorch_tanh``/``gelu_new``/``gelu_fast``) and ``silu`` ->
+            # Swish, faithfully matching HuggingFace's ``act_fn(gate) * up`` for
+            # whatever ``hidden_act`` the checkpoint declares.
+            self._moe_act_fn = get_activation(config.hidden_act)
             moe_inter = config.moe_intermediate_size
 
             self.router = _Gemma4MoeRouter(
@@ -1497,12 +1543,16 @@ class Gemma4DecoderLayer(nn.Module):
                 # microsoft/onnxruntime#28467, MoE GEMM Refactor) which
                 # plumbs the SwiGLU schema attributes to the kernel.
                 #
-                # Gemma 4 SwiGLU semantics (vs GPT-OSS):
-                #   activation_alpha=1.0   — silu(gate) (no GPT-OSS alpha=1.702)
-                #   activation_beta=0.0    — linear * gate (no GPT-OSS "+1" bias)
-                #   swiglu_limit=inf       — no clipping (≤0 disables the clamp)
-                #   swiglu_fusion=1        — interleaved layout
-                #                            [g_0, u_0, g_1, u_1, ...].
+                # Gemma 4 gated-FFN semantics via the fused SwiGLU schema:
+                #   activation_type=swiglu   — x * sigmoid(activation_alpha*x) * up
+                #   activation_alpha=1.702   — approximates gelu_pytorch_tanh, the
+                #                              activation Gemma 4 experts actually
+                #                              use (act_fn(gate)*up); a silu expert
+                #                              would use 1.0. (See _moe_swiglu_alpha.)
+                #   activation_beta=0.0      — linear * gate (no GPT-OSS "+1" bias)
+                #   swiglu_limit=inf         — no clipping (≤0 disables the clamp)
+                #   swiglu_fusion=1          — interleaved layout
+                #                              [g_0, u_0, g_1, u_1, ...].
                 #
                 # mobius stores ``fc1_experts_weights`` chunked as
                 # ``[E, 2*inter, H]`` (first ``inter`` rows = gate,
@@ -1546,7 +1596,7 @@ class Gemma4DecoderLayer(nn.Module):
                         activation_type="swiglu",
                         k=self._top_k,
                         normalize_routing_weights=1,
-                        activation_alpha=1.0,
+                        activation_alpha=self._moe_swiglu_alpha,
                         activation_beta=0.0,
                         swiglu_limit=float("inf"),
                         swiglu_fusion=1,
@@ -1589,16 +1639,18 @@ class Gemma4DecoderLayer(nn.Module):
         normed_flat: ir.Value,
         router_probs: ir.Value,
     ) -> ir.Value:
-        """Fallback expert dispatch (static unroll) when fused MoE op is unavailable.
+        """Fallback expert dispatch when the fused MoE op is unavailable.
 
-        Iterates over each expert (outer loop), accumulates the routing weight for
-        all k slots that select that expert (inner loop), applies the SwiGLU MLP,
-        and accumulates into the output tensor.
+        Vectorized dense evaluation: every expert is evaluated for every token
+        with batched ``Einsum`` GEMMs, then masked by a scattered top-K routing
+        weight. This emits O(1) ONNX nodes per layer (independent of expert
+        count), unlike a per-expert static unroll which produces O(E x K) nodes
+        (~6k per layer at E=128/K=8 — impractical for large MoE checkpoints).
 
-        This produces O(E x K) ONNX nodes (e.g. Gemma4 26B: 256 experts x 2 top-k =
-        512 per layer).  The primary path uses a fused MoE op for supported EPs
-        (CUDA/DML); this fallback is only invoked for CPU/other EPs where the fused
-        op is absent.
+        Standard ``MatMul``/``Einsum`` accumulate in fp32 on CUDA even for fp16
+        inputs, so this path is numerically faithful to HuggingFace — unlike the
+        released-ORT fused ``com.microsoft::MoE`` kernel, which fp16-accumulates
+        the expert GEMMs and loses accuracy at large hidden size.
 
         Args:
             normed_flat: [T, H] — pre-normed input for the experts (T = B*S).
@@ -1607,7 +1659,9 @@ class Gemma4DecoderLayer(nn.Module):
         Returns:
             [T, H] — weighted sum of expert outputs.
         """
-        # Top-K selection: top_weights/top_indices both [T, K]
+        moe_inter = self._moe_intermediate_size
+
+        # Top-K selection: top_weights_raw/top_indices both [T, K]
         top_weights_raw, top_indices = op.TopK(
             router_probs, op.Constant(value_ints=[self._top_k]), axis=-1, _outputs=2
         )
@@ -1615,63 +1669,44 @@ class Gemma4DecoderLayer(nn.Module):
         top_weights = op.Div(
             top_weights_raw, op.ReduceSum(top_weights_raw, [1], keepdims=1)
         )  # [T, K]
-
-        # Scale routing weights by per_expert_scale for each selected expert
-        # Gather from [E] using [T, K] indices → result [T, K]
+        # Scale routing weights by per_expert_scale for each selected expert.
+        # (For Gemma 4 this is a no-op — per_expert_scale is baked into fc2 and
+        # neutralized to ones in preprocess_weights — but kept for generality.)
         pes_topk = op.Gather(self.router.per_expert_scale, top_indices, axis=0)  # [T, K]
         top_weights = op.Mul(top_weights, op.CastLike(pes_topk, top_weights))  # [T, K]
 
-        # Build output accumulator, matching dtype of the input
-        out_shape = op.Shape(normed_flat)  # [T, H] shape vec
-        output = op.CastLike(
-            op.ConstantOfShape(out_shape, value=ir.tensor(np.zeros(1, dtype=np.float32))),
-            normed_flat,
+        # Scatter the renormalized top-K weights back to a dense [T, E] vector.
+        num_tokens = op.Shape(normed_flat, start=0, end=1)  # [1]
+        dense_shape = op.Concat(
+            num_tokens, op.Constant(value_ints=[self._num_experts]), axis=0
+        )  # [T, E]
+        dense_w = op.CastLike(
+            op.ConstantOfShape(dense_shape, value=ir.tensor(np.zeros(1, dtype=np.float32))),
+            top_weights,
         )
+        dense_w = op.ScatterElements(dense_w, top_indices, top_weights, axis=1)  # [T, E]
 
-        # T_shape: 1-D tensor [T] used for per-expert weight accumulation
-        t_shape = op.Shape(normed_flat, start=0, end=1)  # shape vec of length 1
+        # fc1_experts_weights [E, 2*moe_inter, H] stores gate rows then up rows.
+        gate_w = op.Slice(self.fc1_experts_weights, [0], [moe_inter], [1])  # [E, moe_inter, H]
+        up_w = op.Slice(
+            self.fc1_experts_weights, [moe_inter], [2 * moe_inter], [1]
+        )  # [E, moe_inter, H]
 
-        for e_idx in range(self._num_experts):
-            # Gather this expert's weight matrices
-            fc1 = op.Squeeze(
-                op.Gather(self.fc1_experts_weights, [e_idx], axis=0), [0]
-            )  # [2*moe_inter, H]
-            fc2 = op.Squeeze(
-                op.Gather(self.fc2_experts_weights, [e_idx], axis=0), [0]
-            )  # [H, moe_inter]
+        # Dense per-expert gate/up projections: [T, H] x [E, moe_inter, H] -> [T, E, moe_inter]
+        gate = op.Einsum(normed_flat, gate_w, equation="th,eih->tei")
+        up = op.Einsum(normed_flat, up_w, equation="th,eih->tei")
+        # Exact expert activation via ACT2FN: ``gelu_pytorch_tanh`` -> tanh-approx
+        # GELU, bare ``gelu`` -> erf GELU, ``silu``/``swish`` -> Swish, etc. This
+        # avoids the swiglu approximation used on the fused path.
+        activated = self._moe_act_fn(op, gate)
+        inter = op.Mul(activated, up)  # [T, E, moe_inter]
 
-            # Gated SiLU MLP: fc1 produces gate+up concatenated → SwiGLU
-            proj = op.MatMul(normed_flat, op.Transpose(fc1))  # [T, 2*moe_inter]
-            half = op.Shape(fc2, start=1, end=2)  # [moe_inter]
-            gate = op.Slice(proj, [0], half, [1])  # [T, moe_inter] first half
-            up = op.Slice(proj, half, op.Shape(proj, start=1, end=2), [1])  # second half
-            expert_out = op.MatMul(
-                op.Mul(op.Swish(gate), up),  # [T, moe_inter]
-                op.Transpose(fc2),  # → [T, H]
-            )
+        # Down projection: [T, E, moe_inter] x [E, H, moe_inter] -> [T, E, H]
+        expert_out = op.Einsum(inter, self.fc2_experts_weights, equation="tei,ehi->teh")
 
-            # Accumulate routing weight for expert e_idx across all k slots
-            e_weight = op.CastLike(
-                op.ConstantOfShape(t_shape, value=ir.tensor(np.zeros(1, dtype=np.float32))),
-                top_weights,
-            )
-            for k_idx in range(self._top_k):
-                # idx_k: [T] — which expert was selected at slot k_idx
-                idx_k = op.Squeeze(op.Slice(top_indices, [k_idx], [k_idx + 1], [1]), [1])
-                # w_k: [T] — routing weight for slot k_idx
-                w_k = op.Squeeze(op.Slice(top_weights, [k_idx], [k_idx + 1], [1]), [1])
-                # Add w_k only for tokens routed to expert e_idx at this slot
-                is_expert = op.CastLike(op.Equal(idx_k, op.Constant(value_int=e_idx)), w_k)
-                e_weight = op.Add(e_weight, op.Mul(is_expert, w_k))
-
-            # Weight expert output by aggregated routing weight and add to output
-            e_weight_2d = op.Reshape(
-                e_weight,
-                op.Concat(t_shape, op.Constant(value_ints=[1]), axis=0),  # [T, 1]
-            )
-            output = op.Add(output, op.Mul(expert_out, op.CastLike(e_weight_2d, expert_out)))
-
-        return output
+        # Weight by the dense routing vector and sum over experts.
+        weighted = op.Mul(expert_out, op.Unsqueeze(dense_w, [2]))  # [T, E, H] * [T, E, 1]
+        return op.ReduceSum(weighted, [1], keepdims=0)  # [T, H]
 
 
 # ---------------------------------------------------------------------------
@@ -2320,6 +2355,59 @@ class Gemma4TextModel(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def _validate_gemma4_output_layer_indices(config: Gemma4Config) -> list[int] | None:
+    """Validate ``config.output_layer_indices`` for the Gemma4 text model.
+
+    Unlike the generic :class:`~mobius.models.base.TextModel` — which captures a
+    distinct *pre*-final-norm tensor for every requested decoder layer — Gemma4's
+    ``forward`` exposes only the FINAL post-final-norm hidden state (the exact
+    ``lm_head`` input, == HuggingFace ``output_hidden_states=True``
+    ``hidden_states[-1]``). A borrowed-KV speculative drafter consumes that value
+    as its folded-carry seed. It is faithful ONLY for the last decoder layer, so
+    rather than pretending general per-layer support, Gemma4 accepts exactly one
+    index equal to ``num_hidden_layers - 1``.
+
+    Index convention follows :attr:`ArchitectureConfig.output_layer_indices`:
+    non-negative, 0-based, where ``hidden_states.{k}`` == HF
+    ``hidden_states[k + 1]`` (so the post-norm final slot ``hidden_states[-1]``
+    is ``k = num_hidden_layers - 1``). Duplicate, out-of-range (including
+    negative), multiple, or non-last indices are rejected with a clear error.
+    ``None``/empty returns ``None`` and preserves the legacy 2-tuple output
+    contract (existing exports stay byte-identical).
+
+    Returns:
+        ``[num_hidden_layers - 1]`` for a valid request, else ``None``.
+
+    Raises:
+        ValueError: on duplicate, out-of-range/negative, multiple, or non-last
+            indices, naming the only supported value.
+    """
+    raw = getattr(config, "output_layer_indices", None)
+    if not raw:
+        return None
+    indices = list(raw)
+    num_layers = config.num_hidden_layers
+    # Match the generic TextModel validation order: duplicates, then range.
+    if len(set(indices)) != len(indices):
+        raise ValueError(f"output_layer_indices must not contain duplicates: {indices}")
+    out_of_range = [i for i in indices if not 0 <= i < num_layers]
+    if out_of_range:
+        raise ValueError(
+            f"output_layer_indices {out_of_range} out of range [0, {num_layers}) "
+            "(negative indices are not supported)"
+        )
+    last = num_layers - 1
+    if indices != [last]:
+        raise ValueError(
+            "Gemma4 exposes only the post-final-norm last hidden state "
+            "(== HuggingFace output_hidden_states[-1], the lm_head input) as the "
+            "speculative folded-carry seed; per-layer pre-norm hidden states are "
+            f"not available. output_layer_indices must be exactly [{last}] "
+            f"(num_hidden_layers - 1), got {indices}."
+        )
+    return indices
+
+
 class Gemma4CausalLMModel(CausalLMModel):
     """Gemma 4 text-only causal language model.
 
@@ -2342,6 +2430,17 @@ class Gemma4CausalLMModel(CausalLMModel):
         self.config = config
         self.model = Gemma4TextModel(config)
         self.lm_head = _make_lm_head(config)
+        # Speculative folded-carry seed: when requested, additionally emit the
+        # post-final-norm hidden state (the lm_head input, == HF
+        # ``output_hidden_states[-1]``) as ``hidden_states.{idx}``. Gemma4 exposes
+        # only this final normalized hidden (not per-layer pre-norm), so a valid
+        # request is exactly one index == ``num_hidden_layers - 1``; the helper
+        # validates and rejects duplicate/out-of-range/negative/multiple/non-last
+        # indices. ``None``/empty keeps the legacy 2-tuple contract (existing
+        # exports byte-identical).
+        self.output_layer_indices: list[int] | None = _validate_gemma4_output_layer_indices(
+            config
+        )
 
     def forward(
         self,
@@ -2351,7 +2450,7 @@ class Gemma4CausalLMModel(CausalLMModel):
         position_ids: ir.Value,
         past_key_values: list | None = None,
         inputs_embeds: ir.Value | None = None,
-    ) -> tuple[ir.Value, list]:
+    ) -> tuple[ir.Value, list] | tuple[ir.Value, list, list]:
         hidden_states, present_key_values = self.model(
             op,
             input_ids=input_ids,
@@ -2360,6 +2459,8 @@ class Gemma4CausalLMModel(CausalLMModel):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
         )
+        # ``hidden_states`` here is post-final-norm (``Gemma4TextModel`` applies
+        # ``self.norm`` before returning) — i.e. the exact lm_head input.
         hidden_states = _retain_last_sequence_token(op, hidden_states)
         logits = self.lm_head(op, hidden_states)
         # Optional final logit soft-capping (tanh scaled): logit_cap * tanh(x / logit_cap)
@@ -2368,6 +2469,15 @@ class Gemma4CausalLMModel(CausalLMModel):
                 op, self.config.final_logit_softcapping, self.config.dtype
             )
             logits = op.Mul(op.Tanh(op.Div(logits, cap)), cap)
+        if self.output_layer_indices:
+            # Materialize a distinct Identity per requested index so each graph
+            # output owns a unique name and never renames the internal lm_head
+            # input value in place (a shared Value passed to ``add_output`` twice
+            # would collapse). Validation restricts this to exactly the last-layer
+            # index, but the per-index Identity keeps the contract robust and
+            # mirrors the generic "one distinct Value per output" shape.
+            hidden_outputs = [op.Identity(hidden_states) for _ in self.output_layer_indices]
+            return logits, present_key_values, hidden_outputs
         return logits, present_key_values
 
     def preprocess_weights(
