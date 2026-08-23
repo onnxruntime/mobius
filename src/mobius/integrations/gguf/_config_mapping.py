@@ -24,6 +24,7 @@ __all__ = ["gguf_to_config", "resolve_model_type", "assert_glm_moe_dsa_resolvabl
 
 import dataclasses
 import logging
+from types import MappingProxyType
 from typing import Any
 
 import numpy as np
@@ -35,49 +36,26 @@ from mobius._configs import (
     MuseGlimmerConfig,
     _shallow_fields,
 )
+from mobius.integrations.gguf._arch_registry import iter_arch_specs, try_get_arch_spec
 
 logger = logging.getLogger(__name__)
 
 
 # Map GGUF architecture names → our registry model_type strings.
-# Most names match; a few need remapping.
-GGUF_ARCH_TO_MODEL_TYPE: dict[str, str] = {
-    "llama": "llama",
-    "mistral": "llama",  # Mistral uses Llama architecture
-    "qwen2": "qwen2",
-    "qwen2_moe": "qwen2_moe",
-    "qwen3": "qwen3",
-    "qwen3_moe": "qwen3_moe",
-    "qwen35": "qwen3_5_text",
-    "qwen35moe": "qwen3_5_moe",
-    "gemma2": "gemma2",
-    "gemma3": "gemma3_text",
-    # Gemma 4 GGUF contains the text backbone only — no vision or audio encoder.
-    # Vision and audio encoders are exported separately from the HuggingFace checkpoint.
-    "gemma4": "gemma4_text",
-    "phi3": "phi3",
-    "falcon": "falcon",
-    "gpt2": "gpt2",
-    "mamba": "mamba",
-    "bloom": "bloom",
-    "starcoder2": "starcoder2",
-    "stablelm": "stablelm",
-    "nemotron": "nemotron",
-    "t5": "t5",
-    "hunyuan-dense": "hunyuan_v1_dense",
-    "deepseek4": "deepseek_v4",
-    # GLM-5.2 GGUFs (e.g. unsloth/GLM-5.2-GGUF) tag the architecture 'glm-dsa'
-    # (MLA + DeepSeek Sparse Attention + MoE). Mobius's canonical registry key
-    # is 'glm_moe_dsa'. This is an explicit format-bridge mapping keyed on the
-    # authoritative GGUF architecture string, never on the filename or model
-    # name. ``assert_glm_moe_dsa_resolvable`` verifies the head/layer/expert/DSA
-    # properties before the builder selects GlmMoeDsaCausalLMModel.
-    "glm-dsa": "glm_moe_dsa",
-    "glm_dsa": "glm_moe_dsa",
-    "deci": "llama",  # DeciLM uses Llama architecture
-    "muse-glimmer": "muse_glimmer_text",
-    "muse_glimmer": "muse_glimmer_text",
-}
+#
+# Derived from :mod:`mobius.integrations.gguf._arch_registry`, which is the
+# single source of truth. It stays exported under this name because callers
+# outside this module read it, but it is now read-only: mutating it here would
+# desynchronize it from the tensor mapping, the weight processors, and the
+# capability verdicts that are all built from the same specs.
+GGUF_ARCH_TO_MODEL_TYPE: MappingProxyType[str, str] = MappingProxyType(
+    {
+        name: spec.model_type
+        for spec in iter_arch_specs()
+        if spec.model_type is not None
+        for name in sorted(spec.names)
+    }
+)
 
 
 # Standard GGUF metadata keys → HuggingFace config field names.
@@ -107,40 +85,34 @@ _DEFAULT_KEY_MAP: dict[str, str] = {
     "ssm.conv_kernel": "linear_conv_kernel_dim",
 }
 
-# Muse Glimmer has no rope.dimension_count; head_dim comes from key_length.
 _MUSE_GLIMMER_KEY_MAP = {
     "attention.key_length": "head_dim",
     "attention.sliding_window": "sliding_window",
 }
 
-_ARCH_KEY_MAPS: dict[str, dict[str, str]] = {
-    # Both spellings are accepted wherever muse-glimmer is recognized.
-    "muse-glimmer": _MUSE_GLIMMER_KEY_MAP,
-    "muse_glimmer": _MUSE_GLIMMER_KEY_MAP,
-    "deepseek4": {
-        "attention.key_length": "head_dim",
-        "rope.dimension_count": "qk_rope_head_dim",
-        "attention.q_lora_rank": "q_lora_rank",
-        "attention.sliding_window": "sliding_window",
-        "expert_count": "num_local_experts",
-        "expert_used_count": "num_experts_per_tok",
-        "expert_feed_forward_length": "moe_intermediate_size",
-        "expert_shared_count": "n_shared_experts",
-        "expert_weights_scale": "routed_scaling_factor",
-        "expert_weights_norm": "norm_topk_prob",
-        "swiglu_clamp_exp": "swiglu_limit",
-        "attention.indexer.head_count": "index_n_heads",
-        "attention.indexer.key_length": "index_head_dim",
-        "attention.indexer.top_k": "index_topk",
-        "attention.output_group_count": "o_groups",
-        "attention.output_lora_rank": "o_lora_rank",
-        "attention.compress_ratios": "compress_ratios",
-        "attention.compress_rope_freq_base": "compress_rope_theta",
-        "hyper_connection.count": "hc_mult",
-        "hyper_connection.sinkhorn_iterations": "hc_sinkhorn_iters",
-        "hyper_connection.epsilon": "hc_eps",
-        "hash_layer_count": "num_hash_layers",
-    },
+_DEEPSEEK4_KEY_MAP = {
+    "attention.key_length": "head_dim",
+    "rope.dimension_count": "qk_rope_head_dim",
+    "attention.q_lora_rank": "q_lora_rank",
+    "attention.sliding_window": "sliding_window",
+    "expert_count": "num_local_experts",
+    "expert_used_count": "num_experts_per_tok",
+    "expert_feed_forward_length": "moe_intermediate_size",
+    "expert_shared_count": "n_shared_experts",
+    "expert_weights_scale": "routed_scaling_factor",
+    "expert_weights_norm": "norm_topk_prob",
+    "swiglu_clamp_exp": "swiglu_limit",
+    "attention.indexer.head_count": "index_n_heads",
+    "attention.indexer.key_length": "index_head_dim",
+    "attention.indexer.top_k": "index_topk",
+    "attention.output_group_count": "o_groups",
+    "attention.output_lora_rank": "o_lora_rank",
+    "attention.compress_ratios": "compress_ratios",
+    "attention.compress_rope_freq_base": "compress_rope_theta",
+    "hyper_connection.count": "hc_mult",
+    "hyper_connection.sinkhorn_iterations": "hc_sinkhorn_iters",
+    "hyper_connection.epsilon": "hc_eps",
+    "hash_layer_count": "num_hash_layers",
 }
 
 # GLM-5.2 ('glm-dsa') shares DeepSeek's MLA + MoE + DSA-indexer metadata layout
@@ -164,8 +136,39 @@ _GLM_DSA_KEY_MAP = {
     "attention.indexer.key_length": "index_head_dim",
     "attention.indexer.top_k": "index_topk",
 }
-_ARCH_KEY_MAPS["glm-dsa"] = _GLM_DSA_KEY_MAP
-_ARCH_KEY_MAPS["glm_dsa"] = _GLM_DSA_KEY_MAP
+
+#: Named architecture-specific key maps that :attr:`GGUFArchitectureSpec.
+#: config_key_map` selects. Every name here must be referenced by a spec and
+#: every name a spec references must exist here; ``_arch_registry_test`` checks
+#: both directions so a typo cannot silently drop config fields.
+_KEY_MAP_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
+    {
+        "muse_glimmer": _MUSE_GLIMMER_KEY_MAP,
+        "deepseek4": _DEEPSEEK4_KEY_MAP,
+        "glm_dsa": _GLM_DSA_KEY_MAP,
+    }
+)
+
+
+def _arch_key_map(gguf_arch: str) -> dict[str, str]:
+    """Return the extra GGUF-key → config-field map for *gguf_arch*."""
+    spec = try_get_arch_spec(gguf_arch)
+    if spec is None or spec.config_key_map is None:
+        return {}
+    return _KEY_MAP_TABLES[spec.config_key_map]
+
+
+#: Per-architecture key maps expanded over every canonical name and alias.
+#: Derived from the registry rather than declared, so a spelling accepted by the
+#: tensor mapping cannot be missing here.
+_ARCH_KEY_MAPS: MappingProxyType[str, dict[str, str]] = MappingProxyType(
+    {
+        name: _KEY_MAP_TABLES[spec.config_key_map]
+        for spec in iter_arch_specs()
+        if spec.config_key_map is not None
+        for name in sorted(spec.names)
+    }
+)
 
 
 # GGUF hidden_act values → HuggingFace activation function names
@@ -225,7 +228,7 @@ def _extract_config_fields(
     # architectures before they are added upstream.
     fallback_mapping = {
         **_DEFAULT_KEY_MAP,
-        **_ARCH_KEY_MAPS.get(gguf_arch, {}),
+        **_arch_key_map(gguf_arch),
     }
     for gguf_suffix, hf_key in fallback_mapping.items():
         full_key = f"{gguf_arch}.{gguf_suffix}"
@@ -269,6 +272,13 @@ def gguf_to_config(
     """
     gguf_arch = model.architecture
     metadata = model.metadata
+
+    # Resolve the architecture spec once. It is deliberately *not* required
+    # here: config extraction is a separate capability from tensor mapping, and
+    # some architectures (bloom, t5) can be configured but not mapped. The
+    # tensor-mapping gate raises for those, with a reason.
+    spec = try_get_arch_spec(gguf_arch)
+    canonical_arch = spec.gguf_arch if spec is not None else gguf_arch
 
     # Resolve model_type
     model_type = GGUF_ARCH_TO_MODEL_TYPE.get(gguf_arch, gguf_arch)
@@ -383,8 +393,8 @@ def gguf_to_config(
     # and the full-attention layers produce garbage tokens. Section interleave,
     # when a model needs it, is a distinct ``mrope_interleaved`` signal handled
     # via ``mrope_section``. Only architectures that genuinely use adjacent-pair
-    # rotation set the flat flag here.
-    rope_interleave = gguf_arch == "deepseek4"
+    # rotation declare the flag on their spec.
+    rope_interleave = spec is not None and spec.rope_interleave
 
     # Derive rope_type from rope.scaling.type. GGUF stores the scaling
     # variant under ``<arch>.rope.scaling.type`` (or omits the key for the
@@ -431,7 +441,7 @@ def gguf_to_config(
     # HF dynamic-NTK config so the ONNX model behaves correctly on
     # long-context inputs.
     if (
-        gguf_arch == "hunyuan-dense"
+        canonical_arch == "hunyuan-dense"
         and rope_type == "default"
         and rope_freq_base is not None
         and float(rope_freq_base) > 1e6
@@ -492,7 +502,7 @@ def gguf_to_config(
         routed_scaling_factor=hf_fields.get("routed_scaling_factor", 1.0),
         scoring_func=(
             "sqrtsoftplus"
-            if gguf_arch == "deepseek4"
+            if canonical_arch == "deepseek4"
             else hf_fields.get("scoring_func", "softmax")
         ),
         q_lora_rank=hf_fields.get("q_lora_rank"),
@@ -526,7 +536,11 @@ def gguf_to_config(
         linear_conv_kernel_dim=(hf_fields.get("linear_conv_kernel_dim") or 4),
     )
 
-    # Store model_type for registry lookup and tensor processor dispatch.
+    # Store the source architecture and model_type for registry lookup and for
+    # weight-processor dispatch. ``_gguf_arch`` is what lets downstream
+    # dispatch key on the architecture spec instead of guessing from
+    # ``model_type``, which is where the Gemma 3 processor used to get lost.
+    config._gguf_arch = spec.gguf_arch if spec is not None else gguf_arch
     config._gguf_model_type = model_type
     config.model_type = model_type
 
@@ -534,9 +548,11 @@ def gguf_to_config(
     # config subclass (e.g. Gemma4Config instead of plain ArchitectureConfig).
     # Postprocessors take the GGUF model too, because a few architectures store
     # config scalars inside tensors rather than in the key-value metadata.
-    postprocessor = _CONFIG_POSTPROCESSORS.get(model_type)
-    if postprocessor is not None:
+    postprocessor_name = None if spec is None else spec.config_postprocessor
+    if postprocessor_name is not None:
+        postprocessor = _CONFIG_POSTPROCESSORS[postprocessor_name]
         config = postprocessor(config, metadata, model)
+        config._gguf_arch = spec.gguf_arch
         config._gguf_model_type = model_type
         config.model_type = model_type
 
@@ -997,14 +1013,18 @@ def _muse_glimmer_qk_scale_factor(model: Any, default: float) -> float:
     return float(values[0])
 
 
-# Architecture-specific config postprocessors.
-# Each takes a base ArchitectureConfig + raw metadata and returns
-# an architecture-specific config subclass.
+# Architecture-specific config postprocessors, keyed by the name a
+# :class:`GGUFArchitectureSpec` refers to. Each takes a base ArchitectureConfig
+# + raw metadata and returns an architecture-specific config subclass.
+#
+# Keyed by postprocessor name rather than by ``model_type``: the old
+# model_type keying is what let the Gemma weight processor drift out of reach
+# when an architecture's model_type gained a ``_text`` suffix.
 _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "gemma2": _gemma2_postprocess,
-    "gemma3_text": _gemma3_postprocess,
-    "gemma4_text": _gemma4_postprocess,
-    "muse_glimmer_text": _muse_glimmer_postprocess,
+    "gemma3": _gemma3_postprocess,
+    "gemma4": _gemma4_postprocess,
+    "muse_glimmer": _muse_glimmer_postprocess,
 }
 
 

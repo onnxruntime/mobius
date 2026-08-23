@@ -130,6 +130,7 @@ def derive_mtp_config(config):
     # same way as the backbone.
     mtp_config.model_type = getattr(config, "model_type", None)
     mtp_config._gguf_model_type = getattr(config, "_gguf_model_type", None)
+    mtp_config._gguf_arch = getattr(config, "_gguf_arch", None)
     return mtp_config
 
 

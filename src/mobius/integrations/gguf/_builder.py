@@ -29,6 +29,16 @@ import tqdm
 from huggingface_hub import HfApi, hf_hub_download
 
 from mobius._model_package import ModelPackage
+from mobius.integrations.gguf._arch_registry import (
+    MMPROJ_ARCHITECTURE,
+    arch_names_with,
+    try_get_arch_spec,
+)
+from mobius.integrations.gguf._errors import (
+    DisabledGGUFArchitectureError,
+    ShardedGGUFNotSupportedError,
+)
+from mobius.integrations.gguf._spec import Support
 
 _HUB_PREFLIGHT_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (OSError,)
 try:
@@ -89,12 +99,28 @@ def _raise_for_unsupported_gguf_architecture(
     source: str,
     tensor_names: Iterable[str] | None = None,
 ) -> None:
-    """Reject GGUF architectures that do not have semantic conversion evidence."""
-    if architecture != _NEMOTRON_H_MOE_ARCHITECTURE:
+    """Reject GGUF architectures that do not have semantic conversion evidence.
+
+    Only architectures the registry marks ``REJECTED`` are refused here. An
+    architecture that is merely unregistered still reaches the tensor-mapping
+    gate, which produces the actionable "not imported yet" message; failing
+    early would change which error a caller sees.
+    """
+    spec = try_get_arch_spec(architecture)
+    if spec is None:
+        return
+    if spec.gguf_arch == MMPROJ_ARCHITECTURE:
+        # mmproj sidecars are opened deliberately by the multimodal path, which
+        # pairs them with a text backbone. They are rejected only when someone
+        # passes one as the model itself, and the tensor-mapping gate already
+        # produces that message.
+        return
+    rejected = [name for name, verdict in spec.verdicts.items() if verdict is Support.REJECTED]
+    if not rejected:
         return
 
     layout = ""
-    if tensor_names is not None:
+    if architecture == _NEMOTRON_H_MOE_ARCHITECTURE and tensor_names is not None:
         counts, mtp_blocks, mtp_kinds = _summarize_nemotron_h_moe_layout(tensor_names)
         mtp_kind_names = {index: sorted(kinds) for index, kinds in mtp_kinds.items()}
         layout = (
@@ -104,18 +130,9 @@ def _raise_for_unsupported_gguf_architecture(
             f"{list(mtp_blocks)} with mixer types {mtp_kind_names}."
         )
 
-    raise NotImplementedError(
-        "Direct GGUF conversion for architecture 'nemotron_h_moe' is intentionally "
-        f"disabled for {source!r}.{layout} GGUF block_count includes a combined "
-        "attention+MoE MTP auxiliary block, so aliasing it to the 52-layer "
-        "'nemotron_h' backbone would build the wrong graph. The current Nemotron-H "
-        "Mamba2 path also lacks passing full-logit/generation parity, and common "
-        "GGUF presets contain Q5_0/Q5_1 expert tensors that cannot be preserved by "
-        "MatMulNBits. No ONNX artifacts were emitted. Use llama.cpp/Unsloth to run "
-        "the GGUF without changing its quantization, or start from the official "
-        "pinned BF16 Hugging Face checkpoint and quantize the validated ONNX export "
-        "with Olive only after L4/L5 semantic generation passes. See "
-        "docs/api/build_from_gguf.md for the pinned recipe and waiver."
+    raise DisabledGGUFArchitectureError(
+        f"Direct GGUF conversion for architecture {spec.gguf_arch!r} is intentionally "
+        f"disabled for {source!r}.{layout} {spec.reason} No ONNX artifacts were emitted."
     )
 
 
@@ -136,7 +153,7 @@ def _raise_for_sharded_gguf(
         return
 
     shard_detail = f" shard {shard_index} of {split_count}" if shard_index else ""
-    raise NotImplementedError(
+    raise ShardedGGUFNotSupportedError(
         f"Sharded GGUF input is not supported: {source!r} is{shard_detail}. "
         "The GGUF builder reads one file and cannot assemble split tensor tables; "
         "continuing would emit an incomplete ONNX model. Select a single-file GGUF "
@@ -890,7 +907,7 @@ def _replace_native_block_linears(module, gguf_model, gguf_arch: str) -> None:
 #: llama.cpp converter bakes the ``+1`` into every ``*norm.weight`` *except* the
 #: Gated-DeltaNet internal ``linear_attn.norm`` (a plain gated RMSNorm), so the
 #: GGUF path must undo it — see :func:`_normalize_gguf_weights`.
-_OFFSET_NORM_GGUF_ARCHS: frozenset[str] = frozenset({"qwen35", "qwen35moe"})
+_OFFSET_NORM_GGUF_ARCHS: frozenset[str] = arch_names_with(lambda spec: spec.offset_norm)
 
 #: GGUF architectures whose llama.cpp converter reorders Gated-DeltaNet V-heads
 #: from HuggingFace *grouped* order (``head = group * v_per_k + j``) into ggml
@@ -898,7 +915,7 @@ _OFFSET_NORM_GGUF_ARCHS: frozenset[str] = frozenset({"qwen35", "qwen35moe"})
 #: is grouped (``num_value_heads != num_key_heads``). mobius's ``GatedDeltaNet``
 #: forward consumes the HF grouped order, so the GGUF path must undo the tiling —
 #: see :func:`_reorder_deltanet_v_heads`.
-_V_HEAD_REORDER_GGUF_ARCHS: frozenset[str] = frozenset({"qwen35", "qwen35moe"})
+_V_HEAD_REORDER_GGUF_ARCHS: frozenset[str] = arch_names_with(lambda spec: spec.v_head_reorder)
 
 
 def _normalize_gguf_weights(
@@ -1183,22 +1200,19 @@ def _reorder_out_proj_cols(state_dict: dict, stem: str, head_perm, head_v_dim: i
 
 def _has_quantized_weights(gguf_model, gguf_arch: str) -> bool:
     """Return whether a GGUF has mapped weights with a quantized tensor type."""
-    from gguf import GGMLQuantizationType
-
+    from mobius.integrations.gguf._quant_registry import float_storage_type_ids
     from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
 
-    float_types = {
-        GGMLQuantizationType.F32,
-        GGMLQuantizationType.F16,
-        GGMLQuantizationType.BF16,
-    }
-    f64_type = getattr(GGMLQuantizationType, "F64", None)
-    if f64_type is not None:
-        float_types.add(f64_type)
+    float_type_ids = float_storage_type_ids()
 
     for name, _raw, qtype, _shape in gguf_model.tensor_items_raw():
         hf_name = map_gguf_to_hf_names(name, gguf_arch)
-        if hf_name is not None and hf_name.endswith(".weight") and qtype not in float_types:
+        type_id = getattr(qtype, "value", qtype)
+        if (
+            hf_name is not None
+            and hf_name.endswith(".weight")
+            and type_id not in float_type_ids
+        ):
             return True
     return False
 
@@ -1217,40 +1231,15 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
     """
     from gguf import GGMLQuantizationType
 
+    from mobius.integrations.gguf._quant_registry import (
+        explicit_zero_point_type_names,
+        get_quant_spec,
+    )
     from mobius.integrations.gguf._repacker import can_repack, repack_quant_params
     from mobius.integrations.gguf._tencent_q1_0 import is_tencent_q1_0_layout
     from mobius.integrations.gguf._tensor_mapping import (
         map_gguf_to_hf_names,
     )
-
-    # Whether the graph can omit zero_points for each supported GGUF type.
-    #
-    # Mainline Q1_0 (1-bit binary) is repacked into 2-bit MatMulNBits
-    # with zp=1 — see _repack_q1_0. Tencent's custom Q1_0 (2-bit SEQ,
-    # 512-elt blocks) is inflated to 4-bit MatMulNBits with zp=3 — see
-    # parse_tencent_q1_0_tensor — because the ORT CPU unpacked-float-zp
-    # path is currently only implemented for bits=4, and the half-integer
-    # SEQ offset 1.5 cannot be expressed with integer zp at bits=2.
-    #
-    # Q4_0 and Q8_0 are symmetric formats, but their GGUF dequantization
-    # formulas are still ``(q - 8) * scale`` and ``(q - 128) * scale``.
-    # Emit those zero_points explicitly: GatherBlockQuantized has diverging
-    # CPU/CUDA defaults when the input is omitted, which corrupts embeddings
-    # on CUDA before the first decoder layer runs.
-    # Whether the repacked form can omit zero points. Every entry here is a
-    # *repack target* property, not a source-format property: Q4_K and Q6_K both
-    # requantize through the asymmetric affine path, so both need zero points
-    # even though Q6_K's source form is symmetric around 32.
-    # Keep in sync with `_REPACK_PARAMS` in `_repacker.py` — a type that can be
-    # repacked but is missing here raises `KeyError` at build time.
-    type_can_omit_zero_points: dict = {
-        GGMLQuantizationType.Q4_0: False,
-        GGMLQuantizationType.Q4_1: False,
-        GGMLQuantizationType.Q4_K: False,
-        GGMLQuantizationType.Q6_K: False,
-        GGMLQuantizationType.Q8_0: False,
-        GGMLQuantizationType.Q1_0: False,
-    }
 
     counts: Counter = Counter()
     for name, _raw, qtype, _shape in gguf_model.tensor_items_raw():
@@ -1269,16 +1258,7 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
         {qtype: count for qtype, count in counts.items() if _native_block_format(qtype)}
     )
     if native_counts:
-        explicit_zero_point_types = {
-            "Q1_0",
-            "Q2_K",
-            "Q4_0",
-            "Q4_1",
-            "Q4_K",
-            "Q5_1",
-            "Q5_K",
-            "Q8_0",
-        }
+        explicit_zero_point_types = explicit_zero_point_type_names()
         can_omit_zero_points = not any(
             getattr(qtype, "name", None) in explicit_zero_point_types
             for qtype in counts
@@ -1319,7 +1299,16 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
     params = repack_quant_params(dominant_value)
     assert params is not None
     bits, block_size = params
-    is_sym = type_can_omit_zero_points[dominant]
+    # Whether the repacked form may drop zero points is a property of the repack
+    # *target*, not of the source format: Q4_K and Q6_K both requantize through
+    # the asymmetric affine path, so both need zero points even though Q6_K's
+    # source form is symmetric around 32. Q4_0/Q8_0 look symmetric too, but
+    # their GGUF dequantization is still ``(q - 8) * scale`` / ``(q - 128) *
+    # scale``, and GatherBlockQuantized has diverging CPU/CUDA defaults when the
+    # input is omitted, which corrupts embeddings before the first decoder layer.
+    dominant_spec = get_quant_spec(dominant)
+    assert dominant_spec is not None and dominant_spec.affine_repack is not None
+    is_sym = dominant_spec.affine_repack.omit_zero_points
 
     # Tencent Q1_0 files reuse the Q1_0 type id but ship a different
     # on-disk layout (2-bit SEQ, 512-element blocks, fp16 scale per block).
@@ -1382,31 +1371,10 @@ def _can_quantize_embedding(
 
 def _can_quantize_lm_head(gguf_model, gguf_arch: str) -> bool:
     """Return whether an untied GGUF output head can be kept quantized."""
+    from mobius.integrations.gguf._quant_registry import lm_head_preserve_type_names
     from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
 
-    supported_types = {
-        "Q1_0",
-        "Q2_K",
-        "Q3_K",
-        "Q4_0",
-        "Q4_1",
-        "Q4_K",
-        "Q5_0",
-        "Q5_1",
-        "Q5_K",
-        "Q6_K",
-        "Q8_0",
-        "MXFP4",
-        "IQ4_NL",
-        "IQ4_XS",
-        "IQ3_S",
-        "IQ3_XXS",
-        "IQ2_XXS",
-        "IQ2_XS",
-        "IQ2_S",
-        "IQ1_S",
-        "IQ1_M",
-    }
+    supported_types = lm_head_preserve_type_names()
     for name, _raw, qtype, shape in gguf_model.tensor_items_raw():
         if map_gguf_to_hf_names(name, gguf_arch) != "lm_head.weight":
             continue
