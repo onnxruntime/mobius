@@ -1084,7 +1084,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "fuyu": "adept/fuyu-8b",
     "glm4v": "THUDM/glm-4v-9b",
     "glm4v_moe": "THUDM/glm-4v-9b",
-    "glm4v_moe_text": "THUDM/glm-4v-9b",
+    "glm4v_moe_text": "zai-org/GLM-4.5V",
     "glm4v_text": "THUDM/glm-4v-9b",
     "got_ocr2": "stepfun-ai/GOT-OCR2_0",
     "hunyuan_vl_mot": "tencent/HY-Embodied-0.5-X",
