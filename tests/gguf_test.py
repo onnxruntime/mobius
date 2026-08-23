@@ -476,7 +476,7 @@ class TestCLIBuildGGUF:
             main(["build-gguf", "--help"])
         out = capsys.readouterr().out
         assert "--dequantize" in out
-        assert "output_dir" in out, "output directory is a positional, like build"
+        assert "--output OUTPUT_DIR" in out
         assert "--keep-quantized" not in out, "the unread deprecated alias was removed"
         assert "--max-shard-size" in out, "shard sizing applies to GGUF builds too"
 
@@ -495,7 +495,7 @@ class TestCLIBuildGGUF:
 
         path = _create_tiny_gguf(tmp_path / f"test-{float_type}.gguf", float_type=float_type)
         output_dir = tmp_path / f"output-{float_type}"
-        main(["build-gguf", path, str(output_dir)])
+        main(["build-gguf", path, "--output", str(output_dir)])
 
         package = ModelPackage.load(str(output_dir))
         op_types = {node.op_type for node in package["model"].graph}
@@ -529,6 +529,7 @@ class TestCLIBuildGGUF:
                 [
                     "build-gguf",
                     str(tmp_path / "model.gguf"),
+                    "--output",
                     str(tmp_path / "output"),
                     *extra_args,
                 ]
@@ -557,6 +558,7 @@ class TestCLIBuildGGUF:
                 [
                     "build-gguf",
                     str(tmp_path / "model.gguf"),
+                    "--output",
                     str(output_dir),
                     "--runtime",
                     "ort-genai",

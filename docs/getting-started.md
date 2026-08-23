@@ -109,7 +109,7 @@ pkg.save("output/model/")
 Or via CLI:
 
 ```bash
-mobius build-gguf path/to/model.gguf output/model/
+mobius build-gguf path/to/model.gguf --output output/model/
 ```
 
 Pass `--dequantize` on the CLI, or `keep_quantized=False` to
@@ -182,20 +182,20 @@ rewrite(model, pattern_rewrite_rules=skip_norm_rules())
 Or via CLI:
 
 ```bash
-mobius build --model Qwen/Qwen2.5-0.5B output/ --ep cuda --dtype f16
+mobius build --model Qwen/Qwen2.5-0.5B --output output/ --ep cuda --dtype f16
 ```
 
 ## CLI Quick Start
 
 ```bash
 # Basic build
-mobius build --model meta-llama/Llama-3.2-1B output/
+mobius build --model meta-llama/Llama-3.2-1B --output output/
 
 # Build for CUDA with f16
-mobius build --model meta-llama/Llama-3.2-1B output/ --ep cuda --dtype f16
+mobius build --model meta-llama/Llama-3.2-1B --output output/ --ep cuda --dtype f16
 
 # Build for ORT GenAI runtime
-mobius build --model meta-llama/Llama-3.2-1B output/ --ep cuda --dtype f16 --runtime ort-genai
+mobius build --model meta-llama/Llama-3.2-1B --output output/ --ep cuda --dtype f16 --runtime ort-genai
 ```
 
 The `mobius` CLI has these subcommands:

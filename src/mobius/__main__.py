@@ -10,6 +10,7 @@ import glob
 import json
 import logging
 import os
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import tqdm
@@ -750,6 +751,45 @@ def _add_release_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
+class _UniqueOutputAction(argparse.Action):
+    """Reject repeated ``--output`` spellings instead of silently taking the last."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str,
+        option_string: str | None = None,
+    ) -> None:
+        if getattr(namespace, self.dest, None) is not None:
+            parser.error("--output/-o may be specified only once.")
+        setattr(namespace, self.dest, values)
+
+
+class _MobiusArgumentParser(argparse.ArgumentParser):
+    """Normalize the canonical output option and hidden positional compatibility."""
+
+    def parse_args(
+        self,
+        args: Sequence[str] | None = None,
+        namespace: argparse.Namespace | None = None,
+    ) -> argparse.Namespace:
+        parsed = super().parse_args(args, namespace)
+        if getattr(parsed, "command", None) not in {"build", "build-gguf"}:
+            return parsed
+
+        output_dir = parsed.output_dir
+        legacy_output_dir = parsed._legacy_output_dir
+        if output_dir is None and legacy_output_dir is None:
+            self.error("--output/-o is required.")
+        if output_dir is not None and legacy_output_dir is not None:
+            self.error("use --output/-o or the legacy positional output_dir, not both.")
+
+        parsed.output_dir = output_dir if output_dir is not None else legacy_output_dir
+        del parsed._legacy_output_dir
+        return parsed
+
+
 def _add_shared_build_arguments(parser: argparse.ArgumentParser) -> None:
     """Add the options that mean exactly the same thing on every build command.
 
@@ -760,6 +800,20 @@ def _add_shared_build_arguments(parser: argparse.ArgumentParser) -> None:
     restricts) stay declared locally, so a divergence has to be written down on
     purpose.
     """
+    parser.add_argument(
+        "--output",
+        "-o",
+        dest="output_dir",
+        action=_UniqueOutputAction,
+        default=None,
+        metavar="OUTPUT_DIR",
+        help="Output directory for the ONNX model.",
+    )
+    parser.add_argument(
+        "_legacy_output_dir",
+        nargs="?",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--dtype",
         choices=sorted(DTYPE_MAP),
@@ -812,14 +866,21 @@ def build_parser() -> argparse.ArgumentParser:
     could only reach it by invoking ``--help`` and catching ``SystemExit`` — an
     assertion that holds regardless of what the arguments actually do.
     """
-    parser = argparse.ArgumentParser(
+    parser = _MobiusArgumentParser(
         prog="mobius",
         description="Build ONNX models for GenAI from HuggingFace model architectures.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # --- build ---
-    build_parser = subparsers.add_parser("build", help="Build an ONNX model.")
+    build_parser = subparsers.add_parser(
+        "build",
+        help="Build an ONNX model.",
+        usage=(
+            "mobius build (--model MODEL_ID | --config CONFIG_PATH) "
+            "--output OUTPUT_DIR [options]"
+        ),
+    )
     source_group = build_parser.add_mutually_exclusive_group(required=True)
     source_group.add_argument(
         "--model",
@@ -830,10 +891,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         metavar="CONFIG_PATH",
         help="Path to a local model directory containing config.json (and optionally safetensors weights).",
-    )
-    build_parser.add_argument(
-        "output_dir",
-        help="Output directory for the ONNX model.",
     )
     build_parser.add_argument(
         "--task",
@@ -942,15 +999,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- build-gguf ---
     gguf_parser = subparsers.add_parser(
-        "build-gguf", help="Build ONNX model from a GGUF file."
+        "build-gguf",
+        help="Build ONNX model from a GGUF file.",
+        usage="mobius build-gguf GGUF_PATH --output OUTPUT_DIR [options]",
     )
     gguf_parser.add_argument(
         "gguf_path",
         help="Path to a .gguf model file.",
-    )
-    gguf_parser.add_argument(
-        "output_dir",
-        help="Output directory for the ONNX model.",
     )
     gguf_parser.add_argument(
         "--mmproj",

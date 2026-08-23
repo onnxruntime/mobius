@@ -184,8 +184,8 @@ class TestReleaseFlag:
     #: Smallest argument set each build command accepts, so the test exercises the
     #: real parser rather than a stand-in.
     _MINIMAL_ARGS: ClassVar[dict[str, list[str]]] = {
-        "build": ["--model", "some/model", "out_dir"],
-        "build-gguf": ["some.gguf", "out_dir"],
+        "build": ["--model", "some/model", "--output", "out_dir"],
+        "build-gguf": ["some.gguf", "--output", "out_dir"],
     }
 
     def test_build_and_gguf_describe_release_identically(self):

@@ -177,7 +177,7 @@ python -m mobius build `
   --config .\nemotron-bf16 `
   --dtype bf16 --ep cuda `
   --external-data safetensors --max-shard-size 5GB `
-  .\nemotron-bf16-onnx
+  --output .\nemotron-bf16-onnx
 ```
 
 After the BF16 package passes full-logit and generation parity, quantize its
