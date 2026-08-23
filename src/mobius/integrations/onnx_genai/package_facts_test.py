@@ -288,6 +288,10 @@ class TestDecoderPackageFacts:
             json.dumps({"model": {"eos_token_id": _IMAGE_ID}}), encoding="utf-8"
         )
         package_dir = tmp_path / "package"
+        package_dir.mkdir()
+        (package_dir / "genai_config.json").write_text(
+            json.dumps({"model": {"eos_token_id": _BOS_ID}}), encoding="utf-8"
+        )
 
         def _materialize_tokenizer(output_dir, source, *, revision=None):
             del source, revision
@@ -312,6 +316,8 @@ class TestDecoderPackageFacts:
             "content": "<|endoftext|>",
         }
         assert tokenizer["artifacts"] == [{"location": "tokenizer.json"}]
+        workflow = metadata["pipeline"]["workflow"]
+        assert workflow["inputs"]["package.eos_ids"]["default"] == _IMAGE_ID
 
 
 class TestMultimodalPackageFacts:
