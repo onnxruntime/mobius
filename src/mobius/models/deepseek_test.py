@@ -97,6 +97,57 @@ def test_deepseek_dense_moe_fallback_matches_numpy_reference():
     assert all(node.domain != "com.microsoft" for node in graph)
 
 
+def test_deepseek_moe_ffn_linear_class_reaches_routed_experts():
+    """``linear_class`` must reach the routed dense-loop experts, not just the shared expert.
+
+    Regression test for a bug where ``_DeepSeekMoEFFN`` constructed its
+    ``MoELayer`` without forwarding ``linear_class``, so a quantized config
+    quantized attention/dense-FFN/shared-expert linears but silently left the
+    routed MoE experts as plain float ``MatMul`` -- losing quantization and
+    breaking the ``fuse_dense_moe_to_qmoe`` post-hoc rewrite, which only
+    matches a quantized ``MatMulNBits`` dense-fallback pattern.
+    """
+    from mobius.components._common import Linear
+
+    created: list[Linear] = []
+
+    class TrackingLinear(Linear):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    config = make_config(
+        hidden_size=4,
+        intermediate_size=8,
+        moe_intermediate_size=3,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        n_group=2,
+        topk_group=1,
+        n_shared_experts=1,
+        scoring_func="sigmoid",
+        topk_method="noaux_tc",
+    )
+    module = _DeepSeekMoEFFN(config, DeepSeekMoEGate(config), linear_class=TrackingLinear)
+
+    # The dense loop-over-experts fallback must have been built with
+    # TrackingLinear for every routed expert's projections. Check
+    # `module.moe.experts` directly (not the global `created` list) so this
+    # assertion can't pass merely because the shared expert below picked up
+    # the class -- that path already worked before this fix.
+    assert module.moe.experts is not None
+    routed_linears = [m for m in module.moe.experts.modules() if isinstance(m, Linear)]
+    assert len(routed_linears) > 0
+    assert all(isinstance(m, TrackingLinear) for m in routed_linears)
+    # The shared expert must still be quantized too (it already worked
+    # before this fix; guard against a future regression there as well).
+    shared_linears = [m for m in module.shared_experts.modules() if isinstance(m, Linear)]
+    assert len(shared_linears) > 0
+    assert all(isinstance(m, TrackingLinear) for m in shared_linears)
+    # Sanity: the tracking list saw both groups (routed + shared).
+    assert len(created) == len(routed_linears) + len(shared_linears)
+
+
 def test_noaux_tc_supports_single_expert_groups():
     config = make_config(
         hidden_size=4,
