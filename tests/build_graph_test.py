@@ -5006,6 +5006,26 @@ class TestBuildCodecGraph:
         }
         assert codebooks == {(2048, 256)}
 
+    def test_encoder_input_declares_configured_audio_channels(self):
+        """The graph input channel count must match the first conv.
+
+        ``audio_channels`` sizes ``encoder.layers.0.conv``, so a task that
+        always declared a mono input would feed a 1-channel tensor into a
+        conv expecting more.
+        """
+        import dataclasses
+
+        from mobius.models.qwen3_tts_tokenizer import Qwen3TTSTokenizerV2Model
+        from mobius.tasks import CodecTask
+
+        config = self._codec_config()
+        config.codec_encoder = dataclasses.replace(config.codec_encoder, audio_channels=2)
+        module = Qwen3TTSTokenizerV2Model(config)
+        pkg = build_from_module(module, config, task=CodecTask())
+
+        waveform = next(inp for inp in pkg["encoder"].graph.inputs if inp.name == "waveform")
+        assert waveform.shape[1] == 2
+
     def test_registry_lookup(self):
         """Verify qwen3_tts_tokenizer_12hz is registered with codec task."""
         model_cls = registry.get("qwen3_tts_tokenizer_12hz")
