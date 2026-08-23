@@ -52,6 +52,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _SKIP_REASONS: dict[str, str] = {
     "phi4mm": "Multi-modal model, requires special HF setup",
+    "glm_moe_dsa": "DSA uses the native pkg.nxrt::IndexShare op, unavailable in stock ORT",
     # trust_remote_code models: require downloading model files — not suitable for offline tests
     "chatglm": "Requires trust_remote_code=True (not in HF native CONFIG_MAPPING)",
     "qwen": "HF Qwen requires trust_remote_code=True (not in HF native CONFIG_MAPPING)",
