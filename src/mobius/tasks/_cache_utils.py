@@ -94,7 +94,6 @@ def _make_kv_cache_inputs(
     prefix: str = "past_key_values",
     key_head_dim: int | None = None,
     value_head_dim: int | None = None,
-    cache_specs: list[tuple[int, int, int]] | None = None,
 ) -> list[tuple[ir.Value, ir.Value]]:
     """Create KV cache input values for ``num_layers`` layers.
 
@@ -106,31 +105,23 @@ def _make_kv_cache_inputs(
             For MLA attention, this is ``qk_nope_head_dim + qk_rope_head_dim``.
         value_head_dim: Head dim for values. Defaults to ``head_dim``.
             For MLA attention, this is ``v_head_dim``.
-        cache_specs: Optional per-layer ``(num_heads, key_head_dim,
-            value_head_dim)`` values for models with non-uniform cache layouts.
 
     Returns:
         A list of ``(key, value)`` tuples for passing to the module.
     """
-    if cache_specs is None:
-        k_dim = key_head_dim if key_head_dim is not None else head_dim
-        v_dim = value_head_dim if value_head_dim is not None else head_dim
-        cache_specs = [(num_kv_heads, k_dim, v_dim)] * num_layers
-    elif len(cache_specs) != num_layers:
-        raise ValueError(
-            f"cache_specs has {len(cache_specs)} entries for {num_layers} cache layers"
-        )
+    k_dim = key_head_dim if key_head_dim is not None else head_dim
+    v_dim = value_head_dim if value_head_dim is not None else head_dim
     pairs: list[tuple[ir.Value, ir.Value]] = []
-    for i, (layer_num_heads, k_dim, v_dim) in enumerate(cache_specs):
+    for i in range(num_layers):
         past_key = builder.input(
             f"{prefix}.{i}.key",
             dtype=dtype,
-            shape=[batch, layer_num_heads, past_seq_len, k_dim],
+            shape=[batch, num_kv_heads, past_seq_len, k_dim],
         )
         past_value = builder.input(
             f"{prefix}.{i}.value",
             dtype=dtype,
-            shape=[batch, layer_num_heads, past_seq_len, v_dim],
+            shape=[batch, num_kv_heads, past_seq_len, v_dim],
         )
         pairs.append((past_key, past_value))
     return pairs
@@ -147,7 +138,6 @@ def _register_kv_cache_outputs(
     value_head_dim: int | None = None,
     total_seq_len: ir.SymbolicDim | str | int | None = None,
     dtype: ir.DataType | None = None,
-    cache_specs: list[tuple[int, int, int]] | None = None,
 ) -> None:
     """Name and register KV cache outputs on the graph.
 
@@ -171,9 +161,6 @@ def _register_kv_cache_outputs(
     When the parameters are omitted, output shapes/dtypes are left to the
     shape inference pass that runs during model optimization.
 
-    ``cache_specs`` replaces the three uniform head parameters with per-layer
-    ``(num_heads, key_head_dim, value_head_dim)`` values.
-
     The present-shape parameters are all-or-nothing by design: pass every one
     to stamp the explicit type, or none to opt out and infer. A *partial* set
     is always a wiring slip (a caller wired some dims but dropped others) and is
@@ -189,10 +176,6 @@ def _register_kv_cache_outputs(
         "total_seq_len": total_seq_len,
         "dtype": dtype,
     }
-    if cache_specs is not None:
-        params.pop("num_kv_heads")
-        params.pop("key_head_dim")
-        params.pop("value_head_dim")
     provided = [name for name, value in params.items() if value is not None]
     stamp = len(provided) == len(params)
     if provided and not stamp:
@@ -200,19 +183,12 @@ def _register_kv_cache_outputs(
         raise ValueError(
             f"_register_kv_cache_outputs received a partial set of present-shape "
             f"parameters (provided {provided}, missing {missing}); these are "
-            f"all-or-nothing. Pass all required values to stamp explicit present.* types "
+            f"all-or-nothing. Pass all six to stamp explicit present.* types "
             f"(required for correct GroupQueryAttention head_dim), or none to opt "
             f"out and infer."
         )
-    if cache_specs is not None and len(cache_specs) != len(present_key_values):
-        raise ValueError(
-            f"cache_specs has {len(cache_specs)} entries for "
-            f"{len(present_key_values)} present cache pairs"
-        )
     for i, (present_key, present_value) in enumerate(present_key_values):
         if stamp:
-            if cache_specs is not None:
-                num_kv_heads, key_head_dim, value_head_dim = cache_specs[i]
             present_key.shape = ir.Shape([batch, num_kv_heads, total_seq_len, key_head_dim])
             present_key.type = ir.TensorType(dtype)
             present_value.shape = ir.Shape(

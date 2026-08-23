@@ -394,6 +394,10 @@ class GlmMoeDsaAttention(DeepSeekMLA):
         value_f32 = op.Cast(padded_value, to=ir.DataType.FLOAT) if needs_cast else padded_value
 
         selected_indices = op.Unsqueeze(topk_indices, [1])
+        # pkg.nxrt is a custom onnx-genai runtime domain; the ONNX checker
+        # requires every domain used by a node to have a matching
+        # opset_imports entry (not automatically added by the op call),
+        # same as BlockQuantizedMatMul in _quantized_linear.py.
         op.builder.graph.opset_imports["pkg.nxrt"] = 1
         attn_output = op.IndexShare(
             q_f32,
@@ -408,9 +412,6 @@ class GlmMoeDsaAttention(DeepSeekMLA):
             _domain="pkg.nxrt",
             _outputs=1,
         )
-        # IndexShare has no ONNX shape-inference schema; its output matches Q in BNSH layout.
-        attn_output.type = q_f32.type
-        attn_output.shape = q_f32.shape
         if needs_cast:
             attn_output = op.Cast(attn_output, to=self.dtype)
         if value_pad > 0:
@@ -655,26 +656,6 @@ class GlmMoeDsaCausalLMModel(DeepSeekV3CausalLMModel):
         )
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    def dynamic_kv_cache_specs(self) -> list[tuple[int, int, int]] | None:
-        """Return the packed per-layer DSA cache layouts."""
-        if not self.config.use_dsa:
-            return None
-        # DSA packs each token's per-head main key/value columns into one cache
-        # head, with the indexer key appended to full-layer keys: (B, 1, T, D).
-        main_key_dim = self.config.num_attention_heads * (
-            (self.config.qk_nope_head_dim or 0) + (self.config.qk_rope_head_dim or 0)
-        )
-        main_value_dim = self.config.num_attention_heads * (self.config.v_head_dim or 0)
-        index_head_dim = self.config.index_head_dim or 0
-        return [
-            (
-                1,
-                main_key_dim + (index_head_dim if indexer_type == "full" else 0),
-                main_value_dim,
-            )
-            for indexer_type in _indexer_types(self.config)
-        ]
-
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
@@ -708,3 +689,31 @@ class GlmMoeDsaCausalLMModel(DeepSeekV3CausalLMModel):
             filtered = {k: v for k, v in filtered.items() if k not in indexer_keys}
 
         return DeepSeekV3CausalLMModel.preprocess_weights(self, filtered)
+
+    def dsa_kv_cache_specs(self) -> list[tuple[int, int]]:
+        """Per-layer ``(key_head_dim, value_head_dim)`` for the packed DSA cache.
+
+        Only meaningful when ``config.use_dsa`` (``self.model`` is a
+        :class:`GlmMoeDsaTextModel`): ``GlmMoeDsaAttention._pack_present``
+        packs the indexer's own key cache into the *same* present-KV tensor
+        as the main attention (indexer columns appended after the main key
+        columns), so the key head_dim varies per layer -- "full" indexer
+        layers add ``index_head_dim`` extra columns, "shared" layers don't
+        -- unlike the uniform per-layer shape every other registered task
+        assumes. Reads the exact dims off the already-constructed attention
+        modules (rather than recomputing from config) so this can never
+        drift from what ``_pack_present``/``_unpack_past`` actually produce.
+        Consumed by :class:`mobius.tasks._glm_moe_dsa.GlmMoeDsaTask`.
+        """
+        return [
+            (
+                layer.self_attn.main_key_dim
+                + (
+                    layer.self_attn.index_head_dim
+                    if layer.self_attn.indexer_type == "full"
+                    else 0
+                ),
+                layer.self_attn.main_value_dim,
+            )
+            for layer in self.model.layers
+        ]

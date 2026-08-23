@@ -243,7 +243,7 @@ class TestGlmMoeDsaGraphBuild:
     def _build(self, **overrides):
         config = _glm_config(**overrides)
         model = GlmMoeDsaCausalLMModel(config)
-        package = build_from_module(model, config, task="text-generation")
+        package = build_from_module(model, config, task="glm-moe-dsa")
         return config, package["model"]
 
     def test_dsa_path_emits_one_index_share_per_hidden_layer_and_no_attention(self):

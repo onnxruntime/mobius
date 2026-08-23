@@ -52,7 +52,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _SKIP_REASONS: dict[str, str] = {
     "phi4mm": "Multi-modal model, requires special HF setup",
-    "glm_moe_dsa": "DSA uses the native pkg.nxrt::IndexShare op, unavailable in stock ORT",
     # trust_remote_code models: require downloading model files — not suitable for offline tests
     "chatglm": "Requires trust_remote_code=True (not in HF native CONFIG_MAPPING)",
     "qwen": "HF Qwen requires trust_remote_code=True (not in HF native CONFIG_MAPPING)",
@@ -85,6 +84,17 @@ _SKIP_REASONS: dict[str, str] = {
     # Zamba weight-tying references layers.2.shared_transf (the third layer) but
     # the tiny config only has 2 layers — HF tie_weights validation crashes.
     "zamba": "Zamba weight-tying requires num_layers > 2; tiny 2-layer config causes HF tie_weights error",
+    # GLM-5.2's default (config.use_dsa=True) DSA/IndexShare path emits
+    # pkg.nxrt::IndexShare -- a custom onnx-genai-runtime domain with no
+    # stock-ORT registration, so this generic OnnxModelSession-based harness
+    # can never execute it (unlike com.microsoft::QMoE, a real ORT contrib
+    # op). DSA numeric correctness is covered instead by the dedicated
+    # GlmMoeDsaIndexer-vs-transformers parity test in glm_moe_dsa_test.py and
+    # by onnx-genai's native-CPU/CUDA e2e regression
+    # (glm_tiny_qmoe_native_cuda_e2e.rs); the config.use_dsa=False
+    # (--glm-full-attention) dense-MLA fallback has no custom ops and would
+    # be exercised by this harness if the tiny config defaulted to it.
+    "glm_moe_dsa": "DSA/IndexShare emits pkg.nxrt::IndexShare, unsupported by stock ORT",
 }
 
 # Per-model atol overrides for L3 synthetic parity.

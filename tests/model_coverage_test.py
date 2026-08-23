@@ -221,6 +221,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "dbrx": "Large MoE (132B) — no small public checkpoint",
     "deepseek_v3": "Very large MoE (671B) — no small public checkpoint",
     "deepseek_v4": "Very large MoE (284B) — no small public checkpoint",
+    "glm_moe_dsa": "Very large MoE (~1.5T, zai-org/GLM-5.2) — no small public checkpoint",
     "llama4_text": "Very large MoE (109B) — no small public checkpoint",
     "qwen3_5_moe": "Large MoE (22B) — no small public checkpoint",
     # --- Models without test_model_id ---

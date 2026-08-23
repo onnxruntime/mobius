@@ -185,8 +185,6 @@ class CausalLMTask(ModelTask):
             # than they have layers; they report the count via this hook.
             count_fn = getattr(module, "kv_cache_layer_count", None)
             num_cache_layers = count_fn() if callable(count_fn) else config.num_hidden_layers
-            specs_fn = getattr(module, "dynamic_kv_cache_specs", None)
-            cache_specs = specs_fn() if callable(specs_fn) else None
 
             past_key_values = _make_kv_cache_inputs(
                 builder,
@@ -198,7 +196,6 @@ class CausalLMTask(ModelTask):
                 past_seq_len,
                 key_head_dim=kv_key_head_dim,
                 value_head_dim=kv_value_head_dim,
-                cache_specs=cache_specs,
             )
 
         with prefill_prefix_pruning(self._prune_prefill_prefix):
@@ -239,7 +236,6 @@ class CausalLMTask(ModelTask):
                 value_head_dim=kv_value_head_dim,
                 total_seq_len="past_sequence_len + sequence_len",
                 dtype=config.dtype,
-                cache_specs=cache_specs,
             )
 
         if intermediate_hidden_states is not None:
