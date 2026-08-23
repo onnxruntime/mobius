@@ -15,8 +15,8 @@ Build an ONNX model from a HuggingFace model ID or local config directory.
 ### Synopsis
 
 ```bash
-mobius build --model MODEL_ID OUTPUT_DIR [options]
-mobius build --config CONFIG_PATH OUTPUT_DIR [options]
+mobius build --model MODEL_ID --output OUTPUT_DIR [options]
+mobius build --config CONFIG_PATH --output OUTPUT_DIR [options]
 ```
 
 The model task is auto-detected from the model type. For example, Whisper
@@ -24,11 +24,11 @@ models automatically use `speech-to-text`, standard LLMs use
 `text-generation`, and diffusers pipelines are detected and built as
 multi-component packages.
 
-### Arguments
+### Output Option
 
-| Argument | Description |
-|----------|-------------|
-| `OUTPUT_DIR` | Output directory for the ONNX model files. Created if it doesn't exist. |
+| Option | Description |
+|--------|-------------|
+| `--output OUTPUT_DIR`, `-o OUTPUT_DIR` | Required output directory for the ONNX model files. Created if it doesn't exist. |
 
 ### Source Options (mutually exclusive)
 
@@ -70,25 +70,25 @@ capabilities.
 
 ```bash
 # Default (portable ONNX with standard fusions as model local functions)
-mobius build --model meta-llama/Llama-3.2-1B output/
+mobius build --model meta-llama/Llama-3.2-1B --output output/
 
 # CPU (GQA fusion for f32)
-mobius build --model meta-llama/Llama-3.2-1B output/ --ep cpu
+mobius build --model meta-llama/Llama-3.2-1B --output output/ --ep cpu
 
 # CUDA GPU (GQA, SkipNorm, PackQKV fusions for f16/bf16)
-mobius build --model meta-llama/Llama-3.2-1B output/ --ep cuda --dtype f16
+mobius build --model meta-llama/Llama-3.2-1B --output output/ --ep cuda --dtype f16
 
 # DirectML (GQA without fused RoPE)
-mobius build --model meta-llama/Llama-3.2-1B output/ --ep dml --dtype f16
+mobius build --model meta-llama/Llama-3.2-1B --output output/ --ep dml --dtype f16
 
 # TensorRT-RTX (GQA, no SkipLayerNorm)
-mobius build --model meta-llama/Llama-3.2-1B output/ --ep trt-rtx --dtype f16
+mobius build --model meta-llama/Llama-3.2-1B --output output/ --ep trt-rtx --dtype f16
 
 # WebGPU
-mobius build --model meta-llama/Llama-3.2-1B output/ --ep webgpu --dtype f16
+mobius build --model meta-llama/Llama-3.2-1B --output output/ --ep webgpu --dtype f16
 
 # Strict ONNX standard (zero custom ops)
-mobius build --model meta-llama/Llama-3.2-1B output/ --ep onnx-standard
+mobius build --model meta-llama/Llama-3.2-1B --output output/ --ep onnx-standard
 ```
 
 ### Optimization Rules (`--optimize`)
@@ -119,14 +119,14 @@ optimization.
 
 ```bash
 # Apply specific rules
-mobius build --model meta-llama/Llama-3.2-1B output/ \
+mobius build --model meta-llama/Llama-3.2-1B --output output/ \
     --optimize=group_query_attention,skip_norm
 
 # Apply all available rules
-mobius build --model meta-llama/Llama-3.2-1B output/ --optimize
+mobius build --model meta-llama/Llama-3.2-1B --output output/ --optimize
 
 # Combine EP-aware building with additional post-hoc rules
-mobius build --model meta-llama/Llama-3.2-1B output/ \
+mobius build --model meta-llama/Llama-3.2-1B --output output/ \
     --ep cuda --dtype f16 --optimize=bias_gelu
 ```
 
@@ -141,7 +141,7 @@ They can be combined when you need both EP-aware construction and additional
 post-hoc rules:
 
 ```bash
-mobius build --model meta-llama/Llama-3.2-1B output/ \
+mobius build --model meta-llama/Llama-3.2-1B --output output/ \
     --ep cuda --dtype f16 --optimize=bias_gelu
 ```
 
@@ -164,7 +164,7 @@ tokenizer files to the output directory:
 #### Example
 
 ```bash
-mobius build --model Qwen/Qwen2.5-0.5B output/ \
+mobius build --model Qwen/Qwen2.5-0.5B --output output/ \
     --ep cuda --dtype f16 --runtime ort-genai
 ```
 
@@ -192,13 +192,13 @@ The legacy boolean flags `--static-cache`, `--fp8-kv-cache`, and
 `--text-only` have been removed in favor of `--features`.
 
 ```bash
-mobius build --model meta-llama/Llama-3.2-1B output/ \
+mobius build --model meta-llama/Llama-3.2-1B --output output/ \
     --features static-cache --max-seq-len 2048
 
-mobius build --model Qwen/Qwen2.5-0.5B output/ \
+mobius build --model Qwen/Qwen2.5-0.5B --output output/ \
     --ep cuda --dtype f16 --features fp8-kv-cache
 
-mobius build --model meta-llama/Llama-3.2-1B output/ \
+mobius build --model meta-llama/Llama-3.2-1B --output output/ \
     --features prune-prefill-prefix
 ```
 
@@ -223,10 +223,11 @@ Cannot be combined with `--task`.
 #### Example
 
 ```bash
-mobius build --model meta-llama/Llama-3.2-1B output/ --features static-cache
+mobius build --model meta-llama/Llama-3.2-1B --output output/ \
+    --features static-cache
 
 # With explicit max sequence length
-mobius build --model meta-llama/Llama-3.2-1B output/ \
+mobius build --model meta-llama/Llama-3.2-1B --output output/ \
     --features static-cache --max-seq-len 2048
 ```
 
@@ -248,7 +249,7 @@ it off when the build-time provenance would help inspect or debug the graph.
 
 ```bash
 # Release export from a HuggingFace model
-mobius build --model meta-llama/Llama-3.2-1B output/ --release
+mobius build --model meta-llama/Llama-3.2-1B --output output/ --release
 
 # Release export from GGUF
 mobius build-gguf model.gguf --output output/ --release
@@ -273,7 +274,8 @@ mobius build-gguf model.gguf --output output/ --release
 
 ```bash
 # Export gemma-4-12B's text backbone as a GQA decoder-only LLM
-mobius build --model google/gemma-4-12B output/ --features text-only --ep cuda --dtype f16
+mobius build --model google/gemma-4-12B --output output/ \
+    --features text-only --ep cuda --dtype f16
 ```
 
 For a full ORT-GenAI text-only package (with `genai_config.json`), use
@@ -284,31 +286,34 @@ For a full ORT-GenAI text-only package (with `genai_config.json`), use
 
 ```bash
 # Build from a HuggingFace model ID
-mobius build --model Qwen/Qwen2.5-0.5B output_dir/
+mobius build --model Qwen/Qwen2.5-0.5B --output output_dir/
 
 # Build without weights (graph skeleton only)
-mobius build --model meta-llama/Llama-3.2-1B output_dir/ --no-weights
+mobius build --model meta-llama/Llama-3.2-1B --output output_dir/ --no-weights
 
 # Build from a local config directory
-mobius build --config /path/to/model/ output_dir/
+mobius build --config /path/to/model/ --output output_dir/
 
 # Export with safetensors external data
-mobius build --model Qwen/Qwen2.5-0.5B output_dir/ --external-data safetensors
+mobius build --model Qwen/Qwen2.5-0.5B --output output_dir/ \
+    --external-data safetensors
 
 # Build encoder-decoder model (produces encoder.onnx + decoder.onnx)
-mobius build --model openai/whisper-tiny output_dir/
+mobius build --model openai/whisper-tiny --output output_dir/
 
 # Build a diffusers pipeline (auto-detected)
-mobius build --model Qwen/Qwen-Image-2512 output_dir/
+mobius build --model Qwen/Qwen-Image-2512 --output output_dir/
 
 # Build only the VAE decoder from a diffusers pipeline
-mobius build --model Qwen/Qwen-Image-2512 output_dir/ --component vae_decoder
+mobius build --model Qwen/Qwen-Image-2512 --output output_dir/ \
+    --component vae_decoder
 
 # Override task explicitly
-mobius build --model google/gemma-3-4b-pt output_dir/ --task vision-language
+mobius build --model google/gemma-3-4b-pt --output output_dir/ \
+    --task vision-language
 
 # Build for ORT GenAI runtime
-mobius build --model Qwen/Qwen2.5-0.5B output_dir/ \
+mobius build --model Qwen/Qwen2.5-0.5B --output output_dir/ \
     --ep cuda --dtype f16 --runtime ort-genai
 ```
 
@@ -326,7 +331,7 @@ dequantize/requantize for multimodal and mixed source qtypes.
 ### Synopsis
 
 ```bash
-mobius build-gguf GGUF_PATH OUTPUT_DIR [options]
+mobius build-gguf GGUF_PATH --output OUTPUT_DIR [options]
 ```
 
 ### Arguments
@@ -334,12 +339,12 @@ mobius build-gguf GGUF_PATH OUTPUT_DIR [options]
 | Argument | Description |
 |----------|-------------|
 | `GGUF_PATH` | Path to a `.gguf` model file. |
-| `OUTPUT_DIR` | Output directory for the ONNX model. |
 
 ### Options
 
 | Option | Description |
 |--------|-------------|
+| `--output OUTPUT_DIR`, `-o OUTPUT_DIR` | Required output directory for the ONNX model. |
 | `--max-shard-size SIZE` | Maximum external-data shard size (e.g. `5GB`). |
 | `--dequantize` | Explicitly dequantize all GGUF weights to float. |
 | `--dtype DTYPE` | Target dtype for model weights: `f16`, `bf16`, `f32`. |
@@ -354,13 +359,13 @@ mobius build-gguf GGUF_PATH OUTPUT_DIR [options]
 
 ```bash
 # Basic GGUF conversion (preserves supported quantization)
-mobius build-gguf model.gguf output/
+mobius build-gguf model.gguf --output output/
 
 # Explicitly dequantize all weights
-mobius build-gguf model.gguf output-float/ --dequantize
+mobius build-gguf model.gguf --output output-float/ --dequantize
 
 # Convert with specific dtype
-mobius build-gguf model.gguf output/ --dtype f16
+mobius build-gguf model.gguf --output output/ --dtype f16
 ```
 
 F32-, F16-, and BF16-only files build normally as float models because they

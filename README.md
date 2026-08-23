@@ -104,16 +104,16 @@ See the [EP quickstart](docs/ep_quickstart.md) and
 ### CLI
 
 ```sh
-mobius build --model Qwen/Qwen2.5-0.5B output_dir/
+mobius build --model Qwen/Qwen2.5-0.5B --output output_dir/
 
 # Build for CUDA with f16
-mobius build --model meta-llama/Llama-3.2-1B output_dir/ --ep cuda --dtype f16
+mobius build --model meta-llama/Llama-3.2-1B --output output_dir/ --ep cuda --dtype f16
 
 # Build a diffusers pipeline (all components)
-mobius build --model Qwen/Qwen-Image-2512 output_dir/
+mobius build --model Qwen/Qwen-Image-2512 --output output_dir/
 
 # Build encoder-decoder model (produces encoder/model.onnx + decoder/model.onnx)
-mobius build --model openai/whisper-tiny output_dir/
+mobius build --model openai/whisper-tiny --output output_dir/
 ```
 
 Build-mode toggles use the cargo-style `--features` option. Available features
@@ -121,7 +121,7 @@ are `static-cache`, `fp8-kv-cache`, `prune-prefill-prefix`, and `text-only`. Pas
 as a comma-separated list or repeat the option:
 
 ```sh
-mobius build --model meta-llama/Llama-3.2-1B output_dir/ \
+mobius build --model meta-llama/Llama-3.2-1B --output output_dir/ \
       --features static-cache,prune-prefill-prefix --max-seq-len 2048
 ```
 
@@ -130,7 +130,7 @@ by stripping build-time debug and provenance metadata. Functional `mobius.*`
 metadata is preserved:
 
 ```sh
-mobius build --model meta-llama/Llama-3.2-1B output_dir/ --release
+mobius build --model meta-llama/Llama-3.2-1B --output output_dir/ --release
 mobius build-gguf model.gguf --output output_dir/ --release
 ```
 

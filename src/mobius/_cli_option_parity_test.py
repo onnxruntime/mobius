@@ -14,39 +14,86 @@ import pytest
 
 from mobius.__main__ import build_parser
 
-_MINIMAL = {
-    "build": ["--model", "some/model", "out_dir"],
-    "build-gguf": ["some.gguf", "out_dir"],
+_SOURCE_ARGS = {
+    "build": ["--model", "some/model"],
+    "build-gguf": ["some.gguf"],
 }
 
 
-class TestOutputDirIsPositionalEverywhere:
-    """Both commands take the output directory the same way.
-
-    ``build-gguf`` used to take ``--output/-o`` with a default derived from the
-    GGUF filename, so the same concept was positional-and-required on one command
-    and optional-with-a-default on the other.
-    """
+class TestOutputDirForms:
+    """Both build commands expose one canonical output option."""
 
     @pytest.mark.parametrize("command", ["build", "build-gguf"])
-    def test_output_dir_is_a_required_positional(self, command):
-        args = build_parser().parse_args([command, *_MINIMAL[command]])
+    @pytest.mark.parametrize("flag", ["--output", "-o"])
+    def test_output_option_is_accepted(self, command, flag):
+        args = build_parser().parse_args([command, *_SOURCE_ARGS[command], flag, "out_dir"])
         assert args.output_dir == "out_dir"
 
-        with pytest.raises(SystemExit):
-            # Dropping the trailing output_dir must be an error, not a default.
-            build_parser().parse_args([command, *_MINIMAL[command][:-1]])
+    @pytest.mark.parametrize("command", ["build", "build-gguf"])
+    def test_legacy_positional_is_still_accepted(self, command):
+        args = build_parser().parse_args([command, *_SOURCE_ARGS[command], "out_dir"])
+        assert args.output_dir == "out_dir"
 
-    def test_gguf_no_longer_accepts_the_output_flag(self):
-        """The old spelling is gone rather than silently kept as an alias.
+    @pytest.mark.parametrize("command", ["build", "build-gguf"])
+    def test_missing_output_is_rejected(self, command):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args([command, *_SOURCE_ARGS[command]])
 
-        Left in place it would be a second way to say the same thing, and the two
-        would drift.
-        """
+    @pytest.mark.parametrize("command", ["build", "build-gguf"])
+    @pytest.mark.parametrize("positional", ["out_dir", "different_out_dir"])
+    def test_option_and_positional_together_are_rejected(self, command, positional):
         with pytest.raises(SystemExit):
-            build_parser().parse_args(["build-gguf", "some.gguf", "-o", "out_dir"])
+            build_parser().parse_args(
+                [
+                    command,
+                    *_SOURCE_ARGS[command],
+                    positional,
+                    "--output",
+                    "out_dir",
+                ]
+            )
+
+    @pytest.mark.parametrize("command", ["build", "build-gguf"])
+    @pytest.mark.parametrize("second_flag", ["--output", "-o"])
+    def test_repeated_output_option_is_rejected(self, command, second_flag):
         with pytest.raises(SystemExit):
-            build_parser().parse_args(["build-gguf", "some.gguf", "--output", "out_dir"])
+            build_parser().parse_args(
+                [
+                    command,
+                    *_SOURCE_ARGS[command],
+                    "--output",
+                    "out_dir",
+                    second_flag,
+                    "other_dir",
+                ]
+            )
+
+    @pytest.mark.parametrize(
+        ("command", "handler_name"),
+        [("build", "_cmd_build"), ("build-gguf", "_cmd_build_gguf")],
+    )
+    def test_cli_dispatch_receives_normalized_output(self, monkeypatch, command, handler_name):
+        from mobius import __main__ as cli
+
+        received = []
+        monkeypatch.setattr(
+            cli,
+            handler_name,
+            lambda args: received.append(args.output_dir),
+        )
+
+        cli.main([command, *_SOURCE_ARGS[command], "--output", "out_dir"])
+
+        assert received == ["out_dir"]
+
+    @pytest.mark.parametrize("command", ["build", "build-gguf"])
+    def test_help_advertises_only_output_option(self, command, capsys):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args([command, "--help"])
+        help_text = capsys.readouterr().out
+        assert "--output OUTPUT_DIR" in help_text
+        assert "legacy positional" not in help_text
+        assert "[_legacy_output_dir]" not in help_text
 
 
 class TestKeepQuantizedRemoved:
@@ -58,14 +105,18 @@ class TestKeepQuantizedRemoved:
         occupying the mutually exclusive group.
         """
         with pytest.raises(SystemExit):
-            build_parser().parse_args(["build-gguf", "some.gguf", "out", "--keep-quantized"])
+            build_parser().parse_args(
+                ["build-gguf", "some.gguf", "--output", "out", "--keep-quantized"]
+            )
 
     def test_dequantize_still_works(self):
         """Removing the dead alias must not disturb the flag that does the work."""
-        args = build_parser().parse_args(["build-gguf", "some.gguf", "out", "--dequantize"])
+        args = build_parser().parse_args(
+            ["build-gguf", "some.gguf", "--output", "out", "--dequantize"]
+        )
         assert args.dequantize is True
 
-        default = build_parser().parse_args(["build-gguf", "some.gguf", "out"])
+        default = build_parser().parse_args(["build-gguf", "some.gguf", "--output", "out"])
         assert default.dequantize is False
 
 
@@ -83,7 +134,16 @@ class TestSharedSaveOptions:
         ],
     )
     def test_option_is_accepted_by_both(self, command, flag, value, dest):
-        args = build_parser().parse_args([command, *_MINIMAL[command], flag, value])
+        args = build_parser().parse_args(
+            [
+                command,
+                *_SOURCE_ARGS[command],
+                "--output",
+                "out_dir",
+                flag,
+                value,
+            ]
+        )
         parsed = getattr(args, dest)
         assert str(parsed) == value or parsed == int(value)
 
