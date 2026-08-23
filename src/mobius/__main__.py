@@ -41,6 +41,7 @@ _BUILD_FEATURES: dict[str, str] = {
     "fp8-kv-cache": "fp8_kv_cache",
     "prune-prefill-prefix": "prune_prefill_prefix",
     "text-only": "text_only",
+    "glm-full-attention": "glm_full_attention",
 }
 
 
@@ -342,6 +343,13 @@ def _cmd_build(args: argparse.Namespace) -> None:
         config = _config_from_hf(hf_config, parent_config=parent_config)
         if dtype_override is not None:
             config = dataclasses.replace(config, dtype=dtype_override)
+        if args.glm_full_attention:
+            if model_type != "glm_moe_dsa":
+                raise SystemExit(
+                    "Error: --features glm-full-attention is only supported for "
+                    f"model_type 'glm_moe_dsa' (got '{model_type}')."
+                )
+            config = dataclasses.replace(config, use_dsa=False)
         if static_cache_params is not None:
             task = _resolve_static_cache_task(model_type)
         elif task is None:
@@ -389,6 +397,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             fp8_kv_cache=fp8_kv_cache,
             kv_cache_scales=kv_cache_scales,
             prune_prefill_prefix=prune_prefill_prefix,
+            glm_full_attention=args.glm_full_attention,
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)
