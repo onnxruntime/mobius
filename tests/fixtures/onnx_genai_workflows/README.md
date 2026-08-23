@@ -31,5 +31,9 @@ conditional/unconditional frozen state groups, classifier-free guidance, x0
 prediction, and the flow update `v = (x0 - z) / max(1 - t, t_eps)`. The graphs
 are tiny and deterministic; ordinary CI never downloads production weights.
 
-SHA-256 of `shared_state_pixel_flow/inference_metadata.yaml`:
-`9dd15af58703f0ef163abb17f7008e92f58b3c7a4071784b1b8e53c05b411abd`.
+Only `request.prompt_tokens` and `request.negative_prompt_tokens` are
+externally required. The reference image and the initial latent are both
+optional and presence-gated: with no image the package takes its text or
+text-to-image path, and with no latent it draws its own from the generic
+`seed`/`width`/`height` request roles. A caller therefore never has to attach
+an input for a branch it does not take.

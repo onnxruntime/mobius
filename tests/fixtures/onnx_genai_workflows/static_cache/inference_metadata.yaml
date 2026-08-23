@@ -52,7 +52,7 @@ pipeline:
           kind: opaque
         source:
           kind: literal
-        required: true
+        required: false
         default: 127
       package.one_token:
         contract:

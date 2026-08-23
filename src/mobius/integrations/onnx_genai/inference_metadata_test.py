@@ -33,9 +33,11 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     build_diffusion_pipeline_metadata,
     build_multimodal_pipeline_metadata,
     build_native_vlm_package_metadata,
+    declare_input_admission,
     is_native_vlm_package,
     load_diffusers_scheduler_config,
     load_diffusers_vae_scaling_factor,
+    published_value_references,
     validate_executable_closure,
     write_diffusion_pipeline_metadata,
     write_mtp_speculator_metadata,
@@ -1967,3 +1969,199 @@ class TestMtpSpeculatorMetadata:
             schema = json.load(handle)
         meta = self._write(tmp_path)
         jsonschema.validate(instance=meta, schema=schema)
+
+
+class TestInputAdmissionIsDerivedNotDefaulted:
+    """A package states what a caller must attach; a reader never guesses it.
+
+    ``required`` decides admission: an input a runtime believes is required and
+    the caller did not attach rejects the request on *every* path, before any
+    component runs. A consumer that reads a declaration with no ``required``
+    key has to pick a default, and the one the schema picks is ``true`` -- the
+    opposite of what omission means to a producer whose workflow computes,
+    defaults, or presence-gates the value. These tests pin the derivation so a
+    branch input can never again be published as a universal obligation.
+    """
+
+    @staticmethod
+    def _workflow(**inputs):
+        return {
+            "inputs": inputs,
+            "steps": [
+                {
+                    "kind": "branch",
+                    "predicate": "request.thing_present",
+                    "cases": {
+                        "true": {
+                            "kind": "invoke",
+                            "component": "use",
+                            "inputs": {"tensor": "request.thing"},
+                            "outputs": {"out": "used"},
+                        },
+                        "false": {
+                            "kind": "invoke",
+                            "component": "make",
+                            "inputs": {"seed": "request.seed"},
+                            "outputs": {"out": "made"},
+                        },
+                    },
+                    "outputs": {"value": {"cases": {"true": "used", "false": "made"}}},
+                },
+                {
+                    "kind": "invoke",
+                    "component": "head",
+                    "inputs": {"value": "value", "prompt": "request.prompt"},
+                    "outputs": {"out": "result"},
+                },
+                {"kind": "emit", "value": "result", "output": "result", "mode": "replace"},
+            ],
+        }
+
+    def test_a_presence_gated_branch_input_is_not_a_universal_obligation(self):
+        """The failure this whole invariant exists for.
+
+        ``request.thing`` is read by exactly one branch case, and the other case
+        builds the value instead. A caller on the generating path has nothing to
+        attach, so admitting against it rejects a request the workflow can serve.
+        """
+        workflow = self._workflow(
+            **{
+                "request.prompt": {"source": {"kind": "request"}},
+                "request.seed": {"source": {"kind": "request"}, "default": 0},
+                "request.thing": {
+                    "source": {"kind": "application", "name": "thing"},
+                    "present_as": "request.thing_present",
+                },
+            }
+        )
+        declare_input_admission(workflow)
+        assert workflow["inputs"]["request.thing"]["required"] is False
+        assert workflow["inputs"]["request.seed"]["required"] is False
+        assert workflow["inputs"]["request.prompt"]["required"] is True
+
+    def test_every_declaration_publishes_admission_rather_than_implying_it(self):
+        workflow = self._workflow(
+            **{
+                "request.prompt": {"source": {"kind": "request"}},
+                "request.seed": {"source": {"kind": "literal"}, "default": 0},
+                "request.thing": {
+                    "source": {"kind": "application", "name": "thing"},
+                    "present_as": "request.thing_present",
+                },
+            }
+        )
+        declare_input_admission(workflow)
+        assert all("required" in declaration for declaration in workflow["inputs"].values())
+
+    def test_a_package_supplied_source_is_never_a_caller_obligation(self):
+        workflow = self._workflow(
+            **{
+                "request.prompt": {"source": {"kind": "request"}},
+                "request.seed": {"source": {"kind": "literal"}},
+                "request.thing": {
+                    "source": {"kind": "application", "name": "thing"},
+                    "present_as": "request.thing_present",
+                },
+            }
+        )
+        declare_input_admission(workflow)
+        assert workflow["inputs"]["request.seed"]["required"] is False
+
+    def test_declaring_both_an_escape_and_an_obligation_fails_closed(self):
+        workflow = self._workflow(
+            **{
+                "request.prompt": {"source": {"kind": "request"}},
+                "request.seed": {"source": {"kind": "request"}, "default": 0},
+                "request.thing": {
+                    "source": {"kind": "application", "name": "thing"},
+                    "present_as": "request.thing_present",
+                    "required": True,
+                },
+            }
+        )
+        with pytest.raises(ValueError, match="already proceeds without it"):
+            declare_input_admission(workflow)
+
+    def test_relaxing_an_obligation_without_a_way_to_proceed_fails_closed(self):
+        """The tempting non-fix -- flip ``required`` -- is refused at the source.
+
+        Admission is the only place a missing value is reported cleanly. An
+        input marked optional that the workflow has no default, package source
+        or presence gate for does not become optional; the request is admitted
+        and then reads an unbound value part-way through, which is a worse
+        failure than the rejection it replaced.
+        """
+        workflow = self._workflow(
+            **{
+                "request.prompt": {"source": {"kind": "request"}},
+                "request.thing": {
+                    "source": {"kind": "application", "name": "thing"},
+                    "required": False,
+                },
+            }
+        )
+        with pytest.raises(ValueError, match="no defined behaviour"):
+            declare_input_admission(workflow)
+
+    def test_a_presence_gate_no_step_reads_does_not_make_absence_executable(self):
+        workflow = self._workflow(
+            **{
+                "request.prompt": {"source": {"kind": "request"}},
+                "request.seed": {"source": {"kind": "request"}, "default": 0},
+                "request.thing": {
+                    "source": {"kind": "application", "name": "thing"},
+                    "present_as": "request.thing_supplied",
+                },
+            }
+        )
+        with pytest.raises(ValueError, match="no step reads"):
+            declare_input_admission(workflow)
+
+    def test_derivation_reads_every_nested_position_a_value_can_occupy(self):
+        workflow = {
+            "inputs": {},
+            "state": {"cell": {"initializer": "package.zero"}},
+            "serving": {
+                "active": "package.active",
+                "state_service": {"groups": {"g": {"ports": {"c": {"past": "past"}}}}},
+            },
+            "steps": [
+                {
+                    "kind": "loop",
+                    "setup": [
+                        {
+                            "kind": "invoke",
+                            "component": "c",
+                            "inputs": {"a": "setup.value"},
+                            "outputs": {"b": "seeded"},
+                        }
+                    ],
+                    "steps": [
+                        {
+                            "kind": "emit",
+                            "value": "row",
+                            "output": "tokens",
+                            "mode": "append",
+                            "when": "package.active",
+                            "valid_length": "row.length",
+                        }
+                    ],
+                    "continue_when": "loop_active",
+                    "max_iterations": "request.max_iterations",
+                    "carried": [
+                        {"cell": "cell", "next": "cell.next", "initial": "cell.first"}
+                    ],
+                }
+            ],
+        }
+        assert published_value_references(workflow) == {
+            "setup.value",
+            "row",
+            "package.active",
+            "row.length",
+            "loop_active",
+            "request.max_iterations",
+            "cell.next",
+            "cell.first",
+            "package.zero",
+        }

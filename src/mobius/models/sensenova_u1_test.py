@@ -620,6 +620,97 @@ class TestInferenceMetadataStatus:
         ):
             assert forbidden not in serialized
 
+    def test_the_only_required_inputs_are_the_two_prompt_attachments(self):
+        """Neither generation path may oblige a caller to attach a branch input.
+
+        This package serves three paths from one workflow -- text understanding,
+        text-to-image, and reference-image editing -- and each one leaves some
+        declared input unread. Admission happens before any of them is chosen,
+        so an input a branch needs and the others do not must be presence-gated
+        or defaulted; the runtime otherwise rejects every request that omits it,
+        including the ones whose path never looks at it.
+
+        The initial latent is the case that matters most: it is *derived* from
+        the generic ``seed``/``width``/``height`` roles when the caller sends
+        none, and a caller-supplied value is an override of that derivation, not
+        a precondition for it.
+        """
+        from mobius.integrations.onnx_genai.inference_metadata import (
+            published_value_references,
+        )
+        from mobius.integrations.onnx_genai.shared_state_flow_metadata import (
+            build_shared_state_pixel_flow_workflow_metadata,
+        )
+
+        config, _, package = _build()
+        workflow = build_shared_state_pixel_flow_workflow_metadata(
+            package, config, num_inference_steps=2
+        )["pipeline"]["workflow"]
+        inputs = workflow["inputs"]
+
+        assert {name for name, declaration in inputs.items() if declaration["required"]} == {
+            "request.prompt_tokens",
+            "request.negative_prompt_tokens",
+        }
+        # Nothing is required by omission: a reader never has to supply the
+        # polarity of a missing key.
+        assert all("required" in declaration for declaration in inputs.values())
+
+        # The latent and the reference image are the two presence-gated
+        # attachments, and both gates are real: a step branches on each.
+        references = published_value_references(workflow)
+        gated = {
+            name: declaration["present_as"]
+            for name, declaration in inputs.items()
+            if "present_as" in declaration
+        }
+        assert gated == {
+            "request.latent": "request.latent_present",
+            "request.image": "request.image_present",
+        }
+        assert set(gated.values()) <= references
+
+        # Every optional input is optional for a stated reason, so no path is
+        # left needing a value the package cannot produce.
+        for name, declaration in inputs.items():
+            if declaration["required"]:
+                continue
+            assert (
+                "default" in declaration
+                or "present_as" in declaration
+                or declaration["source"]["kind"] == "literal"
+            ), f"{name} is optional but the workflow has no way to proceed without it"
+
+    def test_each_pixel_flow_path_is_admissible_from_its_own_attachments(self):
+        """Text, text-to-image and reference-image edit, through one admission.
+
+        Admission is exactly "every required input has a value", so the three
+        modes are checked the way a runtime checks them: from the attachments a
+        caller of that mode sends, and nothing else.
+        """
+        from mobius.integrations.onnx_genai.shared_state_flow_metadata import (
+            build_shared_state_pixel_flow_workflow_metadata,
+        )
+
+        config, _, package = _build()
+        inputs = build_shared_state_pixel_flow_workflow_metadata(
+            package, config, num_inference_steps=2
+        )["pipeline"]["workflow"]["inputs"]
+
+        def unsatisfied(attached: set[str]) -> set[str]:
+            return {
+                name
+                for name, declaration in inputs.items()
+                if declaration["required"] and name not in attached
+            }
+
+        prompts = {"request.prompt_tokens", "request.negative_prompt_tokens"}
+        assert unsatisfied(prompts | {"request.text_only"}) == set()
+        assert unsatisfied(prompts) == set()
+        assert unsatisfied(prompts | {"request.image", "request.image_mask"}) == set()
+        # The override path stays admissible too -- optional does not mean unusable.
+        assert unsatisfied(prompts | {"request.latent"}) == set()
+
     def test_auto_export_writes_exact_synthesized_processor_asset(self, tmp_path):
         import json
 

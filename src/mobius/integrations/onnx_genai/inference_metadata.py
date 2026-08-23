@@ -1510,6 +1510,7 @@ def add_policy_components_to_workflow(
                 declaration["application_overridable"] = True
         components[name] = declaration
     declare_request_alignment(workflow)
+    declare_input_admission(workflow)
     return metadata
 
 
@@ -1551,6 +1552,139 @@ def declare_request_alignment(workflow: dict[str, Any]) -> None:
         if isinstance(declaration, dict) and declaration.get("service_group"):
             declaration.setdefault("management", "runtime")
             declaration.setdefault("release_boundary", declaration.get("scope", "invocation"))
+
+
+def published_value_references(workflow: dict[str, Any]) -> set[str]:
+    """Every value name the published program reads, on any path.
+
+    Reachability here is deliberately path-insensitive: it answers "does this
+    workflow ever look at this value", which is what an admission decision
+    needs. Whether a particular request reaches the branch that reads it is a
+    runtime fact, and a package that guessed at it would be describing one
+    caller rather than its own contract.
+    """
+    references: set[str] = set()
+
+    def note(value: Any) -> None:
+        if isinstance(value, str):
+            references.add(value)
+        elif isinstance(value, dict):
+            for item in value.values():
+                note(item)
+        elif isinstance(value, list):
+            for item in value:
+                note(item)
+
+    def visit(step: Any) -> None:
+        if isinstance(step, list):
+            for item in step:
+                visit(item)
+            return
+        if not isinstance(step, dict):
+            return
+        kind = step.get("kind")
+        if kind == "invoke":
+            note(step.get("inputs"))
+        elif kind == "emit":
+            note(step.get("value"))
+            note(step.get("valid_length"))
+            note(step.get("when"))
+        elif kind == "branch":
+            note(step.get("predicate"))
+            note(step.get("outputs"))
+            for case in (step.get("cases") or {}).values():
+                visit(case)
+            visit(step.get("default"))
+        elif kind == "loop":
+            note(step.get("continue_when"))
+            note(step.get("max_iterations"))
+            for carry in step.get("carried") or []:
+                note(carry.get("next"))
+                note(carry.get("initial"))
+        for key in ("steps", "setup", "nodes"):
+            visit(step.get(key))
+
+    visit(workflow.get("steps") or [])
+    for declaration in (workflow.get("state") or {}).values():
+        if isinstance(declaration, dict):
+            note(declaration.get("initializer"))
+    # The serving block names the workflow values a runtime reads to drive
+    # batching -- the active/done row masks and the accepted length. Its
+    # ``state_service`` sibling names ports rather than values, so it is not a
+    # reference set.
+    serving = workflow.get("serving") or {}
+    for key, value in serving.items():
+        if key != "state_service":
+            note(value)
+    return references
+
+
+def declare_input_admission(workflow: dict[str, Any]) -> None:
+    """Publish every package input's admission requirement instead of implying it.
+
+    ``required`` is what a runtime admits a request against: an input it holds
+    required and the caller did not attach is a rejected request, on every path,
+    before a single component runs. A consumer cannot see what an *absent*
+    ``required`` key was meant to say, so it has to choose a default, and the
+    choice it makes is the opposite of what omission means to a producer -- a
+    value the workflow computes for itself, defaults for itself, or explicitly
+    branches on the absence of, silently becomes a mandatory caller attachment.
+
+    So the flag is derived from the published program rather than left to a
+    reader, and stamped on every declaration:
+
+    * a declaration the package can satisfy on its own -- it carries a
+      ``default``, or the package rather than the caller is its ``source`` -- is
+      not something a caller can be required to send;
+    * a declaration whose absence the program *observes*, through a
+      ``present_as`` symbol the steps actually branch on, is by construction
+      executable without it;
+    * anything else is genuinely externally required, and says so out loud.
+
+    A builder that declares both an escape and ``required: True`` has written
+    two contradictory contracts, and there is no reading of the package that
+    satisfies both, so this fails closed rather than picking one. The mirror
+    case fails closed for the same reason: an input marked optional that the
+    package has no way to proceed without is not optional, it is a request that
+    is admitted and then fails part-way through on an unbound value, which is
+    strictly worse than the rejection it replaced.
+    """
+    inputs = workflow.get("inputs") or {}
+    if not inputs:
+        return
+    references = published_value_references(workflow)
+    for name, declaration in inputs.items():
+        if not isinstance(declaration, dict):
+            continue
+        escapes = []
+        if "default" in declaration:
+            escapes.append("a default")
+        if (declaration.get("source") or {}).get("kind") == "literal":
+            escapes.append("a package-supplied source")
+        present_as = declaration.get("present_as")
+        if present_as is not None:
+            if present_as not in references:
+                raise ValueError(
+                    f"workflow input {name!r} declares the presence symbol "
+                    f"{present_as!r} that no step reads, so the workflow never "
+                    "handles the input being absent"
+                )
+            escapes.append(f"the presence gate {present_as!r}")
+        if not escapes:
+            if declaration.get("required", True) is False:
+                raise ValueError(
+                    f"workflow input {name!r} is declared optional but the workflow "
+                    "carries no default, no package-supplied source and no presence "
+                    "gate for it, so a request that omits it has no defined behaviour"
+                )
+            declaration["required"] = True
+            continue
+        if declaration.get("required", False):
+            raise ValueError(
+                f"workflow input {name!r} is declared required but the workflow "
+                f"already proceeds without it through {', '.join(escapes)}"
+            )
+        declaration["required"] = False
 
 
 def add_adapter_service_to_metadata(
@@ -1611,6 +1745,10 @@ def add_adapter_service_to_metadata(
                     else {"kind": "opaque"}
                 ),
                 "source": source or {"kind": "request"},
+                # A selection tensor has no package-side default and no
+                # presence gate: the service reads it for every batch it plans,
+                # so the caller supplies it or the request is not admissible.
+                "required": True,
             }
         if not compatible_input(name, dtype=dtype, shape=shape, role=role):
             raise ValueError(
@@ -1683,6 +1821,7 @@ def add_adapter_service_to_metadata(
         # inside `ensure_input` also covers the declarations a producer wrote
         # by hand before attaching the adapter service.
         declare_request_alignment(workflow)
+        declare_input_admission(workflow)
     return metadata
 
 

@@ -37,6 +37,9 @@ import yaml
 from mobius import registry
 from mobius._configs import ArchitectureConfig
 from mobius._optimizations import optimize_model
+from mobius.integrations.onnx_genai.inference_metadata import (
+    published_value_references,
+)
 from mobius.integrations.onnx_genai.workflow_metadata import (
     build_decoder_workflow_metadata,
     build_vlm_workflow_metadata,
@@ -945,3 +948,53 @@ class TestCheckedInPackagesShareTheShape:
                 f"{name} is handed a fixed-capacity write cursor but declares no "
                 "sequence role, so no decode ABI can be resolved for it"
             )
+
+    def test_no_input_leaves_its_admission_requirement_to_the_reader(self, directory):
+        """Admission is a fact of the package, not a default the consumer picks.
+
+        A runtime rejects a request that omits an input the package holds
+        required, before any component runs. A declaration with no ``required``
+        key does not say it is optional -- it says nothing, and the schema that
+        reads it fills in ``true``, which is the opposite of what omission means
+        to a producer whose workflow can supply the value itself.
+        """
+        workflow = self._metadata(directory)["pipeline"]["workflow"]
+        for name, declaration in (workflow.get("inputs") or {}).items():
+            assert "required" in declaration, (
+                f"{name} does not publish whether a caller must attach it, so "
+                "every reader has to guess, and the guess rejects requests this "
+                "package can serve"
+            )
+
+    def test_a_required_input_is_one_the_package_cannot_supply_itself(self, directory):
+        """No caller is obliged to attach a value the workflow already has.
+
+        Three declarations mean "this runs without the caller": a ``default``, a
+        package-owned ``literal`` source, and a ``present_as`` symbol the steps
+        branch on. Any of them alongside ``required: true`` is two contracts
+        that cannot both hold, and the runtime honours the one that turns an
+        optional branch input into a universal obligation.
+        """
+        workflow = self._metadata(directory)["pipeline"]["workflow"]
+        references = published_value_references(workflow)
+        for name, declaration in (workflow.get("inputs") or {}).items():
+            present_as = declaration.get("present_as")
+            if present_as is not None:
+                assert present_as in references, (
+                    f"{name} advertises the presence symbol {present_as!r} that no "
+                    "step reads, so the workflow never handles it being absent"
+                )
+            if not declaration.get("required"):
+                assert (
+                    "default" in declaration
+                    or (declaration.get("source") or {}).get("kind") == "literal"
+                    or present_as is not None
+                ), (
+                    f"{name} is published as optional but the package carries no "
+                    "default, no package-supplied source and no presence gate for "
+                    "it, so omitting it has no defined behaviour"
+                )
+                continue
+            assert "default" not in declaration
+            assert (declaration.get("source") or {}).get("kind") != "literal"
+            assert present_as is None
