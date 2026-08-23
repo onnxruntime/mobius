@@ -230,6 +230,30 @@ mobius build --model meta-llama/Llama-3.2-1B output/ \
     --features static-cache --max-seq-len 2048
 ```
 
+### Release Builds (`--release`)
+
+```
+--release
+```
+
+Create a smaller saved model by removing build-time debug and provenance
+metadata immediately before serialization. This includes source module paths,
+class hierarchies, name scopes, originating rewrite rules, and
+symbolic-shape-inference internals. Functional metadata whose keys begin with
+`mobius.*` is preserved.
+
+`--release` applies to both `mobius build` and `mobius build-gguf`. It changes
+metadata only, not the graph structure, weights, or inference behavior. Leave
+it off when the build-time provenance would help inspect or debug the graph.
+
+```bash
+# Release export from a HuggingFace model
+mobius build --model meta-llama/Llama-3.2-1B output/ --release
+
+# Release export from GGUF
+mobius build-gguf model.gguf --output output/ --release
+```
+
 ### Other Flags
 
 | Option | Description |
@@ -240,6 +264,7 @@ mobius build --model meta-llama/Llama-3.2-1B output/ \
 | `--no-weights` | Export graph structure only, without weight data. Useful for inspection or testing. |
 | `--external-data FORMAT` | External data format: `onnx` (default) or `safetensors`. |
 | `--max-shard-size SIZE` | Maximum shard size for safetensors external data (e.g. `5GB`). Only used with `--external-data safetensors`. |
+| `--release` | Strip build-time debug and provenance metadata before saving while preserving functional `mobius.*` metadata. |
 | `--trust-remote-code` | Trust remote code when loading the HuggingFace model config. |
 | `--component NAME` | Build only one component from a diffusers pipeline (e.g. `--component vae_decoder`). |
 | `--kv-cache-scale-file PATH` | Optional JSON file of calibrated per-layer FP8 KV-cache scales (onnxruntime-genai format). Only used with the `fp8-kv-cache` feature; without it all layers use a unit scale of 1.0. |
@@ -321,6 +346,7 @@ mobius build-gguf GGUF_PATH OUTPUT_DIR [options]
 | `--external-data FORMAT` | External data format: `onnx` (default) or `safetensors`. |
 | `--ep EP` | Target execution provider for EP-aware optimization. |
 | `--runtime RUNTIME` | `onnx-genai` emits supported runtime metadata. `ort-genai` is rejected until GGUF cache/tokenizer generation coverage exists. |
+| `--release` | Strip build-time debug and provenance metadata before saving while preserving functional `mobius.*` metadata. |
 | `--static-cache` | Build a fixed-width cache where supported. |
 | `--max-seq-len N` | Set the fixed cache length; requires `--static-cache`. |
 

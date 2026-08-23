@@ -125,6 +125,15 @@ mobius build --model meta-llama/Llama-3.2-1B output_dir/ \
       --features static-cache,prune-prefill-prefix --max-seq-len 2048
 ```
 
+Use `--release` with either `build` or `build-gguf` to reduce saved model size
+by stripping build-time debug and provenance metadata. Functional `mobius.*`
+metadata is preserved:
+
+```sh
+mobius build --model meta-llama/Llama-3.2-1B output_dir/ --release
+mobius build-gguf model.gguf --output output_dir/ --release
+```
+
 See the [CLI Reference](https://onnxruntime.github.io/mobius/cli_reference.html) for all subcommands and flags.
 
 ### Examples
