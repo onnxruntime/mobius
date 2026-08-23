@@ -1599,6 +1599,7 @@ class TestMistral3VL3Model:
 _ENCODER_MODELS = [
     pytest.param("google-bert/bert-base-uncased", False, id="bert-base"),
     pytest.param("distilbert/distilbert-base-uncased", False, id="distilbert-base"),
+    pytest.param("facebook/esm2_t6_8M_UR50D", False, id="esm2-8m"),
     pytest.param(
         "FacebookAI/roberta-base",
         False,
@@ -1616,6 +1617,23 @@ _ENCODER_MODELS = [
         ),
     ),
 ]
+
+# Two inputs of deliberately unequal length, so batching them forces padding.
+# Protein models have an amino-acid vocabulary, so they get real sequences
+# (hemoglobin alpha and a ubiquitin fragment) rather than English.
+_UNEQUAL_LENGTH_PROMPTS = {
+    "protein": [
+        "MVLSPADKTNVKAAWGKVGAHAGEYGAEALERMFLSFPTTKTYFPHFDLSH",
+        "MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLEDGRTLSDYNIQKESTLHLVLRLRGG",
+    ],
+    "text": [
+        "The capital of France is Paris.",
+        (
+            "Encoder models read the whole sequence at once, so padding must not "
+            "change a row's contextual embeddings."
+        ),
+    ],
+}
 
 
 @pytest.mark.integration
@@ -1666,6 +1684,83 @@ class TestEncoderOnlyForward:
             rtol=1e-3,
             atol=1e-3,
         )
+
+    def test_padded_batch_matches_huggingface_and_unpadded_rows(
+        self, model_id: str, trust_remote_code: bool
+    ):
+        """Batch two unequal-length inputs and check every row three ways.
+
+        This is the assertion the attention-mask path lives or dies on. An
+        encoder that hands the raw rank-2 mask to ``op.Attention`` cannot even
+        run at batch > 1 -- the mask fails to broadcast to
+        ``(batch, heads, q, kv)`` -- and were it to run it would add a 0/1 bias
+        where a large negative one is required, so padded positions would leak
+        into every valid residue. Checking each row against both HuggingFace
+        and its own unpadded run separates "the export is wrong" from "the
+        export is right but padding-sensitive".
+        """
+        from mobius._testing.torch_reference import (
+            load_torch_encoder_model,
+            torch_encoder_forward,
+        )
+
+        onnx_model = build(model_id, dtype="f32", load_weights=True)
+        torch_model, tokenizer = load_torch_encoder_model(model_id)
+        prompts = _UNEQUAL_LENGTH_PROMPTS["protein" if "esm" in model_id.lower() else "text"]
+        session = _make_session(onnx_model)
+
+        def feeds_for(texts: list[str]) -> dict[str, np.ndarray]:
+            batch = tokenizer(texts, return_tensors="np", padding=True)
+            feeds: dict[str, np.ndarray] = {
+                "input_ids": batch["input_ids"].astype(np.int64),
+                "attention_mask": batch["attention_mask"].astype(np.int64),
+            }
+            if "token_type_ids" in session.input_names:
+                token_type_ids = batch.get("token_type_ids")
+                feeds["token_type_ids"] = (
+                    np.zeros_like(feeds["input_ids"])
+                    if token_type_ids is None
+                    else token_type_ids.astype(np.int64)
+                )
+            return feeds
+
+        try:
+            batched = feeds_for(prompts)
+            mask = batched["attention_mask"]
+            assert mask.shape[0] == 2
+            assert mask.min() == 0, "prompts must differ in length so the batch pads"
+
+            batched_out = session.run(batched)["last_hidden_state"]
+            torch_hidden = torch_encoder_forward(
+                torch_model,
+                batched["input_ids"],
+                mask,
+                batched.get("token_type_ids"),
+            )
+
+            for row, prompt in enumerate(prompts):
+                length = int(mask[row].sum())
+                got, ref = batched_out[row, :length], torch_hidden[row, :length]
+
+                # Scale-free metrics rather than an elementwise tolerance. A
+                # contextual embedding is used as a direction: what matters is
+                # that the vector matches, not that every one of its small
+                # components survives fp32 cancellation through six layers.
+                rel_l2 = np.linalg.norm(got - ref) / np.linalg.norm(ref)
+                cosine = (got * ref).sum(-1) / (
+                    np.linalg.norm(got, axis=-1) * np.linalg.norm(ref, axis=-1)
+                )
+                assert rel_l2 < 1e-3, f"row {row}: relative L2 error {rel_l2:.2e}"
+                assert cosine.min() > 1 - 1e-5, (
+                    f"row {row}: worst per-token cosine {cosine.min():.8f}"
+                )
+
+                solo = session.run(feeds_for([prompt]))["last_hidden_state"]
+                # Padding is bit-exact, not merely close: a padded position that
+                # reached a valid one would show up here as a real difference.
+                np.testing.assert_array_equal(solo[0, :length], got)
+        finally:
+            session.close()
 
 
 # ---------------------------------------------------------------------------

@@ -13,8 +13,11 @@ __all__ = [
     "build_diffusers_pipeline",
 ]
 
+import dataclasses
 import json
 import logging
+import os
+from typing import TYPE_CHECKING
 
 import onnx_ir as ir
 import torch
@@ -24,6 +27,9 @@ from mobius._builder import build_from_module, resolve_dtype
 from mobius._model_package import ModelPackage
 from mobius._optimizations import fold_initializers_after_weights
 from mobius.integrations._weight_loading import _parallel_download, apply_weights
+
+if TYPE_CHECKING:
+    from mobius.integrations.onnx_genai import HierarchicalAudioWorkflowConfig
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +57,55 @@ _PIPELINE_MODEL_TYPES: dict[str, str] = {
 }
 
 
+def _pipeline_workflow_adapters() -> dict[str, type]:
+    """Map a pipeline class to the mobius adapter that owns its workflow config.
+
+    A hierarchical-audio pipeline cannot describe its ONNX GenAI execution from
+    the exported graphs alone (semantic-token boundary, guidance schedule,
+    chunked flow plan, prompt template). Mobius owns those model-specific
+    defaults in the config-adapter layer -- exactly like the ``from_diffusers``
+    component adapters -- and selects the adapter here by pipeline class, so the
+    generic metadata writer stays model-agnostic. Returned lazily to keep the
+    ``_configs`` import off module load.
+    """
+    from mobius.integrations.diffusers._configs import MiniMaxMusic3WorkflowConfig
+
+    return {"MiniMaxMusic3ModularPipeline": MiniMaxMusic3WorkflowConfig}
+
+
+def _resolve_hierarchical_workflow_config(
+    pipeline_class: str,
+    workflow_roles: dict[str, str],
+    component_configs: dict[str, dict],
+    workflow_config: HierarchicalAudioWorkflowConfig | None,
+) -> HierarchicalAudioWorkflowConfig | None:
+    """Resolve the workflow config for a hierarchical-audio pipeline.
+
+    Precedence:
+
+    1. An explicit caller ``workflow_config`` always wins (override).
+    2. Otherwise mobius supplies the defaults it owns for a recognised pipeline
+       through its config adapter, selected by pipeline class.
+    3. When neither is available the result is ``None`` so the caller can fail
+       closed rather than invent semantic values.
+
+    In every non-``None`` case the built graphs' structural role map is
+    authoritative and replaces the config's ``components`` field, so the caller
+    can pass a config whose roles are placeholders.
+    """
+    resolved = workflow_config
+    if resolved is None:
+        adapter = _pipeline_workflow_adapters().get(pipeline_class)
+        if adapter is not None:
+            resolved = adapter.from_diffusers(
+                components=dict(workflow_roles),
+                component_configs=component_configs,
+            )
+    if resolved is not None:
+        resolved = dataclasses.replace(resolved, components=dict(workflow_roles))
+    return resolved
+
+
 def _init_diffusers_class_map() -> None:
     """Lazily populate the diffusers class map on first use."""
     if _DIFFUSERS_CLASS_MAP:
@@ -67,12 +122,17 @@ def _init_diffusers_class_map() -> None:
         QwenImageConfig,
         QwenImageTextEncoderConfig,
         QwenImageVAEConfig,
+        T5TextEncoderConfig,
         UNet2DConfig,
         VAEConfig,
     )
     from mobius.models.clip import CLIPTextModel
     from mobius.models.cogvideox import (
         CogVideoXTransformer3DModel,
+    )
+    from mobius.models.cogvideox_vae import (
+        AutoencoderKLCogVideoXModel,
+        CogVideoXVAEConfig,
     )
     from mobius.models.dit import DiTConfig, DiTTransformer2DModel
     from mobius.models.flux_sd3 import (
@@ -92,9 +152,9 @@ def _init_diffusers_class_map() -> None:
     from mobius.models.qwen_image import QwenImageTransformer2DModel
     from mobius.models.qwen_image_vae import AutoencoderKLQwenImageModel
     from mobius.models.qwen_vl import Qwen25VLCausalLMModel
+    from mobius.models.t5 import T5EncoderModel
     from mobius.models.unet import UNet2DConditionModel
     from mobius.models.vae import AutoencoderKLModel
-    from mobius.models.video_vae import VideoAutoencoderModel, VideoVAEConfig
 
     _DIFFUSERS_CLASS_MAP.update(
         {
@@ -111,6 +171,11 @@ def _init_diffusers_class_map() -> None:
                 "denoising",
             ),
             "CLIPTextModel": (CLIPTextModel, CLIPTextConfig, "feature-extraction"),
+            "T5EncoderModel": (
+                T5EncoderModel,
+                T5TextEncoderConfig,
+                "t5-text-encoding",
+            ),
             "QwenImageTransformer2DModel": (
                 QwenImageTransformer2DModel,
                 QwenImageConfig,
@@ -128,9 +193,9 @@ def _init_diffusers_class_map() -> None:
                 "qwen-image-vae",
             ),
             "AutoencoderKLCogVideoX": (
-                VideoAutoencoderModel,
-                VideoVAEConfig,
-                "vae",
+                AutoencoderKLCogVideoXModel,
+                CogVideoXVAEConfig,
+                "video-vae",
             ),
             "CogVideoXTransformer3DModel": (
                 CogVideoXTransformer3DModel,
@@ -176,6 +241,14 @@ def _load_diffusers_pipeline_index(
     from huggingface_hub import hf_hub_download
     from huggingface_hub.utils import EntryNotFoundError
 
+    if os.path.isdir(model_id):
+        for filename in ("model_index.json", "modular_model_index.json"):
+            path = os.path.join(model_id, filename)
+            if os.path.isfile(path):
+                with open(path) as f:
+                    return json.load(f)
+        return None
+
     path = None
     for filename in ("model_index.json", "modular_model_index.json"):
         try:
@@ -220,15 +293,26 @@ def _download_diffusers_component_weights(
     weight_basenames = ["diffusion_pytorch_model", "pytorch_model", "model"]
 
     all_files = None
+    local_root = model_id if os.path.isdir(model_id) else None
     for ext in ("safetensors", "bin"):
         # Sharded weights: <basename>.<ext>.index.json maps params -> shard files.
         for basename in weight_basenames:
+            local_index = (
+                os.path.join(local_root, prefix, f"{basename}.{ext}.index.json")
+                if local_root
+                else None
+            )
             try:
-                index_path = hf_hub_download(
-                    repo_id=model_id,
-                    filename=f"{prefix}{basename}.{ext}.index.json",
-                    revision=revision,
-                )
+                if local_index is not None:
+                    if not os.path.isfile(local_index):
+                        continue
+                    index_path = local_index
+                else:
+                    index_path = hf_hub_download(
+                        repo_id=model_id,
+                        filename=f"{prefix}{basename}.{ext}.index.json",
+                        revision=revision,
+                    )
                 with open(index_path) as f:
                     index = json.load(f)
                 all_files = sorted(set(index["weight_map"].values()))
@@ -239,12 +323,19 @@ def _download_diffusers_component_weights(
             break
         # Single-file weights.
         for basename in weight_basenames:
+            local_weight = (
+                os.path.join(local_root, prefix, f"{basename}.{ext}") if local_root else None
+            )
             try:
-                hf_hub_download(
-                    repo_id=model_id,
-                    filename=f"{prefix}{basename}.{ext}",
-                    revision=revision,
-                )
+                if local_weight is not None:
+                    if not os.path.isfile(local_weight):
+                        continue
+                else:
+                    hf_hub_download(
+                        repo_id=model_id,
+                        filename=f"{prefix}{basename}.{ext}",
+                        revision=revision,
+                    )
                 all_files = [f"{basename}.{ext}"]
                 break
             except EntryNotFoundError:
@@ -258,11 +349,15 @@ def _download_diffusers_component_weights(
             f"in '{model_id}'. Tried {weight_basenames} with .safetensors and .bin."
         )
 
-    paths = _parallel_download(
-        model_id,
-        [f"{prefix}{f}" for f in all_files],
-        revision=revision,
-        desc=f"{component_name} weights",
+    paths = (
+        [os.path.join(model_id, prefix, filename) for filename in all_files]
+        if local_root
+        else _parallel_download(
+            model_id,
+            [f"{prefix}{f}" for f in all_files],
+            revision=revision,
+            desc=f"{component_name} weights",
+        )
     )
 
     state_dict: dict[str, torch.Tensor] = {}
@@ -286,10 +381,15 @@ def _load_diffusers_component_config(
 
     resolved_subfolder = component_name if subfolder is None else subfolder
     filename = f"{resolved_subfolder}/config.json" if resolved_subfolder else "config.json"
-    path = hf_hub_download(
-        repo_id=model_id,
-        filename=filename,
-        revision=revision,
+    local_path = os.path.join(model_id, filename)
+    path = (
+        local_path
+        if os.path.isdir(model_id) and os.path.isfile(local_path)
+        else hf_hub_download(
+            repo_id=model_id,
+            filename=filename,
+            revision=revision,
+        )
     )
     with open(path) as f:
         return json.load(f)
@@ -322,6 +422,10 @@ def _resolve_diffusers_component_source(
     subfolder = metadata.get("subfolder") if "subfolder" in metadata else component_name
     if subfolder is None:
         subfolder = ""
+    if os.path.isdir(root_model_id) and os.path.isfile(
+        os.path.join(root_model_id, subfolder, "config.json")
+    ):
+        return root_model_id, None, subfolder
     return component_model_id, component_revision, subfolder
 
 
@@ -333,7 +437,13 @@ def _load_optional_diffusers_json(
     from huggingface_hub.utils import EntryNotFoundError
 
     try:
-        path = hf_hub_download(repo_id=model_id, filename=filename, revision=revision)
+        local_path = os.path.join(model_id, filename)
+        if os.path.isdir(model_id):
+            if not os.path.isfile(local_path):
+                return {}
+            path = local_path
+        else:
+            path = hf_hub_download(repo_id=model_id, filename=filename, revision=revision)
     except EntryNotFoundError:
         return {}
     with open(path) as f:
@@ -376,6 +486,7 @@ def build_diffusers_pipeline(
     unet_loras: dict | None = None,
     components: set[str] | None = None,
     execution_provider: str = "default",
+    workflow_config: HierarchicalAudioWorkflowConfig | None = None,
 ) -> ModelPackage:
     """Build ONNX models for all supported components in a diffusers pipeline.
 
@@ -399,6 +510,15 @@ def build_diffusers_pipeline(
         components: Optional component-name allowlist. Non-neural pipeline metadata
             is still retained so a single-component export preserves its contract.
         execution_provider: Target execution provider for EP-aware graph optimization.
+        workflow_config: Optional typed, model-agnostic workflow description for
+            pipelines whose ONNX GenAI execution cannot be derived from the graphs
+            alone (currently hierarchical audio). When omitted, mobius supplies the
+            defaults it owns for a recognised pipeline via its config adapter. When
+            neither a caller argument nor a registered adapter is available the
+            graphs are still built, but the package is marked so ONNX GenAI
+            metadata emission fails closed with an instruction to supply the config
+            rather than being misclassified. The generic metadata writer never
+            selects values by pipeline/model/class name.
 
     Returns:
         A :class:`ModelPackage` containing the built component model(s).
@@ -467,16 +587,12 @@ def build_diffusers_pipeline(
         config = config_class.from_diffusers(component_config_dict)
 
         if dtype is not None and hasattr(config, "dtype"):
-            import dataclasses
-
             config = dataclasses.replace(config, dtype=dtype)
 
         # Runtime LoRA: bake the requested adapters into the UNet denoiser and
         # merge their (remapped) weights alongside the base weights.
         lora_weights: dict = {}
         if unet_loras and task_name == "denoising" and hasattr(config, "lora_adapters"):
-            import dataclasses
-
             adapters, lora_weights = _prepare_unet_loras(unet_loras)
             config = dataclasses.replace(config, lora_adapters=adapters)
 
@@ -545,6 +661,54 @@ def build_diffusers_pipeline(
             revision=source_revision,
         )
 
+    # Structural role extraction (model-building layer): map each recognized
+    # component class to the structural role it plays so a hierarchical-audio
+    # pipeline's graphs can be wired to a workflow. This maps only class -> role;
+    # the semantic values come from an explicit ``workflow_config`` argument or
+    # the pipeline's mobius config adapter resolved below.
+    role_specs = {
+        "Qwen3ForCausalLM": {
+            "global_decoder": "",
+            "global_embedding": "_embedding",
+            "semantic_embedding": "_semantic_embedding",
+        },
+        "MiniMaxMusic3RVQDepthDecoder": {
+            "local_decoder": "",
+            "local_projection": "_projection",
+            "local_embedding": "_embedding",
+            "local_feedback_embedding": "_feedback_embedding",
+            "local_heads": "_heads",
+        },
+        "MiniMaxMusic3ConditionEncoder": {"condition_encoder": ""},
+        "MiniMaxMusic3Transformer1DModel": {"flow_transformer": ""},
+        "MiniMaxMusic3Vocoder": {"vocoder": ""},
+    }
+    workflow_roles: dict[str, str] = {}
+    for component_name, component_info in pipeline_index.items():
+        if not isinstance(component_info, list) or len(component_info) not in (2, 3):
+            continue
+        for role, suffix in role_specs.get(component_info[1], {}).items():
+            workflow_roles[role] = f"{component_name}{suffix}"
+
+    from mobius.integrations.onnx_genai import HIERARCHICAL_AUDIO_ROLES
+
+    # A complete role set means the built graphs form a hierarchical-audio
+    # topology. An explicit ``workflow_config`` argument always wins (caller
+    # override); otherwise mobius supplies the model-specific defaults it owns as
+    # the canonical registry, selecting the config adapter by pipeline class --
+    # never by a class-name branch inside the generic metadata writer. When no
+    # adapter is registered for the pipeline and no argument was given, the
+    # graphs still build and ``workflow_kind`` marks the package so ONNX GenAI
+    # metadata emission fails closed with an instruction to supply the config.
+    is_hierarchical_audio = workflow_roles.keys() >= HIERARCHICAL_AUDIO_ROLES
+    resolved_workflow_config = (
+        _resolve_hierarchical_workflow_config(
+            pipeline_class, workflow_roles, component_configs, workflow_config
+        )
+        if is_hierarchical_audio
+        else None
+    )
+
     package.config = DiffusersPipelineConfig(
         source_model_id=model_id,
         pipeline_class=pipeline_class,
@@ -559,6 +723,8 @@ def build_diffusers_pipeline(
             if "processor" in pipeline_index
             else {}
         ),
+        workflow_config=resolved_workflow_config,
+        workflow_kind="hierarchical_audio" if is_hierarchical_audio else None,
         model_type=_PIPELINE_MODEL_TYPES.get(pipeline_class, "diffusers"),
     )
     return package

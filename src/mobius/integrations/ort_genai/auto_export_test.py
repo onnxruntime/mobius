@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import types
 from unittest import mock
 
@@ -855,6 +856,30 @@ class TestFixChatTemplate:
         assert attrs["hop_length_ms"] == 10.0  # noqa: RUF069
         assert attrs["mel_floor"] == 0.001  # noqa: RUF069
 
+    def test_audio_glmasr_writes_whisper_feature_extraction_json(self, tmp_path):
+        config = mock.MagicMock()
+        config.audio = mock.MagicMock()
+        config.model_type = "glmasr"
+
+        path = _write_audio_processor_config(config, str(tmp_path))
+
+        assert path is not None
+        assert path.endswith("audio_processor.json")
+        with open(path) as f:
+            data = json.load(f)
+        operations = data["feature_extraction"]["sequence"]
+        assert [item["operation"]["type"] for item in operations] == [
+            "AudioDecoder",
+            "STFTNorm",
+            "LogMelSpectrum",
+        ]
+        assert operations[1]["operation"]["attrs"] == {
+            "n_fft": 400,
+            "frame_length": 400,
+            "hop_length": 160,
+        }
+        assert operations[2]["operation"]["attrs"]["n_mel"] == 128
+
     def test_handles_tokenizer_load_error(self, tmp_path):
         """Gracefully handles AutoTokenizer.from_pretrained raising."""
         tc = {"tokenizer_class": "LlamaTokenizer"}
@@ -1202,6 +1227,111 @@ class TestExportForOrtGenai:
         assert model["vision"]["patch_size"] == 16
         assert model["vision"]["window_size"] == 64
 
+    def test_qwen35_vl_uses_native_qwen35_runtime_type(self, tmp_path):
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 448
+            patch_size: int = 16
+            spatial_merge_size: int = 2
+            window_size: int = 112
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "qwen3_5_vl"
+            vocab_size: int = 248064
+            hidden_size: int = 2048
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 16
+            num_key_value_heads: int = 8
+            head_dim: int = 128
+            image_token_id: int = 248056
+            vision_start_token_id: int = 248053
+            video_token_id: int = 248057
+            tokens_per_second: float = 2.0
+            temporal_patch_size: int = 2
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+
+        pkg = ModelPackage(
+            {
+                "decoder": _mock_model(),
+                "vision_encoder": _mock_model(),
+                "embedding": _mock_model(),
+            },
+            config=FakeConfig(),
+        )
+
+        result = write_ort_genai_config(pkg, str(tmp_path), ep="trt-rtx")
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+        model = data["model"]
+        assert model["type"] == "qwen3_5"
+        assert model["image_token_id"] == 248056
+        assert model["vision_start_token_id"] == 248053
+        assert model["video_token_id"] == 248057
+        assert model["vision"]["patch_size"] == 16
+        assert model["vision"]["window_size"] == 112
+        assert model["vision"]["tokens_per_second"] == pytest.approx(2.0)
+        assert (
+            model["decoder"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "enable_cuda_graph"
+            ]
+            == "1"
+        )
+        assert (
+            model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "enable_cuda_graph"
+            ]
+            == "0"
+        )
+        assert (
+            model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "enable_cuda_graph"
+            ]
+            == "0"
+        )
+        assert (
+            model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "nv_profile_min_shapes"
+            ]
+            == "input_ids:1x1,image_features:0x1024"
+        )
+        assert (
+            model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "nv_profile_opt_shapes"
+            ]
+            == "input_ids:1x226,image_features:192x1024"
+        )
+        assert (
+            model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "nv_profile_max_shapes"
+            ]
+            == "input_ids:1x1024,image_features:2520x1024"
+        )
+        assert (
+            model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "nv_profile_min_shapes"
+            ]
+            == "pixel_values:600x1536"
+        )
+        assert (
+            model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "nv_profile_opt_shapes"
+            ]
+            == "pixel_values:600x1536"
+        )
+        assert (
+            model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "nv_profile_max_shapes"
+            ]
+            == "pixel_values:600x1536"
+        )
+
     def test_glm_ocr_writes_qwen_runtime_and_packed_processor_contract(self, tmp_path):
         import dataclasses
 
@@ -1280,9 +1410,7 @@ class TestExportForOrtGenai:
         """GLM-OCR's longest_edge is a pixel-count ceiling, not a side length."""
         import dataclasses
 
-        from mobius.integrations.ort_genai.auto_export import (
-            _write_vision_processor_config,
-        )
+        from mobius.integrations.ort_genai.auto_export import _write_vision_processor_config
 
         revision = "ca5d8b3e287e52589e37c28385d9655ee4372f9d"
 
@@ -1334,6 +1462,75 @@ class TestExportForOrtGenai:
         assert resize["width"] == 336
         assert resize["min_pixels"] == 12544
         assert resize["max_pixels"] == 9633792
+
+    def test_qwen36_vl_hf_parent_type_maps_to_qwen35_runtime(self, tmp_path):
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 448
+            patch_size: int = 16
+            spatial_merge_size: int = 2
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            # build_transformers_model unwraps Qwen3.6 VL to the text sub-config,
+            # but write_ort_genai_config must preserve the multimodal HF parent
+            # type and map it to ORT GenAI's native qwen3_5 runtime.
+            model_type: str = "qwen3_5_moe_text"
+            vocab_size: int = 248064
+            hidden_size: int = 2048
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 16
+            num_key_value_heads: int = 8
+            head_dim: int = 128
+            image_token_id: int = 248056
+            vision_start_token_id: int = 248053
+            video_token_id: int = 248057
+            tokens_per_second: float = 2.0
+            temporal_patch_size: int = 2
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+
+        pkg = ModelPackage(
+            {
+                "decoder": _mock_model(),
+                "vision_encoder": _mock_model(),
+                "embedding": _mock_model(),
+            },
+            config=FakeConfig(),
+        )
+
+        hf_config = mock.MagicMock(
+            model_type="qwen3_5_moe",
+            bos_token_id=248044,
+            eos_token_id=248044,
+            pad_token_id=248044,
+        )
+        with (
+            mock.patch("transformers.AutoConfig.from_pretrained", return_value=hf_config),
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._load_generation_config",
+                return_value=None,
+            ),
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files",
+                return_value=[],
+            ),
+            mock.patch("transformers.AutoProcessor.from_pretrained", side_effect=OSError),
+        ):
+            result = write_ort_genai_config(
+                pkg,
+                str(tmp_path),
+                hf_model_id="Qwen/Qwen3.6-35B-A3B",
+            )
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+        assert data["model"]["type"] == "qwen3_5"
+        assert data["model"]["vision"]["patch_size"] == 16
 
     def test_mage_vl_is_rejected_before_writing_runtime_artifacts(self, tmp_path):
         import dataclasses
@@ -1583,6 +1780,49 @@ class TestExportForOrtGenai:
         assert speech["inputs"]["audio_embeds"] == "input_features"
         assert speech["inputs"]["attention_mask"] == "input_features_mask"
 
+    def test_glmasr_rejected_until_runtime_registers_model_type(self, tmp_path):
+        """Do not emit metadata that onnxruntime-genai cannot load."""
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeAudio:
+            audio_token_id: int = 59260
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "glmasr"
+            vocab_size: int = 59264
+            hidden_size: int = 2048
+            num_hidden_layers: int = 28
+            num_attention_heads: int = 16
+            num_key_value_heads: int = 4
+            head_dim: int = 128
+            audio_token_id: int = 59260
+            audio: FakeAudio = dataclasses.field(default_factory=FakeAudio)
+
+        pkg = ModelPackage(
+            {
+                "decoder": _mock_model_with_inputs(
+                    ["inputs_embeds", "attention_mask", "position_ids"]
+                ),
+                "audio_encoder": _mock_model(
+                    inputs=["input_features", "input_features_mask"],
+                    outputs=["audio_features", "audio_feature_lengths"],
+                ),
+                "embedding": _mock_model(
+                    inputs=["input_ids", "audio_features"],
+                    outputs=["inputs_embeds"],
+                ),
+            },
+            config=FakeConfig(),
+        )
+
+        with pytest.raises(ValueError, match="does not register a GLM-ASR"):
+            write_ort_genai_config(pkg, str(tmp_path))
+
     def test_tokenizer_not_copied_without_model_id(self, tmp_path):
         """No tokenizer files copied when hf_model_id=None."""
         from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
@@ -1593,6 +1833,45 @@ class TestExportForOrtGenai:
         ) as mock_copy:
             write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
         mock_copy.assert_not_called()
+
+    def test_hub_artifacts_use_pinned_revision(self, tmp_path):
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        pkg = self._make_pkg()
+        revision = "61ba4e0b3309b6656edea3e93e419f7bd5c61957"
+        fake_hf = mock.MagicMock(
+            model_type="llama",
+            bos_token_id=1,
+            eos_token_id=2,
+            pad_token_id=0,
+        )
+        with (
+            mock.patch(
+                "transformers.AutoConfig.from_pretrained",
+                return_value=fake_hf,
+            ) as mock_config,
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files",
+                return_value=[],
+            ) as mock_copy,
+        ):
+            write_ort_genai_config(
+                pkg,
+                str(tmp_path),
+                hf_model_id="zai-org/GLM-ASR-Nano-2512",
+                revision=revision,
+            )
+
+        mock_config.assert_called_once_with(
+            "zai-org/GLM-ASR-Nano-2512",
+            revision=revision,
+            trust_remote_code=False,
+        )
+        mock_copy.assert_called_once_with(
+            "zai-org/GLM-ASR-Nano-2512",
+            str(tmp_path),
+            revision=revision,
+        )
 
     def test_tokenizer_copied_when_model_id_provided(self, tmp_path):
         """Tokenizer files are copied when hf_model_id is provided."""
@@ -2127,6 +2406,194 @@ class TestExportForOrtGenai:
         assert data["model"]["bos_token_id"] == 1
         assert data["model"]["eos_token_id"] == 2
         assert data["model"]["pad_token_id"] == 0
+
+    @pytest.mark.parametrize(
+        ("tokens", "vocab_size", "expected", "filename", "key"),
+        [
+            (
+                {"<tool_call>": 151657, "</tool_call>": 151658},
+                151936,
+                {"bot_token_id": 151657, "eot_token_id": 151658},
+                "tokenizer_config.json",
+                "added_tokens_decoder",
+            ),
+            (
+                {
+                    "<tool_call>": 151657,
+                    "</tool_call>": 151658,
+                    "<think>": 151667,
+                    "</think>": 151668,
+                },
+                151936,
+                {
+                    "bot_token_id": 151657,
+                    "eot_token_id": 151658,
+                    "bor_token_id": 151667,
+                    "eor_token_id": 151668,
+                },
+                "tokenizer.json",
+                "added_tokens",
+            ),
+            (
+                {"<|tool_call|>": 200025, "<|/tool_call|>": 200026},
+                200064,
+                {"bot_token_id": 200025, "eot_token_id": 200026},
+                "tokenizer.json",
+                "added_tokens",
+            ),
+            ({}, 256, {}, "tokenizer_config.json", "added_tokens_decoder"),
+            (
+                {"<tool_call>": 151657, "</tool_call>": 151658},
+                151658,
+                {"bot_token_id": 151657},
+                "tokenizer.json",
+                "added_tokens",
+            ),
+        ],
+    )
+    def test_tool_call_special_tokens_read_from_tokenizer_metadata(
+        self, tmp_path, tokens, vocab_size, expected, filename, key
+    ):
+        """Tool and reasoning delimiters are read from both tokenizer metadata formats."""
+        tokenizer_dir = tmp_path / "tokenizer"
+        tokenizer_dir.mkdir()
+        tokenizer_config = (
+            {str(token_id): {"content": token} for token, token_id in tokens.items()}
+            if key == "added_tokens_decoder"
+            else [{"id": token_id, "content": token} for token, token_id in tokens.items()]
+        )
+        (tokenizer_dir / filename).write_text(json.dumps({key: tokenizer_config}))
+
+        pkg = _make_fake_llm_pkg("llama")
+        pkg.config.vocab_size = vocab_size
+        result = write_ort_genai_config(
+            pkg, str(tmp_path / "output"), local_config_dir=str(tokenizer_dir)
+        )
+        with open(result["genai_config"]) as f:
+            model = json.load(f)["model"]
+
+        assert {name: model[name] for name in expected} == expected
+        for name in {"bot_token_id", "eot_token_id", "bor_token_id", "eor_token_id"} - set(
+            expected
+        ):
+            assert name not in model
+
+    def test_invalid_tokenizer_added_tokens_are_ignored(self, tmp_path):
+        """A malformed added_tokens_decoder does not prevent exporting."""
+        tokenizer_dir = tmp_path / "tokenizer"
+        tokenizer_dir.mkdir()
+        (tokenizer_dir / "tokenizer_config.json").write_text(
+            json.dumps({"added_tokens_decoder": None})
+        )
+
+        result = write_ort_genai_config(
+            _make_fake_llm_pkg("llama"),
+            str(tmp_path / "output"),
+            local_config_dir=str(tokenizer_dir),
+        )
+        with open(result["genai_config"]) as f:
+            model = json.load(f)["model"]
+
+        assert (
+            not {"bot_token_id", "eot_token_id", "bor_token_id", "eor_token_id"} & model.keys()
+        )
+
+    def test_ambiguous_tool_tokens_are_ignored(self, tmp_path):
+        """Conflicting tool delimiter spellings do not choose an arbitrary ID."""
+        tokenizer_dir = tmp_path / "tokenizer"
+        tokenizer_dir.mkdir()
+        (tokenizer_dir / "tokenizer_config.json").write_text(
+            json.dumps(
+                {
+                    "added_tokens_decoder": {
+                        "10": {"content": "<tool_call>"},
+                        "11": {"content": "<|tool_call|>"},
+                    }
+                }
+            )
+        )
+
+        result = write_ort_genai_config(
+            _make_fake_llm_pkg("llama"),
+            str(tmp_path / "output"),
+            local_config_dir=str(tokenizer_dir),
+        )
+        with open(result["genai_config"]) as f:
+            model = json.load(f)["model"]
+
+        assert "bot_token_id" not in model
+
+    def test_conflicting_tokenizer_metadata_is_ignored(self, tmp_path):
+        """Conflicting IDs across tokenizer metadata files do not choose an arbitrary ID."""
+        tokenizer_dir = tmp_path / "tokenizer"
+        tokenizer_dir.mkdir()
+        (tokenizer_dir / "tokenizer_config.json").write_text(
+            json.dumps({"added_tokens_decoder": {"10": {"content": "<tool_call>"}}})
+        )
+        (tokenizer_dir / "tokenizer.json").write_text(
+            json.dumps({"added_tokens": [{"id": 11, "content": "<tool_call>"}]})
+        )
+
+        result = write_ort_genai_config(
+            _make_fake_llm_pkg("llama"),
+            str(tmp_path / "output"),
+            local_config_dir=str(tokenizer_dir),
+        )
+        with open(result["genai_config"]) as f:
+            model = json.load(f)["model"]
+
+        assert "bot_token_id" not in model
+
+    @pytest.mark.integration
+    @pytest.mark.parametrize(
+        ("model_id", "model_type", "vocab_size", "expected"),
+        [
+            (
+                "Qwen/Qwen3-0.6B",
+                "qwen3",
+                151936,
+                {
+                    "bot_token_id": 151657,
+                    "eot_token_id": 151658,
+                    "bor_token_id": 151667,
+                    "eor_token_id": 151668,
+                },
+            ),
+            (
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                "qwen2",
+                151936,
+                {"bot_token_id": 151657, "eot_token_id": 151658},
+            ),
+            (
+                "microsoft/Phi-4-mini-instruct",
+                "phi3",
+                200064,
+                {"bot_token_id": 200025, "eot_token_id": 200026},
+            ),
+        ],
+    )
+    def test_real_hf_tokenizers_emit_tool_call_tokens(
+        self, tmp_path, model_id, model_type, vocab_size, expected
+    ):
+        """Real Hub tokenizer metadata produces the expected ORT-GenAI token IDs."""
+        from huggingface_hub import hf_hub_download
+
+        tokenizer_dir = tmp_path / "tokenizer"
+        tokenizer_dir.mkdir()
+        for filename in ("tokenizer_config.json", "tokenizer.json"):
+            source = hf_hub_download(model_id, filename)
+            shutil.copyfile(source, tokenizer_dir / filename)
+
+        pkg = _make_fake_llm_pkg(model_type)
+        pkg.config.vocab_size = vocab_size
+        result = write_ort_genai_config(
+            pkg, str(tmp_path / "output"), local_config_dir=str(tokenizer_dir)
+        )
+        with open(result["genai_config"], encoding="utf-8") as f:
+            model = json.load(f)["model"]
+
+        assert {name: model[name] for name in expected} == expected
 
     def test_config_mode_eos_token_id_as_list(self, tmp_path):
         """eos_token_id can be a list[int] (e.g. Gemma multi-stop tokens)."""

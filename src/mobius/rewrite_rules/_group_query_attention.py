@@ -347,6 +347,12 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
         # GLM4/ChatGLM use interleaved=1; most models use 0. Must not hardcode.
         q_rope_node = attn.inputs[0].producer()  # RotaryEmbedding producing q_rot
         rotary_interleaved = q_rope_node.attributes.get_int("interleaved", 0)
+        # Preserve partial RoPE: the source RotaryEmbedding rotates only the
+        # first ``rotary_embedding_dim`` head elements (e.g. Qwen3.5 rotates 64
+        # of 256). Omitting it makes the fused GQA default to the full head_dim
+        # and read past the partial cos/sin cache, corrupting every
+        # full-attention layer. Propagate it whenever the source op sets it.
+        rotary_embedding_dim = q_rope_node.attributes.get_int("rotary_embedding_dim", 0)
 
         # Trace cos/sin back through Gather to the cache table initializers
         if self._cos_cache is None:
@@ -389,6 +395,8 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
         }
         if softcap:
             gqa_attrs["softcap"] = softcap
+        if rotary_embedding_dim:
+            gqa_attrs["rotary_embedding_dim"] = rotary_embedding_dim
         window = local_window_from_attention_bias(attention_bias).window
         if window is not None:
             gqa_attrs["local_window_size"] = window

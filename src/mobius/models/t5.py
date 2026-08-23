@@ -332,6 +332,19 @@ class T5Encoder(nn.Module):
             max_distance=self._max_distance,
             num_heads=self._num_heads,
         )
+        if attention_mask is not None:
+            # HF T5 adds a broadcastable padding bias to the learned relative
+            # bias: [B, S] -> [B, 1, 1, S]. Masked keys receive a large
+            # negative value so every query ignores padding tokens.
+            valid = op.CastLike(attention_mask, position_bias)
+            padding = op.Mul(
+                op.Sub(op.CastLike(op.Constant(value_float=1.0), position_bias), valid),
+                op.CastLike(op.Constant(value_float=-10000.0), position_bias),
+            )
+            position_bias = op.Add(
+                position_bias,
+                op.Unsqueeze(padding, op.Constant(value_ints=[1, 2])),
+            )
         for block in self.block:
             hidden_states = block(op, hidden_states, attention_bias=position_bias)
         hidden_states = self.final_layer_norm(op, hidden_states)
@@ -472,6 +485,40 @@ class T5ForConditionalGeneration(nn.Module):
             embed = new_state_dict.get("encoder.embed_tokens.weight")
             if embed is not None:
                 new_state_dict["decoder.lm_head.weight"] = embed
+        return new_state_dict
+
+
+class T5EncoderModel(nn.Module):
+    """Encoder-only T5 model used as a diffusion prompt encoder."""
+
+    default_task = "t5-text-encoding"
+    category = "encoder"
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        self.config = config
+        self.encoder = T5Encoder(config)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        input_ids: ir.Value,
+        attention_mask: ir.Value | None = None,
+    ):
+        return self.encoder(op, input_ids=input_ids, attention_mask=attention_mask)
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        new_state_dict = {}
+        for name, tensor in state_dict.items():
+            new_name = _rename_t5_weight(name)
+            if new_name is not None and new_name.startswith("encoder."):
+                new_state_dict[new_name] = tensor
+        if "encoder.embed_tokens.weight" not in new_state_dict:
+            shared = state_dict.get("shared.weight")
+            if shared is not None:
+                new_state_dict["encoder.embed_tokens.weight"] = shared
         return new_state_dict
 
 

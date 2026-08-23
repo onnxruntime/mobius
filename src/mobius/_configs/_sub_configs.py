@@ -148,6 +148,18 @@ class CodecEncoderConfig:
     max_position_embeddings: int = 8000
     num_quantizers: int = 32
     num_semantic_quantizers: int = 1
+    # Mimi convolutional encoder shape (HF ``MimiConfig`` defaults). The conv
+    # stack is derived from these: 1 leading conv, then per upsampling ratio
+    # ``num_residual_layers`` residual blocks + ELU + a strided conv that
+    # doubles the channel count, then a trailing ELU + conv to ``hidden_size``.
+    audio_channels: int = 1
+    num_filters: int = 64
+    num_residual_layers: int = 1
+    kernel_size: int = 7
+    last_kernel_size: int = 3
+    residual_kernel_size: int = 3
+    compress: int = 2
+    upsampling_ratios: list[int] = dataclasses.field(default_factory=lambda: [8, 6, 5, 4])
 
 
 @dataclasses.dataclass
@@ -226,6 +238,11 @@ class AudioConfig:
     encoder_layers: int | None = None
     encoder_attention_heads: int | None = None
     encoder_ffn_dim: int | None = None
+    encoder_head_dim: int | None = None
+    encoder_num_key_value_heads: int | None = None
+    encoder_partial_rotary_factor: float | None = None
+    encoder_rope_theta: float | None = None
+    encoder_layer_norm_eps: float | None = None
     num_mel_bins: int | None = None
     max_source_positions: int | None = None
     downsample_hidden_size: int | None = None

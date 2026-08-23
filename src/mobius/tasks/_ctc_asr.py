@@ -19,6 +19,23 @@ from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import ModelTask, _make_graph, _make_model
 
+#: Graph metadata key recording whether a row's outputs depend on the padded
+#: width of its batch.  Carried on the ONNX model so a metadata producer can
+#: publish the fact without knowing anything about the architecture, and so it
+#: survives a round trip through the serialized file.
+BATCH_PADDING_SENSITIVE_KEY = "mobius.batch_padding_sensitive"
+
+
+def _record_batch_padding_sensitivity(model: ir.Model, module: object) -> None:
+    """Copy a module's batch-padding sensitivity onto the built ONNX model.
+
+    Modules that do not answer the question leave the key absent, which readers
+    must treat as unstated rather than as "rows are independent".
+    """
+    sensitive = getattr(module, "batch_padding_sensitive", None)
+    if isinstance(sensitive, bool):
+        model.metadata_props[BATCH_PADDING_SENSITIVE_KEY] = "true" if sensitive else "false"
+
 
 class CTCAsrTask(ModelTask):
     """Build ONNX graph for CTC-based ASR (raw waveform → frame logits).
@@ -30,8 +47,14 @@ class CTCAsrTask(ModelTask):
                              required graph input; callers with no
                              padding should pass an all-ones mask.
 
-    Output:
-        ``logits`` — (batch, num_frames, vocab_size) CTC logit scores  FLOAT
+    Outputs:
+        ``logits``        — (batch, num_frames, vocab_size) CTC logit scores
+        ``frame_lengths`` — (batch,) INT64 count of non-padded frames per row
+
+    ``frame_lengths`` is emitted so a padded batch can be segmented back into
+    per-row transcripts without the caller re-deriving the convolutional
+    downsampling ratio.  It is only emitted when the module knows how to compute
+    it, keeping the task usable for encoders with a different contract.
     """
 
     name = "ctc-asr"
@@ -60,7 +83,14 @@ class CTCAsrTask(ModelTask):
         logits = module(builder.op, input_values=input_values, attention_mask=attention_mask)
         builder.add_output(logits, "logits")
 
-        return ModelPackage({"model": _make_model(graph)}, config=config)
+        frame_lengths_fn = getattr(module, "frame_lengths", None)
+        if callable(frame_lengths_fn):
+            frame_lengths = frame_lengths_fn(builder.op, attention_mask)
+            builder.add_output(frame_lengths, "frame_lengths")
+
+        model = _make_model(graph)
+        _record_batch_padding_sensitivity(model, module)
+        return ModelPackage({"model": model}, config=config)
 
 
 class FeatureCTCAsrTask(ModelTask):

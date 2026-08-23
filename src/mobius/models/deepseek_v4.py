@@ -17,21 +17,29 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 
 import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
+from mobius._weight_utils import (
+    pack_qmoe_expert_weights,
+    stack_per_expert_moe_weights,
+    supported_qmoe_quantization,
+)
 from mobius.components import (
     Embedding,
     Linear,
+    MoELayer,
     QuantizedEmbedding,
     RMSNorm,
     create_attention_bias,
     initialize_rope,
     make_quantized_linear_factory,
 )
+from mobius.components._moe import _scatter_selected_to_full
 from mobius.components._rotary_embedding import apply_rotary_pos_emb
 from mobius.models.base import CausalLMModel
 
@@ -123,6 +131,32 @@ class DeepSeekV4DeferredNorm(nn.Module):
         return _shape_anchor(op, [self.weight])
 
 
+def _validate_hash_routing_tables(state_dict: dict[str, torch.Tensor]) -> None:
+    """Fail fast if a hash-routing table names a duplicate expert for a token.
+
+    ``_scatter_selected_to_full`` (used by ``DeepSeekV4Gate.qmoe_routing`` to
+    drive QMoE) requires ``top_k`` *distinct* experts per token:
+    ``ScatterElements`` overwrites rather than accumulates duplicate indices,
+    so a repeated expert would silently drop one of its contributions instead
+    of raising an error. Real hash tables have no reason to route a token to
+    the same expert twice, but this checks the actual checkpoint data rather
+    than relying on that assumption alone.
+    """
+    for key, table in state_dict.items():
+        if not key.endswith(".mlp.moe.gate.tid2eid") or table.shape[-1] <= 1:
+            continue
+        sorted_table, _ = torch.sort(table, dim=-1)
+        duplicate_rows = torch.any(sorted_table[..., 1:] == sorted_table[..., :-1], dim=-1)
+        if duplicate_rows.any():
+            bad_tokens = torch.nonzero(duplicate_rows, as_tuple=False).flatten()[:5].tolist()
+            raise ValueError(
+                f"{key} routes token id(s) {bad_tokens} (showing up to 5 of "
+                f"{int(duplicate_rows.sum())}) to a duplicate expert; QMoE "
+                "export requires top_k distinct experts per token (see "
+                "mobius.components._moe._scatter_selected_to_full)."
+            )
+
+
 class DeepSeekV4Gate(nn.Module):
     """V4 sqrt-softplus router with hash routing for the first layers."""
 
@@ -183,6 +217,42 @@ class DeepSeekV4Gate(nn.Module):
             routing_weights = op.Mul(routing_weights, self.route_scale)
         return routing_weights, selected_experts
 
+    def qmoe_routing(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        input_ids: ir.Value,
+    ):
+        """Adapt the already-selected (routing_weights, selected_experts) pair for QMoE.
+
+        This does not alter their computation.
+
+        Hash routing (``tid2eid``) is not expressible as "top-k of a
+        per-expert score" (QMoE's only selection ABI), so this reuses
+        ``forward()`` verbatim -- covering both hash and learned top-k
+        routing identically -- and scatters its output into the
+        full-``num_experts``-width tensors QMoE requires. See
+        ``_scatter_selected_to_full`` for why this preserves the exact
+        selection and weights, and for why -- like V3's ``DeepSeekMoEGate``
+        -- this path is CPU-EP-correct only: CUDA QMoE ignores the gathered
+        ``router_weights`` this adapter relies on (learned layers select via
+        ``scores + bias`` but weight by ``scores`` alone, so raw-logit
+        passthrough can't make CUDA's forced internal recompute agree either).
+        """
+        routing_weights, selected_experts = self.forward(op, hidden_states, input_ids)
+        # QMoE's router_probs/router_weights share type constraint "T" with
+        # hidden_states; routing_weights is computed in float32 (matching the
+        # reference sqrt-softplus/softmax/sigmoid scoring), so cast back
+        # before scattering.
+        routing_weights = op.CastLike(routing_weights, hidden_states)
+        router_probs, router_weights = _scatter_selected_to_full(
+            op, routing_weights, selected_experts, self.num_experts
+        )
+        # route_scale (and, for non-softmax scoring, weight_sum renormalization)
+        # is already folded into routing_weights above, so QMoE must not
+        # renormalize or rescale again.
+        return router_probs, router_weights, False, 1.0
+
 
 class _DeepSeekV4Expert(nn.Module):
     def __init__(self, config: ArchitectureConfig, intermediate_size: int):
@@ -207,12 +277,22 @@ class DeepSeekV4MoE(nn.Module):
         super().__init__()
         assert config.num_local_experts is not None
         assert config.moe_intermediate_size is not None
-        self.gate = DeepSeekV4Gate(config, layer_id)
-        self.experts = nn.ModuleList(
-            [
-                _DeepSeekV4Expert(config, config.moe_intermediate_size)
-                for _ in range(config.num_local_experts)
-            ]
+        gate = DeepSeekV4Gate(config, layer_id)
+        # QMoE's clipped-SwiGLU maps exactly onto _DeepSeekV4Expert's
+        # activation (plain SiLU: alpha=1.0, beta=0.0). config.swiglu_limit<=0
+        # means "no clipping" in _DeepSeekV4Expert.forward, but QMoE treats
+        # swiglu_limit=0.0 as "clip to zero" -- math.inf is required to
+        # disable clipping at the op level.
+        swiglu_limit = config.swiglu_limit if config.swiglu_limit > 0 else math.inf
+        self.moe = MoELayer(
+            config,
+            gate=gate,
+            expert_factory=lambda expert_config, _linear_class: _DeepSeekV4Expert(
+                expert_config, expert_config.intermediate_size
+            ),
+            activation_alpha=1.0,
+            activation_beta=0.0,
+            swiglu_limit=swiglu_limit,
         )
         shared_size = config.moe_intermediate_size * (config.n_shared_experts or 1)
         self.shared_experts = _DeepSeekV4Expert(config, shared_size)
@@ -223,19 +303,8 @@ class DeepSeekV4MoE(nn.Module):
         hidden_states: ir.Value,
         input_ids: ir.Value,
     ):
-        routing_weights, selected_experts = self.gate(op, hidden_states, input_ids)
-        result = None
-        for expert_idx, expert in enumerate(self.experts):
-            expert_output = expert(op, hidden_states)
-            match = op.Equal(selected_experts, op.Constant(value_int=expert_idx))
-            weight = op.ReduceSum(
-                op.Mul(routing_weights, op.CastLike(match, routing_weights)),
-                [-1],
-                keepdims=True,
-            )
-            contribution = op.Mul(expert_output, weight)
-            result = contribution if result is None else op.Add(result, contribution)
-        return op.Add(result, self.shared_experts(op, hidden_states))
+        moe_output = self.moe(op, hidden_states, input_ids)
+        return op.Add(moe_output, self.shared_experts(op, hidden_states))
 
 
 class DeepSeekV4CompressorTensors(nn.Module):
@@ -819,6 +888,9 @@ class DeepSeekV4CausalLMModel(CausalLMModel):
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         """Map the official DeepSeek checkpoint names to mobius modules."""
+        # Same predicate as MoELayer/_supported_qmoe_quantization so the
+        # repacked weights and the emitted graph never disagree.
+        use_qmoe = supported_qmoe_quantization(self.config.quantization) is not None
         renamed: dict[str, torch.Tensor] = {}
         skipped = 0
         for key, value in state_dict.items():
@@ -860,7 +932,9 @@ class DeepSeekV4CausalLMModel(CausalLMModel):
                 new_key = new_key.replace(".attn.", ".self_attn.")
                 new_key = new_key.replace(".attn_norm.", ".input_layernorm.")
                 new_key = new_key.replace(".ffn_norm.", ".post_attention_layernorm.")
-                new_key = new_key.replace(".ffn.gate.", ".mlp.gate.")
+                # DeepSeekV4MoE composes the shared MoELayer, so the gate
+                # lives at mlp.moe.gate.* (see DeepSeekV4MoE.__init__).
+                new_key = new_key.replace(".ffn.gate.", ".mlp.moe.gate.")
                 new_key = new_key.replace(".ffn.experts.", ".mlp.experts.")
                 new_key = new_key.replace(".ffn.shared_experts.", ".mlp.shared_experts.")
                 new_key = new_key.replace(".w1.", ".gate_proj.")
@@ -868,6 +942,13 @@ class DeepSeekV4CausalLMModel(CausalLMModel):
                 new_key = new_key.replace(".w3.", ".up_proj.")
                 if ".hc_" in new_key and new_key.endswith("_fn"):
                     new_key = f"{new_key}.weight"
+                # Dense fallback (unquantized or non-QMoE-eligible): experts
+                # are a plain ModuleList under moe.experts.{i}.*. Skipped for
+                # the QMoE path -- stack_per_expert_moe_weights below expects
+                # this same per-index ".mlp.experts.{i}.*" layout as input,
+                # fusing it into the tensors pack_qmoe_expert_weights expects.
+                if not use_qmoe:
+                    new_key = new_key.replace(".mlp.experts.", ".mlp.moe.experts.")
             renamed[new_key] = value
         if skipped:
             logger.warning(
@@ -875,4 +956,13 @@ class DeepSeekV4CausalLMModel(CausalLMModel):
                 "num_nextn_predict_layers.",
                 skipped,
             )
-        return super().preprocess_weights(renamed)
+        processed = super().preprocess_weights(renamed)
+        if use_qmoe:
+            _validate_hash_routing_tables(processed)
+            # DeepSeek-V4 checkpoints store routed experts per-index
+            # (".mlp.experts.{i}.gate_proj/up_proj/down_proj.*"), unlike
+            # DeepSeek-V3's already-fused HF format. Bridge to the fused
+            # expert-major layout pack_qmoe_expert_weights expects.
+            processed = stack_per_expert_moe_weights(processed, qmoe_target_path=".mlp")
+            processed = pack_qmoe_expert_weights(processed)
+        return processed

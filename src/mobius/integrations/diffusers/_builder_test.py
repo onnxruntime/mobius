@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+import json
 from unittest.mock import mock_open, patch
 
 import onnx_ir as ir
@@ -17,11 +19,201 @@ from mobius.integrations.diffusers._builder import (
     _init_diffusers_class_map,
     _load_diffusers_component_config,
     _load_diffusers_pipeline_index,
+    _load_optional_diffusers_json,
     _resolve_diffusers_component_source,
+    _resolve_hierarchical_workflow_config,
     build_diffusers_pipeline,
 )
+from mobius.integrations.diffusers._configs import (
+    MINIMAX_MUSIC3_AUDIO_CODE_OFFSET,
+    MINIMAX_MUSIC3_AUDIO_END_TOKEN_ID,
+    MINIMAX_MUSIC3_GLOBAL_CONTEXT,
+    MINIMAX_MUSIC3_SEMANTIC_VOCAB_SIZE,
+    MINIMAX_MUSIC3_UNCONDITIONAL_TOKEN_ID,
+    MiniMaxMusic3WorkflowConfig,
+)
+from mobius.integrations.onnx_genai import HierarchicalAudioWorkflowConfig
 
 # ── Helpers ──────────────────────────────────────────────────────────────
+
+
+def _hierarchical_workflow_config(**overrides) -> HierarchicalAudioWorkflowConfig:
+    """Construct a valid hierarchical-audio workflow config for tests.
+
+    The values are illustrative structural/semantic facts, not a checked-in
+    model contract; callers override individual fields to prove the metadata
+    producer follows its typed input rather than any default.
+    """
+    fields = {
+        "components": {
+            "global_decoder": "decoder",
+            "global_embedding": "embedding",
+            "semantic_embedding": "semantic",
+            "local_decoder": "local",
+            "local_projection": "projection",
+            "local_embedding": "local_embedding",
+            "local_feedback_embedding": "feedback",
+            "local_heads": "heads",
+            "condition_encoder": "condition",
+            "flow_transformer": "flow",
+            "vocoder": "vocoder",
+        },
+        "semantic_vocabulary_start": 901,
+        "semantic_vocabulary_size": 16,
+        "stop_token_id": 4,
+        "unconditional_token_id": 5,
+        "semantic_guidance_scale": 1.5,
+        "local_guidance_scale": 1.5,
+        "flow_guidance_scale": 1.7,
+        "sampling_top_k": 50,
+        "chunk_frames": 200,
+        "chunk_hop": 100,
+        "flow_steps": 30,
+        "carry_length": 172,
+        "crop_left_latents": 86,
+        "crop_right_latents": 258,
+        "max_prompt_tokens": 5000,
+        "max_audio_frames": 9000,
+        "global_context": 128,
+        "target_sample_rate": 32000,
+        "unconditional_replace_from": 1,
+        "unconditional_preserve_trailing": 2,
+        "prompt_segments": [{"literal": "<prompt>"}],
+    }
+    fields.update(overrides)
+    return HierarchicalAudioWorkflowConfig(**fields)
+
+
+@pytest.mark.parametrize(
+    ("semantic_start", "flow_steps", "target_sample_rate"),
+    [(901, 30, 32000), (2048, 12, 44100)],
+)
+def test_hierarchical_workflow_config_records_explicit_inputs(
+    semantic_start, flow_steps, target_sample_rate
+):
+    """Two explicit configs prove emitted policy/template fields follow input."""
+    config = _hierarchical_workflow_config(
+        semantic_vocabulary_start=semantic_start,
+        flow_steps=flow_steps,
+        target_sample_rate=target_sample_rate,
+    )
+    assert config.semantic_vocabulary_start == semantic_start
+    assert config.flow_steps == flow_steps
+    assert config.target_sample_rate == target_sample_rate
+    # asdict is the boundary the producer consumes; every field must survive it.
+    as_dict = dataclasses.asdict(config)
+    assert as_dict["semantic_vocabulary_start"] == semantic_start
+    assert as_dict["flow_steps"] == flow_steps
+    assert as_dict["target_sample_rate"] == target_sample_rate
+    assert as_dict["prompt_segments"] == [{"literal": "<prompt>"}]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"components": {"global_decoder": "decoder"}}, "missing component roles"),
+        ({"flow_steps": 0}, "flow_steps"),
+        ({"chunk_hop": 500}, "chunk_hop cannot exceed chunk_frames"),
+        ({"semantic_guidance_scale": 0.0}, "semantic_guidance_scale"),
+        ({"prompt_segments": []}, "prompt_segments"),
+    ],
+)
+def test_hierarchical_workflow_config_fails_closed_on_invalid_input(overrides, match):
+    """The typed config refuses to describe an under-specified workflow."""
+    with pytest.raises((ValueError, TypeError), match=match):
+        _hierarchical_workflow_config(**overrides)
+
+
+def test_minimax_workflow_adapter_applies_owned_defaults():
+    """The mobius adapter fills the typed config from Music 3 defaults it owns."""
+    roles = _hierarchical_workflow_config().components
+    config = MiniMaxMusic3WorkflowConfig.from_diffusers(
+        components=dict(roles),
+        component_configs={"decoder": {"max_position_embeddings": 4096}},
+    )
+    assert isinstance(config, HierarchicalAudioWorkflowConfig)
+    # Semantic constants come from the mobius-owned defaults, not the writer.
+    assert config.semantic_vocabulary_start == MINIMAX_MUSIC3_AUDIO_CODE_OFFSET
+    assert config.semantic_vocabulary_size == MINIMAX_MUSIC3_SEMANTIC_VOCAB_SIZE
+    assert config.stop_token_id == MINIMAX_MUSIC3_AUDIO_END_TOKEN_ID
+    assert config.unconditional_token_id == MINIMAX_MUSIC3_UNCONDITIONAL_TOKEN_ID
+    # The context window is derived from the source language config.
+    assert config.global_context == 4096
+    assert config.components == dict(roles)
+    assert config.prompt_segments  # non-empty prompt template
+
+
+@pytest.mark.parametrize("max_positions", [2048, 8192])
+def test_minimax_workflow_adapter_generalizes_context(max_positions):
+    """A divergent language config flows through to the derived context window."""
+    roles = _hierarchical_workflow_config().components
+    config = MiniMaxMusic3WorkflowConfig.from_diffusers(
+        components=dict(roles),
+        component_configs={"decoder": {"max_position_embeddings": max_positions}},
+    )
+    assert config.global_context == max_positions
+
+
+def test_minimax_workflow_adapter_context_fallback():
+    """When the source omits the context window the adapter uses its named default."""
+    roles = _hierarchical_workflow_config().components
+    config = MiniMaxMusic3WorkflowConfig.from_diffusers(
+        components=dict(roles),
+        component_configs={},
+    )
+    assert config.global_context == MINIMAX_MUSIC3_GLOBAL_CONTEXT
+
+
+def test_resolve_workflow_config_explicit_argument_overrides_defaults():
+    """An explicit caller config wins over the mobius adapter defaults."""
+    roles = _hierarchical_workflow_config().components
+    override = _hierarchical_workflow_config(
+        semantic_vocabulary_start=2048,
+        stop_token_id=7,
+        flow_steps=12,
+        target_sample_rate=44100,
+    )
+    resolved = _resolve_hierarchical_workflow_config(
+        "MiniMaxMusic3ModularPipeline",
+        dict(roles),
+        {"decoder": {"max_position_embeddings": 4096}},
+        override,
+    )
+    assert resolved is not None
+    # The caller's divergent values survive; the adapter defaults are not used.
+    assert resolved.semantic_vocabulary_start == 2048
+    assert resolved.stop_token_id == 7
+    assert resolved.flow_steps == 12
+    assert resolved.target_sample_rate == 44100
+    # The built graphs' structural role map is authoritative.
+    assert resolved.components == dict(roles)
+
+
+def test_resolve_workflow_config_uses_adapter_defaults():
+    """Without an explicit config, mobius supplies the pipeline's owned defaults."""
+    roles = _hierarchical_workflow_config().components
+    resolved = _resolve_hierarchical_workflow_config(
+        "MiniMaxMusic3ModularPipeline",
+        dict(roles),
+        {"decoder": {"max_position_embeddings": 4096}},
+        None,
+    )
+    assert resolved is not None
+    assert resolved.semantic_vocabulary_start == MINIMAX_MUSIC3_AUDIO_CODE_OFFSET
+    assert resolved.global_context == 4096
+    assert resolved.components == dict(roles)
+
+
+def test_resolve_workflow_config_fails_closed_for_unknown_pipeline():
+    """A hierarchical topology with no registered adapter fails closed (None)."""
+    roles = _hierarchical_workflow_config().components
+    resolved = _resolve_hierarchical_workflow_config(
+        "SomeUnknownAudioPipeline",
+        dict(roles),
+        {"decoder": {"max_position_embeddings": 4096}},
+        None,
+    )
+    assert resolved is None
 
 
 def _fake_pipeline_index(
@@ -60,6 +252,7 @@ class TestInitDiffusersClassMap:
             "Qwen2_5_VLForConditionalGeneration",
             "UNet2DConditionModel",
             "CLIPTextModel",
+            "T5EncoderModel",
             "AutoencoderKL",
             "AutoencoderKLQwenImage",
             "AutoencoderKLCogVideoX",
@@ -94,7 +287,9 @@ class TestInitDiffusersClassMap:
             "qwen-image-denoising",
             "qwen-image-text-encoding",
             "video-denoising",
+            "video-vae",
             "feature-extraction",
+            "t5-text-encoding",
             "minimax-music3-condition",
             "minimax-music3-denoising",
             "minimax-music3-language",
@@ -169,6 +364,54 @@ class TestDiffusersHubRevision:
             revision="pinned-revision",
         )
 
+
+class TestLocalDiffusersPackage:
+    def test_loads_modular_index_without_hub_access(self, tmp_path):
+        index = {"_class_name": "LocalModularPipeline"}
+        (tmp_path / "modular_model_index.json").write_text(json.dumps(index))
+
+        with patch("huggingface_hub.hf_hub_download") as download:
+            assert _load_diffusers_pipeline_index(str(tmp_path)) == index
+
+        download.assert_not_called()
+
+    def test_resolves_root_component_to_local_subfolder(self, tmp_path):
+        component = tmp_path / "transformer"
+        component.mkdir()
+        (component / "config.json").write_text("{}")
+        info = [
+            "diffusers",
+            "Transformer",
+            {
+                "pretrained_model_name_or_path": "upstream/model",
+                "revision": "upstream-revision",
+                "subfolder": "transformer",
+            },
+        ]
+
+        assert _resolve_diffusers_component_source(
+            str(tmp_path), "ignored-local-revision", "transformer", info
+        ) == (str(tmp_path), None, "transformer")
+
+    def test_loads_local_component_and_optional_configs(self, tmp_path):
+        component = tmp_path / "transformer"
+        scheduler = tmp_path / "scheduler"
+        component.mkdir()
+        scheduler.mkdir()
+        (component / "config.json").write_text('{"width": 64}')
+        (scheduler / "scheduler_config.json").write_text('{"steps": 30}')
+
+        with patch("huggingface_hub.hf_hub_download") as download:
+            assert _load_diffusers_component_config(str(tmp_path), "transformer") == {
+                "width": 64
+            }
+            assert _load_optional_diffusers_json(
+                str(tmp_path), "scheduler/scheduler_config.json"
+            ) == {"steps": 30}
+            assert _load_optional_diffusers_json(str(tmp_path), "missing.json") == {}
+
+        download.assert_not_called()
+
     @patch("huggingface_hub.hf_hub_download", return_value="config.json")
     def test_component_config_download_uses_revision(self, mock_download):
         with patch("builtins.open", mock_open(read_data='{"in_channels": 3}')):
@@ -198,6 +441,22 @@ class TestDiffusersHubRevision:
             repo_id="external/component-repo",
             filename="nested/transformer/config.json",
             revision="component-revision",
+        )
+
+    @patch("huggingface_hub.hf_hub_download", return_value="scheduler_config.json")
+    def test_optional_metadata_download_uses_revision(self, mock_download):
+        with patch("builtins.open", mock_open(read_data='{"beta_start": 0.001}')):
+            result = _load_optional_diffusers_json(
+                "fake/model",
+                "scheduler/scheduler_config.json",
+                revision="pinned-revision",
+            )
+
+        assert result == {"beta_start": 0.001}
+        mock_download.assert_called_once_with(
+            repo_id="fake/model",
+            filename="scheduler/scheduler_config.json",
+            revision="pinned-revision",
         )
 
     @patch("mobius.integrations.diffusers._builder._parallel_download", return_value=[])
@@ -284,23 +543,6 @@ class TestDiffusersHubRevision:
         assert _resolve_diffusers_component_source(
             "root/music", "caller-revision", "condition_encoder", external_entry
         ) == ("external/components", "external-revision", "")
-
-    @patch("huggingface_hub.hf_hub_download", return_value="scheduler.json")
-    def test_optional_metadata_download_uses_revision(self, mock_download):
-        from mobius.integrations.diffusers._builder import _load_optional_diffusers_json
-
-        with patch("builtins.open", mock_open(read_data='{"shift": 3.0}')):
-            result = _load_optional_diffusers_json(
-                "fake/model",
-                "scheduler/scheduler_config.json",
-                revision="pinned-revision",
-            )
-        assert result == {"shift": 3.0}
-        mock_download.assert_called_once_with(
-            repo_id="fake/model",
-            filename="scheduler/scheduler_config.json",
-            revision="pinned-revision",
-        )
 
     @patch("huggingface_hub.hf_hub_download")
     def test_falls_back_to_modular_model_index(self, mock_download):
@@ -450,7 +692,7 @@ class TestBuildDiffusersPipelineFiltering:
         mock_load_index.return_value = {
             "_class_name": "FluxPipeline",
             "scheduler": ["diffusers", "EulerDiscreteScheduler"],
-            "text_encoder": ["transformers", "T5EncoderModel"],
+            "text_encoder": ["transformers", "UnsupportedTextEncoderModel"],
         }
         with pytest.raises(ValueError, match="No supported neural network"):
             build_diffusers_pipeline("fake/model", load_weights=False)

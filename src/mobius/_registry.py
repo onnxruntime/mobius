@@ -35,6 +35,7 @@ from mobius._configs import (
     MuseGlimmerConfig,
     NemotronParseConfig,
     ParakeetCTCConfig,
+    SenseNovaU1Config,
     WhisperConfig,
 )
 from mobius.models import (
@@ -67,6 +68,7 @@ from mobius.models import (
     Glm4CausalLMModel,
     Glm4MoECausalLMModel,
     GlmCausalLMModel,
+    GlmMoeDsaCausalLMModel,
     GlmOcrForConditionalGeneration,
     GPTOSSCausalLMModel,
     GraniteCausalLMModel,
@@ -126,6 +128,7 @@ from mobius.models.cohere import CohereCausalLMModel
 from mobius.models.ctrl import CTRLCausalLMModel
 from mobius.models.depth_anything import DepthAnythingForDepthEstimation
 from mobius.models.distilbert import DistilBertModel
+from mobius.models.esm import EsmConfig, EsmModel
 from mobius.models.falcon import (
     BloomCausalLMModel,
     FalconCausalLMModel,
@@ -133,6 +136,7 @@ from mobius.models.falcon import (
 )
 from mobius.models.fun_asr import FunASRForConditionalGeneration
 from mobius.models.gemma3n import Gemma3nCausalLMModel, Gemma3nMultiModalModel
+from mobius.models.glm_asr import GlmAsrForConditionalGeneration
 from mobius.models.gpt2 import GPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
 from mobius.models.gptj_codegen import CodeGenCausalLMModel, GPTJCausalLMModel
@@ -160,6 +164,7 @@ from mobius.models.qwen3_tts import Qwen3TTSForConditionalGeneration
 from mobius.models.qwen3_tts_tokenizer import Qwen3TTSTokenizerV2Model
 from mobius.models.sam2 import Sam2VisionModel
 from mobius.models.segformer import SegformerForSemanticSegmentation
+from mobius.models.sensenova_u1 import SenseNovaU1Model
 from mobius.models.sensevoice_small import SenseVoiceSmallModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5ForConditionalGeneration
@@ -584,6 +589,8 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "deepseek_v3": ModelRegistration(DeepSeekV3CausalLMModel),
     "deepseek_v4": ModelRegistration(DeepSeekV4CausalLMModel, task="deepseek-v4"),
     "deepseek_vl_v2": ModelRegistration(DeepSeekOCR2CausalLMModel),
+    # --- GLM-5.2 (MLA + DeepSeek Sparse Attention (DSA) + MoE) ---
+    "glm_moe_dsa": ModelRegistration(GlmMoeDsaCausalLMModel, task="glm-moe-dsa"),
     # --- SSM (Mamba / Mamba2) ---
     "falcon_mamba": ModelRegistration(MambaCausalLMModel),
     "mamba": ModelRegistration(MambaCausalLMModel),
@@ -627,6 +634,13 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     ),
     "got_ocr2": ModelRegistration(LLaVAModel, task="vision-language"),
     "hunyuan_vl_mot": ModelRegistration(HunYuanVLMoTModel, task="hunyuan-vl-mot"),
+    "neo_chat": ModelRegistration(
+        SenseNovaU1Model,
+        task="sensenova-u1",
+        config_class=SenseNovaU1Config,
+        family="sensenova",
+        variant="mot_unified",
+    ),
     "idefics2": ModelRegistration(LLaVAModel, task="vision-language"),
     "idefics3": ModelRegistration(LLaVAModel, task="vision-language"),
     "instructblip": ModelRegistration(LLaVAModel, task="vision-language"),
@@ -699,6 +713,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "fun_asr": ModelRegistration(
         FunASRForConditionalGeneration, task="fun-asr-speech-language"
     ),
+    "glmasr": ModelRegistration(GlmAsrForConditionalGeneration, task="glmasr-speech-language"),
     "qwen3_asr": ModelRegistration(Qwen3ASRForConditionalGeneration, task="speech-language"),
     "qwen3_forced_aligner": ModelRegistration(
         Qwen3ASRForConditionalGeneration, task="speech-language"
@@ -729,7 +744,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "electra": ModelRegistration(BertModel, task="feature-extraction"),
     "ernie": ModelRegistration(BertModel, task="feature-extraction"),
     "ernie_m": ModelRegistration(BertModel, task="feature-extraction"),
-    "esm": ModelRegistration(BertModel, task="feature-extraction"),
+    "esm": ModelRegistration(EsmModel, task="feature-extraction", config_class=EsmConfig),
     "flaubert": ModelRegistration(BertModel, task="feature-extraction"),
     "ibert": ModelRegistration(BertModel, task="feature-extraction"),
     "layoutlm": ModelRegistration(BertModel, task="feature-extraction"),
@@ -889,6 +904,12 @@ _TEXT_ONLY_MODEL_TYPE: dict[str, str] = {
     "muse_glimmer_text": "muse_glimmer_text",
     "gemma3n": "gemma3n_text",
     "gemma3n_text": "gemma3n_text",
+    # Shipped Gemma 4 multimodal checkpoints (e.g. ``google/gemma-4-E2B-it``)
+    # declare ``model_type="gemma4"`` with a nested ``text_config`` whose own
+    # ``model_type`` is ``gemma4_text``. Both resolve to the same
+    # ``Gemma4CausalLMModel`` backbone, so ``text_only=True`` is supported.
+    "gemma4": "gemma4_text",
+    "gemma4_text": "gemma4_text",
     "gemma4_unified": "gemma4_unified_text",
     "gemma4_unified_text": "gemma4_unified_text",
     # Qwen3.5-MoE-VL (Qwen3.6-35B-A3B): export just the hybrid MoE text
@@ -1028,6 +1049,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "deepseek_v2_moe": "deepseek-ai/DeepSeek-V2-Lite",
     "deepseek_v3": "deepseek-ai/DeepSeek-V3",
     "deepseek_v4": "deepseek-ai/DeepSeek-V4-Flash",
+    # --- GLM-5.2 (MLA + DSA + MoE) ---
+    "glm_moe_dsa": "zai-org/GLM-5.2",
 
     # --- SSM (Mamba) ---
     "mamba": "state-spaces/mamba-130m-hf",
@@ -1081,10 +1104,11 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "fuyu": "adept/fuyu-8b",
     "glm4v": "THUDM/glm-4v-9b",
     "glm4v_moe": "THUDM/glm-4v-9b",
-    "glm4v_moe_text": "THUDM/glm-4v-9b",
+    "glm4v_moe_text": "zai-org/GLM-4.5V",
     "glm4v_text": "THUDM/glm-4v-9b",
     "got_ocr2": "stepfun-ai/GOT-OCR2_0",
     "hunyuan_vl_mot": "tencent/HY-Embodied-0.5-X",
+    "neo_chat": "sensenova/SenseNova-U1.5-8B-MoT",
     "instructblipvideo": "Salesforce/instructblip-flan-t5-xl",
     "internvl": "OpenGVLab/InternVL2-1B",
     "internvl_chat": "OpenGVLab/InternVL-Chat-V1-5",
@@ -1107,6 +1131,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "whisper": "openai/whisper-tiny",
     "qwen3_asr": "Qwen/Qwen3-ASR-0.6B",
     "fun_asr": "justinchuby/Fun-ASR-Nano-2512",
+    "glmasr": "zai-org/GLM-ASR-Nano-2512",
     "sensevoice_small": "mlx-community/SenseVoiceSmall",
     "mms": "facebook/mms-300m",
     "parakeet_ctc": "nvidia/parakeet-ctc-1.1b",
@@ -1280,6 +1305,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "qwen3_asr": "qwen",
     "qwen3_forced_aligner": "qwen",
     "fun_asr": "qwen",
+    "glmasr": "glm",
     "qwen3_tts": "qwen",
     "qwen3_tts_tokenizer_12hz": "qwen",
     "deepseek_v2": "deepseek",
@@ -1287,6 +1313,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "deepseek_v3": "deepseek",
     "deepseek_v4": "deepseek",
     "deepseek_vl_v2": "deepseek",
+    "glm_moe_dsa": "glm",
     "olmo": "olmo",
     "olmo2": "olmo",
     "olmo3": "olmo",
@@ -1360,6 +1387,7 @@ _VARIANT_LABELS: dict[str, str] = {
     "deepseek_v2_moe": "mla+moe",
     "deepseek_v3": "mla+moe",
     "deepseek_v4": "dense-csa-fallback+mtp+moe+hc",
+    "glm_moe_dsa": "mla+dsa-indexshare+full-attention-fallback+moe",
     "phi3small": "blocksparse",
     "falcon_h1": "hybrid-ssm",
     "mamba": "ssm",

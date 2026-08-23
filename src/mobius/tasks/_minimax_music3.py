@@ -102,6 +102,7 @@ class MiniMaxMusic3LanguageTask(ModelTask):
         embeddings = _LanguageEmbeddingModel(Embedding(config.vocab_size, config.hidden_size))(
             builder.op, input_ids
         )
+        embeddings = builder.op.Cast(embeddings, to=config.dtype)
         builder.add_output(embeddings, "inputs_embeds")
         embedding = _make_model(graph)
 
@@ -118,6 +119,7 @@ class MiniMaxMusic3LanguageTask(ModelTask):
         semantic_embedding = _LanguageEmbeddingModel(
             Embedding(config.vocab_size, config.hidden_size)
         )(builder.op, semantic_ids)
+        semantic_embedding = builder.op.Cast(semantic_embedding, to=config.dtype)
         semantic_embedding = builder.op.Mul(semantic_embedding, MINIMAX_MUSIC3_FEEDBACK_SCALE)
         builder.add_output(semantic_embedding, "semantic_feedback_embedding")
         return ModelPackage(
@@ -166,7 +168,10 @@ class MiniMaxMusic3RVQTask(ModelTask):
         embedding_module = _AudioEmbeddingModel(
             config.audio_vocab_size * (config.num_codebooks - 1), config.hidden_size
         )
-        builder.add_output(embedding_module(builder.op, code_ids), "code_embeddings")
+        code_embeddings = builder.op.Cast(
+            embedding_module(builder.op, code_ids), to=config.dtype
+        )
+        builder.add_output(code_embeddings, "code_embeddings")
         embedding = _make_model(graph)
 
         # Complete-frame feedback sums all seven residual-codebook embeddings.
@@ -187,6 +192,7 @@ class MiniMaxMusic3RVQTask(ModelTask):
             config.audio_vocab_size * (config.num_codebooks - 1), config.hidden_size
         )
         acoustic_embeddings = feedback_embedding_module(builder.op, acoustic_ids)
+        acoustic_embeddings = builder.op.Cast(acoustic_embeddings, to=config.dtype)
         acoustic_embeddings = builder.op.ReduceSum(
             acoustic_embeddings,
             builder.op.Constant(value_ints=[2]),

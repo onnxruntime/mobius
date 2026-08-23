@@ -29,10 +29,11 @@ from __future__ import annotations
 import re
 
 import onnx_ir as ir
+import torch
 from onnxscript import nn
 from onnxscript._internal import builder
 
-from mobius._configs import ArchitectureConfig
+from mobius._configs import ArchitectureConfig, MMSConfig
 from mobius.components._common import LayerNorm, Linear
 from mobius.models.wav2vec2 import Wav2Vec2Model
 
@@ -166,6 +167,7 @@ class Wav2Vec2ForCTCModel(Wav2Vec2Model):
 
     default_task: str = "ctc-asr"
     category: str = "Speech-to-Text"
+    config_class = MMSConfig
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config)
@@ -184,6 +186,8 @@ class Wav2Vec2ForCTCModel(Wav2Vec2Model):
                 adapter_kernel_size=adapter_kernel_size,
                 adapter_stride=adapter_stride,
             )
+        self._adapter_stride = adapter_stride
+        self._num_adapter_layers = num_adapter_layers
 
         # CTC head: projects hidden states to per-frame vocabulary logits
         self.lm_head = Linear(output_hidden_size, config.vocab_size, bias=True)
@@ -216,67 +220,43 @@ class Wav2Vec2ForCTCModel(Wav2Vec2Model):
         # CTC head: (B, T'', H) → (B, T'', vocab_size)
         return self.lm_head(op, hidden_states)
 
-    def preprocess_weights(self, state_dict: dict[str, object]) -> dict[str, object]:
-        """Map HuggingFace weight names to ONNX module names.
+    def frame_lengths(self, op: builder.OpBuilder, attention_mask: ir.Value) -> ir.Value:
+        """Per-row valid frame count, including the MMS adapter downsampling.
 
-        HF layout (Wav2Vec2ForCTC):
-          wav2vec2.feature_extractor.conv_layers.N.conv.weight  →  feature_extractor.conv_layers.N.conv
-          wav2vec2.feature_extractor.conv_layers.N.conv.bias    →  feature_extractor.conv_layers.N.conv_bias
-          wav2vec2.feature_extractor.conv_layers.0.layer_norm.* →  feature_extractor.conv_layers.0.layer_norm[_bias]
-          wav2vec2.encoder.layer_norm.weight                    →  layer_norm.weight  (top-level post-encoder norm)
-          wav2vec2.encoder.pos_conv_embed.*                     →  (dropped — not in our model)
-          wav2vec2.encoder.layers.N.*                           →  encoder.layers.N.*
-          wav2vec2.adapter.layers.N.conv.weight                 →  adapter.layers.N.conv  (bare param)
-          wav2vec2.feature_projection.*                         →  feature_projection.*
-          lm_head.weight / lm_head.bias                        →  lm_head.weight / lm_head.bias
+        The adapter's strided convolutions shrink the frame axis further, so the
+        logits' time axis is shorter than the encoder's.  Reporting the encoder
+        count here would over-run the logits when segmenting a padded batch.
         """
-        result: dict[str, object] = {}
-        for key, value in state_dict.items():
-            k = key
+        lengths = super().frame_lengths(op, attention_mask)
+        if not hasattr(self, "adapter"):
+            return lengths
+        stride = op.Constant(value_int=int(self._adapter_stride))
+        one = op.Constant(value_int=1)
+        for _ in range(self._num_adapter_layers):
+            # Adapter convs use kernel 1 semantics for length purposes: HF's
+            # _get_feat_extract_output_lengths passes kernel_size=1.
+            lengths = op.Add(op.Div(op.Sub(lengths, one), stride), one)
+        return lengths
 
-            # Strip outer model prefix (wav2vec2.*, hubert.*, wavlm.*)
-            for prefix in ("wav2vec2.", "hubert.", "wavlm."):
-                if k.startswith(prefix):
-                    k = k[len(prefix) :]
-                    break
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Map HuggingFace ``Wav2Vec2ForCTC`` weight names to ONNX module names.
 
-            # FFN weight renames: HF uses intermediate_dense/output_dense, we use up_proj/down_proj
-            k = k.replace(".intermediate_dense.", ".up_proj.").replace(
-                ".output_dense.", ".down_proj."
-            )
+        The encoder names are handled by :meth:`Wav2Vec2Model.preprocess_weights`
+        (prefix strip, FFN rename, positional-conv weight-norm materialization).
+        Only the MMS adapter needs extra work: HF wraps its convolution in an
+        ``nn.Conv1d`` (``*.conv.weight``/``*.conv.bias``) while ``_AdapterLayer``
+        holds bare parameters named ``conv`` and ``conv_bias``.
 
-            # Feature extractor CNN: nn.Conv1d has .weight/.bias sub-attributes;
-            # our _ConvLayerBlock uses bare nn.Parameter named 'conv' and 'conv_bias'.
-            if k.startswith("feature_extractor.conv_layers."):
-                # conv.weight → conv (bare param)
-                k = re.sub(r"\.conv\.weight$", ".conv", k)
-                # conv.bias → conv_bias (bare param named differently)
-                k = re.sub(r"\.conv\.bias$", ".conv_bias", k)
-                # GroupNorm weight/bias → bare params layer_norm / layer_norm_bias
-                k = re.sub(r"\.layer_norm\.weight$", ".layer_norm", k)
-                k = re.sub(r"\.layer_norm\.bias$", ".layer_norm_bias", k)
-                result[k] = value
-                continue
+        ``lm_head.weight``/``lm_head.bias`` already match.
+        """
+        result = super().preprocess_weights(state_dict)
 
-            # Stable encoder layer_norm lives at HF's encoder.layer_norm.*;
-            # our Wav2Vec2Model puts it at top-level as self.layer_norm.
-            if k == "encoder.layer_norm.weight":
-                result["layer_norm.weight"] = value
-                continue
-            if k == "encoder.layer_norm.bias":
-                result["layer_norm.bias"] = value
-                continue
-
-            # Positional conv embedding — not present in our simplified encoder.
-            if k.startswith("encoder.pos_conv_embed."):
-                continue
-
-            # Adapter conv weights: HF uses nn.Conv1d → .conv.weight / .conv.bias;
-            # our _AdapterLayer uses bare params named 'conv' / 'conv_bias'.
-            if k.startswith("adapter.layers."):
-                k = re.sub(r"\.conv\.weight$", ".conv", k)
-                k = re.sub(r"\.conv\.bias$", ".conv_bias", k)
-
-            result[k] = value
-
-        return result
+        adapted: dict[str, torch.Tensor] = {}
+        for key, value in result.items():
+            if key.startswith("adapter.layers."):
+                key = re.sub(r"\.conv\.weight$", ".conv", key)
+                key = re.sub(r"\.conv\.bias$", ".conv_bias", key)
+            adapted[key] = value
+        return adapted

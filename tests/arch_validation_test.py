@@ -113,13 +113,29 @@ def _load_hf_config(model_id: str, revision: str | None = None):
         return _try_load_config_json(model_id, revision=revision)
 
 
-def _resolve_hf_config(hf_config):
+def _resolve_hf_config(hf_config, registration=None):
     """Resolve nested config wrappers (thinker, talker, text, llm, decoder).
 
     Mirrors the resolution logic in ``build()`` — some models
     wrap the actual config inside a parent config.
+
+    The generic ``decoder`` unwrap is skipped for a model whose registry entry
+    names its own ``config_class``: such a class consumes the *composite* config
+    and reads the sub-configs itself (Nemotron Parse reads both
+    ``config.decoder`` and ``config.encoder``). Unwrapping first hands it a
+    sub-config, which loses the parent's ``model_type``, so resolution falls back
+    to plain ``ArchitectureConfig``.
+
+    Only that branch. Production ``_select_primary_config`` has no generic
+    ``decoder`` unwrap at all — this harness added one — whereas the
+    ``talker``/``thinker``/``text``/``llm`` branches do mirror production and are
+    still needed by models that also declare a ``config_class`` (lfm2_vl,
+    muse_glimmer).
     """
     parent_config = hf_config
+    owns_composite = (
+        registration is not None and getattr(registration, "config_class", None) is not None
+    )
     if hasattr(hf_config, "talker_config"):
         talker = hf_config.talker_config
         # Qwen3-Omni talker nests the real model config under text_config
@@ -138,14 +154,14 @@ def _resolve_hf_config(hf_config):
     elif hasattr(hf_config, "llm_config"):
         # InternVL2 wraps the LLM config under llm_config
         hf_config = hf_config.llm_config
-    elif hasattr(hf_config, "decoder"):
+    elif hasattr(hf_config, "decoder") and not owns_composite:
         # VisionEncoderDecoder (TrOCR) wraps decoder config
         hf_config = hf_config.decoder
     return hf_config, parent_config
 
 
 def _build_graph(model_type: str, model_id: str):
-    """Download config, build ONNX graph, return ModelPackage.
+    """Download config, build ONNX graph, return ``(ModelPackage, task)``.
 
     Uses get_task().build() directly (same pattern as build_graph_test.py)
     to bypass ArchitectureConfig.validate() which rejects non-LM configs
@@ -158,7 +174,7 @@ def _build_graph(model_type: str, model_id: str):
             f"Cannot download config for {model_id} (gated/private model or network error)"
         )
 
-    hf_config, parent_config = _resolve_hf_config(hf_config)
+    hf_config, parent_config = _resolve_hf_config(hf_config, registration)
     config = _config_from_hf(
         hf_config,
         parent_config=parent_config,
@@ -168,7 +184,7 @@ def _build_graph(model_type: str, model_id: str):
     module = registration.module_class(config)
     task_name = registration.task or _default_task_for_model(model_type)
     task = get_task(task_name)
-    return task.build(module, config)
+    return task.build(module, config), task
 
 
 @pytest.mark.arch_validation
@@ -200,7 +216,7 @@ class TestArchValidation:
         shape mismatches, missing fields, or initialization errors, this
         test will catch them.
         """
-        pkg = _build_graph(model_type, model_id)
+        pkg, task = _build_graph(model_type, model_id)
 
         # Validate: every component has a non-empty graph
         assert len(pkg) > 0, "ModelPackage is empty"
@@ -210,6 +226,16 @@ class TestArchValidation:
             assert len(nodes) > 0, f"{component_name} has no nodes"
             assert len(model.graph.inputs) > 0, f"{component_name} has no inputs"
             assert len(model.graph.outputs) > 0, f"{component_name} has no outputs"
+
+        # Every component the task builds must declare a role. An undeclared
+        # component falls back to the "decoder" role in build_from_module and
+        # would be handed fusion passes meant for attention stacks, and
+        # inspect_components would not report it at all.
+        undeclared = sorted(set(pkg) - set(task.model_roles or {}))
+        assert not undeclared, (
+            f"{model_type}: components {undeclared} are built but missing from "
+            f"{type(task).__name__}.model_roles"
+        )
 
         del pkg
 
@@ -221,10 +247,16 @@ class TestArchValidation:
         inputs/outputs are defined. Note: output type info may not be
         available for all outputs when building without shape inference.
         """
-        pkg = _build_graph(model_type, model_id)
+        pkg, task = _build_graph(model_type, model_id)
+        roles = task.model_roles or {}
 
         for component_name, model in pkg.items():
-            # Model should have initializers (parameters)
+            # Model should have initializers (parameters). "glue" components are
+            # parameter-free loop wiring — they read every tensor they use from
+            # a graph input, so they hold only hoisted constants (if anything)
+            # and the parameter check does not apply.
+            if roles.get(component_name) == "glue":
+                continue
             initializers = list(model.graph.initializers)
             assert len(initializers) > 0, (
                 f"{component_name} has no initializers — graph may be missing parameters"

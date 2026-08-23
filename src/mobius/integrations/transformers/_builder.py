@@ -158,11 +158,18 @@ def build_transformers_model(
     fp8_kv_cache: bool = False,
     kv_cache_scales: dict[int, tuple[float, float]] | None = None,
     prune_prefill_prefix: bool = False,
+    glm_full_attention: bool = False,
 ) -> ModelPackage:
     """Build a model package from a Transformers checkpoint.
 
     If the repository is not a supported Transformers checkpoint, dispatch to
     the Diffusers integration so :func:`mobius.build` remains ecosystem-agnostic.
+
+    ``glm_full_attention`` is the ``--glm-full-attention`` CLI feature: it
+    forces ``config.use_dsa=False`` so GLM-5.2 (``glm_moe_dsa``) exports plain
+    dense causal attention (executable on stock ORT) instead of the DSA
+    ``IndexShare`` path, which requires the native custom-op runtime kernel.
+    It is only valid for ``model_type == "glm_moe_dsa"``.
     """
     from mobius.integrations.diffusers import build_diffusers_pipeline
     from mobius.integrations.transformers._config_resolver import (
@@ -181,6 +188,12 @@ def build_transformers_model(
                 f"text_only=True is not supported for '{model_id}': it does not "
                 "resolve to a registered text-capable model_type (it looks like "
                 "a diffusers pipeline or an unsupported config)."
+            )
+        if glm_full_attention:
+            raise ValueError(
+                f"glm_full_attention=True is not supported for '{model_id}': it "
+                "does not resolve to a registered 'glm_moe_dsa' model_type (it "
+                "looks like a diffusers pipeline or an unsupported config)."
             )
         return build_diffusers_pipeline(
             model_id,
@@ -225,6 +238,14 @@ def build_transformers_model(
             config,
             output_layer_indices=list(output_layer_indices),
         )
+    if glm_full_attention:
+        if model_type != "glm_moe_dsa":
+            raise ValueError(
+                f"glm_full_attention=True is not supported for model_type "
+                f"'{model_type}'. It is only available for GLM-5.2 "
+                "('glm_moe_dsa') checkpoints."
+            )
+        config = dataclasses.replace(config, use_dsa=False)
     if task is None:
         task = _default_task_for_model(model_type)
 

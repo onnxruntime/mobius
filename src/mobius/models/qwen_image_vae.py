@@ -13,16 +13,13 @@ HF diffusers class: AutoencoderKLQwenImage
 from __future__ import annotations
 
 import itertools
-from typing import TYPE_CHECKING
 
+import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
 from mobius.components import Conv2d as _Conv2d
 from mobius.components import SiLU as _SiLU
 from mobius.integrations.diffusers._configs import QwenImageVAEConfig
-
-if TYPE_CHECKING:
-    import onnx_ir as ir
 
 # ---------------------------------------------------------------------------
 # Building blocks
@@ -110,11 +107,15 @@ class _RMSNorm3d(nn.Module):
 
     def forward(self, op: OpBuilder, x: ir.Value):
         # F.normalize(x, dim=1) * scale * gamma
-        # L2 normalize along channel dimension
-        norm = op.ReduceL2(x, [1], keepdims=True)
+        # The L2 reduction runs in float32: this norm consumes raw convolution
+        # output, so squaring activations > 256 overflows float16, and
+        # onnxruntime ships no bfloat16 ReduceL2 kernel at all (a bfloat16 graph
+        # would fail to load because the node cannot be assigned to a provider).
+        x_f32 = op.Cast(x, to=ir.DataType.FLOAT)
+        norm = op.ReduceL2(x_f32, [1], keepdims=True)
         eps = 1e-12
         norm = op.Max(norm, eps)
-        x_normalized = op.Div(x, norm)
+        x_normalized = op.CastLike(op.Div(x_f32, norm), x)
         scale = self._scale
         return op.Mul(op.Mul(x_normalized, scale), self.gamma)
 
@@ -266,8 +267,18 @@ class _SequentialConv2d(nn.Module):
 class _Resample(nn.Module):
     """2D or 3D resampling for encoder (downsample) or decoder (upsample).
 
-    For ONNX export, temporal resampling uses CausalConv3d (downsample3d)
-    or CausalConv3d + pixel shuffle (upsample3d).
+    Temporal resampling in ``QwenImageResample`` is driven by the causal feature
+    cache: ``time_conv`` only runs for the *second and later* chunks of a video
+    (``feat_cache[idx] is not None``). Image pipelines encode/decode exactly one
+    ``T=1`` chunk, so the cache is always empty and both the temporal convolution
+    and the temporal pixel-shuffle are skipped entirely — ``downsample3d`` and
+    ``upsample3d`` then behave like their 2D counterparts.
+
+    Mobius exports that single-chunk image path, so ``time_conv`` is declared to
+    keep the module hierarchy aligned with diffusers but is never invoked.
+    Applying it would be incorrect: a ``(3, 1, 1)`` stride-2 temporal convolution
+    over ``T = 1`` yields ``T = 0`` in the encoder, and would double ``T`` in the
+    decoder.
     """
 
     def __init__(self, dim: int, mode: str):
@@ -297,39 +308,12 @@ class _Resample(nn.Module):
             self.time_conv = _CausalConv3d(dim, dim * 2, (3, 1, 1), padding=(1, 0, 0))
 
     def forward(self, op: OpBuilder, x: ir.Value):
-        # x: (B, C, T, H, W)
+        # x: (B, C, T, H, W). Single-chunk image path: no temporal resampling.
         b_shape = op.Shape(x, start=0, end=1)
         c_shape = op.Shape(x, start=1, end=2)
         t_shape = op.Shape(x, start=2, end=3)
         h_shape = op.Shape(x, start=3, end=4)
         w_shape = op.Shape(x, start=4, end=5)
-
-        if self._mode == "upsample3d":
-            # Temporal upsample via CausalConv3d → pixel shuffle along T
-            x = self.time_conv(op, x)
-            # time_conv output: (B, 2C, T, H, W) → reshape to (B, 2, C, T, H, W)
-            two = op.Constant(value_ints=[2])
-            x = op.Reshape(
-                x, op.Concat(b_shape, two, c_shape, t_shape, h_shape, w_shape, axis=0)
-            )
-            # Interleave: stack dim=0 and dim=1 along temporal → (B, C, T*2, H, W)
-            x0 = op.Gather(x, op.Constant(value_ints=[0]), axis=1)
-            x1 = op.Gather(x, op.Constant(value_ints=[1]), axis=1)
-            t2 = op.Mul(t_shape, two)
-            # Interleave by stacking at dim 3, then reshaping
-            # (B, C, T, H, W) each → stack → (B, C, T, 2, H, W) → (B, C, T*2, H, W)
-            stacked = op.Concat(
-                op.Unsqueeze(x0, [3]),
-                op.Unsqueeze(x1, [3]),
-                axis=3,
-            )
-            x = op.Reshape(stacked, op.Concat(b_shape, c_shape, t2, h_shape, w_shape, axis=0))
-
-        if self._mode == "downsample3d":
-            # Temporal downsample
-            x = self.time_conv(op, x)
-            # Update T after temporal conv
-            t_shape = op.Shape(x, start=2, end=3)
 
         # Reshape to (B*T, C, H, W) for spatial operation
         bt = op.Mul(b_shape, t_shape)
@@ -339,12 +323,17 @@ class _Resample(nn.Module):
         )
 
         if self._mode in ("upsample2d", "upsample3d"):
-            # Nearest-neighbor 2x upsample
-            x_2d = op.Resize(
+            # Nearest-neighbor 2x upsample. QwenImageUpsample runs the
+            # interpolation in float32 and casts back, which also keeps the
+            # graph off ORT's missing bfloat16 Resize kernel.
+            x_2d = op.CastLike(
+                op.Resize(
+                    op.Cast(x_2d, to=ir.DataType.FLOAT),
+                    None,
+                    op.Constant(value_floats=[1.0, 1.0, 2.0, 2.0]),
+                    mode="nearest",
+                ),
                 x_2d,
-                None,
-                op.Constant(value_floats=[1.0, 1.0, 2.0, 2.0]),
-                mode="nearest",
             )
 
         x_2d = self.resample(op, x_2d)

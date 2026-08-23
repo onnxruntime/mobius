@@ -144,6 +144,9 @@ def _all_registered_with_test_id() -> dict[str, str]:
 #
 _COVERAGE_SKIP: dict[str, str] = {
     # --- Specialized-test models (covered by a co-located test class) ---
+    "neo_chat": "SenseNova U1.5 is a 17.5B (~50 GB) five-component package; "
+    "L1-L3 use the tiny config and co-located tests, while pinned L4/L5 text, "
+    "image, and edit evidence requires the documented H200 validation.",
     "llada": "Masked-diffusion LM — covered by src/mobius/models/llada_test.py "
     "(graph build + diffusers-parity + bidirectionality); no small public "
     "checkpoint and non-standard I/O (no attention_mask/KV cache/golden data)",
@@ -218,6 +221,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "dbrx": "Large MoE (132B) — no small public checkpoint",
     "deepseek_v3": "Very large MoE (671B) — no small public checkpoint",
     "deepseek_v4": "Very large MoE (284B) — no small public checkpoint",
+    "glm_moe_dsa": "Very large MoE (~1.5T, zai-org/GLM-5.2) — no small public checkpoint",
     "llama4_text": "Very large MoE (109B) — no small public checkpoint",
     "qwen3_5_moe": "Large MoE (22B) — no small public checkpoint",
     # --- Models without test_model_id ---

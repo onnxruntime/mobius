@@ -35,7 +35,12 @@ __all__ = [
     "fold_initializers_after_weights",
     # Passes (used by tests and _builder re-exports)
     "CleanupMetadataPass",
+    "StripDebugMetadataPass",
     "SymbolicShapeInferencePass",
+    "strip_debug_metadata",
+    "DEBUG_METADATA_PREFIXES",
+    "DEBUG_METADATA_KEYS",
+    "FUNCTIONAL_METADATA_PREFIX",
     # Diagnostic helpers
     "_count_all_ops",
     "_count_ops",
@@ -62,6 +67,7 @@ from mobius._passes import (
 )
 from mobius.functions import register_function_bodies
 from mobius.rewrite_rules import (
+    clip_to_min_max_rules,
     decompose_attention_pass,
     decompose_rope_rules,
     gelu_fusion_rules,
@@ -116,6 +122,81 @@ class CleanupMetadataPass(ir.passes.InPlacePass):
                     modified = True
                     del node.metadata_props[key]
         return ir.passes.PassResult(model, modified=modified)
+
+
+#: Metadata written by the build toolchain to describe *where a node came from*.
+#: Useful when debugging a graph, carried into every serialized model, and read
+#: by nothing at inference time.
+#:
+#: Prefixes are matched with ``startswith``; bare names are matched exactly.
+#: Keeping this explicit rather than "strip everything that is not ours" means a
+#: new provenance key from a toolchain upgrade is *kept* until someone lists it,
+#: which is the safe direction to fail: a graph that is larger than it needs to
+#: be, rather than one missing metadata a runtime depended on.
+DEBUG_METADATA_PREFIXES: tuple[str, ...] = (
+    "pkg.onnxscript.",
+    "pkg.onnx_shape_inference.",
+)
+DEBUG_METADATA_KEYS: tuple[str, ...] = ("namespace",)
+
+#: Everything mobius itself writes for a runtime to read back is under this
+#: prefix — pipeline component presence, optional-input presence, generation
+#: policy contracts, conv-cache spatial scales, batch-padding sensitivity. The
+#: strip pass must never touch it; ``StripDebugMetadataPass`` asserts as much.
+FUNCTIONAL_METADATA_PREFIX = "mobius."
+
+
+def _is_debug_metadata(key: str) -> bool:
+    return key.startswith(DEBUG_METADATA_PREFIXES) or key in DEBUG_METADATA_KEYS
+
+
+class StripDebugMetadataPass(ir.passes.InPlacePass):
+    """Remove build-time provenance metadata from every node and value.
+
+    ``onnxscript`` annotates each node with the ``nn.Module`` path that produced
+    it (``namespace``, ``pkg.onnxscript.class_hierarchy``,
+    ``pkg.onnxscript.name_scopes``), which rewrite rule created it
+    (``pkg.onnxscript.rewriter.rule_name``), and symbolic-inference internals on
+    values (``pkg.onnx_shape_inference.sym_data``). That is exactly what you want
+    when reading a graph in Netron and tracing a node back to the source module,
+    and it is dead weight in a shipped artifact: on the tiny test models it is
+    **36-39% of the serialized graph** (weights excluded), and it scales with
+    node count, so the fraction holds for real models.
+
+    Deliberately *not* driven by "delete anything not prefixed ``mobius.``".
+    Metadata this pass does not recognise is preserved, so an unrecognised key
+    costs bytes rather than breaking a runtime that reads it.
+    """
+
+    def call(self, model: ir.Model) -> ir.passes.PassResult:
+        removed = 0
+
+        def strip(props) -> None:
+            nonlocal removed
+            for key in [key for key in props if _is_debug_metadata(key)]:
+                assert not key.startswith(FUNCTIONAL_METADATA_PREFIX), (
+                    f"{key!r} is both functional and debug metadata; the two "
+                    "namespaces must stay disjoint"
+                )
+                del props[key]
+                removed += 1
+
+        seen: set[int] = set()
+        for node in model.graph.all_nodes():
+            strip(node.metadata_props)
+            for value in (*node.inputs, *node.outputs):
+                if value is not None and id(value) not in seen:
+                    seen.add(id(value))
+                    strip(value.metadata_props)
+
+        if removed:
+            logger.debug("Stripped %d debug metadata entries", removed)
+        return ir.passes.PassResult(model, modified=bool(removed))
+
+
+def strip_debug_metadata(model: ir.Model) -> ir.Model:
+    """Run :class:`StripDebugMetadataPass` over ``model`` in place."""
+    return StripDebugMetadataPass()(model).model
 
 
 # Maximum number of elements allowed in a constant-folded output tensor.
@@ -355,6 +436,13 @@ def _get_optimization_passes(
     if caps.requires_graph_capture_rewrite:
         lower.append(("StaticEmptyKV", list(static_empty_kv_rules())))
 
+    # --- bfloat16 Clip lowering (all EPs) ---
+    # ORT has no bfloat16 Clip kernel and expands the op's ONNX function body
+    # into Less/Where, which also lack bfloat16 kernels — the unassigned nodes
+    # abort session creation. Min/Max are kernel-backed and exactly equivalent.
+    if dtype == ir.DataType.BFLOAT16:
+        lower.append(("ClipToMinMax", list(clip_to_min_max_rules())))
+
     return fuse, lower
 
 
@@ -593,7 +681,28 @@ def optimize_model(
                 stacklevel=4,
             )
         else:
-            Fp8KvCachePass(kv_cache_scales)(model)
+            fp8_pass = Fp8KvCachePass(kv_cache_scales)
+            fp8_pass(model)
+            if fp8_pass.converted == 0:
+                # The gate above tests the *intent* to fuse GQA; only the pass
+                # knows the outcome. FP8 KV storage is a property of the
+                # attention operator, because the scales that dequantize the
+                # cache on read are node inputs: GroupQueryAttention has
+                # ``k_scale``/``v_scale``, ai.onnx ``Attention`` has no such
+                # slot. Retyping a cache that no operator can dequantize would
+                # declare FP8 over data that is read as fp16 — silently wrong
+                # numerics — and quietly leaving the cache at the model dtype
+                # would hand back a package that does not do what was asked.
+                raise ValueError(
+                    "fp8_kv_cache=True was requested but the optimized graph "
+                    "exposes no GroupQueryAttention KV cache to convert. FP8 KV "
+                    "storage needs an attention operator with k_scale/v_scale "
+                    "inputs to dequantize the cache on read; a static-cache "
+                    "export scatters into fixed buffers read by ai.onnx "
+                    "Attention, which has no such inputs. Build without "
+                    "--features fp8-kv-cache, or without --features static-cache "
+                    "so the decoder fuses to GroupQueryAttention."
+                )
 
 
 def fold_initializers_after_weights(model: ir.Model) -> None:

@@ -433,11 +433,19 @@ class _Snake1d(nn.Module):
         self.alpha = nn.Parameter([1, channels, 1])
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
-        angle = op.Mul(self.alpha, hidden_states)
-        return op.Add(
-            hidden_states,
-            op.Mul(op.Reciprocal(op.Add(self.alpha, 1e-9)), op.Pow(op.Sin(angle), 2.0)),
+        # Checkpoint alpha values can be smaller than fp16's finite reciprocal
+        # range. Evaluate Snake in fp32, then return to the surrounding model dtype.
+        hidden_states_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
+        alpha_f32 = op.Cast(self.alpha, to=ir.DataType.FLOAT)
+        angle = op.Mul(alpha_f32, hidden_states_f32)
+        output = op.Add(
+            hidden_states_f32,
+            op.Mul(
+                op.Reciprocal(op.Add(alpha_f32, 1e-9)),
+                op.Pow(op.Sin(angle), 2.0),
+            ),
         )
+        return op.Cast(output, to=hidden_states.dtype)
 
 
 class _VocoderResidualUnit(nn.Module):

@@ -3158,6 +3158,190 @@ class TestBuildGraphMoonshine:
         assert "Sigmoid" not in decoder_ops
 
 
+class TestBuildGraphGlmAsr:
+    """Verify GLM-ASR's audio encoder, projector, embedding, and decoder split."""
+
+    def _config(self):
+        from mobius._configs import GlmAsrConfig
+
+        return _base_config(
+            _config_cls=GlmAsrConfig,
+            audio_token_id=100,
+            audio=AudioConfig(
+                d_model=64,
+                encoder_layers=2,
+                encoder_attention_heads=4,
+                encoder_ffn_dim=256,
+                encoder_head_dim=16,
+                encoder_num_key_value_heads=4,
+                encoder_partial_rotary_factor=0.5,
+                encoder_rope_theta=10_000.0,
+                encoder_layer_norm_eps=1e-5,
+                num_mel_bins=128,
+                max_source_positions=256,
+                output_dim=64,
+                activation_function="gelu",
+                audio_token_id=100,
+            ),
+        )
+
+    def _build(self):
+        from mobius.models.glm_asr import GlmAsrForConditionalGeneration
+        from mobius.tasks import GlmAsrSpeechLanguageTask
+
+        config = self._config()
+        module = GlmAsrForConditionalGeneration(config)
+        return (
+            config,
+            module,
+            build_from_module(module, config, task=GlmAsrSpeechLanguageTask()),
+        )
+
+    def test_package_contract_and_attention(self):
+        config, _, pkg = self._build()
+
+        assert set(pkg) == {"audio_encoder", "embedding", "decoder"}
+        audio = pkg["audio_encoder"]
+        assert {value.name for value in audio.graph.inputs} == {
+            "input_features",
+            "input_features_mask",
+        }
+        assert {value.name for value in audio.graph.outputs} == {
+            "audio_features",
+            "audio_feature_lengths",
+        }
+        attention_nodes = [node for node in audio.graph if node.op_type == "Attention"]
+        assert len(attention_nodes) == config.audio.encoder_layers
+        assert all(node.attributes["is_causal"].value == 0 for node in attention_nodes)
+        assert all(len(node.inputs) == 3 or node.inputs[3] is None for node in attention_nodes)
+        assert all(len(node.outputs) == 1 for node in attention_nodes)
+
+        decoder_inputs = {value.name for value in pkg["decoder"].graph.inputs}
+        assert {"inputs_embeds", "attention_mask", "position_ids"} <= decoder_inputs
+        assert "past_key_values.0.key" in decoder_inputs
+        assert "past_key_values.0.value" in decoder_inputs
+
+    def test_configured_audio_and_projector_activations(self):
+        from mobius.models.glm_asr import GlmAsrForConditionalGeneration
+        from mobius.tasks import GlmAsrSpeechLanguageTask
+
+        config = self._config()
+        assert config.audio is not None
+        config.audio.activation_function = "relu"
+        config.projector_hidden_act = "silu"
+        package = build_from_module(
+            GlmAsrForConditionalGeneration(config),
+            config,
+            task=GlmAsrSpeechLanguageTask(),
+        )
+
+        audio_ops = [node.op_type for node in package["audio_encoder"].graph]
+        assert audio_ops.count("Relu") == config.audio.encoder_layers
+        assert audio_ops.count("Swish") == 1
+
+    def test_checkpoint_weight_routing(self):
+        import torch
+
+        _, module, _ = self._build()
+        tensor = torch.ones(1)
+        routed = module.preprocess_weights(
+            {
+                "audio_tower.conv1.weight": tensor,
+                "multi_modal_projector.linear_1.weight": tensor,
+                "language_model.model.embed_tokens.weight": tensor,
+                "language_model.model.layers.0.self_attn.q_proj.weight": tensor,
+                "language_model.model.norm.weight": tensor,
+                "language_model.lm_head.weight": tensor,
+            }
+        )
+
+        assert set(routed) == {
+            "audio_encoder.audio_tower.conv1.weight",
+            "audio_encoder.multi_modal_projector.linear_1.weight",
+            "embedding.embed_tokens.weight",
+            "decoder.layers.0.self_attn.q_proj.weight",
+            "decoder.norm.weight",
+            "decoder.lm_head.weight",
+        }
+
+    def test_cuda_build_preserves_standard_decoder_attention(self):
+        from mobius.models.glm_asr import GlmAsrForConditionalGeneration
+        from mobius.tasks import GlmAsrSpeechLanguageTask
+
+        config = self._config()
+        config.dtype = ir.DataType.FLOAT16
+        package = build_from_module(
+            GlmAsrForConditionalGeneration(config),
+            config,
+            task=GlmAsrSpeechLanguageTask(),
+            execution_provider="cuda",
+        )
+        decoder_ops = [node.op_type for node in package["decoder"].graph]
+        assert decoder_ops.count("Attention") == config.num_hidden_layers
+        assert "GroupQueryAttention" not in decoder_ops
+
+    def test_three_stage_pipeline_runs_with_ort(self):
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.rewrite_rules._testing_utils import fill_random_weights
+
+        config, _, pkg = self._build()
+        for model in pkg.values():
+            fill_random_weights(model)
+
+        mel_sequence = 32
+        audio_session = OnnxModelSession(pkg["audio_encoder"])
+        audio_outputs = audio_session.run(
+            {
+                "input_features": np.random.default_rng(0)
+                .standard_normal((1, 128, mel_sequence))
+                .astype(np.float32),
+                "input_features_mask": np.ones((1, mel_sequence), dtype=np.int64),
+            }
+        )
+        audio_session.close()
+        assert audio_outputs["audio_feature_lengths"].tolist() == [4]
+        audio_features = audio_outputs["audio_features"].reshape(-1, config.hidden_size)
+
+        input_ids = np.array(
+            [[1, 2, *([config.audio_token_id] * audio_features.shape[0]), 3]],
+            dtype=np.int64,
+        )
+        embedding_session = OnnxModelSession(pkg["embedding"])
+        inputs_embeds = embedding_session.run(
+            {"input_ids": input_ids, "audio_features": audio_features}
+        )["inputs_embeds"]
+        embedding_session.close()
+
+        sequence_length = input_ids.shape[1]
+        decoder_inputs = {
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": np.ones_like(input_ids),
+            "position_ids": np.arange(sequence_length, dtype=np.int64)[None, :],
+        }
+        for layer in range(config.num_hidden_layers):
+            for cache_kind in ("key", "value"):
+                decoder_inputs[f"past_key_values.{layer}.{cache_kind}"] = np.zeros(
+                    (1, config.num_key_value_heads, 0, config.head_dim),
+                    dtype=np.float32,
+                )
+        decoder_session = OnnxModelSession(pkg["decoder"])
+        decoder_outputs = decoder_session.run(decoder_inputs)
+        decoder_session.close()
+
+        assert decoder_outputs["logits"].shape == (
+            1,
+            sequence_length,
+            config.vocab_size,
+        )
+        assert decoder_outputs["present.0.key"].shape[2] == sequence_length
+
+    def test_registry_lookup(self):
+        from mobius.models.glm_asr import GlmAsrForConditionalGeneration
+
+        assert registry.get("glmasr") is GlmAsrForConditionalGeneration
+        assert _default_task_for_model("glmasr") == "glmasr-speech-language"
+
+
 class TestBuildGraphQwen3ASR:
     """Verify Qwen3-ASR 3-model split with SpeechLanguageTask."""
 
@@ -4321,6 +4505,77 @@ class TestBuildCogVideoXGraph:
         assert len(sample_input.shape) == 5  # [B, T, C, H, W]
 
 
+class TestBuildCogVideoXVAEGraph:
+    """Verify the CogVideoX causal 3D VAE decoder graph construction."""
+
+    @staticmethod
+    def _config():
+        from mobius.models.cogvideox_vae import CogVideoXVAEConfig
+
+        return CogVideoXVAEConfig(
+            in_channels=3,
+            out_channels=3,
+            latent_channels=4,
+            block_out_channels=(8, 8, 8, 8),
+            layers_per_block=1,
+            norm_num_groups=2,
+            temporal_compression_ratio=4,
+            scaling_factor=1.15258426,
+        )
+
+    def test_video_vae_graph_builds_with_paired_conv_caches(self):
+        from mobius.models.cogvideox_vae import AutoencoderKLCogVideoXModel
+        from mobius.tasks import VideoVAETask
+        from mobius.tasks._video_vae import (
+            CONV_CACHE_INPUT_PREFIX,
+            CONV_CACHE_OUTPUT_PREFIX,
+            CONV_CACHE_SCALE_METADATA,
+        )
+
+        config = self._config()
+        model = VideoVAETask().build(AutoencoderKLCogVideoXModel(config), config)["decoder"]
+
+        assert model.graph is not None
+        latent = next(v for v in model.graph.inputs if v.name == "latent_sample")
+        # [B, C, T, H, W]: the temporal axis is explicit, and the frame count is
+        # a free dimension rather than a baked clip length.
+        assert len(latent.shape) == 5
+        assert str(latent.shape[2]) == "latent_frames"
+
+        sample = next(v for v in model.graph.outputs if v.name == "sample")
+        assert len(sample.shape) == 5
+        assert int(sample.shape[1]) == config.out_channels
+
+        cache_inputs = {
+            v.name[len(CONV_CACHE_INPUT_PREFIX) :]
+            for v in model.graph.inputs
+            if v.name.startswith(CONV_CACHE_INPUT_PREFIX)
+        }
+        cache_outputs = {
+            v.name[len(CONV_CACHE_OUTPUT_PREFIX) :]
+            for v in model.graph.outputs
+            if v.name.startswith(CONV_CACHE_OUTPUT_PREFIX)
+        }
+        # Every cached convolution has to be readable and writable, or a clip
+        # decoded in chunks would silently lose the frames before each chunk.
+        assert cache_inputs
+        assert cache_inputs == cache_outputs
+        for name in cache_inputs:
+            key = f"{CONV_CACHE_SCALE_METADATA}{CONV_CACHE_INPUT_PREFIX}{name}"
+            assert key in model.metadata_props
+
+    def test_video_vae_cache_spec_matches_upsampled_resolutions(self):
+        from mobius.models.cogvideox_vae import AutoencoderKLCogVideoXModel
+
+        config = self._config()
+        module = AutoencoderKLCogVideoXModel(config)
+        scales = {entry.name: entry.spatial_scale for entry in module.conv_cache_spec()}
+        assert scales["conv_in"] == 1
+        # Three upsampling stages for four blocks, so the last cached
+        # convolutions live at the full frame resolution.
+        assert scales["conv_out"] == 2 ** (len(config.block_out_channels) - 1)
+
+
 class TestBuildAdapterGraph:
     """Verify T2I-Adapter and IP-Adapter graph construction."""
 
@@ -4524,12 +4779,13 @@ class TestBuildMoshiLM:
         for node in gqa_nodes:
             assert node.attributes["local_window_size"].value == full_window
 
-    def test_depformer_io(self):
+    @pytest.mark.parametrize("dep_q", [8, 16])
+    def test_depformer_io(self, dep_q):
         """Depformer model I/O: hidden + prev_token + substep_index -> logits."""
         from mobius.models.moshi import MoshiDepformerModel, moshi_depformer_config
         from mobius.tasks import MoshiDepformerTask
 
-        config = moshi_depformer_config()
+        config = moshi_depformer_config(dep_q=dep_q)
         pkg = build_from_module(MoshiDepformerModel(config), config, task=MoshiDepformerTask())
         model = pkg["model"]
         inputs = {inp.name for inp in model.graph.inputs}
@@ -4539,6 +4795,14 @@ class TestBuildMoshiLM:
         assert "substep_index" in inputs
         assert "logits" in outputs
         assert "present.0.key" in outputs
+        assert model.graph.initializers["depformer_in.weight"].shape[0] == dep_q
+
+    @pytest.mark.parametrize("dep_q", [0, 1, 2, 7, 9, 17])
+    def test_depformer_rejects_unsupported_width(self, dep_q):
+        from mobius.models.moshi import moshi_depformer_config
+
+        with pytest.raises(ValueError, match=r"dep_q must be 8 .* or 16"):
+            moshi_depformer_config(dep_q)
 
 
 class TestBuildCodecGraph:
@@ -4593,6 +4857,10 @@ class TestBuildCodecGraph:
                 max_position_embeddings=128,
                 num_quantizers=8,
                 num_semantic_quantizers=1,
+                # Narrow conv stack (1->4->8->16->32->64->32) but the same
+                # depth as the real checkpoint, so `layers.*` numbering and
+                # weight names match what the real model relies on.
+                num_filters=4,
             ),
         )
 
@@ -4645,6 +4913,164 @@ class TestBuildCodecGraph:
 
         output_names = {out.name for out in encoder.graph.outputs}
         assert "codes" in output_names
+
+    @staticmethod
+    def _conv_encoder_weights(encoder_config):
+        """Return {param name: shape} for the conv stack of an encoder config."""
+        from mobius.models.qwen3_tts_tokenizer import Qwen3TTSCodecEncoderModel
+
+        config = ArchitectureConfig(
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=8,
+            intermediate_size=64,
+            vocab_size=256,
+            max_position_embeddings=128,
+            codec_encoder=encoder_config,
+        )
+        module = Qwen3TTSCodecEncoderModel(config)
+        return {
+            name: tuple(param.shape)
+            for name, param in module.named_parameters()
+            if name.startswith("encoder.layers") and name.endswith("conv.weight")
+        }
+
+    def test_default_config_conv_stack_matches_checkpoint(self):
+        """Default config must reproduce the real checkpoint's conv stack.
+
+        Both names and shapes are asserted: the ``layers.*`` indices are
+        derived from ``upsampling_ratios``/``num_residual_layers``, so a
+        drift in indexing would only surface at weight-load time.
+        """
+        from mobius._configs import CodecEncoderConfig
+
+        weights = self._conv_encoder_weights(CodecEncoderConfig())
+
+        # Matches Qwen/Qwen3-TTS-Tokenizer-12Hz encoder.encoder.layers.*
+        assert weights == {
+            "encoder.layers.0.conv.weight": (64, 1, 7),
+            "encoder.layers.1.block.1.conv.weight": (32, 64, 3),
+            "encoder.layers.1.block.3.conv.weight": (64, 32, 1),
+            "encoder.layers.3.conv.weight": (128, 64, 8),
+            "encoder.layers.4.block.1.conv.weight": (64, 128, 3),
+            "encoder.layers.4.block.3.conv.weight": (128, 64, 1),
+            "encoder.layers.6.conv.weight": (256, 128, 10),
+            "encoder.layers.7.block.1.conv.weight": (128, 256, 3),
+            "encoder.layers.7.block.3.conv.weight": (256, 128, 1),
+            "encoder.layers.9.conv.weight": (512, 256, 12),
+            "encoder.layers.10.block.1.conv.weight": (256, 512, 3),
+            "encoder.layers.10.block.3.conv.weight": (512, 256, 1),
+            "encoder.layers.12.conv.weight": (1024, 512, 16),
+            "encoder.layers.14.conv.weight": (512, 1024, 3),
+        }
+
+    def test_tiny_config_keeps_checkpoint_layer_names(self):
+        """The tiny test config must keep the checkpoint's layer numbering."""
+        from mobius._configs import CodecEncoderConfig
+
+        tiny = self._conv_encoder_weights(self._codec_config().codec_encoder)
+        default = self._conv_encoder_weights(CodecEncoderConfig())
+
+        assert set(tiny) == set(default)
+        # Only the widths shrink: 1 -> 4 -> 8 -> 16 -> 32 -> 64 -> 32.
+        assert tiny["encoder.layers.0.conv.weight"] == (4, 1, 7)
+        assert tiny["encoder.layers.12.conv.weight"] == (64, 32, 16)
+        assert tiny["encoder.layers.14.conv.weight"] == (32, 64, 3)
+
+    def test_conv_stack_indices_follow_config(self):
+        """Layer indices are derived from ratios and residual-layer count."""
+        from mobius._configs import CodecEncoderConfig
+
+        # 2 ratios -> final conv lands at layers.8
+        two_ratios = self._conv_encoder_weights(
+            CodecEncoderConfig(hidden_size=8, num_filters=2, upsampling_ratios=[4, 2])
+        )
+        assert "encoder.layers.8.conv.weight" in two_ratios
+        assert two_ratios["encoder.layers.8.conv.weight"] == (8, 8, 3)
+
+        # 4 ratios with 2 residual layers each -> final conv at layers.18
+        deep = self._conv_encoder_weights(
+            CodecEncoderConfig(hidden_size=8, num_filters=2, num_residual_layers=2)
+        )
+        assert "encoder.layers.18.conv.weight" in deep
+
+    def test_hidden_size_drives_conv_output_width(self):
+        """The final conv width follows ``hidden_size`` (no hardcoded 512).
+
+        Regression guard: a hardcoded final width silently produced a
+        malformed graph (LayerNormalization over a mismatched width).
+        """
+        from mobius._configs import CodecEncoderConfig
+
+        weights = self._conv_encoder_weights(CodecEncoderConfig(hidden_size=32, num_filters=4))
+        assert weights["encoder.layers.14.conv.weight"][0] == 32
+
+    def test_default_config_rvq_projections_match_checkpoint(self):
+        """Encoder RVQ projections must match the real checkpoint's shapes.
+
+        The RVQ consumes ``hidden_size``-wide features and projects to
+        ``codebook_dim``, mirroring HF ``MimiResidualVectorQuantizer``.
+        Deriving these from ``codebook_dim`` alone produced projections
+        that could not load the checkpoint's weights at all.
+        """
+        from mobius._configs import CodecEncoderConfig
+        from mobius.models.qwen3_tts_tokenizer import Qwen3TTSCodecEncoderModel
+
+        config = ArchitectureConfig(
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=8,
+            intermediate_size=64,
+            vocab_size=256,
+            max_position_embeddings=128,
+            codec_encoder=CodecEncoderConfig(),
+        )
+        module = Qwen3TTSCodecEncoderModel(config)
+        shapes = {
+            name: tuple(param.shape)
+            for name, param in module.named_parameters()
+            if "_proj.weight" in name and "quantizer" in name
+        }
+
+        # Matches Qwen/Qwen3-TTS-Tokenizer-12Hz encoder.quantizer.* weights.
+        for prefix in (
+            "quantizer.semantic_residual_vector_quantizer",
+            "quantizer.acoustic_residual_vector_quantizer",
+        ):
+            assert shapes[f"{prefix}.input_proj.weight"] == (256, 512, 1)
+            assert shapes[f"{prefix}.output_proj.weight"] == (512, 256, 1)
+
+        # Codebooks are codebook_dim-wide, matching codebook.embed_sum.
+        codebooks = {
+            tuple(param.shape)
+            for name, param in module.named_parameters()
+            if name.endswith("codebook.embedding")
+        }
+        assert codebooks == {(2048, 256)}
+
+    def test_encoder_input_declares_configured_audio_channels(self):
+        """The graph input channel count must match the first conv.
+
+        ``audio_channels`` sizes ``encoder.layers.0.conv``, so a task that
+        always declared a mono input would feed a 1-channel tensor into a
+        conv expecting more.
+        """
+        import dataclasses
+
+        from mobius.models.qwen3_tts_tokenizer import Qwen3TTSTokenizerV2Model
+        from mobius.tasks import CodecTask
+
+        config = self._codec_config()
+        config.codec_encoder = dataclasses.replace(config.codec_encoder, audio_channels=2)
+        module = Qwen3TTSTokenizerV2Model(config)
+        pkg = build_from_module(module, config, task=CodecTask())
+
+        waveform = next(inp for inp in pkg["encoder"].graph.inputs if inp.name == "waveform")
+        assert waveform.shape[1] == 2
 
     def test_registry_lookup(self):
         """Verify qwen3_tts_tokenizer_12hz is registered with codec task."""
@@ -5456,6 +5882,10 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "llava_onevision",
     "mistral3",
     "molmo",
+    # SenseNova-U1.5 NEO-unify (co-located src/mobius/models/sensenova_u1_test.py):
+    # a unified any-to-any package whose five components include an
+    # image-generation branch, so it does not fit the generic VLM harness.
+    "neo_chat",
     "ovis2",
     "paligemma",
     "pixtral",

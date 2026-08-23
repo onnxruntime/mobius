@@ -16,6 +16,7 @@ from mobius.integrations.diffusers._configs import (
     CLIPTextConfig,
     QwenImageConfig,
     QwenImageVAEConfig,
+    T5TextEncoderConfig,
     UNet2DConfig,
 )
 
@@ -89,6 +90,32 @@ class TestUNet2DConfigFromDiffusers:
         assert tuple(unet.block_out_channels) == (320, 640, 1280, 1280)
         assert unet.cross_attention_dim == 768
         assert unet.layers_per_block == 2
+
+    def test_preserves_explicitly_absent_mid_block(self):
+        unet = UNet2DConfig.from_diffusers({"mid_block_type": None})
+        assert unet.mid_block_type is None
+
+
+def test_t5_text_encoder_config_maps_diffusers_fields():
+    config = T5TextEncoderConfig.from_diffusers(
+        {
+            "model_type": "t5",
+            "vocab_size": 32128,
+            "d_model": 4096,
+            "d_ff": 10240,
+            "d_kv": 64,
+            "num_layers": 24,
+            "num_heads": 64,
+            "feed_forward_proj": "gated-gelu",
+            "relative_attention_num_buckets": 32,
+            "relative_attention_max_distance": 128,
+        }
+    )
+    assert config.hidden_size == 4096
+    assert config.intermediate_size == 10240
+    assert config.num_hidden_layers == 24
+    assert config.num_attention_heads == 64
+    assert config.is_gated_act
 
 
 class TestQwenImageEditOfficialConfigs:

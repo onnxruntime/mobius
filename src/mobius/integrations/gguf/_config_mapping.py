@@ -252,6 +252,36 @@ def gguf_to_config(
                 f"GGUF file missing required metadata for '{field}'. Architecture: {gguf_arch}"
             )
 
+    # Exclude Multi-Token-Prediction (MTP / "nextn") blocks from the decoder
+    # layer count. GGUF's ``block_count`` counts the trailing MTP prediction
+    # block(s) alongside the regular decoder layers (e.g. Qwen3.5/3.8 store
+    # ``block_count = num_hidden_layers + nextn_predict_layers``), but the base
+    # decode model does not build them. Their weights (``blk.<n>.nextn.*`` and
+    # the accompanying attention/FFN tensors of the trailing block) are skipped
+    # during tensor mapping. Without this correction the builder would create
+    # an extra decoder layer whose linear-attention / GQA initializers have no
+    # backing GGUF weights and fail the ``_check_weights`` invariant on save.
+    nextn_layers = metadata.get(f"{gguf_arch}.nextn_predict_layers")
+    mtp_predict_layers = 0
+    mtp_block_indices: list[int] = []
+    if nextn_layers is not None and int(nextn_layers) > 0:
+        mtp_count = int(nextn_layers)
+        decoder_layers = int(hf_fields["num_hidden_layers"]) - mtp_count
+        if decoder_layers <= 0:
+            raise ValueError(
+                f"GGUF metadata inconsistent: block_count "
+                f"({hf_fields['num_hidden_layers']}) <= nextn_predict_layers "
+                f"({mtp_count}) for architecture {gguf_arch}."
+            )
+        hf_fields["num_hidden_layers"] = decoder_layers
+        # The trailing ``mtp_count`` GGUF blocks (indices ``decoder_layers`` ..
+        # ``decoder_layers + mtp_count - 1``) hold the self-speculative MTP head
+        # weights (``blk.<n>.nextn.*`` plus the head's own attention/FFN block).
+        # Surface them so the builder can emit the MTP sidecar instead of
+        # silently dropping the tensors.
+        mtp_predict_layers = mtp_count
+        mtp_block_indices = list(range(decoder_layers, decoder_layers + mtp_count))
+
     # Derive head_dim if not explicitly provided.
     # Prefer attention.key_length (the actual head dimension) over
     # rope.dimension_count (which may be just the rotary embedding
@@ -308,11 +338,21 @@ def gguf_to_config(
     else:
         partial_rotary_factor = 1.0
 
-    # Derive rope_interleave from rope.dimension_sections metadata.
-    rope_sections = metadata.get(f"{gguf_arch}.rope.dimension_sections")
-    rope_interleave = gguf_arch == "deepseek4" or (
-        rope_sections is not None and any(s > 0 for s in rope_sections)
-    )
+    # Derive rope_interleave.
+    #
+    # ``rope.dimension_sections`` encodes M-RoPE *section* sizes (the Qwen-VL
+    # family splits the rotary dimension across the temporal/height/width
+    # position axes, e.g. ``[11, 11, 10, 0]``). It does NOT select the GPT-J
+    # style adjacent-pair rotation that the flat ``rope_interleave`` flag
+    # controls: Qwen3.5 (and every other section-carrying arch here) rotates
+    # with split-half (NEOX / ``rotate_half``) semantics. Deriving
+    # ``rope_interleave`` from section presence therefore corrupts RoPE — the
+    # exported GroupQueryAttention/RotaryEmbedding gets ``rotary_interleaved=1``
+    # and the full-attention layers produce garbage tokens. Section interleave,
+    # when a model needs it, is a distinct ``mrope_interleaved`` signal handled
+    # via ``mrope_section``. Only architectures that genuinely use adjacent-pair
+    # rotation set the flat flag here.
+    rope_interleave = gguf_arch == "deepseek4"
 
     # Derive rope_type from rope.scaling.type. GGUF stores the scaling
     # variant under ``<arch>.rope.scaling.type`` (or omits the key for the
@@ -468,6 +508,11 @@ def gguf_to_config(
         config._gguf_model_type = model_type
         config.model_type = model_type
 
+    # Re-surface after any postprocessor swap so the MTP metadata survives on
+    # the final config instance.
+    config._gguf_nextn_predict_layers = mtp_predict_layers
+    config._gguf_mtp_block_indices = mtp_block_indices
+
     logger.info(
         "Extracted config from GGUF: arch=%s, model_type=%s, "
         "hidden=%d, layers=%d, heads=%d, vocab=%d",
@@ -485,6 +530,7 @@ def gguf_to_config(
 def _gemma2_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
+    model: Any = None,
 ) -> Gemma2Config:
     """Convert a base config to Gemma2Config with architecture-specific fields.
 
