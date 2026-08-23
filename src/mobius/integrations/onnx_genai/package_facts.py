@@ -100,13 +100,16 @@ _ALGORITHMS: Final[Mapping[str, str]] = {
 }
 
 #: Package-relative tokenizer assets, in the order a package lists them.
-#: Only the ones the source actually provides are declared.
+#: The tokenizer subset of ``_RUNTIME_ASSET_NAMES``: every file the writers can
+#: copy into a package, so a declared artifact set is never missing one they did.
 TOKENIZER_ARTIFACT_NAMES: Final[tuple[str, ...]] = (
     "tokenizer.json",
     "tokenizer_config.json",
     "special_tokens_map.json",
-    "vocab.json",
+    "tokenizer.model",
+    "added_tokens.json",
     "merges.txt",
+    "vocab.json",
     "chat_template.jinja",
 )
 
@@ -219,7 +222,71 @@ def _uses_byte_level(node: Any) -> bool:
     return False
 
 
-def _surface_forms(vocab: Any, added_tokens: Any) -> dict[int, str]:
+def _byte_level_alphabet() -> frozenset[str]:
+    """The 256 characters a byte-level vocabulary spells raw bytes with.
+
+    Byte-level BPE maps every byte to one printable character so the vocabulary
+    stays valid UTF-8.  A vocabulary that contains all 256 of them as
+    single-character entries addresses bytes; one that does not, does not.  This
+    is measurable evidence, which matters for legacy artifacts that ship no
+    normalizer chain to state it.
+    """
+    printable = (
+        list(range(ord("!"), ord("~") + 1))
+        + list(range(ord("\u00a1"), ord("\u00ac") + 1))
+        + list(range(ord("\u00ae"), ord("\u00ff") + 1))
+    )
+    mapped = list(printable)
+    spare = 0
+    for byte in range(256):
+        if byte not in printable:
+            printable.append(byte)
+            mapped.append(256 + spare)
+            spare += 1
+    return frozenset(chr(code) for code in mapped)
+
+
+_BYTE_LEVEL_ALPHABET: Final = _byte_level_alphabet()
+
+
+def _spells_raw_bytes(surfaces: Mapping[int, str]) -> bool:
+    """Whether the vocabulary carries the whole byte-level alphabet."""
+    return {form for form in surfaces.values() if len(form) == 1} >= _BYTE_LEVEL_ALPHABET
+
+
+def _merge_added_tokens(surfaces: dict[int, str], added_tokens: Any) -> None:
+    """Merge one added-token block, in any of the three shapes HF ships it in.
+
+    ``tokenizer.json`` carries ``[{"id": .., "content": ..}, ..]``,
+    ``tokenizer_config.json`` carries ``added_tokens_decoder`` keyed by id, and
+    the legacy ``added_tokens.json`` is a plain ``content -> id`` table.  A
+    checkpoint may declare a token in one and not the others: Qwen2-VL's
+    ``<|image_pad|>`` is absent from its ``tokenizer.json`` and present only in
+    ``added_tokens_decoder``, so reading a single block would drop exactly the
+    placeholder a multimodal package exists to declare.
+    """
+    if isinstance(added_tokens, list):
+        for added in added_tokens:
+            if not isinstance(added, dict):
+                continue
+            token_id, content = added.get("id"), added.get("content")
+            if isinstance(token_id, int) and not isinstance(token_id, bool) and content:
+                surfaces[token_id] = str(content)
+        return
+    if not isinstance(added_tokens, dict):
+        return
+    for key, value in added_tokens.items():
+        if isinstance(value, dict):
+            # ``added_tokens_decoder``: id -> descriptor.
+            content = value.get("content")
+            if content and str(key).lstrip("-").isdigit():
+                surfaces[int(key)] = str(content)
+        elif isinstance(value, int) and not isinstance(value, bool):
+            # ``added_tokens.json``: content -> id.
+            surfaces[value] = str(key)
+
+
+def _surface_forms(vocab: Any, *added_blocks: Any) -> dict[int, str]:
     """Map vocabulary id to surface form; added tokens take precedence."""
     surfaces: dict[int, str] = {}
     if isinstance(vocab, dict):
@@ -231,27 +298,66 @@ def _surface_forms(vocab: Any, added_tokens: Any) -> dict[int, str]:
         for index, entry in enumerate(vocab):
             if isinstance(entry, (list, tuple)) and entry:
                 surfaces[index] = str(entry[0])
-    if isinstance(added_tokens, list):
-        for added in added_tokens:
-            if isinstance(added, dict) and isinstance(added.get("id"), int):
-                content = added.get("content")
-                if content is not None:
-                    surfaces[int(added["id"])] = str(content)
+    for block in added_blocks:
+        _merge_added_tokens(surfaces, block)
     return surfaces
+
+
+def _side_added_tokens(source: str) -> tuple[Any, ...]:
+    """Added-token blocks that live outside ``tokenizer.json``."""
+    blocks: list[Any] = []
+    config_path = _source_asset_path(source, "tokenizer_config.json")
+    if config_path is not None:
+        config = _load_json(config_path)
+        if isinstance(config, dict):
+            blocks.append(config.get("added_tokens_decoder"))
+    added_path = _source_asset_path(source, "added_tokens.json")
+    if added_path is not None:
+        blocks.append(_load_json(added_path))
+    return tuple(blocks)
+
+
+def _model_algorithm(model: Mapping[str, Any]) -> str | None:
+    """Name the algorithm a ``tokenizer.json`` model body describes.
+
+    ``model.type`` was only added to the format later, so the canonical
+    WordPiece, Unigram and older BPE checkpoints on the Hub carry a model body
+    with no type at all.  Each algorithm still leaves a distinct fingerprint in
+    that body, so it is read from the fields present rather than defaulted.
+    """
+    declared = _ALGORITHMS.get(str(model.get("type", "")))
+    if declared is not None:
+        return declared
+    if isinstance(model.get("merges"), list):
+        return "bpe"
+    if "continuing_subword_prefix" in model or "max_input_chars_per_word" in model:
+        return "wordpiece"
+    if "unk_id" in model or isinstance(model.get("vocab"), list):
+        return "unigram"
+    if isinstance(model.get("vocab"), dict):
+        return "word_level"
+    return None
 
 
 def read_tokenizer_definition(source: str | None) -> TokenizerDefinition | None:
     """Read the packaged tokenizer's own vocabulary description.
 
     ``tokenizer.json`` is a complete tokenizer definition and is preferred: it
-    states the algorithm, the whole vocabulary and the normalizer/pre-tokenizer
-    chain that decides whether ids address bytes or characters.
+    states the whole vocabulary and the normalizer/pre-tokenizer chain that
+    decides whether ids address bytes or characters.  When it parses, it is the
+    answer — a legacy side file sitting next to it is a partial view of the same
+    tokenizer and would contradict it.
 
     A package whose tokenizer predates that format ships the artifacts instead:
     a flat ``vocab.json``, plus ``merges.txt`` when and only when the vocabulary
-    is a merge table.  That pair is itself the evidence for the algorithm — a
+    is a merge table.  That pair is itself the evidence for the algorithm -- a
     vocabulary with merges is BPE, one without is a flat word-level table where
-    each entry is one unit — so it is read rather than guessed at.
+    each entry is one unit -- and byte addressing is read from whether the
+    vocabulary carries the byte-level alphabet.
+
+    Either way, added tokens declared outside the definition are merged in: a
+    checkpoint may name a special token only in ``tokenizer_config.json`` or
+    ``added_tokens.json``, and dropping it would leave the role unstatable.
 
     Returns ``None`` when no tokenizer definition is reachable.  A package that
     cannot show its vocabulary states no tokenizer facts at all, because a
@@ -259,6 +365,7 @@ def read_tokenizer_definition(source: str | None) -> TokenizerDefinition | None:
     """
     if not source:
         return None
+    side_blocks = _side_added_tokens(source)
 
     path = _source_asset_path(source, "tokenizer.json")
     if path is not None:
@@ -266,8 +373,10 @@ def read_tokenizer_definition(source: str | None) -> TokenizerDefinition | None:
         if isinstance(definition, dict):
             model = definition.get("model")
             model = model if isinstance(model, dict) else {}
-            algorithm = _ALGORITHMS.get(str(model.get("type", "")))
-            surfaces = _surface_forms(model.get("vocab"), definition.get("added_tokens"))
+            algorithm = _model_algorithm(model)
+            surfaces = _surface_forms(
+                model.get("vocab"), definition.get("added_tokens"), *side_blocks
+            )
             if algorithm is not None and surfaces:
                 return TokenizerDefinition(
                     algorithm=algorithm,
@@ -284,16 +393,13 @@ def read_tokenizer_definition(source: str | None) -> TokenizerDefinition | None:
     if vocab_path is None:
         return None
     vocab = _load_json(vocab_path)
-    surfaces = _surface_forms(vocab, None)
+    surfaces = _surface_forms(vocab, *side_blocks)
     if not surfaces:
         return None
     has_merges = _source_asset_path(source, "merges.txt") is not None
     return TokenizerDefinition(
         algorithm="bpe" if has_merges else "word_level",
-        # Legacy artifacts carry no normalizer chain, so there is nothing that
-        # states byte addressing; the schema default of ``false`` is the only
-        # honest answer.
-        byte_level=False,
+        byte_level=_spells_raw_bytes(surfaces),
         surface_forms=surfaces,
     )
 
@@ -414,16 +520,23 @@ def build_tokenizer_facts(
     config: Any,
     *,
     roles: Sequence[SpecialTokenRole] = TEXT_TOKEN_ROLES,
+    package_dir: str | None = None,
 ) -> TokenizerFacts | None:
     """Describe the packaged tokenizer, or ``None`` when it cannot be read.
 
     Args:
-        source: HuggingFace model id or local directory carrying the package's
-            tokenizer artifacts.
+        source: HuggingFace model id or local directory carrying the source
+            checkpoint's tokenizer artifacts.
         config: Resolved architecture config; supplies each role's id.
         roles: Semantic roles this package can state.  A text package states
             text roles; a multimodal one adds the media placeholders whose
             positions its encoder features replace.
+        package_dir: The materialized package, when it exists.  Its tokenizer
+            outranks the source's: the writers rebuild it through the fast
+            backend, which folds every added token into one definition, whereas
+            a source checkpoint may scatter them across side files it does not
+            ship.  It is also the only thing that can name package-relative
+            artifacts, since only the package says which files it contains.
 
     Returns:
         The facts, or ``None`` when no tokenizer definition is reachable.
@@ -432,18 +545,22 @@ def build_tokenizer_facts(
     decoder's logits width.  The two usually agree; where they differ the logits
     tensor is padded to a hardware-friendly multiple and the extra columns
     address nothing, so the vocabulary is the width a caller can actually render.
-
-    Artifact locations are deliberately not derived from ``source``: they are
-    package-relative paths, and only the package directory says which files it
-    ships.  :func:`declare_tokenizer_artifacts` fills them in once it exists.
     """
-    definition = read_tokenizer_definition(source)
+    definition = read_tokenizer_definition(package_dir) or read_tokenizer_definition(source)
     if definition is None or definition.vocab_size <= 0:
         return None
+    artifacts = ()
+    if package_dir is not None:
+        artifacts = tuple(
+            TokenizerArtifact(location=name)
+            for name in TOKENIZER_ARTIFACT_NAMES
+            if os.path.isfile(os.path.join(package_dir, name))
+        )
     return TokenizerFacts(
         algorithm=definition.algorithm,
         vocab_size=definition.vocab_size,
         byte_level=definition.byte_level,
+        artifacts=artifacts,
         special_tokens=build_special_tokens(
             definition,
             config,
@@ -459,40 +576,17 @@ def attach_package_facts(
     config: Any,
     *,
     roles: Sequence[SpecialTokenRole] = TEXT_TOKEN_ROLES,
+    package_dir: str | None = None,
 ) -> None:
-    """Merge tokenizer facts into ``metadata['package']`` when they are known.
+    """Publish tokenizer facts under ``metadata['package']`` when they are known.
 
-    The section is left absent when nothing can be read, so a reader can tell
-    "this package does not state its tokenizer" apart from "this package states
-    an empty tokenizer".
+    Builders call this with the source checkpoint alone; writers call it again
+    with the materialized package, which outranks it and adds the artifact
+    locations.  The section is left absent when nothing can be read, so a reader
+    can tell "this package does not state its tokenizer" apart from "this
+    package states an empty tokenizer".
     """
-    tokenizer = build_tokenizer_facts(source, config, roles=roles)
+    tokenizer = build_tokenizer_facts(source, config, roles=roles, package_dir=package_dir)
     if tokenizer is None:
         return
-    package = metadata.setdefault("package", {})
-    package.setdefault("tokenizer", tokenizer.to_metadata())
-
-
-def declare_tokenizer_artifacts(metadata: dict[str, Any], package_dir: str) -> None:
-    """Declare the tokenizer files the package directory actually contains.
-
-    ``TokenizerArtifact.location`` is a package-relative path a reader may open,
-    so the only thing that can answer it is the package itself.  Deriving it
-    from the source checkpoint instead would name files that the writer never
-    copied — a CTC package ships ``vocab.json`` where a BPE package ships
-    ``tokenizer.json``, and neither ships the other.
-
-    Does nothing when the document states no tokenizer facts to attach them to.
-    """
-    tokenizer = (metadata.get("package") or {}).get("tokenizer")
-    if not isinstance(tokenizer, dict):
-        return
-    locations = [
-        {"location": name}
-        for name in TOKENIZER_ARTIFACT_NAMES
-        if os.path.isfile(os.path.join(package_dir, name))
-    ]
-    if locations:
-        tokenizer["artifacts"] = locations
-    else:
-        tokenizer.pop("artifacts", None)
+    metadata.setdefault("package", {})["tokenizer"] = tokenizer.to_metadata()

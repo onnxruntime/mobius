@@ -31,6 +31,7 @@ from mobius.integrations.onnx_genai.inference_metadata_test import (
 )
 from mobius.integrations.onnx_genai.package_facts import (
     IMAGE_PLACEHOLDER_ROLE,
+    _byte_level_alphabet,
     read_tokenizer_definition,
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
@@ -246,8 +247,7 @@ class TestDecoderPackageFacts:
         # would hand a reader a package-relative path that does not resolve.
         (source / "merges.txt").write_text("", encoding="utf-8")
         package_dir = tmp_path / "package"
-        package_dir.mkdir()
-        (package_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+        _write_tokenizer(package_dir)
 
         write_decoder_workflow_metadata(
             _decoder_package(_TextCfg()),
@@ -345,6 +345,157 @@ class TestMultimodalPackageFacts:
         assert "audio_placeholder" not in tokenizer["special_tokens"]
 
 
+class TestScatteredAddedTokens:
+    """A checkpoint may name a special token outside its tokenizer definition."""
+
+    def test_a_token_declared_only_in_tokenizer_config_is_still_rendered(self, tmp_path):
+        # Qwen2-VL's `<|image_pad|>` is absent from its own tokenizer.json and
+        # present only in tokenizer_config.json's added_tokens_decoder. Reading
+        # one block would drop exactly the placeholder a multimodal package
+        # exists to declare, leaving the image nowhere to go.
+        _write_tokenizer(tmp_path)
+        (tmp_path / "tokenizer_config.json").write_text(
+            json.dumps(
+                {"added_tokens_decoder": {str(_IMAGE_ID): {"content": "<|image_pad|>"}}}
+            ),
+            encoding="utf-8",
+        )
+        definition = read_tokenizer_definition(str(tmp_path))
+        assert definition is not None
+        assert definition.surface_forms[_IMAGE_ID] == "<|image_pad|>"
+        assert definition.vocab_size == _IMAGE_ID + 1
+
+    def test_the_legacy_added_tokens_table_is_merged_too(self, tmp_path):
+        _write_tokenizer(tmp_path)
+        (tmp_path / "added_tokens.json").write_text(
+            json.dumps({"<|video_pad|>": _VIDEO_ID}), encoding="utf-8"
+        )
+        definition = read_tokenizer_definition(str(tmp_path))
+        assert definition is not None
+        assert definition.surface_forms[_VIDEO_ID] == "<|video_pad|>"
+
+    def test_the_multimodal_package_publishes_the_scattered_placeholder(self, tmp_path):
+        _write_tokenizer(tmp_path)
+        (tmp_path / "tokenizer_config.json").write_text(
+            json.dumps(
+                {"added_tokens_decoder": {str(_IMAGE_ID): {"content": "<|image_pad|>"}}}
+            ),
+            encoding="utf-8",
+        )
+        config = _MediaCfg(image_token_id=_IMAGE_ID, eos_token_id=_EOS_ID)
+        metadata = build_vlm_workflow_metadata(_vlm_package(), config, source=str(tmp_path))
+        assert metadata["package"]["tokenizer"]["special_tokens"][IMAGE_PLACEHOLDER_ROLE] == {
+            "id": _IMAGE_ID,
+            "content": "<|image_pad|>",
+        }
+
+
+class TestAlgorithmIsReadNotDefaulted:
+    """`model.type` postdates the format, so the model body is the evidence."""
+
+    @staticmethod
+    def _write(directory: Path, model: dict, **sections) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "tokenizer.json").write_text(
+            json.dumps({"model": model, **sections}), encoding="utf-8"
+        )
+
+    def test_a_wordpiece_body_without_a_type_is_wordpiece(self, tmp_path):
+        self._write(
+            tmp_path,
+            {
+                "continuing_subword_prefix": "##",
+                "max_input_chars_per_word": 100,
+                "unk_token": "[UNK]",
+                "vocab": {"[PAD]": 0, "the": 1, "##ing": 2},
+            },
+        )
+        definition = read_tokenizer_definition(str(tmp_path))
+        assert definition is not None
+        assert definition.algorithm == "wordpiece"
+
+    def test_a_unigram_body_without_a_type_is_unigram(self, tmp_path):
+        self._write(
+            tmp_path, {"unk_id": 2, "vocab": [["<pad>", 0.0], ["</s>", 0.0], ["a", -1.0]]}
+        )
+        definition = read_tokenizer_definition(str(tmp_path))
+        assert definition is not None
+        assert definition.algorithm == "unigram"
+        assert definition.surface_forms[2] == "a"
+
+    def test_a_typeless_definition_outranks_a_legacy_file_beside_it(self, tmp_path):
+        # A definition that parses is the answer. Falling through to the flat
+        # side file would report byte_level=False about a tokenizer whose own
+        # chain says otherwise -- two contradictory claims from one checkpoint.
+        self._write(
+            tmp_path,
+            {"merges": [], "vocab": {"a": 0, "b": 1}},
+            pre_tokenizer={"type": "ByteLevel", "add_prefix_space": False},
+        )
+        (tmp_path / "vocab.json").write_text(json.dumps({"a": 0}), encoding="utf-8")
+        definition = read_tokenizer_definition(str(tmp_path))
+        assert definition is not None
+        assert definition.algorithm == "bpe"
+        assert definition.byte_level is True
+
+    def test_byte_addressing_is_measured_from_a_legacy_vocabulary(self, tmp_path):
+        # Legacy artifacts carry no normalizer chain, but a byte-level
+        # vocabulary still shows it: every one of the 256 byte glyphs is a
+        # single-character entry.
+        alphabet = sorted(_byte_level_alphabet())
+        vocab = {glyph: index for index, glyph in enumerate(alphabet)}
+        vocab["\u0120the"] = len(vocab)
+        (tmp_path / "vocab.json").write_text(json.dumps(vocab), encoding="utf-8")
+        (tmp_path / "merges.txt").write_text("\u0120 t\n", encoding="utf-8")
+        definition = read_tokenizer_definition(str(tmp_path))
+        assert definition is not None
+        assert definition.algorithm == "bpe"
+        assert definition.byte_level is True
+
+    def test_a_character_vocabulary_is_not_called_byte_level(self, tmp_path):
+        (tmp_path / "vocab.json").write_text(
+            json.dumps({"<pad>": 0, "|": 1, "A": 2}), encoding="utf-8"
+        )
+        definition = read_tokenizer_definition(str(tmp_path))
+        assert definition is not None
+        assert definition.byte_level is False
+
+
+class TestPackageOutranksSource:
+    """The materialized package is the tokenizer a reader will actually load."""
+
+    def test_the_shipped_definition_wins_over_the_source_checkpoint(self, tmp_path):
+        # Writers rebuild tokenizer.json through the fast backend, folding every
+        # scattered added token into one definition. Reporting the source's
+        # partial view instead would contradict the file shipped beside it.
+        source = tmp_path / "source"
+        _write_tokenizer(source)
+        package_dir = tmp_path / "package"
+        _write_tokenizer(package_dir, added={_IMAGE_ID: "<image>", _VIDEO_ID: "<video>"})
+
+        write_decoder_workflow_metadata(
+            _decoder_package(_TextCfg()), str(package_dir), _TextCfg(), source=str(source)
+        )
+        metadata = yaml.safe_load((package_dir / "inference_metadata.yaml").read_text())
+        assert metadata["package"]["tokenizer"]["vocab_size"] == _MEDIA_VOCAB_SIZE
+
+    def test_every_tokenizer_asset_the_writers_copy_can_be_declared(self, tmp_path):
+        source = tmp_path / "source"
+        _write_tokenizer(source)
+        package_dir = tmp_path / "package"
+        _write_tokenizer(package_dir)
+        for name in ("tokenizer.model", "added_tokens.json", "chat_template.jinja"):
+            (package_dir / name).write_text("x", encoding="utf-8")
+
+        write_decoder_workflow_metadata(
+            _decoder_package(_TextCfg()), str(package_dir), _TextCfg(), source=str(source)
+        )
+        metadata = yaml.safe_load((package_dir / "inference_metadata.yaml").read_text())
+        assert [
+            entry["location"] for entry in metadata["package"]["tokenizer"]["artifacts"]
+        ] == ["tokenizer.json", "tokenizer.model", "added_tokens.json", "chat_template.jinja"]
+
+
 class TestCtcPackageFacts:
     """A CTC package renders a transcript from class ids, so it has a vocabulary."""
 
@@ -388,6 +539,27 @@ class TestCtcPackageFacts:
         blank_id = metadata["profiles"]["transcription"]["decoding"]["blank_id"]
         assert tokenizer["special_tokens"]["pad"] == {"id": blank_id, "content": "<pad>"}
         _validate(metadata)
+
+    def test_a_package_that_ships_no_vocabulary_still_states_its_facts(self, tmp_path):
+        # `auto_export`'s CTC branch reaches for a fast tokenizer, which a
+        # Wav2Vec2/MMS checkpoint does not have, so the package ends up with no
+        # vocabulary file. The facts are self-contained and survive that; the
+        # artifact list must not name a file the package does not contain.
+        config = self._config()
+        source = tmp_path / "source"
+        self._write_vocabulary(source, config.vocab_size)
+        package_dir = tmp_path / "package"
+
+        write_ctc_asr_workflow_metadata(
+            CTCAsrTask().build(Wav2Vec2ForCTCModel(config), config),
+            str(package_dir),
+            config,
+            source=str(source),
+        )
+        metadata = yaml.safe_load((package_dir / "inference_metadata.yaml").read_text())
+        tokenizer = metadata["package"]["tokenizer"]
+        assert tokenizer["vocab_size"] == config.vocab_size
+        assert "artifacts" not in tokenizer
 
     def test_the_writer_declares_the_vocabulary_it_shipped(self, tmp_path):
         config = self._config()

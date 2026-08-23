@@ -124,7 +124,6 @@ from mobius.integrations.onnx_genai.package_facts import (
     MEDIA_TOKEN_ROLES,
     TEXT_TOKEN_ROLES,
     attach_package_facts,
-    declare_tokenizer_artifacts,
     source_declared_value,
 )
 from mobius.tasks._ctc_asr import BATCH_PADDING_SENSITIVE_KEY
@@ -7171,7 +7170,13 @@ def write_vlm_workflow_metadata(
 ) -> str:
     os.makedirs(output_dir, exist_ok=True)
     metadata = build_vlm_workflow_metadata(pkg, config, source=source)
-    declare_tokenizer_artifacts(metadata, output_dir)
+    attach_package_facts(
+        metadata,
+        source,
+        config,
+        roles=(*TEXT_TOKEN_ROLES, *MEDIA_TOKEN_ROLES),
+        package_dir=output_dir,
+    )
     pkg.save_policy_components(output_dir)
     add_adapter_service_to_metadata(metadata, pkg, output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
@@ -7973,7 +7978,9 @@ def write_speculative_workflow_metadata(
         adaptive_k_max=adaptive_k_max,
         source=source,
     )
-    declare_tokenizer_artifacts(metadata, output_dir)
+    attach_package_facts(
+        metadata, source, getattr(pkg, "config", None), package_dir=output_dir
+    )
     pkg.save_policy_components(output_dir)
     add_adapter_service_to_metadata(metadata, pkg, output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
@@ -9650,7 +9657,7 @@ def write_decoder_workflow_metadata(
     """Write decoder workflow metadata and policy artifacts."""
     os.makedirs(output_dir, exist_ok=True)
     metadata = build_decoder_workflow_metadata(pkg, config, sampler=sampler, source=source)
-    declare_tokenizer_artifacts(metadata, output_dir)
+    attach_package_facts(metadata, source, config, package_dir=output_dir)
     pkg.save_policy_components(output_dir)
     add_adapter_service_to_metadata(metadata, pkg, output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
@@ -9677,7 +9684,7 @@ def write_speech_to_text_workflow_metadata(
         audio_preprocessing=audio_preprocessing,
         source=source,
     )
-    declare_tokenizer_artifacts(metadata, output_dir)
+    attach_package_facts(metadata, source, config, package_dir=output_dir)
     pkg.save_policy_components(output_dir)
     add_adapter_service_to_metadata(metadata, pkg, output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
@@ -10034,7 +10041,7 @@ def write_ctc_asr_workflow_metadata(
     """Write one-file CTC ASR metadata into *output_dir*."""
     os.makedirs(output_dir, exist_ok=True)
     metadata = build_ctc_asr_workflow_metadata(pkg, config, source=source)
-    declare_tokenizer_artifacts(metadata, output_dir)
+    attach_package_facts(metadata, source, config, package_dir=output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
         _dump_yaml(metadata, handle)
