@@ -79,3 +79,108 @@ def test_list_intermediate_size_collapses_to_first_element():
     out = ArchitectureConfig.from_transformers(cfg)
     assert out.intermediate_size == 8192
     assert isinstance(out.intermediate_size, int)
+
+
+def _codec_hf_config(**encoder_overrides):
+    """A Qwen3-TTS-Tokenizer-style HF config with nested encoder/decoder."""
+    encoder = {
+        "codebook_dim": 256,
+        "codebook_size": 2048,
+        "hidden_size": 512,
+        "intermediate_size": 2048,
+        "num_hidden_layers": 8,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 8,
+        "head_dim": 64,
+        "num_quantizers": 32,
+        "num_semantic_quantizers": 1,
+        "audio_channels": 1,
+        "num_filters": 64,
+        "num_residual_layers": 1,
+        "kernel_size": 7,
+        "last_kernel_size": 3,
+        "residual_kernel_size": 3,
+        "compress": 2,
+        "upsampling_ratios": [8, 6, 5, 4],
+    }
+    encoder.update(encoder_overrides)
+    return _FakeHFConfig(
+        model_type="qwen3_tts_tokenizer_12hz",
+        hidden_size=512,
+        num_attention_heads=8,
+        num_hidden_layers=8,
+        vocab_size=2048,
+        decoder_config={"hidden_size": 512, "codebook_dim": 512},
+        encoder_config=encoder,
+    )
+
+
+def test_codec_encoder_conv_fields_extracted_from_nested_config():
+    """Nested ``encoder_config`` values drive the derived conv stack.
+
+    These fields are read with ``getattr`` off a nested config, so a wrong
+    key or default would silently fall back to the checkpoint defaults and
+    build the wrong architecture.
+    """
+    out = ArchitectureConfig.from_transformers(_codec_hf_config())
+
+    enc = out.codec_encoder
+    assert enc is not None
+    assert enc.audio_channels == 1
+    assert enc.num_filters == 64
+    assert enc.num_residual_layers == 1
+    assert enc.kernel_size == 7
+    assert enc.last_kernel_size == 3
+    assert enc.residual_kernel_size == 3
+    assert enc.compress == 2
+    assert enc.upsampling_ratios == [8, 6, 5, 4]
+
+
+def test_codec_encoder_conv_fields_honor_non_default_values():
+    """Non-default nested values must survive extraction unchanged."""
+    out = ArchitectureConfig.from_transformers(
+        _codec_hf_config(
+            hidden_size=64,
+            audio_channels=2,
+            num_filters=8,
+            num_residual_layers=3,
+            kernel_size=5,
+            last_kernel_size=1,
+            residual_kernel_size=7,
+            compress=4,
+            upsampling_ratios=[4, 2],
+        )
+    )
+
+    enc = out.codec_encoder
+    assert enc is not None
+    assert enc.hidden_size == 64
+    assert enc.audio_channels == 2
+    assert enc.num_filters == 8
+    assert enc.num_residual_layers == 3
+    assert enc.kernel_size == 5
+    assert enc.last_kernel_size == 1
+    assert enc.residual_kernel_size == 7
+    assert enc.compress == 4
+    assert enc.upsampling_ratios == [4, 2]
+
+
+def test_codec_encoder_conv_fields_fall_back_to_checkpoint_defaults():
+    """A config omitting the conv fields still yields the real architecture."""
+    out = ArchitectureConfig.from_transformers(
+        _FakeHFConfig(
+            model_type="qwen3_tts_tokenizer_12hz",
+            hidden_size=512,
+            num_attention_heads=8,
+            num_hidden_layers=8,
+            vocab_size=2048,
+            decoder_config={"hidden_size": 512},
+            encoder_config={"hidden_size": 512},
+        )
+    )
+
+    enc = out.codec_encoder
+    assert enc is not None
+    assert enc.num_filters == 64
+    assert enc.upsampling_ratios == [8, 6, 5, 4]
+    assert enc.num_residual_layers == 1

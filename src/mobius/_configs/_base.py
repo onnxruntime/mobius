@@ -1125,6 +1125,14 @@ class ArchitectureConfig(BaseModelConfig):
                 max_position_embeddings=getattr(ec, "max_position_embeddings", 8000),
                 num_quantizers=getattr(ec, "num_quantizers", 32),
                 num_semantic_quantizers=getattr(ec, "num_semantic_quantizers", 1),
+                audio_channels=getattr(ec, "audio_channels", 1),
+                num_filters=getattr(ec, "num_filters", 64),
+                num_residual_layers=getattr(ec, "num_residual_layers", 1),
+                kernel_size=getattr(ec, "kernel_size", 7),
+                last_kernel_size=getattr(ec, "last_kernel_size", 3),
+                residual_kernel_size=getattr(ec, "residual_kernel_size", 3),
+                compress=getattr(ec, "compress", 2),
+                upsampling_ratios=list(getattr(ec, "upsampling_ratios", [8, 6, 5, 4])),
             )
 
         # Model dtype

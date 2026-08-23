@@ -4811,6 +4811,10 @@ class TestBuildCodecGraph:
                 max_position_embeddings=128,
                 num_quantizers=8,
                 num_semantic_quantizers=1,
+                # Narrow conv stack (1->4->8->16->32->64->32) but the same
+                # depth as the real checkpoint, so `layers.*` numbering and
+                # weight names match what the real model relies on.
+                num_filters=4,
             ),
         )
 
@@ -4863,6 +4867,164 @@ class TestBuildCodecGraph:
 
         output_names = {out.name for out in encoder.graph.outputs}
         assert "codes" in output_names
+
+    @staticmethod
+    def _conv_encoder_weights(encoder_config):
+        """Return {param name: shape} for the conv stack of an encoder config."""
+        from mobius.models.qwen3_tts_tokenizer import Qwen3TTSCodecEncoderModel
+
+        config = ArchitectureConfig(
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=8,
+            intermediate_size=64,
+            vocab_size=256,
+            max_position_embeddings=128,
+            codec_encoder=encoder_config,
+        )
+        module = Qwen3TTSCodecEncoderModel(config)
+        return {
+            name: tuple(param.shape)
+            for name, param in module.named_parameters()
+            if name.startswith("encoder.layers") and name.endswith("conv.weight")
+        }
+
+    def test_default_config_conv_stack_matches_checkpoint(self):
+        """Default config must reproduce the real checkpoint's conv stack.
+
+        Both names and shapes are asserted: the ``layers.*`` indices are
+        derived from ``upsampling_ratios``/``num_residual_layers``, so a
+        drift in indexing would only surface at weight-load time.
+        """
+        from mobius._configs import CodecEncoderConfig
+
+        weights = self._conv_encoder_weights(CodecEncoderConfig())
+
+        # Matches Qwen/Qwen3-TTS-Tokenizer-12Hz encoder.encoder.layers.*
+        assert weights == {
+            "encoder.layers.0.conv.weight": (64, 1, 7),
+            "encoder.layers.1.block.1.conv.weight": (32, 64, 3),
+            "encoder.layers.1.block.3.conv.weight": (64, 32, 1),
+            "encoder.layers.3.conv.weight": (128, 64, 8),
+            "encoder.layers.4.block.1.conv.weight": (64, 128, 3),
+            "encoder.layers.4.block.3.conv.weight": (128, 64, 1),
+            "encoder.layers.6.conv.weight": (256, 128, 10),
+            "encoder.layers.7.block.1.conv.weight": (128, 256, 3),
+            "encoder.layers.7.block.3.conv.weight": (256, 128, 1),
+            "encoder.layers.9.conv.weight": (512, 256, 12),
+            "encoder.layers.10.block.1.conv.weight": (256, 512, 3),
+            "encoder.layers.10.block.3.conv.weight": (512, 256, 1),
+            "encoder.layers.12.conv.weight": (1024, 512, 16),
+            "encoder.layers.14.conv.weight": (512, 1024, 3),
+        }
+
+    def test_tiny_config_keeps_checkpoint_layer_names(self):
+        """The tiny test config must keep the checkpoint's layer numbering."""
+        from mobius._configs import CodecEncoderConfig
+
+        tiny = self._conv_encoder_weights(self._codec_config().codec_encoder)
+        default = self._conv_encoder_weights(CodecEncoderConfig())
+
+        assert set(tiny) == set(default)
+        # Only the widths shrink: 1 -> 4 -> 8 -> 16 -> 32 -> 64 -> 32.
+        assert tiny["encoder.layers.0.conv.weight"] == (4, 1, 7)
+        assert tiny["encoder.layers.12.conv.weight"] == (64, 32, 16)
+        assert tiny["encoder.layers.14.conv.weight"] == (32, 64, 3)
+
+    def test_conv_stack_indices_follow_config(self):
+        """Layer indices are derived from ratios and residual-layer count."""
+        from mobius._configs import CodecEncoderConfig
+
+        # 2 ratios -> final conv lands at layers.8
+        two_ratios = self._conv_encoder_weights(
+            CodecEncoderConfig(hidden_size=8, num_filters=2, upsampling_ratios=[4, 2])
+        )
+        assert "encoder.layers.8.conv.weight" in two_ratios
+        assert two_ratios["encoder.layers.8.conv.weight"] == (8, 8, 3)
+
+        # 4 ratios with 2 residual layers each -> final conv at layers.18
+        deep = self._conv_encoder_weights(
+            CodecEncoderConfig(hidden_size=8, num_filters=2, num_residual_layers=2)
+        )
+        assert "encoder.layers.18.conv.weight" in deep
+
+    def test_hidden_size_drives_conv_output_width(self):
+        """The final conv width follows ``hidden_size`` (no hardcoded 512).
+
+        Regression guard: a hardcoded final width silently produced a
+        malformed graph (LayerNormalization over a mismatched width).
+        """
+        from mobius._configs import CodecEncoderConfig
+
+        weights = self._conv_encoder_weights(CodecEncoderConfig(hidden_size=32, num_filters=4))
+        assert weights["encoder.layers.14.conv.weight"][0] == 32
+
+    def test_default_config_rvq_projections_match_checkpoint(self):
+        """Encoder RVQ projections must match the real checkpoint's shapes.
+
+        The RVQ consumes ``hidden_size``-wide features and projects to
+        ``codebook_dim``, mirroring HF ``MimiResidualVectorQuantizer``.
+        Deriving these from ``codebook_dim`` alone produced projections
+        that could not load the checkpoint's weights at all.
+        """
+        from mobius._configs import CodecEncoderConfig
+        from mobius.models.qwen3_tts_tokenizer import Qwen3TTSCodecEncoderModel
+
+        config = ArchitectureConfig(
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=8,
+            intermediate_size=64,
+            vocab_size=256,
+            max_position_embeddings=128,
+            codec_encoder=CodecEncoderConfig(),
+        )
+        module = Qwen3TTSCodecEncoderModel(config)
+        shapes = {
+            name: tuple(param.shape)
+            for name, param in module.named_parameters()
+            if "_proj.weight" in name and "quantizer" in name
+        }
+
+        # Matches Qwen/Qwen3-TTS-Tokenizer-12Hz encoder.quantizer.* weights.
+        for prefix in (
+            "quantizer.semantic_residual_vector_quantizer",
+            "quantizer.acoustic_residual_vector_quantizer",
+        ):
+            assert shapes[f"{prefix}.input_proj.weight"] == (256, 512, 1)
+            assert shapes[f"{prefix}.output_proj.weight"] == (512, 256, 1)
+
+        # Codebooks are codebook_dim-wide, matching codebook.embed_sum.
+        codebooks = {
+            tuple(param.shape)
+            for name, param in module.named_parameters()
+            if name.endswith("codebook.embedding")
+        }
+        assert codebooks == {(2048, 256)}
+
+    def test_encoder_input_declares_configured_audio_channels(self):
+        """The graph input channel count must match the first conv.
+
+        ``audio_channels`` sizes ``encoder.layers.0.conv``, so a task that
+        always declared a mono input would feed a 1-channel tensor into a
+        conv expecting more.
+        """
+        import dataclasses
+
+        from mobius.models.qwen3_tts_tokenizer import Qwen3TTSTokenizerV2Model
+        from mobius.tasks import CodecTask
+
+        config = self._codec_config()
+        config.codec_encoder = dataclasses.replace(config.codec_encoder, audio_channels=2)
+        module = Qwen3TTSTokenizerV2Model(config)
+        pkg = build_from_module(module, config, task=CodecTask())
+
+        waveform = next(inp for inp in pkg["encoder"].graph.inputs if inp.name == "waveform")
+        assert waveform.shape[1] == 2
 
     def test_registry_lookup(self):
         """Verify qwen3_tts_tokenizer_12hz is registered with codec task."""
