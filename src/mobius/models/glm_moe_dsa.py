@@ -394,6 +394,7 @@ class GlmMoeDsaAttention(DeepSeekMLA):
         value_f32 = op.Cast(padded_value, to=ir.DataType.FLOAT) if needs_cast else padded_value
 
         selected_indices = op.Unsqueeze(topk_indices, [1])
+        op.builder.graph.opset_imports["pkg.nxrt"] = 1
         attn_output = op.IndexShare(
             q_f32,
             key_f32,
@@ -407,6 +408,9 @@ class GlmMoeDsaAttention(DeepSeekMLA):
             _domain="pkg.nxrt",
             _outputs=1,
         )
+        # IndexShare has no ONNX shape-inference schema; its output matches Q in BNSH layout.
+        attn_output.type = q_f32.type
+        attn_output.shape = q_f32.shape
         if needs_cast:
             attn_output = op.Cast(attn_output, to=self.dtype)
         if value_pad > 0:
@@ -650,6 +654,26 @@ class GlmMoeDsaCausalLMModel(DeepSeekV3CausalLMModel):
             GlmMoeDsaTextModel(config) if config.use_dsa else DeepSeekV3TextModel(config)
         )
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def dynamic_kv_cache_specs(self) -> list[tuple[int, int, int]] | None:
+        """Return the packed per-layer DSA cache layouts."""
+        if not self.config.use_dsa:
+            return None
+        # DSA packs each token's per-head main key/value columns into one cache
+        # head, with the indexer key appended to full-layer keys: (B, 1, T, D).
+        main_key_dim = self.config.num_attention_heads * (
+            (self.config.qk_nope_head_dim or 0) + (self.config.qk_rope_head_dim or 0)
+        )
+        main_value_dim = self.config.num_attention_heads * (self.config.v_head_dim or 0)
+        index_head_dim = self.config.index_head_dim or 0
+        return [
+            (
+                1,
+                main_key_dim + (index_head_dim if indexer_type == "full" else 0),
+                main_value_dim,
+            )
+            for indexer_type in _indexer_types(self.config)
+        ]
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]

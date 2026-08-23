@@ -650,6 +650,36 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         True,
     ),
+    # GLM-5.2 needs explicit MLA/DSA dimensions; the generic tiny defaults
+    # leave the split head and indexer dimensions unset.
+    (
+        "glm_moe_dsa",
+        {
+            "num_key_value_heads": TINY_HEADS,
+            "q_lora_rank": 24,
+            "kv_lora_rank": 16,
+            "qk_nope_head_dim": 8,
+            "qk_rope_head_dim": 8,
+            "v_head_dim": 16,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 16,
+            "n_group": 2,
+            "topk_group": 1,
+            "routed_scaling_factor": 2.5,
+            "scoring_func": "sigmoid",
+            "topk_method": "noaux_tc",
+            "first_k_dense_replace": 0,
+            "n_shared_experts": 1,
+            "norm_topk_prob": True,
+            "index_topk": 3,
+            "index_head_dim": 16,
+            "index_n_heads": 2,
+            "indexer_rope_interleave": True,
+            "use_dsa": True,
+        },
+        True,
+    ),
     (
         "deepseek_v4",
         {
