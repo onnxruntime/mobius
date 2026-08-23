@@ -6167,11 +6167,8 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "falcon_mamba",
     "mamba",
     "mamba2",
-    # Speech enhancement: bespoke IO contract (noisy magnitude + phase
-    # spectrograms instead of input_ids/audio features), so the generic
-    # config matrices can't drive it. Covered by
-    # src/mobius/models/reuse_test.py.
-    "reuse",
+    # Speech enhancement: "reuse" is driven by SPEECH_CONFIGS; "semamba" is
+    # a bare alias of the same class, so it has no config of its own.
     "semamba",
     # Hybrid SSM+Attention dedicated tests
     "bamba",
@@ -6885,6 +6882,7 @@ _SPEECH_TASK_KEYS: dict[str, set[str]] = {
     "codec": {"decoder", "encoder"},
     "audio-feature-extraction": {"model"},
     "feature-ctc-asr": {"model"},
+    "speech-enhancement": {"model"},
 }
 
 

@@ -181,6 +181,25 @@ class TestBuildGraphReUse:
         assert result[f"{prefix}.conv1d.bias"] == "c"
         assert f"{prefix}.A_log" not in result
 
+    def test_preprocess_weights_is_idempotent(self):
+        """Already-nested names must survive a second pass unchanged.
+
+        Renaming on suffix alone would turn ``ssm.A_log`` into
+        ``ssm.ssm.A_log``, silently dropping every SSM parameter when a
+        converted state dict is preprocessed again.
+        """
+        config = _tiny_config()
+        module = SEMambaSpeechEnhancementModel(config)
+        onnx_names = {name for name, _ in module.named_parameters()}
+        checkpoint_names = {name.replace(".ssm.", ".") for name in onnx_names}
+
+        once = module.preprocess_weights(dict.fromkeys(checkpoint_names, 0))
+        twice = module.preprocess_weights(dict(once))
+
+        assert set(once) == onnx_names
+        assert set(twice) == onnx_names
+        assert not any(".ssm.ssm." in name for name in twice)
+
     def test_preprocess_weights_covers_every_parameter(self):
         """Renaming a checkpoint-shaped state dict yields exactly our names."""
         config = _tiny_config()

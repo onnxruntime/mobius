@@ -622,14 +622,23 @@ class SEMambaSpeechEnhancementModel(nn.Module):
         ``ssm`` submodule (``forward_blocks.ssm.A_log``) — the same offset
         the Mamba causal-LM models correct for.  Everything else, including
         the encoder/decoder ``nn.Sequential`` indices, already lines up.
+
+        The rename is idempotent: a state dict that already uses the nested
+        names is returned unchanged, so re-running this (or loading an
+        already-converted checkpoint) cannot produce ``ssm.ssm.A_log``.
         """
         renames = {}
         for key in list(state_dict):
             for param in _SSM_PARAMS:
                 suffix = f".{param}"
-                if key.endswith(suffix):
-                    renames[key] = f"{key[: -len(suffix)]}.ssm{suffix}"
+                if not key.endswith(suffix):
+                    continue
+                prefix = key[: -len(suffix)]
+                # Already nested — leave it alone.
+                if prefix.endswith(".ssm") or prefix == "ssm":
                     break
+                renames[key] = f"{prefix}.ssm{suffix}"
+                break
         for old_key, new_key in renames.items():
             state_dict[new_key] = state_dict.pop(old_key)
         return state_dict

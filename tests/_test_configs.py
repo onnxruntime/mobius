@@ -63,7 +63,7 @@ from mobius._configs import (
     YolosConfig,
     Zamba2Config,
 )
-from mobius.models import EsmConfig
+from mobius.models import EsmConfig, ReUseConfig
 
 # ---------------------------------------------------------------------------
 # Tiny model dimensions shared by all configs
@@ -3735,6 +3735,25 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
                 num_blocks=3,
                 tp_num_blocks=2,
             ),
+        },
+        True,
+    ),
+    # --- RE-USE / SEMamba (spectral speech enhancement) ---
+    # Bidirectional Mamba over time and frequency; consumes a noisy STFT
+    # magnitude/phase pair rather than audio features.
+    (
+        "reuse",
+        {
+            "_config_cls": ReUseConfig,
+            "hid_feature": 8,
+            "num_tfmamba": 1,
+            "d_state": 4,
+            "d_conv": 4,
+            "expand": 2,
+            "n_fft": 32,
+            "hop_size": 4,
+            "win_size": 32,
+            "sampling_rate": 8000,
         },
         True,
     ),

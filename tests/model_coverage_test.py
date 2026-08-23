@@ -175,6 +175,11 @@ _COVERAGE_SKIP: dict[str, str] = {
     "hy_v3": "L1 graph construction, native Transformers L2 config loading, and "
     "payload-free L3 trunk parity are covered; the immutable official checkpoint is "
     "597,578,239,288 bytes, so L4/L5 real-weight goldens exceed the 16 GiB policy.",
+    "reuse": "RE-USE / SEMamba speech enhancement — L1/L3 run from "
+    "SPEECH_CONFIGS and src/mobius/models/reuse_test.py. No L2: the published "
+    "nvidia/RE-USE config.json is a bespoke model_cfg/stft_cfg document with no "
+    "model_type field, which arch_validation_test requires, so the generic "
+    "download-and-build path cannot drive it.",
     # --- Internal / duplicate aliases ---
     "code_llama": "Alias for llama — covered by llama",
     "command_r": "Alias for cohere — covered by cohere",
@@ -245,6 +250,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "generic L2/L4/L5; pinned HF-to-GGUF config semantics and synthetic ORT parity "
     "are covered by _specialized_encoders_test.py.",
     "seed_oss": "Internal model — no public HF checkpoint",
+    "semamba": "Alias for reuse — covered by reuse",
     "shieldgemma2": "Alias for gemma2 — covered by gemma2",
     "yi": "Alias for llama — covered by llama",
     # --- VL models / text-decoder submodels (L1 graph-build only) ---
