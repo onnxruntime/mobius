@@ -61,6 +61,7 @@ where = ["src"]
 [tool.setuptools.package-data]
 "mobius.upstream_patches" = ["data/*/*/*.patch", "data/*/*/*.json", "data/*/*/*.md"]
 "mobius.integrations.onnx_genai" = ["_schema/*.json"]
+"mobius.integrations.gguf._upstream_data" = ["*.json"]
 
 [tool.setuptools.dynamic]
 version = { attr = "mobius.__version__" }
