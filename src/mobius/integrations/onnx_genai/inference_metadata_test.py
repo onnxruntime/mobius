@@ -9,6 +9,7 @@ import dataclasses
 import json
 import math
 import os
+import re
 from pathlib import Path
 
 import jsonschema
@@ -40,6 +41,9 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     write_diffusion_pipeline_metadata,
     write_mtp_speculator_metadata,
     write_native_vlm_package_metadata,
+)
+from mobius.integrations.onnx_genai.workflow_metadata import (
+    build_vlm_workflow_metadata,
 )
 
 
@@ -179,23 +183,18 @@ def test_workflow_policy_components_reference_saved_onnx_artifacts(tmp_path):
     assert (tmp_path / component["implementation"]["artifact"]).is_file()
 
 
-def _onnx_genai_schema_path() -> str | None:
-    """Locate onnx-genai's committed pipeline JSON schema, if available."""
-    candidates = [
-        os.environ.get("ONNX_GENAI_SCHEMA"),
-        os.path.join(
-            os.path.dirname(__file__),
-            "../../../../../onnx-genai/schema/inference_metadata.schema.json",
-        ),
-        "/home/justinchu/onnx-genai/schema/inference_metadata.schema.json",
-        os.path.expanduser(
-            "~/Documents/GitHub/onnx-genai/schema/inference_metadata.schema.json"
-        ),
-    ]
-    for candidate in candidates:
-        if candidate and os.path.exists(candidate):
-            return candidate
-    return None
+def _onnx_genai_schema_path() -> str:
+    """Locate onnx-genai's published pipeline JSON schema.
+
+    The vendored copy under ``_schema/`` is the default so conformance never
+    skips. A developer checkout is deliberately not consulted implicitly: one
+    that is ahead of or behind ``main`` makes the result machine-dependent. Set
+    ``ONNX_GENAI_SCHEMA`` to validate against a specific revision.
+    """
+    override = os.environ.get("ONNX_GENAI_SCHEMA")
+    if override:
+        return override
+    return os.path.join(os.path.dirname(__file__), "_schema", "inference_metadata.schema.json")
 
 
 def _value(
@@ -575,12 +574,17 @@ def _assert_all_graph_ports_declared(
 
 
 class TestNativeVlmPackageMetadata:
-    def _validate(self, metadata: dict) -> None:
-        schema_path = _onnx_genai_schema_path()
-        if schema_path is None:
-            pytest.skip("onnx-genai schema not found (set ONNX_GENAI_SCHEMA)")
-        with open(schema_path, encoding="utf-8") as handle:
-            jsonschema.validate(instance=metadata, schema=json.load(handle))
+    def _validate(self, package, config, source=None) -> None:
+        """Validate the *published* package contract against onnx-genai's schema.
+
+        ``build_native_vlm_package_metadata`` returns mobius's internal
+        structural descriptor; what a package publishes is the typed SSA
+        workflow ``build_vlm_workflow_metadata`` derives from it.
+        """
+        published = build_vlm_workflow_metadata(package, config, source=source)
+        assert set(published["pipeline"]) == {"workflow"}
+        with open(_onnx_genai_schema_path(), encoding="utf-8") as handle:
+            jsonschema.validate(instance=published, schema=json.load(handle))
 
     def test_gemma4_routes_all_embedding_outputs(self, tmp_path):
         config = _VlmConfig(
@@ -706,7 +710,7 @@ class TestNativeVlmPackageMetadata:
         )
         emitted_yaml = yaml.safe_load(yaml.safe_dump(metadata, sort_keys=False))
         validate_executable_closure(package, metadata)
-        self._validate(metadata)
+        self._validate(package, config, source=str(source))
         _assert_all_graph_ports_declared(package, metadata)
         assert metadata["schema_version"] == "v1"
         assert {
@@ -907,7 +911,7 @@ class TestNativeVlmPackageMetadata:
         metadata = build_native_vlm_package_metadata(
             package, config=config, source=str(source)
         )
-        self._validate(metadata)
+        self._validate(package, config, source=str(source))
         _assert_all_graph_ports_declared(package, metadata)
         assert {
             "position_program",
@@ -1051,7 +1055,7 @@ class TestNativeVlmPackageMetadata:
         metadata = build_native_vlm_package_metadata(
             package, config=config, source=str(source)
         )
-        self._validate(metadata)
+        self._validate(package, config, source=str(source))
         _assert_all_graph_ports_declared(package, metadata)
         flow = metadata["pipeline"]["dataflow"]
         for gate in ("vision_gate", "speech_gate"):
@@ -1532,47 +1536,130 @@ class TestNativeVlmPackageMetadata:
         )
 
 
+def _constant_values(component) -> list[float]:
+    """Read the constant a schedule policy component materializes."""
+    initializer = next(node for node in component.model.graph if node.op_type == "Constant")
+    return initializer.attributes["value"].as_tensor().numpy().tolist()
+
+
+def _invocations(workflow: dict, component: str) -> list[dict]:
+    """Every ``invoke`` step of ``component``, at any nesting depth."""
+    found: list[dict] = []
+
+    def walk(step: dict) -> None:
+        kind = step["kind"]
+        if kind == "invoke":
+            if step["component"] == component:
+                found.append(step)
+        elif kind == "loop":
+            for child in (*step.get("setup", []), *step["steps"]):
+                walk(child)
+        elif kind == "sequence":
+            for child in step["steps"]:
+                walk(child)
+        elif kind == "branch":
+            for case in step["cases"].values():
+                walk(case)
+            if step.get("default"):
+                walk(step["default"])
+
+    for step in workflow["steps"]:
+        walk(step)
+    return found
+
+
 class TestBuildDiffusionPipelineMetadata:
-    def test_denoiser_only_minimal(self):
-        meta = build_diffusion_pipeline_metadata(num_inference_steps=20)
-        pipe = meta["pipeline"]
-        assert set(pipe["models"]) == {"denoiser"}
-        assert pipe["strategy"]["kind"] == "iterative"
-        assert pipe["strategy"]["denoiser"] == "denoiser"
-        assert pipe["strategy"]["num_steps"] == 20
-        assert pipe["strategy"]["timestep_input"] == "timestep"
-        # Loop-carried self-edge is present.
-        assert {"from": "denoiser.noise_pred", "to": "denoiser.sample"} in pipe["dataflow"]
-        # Default DDIM scheduler config.
-        sched = pipe["strategy"]["scheduler_config"]
-        assert sched["kind"] == "ddim"
-        assert sched["num_train_timesteps"] == 1000
+    """The published document is a typed SSA workflow.
+
+    ``PipelineSpec`` declares ``workflow`` as its only property
+    (``crates/onnx-genai-metadata/src/schema/pipeline.rs``), so the sampler is
+    an executable component the package ships.
+    """
+
+    def _workflow(self, **kwargs) -> dict:
+        meta = build_diffusion_pipeline_metadata(
+            vae_filename="vae.onnx",
+            **kwargs,
+        )
+        assert set(meta["pipeline"]) == {"workflow"}
+        return meta["pipeline"]["workflow"]
+
+    def test_a_latent_only_pipeline_is_not_publishable(self):
+        # The workflow terminates in a decoded image, so a package with no
+        # decoder has no executable result to declare.
+        with pytest.raises(ValueError, match="without a VAE decoder"):
+            build_diffusion_pipeline_metadata(num_inference_steps=20)
+
+    def test_denoise_loop_carries_the_latent_through_the_solver(self):
+        workflow = self._workflow(num_inference_steps=20)
+        assert set(workflow["components"]) >= {
+            "denoiser",
+            "vae",
+            "solver_step",
+            "diffusion_schedule",
+            "diffusion_timesteps",
+            "schedule_lookup",
+        }
+        loop = next(step for step in workflow["steps"] if step["kind"] == "loop")
+        assert loop["max_iterations"] == "request.max_iterations"
+        assert workflow["inputs"]["request.max_iterations"]["default"] == 20
+        # The latent is loop-carried state, advanced by the solver each step.
+        # ``latent`` is also a workflow output, so the published cell is
+        # disambiguated to ``latent_state``.
+        latent_carry = next(
+            carry for carry in loop["carried"] if carry["cell"] == "latent_state"
+        )
+        assert latent_carry["next"] == "latent.body"
+        solver = _invocations(workflow, "solver_step")[0]
+        assert solver["inputs"]["sample"] == "latent_state"
+        assert solver["inputs"]["derivative"] == "denoiser.estimate"
+        assert solver["outputs"]["next_state"] == "latent.body"
+        # The step index is the loop induction value, not a timestep port name.
+        assert loop["iteration"]["value"] == "loop.iteration"
+        lookup = _invocations(workflow, "schedule_lookup")[0]
+        assert lookup["inputs"] == {
+            "schedule": "diffusion.timesteps",
+            "step": "loop.iteration",
+        }
 
     def test_full_pipeline_with_vae_and_text_encoder(self):
-        meta = build_diffusion_pipeline_metadata(
+        workflow = self._workflow(
             num_inference_steps=4,
-            vae_filename="vae.onnx",
             text_encoder_filename="text_encoder.onnx",
             guidance_scale=7.5,
         )
-        pipe = meta["pipeline"]
-        assert set(pipe["models"]) == {"denoiser", "vae", "text_encoder"}
-        # Text encoder feeds conditioning (prompt-phase); VAE decodes final latent.
-        assert {
-            "from": "text_encoder.last_hidden_state",
-            "to": "denoiser.encoder_hidden_states",
-        } in pipe["dataflow"]
-        assert {"from": "denoiser.sample", "to": "vae.latent"} in pipe["dataflow"]
-        assert pipe["phases"]["text_encoder"] == {"run_on": "prompt_only"}
-        assert pipe["phases"]["vae"] == {"run_on": "final_only"}
-        # CFG enabled -> conditioning input declared for the unconditional pass.
-        assert pipe["strategy"]["guidance_scale"] == pytest.approx(7.5)
-        assert pipe["strategy"]["cfg_conditioning_input"] == "encoder_hidden_states"
+        assert set(workflow["components"]) >= {
+            "denoiser",
+            "vae",
+            "text_encoder",
+            "guidance_combine",
+        }
+        # The text encoder runs once in the loop setup; the VAE decodes the
+        # final latent after the loop.
+        loop = next(step for step in workflow["steps"] if step["kind"] == "loop")
+        encoder_calls = [
+            step for step in loop["setup"] if step.get("component") == "text_encoder"
+        ]
+        assert len(encoder_calls) == 2  # conditional + unconditional
+        assert encoder_calls[0]["outputs"]["last_hidden_state"] == (
+            "conditioning.encoder_hidden_states"
+        )
+        vae = _invocations(workflow, "vae")[0]
+        assert vae["inputs"]["latent"] == "latent_state"
+        # CFG is two denoiser invocations plus a combine, not a hidden flag.
+        denoiser_calls = _invocations(workflow, "denoiser")
+        assert len(denoiser_calls) == 2
+        assert denoiser_calls[0]["inputs"]["encoder_hidden_states"] == (
+            "conditioning.unconditional.encoder_hidden_states"
+        )
+        assert denoiser_calls[1]["inputs"]["encoder_hidden_states"] == (
+            "conditioning.encoder_hidden_states"
+        )
+        assert workflow["inputs"]["request.guidance_scale"]["default"] == pytest.approx(7.5)
 
     def test_sdxl_dual_conditioning_edges(self):
-        meta = build_diffusion_pipeline_metadata(
+        workflow = self._workflow(
             num_inference_steps=4,
-            vae_filename="vae.onnx",
             text_encoder_filename="text_encoder.onnx",
             guidance_scale=7.5,
             text_encoder_edges=[
@@ -1580,16 +1667,86 @@ class TestBuildDiffusionPipelineMetadata:
                 ("text_embeds", "text_embeds"),
             ],
         )
-        flow = meta["pipeline"]["dataflow"]
-        assert {
-            "from": "text_encoder.encoder_hidden_states",
-            "to": "denoiser.encoder_hidden_states",
-        } in flow
-        assert {"from": "text_encoder.text_embeds", "to": "denoiser.text_embeds"} in flow
+        loop = next(step for step in workflow["steps"] if step["kind"] == "loop")
+        encoder = next(
+            step for step in loop["setup"] if step.get("component") == "text_encoder"
+        )
+        assert encoder["outputs"] == {
+            "encoder_hidden_states": "conditioning.encoder_hidden_states",
+            "text_embeds": "conditioning.text_embeds",
+        }
+        denoiser = _invocations(workflow, "denoiser")[-1]
+        assert denoiser["inputs"]["encoder_hidden_states"] == (
+            "conditioning.encoder_hidden_states"
+        )
+        assert denoiser["inputs"]["text_embeds"] == "conditioning.text_embeds"
 
     def test_guidance_scale_one_does_not_enable_cfg(self):
-        meta = build_diffusion_pipeline_metadata(num_inference_steps=2, guidance_scale=1.0)
-        assert "cfg_conditioning_input" not in meta["pipeline"]["strategy"]
+        workflow = self._workflow(
+            num_inference_steps=2,
+            text_encoder_filename="text_encoder.onnx",
+            guidance_scale=1.0,
+        )
+        assert "guidance_combine" not in workflow["components"]
+        assert "request.guidance_scale" not in workflow["inputs"]
+        assert len(_invocations(workflow, "denoiser")) == 1
+
+    def test_start_step_slices_the_schedule(self):
+        # img2img "skip the noisiest steps" is a shorter schedule, not a knob.
+        workflow = self._workflow(num_inference_steps=10, start_step=4)
+        assert workflow["inputs"]["request.max_iterations"]["default"] == 6
+
+    def test_schedule_is_derived_from_the_scheduler_not_invented(self):
+        """``solver_step`` integrates the checkpoint's own noise schedule.
+
+        The schedule component is what the solver reads as alpha_cumprod (DDIM)
+        or sigma (Euler / DPM-Solver++), so a placeholder ramp would silently
+        denoise along the wrong trajectory.
+        """
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.onnx_genai.auto_export import _ddim_alpha_schedule
+
+        scheduler = SchedulerConfig(kind="ddim", beta_start=0.0001, beta_end=0.02)
+        package = ModelPackage({})
+        build_diffusion_pipeline_metadata(
+            num_inference_steps=5,
+            vae_filename="vae.onnx",
+            scheduler=scheduler,
+            package=package,
+        )
+        _, expected = _ddim_alpha_schedule(scheduler, 5)
+        emitted = _constant_values(package.policy_components["diffusion_schedule"])
+        assert emitted == pytest.approx(expected, rel=1e-6)
+        # Guard the specific regression: a 1 - i/n ramp is not a beta schedule.
+        assert emitted != pytest.approx([1.0 - index / 5 for index in range(6)])
+
+    def test_vae_scaling_factor_unnormalizes_the_decoder_input(self):
+        workflow = self._workflow(num_inference_steps=3, vae_scaling_factor=0.18215)
+        assert {"tensor_scale", "decoder_input_scale"} <= set(workflow["components"])
+        vae = _invocations(workflow, "vae")[0]
+        assert vae["inputs"]["latent"] == "diffusion.decoder_input"
+
+    def test_variance_preserving_solver_does_not_rescale_the_initial_latent(self):
+        workflow = self._workflow(num_inference_steps=3)
+        # DDIM starts from the unit-variance draw itself; only a sigma-space
+        # sampler scales it by the largest sigma.
+        assert "initial_state_scale" not in workflow["components"]
+        assert workflow["state"]["latent_state"]["initializer"] == "request.noise"
+
+    def test_sigma_space_solver_scales_the_initial_latent(self):
+        workflow = self._workflow(
+            num_inference_steps=3, scheduler=SchedulerConfig(kind="euler")
+        )
+        assert "initial_state_scale" in workflow["components"]
+        assert workflow["state"]["latent_state"]["initializer"] == "diffusion.initial_state"
+
+    def test_stochastic_scheduler_is_rejected(self):
+        with pytest.raises(ValueError, match="euler_ancestral"):
+            build_diffusion_pipeline_metadata(
+                num_inference_steps=4,
+                vae_filename="vae.onnx",
+                scheduler=SchedulerConfig(kind="euler_ancestral"),
+            )
 
     def test_scheduler_from_diffusers_config(self):
         sched = SchedulerConfig.from_diffusers(
@@ -1732,19 +1889,21 @@ class TestBuildDiffusionPipelineMetadata:
         )
         with open(path) as handle:
             loaded = yaml.safe_load(handle)
-        assert loaded["pipeline"]["strategy"]["num_steps"] == 3
-        assert "vae" in loaded["pipeline"]["models"]
+        workflow = loaded["pipeline"]["workflow"]
+        assert workflow["inputs"]["request.max_iterations"]["default"] == 3
+        assert "vae" in workflow["components"]
+        # The workflow declares the sampler components as ONNX artifacts, so
+        # the writer has to ship them next to the document.
+        solver = workflow["components"]["solver_step"]["implementation"]["artifact"]
+        assert (tmp_path / solver).is_file()
 
     def test_matches_onnx_genai_json_schema(self):
         """The emitted metadata validates against onnx-genai's published schema."""
-        schema_path = _onnx_genai_schema_path()
-        if schema_path is None:
-            pytest.skip("onnx-genai schema not found (set ONNX_GENAI_SCHEMA)")
         import json
 
         import jsonschema
 
-        with open(schema_path) as handle:
+        with open(_onnx_genai_schema_path()) as handle:
             schema = json.load(handle)
         meta = build_diffusion_pipeline_metadata(
             num_inference_steps=4,
@@ -1890,15 +2049,120 @@ class _MtpBackboneConfig:
 
 
 def _seed_backbone_metadata(directory: Path) -> str:
-    """Write a minimal backbone inference_metadata.yaml for the MTP writer.
+    """Write a backbone inference_metadata.yaml for the MTP writer to extend.
 
-    Deliberately empty: the writer only *appends* a ``speculative`` block, and
-    the runtime schema rejects unknown top-level properties, so seeding a
-    convenience key such as ``model_type`` would fail schema validation for a
-    reason that has nothing to do with the speculator block under test.
+    ``SpeculativeContract`` names workflow components and state cells, so the
+    backbone must already publish a ``pipeline.workflow``. This is the shape
+    ``write_onnx_genai_config`` emits for a single-component decoder package,
+    reduced to what the speculator claim touches: one decoder component and one
+    service-group-backed KV cell.
     """
+    kv_contract = {
+        "dtype": "float16",
+        "rank": 4,
+        "shape": ["batch", "kv_heads", "sequence", "head_dim"],
+        "batch_layout": {"kind": "request_aligned", "axis": 0},
+    }
+    metadata = {
+        "schema_version": "v1",
+        "pipeline": {
+            "workflow": {
+                "manifest": {"capabilities": ["workflow_ssa", "serving_service_contract"]},
+                "inputs": {
+                    "request.input_ids": {
+                        "contract": {
+                            "dtype": "int64",
+                            "rank": 2,
+                            "shape": ["batch", "sequence"],
+                            "batch_layout": {"kind": "request_aligned", "axis": 0},
+                        },
+                        "role": {"kind": "runtime", "version": "1.0", "role": "prompt_tokens"},
+                        "source": {"kind": "request"},
+                        "required": True,
+                    },
+                    "request.decoder_cache": {
+                        "contract": kv_contract,
+                        "role": {"kind": "opaque"},
+                        "source": {"kind": "application", "name": "decoder_cache"},
+                        "required": True,
+                    },
+                    "request.active": {
+                        "contract": {
+                            "dtype": "bool",
+                            "rank": 1,
+                            "shape": ["batch"],
+                            "batch_layout": {"kind": "request_aligned", "axis": 0},
+                        },
+                        "role": {"kind": "opaque"},
+                        "source": {"kind": "application", "name": "active"},
+                        "required": True,
+                    },
+                    "request.done": {
+                        "contract": {
+                            "dtype": "bool",
+                            "rank": 1,
+                            "shape": ["batch"],
+                            "batch_layout": {"kind": "request_aligned", "axis": 0},
+                        },
+                        "role": {"kind": "opaque"},
+                        "source": {"kind": "application", "name": "done"},
+                        "required": True,
+                    },
+                },
+                "components": {
+                    "decoder": {
+                        "implementation": {"kind": "onnx", "artifact": "model.onnx"},
+                        "ports": {"roles": {"input_ids": "token_ids", "logits": "logits"}},
+                    }
+                },
+                "state": {
+                    "decoder_cache.0": {
+                        "contract": kv_contract,
+                        "scope": "invocation",
+                        "initializer": "request.decoder_cache",
+                        "recurrence": {"kind": "invariant"},
+                        "service_group": "decoder_cache",
+                    }
+                },
+                "steps": [
+                    {
+                        "kind": "invoke",
+                        "component": "decoder",
+                        "inputs": {
+                            "input_ids": "request.input_ids",
+                            "past_key_values.0.key": "decoder_cache.0",
+                        },
+                        "outputs": {"logits": "decoder.logits"},
+                    }
+                ],
+                "serving": {
+                    "active": "request.active",
+                    "done": "request.done",
+                    "state_service": {
+                        "groups": {
+                            "decoder_cache": {
+                                "kind": "full_attention",
+                                "sequence_axis": 2,
+                                "layout": "bnsh",
+                                "update": {"kind": "append"},
+                                "capabilities": {"snapshot": True, "fork": True},
+                                "ports": {
+                                    "decoder": {
+                                        "decoder_cache.0": {
+                                            "input": "past_key_values.0.key",
+                                            "output": "present.0.key",
+                                        }
+                                    }
+                                },
+                            }
+                        }
+                    },
+                },
+            }
+        },
+    }
     path = directory / "inference_metadata.yaml"
-    path.write_text(yaml.safe_dump({}), encoding="utf-8")
+    path.write_text(yaml.safe_dump(metadata, sort_keys=False), encoding="utf-8")
     return str(path)
 
 
@@ -1906,10 +2170,9 @@ class TestMtpSpeculatorMetadata:
     """The emitted ``speculative`` block conforms to the onnx-genai runtime schema.
 
     Authoritative source: onnx-genai
-    ``crates/onnx-genai-metadata/src/schema/generation.rs`` (``SpeculatorConfig``,
-    ``MtpKvMode``, ``MtpHiddenLayout``, ``MtpTargetInitializer``) +
-    ``parser.rs`` (``resolve_mtp``) + ``config.rs``
-    (``validate_resolved_mtp_config``).
+    ``crates/onnx-genai-metadata/src/schema/package.rs`` (``SpeculativeContract``,
+    ``SpeculativeProposalExecution``, ``SpeculativeVocabulary``) plus
+    ``validation.rs`` (``validate_speculative_rollback``).
     """
 
     def _write(self, tmp_path: Path) -> dict:
@@ -1931,39 +2194,102 @@ class TestMtpSpeculatorMetadata:
     def test_exact_schema_keys_and_values(self, tmp_path):
         spec = self._write(tmp_path)["speculative"]
         assert spec == {
-            "proposal_type": "mtp",
-            "num_speculative_tokens": 1,
-            "model": "mtp/model.onnx",
-            "target_hidden_layout": "BSH",
-            "hc_mult": 1,
-            "mtp_hidden_output": "mtp_hidden",
-            "kv_mode": "proposal_local",
-            "embedding": {
-                "source": "target_initializer",
-                "name": "model.embed_tokens.weight",
-            },
-            "lm_head": {
-                "source": "target_initializer",
-                "name": "lm_head.weight",
-            },
-            "target_hidden_output": "hidden_states.63",
-            "target_hidden_size": 5120,
-            "vocab_size": 248320,
+            "proposer": "mtp",
+            "target": "decoder",
+            "proposal_execution": {"kind": "block"},
+            "port_bindings": {"target_hidden_context": "hidden_states"},
+            "shared_weights": ["lm_head.weight", "model.embed_tokens.weight"],
+            "vocabulary": {"kind": "identical"},
+            "max_proposal_width": 1,
+            "distribution_preserving": True,
+            "rollback_state": ["decoder_cache.0"],
         }
 
     def test_no_legacy_field_names(self, tmp_path):
         spec = self._write(tmp_path)["speculative"]
-        # Field names the runtime cannot parse must not appear.
-        for banned in ("model_path", "hidden_size", "embedding_weights", "lm_head_weights"):
+        # SpeculativeContract sets ``deny_unknown_fields``, so any of these
+        # makes the whole package unparseable rather than being ignored.
+        for banned in (
+            "proposal_type",
+            "num_speculative_tokens",
+            "model",
+            "model_path",
+            "target_hidden_layout",
+            "hc_mult",
+            "mtp_hidden_output",
+            "kv_mode",
+            "embedding",
+            "lm_head",
+            "embedding_weights",
+            "lm_head_weights",
+            "target_hidden_output",
+            "target_hidden_size",
+            "hidden_size",
+            "vocab_size",
+        ):
             assert banned not in spec
-        assert spec["kv_mode"] != "hidden_threaded"
+
+    def test_proposer_is_registered_as_a_workflow_component(self, tmp_path):
+        workflow = self._write(tmp_path)["pipeline"]["workflow"]
+        # proposer/target are workflow component names, so the head has to be
+        # declared before it can be referenced.
+        assert workflow["components"]["mtp"]["implementation"] == {
+            "kind": "onnx",
+            "artifact": "mtp/model.onnx",
+        }
+        roles = workflow["components"]["mtp"]["ports"]["roles"]
+        assert roles["hidden_states"] == "hidden_states"
+        assert roles["inputs_embeds"] == "inputs_embeds"
+        # The target output the head is seeded from is named by role, not by a
+        # free-form ``target_hidden_output`` string.
+        assert (
+            workflow["components"]["decoder"]["ports"]["roles"]["hidden_states.63"]
+            == "hidden_states"
+        )
+
+    def test_rollback_capacity_covers_the_proposal_width(self, tmp_path):
+        workflow = self._write(tmp_path)["pipeline"]["workflow"]
+        group = workflow["serving"]["state_service"]["groups"]["decoder_cache"]
+        # A rolled-back cell whose group declares no rollback_positions makes
+        # the package unloadable, so attaching the speculator states the bound.
+        assert group["capabilities"]["rollback_positions"] >= 1
+
+    def test_anchors_to_a_real_mobius_decoder_workflow(self, tmp_path):
+        """The target is picked out of a workflow mobius actually emits.
+
+        A real decoder workflow ships a dozen generated policy graphs, every one
+        of which is an ONNX component, so the verifier can only be identified by
+        its declared ``logits`` role.
+        """
+        from mobius.integrations.onnx_genai.auto_export_test import _decoder_package
+        from mobius.integrations.onnx_genai.workflow_metadata import (
+            write_decoder_workflow_metadata,
+        )
+
+        package = _decoder_package()
+        write_decoder_workflow_metadata(package, str(tmp_path), package.config)
+        out = write_mtp_speculator_metadata(
+            str(tmp_path), backbone_config=_MtpBackboneConfig()
+        )
+        assert out is not None
+        with open(out, encoding="utf-8") as handle:
+            metadata = yaml.safe_load(handle)
+        workflow = metadata["pipeline"]["workflow"]
+        components = set(workflow["components"])
+        assert len(components) > 2, "a real decoder workflow ships policy components"
+        assert metadata["speculative"]["target"] == "model"
+        assert metadata["speculative"]["proposer"] == "mtp"
+        with open(_onnx_genai_schema_path()) as handle:
+            jsonschema.validate(instance=metadata, schema=json.load(handle))
+
+    def test_requires_a_workflow_to_anchor_against(self, tmp_path):
+        (tmp_path / "inference_metadata.yaml").write_text(yaml.safe_dump({}), encoding="utf-8")
+        with pytest.raises(ValueError, match=re.escape("pipeline.workflow")):
+            write_mtp_speculator_metadata(str(tmp_path), backbone_config=_MtpBackboneConfig())
 
     def test_matches_onnx_genai_json_schema(self, tmp_path):
         """Emitted metadata validates against onnx-genai's published schema."""
-        schema_path = _onnx_genai_schema_path()
-        if schema_path is None:
-            pytest.skip("onnx-genai schema not found (set ONNX_GENAI_SCHEMA)")
-        with open(schema_path) as handle:
+        with open(_onnx_genai_schema_path()) as handle:
             schema = json.load(handle)
         meta = self._write(tmp_path)
         jsonschema.validate(instance=meta, schema=schema)

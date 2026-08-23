@@ -1,0 +1,5726 @@
+{
+  "$defs": {
+    "AbsentInputKind": {
+      "description": "Supported absent-input fallback kinds.",
+      "oneOf": [
+        {
+          "const": "zeros",
+          "description": "Materialize a zero-initialized tensor.",
+          "type": "string"
+        }
+      ]
+    },
+    "AbsentInputSpec": {
+      "description": "Explicit tensor fallback for an absent optional graph input.",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/AbsentInputKind",
+          "description": "Fallback materialization kind."
+        },
+        "shape": {
+          "description": "Runtime-resolved shape of the fallback tensor.",
+          "items": {
+            "$ref": "#/$defs/TensorDimension"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind",
+        "shape"
+      ],
+      "type": "object"
+    },
+    "AdapterArtifact": {
+      "additionalProperties": false,
+      "properties": {
+        "alpha": {
+          "format": "double",
+          "type": "number"
+        },
+        "bindings": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/AdapterTargetBinding"
+          },
+          "type": "array"
+        },
+        "dtype": {
+          "$ref": "#/$defs/TensorDType"
+        },
+        "identity": {
+          "type": "string"
+        },
+        "index": {
+          "description": "Stable non-negative wire ID used by selection.segments.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "provenance": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AdapterProvenance"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rank": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "version": {
+          "type": "string"
+        },
+        "weights": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/AdapterWeightArtifact"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "index",
+        "identity",
+        "version",
+        "rank",
+        "alpha",
+        "dtype"
+      ],
+      "type": "object"
+    },
+    "AdapterCacheContract": {
+      "additionalProperties": false,
+      "properties": {
+        "eviction": {
+          "$ref": "#/$defs/AdapterEvictionPolicy",
+          "default": "lru"
+        },
+        "max_entries": {
+          "default": 16,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "AdapterDiscoveryFallback": {
+      "oneOf": [
+        {
+          "enum": [
+            "disabled"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "tooling_only",
+          "description": "Tooling/load-time graph discovery may produce a resolved manifest; execution may not guess.",
+          "type": "string"
+        }
+      ]
+    },
+    "AdapterEvictionPolicy": {
+      "enum": [
+        "lru"
+      ],
+      "type": "string"
+    },
+    "AdapterPlanningContract": {
+      "additionalProperties": false,
+      "properties": {
+        "bucket_by_adapter_set": {
+          "default": true,
+          "type": "boolean"
+        },
+        "invalidate_capture_on_eviction": {
+          "default": true,
+          "type": "boolean"
+        },
+        "stable_buffers": {
+          "default": true,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "AdapterProvenance": {
+      "additionalProperties": false,
+      "properties": {
+        "producer": {
+          "description": "Producer/importer that resolved the manifest and normalized the artifact.",
+          "type": "string"
+        },
+        "revision": {
+          "description": "Immutable source revision, commit, or content identifier.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "description": "Source model or adapter URI without credentials.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "producer"
+      ],
+      "type": "object"
+    },
+    "AdapterScaleEncoding": {
+      "oneOf": [
+        {
+          "const": "alpha_over_rank",
+          "description": "Runtime applies the binding/artifact `alpha / rank` factor.",
+          "type": "string"
+        },
+        {
+          "const": "baked",
+          "description": "Source factors already encode the complete static scale (ORT `TORT` convention).",
+          "type": "string"
+        }
+      ]
+    },
+    "AdapterSelectionContract": {
+      "additionalProperties": false,
+      "properties": {
+        "active": {
+          "description": "Optional bool[batch]; inactive rows never load or apply adapters.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "adapter_counts": {
+          "description": "Int64[batch] number of valid adapter IDs in each row.",
+          "type": "string"
+        },
+        "max_adapters": {
+          "description": "Fixed second dimension of segments and scales.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "scales": {
+          "description": "Float32[batch,max_adapters] effective request scales.",
+          "type": "string"
+        },
+        "segments": {
+          "description": "Int64[batch,max_adapters] segment IDs in composition order.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "segments",
+        "adapter_counts",
+        "scales",
+        "max_adapters"
+      ],
+      "type": "object"
+    },
+    "AdapterServiceContract": {
+      "additionalProperties": false,
+      "properties": {
+        "application_capability": {
+          "description": "Generic application capability required from the runtime or execution provider.",
+          "type": "string"
+        },
+        "artifacts": {
+          "additionalProperties": {
+            "$ref": "#/$defs/AdapterArtifact"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "cache": {
+          "$ref": "#/$defs/AdapterCacheContract",
+          "default": {
+            "eviction": "lru",
+            "max_entries": 16
+          }
+        },
+        "discovery_fallback": {
+          "$ref": "#/$defs/AdapterDiscoveryFallback",
+          "default": "disabled",
+          "description": "Explicit load-time tooling fallback. Runtime execution never guesses targets."
+        },
+        "planning": {
+          "$ref": "#/$defs/AdapterPlanningContract",
+          "default": {
+            "bucket_by_adapter_set": true,
+            "invalidate_capture_on_eviction": true,
+            "stable_buffers": true
+          }
+        },
+        "portable_fallback": {
+          "default": false,
+          "type": "boolean"
+        },
+        "selection": {
+          "$ref": "#/$defs/AdapterSelectionContract",
+          "description": "Request-scoped adapter-set inputs. These are immutable SSA inputs for one request."
+        },
+        "target_manifest": {
+          "$ref": "#/$defs/LoraTargetManifest",
+          "description": "Authoritative, architecture-neutral bindings resolved by producer/import tooling."
+        }
+      },
+      "required": [
+        "target_manifest",
+        "selection",
+        "application_capability"
+      ],
+      "type": "object"
+    },
+    "AdapterTargetBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "alpha": {
+          "description": "Per-target alpha override; absent uses the artifact alpha.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "rank": {
+          "description": "Per-target rank override; absent uses the artifact rank.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "target": {
+          "description": "Stable target ID declared by the authoritative target manifest.",
+          "type": "string"
+        },
+        "weight_key": {
+          "description": "Key used to find this target's A/B tensors in the adapter bundle.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target",
+        "weight_key"
+      ],
+      "type": "object"
+    },
+    "AdapterWeightArtifact": {
+      "additionalProperties": false,
+      "properties": {
+        "config_location": {
+          "description": "PEFT `adapter_config.json` paired with the safetensors file.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "format": {
+          "$ref": "#/$defs/AdapterWeightFormat",
+          "default": "json"
+        },
+        "loader_capability": {
+          "description": "Loader capability required to normalize this source into the canonical artifact.",
+          "type": "string"
+        },
+        "location": {
+          "type": "string"
+        },
+        "scale_encoding": {
+          "$ref": "#/$defs/AdapterScaleEncoding",
+          "description": "Whether alpha/rank remains to be applied or is already baked into B."
+        }
+      },
+      "required": [
+        "location",
+        "loader_capability",
+        "scale_encoding"
+      ],
+      "type": "object"
+    },
+    "AdapterWeightFormat": {
+      "oneOf": [
+        {
+          "const": "json",
+          "description": "Portable JSON tensor bundle used by the reference fallback.",
+          "type": "string"
+        },
+        {
+          "const": "ort_genai",
+          "description": "Native ONNX Runtime GenAI adapter bundle.",
+          "type": "string"
+        },
+        {
+          "const": "hf_peft",
+          "description": "Hugging Face PEFT `adapter_config.json` plus safetensors.",
+          "type": "string"
+        },
+        {
+          "const": "safetensors",
+          "description": "Manifest-keyed safetensors parameter bundle.",
+          "type": "string"
+        }
+      ]
+    },
+    "AttentionConfig": {
+      "description": "Build-time attention architecture and dimensions.",
+      "properties": {
+        "fallback_behavior": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AttentionType"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Compatible attention behavior for runtimes that do not recognize `type`."
+        },
+        "head_dim": {
+          "description": "Per-head hidden dimension.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "key_sequence_lengths": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KeySequenceLengthsSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Representation compatibility for the attention key-sequence lengths.\n\nAbsent means the canonical contiguous `int32 [batch_size]` representation\nis required."
+        },
+        "num_attention_heads": {
+          "description": "Number of query/attention heads.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "num_kv_heads": {
+          "description": "Number of key/value heads; required by runtimes that need explicit GQA dimensions.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "sink_tokens": {
+          "description": "Number of leading \"attention sink\" tokens always retained alongside the\nsliding window (StreamingLLM). Only meaningful when `sliding_window` is\nset; `null` or `0` disables sink retention. These first tokens stabilize\nthe attention distribution and are never evicted by the window.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "sliding_window": {
+          "description": "Sliding-window length in tokens, or null for full-context attention.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "type": {
+          "$ref": "#/$defs/AttentionType",
+          "description": "Attention architecture.\n\nCanonical values include `multi_head`, `grouped_query`, and\n`multi_latent`; future values are allowed when paired with a usable\n`fallback_behavior`."
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    "AttentionType": {
+      "description": "Attention architecture vocabulary with an extension branch.",
+      "oneOf": [
+        {
+          "enum": [
+            "multi_head",
+            "multi_head_attention",
+            "grouped_query",
+            "group_query_attention",
+            "grouped_query_attention",
+            "gqa",
+            "multi_latent",
+            "multi_latent_attention",
+            "mla"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "multi_head",
+              "multi_head_attention",
+              "grouped_query",
+              "group_query_attention",
+              "grouped_query_attention",
+              "gqa",
+              "multi_latent",
+              "multi_latent_attention",
+              "mla"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "AudioOutputBinding": {
+      "description": "One named tensor output produced by an audio preprocessing program.\n\nThe output binds a processor-local value to a typed workflow SSA name.\nNeither the name nor the content role is inferred from a model identity.",
+      "properties": {
+        "content": {
+          "$ref": "#/$defs/AudioOutputContent",
+          "description": "Generic content role of this output."
+        },
+        "contract": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TensorContract"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Full workflow tensor contract. Required when `pipeline.workflow` is present."
+        },
+        "dtype": {
+          "$ref": "#/$defs/TensorDType",
+          "description": "Element type of the emitted tensor."
+        },
+        "name": {
+          "description": "Workflow SSA value this output binds to.",
+          "examples": [
+            "audio.input_features"
+          ],
+          "minLength": 1,
+          "type": "string"
+        },
+        "optional": {
+          "description": "Whether the runtime may omit this output when a model does not need it.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "pad_value": {
+          "description": "Optional sentinel/pad value for padded entries.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "rank": {
+          "description": "Tensor rank of the emitted tensor.\n\nRedundant with `contract.rank` and retained only for programs that\ndeclare no full contract; workflow packages declare `contract`.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "source": {
+          "description": "Program-local value produced by a transform.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "source",
+        "content",
+        "dtype"
+      ],
+      "type": "object"
+    },
+    "AudioOutputContent": {
+      "description": "Generic audio-output content-role vocabulary.",
+      "oneOf": [
+        {
+          "enum": [
+            "waveform",
+            "features",
+            "audio_features",
+            "valid_frames",
+            "valid_samples",
+            "sample_lengths",
+            "frame_lengths",
+            "validity_mask"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "waveform",
+              "features",
+              "audio_features",
+              "valid_frames",
+              "valid_samples",
+              "sample_lengths",
+              "frame_lengths",
+              "validity_mask"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "AudioPreprocessingProgram": {
+      "description": "Generic audio preprocessing program: an ordered transform pipeline plus the\nnamed workflow SSA tensor outputs it emits.\n\nThe program is expressed entirely as parameterized, architecture-neutral\ndata, mirroring `ImagePreprocessingProgram`. Transform operations are\ngeneric (decode, resample, downmix, rescale, normalize, pad, frame,\nspectrogram, log_mel). In workflow metadata, outputs are materialized by a\nmanifest-pinned preprocessing adapter invocation and bind processor-local\nvalues to typed SSA names. A package may name an output `input_values`,\n`input_features`, `attention_mask`, or anything else without introducing\nruntime model-family dispatch.\n\nOne program type covers every audio family. A CTC acoustic model declares\nresample/downmix/zero_mean_unit_variance over raw samples; an\nencoder-decoder speech model declares resample/pad/log_mel over a fixed\nwindow. The runtime reads the same fields either way.",
+      "properties": {
+        "outputs": {
+          "description": "Named tensor outputs the program emits, each bound to a workflow SSA value.",
+          "items": {
+            "$ref": "#/$defs/AudioOutputBinding"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "transforms": {
+          "description": "Ordered list of generic transform operations applied to decoded audio.",
+          "items": {
+            "$ref": "#/$defs/AudioTransform"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "outputs"
+      ],
+      "type": "object"
+    },
+    "AudioTransform": {
+      "description": "One generic audio transform operation.\n\n`op` selects the operation from a generic vocabulary; the remaining fields\nare the parameters that operation reads (only the relevant ones are set).\nEvery parameter is model DATA — concrete sample rates, channel counts, mel\nbin counts, and so on live in a model's fixture, never as constants baked\ninto this schema.",
+      "properties": {
+        "channels": {
+          "description": "Target channel count for a `downmix` operation.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "epsilon": {
+          "description": "Numerical stabilizer added to the variance for `zero_mean_unit_variance`.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "hop_length": {
+          "description": "Hop length in samples for a spectrogram operation.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "inputs": {
+          "description": "Named values consumed by this transform.\n\nAbsent means the operation consumes the immediately preceding value.\nExplicit names allow branching programs without tensor-name heuristics.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "mel_scale": {
+          "description": "Mel scale convention — generic string data (e.g. `slaney`, `htk`).",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "description": "Padding side / normalization mode selector — generic string data\n(e.g. `right`, `left`, `fixed_window`).",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "n_fft": {
+          "description": "FFT size for a spectrogram operation.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "num_mel_bins": {
+          "description": "Mel filterbank size for a `log_mel`/`log_mel_spectrogram` operation.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "op": {
+          "$ref": "#/$defs/AudioTransformOp",
+          "description": "Generic operation selector (e.g. `resample`, `zero_mean_unit_variance`,\n`log_mel`)."
+        },
+        "outputs": {
+          "description": "Named values produced by this transform.\n\nThese names are processor-local data. Final graph bindings select them\nthrough `AudioOutputBinding::source`.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "pad_value": {
+          "description": "Fill value used by a `pad` operation.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "sample_rate": {
+          "description": "Target sample rate in Hz for a `resample` operation, and the analysis\nrate a mel filterbank is built for.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "scale": {
+          "description": "Scalar multiplier for a `rescale` operation.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "target_length": {
+          "description": "Fixed target length in samples or frames for a `pad`/`trim` operation.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "win_length": {
+          "description": "Analysis window length in samples for a spectrogram operation.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "window": {
+          "description": "Analysis window function — generic string data (e.g. `hann`).",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "op"
+      ],
+      "type": "object"
+    },
+    "AudioTransformOp": {
+      "description": "Generic audio transform-operation vocabulary.\n\nOne vocabulary spans every declared audio program. A CTC acoustic\nmodel normalizes raw samples and never builds a spectrogram; a\nspeech-to-text encoder pads to a fixed window and takes a log-mel.\nBoth are the same kind of declaration, so both draw their operation\nnames from here rather than from a per-family list.",
+      "oneOf": [
+        {
+          "enum": [
+            "decode",
+            "resample",
+            "downmix",
+            "rescale",
+            "zero_mean_unit_variance",
+            "normalize",
+            "pad",
+            "trim",
+            "frame",
+            "spectrogram",
+            "log_mel",
+            "log_mel_spectrogram",
+            "emit_valid_frames",
+            "emit_valid_samples",
+            "emit_sample_lengths",
+            "emit_validity_mask"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "decode",
+              "resample",
+              "downmix",
+              "rescale",
+              "zero_mean_unit_variance",
+              "normalize",
+              "pad",
+              "trim",
+              "frame",
+              "spectrogram",
+              "log_mel",
+              "log_mel_spectrogram",
+              "emit_valid_frames",
+              "emit_valid_samples",
+              "emit_sample_lengths",
+              "emit_validity_mask"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "BatchInvariance": {
+      "description": "Dependence of a row's outputs on the rows batched with it.",
+      "oneOf": [
+        {
+          "enum": [
+            "row_independent",
+            "padding_sensitive"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "row_independent",
+              "padding_sensitive"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "BatchLayout": {
+      "description": "Structural relationship between a typed value and the runtime batch.\n\n`shared` values are invariant across requests. `request_aligned` values carry\nexactly one entry per in-flight request along `axis`, so compaction permutes\nthat axis. `token_packed` values are ragged: `offsets` names the\nrequest-aligned exclusive-prefix offset value and `owner` names the\nper-item owner mapping, which together let a runtime split and regroup the\npacked value without any serialized request ID. `runtime_sequence_state`\nmarks a value whose per-sequence storage the runtime owns outright.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "shared",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "axis": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "request_aligned",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "axis"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Each request owns a fixed-size contiguous group on ``axis`` (for\nexample conditional/unconditional classifier-free-guidance rows).",
+          "properties": {
+            "axis": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "factor": {
+              "description": "Number of contiguous physical rows owned by each logical request.\nValidation requires this to be at least one.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "request_expanded",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "axis",
+            "factor"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "axis": {
+              "description": "Packed axis of this value.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "token_packed",
+              "type": "string"
+            },
+            "offsets": {
+              "description": "Request-aligned value holding the exclusive prefix offset of each request's items.",
+              "type": "string"
+            },
+            "owner": {
+              "description": "Item-aligned value mapping each packed item to its owning request row.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "offsets",
+            "owner",
+            "axis"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "runtime_sequence_state",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ChunkedPrefillConfig": {
+      "description": "Runtime chunked-prefill preference.",
+      "properties": {
+        "chunk_size": {
+          "description": "Preferred number of prompt tokens processed in each prefill chunk.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ComponentContract": {
+      "additionalProperties": false,
+      "properties": {
+        "bindings": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Semantic role to concrete component port name.",
+          "type": "object"
+        },
+        "equivalence": {
+          "$ref": "#/$defs/EquivalenceClass",
+          "default": "semantic",
+          "description": "How closely a substituted implementation must reproduce this contract.\n\nA runtime may freely choose any equivalent implementation, but the\ndeclared class bounds what \"equivalent\" means. Only a\n`distribution_preserving` (or `bitwise`) contract may be optimized\nspeculatively without caller opt-in."
+        },
+        "id": {
+          "description": "Versioned semantic capability identifier. It never selects execution behavior.",
+          "type": "string"
+        },
+        "parameters": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ScalarValue"
+          },
+          "default": {},
+          "description": "Contract parameters that are not tensor ports, such as adapter actions.",
+          "type": "object"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "version"
+      ],
+      "type": "object"
+    },
+    "ComponentImplementation": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "artifact": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "onnx",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "artifact"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "abi": {
+              "type": "string"
+            },
+            "artifact": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "const": "adapter",
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "abi",
+            "version"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "binding",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ComponentPorts": {
+      "additionalProperties": false,
+      "description": "Explicit input/output ports of one executable component.",
+      "properties": {
+        "inputs": {
+          "additionalProperties": {
+            "$ref": "#/$defs/TensorContract"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "outputs": {
+          "additionalProperties": {
+            "$ref": "#/$defs/TensorContract"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "roles": {
+          "additionalProperties": {
+            "$ref": "#/$defs/PortRole"
+          },
+          "description": "Semantic role of the ports whose meaning the workflow's own structure\ncannot recover, keyed by port name.\n\nState ports never need an entry: a state group already names its\nper-component `(input, output)` pair, and the fixed-capacity control\nports are named by [`StateUpdate::IndexedScatter`]. What is left is the\nper-step dataflow a workflow binds by SSA value, where the binding\nrecords WHICH value reaches a port but not WHAT the component does with\nit. A runtime that specializes a decode step — packing tokens, reusing a\nlogits buffer, skipping a mask it can prove is causal — needs that\nsecond fact, and inferring it from a port's spelling is exactly the\nname-guessing this schema refuses everywhere else.\n\nRoles are architecture-neutral and describe the port, never the model\nfamily that happens to expose it.",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "ComponentRowScope": {
+      "additionalProperties": false,
+      "description": "Row scope of a component's runtime-private state.",
+      "properties": {
+        "axis": {
+          "description": "Batch axis of the component's row-scoped ports.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "stateful": {
+          "default": false,
+          "description": "Whether the component retains state between invocations for each row.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "axis"
+      ],
+      "type": "object"
+    },
+    "ConstraintLanguageFacts": {
+      "additionalProperties": false,
+      "description": "A constraint language the package's parser accepts.\n\nThe parser implementation may be native; only the dialect and version are\nportable facts. A request carries the grammar or JSON Schema itself.",
+      "properties": {
+        "component": {
+          "description": "Workflow component that interprets this dialect.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "dialect": {
+          "description": "Dialect identifier, e.g. `json_schema`, `ebnf`, `regex`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "version": {
+          "description": "Exact dialect version, e.g. `2020-12` for JSON Schema.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "dialect",
+        "version",
+        "component"
+      ],
+      "type": "object"
+    },
+    "DType": {
+      "description": "Scalar dtype vocabulary with common ONNX and runtime aliases.",
+      "oneOf": [
+        {
+          "enum": [
+            "float32",
+            "fp32",
+            "float16",
+            "fp16",
+            "half",
+            "bfloat16",
+            "bf16",
+            "float8_e4m3fn",
+            "fp8_e4m3fn",
+            "float8_e4m3",
+            "fp8_e4m3",
+            "float8_e5m2",
+            "fp8_e5m2",
+            "int8",
+            "uint8",
+            "int4",
+            "uint4"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "float32",
+              "fp32",
+              "float16",
+              "fp16",
+              "half",
+              "bfloat16",
+              "bf16",
+              "float8_e4m3fn",
+              "fp8_e4m3fn",
+              "float8_e4m3",
+              "fp8_e4m3",
+              "float8_e5m2",
+              "fp8_e5m2",
+              "int8",
+              "uint8",
+              "int4",
+              "uint4"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "DecodingVocabulary": {
+      "additionalProperties": false,
+      "description": "Source of the class-id -> string mapping used to render a transcript.",
+      "properties": {
+        "ignored_tokens": {
+          "description": "Token strings dropped before rendering (e.g. `<pad>`, `<s>`).\n\nRemoval happens after CTC collapsing and before word splitting, so an\nignored token never joins or separates words.\n\nEvery entry must be present in `tokens` when `source` is `inline`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "size": {
+          "description": "Number of classes in the decoding vocabulary.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/$defs/DecodingVocabularySource",
+          "description": "Generic source selector (e.g. `tokenizer`, `inline`)."
+        },
+        "tokens": {
+          "description": "Inline class-id -> string table, ordered by class id.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "word_delimiter": {
+          "description": "Token string that separates words when rendering (e.g. `|`).\n\nA delimiter *separates* words, so it never contributes whitespace of its\nown: a reader splits the decoded token run on this token, discards empty\ngroups, and joins the remaining groups with a single U+0020. Leading,\ntrailing, and repeated delimiters therefore produce no empty words and no\nleading or trailing space. When absent, tokens are concatenated verbatim.\n\nMust be present in `tokens` when `source` is `inline`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "type": "object"
+    },
+    "DecodingVocabularySource": {
+      "description": "Class-id -> string mapping source vocabulary.",
+      "oneOf": [
+        {
+          "enum": [
+            "tokenizer",
+            "inline"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "tokenizer",
+              "inline"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "EffectContract": {
+      "additionalProperties": false,
+      "description": "Declared semantics of one external effect domain.\n\nRetry class and speculation safety are independent axes. A transactional\neffect may still be unsafe to speculate, and an idempotent effect is not\nautomatically rewindable.",
+      "properties": {
+        "retry": {
+          "$ref": "#/$defs/EffectRetryClass",
+          "description": "Minimum retry-relevant class for runtime/server recovery orchestration."
+        },
+        "speculation_safety": {
+          "$ref": "#/$defs/SpeculationSafety",
+          "default": {
+            "kind": "none"
+          },
+          "description": "Whether and how far this effect can participate in speculative execution."
+        }
+      },
+      "required": [
+        "retry"
+      ],
+      "type": "object"
+    },
+    "EffectRetryClass": {
+      "description": "Retry-relevant classification of an external effect.",
+      "oneOf": [
+        {
+          "const": "pure",
+          "description": "No observable external effect; replay is always safe.",
+          "type": "string"
+        },
+        {
+          "const": "idempotent",
+          "description": "Repeating the effect with the same inputs is observationally equivalent.",
+          "type": "string"
+        },
+        {
+          "const": "transactional",
+          "description": "The effect participates in an external transaction that can be aborted.",
+          "type": "string"
+        },
+        {
+          "const": "non_retryable",
+          "description": "The effect must never be repeated or rolled back.",
+          "type": "string"
+        }
+      ]
+    },
+    "EquivalenceClass": {
+      "description": "Correctness bound on substituting an equivalent component implementation.",
+      "oneOf": [
+        {
+          "const": "bitwise",
+          "description": "Every substituted implementation must produce bit-identical outputs.",
+          "type": "string"
+        },
+        {
+          "const": "distribution_preserving",
+          "description": "Outputs may differ numerically but must preserve the output distribution.",
+          "type": "string"
+        },
+        {
+          "const": "semantic",
+          "description": "Only the declared semantics are preserved; the distribution may change.",
+          "type": "string"
+        }
+      ]
+    },
+    "ExpertShardFacts": {
+      "additionalProperties": false,
+      "description": "Expert identity and routing facts for expert parallelism.",
+      "properties": {
+        "contiguous_groups_only": {
+          "default": false,
+          "description": "Whether experts may be split across ranks in arbitrary contiguous groups.",
+          "type": "boolean"
+        },
+        "expert_count": {
+          "description": "Total number of experts per sparse layer.",
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "replicated": {
+          "description": "Values replicated on every expert-parallel rank, such as the router.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "expert_count"
+      ],
+      "type": "object"
+    },
+    "GenerationContract": {
+      "additionalProperties": false,
+      "description": "Authoritative generation defaults and the structural override surface.",
+      "properties": {
+        "defaults": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GenerationDefaults"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Authoritative package defaults."
+        },
+        "overrides": {
+          "additionalProperties": {
+            "$ref": "#/$defs/GenerationOverride"
+          },
+          "description": "Overridable fields, each bound to a request-sourced workflow input.\n\nA caller may override exactly these fields and no others. An override of\nany unlisted field must fail loudly rather than being silently dropped.",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "GenerationDefaults": {
+      "description": "Author-declared text-generation defaults (sampling and beam search).\n\nMirrors the `search` section of an onnxruntime-genai `genai_config.json`.\nEvery field is optional so only values the author declared are carried over.",
+      "properties": {
+        "diversity_penalty": {
+          "description": "Diversity penalty for diverse beam groups.",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "do_sample": {
+          "description": "Whether to randomize sampling through `top_k`/`top_p` (else greedy).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "early_stopping": {
+          "description": "Whether beam search stops once enough beams have finished.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "length_penalty": {
+          "description": "Exponential length penalty used with beam search.",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max_length": {
+          "description": "Maximum final sequence length.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_length": {
+          "description": "Minimum final sequence length.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "no_repeat_ngram_size": {
+          "description": "Disallow repeating n-grams of this size (`0` = disabled).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "num_beams": {
+          "description": "Number of beams for beam search (`1` = no beam search).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "num_return_sequences": {
+          "description": "Number of sequences returned after search.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "repetition_penalty": {
+          "description": "Penalty applied to already-generated tokens (`1.0` = no penalty).",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "temperature": {
+          "description": "Softmax temperature applied before sampling.",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "top_k": {
+          "description": "Number of highest-probability tokens kept for top-k filtering.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "top_p": {
+          "description": "Nucleus (top-p) cumulative-probability threshold.",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "GenerationOverride": {
+      "additionalProperties": false,
+      "description": "One caller-overridable generation field.",
+      "properties": {
+        "constraint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GenerationOverrideConstraint"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Declared bounds the runtime enforces before executing the request."
+        },
+        "input": {
+          "description": "Request-sourced workflow input that carries the override value.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "input"
+      ],
+      "type": "object"
+    },
+    "GenerationOverrideConstraint": {
+      "additionalProperties": false,
+      "description": "Declared bounds on one overridable generation field.",
+      "properties": {
+        "maximum": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "minimum": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "HardwareRequirements": {
+      "description": "Model-side hardware requirements and distribution-matching hints.",
+      "properties": {
+        "beneficial_dtypes": {
+          "description": "Dtypes that improve performance or memory use but are not mandatory.",
+          "items": {
+            "$ref": "#/$defs/DType"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "kv_cache_memory_per_1k_tokens_mb": {
+          "description": "Estimated KV-cache memory in MiB per 1,000 cached tokens.",
+          "format": "float",
+          "minimum": 0.0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "min_memory_gb": {
+          "description": "Minimum aggregate accelerator or system memory in GiB.",
+          "format": "float",
+          "minimum": 0.0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "min_tp_degree": {
+          "description": "Minimum useful tensor-parallel degree when tensor parallelism is selected.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "required_dtypes": {
+          "description": "Dtypes the selected device or execution provider must support.",
+          "items": {
+            "$ref": "#/$defs/DType"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "supports_tensor_parallel": {
+          "description": "Whether the model can be partitioned with tensor parallelism.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ImageOutputBinding": {
+      "description": "One named tensor output produced by an image preprocessing program.\n\nThe output binds a processor-local value to a typed workflow SSA name.\nNeither the name nor the content role is inferred from a model identity.",
+      "properties": {
+        "content": {
+          "$ref": "#/$defs/ImageOutputContent",
+          "description": "Generic content role this tensor carries (pixels, coordinates, grid,\noriginal size, or validity mask) — never a model-family label."
+        },
+        "contract": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TensorContract"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Full workflow tensor contract. Required when `pipeline.workflow` is present."
+        },
+        "dtype": {
+          "$ref": "#/$defs/TensorDType",
+          "description": "Declared output dtype. Always explicit; never inferred from the model."
+        },
+        "name": {
+          "description": "Workflow SSA value produced by the preprocessing adapter invocation.",
+          "examples": [
+            "image.pixel_values"
+          ],
+          "minLength": 1,
+          "type": "string"
+        },
+        "optional": {
+          "description": "Whether the runtime may omit this output when a model does not need it.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "pad_value": {
+          "description": "Optional sentinel/pad value for padded entries (e.g. `-1` coordinates).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "source": {
+          "description": "Named processor-local value produced by a transform.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "name",
+        "content",
+        "dtype"
+      ],
+      "type": "object"
+    },
+    "ImageOutputContent": {
+      "description": "Generic image-output content-role vocabulary.",
+      "oneOf": [
+        {
+          "enum": [
+            "pixels",
+            "patch_coordinates",
+            "grid_dimensions",
+            "original_size",
+            "transformed_size",
+            "validity_mask"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "pixels",
+              "patch_coordinates",
+              "grid_dimensions",
+              "original_size",
+              "transformed_size",
+              "validity_mask"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "ImageOutputValueRange": {
+      "description": "Numeric interpretation of pixels emitted by an image workflow output.\n\nThis is an output contract, not a model-family hint: consumers must never\ninfer normalization from observed pixel values.",
+      "enum": [
+        "zero_to_one",
+        "negative_one_to_one",
+        "zero_to_255"
+      ],
+      "type": "string"
+    },
+    "ImagePreprocessingProgram": {
+      "description": "Generic image preprocessing program: an ordered transform pipeline plus the\nnamed workflow SSA tensor outputs it emits.\n\nThe program is expressed entirely as parameterized, architecture-neutral\ndata. Transform operations are generic (decode, resize, rescale, normalize,\ntile, patchify, pad). In workflow metadata, outputs are materialized by a\nmanifest-pinned preprocessing adapter invocation and bind processor-local\nvalues to typed SSA names. A package may name an output `pixel_position_ids`,\n`image_grid_thw`, or anything else without introducing runtime model-family\ndispatch.",
+      "properties": {
+        "outputs": {
+          "description": "Named tensor outputs the program emits, each bound to a workflow SSA value.",
+          "items": {
+            "$ref": "#/$defs/ImageOutputBinding"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "transforms": {
+          "description": "Ordered list of generic transform operations applied to decoded pixels.",
+          "items": {
+            "$ref": "#/$defs/ImageTransform"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "outputs"
+      ],
+      "type": "object"
+    },
+    "ImageSizeSpec": {
+      "anyOf": [
+        {
+          "description": "A single edge length applied to both dimensions.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "description": "Explicit width and height.",
+          "properties": {
+            "height": {
+              "description": "Target height in pixels.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "width": {
+              "description": "Target width in pixels.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "width",
+            "height"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "A square size or an explicit width/height for an image transform."
+    },
+    "ImageTransform": {
+      "description": "One generic image transform operation.\n\n`op` selects the operation from a generic vocabulary; the remaining fields\nare the parameters that operation reads (only the relevant ones are set).\nEvery parameter is model DATA — concrete sizes, patch sizes, means, and so on\nlive in a model's fixture, never as constants baked into this schema.",
+      "properties": {
+        "canvas_pad_value": {
+          "description": "RGB canvas fill value applied before dynamic tiling.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "channel_order": {
+          "description": "Flattened patch feature order (`channels_first` or `channels_last`).",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "coordinate_order": {
+          "description": "Patch-coordinate component order (`yx` or `xy`).",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "flatten": {
+          "description": "Whether `patchify` flattens each patch into a single feature vector.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "include_thumbnail": {
+          "description": "Whether a `tile` operation also emits a global thumbnail tile.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "inputs": {
+          "description": "Named values consumed by this transform.\n\nAbsent means the operation consumes the immediately preceding value.\nExplicit names allow branching programs without tensor-name heuristics.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "interpolation": {
+          "description": "Interpolation filter for a `resize` operation — generic string data.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mask_patch_size": {
+          "description": "Pixel edge represented by one validity-mask cell.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_patches": {
+          "description": "Maximum number of spatial patches for a patch-budget resize.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_pixels": {
+          "description": "Maximum pixel area for an aspect-preserving `pixel_area` resize.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_tiles": {
+          "description": "Maximum number of local tiles for a `tile` operation.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "mean": {
+          "description": "Per-channel mean for a `normalize` operation (length is model data).",
+          "items": {
+            "format": "float",
+            "type": "number"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "merge_size": {
+          "description": "Spatial patch-group edge controlling packed patch traversal order.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_pixels": {
+          "description": "Minimum pixel area for an aspect-preserving `pixel_area` resize.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "mode": {
+          "description": "Resize/crop mode (e.g. `pad`, `crop`, `stretch`) — generic string data.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "op": {
+          "$ref": "#/$defs/ImageTransformOp",
+          "description": "Generic operation selector (e.g. `resize`, `normalize`, `patchify`)."
+        },
+        "outputs": {
+          "description": "Named values produced by this transform.\n\nThese names are processor-local data. Final graph bindings select them\nthrough `ImageOutputBinding::source`.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "pad_value": {
+          "description": "Fill value for a `pad` operation, or sentinel for padded coordinates.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "patch_order": {
+          "description": "Order patches are emitted in (`merge_groups`, the default, or `raster`).\nIndependent of `merge_size`, which only sets how many patches collapse\ninto one image token.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "patch_size": {
+          "description": "Edge length of a square patch for a `patchify` operation.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "pooling_kernel_size": {
+          "description": "Spatial pooling edge used when resolving a patch-budget resize.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "scale": {
+          "description": "Scalar multiplier for a `rescale` operation.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "size": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImageSizeSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Target size for a `resize` operation."
+        },
+        "size_multiple": {
+          "description": "Required divisibility of both resized dimensions.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "std": {
+          "description": "Per-channel standard deviation for a `normalize` operation.",
+          "items": {
+            "format": "float",
+            "type": "number"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "target_length": {
+          "description": "Exact first-axis length produced by a `pad` operation.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "temporal_order": {
+          "description": "Relative nesting of the temporal and channel axes inside a flattened\n`channels_first` patch (`channel_major` or `temporal_major`).",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "temporal_patch_size": {
+          "description": "Number of identical temporal frames packed into each spatial patch.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "thumbnail_interpolation": {
+          "description": "Interpolation filter used specifically for a global thumbnail.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thumbnail_order": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThumbnailOrder"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Ordering of a global thumbnail relative to local tiles."
+        },
+        "tile_size": {
+          "description": "Edge length of a square tile for a `tile` operation.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "op"
+      ],
+      "type": "object"
+    },
+    "ImageTransformOp": {
+      "description": "Generic image transform-operation vocabulary.",
+      "oneOf": [
+        {
+          "enum": [
+            "decode",
+            "decode_rgb",
+            "convert_rgb",
+            "resize",
+            "rescale",
+            "normalize",
+            "tile",
+            "flatten",
+            "patchify",
+            "pad",
+            "emit_original_size",
+            "emit_transformed_size",
+            "emit_validity_mask",
+            "emit_patch_coordinates",
+            "emit_grid_coordinates"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "decode",
+              "decode_rgb",
+              "convert_rgb",
+              "resize",
+              "rescale",
+              "normalize",
+              "tile",
+              "flatten",
+              "patchify",
+              "pad",
+              "emit_original_size",
+              "emit_transformed_size",
+              "emit_validity_mask",
+              "emit_patch_coordinates",
+              "emit_grid_coordinates"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "KeySequenceLengthsSpec": {
+      "description": "Explicit compatibility rules for attention key-sequence-length metadata.",
+      "properties": {
+        "scalar_broadcast": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SequenceLengthScalarBroadcast"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional scalar compatibility. `unit_batch` authorizes a contiguous\nrank-0 one-element `int32` tensor only when the attention batch is one."
+        }
+      },
+      "type": "object"
+    },
+    "KvAxisStrides": {
+      "description": "Symbolic element stride of each of the four logical KV axes.\n\nThe stride of an axis is the product of the runtime dimensions in its factor\nlist; an **empty** list means unit stride (the innermost, contiguous axis).\nThe innermost axis of every layout the converted kernels honor is\n`head_dim`, whose stride is `1` (empty), because the fp16 read vectorizes\n`head_dim` as `half2` and the fused write addresses it as `dst + d`.\n\nThe two historical layouts map onto this as:\n\n| axis     | head-major BNSH        | seq-major BSNH        |\n|----------|------------------------|-----------------------|\n| batch    | `kv_heads·seq·head_dim`| `seq·kv_heads·head_dim`|\n| head     | `seq·head_dim`         | `head_dim`            |\n| seq      | `head_dim`             | `kv_heads·head_dim`   |\n| head_dim | `1`                    | `1`                   |",
+      "properties": {
+        "batch": {
+          "default": [],
+          "description": "Factors of the batch-axis stride.",
+          "items": {
+            "$ref": "#/$defs/KvStrideDim"
+          },
+          "type": "array"
+        },
+        "head": {
+          "default": [],
+          "description": "Factors of the KV-head-axis stride.",
+          "items": {
+            "$ref": "#/$defs/KvStrideDim"
+          },
+          "type": "array"
+        },
+        "head_dim": {
+          "default": [],
+          "description": "Factors of the head-dim-axis stride. Unit (empty) for every honored\nlayout.",
+          "items": {
+            "$ref": "#/$defs/KvStrideDim"
+          },
+          "type": "array"
+        },
+        "seq": {
+          "default": [],
+          "description": "Factors of the sequence-axis (per-token) stride.",
+          "items": {
+            "$ref": "#/$defs/KvStrideDim"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "KvCacheLayout": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/KvNamedLayout",
+          "description": "A readable shorthand for a standard layout. Deserializes from the strings\n`\"head_major_bnsh\"` and `\"seq_major_bsnh\"`; expands to explicit strides\nvia [`KvCacheLayout::resolve_strides`]."
+        },
+        {
+          "$ref": "#/$defs/KvStrideDescriptor",
+          "description": "A fully explicit stride descriptor for layouts the named forms cannot\nexpress."
+        }
+      ],
+      "description": "Physical memory layout of a backend's KV cache tensors, as a stride\ndescriptor.\n\nThis is a **per-backend capability**, not a cross-backend constant: the two\nbackends own their KV buffers independently and never read each other's KV\nbytes, so they may store the cache differently. The ONNX Runtime backend\nrequires head-major BNSH (`[batch, kv_heads, seq, head_dim]`) because ORT's\nGroupQueryAttention past/present is BNSH on every dispatch path (Flash,\ncuDNN SDPA, memory-efficient, XQA). The native backend additionally supports\nseq-major BSNH (`[batch, seq, kv_heads, head_dim]`), which makes each token's\nlive prefix contiguous across heads — shrinking the VMM granule floor by the\n`kv_heads` factor, removing growth-triggered graph re-capture (the append\nstride is sequence-length independent), and making page-level prefix sharing\n(#777) practical. Absent preserves the historical head-major behavior.\n\nLayout preference is per-EP and per-platform rather than a global constant,\nand a JIT backend compiles a specialized kernel per descriptor, so this is a\ndescriptor rather than a closed enum: a raw stride tuple is unreadable, so\nthe common cases are still nameable (`head_major_bnsh`, `seq_major_bsnh`)\nwhile an explicit [`KvStrideDescriptor`] expresses anything the named forms\ncannot (e.g. a token-major view).\n\nOn-device, the native backend selects the layout by stamping the `kv_layout`\nattribute (`0` = BNSH, `1` = BSNH) on its GroupQueryAttention nodes; the\nCUDA EP honors it on the fused fp16 single-token decode pair. Seq-major is\nonly enabled end-to-end once the prefill (flash) read is also converted, so\nthe two never disagree about how a shared cache is physically laid out."
+    },
+    "KvNamedLayout": {
+      "description": "The named, human-readable KV cache layouts.",
+      "oneOf": [
+        {
+          "const": "head_major_bnsh",
+          "description": "Head-major BNSH `[batch, kv_heads, seq, head_dim]`. ORT-compatible; the\ndefault for both backends.",
+          "type": "string"
+        },
+        {
+          "const": "seq_major_bsnh",
+          "description": "Seq-major BSNH `[batch, seq, kv_heads, head_dim]`. Native backend only.",
+          "type": "string"
+        }
+      ]
+    },
+    "KvOwnership": {
+      "description": "Ownership model for a graph's KV cache inputs.",
+      "oneOf": [
+        {
+          "const": "owned",
+          "description": "The graph consumes past KV and emits replacement/extended present KV.",
+          "type": "string"
+        },
+        {
+          "const": "shared",
+          "description": "The graph reads references to KV owned and advanced by another decoder.",
+          "type": "string"
+        }
+      ]
+    },
+    "KvStrideDescriptor": {
+      "description": "A fully explicit KV-cache stride descriptor.\n\nThis is the general form the two named layouts expand into, and the shape a\nfuture layout (e.g. token-major) is expressed in without adding an enum\nvariant. The `reservation_*` fields describe a binding that is a **view into\na larger reservation** rather than the owner of its whole buffer:\ntoken-major stores every layer's tokens in one reservation and hands each\n`(layer, side)` a sub-view, so its per-token (seq) stride is taken over the\nreservation's total token count and its data starts at a non-zero offset.\nBoth historical layouts are whole-buffer bindings: `offset == 0` and no\nreservation override.",
+      "properties": {
+        "reservation_offset_elements": {
+          "description": "Element offset of this binding's first element within the reservation it\nviews. `0` for a binding that owns its whole buffer — the only case the\nconverted kernels honor today.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reservation_seq_slots": {
+          "description": "Sequence-axis extent, in token slots, of the reservation this binding\nviews when the reservation is larger than the binding's own\n`cache_capacity`. Absent means the binding spans its own capacity (a\nwhole-buffer binding). Present expresses a token-major view whose seq\nstride collapses the per-`(layer, side)` buffer boundary; not honored by\nthe converted path yet.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "strides": {
+          "$ref": "#/$defs/KvAxisStrides",
+          "description": "Symbolic stride of each logical axis."
+        }
+      },
+      "required": [
+        "strides"
+      ],
+      "type": "object"
+    },
+    "KvStrideDim": {
+      "description": "A runtime KV-cache dimension that an axis stride can be a multiple of.\n\nAbsolute element strides are a serving-time property — they depend on the\n`cache_capacity` a runtime picks — so metadata cannot store them as numbers.\nA stride is therefore stored **symbolically**, as the (unordered) set of\nruntime dimensions it multiplies. The concrete element stride of an axis is\nthe product of the sizes of the dimensions in its factor list.",
+      "oneOf": [
+        {
+          "const": "kv_heads",
+          "description": "Number of KV heads (`kv_heads` / `N`).",
+          "type": "string"
+        },
+        {
+          "const": "seq_capacity",
+          "description": "Sequence capacity of the growing axis (`cache_capacity` / `S`).",
+          "type": "string"
+        },
+        {
+          "const": "head_dim",
+          "description": "Per-token head width (`head_dim` / `H`).",
+          "type": "string"
+        }
+      ]
+    },
+    "LiteralValue": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ScalarValue"
+        },
+        {
+          "items": {
+            "$ref": "#/$defs/ScalarValue"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "A literal tensor initializer.\n\nA single scalar broadcasts to every element of the declared contract, which\ncovers flags, counters, and zero-filled buffers. Workflows whose constants\nare genuinely per-position -- interleaved stream delay patterns, per-stream\ninitial tokens, fixed schedule tables -- declare the elements explicitly in\nrow-major order instead, so the value stays inside the metadata document and\ndoes not become an out-of-band artifact."
+    },
+    "LoopStatePair": {
+      "description": "One fixed-shape loop-carried recurrent-state port pair.\n\nGeneric and architecture-neutral: the runtime zero/other-initializes `input`\non the first step, runs the graph, and copies `output` back into `input` for\nthe next step (`replace` update). This models any fixed recurrent tensor\n(convolution state, linear-attention recurrent state, and so on) without\nreferencing a model family. It is intentionally distinct from growing KV\nstate, whose logical cells and storage service are declared by a workflow.",
+      "properties": {
+        "init": {
+          "$ref": "#/$defs/StateInitKind",
+          "description": "How `input` is initialized before the first step (e.g. `zeros`)."
+        },
+        "input": {
+          "description": "Graph input port that receives the carried state for this step.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "output": {
+          "description": "Graph output port that produces the next-step state.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "update": {
+          "$ref": "#/$defs/StateUpdateKind",
+          "description": "How `output` becomes the next step's `input` (fixed state uses `replace`)."
+        }
+      },
+      "required": [
+        "input",
+        "output",
+        "init",
+        "update"
+      ],
+      "type": "object"
+    },
+    "LoraGraphInputBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "a": {
+          "type": "string"
+        },
+        "b": {
+          "type": "string"
+        },
+        "scale": {
+          "description": "Optional graph input for request scale; otherwise scale is folded into stable factors.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "a",
+        "b"
+      ],
+      "type": "object"
+    },
+    "LoraTargetDescriptor": {
+      "additionalProperties": false,
+      "description": "One resolved base projection. Fused-QKV knowledge is lowered to an optional slice.",
+      "properties": {
+        "activation_dtype": {
+          "$ref": "#/$defs/TensorDType",
+          "description": "Projection activation dtype used by graph-native delta application."
+        },
+        "alpha": {
+          "description": "Optional alpha policy for artifacts binding this target.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "component": {
+          "description": "Workflow component name, or `model` for a bare decoder package.",
+          "type": "string"
+        },
+        "graph_inputs": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LoraGraphInputBinding"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Phase-1 graph-native optional A/B inputs. Base-only omits both and is bit-identical."
+        },
+        "id": {
+          "type": "string"
+        },
+        "initializer": {
+          "description": "Exact immutable base initializer name.",
+          "type": "string"
+        },
+        "input_features": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "layer_index": {
+          "description": "Optional producer/importer layer identity retained from Phase-2 manifests.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "node_name": {
+          "description": "Exact ONNX projection node name used for load-time manifest validation.",
+          "type": "string"
+        },
+        "output_features": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output_name": {
+          "description": "Exact graph value produced by the projection.",
+          "type": "string"
+        },
+        "output_slice": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LoraTargetSlice"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Resolved child range within a fused output; producer/import tooling owns discovery."
+        },
+        "rank": {
+          "description": "Optional rank policy for artifacts binding this target.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "component",
+        "initializer",
+        "node_name",
+        "output_name",
+        "activation_dtype",
+        "input_features",
+        "output_features"
+      ],
+      "type": "object"
+    },
+    "LoraTargetManifest": {
+      "additionalProperties": false,
+      "description": "Authoritative generic target map migrated from Phase-2 `LoraTargetManifest`.",
+      "properties": {
+        "targets": {
+          "items": {
+            "$ref": "#/$defs/LoraTargetDescriptor"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "targets"
+      ],
+      "type": "object"
+    },
+    "LoraTargetSlice": {
+      "additionalProperties": false,
+      "properties": {
+        "alpha": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "offset": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rank": {
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "role": {
+          "description": "Producer-defined semantic label; runtime execution uses only the resolved range.",
+          "type": "string"
+        },
+        "width": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "role",
+        "offset",
+        "width"
+      ],
+      "type": "object"
+    },
+    "MediaContainer": {
+      "enum": [
+        "raw",
+        "wav"
+      ],
+      "type": "string"
+    },
+    "MediaDelivery": {
+      "enum": [
+        "buffered",
+        "streaming"
+      ],
+      "type": "string"
+    },
+    "MediaEncoding": {
+      "enum": [
+        "pcm_s16_le",
+        "pcm_f32_le"
+      ],
+      "type": "string"
+    },
+    "MediaOutputContract": {
+      "additionalProperties": false,
+      "properties": {
+        "channels": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "container": {
+          "$ref": "#/$defs/MediaContainer"
+        },
+        "delivery": {
+          "$ref": "#/$defs/MediaDelivery",
+          "default": "buffered"
+        },
+        "encoding": {
+          "$ref": "#/$defs/MediaEncoding"
+        },
+        "sample_rate_hz": {
+          "description": "Sample rate of the encoded response.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "source_sample_rate_hz": {
+          "description": "Sample rate of a pre-adapter waveform. When it differs from\n`sample_rate_hz`, the API boundary resamples before encoding.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "container",
+        "encoding"
+      ],
+      "type": "object"
+    },
+    "MixtureOfExpertsSpec": {
+      "description": "Explicit sparse mixture-of-experts structure and graph representation.",
+      "properties": {
+        "activation": {
+          "description": "Expert FFN activation name, such as `silu`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "expert_intermediate_size": {
+          "description": "Intermediate width of each routed expert FFN.",
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "experts_per_token": {
+          "description": "Number of routed experts selected for each token.",
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "representation": {
+          "$ref": "#/$defs/MoERepresentation",
+          "description": "Expert graph representation: `dense_fallback`, `moe`, or `qmoe`."
+        },
+        "routed_expert_count": {
+          "description": "Number of independently routed experts.",
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "router": {
+          "$ref": "#/$defs/MoERouterSpec",
+          "description": "Router scoring, selection, normalization, and scaling semantics."
+        },
+        "shared_expert_count": {
+          "description": "Number of dense shared experts evaluated for every token.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "shared_expert_intermediate_size": {
+          "description": "Total intermediate width of the always-on shared-expert FFN.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "representation",
+        "routed_expert_count",
+        "shared_expert_count",
+        "experts_per_token",
+        "expert_intermediate_size",
+        "shared_expert_intermediate_size",
+        "activation",
+        "router"
+      ],
+      "type": "object"
+    },
+    "MoEGroupScore": {
+      "description": "Group-scoring reduction vocabulary.",
+      "oneOf": [
+        {
+          "enum": [
+            "maximum",
+            "top_2_sum"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "maximum",
+              "top_2_sum"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "MoERepresentation": {
+      "description": "Sparse expert graph representation vocabulary.",
+      "oneOf": [
+        {
+          "enum": [
+            "dense_fallback",
+            "moe",
+            "qmoe"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "dense_fallback",
+              "moe",
+              "qmoe"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "MoERouterScoreFunction": {
+      "description": "Router score-operation vocabulary.",
+      "oneOf": [
+        {
+          "enum": [
+            "softmax",
+            "sigmoid"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "softmax",
+              "sigmoid"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "MoERouterSelectionMethod": {
+      "description": "Router expert-selection vocabulary.",
+      "oneOf": [
+        {
+          "enum": [
+            "top_k",
+            "grouped_top_k",
+            "sparse_mixer"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "top_k",
+              "grouped_top_k",
+              "sparse_mixer"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "MoERouterSpec": {
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "selection_method": {
+                "const": "grouped_top_k"
+              }
+            },
+            "required": [
+              "selection_method"
+            ]
+          },
+          "then": {
+            "required": [
+              "group_count",
+              "groups_per_token",
+              "group_score"
+            ]
+          }
+        }
+      ],
+      "description": "Explicit router semantics, kept separate from expert FFN execution.",
+      "properties": {
+        "group_count": {
+          "description": "Number of expert groups considered by grouped selection.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "group_score": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoEGroupScore"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Reduction used to score a group before group TopK."
+        },
+        "groups_per_token": {
+          "description": "Number of groups retained per token by grouped selection.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "normalize_weights": {
+          "description": "Whether selected aggregation weights are normalized to sum to one.",
+          "type": "boolean"
+        },
+        "scaling_factor": {
+          "description": "Multiplicative scale applied to final aggregation weights.",
+          "format": "float",
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "score_function": {
+          "$ref": "#/$defs/MoERouterScoreFunction",
+          "description": "Elementwise score operation applied to router logits."
+        },
+        "selection_method": {
+          "$ref": "#/$defs/MoERouterSelectionMethod",
+          "description": "Expert selection operation applied to the scores."
+        }
+      },
+      "required": [
+        "score_function",
+        "selection_method",
+        "normalize_weights",
+        "scaling_factor"
+      ],
+      "type": "object"
+    },
+    "ModelCapabilities": {
+      "description": "Model properties that are baked into the graph or advertised as configurable.",
+      "properties": {
+        "attention": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AttentionConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Attention architecture and dimensions."
+        },
+        "io": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelIoSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "deprecated": true,
+          "description": "DEPRECATED, import-only: legacy explicit graph I/O for a bare\nsingle-decoder package.\n\nThe canonical, and only authoritative, expression of a package's\nexecutable graph ABI is the workflow:\n`pipeline.workflow.components.<component>.ports` (with `ports.roles`),\nthe invoke bindings that connect them, and the `state_service` groups\nthat declare model state. A composite package and a bare one-file\ndecoder use that same representation.\n\nThis block remains only so packages written before the workflow existed\nstill load. It is never read directly: [`ModelCapabilities::io`] resolves\nthe workflow first and falls back here, and a document carrying both is\nrejected so the two can never disagree. New producers must not emit it."
+        },
+        "max_sequence_length": {
+          "description": "Maximum total sequence length, in tokens.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "mixture_of_experts": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MixtureOfExpertsSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Explicit sparse mixture-of-experts graph and routing contract.\n\nThis describes graph structure, never a model family. Runtimes use the\ndeclared representation and dimensions instead of inferring them from\nnode names, initializer shapes, or architecture strings."
+        },
+        "runtime_configurable": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RuntimeConfigurable"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Features that a serving runtime may configure at load time."
+        },
+        "sharding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ShardingContract"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Legal tensor, pipeline, and expert sharding facts.\n\nThe caller and runtime choose degree, device mapping, and collective\nbackend. Portable metadata never standardizes a cross-runtime KV or\ncache wire format."
+        },
+        "vocab_size": {
+          "description": "Vocabulary size (rows of the token-embedding / logits table).",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ModelIoSpec": {
+      "additionalProperties": false,
+      "description": "Explicit binding of the graph ports the decode step reads and writes.\n\nEvery field is optional so a model package can declare only the ports its\ngraph exposes. A port left unset is resolved ONLY from an unambiguous\ndtype/shape signal; when the shape cannot disambiguate the port, the runtime\nfails with an actionable error naming the key to declare rather than\ninterpreting a tensor name. A declared port is always authoritative.",
+      "properties": {
+        "aliasing": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StateAliasing"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Whether the graph permits, requires, or forbids the runtime aliasing a\n`present` output onto its paired `past` input.\n\nThis is the graph ABI fact that replaced the old `shared_buffer` policy\nflag: the package states what aliasing its graph is CORRECT under, and\nthe runtime alone decides whether to exploit it (execution provider\ncapability, buffer capacity, and batching are runtime concerns). A graph\nthat reads a `past` region after the paired `present` write would touch\nit must declare `forbidden`, which is the default when the package is\nsilent — silence never grants an optimization."
+        },
+        "attention_mask_input": {
+          "description": "Attention-mask input, if the graph takes one.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "audio_features_input": {
+          "description": "Raw audio-feature prompt input for an encoder-decoder encoder graph\n(e.g. Whisper `audio_features`, a log-mel `[batch, mels, frames]`\ntensor). Declared on the encoder component; a text encoder-decoder uses\n`token_input` instead.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cross_kv_inputs": {
+          "description": "Cross-attention past-KV cache inputs for an encoder-decoder decoder, in\nthe SAME order as `cross_kv_outputs`. These are the encoder-derived KV\ntensors, distinct from the self-attention `kv_inputs`.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "cross_kv_outputs": {
+          "description": "Cross-attention present-KV cache outputs (produced by the encoder for an\nencoder-decoder model), paired positionally with `cross_kv_inputs`.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "encoder_hidden_states_input": {
+          "description": "Encoder-hidden-states input for an encoder-decoder (cross-attention)\ndecoder graph (e.g. `encoder_hidden_states`).",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hidden_output": {
+          "description": "Per-token hidden-state output for embedding / VLM hidden extraction, if\nthe graph exposes a distinct hidden output (e.g. `last_hidden_state`).",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "inputs_embeds_input": {
+          "description": "Pre-embedded / routed sequence input (e.g. `inputs_embeds`).\n\nMay be declared alongside `token_input` (see its documentation): a graph\nthat consumes both a raw token input and one or more routed sequence\ninputs is explicitly permitted.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kv_inputs": {
+          "description": "Past-KV cache inputs, in the SAME order as `kv_outputs` (positional\npairing). Length must match `kv_outputs`.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "kv_layout": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KvCacheLayout"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Physical layout of this backend's KV cache tensors, as a stride\ndescriptor. Accepts a readable named layout (`head_major_bnsh` or\n`seq_major_bsnh`) or a fully explicit [`KvStrideDescriptor`]. This is a\nper-backend capability — each backend owns its KV buffers and never reads\nthe other's KV bytes — so the ORT backend stays head-major while the\nnative backend may declare seq-major. Absent preserves the historical\nhead-major (BNSH) behavior. See [`KvCacheLayout`]."
+        },
+        "kv_outputs": {
+          "description": "Present-KV cache outputs, paired positionally with `kv_inputs`.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "kv_ownership": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KvOwnership"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Whether this graph owns past/present KV state or reads target-owned KV.\n\nAbsent preserves the historical `owned` behavior."
+        },
+        "logits_output": {
+          "description": "Logits output.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "optional_inputs": {
+          "additionalProperties": {
+            "$ref": "#/$defs/OptionalInputSpec"
+          },
+          "description": "Optional graph inputs and their explicit absent-value contracts, keyed by\nthe real ONNX input port name.",
+          "type": "object"
+        },
+        "position_ids_input": {
+          "description": "Position-ids input, if the graph takes one.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sequence_source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SequenceInputKind"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Which declared sequence port drives autoregressive execution.\n\nAbsent preserves the historical `token_ids` behavior. Declaring\n`inputs_embeds` requires `inputs_embeds_input`; declaring `token_ids`\nrequires `token_input`."
+        },
+        "state_pairs": {
+          "description": "Fixed-shape loop-carried recurrent state ports, distinct from KV cache.\n\nEach pair binds an input port to its matching output port and declares\nhow the input is initialized and how the output feeds the next step\n(`replace` semantics for fixed recurrent tensors). These are neither KV\ncache nor fixed conditioning; the sparse set of state ports comes from\nthis declared list, never expanded from a layer count.",
+          "items": {
+            "$ref": "#/$defs/LoopStatePair"
+          },
+          "minItems": 1,
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "static_cache": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StaticCacheIoSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Explicit port binding for a fixed-buffer TensorScatter static KV cache.\n\nA static-cache decoder scatters each step's K/V into pre-allocated,\nfixed-length buffers via an integer write-index vector and a non-pad\nsequence-length vector, rather than growing/appending a cache. These\ncontrol ports are integer vectors and are therefore SHAPE-indistinguish-\nable from one another, so shape cannot disambiguate them: the ABI must be\ndeclared explicitly. When present, this spec is authoritative and the\nruntime binds exactly these ports. When absent, a graph that exposes the\nscatter ABI is REJECTED with an actionable error naming this key rather\nthan having its integer control ports guessed by name."
+        },
+        "token_input": {
+          "description": "Token-id input (e.g. `input_ids`).\n\nA graph MAY declare this together with `inputs_embeds_input`: some fused\ndecoders consume a raw token stream AND a routed pre-embedded sequence in\nthe same forward pass. The two are not mutually exclusive; declaring both\nis a valid, explicit contract.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "OptionalInputSpec": {
+      "description": "Presence and absent-value contract for one optional graph input.",
+      "properties": {
+        "absent": {
+          "$ref": "#/$defs/AbsentInputSpec",
+          "description": "Tensor value supplied when the presence key is absent."
+        },
+        "presence": {
+          "description": "Opaque, non-empty request presence key; not a port or model name.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "presence",
+        "absent"
+      ],
+      "type": "object"
+    },
+    "OutputStage": {
+      "enum": [
+        "pre_adapter",
+        "post_adapter"
+      ],
+      "type": "string"
+    },
+    "PackageFacts": {
+      "additionalProperties": false,
+      "description": "Exact package facts required to interpret request data correctly.",
+      "properties": {
+        "constraint_languages": {
+          "description": "Constraint/grammar dialects this package's parser can interpret.",
+          "items": {
+            "$ref": "#/$defs/ConstraintLanguageFacts"
+          },
+          "type": "array"
+        },
+        "tokenizer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TokenizerFacts"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Exact tokenizer, vocabulary, and special-token facts."
+        }
+      },
+      "type": "object"
+    },
+    "PipelineSpec": {
+      "additionalProperties": false,
+      "description": "Executable package described by the universal typed workflow IR.",
+      "properties": {
+        "workflow": {
+          "$ref": "#/$defs/WorkflowSpec",
+          "description": "Required component-centric SSA workflow."
+        }
+      },
+      "required": [
+        "workflow"
+      ],
+      "type": "object"
+    },
+    "PipelineStageFacts": {
+      "additionalProperties": false,
+      "description": "One legal pipeline stage boundary.",
+      "properties": {
+        "components": {
+          "description": "Workflow components executed by this stage, in order.",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "outputs": {
+          "description": "Typed values crossing into the next stage.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "state_groups": {
+          "description": "State groups this stage owns.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "components"
+      ],
+      "type": "object"
+    },
+    "PoolingKind": {
+      "description": "Pooling reduction kind.",
+      "enum": [
+        "mean",
+        "max",
+        "cls",
+        "last_token"
+      ],
+      "type": "string"
+    },
+    "PoolingSpec": {
+      "additionalProperties": false,
+      "description": "Pooling reduction applied to a sequence-valued task output.",
+      "properties": {
+        "axis": {
+          "description": "Axis reduced by the pooling operation.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kind": {
+          "$ref": "#/$defs/PoolingKind"
+        },
+        "normalize": {
+          "default": false,
+          "description": "Whether the pooled vector is L2-normalized.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "kind",
+        "axis"
+      ],
+      "type": "object"
+    },
+    "PortRole": {
+      "description": "Architecture-neutral semantic role of one component port.\n\nThis vocabulary names what a value MEANS to the component that consumes or\nproduces it. It deliberately excludes anything a state group already\ndeclares, so a role and a state binding can never disagree about the same\nport.",
+      "oneOf": [
+        {
+          "const": "token_ids",
+          "description": "Discrete token identifiers driving autoregressive execution.",
+          "type": "string"
+        },
+        {
+          "const": "inputs_embeds",
+          "description": "Pre-embedded sequence, used when another component owns the embedding.",
+          "type": "string"
+        },
+        {
+          "const": "attention_mask",
+          "description": "Attention mask over the sequence.",
+          "type": "string"
+        },
+        {
+          "const": "position_ids",
+          "description": "Per-position indices used by position embedding.",
+          "type": "string"
+        },
+        {
+          "const": "logits",
+          "description": "Unnormalized next-token scores.",
+          "type": "string"
+        },
+        {
+          "const": "hidden_states",
+          "description": "Per-token hidden states exposed as a distinct output.",
+          "type": "string"
+        },
+        {
+          "const": "encoder_hidden_states",
+          "description": "Encoder result consumed by a cross-attending decoder.",
+          "type": "string"
+        },
+        {
+          "const": "audio_features",
+          "description": "Encoded audio features consumed by a speech decoder.",
+          "type": "string"
+        }
+      ]
+    },
+    "Precision": {
+      "description": "Weight precision and quantization-recipe vocabulary.",
+      "oneOf": [
+        {
+          "enum": [
+            "float32",
+            "fp32",
+            "float16",
+            "fp16",
+            "bfloat16",
+            "bf16",
+            "float8_e4m3fn",
+            "float8_e5m2",
+            "int8",
+            "int4",
+            "int4_group128"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "float32",
+              "fp32",
+              "float16",
+              "fp16",
+              "bfloat16",
+              "bf16",
+              "float8_e4m3fn",
+              "float8_e5m2",
+              "int8",
+              "int4",
+              "int4_group128"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "PreprocessingSpec": {
+      "description": "Declared, architecture-neutral input preprocessing programs.",
+      "properties": {
+        "audio": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AudioPreprocessingProgram"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Typed audio preprocessing transform program and its named tensor outputs."
+        },
+        "image": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImagePreprocessingProgram"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Typed image preprocessing transform program and its named tensor outputs."
+        }
+      },
+      "type": "object"
+    },
+    "ProfileRequirement": {
+      "description": "Whether a reader may ignore a profile it does not understand.",
+      "oneOf": [
+        {
+          "const": "required",
+          "description": "A reader that cannot execute this profile must refuse to load the package.",
+          "type": "string"
+        },
+        {
+          "const": "ignorable",
+          "description": "A reader that does not understand this profile may skip it.",
+          "type": "string"
+        }
+      ]
+    },
+    "QuantizationIntent": {
+      "description": "Runtime-independent model-weight quantization intent.",
+      "properties": {
+        "default": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Precision"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Default precision or quantization recipe for model weights."
+        },
+        "overrides": {
+          "description": "Layer- or component-specific precision overrides.",
+          "items": {
+            "$ref": "#/$defs/QuantizationOverride"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "QuantizationOverride": {
+      "description": "Precision override for selected layers or a named graph component.",
+      "properties": {
+        "component": {
+          "description": "Logical component path, for example `attention.qk` or `lm_head`.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "layers": {
+          "description": "Layer indices to which the override applies; negative indices count from the end.",
+          "items": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "precision": {
+          "$ref": "#/$defs/Precision",
+          "description": "Required precision or quantization recipe."
+        }
+      },
+      "required": [
+        "precision"
+      ],
+      "type": "object"
+    },
+    "RuntimeConfigurable": {
+      "additionalProperties": false,
+      "description": "Features whose concrete settings may be selected by the runtime.",
+      "properties": {
+        "chunked_prefill": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChunkedPrefillConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Chunked-prefill support and preferred chunk size."
+        },
+        "continuous_batching": {
+          "description": "Whether continuous batching may be enabled.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "prefix_cache": {
+          "description": "Whether prefix caching may be enabled.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "RuntimeInputRole": {
+      "oneOf": [
+        {
+          "enum": [
+            "prompt_text",
+            "prompt_tokens",
+            "negative_prompt_text",
+            "negative_prompt_tokens",
+            "media",
+            "max_iterations",
+            "max_output_tokens",
+            "seed",
+            "guidance_scale",
+            "width",
+            "height",
+            "denoising_strength",
+            "sampling_temperature",
+            "sampling_top_k",
+            "sampling_top_p",
+            "sampling_min_p",
+            "constraint",
+            "session_id",
+            "adapter_segments",
+            "adapter_counts",
+            "adapter_scales",
+            "adapter_active"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "row_selection",
+          "description": "Runtime-minted gather of source batch positions for beam or speculative\nrow expansion. Values are positions inside the current batch, never\nscheduler slots, request IDs, or epochs.",
+          "type": "string"
+        }
+      ]
+    },
+    "ScalarValue": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "format": "int64",
+          "type": "integer"
+        },
+        {
+          "format": "double",
+          "type": "number"
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "SemanticInputRole": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "runtime",
+              "type": "string"
+            },
+            "role": {
+              "$ref": "#/$defs/RuntimeInputRole"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "version",
+            "role"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "opaque",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SequenceDecodingKind": {
+      "description": "Frame-synchronous sequence-decoding algorithm vocabulary.",
+      "oneOf": [
+        {
+          "enum": [
+            "ctc",
+            "greedy_argmax"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "ctc",
+              "greedy_argmax"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "SequenceDecodingSpec": {
+      "additionalProperties": false,
+      "description": "Frame-synchronous decoding contract for non-autoregressive sequence models.\n\nA CTC acoustic model emits one class distribution per encoder frame. The\ntranscript is recovered by taking the per-frame argmax, collapsing runs of\nrepeated ids, and dropping the blank id — no generation loop and no\nautoregressive state are involved.",
+      "properties": {
+        "blank_id": {
+          "description": "Class id reserved for the CTC blank symbol.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "class_axis": {
+          "description": "Axis of the logits tensor that enumerates classes.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "collapse_repeats": {
+          "default": false,
+          "description": "Whether runs of identical consecutive ids collapse to one id.",
+          "type": "boolean"
+        },
+        "kind": {
+          "$ref": "#/$defs/SequenceDecodingKind",
+          "description": "Generic decoding algorithm selector (e.g. `ctc`)."
+        },
+        "lengths": {
+          "description": "Profile output role naming the per-row count of valid frames.\n\nPresent when the package is batched with padding: rows are decoded only\nover their own valid frame prefix so a padded batch produces the same\ntranscript per row as an unpadded single-row run.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_axis": {
+          "description": "Axis of the logits tensor that enumerates frames.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "vocabulary": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecodingVocabulary"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where the class-id -> string mapping comes from."
+        }
+      },
+      "required": [
+        "kind",
+        "time_axis",
+        "class_axis"
+      ],
+      "type": "object"
+    },
+    "SequenceInputKind": {
+      "description": "Primary autoregressive sequence source for a decoder or proposer graph.",
+      "oneOf": [
+        {
+          "const": "token_ids",
+          "description": "Integer token ids supplied through `token_input`.",
+          "type": "string"
+        },
+        {
+          "const": "inputs_embeds",
+          "description": "Precomputed floating-point embeddings supplied through\n`inputs_embeds_input`.",
+          "type": "string"
+        }
+      ]
+    },
+    "SequenceLengthScalarBroadcast": {
+      "description": "Permitted scalar compatibility for attention key-sequence lengths.",
+      "oneOf": [
+        {
+          "const": "unit_batch",
+          "description": "Interpret one rank-0 value as the canonical one-element vector only for\nan attention batch of exactly one.",
+          "type": "string"
+        }
+      ]
+    },
+    "ServingServiceContract": {
+      "additionalProperties": false,
+      "properties": {
+        "accepted_len": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "active": {
+          "type": "string"
+        },
+        "done": {
+          "type": "string"
+        },
+        "state_service": {
+          "$ref": "#/$defs/StateServiceContract",
+          "description": "Semantic state groups whose graph ABI the runtime must honor."
+        }
+      },
+      "required": [
+        "active",
+        "done",
+        "state_service"
+      ],
+      "type": "object"
+    },
+    "SessionLeaseContract": {
+      "additionalProperties": false,
+      "properties": {
+        "optimistic_metadata_version": {
+          "default": false,
+          "type": "boolean"
+        },
+        "policy": {
+          "$ref": "#/$defs/SessionMutationPolicy",
+          "default": "exclusive"
+        },
+        "ttl_seconds": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "SessionMutationPolicy": {
+      "enum": [
+        "exclusive",
+        "copy_on_write"
+      ],
+      "type": "string"
+    },
+    "ShapeRecurrence": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "invariant",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "axis": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "increment": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "growing",
+              "type": "string"
+            },
+            "max": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "axis",
+            "increment",
+            "max"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The selected axis may grow or shrink between iterations, but never exceed `max`.",
+          "properties": {
+            "axis": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "bounded",
+              "type": "string"
+            },
+            "max": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "axis",
+            "max"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ShardingContract": {
+      "additionalProperties": false,
+      "description": "Legal sharding and replication facts for distributed execution.\n\nThe caller and runtime choose degree, device mapping, placement, and\ncollective backend. Metadata only declares what is legal.",
+      "properties": {
+        "expert_parallel": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExpertShardFacts"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Legal expert-parallel facts for sparse mixture-of-experts layers."
+        },
+        "pipeline_parallel": {
+          "description": "Legal pipeline-parallel stage boundaries and their cross-stage state.",
+          "items": {
+            "$ref": "#/$defs/PipelineStageFacts"
+          },
+          "type": "array"
+        },
+        "tensor_parallel": {
+          "additionalProperties": {
+            "$ref": "#/$defs/TensorShardFacts"
+          },
+          "description": "Legal tensor-parallel shard axes by logical parameter group.",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "SpecialTokenFact": {
+      "additionalProperties": false,
+      "description": "One special token, pinned by id and exact surface bytes.",
+      "properties": {
+        "content": {
+          "description": "Exact UTF-8 surface form of the token.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "id": {
+          "description": "Vocabulary id of the token.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "content"
+      ],
+      "type": "object"
+    },
+    "SpeculationSafety": {
+      "description": "Whether an effect may be executed inside a speculative region.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The effect must not run speculatively.",
+          "properties": {
+            "kind": {
+              "const": "none",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The effect's observable state can be cloned before a speculative region.",
+          "properties": {
+            "kind": {
+              "const": "clonable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The effect can be rewound by at most `max_depth` proposed positions.",
+          "properties": {
+            "kind": {
+              "const": "rewindable",
+              "type": "string"
+            },
+            "max_depth": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "max_depth"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SpeculativeContract": {
+      "additionalProperties": false,
+      "description": "Portable compatibility facts for speculative decoding.\n\nProposal width, tree shape, scheduling, kernels, and whether speculation is\nenabled at all are runtime decisions.",
+      "properties": {
+        "distribution_preserving": {
+          "default": false,
+          "description": "Whether accepting proposals preserves the target's output distribution.\n\nA runtime may auto-enable speculation only when this is true; otherwise\nthe caller must opt in explicitly.",
+          "type": "boolean"
+        },
+        "max_proposal_width": {
+          "description": "Maximum number of proposed positions this package can undo.\n\nThis is a rollback bound, not a choice of proposal width: the runtime\npicks any K up to this bound. A validator rejects a package whose state\nor speculative effects cannot be undone this far.",
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "port_bindings": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Proposer ports bound to target-owned values, by semantic role.",
+          "type": "object"
+        },
+        "proposal_execution": {
+          "$ref": "#/$defs/SpeculativeProposalExecution",
+          "default": {
+            "kind": "block"
+          },
+          "description": "How the proposer materializes one candidate block.\n\n`block` components emit the complete proposal in one invocation.\n`chained` components emit one distribution and recurrence update per\ninvocation; the runtime repeatedly invokes the same typed component up\nto `max_proposal_width`."
+        },
+        "proposer": {
+          "description": "Workflow component that proposes tokens.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "rollback_state": {
+          "description": "State groups that must roll back when a proposal is rejected.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "shared_state": {
+          "description": "State groups the proposer shares with the target.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "shared_weights": {
+          "description": "Target initializers the proposer borrows.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "target": {
+          "description": "Workflow component that verifies proposals.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "vocabulary": {
+          "$ref": "#/$defs/SpeculativeVocabulary",
+          "description": "How the proposer's vocabulary relates to the target's."
+        }
+      },
+      "required": [
+        "proposer",
+        "target",
+        "vocabulary",
+        "max_proposal_width"
+      ],
+      "type": "object"
+    },
+    "SpeculativeProposalExecution": {
+      "description": "Execution shape of a speculative proposer.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "One proposer invocation returns the complete token block.",
+          "properties": {
+            "kind": {
+              "const": "block",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Repeated proposer invocations form an autoregressive proposal chain.",
+          "properties": {
+            "folded_carry_output": {
+              "description": "Proposer OUTPUT port producing the folded carry for the NEXT step\n(carry_k, k>=1). The carry has no dedicated input port: it re-enters\nas the trailing segment of the proposer's fused\n`token_embedding_input` (`concat(embed(last_token), carry)`), so it\nowns no workflow state cell. Three ports pin the fold EXPLICITLY, so\na runtime never infers by convention:\n\n* DESTINATION: `port_bindings.target_hidden_context` names the\n  proposer input port the carry lands in. For a folded carry it must\n  equal `token_embedding_input`: the carry occupies the fused input's\n  trailing half, so the destination is that fused input, never a\n  separate port.\n* carry_0 SOURCE: `folded_carry_seed` names the target output read\n  as the carry on the first step.\n* carry_k SOURCE: this field, the proposer output on every later\n  step.\n\nBecause a folded carry is recomputed from committed tokens on\nrejection rather than restored, it does not appear in\n`rollback_state`. A chained proposer declares at least one of\n`recurrent` or `folded_carry_output`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "folded_carry_seed": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SpeculativeValueRef"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "carry_0 seed: the target component OUTPUT read as the folded carry on\nthe FIRST step, before the proposer has produced a carry. Named\nexplicitly (`component` + `output`) so a runtime reads it rather than\ninferring \"the target hidden output\" by convention. Its `component`\nmust be the speculative target, since carry_0 is the target's own\nper-token hidden output. Required whenever `folded_carry_output` is\npresent."
+            },
+            "kind": {
+              "const": "chained",
+              "type": "string"
+            },
+            "logits_output": {
+              "description": "Proposer output port carrying the next-token distribution.",
+              "minLength": 1,
+              "type": "string"
+            },
+            "recurrent": {
+              "default": [],
+              "description": "Loop-carried hidden/cache state updated by every proposer invocation\nthrough its own input port.",
+              "items": {
+                "$ref": "#/$defs/SpeculativeRecurrenceBinding"
+              },
+              "type": "array"
+            },
+            "token_embedding": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TokenEmbeddingSource"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Where a runtime obtains `embed(last_token)` for the LEADING half of\nthe fused `token_embedding_input`. A folded-carry proposer graph\nconsumes only the fused input, so it reads no embedding initializer of\nits own and `speculative.shared_weights` stays empty; this names the\nmodel-agnostic embedding table the runtime gathers the leading half\nfrom (never extracted heuristically from a graph). Its `component`\nmust be the speculative target — an ONNX model that owns the named\n`table` initializer — so the table resolves to a real initializer in\nthe target model/artifact. Required whenever `folded_carry_output` is\npresent."
+            },
+            "token_embedding_input": {
+              "description": "Proposer input port receiving the previous selected token embedding.",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "token_embedding_input",
+            "logits_output"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SpeculativeRecurrenceBinding": {
+      "additionalProperties": false,
+      "description": "One loop-carried proposer value in a chained proposal.",
+      "properties": {
+        "input": {
+          "description": "Proposer input port receiving the current value.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "output": {
+          "description": "Proposer output port producing the next value.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "state": {
+          "description": "Workflow state cell checkpointed before proposal and restored on rejection.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "state",
+        "input",
+        "output"
+      ],
+      "type": "object"
+    },
+    "SpeculativeValueRef": {
+      "additionalProperties": false,
+      "description": "An explicit reference to a value a workflow component produces.\n\nBoth halves are named so a speculative runtime resolves the value from the\ndeclared graph I/O, never by string convention or shape guessing.",
+      "properties": {
+        "component": {
+          "description": "The workflow component that produces the value.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "output": {
+          "description": "The declared output port of that component carrying the value.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "component",
+        "output"
+      ],
+      "type": "object"
+    },
+    "SpeculativeVocabulary": {
+      "description": "Vocabulary relationship between a proposer and its target.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Proposer and target share one identical vocabulary.",
+          "properties": {
+            "kind": {
+              "const": "identical",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The proposer's vocabulary is a prefix-compatible subset of the target's.",
+          "properties": {
+            "kind": {
+              "const": "subset",
+              "type": "string"
+            },
+            "proposer_vocab_size": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "proposer_vocab_size"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A declared mapping artifact translates proposer ids into target ids.",
+          "properties": {
+            "artifact": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "mapped",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "artifact"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "StateAliasing": {
+      "description": "Legality of aliasing a component's `present` output onto its `past` input.",
+      "oneOf": [
+        {
+          "const": "permitted",
+          "description": "The runtime may alias input and output buffers but need not.",
+          "type": "string"
+        },
+        {
+          "const": "required",
+          "description": "The component only works correctly when input and output alias.",
+          "type": "string"
+        },
+        {
+          "const": "forbidden",
+          "description": "Aliasing input and output buffers is incorrect for this component.",
+          "type": "string"
+        }
+      ]
+    },
+    "StateCheckpointContract": {
+      "additionalProperties": false,
+      "description": "The only portable, cross-build path for a state group's contents.\n\nThis is deliberately not a wire format: metadata names the adapter and its\nversion, and the adapter owns the encoding. A portable checkpoint is slow and\nsurvives a version change; a private transfer is fast and does not.",
+      "properties": {
+        "adapter": {
+          "description": "Versioned adapter identifier, for example `onnx-genai.kv-checkpoint`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "version": {
+          "description": "Adapter version this group's checkpoints are written against.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "adapter",
+        "version"
+      ],
+      "type": "object"
+    },
+    "StateGroupCapabilities": {
+      "additionalProperties": false,
+      "description": "Rollback, snapshot, and fork bounds declared for one state group.",
+      "properties": {
+        "cascade": {
+          "description": "Other groups that must be rolled back, snapshotted, or forked together.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "fork": {
+          "default": false,
+          "description": "Whether the runtime can fork this group into an independent row.",
+          "type": "boolean"
+        },
+        "rollback_positions": {
+          "description": "Maximum number of trailing positions that can be discarded correctly.\n\nAbsent means the group cannot be rolled back at all.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "snapshot": {
+          "default": false,
+          "description": "Whether the runtime can snapshot and restore this group.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "StateGroupContract": {
+      "additionalProperties": false,
+      "description": "One semantic group of model state sharing a kind, geometry, and graph ABI.",
+      "properties": {
+        "aliasing": {
+          "$ref": "#/$defs/StateAliasing",
+          "default": "forbidden",
+          "description": "Whether the component may write `present` into the `past` buffer."
+        },
+        "capabilities": {
+          "$ref": "#/$defs/StateGroupCapabilities",
+          "default": {
+            "fork": false,
+            "snapshot": false
+          },
+          "description": "Rollback, snapshot, and fork bounds usable by the runtime."
+        },
+        "checkpoint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StateCheckpointContract"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The versioned checkpoint adapter through which this group's state may\nleave the process portably.\n\nAbsent means the group's state is private: it may still move between\nprocesses, but only through a private runtime protocol that requires a\nmatching protocol and build on both ends (prefill/decode disaggregation,\nencoder/decoder interchange). Those transfers are fast precisely because\nthey are not portable, and treating one as a portable export is how a\ncluster silently corrupts state across a rolling upgrade."
+        },
+        "kind": {
+          "$ref": "#/$defs/StateKind",
+          "description": "Semantic kind of the state in this group."
+        },
+        "layout": {
+          "description": "Graph-visible element layout of the state tensors.",
+          "type": "string"
+        },
+        "logical_lengths": {
+          "description": "Semantic state cell holding the current logical length of each row.\n\nRequired only when the logical length is graph-visible. Absent means the\nruntime derives length from its private sequence table.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ports": {
+          "additionalProperties": {
+            "additionalProperties": {
+              "$ref": "#/$defs/StatePortAlias"
+            },
+            "type": "object"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "reuse": {
+          "$ref": "#/$defs/StateReuse",
+          "default": {
+            "evictable_prefix": false,
+            "prefix_reusable": false
+          },
+          "description": "Prefix reuse and eviction semantics of this group."
+        },
+        "sequence_axis": {
+          "description": "Axis whose extent represents logical sequence positions.\n\nRequired for sequence-growing and indexed-scatter state. Fixed-size\nrecurrent state updated by replacement has no logical sequence extent\nand therefore omits this field.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "total_length": {
+          "description": "Graph-visible total-length input, when the component reads one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "update": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StateUpdate"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How the graph writes each step's positions into this group's buffers.\n\nAbsent means the buffer extends along `sequence_axis` as the sequence\ngrows, which is the historical behavior. `indexed_scatter` declares a\nbuffer of fixed capacity whose new positions are written at destinations\nthe graph reads from a declared value. That distinction is what makes\nrewind, row replacement, and inactive-row compaction expressible: in a\ngrowing buffer the valid region is the whole tensor, while in a\nfixed-capacity buffer it is a declared prefix that the shape cannot\nreveal.\n\nThis describes the GRAPH's update discipline, not an allocator. The\nphysical buffer and where it lives remain runtime-owned."
+        }
+      },
+      "required": [
+        "kind",
+        "layout"
+      ],
+      "type": "object"
+    },
+    "StateInitKind": {
+      "description": "Loop-carried state initialization vocabulary.",
+      "oneOf": [
+        {
+          "enum": [
+            "zeros"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "zeros"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "StateKind": {
+      "description": "Semantic kind of a model state group.",
+      "oneOf": [
+        {
+          "const": "full_attention",
+          "description": "Dense causal attention over the full sequence.",
+          "type": "string"
+        },
+        {
+          "const": "sliding_attention",
+          "description": "Causal attention restricted to a sliding window.",
+          "type": "string"
+        },
+        {
+          "const": "multi_latent_attention",
+          "description": "Compressed latent attention state (MLA).",
+          "type": "string"
+        },
+        {
+          "const": "recurrent",
+          "description": "Fixed-size recurrent or state-space carry.",
+          "type": "string"
+        },
+        {
+          "const": "cross_attention",
+          "description": "Cross-attention state keyed by an encoder result.",
+          "type": "string"
+        },
+        {
+          "const": "encoder",
+          "description": "Encoder output retained across decoder steps.",
+          "type": "string"
+        }
+      ]
+    },
+    "StateManagement": {
+      "description": "Storage ownership of one workflow state cell.",
+      "oneOf": [
+        {
+          "const": "workflow",
+          "description": "Ordinary SSA-managed value; liveness is derived from the workflow graph.",
+          "type": "string"
+        },
+        {
+          "const": "runtime",
+          "description": "The runtime owns the physical storage and its allocation policy.",
+          "type": "string"
+        },
+        {
+          "const": "external",
+          "description": "An external service owns the storage; only the typed handle is portable.",
+          "type": "string"
+        }
+      ]
+    },
+    "StatePortAccess": {
+      "description": "State access performed by one component binding.",
+      "oneOf": [
+        {
+          "const": "read_write",
+          "description": "The component consumes the current value and produces its successor.",
+          "type": "string"
+        },
+        {
+          "const": "read_only",
+          "description": "The component consumes a frozen value; any graph output is discarded.",
+          "type": "string"
+        }
+      ]
+    },
+    "StatePortAlias": {
+      "additionalProperties": false,
+      "properties": {
+        "access": {
+          "$ref": "#/$defs/StatePortAccess",
+          "description": "Whether this component advances the state or only observes a frozen\nvalue produced by another component in the same service group.\n\nA read-only binding still names the graph's present output when the\nartifact exposes one for kernel ABI reasons, but that output is not a\nstate transition and must not be aliased back onto the input."
+        },
+        "input": {
+          "type": "string"
+        },
+        "layer": {
+          "description": "Zero-based layer index of this port pair within its group.\n\nRequired when a group binds more than one alias of the same\n[`StatePortRole`], because the map key is a producer-chosen label and\nits lexicographic order is not the layer order (`layer.10` sorts before\n`layer.2`). A runtime that pairs per-layer buffers positionally would\notherwise silently transpose two layers' caches.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "output": {
+          "description": "Graph output port carrying this pair's next-step value.\n\nRequired for a read-write transition. A `read_only` binding MAY omit it:\na pure borrowed-state reader — e.g. a shared-KV drafter that consumes\nanother decoder's cache and advances nothing — exposes no present output\nat all, so there is nothing to name. A read-only reader whose artifact\nstill emits a discarded present output for kernel-ABI reasons may name it\nhere, but that value is never a state transition.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StatePortRole"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Which half of an attention cache this port pair carries.\n\nA graph that splits keys and values into separate buffers exposes two\naliases per layer that are shape-identical and therefore\nindistinguishable; a graph that packs them exposes one. Only the\nproducer knows which it built, and recovering it from a port's spelling\nwould be the name-guessing this schema refuses. Absent means the group\ndoes not distinguish halves, which is correct for recurrent and latent\nstate."
+        }
+      },
+      "required": [
+        "input"
+      ],
+      "type": "object"
+    },
+    "StatePortRole": {
+      "description": "Which half of a split attention cache a state port pair carries.",
+      "oneOf": [
+        {
+          "const": "key",
+          "description": "Keys of a split key/value cache.",
+          "type": "string"
+        },
+        {
+          "const": "value",
+          "description": "Values of a split key/value cache.",
+          "type": "string"
+        },
+        {
+          "const": "combined",
+          "description": "A single buffer holding keys and values together.",
+          "type": "string"
+        }
+      ]
+    },
+    "StateReleaseBoundary": {
+      "description": "Logical boundary after which a managed or external state cell is releasable.",
+      "oneOf": [
+        {
+          "const": "invocation",
+          "description": "Releasable when the invocation that created it completes.",
+          "type": "string"
+        },
+        {
+          "const": "session",
+          "description": "Releasable when the session that owns it ends.",
+          "type": "string"
+        },
+        {
+          "const": "row",
+          "description": "Releasable when its owning batch row is released.",
+          "type": "string"
+        }
+      ]
+    },
+    "StateReuse": {
+      "additionalProperties": false,
+      "description": "Semantic reuse and eviction legality of a state group.",
+      "properties": {
+        "evictable_prefix": {
+          "default": false,
+          "description": "Whether dropping the oldest positions preserves declared semantics.",
+          "type": "boolean"
+        },
+        "prefix_reusable": {
+          "default": false,
+          "description": "Whether a shared token prefix produces identical state that may be reused.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "StateServiceContract": {
+      "additionalProperties": false,
+      "description": "Semantic model-state contract.\n\nThis declares what the state *means* and which graph ABI facts constrain the\nruntime. It never selects paged, shared-buffer, or separate storage, a slot\nallocation algorithm, a compaction algorithm, or a device.",
+      "properties": {
+        "groups": {
+          "additionalProperties": {
+            "$ref": "#/$defs/StateGroupContract"
+          },
+          "default": {},
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "StateUpdate": {
+      "description": "How a state group's buffers absorb each step's new positions.\n\nBoth variants describe what the GRAPH does. Neither selects a storage\nstrategy, a slot allocator, or a device: a runtime is free to back an\n`append` group with a fixed arena or an `indexed_scatter` group with paged\nstorage, so long as the graph sees what it declared.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Each step's positions extend the buffer along `sequence_axis`.\n\nThe valid region is the whole tensor, so no write cursor is graph-visible\nand the buffer's shape carries the length.",
+          "properties": {
+            "kind": {
+              "const": "append",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Each step replaces the complete fixed-size state tensor.\n\nThis is the common discipline for recurrent accumulators, state-space\ncarries, and causal-convolution history. The algorithm does not need a\ndistinct state kind: separate groups already declare each tensor's\nshape, ports, lifetime, and rollback behavior.",
+          "properties": {
+            "kind": {
+              "const": "replace",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Each step's positions are scattered into a buffer of FIXED capacity at\ndestinations the graph reads from `write_indices`.\n\nThe tensor's extent along `sequence_axis` is the capacity, not the\nlength: the valid region is the prefix named by the group's\n`logical_lengths`. Because destinations are data rather than position,\nrewinding a row is a cursor move, replacing a row reuses its slots, and\nrows of unequal length share one rectangular buffer.",
+          "properties": {
+            "capacity": {
+              "description": "Integer-scalar workflow value giving the fixed extent of\n`sequence_axis` that the graph was built against.\n\nThis is a graph fact, not a deployment budget. It bounds legal write\ndestinations; it does not say where the buffer lives, when it is\nallocated, or how many rows a deployment admits.",
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "const": "indexed_scatter",
+              "type": "string"
+            },
+            "kv_length_ports": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Per-component input port that receives the graph-visible valid\nlength, keyed by component name.\n\nExactly the same problem as `write_indices_ports`, and unsolvable the\nsame way: the length is a rank-1 integer vector, so it is\nshape-indistinguishable from the destinations sitting next to it. A\ngraph that reads no length port declares none.",
+              "type": "object"
+            },
+            "write_indices": {
+              "description": "Semantic state cell carrying this step's per-row destination\npositions along `sequence_axis`.\n\nA cell rather than a step output because the write cursor is part of\nthe group's state: it must be checkpointed, forked, and rewound with\nthe buffer it indexes, or a restored row would overwrite live\npositions.",
+              "minLength": 1,
+              "type": "string"
+            },
+            "write_indices_ports": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "description": "Per-component input port that receives the destinations, keyed by\ncomponent name.\n\nThe same class of fact as [`StateGroupContract::ports`]: which port\nof which component carries this group's ABI. A runtime cannot\nrecover it from the step graph, because destinations are an ordinary\ninteger vector and are shape-indistinguishable from every other\ninteger control input.",
+              "type": "object"
+            }
+          },
+          "required": [
+            "kind",
+            "write_indices",
+            "capacity"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "StateUpdateKind": {
+      "description": "Loop-carried state update-semantics vocabulary.",
+      "oneOf": [
+        {
+          "enum": [
+            "replace"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "replace"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "StaticCacheIoSpec": {
+      "description": "Explicit port ABI for a fixed-buffer TensorScatter static KV cache.\n\nDescribes GRAPH STRUCTURE, never a model family. The four per-layer cache\nlists pair positionally per layer and must all have the same length: index\n`i` in each list is layer `i`'s key/value input and updated key/value output.",
+      "properties": {
+        "key_cache_inputs": {
+          "description": "Per-layer static key-cache buffer inputs, positional per layer. Length\nmust equal `value_cache_inputs`, `key_cache_outputs`, and\n`value_cache_outputs`.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "key_cache_outputs": {
+          "description": "Per-layer updated key-cache outputs, paired positionally with\n`key_cache_inputs`.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "kv_sequence_length_input": {
+          "description": "Input port carrying the non-pad KV sequence length (`int` vector).\nShape-indistinguishable from `write_indices_input`, so it too must be\nnamed explicitly.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "value_cache_inputs": {
+          "description": "Per-layer static value-cache buffer inputs, paired positionally with\n`key_cache_inputs`.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "value_cache_outputs": {
+          "description": "Per-layer updated value-cache outputs, paired positionally with\n`value_cache_inputs`.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "write_indices_input": {
+          "description": "Input port carrying the per-token scatter write positions\n(`int` vector). Shape-indistinguishable from other integer control\ninputs, so it must be named explicitly.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "write_indices_input",
+        "kv_sequence_length_input",
+        "key_cache_inputs",
+        "value_cache_inputs",
+        "key_cache_outputs",
+        "value_cache_outputs"
+      ],
+      "type": "object"
+    },
+    "TaskProfile": {
+      "additionalProperties": false,
+      "description": "One executable task profile that shares the package's common facts.\n\nGenerative and non-generative tasks live in one document. Each profile\ncarries its own version and a requirement class so a strict reader can skip\nan optional profile it does not understand while still rejecting unknown\ncore fields.",
+      "properties": {
+        "batch_invariance": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BatchInvariance"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Whether a row's outputs depend on the other rows batched with it.\n\n`row_independent` means a row produces identical values whether it is\nrun alone or co-batched with rows of any other length, so a runtime may\nbatch freely. `padding_sensitive` means padding a row to the batch width\nchanges its values — for example when a normalization reduces over the\npadded time axis — so a runtime that batches trades accuracy for\nthroughput and must not treat batched results as equal to solo results.\n\nAbsent means unstated, not `row_independent`."
+        },
+        "decoding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SequenceDecodingSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How a non-generative sequence output is decoded into discrete tokens."
+        },
+        "generation_affecting": {
+          "default": false,
+          "description": "Whether this profile changes generated output and therefore participates\nin cache correctness dependencies.",
+          "type": "boolean"
+        },
+        "kind": {
+          "description": "Task kind identifier, e.g. `generation`, `embedding`, `reranking`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "outputs": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Workflow outputs this profile consumes, by semantic role.",
+          "type": "object"
+        },
+        "pooling": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PoolingSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Pooling applied to a sequence-valued output, when the task needs it."
+        },
+        "requirement": {
+          "$ref": "#/$defs/ProfileRequirement",
+          "default": "required",
+          "description": "Whether a reader that does not understand this profile may skip it."
+        },
+        "version": {
+          "description": "Version of this profile's own contract.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "version"
+      ],
+      "type": "object"
+    },
+    "TensorContract": {
+      "additionalProperties": false,
+      "description": "Typed tensor contract used at package and component boundaries.",
+      "properties": {
+        "batch_layout": {
+          "$ref": "#/$defs/BatchLayout",
+          "description": "How this value relates to the runtime's private request/sequence table.\n\nThis is a structural batching fact, never a row identity. It is the only\ninformation a runtime needs to move, split, or drop this value during\ncompaction; scheduler slots, epochs, block tables, and sequence handles\nstay runtime-private."
+        },
+        "dtype": {
+          "$ref": "#/$defs/TensorDType"
+        },
+        "optional": {
+          "default": false,
+          "type": "boolean"
+        },
+        "rank": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "shape": {
+          "items": {
+            "$ref": "#/$defs/TensorDimension"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "dtype",
+        "rank"
+      ],
+      "type": "object"
+    },
+    "TensorDType": {
+      "description": "Tensor-boundary dtype vocabulary, including non-numeric pipeline values.",
+      "oneOf": [
+        {
+          "enum": [
+            "float32",
+            "fp32",
+            "float16",
+            "fp16",
+            "bfloat16",
+            "bf16",
+            "float8_e4m3fn",
+            "float8_e5m2",
+            "int64",
+            "int32",
+            "int8",
+            "uint8",
+            "bool",
+            "string"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "float32",
+              "fp32",
+              "float16",
+              "fp16",
+              "bfloat16",
+              "bf16",
+              "float8_e4m3fn",
+              "float8_e5m2",
+              "int64",
+              "int32",
+              "int8",
+              "uint8",
+              "bool",
+              "string"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "TensorDimension": {
+      "anyOf": [
+        {
+          "description": "A fixed, non-negative dimension.",
+          "format": "int64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "description": "A runtime shape symbol.",
+          "minLength": 1,
+          "type": "string"
+        }
+      ],
+      "description": "One fixed or runtime-resolved tensor-shape dimension."
+    },
+    "TensorShardFacts": {
+      "additionalProperties": false,
+      "description": "Shard axis and replication facts of one logical parameter group.",
+      "properties": {
+        "max_shards": {
+          "description": "Largest legal shard count; the caller may choose any divisor.",
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "replicated": {
+          "description": "Values that must be replicated identically on every rank.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "shard_axis": {
+          "description": "Axis of the parameter that may be split across ranks.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "shard_axis",
+        "max_shards"
+      ],
+      "type": "object"
+    },
+    "ThumbnailOrder": {
+      "description": "Optional-thumbnail ordering vocabulary.",
+      "oneOf": [
+        {
+          "enum": [
+            "none",
+            "prepend",
+            "append"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "none",
+              "prepend",
+              "append"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "TokenEmbeddingSource": {
+      "additionalProperties": false,
+      "description": "Explicit, model-agnostic source of the token embedding a chained proposer\nfolds into the leading half of its fused input.\n\nA folded-carry proposer never reads an embedding initializer inside its own\ngraph, so the table cannot be recovered from the proposer graph. This names\nthe component whose embedding the runtime reuses and the initializer that\nholds it, so gathering `embed(last_token)` is a declared contract rather than\na per-model heuristic.",
+      "properties": {
+        "component": {
+          "description": "The workflow component whose token-embedding table is reused. For a\nfolded carry this must be the speculative target, whose vocabulary the\nproposer shares and whose ONNX model owns the `table` initializer.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "table": {
+          "description": "The named embedding table (graph initializer) on that component, e.g.\n`model.embed_tokens.weight`. A `[vocab, hidden]` row-major matrix. It\nmust name a real initializer in the target model/artifact.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "component",
+        "table"
+      ],
+      "type": "object"
+    },
+    "TokenizerArtifact": {
+      "additionalProperties": false,
+      "description": "One package-relative tokenizer artifact.",
+      "properties": {
+        "location": {
+          "description": "Package-relative path of the artifact.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "location"
+      ],
+      "type": "object"
+    },
+    "TokenizerFacts": {
+      "additionalProperties": false,
+      "description": "Tokenizer facts and package-relative artifacts.\n\nA request carries text, tokens, grammars, and JSON Schemas. Interpreting any\nof them requires the vocabulary contract the package was built against.",
+      "properties": {
+        "algorithm": {
+          "description": "Tokenizer algorithm identifier, e.g. `bpe`, `unigram`, `wordpiece`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "artifacts": {
+          "description": "Package-relative tokenizer artifacts.",
+          "items": {
+            "$ref": "#/$defs/TokenizerArtifact"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "byte_level": {
+          "default": false,
+          "description": "Whether the tokenizer operates on raw bytes rather than Unicode scalars.",
+          "type": "boolean"
+        },
+        "special_tokens": {
+          "additionalProperties": {
+            "$ref": "#/$defs/SpecialTokenFact"
+          },
+          "description": "Special tokens by semantic role, e.g. `bos`, `eos`, `pad`.",
+          "type": "object"
+        },
+        "vocab_size": {
+          "description": "Number of entries in the vocabulary, including added tokens.",
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "algorithm",
+        "vocab_size"
+      ],
+      "type": "object"
+    },
+    "WorkflowBranchOutput": {
+      "additionalProperties": false,
+      "properties": {
+        "cases": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "default": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "cases"
+      ],
+      "type": "object"
+    },
+    "WorkflowCarry": {
+      "additionalProperties": false,
+      "properties": {
+        "cell": {
+          "type": "string"
+        },
+        "initial": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "next": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "cell",
+        "next"
+      ],
+      "type": "object"
+    },
+    "WorkflowComponent": {
+      "additionalProperties": false,
+      "properties": {
+        "application_overridable": {
+          "default": false,
+          "description": "Allow an application to select another declared component with the same\nversioned contract ABI for this invocation.",
+          "type": "boolean"
+        },
+        "cache_affects_state": {
+          "description": "Non-dataflow facts that change this component's observable state.\n\nCache correctness dependencies of ONNX components are derived from the\nworkflow SSA graph. Native and external components must declare any\nadditional state they read that is not visible as a typed input.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "contract": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ComponentContract"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "effects": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "implementation": {
+          "$ref": "#/$defs/ComponentImplementation"
+        },
+        "ports": {
+          "$ref": "#/$defs/ComponentPorts",
+          "default": {
+            "inputs": {},
+            "outputs": {}
+          }
+        },
+        "row_scope": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ComponentRowScope"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Declared per-request row scope of this component's private state.\n\nA component with row scope must implement the mandatory row ABI\n(`compact(selection)` and `release(row)`). This is an ABI invariant, not\na negotiated capability: a runtime may not load a package whose\nrow-scoped component cannot be compacted."
+        }
+      },
+      "required": [
+        "implementation"
+      ],
+      "type": "object"
+    },
+    "WorkflowEmitMode": {
+      "enum": [
+        "replace",
+        "append",
+        "event"
+      ],
+      "type": "string"
+    },
+    "WorkflowInput": {
+      "additionalProperties": false,
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/TensorContract"
+        },
+        "default": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LiteralValue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "externally_suppliable": {
+          "description": "Whether an application may supply a previously computed typed value in\nplace of recomputing it, such as a cached encoder result.\n\nTransport, remote caching, and identity of the supplied value remain\nruntime-owned; metadata only declares that the substitution is legal.",
+          "type": "boolean"
+        },
+        "present_as": {
+          "description": "Initial scalar bool SSA value indicating whether the caller supplied this input.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "required": {
+          "default": true,
+          "type": "boolean"
+        },
+        "role": {
+          "$ref": "#/$defs/SemanticInputRole"
+        },
+        "source": {
+          "$ref": "#/$defs/WorkflowInputSource"
+        }
+      },
+      "required": [
+        "contract",
+        "role",
+        "source"
+      ],
+      "type": "object"
+    },
+    "WorkflowInputSource": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "request",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "application",
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "name"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "literal",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "artifact",
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "path"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "WorkflowLoopIteration": {
+      "additionalProperties": false,
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/TensorContract",
+          "description": "`int64` scalar or rank-one broadcast contract."
+        },
+        "value": {
+          "description": "SSA value containing the current zero-based iteration.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "value",
+        "contract"
+      ],
+      "type": "object"
+    },
+    "WorkflowLoopTermination": {
+      "enum": [
+        "predicate",
+        "generation_eos"
+      ],
+      "type": "string"
+    },
+    "WorkflowManifest": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter_abis": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "capabilities": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "type": "object"
+    },
+    "WorkflowOutput": {
+      "additionalProperties": false,
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/TensorContract"
+        },
+        "media": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MediaOutputContract"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Concrete media delivery contract for a post-processing output.\n\nTensor shape alone cannot distinguish PCM samples from encoded WAV bytes,\nnor can it carry the sample rate and channel count required by an audio\nserving API. This remains architecture-neutral and intentionally contains\nno model-family identifiers or artifact fingerprints."
+        },
+        "role": {
+          "$ref": "#/$defs/WorkflowOutputRole"
+        },
+        "stage": {
+          "$ref": "#/$defs/OutputStage"
+        },
+        "value_range": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImageOutputValueRange"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "contract",
+        "role",
+        "stage"
+      ],
+      "type": "object"
+    },
+    "WorkflowOutputRole": {
+      "oneOf": [
+        {
+          "enum": [
+            "tokens",
+            "text",
+            "image",
+            "audio",
+            "tensor",
+            "event"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "video",
+          "description": "A frame sequence. Distinct from `Image` because a consumer has to know\nthe value carries a temporal axis and may be published incrementally.",
+          "type": "string"
+        }
+      ]
+    },
+    "WorkflowSpec": {
+      "additionalProperties": false,
+      "description": "Sound, component-centric workflow IR. Tensor math lives in invoked components.",
+      "properties": {
+        "components": {
+          "additionalProperties": {
+            "$ref": "#/$defs/WorkflowComponent"
+          },
+          "type": "object"
+        },
+        "effects": {
+          "additionalProperties": {
+            "$ref": "#/$defs/EffectContract"
+          },
+          "default": {},
+          "description": "Retry and speculation semantics of every declared external effect domain.",
+          "type": "object"
+        },
+        "inputs": {
+          "additionalProperties": {
+            "$ref": "#/$defs/WorkflowInput"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "manifest": {
+          "$ref": "#/$defs/WorkflowManifest"
+        },
+        "outputs": {
+          "additionalProperties": {
+            "$ref": "#/$defs/WorkflowOutput"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "serving": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ServingServiceContract"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "additionalProperties": {
+            "$ref": "#/$defs/WorkflowStateCell"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "steps": {
+          "items": {
+            "$ref": "#/$defs/WorkflowStep"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "manifest",
+        "components",
+        "steps"
+      ],
+      "type": "object"
+    },
+    "WorkflowStateCell": {
+      "additionalProperties": false,
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/WorkflowStateClass",
+          "default": "semantic"
+        },
+        "contract": {
+          "$ref": "#/$defs/TensorContract"
+        },
+        "initializer": {
+          "type": "string"
+        },
+        "management": {
+          "$ref": "#/$defs/StateManagement",
+          "default": "workflow",
+          "description": "Who owns the physical storage of this cell.\n\nWorkflow-managed cells follow ordinary SSA liveness. Runtime-managed and\nexternal cells must also declare a logical release boundary so a runtime\nknows when the semantic value stops being reachable."
+        },
+        "recurrence": {
+          "$ref": "#/$defs/ShapeRecurrence"
+        },
+        "release_boundary": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StateReleaseBoundary"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Logical point at which the runtime may release this cell's storage."
+        },
+        "scope": {
+          "$ref": "#/$defs/WorkflowStateScope"
+        },
+        "service_group": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionLeaseContract"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "contract",
+        "scope",
+        "initializer",
+        "recurrence"
+      ],
+      "type": "object"
+    },
+    "WorkflowStateClass": {
+      "enum": [
+        "semantic",
+        "advisory"
+      ],
+      "type": "string"
+    },
+    "WorkflowStateScope": {
+      "enum": [
+        "invocation",
+        "session"
+      ],
+      "type": "string"
+    },
+    "WorkflowStep": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "sequence",
+              "type": "string"
+            },
+            "steps": {
+              "items": {
+                "$ref": "#/$defs/WorkflowStep"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "steps"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "component": {
+              "type": "string"
+            },
+            "inputs": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "type": "object"
+            },
+            "kind": {
+              "const": "invoke",
+              "type": "string"
+            },
+            "outputs": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "type": "object"
+            }
+          },
+          "required": [
+            "kind",
+            "component"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "carried": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/WorkflowCarry"
+              },
+              "type": "array"
+            },
+            "continue_when": {
+              "type": "string"
+            },
+            "iteration": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WorkflowLoopIteration"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "const": "loop",
+              "type": "string"
+            },
+            "max_iterations": {
+              "type": "string"
+            },
+            "setup": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/WorkflowStep"
+              },
+              "type": "array"
+            },
+            "steps": {
+              "items": {
+                "$ref": "#/$defs/WorkflowStep"
+              },
+              "type": "array"
+            },
+            "termination": {
+              "$ref": "#/$defs/WorkflowLoopTermination",
+              "default": "predicate"
+            }
+          },
+          "required": [
+            "kind",
+            "steps",
+            "continue_when",
+            "max_iterations"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "cases": {
+              "additionalProperties": {
+                "$ref": "#/$defs/WorkflowStep"
+              },
+              "type": "object"
+            },
+            "default": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WorkflowStep"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "const": "branch",
+              "type": "string"
+            },
+            "outputs": {
+              "additionalProperties": {
+                "$ref": "#/$defs/WorkflowBranchOutput"
+              },
+              "default": {},
+              "type": "object"
+            },
+            "predicate": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "predicate",
+            "cases"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "axis": {
+              "description": "Axis along which the output grows; defaults to the final axis.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "const": "emit",
+              "type": "string"
+            },
+            "mode": {
+              "$ref": "#/$defs/WorkflowEmitMode"
+            },
+            "output": {
+              "type": "string"
+            },
+            "valid_length": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "value": {
+              "type": "string"
+            },
+            "when": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "value",
+            "output",
+            "mode"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "$id": "https://github.com/onnx/onnx/issues/8184",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "not": {
+        "properties": {
+          "model": {
+            "required": [
+              "io"
+            ]
+          }
+        },
+        "required": [
+          "pipeline",
+          "model"
+        ]
+      }
+    }
+  ],
+  "description": "Portable, runtime-agnostic inference metadata for ONNX generative models. The v1 top-level surface is closed; executable composite packages use pipeline.workflow.",
+  "properties": {
+    "adapters": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AdapterServiceContract"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Runtime-managed LoRA adapters for bare or composite model packages.\n\nThis is the migrated `InferenceMetadata.adapters` contract from native\nLoRA phases 1 and 2. Composite execution references workflow SSA inputs,\nbut artifact identity, target resolution, and lifecycle remain package\nmetadata rather than workflow control-flow nodes."
+    },
+    "generation": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GenerationContract"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Authoritative generation defaults and the structural override surface."
+    },
+    "hardware_requirements": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/HardwareRequirements"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Minimum and beneficial hardware capabilities used for distribution matching."
+    },
+    "model": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ModelCapabilities"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Build-time model properties and runtime-configurable capabilities."
+    },
+    "package": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PackageFacts"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Exact package facts needed to interpret request data correctly.\n\nTokenizer artifacts, vocabulary size, special tokens, and the constraint\ndialects the package's parser accepts. Grammars and JSON Schemas\nthemselves are request data, not package metadata."
+    },
+    "pipeline": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PipelineSpec"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Declarative multi-model pipeline and its dataflow graph."
+    },
+    "preprocessing": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PreprocessingSpec"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Declared, architecture-neutral input preprocessing programs.\n\nCarries the typed multimodal preprocessing contract (currently the image\ntransform program and its named tensor outputs). Every operation and\noutput is generic, parameterized data — never a model family, vendor\nstring, or baked-in shape. Absent means the model declares no native\npreprocessing program and a runtime must obtain it elsewhere or fail."
+    },
+    "profiles": {
+      "additionalProperties": {
+        "$ref": "#/$defs/TaskProfile"
+      },
+      "description": "Executable task profiles sharing this package's common facts.\n\nEvery profile carries its own version and requirement class. A strict\nreader may skip an `ignorable` profile it does not understand; unknown\ncore fields still fail.",
+      "type": "object"
+    },
+    "quantization": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/QuantizationIntent"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Model weight quantization intent, independent of the packed representation."
+    },
+    "required_capabilities": {
+      "default": [],
+      "description": "Capability identifiers that a runtime MUST support or refuse to load the model.",
+      "examples": [
+        [
+          "kv_cache",
+          "grouped_query_attention"
+        ]
+      ],
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "description": "Schema version of this inference-metadata document, e.g. `\"v1\"`.\n\nAbsent means the initial `\"v1\"` contract (readers default to `v1`).\nBump this only for breaking schema changes; additive fields keep the\nsame major version and rely on the forward-compatible \"ignore unknown\nfields\" rule.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "speculative": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SpeculativeContract"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Portable speculative-decoding compatibility facts."
+    }
+  },
+  "title": "ONNX Inference Metadata",
+  "type": "object"
+}

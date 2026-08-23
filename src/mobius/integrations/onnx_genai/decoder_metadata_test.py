@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import dataclasses
-import os
 
 import onnx_ir as ir
 import pytest
@@ -19,22 +18,9 @@ from mobius.integrations.onnx_genai.decoder_metadata import (
     moe_metadata_from_config,
     write_decoder_metadata,
 )
-
-
-def _schema_path() -> str | None:
-    for c in [
-        os.environ.get("ONNX_GENAI_SCHEMA"),
-        os.path.join(
-            os.path.dirname(__file__),
-            "../../../../../onnx-genai/schema/inference_metadata.schema.json",
-        ),
-        os.path.expanduser(
-            "~/Documents/GitHub/onnx-genai/schema/inference_metadata.schema.json"
-        ),
-    ]:
-        if c and os.path.exists(c):
-            return c
-    return None
+from mobius.integrations.onnx_genai.inference_metadata_test import (
+    _onnx_genai_schema_path,
+)
 
 
 @dataclasses.dataclass
@@ -140,14 +126,11 @@ class TestDecoderMetadata:
         cfg.topk_group = 2
         meta = decoder_metadata_from_config(cfg)
 
-        schema_path = _schema_path()
-        if schema_path is None:
-            pytest.skip("onnx-genai schema not found")
         import json
 
         import jsonschema
 
-        with open(schema_path) as handle:
+        with open(_onnx_genai_schema_path()) as handle:
             schema = json.load(handle)
         jsonschema.validate(instance=meta, schema=schema)
 
