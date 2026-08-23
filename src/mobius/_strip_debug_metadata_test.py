@@ -97,10 +97,12 @@ class TestStripDebugMetadata:
         strip_debug_metadata(model)
 
         assert (
-            model.graph.metadata_props[f"{FUNCTIONAL_METADATA_PREFIX}pipeline.when_present"] == "x"
+            model.graph.metadata_props[f"{FUNCTIONAL_METADATA_PREFIX}pipeline.when_present"]
+            == "x"
         )
         assert (
-            node.metadata_props[f"{FUNCTIONAL_METADATA_PREFIX}generation.policy_effects"] == "y"
+            node.metadata_props[f"{FUNCTIONAL_METADATA_PREFIX}generation.policy_effects"]
+            == "y"
         )
 
     def test_preserves_unrecognised_metadata(self):

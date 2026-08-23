@@ -1269,6 +1269,29 @@ class ArchitectureConfig(BaseModelConfig):
             )
 
 
+def _as_attribute_config(value):
+    """Recursively give a plain ``dict`` HF sub-config attribute access.
+
+    ``transformers`` 5.x increasingly leaves nested sub-configs (a decoder,
+    a vision tower) as plain dicts on the parent config rather than as
+    ``PretrainedConfig`` instances. Every ``from_transformers`` here reads its
+    input with ``getattr``, so a dict silently degrades: ``getattr(d, "x", None)``
+    is always ``None``, which turns into a wrong default rather than an error,
+    or into ``AttributeError`` on a required field.
+
+    Non-dict values, including real config objects, are returned unchanged.
+    """
+    import types
+
+    if isinstance(value, dict):
+        return types.SimpleNamespace(
+            **{key: _as_attribute_config(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return [_as_attribute_config(item) for item in value]
+    return value
+
+
 def _shallow_fields(config) -> dict:
     """Extract fields from a dataclass without recursive conversion.
 
@@ -1363,18 +1386,8 @@ class NemotronParseConfig(ArchitectureConfig):
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> NemotronParseConfig:
         del parent_config
-        import types
 
-        def _namespace(value):
-            if isinstance(value, dict):
-                return types.SimpleNamespace(
-                    **{key: _namespace(item) for key, item in value.items()}
-                )
-            if isinstance(value, list):
-                return [_namespace(item) for item in value]
-            return value
-
-        decoder = _namespace(getattr(config, "decoder", None))
+        decoder = _as_attribute_config(getattr(config, "decoder", None))
         if decoder is None:
             raise ValueError("Nemotron Parse config is missing its decoder sub-config")
         base = ArchitectureConfig.from_transformers(decoder, parent_config=config)
@@ -1400,7 +1413,7 @@ class NemotronParseConfig(ArchitectureConfig):
         else:
             image_height, image_width = (int(raw_image_size[0]), int(raw_image_size[1]))
 
-        encoder = _namespace(getattr(config, "encoder", None))
+        encoder = _as_attribute_config(getattr(config, "encoder", None))
         patch_size = int(getattr(encoder, "patch_size", 16))
         max_resolution = int(
             getattr(encoder, "max_resolution", max(image_height, image_width))

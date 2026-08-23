@@ -109,13 +109,29 @@ def _load_hf_config(model_id: str):
         return _try_load_config_json(model_id)
 
 
-def _resolve_hf_config(hf_config):
+def _resolve_hf_config(hf_config, registration=None):
     """Resolve nested config wrappers (thinker, talker, text, llm, decoder).
 
     Mirrors the resolution logic in ``build()`` — some models
     wrap the actual config inside a parent config.
+
+    The generic ``decoder`` unwrap is skipped for a model whose registry entry
+    names its own ``config_class``: such a class consumes the *composite* config
+    and reads the sub-configs itself (Nemotron Parse reads both
+    ``config.decoder`` and ``config.encoder``). Unwrapping first hands it a
+    sub-config, which loses the parent's ``model_type``, so resolution falls back
+    to plain ``ArchitectureConfig``.
+
+    Only that branch. Production ``_select_primary_config`` has no generic
+    ``decoder`` unwrap at all — this harness added one — whereas the
+    ``talker``/``thinker``/``text``/``llm`` branches do mirror production and are
+    still needed by models that also declare a ``config_class`` (lfm2_vl,
+    muse_glimmer).
     """
     parent_config = hf_config
+    owns_composite = (
+        registration is not None and getattr(registration, "config_class", None) is not None
+    )
     if hasattr(hf_config, "talker_config"):
         talker = hf_config.talker_config
         # Qwen3-Omni talker nests the real model config under text_config
@@ -134,7 +150,7 @@ def _resolve_hf_config(hf_config):
     elif hasattr(hf_config, "llm_config"):
         # InternVL2 wraps the LLM config under llm_config
         hf_config = hf_config.llm_config
-    elif hasattr(hf_config, "decoder"):
+    elif hasattr(hf_config, "decoder") and not owns_composite:
         # VisionEncoderDecoder (TrOCR) wraps decoder config
         hf_config = hf_config.decoder
     return hf_config, parent_config
@@ -153,8 +169,8 @@ def _build_graph(model_type: str, model_id: str):
             f"Cannot download config for {model_id} (gated/private model or network error)"
         )
 
-    hf_config, parent_config = _resolve_hf_config(hf_config)
     registration = registry.get_registration(model_type)
+    hf_config, parent_config = _resolve_hf_config(hf_config, registration)
     config = _config_from_hf(
         hf_config,
         parent_config=parent_config,
