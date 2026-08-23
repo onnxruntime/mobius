@@ -109,7 +109,7 @@ pkg.save("output/model/")
 Or via CLI:
 
 ```bash
-mobius build-gguf path/to/model.gguf --output output/model/
+mobius build-gguf path/to/model.gguf output/model/
 ```
 
 Pass `--dequantize` on the CLI, or `keep_quantized=False` to
