@@ -186,14 +186,10 @@ def test_workflow_policy_components_reference_saved_onnx_artifacts(tmp_path):
 def _onnx_genai_schema_path() -> str:
     """Locate onnx-genai's published pipeline JSON schema.
 
-    The vendored copy under ``_schema/`` is the default so this never skips:
-    the previous behaviour — search a few local onnx-genai checkouts and
-    ``pytest.skip`` when none is found — meant these tests were silently
-    inactive in CI, which is how two upstream contract redesigns went unnoticed.
-    A developer checkout is deliberately *not* consulted implicitly either,
-    because a clone that is ahead of or behind ``main`` would make the result
-    machine-dependent in exactly the same way. Set ``ONNX_GENAI_SCHEMA`` to
-    validate against a specific revision.
+    The vendored copy under ``_schema/`` is the default so conformance never
+    skips. A developer checkout is deliberately not consulted implicitly: one
+    that is ahead of or behind ``main`` makes the result machine-dependent. Set
+    ``ONNX_GENAI_SCHEMA`` to validate against a specific revision.
     """
     override = os.environ.get("ONNX_GENAI_SCHEMA")
     if override:
@@ -583,11 +579,7 @@ class TestNativeVlmPackageMetadata:
 
         ``build_native_vlm_package_metadata`` returns mobius's internal
         structural descriptor; what a package publishes is the typed SSA
-        workflow ``build_vlm_workflow_metadata`` derives from it. onnx-genai's
-        ``PipelineSpec`` has ``workflow`` as its only property, so the
-        descriptor's ``models``/``dataflow``/``strategy`` view is not a
-        publishable document and validating it against the schema would assert
-        the wrong contract.
+        workflow ``build_vlm_workflow_metadata`` derives from it.
         """
         published = build_vlm_workflow_metadata(package, config, source=source)
         assert set(published["pipeline"]) == {"workflow"}
@@ -1577,12 +1569,11 @@ def _invocations(workflow: dict, component: str) -> list[dict]:
 
 
 class TestBuildDiffusionPipelineMetadata:
-    """The published document is a typed SSA workflow, not an ``iterative`` strategy.
+    """The published document is a typed SSA workflow.
 
-    onnx-genai's ``PipelineSpec`` declares ``workflow`` as its only property
+    ``PipelineSpec`` declares ``workflow`` as its only property
     (``crates/onnx-genai-metadata/src/schema/pipeline.rs``), so the sampler is
-    an executable component the package ships rather than a ``strategy`` block
-    the runtime interprets.
+    an executable component the package ships.
     """
 
     def _workflow(self, **kwargs) -> dict:
@@ -1612,7 +1603,7 @@ class TestBuildDiffusionPipelineMetadata:
         loop = next(step for step in workflow["steps"] if step["kind"] == "loop")
         assert loop["max_iterations"] == "request.max_iterations"
         assert workflow["inputs"]["request.max_iterations"]["default"] == 20
-        # The loop-carried latent replaces the old denoiser output self-edge.
+        # The latent is loop-carried state, advanced by the solver each step.
         # ``latent`` is also a workflow output, so the published cell is
         # disambiguated to ``latent_state``.
         latent_carry = next(
@@ -1643,8 +1634,8 @@ class TestBuildDiffusionPipelineMetadata:
             "text_encoder",
             "guidance_combine",
         }
-        # The text encoder runs once in the loop setup (the old "prompt_only"
-        # phase); the VAE decodes the final latent after the loop.
+        # The text encoder runs once in the loop setup; the VAE decodes the
+        # final latent after the loop.
         loop = next(step for step in workflow["steps"] if step["kind"] == "loop")
         encoder_calls = [
             step for step in loop["setup"] if step.get("component") == "text_encoder"
@@ -2060,12 +2051,11 @@ class _MtpBackboneConfig:
 def _seed_backbone_metadata(directory: Path) -> str:
     """Write a backbone inference_metadata.yaml for the MTP writer to extend.
 
-    ``SpeculativeContract`` is expressed against the workflow — ``proposer`` and
-    ``target`` are component names and ``rollback_state`` names state cells — so
-    the backbone must already publish a ``pipeline.workflow`` for the writer to
-    anchor against. This is the shape ``write_onnx_genai_config`` emits for a
-    single-component decoder package, reduced to what the speculator claim
-    touches: one ONNX decoder component and one service-group-backed KV cell.
+    ``SpeculativeContract`` names workflow components and state cells, so the
+    backbone must already publish a ``pipeline.workflow``. This is the shape
+    ``write_onnx_genai_config`` emits for a single-component decoder package,
+    reduced to what the speculator claim touches: one decoder component and one
+    service-group-backed KV cell.
     """
     kv_contract = {
         "dtype": "float16",
@@ -2180,12 +2170,9 @@ class TestMtpSpeculatorMetadata:
     """The emitted ``speculative`` block conforms to the onnx-genai runtime schema.
 
     Authoritative source: onnx-genai
-    ``crates/onnx-genai-metadata/src/schema/package.rs``
-    (``SpeculativeContract``, ``SpeculativeProposalExecution``,
-    ``SpeculativeVocabulary``) + ``validation.rs``
-    (``validate_speculative_rollback``). The older flat ``SpeculatorConfig``
-    block in ``schema/generation.rs`` describes a HuggingFace ``config.json``
-    speculator section, not ``InferenceMetadata.speculative``.
+    ``crates/onnx-genai-metadata/src/schema/package.rs`` (``SpeculativeContract``,
+    ``SpeculativeProposalExecution``, ``SpeculativeVocabulary``) plus
+    ``validation.rs`` (``validate_speculative_rollback``).
     """
 
     def _write(self, tmp_path: Path) -> dict:
@@ -2220,7 +2207,6 @@ class TestMtpSpeculatorMetadata:
 
     def test_no_legacy_field_names(self, tmp_path):
         spec = self._write(tmp_path)["speculative"]
-        # Fields of the superseded flat MTP block. onnx-genai's
         # SpeculativeContract sets ``deny_unknown_fields``, so any of these
         # makes the whole package unparseable rather than being ignored.
         for banned in (

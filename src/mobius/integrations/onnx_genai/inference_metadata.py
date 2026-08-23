@@ -4,29 +4,22 @@
 """Emit onnx-genai ``inference_metadata`` for multi-model pipelines.
 
 Mobius builds the neural components of a diffusion model (denoiser transformer,
-VAE, and — externally — a text encoder) as separate ONNX graphs, but does not
-itself carry a scheduler loop. onnx-genai's pipeline contract supplies that loop
-declaratively: given an ``inference_metadata`` document, the runtime executes
-the denoise loop and returns the decoded output.
+VAE, and — externally — a text encoder) as separate ONNX graphs. The document
+this module produces wires them into onnx-genai's ``pipeline.workflow``: a typed
+SSA graph in which the sampler is an executable component the package ships, so
+the sigma schedule and timestep table are constant components, the step index is
+the loop induction value, and classifier-free guidance is two denoiser
+invocations plus a combine component.
 
-That contract is a *typed SSA workflow*. onnx-genai's ``PipelineSpec`` has a
-single property, ``workflow`` (``crates/onnx-genai-metadata/src/schema/``), so
-the sampler is not a ``strategy`` block the runtime interprets but an ordinary
-executable component the package ships: the sigma schedule and timestep table
-are constant components, the step index is the loop induction value, and
-classifier-free guidance is two denoiser invocations plus a combine component.
-This module builds that document from the component filenames plus a scheduler
-config, materializing the sampler components from mobius's policy library. It
-reads no torch/diffusers state — only plain values — so it is cheap to unit-test
-and safe to call anywhere.
+It builds that document from the component filenames plus a scheduler config,
+materializing the sampler components from mobius's policy library. It reads no
+torch/diffusers state — only plain values — so it is cheap to unit-test and safe
+to call anywhere.
 
-Not everything here is publishable. :func:`build_native_vlm_package_metadata`
-returns mobius's *internal* structural descriptor of a VLM package (a
-``models``/``dataflow``/``strategy`` view used to reason about wiring and
-validate the executable closure); the published contract for such a package is
-the workflow that
+Not everything here is publishable: :func:`build_native_vlm_package_metadata`
+returns mobius's *internal* structural descriptor of a VLM package, from which
 :func:`~mobius.integrations.onnx_genai.workflow_metadata.build_vlm_workflow_metadata`
-derives from it.
+derives the published contract.
 
 Autoregressive decoder-only LLM metadata (``model.attention`` + ``kv_cache``)
 lives in the sibling :mod:`mobius.integrations.onnx_genai.decoder_metadata`
@@ -1746,15 +1739,13 @@ def build_native_vlm_package_metadata(
 ) -> dict[str, Any]:
     """Describe a native VLM package by inspecting every component graph.
 
-    This returns mobius's **internal** structural descriptor, not the published
-    onnx-genai document. Its ``pipeline`` key is a ``models``/``dataflow``/
-    ``strategy`` view used to reason about component wiring and to validate the
-    executable closure; onnx-genai's ``PipelineSpec`` accepts only a typed SSA
-    ``workflow`` and rejects every other property, so this view is consumed by
-    :func:`~mobius.integrations.onnx_genai.workflow_metadata.build_vlm_workflow_metadata`
-    (which publishes the workflow and the ``preprocessing`` program) rather than
-    written to disk. Use :func:`write_native_vlm_package_metadata` to emit the
-    package contract.
+    This is mobius's **internal** structural descriptor, not a publishable
+    document: its ``pipeline`` key is a ``models``/``dataflow``/``strategy``
+    view used to reason about component wiring and validate the executable
+    closure. It is consumed by
+    :func:`~mobius.integrations.onnx_genai.workflow_metadata.build_vlm_workflow_metadata`,
+    which publishes the workflow and the ``preprocessing`` program. Use
+    :func:`write_native_vlm_package_metadata` to emit the package contract.
 
     Processor selection is registry-driven from graph rank/dtype/shape
     signatures. No model type, architecture name, or model-name branch
@@ -2049,10 +2040,7 @@ def write_native_vlm_package_metadata(
     What lands in ``inference_metadata.yaml`` is the typed SSA workflow built by
     :func:`~mobius.integrations.onnx_genai.workflow_metadata.build_vlm_workflow_metadata`,
     not the structural descriptor :func:`build_native_vlm_package_metadata`
-    returns. onnx-genai's ``PipelineSpec`` has exactly one property
-    (``workflow``) and forbids anything else, so the descriptor's
-    ``models``/``dataflow``/``strategy`` view is mobius-internal and is never
-    published.
+    returns.
     """
     from mobius.integrations.onnx_genai.workflow_metadata import (
         write_vlm_workflow_metadata,
@@ -2340,8 +2328,8 @@ _SCHEDULER_SOLVERS: dict[str, tuple[str, bool]] = {
 
 #: Latent axis names shared by the solver, guidance and clamp policy components
 #: (``mobius.generation._policy_components._IMAGE_LATENT_DIMS``). The workflow's
-#: latent contract uses the same symbols so a declared value and the component
-#: port it binds to can never disagree about an axis.
+#: latent contract reuses them so a declared value and the component port it
+#: binds to can never disagree about an axis.
 _LATENT_DIMS: tuple[str, ...] = ("batch", "channels", "height", "width")
 
 _WORKFLOW_DTYPES: dict[str, str] = {
@@ -2374,17 +2362,15 @@ def _diffusion_schedule_values(
 ) -> tuple[list[float], list[float], int]:
     """Resolve the solver schedule, the timestep table and the executed step count.
 
-    The schedule is what ``solver_step`` integrates, so it is derived from the
-    scheduler's own noise schedule rather than invented: a variance-preserving
-    DDIM solver reads cumulative alphas, a sigma-space Euler / DPM-Solver++ one
-    reads sigmas. Both come from the same diffusers-compatible derivations the
-    package exporter uses, so a ComfyUI conversion and a package export of the
-    same checkpoint describe the same dynamics.
+    The schedule is what ``solver_step`` integrates: a variance-preserving DDIM
+    solver reads cumulative alphas, a sigma-space Euler / DPM-Solver++ one reads
+    sigmas. Both use the same diffusers-compatible derivations the package
+    exporter does, so a ComfyUI conversion and a package export of one
+    checkpoint describe the same dynamics.
 
-    ``start_step`` is img2img's "skip the noisiest steps": diffusers implements
-    it by starting from a later entry of the same table, so it lowers to a
-    sliced schedule plus a smaller loop bound rather than to a separate control
-    knob the typed workflow has no room for.
+    ``start_step`` is img2img's "skip the noisiest steps", which diffusers
+    implements by starting from a later entry of the same table, so it lowers to
+    a sliced schedule plus a smaller loop bound.
     """
     from mobius.integrations.onnx_genai.auto_export import (
         _ddim_alpha_schedule,
@@ -2445,12 +2431,10 @@ def build_diffusion_pipeline_metadata(
 ) -> dict[str, Any]:
     """Build the onnx-genai ``inference_metadata`` document for a diffusion pipeline.
 
-    onnx-genai's ``PipelineSpec`` has a single property, ``workflow``: a typed
-    SSA graph in which the sampler is an ordinary executable component rather
-    than a ``strategy`` block the runtime interprets. So the denoise loop is
-    emitted explicitly — the sigma schedule and timestep table are constant
-    components, the step index is the loop induction value, and classifier-free
-    guidance is two denoiser invocations plus a combine component.
+    The denoise loop is emitted as an explicit ``pipeline.workflow``: the sigma
+    schedule and timestep table are constant components, the step index is the
+    loop induction value, and classifier-free guidance is two denoiser
+    invocations plus a combine component.
 
     Only the ONNX components a caller *names* are described by artifact; their
     graphs stay authoritative for which ports exist. The solver, schedule,
@@ -2463,9 +2447,10 @@ def build_diffusion_pipeline_metadata(
         denoiser_*: Denoiser component filename and I/O port names.
         scheduler: Noise-schedule config (defaults to DDIM defaults). Its
             ``kind`` selects the solver component.
-        timesteps: Explicit per-step timestep table; a linear ramp otherwise.
-        schedule: Explicit sigma schedule (``num_inference_steps + 1`` values);
-            a linear ramp otherwise.
+        timesteps: Explicit per-step timestep table; derived from ``scheduler``
+            otherwise.
+        schedule: Explicit solver schedule (``num_inference_steps + 1`` values);
+            derived from ``scheduler`` otherwise.
         guidance_scale: When set and != 1.0, enables classifier-free guidance.
         start_step: img2img skip count; lowered to a sliced schedule.
         vae_filename: VAE decoder producing the image output.
@@ -3141,11 +3126,8 @@ def write_diffusion_pipeline_metadata(
     return path
 
 
-#: Proposer input port that receives the target's per-token hidden state.
-#:
-#: ``SpeculativeContract.port_bindings`` is keyed by semantic role; onnx-genai
-#: names this role ``target_hidden_context``
-#: (``crates/onnx-genai-metadata/src/schema/package.rs``).
+#: ``SpeculativeContract.port_bindings`` role for the proposer input port that
+#: receives the target's per-token hidden state.
 _TARGET_HIDDEN_CONTEXT_ROLE = "target_hidden_context"
 
 #: Port roles the Qwen3.5/3.8 MTP sidecar exposes. The graph is authoritative
@@ -3163,11 +3145,11 @@ _MTP_PROPOSER_PORT_ROLES: dict[str, str] = {
 def _speculative_target_candidates(workflow: dict[str, Any], exclude: str) -> list[str]:
     """Workflow components that can verify a speculative proposal.
 
-    A verifier is the component that scores the next token, so it is selected by
-    its declared ``logits`` output role. Selecting on ``implementation.kind ==
-    "onnx"`` would not work: the generated policy graphs a workflow ships (the
-    sampler, the termination predicate, the state updates) are ONNX components
-    too, and a real decoder package declares about a dozen of them.
+    A verifier scores the next token, so it is selected by its declared
+    ``logits`` output role. Selecting on ``implementation.kind == "onnx"`` would
+    not narrow anything: the generated policy graphs a workflow ships (sampler,
+    termination predicate, state updates) are ONNX components too, and a real
+    decoder package declares about a dozen of them.
     """
     return [
         name
@@ -3196,38 +3178,24 @@ def write_mtp_speculator_metadata(
     backbone (``mtp/model.onnx``). It borrows the target's shared embedding /
     LM head and is seeded by the backbone's final-layer hidden state.
 
-    The emitted block is onnx-genai's ``SpeculativeContract``
-    (``crates/onnx-genai-metadata/src/schema/package.rs``), which replaced the
-    older flat ``SpeculatorConfig`` block. That contract is expressed entirely
-    in terms of the *workflow*: ``proposer`` and ``target`` name workflow
-    components, ``rollback_state`` names workflow state cells, and the hidden
-    handoff is a ``port_bindings`` role rather than a pair of free-form port
-    names. So this writer also registers the head as a workflow component and
-    completes the rollback capabilities the claim depends on:
+    ``SpeculativeContract`` is expressed in terms of the workflow — ``proposer``
+    and ``target`` are component names, ``rollback_state`` names state cells —
+    so this writer also registers the head as a workflow component and completes
+    the rollback capabilities the claim depends on. Notably:
 
-    - ``proposer`` / ``target`` are workflow component names. The backbone
-      metadata must already declare a ``pipeline.workflow`` with exactly one
-      ONNX component (the decoder) to anchor against; anything else fails
-      closed rather than publishing an unanchored contract.
-    - ``proposal_execution: block``. The head returns its complete proposal in
-      one invocation. It is deliberately *not* declared ``chained``: a chained
-      proposer must expose a ``logits_output`` carrying the next-token
-      distribution, and this sidecar emits only ``mtp_hidden`` — the runtime
-      obtains draft logits by decoding it through the target's LM head, which
-      is why that initializer is listed in ``shared_weights``.
+    - ``proposal_execution: block``, not ``chained``: a chained proposer must
+      expose a ``logits_output``, and this sidecar emits only ``mtp_hidden``.
+      The runtime obtains draft logits by decoding it through the target's LM
+      head, which is why that initializer is listed in ``shared_weights``.
     - ``port_bindings.target_hidden_context`` names the proposer input port the
-      target's per-token hidden state lands in. The *source* of that value is
-      declared structurally, as a ``hidden_states`` port role on the target
-      component, instead of being spelled out as a layer-indexed port name.
-    - ``vocabulary: identical`` — the head shares the target's LM head, so it
-      scores the target's own vocabulary axis.
-    - ``rollback_state`` lists the target's service-group-backed state cells,
-      and each reached group is given a ``rollback_positions`` bound of at
-      least ``max_proposal_width``: a rejected proposal must be undoable that
-      far or the runtime rejects the package.
+      target's hidden state lands in; its source is declared as a
+      ``hidden_states`` port role on the target component.
+    - ``vocabulary: identical`` — sharing the target's LM head means scoring the
+      target's own vocabulary axis.
 
-    The backbone ``inference_metadata.yaml`` must already exist. Returns the
-    metadata path, or ``None`` when it is missing.
+    The backbone ``inference_metadata.yaml`` must already exist and declare a
+    ``pipeline.workflow`` to anchor against. Returns the metadata path, or
+    ``None`` when the file is missing.
     """
     if num_speculative_tokens < 1:
         raise ValueError("num_speculative_tokens must be >= 1")
@@ -3310,10 +3278,10 @@ def _declare_rollback_capacity(
 ) -> None:
     """Guarantee every group reached by ``cells`` can rewind ``positions``.
 
-    A speculative package is rejected when a rolled-back cell resolves to a
-    state group that declares no ``rollback_positions``, or fewer than the
-    declared maximum proposal width. Attaching the speculator is what creates
-    that requirement, so it is also what states the bound.
+    A package is rejected when a rolled-back cell resolves to a group declaring
+    no ``rollback_positions``, or fewer than the maximum proposal width.
+    Attaching the speculator creates that requirement, so it also states the
+    bound.
     """
     groups = (workflow.get("serving") or {}).get("state_service", {}).get("groups", {})
     state = workflow.get("state") or {}

@@ -231,10 +231,8 @@ def test_ancestral_sampler_is_rejected():
 def test_unmaterializable_sigma_spacing_is_rejected(spacing):
     wf = json.loads(json.dumps(_DEFAULT_TXT2IMG))
     wf["3"]["inputs"]["scheduler"] = spacing
-    # The published workflow ships the sigma table as a constant component, so a
-    # spacing mobius cannot materialize has to fail rather than be dropped: the
-    # old document merely carried ``use_karras_sigmas`` as a hint for a runtime
-    # scheduler that no longer exists.
+    # The workflow ships the sigma table as a constant component, so a spacing
+    # mobius cannot materialize has to fail rather than be silently dropped.
     with pytest.raises(ValueError, match="Karras or exponential sigmas"):
         parse_comfyui_workflow(wf)
 
