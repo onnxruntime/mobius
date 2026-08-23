@@ -52,6 +52,16 @@ from mobius.components import Conv2d, LayerNorm, Linear, SequenceMambaBlock
 # Slice "start" sentinel for a reverse (negative-step) slice.
 _INT64_MIN = -9223372036854775808
 
+# Frequency-axis geometry of the encoder, kept here because two places depend on
+# it: ``SEMambaSpeechEnhancementModel.forward`` emits the tail pad, and
+# ``DenseEncoder`` builds the strided convolution, while
+# ``ReUseConfig.encoder_freq_bins`` predicts the resulting extent at build time.
+# ``TestEncoderFreqBins`` pins the prediction against the graph the model
+# actually builds, so these cannot drift apart silently.
+_ENCODER_FREQ_TAIL_PAD = 2
+_ENCODER_FREQ_KERNEL = 3
+_ENCODER_FREQ_STRIDE = 2
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -105,6 +115,31 @@ class ReUseConfig(BaseModelConfig):
     def num_freq_bins(self) -> int:
         """Number of frequency bins on the model's input/output."""
         return self.n_fft // 2 + 1
+
+    @property
+    def encoder_freq_bins(self) -> int:
+        """Frequency extent of the encoder output, i.e. what the TF blocks see.
+
+        Statically derivable, which is the point of computing it here rather than
+        with ``Shape`` at run time: the frequency axis is a fixed function of
+        ``n_fft``, so an execution provider can claim the frequency-axis scans even
+        when the time axis is fully dynamic.
+
+        The derivation mirrors what the graph actually does, in order:
+
+        1. ``forward`` zero-pads the tail of the frequency axis by
+           ``_ENCODER_FREQ_TAIL_PAD``, so the strided convolution never drops a
+           partial window.
+        2. ``DenseEncoder.dense_conv_2`` is a ``kernel=(1, 3)``, ``stride=(4, 2)``
+           convolution with no padding, giving the usual
+           ``floor((in - kernel) / stride) + 1``.
+
+        ``n_fft`` is even, so ``num_freq_bins`` is odd and the floor is exact.
+        The decoder's ``up_conv1`` doubles this back to ``2 * encoder_freq_bins``,
+        which is ``>= num_freq_bins``; ``forward`` crops off the overshoot.
+        """
+        padded = self.num_freq_bins + _ENCODER_FREQ_TAIL_PAD
+        return (padded - _ENCODER_FREQ_KERNEL) // _ENCODER_FREQ_STRIDE + 1
 
     @property
     def d_inner(self) -> int:
@@ -367,7 +402,14 @@ class DenseEncoder(nn.Module):
         )
         self.dense_block = DenseBlock(config, depth=config.dense_depth)
         self.dense_conv_2 = _norm_act_stage(
-            Conv2d(hid, hid, kernel_size=(1, 3), stride=(4, 2)), hid, eps
+            Conv2d(
+                hid,
+                hid,
+                kernel_size=(1, _ENCODER_FREQ_KERNEL),
+                stride=(4, _ENCODER_FREQ_STRIDE),
+            ),
+            hid,
+            eps,
         )
 
     def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
@@ -497,12 +539,19 @@ class TFMambaBlock(nn.Module):
         self.time_mamba = BiMambaBlock(config)
         self.freq_mamba = BiMambaBlock(config)
         self._channels = config.hid_feature
+        self._freq = config.encoder_freq_bins
 
     def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
         channels = op.Constant(value_ints=[self._channels])
         batch = op.Shape(x, start=0, end=1)
         time = op.Shape(x, start=2, end=3)
-        freq = op.Shape(x, start=3, end=4)
+        # The frequency extent is a fixed function of n_fft, so it is emitted as a
+        # constant rather than read back with Shape. That keeps the frequency-axis
+        # Scan's extent statically known even when the time axis is dynamic, which
+        # is what lets an execution provider claim it — a Shape-derived extent
+        # leaves the scan unclaimable and, since an unclaimed node is a partition
+        # boundary, fragments the surrounding graph too.
+        freq = op.Constant(value_ints=[self._freq])
         minus_one = op.Constant(value_ints=[-1])
 
         # --- Time branch: (B, C, T, F) -> (B*F, T, C) ---
@@ -575,10 +624,16 @@ class SEMambaSpeechEnhancementModel(nn.Module):
         pha = op.Unsqueeze(op.Transpose(noisy_pha, perm=[0, 2, 1]), [1])
         x = op.Concat(mag, pha, axis=1)  # (B, 2, T, F)
 
-        # Zero-pad the tail of both the time and frequency axes by 2. The
-        # reference does this so the strided encoder convolution never has to
-        # drop a partial window.
-        x = op.Pad(x, op.Constant(value_ints=[0, 0, 0, 0, 0, 0, 2, 2]))
+        # Zero-pad the tail of both the time and frequency axes. The reference
+        # does this so the strided encoder convolution never has to drop a
+        # partial window. The frequency pad is part of how
+        # ``ReUseConfig.encoder_freq_bins`` predicts the encoder's output extent.
+        x = op.Pad(
+            x,
+            op.Constant(
+                value_ints=[0, 0, 0, 0, 0, 0, _ENCODER_FREQ_TAIL_PAD, _ENCODER_FREQ_TAIL_PAD]
+            ),
+        )
 
         x = self.dense_encoder(op, x)  # (B, C, T', F')
         for block in self.TSMamba:

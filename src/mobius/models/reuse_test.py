@@ -385,6 +385,100 @@ class TestBuildReUse:
         assert "model" in pkg
 
 
+class TestEncoderFreqBins:
+    """The encoder's frequency extent is predicted at build time, not read back.
+
+    ``TFMambaBlock`` emits ``config.encoder_freq_bins`` as a constant instead of
+    ``Shape(x)[3]``. That prediction duplicates geometry owned by two other
+    places — the frequency tail pad in
+    ``SEMambaSpeechEnhancementModel.forward`` and the strided convolution in
+    ``DenseEncoder`` — so these tests pin it against the graph that is actually
+    built. A wrong constant is a loud failure (the frequency ``Reshape`` gets an
+    incompatible target), never silent corruption, but it should fail here
+    rather than at inference time.
+    """
+
+    @pytest.mark.parametrize("n_fft", [320, 400, 512, 322])
+    def test_matches_the_conv_geometry(self, n_fft):
+        """Derivation agrees with the pad-then-strided-conv arithmetic.
+
+        ``322`` is included on purpose: it is the ``n_fft % 4 == 2`` case, the
+        only one where the floor division actually truncates.
+        """
+        config = ReUseConfig(n_fft=n_fft)
+        padded = config.num_freq_bins + 2  # tail pad on the frequency axis
+        expected = (padded - 3) // 2 + 1  # kernel 3, stride 2, no padding
+        assert config.encoder_freq_bins == expected
+
+    @pytest.mark.parametrize("n_fft", [320, 400, 512, 322])
+    def test_decoder_can_cover_the_input_extent(self, n_fft):
+        """``up_conv1`` doubles the extent, which must reach the input width.
+
+        ``forward`` crops the overshoot, so the requirement is ``>=``. If this
+        ever became ``<`` the model would silently return a truncated spectrum.
+        """
+        config = ReUseConfig(n_fft=n_fft)
+        assert 2 * config.encoder_freq_bins >= config.num_freq_bins
+
+    def test_prediction_matches_the_built_graph(self):
+        """The constant equals the extent the graph really carries.
+
+        This is the anti-drift guard: it reads the inferred shape of the
+        frequency Scan's input, so changing the encoder stride, kernel or pad
+        without updating the derivation fails here.
+        """
+        config, pkg = _build()
+        scans = [
+            node
+            for node in pkg["model"].graph
+            if node.op_type == "Scan" and "freq_mamba" in (node.name or "")
+        ]
+        assert scans, "no frequency-axis Scan found"
+        for scan in scans:
+            # Scan inputs are [initial_state..., scan_input...]; the scan inputs
+            # are time-major, so axis 0 is the swept extent.
+            swept = scan.inputs[2].shape
+            assert swept is not None
+            assert swept[0] == config.encoder_freq_bins
+
+    def test_frequency_extent_is_not_read_back_at_runtime(self):
+        """No Shape node feeds the frequency axis of a TF block's Reshape.
+
+        Kept as a behavioural assertion rather than a node count so that
+        unrelated Shape nodes elsewhere in the graph do not make it brittle.
+        """
+        _config, pkg = _build()
+        graph = pkg["model"].graph
+        producers = {v.name: node for node in graph for v in node.outputs}
+        for node in graph:
+            if node.op_type != "Scan" or "freq_mamba" not in (node.name or ""):
+                continue
+            # Walk back from the swept input; the extent must originate in a
+            # Constant, never a Shape read of the encoder output.
+            seen: set[str] = set()
+            frontier = [node.inputs[2]]
+            saw_shape_on_freq_axis = False
+            while frontier:
+                value = frontier.pop()
+                if value is None or value.name in seen:
+                    continue
+                seen.add(value.name)
+                producer = producers.get(value.name)
+                if producer is None or producer.op_type == "Scan":
+                    continue
+                if (
+                    producer.op_type == "Shape"
+                    and producer.attributes.get("start") is not None
+                ):
+                    if producer.attributes["start"].as_int() == 3:
+                        saw_shape_on_freq_axis = True
+                frontier.extend(producer.inputs)
+            assert not saw_shape_on_freq_axis, (
+                "the frequency extent is derived from Shape(x)[3] again; it is a "
+                "fixed function of n_fft and should be emitted as a constant"
+            )
+
+
 class TestExecutionProviderPartitioning:
     """Lock in graph shapes that plugin EPs need in order to claim the SSM.
 
