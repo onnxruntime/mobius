@@ -409,13 +409,12 @@ class TestExecutionProviderPartitioning:
             assert "scan_output_axes" not in scan.attributes
 
     def test_sequence_reverse_uses_negative_step_slice(self):
-        """The backward branch must reverse with a negative-step Slice.
+        """The backward branch reverses with a negative-step Slice.
 
-        ReverseSequence is faster in isolation, but the MLX EP cannot claim
-        a reverse Slice, and that unclaimable node is what splits the model
-        into one small compilable subgraph per block. Claiming the reverse
-        instead collapses all 30 blocks into a single subgraph that the EP
-        runs eagerly: 70s versus 0.5s end to end.
+        ReverseSequence would also reverse the sequence, but it needs an
+        extra Expand to build per-row lengths and implies padding semantics
+        this model does not have — nothing here is padded, so every row is
+        reversed in full.
         """
         _config, pkg = _build()
 

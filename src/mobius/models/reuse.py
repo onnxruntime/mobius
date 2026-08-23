@@ -470,14 +470,12 @@ class BiMambaBlock(nn.Module):
         out_fw = op.Add(self.forward_blocks(op, x), x)
 
         # Reverse along the sequence axis. ONNX has no Flip, and a
-        # negative-step Slice is the standard spelling.
+        # negative-step Slice is the standard spelling for it.
         #
-        # ReverseSequence is the obvious "more supported" alternative and is
-        # ~4x faster in isolation, but do not switch: on the MLX plugin EP the
-        # reverse Slice is unclaimable and therefore splits the graph into one
-        # small compilable subgraph per block. Claiming the reverse instead
-        # merges all 30 blocks into a single subgraph that the EP runs
-        # eagerly, which measured 70s vs 0.83s end to end.
+        # ReverseSequence would also work and needs no negative-step support,
+        # but it costs an extra Expand to build the per-row lengths and says
+        # something the model does not mean: nothing here is padded, so every
+        # row is reversed in full. Slice states the intent directly.
         x_rev = op.Slice(x, [-1], [_INT64_MIN], [1], [-1])
         out_bw = op.Add(self.backward_blocks(op, x_rev), x_rev)
         out_bw = op.Slice(out_bw, [-1], [_INT64_MIN], [1], [-1])
