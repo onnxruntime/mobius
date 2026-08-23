@@ -18,6 +18,7 @@ apart, so that the same divergence cannot be reintroduced silently:
 from __future__ import annotations
 
 import inspect
+import pathlib
 import re
 from typing import ClassVar
 
@@ -233,6 +234,49 @@ class TestRejectionsAreActionable:
             get_arch_spec("definitely-not-real")
         with pytest.raises(NotImplementedError):
             get_arch_spec("nemotron_h_moe")
+
+
+class TestDocumentedSupportMatrix:
+    """The published matrix must be the registry, not a stale copy of it.
+
+    ``docs/api/build_from_gguf.md`` previously claimed "Most decoder-only LLM
+    architectures are supported", which is not a checkable statement. This test
+    is what makes the replacement checkable.
+    """
+
+    _DOC = pathlib.Path(__file__).resolve().parents[4] / "docs" / "api" / "build_from_gguf.md"
+    _BEGIN = "<!-- BEGIN GGUF SUPPORT MATRIX (generated; see _arch_registry.py) -->"
+    _END = "<!-- END GGUF SUPPORT MATRIX -->"
+
+    @staticmethod
+    def _expected_rows() -> list[str]:
+        rows = []
+        for spec in sorted(iter_arch_specs(), key=lambda s: s.gguf_arch):
+            aliases = ", ".join(f"`{a}`" for a in sorted(spec.aliases)) or "—"
+            model_type = f"`{spec.model_type}`" if spec.model_type else "—"
+            status = (
+                "supported"
+                if spec.is_importable
+                else "; ".join(
+                    f"{name} {verdict.value}"
+                    for name, verdict in spec.verdicts.items()
+                    if verdict is not Support.SUPPORTED
+                )
+            )
+            rows.append(f"| `{spec.gguf_arch}` | {aliases} | {model_type} | {status} |")
+        return rows
+
+    def test_the_doc_table_matches_the_registry(self) -> None:
+        text = self._DOC.read_text(encoding="utf-8")
+        assert self._BEGIN in text and self._END in text, (
+            f"{self._DOC} is missing the generated support-matrix markers"
+        )
+        block = text.split(self._BEGIN, 1)[1].split(self._END, 1)[0]
+        documented = [line for line in block.splitlines() if line.startswith("| `")]
+        assert documented == self._expected_rows(), (
+            "docs/api/build_from_gguf.md is out of date with the architecture "
+            "registry. Regenerate the support matrix between its markers."
+        )
 
 
 class TestOffsetNormCompensation:

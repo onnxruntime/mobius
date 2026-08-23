@@ -84,12 +84,82 @@ conversion explicitly.
 
 ## Supported GGUF Architectures
 
-The GGUF builder maps GGUF architecture names (e.g. `llama`, `qwen2`,
-`gemma`) to the same model classes used by `build()`. Most decoder-only
-LLM architectures are supported.
+Support is declared once, in
+`mobius/integrations/gguf/_arch_registry.py`, as four independent verdicts per
+architecture — config extraction, tensor mapping, graph construction, and
+runtime packaging. Anything short of "supported" carries a reason, and the
+table below is checked against the registry by
+`_arch_registry_test.py::TestDocumentedSupportMatrix`, so it cannot drift.
+
+Being listed is not a support claim. `build_from_gguf` refuses every
+architecture that is not fully supported, naming the missing capability and the
+reason.
+
+<!-- BEGIN GGUF SUPPORT MATRIX (generated; see _arch_registry.py) -->
+
+| GGUF architecture | Accepted aliases | mobius `model_type` | Status |
+|---|---|---|---|
+| `bloom` | — | `bloom` | tensor_map deferred |
+| `clip` | — | — | config rejected; tensor_map rejected; graph rejected; runtime rejected |
+| `deci` | — | `llama` | supported |
+| `deepseek4` | — | `deepseek_v4` | supported |
+| `falcon` | — | `falcon` | supported |
+| `gemma` | — | `gemma` | supported |
+| `gemma2` | — | `gemma2` | supported |
+| `gemma3` | — | `gemma3_text` | supported |
+| `gemma4` | — | `gemma4_text` | supported |
+| `glm-dsa` | `glm_dsa` | `glm_moe_dsa` | tensor_map deferred |
+| `gpt2` | — | `gpt2` | supported |
+| `hunyuan-dense` | `hunyuan_v1_dense` | `hunyuan_v1_dense` | supported |
+| `internlm2` | — | `internlm2` | supported |
+| `llama` | `mistral` | `llama` | supported |
+| `mamba` | — | `mamba` | supported |
+| `muse-glimmer` | `muse_glimmer` | `muse_glimmer_text` | supported |
+| `nemotron` | — | `nemotron` | supported |
+| `nemotron_h_moe` | — | — | config rejected; tensor_map rejected; graph rejected; runtime rejected |
+| `phi3` | — | `phi3` | supported |
+| `qwen2` | — | `qwen2` | supported |
+| `qwen2moe` | `qwen2_moe` | `qwen2_moe` | supported |
+| `qwen3` | — | `qwen3` | supported |
+| `qwen35` | — | `qwen3_5_text` | supported |
+| `qwen35moe` | — | `qwen3_5_moe` | supported |
+| `qwen3moe` | `qwen3_moe` | `qwen3_moe` | supported |
+| `stablelm` | — | `stablelm` | supported |
+| `starcoder2` | — | `starcoder2` | supported |
+| `t5` | — | `t5` | tensor_map deferred |
+
+<!-- END GGUF SUPPORT MATRIX -->
+
+Canonical names are the strings llama.cpp writes into `general.architecture`,
+validated against a vendored census of the 147 architectures llama.cpp defines
+at commit `8d9af256337d1a501250f9bbf4c0859a654bddd6`. Aliases are spellings
+llama.cpp does not emit but that mobius still accepts.
+
+An architecture outside this table is refused with a message naming its
+upstream cohort, so an unsupported input is never mistaken for a broken one.
+`clip` files are multimodal projector sidecars: pass them as
+`build_from_gguf(text_gguf, mmproj=...)` rather than on their own.
 
 Sharded GGUF files are rejected. A single shard has only part of the tensor
 table, and treating it as a complete checkpoint would create a corrupt model.
+
+## Supported stored quantization types
+
+`mobius/integrations/gguf/_quant_registry.py` covers all 43 `ggml_type` slots
+at the same pinned commit and answers four separate questions per slot:
+whether the GGUF parse layer can read it, whether it can be dequantized to
+float, whether its blocks are handed to the runtime unchanged, and whether it
+can be repacked into a `MatMulNBits` affine layout.
+
+- **Repacked to `MatMulNBits`**: `Q4_0`, `Q4_1`, `Q8_0`, `Q4_K`, `Q6_K`, `Q1_0`.
+- **Preserved byte-for-byte**: `MXFP4`, `IQ4_NL`, `IQ4_XS`, `IQ3_S`, `IQ3_XXS`,
+  `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ1_S`, `IQ1_M`.
+- **Rejected**: the eight retired slots (`Q4_2`, `Q4_3`, `Q4_0_4_4`,
+  `Q4_0_4_8`, `Q4_0_8_8`, `IQ4_NL_4_4`, `IQ4_NL_4_8`, `IQ4_NL_8_8`), which have
+  a block size of 0 and are unreadable at the GGUF parse layer, and `Q8_1` /
+  `Q8_K`, which are compute-only intermediates that are never valid weight
+  storage.
+
 
 ## NVIDIA Nemotron 3.5 Lightning waiver
 
