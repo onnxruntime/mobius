@@ -243,7 +243,7 @@ class TestGlmMoeDsaGraphBuild:
     def _build(self, **overrides):
         config = _glm_config(**overrides)
         model = GlmMoeDsaCausalLMModel(config)
-        package = build_from_module(model, config, task="text-generation")
+        package = build_from_module(model, config, task="glm-moe-dsa")
         return config, package["model"]
 
     def test_dsa_path_emits_one_index_share_per_hidden_layer_and_no_attention(self):
@@ -253,6 +253,26 @@ class TestGlmMoeDsaGraphBuild:
         assert count_op_type(graph, "Attention") == 0
         assert count_op_type(graph, "GroupQueryAttention") == 0
         assert count_op_type(graph, "MultiHeadAttention") == 0
+
+    def test_dsa_path_uses_packed_single_head_cache_io(self):
+        config, onnx_model = self._build()
+        cache_inputs = {value.name: list(value.shape) for value in onnx_model.graph.inputs[3:]}
+        cache_outputs = {
+            value.name: list(value.shape) for value in onnx_model.graph.outputs[1:]
+        }
+        for i, indexer_type in enumerate(config.indexer_types):
+            key_width = config.num_attention_heads * (
+                config.qk_nope_head_dim + config.qk_rope_head_dim
+            ) + (config.index_head_dim if indexer_type == "full" else 0)
+            value_width = config.num_attention_heads * config.v_head_dim
+            past_key_shape = cache_inputs[f"past_key_values.{i}.key"]
+            past_value_shape = cache_inputs[f"past_key_values.{i}.value"]
+            present_key_shape = cache_outputs[f"present.{i}.key"]
+            present_value_shape = cache_outputs[f"present.{i}.value"]
+            assert [past_key_shape[1], past_key_shape[3]] == [1, key_width]
+            assert [past_value_shape[1], past_value_shape[3]] == [1, value_width]
+            assert [present_key_shape[1], present_key_shape[3]] == [1, key_width]
+            assert [present_value_shape[1], present_value_shape[3]] == [1, value_width]
 
     def test_index_share_inputs_are_float32_under_a_non_float_dtype(self):
         """Regression test for the frozen ``IndexShare`` f32-only schema.
