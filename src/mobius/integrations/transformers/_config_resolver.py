@@ -21,6 +21,7 @@ import logging
 from mobius._configs import (
     ArchitectureConfig,
     BaseModelConfig,
+    _as_attribute_config,
 )
 from mobius._registry import registry
 
@@ -36,6 +37,15 @@ def _config_from_hf(hf_config, parent_config=None, module_class=None) -> BaseMod
     2. Query the :data:`registry` for a config class registered for the model type.
     3. Fall back to ``ArchitectureConfig``.
     """
+    # `transformers` 5.x leaves nested sub-configs (a decoder, a vision tower) as
+    # plain dicts, and callers pass those straight in. Every path below reads the
+    # config with `getattr`, which on a dict yields the default for *every* field:
+    # the model type resolves to None, so step 2 silently falls through to
+    # ArchitectureConfig, and then a required field raises AttributeError far from
+    # the cause. Normalising here fixes it once for every config class instead of
+    # each one re-discovering it.
+    hf_config = _as_attribute_config(hf_config)
+
     config_cls: type[BaseModelConfig] | None = None
 
     # 1. Module-level override
