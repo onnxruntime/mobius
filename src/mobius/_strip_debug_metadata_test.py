@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import onnx_ir as ir
 import pytest
 
@@ -167,9 +169,8 @@ class TestStripDebugMetadata:
             key
             for key in _all_metadata(model)
             if not (
-                key.startswith(DEBUG_METADATA_PREFIXES)
+                key.startswith((*DEBUG_METADATA_PREFIXES, FUNCTIONAL_METADATA_PREFIX))
                 or key in DEBUG_METADATA_KEYS
-                or key.startswith(FUNCTIONAL_METADATA_PREFIX)
             )
         )
         assert not unclassified, (
@@ -180,6 +181,13 @@ class TestStripDebugMetadata:
 
 
 class TestReleaseFlag:
+    #: Smallest argument set each build command accepts, so the test exercises the
+    #: real parser rather than a stand-in.
+    _MINIMAL_ARGS: ClassVar[dict[str, list[str]]] = {
+        "build": ["--model", "some/model", "out_dir"],
+        "build-gguf": ["some.gguf"],
+    }
+
     def test_build_and_gguf_describe_release_identically(self):
         """One flag, one meaning. Both subcommands take it from the same helper."""
         import argparse
@@ -195,10 +203,37 @@ class TestReleaseFlag:
             assert action.default is False
         assert helps[0] == helps[1]
 
-    @pytest.mark.parametrize("command", ["build", "build-gguf"])
-    def test_release_defaults_to_off(self, command):
-        """Debug metadata stays unless asked for — the flag opts *out* of it."""
+    def test_help_renders_a_single_percent_sign(self):
+        """``%%`` in the help string is correct: argparse %-formats help text.
+
+        Asserted because it looks like a typo and has already been reported as
+        one; a plain ``%`` is what would actually be wrong, raising at ``--help``.
+        """
+        import contextlib
+        import io
+
         from mobius.__main__ import main
 
-        with pytest.raises(SystemExit):
-            main([command, "--help"])
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.suppress(SystemExit):
+            main(["build", "--help"])
+        text = buffer.getvalue()
+        assert "35-40%" in text
+        assert "35-40%%" not in text
+
+    @pytest.mark.parametrize("command", ["build", "build-gguf"])
+    def test_release_defaults_to_off(self, command):
+        """Debug metadata stays unless asked for — the flag opts *out* of it.
+
+        Asserted on the parsed value, not on ``--help`` exiting. The first version
+        of this test only checked that ``--help`` raised ``SystemExit``, which is
+        true whatever the default is, so it asserted nothing about the flag.
+        """
+        from mobius.__main__ import build_parser
+
+        parser = build_parser()
+        without = parser.parse_args([command, *self._MINIMAL_ARGS[command]])
+        assert without.release is False
+
+        with_flag = parser.parse_args([command, *self._MINIMAL_ARGS[command], "--release"])
+        assert with_flag.release is True

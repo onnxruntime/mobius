@@ -1269,7 +1269,7 @@ class ArchitectureConfig(BaseModelConfig):
             )
 
 
-def _as_attribute_config(value):
+def _as_attribute_config(value: object) -> object:
     """Recursively give a plain ``dict`` HF sub-config attribute access.
 
     ``transformers`` 5.x increasingly leaves nested sub-configs (a decoder,

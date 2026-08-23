@@ -581,8 +581,8 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         max_seq_len=args.max_seq_len,
     )
 
-    for name, model in pkg.items():
-        if args.release:
+    if args.release:
+        for model in pkg.values():
             strip_debug_metadata(model)
 
     pkg.save(
@@ -797,8 +797,14 @@ def _add_shared_build_arguments(parser: argparse.ArgumentParser) -> None:
     _add_release_argument(parser)
 
 
-def main(argv: list[str] | None = None) -> None:
-    """Entry point for the CLI."""
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the full CLI parser.
+
+    Split out of :func:`main` so the argument surface can be tested without
+    running a command. It previously lived inside ``main``, which meant a test
+    could only reach it by invoking ``--help`` and catching ``SystemExit`` — an
+    assertion that holds regardless of what the arguments actually do.
+    """
     parser = argparse.ArgumentParser(
         prog="mobius",
         description="Build ONNX models for GenAI from HuggingFace model architectures.",
@@ -1063,7 +1069,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     comfy_parser.set_defaults(func=_cmd_convert_comfyui)
 
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Entry point for the CLI."""
+    args = build_parser().parse_args(argv)
     args.func(args)
 
 
