@@ -318,13 +318,22 @@ def parse_comfyui_workflow(
             sched.kind,
         )
 
+    if not has_vae:
+        raise ValueError(
+            "ComfyUI workflow has no VAE decode node, so it produces latents rather "
+            "than an image. Why: onnx-genai's pipeline workflow terminates in a decoded "
+            f"image output, and there is nothing to decode with; supported decode nodes: "
+            f"{', '.join(sorted(_VAE_DECODE_NODES))}. How to fix: add a VAEDecode node to "
+            "the workflow before converting it."
+        )
+
     metadata = build_diffusion_pipeline_metadata(
         num_inference_steps=steps,
         scheduler=sched,
         guidance_scale=guidance,
         start_step=start_step or None,
         denoiser_filename=denoiser_filename,
-        vae_filename=vae_filename if has_vae else None,
+        vae_filename=vae_filename,
         text_encoder_filename=text_encoder_filename if has_text_encoder else None,
     )
     return ComfyUIWorkflow(

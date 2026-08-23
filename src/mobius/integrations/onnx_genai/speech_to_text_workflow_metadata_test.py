@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import json
-import os
 from types import SimpleNamespace
 
 import jsonschema
@@ -18,6 +17,7 @@ from mobius._model_package import ModelPackage
 from mobius.integrations.onnx_genai.auto_export import _audio_preprocessing_program
 from mobius.integrations.onnx_genai.inference_metadata_test import (
     _model,
+    _onnx_genai_schema_path,
     _value,
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
@@ -235,10 +235,7 @@ def test_write_round_trips_the_built_metadata(tmp_path):
 
 
 def test_speech_workflow_matches_producer_schema(tmp_path):
-    schema_path = os.environ.get("ONNX_GENAI_SCHEMA")
-    if not schema_path:
-        pytest.skip("set ONNX_GENAI_SCHEMA to the producer-contract schema")
-    with open(schema_path, encoding="utf-8") as handle:
+    with open(_onnx_genai_schema_path(), encoding="utf-8") as handle:
         schema = json.load(handle)
     processor = tmp_path / "audio_processor.json"
     processor.write_text(json.dumps(_WHISPER_EXTRACTOR), encoding="utf-8")

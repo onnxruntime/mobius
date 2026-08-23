@@ -22,8 +22,9 @@ model families Mobius builds:
   :func:`write_audio_codec_workflow_metadata` emits typed codec SSA, while
   :func:`write_tts_workflow_metadata` reports the current nested-loop induction
   contract blocker precisely.
-* **Diffusion pipelines** — :func:`write_diffusion_pipeline_metadata` emits an
-  iterative pipeline for a denoiser plus optional VAE / text encoder.
+* **Diffusion pipelines** — :func:`write_diffusion_pipeline_metadata` emits a
+  typed SSA denoise loop for a denoiser plus VAE and optional text encoder,
+  shipping the sampler's solver/schedule components alongside it.
 
 :func:`write_onnx_genai_config` is the unified entry point: it inspects the
 built package and dispatches to the matching writer, so

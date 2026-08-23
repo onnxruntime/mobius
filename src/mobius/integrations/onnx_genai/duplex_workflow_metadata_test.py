@@ -20,7 +20,11 @@ import pytest
 import yaml
 
 from mobius._model_package import ModelPackage
-from mobius.integrations.onnx_genai.inference_metadata_test import _model, _value
+from mobius.integrations.onnx_genai.inference_metadata_test import (
+    _model,
+    _onnx_genai_schema_path,
+    _value,
+)
 from mobius.integrations.onnx_genai.workflow_metadata import (
     build_full_duplex_workflow_metadata,
     write_full_duplex_workflow_metadata,
@@ -325,10 +329,7 @@ def test_duplex_workflow_writes_policy_artifacts(tmp_path) -> None:
 
 
 def test_duplex_workflow_matches_producer_schema() -> None:
-    schema_path = os.environ.get("ONNX_GENAI_SCHEMA")
-    if not schema_path or not os.path.isfile(schema_path):
-        pytest.skip("set ONNX_GENAI_SCHEMA to the producer-contract schema")
-    with open(schema_path, encoding="utf-8") as handle:
+    with open(_onnx_genai_schema_path(), encoding="utf-8") as handle:
         schema = json.load(handle)
     metadata = build_full_duplex_workflow_metadata(_duplex_package(), _DuplexConfig())
     jsonschema.validate(metadata, schema)
