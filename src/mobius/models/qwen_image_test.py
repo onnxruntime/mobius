@@ -663,9 +663,9 @@ def test_deterministic_l4_l5_image_edit_golden():
     # different BLAS backend, so they only reproduce up to float32 accumulation
     # order. Tensors here peak around |x| ~= 3.3, where one float32 ULP is about
     # 2.4e-7; the observed cross-platform drift after one transformer layer, three
-    # scheduler steps and a VAE decode is ~6 ULP (1.5e-6). Allow ~20 ULP at that
-    # magnitude, which is still two orders of magnitude tighter than the 1e-4 used
-    # below for ONNX-vs-torch parity, so a genuine logic regression still fails.
+    # scheduler steps and a VAE decode is ~6 ULP (1.5e-6). np.allclose permits
+    # |a-b| <= atol + rtol*|b|; at |x|~=3.3 this is ~3.8e-5 (~160 ULP), still
+    # ~9x tighter than the 1e-4 ONNX-vs-torch parity check below.
     golden_rtol = 1e-5
     golden_atol = 5e-6
     np.testing.assert_allclose(
