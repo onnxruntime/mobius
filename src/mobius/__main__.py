@@ -559,7 +559,7 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         print("Dequantized mode: converting GGUF weights to float...")
 
     gguf_path = args.gguf_path
-    output_dir = args.output or os.path.splitext(gguf_path)[0] + "_onnx"
+    output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
     if args.max_seq_len is not None and not args.static_cache:
@@ -588,6 +588,7 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
     pkg.save(
         output_dir,
         external_data=args.external_data,
+        max_shard_size_bytes=_parse_size(args.max_shard_size) if args.max_shard_size else None,
         max_workers=args.max_workers,
     )
     for name in pkg:
@@ -772,6 +773,12 @@ def _add_shared_build_arguments(parser: argparse.ArgumentParser) -> None:
         help="External data format (default: onnx).",
     )
     parser.add_argument(
+        "--max-shard-size",
+        metavar="SIZE",
+        default=None,
+        help="Maximum external-data shard size (e.g. '5GB'). Used by both ONNX and safetensors.",
+    )
+    parser.add_argument(
         "--max-workers",
         type=int,
         default=8,
@@ -832,12 +839,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--task",
         default=None,
         help="Model task (auto-detected if not specified). Use 'mobius list tasks' to see available tasks.",
-    )
-    build_parser.add_argument(
-        "--max-shard-size",
-        metavar="SIZE",
-        default=None,
-        help="Maximum external-data shard size (e.g. '5GB'). Used by both ONNX and safetensors.",
     )
     build_parser.add_argument(
         "--no-weights",
@@ -948,11 +949,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to a .gguf model file.",
     )
     gguf_parser.add_argument(
-        "--output",
-        "-o",
-        default=None,
-        metavar="DIR",
-        help="Output directory (default: <gguf_stem>_onnx/).",
+        "output_dir",
+        help="Output directory for the ONNX model.",
     )
     gguf_parser.add_argument(
         "--mmproj",
@@ -966,19 +964,10 @@ def build_parser() -> argparse.ArgumentParser:
             "experimental."
         ),
     )
-    quantization_group = gguf_parser.add_mutually_exclusive_group()
-    quantization_group.add_argument(
+    gguf_parser.add_argument(
         "--dequantize",
         action="store_true",
         help="Dequantize all GGUF weights to float instead of preserving quantization.",
-    )
-    quantization_group.add_argument(
-        "--keep-quantized",
-        action="store_true",
-        help=(
-            "Deprecated compatibility alias; supported GGUF quantization is "
-            "preserved by default."
-        ),
     )
     gguf_parser.add_argument(
         "--runtime",

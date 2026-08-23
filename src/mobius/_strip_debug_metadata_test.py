@@ -185,7 +185,7 @@ class TestReleaseFlag:
     #: real parser rather than a stand-in.
     _MINIMAL_ARGS: ClassVar[dict[str, list[str]]] = {
         "build": ["--model", "some/model", "out_dir"],
-        "build-gguf": ["some.gguf"],
+        "build-gguf": ["some.gguf", "out_dir"],
     }
 
     def test_build_and_gguf_describe_release_identically(self):

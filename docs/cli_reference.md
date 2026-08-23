@@ -301,7 +301,7 @@ dequantize/requantize for multimodal and mixed source qtypes.
 ### Synopsis
 
 ```bash
-mobius build-gguf GGUF_PATH [options]
+mobius build-gguf GGUF_PATH OUTPUT_DIR [options]
 ```
 
 ### Arguments
@@ -309,14 +309,14 @@ mobius build-gguf GGUF_PATH [options]
 | Argument | Description |
 |----------|-------------|
 | `GGUF_PATH` | Path to a `.gguf` model file. |
+| `OUTPUT_DIR` | Output directory for the ONNX model. |
 
 ### Options
 
 | Option | Description |
 |--------|-------------|
-| `--output DIR`, `-o DIR` | Output directory. Default: `<gguf_stem>_onnx/`. |
+| `--max-shard-size SIZE` | Maximum external-data shard size (e.g. `5GB`). |
 | `--dequantize` | Explicitly dequantize all GGUF weights to float. |
-| `--keep-quantized` | Deprecated compatibility alias for the default quantization-preserving behavior. Cannot be combined with `--dequantize`. |
 | `--dtype DTYPE` | Target dtype for model weights: `f16`, `bf16`, `f32`. |
 | `--external-data FORMAT` | External data format: `onnx` (default) or `safetensors`. |
 | `--ep EP` | Target execution provider for EP-aware optimization. |
@@ -328,13 +328,13 @@ mobius build-gguf GGUF_PATH [options]
 
 ```bash
 # Basic GGUF conversion (preserves supported quantization)
-mobius build-gguf model.gguf --output output/
+mobius build-gguf model.gguf output/
 
 # Explicitly dequantize all weights
-mobius build-gguf model.gguf --output output-float/ --dequantize
+mobius build-gguf model.gguf output-float/ --dequantize
 
 # Convert with specific dtype
-mobius build-gguf model.gguf --output output/ --dtype f16
+mobius build-gguf model.gguf output/ --dtype f16
 ```
 
 F32-, F16-, and BF16-only files build normally as float models because they
