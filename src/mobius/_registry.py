@@ -584,7 +584,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "deepseek_v4": ModelRegistration(DeepSeekV4CausalLMModel, task="deepseek-v4"),
     "deepseek_vl_v2": ModelRegistration(DeepSeekOCR2CausalLMModel),
     # --- GLM-5.2 (MLA + DeepSeek Sparse Attention (DSA) + MoE) ---
-    "glm_moe_dsa": ModelRegistration(GlmMoeDsaCausalLMModel),
+    "glm_moe_dsa": ModelRegistration(GlmMoeDsaCausalLMModel, task="glm-moe-dsa"),
     # --- SSM (Mamba / Mamba2) ---
     "falcon_mamba": ModelRegistration(MambaCausalLMModel),
     "mamba": ModelRegistration(MambaCausalLMModel),

@@ -394,6 +394,11 @@ class GlmMoeDsaAttention(DeepSeekMLA):
         value_f32 = op.Cast(padded_value, to=ir.DataType.FLOAT) if needs_cast else padded_value
 
         selected_indices = op.Unsqueeze(topk_indices, [1])
+        # pkg.nxrt is a custom onnx-genai runtime domain; the ONNX checker
+        # requires every domain used by a node to have a matching
+        # opset_imports entry (not automatically added by the op call),
+        # same as BlockQuantizedMatMul in _quantized_linear.py.
+        op.builder.graph.opset_imports["pkg.nxrt"] = 1
         attn_output = op.IndexShare(
             q_f32,
             key_f32,
@@ -684,3 +689,31 @@ class GlmMoeDsaCausalLMModel(DeepSeekV3CausalLMModel):
             filtered = {k: v for k, v in filtered.items() if k not in indexer_keys}
 
         return DeepSeekV3CausalLMModel.preprocess_weights(self, filtered)
+
+    def dsa_kv_cache_specs(self) -> list[tuple[int, int]]:
+        """Per-layer ``(key_head_dim, value_head_dim)`` for the packed DSA cache.
+
+        Only meaningful when ``config.use_dsa`` (``self.model`` is a
+        :class:`GlmMoeDsaTextModel`): ``GlmMoeDsaAttention._pack_present``
+        packs the indexer's own key cache into the *same* present-KV tensor
+        as the main attention (indexer columns appended after the main key
+        columns), so the key head_dim varies per layer -- "full" indexer
+        layers add ``index_head_dim`` extra columns, "shared" layers don't
+        -- unlike the uniform per-layer shape every other registered task
+        assumes. Reads the exact dims off the already-constructed attention
+        modules (rather than recomputing from config) so this can never
+        drift from what ``_pack_present``/``_unpack_past`` actually produce.
+        Consumed by :class:`mobius.tasks._glm_moe_dsa.GlmMoeDsaTask`.
+        """
+        return [
+            (
+                layer.self_attn.main_key_dim
+                + (
+                    layer.self_attn.index_head_dim
+                    if layer.self_attn.indexer_type == "full"
+                    else 0
+                ),
+                layer.self_attn.main_value_dim,
+            )
+            for layer in self.model.layers
+        ]
