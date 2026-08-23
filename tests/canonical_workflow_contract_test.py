@@ -984,15 +984,16 @@ class TestCheckedInPackagesShareTheShape:
                     f"{name} advertises the presence symbol {present_as!r} that no "
                     "step reads, so the workflow never handles it being absent"
                 )
+            if (declaration.get("source") or {}).get("kind") == "literal":
+                assert "default" in declaration, (
+                    f"{name} is sourced from a package literal, which is bound from "
+                    "its own default and nothing else, but carries no default"
+                )
             if not declaration.get("required"):
-                assert (
-                    "default" in declaration
-                    or (declaration.get("source") or {}).get("kind") == "literal"
-                    or present_as is not None
-                ), (
+                assert "default" in declaration or present_as is not None, (
                     f"{name} is published as optional but the package carries no "
-                    "default, no package-supplied source and no presence gate for "
-                    "it, so omitting it has no defined behaviour"
+                    "default and no presence gate for it, so omitting it has no "
+                    "defined behaviour"
                 )
                 continue
             assert "default" not in declaration

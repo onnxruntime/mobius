@@ -675,11 +675,9 @@ class TestInferenceMetadataStatus:
         for name, declaration in inputs.items():
             if declaration["required"]:
                 continue
-            assert (
-                "default" in declaration
-                or "present_as" in declaration
-                or declaration["source"]["kind"] == "literal"
-            ), f"{name} is optional but the workflow has no way to proceed without it"
+            assert "default" in declaration or "present_as" in declaration, (
+                f"{name} is optional but the workflow has no way to proceed without it"
+            )
 
     def test_each_pixel_flow_path_is_admissible_from_its_own_attachments(self):
         """Text, text-to-image and reference-image edit, through one admission.

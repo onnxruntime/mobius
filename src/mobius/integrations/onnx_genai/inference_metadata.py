@@ -1608,14 +1608,24 @@ def published_value_references(workflow: dict[str, Any]) -> set[str]:
     for declaration in (workflow.get("state") or {}).values():
         if isinstance(declaration, dict):
             note(declaration.get("initializer"))
+            # A bounded or growing cell reads its own extent every step, so the
+            # bound and the step size are read positions like any other. The
+            # sibling ``kind``/``axis`` keys describe the recurrence rather than
+            # naming values, so they are not references.
+            recurrence = declaration.get("recurrence") or {}
+            note(recurrence.get("max"))
+            note(recurrence.get("increment"))
     # The serving block names the workflow values a runtime reads to drive
-    # batching -- the active/done row masks and the accepted length. Its
-    # ``state_service`` sibling names ports rather than values, so it is not a
-    # reference set.
+    # batching -- the active/done row masks and the accepted length.
     serving = workflow.get("serving") or {}
     for key, value in serving.items():
         if key != "state_service":
             note(value)
+    # ``state_service`` is mostly port and cell names rather than values, with
+    # one exception: a group's fixed update extent is itself a workflow value.
+    for group in ((serving.get("state_service") or {}).get("groups") or {}).values():
+        if isinstance(group, dict):
+            note((group.get("update") or {}).get("capacity"))
     return references
 
 
@@ -1634,11 +1644,12 @@ def declare_input_admission(workflow: dict[str, Any]) -> None:
     reader, and stamped on every declaration:
 
     * a declaration the package can satisfy on its own -- it carries a
-      ``default``, or the package rather than the caller is its ``source`` -- is
-      not something a caller can be required to send;
+      ``default``, which is also the only thing a package-owned ``literal``
+      source is ever bound from -- is not something a caller can be required to
+      send;
     * a declaration whose absence the program *observes*, through a
-      ``present_as`` symbol the steps actually branch on, is by construction
-      executable without it;
+      ``present_as`` symbol the steps actually branch on, is one the workflow
+      has been written to run without;
     * anything else is genuinely externally required, and says so out loud.
 
     A builder that declares both an escape and ``required: True`` has written
@@ -1657,10 +1668,17 @@ def declare_input_admission(workflow: dict[str, Any]) -> None:
         if not isinstance(declaration, dict):
             continue
         escapes = []
+        literal = (declaration.get("source") or {}).get("kind") == "literal"
         if "default" in declaration:
-            escapes.append("a default")
-        if (declaration.get("source") or {}).get("kind") == "literal":
-            escapes.append("a package-supplied source")
+            escapes.append("a package-supplied default" if literal else "a default")
+        elif literal:
+            # A literal source is resolved from the declaration's own default
+            # and from nothing else, so one without a default names a value the
+            # package neither holds nor can ask a caller for.
+            raise ValueError(
+                f"workflow input {name!r} is sourced from a package literal but "
+                "carries no default, so nothing ever binds it"
+            )
         present_as = declaration.get("present_as")
         if present_as is not None:
             if present_as not in references:
@@ -1674,8 +1692,8 @@ def declare_input_admission(workflow: dict[str, Any]) -> None:
             if declaration.get("required", True) is False:
                 raise ValueError(
                     f"workflow input {name!r} is declared optional but the workflow "
-                    "carries no default, no package-supplied source and no presence "
-                    "gate for it, so a request that omits it has no defined behaviour"
+                    "carries no default and no presence gate for it, so a request "
+                    "that omits it has no defined behaviour"
                 )
             declaration["required"] = True
             continue
@@ -1720,6 +1738,9 @@ def add_adapter_service_to_metadata(
             contract.get("dtype") == dtype
             and contract.get("rank") == len(shape)
             and contract.get("shape") == shape
+            # A selection tensor the service reads for every batch it plans has
+            # no package-side escape, so admission derivation stamps it required
+            # and this stays a required-input check either way.
             and declaration.get("required", True)
             and declaration.get("source", {}).get("kind") in {"request", "application"}
             and (

@@ -2057,7 +2057,7 @@ class TestInputAdmissionIsDerivedNotDefaulted:
         workflow = self._workflow(
             **{
                 "request.prompt": {"source": {"kind": "request"}},
-                "request.seed": {"source": {"kind": "literal"}},
+                "package.seed": {"source": {"kind": "literal"}, "default": 0},
                 "request.thing": {
                     "source": {"kind": "application", "name": "thing"},
                     "present_as": "request.thing_present",
@@ -2065,7 +2065,23 @@ class TestInputAdmissionIsDerivedNotDefaulted:
             }
         )
         declare_input_admission(workflow)
-        assert workflow["inputs"]["request.seed"]["required"] is False
+        assert workflow["inputs"]["package.seed"]["required"] is False
+
+    def test_a_package_literal_that_carries_no_value_fails_closed(self):
+        """A literal source is bound from its own default and from nothing else.
+
+        Declaring one without a default names a value the package does not hold
+        and cannot ask a caller for, so it is neither required nor optional --
+        it is unbindable, and saying so here beats discovering it mid-execution.
+        """
+        workflow = self._workflow(
+            **{
+                "request.prompt": {"source": {"kind": "request"}},
+                "package.seed": {"source": {"kind": "literal"}},
+            }
+        )
+        with pytest.raises(ValueError, match="nothing ever binds it"):
+            declare_input_admission(workflow)
 
     def test_declaring_both_an_escape_and_an_obligation_fails_closed(self):
         workflow = self._workflow(
@@ -2118,12 +2134,36 @@ class TestInputAdmissionIsDerivedNotDefaulted:
             declare_input_admission(workflow)
 
     def test_derivation_reads_every_nested_position_a_value_can_occupy(self):
+        """Positions this misses are values a package can silently declare dead.
+
+        The set is deliberately exhaustive over the schema rather than over the
+        walker: a bounded cell reads its own extent, and a state-service group
+        reads its fixed update capacity, both of which are workflow values and
+        neither of which appears in ``steps``.
+        """
         workflow = {
             "inputs": {},
-            "state": {"cell": {"initializer": "package.zero"}},
+            "state": {
+                "cell": {
+                    "initializer": "package.zero",
+                    "recurrence": {
+                        "kind": "bounded",
+                        "axis": 1,
+                        "max": "package.limit",
+                        "increment": "package.one_step",
+                    },
+                }
+            },
             "serving": {
-                "active": "package.active",
-                "state_service": {"groups": {"g": {"ports": {"c": {"past": "past"}}}}},
+                "active": "package.active_rows",
+                "state_service": {
+                    "groups": {
+                        "g": {
+                            "ports": {"c": {"past": "past"}},
+                            "update": {"capacity": "package.capacity"},
+                        }
+                    }
+                },
             },
             "steps": [
                 {
@@ -2164,4 +2204,10 @@ class TestInputAdmissionIsDerivedNotDefaulted:
             "cell.next",
             "cell.first",
             "package.zero",
+            "package.limit",
+            "package.one_step",
+            "package.active_rows",
+            "package.capacity",
         }
+        # Port names and the recurrence discriminator are not values.
+        assert {"past", "bounded"}.isdisjoint(published_value_references(workflow))
