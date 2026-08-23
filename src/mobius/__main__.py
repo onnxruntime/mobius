@@ -226,6 +226,11 @@ def _cmd_build(args: argparse.Namespace) -> None:
             "Error: --features text-only is not supported with --config (local "
             "directory). Use --model <hf-id> --features text-only instead."
         )
+    if args.revision is not None and args.config:
+        raise SystemExit(
+            "Error: --revision is only supported with --model. "
+            "Local --config directories are already immutable inputs."
+        )
 
     # --component selects one component of a diffusers pipeline; text-only
     # produces a single decoder-only model. Combining them would silently
@@ -312,6 +317,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
         print(f"Detected NeMo archive: {args.model}")
         pkg = build_from_nemo(
             args.model,
+            revision=args.revision,
             dtype=dtype_override,
             execution_provider=execution_provider,
         )
@@ -478,20 +484,37 @@ def _save_package(
             print(f"  {name}: {path}")
     elif runtime == "onnx-genai":
         from mobius.integrations.onnx_genai import write_onnx_genai_config
+        from mobius.integrations.onnx_genai.inference_metadata import (
+            is_native_vlm_package,
+            write_native_vlm_package_metadata,
+        )
 
         config = getattr(pkg, "config", None)
         source = getattr(args, "config", None) or getattr(args, "model", None)
-        try:
-            artifacts = write_onnx_genai_config(
-                pkg,
-                output_dir,
-                config=config,
-                source=source,
-                revision=getattr(args, "revision", None),
-                guidance_scale=getattr(args, "guidance_scale", None),
-            )
-        except ValueError as error:
-            raise SystemExit(f"Error: {error}") from error
+        revision = getattr(args, "revision", None)
+        if is_native_vlm_package(pkg):
+            try:
+                artifacts = write_native_vlm_package_metadata(
+                    pkg,
+                    output_dir,
+                    config=config,
+                    source=source,
+                    revision=revision,
+                )
+            except ValueError as error:
+                raise SystemExit(f"Error: {error}") from error
+        else:
+            try:
+                artifacts = write_onnx_genai_config(
+                    pkg,
+                    output_dir,
+                    config=config,
+                    source=source,
+                    revision=revision,
+                    guidance_scale=getattr(args, "guidance_scale", None),
+                )
+            except ValueError as error:
+                raise SystemExit(f"Error: {error}") from error
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
 

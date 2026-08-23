@@ -684,7 +684,7 @@ class ArchitectureConfig(BaseModelConfig):
             config,
             "rope_interleave",
             (getattr(config, "qk_rope_head_dim", None) or 0) > 0
-            or model_type in ("glm", "glm4", "glm4_moe", "chatglm"),
+            or model_type in ("glm", "glm4", "glm4_moe", "glm_ocr_text", "chatglm"),
         )
         if rope_config is not None:
             rope_config = dataclasses.replace(rope_config, rope_interleave=rope_interleave)

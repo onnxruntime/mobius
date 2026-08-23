@@ -69,6 +69,7 @@ from mobius.models import (
     Glm4MoECausalLMModel,
     GlmCausalLMModel,
     GlmMoeDsaCausalLMModel,
+    GlmOcrForConditionalGeneration,
     GPTOSSCausalLMModel,
     GraniteCausalLMModel,
     GraniteMoECausalLMModel,
@@ -193,6 +194,7 @@ class ModelRegistration:
             phimoe).  ``None`` means auto-derive from the model_type prefix.
         variant: Short label identifying the code-path variant (e.g. ``"mla"``,
             ``"moe"``, ``"sliding_window"``).  Used for dashboard display.
+        test_revision: Optional immutable HuggingFace revision for L2 validation.
     """
 
     module_class: type[nn.Module]
@@ -201,6 +203,7 @@ class ModelRegistration:
     test_model_id: str | None = None
     family: str | None = None
     variant: str | None = None
+    test_revision: str | None = None
 
 
 class ModelRegistry:
@@ -236,6 +239,7 @@ class ModelRegistry:
         test_model_id: str | None = None,
         family: str | None = None,
         variant: str | None = None,
+        test_revision: str | None = None,
     ) -> None:
         """Register a module class for an architecture name.
 
@@ -249,6 +253,7 @@ class ModelRegistry:
             test_model_id: HuggingFace model ID for L2 architecture validation.
             family: Dashboard family grouping override.
             variant: Short label for the code-path variant.
+            test_revision: Optional immutable HuggingFace revision for L2 validation.
         """
         self._map[architecture] = ModelRegistration(
             module_class,
@@ -257,6 +262,7 @@ class ModelRegistry:
             test_model_id,
             family,
             variant,
+            test_revision,
         )
 
     def get(self, architecture: str) -> type[nn.Module]:
@@ -620,6 +626,12 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "glm4v_moe": ModelRegistration(LLaVAModel, task="vision-language"),
     "glm4v_moe_text": ModelRegistration(Glm4MoECausalLMModel),
     "glm4v_text": ModelRegistration(Glm4CausalLMModel),
+    "glm_ocr": ModelRegistration(
+        GlmOcrForConditionalGeneration,
+        task="glm-ocr",
+        test_model_id="zai-org/GLM-OCR",
+        test_revision="ca5d8b3e287e52589e37c28385d9655ee4372f9d",
+    ),
     "got_ocr2": ModelRegistration(LLaVAModel, task="vision-language"),
     "hunyuan_vl_mot": ModelRegistration(HunYuanVLMoTModel, task="hunyuan-vl-mot"),
     "neo_chat": ModelRegistration(
@@ -865,7 +877,14 @@ def _create_default_registry() -> ModelRegistry:
     reg = ModelRegistry()
     for arch, entry in _REGISTRATIONS.items():
         reg.register(
-            arch, entry.module_class, task=entry.task, config_class=entry.config_class
+            arch,
+            entry.module_class,
+            task=entry.task,
+            config_class=entry.config_class,
+            test_model_id=entry.test_model_id,
+            family=entry.family,
+            variant=entry.variant,
+            test_revision=entry.test_revision,
         )
     # Attach test_model_id, family, and variant metadata to registrations.
     _apply_test_metadata(reg)
@@ -1048,6 +1067,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "qwen2_vl_text": "Qwen/Qwen2-VL-2B-Instruct",
     "qwen2_5_vl": "Qwen/Qwen2.5-VL-3B-Instruct",
     "qwen2_5_vl_text": "Qwen/Qwen2.5-VL-3B-Instruct",
+    "glm_ocr": "zai-org/GLM-OCR",
     "qwen3_vl": "Qwen/Qwen3-VL-2B-Instruct",
     "qwen3_vl_text": "Qwen/Qwen3-VL-2B-Instruct",
     "qwen3_5": "Qwen/Qwen3.5-2B",

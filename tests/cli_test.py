@@ -79,6 +79,36 @@ class TestCLIBuild:
 
         assert save_package.call_args.args[2].max_workers == 8
 
+    def test_revision_propagates_to_diffusers_detection_and_build(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
+                return_value={"_class_name": "TestPipeline"},
+            ) as mock_detect,
+            mock.patch(
+                "mobius.integrations.diffusers._builder.build_diffusers_pipeline",
+                return_value=mock.MagicMock(),
+            ) as mock_build,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "test/diffusion-model",
+                    "--revision",
+                    "pinned-revision",
+                    tmpdir,
+                ]
+            )
+
+        mock_detect.assert_called_once_with(
+            "test/diffusion-model",
+            revision="pinned-revision",
+        )
+        assert mock_build.call_args.kwargs["revision"] == "pinned-revision"
+
     def test_max_workers_override_reaches_model_package_save(self):
         pkg = mock.MagicMock()
         pkg.items.return_value = []
@@ -788,6 +818,7 @@ class TestCLIBuildRuntime:
             runtime="onnx-genai",
             config="/models/vlm",
             model=None,
+            revision="pinned-revision",
         )
         with (
             tempfile.TemporaryDirectory() as tmpdir,
@@ -803,7 +834,7 @@ class TestCLIBuildRuntime:
             tmpdir,
             config=pkg.config,
             source="/models/vlm",
-            revision=None,
+            revision="pinned-revision",
             guidance_scale=None,
         )
 
@@ -885,10 +916,20 @@ class TestCLIBuildRuntime:
             ) as mock_build_nemo,
             mock.patch("mobius.__main__._save_package") as mock_save,
         ):
-            main(["build", "--model", "/some/model.nemo", tmpdir])
+            main(
+                [
+                    "build",
+                    "--model",
+                    "/some/model.nemo",
+                    "--revision",
+                    "pinned-revision",
+                    tmpdir,
+                ]
+            )
 
         mock_build_nemo.assert_called_once()
         assert mock_build_nemo.call_args.args[0] == "/some/model.nemo"
+        assert mock_build_nemo.call_args.kwargs["revision"] == "pinned-revision"
         mock_save.assert_called_once()
 
     def test_invalid_runtime_value_errors(self):
