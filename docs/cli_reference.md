@@ -237,11 +237,11 @@ mobius build --model meta-llama/Llama-3.2-1B --output output/ \
 --release
 ```
 
-Create a smaller saved model by removing build-time debug and provenance
+Reduce saved model size by removing build-time debug and provenance
 metadata immediately before serialization. This includes source module paths,
 class hierarchies, name scopes, originating rewrite rules, and
 symbolic-shape-inference internals. Functional metadata whose keys begin with
-`mobius.*` is preserved.
+`mobius.` is preserved.
 
 `--release` applies to both `mobius build` and `mobius build-gguf`. It changes
 metadata only, not the graph structure, weights, or inference behavior. Leave
