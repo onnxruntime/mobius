@@ -365,6 +365,28 @@ class TestScatteredAddedTokens:
         assert definition.surface_forms[_IMAGE_ID] == "<|image_pad|>"
         assert definition.vocab_size == _IMAGE_ID + 1
 
+    def test_an_unparseable_added_token_key_is_skipped_not_raised(self, tmp_path):
+        # Every other read path in the module degrades to stating nothing; a
+        # malformed side file must not abort an export either.
+        _write_tokenizer(tmp_path)
+        (tmp_path / "tokenizer_config.json").write_text(
+            json.dumps(
+                {
+                    "added_tokens_decoder": {
+                        "\u00b2": {"content": "<bad>"},
+                        "-1": {"content": "<negative>"},
+                        str(_IMAGE_ID): {"content": "<image>"},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        definition = read_tokenizer_definition(str(tmp_path))
+        assert definition is not None
+        assert definition.surface_forms[_IMAGE_ID] == "<image>"
+        assert "<bad>" not in definition.surface_forms.values()
+        assert "<negative>" not in definition.surface_forms.values()
+
     def test_the_legacy_added_tokens_table_is_merged_too(self, tmp_path):
         _write_tokenizer(tmp_path)
         (tmp_path / "added_tokens.json").write_text(
@@ -437,6 +459,32 @@ class TestAlgorithmIsReadNotDefaulted:
         assert definition is not None
         assert definition.algorithm == "bpe"
         assert definition.byte_level is True
+
+    def test_the_alphabet_matches_the_tokenizers_library(self):
+        # `_byte_level_alphabet` reproduces the byte-to-Unicode mapping the
+        # `tokenizers` ByteLevel stage uses. Building a fixture from it and
+        # then asserting against it would cancel any error out on both sides,
+        # so it is pinned against the external table it claims to reproduce.
+        pre_tokenizers = pytest.importorskip("tokenizers.pre_tokenizers")
+        assert _byte_level_alphabet() == frozenset(pre_tokenizers.ByteLevel.alphabet())
+
+    def test_a_sentencepiece_fallback_chain_is_not_byte_level(self, tmp_path):
+        # Gemma and Phi-3.5 work in Unicode scalars with U+2581 word marks and
+        # reach for `<0x..>` pieces only for characters their vocabulary lacks.
+        # Reporting that as byte-level would tell a front end to apply the
+        # byte-to-Unicode mapping to text that never went through it.
+        self._write(
+            tmp_path,
+            {"type": "BPE", "byte_fallback": True, "merges": [], "vocab": {"\u2581the": 0}},
+            decoder={
+                "type": "Sequence",
+                "decoders": [{"type": "Replace"}, {"type": "ByteFallback"}, {"type": "Fuse"}],
+            },
+        )
+        definition = read_tokenizer_definition(str(tmp_path))
+        assert definition is not None
+        assert definition.algorithm == "bpe"
+        assert definition.byte_level is False
 
     def test_byte_addressing_is_measured_from_a_legacy_vocabulary(self, tmp_path):
         # Legacy artifacts carry no normalizer chain, but a byte-level

@@ -212,9 +212,16 @@ def _load_json(path: str) -> Any:
 
 
 def _uses_byte_level(node: Any) -> bool:
-    """Whether any component round-trips raw bytes rather than Unicode scalars."""
+    """Whether any component addresses raw bytes rather than Unicode scalars.
+
+    Only a ``ByteLevel`` stage qualifies.  ``ByteFallback`` does not: a
+    SentencePiece tokenizer works in Unicode scalars with ``\u2581`` word marks
+    and reaches for ``<0x..>`` pieces only when a character is absent from its
+    vocabulary.  Calling that byte-level would tell a front end to apply the
+    byte-to-Unicode mapping to text that never went through it.
+    """
     if isinstance(node, dict):
-        if node.get("type") in {"ByteLevel", "ByteFallback"}:
+        if node.get("type") == "ByteLevel":
             return True
         return any(_uses_byte_level(value) for value in node.values())
     if isinstance(node, list):
@@ -279,9 +286,15 @@ def _merge_added_tokens(surfaces: dict[int, str], added_tokens: Any) -> None:
         if isinstance(value, dict):
             # ``added_tokens_decoder``: id -> descriptor.
             content = value.get("content")
-            if content and str(key).lstrip("-").isdigit():
-                surfaces[int(key)] = str(content)
-        elif isinstance(value, int) and not isinstance(value, bool):
+            if not content:
+                continue
+            try:
+                token_id = int(key)
+            except (TypeError, ValueError):
+                continue
+            if token_id >= 0:
+                surfaces[token_id] = str(content)
+        elif isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             # ``added_tokens.json``: content -> id.
             surfaces[value] = str(key)
 
