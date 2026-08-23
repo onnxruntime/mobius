@@ -665,9 +665,13 @@ def build_from_gguf(
     # byte-identical to today.
     from mobius.integrations.gguf._mtp import build_mtp_head_from_gguf, has_mtp_head
 
-    # Re-attach the MTP metadata dropped by the dtype/quantization
+    # Re-attach the GGUF metadata dropped by the dtype/quantization
     # ``dataclasses.replace`` calls above so auto-detection sees it on the final
     # config instance (and ``derive_mtp_config`` can read model_type/quant/dtype).
+    # ``_gguf_arch`` matters most: it is the key ``process_tensors`` dispatches
+    # on, so losing it here would silently demote every non-float32 and every
+    # quantized import to the ``model_type`` fallback.
+    config._gguf_arch = gguf_arch
     config._gguf_model_type = model_type
     config._gguf_nextn_predict_layers = mtp_predict_layers
     config._gguf_mtp_block_indices = mtp_block_indices

@@ -799,6 +799,9 @@ def build_muse_glimmer_vlm_from_gguf(
         and value.dtype != torch.uint8
     }
     rest = {key: value for key, value in text_state.items() if key not in float_state}
+    # ``dataclasses.replace`` above drops the plain instance attribute that
+    # ``process_tensors`` dispatches on, so restore it before processing.
+    config._gguf_arch = text_gguf.architecture
     float_state = _normalize_gguf_weights(process_tensors(float_state, config))
     text_state = {**float_state, **rest}
 

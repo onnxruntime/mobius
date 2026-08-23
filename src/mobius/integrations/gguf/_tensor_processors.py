@@ -200,38 +200,34 @@ def _reverse_permute(
     return w.swapaxes(1, 2).reshape(weights.shape)
 
 
-def _process_gemma(
+def _process_unoffset_norm(
     state_dict: dict[str, torch.Tensor],
     config: Any,
 ) -> dict[str, torch.Tensor]:
-    """Restore Gemma norm weights to the HF convention.
+    """Undo the ``+1`` llama.cpp bakes into centered norm weights.
 
-    llama.cpp bakes the Gemma ``(1 + w)`` RMSNorm offset into the stored
-    weights: ``w_gguf = w_hf + 1``. The mobius Gemma graph normalizes with
-    :class:`OffsetRMSNorm`, which re-applies ``(1 + weight)`` at runtime, so the
-    initializer it consumes must be the raw ``w_hf``. Subtract 1 to undo the
-    llama.cpp offset (matching HF's ``Gemma2TensorProcessor`` in
-    ``modeling_gguf_pytorch_utils.py``); otherwise the offset is applied twice
-    and every norm — hence the whole model — is corrupted.
+    Several architectures scale by ``(1 + w)`` rather than by ``w``: Gemma's
+    ``Gemma*RMSNorm`` and Nemotron's ``NemotronLayerNorm1P`` both store ``w_hf``
+    in the HuggingFace checkpoint and add one at runtime. llama.cpp has no
+    offset norm, so its converters fold the constant in and write
+    ``w_gguf = w_hf + 1`` — see ``conversion/nemotron.py`` at the pinned commit
+    ("Adding +1 to LayerNorm's weights here to implement layernorm1p w/o
+    changing anything on the GGML engine side") and the Gemma equivalents.
+
+    The mobius graphs normalize with :class:`OffsetRMSNorm` /
+    :class:`OffsetLayerNorm`, which re-apply the ``1 +`` themselves, so the
+    initializer they consume must be the raw ``w_hf``. Subtract one to undo the
+    fold; otherwise the offset lands twice and every norm — hence the whole
+    model — is corrupted.
+
+    This matches HF's ``Gemma2TensorProcessor`` **and** ``NemotronTensorProcessor``
+    in ``modeling_gguf_pytorch_utils.py``, both of which subtract one. mobius
+    previously had a separate Nemotron processor that added one instead, leaving
+    Nemotron GGUF imports scaling by ``w_hf + 3`` instead of ``w_hf + 1``.
     """
     for name in list(state_dict):
         if "norm" in name and name.endswith(".weight"):
             state_dict[name] = state_dict[name] - 1
-    return state_dict
-
-
-def _process_nemotron(
-    state_dict: dict[str, torch.Tensor],
-    config: Any,
-) -> dict[str, torch.Tensor]:
-    """Restore Nemotron norm weights (same offset as Gemma).
-
-    Reference: ``NemotronTensorProcessor`` in HF's
-    ``modeling_gguf_pytorch_utils.py``.
-    """
-    for name in list(state_dict):
-        if "norm" in name and name.endswith(".weight"):
-            state_dict[name] = state_dict[name] + 1
     return state_dict
 
 
@@ -322,8 +318,7 @@ def _process_mamba(
 # ``LLAMA_QK_PERMUTE_MODEL_TYPES``.
 _PROCESSOR_IMPLS: dict[str, Any] = {
     "llama": _process_llama,
-    "gemma": _process_gemma,
-    "nemotron": _process_nemotron,
+    "unoffset_norm": _process_unoffset_norm,
     "muse_glimmer": _process_muse_glimmer,
     "gpt2": _process_gpt2,
     "mamba": _process_mamba,
@@ -338,7 +333,7 @@ _PROCESSOR_IMPLS: dict[str, Any] = {
 #: ``gemma3`` resolves to ``gemma3_text`` and is handled through its spec.
 _EXTRA_MODEL_TYPE_PROCESSORS: dict[str, str] = {
     "mistral": "llama",
-    "gemma3": "gemma",
+    "gemma3": "unoffset_norm",
 }
 
 #: Fallback ``model_type`` → processor-name map for configs that did not come

@@ -20,6 +20,7 @@ from __future__ import annotations
 import inspect
 import pathlib
 import re
+from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
@@ -292,12 +293,17 @@ class TestOffsetNormCompensation:
     because its processor was registered under ``model_type`` ``gemma3`` while
     GGUF ``gemma3`` resolves to ``gemma3_text``. Every norm was left doubled.
 
+    Nemotron failed it in the other direction: it uses ``OffsetLayerNorm`` and
+    had a processor, but that processor *added* one instead of subtracting it,
+    so the effective scale came out ``w_hf + 3``. The check therefore matches
+    both offset norm classes and both failure shapes.
+
     Gemma 4 deliberately passes with neither, because ``models/gemma4.py``
     normalizes with plain ``RMSNorm``.
     """
 
     _OFFSET_CALL = re.compile(
-        r"(?<![\w.])OffsetRMSNorm\s*\(|(?:rms_)?norm_class=OffsetRMSNorm"
+        r"(?<![\w.])Offset(?:RMSNorm|LayerNorm)\s*\(|(?:rms_)?norm_class=Offset\w+"
     )
 
     @classmethod
@@ -326,12 +332,12 @@ class TestOffsetNormCompensation:
         assert spec.model_type is not None
         if not self._model_uses_offset_norm(spec.model_type):
             return
-        compensated = spec.tensor_processor == "gemma" or spec.offset_norm
+        compensated = spec.tensor_processor == "unoffset_norm" or spec.offset_norm
         assert compensated, (
-            f"{spec.gguf_arch}: {spec.model_type} normalizes with OffsetRMSNorm, so "
-            "llama.cpp's baked-in +1 must be removed on import via the 'gemma' "
-            "tensor processor or the offset_norm hook. Without it every norm is "
-            "applied twice and the model produces garbage."
+            f"{spec.gguf_arch}: {spec.model_type} normalizes with an offset norm, so "
+            "llama.cpp's baked-in +1 must be removed on import via the "
+            "'unoffset_norm' tensor processor or the offset_norm hook. Without it "
+            "the offset lands twice and the model produces garbage."
         )
 
     def test_gemma4_is_deliberately_uncompensated(self) -> None:
@@ -340,3 +346,34 @@ class TestOffsetNormCompensation:
         assert not self._model_uses_offset_norm("gemma4_text")
         assert spec.tensor_processor is None
         assert not spec.offset_norm
+
+    @pytest.mark.parametrize("architecture", ["gemma", "gemma2", "gemma3", "nemotron"])
+    def test_the_offset_is_removed_in_the_right_direction(self, architecture: str) -> None:
+        """Pin the sign, not just which processor is declared.
+
+        Declaring a processor is not enough — Nemotron declared one that added
+        one instead of subtracting it. llama.cpp writes ``w_gguf = w_hf + 1``
+        and the graph re-applies ``1 +``, so the initializer must come out at
+        ``w_gguf - 1`` and the effective scale back at ``w_gguf``.
+        """
+        import torch
+
+        from mobius.integrations.gguf._tensor_processors import process_tensors
+
+        config = SimpleNamespace(
+            _gguf_arch=architecture,
+            model_type=get_arch_spec(architecture).model_type,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+        )
+        w_gguf = 1.25
+        processed = process_tensors(
+            {"model.layers.0.input_layernorm.weight": torch.full((8,), w_gguf)}, config
+        )
+        initializer = float(processed["model.layers.0.input_layernorm.weight"][0])
+        assert initializer == pytest.approx(w_gguf - 1.0), (
+            f"{architecture}: expected the llama.cpp +1 to be subtracted"
+        )
+        assert 1.0 + initializer == pytest.approx(w_gguf), (
+            f"{architecture}: effective scale must round-trip to the stored weight"
+        )

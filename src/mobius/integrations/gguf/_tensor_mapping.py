@@ -37,7 +37,11 @@ import functools
 import re
 from types import MappingProxyType
 
-from mobius.integrations.gguf._arch_registry import get_arch_spec
+from mobius.integrations.gguf._arch_registry import get_arch_spec, try_get_arch_spec
+from mobius.integrations.gguf._errors import (
+    DisabledGGUFArchitectureError,
+    UnsupportedGGUFArchitectureError,
+)
 
 # ---------------------------------------------------------------------------
 # Architecture-specific GGUF → HF stem mappings
@@ -368,11 +372,22 @@ def _build_mapping(
     immutable proxy to prevent mutation of the cache.
 
     Raises:
-        UnsupportedGGUFArchitectureError: The architecture has no tensor mapping.
-        DisabledGGUFArchitectureError: Conversion is deliberately turned off.
+        UnsupportedGGUFArchitectureError: The architecture has no tensor
+            mapping, whether because it is unregistered, deliberately disabled,
+            or registered without one. This gate has always reported every such
+            case as a ``ValueError``, so it reports disabled architectures that
+            way too rather than leaking the ``NotImplementedError`` base that
+            :func:`get_arch_spec` uses.
     """
-    spec = get_arch_spec(architecture.lower())
-
+    spec = try_get_arch_spec(architecture.lower())
+    if spec is None or not spec.is_importable:
+        try:
+            get_arch_spec(architecture.lower())
+        except DisabledGGUFArchitectureError as error:
+            raise UnsupportedGGUFArchitectureError(str(error)) from None
+        except UnsupportedGGUFArchitectureError:
+            raise
+        raise AssertionError("unreachable: spec is importable after all")
     result: dict[str, str] = {}
     for table_name in spec.tensor_map_recipe:
         table = _MAPPING_TABLES.get(table_name)

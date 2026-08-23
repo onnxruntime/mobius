@@ -158,13 +158,13 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         gguf_arch="gemma",
         model_type="gemma",
         tensor_map_recipe=("llama",),
-        tensor_processor="gemma",
+        tensor_processor="unoffset_norm",
     ),
     GGUFArchitectureSpec(
         gguf_arch="gemma2",
         model_type="gemma2",
         tensor_map_recipe=("llama", "gemma2_extras"),
-        tensor_processor="gemma",
+        tensor_processor="unoffset_norm",
         config_postprocessor="gemma2",
     ),
     GGUFArchitectureSpec(
@@ -173,7 +173,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map_recipe=("llama", "gemma3_extras"),
         # models/gemma3_text.py normalizes with OffsetRMSNorm, so the llama.cpp
         # `+1` baked into every *norm.weight must be removed on import.
-        tensor_processor="gemma",
+        tensor_processor="unoffset_norm",
         config_postprocessor="gemma3",
     ),
     GGUFArchitectureSpec(
@@ -229,7 +229,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         gguf_arch="nemotron",
         model_type="nemotron",
         tensor_map_recipe=("llama",),
-        tensor_processor="nemotron",
+        tensor_processor="unoffset_norm",
     ),
     GGUFArchitectureSpec(
         gguf_arch="hunyuan-dense",
