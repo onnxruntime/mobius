@@ -279,6 +279,40 @@ class TestDecoderPackageFacts:
         assert locations == ["tokenizer.json", "tokenizer_config.json"]
         assert all((package_dir / location).is_file() for location in locations)
 
+    def test_dispatcher_reads_definition_from_package_and_declarations_from_source(
+        self, tmp_path, monkeypatch
+    ):
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "genai_config.json").write_text(
+            json.dumps({"model": {"eos_token_id": _IMAGE_ID}}), encoding="utf-8"
+        )
+        package_dir = tmp_path / "package"
+
+        def _materialize_tokenizer(output_dir, source, *, revision=None):
+            del source, revision
+            return str(_write_tokenizer(Path(output_dir), added={_IMAGE_ID: "<|endoftext|>"}))
+
+        monkeypatch.setattr(
+            "mobius.integrations.onnx_genai.auto_export._write_hf_tokenizer",
+            _materialize_tokenizer,
+        )
+        artifacts = write_onnx_genai_config(
+            _decoder_package(_TextCfg()),
+            str(package_dir),
+            config=_TextCfg(),
+            source=str(source),
+        )
+
+        metadata = yaml.safe_load(Path(artifacts["inference_metadata"]).read_text())
+        tokenizer = metadata["package"]["tokenizer"]
+        assert tokenizer["vocab_size"] == _IMAGE_ID + 1
+        assert tokenizer["special_tokens"]["eos"] == {
+            "id": _IMAGE_ID,
+            "content": "<|endoftext|>",
+        }
+        assert tokenizer["artifacts"] == [{"location": "tokenizer.json"}]
+
 
 class TestMultimodalPackageFacts:
     """A multimodal package must state where an image goes in the prompt."""
