@@ -2046,9 +2046,13 @@ def write_native_vlm_package_metadata(
         write_vlm_workflow_metadata,
     )
 
-    path = write_vlm_workflow_metadata(pkg, directory, config, source=source)
-    artifacts = {"inference_metadata": path}
-    artifacts.update(_copy_runtime_assets(directory, source, revision=revision))
+    # Assets first: the workflow document declares their package-relative
+    # locations under ``package.tokenizer.artifacts``, so they have to be in the
+    # package before the document that names them is written.
+    artifacts = _copy_runtime_assets(directory, source, revision=revision)
+    artifacts["inference_metadata"] = write_vlm_workflow_metadata(
+        pkg, directory, config, source=source
+    )
     return artifacts
 
 
