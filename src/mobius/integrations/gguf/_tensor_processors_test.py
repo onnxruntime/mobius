@@ -99,6 +99,40 @@ class TestProcessTensorsLlama:
             original,
         )
 
+    def test_internlm2_reverses_the_pinned_converter_permutation(self) -> None:
+        """InternLM2's converter calls LlamaModel.permute for both Q and K."""
+        config = self._make_config(
+            model_type="internlm2",
+            num_heads=4,
+            num_kv_heads=2,
+        )
+        config._gguf_arch = "internlm2"
+        original_q = torch.arange(64 * 8, dtype=torch.float32).reshape(64, 8)
+        original_k = torch.arange(32 * 8, dtype=torch.float32).reshape(32, 8)
+        state_dict = {
+            "model.layers.0.self_attn.q_proj.weight": self._forward_permute(original_q, 4),
+            "model.layers.0.self_attn.k_proj.weight": self._forward_permute(original_k, 2),
+        }
+
+        result = process_tensors(state_dict, config)
+
+        torch.testing.assert_close(
+            result["model.layers.0.self_attn.q_proj.weight"], original_q
+        )
+        torch.testing.assert_close(
+            result["model.layers.0.self_attn.k_proj.weight"], original_k
+        )
+
+    def test_dense_cohort_converter_permutation_contract(self) -> None:
+        from mobius.integrations.gguf._tensor_processors import (
+            needs_llama_qk_permute,
+        )
+
+        for model_type in ("olmo", "arcee", "smollm3", "internlm2"):
+            assert needs_llama_qk_permute(model_type)
+        for model_type in ("olmo2", "cohere2", "exaone"):
+            assert not needs_llama_qk_permute(model_type)
+
     def test_reverse_matches_hf_reference_head_dim_64(self) -> None:
         """Reverse permute must match HF's reference for real head dims.
 

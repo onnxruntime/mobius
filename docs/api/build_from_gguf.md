@@ -99,10 +99,13 @@ reason.
 
 | GGUF architecture | Accepted aliases | mobius `model_type` | Status |
 |---|---|---|---|
+| `arcee` | — | `arcee` | runtime deferred |
 | `bloom` | — | `bloom` | tensor_map deferred |
 | `clip` | — | — | config rejected; tensor_map rejected; graph rejected; runtime rejected |
+| `cohere2` | — | `cohere2` | runtime deferred |
 | `deci` | — | `llama` | supported |
 | `deepseek4` | — | `deepseek_v4` | supported |
+| `exaone` | — | `exaone` | runtime deferred |
 | `falcon` | — | `falcon` | supported |
 | `gemma` | — | `gemma` | supported |
 | `gemma2` | — | `gemma2` | supported |
@@ -117,6 +120,8 @@ reason.
 | `muse-glimmer` | `muse_glimmer` | `muse_glimmer_text` | supported |
 | `nemotron` | — | `nemotron` | supported |
 | `nemotron_h_moe` | — | — | config rejected; tensor_map rejected; graph rejected; runtime rejected |
+| `olmo` | — | `olmo` | supported |
+| `olmo2` | — | `olmo2` | supported |
 | `phi3` | — | `phi3` | supported |
 | `qwen2` | — | `qwen2` | supported |
 | `qwen2moe` | `qwen2_moe` | `qwen2_moe` | supported |
@@ -124,6 +129,7 @@ reason.
 | `qwen35` | — | `qwen3_5_text` | supported |
 | `qwen35moe` | — | `qwen3_5_moe` | supported |
 | `qwen3moe` | `qwen3_moe` | `qwen3_moe` | supported |
+| `smollm3` | — | `smollm3` | supported |
 | `stablelm` | — | `stablelm` | supported |
 | `starcoder2` | — | `starcoder2` | supported |
 | `t5` | — | `t5` | tensor_map deferred |
@@ -142,6 +148,34 @@ upstream cohort, so an unsupported input is never mistaken for a broken one.
 
 Sharded GGUF files are rejected. A single shard has only part of the tensor
 table, and treating it as a complete checkpoint would create a corrupt model.
+
+### Dense-transformer validation
+
+The first dense-transformer cohort adds exact config, tensor-map, and graph
+support for OLMo, OLMo2, Cohere2, Arcee, SmolLM3, and Exaone. Runtime remains
+deferred for Cohere2, Arcee, and Exaone until pinned real-weight parity or
+generation evidence is available; synthetic graph execution alone is not a
+runtime claim.
+
+Runtime coverage for the other three mappings is pinned to:
+
+| Architecture | Revision and file | Size | SHA-256 | Stored qtypes |
+|---|---|---:|---|---|
+| OLMo | `QuantFactory/AMD-OLMo-1B-GGUF@5f34243a42dbae2141b8f5286320bf63d51eeefb`<br>`AMD-OLMo-1B.Q4_K_M.gguf` | 733,520,128 | `2a848051ef7a3edfd829ce915835794e789e6ed7f425066c242759b8dbc645b4` | 96 Q4_K, 17 Q6_K |
+| OLMo2 | `allenai/OLMo-2-0425-1B-Instruct-GGUF@62f8c199538474c3e33ed5d7e0580abd66686a27`<br>`OLMo-2-0425-1B-Instruct-Q4_K_M.gguf` | 935,515,296 | `abd8187934a438fbf7cfff0a1de5b9d2793ce913f158794df1951dcba6c93cc6` | 97 Q4_K, 17 Q6_K, 65 F32 |
+| SmolLM3 | `ggml-org/SmolLM3-3B-GGUF@4965cb60b150737b68a0408c36aeefb65078f894`<br>`SmolLM3-Q4_K_M.gguf` | 1,915,305,312 | `8334b850b7bd46238c16b0c550df2138f0889bf433809008cc17a8b05761863e` | 216 Q4_K, 37 Q6_K, 73 F32 |
+
+For these mixed Q4_K_M artifacts, projections are not preserved natively.
+Q4_K and Q6_K tensors are dequantized and affine-requantized to explicit
+zero-point 4-bit/block-32 `MatMulNBits`; compatible token embeddings use
+`GatherBlockQuantized`, and float normalization tensors remain float.
+Pinned integration tests save the packages, open ORT CPU sessions, and verify
+repeatable logits and greedy outputs.
+
+Other C01 candidates remain excluded until their distinct semantics are
+implemented and validated. These include fused/interleaved or dual-form QKV
+(GPT-NeoX and Phi-2), ALiBi (Baichuan and MPT), learned position embeddings
+(StarCoder), and unproven model aliases (Qwen and Command-R).
 
 ## Supported stored quantization types
 

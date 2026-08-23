@@ -68,10 +68,13 @@ _DEFAULT_KEY_MAP: dict[str, str] = {
     "attention.head_count": "num_attention_heads",
     "attention.head_count_kv": "num_key_value_heads",
     "attention.layer_norm_rms_epsilon": "rms_norm_eps",
+    "attention.layer_norm_epsilon": "rms_norm_eps",
     "rope.freq_base": "rope_theta",
     "context_length": "max_position_embeddings",
     "vocab_size": "vocab_size",
     "rope.dimension_count": "head_dim",
+    "attention.sliding_window": "sliding_window",
+    "logit_scale": "logit_scale",
     # MoE fields
     "expert_count": "num_local_experts",
     "expert_used_count": "num_experts_per_tok",
@@ -279,6 +282,17 @@ def gguf_to_config(
     # tensor-mapping gate raises for those, with a reason.
     spec = try_get_arch_spec(gguf_arch)
     canonical_arch = spec.gguf_arch if spec is not None else gguf_arch
+    if spec is not None:
+        missing_metadata = [
+            suffix
+            for suffix in spec.required_metadata
+            if f"{gguf_arch}.{suffix}" not in metadata
+        ]
+        if missing_metadata:
+            raise ValueError(
+                f"GGUF architecture {gguf_arch!r} is missing required metadata: "
+                f"{', '.join(missing_metadata)}"
+            )
 
     # Resolve model_type
     model_type = GGUF_ARCH_TO_MODEL_TYPE.get(gguf_arch, gguf_arch)
@@ -334,6 +348,10 @@ def gguf_to_config(
     key_length = metadata.get(f"{gguf_arch}.attention.key_length")
     if key_length is not None:
         head_dim = int(key_length)
+    elif canonical_arch == "cohere2":
+        # Cohere2's rope.dimension_count is the rotated prefix, not the full
+        # attention head width. The graph still projects hidden_size / heads.
+        head_dim = hidden_size // num_attention_heads
     elif head_dim is None:
         head_dim = hidden_size // num_attention_heads
 
@@ -374,9 +392,9 @@ def gguf_to_config(
     linear_value_head_dim = int(ssm_state_size) if ssm_state_size else None
 
     # Derive partial_rotary_factor from rope.dimension_count / head_dim.
-    rope_dim = hf_fields.get("head_dim")  # from rope.dimension_count
+    rope_dim = metadata.get(f"{gguf_arch}.rope.dimension_count")
     if rope_dim is not None and head_dim > 0 and rope_dim != head_dim:
-        partial_rotary_factor = rope_dim / head_dim
+        partial_rotary_factor = int(rope_dim) / head_dim
     else:
         partial_rotary_factor = 1.0
 
@@ -520,6 +538,7 @@ def gguf_to_config(
         num_hash_layers=hf_fields.get("num_hash_layers", 0),
         swiglu_limit=swiglu_limit,
         sliding_window=hf_fields.get("sliding_window"),
+        logit_scale=hf_fields.get("logit_scale", 1.0),
         original_max_position_embeddings=(
             rope_scaling.get("original_max_position_embeddings")
             if rope_scaling is not None
@@ -888,6 +907,74 @@ def _gemma3_postprocess(
     return config
 
 
+def _olmo_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> ArchitectureConfig:
+    """Reject OLMo variants whose QKV clamp the current graph cannot express."""
+    clamp = metadata.get("olmo.attention.clamp_kqv")
+    if clamp is not None and float(clamp) > 0:
+        raise ValueError(
+            "GGUF metadata olmo.attention.clamp_kqv is non-zero, but mobius's "
+            "OLMo attention graph does not implement QKV activation clamping."
+        )
+    return config
+
+
+def _dense_sliding_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> ArchitectureConfig:
+    """Apply dense-architecture attention semantics omitted by generic GGUF metadata."""
+    arch = config._gguf_arch
+    if arch == "olmo2":
+        config.attn_qk_norm = True
+        config.attn_qk_norm_full = True
+    elif arch == "cohere2":
+        # Cohere2 rotates adjacent even/odd pairs rather than split halves.
+        config.rope_interleave = True
+        config.layer_types = [
+            "full_attention" if (layer_index + 1) % 4 == 0 else "sliding_attention"
+            for layer_index in range(config.num_hidden_layers)
+        ]
+        config.no_rope_layers = [
+            0 if layer_type == "full_attention" else 1 for layer_type in config.layer_types
+        ]
+    elif arch == "smollm3":
+        # llama.cpp does not serialize no_rope_layer_interval. SmolLM3 fixes it
+        # at four: every fourth layer skips RoPE.
+        config.no_rope_layers = [
+            0 if (layer_index + 1) % 4 == 0 else 1
+            for layer_index in range(config.num_hidden_layers)
+        ]
+
+    pattern = metadata.get(f"{arch}.attention.sliding_window_pattern")
+    if pattern is None:
+        return config
+    if arch == "olmo2":
+        raise ValueError(
+            "GGUF architecture olmo2 carries an attention.sliding_window_pattern "
+            "(OLMo3 semantics), but mobius's OLMo2 graph does not yet implement "
+            "per-layer sliding attention."
+        )
+    if not isinstance(pattern, (list, tuple, np.ndarray)):
+        raise TypeError(
+            f"GGUF metadata {arch}.attention.sliding_window_pattern must be a "
+            f"per-layer bool array, got {type(pattern).__name__}."
+        )
+    if len(pattern) != config.num_hidden_layers:
+        raise ValueError(
+            f"GGUF metadata {arch}.attention.sliding_window_pattern has "
+            f"{len(pattern)} entries for {config.num_hidden_layers} layers."
+        )
+    config.layer_types = [
+        "sliding_attention" if bool(is_sliding) else "full_attention" for is_sliding in pattern
+    ]
+    return config
+
+
 def _muse_glimmer_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -1021,6 +1108,8 @@ def _muse_glimmer_qk_scale_factor(model: Any, default: float) -> float:
 # model_type keying is what let the Gemma weight processor drift out of reach
 # when an architecture's model_type gained a ``_text`` suffix.
 _CONFIG_POSTPROCESSORS: dict[str, Any] = {
+    "olmo": _olmo_postprocess,
+    "dense_sliding": _dense_sliding_postprocess,
     "gemma2": _gemma2_postprocess,
     "gemma3": _gemma3_postprocess,
     "gemma4": _gemma4_postprocess,
@@ -1037,6 +1126,8 @@ def _default_activation(model_type: str) -> str:
     if model_type.startswith("gemma"):
         return "gelu_pytorch_tanh"
     # Most modern models use SiLU/Swish
+    if model_type == "arcee":
+        return "relu2"
     gelu_models = {"gpt2", "bloom", "starcoder2", "t5"}
     if model_type in gelu_models:
         return "gelu"

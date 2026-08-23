@@ -92,6 +92,12 @@ _MMPROJ_REASON = (
     "than building it directly."
 )
 
+_RUNTIME_VALIDATION_PENDING = (
+    "Config extraction, exact tensor-name closure, and a full synthetic GGUF graph build "
+    "are covered, but no representative real-weight GGUF has yet passed ORT parity or "
+    "generation validation. Runtime packaging remains deferred until that evidence exists."
+)
+
 
 _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     # ---------------------------------------------------------------- Llama
@@ -224,6 +230,64 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         gguf_arch="internlm2",
         model_type="internlm2",
         tensor_map_recipe=("llama",),
+        tensor_processor="llama",
+        llama_qk_permute=True,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="olmo",
+        model_type="olmo",
+        tensor_map_recipe=("olmo",),
+        config_postprocessor="olmo",
+        required_metadata=("attention.layer_norm_epsilon",),
+        tensor_processor="llama",
+        llama_qk_permute=True,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="olmo2",
+        model_type="olmo2",
+        tensor_map_recipe=("llama", "olmo2_extras"),
+        config_postprocessor="dense_sliding",
+        required_metadata=("attention.layer_norm_rms_epsilon",),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="cohere2",
+        model_type="cohere2",
+        tensor_map_recipe=("llama",),
+        config_postprocessor="dense_sliding",
+        required_metadata=(
+            "attention.layer_norm_epsilon",
+            "attention.sliding_window",
+            "logit_scale",
+        ),
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="arcee",
+        model_type="arcee",
+        tensor_map_recipe=("arcee",),
+        required_metadata=("attention.layer_norm_rms_epsilon",),
+        tensor_processor="llama",
+        llama_qk_permute=True,
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="smollm3",
+        model_type="smollm3",
+        tensor_map_recipe=("llama",),
+        config_postprocessor="dense_sliding",
+        required_metadata=("attention.layer_norm_rms_epsilon",),
+        tensor_processor="llama",
+        llama_qk_permute=True,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="exaone",
+        model_type="exaone",
+        tensor_map_recipe=("llama",),
+        required_metadata=("attention.layer_norm_rms_epsilon",),
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="nemotron",

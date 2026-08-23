@@ -8,6 +8,152 @@ from __future__ import annotations
 import pytest
 
 
+class _FakeDenseGGUF:
+    def __init__(self, architecture: str, metadata: dict, tensor_names: list[str]):
+        self.architecture = architecture
+        self.metadata = metadata
+        self.tensor_names = tensor_names
+
+    def get_metadata(self, key, default=None):
+        return self.metadata.get(key, default)
+
+
+def _dense_metadata(architecture: str) -> dict:
+    return {
+        f"{architecture}.embedding_length": 64,
+        f"{architecture}.feed_forward_length": 128,
+        f"{architecture}.block_count": 2,
+        f"{architecture}.attention.head_count": 4,
+        f"{architecture}.attention.head_count_kv": 2,
+        f"{architecture}.context_length": 512,
+        f"{architecture}.rope.freq_base": 10_000.0,
+        f"{architecture}.rope.dimension_count": 16,
+        f"{architecture}.vocab_size": 256,
+    }
+
+
+class TestDenseCohortConfig:
+    @pytest.mark.parametrize("architecture", ["arcee", "smollm3", "exaone"])
+    def test_rmsnorm_dense_configs(self, architecture: str) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = _dense_metadata(architecture)
+        metadata[f"{architecture}.attention.layer_norm_rms_epsilon"] = 1e-5
+        config = gguf_to_config(
+            _FakeDenseGGUF(
+                architecture,
+                metadata,
+                ["token_embd.weight", "output.weight", "blk.0.attn_q.weight"],
+            )
+        )
+
+        assert config.model_type == architecture
+        assert config.rms_norm_eps == pytest.approx(1e-5)
+        assert config.hidden_act == ("relu2" if architecture == "arcee" else "silu")
+
+    def test_olmo_weight_free_layernorm_config(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = _dense_metadata("olmo")
+        metadata["olmo.attention.layer_norm_epsilon"] = 1e-5
+        config = gguf_to_config(
+            _FakeDenseGGUF("olmo", metadata, ["token_embd.weight", "output.weight"])
+        )
+
+        assert config.model_type == "olmo"
+        assert config.rms_norm_eps == pytest.approx(1e-5)
+
+    def test_olmo_rejects_nonzero_qkv_clamp(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = _dense_metadata("olmo")
+        metadata["olmo.attention.layer_norm_epsilon"] = 1e-5
+        metadata["olmo.attention.clamp_kqv"] = 8.0
+        with pytest.raises(ValueError, match="clamp_kqv"):
+            gguf_to_config(_FakeDenseGGUF("olmo", metadata, ["token_embd.weight"]))
+
+    def test_olmo2_qk_norm_and_olmo3_pattern_rejection(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = _dense_metadata("olmo2")
+        metadata["olmo2.attention.layer_norm_rms_epsilon"] = 1e-6
+        config = gguf_to_config(
+            _FakeDenseGGUF("olmo2", metadata, ["token_embd.weight", "output.weight"])
+        )
+
+        assert config.model_type == "olmo2"
+        assert config.attn_qk_norm is True
+        assert config.attn_qk_norm_full is True
+
+        metadata["olmo2.attention.sliding_window"] = 128
+        metadata["olmo2.attention.sliding_window_pattern"] = [True, False]
+        with pytest.raises(ValueError, match="OLMo3 semantics"):
+            gguf_to_config(
+                _FakeDenseGGUF("olmo2", metadata, ["token_embd.weight", "output.weight"])
+            )
+
+    def test_cohere2_logit_scale_and_partial_rope(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = _dense_metadata("cohere2")
+        metadata["cohere2.block_count"] = 4
+        metadata["cohere2.attention.layer_norm_epsilon"] = 1e-5
+        metadata["cohere2.attention.sliding_window"] = 128
+        metadata["cohere2.logit_scale"] = 0.0625
+        metadata["cohere2.rope.dimension_count"] = 8
+        config = gguf_to_config(
+            _FakeDenseGGUF("cohere2", metadata, ["token_embd.weight", "output_norm.weight"])
+        )
+
+        assert config.model_type == "cohere2"
+        assert config.logit_scale == pytest.approx(0.0625)
+        assert config.head_dim == 16
+        assert config.partial_rotary_factor == pytest.approx(0.5)
+        assert config.rope_interleave is True
+        assert config.layer_types == [
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
+        ]
+        assert config.no_rope_layers == [1, 1, 1, 0]
+
+    def test_smollm3_reconstructs_fixed_no_rope_schedule(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = _dense_metadata("smollm3")
+        metadata["smollm3.block_count"] = 8
+        metadata["smollm3.attention.layer_norm_rms_epsilon"] = 1e-6
+        config = gguf_to_config(
+            _FakeDenseGGUF("smollm3", metadata, ["token_embd.weight", "output.weight"])
+        )
+
+        assert config.no_rope_layers == [1, 1, 1, 0, 1, 1, 1, 0]
+
+    @pytest.mark.parametrize(
+        ("architecture", "required_suffix"),
+        [
+            ("olmo", "attention.layer_norm_epsilon"),
+            ("olmo2", "attention.layer_norm_rms_epsilon"),
+            ("cohere2", "logit_scale"),
+            ("arcee", "attention.layer_norm_rms_epsilon"),
+        ],
+    )
+    def test_missing_required_metadata_is_rejected(
+        self, architecture: str, required_suffix: str
+    ) -> None:
+        from mobius.integrations.gguf._arch_registry import get_arch_spec
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = _dense_metadata(architecture)
+        for suffix in get_arch_spec(architecture).required_metadata:
+            metadata[f"{architecture}.{suffix}"] = 1
+        del metadata[f"{architecture}.{required_suffix}"]
+
+        with pytest.raises(ValueError, match=required_suffix):
+            gguf_to_config(_FakeDenseGGUF(architecture, metadata, ["token_embd.weight"]))
+
+
 class TestGemma3Postprocess:
     """Gemma3 config postprocessing fills fields GGUF omits."""
 

@@ -25,8 +25,19 @@ from typing import TYPE_CHECKING
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius.components import MLP, Attention, LayerNorm, LayerNormNoBias, StaticCacheState
-from mobius.models.base import LayerNormCausalLMModel, LayerNormTextModel
+from mobius.components import (
+    MLP,
+    Attention,
+    LayerNorm,
+    LayerNormNoBias,
+    StaticCacheState,
+    create_attention_bias,
+)
+from mobius.models.base import (
+    LayerNormCausalLMModel,
+    LayerNormTextModel,
+    linear_class_for_config,
+)
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -39,12 +50,12 @@ class _CohereDecoderLayer(nn.Module):
     are summed before the residual addition, matching HF ``CohereDecoderLayer``.
     """
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(self, config: ArchitectureConfig, linear_class=None):
         super().__init__()
         # Single shared norm (HF: input_layernorm only, no bias, no post_attention_layernorm)
         self.input_layernorm = LayerNormNoBias(config.hidden_size, eps=config.rms_norm_eps)
-        self.self_attn = Attention(config, rms_norm_class=LayerNorm)
-        self.mlp = MLP(config)
+        self.self_attn = Attention(config, rms_norm_class=LayerNorm, linear_class=linear_class)
+        self.mlp = MLP(config, linear_class=linear_class)
 
     def forward(
         self,
@@ -84,12 +95,68 @@ class _CohereTextModel(LayerNormTextModel):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config)
+        linear_class = linear_class_for_config(config)
         # Replace the two-norm decoder layers with single-norm parallel layers.
         self.layers = nn.ModuleList(
-            [_CohereDecoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [
+                _CohereDecoderLayer(config, linear_class=linear_class)
+                for _ in range(config.num_hidden_layers)
+            ]
         )
         # Final norm is weight-only (no bias) — override LayerNormTextModel's default.
         self.norm = LayerNormNoBias(config.hidden_size, eps=config.rms_norm_eps)
+        self.layer_types = config.layer_types
+        self.no_rope_layers = config.no_rope_layers
+
+    def forward(
+        self,
+        op: OpBuilder,
+        input_ids: ir.Value,
+        attention_mask: ir.Value | None,
+        position_ids: ir.Value,
+        past_key_values: list | None = None,
+        inputs_embeds: ir.Value | None = None,
+        deepstack_embeds: list | None = None,
+    ):
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = self.embed_tokens(op, input_ids)
+        position_embeddings = self.rotary_emb(op, position_ids)
+
+        full_attn_bias = create_attention_bias(
+            op,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            dtype=self._dtype,
+        )
+        sliding_attn_bias = create_attention_bias(
+            op,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            sliding_window=self.config.sliding_window,
+            dtype=self._dtype,
+        )
+
+        present_key_values = []
+        past_kvs = past_key_values or [None] * len(self.layers)
+        for layer_index, (layer, past_kv) in enumerate(zip(self.layers, past_kvs)):
+            layer_type = (
+                self.layer_types[layer_index] if self.layer_types else "full_attention"
+            )
+            use_rope = self.no_rope_layers is None or self.no_rope_layers[layer_index] == 1
+            hidden_states, present_kv = layer(
+                op,
+                hidden_states=hidden_states,
+                attention_bias=(
+                    sliding_attn_bias if layer_type == "sliding_attention" else full_attn_bias
+                ),
+                position_embeddings=position_embeddings if use_rope else None,
+                past_key_value=past_kv,
+            )
+            present_key_values.append(present_kv)
+
+        return self.norm(op, hidden_states), present_key_values
 
 
 class CohereCausalLMModel(LayerNormCausalLMModel):
@@ -108,7 +175,7 @@ class CohereCausalLMModel(LayerNormCausalLMModel):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config)
-        self.model = _CohereTextModel(config)
+        self._replace_text_model(_CohereTextModel(config))
         self.logit_scale = config.logit_scale
 
     def forward(

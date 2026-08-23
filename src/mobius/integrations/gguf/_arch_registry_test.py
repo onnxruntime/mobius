@@ -44,14 +44,19 @@ from mobius.integrations.gguf._errors import (
 )
 from mobius.integrations.gguf._mmproj import _VLM_BUILDERS
 from mobius.integrations.gguf._spec import Support
-from mobius.integrations.gguf._tensor_mapping import _MAPPING_TABLES
+from mobius.integrations.gguf._tensor_mapping import (
+    _MAPPING_TABLES,
+    _build_mapping,
+    is_known_skip,
+    map_gguf_to_hf_names,
+)
 from mobius.integrations.gguf._tensor_processors import _PROCESSOR_IMPLS
 from mobius.integrations.gguf._upstream import upstream_architectures
 
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 23
+_EXPECTED_SUPPORTED_COUNT = 29
 
 
 class TestCapabilityClosure:
@@ -197,6 +202,37 @@ class TestDerivedViewsAgree:
             GGUF_ARCH_TO_MODEL_TYPE["nope"] = "nope"  # type: ignore[index]
 
 
+class TestPinnedTensorClosure:
+    """Every pinned source tensor must map or be an intentional computed skip."""
+
+    _NEW_ARCHITECTURES = ("olmo", "olmo2", "cohere2", "arcee", "smollm3", "exaone")
+
+    @staticmethod
+    def _unmapped(architecture: str) -> list[str]:
+        upstream = upstream_architectures()[architecture]
+        unmapped = []
+        for family in upstream.tensor_families:
+            name = family.replace("{bid}", "0") + ".weight"
+            if map_gguf_to_hf_names(name, architecture) is None and not is_known_skip(name):
+                unmapped.append(family)
+        return unmapped
+
+    @pytest.mark.parametrize("architecture", _NEW_ARCHITECTURES)
+    def test_every_pinned_tensor_family_closes(self, architecture: str) -> None:
+        assert not self._unmapped(architecture)
+
+    def test_deleting_one_mapping_breaks_closure(self) -> None:
+        """Falsify the support claim rather than only testing the happy path."""
+        olmo_mapping = _MAPPING_TABLES["olmo"]
+        removed = olmo_mapping.pop("blk.{bid}.attn_q")
+        _build_mapping.cache_clear()
+        try:
+            assert self._unmapped("olmo") == ["blk.{bid}.attn_q"]
+        finally:
+            olmo_mapping["blk.{bid}.attn_q"] = removed
+            _build_mapping.cache_clear()
+
+
 class TestRejectionsAreActionable:
     """An unsupported input must say what it is and what to do instead."""
 
@@ -257,7 +293,7 @@ class TestDocumentedSupportMatrix:
             model_type = f"`{spec.model_type}`" if spec.model_type else "—"
             status = (
                 "supported"
-                if spec.is_importable
+                if all(verdict is Support.SUPPORTED for verdict in spec.verdicts.values())
                 else "; ".join(
                     f"{name} {verdict.value}"
                     for name, verdict in spec.verdicts.items()
