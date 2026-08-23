@@ -171,6 +171,9 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         gguf_arch="gemma3",
         model_type="gemma3_text",
         tensor_map_recipe=("llama", "gemma3_extras"),
+        # models/gemma3_text.py normalizes with OffsetRMSNorm, so the llama.cpp
+        # `+1` baked into every *norm.weight must be removed on import.
+        tensor_processor="gemma",
         config_postprocessor="gemma3",
     ),
     GGUFArchitectureSpec(

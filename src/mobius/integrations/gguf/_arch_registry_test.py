@@ -17,6 +17,7 @@ apart, so that the same divergence cannot be reintroduced silently:
 
 from __future__ import annotations
 
+import inspect
 import re
 from typing import ClassVar
 
@@ -232,3 +233,66 @@ class TestRejectionsAreActionable:
             get_arch_spec("definitely-not-real")
         with pytest.raises(NotImplementedError):
             get_arch_spec("nemotron_h_moe")
+
+
+class TestOffsetNormCompensation:
+    """Offset-norm architectures must have their llama.cpp ``+1`` removed.
+
+    llama.cpp bakes the ``1 +`` of a centered RMSNorm into the stored weight so
+    its generic kernel can use the tensor directly. Any mobius model that
+    normalizes with ``OffsetRMSNorm`` re-applies that ``1 +`` at runtime, so the
+    import path has to subtract it back out — through the Gemma weight
+    processor or through the ``offset_norm`` normalization hook.
+
+    Gemma 3 failed exactly this: it used ``OffsetRMSNorm`` and had neither,
+    because its processor was registered under ``model_type`` ``gemma3`` while
+    GGUF ``gemma3`` resolves to ``gemma3_text``. Every norm was left doubled.
+
+    Gemma 4 deliberately passes with neither, because ``models/gemma4.py``
+    normalizes with plain ``RMSNorm``.
+    """
+
+    _OFFSET_CALL = re.compile(
+        r"(?<![\w.])OffsetRMSNorm\s*\(|(?:rms_)?norm_class=OffsetRMSNorm"
+    )
+
+    @classmethod
+    def _model_uses_offset_norm(cls, model_type: str) -> bool:
+        registration = _REGISTRATIONS[model_type]
+        module_class = getattr(registration, "module_class", None) or getattr(
+            registration, "model_class", None
+        )
+        if module_class is None:
+            return False
+        module = inspect.getmodule(module_class)
+        if module is None:
+            return False
+        try:
+            source = inspect.getsource(module)
+        except OSError:
+            return False
+        return bool(cls._OFFSET_CALL.search(source))
+
+    @pytest.mark.parametrize(
+        "spec",
+        [s for s in iter_arch_specs() if s.is_importable],
+        ids=lambda s: s.gguf_arch,
+    )
+    def test_offset_norm_models_have_compensation(self, spec) -> None:
+        assert spec.model_type is not None
+        if not self._model_uses_offset_norm(spec.model_type):
+            return
+        compensated = spec.tensor_processor == "gemma" or spec.offset_norm
+        assert compensated, (
+            f"{spec.gguf_arch}: {spec.model_type} normalizes with OffsetRMSNorm, so "
+            "llama.cpp's baked-in +1 must be removed on import via the 'gemma' "
+            "tensor processor or the offset_norm hook. Without it every norm is "
+            "applied twice and the model produces garbage."
+        )
+
+    def test_gemma4_is_deliberately_uncompensated(self) -> None:
+        """Guard the inverse: applying the un-offset here would corrupt Gemma 4."""
+        spec = get_arch_spec("gemma4")
+        assert not self._model_uses_offset_norm("gemma4_text")
+        assert spec.tensor_processor is None
+        assert not spec.offset_norm
