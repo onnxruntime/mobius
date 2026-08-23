@@ -61,6 +61,49 @@ class TestReUseConfig:
         assert config.sampling_rate == 8000
         assert config.model_type == "reuse"
 
+    def test_from_json_defaults_match_the_dataclass(self):
+        """An absent field must fall back to the same value the dataclass declares.
+
+        ``from_json`` previously defaulted ``num_tfmamba`` to 4 while the dataclass
+        said 30, so a config.json missing that key would silently build a model an
+        eighth of the real depth — and still load, because every layer is
+        independently named.
+        """
+        from_empty = ReUseConfig.from_json({})
+        declared = ReUseConfig()
+        for field in (
+            "input_channel",
+            "output_channel",
+            "hid_feature",
+            "num_tfmamba",
+            "d_state",
+            "d_conv",
+            "expand",
+            "norm_epsilon",
+            "n_fft",
+            "hop_size",
+            "win_size",
+            "sampling_rate",
+            "compress_factor",
+        ):
+            assert getattr(from_empty, field) == getattr(declared, field), field
+
+    def test_compress_factor_is_read_from_model_cfg(self):
+        """It describes a front-end step but is declared under ``model_cfg`` upstream.
+
+        Checked against the published nvidia/RE-USE config.json, where
+        ``compress_factor`` sits in ``model_cfg`` alongside ``hid_feature``, not in
+        ``stft_cfg`` with ``n_fft``. Reading it from ``stft_cfg`` would silently
+        fall back to the default for the real checkpoint.
+        """
+        config = ReUseConfig.from_json(
+            {
+                "model_cfg": {"compress_factor": "custom"},
+                "stft_cfg": {"compress_factor": "wrong"},
+            }
+        )
+        assert config.compress_factor == "custom"
+
     def test_real_checkpoint_shape_parameters(self):
         """The published config yields the checkpoint's real dimensions."""
         config = ReUseConfig.from_json(
@@ -383,6 +426,29 @@ class TestBuildReUse:
         pkg = build_reuse(str(self._checkpoint_dir(tmp_path)), load_weights=False)
 
         assert "model" in pkg
+
+    def test_norm_epsilon_reaches_every_normalization(self):
+        """``norm_epsilon`` must govern the LayerNorms too, not just the InstanceNorms.
+
+        The BiMamba LayerNorm hardcoded 1e-5, which happens to equal both PyTorch's
+        default and the published config's value, so nothing diverged in practice —
+        but a config setting a different epsilon would have been half-applied.
+        """
+        config = _tiny_config()
+        config.norm_epsilon = 3e-3
+        module = SEMambaSpeechEnhancementModel(config)
+        pkg = build_from_module(module, config, task=SpeechEnhancementTask())
+
+        epsilons = {
+            node.attributes["epsilon"].as_float()
+            for node in pkg["model"].graph
+            if node.op_type in ("LayerNormalization", "InstanceNormalization")
+            and "epsilon" in node.attributes
+        }
+        assert epsilons, "no normalization nodes found"
+        assert all(eps == pytest.approx(3e-3) for eps in epsilons), (
+            f"some normalizations ignore config.norm_epsilon: {sorted(epsilons)}"
+        )
 
 
 class TestEncoderFreqBins:

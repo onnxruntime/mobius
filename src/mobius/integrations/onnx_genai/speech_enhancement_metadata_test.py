@@ -121,6 +121,37 @@ class TestMetadata:
             assert binding["contract"]["rank"] == 3
             assert binding["dtype"] == "float32"
 
+    def test_declares_the_adapter_abi_when_the_front_end_ships(self):
+        """A runtime must be able to version-check the STFT adapter it has to supply.
+
+        The component already names the ABI, but a consumer reads the manifest to
+        decide whether it can run the package at all — the other audio workflows
+        declare it there, and omitting it hides the requirement until binding time.
+        """
+        pkg, config = _package()
+
+        metadata = build_speech_enhancement_workflow_metadata(pkg, config)
+
+        manifest = metadata["pipeline"]["workflow"]["manifest"]
+        component = metadata["pipeline"]["workflow"]["components"]["audio_preprocess"]
+        abi = component["implementation"]["abi"]
+        assert manifest["adapter_abis"][abi] == component["implementation"]["version"]
+
+    def test_omits_the_adapter_abi_when_no_front_end_ships(self):
+        """No adapter in the package means nothing for a runtime to version-check.
+
+        Declaring the ABI unconditionally would advertise a requirement the caller
+        does not have to satisfy, since it supplies the spectra itself.
+        """
+        pkg, config = _package()
+        config.sampling_rate = None  # type: ignore[assignment]
+
+        metadata = build_speech_enhancement_workflow_metadata(pkg, config)
+
+        manifest = metadata["pipeline"]["workflow"]["manifest"]
+        assert "adapter_abis" not in manifest
+        assert "audio_preprocess" not in metadata["pipeline"]["workflow"]["components"]
+
     def test_omits_the_program_when_geometry_is_unknown(self):
         """Never invent a transform program the config cannot justify."""
         pkg, config = _package()

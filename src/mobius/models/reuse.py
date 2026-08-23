@@ -105,8 +105,10 @@ class ReUseConfig(BaseModelConfig):
     win_size: int = 320
     #: Audio sample rate the model was trained for.
     sampling_rate: int = 8000
-    #: Magnitude compression applied before the model (informational only —
-    #: it is applied by the STFT front-end, outside this graph).
+    #: Magnitude compression applied before the model. Informational only: it is
+    #: applied by the STFT front-end, outside this graph. Note it is declared
+    #: under ``model_cfg`` in the checkpoint's config.json, not ``stft_cfg``,
+    #: despite describing a front-end step.
     compress_factor: str = "relu_log1p"
 
     model_type: str | None = "reuse"
@@ -168,7 +170,7 @@ class ReUseConfig(BaseModelConfig):
             input_channel=int(model_cfg.get("input_channel", 2)),
             output_channel=int(model_cfg.get("output_channel", 1)),
             hid_feature=int(model_cfg.get("hid_feature", 64)),
-            num_tfmamba=int(model_cfg.get("num_tfmamba", 4)),
+            num_tfmamba=int(model_cfg.get("num_tfmamba", 30)),
             d_state=int(model_cfg.get("d_state", 16)),
             d_conv=int(model_cfg.get("d_conv", 4)),
             expand=int(model_cfg.get("expand", 4)),
@@ -505,7 +507,7 @@ class BiMambaBlock(nn.Module):
             config.d_conv,
         )
         self.output_proj = Linear(2 * d_model, d_model, bias=True)
-        self.norm = LayerNorm(d_model, eps=1e-5)
+        self.norm = LayerNorm(d_model, eps=config.norm_epsilon)
 
     def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
         # x: (batch, seq_len, d_model)

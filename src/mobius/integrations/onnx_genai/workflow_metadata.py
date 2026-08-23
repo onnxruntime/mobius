@@ -10580,6 +10580,14 @@ def build_speech_enhancement_workflow_metadata(
 
     workflow = {
         "manifest": {
+            # Declared only when the STFT adapter is actually shipped. Without
+            # `transforms` the caller supplies the spectra directly, so there is no
+            # adapter for a runtime to version-check.
+            **(
+                {"adapter_abis": {_AUDIO_PREPROCESS_ABI: _AUDIO_PREPROCESS_ABI_VERSION}}
+                if transforms is not None
+                else {}
+            ),
             "capabilities": ["workflow_ssa", "linear_effects", "typed_emit"],
         },
         "effects": effects,
