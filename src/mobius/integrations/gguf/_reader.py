@@ -230,6 +230,11 @@ class GGUFModel:
         """
         return list(self._reader.tensors)
 
+    @property
+    def is_little_endian(self) -> bool:
+        """Whether raw tensor payloads use ONNX-compatible little-endian bytes."""
+        return getattr(self._reader.endianess, "name", None) == "LITTLE"
+
     def _dequantize_tensor(self, tensor) -> np.ndarray:
         """Dequantize a single :class:`ReaderTensor` to a numpy array.
 
@@ -342,6 +347,17 @@ class GGUFModel:
         if name not in self._tensor_index:
             raise KeyError(f"Tensor '{name}' not found in GGUF file.")
         return self._reader.get_tensor(self._tensor_index[name]).tensor_type
+
+    def tensor_storage_range(self, name: str) -> tuple[int, int, str]:
+        """Return the exact file offset, byte length, and qtype for a tensor."""
+        if name not in self._tensor_index:
+            raise KeyError(f"Tensor '{name}' not found in GGUF file.")
+        tensor = self._reader.get_tensor(self._tensor_index[name])
+        return (
+            int(tensor.data_offset),
+            int(tensor.n_bytes),
+            str(getattr(tensor.tensor_type, "name", tensor.tensor_type)),
+        )
 
     def __repr__(self) -> str:
         arch = self.architecture if self._reader else "?"

@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -388,6 +390,169 @@ def mixed_native_q5_q8_gguf(tmp_path: Path) -> Path:
         value_projection_quantization="q5_1",
     )
     return path
+
+
+class TestReuseGgufWeights:
+    """Tests for mixed GGUF references plus converted ONNX sidecar weights."""
+
+    def test_mixed_save_preserves_ranges_and_runs(self, tmp_path: Path):
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.gguf import (
+            build_from_gguf,
+            verify_gguf_reuse_manifest,
+        )
+
+        gguf_path = tmp_path / "model.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        package = build_from_gguf(gguf_path, reuse_gguf_weights=True)
+        package.save(str(tmp_path), progress_bar=False)
+
+        verify_gguf_reuse_manifest(tmp_path)
+        manifest = json.loads((tmp_path / "gguf-reuse.json").read_text())
+        converted = manifest["converted_tensors"]
+        assert len(converted) == len(set(converted))
+        assert converted.count("model.layers.0.self_attn.q_proj.weight") == 1
+        assert "model.embed_tokens.weight" not in converted
+        reloaded = ModelPackage.load(str(tmp_path))
+        initializers = reloaded["model"].graph.initializers
+        embedding = initializers["model.embed_tokens.weight"].const_value
+        q_proj = initializers["model.layers.0.self_attn.q_proj.weight"].const_value
+        assert isinstance(embedding, ir.ExternalTensor)
+        assert embedding.location == "model.gguf"
+        assert embedding.offset is not None
+        assert embedding.length == 256 * 64 * 4
+        # Llama Q weights require a logical row permutation, so they are converted.
+        assert isinstance(q_proj, ir.ExternalTensor)
+        assert q_proj.location == "model.onnx.data"
+
+        options = ort.SessionOptions()
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        session = ort.InferenceSession(
+            str(tmp_path / "model.onnx"),
+            sess_options=options,
+            providers=["CPUExecutionProvider"],
+        )
+        feeds = {
+            "input_ids": np.zeros((1, 2), dtype=np.int64),
+            "attention_mask": np.zeros((1, 2), dtype=np.int64),
+            "position_ids": np.zeros((1, 2), dtype=np.int64),
+            "past_key_values.0.key": np.zeros((1, 2, 0, 16), dtype=np.float32),
+            "past_key_values.0.value": np.zeros((1, 2, 0, 16), dtype=np.float32),
+        }
+        outputs = session.run(None, feeds)
+        assert outputs[0].shape == (1, 2, 256)
+        assert np.isfinite(outputs[0]).all()
+
+    def test_native_projection_bytes_are_not_copied_to_sidecar(self, tmp_path: Path):
+        from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        gguf_path = tmp_path / "model.gguf"
+        _write_quantized_gguf(
+            gguf_path,
+            architecture="qwen2",
+            hidden_size=256,
+            num_heads=4,
+            num_kv_heads=4,
+            intermediate_size=256,
+            projection_quantization="iq4_nl",
+        )
+        package = build_from_gguf(gguf_path, reuse_gguf_weights=True)
+        package.save(str(tmp_path), progress_bar=False)
+
+        source = GGUFModel(gguf_path)
+        offset, length, _ = source.tensor_storage_range("blk.0.attn_q.weight")
+        direct_payload = gguf_path.read_bytes()[offset : offset + length]
+        sidecar = (tmp_path / "model.onnx.data").read_bytes()
+        assert direct_payload not in sidecar
+
+        reloaded = ir.load(tmp_path / "model.onnx")
+        q_proj = reloaded.graph.initializers[
+            "model.layers.0.self_attn.q_proj.weight"
+        ].const_value
+        assert isinstance(q_proj, ir.ExternalTensor)
+        assert (q_proj.location, q_proj.offset, q_proj.length) == (
+            "model.gguf",
+            offset,
+            length,
+        )
+
+    def test_rejects_non_flat_source_and_detects_identity_change(self, tmp_path: Path):
+        from mobius.integrations.gguf import (
+            build_from_gguf,
+            verify_gguf_reuse_manifest,
+        )
+
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+        gguf_path = source_dir / "model.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        package = build_from_gguf(gguf_path, reuse_gguf_weights=True)
+
+        with pytest.raises(ValueError, match="flat same-directory packaging"):
+            package.save(str(tmp_path / "output"), progress_bar=False)
+
+        package.save(str(source_dir), progress_bar=False)
+        with gguf_path.open("r+b") as stream:
+            stream.seek(-1, 2)
+            byte = stream.read(1)
+            stream.seek(-1, 2)
+            stream.write(bytes([byte[0] ^ 0xFF]))
+        with pytest.raises(ValueError, match="identity mismatch"):
+            verify_gguf_reuse_manifest(source_dir)
+
+    def test_does_not_reuse_same_size_dtype_cast(self, tmp_path: Path):
+        from mobius.integrations.gguf import build_from_gguf
+
+        gguf_path = tmp_path / "model.gguf"
+        _write_quantized_gguf(
+            gguf_path,
+            projection_quantization="f16",
+            float_type="f16",
+        )
+        with pytest.raises(ValueError, match="no byte-compatible tensors"):
+            build_from_gguf(
+                gguf_path,
+                dtype="bf16",
+                reuse_gguf_weights=True,
+            )
+
+    def test_rejects_generated_artifact_name_collision(self, tmp_path: Path):
+        from mobius.integrations.gguf import build_from_gguf
+
+        gguf_path = tmp_path / "model.onnx.data"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        package = build_from_gguf(gguf_path, reuse_gguf_weights=True)
+        with pytest.raises(ValueError, match="collides"):
+            package.save(str(tmp_path), progress_bar=False)
+        # Validation happens before any generated artifact can truncate the source.
+        assert gguf_path.stat().st_size == package.gguf_reuse_plan.size
+
+    def test_rejects_hardlink_to_generated_artifact(self, tmp_path: Path):
+        from mobius.integrations.gguf import build_from_gguf
+
+        gguf_path = tmp_path / "source.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        package = build_from_gguf(gguf_path, reuse_gguf_weights=True)
+        os.link(gguf_path, tmp_path / "model.onnx.data")
+
+        with pytest.raises(ValueError, match="hard-linked"):
+            package.save(str(tmp_path), progress_bar=False)
+        assert gguf_path.stat().st_size == package.gguf_reuse_plan.size
+
+    def test_ordinary_resave_removes_stale_reuse_manifest(self, tmp_path: Path):
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.gguf import build_from_gguf
+
+        gguf_path = tmp_path / "source.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        build_from_gguf(gguf_path, reuse_gguf_weights=True).save(
+            str(tmp_path), progress_bar=False
+        )
+
+        loaded = ModelPackage.load(str(tmp_path))
+        loaded.save(str(tmp_path), progress_bar=False)
+        assert not (tmp_path / "gguf-reuse.json").exists()
 
 
 class TestBuildQuantizedGguf:

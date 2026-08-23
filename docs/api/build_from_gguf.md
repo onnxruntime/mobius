@@ -22,6 +22,7 @@ def build_from_gguf(
     mmproj: str | Path | None = None,
     static_cache: bool = False,
     max_seq_len: int | None = None,
+    reuse_gguf_weights: bool = False,
 ) -> ModelPackage:
 ```
 
@@ -37,6 +38,7 @@ def build_from_gguf(
 | `mmproj` | `str \| Path \| None` | `None` | Optional companion multimodal-projector GGUF. |
 | `static_cache` | `bool` | `False` | Build a fixed-width KV cache when the architecture supports it. |
 | `max_seq_len` | `int \| None` | `None` | Static-cache sequence limit. |
+| `reuse_gguf_weights` | `bool` | `False` | Reuse byte-compatible F32/F16 and native IQ/MXFP4 tensor ranges from the original GGUF instead of copying them into ONNX external data. |
 
 ## Returns
 
@@ -62,6 +64,45 @@ pkg.save("output/llama-float/")
 # Via CLI
 mobius build-gguf llama-3.2-1b-q4_0.gguf --output output/llama/
 ```
+
+### Reuse the original GGUF as external data
+
+Place the GGUF directly in the output directory, then opt in:
+
+```bash
+mobius build-gguf output/llama/model.gguf \
+  --output output/llama/ \
+  --reuse-gguf-weights
+```
+
+The package contains `model.onnx`, the original GGUF, `model.onnx.data` with
+only converted/materialized tensors, and `gguf-reuse.json`. The manifest pins
+the GGUF location, size, SHA-256, qtypes, and exact reused ranges. ONNX runtimes
+do not enforce that digest; applications can call
+`mobius.integrations.gguf.verify_gguf_reuse_manifest()` before session creation.
+
+Initial support is deliberately limited to one flat text model. Multimodal,
+MTP, nested, sharded, symlinked, absolute, and parent-relative GGUF layouts are
+rejected rather than copied or linked. F32/F16 tensors and compatible
+IQ4_NL/IQ4_XS/IQ3_S/IQ3_XXS/IQ2_XXS/IQ2_XS/IQ2_S/IQ1_S/IQ1_M/MXFP4
+projection/output tensors can be reused when no logical transform is required.
+Repacked, requantized, dequantized, or synthesized tensors are true storage
+changes and therefore go to the sidecar.
+
+Float transpose, norm-offset arithmetic, Llama Q/K row permutation, and Mamba
+`A_log` arithmetic are not inherent storage incompatibilities: ONNX can express
+them as graph operations over the original external tensor. They are deferred
+from this first PR because each transform needs consumer-aware graph rewiring
+and runtime validation across constant-folding implementations. Until that work
+lands, those transformed tensors also go to the sidecar rather than being
+misrepresented as byte-compatible.
+
+When a package later contains graph-level external-weight transforms, create ORT
+sessions with graph optimization disabled
+(`SessionOptions.graph_optimization_level = ORT_DISABLE_ALL`) so ORT does not
+constant-fold them into another materialized weight copy. This first version
+already recommends that setting for stable package-size behavior, although its
+direct tensors require no transform.
 
 ## Behavior
 
