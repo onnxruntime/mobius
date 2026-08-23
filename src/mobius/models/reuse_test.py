@@ -548,17 +548,24 @@ class TestEncoderFreqBins:
 class TestExecutionProviderPartitioning:
     """Lock in graph shapes that plugin EPs need in order to claim the SSM.
 
-    Both assertions here look like arbitrary spelling choices but were
-    measured on the MLX plugin EP (Apple M1 Max, 2s of audio): getting
-    either wrong costs between 2x and 80x.
+    Both assertions look like arbitrary spelling choices. They are not: each was
+    measured on the MLX plugin EP (Apple M1 Max, 2 s of audio at 8 kHz, steady
+    state), and getting either wrong costs far more than the transposes and
+    slices they buy.
+
+    Quote steady-state numbers only when citing this model's throughput. The
+    first run is roughly 4x slower — one-time graph translation and kernel
+    compilation — and the gap widens with the frequency extent, so a
+    median-of-three silently reports a warm-up figure.
     """
 
     def test_scan_iterates_axis_zero(self):
         """Scan must iterate axis 0, not name a `scan_input_axes` of 1.
 
         The MLX EP rejects any Scan whose scan axis is not 0
-        ("only scan_input_axes=0 is supported"), which sends all 120
-        recurrences back to CPU and erases the speedup.
+        ("only scan_input_axes=0 is supported"). Since an unclaimed node is a
+        partition boundary, that sends all 120 recurrences back to CPU and
+        gives up the whole 7.0x the EP is worth on this model.
         """
         _config, pkg = _build()
 
