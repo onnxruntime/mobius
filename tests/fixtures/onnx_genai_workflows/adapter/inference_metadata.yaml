@@ -25,6 +25,7 @@ pipeline:
           role: adapter_active
         source:
           kind: request
+        required: true
       activations:
         contract:
           dtype: float32
@@ -40,6 +41,7 @@ pipeline:
         source:
           kind: application
           name: activations
+        required: true
       request.adapter_segments:
         contract:
           dtype: int64
@@ -56,6 +58,7 @@ pipeline:
           role: adapter_segments
         source:
           kind: request
+        required: true
       request.adapter_counts:
         contract:
           dtype: int64
@@ -71,6 +74,7 @@ pipeline:
           role: adapter_counts
         source:
           kind: request
+        required: true
       request.adapter_scales:
         contract:
           dtype: float32
@@ -87,6 +91,7 @@ pipeline:
           role: adapter_scales
         source:
           kind: request
+        required: true
     outputs:
       result:
         contract:

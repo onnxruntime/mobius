@@ -117,6 +117,7 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     add_adapter_service_to_metadata,
     add_policy_components_to_workflow,
     build_native_vlm_package_metadata,
+    declare_input_admission,
     declare_request_alignment,
     request_batch_layout,
 )
@@ -468,6 +469,7 @@ def _publish_workflow_v1(workflow: dict[str, Any]) -> dict[str, Any]:
     published = convert(graph)
     workflow["steps"] = published["steps"] if published["kind"] == "sequence" else [published]
     declare_request_alignment(workflow)
+    declare_input_admission(workflow)
     return workflow
 
 
@@ -8377,7 +8379,7 @@ def _build_autoregressive_workflow_metadata(
                 "contract": {"dtype": "int64", "rank": 1, "shape": ["E"]},
                 "role": {"kind": "opaque"},
                 "source": {"kind": "literal"},
-                "required": True,
+                "required": False,
                 "default": eos_token_id,
             },
             "package.one_token": {
