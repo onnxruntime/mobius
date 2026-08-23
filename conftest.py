@@ -9,6 +9,14 @@ import importlib
 import os
 import sys
 
+# Repo rule: ONNX Runtime telemetry stays off. ORT reads this when its native library loads, so it
+# has to be set before anything imports `onnxruntime` — a fixture, even session-scoped and autouse,
+# runs too late because test modules import ORT at module scope. The rootdir conftest is imported
+# before those, which makes this the earliest reliable point.
+#
+# Assigned only if unset, so an explicit ORT_DISABLE_TELEMETRY=0 still wins for debugging.
+os.environ.setdefault("ORT_DISABLE_TELEMETRY", "1")
+
 # Insert the worktree src/ at the front of sys.path so it takes priority
 # over any installed (editable or otherwise) copy of the package.
 _src = os.path.join(os.path.dirname(__file__), "src")

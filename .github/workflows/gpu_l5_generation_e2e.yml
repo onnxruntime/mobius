@@ -34,6 +34,12 @@ concurrency:
   group: gpu-l5-tests-${{ github.ref }}
   cancel-in-progress: true
 
+# Repo rule: ONNX Runtime telemetry stays off. Workflow-level so every job and step inherits
+# it, including those that reach ORT without going through pytest and so never load the
+# rootdir conftest that sets it locally.
+env:
+  ORT_DISABLE_TELEMETRY: "1"
+
 jobs:
   generation-tests:
     name: L5 - Full token generation and decoding correctness
