@@ -41,6 +41,7 @@ import dataclasses
 import json
 import logging
 import math
+import os
 from typing import Any
 
 from mobius.integrations.onnx_genai.inference_metadata import (
@@ -80,6 +81,12 @@ class ComfyUIWorkflow:
     ``metadata`` is the onnx-genai ``inference_metadata`` document (topology +
     scheduler + guidance). The remaining fields are the per-run inputs recovered
     from the graph so a caller can actually drive the pipeline.
+
+    The document declares the sampler as executable components under
+    ``policies/*.onnx``. Those graphs are generated during translation rather
+    than read off disk, so they are carried here in ``policy_components``;
+    :meth:`save_policy_components` writes them next to the metadata. A package
+    whose metadata references them without shipping them is not loadable.
     """
 
     metadata: dict[str, Any]
@@ -99,6 +106,18 @@ class ComfyUIWorkflow:
     start_step: int = 0
     loras: tuple[tuple[str, float], ...] = ()
     controlnet: tuple[str, float] | None = None
+    policy_components: Any | None = None
+
+    def save_policy_components(self, directory: str) -> dict[str, str]:
+        """Write the generated sampler graphs ``metadata`` references.
+
+        Returns the package-relative artifact paths, or an empty mapping when
+        the workflow carries no generated components.
+        """
+        if self.policy_components is None:
+            return {}
+        os.makedirs(directory, exist_ok=True)
+        return self.policy_components.save_policy_components(directory)
 
 
 def _nodes(workflow: dict[str, Any]) -> dict[str, Any]:
@@ -327,6 +346,11 @@ def parse_comfyui_workflow(
             "the workflow before converting it."
         )
 
+    from mobius._model_package import ModelPackage
+
+    # The sampler components the document declares are generated here, so they
+    # travel with the parsed workflow instead of being discarded.
+    policy_components = ModelPackage({})
     metadata = build_diffusion_pipeline_metadata(
         num_inference_steps=steps,
         scheduler=sched,
@@ -335,9 +359,11 @@ def parse_comfyui_workflow(
         denoiser_filename=denoiser_filename,
         vae_filename=vae_filename,
         text_encoder_filename=text_encoder_filename if has_text_encoder else None,
+        package=policy_components,
     )
     return ComfyUIWorkflow(
         metadata=metadata,
+        policy_components=policy_components,
         prompt=prompt,
         negative_prompt=negative_prompt,
         width=width,
@@ -362,6 +388,12 @@ def translate_comfyui_workflow(workflow: dict[str, Any], **kwargs: Any) -> dict[
 
     Convenience wrapper over :func:`parse_comfyui_workflow` for callers that only
     need the pipeline document (see that function for the full run parameters).
+
+    The document references generated sampler graphs under ``policies/*.onnx``,
+    which this wrapper drops. To write a loadable package use
+    :func:`convert_comfyui_workflow`, or keep the
+    :class:`ComfyUIWorkflow` and call
+    :meth:`~ComfyUIWorkflow.save_policy_components`.
     """
     return parse_comfyui_workflow(workflow, **kwargs).metadata
 
@@ -374,5 +406,9 @@ def parse_comfyui_workflow_file(path: str, **kwargs: Any) -> ComfyUIWorkflow:
 
 
 def translate_comfyui_workflow_file(path: str, **kwargs: Any) -> dict[str, Any]:
-    """Load a ComfyUI API-format JSON file and translate it to metadata."""
+    """Load a ComfyUI API-format JSON file and translate it to metadata.
+
+    Returns the document only; see :func:`translate_comfyui_workflow` for how to
+    materialize the sampler graphs it references.
+    """
     return parse_comfyui_workflow_file(path, **kwargs).metadata

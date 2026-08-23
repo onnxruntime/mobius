@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 
 import pytest
+import yaml
 
 from mobius.integrations.onnx_genai.comfyui import (
     ComfyUIWorkflow,
@@ -305,6 +306,47 @@ def test_translate_from_file(tmp_path):
     meta = translate_comfyui_workflow_file(str(path))
     workflow = meta["pipeline"]["workflow"]
     assert workflow["inputs"]["request.max_iterations"]["default"] == 20
+
+
+def _referenced_artifacts(metadata: dict) -> set[str]:
+    """Every ONNX artifact the published workflow declares."""
+    return {
+        declaration["implementation"]["artifact"]
+        for declaration in metadata["pipeline"]["workflow"]["components"].values()
+        if declaration["implementation"]["kind"] == "onnx"
+    }
+
+
+def test_parsed_workflow_can_materialize_the_policies_it_references(tmp_path):
+    """The generated sampler graphs travel with the parse result.
+
+    The document declares them as ``policies/*.onnx`` artifacts, so a caller
+    that only had the metadata dict could not produce a loadable package.
+    """
+    parsed = parse_comfyui_workflow(_DEFAULT_TXT2IMG)
+    written = parsed.save_policy_components(str(tmp_path))
+    assert written, "a diffusion workflow always generates sampler components"
+    for artifact in _referenced_artifacts(parsed.metadata):
+        if artifact.startswith("policies/"):
+            assert (tmp_path / artifact).is_file(), artifact
+
+
+def test_conversion_writes_every_referenced_policy_artifact(tmp_path):
+    convert_comfyui_workflow(_DEFAULT_TXT2IMG, None, str(tmp_path), compute_timesteps=False)
+    with open(tmp_path / "inference_metadata.yaml", encoding="utf-8") as handle:
+        metadata = yaml.safe_load(handle)
+    policies = {
+        artifact
+        for artifact in _referenced_artifacts(metadata)
+        if artifact.startswith("policies/")
+    }
+    assert policies
+    for artifact in policies:
+        assert (tmp_path / artifact).is_file(), artifact
+    # And nothing stale: the reconciled solver's components are the only ones
+    # written, so a package never ships a graph its document does not declare.
+    written = {f"policies/{path.name}" for path in (tmp_path / "policies").iterdir()}
+    assert written == policies
 
 
 def test_translated_metadata_matches_onnx_genai_schema():

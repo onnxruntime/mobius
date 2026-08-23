@@ -217,6 +217,11 @@ def convert_comfyui_workflow(
     os.makedirs(output_dir, exist_ok=True)
     from mobius._model_package import ModelPackage
 
+    # Deliberately a fresh package rather than ``parsed_workflow.policy_components``:
+    # the checkpoint's scheduler config can reconcile to a different solver than
+    # the ComfyUI sampler implied, and reusing the parse-time package would leave
+    # that run's components (say Euler's ``model_input_scale``) behind for a DDIM
+    # document that never references them.
     package = ModelPackage({})
     use_karras = parsed_workflow.scheduler_spacing == "karras"
     use_exponential = parsed_workflow.scheduler_spacing == "exponential"
