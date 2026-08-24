@@ -395,7 +395,9 @@ def estimate_budget(
     # The weights loaded at runtime are the weights that were exported, so the
     # exported artifact size is the right default VRAM footprint (an int4-qmoe
     # export loads int4, not the bf16 source).
-    vram_base = output_bytes if target_dtype_bytes is None else int(param_count * target_dtype_bytes)
+    vram_base = (
+        output_bytes if target_dtype_bytes is None else int(param_count * target_dtype_bytes)
+    )
     vram_weights = int(vram_base * (1 + vram_headroom_frac))
 
     return Budget(
@@ -434,9 +436,7 @@ def _free_bytes(path: pathlib.Path) -> int:
 def _same_device(a: pathlib.Path, b: pathlib.Path) -> bool:
     """True when two paths resolve to the same filesystem (shared free space)."""
     try:
-        return (
-            os.stat(_existing_ancestor(a)).st_dev == os.stat(_existing_ancestor(b)).st_dev
-        )
+        return os.stat(_existing_ancestor(a)).st_dev == os.stat(_existing_ancestor(b)).st_dev
     except OSError:
         return False
 
@@ -469,9 +469,7 @@ def _available_ram_bytes() -> int | None:
     return None
 
 
-def check_disk(
-    kind: str, path: pathlib.Path, required: int, margin_frac: float
-) -> SpaceCheck:
+def check_disk(kind: str, path: pathlib.Path, required: int, margin_frac: float) -> SpaceCheck:
     free = _free_bytes(path)
     ok = free * (1 - margin_frac) >= required
     return SpaceCheck(
@@ -637,9 +635,7 @@ def run_preflight(
         checks.append(
             check_disk("disk:download", download_path, download_required, margin_frac)
         )
-        checks.append(
-            check_disk("disk:output", output_path, budget.output_bytes, margin_frac)
-        )
+        checks.append(check_disk("disk:output", output_path, budget.output_bytes, margin_frac))
     checks.append(check_ram(budget.peak_ram_bytes, margin_frac))
 
     for chk in checks:

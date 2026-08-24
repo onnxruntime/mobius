@@ -72,9 +72,7 @@ def _save_sharded(
         if not shard_names:
             continue
         fn = f"model-{i + 1:05d}-of-{n_shards:05d}.safetensors"
-        safetensors.torch.save_file(
-            {n: state[n] for n in shard_names}, str(directory / fn)
-        )
+        safetensors.torch.save_file({n: state[n] for n in shard_names}, str(directory / fn))
         for n in shard_names:
             weight_map[n] = fn
     (directory / "model.safetensors.index.json").write_text(
@@ -102,9 +100,7 @@ class TestStreamingCorrectness:
         def _no_hub(*_a, **_k):
             raise AssertionError("streaming a local dir must not call the Hub")
 
-        monkeypatch.setattr(
-            "mobius.integrations._weight_loading.hf_hub_download", _no_hub
-        )
+        monkeypatch.setattr("mobius.integrations._weight_loading.hf_hub_download", _no_hub)
         model = _fresh_model()
         state = _make_checkpoint_state(model)
         _save_single(state, tmp_path)
@@ -172,9 +168,7 @@ class TestStreamingRefusals:
         del state[dropped]
         _save_single(state, tmp_path)
 
-        assigned = stream_safetensors_to_model(
-            model, str(tmp_path), require_passthrough=False
-        )
+        assigned = stream_safetensors_to_model(model, str(tmp_path), require_passthrough=False)
         assert dropped not in assigned
 
     def test_fp8_checkpoint_refuses_rather_than_dropping_scale(self, tmp_path):

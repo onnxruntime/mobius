@@ -45,7 +45,9 @@ def _write_sharded(tmp_path: pathlib.Path, n_shards: int = 2) -> None:
         )
         weight_map[f"w{i}"] = fn
     (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps({"metadata": {"total_size": n_shards * 1024 * 1024 * 2}, "weight_map": weight_map})
+        json.dumps(
+            {"metadata": {"total_size": n_shards * 1024 * 1024 * 2}, "weight_map": weight_map}
+        )
     )
 
 
@@ -98,7 +100,10 @@ class TestResolveSource:
             resolve_source(str(tmp_path))
 
     def test_hub_resolves_shards_and_sizes(self, tmp_path, monkeypatch):
-        weight_map = {"w0": "model-00001-of-00002.safetensors", "w1": "model-00002-of-00002.safetensors"}
+        weight_map = {
+            "w0": "model-00001-of-00002.safetensors",
+            "w1": "model-00002-of-00002.safetensors",
+        }
         _fake_hub(tmp_path, monkeypatch, weight_map)
         info = types.SimpleNamespace(
             sha="deadbeef",
@@ -323,7 +328,12 @@ class TestResumability:
         monkeypatch.setattr(preflight, "_available_ram_bytes", lambda: 10**15)
         state_file = tmp_path / "state.json"
         state_file.write_text(
-            json.dumps({"commit_sha": "OLDSHA", "validated_shards": ["model-00001-of-00001.safetensors"]})
+            json.dumps(
+                {
+                    "commit_sha": "OLDSHA",
+                    "validated_shards": ["model-00001-of-00001.safetensors"],
+                }
+            )
         )
         info = types.SimpleNamespace(
             sha="NEWSHA",
