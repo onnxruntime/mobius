@@ -209,6 +209,8 @@ class GGUFArchitectureSpec:
         tensor_map: Whether GGUF tensor names can be mapped to HuggingFace names.
         graph: Whether mobius can build the graph for ``model_type``.
         runtime: Whether a loadable runtime package can be written.
+        quantized_import: Whether the graph exposes packed projection modules
+            that can consume a preserved GGUF quantization route.
         reason: Why any non-``SUPPORTED`` verdict is what it is. Required
             whenever at least one verdict is not ``SUPPORTED``.
         config_key_map: Name of the architecture-specific GGUF-key → config-field
@@ -238,6 +240,7 @@ class GGUFArchitectureSpec:
     tensor_map: Support = Support.SUPPORTED
     graph: Support = Support.SUPPORTED
     runtime: Support = Support.SUPPORTED
+    quantized_import: Support = Support.SUPPORTED
     reason: str | None = None
     config_key_map: str | None = None
     config_postprocessor: str | None = None
@@ -255,7 +258,9 @@ class GGUFArchitectureSpec:
             raise ValueError("GGUFArchitectureSpec.gguf_arch must be non-empty")
         if self.gguf_arch in self.aliases:
             raise ValueError(f"{self.gguf_arch!r}: canonical name must not repeat in aliases")
-        _require_reason(f"GGUF architecture {self.gguf_arch!r}", self.verdicts, self.reason)
+        _require_reason(
+            f"GGUF architecture {self.gguf_arch!r}", self.capabilities, self.reason
+        )
         if self.graph is Support.SUPPORTED and not self.model_type:
             raise ValueError(
                 f"{self.gguf_arch!r}: graph=SUPPORTED requires a model_type to build with"
@@ -278,12 +283,20 @@ class GGUFArchitectureSpec:
 
     @property
     def verdicts(self) -> dict[str, Support]:
-        """The four capability verdicts, keyed by capability name."""
+        """The core float-import verdicts, keyed by capability name."""
         return {
             "config": self.config,
             "tensor_map": self.tensor_map,
             "graph": self.graph,
             "runtime": self.runtime,
+        }
+
+    @property
+    def capabilities(self) -> dict[str, Support]:
+        """All architecture verdicts, including quantized-import reachability."""
+        return {
+            **self.verdicts,
+            "quantized_import": self.quantized_import,
         }
 
     @property

@@ -183,11 +183,10 @@ def build_mtp_head_from_gguf(
     if not mtp_blocks:
         return None
     if len(mtp_blocks) > 1:
-        logger.warning(
-            "GGUF declares %d MTP blocks; only the first (block %d) is exported "
-            "as the self-speculative head.",
-            len(mtp_blocks),
-            mtp_blocks[0],
+        raise ValueError(
+            f"GGUF declares {len(mtp_blocks)} MTP blocks, but mobius can export "
+            "exactly one MTP sidecar head. Multi-head MTP export is not supported; "
+            "no partial sidecar was produced."
         )
     mtp_block_index = int(mtp_blocks[0])
     gguf_arch = gguf_model.architecture

@@ -1566,7 +1566,10 @@ class TestBuildQuantizedGguf:
         path = tmp_path / "internlm2_q4_0.gguf"
         _write_quantized_gguf(path, architecture="internlm2")
 
-        with pytest.raises(ValueError, match="does not expose quantized projection"):
+        with pytest.raises(
+            ValueError,
+            match=r"does not support keep_quantized=True.*floating Linear modules",
+        ):
             build_from_gguf(path)
 
     def test_q6_k_selects_the_asymmetric_four_bit_repack_target(self):

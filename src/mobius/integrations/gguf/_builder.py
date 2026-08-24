@@ -583,6 +583,16 @@ def build_from_gguf(
     gguf_arch = gguf_model.architecture
     logger.info("Loaded GGUF model: %s (arch=%s)", gguf_path, gguf_arch)
     preserve_quantization = keep_quantized and _has_quantized_weights(gguf_model, gguf_arch)
+    arch_spec = try_get_arch_spec(gguf_arch)
+    if (
+        preserve_quantization
+        and arch_spec is not None
+        and arch_spec.quantized_import is not Support.SUPPORTED
+    ):
+        raise ValueError(
+            f"GGUF architecture {gguf_arch!r} does not support keep_quantized=True: "
+            f"{arch_spec.reason}"
+        )
     if keep_quantized and not preserve_quantization:
         logger.info("GGUF contains no mapped quantized weights; using the float import path")
 

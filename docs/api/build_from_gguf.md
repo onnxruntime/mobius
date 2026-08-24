@@ -131,10 +131,10 @@ silently treated as preserved source quantization.
 ## Supported GGUF Architectures
 
 Support is declared once, in
-`mobius/integrations/gguf/_arch_registry.py`, as four independent verdicts per
-architecture — config extraction, tensor mapping, graph construction, and
-runtime packaging. Anything short of "supported" carries a reason, and the
-table below is checked against the registry by
+`mobius/integrations/gguf/_arch_registry.py`, as five independent verdicts per
+architecture — config extraction, tensor mapping, graph construction, runtime
+packaging, and quantized import. Anything short of "supported" carries a reason,
+and the table below is checked against the registry by
 `_arch_registry_test.py::TestDocumentedSupportMatrix`, so it cannot drift.
 
 Being listed is not a support claim. `build_from_gguf` refuses every
@@ -143,42 +143,42 @@ reason.
 
 <!-- BEGIN GGUF SUPPORT MATRIX (generated; see _arch_registry.py) -->
 
-| GGUF architecture | Accepted aliases | mobius `model_type` | Status |
-|---|---|---|---|
-| `arcee` | — | `arcee` | runtime deferred |
-| `bloom` | — | `bloom` | tensor_map deferred |
-| `clip` | — | — | config rejected; tensor_map rejected; graph rejected; runtime rejected |
-| `cohere2` | — | `cohere2` | runtime deferred |
-| `deci` | — | `llama` | supported |
-| `deepseek4` | — | `deepseek_v4` | supported |
-| `exaone` | — | `exaone` | runtime deferred |
-| `falcon` | — | `falcon` | supported |
-| `gemma` | — | `gemma` | supported |
-| `gemma2` | — | `gemma2` | supported |
-| `gemma3` | — | `gemma3_text` | supported |
-| `gemma4` | — | `gemma4_text` | supported |
-| `glm-dsa` | `glm_dsa` | `glm_moe_dsa` | tensor_map deferred |
-| `gpt2` | — | `gpt2` | supported |
-| `hunyuan-dense` | `hunyuan_v1_dense` | `hunyuan_v1_dense` | supported |
-| `internlm2` | — | `internlm2` | supported |
-| `llama` | `mistral` | `llama` | supported |
-| `mamba` | — | `mamba` | supported |
-| `muse-glimmer` | `muse_glimmer` | `muse_glimmer_text` | supported |
-| `nemotron` | — | `nemotron` | supported |
-| `nemotron_h_moe` | — | — | config rejected; tensor_map rejected; graph rejected; runtime rejected |
-| `olmo` | — | `olmo` | supported |
-| `olmo2` | — | `olmo2` | supported |
-| `phi3` | — | `phi3` | supported |
-| `qwen2` | — | `qwen2` | supported |
-| `qwen2moe` | `qwen2_moe` | `qwen2_moe` | supported |
-| `qwen3` | — | `qwen3` | supported |
-| `qwen35` | — | `qwen3_5_text` | supported |
-| `qwen35moe` | — | `qwen3_5_moe` | supported |
-| `qwen3moe` | `qwen3_moe` | `qwen3_moe` | supported |
-| `smollm3` | — | `smollm3` | supported |
-| `stablelm` | — | `stablelm` | supported |
-| `starcoder2` | — | `starcoder2` | supported |
-| `t5` | — | `t5` | tensor_map deferred |
+| GGUF architecture | Accepted aliases | mobius `model_type` | Float import | Quantized import |
+|---|---|---|---|---|
+| `arcee` | — | `arcee` | runtime deferred | unreachable |
+| `bloom` | — | `bloom` | tensor_map deferred | unreachable |
+| `clip` | — | — | config rejected; tensor_map rejected; graph rejected; runtime rejected | unreachable |
+| `cohere2` | — | `cohere2` | runtime deferred | unreachable |
+| `deci` | — | `llama` | supported | supported |
+| `deepseek4` | — | `deepseek_v4` | supported | supported |
+| `exaone` | — | `exaone` | runtime deferred | unreachable |
+| `falcon` | — | `falcon` | supported | supported |
+| `gemma` | — | `gemma` | supported | supported |
+| `gemma2` | — | `gemma2` | supported | supported |
+| `gemma3` | — | `gemma3_text` | supported | supported |
+| `gemma4` | — | `gemma4_text` | supported | supported |
+| `glm-dsa` | `glm_dsa` | `glm_moe_dsa` | tensor_map deferred | unreachable |
+| `gpt2` | — | `gpt2` | supported | supported |
+| `hunyuan-dense` | `hunyuan_v1_dense` | `hunyuan_v1_dense` | supported | supported |
+| `internlm2` | — | `internlm2` | supported | rejected |
+| `llama` | `mistral` | `llama` | supported | supported |
+| `mamba` | — | `mamba` | supported | supported |
+| `muse-glimmer` | `muse_glimmer` | `muse_glimmer_text` | supported | supported |
+| `nemotron` | — | `nemotron` | supported | supported |
+| `nemotron_h_moe` | — | — | config rejected; tensor_map rejected; graph rejected; runtime rejected | unreachable |
+| `olmo` | — | `olmo` | supported | supported |
+| `olmo2` | — | `olmo2` | supported | supported |
+| `phi3` | — | `phi3` | supported | supported |
+| `qwen2` | — | `qwen2` | supported | supported |
+| `qwen2moe` | `qwen2_moe` | `qwen2_moe` | supported | supported |
+| `qwen3` | — | `qwen3` | supported | supported |
+| `qwen35` | — | `qwen3_5_text` | supported | supported |
+| `qwen35moe` | — | `qwen3_5_moe` | supported | supported |
+| `qwen3moe` | `qwen3_moe` | `qwen3_moe` | supported | supported |
+| `smollm3` | — | `smollm3` | supported | supported |
+| `stablelm` | — | `stablelm` | supported | supported |
+| `starcoder2` | — | `starcoder2` | supported | supported |
+| `t5` | — | `t5` | tensor_map deferred | unreachable |
 
 <!-- END GGUF SUPPORT MATRIX -->
 
@@ -229,6 +229,9 @@ implemented and validated. These include fused/interleaved or dual-form QKV
 and all 25 active storage-quantized types at the same pinned commit. Every
 stored qtype has one explicit projection/output route. The table is generated
 from that registry and checked byte-for-byte by `_quant_registry_test.py`.
+Those routes apply only when the architecture table above marks quantized
+import supported; otherwise `keep_quantized=True` is rejected before graph
+construction.
 
 <!-- BEGIN GGUF QUANTIZATION MATRIX (generated; see _quant_registry.py) -->
 

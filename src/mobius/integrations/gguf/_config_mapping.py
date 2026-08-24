@@ -322,6 +322,13 @@ def gguf_to_config(
     mtp_block_indices: list[int] = []
     if nextn_layers is not None and int(nextn_layers) > 0:
         mtp_count = int(nextn_layers)
+        if mtp_count > 1:
+            raise ValueError(
+                f"GGUF architecture {gguf_arch!r} declares nextn_predict_layers="
+                f"{mtp_count}, but mobius can export exactly one MTP sidecar head. "
+                "Multi-head MTP export is not supported; use a checkpoint with one "
+                "nextn prediction layer."
+            )
         decoder_layers = int(hf_fields["num_hidden_layers"]) - mtp_count
         if decoder_layers <= 0:
             raise ValueError(

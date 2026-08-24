@@ -30,7 +30,7 @@ _VOCAB = 100
 _BLOCK_COUNT = 2  # 1 decoder layer + 1 nextn head block
 
 
-def _write_qwen35_mtp_gguf(path: Path, *, quantized: bool = False) -> None:
+def _write_qwen35_mtp_gguf(path: Path, *, quantized: bool = False, mtp_count: int = 1) -> None:
     """Write a tiny ``qwen35`` GGUF with a trailing ``blk.1.nextn.*`` MTP head."""
     from gguf import GGUFWriter
 
@@ -38,14 +38,14 @@ def _write_qwen35_mtp_gguf(path: Path, *, quantized: bool = False) -> None:
     writer.add_context_length(512)
     writer.add_embedding_length(_H)
     writer.add_feed_forward_length(_FFN)
-    writer.add_block_count(_BLOCK_COUNT)
+    writer.add_block_count(1 + mtp_count)
     writer.add_head_count(_NH)
     writer.add_head_count_kv(_NKV)
     writer.add_rope_freq_base(10000.0)
     writer.add_layer_norm_rms_eps(1e-5)
     writer.add_vocab_size(_VOCAB)
     # UINT32 == GGUFValueType 4.
-    writer.add_key_value("qwen35.nextn_predict_layers", 1, 4)
+    writer.add_key_value("qwen35.nextn_predict_layers", mtp_count, 4)
     writer.add_key_value("qwen35.attention.key_length", _HD, 4)
 
     def f32(name: str, shape: tuple[int, ...]) -> None:
@@ -81,13 +81,14 @@ def _write_qwen35_mtp_gguf(path: Path, *, quantized: bool = False) -> None:
     # Decoder layer 0.
     _add_decoder_block(0)
 
-    # MTP head block (index 1): the nextn cross-conditioning tensors plus a
-    # full attention/FFN sublayer.
-    weight("blk.1.nextn.eh_proj.weight", (_H, 2 * _H))
-    f32("blk.1.nextn.enorm.weight", (_H,))
-    f32("blk.1.nextn.hnorm.weight", (_H,))
-    f32("blk.1.nextn.shared_head_norm.weight", (_H,))
-    _add_decoder_block(1)
+    # MTP head blocks: each has cross-conditioning tensors plus a full
+    # attention/FFN sublayer.
+    for index in range(1, 1 + mtp_count):
+        weight(f"blk.{index}.nextn.eh_proj.weight", (_H, 2 * _H))
+        f32(f"blk.{index}.nextn.enorm.weight", (_H,))
+        f32(f"blk.{index}.nextn.hnorm.weight", (_H,))
+        f32(f"blk.{index}.nextn.shared_head_norm.weight", (_H,))
+        _add_decoder_block(index)
 
     f32("token_embd.weight", (_VOCAB, _H))
     f32("output_norm.weight", (_H,))
@@ -221,6 +222,30 @@ class TestBuildMtpHead:
         assert op_types.count("MatMulNBits") == 8
         assert "fc.weight" in head.graph.initializers
         assert "fc.scales" in head.graph.initializers
+
+    def test_multiple_mtp_heads_reject_before_any_package_is_built(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "tiny_qwen35_multi_mtp.gguf"
+        _write_qwen35_mtp_gguf(path, mtp_count=2)
+
+        built = False
+
+        def _unexpected_build(*args, **kwargs):
+            nonlocal built
+            built = True
+            raise AssertionError("graph construction must not start for multi-MTP input")
+
+        monkeypatch.setattr(core_builder, "build_from_module", _unexpected_build)
+        with pytest.raises(
+            ValueError,
+            match=r"nextn_predict_layers=2.*exactly one MTP sidecar head",
+        ):
+            build_from_gguf(str(path))
+        assert built is False
 
     def test_no_head_when_gguf_lacks_nextn(self):
         # A config with no MTP metadata must not build a head.
