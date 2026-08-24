@@ -46,6 +46,7 @@ import math
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import numpy as np
 
@@ -289,18 +290,35 @@ def _canonical_text_architecture(architecture: str) -> str:
 
 
 def _normalized_identity(value: object) -> str:
-    return "".join(character for character in str(value).lower() if character.isalnum())
+    if not isinstance(value, str):
+        return ""
+    return value.strip().casefold()
 
 
 def _normalized_repository(value: object) -> str:
-    repository = str(value).strip().lower().rstrip("/")
-    if repository.endswith(".git"):
+    if not isinstance(value, str):
+        return ""
+    repository = value.strip()
+    if not repository:
+        return ""
+    parsed = urlsplit(repository)
+    if parsed.scheme:
+        path = parsed.path.rstrip("/")
+        if path.casefold().endswith(".git"):
+            path = path[:-4]
+        return urlunsplit(
+            (
+                parsed.scheme.casefold(),
+                parsed.netloc.casefold(),
+                path.casefold(),
+                parsed.query,
+                parsed.fragment,
+            )
+        )
+    repository = repository.rstrip("/")
+    if repository.casefold().endswith(".git"):
         repository = repository[:-4]
-    for prefix in ("https://", "http://", "hf://"):
-        if repository.startswith(prefix):
-            repository = repository[len(prefix) :]
-            break
-    return repository
+    return repository.casefold()
 
 
 def _validate_mmproj_source_identity(text_gguf: Any, mmproj_gguf: Any) -> None:
@@ -311,19 +329,30 @@ def _validate_mmproj_source_identity(text_gguf: Any, mmproj_gguf: Any) -> None:
         ("general.base_model.0.repo_url", _normalized_repository),
     )
     for key, normalize in bindings:
-        text_value = text_gguf.metadata.get(key)
-        sidecar_value = mmproj_gguf.metadata.get(key)
-        if key == "general.name" and (not text_value or not sidecar_value):
+        text_present = key in text_gguf.metadata
+        sidecar_present = key in mmproj_gguf.metadata
+        if key == "general.name" and not (text_present and sidecar_present):
             raise ValueError(
                 "Cannot establish a trusted text/mmproj pairing: both files must declare "
                 "non-empty general.name metadata."
             )
-        if bool(text_value) != bool(sidecar_value):
+        if text_present != sidecar_present:
             raise ValueError(
                 "Cannot establish a trusted text/mmproj pairing: identity binding "
                 f"{key!r} is present on only one file."
             )
-        if text_value and sidecar_value and normalize(text_value) != normalize(sidecar_value):
+        if not text_present:
+            continue
+        text_value = text_gguf.metadata[key]
+        sidecar_value = mmproj_gguf.metadata[key]
+        text_identity = normalize(text_value)
+        sidecar_identity = normalize(sidecar_value)
+        if not text_identity or not sidecar_identity:
+            raise ValueError(
+                "Cannot establish a trusted text/mmproj pairing: identity binding "
+                f"{key!r} must be a non-empty string on both files."
+            )
+        if text_identity != sidecar_identity:
             raise ValueError(
                 "mmproj source identity does not match the text GGUF: "
                 f"{key} is {sidecar_value!r} on the sidecar and {text_value!r} "
@@ -381,6 +410,35 @@ def _validate_block_tensor_set(
         )
 
 
+def _validate_gemma4_audio_metadata(metadata: dict[str, Any]) -> None:
+    """Validate every pinned field required by an active Gemma4 audio encoder."""
+    if metadata["clip.has_audio_encoder"] is not True:
+        raise ValueError("clip.has_audio_encoder must be boolean true for gemma4a.")
+    positive_integer_keys = (
+        "clip.audio.embedding_length",
+        "clip.audio.feed_forward_length",
+        "clip.audio.block_count",
+        "clip.audio.projection_dim",
+        "clip.audio.attention.head_count",
+        "clip.audio.num_mel_bins",
+    )
+    for key in positive_integer_keys:
+        value = metadata[key]
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value <= 0:
+            raise ValueError(f"{key} must be a positive integer, got {value!r}.")
+    epsilon = metadata["clip.audio.attention.layer_norm_epsilon"]
+    if (
+        isinstance(epsilon, bool)
+        or not isinstance(epsilon, (int, float, np.integer, np.floating))
+        or not math.isfinite(float(epsilon))
+        or epsilon <= 0
+    ):
+        raise ValueError(
+            "clip.audio.attention.layer_norm_epsilon must be a positive finite "
+            f"number, got {epsilon!r}."
+        )
+
+
 def _validate_mmproj_tensor_closure(mmproj_gguf: Any, spec: ProjectorSpec) -> None:
     """Validate the complete sidecar inventory, including deferred companions."""
     names = set(mmproj_gguf.tensor_names)
@@ -412,6 +470,8 @@ def _validate_mmproj_tensor_closure(mmproj_gguf: Any, spec: ProjectorSpec) -> No
                 f"{companion.projector_type} companion is missing required metadata: "
                 f"{missing_metadata}"
             )
+        if companion.projector_type == "gemma4a":
+            _validate_gemma4_audio_metadata(mmproj_gguf.metadata)
         companion_top = set(companion.required_top_tensors)
         companion_blocks, companion_matched = _collect_block_tensors(
             names,
@@ -565,17 +625,13 @@ def _validate_supported_mmproj_shapes(mmproj_gguf: Any, spec: ProjectorSpec) -> 
         )
 
     patch_shape = mmproj_gguf.get_tensor_shape("v.patch_embd.weight")
-    if len(patch_shape) not in (4, 5) or patch_shape[0] != hidden:
-        raise ValueError(
-            f"v.patch_embd.weight must be rank 4/5 with output {hidden}, got {patch_shape}."
-        )
-    if patch_shape[-2:] != (patch, patch):
-        raise ValueError(
-            f"v.patch_embd.weight spatial kernel {patch_shape[-2:]} does not match "
-            f"clip.vision.patch_size={patch}."
-        )
-
     if spec.projector_type == "gemma4v":
+        expected_patch_shape = (hidden, 3, patch, patch)
+        if patch_shape != expected_patch_shape:
+            raise ValueError(
+                "Gemma4 v.patch_embd.weight must have graph-compatible shape "
+                f"{expected_patch_shape}, got {patch_shape}."
+            )
         position_shape = mmproj_gguf.get_tensor_shape("v.position_embd.weight")
         if len(position_shape) != 3 or position_shape[0] != 2 or position_shape[2] != hidden:
             raise ValueError(
@@ -619,6 +675,15 @@ def _validate_supported_mmproj_shapes(mmproj_gguf: Any, spec: ProjectorSpec) -> 
         return
 
     if spec.projector_type == "muse-glimmer":
+        if (
+            len(patch_shape) not in (4, 5)
+            or patch_shape[0] != hidden
+            or patch_shape[-2:] != (patch, patch)
+        ):
+            raise ValueError(
+                "Muse Glimmer v.patch_embd.weight must be rank 4/5 with output "
+                f"{hidden} and a {patch}x{patch} spatial kernel, got {patch_shape}."
+            )
         merge = int(md["clip.vision.spatial_merge_size"])
         position_shape = mmproj_gguf.get_tensor_shape("v.position_embd.weight")
         if len(position_shape) != 2 or position_shape[1] != hidden:

@@ -390,6 +390,7 @@ _COMMON_REQUIRED_AUDIO_METADATA = (
     "clip.audio.projection_dim",
     "clip.audio.attention.head_count",
     "clip.audio.attention.layer_norm_epsilon",
+    "clip.audio.num_mel_bins",
 )
 
 

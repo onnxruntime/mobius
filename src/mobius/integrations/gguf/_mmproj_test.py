@@ -45,6 +45,8 @@ def _write_clip_mmproj_gguf(
     extra_tensor: str | None = None,
     identity_name: str = "Gemma-4-E2B-It",
     identity_repo: str | None = "https://huggingface.co/google/gemma-4-E2B-it",
+    patch_weight_shape: tuple[int, ...] | None = None,
+    audio_num_mel_bins: int | None = _NUM_MEL_BINS,
 ) -> None:
     """Write a small synthetic Gemma4 ``clip`` mmproj GGUF for tests."""
     from gguf import GGUFWriter
@@ -75,7 +77,10 @@ def _write_clip_mmproj_gguf(
         writer.add_tensor(name, np.random.randn(*shape).astype(np.float32))
 
     # patch embed (conv layout) + position table + projector.
-    _f32("v.patch_embd.weight", (_VISION_HIDDEN, 3, _PATCH_SIZE, _PATCH_SIZE))
+    _f32(
+        "v.patch_embd.weight",
+        patch_weight_shape or (_VISION_HIDDEN, 3, _PATCH_SIZE, _PATCH_SIZE),
+    )
     _f32("v.position_embd.weight", (2, _POS_EMB_SIZE, _VISION_HIDDEN))
     _f32("mm.input_projection.weight", (_TEXT_HIDDEN, _VISION_HIDDEN))
     for layer in range(_VISION_LAYERS):
@@ -103,7 +108,8 @@ def _write_clip_mmproj_gguf(
         writer.add_uint32("clip.audio.feed_forward_length", _AUDIO_FFN)
         writer.add_uint32("clip.audio.block_count", _AUDIO_LAYERS)
         writer.add_uint32("clip.audio.attention.head_count", _AUDIO_HEADS)
-        writer.add_uint32("clip.audio.num_mel_bins", _NUM_MEL_BINS)
+        if audio_num_mel_bins is not None:
+            writer.add_uint32("clip.audio.num_mel_bins", audio_num_mel_bins)
         writer.add_uint32("clip.audio.projection_dim", _TEXT_HIDDEN)
         writer.add_float32("clip.audio.attention.layer_norm_epsilon", 1e-6)
         _f32("a.conv1d.0.weight", (_AUDIO_CONV0, 1, 3, 3))
@@ -510,6 +516,145 @@ class TestMultimodalPreflightGuards:
 
         resolved = _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
         assert resolved[MMProjModality.VISION].projector_type == "gemma4v"
+
+    @pytest.mark.parametrize(
+        ("text_name", "sidecar_name"),
+        [
+            ("Model-A", "ModelA"),
+            ("org/model", "orgmodel"),
+            ("model_a", "model-a"),
+        ],
+    )
+    def test_identity_normalization_preserves_meaningful_separators(
+        self, tmp_path: Path, text_name: str, sidecar_name: str
+    ):
+        from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
+        from mobius.integrations.gguf._mmproj_registry import MMProjModality
+
+        text_path = tmp_path / "gemma4.gguf"
+        mmproj_path = tmp_path / "mmproj.gguf"
+        _write_minimal_gguf(text_path, "gemma4")
+        _write_clip_mmproj_gguf(mmproj_path, with_audio=False)
+        text, mmproj = self._load_pair(text_path, mmproj_path)
+        text.metadata["general.name"] = text_name
+        mmproj.metadata["general.name"] = sidecar_name
+
+        with pytest.raises(ValueError, match=r"general\.name"):
+            _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
+
+    @pytest.mark.parametrize("empty_value", ["", " \t "])
+    def test_empty_identity_values_are_rejected(self, tmp_path: Path, empty_value: str):
+        from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
+        from mobius.integrations.gguf._mmproj_registry import MMProjModality
+
+        text_path = tmp_path / "gemma4.gguf"
+        mmproj_path = tmp_path / "mmproj.gguf"
+        _write_minimal_gguf(text_path, "gemma4")
+        _write_clip_mmproj_gguf(mmproj_path, with_audio=False)
+        text, mmproj = self._load_pair(text_path, mmproj_path)
+        text.metadata["general.name"] = empty_value
+        mmproj.metadata["general.name"] = empty_value
+
+        with pytest.raises(ValueError, match=r"non-empty string"):
+            _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
+
+    def test_one_sided_present_empty_optional_binding_is_not_treated_absent(
+        self, tmp_path: Path
+    ):
+        from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
+        from mobius.integrations.gguf._mmproj_registry import MMProjModality
+
+        text_path = tmp_path / "gemma4.gguf"
+        mmproj_path = tmp_path / "mmproj.gguf"
+        _write_minimal_gguf(text_path, "gemma4")
+        _write_clip_mmproj_gguf(mmproj_path, with_audio=False)
+        text, mmproj = self._load_pair(text_path, mmproj_path)
+        text.metadata["general.base_model.0.repo_url"] = ""
+        mmproj.metadata.pop("general.base_model.0.repo_url")
+
+        with pytest.raises(ValueError, match=r"present on only one file"):
+            _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
+
+    def test_repository_canonicalization_only_normalizes_url_syntax(self, tmp_path: Path):
+        from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
+        from mobius.integrations.gguf._mmproj_registry import MMProjModality
+
+        text_path = tmp_path / "gemma4.gguf"
+        mmproj_path = tmp_path / "mmproj.gguf"
+        _write_minimal_gguf(text_path, "gemma4")
+        _write_clip_mmproj_gguf(mmproj_path, with_audio=False)
+        text, mmproj = self._load_pair(text_path, mmproj_path)
+        text.metadata["general.base_model.0.repo_url"] = (
+            "HTTPS://HUGGINGFACE.CO/Google/Gemma-4-E2B-It.git/"
+        )
+
+        resolved = _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
+        assert resolved[MMProjModality.VISION].projector_type == "gemma4v"
+
+    @pytest.mark.parametrize(
+        "patch_shape",
+        [
+            (_VISION_HIDDEN, 1, 3, _PATCH_SIZE, _PATCH_SIZE),
+            (_VISION_HIDDEN, 1, _PATCH_SIZE, _PATCH_SIZE),
+            (_VISION_HIDDEN, 3, _PATCH_SIZE, _PATCH_SIZE + 1),
+        ],
+    )
+    def test_gemma4_patch_shape_rejects_before_graph_build(
+        self, tmp_path: Path, patch_shape: tuple[int, ...]
+    ):
+        from mobius.integrations.gguf._mmproj import build_gemma4_vlm_from_gguf
+
+        text_path = tmp_path / "gemma4.gguf"
+        mmproj_path = tmp_path / "mmproj.gguf"
+        _write_minimal_gguf(text_path, "gemma4")
+        _write_clip_mmproj_gguf(
+            mmproj_path,
+            with_audio=False,
+            patch_weight_shape=patch_shape,
+        )
+
+        with (
+            mock.patch("mobius._builder.build_from_module") as build_graph,
+            pytest.raises(ValueError, match=r"graph-compatible shape"),
+        ):
+            build_gemma4_vlm_from_gguf(text_path, mmproj_path, image_token_id=0)
+        build_graph.assert_not_called()
+
+    @pytest.mark.parametrize("num_mel_bins", [None, 0])
+    def test_audio_num_mel_bins_rejects_before_graph_build(
+        self, tmp_path: Path, num_mel_bins: int | None
+    ):
+        from mobius.integrations.gguf._mmproj import build_gemma4_vlm_from_gguf
+
+        text_path = tmp_path / "gemma4.gguf"
+        mmproj_path = tmp_path / "mmproj.gguf"
+        _write_minimal_gguf(text_path, "gemma4")
+        _write_clip_mmproj_gguf(
+            mmproj_path,
+            with_audio=True,
+            audio_num_mel_bins=num_mel_bins,
+        )
+
+        with (
+            mock.patch("mobius._builder.build_from_module") as build_graph,
+            pytest.raises(ValueError, match=r"clip\.audio\.num_mel_bins"),
+        ):
+            build_gemma4_vlm_from_gguf(text_path, mmproj_path, image_token_id=0)
+        build_graph.assert_not_called()
+
+    def test_audio_num_mel_bins_wrong_type_is_rejected(self, tmp_path: Path):
+        from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
+        from mobius.integrations.gguf._mmproj_registry import MMProjModality
+
+        text_path = tmp_path / "gemma4.gguf"
+        mmproj_path = tmp_path / "mmproj.gguf"
+        _write_minimal_gguf(text_path, "gemma4")
+        _write_clip_mmproj_gguf(mmproj_path, with_audio=True)
+        text, mmproj = self._load_pair(text_path, mmproj_path)
+        mmproj.metadata["clip.audio.num_mel_bins"] = "8"
+
+        with pytest.raises(ValueError, match=r"positive integer"):
+            _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
 
     def test_quantized_projector_weight_is_rejected_by_role(self, tmp_path: Path):
         from types import SimpleNamespace

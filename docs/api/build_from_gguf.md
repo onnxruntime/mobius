@@ -590,11 +590,18 @@ and concatenate their feature rows in prompt media order.
 Pairing is fail-closed and independent of local filenames. Both GGUF files must
 carry matching non-empty `general.name` values. If either file declares
 `general.base_model.0.name` or `general.base_model.0.repo_url`, the other must
-declare the same normalized binding. Architecture and matching tensor dimensions
-alone are not accepted as source identity. The validator also inventories every
-sidecar tensor: Gemma4's exact deferred `gemma4a` companion closure is allowed
-when declared, but unknown top-level names, near-miss prefixes/suffixes, ranks,
-and packed projector tensors are rejected before graph construction.
+declare the same non-empty binding. Canonicalization is conservative: casing,
+outer whitespace, URL host syntax, a trailing slash, and a trailing `.git` are
+normalized, but meaningful name and path separators are preserved. Architecture
+and matching tensor dimensions alone are not accepted as source identity. The
+validator also inventories every sidecar tensor: Gemma4's exact deferred
+`gemma4a` companion closure is allowed only with all pinned active-audio
+metadata (including a positive integer `clip.audio.num_mel_bins`), but unknown
+top-level names, near-miss prefixes/suffixes, ranks, and packed projector
+tensors are rejected before graph construction. Gemma4 vision specifically
+requires an RGB Conv2d patch weight shaped `[hidden, 3, patch, patch]`; rank-5
+patch weights remain valid only for supported topologies whose graphs consume
+temporal patches.
 
 Sharded GGUF files are rejected. A single shard has only part of the tensor
 table, and treating it as a complete checkpoint would create a corrupt model.
