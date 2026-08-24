@@ -645,19 +645,6 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     # the generic _base_config default is "silu", so set it explicitly to match HF.
     ("falcon", {"parallel_attn": True, "dual_ln": True, "hidden_act": "gelu"}, True),
     (
-        "falcon_h1",
-        # ALiBi bias shape (1, num_heads, q, total) requires kv_num_heads == num_heads
-        # in ORT Attention (GQA is incompatible with ALiBi). Use MHA (kv_heads=num_heads).
-        # dual_ln=True: new_decoder_architecture uses separate ln_attn + ln_mlp.
-        {
-            "alibi": True,
-            "attn_qkv_bias": True,
-            "num_key_value_heads": TINY_HEADS,
-            "dual_ln": True,
-        },
-        True,
-    ),
-    (
         "bloom",
         {
             "alibi": True,
@@ -1321,21 +1308,6 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "topk_method": "greedy",
             "first_k_dense_replace": TINY_LAYERS,
             "n_shared_experts": 0,
-        },
-        False,
-    ),
-    # falcon_h1: ALiBi with parallel attention+MLP
-    (
-        "falcon_h1",
-        # ALiBi bias shape (1, num_heads, q, total) requires kv_num_heads == num_heads
-        # in ORT Attention (GQA is incompatible with ALiBi). Use MHA (kv_heads=num_heads).
-        # dual_ln=True: new_decoder_architecture uses separate ln_attn + ln_mlp.
-        {
-            "alibi": True,
-            "attn_qkv_bias": True,
-            "parallel_attn": True,
-            "num_key_value_heads": TINY_HEADS,
-            "dual_ln": True,
         },
         False,
     ),

@@ -79,6 +79,31 @@ class TestMapGGUFToHFNames:
         result = map_gguf_to_hf_names("blk.0.attn_q.weight", arch)
         assert result == "model.layers.0.self_attn.q_proj.weight"
 
+    @pytest.mark.parametrize(
+        ("architecture", "gguf_name", "expected"),
+        [
+            (
+                "jamba",
+                "blk.2.ssm_b_norm.weight",
+                "model.layers.2.mamba.B_layernorm.weight",
+            ),
+            (
+                "nemotron_h",
+                "blk.1.ssm_dt.bias",
+                "backbone.layers.1.mixer.dt_bias",
+            ),
+            (
+                "granitehybrid",
+                "blk.0.ffn_gate.weight",
+                "model.layers.0.shared_mlp.gate_proj.weight",
+            ),
+        ],
+    )
+    def test_second_hybrid_cohort_mapping(
+        self, architecture: str, gguf_name: str, expected: str
+    ) -> None:
+        assert map_gguf_to_hf_names(gguf_name, architecture) == expected
+
     # ---- Bias tensors ----
 
     def test_bias_suffix(self) -> None:

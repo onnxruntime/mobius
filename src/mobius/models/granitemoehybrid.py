@@ -371,9 +371,15 @@ class _GraniteMoeHybridTextModel(nn.Module):
         )
 
         layer_types = config.layer_types or []
+        if len(layer_types) != config.num_hidden_layers:
+            raise ValueError(
+                "GraniteHybrid layer_types must contain exactly num_hidden_layers entries"
+            )
+        if any(layer_type not in {"mamba2", "full_attention"} for layer_type in layer_types):
+            raise ValueError(f"Unknown GraniteHybrid layer type in {layer_types!r}")
         self.layers = nn.ModuleList([])
         for i in range(config.num_hidden_layers):
-            ltype = layer_types[i] if i < len(layer_types) else "mamba2"
+            ltype = layer_types[i]
             if ltype == "mamba2":
                 self.layers.append(_GraniteMoeHybridMambaDecoderLayer(config))
             else:
@@ -426,11 +432,11 @@ class _GraniteMoeHybridTextModel(nn.Module):
 
 
 class GraniteMoeHybridCausalLMModel(nn.Module):
-    """GraniteMoeHybrid hybrid Mamba2+Attention causal language model with MoE FFN.
+    """GraniteMoeHybrid hybrid Mamba2+Attention causal language model.
 
-    Every layer has both a routed MoE block (``block_sparse_moe``) and a dense
-    shared MLP (``shared_mlp``). Mamba2 layers use the SSD selective scan;
-    attention layers use standard GQA without rotary position embeddings (NoPE).
+    Routed-MoE checkpoints run ``block_sparse_moe`` plus ``shared_mlp``; dense
+    checkpoints run ``shared_mlp`` alone. Mamba2 layers use the SSD selective
+    scan, while attention layers use RoPE or NoPE according to the config.
 
     Uses ``HybridCausalLMTask`` with mixed ``"mamba2"`` and ``"full_attention"``
     layer types for the KV/SSM cache.

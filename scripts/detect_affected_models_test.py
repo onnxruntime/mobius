@@ -119,11 +119,11 @@ class TestRegistryParsing:
         assert "FalconCausalLMModel" in mapping
         types = mapping["FalconCausalLMModel"]
         assert "falcon" in types
-        assert "falcon_h1" in types
+        assert "falcon_h1" not in types
 
     def test_source_module_to_types(self):
         mapping = _build_source_module_to_types()
-        # falcon.py should map to falcon, bloom, mpt, falcon_h1
+        # Falcon-H1 is a parallel attention+Mamba2 architecture, not a Falcon alias.
         falcon_key = "mobius.models.falcon"
         assert falcon_key in mapping
         types = mapping[falcon_key]

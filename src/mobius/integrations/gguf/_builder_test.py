@@ -4201,6 +4201,41 @@ class TestGGUFPreflightGuards:
         module_lookup.assert_not_called()
         graph_build.assert_not_called()
 
+    @pytest.mark.parametrize("architecture", ["minimax-01", "plamo2", "falcon-h1"])
+    def test_deferred_second_hybrid_cohort_fails_before_graph_construction(
+        self, architecture: str, tmp_path: Path
+    ) -> None:
+        from mobius import _builder as core_builder
+        from mobius import _registry as core_registry
+        from mobius.integrations.gguf import _builder as gguf_builder
+        from mobius.integrations.gguf import _config_mapping, build_from_gguf
+        from mobius.integrations.gguf._errors import UnsupportedGGUFArchitectureError
+
+        path = tmp_path / f"{architecture}.gguf"
+        _write_quantized_gguf(path, architecture=architecture)
+        downstream = AssertionError("deferred architecture reached graph construction")
+        with (
+            mock.patch.object(
+                gguf_builder, "_has_quantized_weights", side_effect=downstream
+            ) as quantization_probe,
+            mock.patch.object(
+                _config_mapping, "gguf_to_config", side_effect=downstream
+            ) as config_extraction,
+            mock.patch.object(
+                core_registry.registry, "get", side_effect=downstream
+            ) as module_lookup,
+            mock.patch.object(
+                core_builder, "build_from_module", side_effect=downstream
+            ) as graph_build,
+            pytest.raises(UnsupportedGGUFArchitectureError, match=architecture),
+        ):
+            build_from_gguf(path)
+
+        quantization_probe.assert_not_called()
+        config_extraction.assert_not_called()
+        module_lookup.assert_not_called()
+        graph_build.assert_not_called()
+
     @pytest.mark.parametrize("projection_quantization", ["f32", "q4_0"])
     def test_standalone_clip_fails_before_all_downstream_stages(
         self, projection_quantization: str, tmp_path: Path
@@ -4672,6 +4707,106 @@ class TestHybridTensorContract:
             _raise_for_invalid_hybrid_tensor_contract(
                 self._FakeGGUF(
                     "lfm2", metadata, [*self._lfm2_names(), "blk.2.ffn_norm.weight"]
+                )
+            )
+
+    @staticmethod
+    def _second_cohort_names(architecture: str) -> list[str]:
+        names = ["token_embd.weight", "output_norm.weight"]
+        if architecture == "jamba":
+            common = [
+                "attn_norm.weight",
+                "ffn_norm.weight",
+                "ffn_gate.weight",
+                "ffn_up.weight",
+                "ffn_down.weight",
+            ]
+            mixers = [
+                [
+                    "ssm_in.weight",
+                    "ssm_conv1d.weight",
+                    "ssm_conv1d.bias",
+                    "ssm_x.weight",
+                    "ssm_dt_norm.weight",
+                    "ssm_dt.weight",
+                    "ssm_dt.bias",
+                    "ssm_b_norm.weight",
+                    "ssm_c_norm.weight",
+                    "ssm_a",
+                    "ssm_d",
+                    "ssm_out.weight",
+                ],
+                ["attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight"],
+            ]
+        elif architecture == "nemotron_h":
+            common = ["attn_norm.weight"]
+            mixers = [
+                [
+                    "ssm_in.weight",
+                    "ssm_conv1d.weight",
+                    "ssm_dt.bias",
+                    "ssm_a",
+                    "ssm_d",
+                    "ssm_norm.weight",
+                    "ssm_out.weight",
+                ],
+                ["ffn_up.weight", "ffn_down.weight"],
+            ]
+        else:
+            common = [
+                "attn_norm.weight",
+                "ffn_norm.weight",
+                "ffn_gate.weight",
+                "ffn_up.weight",
+                "ffn_down.weight",
+            ]
+            mixers = [
+                [
+                    "ssm_in.weight",
+                    "ssm_conv1d.weight",
+                    "ssm_dt.bias",
+                    "ssm_a",
+                    "ssm_d",
+                    "ssm_norm.weight",
+                    "ssm_out.weight",
+                ],
+                ["attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight"],
+            ]
+        for layer, mixer in enumerate(mixers):
+            names.extend(f"blk.{layer}.{suffix}" for suffix in [*common, *mixer])
+        return names
+
+    @pytest.mark.parametrize("architecture", ["jamba", "nemotron_h", "granitehybrid"])
+    def test_second_cohort_exact_closure_and_mutations(self, architecture: str) -> None:
+        from mobius.integrations.gguf._builder import (
+            _raise_for_invalid_hybrid_tensor_contract,
+        )
+
+        metadata = {
+            f"{architecture}.block_count": 2,
+            f"{architecture}.attention.head_count_kv": [0, 2],
+        }
+        if architecture == "nemotron_h":
+            metadata[f"{architecture}.feed_forward_length"] = [0, 128]
+        names = self._second_cohort_names(architecture)
+        _raise_for_invalid_hybrid_tensor_contract(
+            self._FakeGGUF(architecture, metadata, names)
+        )
+
+        with pytest.raises(ValueError, match="unexpected"):
+            _raise_for_invalid_hybrid_tensor_contract(
+                self._FakeGGUF(
+                    architecture,
+                    metadata,
+                    [*names, "blk.0.attn_q.weight"],
+                )
+            )
+        with pytest.raises(ValueError, match="out_of_range"):
+            _raise_for_invalid_hybrid_tensor_contract(
+                self._FakeGGUF(
+                    architecture,
+                    metadata,
+                    [*names, "blk.2.attn_norm.weight"],
                 )
             )
 

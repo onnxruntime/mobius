@@ -516,6 +516,94 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         quantized_import=Support.REJECTED,
         reason=_RECURRENT_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
     ),
+    GGUFArchitectureSpec(
+        gguf_arch="jamba",
+        model_type="jamba",
+        tensor_map_recipe=("jamba",),
+        config_key_map="jamba",
+        config_postprocessor="jamba",
+        tensor_processor="mamba",
+        required_metadata=(
+            "attention.layer_norm_rms_epsilon",
+            "ssm.conv_kernel",
+            "ssm.inner_size",
+            "ssm.state_size",
+            "ssm.time_step_rank",
+        ),
+        runtime=Support.DEFERRED,
+        reason=_RECURRENT_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="nemotron_h",
+        model_type="nemotron_h",
+        tensor_map_recipe=("nemotron_h",),
+        config_key_map="nemotron_h",
+        config_postprocessor="nemotron_h",
+        tensor_processor="mamba",
+        required_metadata=(
+            "attention.layer_norm_rms_epsilon",
+            "ssm.conv_kernel",
+            "ssm.group_count",
+            "ssm.inner_size",
+            "ssm.state_size",
+            "ssm.time_step_rank",
+        ),
+        runtime=Support.DEFERRED,
+        reason=_RECURRENT_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="granitehybrid",
+        model_type="granitemoehybrid",
+        tensor_map_recipe=("granitehybrid",),
+        config_key_map="granitehybrid",
+        config_postprocessor="granitehybrid",
+        tensor_processor="granitehybrid",
+        required_metadata=(
+            "attention.layer_norm_rms_epsilon",
+            "ssm.conv_kernel",
+            "ssm.group_count",
+            "ssm.inner_size",
+            "ssm.state_size",
+            "ssm.time_step_rank",
+        ),
+        runtime=Support.DEFERRED,
+        reason=_RECURRENT_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="minimax-01",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The pinned loader schedule is not periodic and its Lightning Attention "
+            "decay, scaling, residual multipliers, and recurrent rollback semantics "
+            "are not represented by the current MiniMax graph."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="plamo2",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The pinned PLaMo2 loader requires a dedicated fused-QKV Mamba1/attention "
+            "graph with sandwich norms and offset transforms that Mobius does not have."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="falcon-h1",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "Falcon-H1 executes attention and Mamba2 in parallel in every block and "
+            "requires KV and recurrent states simultaneously; FalconCausalLMModel is "
+            "not compatible with that graph or state ABI."
+        ),
+    ),
     # --------------------------------------------------------- Encoder-only
     GGUFArchitectureSpec(
         gguf_arch="bert",

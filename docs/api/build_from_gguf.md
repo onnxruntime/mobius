@@ -222,6 +222,41 @@ validated against a vendored census of the 147 architectures llama.cpp defines
 at commit `8d9af256337d1a501250f9bbf4c0859a654bddd6`. Aliases are spellings
 llama.cpp does not emit but that mobius still accepts.
 
+### Second hybrid cohort
+
+`jamba`, `nemotron_h`, and `granitehybrid` have graph-import support for exact
+dense subsets only; runtime packaging remains deferred pending independent
+real-artifact full-logit and stateful-generation parity.
+
+- Schedules come from suffix-exact per-layer metadata. Jamba and GraniteHybrid
+  use `attention.head_count_kv` (`0` selects Mamba/Mamba2). Nemotron-H combines
+  that array with per-layer `feed_forward_length` to select exactly one of
+  Mamba2, attention, or dense ReLU² MLP.
+- Jamba requires `ssm.inner_size == 2 * embedding_length`. Nemotron-H rejects
+  MTP and all MoE files. GraniteHybrid rejects routed-MoE files until 3-D expert
+  fusion, ordering, and quantized preservation have independent value tests.
+- Every layer must provide exactly its pinned loader tensor family. Missing,
+  wrong-mixer, partial, auxiliary, scale/input-scale, and out-of-range tensors
+  are rejected before graph construction. GGUF Mamba decay values are inverted
+  from `-exp(A_log)`; convolution and grouped Mamba2 tensors are restored to
+  graph shapes.
+- State inputs and outputs are caller-owned. Mamba1 uses conv
+  `[B, d_inner, conv_kernel-1]` and SSM `[B, d_inner, d_state]`; Mamba2 uses
+  conv `[B, d_inner + 2*groups*d_state, conv_kernel-1]` and SSM
+  `[B, heads, d_state, head_dim]`. Rollback restores a previously saved complete
+  state tuple; reorder gathers every state on the batch axis. This does not
+  claim llama.cpp's in-place snapshot/copy-on-write rollback manager.
+- `static_cache=True` and non-hybrid task dispatch are rejected for these mixed
+  state ABIs.
+
+`minimax-01`, `plamo2`, and `falcon-h1` are deferred before config extraction.
+MiniMax-01's pinned Lightning schedule and decay/scaling semantics do not match
+the current graph; PLaMo2 needs a dedicated fused-QKV Mamba1/attention graph;
+Falcon-H1 executes attention and Mamba2 in parallel in every block and therefore
+needs KV plus conv/SSM states simultaneously. It is not an alias of ordinary
+Falcon. `nemotron_h_moe` remains rejected because its folded MTP attention+MoE
+head has no equivalent package contract.
+
 ### Audio/TTS/codec cohort
 
 The four C09 architectures below were audited against llama.cpp commit

@@ -1074,7 +1074,7 @@ class ArchitectureConfig(BaseModelConfig):
         )
 
         # Falcon/Bloom model-specific overrides
-        if model_type in ("falcon", "falcon_h1"):
+        if model_type == "falcon":
             # Falcon MQA: multi_query=True with old architecture → 1 KV head
             if getattr(config, "multi_query", False) and not getattr(
                 config, "new_decoder_architecture", False

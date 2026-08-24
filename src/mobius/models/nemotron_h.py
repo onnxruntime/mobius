@@ -450,9 +450,16 @@ class _NemotronHTextModel(nn.Module):
         )
 
         layer_types = config.layer_types or []
+        if len(layer_types) != config.num_hidden_layers:
+            raise ValueError(
+                "Nemotron-H layer_types must contain exactly num_hidden_layers entries"
+            )
+        valid_types = {"mamba2", "full_attention", "mlp", "moe"}
+        if any(layer_type not in valid_types for layer_type in layer_types):
+            raise ValueError(f"Unknown Nemotron-H layer type in {layer_types!r}")
         self.layers = nn.ModuleList([])
         for i in range(config.num_hidden_layers):
-            ltype = layer_types[i] if i < len(layer_types) else "full_attention"
+            ltype = layer_types[i]
             if ltype == "mamba2":
                 self.layers.append(NemotronHMambaLayer(config))
             elif ltype == "mlp":

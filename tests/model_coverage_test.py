@@ -285,7 +285,6 @@ _COVERAGE_SKIP: dict[str, str] = {
     "doge": "CausalLM — YAML not yet created",
     "ernie4_5": "CausalLM — YAML not yet created",
     "exaone": "CausalLM — YAML not yet created",
-    "falcon_h1": "CausalLM — YAML not yet created",
     "falcon_mamba": "SSM — YAML not yet created",
     "imagegpt": "Vision model — YAML not yet created",
     "internlm2": "CausalLM — YAML not yet created",
