@@ -767,10 +767,26 @@ def build_from_gguf(
         }
         float_dict = {k: state_dict[k] for k in float_keys}
         quant_dict = {k: state_dict[k] for k in state_dict if k not in float_keys}
+        before_processing = dict(float_dict)
         float_dict = process_tensors(float_dict, config)
+        if reuse_candidates_by_id is not None:
+            _record_reuse_process_transforms(
+                before_processing,
+                float_dict,
+                reuse_candidates_by_id,
+                config,
+            )
         state_dict = {**float_dict, **quant_dict}
     else:
+        before_processing = dict(state_dict)
         state_dict = process_tensors(state_dict, config)
+        if reuse_candidates_by_id is not None:
+            _record_reuse_process_transforms(
+                before_processing,
+                state_dict,
+                reuse_candidates_by_id,
+                config,
+            )
 
     # 7b. Normalize GGUF-specific weight shapes to match HF conventions.
     # This converts GGUF tensor quirks (stacked experts, 1D gates, 2D
@@ -834,6 +850,53 @@ def build_from_gguf(
             pkg.mtp_head = mtp_pkg
 
     return pkg
+
+
+def _record_reuse_process_transforms(
+    before: dict,
+    after: dict,
+    candidates: dict,
+    config,
+) -> None:
+    """Carry exact-byte candidates through known graph-expressible transforms."""
+    import dataclasses
+
+    from mobius.integrations.gguf._tensor_processors import needs_llama_qk_permute
+
+    for name, transformed in after.items():
+        original = before.get(name)
+        if original is None or id(original) == id(transformed):
+            continue
+        candidate = candidates.get(id(original))
+        if candidate is None:
+            continue
+
+        transform: str | None = None
+        parameter: int | None = None
+        if needs_llama_qk_permute(getattr(config, "model_type", None)) and (
+            ".q_proj." in name or ".k_proj." in name
+        ):
+            transform = "llama_qk_permute"
+            parameter = (
+                config.num_attention_heads
+                if ".q_proj." in name
+                else config.num_key_value_heads
+            )
+        elif "A_log" in name:
+            transform = "log_neg"
+        elif "norm" in name and original.shape == transformed.shape:
+            transform = "subtract_one"
+        elif tuple(reversed(original.shape)) == tuple(transformed.shape):
+            transform = "transpose"
+        elif original.numel() == transformed.numel():
+            transform = "reshape"
+
+        if transform is not None:
+            candidates[id(transformed)] = dataclasses.replace(
+                candidate,
+                transform=transform,
+                transform_parameter=parameter,
+            )
 
 
 def _is_quantized_weight(key: str, state_dict: dict) -> bool:
@@ -1551,7 +1614,11 @@ def _load_dequantized_state_dict(
 
                     offset, length, qtype_name = gguf_model.tensor_storage_range(gguf_name)
                     reuse_candidates[id(tensor)] = GGUFReuseCandidate(
-                        gguf_name, offset, length, qtype_name
+                        gguf_name,
+                        offset,
+                        length,
+                        qtype_name,
+                        tuple(int(dim) for dim in np_array.shape),
                     )
         else:
             if warn_unmapped:
@@ -1713,7 +1780,11 @@ def _load_quantized_state_dict(
 
                     offset, length, qtype_name = gguf_model.tensor_storage_range(gguf_name)
                     reuse_candidates[id(w)] = GGUFReuseCandidate(
-                        gguf_name, offset, length, qtype_name
+                        gguf_name,
+                        offset,
+                        length,
+                        qtype_name,
+                        tuple(int(dim) for dim in w.shape),
                     )
             n_repacked += len(native_targets)
         elif should_repack:
@@ -1807,7 +1878,11 @@ def _load_quantized_state_dict(
 
                 offset, length, qtype_name = gguf_model.tensor_storage_range(gguf_name)
                 reuse_candidates[id(tensor)] = GGUFReuseCandidate(
-                    gguf_name, offset, length, qtype_name
+                    gguf_name,
+                    offset,
+                    length,
+                    qtype_name,
+                    tuple(int(dim) for dim in arr.shape),
                 )
 
     logger.info(

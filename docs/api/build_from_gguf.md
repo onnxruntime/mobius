@@ -90,19 +90,24 @@ Repacked, requantized, dequantized, or synthesized tensors are true storage
 changes and therefore go to the sidecar.
 
 Float transpose, norm-offset arithmetic, Llama Q/K row permutation, and Mamba
-`A_log` arithmetic are not inherent storage incompatibilities: ONNX can express
-them as graph operations over the original external tensor. They are deferred
-from this first PR because each transform needs consumer-aware graph rewiring
-and runtime validation across constant-folding implementations. Until that work
-lands, those transformed tensors also go to the sidecar rather than being
-misrepresented as byte-compatible.
+`A_log`/shape transforms are not inherent storage incompatibilities. Reuse mode
+keeps their original F32/F16 bytes in the GGUF and inserts the corresponding
+ONNX `Transpose`, `Sub`, `Neg`/`Log`, or `Reshape` operations before their graph
+consumers. Opaque packed UINT8 blocks are never passed through a generic ONNX
+`Transpose`; only a consumer with a proven native block layout can reuse them.
 
-When a package later contains graph-level external-weight transforms, create ORT
-sessions with graph optimization disabled
+Create ORT sessions with graph optimization disabled
 (`SessionOptions.graph_optimization_level = ORT_DISABLE_ALL`) so ORT does not
 constant-fold them into another materialized weight copy. This first version
-already recommends that setting for stable package-size behavior, although its
-direct tensors require no transform.
+therefore rejects `--runtime ort-genai`: the current `genai_config.json` schema
+has no supported session option that can require disabled constant folding.
+Use direct ONNX Runtime for reuse packages.
+
+Disabling folding preserves storage reuse but does not make transforms free at
+runtime. A transpose/permutation or arithmetic node may allocate a transformed
+weight buffer and consume startup or execution time. The package avoids a second
+on-disk copy; peak runtime memory and performance remain transform- and
+execution-provider-dependent.
 
 ## Behavior
 

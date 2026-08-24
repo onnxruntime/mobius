@@ -226,7 +226,6 @@ class ModelPackage(UserDict[str, ir.Model]):
         if reuse_plan is not None and (len(selected) != 1 or use_subfolders):
             raise ValueError("GGUF weight reuse currently supports one flat ONNX model only.")
 
-        converted_tensors: tuple[str, ...] = ()
         for name, model in selected.items():
             callback = _make_progress_callback() if progress_bar else None
             if check_weights:
@@ -239,9 +238,9 @@ class ModelPackage(UserDict[str, ir.Model]):
             path = os.path.join(model_dir, "model.onnx")
             with _namespaced_symbolic_dimensions(model, f"component.{name}") as saved_model:
                 if reuse_plan is not None:
-                    from mobius.integrations.gguf._reuse import save_reuse_model
+                    from mobius.integrations.gguf._reuse import save_reuse_package
 
-                    converted_tensors = save_reuse_model(
+                    save_reuse_package(
                         saved_model,
                         path,
                         reuse_plan,
@@ -264,11 +263,7 @@ class ModelPackage(UserDict[str, ir.Model]):
                         save_kwargs["max_workers"] = max_workers
                     ir.save(saved_model, path, **save_kwargs)
 
-        if reuse_plan is not None:
-            from mobius.integrations.gguf._reuse import write_reuse_manifest
-
-            write_reuse_manifest(directory, reuse_plan, converted_tensors)
-        else:
+        if reuse_plan is None:
             # Re-saving a loaded reuse package through the ordinary saver copies
             # all weights into ONNX external data, so any old reuse manifest in
             # the destination would become a false provenance claim.

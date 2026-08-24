@@ -561,6 +561,22 @@ class TestCLIBuildGGUF:
 
         assert build.call_args.kwargs["reuse_gguf_weights"] is True
 
+    def test_reuse_rejects_ort_genai_runtime(self, tmp_path):
+        from mobius.__main__ import main
+
+        with pytest.raises(SystemExit, match="cannot be combined"):
+            main(
+                [
+                    "build-gguf",
+                    str(tmp_path / "model.gguf"),
+                    "--output",
+                    str(tmp_path / "output"),
+                    "--reuse-gguf-weights",
+                    "--runtime",
+                    "ort-genai",
+                ]
+            )
+
     def test_ort_genai_runtime_is_forwarded_to_package_writer(self, tmp_path):
         """build-gguf forwards the selected runtime after saving the graph."""
         from mobius.__main__ import main

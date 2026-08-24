@@ -606,6 +606,12 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
     mmproj_path = getattr(args, "mmproj", None)
     keep_quantized = not args.dequantize
     reuse_gguf_weights = args.reuse_gguf_weights
+    if reuse_gguf_weights and args.runtime == "ort-genai":
+        raise SystemExit(
+            "Error: --reuse-gguf-weights cannot be combined with --runtime ort-genai "
+            "because genai_config.json cannot require disabled ORT constant folding. "
+            "Use direct ONNX Runtime with ORT_DISABLE_ALL."
+        )
 
     if keep_quantized:
         print("Preserving supported GGUF quantization (float-only inputs stay float)...")
