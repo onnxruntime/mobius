@@ -127,6 +127,37 @@ def test_tiny_graph_builds_v4_backbone():
     graph = build_from_module(DeepSeekV4CausalLMModel(config), config)["model"].graph
     assert graph.num_nodes() > 0
     assert count_op_type(graph, "Attention") == 0
+    # Default EP declares an empty `gqa_dtypes` (see
+    # `mobius._execution_providers`) specifically to guarantee portable,
+    # `com.microsoft`-free graphs -- DeepSeek-V4 must fall back to the
+    # decomposed attention path here, exactly like every other model in
+    # this codebase. See `test_tiny_graph_builds_v4_backbone_fused_gqa_on_cpu_ep`
+    # below for the fused-GQA structural proof under a GQA-capable EP.
+    assert count_op_type(graph, "GroupQueryAttention") == 0
+    assert count_op_type(graph, "Softmax") >= config.num_hidden_layers
+    assert count_op_type(graph, "ScatterElements") == 0
+    assert count_op_type(graph, "Softplus") >= config.num_hidden_layers
+    assert count_op_type(graph, "TopK") >= 1
+    assert count_op_type(graph, "Gather") >= 1
+    assert count_op_type(graph, "RMSNormalization") >= 1
+    assert sum("attn_sink" in name for name in graph.initializers) == config.num_hidden_layers
+    assert "hidden_states" not in {value.name for value in graph.outputs}
+
+
+def test_tiny_graph_builds_v4_backbone_fused_gqa_on_cpu_ep():
+    """Same backbone, built under a GQA-capable EP, must fuse attention.
+
+    ``"cpu"`` declares ``gqa_dtypes={FLOAT}`` (``mobius._execution_providers``),
+    which the tiny config's default ``dtype=ir.DataType.FLOAT`` matches, so
+    this exercises ``_use_fused_gqa()``'s true branch -- the same EP-gating
+    idiom ``lfm2_test.py``/``world_model_test.py`` use for their own
+    GQA-capable-EP structural tests.
+    """
+    config = _tiny_config()
+    graph = build_from_module(
+        DeepSeekV4CausalLMModel(config), config, execution_provider="cpu"
+    )["model"].graph
+    assert count_op_type(graph, "Attention") == 0
     gqa_nodes = [node for node in graph if node.op_type == "GroupQueryAttention"]
     assert len(gqa_nodes) == config.num_hidden_layers
     assert all(node.domain == "com.microsoft" for node in gqa_nodes)
@@ -137,8 +168,8 @@ def test_tiny_graph_builds_v4_backbone():
     assert all(len(node.inputs) == 12 and node.inputs[10] is None for node in gqa_nodes)
     assert all(node.inputs[11] is not None for node in gqa_nodes)
     # Only the Hyper-Connection combination softmax (2 per layer) remains;
-    # the old manual Concat(scores, sink) -> Softmax -> slice attention
-    # softmax is gone now that GQA computes it internally.
+    # the manual Concat(scores, sink) -> Softmax -> slice attention softmax
+    # the decomposed path uses is gone now that GQA computes it internally.
     assert count_op_type(graph, "Softmax") == 2 * config.num_hidden_layers
     assert count_op_type(graph, "ScatterElements") == 0
     assert count_op_type(graph, "Softplus") >= config.num_hidden_layers
@@ -169,6 +200,28 @@ def test_csa_schedule_exports_compressor_and_indexer_tensors_with_dense_attentio
     assert "model.layers.3.self_attn.compressor.wkv.weight" in names
     assert not any("model.layers.3.self_attn.indexer" in name for name in names)
     assert count_op_type(graph, "Attention") == 0
+    assert count_op_type(graph, "GroupQueryAttention") == 0
+    assert count_op_type(graph, "ScatterElements") == 0
+    assert count_op_type(graph, "Softmax") >= config.num_hidden_layers
+
+
+def test_csa_schedule_exports_fused_gqa_regardless_of_compress_ratio_on_cpu_ep():
+    config = _tiny_config(
+        num_hidden_layers=4,
+        compress_ratios=[0, 0, 4, 128],
+    )
+    graph = build_from_module(
+        DeepSeekV4CausalLMModel(config),
+        config,
+        task="deepseek-v4",
+        execution_provider="cpu",
+    )["model"].graph
+    names = set(graph.initializers)
+
+    assert "model.layers.2.self_attn.compressor.wkv.weight" in names
+    assert "model.layers.3.self_attn.compressor.wkv.weight" in names
+    assert not any("model.layers.3.self_attn.indexer" in name for name in names)
+    assert count_op_type(graph, "Attention") == 0
     # Dense-CSA schedule attention is still a single fused GQA call per
     # layer regardless of compress_ratio: the compressor/indexer tensors
     # above are retained as a zero-valued shape anchor (see
@@ -195,8 +248,32 @@ def test_mtp_sidecar_exports_official_block_and_hyper_connection_state():
     assert "mtp.0.h_proj.weight" in names
     assert "mtp.0.hc_head_fn.weight" in names
     assert "mtp.0.self_attn.attn_sink" in names
-    assert count_op_type(mtp_graph, "GroupQueryAttention") == 1
+    assert count_op_type(mtp_graph, "GroupQueryAttention") == 0
     assert count_op_type(mtp_graph, "Softmax") >= 1
+    assert {value.name for value in mtp_graph.outputs} == {
+        "mtp_hidden",
+        "present.0.key",
+        "present.0.value",
+    }
+
+
+def test_mtp_sidecar_exports_fused_gqa_on_cpu_ep():
+    config = _tiny_config(
+        num_nextn_predict_layers=1,
+        compress_ratios=[0, 0, 0],
+    )
+    package = build_from_module(
+        DeepSeekV4CausalLMModel(config),
+        config,
+        task="deepseek-v4",
+        execution_provider="cpu",
+    )
+
+    assert set(package) == {"model", "mtp"}
+    mtp_graph = package["mtp"].graph
+    names = set(mtp_graph.initializers)
+    assert "mtp.0.self_attn.attn_sink" in names
+    assert count_op_type(mtp_graph, "GroupQueryAttention") == 1
     assert {value.name for value in mtp_graph.outputs} == {
         "mtp_hidden",
         "present.0.key",
