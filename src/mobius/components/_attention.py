@@ -354,6 +354,7 @@ class Attention(nn.Module):
                 value_states,
                 attention_bias,
                 past_key_value,
+                hidden_states=hidden_states,
             )
 
         # Apply rotary position embeddings (skip when not provided)
@@ -401,6 +402,7 @@ class Attention(nn.Module):
             static_cache=static_cache,
         )
 
+        attn_output = self._post_attention(op, attn_output, hidden_states)
         attn_output = self._project_output(op, attn_output)
         return attn_output, (present_key, present_value)
 
@@ -418,6 +420,28 @@ class Attention(nn.Module):
         """Apply architecture-specific processing before the output projection."""
         return self.o_proj(op, attn_output)
 
+    def _post_attention(
+        self,
+        op: OpBuilder,
+        attn_output: ir.Value,
+        hidden_states: ir.Value,
+    ) -> ir.Value:
+        """Transform the attention output before the ``o_proj`` projection.
+
+        Extension point for architectures that post-process the attended
+        values while still reusing the whole Q/K/V + RoPE + cache pipeline of
+        this class. The base implementation is the identity, so it is inert
+        for every standard model.
+
+        Args:
+            attn_output: Attention result ``[B, S, num_heads * head_dim]``.
+            hidden_states: The (already normalized) layer input that produced
+                Q/K/V, so a subclass can derive a gate from the same tensor
+                HuggingFace does.
+        """
+        del op, hidden_states
+        return attn_output
+
     def _forward_gqa(
         self,
         op: OpBuilder,
@@ -426,6 +450,8 @@ class Attention(nn.Module):
         value_states: ir.Value,
         gqa_ctx: GQAContext,
         past_key_value: tuple | None,
+        hidden_states: ir.Value | None = None,
+        hidden_states: ir.Value | None = None,
     ):
         """Emit ``com.microsoft::GroupQueryAttention`` directly.
 
@@ -435,6 +461,9 @@ class Attention(nn.Module):
         forward pass and the post-hoc
         :class:`~mobius.rewrite_rules._group_query_attention.RotaryAttentionToGQA`
         rewrite rule; RoPE is handled by the ``do_rotary=1`` attribute instead.
+
+        ``hidden_states`` is only forwarded to :meth:`_post_attention`; it is
+        optional so that existing positional callers keep working.
 
         Returns ``(attn_output, (present_key, present_value))`` in the same
         shape as the standard :meth:`forward` path.
@@ -474,6 +503,8 @@ class Attention(nn.Module):
             **gqa_attrs,
         )
 
+        if hidden_states is not None:
+            attn_out = self._post_attention(op, attn_out, hidden_states)
         attn_out = self._project_output(op, attn_out)
         return attn_out, (present_key, present_value)
 

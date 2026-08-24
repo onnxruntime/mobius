@@ -34,6 +34,7 @@ from mobius._configs import (
     GraniteMoeHybridConfig,
     GrokGGUFConfig,
     GroveMoEGGUFConfig,
+    HrmTextConfig,
     HyV3Config,
     JambaConfig,
     JetMoeConfig,
@@ -285,6 +286,23 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         False,
     ),
     ("helium", {}, False),
+    (
+        # HRM-Text: two recurrently-invoked stacks. ``num_hidden_layers`` here
+        # is the real per-stack depth; ``HrmTextConfig.__post_init__`` inflates
+        # it to num_layers_per_stack * H_cycles * (L_cycles + 1) = 2 * 2 * 3 = 12
+        # exactly as HuggingFace's ``HrmTextConfig`` does, so the tiny HF
+        # reference in the L3 parity test sees the same layer schedule.
+        "hrm_text",
+        {
+            "_config_cls": HrmTextConfig,
+            "num_hidden_layers": 2,
+            "H_cycles": 2,
+            "L_cycles": 2,
+            "initializer_range": 0.02,
+            "prefix_lm": True,
+        },
+        True,
+    ),
     ("hunyuan_v1_dense", {}, False),
     ("llama4_text", {}, False),
     ("ministral", {}, False),

@@ -182,21 +182,30 @@ class TextModel(nn.Module):
             dtype=self._dtype,
         )
 
-    def forward(
+    def _build_attention_context(
         self,
         op: OpBuilder,
-        input_ids: ir.Value,
+        *,
+        input_ids: ir.Value | None,
         attention_mask: ir.Value | None,
         position_ids: ir.Value,
-        past_key_values: list | None = None,
-        inputs_embeds: ir.Value | None = None,
-        deepstack_embeds: list | None = None,
-    ):
-        if inputs_embeds is not None:
-            hidden_states = inputs_embeds
-        else:
-            hidden_states = self.embed_tokens(op, input_ids)
+        hidden_states: ir.Value,
+        past_key_values: list | None,
+    ) -> tuple[GQAContext | ir.Value | None, tuple | None]:
+        """Build the per-graph attention bias and RoPE embeddings.
 
+        Returns ``(attention_bias, position_embeddings)``.  Both are shared by
+        every decoder layer in the graph, so this runs once per forward.
+        Split out of :meth:`forward` so that models with a non-sequential layer
+        schedule (e.g. the HRM-Text H/L recurrence, which invokes its two
+        stacks many times over one shared mask) can reuse the exact same
+        EP-aware GQA / padding-mask / static-cache decision logic.
+
+        Args:
+            input_ids: ``[B, S]`` token ids, or ``None`` for embeds-driven
+                forwards (the padding mask then keys off ``hidden_states``).
+            hidden_states: ``[B, S, hidden]`` embeddings for this step.
+        """
         # Determine whether to emit GroupQueryAttention directly.
         # Conditions:
         #  - attention_mask present: static-cache mode passes None; GQA requires seqlens_k.
@@ -253,50 +262,73 @@ class TextModel(nn.Module):
             # position_embeddings not needed: GroupQueryAttention handles RoPE
             # internally via do_rotary=1. Passing None skips apply_rotary_pos_emb
             # in Attention.forward() (which checks `if position_embeddings is not None`).
-            position_embeddings = None
-        else:
-            # This path (CPU fp32, DML, non-fused RoPE, mRoPE, static cache)
-            # builds at most a bool padding mask; it has no way to express a
-            # sliding window. Warn if the model expects one so the divergence
-            # from HuggingFace for sequences longer than the window is not
-            # silent. (For seq <= window the result is identical regardless.)
-            if self._gqa_local_window_size() > 0:
-                logger.warning(
-                    "Model declares a uniform sliding window "
-                    "(sliding_window=%s) but is being built through a non-GQA "
-                    "attention path (build dtype=%s); the exported graph uses "
-                    "full causal attention and will diverge from HuggingFace "
-                    "for sequences longer than the window. Build with a "
-                    "GQA-capable execution provider/dtype (e.g. CUDA or DML "
-                    "with float16/bfloat16) to apply the window.",
-                    getattr(self.config, "sliding_window", None),
-                    dtype,
-                )
-            # NoPE models (e.g. NemotronH, GraniteMoeHybrid) have
-            # ``rotary_emb = None`` because ``initialize_rope`` returned
-            # ``None`` for ``config.rope_type is None``. Skip building
-            # position_embeddings so that Attention.forward sees
-            # ``position_embeddings=None`` and does not apply rotary encoding.
-            if self.rotary_emb is not None:
-                position_embeddings = self.rotary_emb(op, position_ids)
-            else:
-                position_embeddings = None
+            return attention_bias, None
 
-            # When attention_mask is None (static cache mode), skip mask
-            # creation entirely — the Attention op uses is_causal=1 instead.
-            # When present, create a bool padding mask. Causal masking is
-            # handled by is_causal=1 on the Attention op (set in
-            # _apply_attention), so we only need padding information here.
-            if attention_mask is not None:
-                attention_bias = create_padding_mask(
-                    op,
-                    input_ids=hidden_states if input_ids is None else input_ids,
-                    attention_mask=attention_mask,
-                )
-            else:
-                attention_bias = self._maybe_static_cache_bias(
-                    op, hidden_states, past_key_values
-                )
+        # This path (CPU fp32, DML, non-fused RoPE, mRoPE, static cache)
+        # builds at most a bool padding mask; it has no way to express a
+        # sliding window. Warn if the model expects one so the divergence
+        # from HuggingFace for sequences longer than the window is not
+        # silent. (For seq <= window the result is identical regardless.)
+        if self._gqa_local_window_size() > 0:
+            logger.warning(
+                "Model declares a uniform sliding window "
+                "(sliding_window=%s) but is being built through a non-GQA "
+                "attention path (build dtype=%s); the exported graph uses "
+                "full causal attention and will diverge from HuggingFace "
+                "for sequences longer than the window. Build with a "
+                "GQA-capable execution provider/dtype (e.g. CUDA or DML "
+                "with float16/bfloat16) to apply the window.",
+                getattr(self.config, "sliding_window", None),
+                dtype,
+            )
+        # NoPE models (e.g. NemotronH, GraniteMoeHybrid) have
+        # ``rotary_emb = None`` because ``initialize_rope`` returned
+        # ``None`` for ``config.rope_type is None``. Skip building
+        # position_embeddings so that Attention.forward sees
+        # ``position_embeddings=None`` and does not apply rotary encoding.
+        if self.rotary_emb is not None:
+            position_embeddings = self.rotary_emb(op, position_ids)
+        else:
+            position_embeddings = None
+
+        # When attention_mask is None (static cache mode), skip mask
+        # creation entirely — the Attention op uses is_causal=1 instead.
+        # When present, create a bool padding mask. Causal masking is
+        # handled by is_causal=1 on the Attention op (set in
+        # _apply_attention), so we only need padding information here.
+        if attention_mask is not None:
+            attention_bias = create_padding_mask(
+                op,
+                input_ids=hidden_states if input_ids is None else input_ids,
+                attention_mask=attention_mask,
+            )
+        else:
+            attention_bias = self._maybe_static_cache_bias(op, hidden_states, past_key_values)
+        return attention_bias, position_embeddings
+
+    def forward(
+        self,
+        op: OpBuilder,
+        input_ids: ir.Value,
+        attention_mask: ir.Value | None,
+        position_ids: ir.Value,
+        past_key_values: list | None = None,
+        inputs_embeds: ir.Value | None = None,
+        deepstack_embeds: list | None = None,
+    ):
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = self.embed_tokens(op, input_ids)
+
+        attention_bias, position_embeddings = self._build_attention_context(
+            op,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            past_key_values=past_key_values,
+        )
 
         present_key_values = []
         output_layer_indices = getattr(self, "output_layer_indices", None)

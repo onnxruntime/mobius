@@ -1,0 +1,23 @@
+model_id: "sapientinc/HRM-Text-1B"
+model_type: "hrm_text"
+revision: "9f082d68b8cd0ebc56e33f1c88c45609174c272c"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Here is my poem:"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 24
+  do_sample: false
+
+notes: >-
+  HRM-Text 1B hierarchical recurrent decoder. Two independently-weighted
+  transformer stacks (L_module / H_module) are invoked H_cycles * (L_cycles + 1)
+  = 8 times per forward, so the graph carries 128 KV-cache slots for 16
+  per-stack blocks. Parameterless RMSNorm, sigmoid-gated attention output, and
+  token embeddings scaled by 1 / initializer_range. Base model with no chat
+  template, so the prompt is fed through the plain tokenizer.

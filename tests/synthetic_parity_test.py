@@ -326,6 +326,14 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     "ministral3": {"head_dim": TINY_HEAD_DIM},
     # Helium defaults head_dim=None in HF (causes pow(None,float) error)
     "helium": {"head_dim": TINY_HEAD_DIM},
+    # HRM-Text: head_dim is an explicit config param (HF default 128), and
+    # rope settings live under rope_parameters rather than rope_theta.
+    # num_hidden_layers stays at the tiny *per-stack* depth so that HF's
+    # HrmTextConfig.__post_init__ inflates it the same way ours does.
+    "hrm_text": {
+        "head_dim": TINY_HEAD_DIM,
+        "rope_parameters": {"rope_type": "default", "rope_theta": 10_000.0},
+    },
     # seed_oss defaults head_dim=128 in HF; override to match tiny config
     "seed_oss": {"head_dim": TINY_HEAD_DIM},
     # HunYuan V1 dense defaults head_dim=None in HF (causes pow(None,float) error)
