@@ -23,6 +23,7 @@ import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
+from mobius._build_context import ep_capabilities, get_build_dtype
 from mobius._configs import ArchitectureConfig
 from mobius._weight_utils import (
     pack_qmoe_expert_weights,
@@ -44,6 +45,49 @@ from mobius.components._rotary_embedding import apply_rotary_pos_emb
 from mobius.models.base import CausalLMModel
 
 logger = logging.getLogger(__name__)
+
+
+def _use_fused_gqa() -> bool:
+    """Whether the active EP/build dtype supports direct ``GroupQueryAttention`` emission.
+
+    Mirrors ``TextModel.forward``'s ``use_gqa`` gate (``mobius/models/base.py``):
+    the active EP must declare GQA support for the current build dtype via
+    :func:`~mobius._build_context.ep_capabilities`. Unlike that generic path,
+    V4 always applies RoPE explicitly in-graph (``do_rotary=0``), so this
+    doesn't also need to check ``caps.supports_fused_rope`` -- V4's fused path
+    never asks ``GroupQueryAttention`` to rotate internally.
+
+    EPs such as ``"default"``, ``"onnx-standard"``, ``"qnn"``, and
+    ``"openvino"`` declare an empty ``gqa_dtypes`` specifically so their
+    exported graphs stay free of ``com.microsoft`` ops; V4 must fall back to
+    the portable decomposed attention path for those, exactly like every
+    other model in this codebase.
+    """
+    caps = ep_capabilities()
+    return get_build_dtype() in caps.gqa_dtypes
+
+
+def _gqa_kv_lengths(op: OpBuilder, attention_mask: ir.Value) -> tuple[ir.Value, ir.Value]:
+    """Derive ``GroupQueryAttention``'s required ``seqlens_k``/``total_sequence_length``.
+
+    Same formula ``TextModel`` uses to build a ``GQAContext``
+    (``mobius/models/base.py``): ``seqlens_k[b] = sum(attention_mask[b]) - 1``
+    (last valid KV index per batch entry) and
+    ``total_seq_len = attention_mask.shape[1]`` (past + current length).
+    Computed directly here (rather than via ``GQAContext``, which also
+    bundles ``cos_cache``/``sin_cache`` for the fused-rotary ``do_rotary=1``
+    path that V4 does not use -- RoPE is applied explicitly in-graph).
+    """
+    one_i32 = op.Constant(value_int=1)
+    seqlens_k = op.Cast(
+        op.Sub(op.ReduceSum(attention_mask, [1], keepdims=0), one_i32),
+        to=ir.DataType.INT32,
+    )
+    total_seq_len = op.Cast(
+        op.Gather(op.Shape(attention_mask), 1),
+        to=ir.DataType.INT32,
+    )
+    return seqlens_k, total_seq_len
 
 
 def _projection_class(config: ArchitectureConfig):
@@ -446,6 +490,13 @@ class DeepSeekV4Attention(nn.Module):
         batch: ir.Value,
         sequence_length: ir.Value,
     ) -> ir.Value:
+        """Broadcast the single MQA key/value head across all query heads.
+
+        Only used by the portable decomposed path below (EPs whose
+        ``gqa_dtypes`` is empty). The fused ``GroupQueryAttention`` path does
+        this broadcast internally via its own ``kv_num_heads=1`` handling, so
+        it never calls this helper.
+        """
         value = op.Unsqueeze(value, [2])
         value = op.Expand(
             value,
@@ -472,9 +523,11 @@ class DeepSeekV4Attention(nn.Module):
         self,
         op: OpBuilder,
         hidden_states: ir.Value,
-        attention_bias: ir.Value,
         position_embeddings: tuple,
         past_key_value: tuple | None = None,
+        attention_bias: ir.Value | None = None,
+        seqlens_k: ir.Value | None = None,
+        total_seq_len: ir.Value | None = None,
     ):
         query = self.q_b_proj(op, self.q_a_layernorm(op, self.q_a_proj(op, hidden_states)))
         query_4d = op.Reshape(query, [0, 0, self.num_heads, self.head_dim])
@@ -489,40 +542,98 @@ class DeepSeekV4Attention(nn.Module):
 
         kv = self.kv_layernorm(op, self.kv_proj(op, hidden_states))
         kv = self._rotate(op, kv, position_embeddings, 1)
-        batch = op.Shape(query, start=0, end=1)
-        query_length = op.Shape(query, start=1, end=2)
-        query = op.Transpose(
-            op.Reshape(query, [0, 0, self.num_heads, self.head_dim]),
-            perm=[0, 2, 1, 3],
-        )
-        key = op.Transpose(op.Reshape(kv, [0, 0, 1, self.head_dim]), perm=[0, 2, 1, 3])
-        value = key
-        if past_key_value is not None:
-            key = op.Concat(past_key_value[0], key, axis=2)
-            value = op.Concat(past_key_value[1], value, axis=2)
-        present_key, present_value = key, value
 
-        kv_length = op.Shape(key, start=2, end=3)
-        key = self._expand_kv(op, key, batch, kv_length)
-        value = self._expand_kv(op, value, batch, kv_length)
-        scores = op.Mul(
-            op.MatMul(query, op.Transpose(key, perm=[0, 1, 3, 2])),
-            self.scale,
-        )
-        scores = op.Add(scores, attention_bias)
-        sinks = op.Expand(
-            op.Reshape(
-                op.CastLike(self.attn_sink, scores),
-                [1, self.num_heads, 1, 1],
-            ),
-            op.Concat(batch, [self.num_heads], query_length, [1], axis=0),
-        )
-        probabilities = op.Softmax(op.Concat(scores, sinks, axis=-1), axis=-1)
-        probabilities = op.Slice(probabilities, [0], [-1], [3])
-        output = op.Reshape(
-            op.Transpose(op.MatMul(probabilities, value), perm=[0, 2, 1, 3]),
-            [0, 0, -1],
-        )
+        if seqlens_k is not None:
+            # Fused causal attention core, used only when the active EP's
+            # `ep_capabilities().gqa_dtypes` includes the build dtype (see
+            # `_use_fused_gqa`). `query`/`kv` are already RoPE-rotated
+            # (trailing rope slice only, applied explicitly above via
+            # `_rotate`, the same convention V2/V3 MLA uses with the plain
+            # `Attention` op), so `GroupQueryAttention` only needs
+            # `do_rotary=0` (its default): cos_cache/sin_cache/position_ids
+            # stay unset. V4 is MQA (`kv_num_heads=1`): key and value are
+            # literally the same rotated `kv` tensor -- broadcasting
+            # `kv_num_heads=1` across all query heads is the fused op's own
+            # job, so `_expand_kv` isn't needed on this path. No explicit
+            # `attention_bias` is passed: this is a plain causal decoder
+            # attention (no sliding window, no KV-sharing across layers, no
+            # per-layer dual head_dim), so GQA's own implicit causal masking
+            # plus `seqlens_k`/`total_seq_len` already carries the exact same
+            # causal+padding semantics `create_attention_bias` bakes into an
+            # explicit float bias on the decomposed path below -- this is the
+            # same "direct GQA" convention `Attention._forward_gqa`
+            # (mobius/components/_attention.py) already uses for every other
+            # simple-causal model in this codebase (see the
+            # `attention-optimization` skill: "Use Contrib GQA when you don't
+            # need attention bias"). `head_sink` carries the learned per-head
+            # attention sink exactly as the decomposed path's
+            # `Concat(scores, sinks) -> Softmax -> slice` sequence does, now
+            # as a first-class op input instead of a manually broadcast
+            # Concat.
+            past_key = past_key_value[0] if past_key_value is not None else None
+            past_value = past_key_value[1] if past_key_value is not None else None
+            output, present_key, present_value = op.GroupQueryAttention(
+                query,
+                kv,
+                kv,
+                past_key,
+                past_value,
+                seqlens_k,
+                total_seq_len,
+                None,  # cos_cache: unused, RoPE already applied above
+                None,  # sin_cache: unused, RoPE already applied above
+                None,  # position_ids: unused, do_rotary=0
+                None,  # attention_bias: unused, plain causal + seqlens_k suffices
+                op.CastLike(self.attn_sink, query),  # head_sink
+                num_heads=self.num_heads,
+                kv_num_heads=1,
+                scale=self.scale,
+                _domain="com.microsoft",
+                _outputs=3,
+            )
+        else:
+            # Portable decomposed path: used whenever the active EP declares
+            # no GQA support for the build dtype (e.g. `"default"`,
+            # `"onnx-standard"`, `"qnn"`, `"openvino"` -- see
+            # `_use_fused_gqa`). Manually replicates the exact same
+            # sink-aware dense causal attention using only standard ONNX
+            # ops, so these EPs' exported graphs stay free of
+            # `com.microsoft` custom ops.
+            batch = op.Shape(query, start=0, end=1)
+            query_length = op.Shape(query, start=1, end=2)
+            query = op.Transpose(
+                op.Reshape(query, [0, 0, self.num_heads, self.head_dim]),
+                perm=[0, 2, 1, 3],
+            )
+            key = op.Transpose(op.Reshape(kv, [0, 0, 1, self.head_dim]), perm=[0, 2, 1, 3])
+            value = key
+            if past_key_value is not None:
+                key = op.Concat(past_key_value[0], key, axis=2)
+                value = op.Concat(past_key_value[1], value, axis=2)
+            present_key, present_value = key, value
+
+            kv_length = op.Shape(key, start=2, end=3)
+            key = self._expand_kv(op, key, batch, kv_length)
+            value = self._expand_kv(op, value, batch, kv_length)
+            scores = op.Mul(
+                op.MatMul(query, op.Transpose(key, perm=[0, 1, 3, 2])),
+                self.scale,
+            )
+            scores = op.Add(scores, attention_bias)
+            sinks = op.Expand(
+                op.Reshape(
+                    op.CastLike(self.attn_sink, scores),
+                    [1, self.num_heads, 1, 1],
+                ),
+                op.Concat(batch, [self.num_heads], query_length, [1], axis=0),
+            )
+            probabilities = op.Softmax(op.Concat(scores, sinks, axis=-1), axis=-1)
+            probabilities = op.Slice(probabilities, [0], [-1], [3])
+            output = op.Reshape(
+                op.Transpose(op.MatMul(probabilities, value), perm=[0, 2, 1, 3]),
+                [0, 0, -1],
+            )
+
         output = self._rotate(op, output, position_embeddings, self.num_heads, inverse=True)
 
         if self.compressor is not None:
@@ -630,9 +741,11 @@ class DeepSeekV4DecoderLayer(nn.Module):
         op: OpBuilder,
         hidden_states: ir.Value,
         input_ids: ir.Value,
-        attention_bias: ir.Value,
         position_embeddings: tuple,
         past_key_value: tuple | None = None,
+        attention_bias: ir.Value | None = None,
+        seqlens_k: ir.Value | None = None,
+        total_seq_len: ir.Value | None = None,
     ):
         residual = hidden_states
         value, post, comb = self._hc_pre(
@@ -645,9 +758,11 @@ class DeepSeekV4DecoderLayer(nn.Module):
         value, present = self.self_attn(
             op,
             self.input_layernorm(op, value),
-            attention_bias,
             position_embeddings,
             past_key_value,
+            attention_bias,
+            seqlens_k,
+            total_seq_len,
         )
         hidden_states = self._hc_post(op, value, residual, post, comb)
 
@@ -742,12 +857,17 @@ class DeepSeekV4TextModel(nn.Module):
         )
         position_embeddings = self.rotary_emb(op, position_ids)
         compressed_position_embeddings = self.compressed_rotary_emb(op, position_ids)
-        attention_bias = create_attention_bias(
-            op,
-            input_ids=hidden_states if input_ids is None else input_ids,
-            attention_mask=attention_mask,
-            dtype=self._dtype,
-        )
+        if _use_fused_gqa():
+            attention_bias = None
+            seqlens_k, total_seq_len = _gqa_kv_lengths(op, attention_mask)
+        else:
+            attention_bias = create_attention_bias(
+                op,
+                input_ids=hidden_states if input_ids is None else input_ids,
+                attention_mask=attention_mask,
+                dtype=self._dtype,
+            )
+            seqlens_k, total_seq_len = None, None
         presents = []
         past_kvs = past_key_values or [None] * len(self.layers)
         for layer, past_kv in zip(self.layers, past_kvs):
@@ -760,9 +880,11 @@ class DeepSeekV4TextModel(nn.Module):
                 op,
                 hidden_states,
                 input_ids,
-                attention_bias,
                 layer_position_embeddings,
                 past_kv,
+                attention_bias,
+                seqlens_k,
+                total_seq_len,
             )
             presents.append(present)
         return self.norm(op, self._hc_head(op, hidden_states)), presents, hidden_states
@@ -820,19 +942,26 @@ class DeepSeekV4Mtp(DeepSeekV4DecoderLayer):
             self.h_proj(op, self.hnorm(op, hidden_states)),
         )
         position_embeddings = self.rotary_emb(op, position_ids)
-        attention_bias = create_attention_bias(
-            op,
-            input_ids=inputs_embeds,
-            attention_mask=attention_mask,
-            dtype=self._dtype,
-        )
+        if _use_fused_gqa():
+            attention_bias = None
+            seqlens_k, total_seq_len = _gqa_kv_lengths(op, attention_mask)
+        else:
+            attention_bias = create_attention_bias(
+                op,
+                input_ids=inputs_embeds,
+                attention_mask=attention_mask,
+                dtype=self._dtype,
+            )
+            seqlens_k, total_seq_len = None, None
         hidden_states, present = super().forward(
             op,
             hidden_states,
             None,
-            attention_bias,
             position_embeddings,
             past_key_value,
+            attention_bias,
+            seqlens_k,
+            total_seq_len,
         )
         return self.norm(op, self._hc_head(op, hidden_states)), present
 
