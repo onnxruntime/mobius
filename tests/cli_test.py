@@ -1040,6 +1040,28 @@ class TestCLIBuildRuntime:
 class TestCLIBuildGGUF:
     """The CLI must preserve the public GGUF architecture gate for every mode."""
 
+    def test_runtime_deferred_graph_architecture_fails_before_output_creation(
+        self, tmp_path: Path
+    ) -> None:
+        gguf_path = tmp_path / "llama.gguf"
+        output_dir = tmp_path / "must-not-exist"
+        _write_gated_gguf(gguf_path, architecture="llama", quantized=False)
+
+        with pytest.raises(SystemExit, match=r"runtime packaging for 'llama' is deferred"):
+            main(
+                [
+                    "build-gguf",
+                    str(gguf_path),
+                    "--output",
+                    str(output_dir),
+                    "--runtime",
+                    "onnx-genai",
+                    "--dequantize",
+                ]
+            )
+
+        assert not output_dir.exists()
+
     @pytest.mark.parametrize(
         ("quantized", "options"),
         [

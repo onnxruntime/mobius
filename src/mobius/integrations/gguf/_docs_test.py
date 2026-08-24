@@ -1,0 +1,107 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+"""Closure tests for the generated GGUF support documentation."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from mobius.integrations.gguf._arch_registry import iter_arch_specs
+from mobius.integrations.gguf._docs import check_document, render_blocks, update_document
+from mobius.integrations.gguf._mmproj_registry import (
+    MMPROJ_ARTIFACT_PINS,
+    iter_projector_specs,
+)
+from mobius.integrations.gguf._quant_registry import iter_quant_specs
+from mobius.integrations.gguf._spec import StorageRole, Support
+from mobius.integrations.gguf._tokenizer_registry import tokenizer_pre_policies
+from mobius.integrations.gguf._upstream import UPSTREAM_COMMIT, UPSTREAM_DATE
+
+
+def test_document_is_exact_generator_output() -> None:
+    assert check_document()
+
+
+def test_stale_at_style_pin_is_rejected(tmp_path: Path) -> None:
+    document = tmp_path / "build_from_gguf.md"
+    document.write_text(
+        Path("docs/api/build_from_gguf.md").read_text(encoding="utf-8")
+        + "\nllama.cpp@1111111111111111111111111111111111111111\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Stale llama.cpp pins"):
+        update_document(document)
+
+
+def test_generated_census_counts_and_pin_are_closed() -> None:
+    blocks = render_blocks()
+    assert UPSTREAM_COMMIT in blocks["summary"]
+    assert UPSTREAM_DATE in blocks["summary"]
+    assert blocks["architectures"].count("\n| `") == 147
+    assert blocks["qtypes"].count("\n| ") == 25
+    assert blocks["projectors"].count("\n| `") == 60
+    assert blocks["tokenizers"].count("\n| `") == 87
+    assert len({policy.canonical for policy in tokenizer_pre_policies().values()}) == 56
+
+
+def test_runtime_support_requires_structured_evidence() -> None:
+    # Architecture evidence is not yet represented as structured records, so no
+    # architecture may claim runtime support by inheriting a permissive default.
+    assert all(spec.runtime is not Support.SUPPORTED for spec in iter_arch_specs())
+
+    pins = {pin.artifact_id for pin in MMPROJ_ARTIFACT_PINS}
+    for spec in iter_projector_specs():
+        if spec.runtime is Support.SUPPORTED:
+            assert spec.real_artifact_ids
+            assert set(spec.real_artifact_ids) <= pins
+
+
+def test_all_active_stored_qtypes_have_an_import_route() -> None:
+    active = [
+        spec
+        for spec in iter_quant_specs()
+        if spec.readable and spec.role is StorageRole.QUANTIZED
+    ]
+    assert len(active) == 25
+    routed = [
+        spec
+        for spec in active
+        if (
+            spec.native_preserve is not None
+            or spec.affine_repack is not None
+            or spec.dequantize is Support.SUPPORTED
+        )
+    ]
+    assert len(routed) == 24
+    assert {
+        spec.name
+        for spec in active
+        if spec not in routed and spec.dequantize is Support.DEFERRED and spec.reason
+    } == {"Q2_0"}
+
+
+def test_generated_ids_are_sorted_and_unique() -> None:
+    architectures = [spec.gguf_arch for spec in iter_arch_specs()]
+    assert len(architectures) == len(set(architectures))
+    aliases = [alias for spec in iter_arch_specs() for alias in spec.aliases]
+    assert len(aliases) == len(set(aliases))
+    assert not (set(architectures) & set(aliases))
+
+    projector_ids = sorted(spec.projector_type for spec in iter_projector_specs())
+    assert len(projector_ids) == len(set(projector_ids))
+    tokenizer_ids = sorted(tokenizer_pre_policies())
+    assert len(tokenizer_ids) == len(set(tokenizer_ids))
+    blocks = render_blocks()
+    assert [
+        line.split("`", 2)[1]
+        for line in blocks["projectors"].splitlines()
+        if line.startswith("| `")
+    ] == projector_ids
+    assert [
+        line.split("`", 2)[1]
+        for line in blocks["tokenizers"].splitlines()
+        if line.startswith("| `")
+    ] == tokenizer_ids

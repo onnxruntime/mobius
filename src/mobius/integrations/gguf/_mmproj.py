@@ -755,11 +755,11 @@ def _preflight_mmproj_pair(
             raise ValueError(
                 f"Projector {projector_type!r} is not a {modality.value} projector."
             )
-        if not spec.is_supported:
+        if not spec.is_importable:
             blocked = ", ".join(
                 name
                 for name, verdict in spec.verdicts.items()
-                if verdict is not Support.SUPPORTED
+                if name != "runtime" and verdict is not Support.SUPPORTED
             )
             raise NotImplementedError(
                 f"clip projector {projector_type!r} is known at llama.cpp "
@@ -1503,7 +1503,7 @@ def _resolve_vlm_builder(text_arch: str, projector_type: str) -> Callable[..., M
     from mobius.integrations.gguf._arch_registry import try_get_arch_spec
 
     projector_spec = get_projector_spec(projector_type)
-    if not projector_spec.is_supported:
+    if not projector_spec.is_importable:
         raise NotImplementedError(
             f"clip projector {projector_type!r} cannot build: {projector_spec.reason}"
         )

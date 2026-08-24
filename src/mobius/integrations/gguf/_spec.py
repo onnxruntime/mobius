@@ -65,6 +65,8 @@ __all__ = [
 import dataclasses
 import enum
 
+from mobius.integrations.gguf._runtime_evidence import validate_runtime_evidence_ids
+
 
 class Support(enum.Enum):
     """Verdict for a single capability.
@@ -242,9 +244,10 @@ class GGUFArchitectureSpec:
     config: Support = Support.SUPPORTED
     tensor_map: Support = Support.SUPPORTED
     graph: Support = Support.SUPPORTED
-    runtime: Support = Support.SUPPORTED
+    runtime: Support = Support.DEFERRED
     quantized_import: Support = Support.SUPPORTED
     reason: str | None = None
+    runtime_evidence_ids: tuple[str, ...] = ()
     config_key_map: str | None = None
     config_postprocessor: str | None = None
     tensor_map_recipe: tuple[str, ...] = ()
@@ -264,6 +267,13 @@ class GGUFArchitectureSpec:
         _require_reason(
             f"GGUF architecture {self.gguf_arch!r}", self.capabilities, self.reason
         )
+        if self.runtime is Support.SUPPORTED:
+            validate_runtime_evidence_ids(self.gguf_arch, self.runtime_evidence_ids)
+        if self.runtime is not Support.SUPPORTED and self.runtime_evidence_ids:
+            raise ValueError(
+                f"{self.gguf_arch!r}: runtime evidence cannot accompany "
+                f"runtime={self.runtime.value}"
+            )
         if self.graph is Support.SUPPORTED and not self.model_type:
             raise ValueError(
                 f"{self.gguf_arch!r}: graph=SUPPORTED requires a model_type to build with"

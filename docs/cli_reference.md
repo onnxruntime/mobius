@@ -321,7 +321,8 @@ mobius build --model Qwen/Qwen2.5-0.5B --output output_dir/ \
 
 ## `mobius build-gguf`
 
-Build an ONNX model from a GGUF file (e.g. from llama.cpp).
+Build an ONNX model from a GGUF file (e.g. from llama.cpp). This is an explicit
+opt-in import path; `mobius build` does not auto-discover or select GGUF files.
 Supported GGUF quantization is preserved by default. This can involve
 byte-preserving native blocks in text-only builds, affine repacking, or
 dequantize/requantize for multimodal and mixed source qtypes.
@@ -338,7 +339,7 @@ mobius build-gguf GGUF_PATH --output OUTPUT_DIR [options]
 
 | Argument | Description |
 |----------|-------------|
-| `GGUF_PATH` | Path to a `.gguf` model file. |
+| `GGUF_PATH` | Local `.gguf` path or exact `owner/repo:filename.gguf` Hub reference. Hub preflight range-reads only that filename, resolves the requested ref to an immutable commit, and downloads that exact revision; repository-level metadata is never used. |
 
 ### Options
 
@@ -350,7 +351,10 @@ mobius build-gguf GGUF_PATH --output OUTPUT_DIR [options]
 | `--dtype DTYPE` | Target dtype for model weights: `f16`, `bf16`, `f32`. |
 | `--external-data FORMAT` | External data format: `onnx` (default) or `safetensors`. |
 | `--ep EP` | Target execution provider for EP-aware optimization. |
-| `--runtime RUNTIME` | `onnx-genai` emits supported runtime metadata. `ort-genai` is rejected until GGUF cache/tokenizer generation coverage exists. |
+| `--runtime RUNTIME` | Request `onnx-genai` or `ort-genai` metadata. Emission is rejected unless the architecture has structured runtime evidence and the GGUF embeds an exact validated tokenizer; neither format bypasses the architecture verdict. |
+| `--runtime-version VERSION` | Exact selected runtime version. Once runtime support exists, this must equal the version in the matching evidence record; compatible-version ranges are not inferred. |
+| `--mmproj PATH` | Exact companion `clip` GGUF. Pairing validates source identity, target architecture, modality, tensor closure, and dimensions before graph construction. |
+| `--target-config PATH` | Exact target config directory for `dflash`/`eagle3`; requires the adjacent complete `tokenizer.json` and emits a target-binding draft manifest. |
 | `--release` | Strip build-time debug and provenance metadata before saving while preserving functional `mobius.*` metadata. |
 | `--static-cache` | Build a fixed-width cache where supported. |
 | `--max-seq-len N` | Set the fixed cache length; requires `--static-cache`. |
@@ -371,7 +375,7 @@ mobius build-gguf model.gguf --output output/ --dtype f16
 F32-, F16-, and BF16-only files build normally as float models because they
 contain no quantization to preserve.
 Quantized files containing only qtypes with no supported preservation target
-(for example, pure Q6_K or Q5_K weights) fail instead of silently becoming
+(for example, pure Q5_K weights) fail instead of silently becoming
 float. Re-run with `--dequantize` to request explicit float conversion.
 
 Encoder-only BERT and ModernBERT GGUF backbones auto-select
@@ -389,6 +393,13 @@ tensor table. `nemotron_h_moe` is also rejected until its MTP block, Mamba2
 parity, mixed expert quantization, tokenizer provenance, and real ORT/ORT GenAI
 generation are validated. See
 [`build_from_gguf()`](api/build_from_gguf.md#nvidia-nemotron-35-lightning-waiver).
+
+Runtime packaging requires a validated embedded `tokenizer.huggingface.json`;
+opaque tokenizer pre-types are never reconstructed. Deferred/rejected
+architecture, tokenizer, draft-pairing, or mmproj checks run before durable
+output. Multimodal packages use `decoder`, `vision_encoder`, optional
+`audio_encoder`, and `embedding`; an admitted trailing MTP head is persisted
+under `mtp/`.
 
 ---
 
