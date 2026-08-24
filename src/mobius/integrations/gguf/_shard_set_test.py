@@ -274,6 +274,52 @@ def test_checksum_mismatch_rejected(tmp_path):
         open_gguf_model(shards[0], verify_checksums=True, expected_sha256=bad)
 
 
+def test_manifest_rejects_swapped_continuation_shard(tmp_path):
+    """A same-model mixed-quant continuation-shard swap is caught by the manifest.
+
+    Continuation shards carry no identity metadata, so without a manifest the
+    swap passes structural validation (the documented residual gap in
+    ``_IDENTITY_KEYS``). Supplying ``expected_sizes`` / ``expected_sha256`` (as
+    :mod:`._preflight` produces from HF LFS metadata) fails closed — this is the
+    byte-exact guard the task requires "when manifest data exists".
+    """
+    # A trusted set and a differently-quantized variant of the "same" model
+    # whose continuation shards differ in byte length and content.
+    good = _write_sharded_gguf(
+        tmp_path / "good", stem="tiny", split_max_tensors=3, cols=16, seed=1
+    )
+    other = _write_sharded_gguf(
+        tmp_path / "other", stem="tiny", split_max_tensors=3, cols=24, seed=2
+    )
+
+    manifest = open_gguf_model(good[0], verify_checksums=True).manifest
+    expected_sizes = {s.path.name: s.size_bytes for s in manifest.shards}
+    expected_sha256 = {s.path.name: s.sha256 for s in manifest.shards}
+
+    # Assemble a working set: trusted primary + a continuation shard swapped in
+    # from the other (mixed-quant) export.
+    work = tmp_path / "work"
+    work.mkdir()
+    for p in good:
+        (work / p.name).write_bytes(p.read_bytes())
+    victim = other[1]  # continuation shard, same filename, different bytes/size
+    (work / victim.name).write_bytes(victim.read_bytes())
+    work_shards = sorted(work.glob("tiny-*.gguf"))
+
+    # Documented residual: metadata alone cannot detect the swap, so this must
+    # NOT raise (continuation shards carry no identity keys to compare).
+    open_gguf_model(work_shards[0])
+
+    # With the manifest it fails closed (the size guard fires before hashing).
+    with pytest.raises(GgufShardError, match=r"(?i)size|sha|checksum"):
+        open_gguf_model(
+            work_shards[0],
+            verify_checksums=True,
+            expected_sha256=expected_sha256,
+            expected_sizes=expected_sizes,
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Manifest / determinism
 # --------------------------------------------------------------------------- #
@@ -324,25 +370,75 @@ def test_offsets_within_file_and_aligned(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
+def _write_q8_sharded_gguf(
+    directory: Path,
+    *,
+    stem: str = "q8",
+    num_layers: int = 3,
+    split_max_tensors: int = 3,
+    rows: int = 512,
+    cols: int = 512,
+) -> list[Path]:
+    """Write a split set whose tensors are native ``Q8_0`` blocks.
+
+    Unlike F32 tensors (which ``get_tensor`` returns as a memmap-backed *view*),
+    a quantized tensor is dequantized into a fresh float32 heap array, so
+    ``tracemalloc`` actually observes the per-tensor payload and the
+    bounded-memory assertion is meaningful. ``cols`` must be a multiple of the
+    32-element ``Q8_0`` block; each block is 34 bytes (fp16 scale + 32 int8).
+    """
+    from gguf import GGMLQuantizationType, GGUFWriter
+
+    assert cols % 32 == 0, "Q8_0 requires the last dim to be a multiple of 32"
+    directory.mkdir(parents=True, exist_ok=True)
+    block_bytes = cols // 32 * 34
+    writer = GGUFWriter(str(directory / stem), "llama", split_max_tensors=split_max_tensors)
+    writer.add_context_length(128)
+    writer.add_embedding_length(cols)
+    writer.add_block_count(num_layers)
+    writer.add_head_count(4)
+    writer.add_head_count_kv(2)
+    writer.add_vocab_size(32)
+
+    rng = np.random.default_rng(3)
+    for name in _tensor_names(num_layers):
+        raw = rng.integers(0, 256, size=(rows, block_bytes), dtype=np.uint8)
+        writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q8_0)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    return sorted(directory.glob(f"{stem}-*.gguf"))
+
+
 def test_bounded_memory_random_access(tmp_path):
-    # Larger tensors so the payload dominates over Python object overhead.
-    shards = _write_sharded_gguf(tmp_path, split_max_tensors=3, rows=512, cols=512)
+    # Native Q8_0 blocks so each get_tensor() dequantizes into a real float32
+    # heap array (a memmap *view* would hide the payload from tracemalloc and
+    # make this assertion vacuous).
+    rows = cols = 512
+    shards = _write_q8_sharded_gguf(tmp_path, split_max_tensors=3, rows=rows, cols=cols)
     model = open_gguf_model(shards[0])
-    one_tensor_bytes = 512 * 512 * 4
+    assert model.num_tensors == len(_tensor_names(3))
+    one_tensor_bytes = rows * cols * 4  # dequantized float32 payload
 
     tracemalloc.start()
     try:
         base = tracemalloc.get_traced_memory()[0]
-        for name in model.tensor_names:
-            block = model.get_tensor(name)
-            del block
+        # Random Q8_0 bytes can encode non-finite fp16 scales; we only measure
+        # memory here, so ignore the resulting numpy dequant warnings.
+        with np.errstate(invalid="ignore", over="ignore"):
+            for name in model.tensor_names:
+                block = model.get_tensor(name)
+                # Force materialisation of the dequantized payload.
+                assert block.nbytes == one_tensor_bytes
+                del block
         peak = tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
 
     # Peak stays within a small multiple of a single tensor — we never
     # materialise the whole (multi-tensor) checkpoint at once.
-    assert peak - base < 6 * one_tensor_bytes
+    assert peak - base < 3 * one_tensor_bytes
 
 
 # --------------------------------------------------------------------------- #

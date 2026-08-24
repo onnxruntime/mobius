@@ -77,6 +77,17 @@ _SPLIT_TENSORS_COUNT = "split.tensors.count"
 # them. A divergence means the shards came from different exports (mixed
 # revision) or different quantization presets (mixed quant), which would build
 # a corrupt model if silently stitched together.
+#
+# NOTE ON THE RESIDUAL MIXED-QUANT GAP: in real llama.cpp/Unsloth split sets
+# these keys are carried ONLY by the primary shard (``split.no == 0``);
+# continuation shards store just ``split.*`` plus tensor data. Identity
+# validation therefore cannot, on metadata alone, distinguish a continuation
+# shard of ``…-IQ1_S`` from the same-index continuation shard of ``…-IQ1_M``
+# of the same model (identical tensor names, identical ``split.tensors.count``,
+# per-shard-consistent offsets). The byte-exact guard for that case is the
+# download manifest: pass ``expected_sha256`` / ``expected_sizes`` (both are
+# produced by :mod:`._preflight`), which are verified per shard in
+# :func:`_build_shard_infos` and fail closed on any mismatch.
 _IDENTITY_KEYS = (
     "general.architecture",
     "general.name",
@@ -280,7 +291,11 @@ class GgufShardSet:
             set is expensive; the preflight path opts in.
         expected_sha256: Optional ``{filename: sha256}`` from a download manifest
             (e.g. Hugging Face LFS metadata). When present each listed shard is
-            verified and a mismatch fails closed.
+            verified and a mismatch fails closed. This is the ONLY byte-exact
+            guard against a same-model mixed-quant continuation-shard swap
+            (``IQ1_S`` primary + ``IQ1_M`` continuation), whose continuation
+            shards carry no identity metadata to compare — supply it (from
+            :mod:`._preflight`) whenever manifest data is available.
         expected_sizes: Optional ``{filename: size_bytes}`` verified the same way.
     """
 
@@ -573,7 +588,15 @@ def _validate_shard_set(infos: list[ShardInfo], shards: list[GGUFModel]) -> None
 
 
 def _validate_identity(infos: list[ShardInfo], shards: list[GGUFModel]) -> None:
-    """Every shard that declares an identity key must agree with the others."""
+    """Every shard that declares an identity key must agree with the others.
+
+    This catches the common mixed-revision / mixed-quant cases (a shard whose
+    primary declares a different architecture, name, quantization version, or
+    tokenizer/template). It CANNOT catch a same-model ``IQ1_S`` vs ``IQ1_M``
+    continuation-shard swap, because continuation shards carry no identity
+    keys; supply a manifest (``expected_sha256`` / ``expected_sizes``) for that
+    case. See the note on :data:`_IDENTITY_KEYS`.
+    """
     for key in _IDENTITY_KEYS:
         seen: dict[Any, str] = {}
         for info, shard in zip(infos, shards):
