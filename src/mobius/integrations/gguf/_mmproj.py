@@ -278,6 +278,14 @@ def _resolve_local_path(path: str | Path) -> str:
     return _resolve_gguf_path(path)
 
 
+def _resolve_mmproj_companion_path(path: str | Path) -> str:
+    from mobius.integrations.gguf._builder import (
+        _resolve_mmproj_companion_path as resolve_companion,
+    )
+
+    return resolve_companion(path)
+
+
 _CLIPPING_BOUND_SUFFIXES = (".input_min", ".input_max", ".output_min", ".output_max")
 _FLOAT_MMPROJ_QTYPES = frozenset({"F32", "F16", "BF16"})
 
@@ -1086,7 +1094,7 @@ def build_gemma4_vlm_from_gguf(
             "Text GGUF contains no mapped quantized weights; using the float import path"
         )
 
-    mmproj_gguf = GGUFModel(_resolve_local_path(mmproj_gguf_path))
+    mmproj_gguf = GGUFModel(_resolve_mmproj_companion_path(mmproj_gguf_path))
     _validate_gguf_model(
         mmproj_gguf,
         source=str(mmproj_gguf_path),
@@ -1294,7 +1302,7 @@ def build_muse_glimmer_vlm_from_gguf(
     _validate_gguf_model(text_gguf, source=str(text_gguf_path))
     text_arch = text_gguf.architecture
 
-    mmproj_gguf = GGUFModel(_resolve_local_path(mmproj_gguf_path))
+    mmproj_gguf = GGUFModel(_resolve_mmproj_companion_path(mmproj_gguf_path))
     _validate_gguf_model(
         mmproj_gguf,
         source=str(mmproj_gguf_path),
@@ -1418,7 +1426,7 @@ def build_vlm_from_gguf(
 
     text_gguf = GGUFModel(_resolve_local_path(text_gguf_path))
     _validate_gguf_model(text_gguf, source=str(text_gguf_path))
-    mmproj_gguf = GGUFModel(_resolve_local_path(mmproj_gguf_path))
+    mmproj_gguf = GGUFModel(_resolve_mmproj_companion_path(mmproj_gguf_path))
     _validate_gguf_model(
         mmproj_gguf,
         source=str(mmproj_gguf_path),

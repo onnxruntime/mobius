@@ -333,7 +333,13 @@ def _assert_sparse_moe_graph(pkg, *, source: str, allow_dense: bool) -> None:
     )
 
 
-def _preflight_hf_gguf(api: HfApi, repo_id: str, filename: str) -> None:
+def _preflight_hf_gguf(
+    api: HfApi,
+    repo_id: str,
+    filename: str,
+    *,
+    allow_mmproj_companion: bool = False,
+) -> None:
     """Use Hub metadata to reject known-bad inputs before a multi-GB download."""
     source = f"{repo_id}:{filename}"
     _raise_for_sharded_gguf(source=source, filename=filename)
@@ -364,9 +370,15 @@ def _preflight_hf_gguf(api: HfApi, repo_id: str, filename: str) -> None:
     else:
         architecture = getattr(gguf_metadata, "architecture", None)
     if isinstance(architecture, str):
+        if allow_mmproj_companion and architecture != MMPROJ_ARCHITECTURE:
+            raise ValueError(
+                f"Expected a {MMPROJ_ARCHITECTURE!r} mmproj GGUF for {source!r}, "
+                f"got architecture {architecture!r}. No files were downloaded."
+            )
         _raise_for_unsupported_gguf_architecture(
             architecture,
             source=source,
+            allow_mmproj_companion=allow_mmproj_companion,
         )
 
 
@@ -775,8 +787,8 @@ def _looks_like_hf_repo_id(value: str) -> bool:
     return len(parts) == 2 and all(p and not p.endswith(".gguf") for p in parts)
 
 
-def _resolve_gguf_path(gguf_path: str | Path) -> str:
-    """Resolve a GGUF reference to a local file path.
+def _resolve_gguf_path_impl(gguf_path: str | Path, *, allow_mmproj_companion: bool) -> str:
+    """Resolve a GGUF reference with an internal primary/companion context.
 
     Accepts:
     - An existing local filesystem path (returned unchanged).
@@ -809,9 +821,24 @@ def _resolve_gguf_path(gguf_path: str | Path) -> str:
             )
         filename = files[0]
 
-    _preflight_hf_gguf(api, repo_id, filename)
+    _preflight_hf_gguf(
+        api,
+        repo_id,
+        filename,
+        allow_mmproj_companion=allow_mmproj_companion,
+    )
     logger.info("Downloading %s from %s", filename, repo_id)
     return hf_hub_download(repo_id=repo_id, filename=filename)
+
+
+def _resolve_gguf_path(gguf_path: str | Path) -> str:
+    """Resolve a primary GGUF reference without allowing mmproj sidecars."""
+    return _resolve_gguf_path_impl(gguf_path, allow_mmproj_companion=False)
+
+
+def _resolve_mmproj_companion_path(gguf_path: str | Path) -> str:
+    """Resolve an internal mmproj companion, allowing only ``clip`` Hub metadata."""
+    return _resolve_gguf_path_impl(gguf_path, allow_mmproj_companion=True)
 
 
 def build_from_gguf(
